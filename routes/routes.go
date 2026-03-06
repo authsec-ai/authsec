@@ -14,6 +14,12 @@
 // The well-known OIDC discovery endpoints remain at the root as required by RFC 8414:
 //   /.well-known/openid-configuration
 //   /.well-known/jwks.json
+//
+// Client management routes are served under the /clientms prefix (formerly clients-microservice):
+//   /clientms/health                                  – health check
+//   /clientms/tenants/:tenantId/clients/*             – tenant-scoped client CRUD
+//   /clientms/admin/clients/*                         – admin cross-tenant client view
+//   /clientms/oocmgr/tenant/delete-complete           – OOC manager integration
 package routes
 
 import (
@@ -604,6 +610,18 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
+		// Client Management (formerly clients-microservice)
+		// Served under /clientms to match the original service prefix.
+		// ────────────────────────────────────────────────────
+		registerClientsRoutes(r)
+
+		// ────────────────────────────────────────────────────
+		// Hydra Manager (formerly hydra-service)
+		// Served under /hmgr to match the original service prefix.
+		// ────────────────────────────────────────────────────
+		registerHmgrRoutes(r)
+
+		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)
 		// ────────────────────────────────────────────────────
 		extSvcController := controllers.NewExternalServiceController(config.DB)
@@ -633,6 +651,85 @@ func SetupRoutes(
 		authsec.GET("/clients/clients/api/v1/health", func(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/clientms/api/v1/health"})
 		})
+	}
+}
+
+// registerClientsRoutes registers all client management routes under /clientms.
+// Previously served by the standalone clients-microservice.
+// Auth middleware is applied to all routes inside the /clientms group.
+func registerClientsRoutes(r *gin.Engine) {
+	redoclyHandler := func(c *gin.Context) {
+		html := `<!DOCTYPE html>
+<html>
+  <head>
+    <title>Clients API Documentation</title>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+    <style>body { margin: 0; padding: 0; }</style>
+  </head>
+  <body>
+    <redoc spec-url='/clientms/swagger/doc.json'></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"> </script>
+  </body>
+</html>`
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(200, html)
+	}
+
+	// Documentation endpoints (no auth required)
+	r.GET("/clientms/swagger", redoclyHandler)
+	r.GET("/clientms/swagger/index.html", redoclyHandler)
+
+	clientms := r.Group("/clientms")
+
+	// Health check (no auth required)
+	clientms.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "healthy", "service": "clients-microservice"})
+	})
+
+	// All API routes require JWT authentication
+	clientms.Use(middlewares.AuthMiddleware())
+	{
+		// Tenant-scoped client routes
+		tenantRoutes := clientms.Group("/tenants/:tenantId")
+		{
+			clients := tenantRoutes.Group("/clients")
+			{
+				clients.GET("/getClients", controllers.GetClients)
+				clients.POST("/getClients", controllers.GetClientsByTenant)
+
+				clients.GET("/:id", controllers.GetClient)
+
+				clients.POST("/create", controllers.CreateClient)
+
+				clients.PUT("/:id", controllers.UpdateClient)
+				clients.PATCH("/:id", controllers.EditClient)
+
+				clients.PATCH("/:id/soft-delete", controllers.SoftDeleteClient)
+				clients.DELETE("/:id", controllers.DeleteClient)
+
+				clients.POST("/delete-complete", controllers.DeleteCompleteClient)
+
+				clients.PATCH("/:id/activate", controllers.ActivateClient)
+				clients.PATCH("/:id/deactivate", controllers.DeactivateClient)
+
+				clients.POST("/set-status", controllers.SetClientStatus)
+			}
+		}
+
+		// Admin cross-tenant route (requires admin access)
+		adminClients := clientms.Group("/admin/clients")
+		adminClients.Use(middlewares.Require("clients", "admin"))
+		{
+			adminClients.GET("/", controllers.GetClients)
+		}
+
+		// OOC Manager integration routes (internal service-to-service)
+		oocmgr := clientms.Group("/oocmgr")
+		{
+			oocmgr.POST("/tenant/delete-complete", controllers.DeleteCompleteClient)
+		}
 	}
 }
 
@@ -704,4 +801,90 @@ func registerWebAuthnRoutes(
 	router.POST("/sms/confirmSetup", smsHandler.ConfirmSMSSetup)
 	router.POST("/sms/requestCode", smsHandler.RequestSMSCode)
 	router.POST("/sms/verify", smsHandler.VerifySMS)
+}
+
+// registerHmgrRoutes registers all Hydra Manager routes under /hmgr.
+// Previously served by the standalone hydra-service.
+func registerHmgrRoutes(r *gin.Engine) {
+	hmgrController := controllers.NewHmgrController(*config.AppConfig)
+
+	// ── Public routes (no authentication required) ──
+	pub := r.Group("/hmgr")
+	{
+		// OIDC endpoints
+		pub.GET("/login/page-data", hmgrController.GetLoginPageDataHandler)
+		pub.POST("/auth/initiate/:provider", hmgrController.InitiateAuthHandler)
+		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
+		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
+
+		// SAML endpoints
+		pub.POST("/saml/initiate/:provider", hmgrController.InitiateSAMLAuthHandler)
+		pub.POST("/saml/acs", hmgrController.HandleSAMLACSHandler)
+		pub.POST("/saml/acs/:tenant_id/:client_id", hmgrController.HandleSAMLACSClientHandler)
+		pub.GET("/saml/metadata/:tenant_id/:client_id", hmgrController.GetSAMLMetadataHandler)
+		pub.POST("/saml/test-provider", hmgrController.TestSAMLProviderHandler)
+
+		// DEV ONLY: Temporary unauthenticated SAML provider management
+		// TODO: Remove in production - use /hmgr/admin/saml-providers instead
+		dev := pub.Group("/dev")
+		{
+			dev.GET("/saml-providers", hmgrController.GetSAMLProvidersHandler)
+			dev.POST("/saml-providers", hmgrController.CreateSAMLProviderHandler)
+			dev.PUT("/saml-providers/:id", hmgrController.UpdateSAMLProviderHandler)
+			dev.DELETE("/saml-providers/:id", hmgrController.DeleteSAMLProviderHandler)
+		}
+
+		// Common endpoints
+		pub.GET("/login", hmgrController.LoginRedirectHandler)
+		pub.GET("/consent", hmgrController.ConsentHandler)
+		pub.GET("/health", hmgrController.HealthHandler)
+		pub.GET("/challenge", hmgrController.LoginChallengeHandler)
+	}
+
+	// ── Protected routes requiring authentication ──
+	prot := r.Group("/hmgr/admin")
+	prot.Use(middlewares.AuthMiddleware())
+	{
+		// Admin-only routes
+		admin := prot.Group("/")
+		admin.Use(middlewares.Require("admin", "manage"))
+		{
+			// User management
+			admin.GET("/users", hmgrController.GetUsersHandler)
+			admin.POST("/users", hmgrController.CreateUserHandler)
+			admin.PUT("/users/:id", hmgrController.UpdateUserHandler)
+			admin.DELETE("/users/:id", hmgrController.DeleteUserHandler)
+
+			// Tenant management
+			admin.GET("/tenants", hmgrController.GetTenantsHandler)
+			admin.POST("/tenants", hmgrController.CreateTenantHandler)
+			admin.PUT("/tenants/:id", hmgrController.UpdateTenantHandler)
+			admin.DELETE("/tenants/:id", hmgrController.DeleteTenantHandler)
+
+			// SAML provider management
+			admin.GET("/saml-providers", hmgrController.GetSAMLProvidersHandler)
+			admin.POST("/saml-providers", hmgrController.CreateSAMLProviderHandler)
+			admin.PUT("/saml-providers/:id", hmgrController.UpdateSAMLProviderHandler)
+			admin.DELETE("/saml-providers/:id", hmgrController.DeleteSAMLProviderHandler)
+
+			// Role and permission management
+			admin.GET("/roles", hmgrController.GetRolesHandler)
+			admin.POST("/roles", hmgrController.CreateRoleHandler)
+			admin.PUT("/roles/:id", hmgrController.UpdateRoleHandler)
+			admin.DELETE("/roles/:id", hmgrController.DeleteRoleHandler)
+			admin.GET("/permissions", hmgrController.GetPermissionsHandler)
+			admin.POST("/permissions", hmgrController.CreatePermissionHandler)
+
+			// User role assignments
+			admin.POST("/users/:id/roles", hmgrController.AssignUserRoleHandler)
+			admin.DELETE("/users/:id/roles/:role_id", hmgrController.RemoveUserRoleHandler)
+		}
+
+		// Authenticated user routes (own profile)
+		user := prot.Group("/")
+		{
+			user.GET("/profile", hmgrController.GetProfileHandler)
+			user.PUT("/profile", hmgrController.UpdateProfileHandler)
+		}
+	}
 }

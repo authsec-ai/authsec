@@ -146,6 +146,35 @@ func HealthCheck() error {
 	return nil
 }
 
+// SecretInVault retrieves a secret from Vault for the specified tenant, project, and client
+func SecretInVault(tenantID, projectID, clientID string) (string, error) {
+	if VaultClient == nil {
+		return "", fmt.Errorf("vault client not initialized")
+	}
+
+	secretPath := fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	secret, err := VaultClient.Logical().ReadWithContext(ctx, secretPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read secret from Vault at path %s: %w", secretPath, err)
+	}
+
+	data, err := GetSecretData(secret)
+	if err != nil {
+		return "", fmt.Errorf("failed to extract secret data: %w", err)
+	}
+
+	secretID, ok := data["secret_id"].(string)
+	if !ok || secretID == "" {
+		return "", fmt.Errorf("secret_id not found in Vault at path %s", secretPath)
+	}
+
+	return secretID, nil
+}
+
 // SaveSecretToVault saves a secret to Vault under the specified tenant and project
 func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 	if VaultClient == nil {
@@ -235,4 +264,59 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 
 	log.Printf("Successfully saved secret %s to Vault at path %s", secretID, secretPath)
 	return secretID, nil
+}
+
+// SaveProviderSecretToVault stores provider credentials under a deterministic path.
+func SaveProviderSecretToVault(tenantID, providerName string, data map[string]interface{}) error {
+	if VaultClient == nil {
+		return fmt.Errorf("vault client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("kv/data/oidc/providers/%s/%s", tenantID, providerName)
+	payload := map[string]interface{}{"data": data}
+
+	if _, err := VaultClient.Logical().WriteWithContext(ctx, path, payload); err != nil {
+		return fmt.Errorf("failed to write provider secret to Vault at %s: %w", path, err)
+	}
+	return nil
+}
+
+// DeleteProviderSecretFromVault removes provider credentials from Vault.
+func DeleteProviderSecretFromVault(tenantID, providerName string) error {
+	if VaultClient == nil {
+		return fmt.Errorf("vault client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	metadataPath := fmt.Sprintf("kv/metadata/oidc/providers/%s/%s", tenantID, providerName)
+	if _, err := VaultClient.Logical().DeleteWithContext(ctx, metadataPath); err != nil {
+		return fmt.Errorf("failed to delete provider secret metadata from Vault at %s: %w", metadataPath, err)
+	}
+	return nil
+}
+
+// GetProviderSecretFromVault retrieves provider credentials from Vault.
+func GetProviderSecretFromVault(tenantID, providerName string) (map[string]interface{}, error) {
+	if VaultClient == nil {
+		return nil, fmt.Errorf("vault client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("kv/data/oidc/providers/%s/%s", tenantID, providerName)
+	secret, err := VaultClient.Logical().ReadWithContext(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read provider secret from Vault at %s: %w", path, err)
+	}
+	if secret == nil {
+		return nil, fmt.Errorf("secret not found")
+	}
+	data, err := GetSecretData(secret)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }

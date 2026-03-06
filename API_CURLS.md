@@ -1314,3 +1314,176 @@ curl "$BASE/authsec/services/$SERVICE_ID/credentials" \
 curl "$BASE/authsec/debug/extsvc/auth" \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+---
+
+## Client Management  `/clientms`
+
+Manages multi-tenant client registrations. Formerly the standalone `clients-microservice`, now merged into authsec.
+Requires `clients` RBAC permissions (seeded automatically per-tenant on first client creation).
+
+```bash
+CLIENT_MS="http://localhost:7468"
+CLIENT_ID="<client-uuid>"
+```
+
+### Health
+
+```bash
+curl "$CLIENT_MS/clientms/health"
+```
+
+### List Clients  `GET /clientms/tenants/:tenantId/clients/getClients`
+
+```bash
+# List all clients for a tenant (paginated)
+curl "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/getClients" \
+  -H "Authorization: Bearer $TOKEN"
+
+# With filters
+curl "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/getClients?status=Active&page=1&limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Filter by active only
+curl "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/getClients?active_only=true" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Include soft-deleted clients
+curl "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/getClients?deleted=true" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Legacy POST route (body-based tenant filter)
+curl -X POST "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/getClients" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","active_only":false}'
+```
+
+### Get Client  `GET /clientms/tenants/:tenantId/clients/:id`
+
+```bash
+curl "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Create Client  `POST /clientms/tenants/:tenantId/clients/create`
+
+```bash
+curl -X POST "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/create" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My App",
+    "email": "myapp@example.com",
+    "active": true,
+    "status": "Active",
+    "tags": ["web", "production"],
+    "oidc_enabled": false
+  }'
+```
+
+### Register Client (full registration with Hydra + Vault)  `POST /clientms/tenants/:tenantId/clients/register`
+
+> Note: Uses the legacy RegisterClient route which also creates a Vault secret and registers with Hydra.
+
+```bash
+# The RegisterClient endpoint is wired via the route group;
+# use CreateClient above for standard creation without Hydra/Vault.
+```
+
+### Update Client  `PUT /clientms/tenants/:tenantId/clients/:id`
+
+```bash
+curl -X PUT "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Updated App Name",
+    "status": "Active",
+    "tags": ["web", "v2"]
+  }'
+```
+
+### Edit Client (partial update)  `PATCH /clientms/tenants/:tenantId/clients/:id`
+
+```bash
+curl -X PATCH "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Patched Name"}'
+```
+
+### Soft Delete Client  `PATCH /clientms/tenants/:tenantId/clients/:id/soft-delete`
+
+```bash
+curl -X PATCH "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID/soft-delete" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Delete Client (soft delete via DELETE)  `DELETE /clientms/tenants/:tenantId/clients/:id`
+
+```bash
+curl -X DELETE "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Hard Delete Client  `POST /clientms/tenants/:tenantId/clients/delete-complete`
+
+Permanently removes the client from both tenant DB and main DB, and cleans up Hydra via OOC Manager.
+
+```bash
+curl -X POST "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/delete-complete" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
+```
+
+### Activate Client  `PATCH /clientms/tenants/:tenantId/clients/:id/activate`
+
+```bash
+curl -X PATCH "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID/activate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Deactivate Client  `PATCH /clientms/tenants/:tenantId/clients/:id/deactivate`
+
+```bash
+curl -X PATCH "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/$CLIENT_ID/deactivate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Set Client Status  `POST /clientms/tenants/:tenantId/clients/set-status`
+
+```bash
+curl -X POST "$CLIENT_MS/clientms/tenants/$TENANT_ID/clients/set-status" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","active":true}'
+```
+
+### Admin — List All Clients  `GET /clientms/admin/clients/`
+
+Requires `clients:admin` permission.
+
+```bash
+curl "$CLIENT_MS/clientms/admin/clients/" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### OOC Manager Integration  `POST /clientms/oocmgr/tenant/delete-complete`
+
+Internal service-to-service route for OOC Manager callbacks.
+
+```bash
+curl -X POST "$CLIENT_MS/clientms/oocmgr/tenant/delete-complete" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
+```
+
+### API Documentation
+
+```bash
+# Swagger/Redoc docs (no auth required)
+curl "$CLIENT_MS/clientms/swagger"
+```

@@ -58,6 +58,11 @@ type Config struct {
 
 	// HubSpot integration
 	HubSpotAccessToken string
+
+	// Hydra service fields
+	HydraPublicURL      string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
+	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
+	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
 }
 
 var (
@@ -134,6 +139,11 @@ func LoadConfig() *Config {
 	// Load HubSpot configuration
 	hubSpotAccessToken := getEnv("HUBSPOT_ACCESS_TOKEN", "")
 
+	// Load Hydra service configuration
+	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
+	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
+	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
+
 	// Validate critical variables
 	if dbName == "" || dbUser == "" || dbHost == "" || dbPort == "" {
 		log.Fatal("DB_NAME, DB_USER, DB_HOST, and DB_PORT are required")
@@ -170,6 +180,9 @@ func LoadConfig() *Config {
 		GitHubClientSecret:    githubClientSecret,
 		MicrosoftClientSecret: microsoftClientSecret,
 		HubSpotAccessToken:    hubSpotAccessToken,
+		HydraPublicURL:        hydraPublicURL,
+		ReactAppURL:           reactAppURL,
+		IdentityProviderURL:   identityProviderURL,
 	}
 
 	return AppConfig
