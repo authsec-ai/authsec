@@ -16,9 +16,13 @@
 //   /.well-known/jwks.json
 //
 // All merged microservice routes are under /authsec:
+//   /authsec/uflow/*      – user flow (formerly user-flow)
+//   /authsec/webauthn/*   – WebAuthn/passkeys (formerly webauthn-service)
+//   /authsec/exsvc/*      – external services (formerly mcp-service/external-service)
 //   /authsec/clientms/*   – client management (formerly clients-microservice)
 //   /authsec/hmgr/*       – Hydra manager (formerly hydra-service)
 //   /authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
+//   /authsec/authmgr/*    – Auth manager (formerly auth-manager)
 package routes
 
 import (
@@ -155,54 +159,61 @@ func SetupRoutes(
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
 	{
+		// ────────────────────────────────────────────────────
+		// WebAuthn routes  (/authsec/webauthn/*)
+		// Served under /authsec/webauthn (formerly webauthn-service).
+		// ────────────────────────────────────────────────────
+		registerWebAuthnRoutes(authsec.Group("/webauthn"), webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler)
+
+		// ────────────────────────────────────────────────────
+		// User Flow (formerly user-flow)
+		// Served under /authsec/uflow.
+		// ────────────────────────────────────────────────────
+		uflow := authsec.Group("/uflow")
+
 		// Debug endpoint to discover JWT secret (development only)
-		authsec.POST("/debug/jwt-secret", middlewares.DebugJWTSecret())
+		uflow.POST("/debug/jwt-secret", middlewares.DebugJWTSecret())
 
 		// Device activation page (public)
-		authsec.GET("/activate", deviceAuthController.ShowActivationPage)
-
-		// ────────────────────────────────────────────────────
-		// WebAuthn routes  (/authsec/*)
-		// ────────────────────────────────────────────────────
-		registerWebAuthnRoutes(authsec, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler)
+		uflow.GET("/activate", deviceAuthController.ShowActivationPage)
 
 		// ────────────────────────────────────────────────────
 		// API docs
 		// ────────────────────────────────────────────────────
-		authsec.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
-		authsec.GET("/docs", func(c *gin.Context) {
+		uflow.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+		uflow.GET("/docs", func(c *gin.Context) {
 			c.Header("Content-Type", "text/html; charset=utf-8")
 			html := `<!DOCTYPE html>
-<html>
-<head>
-    <title>AuthSec API Documentation</title>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
-    <style>body { margin: 0; padding: 0; }</style>
-</head>
-<body>
-    <redoc spec-url='/authsec/swagger/doc.json'></redoc>
-    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
-</body>
-</html>`
+						<html>
+						<head>
+							<title>AuthSec API Documentation</title>
+							<meta charset="utf-8"/>
+							<meta name="viewport" content="width=device-width, initial-scale=1">
+							<link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+							<style>body { margin: 0; padding: 0; }</style>
+						</head>
+						<body>
+							<redoc spec-url='/authsec/uflow/swagger/doc.json'></redoc>
+							<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+						</body>
+						</html>`
 			c.String(http.StatusOK, html)
 		})
-		authsec.GET("/apidocs", func(c *gin.Context) {
+		uflow.GET("/apidocs", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"title":   "AuthSec API",
 				"version": "5.0.0",
 				"status":  "available",
 			})
 		})
-		authsec.GET("/apidocs/*any", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"message": "API documentation available at /authsec/docs"})
+		uflow.GET("/apidocs/*any", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"message": "API documentation available at /authsec/uflow/docs"})
 		})
 
 		// ────────────────────────────────────────────────────
 		// Admin RBAC routes
 		// ────────────────────────────────────────────────────
-		adminRBAC := authsec.Group("/admin")
+		adminRBAC := uflow.Group("/admin")
 		adminRBAC.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
@@ -236,7 +247,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// OIDC public endpoints
 		// ────────────────────────────────────────────────────
-		oidcPublic := authsec.Group("/oidc")
+		oidcPublic := uflow.Group("/oidc")
 		{
 			oidcPublic.GET("/providers", oidcController.GetProviders)
 			oidcPublic.POST("/initiate", oidcController.Initiate)
@@ -250,7 +261,7 @@ func SetupRoutes(
 		}
 
 		// Authenticated OIDC endpoints
-		oidcAuth := authsec.Group("/oidc")
+		oidcAuth := uflow.Group("/oidc")
 		oidcAuth.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 		{
 			oidcAuth.POST("/link", oidcController.LinkIdentity)
@@ -261,7 +272,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// Authentication routes
 		// ────────────────────────────────────────────────────
-		auth := authsec.Group("/auth")
+		auth := uflow.Group("/auth")
 		{
 			notify := auth.Group("/notify")
 			notify.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
@@ -346,7 +357,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// Tenant auth routes
 		// ────────────────────────────────────────────────────
-		tenantAuth := authsec.Group("/auth/tenant")
+		tenantAuth := uflow.Group("/auth/tenant")
 		{
 			tenantCIBA := tenantAuth.Group("/ciba")
 			{
@@ -373,7 +384,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// Admin management routes
 		// ────────────────────────────────────────────────────
-		admin := authsec.Group("/admin")
+		admin := uflow.Group("/admin")
 		admin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
@@ -408,7 +419,7 @@ func SetupRoutes(
 		}
 
 		// Platform admin routes
-		adminPlatform := authsec.Group("/admin")
+		adminPlatform := uflow.Group("/admin")
 		adminPlatform.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
@@ -446,7 +457,7 @@ func SetupRoutes(
 		}
 
 		// SCIM token
-		scimToken := authsec.Group("/admin/scim")
+		scimToken := uflow.Group("/admin/scim")
 		scimToken.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
@@ -455,7 +466,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// End-user admin scopes
 		// ────────────────────────────────────────────────────
-		enduserAdmin := authsec.Group("/enduser")
+		enduserAdmin := uflow.Group("/enduser")
 		enduserAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
@@ -470,18 +481,10 @@ func SetupRoutes(
 			enduserAdmin.DELETE("/scopes/:scope_name", scopeController.DeleteUserScope)
 		}
 
-		// Minimal client management compatibility shim
-		clientms := authsec.Group("/clientms")
-		{
-			clientms.POST("/tenants/:tenant_id/clients/getClients", func(c *gin.Context) {
-				c.JSON(http.StatusOK, gin.H{"clients": []interface{}{}})
-			})
-		}
-
 		// ────────────────────────────────────────────────────
 		// End-user self-service routes
 		// ────────────────────────────────────────────────────
-		user := authsec.Group("/user")
+		user := uflow.Group("/user")
 		{
 			user.POST("/login", endUserController.CustomLogin)
 			user.POST("/login/status", endUserController.CustomLoginStatus)
@@ -546,7 +549,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// HubSpot integration
 		// ────────────────────────────────────────────────────
-		hubspot := authsec.Group("/hubspot")
+		hubspot := uflow.Group("/hubspot")
 		hubspot.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 		{
 			hubspot.POST("/contacts/sync", hubspotController.SyncContact)
@@ -557,7 +560,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 
 		// Discovery (public)
-		scimDiscovery := authsec.Group("/scim/v2")
+		scimDiscovery := uflow.Group("/scim/v2")
 		{
 			scimDiscovery.GET("/ServiceProviderConfig", scimController.GetServiceProviderConfig)
 			scimDiscovery.GET("/Schemas", scimController.GetSchemas)
@@ -565,7 +568,7 @@ func SetupRoutes(
 		}
 
 		// End-user provisioning
-		scimEndUser := authsec.Group("/scim/v2/:client_id/:project_id")
+		scimEndUser := uflow.Group("/scim/v2/:client_id/:project_id")
 		scimEndUser.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 		{
 			scimEndUser.GET("/Users", scimController.ListUsers)
@@ -583,7 +586,7 @@ func SetupRoutes(
 		}
 
 		// Admin provisioning
-		scimAdmin := authsec.Group("/scim/v2/admin")
+		scimAdmin := uflow.Group("/scim/v2/admin")
 		scimAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
@@ -601,7 +604,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// Health checks
 		// ────────────────────────────────────────────────────
-		health := authsec.Group("/health")
+		health := uflow.Group("/health")
 		{
 			health.GET("", healthController.ComprehensiveHealthCheck)
 			health.GET("/tenant/:tenant_id", healthController.CheckTenantDatabase)
@@ -627,13 +630,44 @@ func SetupRoutes(
 		registerOocmgrRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
+		// Auth Manager (formerly auth-manager)
+		// Served under /authsec/authmgr.
+		// ────────────────────────────────────────────────────
+		registerAuthmgrRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)
+		// Served under /authsec/exsvc.
 		// ────────────────────────────────────────────────────
 		extSvcController := controllers.NewExternalServiceController(config.DB)
 
-		authsec.GET("/debug/extsvc/auth", middlewares.AuthMiddleware(), controllers.DebugExternalServiceAuth)
+		exsvc := authsec.Group("/exsvc")
+		exsvc.GET("/health", func(c *gin.Context) {
+			c.JSON(200, gin.H{"status": "ok", "service": "external-service"})
+		})
+		exsvc.GET("/debug/auth", middlewares.AuthMiddleware(), controllers.DebugExternalServiceAuth)
+		exsvc.GET("/debug/test", middlewares.AuthMiddleware(), func(c *gin.Context) {
+			c.JSON(200, gin.H{"status": "authenticated", "path": "/debug/test"})
+		})
+		exsvc.GET("/debug/token", middlewares.AuthMiddleware(), func(c *gin.Context) {
+			contextData := make(map[string]interface{})
+			if claims, exists := c.Get("claims"); exists {
+				contextData["claims"] = claims
+			}
+			if perms, exists := c.Get("perms"); exists {
+				contextData["perms"] = perms
+			}
+			if scope, exists := c.Get("scope"); exists {
+				contextData["scope"] = scope
+			}
+			if user, exists := c.Get("user"); exists {
+				contextData["user"] = user
+			}
+			contextData["all_context_keys"] = c.Keys
+			c.JSON(200, gin.H{"status": "authenticated", "context_data": contextData})
+		})
 
-		extSvcs := authsec.Group("/services")
+		extSvcs := exsvc.Group("/services")
 		extSvcs.Use(middlewares.AuthMiddleware())
 		{
 			extSvcs.POST("", middlewares.Require("external-service", "create"), extSvcController.CreateExternalService)
@@ -645,15 +679,15 @@ func SetupRoutes(
 		}
 
 		// Legacy login/register endpoints
-		authsec.POST("/register/verify", userController.VerifyOTPAndCompleteRegistration)
-		authsec.POST("/login/webauthn-callback", userController.WebAuthnCallback)
-		authsec.POST("/login", userController.Login)
+		uflow.POST("/register/verify", userController.VerifyOTPAndCompleteRegistration)
+		uflow.POST("/login/webauthn-callback", userController.WebAuthnCallback)
+		uflow.POST("/login", userController.Login)
 
 		// Misrouted health-check helpers for monitoring
-		authsec.GET("/spire/health", func(c *gin.Context) {
+		uflow.GET("/spire/health", func(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/spiresvc/health"})
 		})
-		authsec.GET("/clients/clients/api/v1/health", func(c *gin.Context) {
+		uflow.GET("/clients/clients/api/v1/health", func(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/clientms/api/v1/health"})
 		})
 	}
@@ -665,19 +699,19 @@ func SetupRoutes(
 func registerClientsRoutes(r gin.IRouter) {
 	redoclyHandler := func(c *gin.Context) {
 		html := `<!DOCTYPE html>
-<html>
-  <head>
-    <title>Clients API Documentation</title>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
-    <style>body { margin: 0; padding: 0; }</style>
-  </head>
-  <body>
-    <redoc spec-url='/clientms/swagger/doc.json'></redoc>
-    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"> </script>
-  </body>
-</html>`
+					<html>
+					<head>
+						<title>Clients API Documentation</title>
+						<meta charset="utf-8"/>
+						<meta name="viewport" content="width=device-width, initial-scale=1">
+						<link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+						<style>body { margin: 0; padding: 0; }</style>
+					</head>
+					<body>
+						<redoc spec-url='/clientms/swagger/doc.json'></redoc>
+						<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"> </script>
+					</body>
+					</html>`
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(200, html)
 	}
@@ -685,6 +719,7 @@ func registerClientsRoutes(r gin.IRouter) {
 	// Documentation endpoints (no auth required)
 	r.GET("/clientms/swagger", redoclyHandler)
 	r.GET("/clientms/swagger/index.html", redoclyHandler)
+	r.GET("/clientms/swagger/doc.json", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	clientms := r.Group("/clientms")
 
@@ -706,7 +741,7 @@ func registerClientsRoutes(r gin.IRouter) {
 
 				clients.GET("/:id", controllers.GetClient)
 
-				clients.POST("/create", controllers.CreateClient)
+				clients.POST("/create", controllers.RegisterClient)
 
 				clients.PUT("/:id", controllers.UpdateClient)
 				clients.PATCH("/:id", controllers.EditClient)
@@ -738,16 +773,20 @@ func registerClientsRoutes(r gin.IRouter) {
 	}
 }
 
-// registerWebAuthnRoutes registers WebAuthn routes directly on the provided router group.
+// registerWebAuthnRoutes registers WebAuthn routes on the provided router group.
 // Previously served by the standalone webauthn-service under /webauthn/*.
-// Now registered flat under the caller's group (i.e. /authsec/*).
+// Now served under /authsec/webauthn/*.
 func registerWebAuthnRoutes(
 	router gin.IRouter,
 	webAuthnHandler *handlers.WebAuthnHandler,
 	adminHandler *handlers.AdminWebAuthnHandler,
 	endUserHandler *handlers.EndUserWebAuthnHandler,
 ) {
-	// Admin WebAuthn (uses global DB)  →  /authsec/admin/*
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "healthy", "service": "webauthn-service"})
+	})
+
+	// Admin WebAuthn (uses global DB)  →  /authsec/webauthn/admin/*
 	admin := router.Group("/admin")
 	{
 		admin.POST("/mfa/status", adminHandler.GetMFAStatus)
@@ -759,7 +798,7 @@ func registerWebAuthnRoutes(
 		admin.POST("/finishAuthentication", adminHandler.FinishAuthentication)
 	}
 
-	// End-user WebAuthn (uses tenant-specific DBs)  →  /authsec/enduser/*
+	// End-user WebAuthn (uses tenant-specific DBs)  →  /authsec/webauthn/enduser/*
 	enduser := router.Group("/enduser")
 	{
 		enduser.POST("/mfa/status", endUserHandler.GetMFAStatus)
@@ -771,7 +810,7 @@ func registerWebAuthnRoutes(
 		enduser.POST("/finishAuthentication", endUserHandler.FinishAuthentication)
 	}
 
-	// Legacy flat routes  →  /authsec/*
+	// Legacy flat routes  →  /authsec/webauthn/*
 	router.POST("/mfa/status", webAuthnHandler.GetMFAStatus)
 	router.POST("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLogin)
 	router.GET("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLoginGET)
@@ -978,5 +1017,74 @@ func registerOocmgrRoutes(r gin.IRouter) {
 	oocmgrClients := v1.Group("/clients")
 	{
 		oocmgrClients.POST("/getClients", ac.GetClientsByTenant)
+	}
+}
+
+// registerAuthmgrRoutes registers all Auth Manager routes under /authmgr.
+// Previously served by the standalone auth-manager microservice.
+func registerAuthmgrRoutes(r gin.IRouter) {
+	ac := controllers.NewAuthmgrController()
+
+	// Public / unauthenticated endpoints
+	authmgr := r.Group("/authmgr")
+	{
+		authmgr.GET("/health", ac.HealthCheck)
+		authmgr.POST("/token/verify", ac.VerifyToken)
+		authmgr.POST("/token/generate", ac.GenerateToken)
+		authmgr.POST("/token/oidc", ac.OIDCToken)
+	}
+
+	// Admin endpoints (protected by authsec AuthMiddleware)
+	admin := r.Group("/authmgr/admin")
+	admin.Use(middlewares.AuthMiddleware())
+	{
+		admin.GET("/profile", ac.GetProfile)
+		admin.GET("/auth-status", ac.GetAuthStatus)
+
+		// Validation
+		admin.GET("/validate/token", ac.ValidateToken)
+		admin.GET("/validate/scope", ac.ValidateScope)
+		admin.GET("/validate/resource", ac.ValidateResource)
+		admin.POST("/validate/permissions", ac.ValidatePermissions)
+
+		// RBAC permission checks
+		admin.GET("/check/permission", ac.CheckPermission)
+		admin.GET("/check/role", ac.CheckRole)
+		admin.GET("/check/role-resource", ac.CheckRoleResource)
+		admin.GET("/check/permission-scoped", ac.CheckPermissionScoped)
+		admin.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
+		admin.GET("/permissions", ac.ListUserPermissions)
+
+		// Group management
+		admin.POST("/groups", ac.CreateGroup)
+		admin.GET("/groups", ac.ListGroups)
+		admin.GET("/groups/:id", ac.GetGroup)
+		admin.PUT("/groups/:id", ac.UpdateGroup)
+		admin.DELETE("/groups/:id", ac.DeleteGroup)
+		admin.POST("/groups/:id/users", ac.AddUsersToGroup)
+		admin.DELETE("/groups/:id/users", ac.RemoveUsersFromGroup)
+		admin.GET("/groups/:id/users", ac.ListGroupUsers)
+	}
+
+	// User endpoints (protected by authsec AuthMiddleware)
+	user := r.Group("/authmgr/user")
+	user.Use(middlewares.AuthMiddleware())
+	{
+		user.GET("/profile", ac.GetProfile)
+		user.GET("/auth-status", ac.GetAuthStatus)
+
+		// Validation
+		user.GET("/validate/token", ac.ValidateToken)
+		user.GET("/validate/scope", ac.ValidateScope)
+		user.GET("/validate/resource", ac.ValidateResource)
+		user.POST("/validate/permissions", ac.ValidatePermissions)
+
+		// RBAC permission checks
+		user.GET("/check/permission", ac.CheckPermission)
+		user.GET("/check/role", ac.CheckRole)
+		user.GET("/check/role-resource", ac.CheckRoleResource)
+		user.GET("/check/permission-scoped", ac.CheckPermissionScoped)
+		user.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
+		user.GET("/permissions", ac.ListUserPermissions)
 	}
 }

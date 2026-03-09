@@ -37,6 +37,7 @@ type Config struct {
 	DatabaseURL        string
 	JWTDefSecret       string
 	JWTSdkSecret       string
+	JWTSecret          string // Primary JWT secret (ext-service / hydra-service / SPIFFE delegate)
 	OOCManagerURL      string
 	VaultAddr          string
 	VaultToken         string
@@ -46,10 +47,42 @@ type Config struct {
 	SMTPUser           string
 	SMTPPassword       string
 	TenantDomainSuffix string
-	CorsAllowOrigin    string // Added for CORS configuration
-	RedisURL           string // Added for Redis caching
+	CorsAllowOrigin    string
+	RedisURL           string
 	ICPServiceURL      string // ICP service URL for PKI provisioning
 	BaseURL            string // Base URL for callbacks (e.g., https://app.authsec.dev)
+
+	// Runtime environment ("development" | "production" | "staging")
+	Environment string
+
+	// TOTP / encryption
+	TotpEncryptionKey      string // 64-hex-char AES-256 key for TOTP secrets at rest
+	SyncConfigEncryptionKey string // 64-hex-char AES-256 key for AD/Entra sync configs
+
+	// Twilio (SMS MFA / voice)
+	TwilioAccountSid string
+	TwilioAuthToken  string
+	TwilioFromNumber string
+
+	// SPIFFE / SVID OIDC
+	SpiffeOIDCIssuer      string
+	SpiffeJWKSKeyID       string
+	SpiffeRSAPrivateKeyB64 string
+	SpiffeTrustDomain     string
+
+	// Okta CIBA integration
+	OktaDomain       string
+	OktaClientID     string
+	OktaClientSecret string
+	OktaIssuer       string
+	OktaAPIToken     string
+
+	// OIDC token validation
+	AuthExpectIss string // Expected issuer claim for incoming OIDC tokens
+	AuthExpectAud string // Expected audience claim for incoming OIDC tokens
+
+	// Server auth gate (maps to REQUIRE_SERVER_AUTH; default true)
+	RequireServerAuth string
 
 	// OIDC Provider credentials (fallback when Vault is not available)
 	GoogleClientSecret    string
@@ -105,6 +138,7 @@ func LoadConfig() *Config {
 	port := getEnv("PORT", "7468")
 	jwtSdkSecret := getEnv("JWT_SDK_SECRET", "authsecai")
 	jwtDefSecret := getEnv("JWT_DEF_SECRET", "authsecai")
+	jwtSecret := getEnv("JWT_SECRET", "")
 	oocManagerURL := getEnv("OOC_MANAGER_URL", "http://localhost:7467")
 
 	vaultAddr := getEnv("VAULT_ADDR", "http://localhost:8200")
@@ -131,6 +165,38 @@ func LoadConfig() *Config {
 	// Load Base URL for OIDC callbacks
 	baseURL := getEnv("BASE_URL", "https://app.authsec.dev")
 
+	// Runtime environment
+	environment := getEnv("ENVIRONMENT", "development")
+
+	// TOTP / encryption keys
+	totpEncryptionKey := getEnv("TOTP_ENCRYPTION_KEY", "")
+	syncConfigEncryptionKey := getEnv("SYNC_CONFIG_ENCRYPTION_KEY", "")
+
+	// Twilio (SMS MFA)
+	twilioAccountSid := getEnv("TWILIO_ACCOUNT_SID", "")
+	twilioAuthToken := getEnv("TWILIO_AUTH_TOKEN", "")
+	twilioFromNumber := getEnv("TWILIO_FROM_NUMBER", "")
+
+	// SPIFFE / SVID OIDC
+	spiffeOIDCIssuer := getEnv("SPIFFE_OIDC_ISSUER", "")
+	spiffeJWKSKeyID := getEnv("SPIFFE_JWKS_KEY_ID", "")
+	spiffeRSAPrivateKeyB64 := getEnv("SPIFFE_RSA_PRIVATE_KEY_B64", "")
+	spiffeTrustDomain := getEnv("SPIFFE_TRUST_DOMAIN", "")
+
+	// Okta CIBA integration
+	oktaDomain := getEnv("OKTA_DOMAIN", "")
+	oktaClientID := getEnv("OKTA_CLIENT_ID", "")
+	oktaClientSecret := getEnv("OKTA_CLIENT_SECRET", "")
+	oktaIssuer := getEnv("OKTA_ISSUER", "")
+	oktaAPIToken := getEnv("OKTA_API_TOKEN", "")
+
+	// OIDC token validation expectations
+	authExpectIss := getEnv("AUTH_EXPECT_ISS", "")
+	authExpectAud := getEnv("AUTH_EXPECT_AUD", "")
+
+	// Server auth gate
+	requireServerAuth := getEnv("REQUIRE_SERVER_AUTH", "true")
+
 	// Load OIDC provider credentials (fallback for when Vault is not available)
 	googleClientSecret := getEnv("GOOGLE_CLIENT_SECRET", "")
 	githubClientSecret := getEnv("GITHUB_CLIENT_SECRET", "")
@@ -153,36 +219,55 @@ func LoadConfig() *Config {
 	}
 
 	AppConfig = &Config{
-		Port:                  port,
-		DBName:                dbName,
-		DBUser:                dbUser,
-		DBPassword:            dbPassword,
-		DBHost:                dbHost,
-		DBPort:                dbPort,
-		DBSchema:              dbSchema,
-		DatabaseURL:           databaseURL,
-		JWTDefSecret:          jwtDefSecret,
-		JWTSdkSecret:          jwtSdkSecret,
-		OOCManagerURL:         oocManagerURL,
-		VaultAddr:             vaultAddr,
-		VaultToken:            vaultToken,
-		HydraAdminURL:         hydraAdminURL,
-		SMTPHost:              smtpHost,
-		SMTPPort:              smtpPort,
-		SMTPUser:              smtpUser,
-		SMTPPassword:          smtpPassword,
-		TenantDomainSuffix:    tenantDomainSuffix,
-		CorsAllowOrigin:       corsAllowOrigin,
-		RedisURL:              redisURL,
-		ICPServiceURL:         icpServiceURL,
-		BaseURL:               baseURL,
-		GoogleClientSecret:    googleClientSecret,
-		GitHubClientSecret:    githubClientSecret,
-		MicrosoftClientSecret: microsoftClientSecret,
-		HubSpotAccessToken:    hubSpotAccessToken,
-		HydraPublicURL:        hydraPublicURL,
-		ReactAppURL:           reactAppURL,
-		IdentityProviderURL:   identityProviderURL,
+		Port:                    port,
+		DBName:                  dbName,
+		DBUser:                  dbUser,
+		DBPassword:              dbPassword,
+		DBHost:                  dbHost,
+		DBPort:                  dbPort,
+		DBSchema:                dbSchema,
+		DatabaseURL:             databaseURL,
+		JWTDefSecret:            jwtDefSecret,
+		JWTSdkSecret:            jwtSdkSecret,
+		JWTSecret:               jwtSecret,
+		OOCManagerURL:           oocManagerURL,
+		VaultAddr:               vaultAddr,
+		VaultToken:              vaultToken,
+		HydraAdminURL:           hydraAdminURL,
+		SMTPHost:                smtpHost,
+		SMTPPort:                smtpPort,
+		SMTPUser:                smtpUser,
+		SMTPPassword:            smtpPassword,
+		TenantDomainSuffix:      tenantDomainSuffix,
+		CorsAllowOrigin:         corsAllowOrigin,
+		RedisURL:                redisURL,
+		ICPServiceURL:           icpServiceURL,
+		BaseURL:                 baseURL,
+		Environment:             environment,
+		TotpEncryptionKey:       totpEncryptionKey,
+		SyncConfigEncryptionKey: syncConfigEncryptionKey,
+		TwilioAccountSid:        twilioAccountSid,
+		TwilioAuthToken:         twilioAuthToken,
+		TwilioFromNumber:        twilioFromNumber,
+		SpiffeOIDCIssuer:        spiffeOIDCIssuer,
+		SpiffeJWKSKeyID:         spiffeJWKSKeyID,
+		SpiffeRSAPrivateKeyB64:  spiffeRSAPrivateKeyB64,
+		SpiffeTrustDomain:       spiffeTrustDomain,
+		OktaDomain:              oktaDomain,
+		OktaClientID:            oktaClientID,
+		OktaClientSecret:        oktaClientSecret,
+		OktaIssuer:              oktaIssuer,
+		OktaAPIToken:            oktaAPIToken,
+		AuthExpectIss:           authExpectIss,
+		AuthExpectAud:           authExpectAud,
+		RequireServerAuth:       requireServerAuth,
+		GoogleClientSecret:      googleClientSecret,
+		GitHubClientSecret:      githubClientSecret,
+		MicrosoftClientSecret:   microsoftClientSecret,
+		HubSpotAccessToken:      hubSpotAccessToken,
+		HydraPublicURL:          hydraPublicURL,
+		ReactAppURL:             reactAppURL,
+		IdentityProviderURL:     identityProviderURL,
 	}
 
 	return AppConfig

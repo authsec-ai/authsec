@@ -27,7 +27,7 @@ curl "$BASE/.well-known/jwks.json"
 
 ```bash
 # Reveal JWT secret (development only)
-curl -X POST "$BASE/authsec/debug/jwt-secret"
+curl -X POST "$BASE/authsec/uflow/debug/jwt-secret"
 ```
 
 ---
@@ -36,99 +36,99 @@ curl -X POST "$BASE/authsec/debug/jwt-secret"
 
 ```bash
 # Global health check
-curl "$BASE/authsec/health"
+curl "$BASE/authsec/uflow/health"
 
 # Tenant DB health
-curl "$BASE/authsec/health/tenant/$TENANT_ID"
+curl "$BASE/authsec/uflow/health/tenant/$TENANT_ID"
 
 # All tenant DBs health
-curl "$BASE/authsec/health/tenants"
+curl "$BASE/authsec/uflow/health/tenants"
 ```
 
 ---
 
-## Admin Authentication  `/authsec/auth/admin`
+## Admin Authentication  `/authsec/uflow/auth/admin`
 
 ```bash
 # Get auth challenge
-curl "$BASE/authsec/auth/admin/challenge"
+curl "$BASE/authsec/uflow/auth/admin/challenge"
 
 # Pre-check before login (check if user exists, get MFA hint)
-curl -X POST "$BASE/authsec/auth/admin/login/precheck" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/login/precheck" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Bootstrap first admin (initial setup)
-curl -X POST "$BASE/authsec/auth/admin/login/bootstrap" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/login/bootstrap" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"changeme","tenant_id":"'"$TENANT_ID"'"}'
 
 # Login
-curl -X POST "$BASE/authsec/auth/admin/login" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"changeme","tenant_id":"'"$TENANT_ID"'"}'
 
 # Login hybrid (password + MFA in one call)
-curl -X POST "$BASE/authsec/auth/admin/login-hybrid" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/login-hybrid" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"changeme","tenant_id":"'"$TENANT_ID"'","totp_code":"123456"}'
 
 # Register admin
-curl -X POST "$BASE/authsec/auth/admin/register" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/register" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"changeme","tenant_id":"'"$TENANT_ID"'","first_name":"Alice","last_name":"Admin"}'
 
 # Complete registration (from invite link)
-curl -X POST "$BASE/authsec/auth/admin/complete-registration" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/complete-registration" \
   -H "Content-Type: application/json" \
   -d '{"token":"<registration-token>","password":"changeme"}'
 
 # Forgot password — send OTP
-curl -X POST "$BASE/authsec/auth/admin/forgot-password" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/forgot-password" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Forgot password — verify OTP
-curl -X POST "$BASE/authsec/auth/admin/forgot-password/verify-otp" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/forgot-password/verify-otp" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'","otp":"123456"}'
 
 # Forgot password — reset
-curl -X POST "$BASE/authsec/auth/admin/forgot-password/reset" \
+curl -X POST "$BASE/authsec/uflow/auth/admin/forgot-password/reset" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'","token":"<reset-token>","new_password":"newpass123"}'
 ```
 
 ---
 
-## End-User Authentication  `/authsec/auth/enduser`
+## End-User Authentication  `/authsec/uflow/auth/enduser`
 
 ```bash
 # Get auth challenge
-curl "$BASE/authsec/auth/enduser/challenge"
+curl "$BASE/authsec/uflow/auth/enduser/challenge"
 
 # Initiate end-user registration (sends OTP)
-curl -X POST "$BASE/authsec/auth/enduser/initiate-registration" \
+curl -X POST "$BASE/authsec/uflow/auth/enduser/initiate-registration" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Verify OTP and complete registration
-curl -X POST "$BASE/authsec/auth/enduser/verify-otp" \
+curl -X POST "$BASE/authsec/uflow/auth/enduser/verify-otp" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","otp":"123456"}'
 
 # Login pre-check
-curl -X POST "$BASE/authsec/auth/enduser/login/precheck" \
+curl -X POST "$BASE/authsec/uflow/auth/enduser/login/precheck" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # WebAuthn callback (after passkey assertion)
-curl -X POST "$BASE/authsec/auth/enduser/webauthn-callback" \
+curl -X POST "$BASE/authsec/uflow/auth/enduser/webauthn-callback" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # SPIFFE SVID delegation
-curl -X POST "$BASE/authsec/auth/enduser/delegate-svid" \
+curl -X POST "$BASE/authsec/uflow/auth/enduser/delegate-svid" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"workload_id":"spiffe://example.org/workload"}'
@@ -140,101 +140,101 @@ curl -X POST "$BASE/authsec/auth/enduser/delegate-svid" \
 
 ```bash
 # Login (custom password login)
-curl -X POST "$BASE/authsec/user/login" \
+curl -X POST "$BASE/authsec/uflow/user/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"pass","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Login status (poll for async logins)
-curl -X POST "$BASE/authsec/user/login/status" \
+curl -X POST "$BASE/authsec/uflow/user/login/status" \
   -H "Content-Type: application/json" \
   -d '{"request_id":"<request-id>"}'
 
 # SAML login
-curl -X POST "$BASE/authsec/user/saml/login" \
+curl -X POST "$BASE/authsec/uflow/user/saml/login" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","relay_state":"<state>"}'
 
 # OIDC login
-curl -X POST "$BASE/authsec/user/oidc/login" \
+curl -X POST "$BASE/authsec/uflow/user/oidc/login" \
   -H "Content-Type: application/json" \
   -d '{"provider":"google","tenant_id":"'"$TENANT_ID"'"}'
 
 # Initiate registration
-curl -X POST "$BASE/authsec/user/register/initiate" \
+curl -X POST "$BASE/authsec/uflow/user/register/initiate" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Complete registration
-curl -X POST "$BASE/authsec/user/register/complete" \
+curl -X POST "$BASE/authsec/uflow/user/register/complete" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","otp":"123456","password":"pass"}'
 
 # Register (combined)
-curl -X POST "$BASE/authsec/user/register" \
+curl -X POST "$BASE/authsec/uflow/user/register" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"pass","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Forgot password — send OTP
-curl -X POST "$BASE/authsec/user/forgot-password" \
+curl -X POST "$BASE/authsec/uflow/user/forgot-password" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Forgot password — verify OTP
-curl -X POST "$BASE/authsec/user/forgot-password/verify-otp" \
+curl -X POST "$BASE/authsec/uflow/user/forgot-password/verify-otp" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","otp":"123456"}'
 
 # Forgot password — reset
-curl -X POST "$BASE/authsec/user/forgot-password/reset" \
+curl -X POST "$BASE/authsec/uflow/user/forgot-password/reset" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","token":"<reset-token>","new_password":"newpass"}'
 
 # ── Authenticated below ──────────────────────────────────────────────────────
 
 # Register client (device/app)
-curl -X POST "$BASE/authsec/user/clients/register" \
+curl -X POST "$BASE/authsec/uflow/user/clients/register" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"client_name":"My App","tenant_id":"'"$TENANT_ID"'"}'
 
 # Get clients
-curl "$BASE/authsec/user/clients" \
+curl "$BASE/authsec/uflow/user/clients" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get specific end-user
-curl "$BASE/authsec/user/enduser/$TENANT_ID/$USER_ID" \
+curl "$BASE/authsec/uflow/user/enduser/$TENANT_ID/$USER_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # List end-users
-curl -X POST "$BASE/authsec/user/enduser/list" \
+curl -X POST "$BASE/authsec/uflow/user/enduser/list" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","page":1,"limit":20}'
 
 # Update end-user
-curl -X PUT "$BASE/authsec/user/enduser/$TENANT_ID/$USER_ID" \
+curl -X PUT "$BASE/authsec/uflow/user/enduser/$TENANT_ID/$USER_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"first_name":"Bob","last_name":"Smith"}'
 
 # Update end-user status
-curl -X PUT "$BASE/authsec/user/enduser/$TENANT_ID/$USER_ID/status" \
+curl -X PUT "$BASE/authsec/uflow/user/enduser/$TENANT_ID/$USER_ID/status" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"active":true}'
 
 # Delete end-user
-curl -X DELETE "$BASE/authsec/user/enduser/$TENANT_ID/$USER_ID" \
+curl -X DELETE "$BASE/authsec/uflow/user/enduser/$TENANT_ID/$USER_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # Admin change user password
-curl -X POST "$BASE/authsec/user/admin/change-password" \
+curl -X POST "$BASE/authsec/uflow/user/admin/change-password" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","new_password":"newpass","tenant_id":"'"$TENANT_ID"'"}'
 
 # Admin reset user password (sends reset email)
-curl -X POST "$BASE/authsec/user/admin/reset-password" \
+curl -X POST "$BASE/authsec/uflow/user/admin/reset-password" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","tenant_id":"'"$TENANT_ID"'"}'
@@ -242,55 +242,55 @@ curl -X POST "$BASE/authsec/user/admin/reset-password" \
 
 ---
 
-## TOTP (User-flow)  `/authsec/auth/totp`
+## TOTP (User-flow)  `/authsec/uflow/auth/totp`
 
 ```bash
 # Login with TOTP code
-curl -X POST "$BASE/authsec/auth/totp/login" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","code":"123456"}'
 
 # Approve device code with TOTP
-curl -X POST "$BASE/authsec/auth/totp/device-approve" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/device-approve" \
   -H "Content-Type: application/json" \
   -d '{"device_code":"<code>","totp_code":"123456"}'
 
 # Register TOTP device (returns QR code)
-curl -X POST "$BASE/authsec/auth/totp/register" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/register" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_name":"My Authenticator","tenant_id":"'"$TENANT_ID"'"}'
 
 # Confirm TOTP registration
-curl -X POST "$BASE/authsec/auth/totp/confirm" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/confirm" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"secret":"<base32-secret>","code":"123456","tenant_id":"'"$TENANT_ID"'"}'
 
 # Verify TOTP (for actions requiring step-up)
-curl -X POST "$BASE/authsec/auth/totp/verify" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/verify" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"code":"123456","tenant_id":"'"$TENANT_ID"'"}'
 
 # List TOTP devices
-curl "$BASE/authsec/auth/totp/devices" \
+curl "$BASE/authsec/uflow/auth/totp/devices" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete TOTP device
-curl -X POST "$BASE/authsec/auth/totp/device/delete" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/device/delete" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_id":"<device-uuid>","tenant_id":"'"$TENANT_ID"'"}'
 
 # Set primary TOTP device
-curl -X POST "$BASE/authsec/auth/totp/device/primary" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/device/primary" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_id":"<device-uuid>","tenant_id":"'"$TENANT_ID"'"}'
 
 # Regenerate backup codes
-curl -X POST "$BASE/authsec/auth/totp/backup/regenerate" \
+curl -X POST "$BASE/authsec/uflow/auth/totp/backup/regenerate" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'"}'
@@ -298,38 +298,38 @@ curl -X POST "$BASE/authsec/auth/totp/backup/regenerate" \
 
 ---
 
-## Tenant TOTP  `/authsec/auth/tenant/totp`
+## Tenant TOTP  `/authsec/uflow/auth/tenant/totp`
 
 ```bash
 # Login with tenant TOTP
-curl -X POST "$BASE/authsec/auth/tenant/totp/login" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/totp/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","code":"123456"}'
 
 # Register tenant TOTP device
-curl -X POST "$BASE/authsec/auth/tenant/totp/register" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/totp/register" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_name":"Work Authenticator","tenant_id":"'"$TENANT_ID"'"}'
 
 # Confirm tenant TOTP device
-curl -X POST "$BASE/authsec/auth/tenant/totp/confirm" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/totp/confirm" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"secret":"<secret>","code":"123456","tenant_id":"'"$TENANT_ID"'"}'
 
 # List tenant TOTP devices
-curl "$BASE/authsec/auth/tenant/totp/devices" \
+curl "$BASE/authsec/uflow/auth/tenant/totp/devices" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete tenant TOTP device
-curl -X POST "$BASE/authsec/auth/tenant/totp/devices/delete" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/totp/devices/delete" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_id":"<device-uuid>","tenant_id":"'"$TENANT_ID"'"}'
 
 # Set primary tenant TOTP device
-curl -X POST "$BASE/authsec/auth/tenant/totp/devices/primary" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/totp/devices/primary" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_id":"<device-uuid>","tenant_id":"'"$TENANT_ID"'"}'
@@ -337,103 +337,103 @@ curl -X POST "$BASE/authsec/auth/tenant/totp/devices/primary" \
 
 ---
 
-## CIBA  `/authsec/auth/ciba`
+## CIBA  `/authsec/uflow/auth/ciba`
 
 ```bash
 # Initiate CIBA authentication
-curl -X POST "$BASE/authsec/auth/ciba/initiate" \
+curl -X POST "$BASE/authsec/uflow/auth/ciba/initiate" \
   -H "Content-Type: application/json" \
   -d '{"client_id":"'"$CLIENT_ID"'","login_hint":"user@example.com","scope":"openid profile","binding_message":"Login to App"}'
 
 # Poll for CIBA token
-curl -X POST "$BASE/authsec/auth/ciba/token" \
+curl -X POST "$BASE/authsec/uflow/auth/ciba/token" \
   -H "Content-Type: application/json" \
   -d '{"auth_req_id":"<auth-req-id>","client_id":"'"$CLIENT_ID"'"}'
 
 # Respond to CIBA request (approve/deny on device)
-curl -X POST "$BASE/authsec/auth/ciba/respond" \
+curl -X POST "$BASE/authsec/uflow/auth/ciba/respond" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"auth_req_id":"<auth-req-id>","approved":true}'
 
 # Register push device for CIBA
-curl -X POST "$BASE/authsec/auth/ciba/register-device" \
+curl -X POST "$BASE/authsec/uflow/auth/ciba/register-device" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_token":"<fcm-token>","device_name":"iPhone 15"}'
 
 # List CIBA devices
-curl "$BASE/authsec/auth/ciba/devices" \
+curl "$BASE/authsec/uflow/auth/ciba/devices" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete CIBA device
-curl -X DELETE "$BASE/authsec/auth/ciba/devices/<device_id>" \
+curl -X DELETE "$BASE/authsec/uflow/auth/ciba/devices/<device_id>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
 
-## Tenant CIBA  `/authsec/auth/tenant/ciba`
+## Tenant CIBA  `/authsec/uflow/auth/tenant/ciba`
 
 ```bash
 # Initiate tenant CIBA
-curl -X POST "$BASE/authsec/auth/tenant/ciba/initiate" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/ciba/initiate" \
   -H "Content-Type: application/json" \
   -d '{"client_id":"'"$CLIENT_ID"'","login_hint":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Poll tenant CIBA token
-curl -X POST "$BASE/authsec/auth/tenant/ciba/token" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/ciba/token" \
   -H "Content-Type: application/json" \
   -d '{"auth_req_id":"<auth-req-id>","client_id":"'"$CLIENT_ID"'"}'
 
 # Respond to tenant CIBA
-curl -X POST "$BASE/authsec/auth/tenant/ciba/respond" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/ciba/respond" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"auth_req_id":"<auth-req-id>","approved":true}'
 
 # Register tenant CIBA device
-curl -X POST "$BASE/authsec/auth/tenant/ciba/register-device" \
+curl -X POST "$BASE/authsec/uflow/auth/tenant/ciba/register-device" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_token":"<fcm-token>","device_name":"My Phone"}'
 
 # List tenant CIBA requests
-curl "$BASE/authsec/auth/tenant/ciba/requests" \
+curl "$BASE/authsec/uflow/auth/tenant/ciba/requests" \
   -H "Authorization: Bearer $TOKEN"
 
 # List tenant CIBA devices
-curl "$BASE/authsec/auth/tenant/ciba/devices" \
+curl "$BASE/authsec/uflow/auth/tenant/ciba/devices" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete tenant CIBA device
-curl -X DELETE "$BASE/authsec/auth/tenant/ciba/devices/<device_id>" \
+curl -X DELETE "$BASE/authsec/uflow/auth/tenant/ciba/devices/<device_id>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
 
-## Device Authorization  `/authsec/auth/device`
+## Device Authorization  `/authsec/uflow/auth/device`
 
 ```bash
 # Request device code (for TV / CLI flows)
-curl -X POST "$BASE/authsec/auth/device/code" \
+curl -X POST "$BASE/authsec/uflow/auth/device/code" \
   -H "Content-Type: application/json" \
   -d '{"client_id":"'"$CLIENT_ID"'","scope":"openid profile"}'
 
 # Poll for device token
-curl -X POST "$BASE/authsec/auth/device/token" \
+curl -X POST "$BASE/authsec/uflow/auth/device/token" \
   -H "Content-Type: application/json" \
   -d '{"device_code":"<device-code>","client_id":"'"$CLIENT_ID"'"}'
 
 # Get activation info (from device browser page)
-curl "$BASE/authsec/auth/device/activate/info?user_code=ABCD-1234"
+curl "$BASE/authsec/uflow/auth/device/activate/info?user_code=ABCD-1234"
 
 # Device activation page (HTML)
-curl "$BASE/authsec/activate?user_code=ABCD-1234"
+curl "$BASE/authsec/uflow/activate?user_code=ABCD-1234"
 
 # Verify device code (user approves on phone)
-curl -X POST "$BASE/authsec/auth/device/verify" \
+curl -X POST "$BASE/authsec/uflow/auth/device/verify" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_code":"ABCD-1234"}'
@@ -441,46 +441,46 @@ curl -X POST "$BASE/authsec/auth/device/verify" \
 
 ---
 
-## Voice Authentication  `/authsec/auth/voice`
+## Voice Authentication  `/authsec/uflow/auth/voice`
 
 ```bash
 # Initiate voice auth
-curl -X POST "$BASE/authsec/auth/voice/initiate" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/initiate" \
   -H "Content-Type: application/json" \
   -d '{"phone_number":"+15551234567","tenant_id":"'"$TENANT_ID"'"}'
 
 # Verify voice OTP
-curl -X POST "$BASE/authsec/auth/voice/verify" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/verify" \
   -H "Content-Type: application/json" \
   -d '{"phone_number":"+15551234567","code":"123456","tenant_id":"'"$TENANT_ID"'"}'
 
 # Get token with voice credentials
-curl -X POST "$BASE/authsec/auth/voice/token" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/token" \
   -H "Content-Type: application/json" \
   -d '{"phone_number":"+15551234567","code":"123456","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Link voice assistant
-curl -X POST "$BASE/authsec/auth/voice/link" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/link" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"assistant_type":"alexa","device_id":"<device-id>"}'
 
 # Unlink voice assistant
-curl -X POST "$BASE/authsec/auth/voice/unlink" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/unlink" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"assistant_type":"alexa"}'
 
 # List voice links
-curl "$BASE/authsec/auth/voice/links" \
+curl "$BASE/authsec/uflow/auth/voice/links" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get pending device codes
-curl "$BASE/authsec/auth/voice/device-pending" \
+curl "$BASE/authsec/uflow/auth/voice/device-pending" \
   -H "Authorization: Bearer $TOKEN"
 
 # Approve device code via voice
-curl -X POST "$BASE/authsec/auth/voice/device-approve" \
+curl -X POST "$BASE/authsec/uflow/auth/voice/device-approve" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"device_code":"<device-code>"}'
@@ -492,56 +492,56 @@ curl -X POST "$BASE/authsec/auth/voice/device-approve" \
 
 ```bash
 # List OIDC providers
-curl "$BASE/authsec/oidc/providers"
+curl "$BASE/authsec/uflow/oidc/providers"
 
 # Initiate OIDC flow
-curl -X POST "$BASE/authsec/oidc/initiate" \
+curl -X POST "$BASE/authsec/uflow/oidc/initiate" \
   -H "Content-Type: application/json" \
   -d '{"provider":"google","tenant_id":"'"$TENANT_ID"'","redirect_uri":"https://app.example.com/callback"}'
 
 # Initiate OIDC registration
-curl -X POST "$BASE/authsec/oidc/register/initiate" \
+curl -X POST "$BASE/authsec/uflow/oidc/register/initiate" \
   -H "Content-Type: application/json" \
   -d '{"provider":"google","tenant_id":"'"$TENANT_ID"'"}'
 
 # Initiate OIDC login
-curl -X POST "$BASE/authsec/oidc/login/initiate" \
+curl -X POST "$BASE/authsec/uflow/oidc/login/initiate" \
   -H "Content-Type: application/json" \
   -d '{"provider":"google","tenant_id":"'"$TENANT_ID"'"}'
 
 # OIDC callback (GET, called by provider)
-curl "$BASE/authsec/oidc/callback?code=<code>&state=<state>"
+curl "$BASE/authsec/uflow/oidc/callback?code=<code>&state=<state>"
 
 # Exchange authorization code for tokens
-curl -X POST "$BASE/authsec/oidc/exchange-code" \
+curl -X POST "$BASE/authsec/uflow/oidc/exchange-code" \
   -H "Content-Type: application/json" \
   -d '{"code":"<auth-code>","state":"<state>","tenant_id":"'"$TENANT_ID"'"}'
 
 # Complete OIDC registration
-curl -X POST "$BASE/authsec/oidc/complete-registration" \
+curl -X POST "$BASE/authsec/uflow/oidc/complete-registration" \
   -H "Content-Type: application/json" \
   -d '{"token":"<oidc-token>","tenant_id":"'"$TENANT_ID"'"}'
 
 # Check if tenant exists for domain
-curl "$BASE/authsec/oidc/check-tenant?domain=example.com"
+curl "$BASE/authsec/uflow/oidc/check-tenant?domain=example.com"
 
 # Get auth URL for provider
-curl -X POST "$BASE/authsec/oidc/auth-url" \
+curl -X POST "$BASE/authsec/uflow/oidc/auth-url" \
   -H "Content-Type: application/json" \
   -d '{"provider":"google","tenant_id":"'"$TENANT_ID"'","redirect_uri":"https://app.example.com/callback"}'
 
 # Link OIDC identity (authenticated)
-curl -X POST "$BASE/authsec/oidc/link" \
+curl -X POST "$BASE/authsec/uflow/oidc/link" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"provider":"github","code":"<auth-code>"}'
 
 # Get linked identities
-curl "$BASE/authsec/oidc/identities" \
+curl "$BASE/authsec/uflow/oidc/identities" \
   -H "Authorization: Bearer $TOKEN"
 
 # Unlink OIDC provider
-curl -X DELETE "$BASE/authsec/oidc/unlink/google" \
+curl -X DELETE "$BASE/authsec/uflow/oidc/unlink/google" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -553,27 +553,27 @@ curl -X DELETE "$BASE/authsec/oidc/unlink/google" \
 
 ```bash
 # List tenants
-curl "$BASE/authsec/admin/tenants" \
+curl "$BASE/authsec/uflow/admin/tenants" \
   -H "Authorization: Bearer $TOKEN"
 
 # Create tenant
-curl -X POST "$BASE/authsec/admin/tenants" \
+curl -X POST "$BASE/authsec/uflow/admin/tenants" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme Corp","slug":"acme","domain":"acme.app.authsec.dev"}'
 
 # Update tenant
-curl -X PUT "$BASE/authsec/admin/tenants/$TENANT_ID" \
+curl -X PUT "$BASE/authsec/uflow/admin/tenants/$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme Corp Updated"}'
 
 # Delete tenant
-curl -X DELETE "$BASE/authsec/admin/tenants/$TENANT_ID" \
+curl -X DELETE "$BASE/authsec/uflow/admin/tenants/$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # List users in tenant
-curl "$BASE/authsec/admin/tenants/$TENANT_ID/users" \
+curl "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/users" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -581,29 +581,29 @@ curl "$BASE/authsec/admin/tenants/$TENANT_ID/users" \
 
 ```bash
 # Add domain to tenant
-curl -X POST "$BASE/authsec/admin/tenants/$TENANT_ID/domains" \
+curl -X POST "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"domain":"custom.example.com"}'
 
 # List tenant domains
-curl "$BASE/authsec/admin/tenants/$TENANT_ID/domains" \
+curl "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains" \
   -H "Authorization: Bearer $TOKEN"
 
 # Verify domain ownership
-curl -X POST "$BASE/authsec/admin/tenants/$TENANT_ID/domains/<domain_id>/verify" \
+curl -X POST "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains/<domain_id>/verify" \
   -H "Authorization: Bearer $TOKEN"
 
 # Set primary domain
-curl -X POST "$BASE/authsec/admin/tenants/$TENANT_ID/domains/<domain_id>/set-primary" \
+curl -X POST "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains/<domain_id>/set-primary" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get domain by ID
-curl "$BASE/authsec/admin/tenants/$TENANT_ID/domains/<domain_id>" \
+curl "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains/<domain_id>" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete domain
-curl -X DELETE "$BASE/authsec/admin/tenants/$TENANT_ID/domains/<domain_id>" \
+curl -X DELETE "$BASE/authsec/uflow/admin/tenants/$TENANT_ID/domains/<domain_id>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -611,29 +611,29 @@ curl -X DELETE "$BASE/authsec/admin/tenants/$TENANT_ID/domains/<domain_id>" \
 
 ```bash
 # List admin users
-curl -X POST "$BASE/authsec/admin/users/list" \
+curl -X POST "$BASE/authsec/uflow/admin/users/list" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"page":1,"limit":20}'
 
 # Delete admin user
-curl -X DELETE "$BASE/authsec/admin/users/$USER_ID" \
+curl -X DELETE "$BASE/authsec/uflow/admin/users/$USER_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # Toggle admin user active/inactive
-curl -X POST "$BASE/authsec/admin/users/active" \
+curl -X POST "$BASE/authsec/uflow/admin/users/active" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","active":true}'
 
 # List end-users by tenant
-curl -X POST "$BASE/authsec/admin/enduser/list" \
+curl -X POST "$BASE/authsec/uflow/admin/enduser/list" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","page":1,"limit":20}'
 
 # Toggle end-user active/inactive
-curl -X POST "$BASE/authsec/admin/enduser/active" \
+curl -X POST "$BASE/authsec/uflow/admin/enduser/active" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","tenant_id":"'"$TENANT_ID"'","active":false}'
@@ -643,25 +643,25 @@ curl -X POST "$BASE/authsec/admin/enduser/active" \
 
 ```bash
 # Invite admin
-curl -X POST "$BASE/authsec/admin/invite" \
+curl -X POST "$BASE/authsec/uflow/admin/invite" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"email":"newadmin@example.com","tenant_id":"'"$TENANT_ID"'","role":"admin"}'
 
 # Cancel invite
-curl -X POST "$BASE/authsec/admin/invite/cancel" \
+curl -X POST "$BASE/authsec/uflow/admin/invite/cancel" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"invite_id":"<invite-uuid>"}'
 
 # Resend invite
-curl -X POST "$BASE/authsec/admin/invite/resend" \
+curl -X POST "$BASE/authsec/uflow/admin/invite/resend" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"invite_id":"<invite-uuid>"}'
 
 # List pending invites
-curl "$BASE/authsec/admin/invite/pending" \
+curl "$BASE/authsec/uflow/admin/invite/pending" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -669,13 +669,13 @@ curl "$BASE/authsec/admin/invite/pending" \
 
 ```bash
 # Create project
-curl -X POST "$BASE/authsec/admin/projects" \
+curl -X POST "$BASE/authsec/uflow/admin/projects" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"My Project","tenant_id":"'"$TENANT_ID"'"}'
 
 # List projects
-curl "$BASE/authsec/admin/projects" \
+curl "$BASE/authsec/uflow/admin/projects" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -683,53 +683,53 @@ curl "$BASE/authsec/admin/projects" \
 
 ```bash
 # Create user-defined group
-curl -X POST "$BASE/authsec/admin/groups" \
+curl -X POST "$BASE/authsec/uflow/admin/groups" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"Engineering","tenant_id":"'"$TENANT_ID"'"}'
 
 # List groups for tenant (admin)
-curl -X POST "$BASE/authsec/admin/groups/list" \
+curl -X POST "$BASE/authsec/uflow/admin/groups/list" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'"}'
 
 # Get groups for tenant
-curl "$BASE/authsec/admin/groups/$TENANT_ID" \
+curl "$BASE/authsec/uflow/admin/groups/$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # Update group
-curl -X PUT "$BASE/authsec/admin/groups/<group_id>" \
+curl -X PUT "$BASE/authsec/uflow/admin/groups/<group_id>" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"Platform Engineering"}'
 
 # Delete group
-curl -X DELETE "$BASE/authsec/admin/groups" \
+curl -X DELETE "$BASE/authsec/uflow/admin/groups" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"group_id":"<group-uuid>"}'
 
 # Bulk add users to group
-curl -X POST "$BASE/authsec/admin/groups/$TENANT_ID/users/bulk" \
+curl -X POST "$BASE/authsec/uflow/admin/groups/$TENANT_ID/users/bulk" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"group_id":"<group-uuid>","user_ids":["<uid1>","<uid2>"]}'
 
 # Bulk remove users from group
-curl -X DELETE "$BASE/authsec/admin/groups/$TENANT_ID/users/bulk" \
+curl -X DELETE "$BASE/authsec/uflow/admin/groups/$TENANT_ID/users/bulk" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"group_id":"<group-uuid>","user_ids":["<uid1>"]}'
 
 # Map groups to client
-curl -X POST "$BASE/authsec/admin/groups/map" \
+curl -X POST "$BASE/authsec/uflow/admin/groups/map" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"client_id":"'"$CLIENT_ID"'","group_ids":["<gid1>"]}'
 
 # Remove groups from client
-curl -X DELETE "$BASE/authsec/admin/groups/map" \
+curl -X DELETE "$BASE/authsec/uflow/admin/groups/map" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"client_id":"'"$CLIENT_ID"'","group_ids":["<gid1>"]}'
@@ -743,33 +743,33 @@ curl -X DELETE "$BASE/authsec/admin/groups/map" \
 
 ```bash
 # Create role (admin)
-curl -X POST "$BASE/authsec/admin/roles" \
+curl -X POST "$BASE/authsec/uflow/admin/roles" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"viewer","permissions":["read:users"],"tenant_id":"'"$TENANT_ID"'"}'
 
 # List roles (admin)
-curl "$BASE/authsec/admin/roles" \
+curl "$BASE/authsec/uflow/admin/roles" \
   -H "Authorization: Bearer $TOKEN"
 
 # Update role (admin)
-curl -X PUT "$BASE/authsec/admin/roles/<role_id>" \
+curl -X PUT "$BASE/authsec/uflow/admin/roles/<role_id>" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"viewer-updated"}'
 
 # Delete role (admin)
-curl -X DELETE "$BASE/authsec/admin/roles/<role_id>" \
+curl -X DELETE "$BASE/authsec/uflow/admin/roles/<role_id>" \
   -H "Authorization: Bearer $TOKEN"
 
 # Create role (end-user context)
-curl -X POST "$BASE/authsec/user/rbac/roles" \
+curl -X POST "$BASE/authsec/uflow/user/rbac/roles" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"app-admin","tenant_id":"'"$TENANT_ID"'"}'
 
 # List roles (end-user context)
-curl "$BASE/authsec/user/rbac/roles" \
+curl "$BASE/authsec/uflow/user/rbac/roles" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -777,17 +777,17 @@ curl "$BASE/authsec/user/rbac/roles" \
 
 ```bash
 # Assign role (admin)
-curl -X POST "$BASE/authsec/admin/bindings" \
+curl -X POST "$BASE/authsec/uflow/admin/bindings" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","role_id":"<role-uuid>","tenant_id":"'"$TENANT_ID"'"}'
 
 # List role bindings (admin)
-curl "$BASE/authsec/admin/bindings" \
+curl "$BASE/authsec/uflow/admin/bindings" \
   -H "Authorization: Bearer $TOKEN"
 
 # Assign role (end-user context)
-curl -X POST "$BASE/authsec/user/rbac/bindings" \
+curl -X POST "$BASE/authsec/uflow/user/rbac/bindings" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","role_id":"<role-uuid>","tenant_id":"'"$TENANT_ID"'"}'
@@ -797,39 +797,39 @@ curl -X POST "$BASE/authsec/user/rbac/bindings" \
 
 ```bash
 # Register permission (admin)
-curl -X POST "$BASE/authsec/admin/permissions" \
+curl -X POST "$BASE/authsec/uflow/admin/permissions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"resource":"documents","action":"read","tenant_id":"'"$TENANT_ID"'"}'
 
 # List permissions (admin)
-curl "$BASE/authsec/admin/permissions" \
+curl "$BASE/authsec/uflow/admin/permissions" \
   -H "Authorization: Bearer $TOKEN"
 
 # Delete permission
-curl -X DELETE "$BASE/authsec/admin/permissions/<permission_id>" \
+curl -X DELETE "$BASE/authsec/uflow/admin/permissions/<permission_id>" \
   -H "Authorization: Bearer $TOKEN"
 
 # Policy check (admin)
-curl -X POST "$BASE/authsec/admin/policy/check" \
+curl -X POST "$BASE/authsec/uflow/admin/policy/check" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"'"$USER_ID"'","resource":"documents","action":"read","tenant_id":"'"$TENANT_ID"'"}'
 
 # Get my permissions
-curl "$BASE/authsec/user/permissions" \
+curl "$BASE/authsec/uflow/user/permissions" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get my effective permissions
-curl "$BASE/authsec/user/permissions/effective" \
+curl "$BASE/authsec/uflow/user/permissions/effective" \
   -H "Authorization: Bearer $TOKEN"
 
 # Check single permission
-curl "$BASE/authsec/user/permissions/check?resource=documents&action=read" \
+curl "$BASE/authsec/uflow/user/permissions/check?resource=documents&action=read" \
   -H "Authorization: Bearer $TOKEN"
 
 # Policy check (end-user)
-curl -X POST "$BASE/authsec/user/rbac/policy/check" \
+curl -X POST "$BASE/authsec/uflow/user/rbac/policy/check" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"resource":"documents","action":"write"}'
@@ -839,23 +839,23 @@ curl -X POST "$BASE/authsec/user/rbac/policy/check" \
 
 ```bash
 # List scopes (admin)
-curl "$BASE/authsec/admin/scopes" \
+curl "$BASE/authsec/uflow/admin/scopes" \
   -H "Authorization: Bearer $TOKEN"
 
 # Add scope (admin)
-curl -X POST "$BASE/authsec/admin/scopes" \
+curl -X POST "$BASE/authsec/uflow/admin/scopes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"read:reports","description":"Read access to reports","tenant_id":"'"$TENANT_ID"'"}'
 
 # Create API scope (admin)
-curl -X POST "$BASE/authsec/admin/api_scopes" \
+curl -X POST "$BASE/authsec/uflow/admin/api_scopes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"api:read","resource":"GET /api/data","tenant_id":"'"$TENANT_ID"'"}'
 
 # List API scopes (admin)
-curl "$BASE/authsec/admin/api_scopes" \
+curl "$BASE/authsec/uflow/admin/api_scopes" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -865,49 +865,49 @@ curl "$BASE/authsec/admin/api_scopes" \
 
 ```bash
 # Sync AD users
-curl -X POST "$BASE/authsec/admin/ad/sync" \
+curl -X POST "$BASE/authsec/uflow/admin/ad/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","ldap_url":"ldap://dc.corp.local","base_dn":"DC=corp,DC=local","username":"svc@corp.local","password":"pass"}'
 
 # Test AD connection
-curl -X POST "$BASE/authsec/admin/ad/test-connection" \
+curl -X POST "$BASE/authsec/uflow/admin/ad/test-connection" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"ldap_url":"ldap://dc.corp.local","base_dn":"DC=corp,DC=local","username":"svc@corp.local","password":"pass"}'
 
 # Test network connectivity
-curl -X POST "$BASE/authsec/admin/ad/test-network" \
+curl -X POST "$BASE/authsec/uflow/admin/ad/test-network" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"host":"dc.corp.local","port":389}'
 
 # Agent-based AD sync
-curl -X POST "$BASE/authsec/admin/ad/agent-sync" \
+curl -X POST "$BASE/authsec/uflow/admin/ad/agent-sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","agent_id":"<agent-uuid>"}'
 
 # Sync Entra ID (Azure AD) users
-curl -X POST "$BASE/authsec/admin/entra/sync" \
+curl -X POST "$BASE/authsec/uflow/admin/entra/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","azure_tenant_id":"<azure-tid>","client_id":"<app-id>","client_secret":"<secret>"}'
 
 # Test Entra ID connection
-curl -X POST "$BASE/authsec/admin/entra/test-connection" \
+curl -X POST "$BASE/authsec/uflow/admin/entra/test-connection" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"azure_tenant_id":"<azure-tid>","client_id":"<app-id>","client_secret":"<secret>"}'
 
 # Sync AD admin users
-curl -X POST "$BASE/authsec/admin/admin-users/ad/sync" \
+curl -X POST "$BASE/authsec/uflow/admin/admin-users/ad/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'"}'
 
 # Sync Entra admin users
-curl -X POST "$BASE/authsec/admin/admin-users/entra/sync" \
+curl -X POST "$BASE/authsec/uflow/admin/admin-users/entra/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'"}'
@@ -915,13 +915,13 @@ curl -X POST "$BASE/authsec/admin/admin-users/entra/sync" \
 
 ---
 
-## SCIM 2.0  `/authsec/scim/v2`
+## SCIM 2.0  `/authsec/uflow/scim/v2`
 
 ```bash
 # Discovery (public)
-curl "$BASE/authsec/scim/v2/ServiceProviderConfig"
-curl "$BASE/authsec/scim/v2/Schemas"
-curl "$BASE/authsec/scim/v2/ResourceTypes"
+curl "$BASE/authsec/uflow/scim/v2/ServiceProviderConfig"
+curl "$BASE/authsec/uflow/scim/v2/Schemas"
+curl "$BASE/authsec/uflow/scim/v2/ResourceTypes"
 
 # End-user provisioning (Bearer = SCIM token)
 SCIM_TOKEN="<scim-token>"
@@ -929,41 +929,41 @@ CLIENT_ID="<client-uuid>"
 PROJECT_ID="<project-uuid>"
 
 # List users
-curl "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users" \
+curl "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users" \
   -H "Authorization: Bearer $SCIM_TOKEN"
 
 # Get user
-curl "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
+curl "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
   -H "Authorization: Bearer $SCIM_TOKEN"
 
 # Create user
-curl -X POST "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users" \
+curl -X POST "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users" \
   -H "Authorization: Bearer $SCIM_TOKEN" \
   -H "Content-Type: application/scim+json" \
   -d '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"user@example.com","emails":[{"value":"user@example.com","primary":true}]}'
 
 # Replace user
-curl -X PUT "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
+curl -X PUT "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
   -H "Authorization: Bearer $SCIM_TOKEN" \
   -H "Content-Type: application/scim+json" \
   -d '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"user@example.com","active":true}'
 
 # Patch user (activate/deactivate)
-curl -X PATCH "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
+curl -X PATCH "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
   -H "Authorization: Bearer $SCIM_TOKEN" \
   -H "Content-Type: application/scim+json" \
   -d '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"replace","path":"active","value":false}]}'
 
 # Delete user
-curl -X DELETE "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
+curl -X DELETE "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Users/<scim-user-id>" \
   -H "Authorization: Bearer $SCIM_TOKEN"
 
 # List groups
-curl "$BASE/authsec/scim/v2/$CLIENT_ID/$PROJECT_ID/Groups" \
+curl "$BASE/authsec/uflow/scim/v2/$CLIENT_ID/$PROJECT_ID/Groups" \
   -H "Authorization: Bearer $SCIM_TOKEN"
 
 # Generate SCIM token
-curl -X POST "$BASE/authsec/admin/scim/generate-token" \
+curl -X POST "$BASE/authsec/uflow/admin/scim/generate-token" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'"}'
@@ -975,17 +975,17 @@ curl -X POST "$BASE/authsec/admin/scim/generate-token" \
 
 ```bash
 # Login (legacy path)
-curl -X POST "$BASE/authsec/login" \
+curl -X POST "$BASE/authsec/uflow/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"pass","tenant_id":"'"$TENANT_ID"'"}'
 
 # Verify OTP and complete registration (legacy)
-curl -X POST "$BASE/authsec/register/verify" \
+curl -X POST "$BASE/authsec/uflow/register/verify" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","otp":"123456","tenant_id":"'"$TENANT_ID"'"}'
 
 # WebAuthn callback (legacy)
-curl -X POST "$BASE/authsec/login/webauthn-callback" \
+curl -X POST "$BASE/authsec/uflow/login/webauthn-callback" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 ```
@@ -997,58 +997,58 @@ curl -X POST "$BASE/authsec/login/webauthn-callback" \
 ### Health
 
 ```bash
-curl "$BASE/authsec/health"
+curl "$BASE/authsec/uflow/health"
 ```
 
 ### MFA Status
 
 ```bash
 # WebAuthn MFA login status (root-level)
-curl -X POST "$BASE/authsec/mfa/loginStatus" \
+curl -X POST "$BASE/authsec/webauthn/mfa/loginStatus" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Legacy flat endpoints
-curl -X POST "$BASE/authsec/mfa/status" \
+curl -X POST "$BASE/authsec/webauthn/mfa/status" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
-curl -X POST "$BASE/authsec/mfa/loginStatus" \
+curl -X POST "$BASE/authsec/webauthn/mfa/loginStatus" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
-curl "$BASE/authsec/mfa/loginStatus?email=user@example.com&tenant_id=$TENANT_ID"
+curl "$BASE/authsec/webauthn/mfa/loginStatus?email=user@example.com&tenant_id=$TENANT_ID"
 ```
 
 ### Legacy WebAuthn Registration & Authentication
 
 ```bash
 # Begin registration
-curl -X POST "$BASE/authsec/beginRegistration" \
+curl -X POST "$BASE/authsec/webauthn/beginRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Begin WebAuthn registration (alternate path)
-curl -X POST "$BASE/authsec/beginAuthRegistration" \
+curl -X POST "$BASE/authsec/webauthn/beginAuthRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish registration
-curl -X POST "$BASE/authsec/finishRegistration" \
+curl -X POST "$BASE/authsec/webauthn/finishRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin authentication
-curl -X POST "$BASE/authsec/beginAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/beginAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish authentication
-curl -X POST "$BASE/authsec/finishAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/finishAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
@@ -1058,49 +1058,49 @@ curl -X POST "$BASE/authsec/finishAuthentication" \
 
 ```bash
 # Begin biometric setup (new passkey for MFA)
-curl -X POST "$BASE/authsec/biometric/beginSetup" \
+curl -X POST "$BASE/authsec/webauthn/biometric/beginSetup" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Confirm biometric setup
-curl -X POST "$BASE/authsec/biometric/confirmSetup" \
+curl -X POST "$BASE/authsec/webauthn/biometric/confirmSetup" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin biometric login setup
-curl -X POST "$BASE/authsec/biometric/beginLoginSetup" \
+curl -X POST "$BASE/authsec/webauthn/biometric/beginLoginSetup" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Confirm biometric login setup
-curl -X POST "$BASE/authsec/biometric/confirmLoginSetup" \
+curl -X POST "$BASE/authsec/webauthn/biometric/confirmLoginSetup" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin biometric verify (MFA challenge)
-curl -X POST "$BASE/authsec/biometric/verifyBegin" \
+curl -X POST "$BASE/authsec/webauthn/biometric/verifyBegin" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish biometric verify
-curl -X POST "$BASE/authsec/biometric/verifyFinish" \
+curl -X POST "$BASE/authsec/webauthn/biometric/verifyFinish" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin biometric login verify
-curl -X POST "$BASE/authsec/biometric/verifyLoginBegin" \
+curl -X POST "$BASE/authsec/webauthn/biometric/verifyLoginBegin" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish biometric login verify
-curl -X POST "$BASE/authsec/biometric/verifyLoginFinish" \
+curl -X POST "$BASE/authsec/webauthn/biometric/verifyLoginFinish" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
@@ -1110,30 +1110,30 @@ curl -X POST "$BASE/authsec/biometric/verifyLoginFinish" \
 
 ```bash
 # MFA status (admin user)
-curl -X POST "$BASE/authsec/admin/mfa/status" \
+curl -X POST "$BASE/authsec/webauthn/admin/mfa/status" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Begin registration (admin)
-curl -X POST "$BASE/authsec/admin/beginRegistration" \
+curl -X POST "$BASE/authsec/webauthn/admin/beginRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish registration (admin)
-curl -X POST "$BASE/authsec/admin/finishRegistration" \
+curl -X POST "$BASE/authsec/webauthn/admin/finishRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin authentication (admin)
-curl -X POST "$BASE/authsec/admin/beginAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/admin/beginAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish authentication (admin)
-curl -X POST "$BASE/authsec/admin/finishAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/admin/finishAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
@@ -1143,30 +1143,30 @@ curl -X POST "$BASE/authsec/admin/finishAuthentication" \
 
 ```bash
 # MFA status (end-user, uses tenant DB)
-curl -X POST "$BASE/authsec/enduser/mfa/status" \
+curl -X POST "$BASE/authsec/webauthn/enduser/mfa/status" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Begin registration (end-user)
-curl -X POST "$BASE/authsec/enduser/beginRegistration" \
+curl -X POST "$BASE/authsec/webauthn/enduser/beginRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish registration (end-user)
-curl -X POST "$BASE/authsec/enduser/finishRegistration" \
+curl -X POST "$BASE/authsec/webauthn/enduser/finishRegistration" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
 
 # Begin authentication (end-user)
-curl -X POST "$BASE/authsec/enduser/beginAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/enduser/beginAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Finish authentication (end-user)
-curl -X POST "$BASE/authsec/enduser/finishAuthentication" \
+curl -X POST "$BASE/authsec/webauthn/enduser/finishAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
@@ -1176,32 +1176,32 @@ curl -X POST "$BASE/authsec/enduser/finishAuthentication" \
 
 ```bash
 # Begin login TOTP setup
-curl -X POST "$BASE/authsec/totp/beginLoginSetup" \
+curl -X POST "$BASE/authsec/webauthn/totp/beginLoginSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
 # Begin TOTP setup
-curl -X POST "$BASE/authsec/totp/beginSetup" \
+curl -X POST "$BASE/authsec/webauthn/totp/beginSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Confirm login TOTP setup
-curl -X POST "$BASE/authsec/totp/confirmLoginSetup" \
+curl -X POST "$BASE/authsec/webauthn/totp/confirmLoginSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","secret":"<base32>","code":"123456"}'
 
 # Confirm TOTP setup
-curl -X POST "$BASE/authsec/totp/confirmSetup" \
+curl -X POST "$BASE/authsec/webauthn/totp/confirmSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","secret":"<base32>","code":"123456"}'
 
 # Verify login TOTP
-curl -X POST "$BASE/authsec/totp/verifyLogin" \
+curl -X POST "$BASE/authsec/webauthn/totp/verifyLogin" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","code":"123456"}'
 
 # Verify TOTP
-curl -X POST "$BASE/authsec/totp/verify" \
+curl -X POST "$BASE/authsec/webauthn/totp/verify" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","code":"123456"}'
 ```
@@ -1210,22 +1210,22 @@ curl -X POST "$BASE/authsec/totp/verify" \
 
 ```bash
 # Begin SMS setup (send code to phone)
-curl -X POST "$BASE/authsec/sms/beginSetup" \
+curl -X POST "$BASE/authsec/webauthn/sms/beginSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","phone_number":"+15551234567"}'
 
 # Confirm SMS setup
-curl -X POST "$BASE/authsec/sms/confirmSetup" \
+curl -X POST "$BASE/authsec/webauthn/sms/confirmSetup" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","phone_number":"+15551234567","code":"123456"}'
 
 # Request SMS code (for login)
-curl -X POST "$BASE/authsec/sms/requestCode" \
+curl -X POST "$BASE/authsec/webauthn/sms/requestCode" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 
 # Verify SMS code
-curl -X POST "$BASE/authsec/sms/verify" \
+curl -X POST "$BASE/authsec/webauthn/sms/verify" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","code":"123456"}'
 ```
@@ -1235,7 +1235,7 @@ curl -X POST "$BASE/authsec/sms/verify" \
 ## HubSpot Integration
 
 ```bash
-curl -X POST "$BASE/authsec/hubspot/contacts/sync" \
+curl -X POST "$BASE/authsec/uflow/hubspot/contacts/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
@@ -1247,25 +1247,25 @@ curl -X POST "$BASE/authsec/hubspot/contacts/sync" \
 
 ```bash
 # Swagger UI
-open "$BASE/authsec/swagger/index.html"
+open "$BASE/authsec/uflow/swagger/index.html"
 
 # ReDoc UI
-open "$BASE/authsec/docs"
+open "$BASE/authsec/uflow/docs"
 
 # API info
-curl "$BASE/authsec/apidocs"
+curl "$BASE/authsec/uflow/apidocs"
 ```
 
 ---
 
-## External Services  `/authsec/services`
+## External Services  `/authsec/exsvc/services`
 
 Manages external service registrations with credentials stored in HashiCorp Vault.
 Requires `external-service` RBAC permissions seeded per tenant on first access.
 
 ```bash
 # Create a service (stores secret_data in Vault)
-curl -X POST "$BASE/authsec/services" \
+curl -X POST "$BASE/authsec/exsvc/services" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1283,15 +1283,15 @@ curl -X POST "$BASE/authsec/services" \
   }'
 
 # List services (for authenticated client)
-curl "$BASE/authsec/services" \
+curl "$BASE/authsec/exsvc/services" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get service by ID
-curl "$BASE/authsec/services/$SERVICE_ID" \
+curl "$BASE/authsec/exsvc/services/$SERVICE_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # Update a service
-curl -X PUT "$BASE/authsec/services/$SERVICE_ID" \
+curl -X PUT "$BASE/authsec/exsvc/services/$SERVICE_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1303,15 +1303,15 @@ curl -X PUT "$BASE/authsec/services/$SERVICE_ID" \
   }'
 
 # Delete a service (also removes Vault secret)
-curl -X DELETE "$BASE/authsec/services/$SERVICE_ID" \
+curl -X DELETE "$BASE/authsec/exsvc/services/$SERVICE_ID" \
   -H "Authorization: Bearer $TOKEN"
 
 # Get service credentials (reads from Vault)
-curl "$BASE/authsec/services/$SERVICE_ID/credentials" \
+curl "$BASE/authsec/exsvc/services/$SERVICE_ID/credentials" \
   -H "Authorization: Bearer $TOKEN"
 
 # Debug: dump JWT claims
-curl "$BASE/authsec/debug/extsvc/auth" \
+curl "$BASE/authsec/exsvc/debug/auth" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -2151,4 +2151,196 @@ curl -X POST "$BASE/authsec/oocmgr/stats/tenant" \
 curl -X POST "$BASE/authsec/oocmgr/clients/getClients" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","active_only":true}'
+```
+
+---
+
+## Auth Manager  `/authsec/authmgr`
+
+> Formerly the standalone `auth-manager` microservice.  
+> Token endpoints are public; admin/user endpoints require a valid Bearer token.
+
+```bash
+BASE=http://localhost:8080
+TOKEN="<your-jwt>"
+TENANT_ID="<tenant-uuid>"
+USER_ID="<user-uuid>"
+```
+
+### Health  `GET /authsec/authmgr/health`
+
+```bash
+curl "$BASE/authsec/authmgr/health"
+```
+
+### Verify Token  `POST /authsec/authmgr/token/verify`
+
+```bash
+curl -X POST "$BASE/authsec/authmgr/token/verify" \
+  -H "Content-Type: application/json" \
+  -d '{"token":"'"$TOKEN"'"}'
+```
+
+### Generate Token  `POST /authsec/authmgr/token/generate`
+
+```bash
+curl -X POST "$BASE/authsec/authmgr/token/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","email_id":"user@example.com","client_id":"<client-uuid>","project_id":"<project-uuid>"}'
+```
+
+### OIDC Token Exchange  `POST /authsec/authmgr/token/oidc`
+
+```bash
+curl -X POST "$BASE/authsec/authmgr/token/oidc" \
+  -H "Content-Type: application/json" \
+  -d '{"oidc_token":"<hydra-access-token>"}'
+```
+
+### Get Profile  `GET /authsec/authmgr/admin/profile`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/profile" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Auth Status  `GET /authsec/authmgr/admin/auth-status`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/auth-status?tenant_id=$TENANT_ID&email=user@example.com" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Validate Token  `GET /authsec/authmgr/admin/validate/token`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/validate/token" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Validate Scope  `GET /authsec/authmgr/admin/validate/scope`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/validate/scope" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Validate Resource  `GET /authsec/authmgr/admin/validate/resource`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/validate/resource" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Validate Permissions  `GET /authsec/authmgr/admin/validate/permissions`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/validate/permissions" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Check Permission  `GET /authsec/authmgr/admin/check/permission`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/check/permission?resource=invoice&scope=read" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Check Role  `GET /authsec/authmgr/admin/check/role`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/check/role?role=admin" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Check Role Resource  `GET /authsec/authmgr/admin/check/role-resource`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/check/role-resource?role=editor&scope_type=project&resource_id=<resource-uuid>" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Check Permission Scoped  `GET /authsec/authmgr/admin/check/permission-scoped`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/check/permission-scoped?resource=invoice&scope=write&scope_type=project&scope_id=<scope-uuid>" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Check OAuth Scope Permission  `GET /authsec/authmgr/admin/check/oauth-scope`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/check/oauth-scope?scope_name=invoice.read&resource=invoice&action=read" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### List User Permissions  `GET /authsec/authmgr/admin/permissions`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/permissions" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Create Groups  `POST /authsec/authmgr/admin/groups`
+
+```bash
+curl -X POST "$BASE/authsec/authmgr/admin/groups" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","groups":["engineers","admins"]}'
+```
+
+### List Groups  `GET /authsec/authmgr/admin/groups`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/groups?tenant_id=$TENANT_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Get Group  `GET /authsec/authmgr/admin/groups/:id`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/groups/1?tenant_id=$TENANT_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Update Group  `PUT /authsec/authmgr/admin/groups/:id`
+
+```bash
+curl -X PUT "$BASE/authsec/authmgr/admin/groups/1" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","name":"senior-engineers"}'
+```
+
+### Delete Group  `DELETE /authsec/authmgr/admin/groups/:id`
+
+```bash
+curl -X DELETE "$BASE/authsec/authmgr/admin/groups/1?tenant_id=$TENANT_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Add Users to Group  `POST /authsec/authmgr/admin/groups/:id/users`
+
+```bash
+curl -X POST "$BASE/authsec/authmgr/admin/groups/1/users" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","user_ids":["'"$USER_ID"'"]}'
+```
+
+### Remove Users from Group  `DELETE /authsec/authmgr/admin/groups/:id/users`
+
+```bash
+curl -X DELETE "$BASE/authsec/authmgr/admin/groups/1/users" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","user_ids":["'"$USER_ID"'"]}'
+```
+
+### List Group Users  `GET /authsec/authmgr/admin/groups/:id/users`
+
+```bash
+curl "$BASE/authsec/authmgr/admin/groups/1/users?tenant_id=$TENANT_ID" \
+  -H "Authorization: Bearer $TOKEN"
 ```
