@@ -15,11 +15,10 @@
 //   /.well-known/openid-configuration
 //   /.well-known/jwks.json
 //
-// Client management routes are served under the /clientms prefix (formerly clients-microservice):
-//   /clientms/health                                  – health check
-//   /clientms/tenants/:tenantId/clients/*             – tenant-scoped client CRUD
-//   /clientms/admin/clients/*                         – admin cross-tenant client view
-//   /clientms/oocmgr/tenant/delete-complete           – OOC manager integration
+// All merged microservice routes are under /authsec:
+//   /authsec/clientms/*   – client management (formerly clients-microservice)
+//   /authsec/hmgr/*       – Hydra manager (formerly hydra-service)
+//   /authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
 package routes
 
 import (
@@ -613,13 +612,19 @@ func SetupRoutes(
 		// Client Management (formerly clients-microservice)
 		// Served under /clientms to match the original service prefix.
 		// ────────────────────────────────────────────────────
-		registerClientsRoutes(r)
+		registerClientsRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
 		// Hydra Manager (formerly hydra-service)
-		// Served under /hmgr to match the original service prefix.
+		// Served under /authsec/hmgr.
 		// ────────────────────────────────────────────────────
-		registerHmgrRoutes(r)
+		registerHmgrRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
+		// OIDC Configuration Manager (formerly oath_oidc_configuration_manager)
+		// Served under /authsec/oocmgr.
+		// ────────────────────────────────────────────────────
+		registerOocmgrRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)
@@ -657,7 +662,7 @@ func SetupRoutes(
 // registerClientsRoutes registers all client management routes under /clientms.
 // Previously served by the standalone clients-microservice.
 // Auth middleware is applied to all routes inside the /clientms group.
-func registerClientsRoutes(r *gin.Engine) {
+func registerClientsRoutes(r gin.IRouter) {
 	redoclyHandler := func(c *gin.Context) {
 		html := `<!DOCTYPE html>
 <html>
@@ -805,7 +810,7 @@ func registerWebAuthnRoutes(
 
 // registerHmgrRoutes registers all Hydra Manager routes under /hmgr.
 // Previously served by the standalone hydra-service.
-func registerHmgrRoutes(r *gin.Engine) {
+func registerHmgrRoutes(r gin.IRouter) {
 	hmgrController := controllers.NewHmgrController(*config.AppConfig)
 
 	// ── Public routes (no authentication required) ──
@@ -886,5 +891,92 @@ func registerHmgrRoutes(r *gin.Engine) {
 			user.GET("/profile", hmgrController.GetProfileHandler)
 			user.PUT("/profile", hmgrController.UpdateProfileHandler)
 		}
+	}
+}
+
+// registerOocmgrRoutes registers all OIDC Configuration Manager routes under /oocmgr.
+// Previously served by the standalone oath_oidc_configuration_manager microservice.
+func registerOocmgrRoutes(r gin.IRouter) {
+	ac := controllers.NewOocmgrController()
+
+	v1 := r.Group("/oocmgr")
+
+	v1.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "healthy", "service": "oidc-config-manager", "version": "2.0.0"})
+	})
+
+	secured := v1.Group("/")
+
+	// ── Main configuration ──
+	secured.POST("/configure-complete-oidc", ac.CompleteOIDCConfiguration)
+
+	// ── Tenant management ──
+	tenant := secured.Group("/tenant")
+	{
+		tenant.POST("/create-base-client", ac.CreateBaseTenantClient)
+		tenant.POST("/check-exists", ac.CheckTenantExists)
+		tenant.POST("/list-all", ac.ListAllTenants)
+		tenant.POST("/delete-complete", ac.DeleteCompleteTenantConfig)
+		tenant.POST("/update-complete", ac.UpdateCompleteTenantConfig)
+		tenant.POST("/login-page-data", ac.GetTenantLoginPageData)
+	}
+
+	// ── Config management ──
+	configs := secured.Group("/config")
+	{
+		configs.POST("/edit", ac.EditConfig)
+	}
+
+	// ── OIDC management ──
+	oidc := secured.Group("/oidc")
+	{
+		oidc.POST("/add-provider", ac.AddOIDCProviderToTenant)
+		oidc.POST("/get-config", ac.GetTenantOIDCConfig)
+		oidc.POST("/get-provider", ac.GetOIDCProvider)
+		oidc.POST("/get-provider-secret", ac.GetProviderSecret)
+		oidc.POST("/update-provider", ac.UpdateOIDCProvider)
+		oidc.POST("/delete-provider", ac.DeleteOIDCProvider)
+		oidc.POST("/templates", ac.GetProviderTemplates)
+		oidc.POST("/validate", ac.ValidateOIDCConfig)
+		oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
+		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
+		oidc.POST("/edit-client-auth-provider", ac.EditAuthProvider)
+	}
+
+	// ── SAML management ──
+	saml := secured.Group("/saml")
+	{
+		saml.POST("/add-provider", ac.AddSAMLProvider)
+		saml.POST("/list-providers", ac.ListSAMLProviders)
+		saml.POST("/get-provider", ac.GetSAMLProvider)
+		saml.POST("/update-provider", ac.UpdateSAMLProvider)
+		saml.POST("/delete-provider", ac.DeleteSAMLProvider)
+		saml.POST("/templates", ac.GetSAMLProviderTemplates)
+	}
+
+	// ── Hydra client management ──
+	hydraClients := secured.Group("/hydra-clients")
+	{
+		hydraClients.POST("/list", ac.ListTenantHydraClients)
+		hydraClients.POST("/get-by-tenant", ac.GetTenantHydraClients)
+		hydraClients.POST("/sync", ac.SyncHydraClients)
+	}
+
+	// ── Testing ──
+	test := v1.Group("/test")
+	{
+		test.POST("/oidc-flow", ac.TestOIDCFlow)
+	}
+
+	// ── Stats ──
+	stats := v1.Group("/stats")
+	{
+		stats.POST("/tenant", ac.GetTenantStats)
+	}
+
+	// ── Clients ──
+	oocmgrClients := v1.Group("/clients")
+	{
+		oocmgrClients.POST("/getClients", ac.GetClientsByTenant)
 	}
 }
