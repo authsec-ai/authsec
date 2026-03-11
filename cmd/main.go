@@ -24,6 +24,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
+	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -57,8 +58,25 @@ func main() {
 
 	monitoring.InitMetrics()
 
-	// Initialise primary database (runs migrations)
+	// Initialise primary database
 	config.InitDatabaseWithoutGORM(cfg)
+
+	// Run database migrations via the authsec-migration system
+	if err := migration.AutoMigrateMigrationLogs(config.DB); err != nil {
+		log.Printf("Warning: failed to create migration_logs table: %v", err)
+	}
+	if os.Getenv("SKIP_MIGRATIONS") != "true" {
+		masterRunner := migration.NewMasterMigrationRunner(
+			migration.MigrationsDir("master"),
+			config.Database.DB,
+			config.DB,
+		)
+		if err := masterRunner.RunMigrations(); err != nil {
+			log.Printf("Warning: master migrations encountered errors (service continuing): %v", err)
+		} else {
+			log.Println("Master migrations completed successfully")
+		}
+	}
 
 	// Initialise auth-manager configuration
 	authManagerConfig.LoadConfig()

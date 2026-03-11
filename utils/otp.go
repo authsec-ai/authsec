@@ -364,6 +364,7 @@ Hello,
 
 A new user has registered under your tenant.
 
+- Name: %s
 - Email: %s
 - Tenant Domain: %s
 - Registration Time: %s

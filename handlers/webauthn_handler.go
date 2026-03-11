@@ -27,7 +27,7 @@ import (
 
 	// ✅ Use sharedmodels for DB structs
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/controllers"
+	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	appmodels "github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -855,7 +855,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 // and webauthn-service were separate microservices.
 func (h *WebAuthnHandler) callUserflowService(clientID, email, tenantID string) (accessToken, refreshToken string, err error) {
 	log.Printf("callUserflowService: invoking internal controller for email=%s, tenantID=%s", email, tenantID)
-	return controllers.WebAuthnRegisterInternal(clientID, email, tenantID)
+	return adminCtrl.WebAuthnRegisterInternal(clientID, email, tenantID)
 }
 
 //

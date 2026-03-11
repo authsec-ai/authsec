@@ -31,7 +31,10 @@ import (
 
 	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/controllers"
+	adminCtrl    "github.com/authsec-ai/authsec/controllers/admin"
+	userCtrl     "github.com/authsec-ai/authsec/controllers/enduser"
+	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
+	sharedCtrl   "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
@@ -55,91 +58,91 @@ func SetupRoutes(
 	// ────────────────────────────────────────────────────────
 	// Initialise controllers
 	// ────────────────────────────────────────────────────────
-	userController, err := controllers.NewUserController()
+	userController, err := adminCtrl.NewUserController()
 	if err != nil {
 		log.Fatalf("Failed to initialize user controller: %v", err)
 	}
-	adminAuthController, err := controllers.NewAdminAuthController()
+	adminAuthController, err := adminCtrl.NewAdminAuthController()
 	if err != nil {
 		log.Fatalf("Failed to initialize admin auth controller: %v", err)
 	}
-	adminUserController, err := controllers.NewAdminUserController()
+	adminUserController, err := adminCtrl.NewAdminUserController()
 	if err != nil {
 		log.Fatalf("Failed to initialize admin user controller: %v", err)
 	}
-	endUserAuthController, err := controllers.NewEndUserAuthController()
+	endUserAuthController, err := userCtrl.NewEndUserAuthController()
 	if err != nil {
 		log.Fatalf("Failed to initialize end-user auth controller: %v", err)
 	}
-	projectController := &controllers.ProjectController{}
+	projectController := &adminCtrl.ProjectController{}
 
 	// Scoped RBAC Controllers
-	rolesScopedBindingsController := controllers.NewRolesScopedBindingsController()
-	authController := controllers.NewAuthorizationController()
-	permissionController := controllers.NewPermissionController()
-	scopeController := controllers.NewScopeController()
-	apiScopesController := controllers.NewAPIScopesController()
+	rolesScopedBindingsController := adminCtrl.NewRolesScopedBindingsController()
+	authController := platformCtrl.NewAuthorizationController()
+	permissionController := adminCtrl.NewPermissionController()
+	scopeController := adminCtrl.NewScopeController()
+	apiScopesController := adminCtrl.NewAPIScopesController()
 
 	// Legacy / existing controllers
-	groupController := &controllers.GroupController{}
-	endUserController := &controllers.EndUserController{}
-	adSyncController := &controllers.ADSyncController{}
-	entraIDController := &controllers.EntraIDController{}
-	syncConfigController := &controllers.SyncConfigController{}
-	healthController := &controllers.HealthController{}
-	adminInviteController, err := controllers.NewAdminInviteController()
+	groupController := &adminCtrl.GroupController{}
+	endUserController := &userCtrl.EndUserController{}
+	adSyncController := &sharedCtrl.ADSyncController{}
+	entraIDController := &sharedCtrl.EntraIDController{}
+	syncConfigController := &adminCtrl.SyncConfigController{}
+	healthController := &sharedCtrl.HealthController{}
+	adminInviteController, err := adminCtrl.NewAdminInviteController()
 	if err != nil {
 		log.Fatalf("Failed to initialize admin invite controller: %v", err)
 	}
 
-	domainController := controllers.NewDomainController(config.GetDatabase())
-	hubspotController := controllers.NewHubSpotController()
+	domainController := adminCtrl.NewDomainController(config.GetDatabase())
+	hubspotController := platformCtrl.NewHubSpotController()
 
-	scimController := &controllers.SCIMController{}
-	scimAdminController, err := controllers.NewSCIMAdminController()
+	scimController := &platformCtrl.SCIMController{}
+	scimAdminController, err := adminCtrl.NewSCIMAdminController()
 	if err != nil {
 		log.Fatalf("Failed to initialize SCIM admin controller: %v", err)
 	}
 
 	_ = middlewares.NewTenantResolutionMiddleware(config.GetDatabase())
 
-	oidcController, err := controllers.NewOIDCController()
+	oidcController, err := platformCtrl.NewOIDCController()
 	if err != nil {
 		log.Fatalf("Failed to initialize OIDC controller: %v", err)
 	}
-	adminSyncController, err := controllers.NewAdminSyncController()
+	adminSyncController, err := adminCtrl.NewAdminSyncController()
 	if err != nil {
 		log.Fatalf("Failed to initialize admin sync controller: %v", err)
 	}
 
-	deviceAuthController, err := controllers.NewDeviceAuthController()
+	deviceAuthController, err := userCtrl.NewDeviceAuthController()
 	if err != nil {
 		log.Fatalf("Failed to initialize device auth controller: %v", err)
 	}
 
-	voiceAuthController, err := controllers.NewVoiceAuthController()
+	voiceAuthController, err := userCtrl.NewVoiceAuthController()
 	if err != nil {
 		log.Fatalf("Failed to initialize voice auth controller: %v", err)
 	}
 
-	totpController, err := controllers.NewTOTPController()
+	totpController, err := userCtrl.NewTOTPController()
 	if err != nil {
 		log.Fatalf("Failed to initialize TOTP controller: %v", err)
 	}
 
-	cibaAuthController, err := controllers.NewCIBAAuthController()
+	cibaAuthController, err := userCtrl.NewCIBAAuthController()
 	if err != nil {
 		log.Fatalf("Failed to initialize CIBA auth controller: %v", err)
 	}
 
-	tenantCIBAController, err := controllers.NewTenantCIBAController()
+	tenantCIBAController, err := userCtrl.NewTenantCIBAController()
 	if err != nil {
 		log.Fatalf("Failed to initialize tenant CIBA auth controller: %v", err)
 	}
 
-	tenantTOTPController := controllers.NewTenantTOTPController()
+	tenantTOTPController := userCtrl.NewTenantTOTPController()
 
-	spiffeDelegateController, err := controllers.NewSpiffeDelegateController()
+	spiffeDelegateController, err := platformCtrl.NewSpiffeDelegateController()
 	if err != nil {
 		log.Fatalf("Failed to initialize SPIFFE delegate controller: %v", err)
 	}
@@ -639,13 +642,13 @@ func SetupRoutes(
 		// External Service (formerly exsvc / mcp-service)
 		// Served under /authsec/exsvc.
 		// ────────────────────────────────────────────────────
-		extSvcController := controllers.NewExternalServiceController(config.DB)
+		extSvcController := platformCtrl.NewExternalServiceController(config.DB)
 
 		exsvc := authsec.Group("/exsvc")
 		exsvc.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"status": "ok", "service": "external-service"})
 		})
-		exsvc.GET("/debug/auth", middlewares.AuthMiddleware(), controllers.DebugExternalServiceAuth)
+		exsvc.GET("/debug/auth", middlewares.AuthMiddleware(), platformCtrl.DebugExternalServiceAuth)
 		exsvc.GET("/debug/test", middlewares.AuthMiddleware(), func(c *gin.Context) {
 			c.JSON(200, gin.H{"status": "authenticated", "path": "/debug/test"})
 		})
@@ -736,25 +739,25 @@ func registerClientsRoutes(r gin.IRouter) {
 		{
 			clients := tenantRoutes.Group("/clients")
 			{
-				clients.GET("/getClients", controllers.GetClients)
-				clients.POST("/getClients", controllers.GetClientsByTenant)
+				clients.GET("/getClients", platformCtrl.GetClients)
+				clients.POST("/getClients", platformCtrl.GetClientsByTenant)
 
-				clients.GET("/:id", controllers.GetClient)
+				clients.GET("/:id", platformCtrl.GetClient)
 
-				clients.POST("/create", controllers.RegisterClient)
+				clients.POST("/create", platformCtrl.RegisterClient)
 
-				clients.PUT("/:id", controllers.UpdateClient)
-				clients.PATCH("/:id", controllers.EditClient)
+				clients.PUT("/:id", platformCtrl.UpdateClient)
+				clients.PATCH("/:id", platformCtrl.EditClient)
 
-				clients.PATCH("/:id/soft-delete", controllers.SoftDeleteClient)
-				clients.DELETE("/:id", controllers.DeleteClient)
+				clients.PATCH("/:id/soft-delete", platformCtrl.SoftDeleteClient)
+				clients.DELETE("/:id", platformCtrl.DeleteClient)
 
-				clients.POST("/delete-complete", controllers.DeleteCompleteClient)
+				clients.POST("/delete-complete", platformCtrl.DeleteCompleteClient)
 
-				clients.PATCH("/:id/activate", controllers.ActivateClient)
-				clients.PATCH("/:id/deactivate", controllers.DeactivateClient)
+				clients.PATCH("/:id/activate", platformCtrl.ActivateClient)
+				clients.PATCH("/:id/deactivate", platformCtrl.DeactivateClient)
 
-				clients.POST("/set-status", controllers.SetClientStatus)
+				clients.POST("/set-status", platformCtrl.SetClientStatus)
 			}
 		}
 
@@ -762,13 +765,13 @@ func registerClientsRoutes(r gin.IRouter) {
 		adminClients := clientms.Group("/admin/clients")
 		adminClients.Use(middlewares.Require("clients", "admin"))
 		{
-			adminClients.GET("/", controllers.GetClients)
+			adminClients.GET("/", platformCtrl.GetClients)
 		}
 
 		// OOC Manager integration routes (internal service-to-service)
 		oocmgr := clientms.Group("/oocmgr")
 		{
-			oocmgr.POST("/tenant/delete-complete", controllers.DeleteCompleteClient)
+			oocmgr.POST("/tenant/delete-complete", platformCtrl.DeleteCompleteClient)
 		}
 	}
 }
@@ -850,7 +853,7 @@ func registerWebAuthnRoutes(
 // registerHmgrRoutes registers all Hydra Manager routes under /hmgr.
 // Previously served by the standalone hydra-service.
 func registerHmgrRoutes(r gin.IRouter) {
-	hmgrController := controllers.NewHmgrController(*config.AppConfig)
+	hmgrController := platformCtrl.NewHmgrController(*config.AppConfig)
 
 	// ── Public routes (no authentication required) ──
 	pub := r.Group("/hmgr")
@@ -936,7 +939,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 // registerOocmgrRoutes registers all OIDC Configuration Manager routes under /oocmgr.
 // Previously served by the standalone oath_oidc_configuration_manager microservice.
 func registerOocmgrRoutes(r gin.IRouter) {
-	ac := controllers.NewOocmgrController()
+	ac := platformCtrl.NewOocmgrController()
 
 	v1 := r.Group("/oocmgr")
 
@@ -1023,7 +1026,7 @@ func registerOocmgrRoutes(r gin.IRouter) {
 // registerAuthmgrRoutes registers all Auth Manager routes under /authmgr.
 // Previously served by the standalone auth-manager microservice.
 func registerAuthmgrRoutes(r gin.IRouter) {
-	ac := controllers.NewAuthmgrController()
+	ac := platformCtrl.NewAuthmgrController()
 
 	// Public / unauthenticated endpoints
 	authmgr := r.Group("/authmgr")
@@ -1086,5 +1089,33 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		user.GET("/check/permission-scoped", ac.CheckPermissionScoped)
 		user.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
 		user.GET("/permissions", ac.ListUserPermissions)
+	}
+
+	// ────────────────────────────────────────────────────────
+	// authsec-migration – database migration management API
+	// Routes mirror the standalone authsec-migration microservice.
+	// ────────────────────────────────────────────────────────
+	migCtrl := adminCtrl.NewMigrationController()
+
+	migv1 := r.Group("/authsec-migration")
+	{
+		// Master database migrations (admin JWT required)
+		master := migv1.Group("/migrations/master")
+		master.Use(middlewares.AuthMiddleware())
+		{
+			master.POST("/run", migCtrl.RunMasterMigrations)
+			master.GET("/status", migCtrl.GetMasterMigrationStatus)
+		}
+
+		// Tenant database management
+		tenants := migv1.Group("/tenants")
+		tenants.Use(middlewares.AuthMiddleware())
+		{
+			tenants.GET("", migCtrl.ListTenants)
+			tenants.POST("/create-db", migCtrl.CreateTenantDB)
+			tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
+			tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
+			tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
+		}
 	}
 }
