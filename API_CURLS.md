@@ -994,7 +994,7 @@ curl -X POST "$BASE/authsec/uflow/login/webauthn-callback" \
 
 ## WebAuthn / Passkeys  `/webauthn`
 
-### Health
+### WebAuthn Health
 
 ```bash
 curl "$BASE/authsec/uflow/health"
@@ -1326,7 +1326,7 @@ Requires `clients` RBAC permissions (seeded automatically per-tenant on first cl
 CLIENT_ID="<client-uuid>"
 ```
 
-### Health
+### Client Management Health
 
 ```bash
 curl "$BASE/authsec/clientms/health"
@@ -1480,7 +1480,7 @@ curl -X POST "$BASE/authsec/clientms/oocmgr/tenant/delete-complete" \
   -d '{"tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
 ```
 
-### API Documentation
+### Client Management API Docs
 
 ```bash
 # Swagger/Redoc docs (no auth required)
@@ -1497,7 +1497,7 @@ Handles OAuth2/OIDC login flows and SAML SP-initiated authentication. Formerly t
 PROVIDER="github"   # oidc provider name
 ```
 
-### Health
+### Hydra Manager Health
 
 ```bash
 curl "$BASE/authsec/hmgr/health"
@@ -1745,7 +1745,7 @@ PROVIDER_ID="<saml-provider-uuid>"
 REACT_APP_URL="https://app.example.com"
 ```
 
-### Health
+### OIDC Config Manager Health
 
 ```bash
 curl "$BASE/authsec/oocmgr/health"
@@ -2343,4 +2343,89 @@ curl -X DELETE "$BASE/authsec/authmgr/admin/groups/1/users" \
 ```bash
 curl "$BASE/authsec/authmgr/admin/groups/1/users?tenant_id=$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## Migration Management  `/authsec/migration`
+
+All migration endpoints require JWT authentication.
+
+### Run Master Migrations  `POST /authsec/migration/migrations/master/run`
+
+```bash
+curl -X POST "$BASE/authsec/migration/migrations/master/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Master Migration Status  `GET /authsec/migration/migrations/master/status`
+
+```bash
+curl "$BASE/authsec/migration/migrations/master/status" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### List Tenants  `GET /authsec/migration/tenants`
+
+```bash
+curl "$BASE/authsec/migration/tenants" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Create Tenant Database  `POST /authsec/migration/tenants/create-db`
+
+Creates the tenant database (if it doesn't exist) and runs migrations asynchronously.
+
+```bash
+curl -X POST "$BASE/authsec/migration/tenants/create-db" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'"}'
+
+# Optionally specify a database name (defaults to tenant_<uuid>)
+curl -X POST "$BASE/authsec/migration/tenants/create-db" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"'"$TENANT_ID"'","database_name":"my_tenant_db"}'
+```
+
+### Run Tenant Migrations  `POST /authsec/migration/tenants/:tenant_id/migrations/run`
+
+Synchronously creates the database (if needed) and runs all pending tenant migrations.
+
+```bash
+curl -X POST "$BASE/authsec/migration/tenants/$TENANT_ID/migrations/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Tenant Migration Status  `GET /authsec/migration/tenants/:tenant_id/migrations/status`
+
+```bash
+curl "$BASE/authsec/migration/tenants/$TENANT_ID/migrations/status" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Migrate All Tenants  `POST /authsec/migration/tenants/migrate-all`
+
+Runs migrations for every tenant that is not yet in `completed` status. Tenants already completed are skipped.
+
+```bash
+curl -X POST "$BASE/authsec/migration/tenants/migrate-all" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Example response:
+
+```json
+{
+  "total": 3,
+  "succeeded": 2,
+  "failed": 0,
+  "skipped": 1,
+  "results": [
+    {"tenant_id": "...", "database_name": "tenant_abc123", "status": "completed"},
+    {"tenant_id": "...", "database_name": "tenant_def456", "status": "completed"},
+    {"tenant_id": "...", "database_name": "tenant_ghi789", "status": "skipped"}
+  ]
+}
 ```

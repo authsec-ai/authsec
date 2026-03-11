@@ -1092,15 +1092,15 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 	}
 
 	// ────────────────────────────────────────────────────────
-	// authsec-migration – database migration management API
-	// Routes mirror the standalone authsec-migration microservice.
+	// migration – database migration management API
+	// Formerly the standalone authsec-migration microservice.
 	// ────────────────────────────────────────────────────────
 	migCtrl := adminCtrl.NewMigrationController()
 
-	migv1 := r.Group("/authsec-migration")
+	mig := r.Group("/authsec/migration")
 	{
 		// Master database migrations (admin JWT required)
-		master := migv1.Group("/migrations/master")
+		master := mig.Group("/migrations/master")
 		master.Use(middlewares.AuthMiddleware())
 		{
 			master.POST("/run", migCtrl.RunMasterMigrations)
@@ -1108,7 +1108,7 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		}
 
 		// Tenant database management
-		tenants := migv1.Group("/tenants")
+		tenants := mig.Group("/tenants")
 		tenants.Use(middlewares.AuthMiddleware())
 		{
 			tenants.GET("", migCtrl.ListTenants)

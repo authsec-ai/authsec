@@ -16,6 +16,7 @@ AuthSec is a single Go service that consolidates **seven formerly independent mi
   - [OIDC Config Manager (`/authsec/oocmgr`)](#oidc-config-manager-authsecoocmgr)
   - [Auth Manager (`/authsec/authmgr`)](#auth-manager-authsecauthmgr)
   - [External Services (`/authsec/exsvc`)](#external-services-authsecexsvc)
+  - [Migration Management (`/authsec/migration`)](#migration-management-authsecmigration)
   - [Well-Known Endpoints](#well-known-endpoints)
   - [Metrics](#metrics)
 - [Authentication & Middleware](#authentication--middleware)
@@ -33,16 +34,17 @@ AuthSec is a single Go service that consolidates **seven formerly independent mi
 ┌────────────────────────────────────────────────────────────────────┐
 │                          authsec  (port 7468)                      │
 │                                                                    │
-│  /authsec/uflow/*    – user-flow (auth, RBAC, OIDC, SCIM, …)      │
-│  /authsec/webauthn/* – webauthn-service (passkeys, TOTP, SMS)     │
-│  /authsec/clientms/* – clients-microservice                       │
-│  /authsec/hmgr/*     – hydra-service                              │
-│  /authsec/oocmgr/*   – oath_oidc_configuration_manager           │
-│  /authsec/authmgr/*  – auth-manager (RBAC checks, group mgmt)    │
-│  /authsec/exsvc/*    – external-service / mcp-service            │
+│  /authsec/uflow/*        – user-flow (auth, RBAC, OIDC, SCIM, …)  │
+│  /authsec/webauthn/*     – webauthn-service (passkeys, TOTP, SMS) │
+│  /authsec/clientms/*     – clients-microservice                   │
+│  /authsec/hmgr/*         – hydra-service                          │
+│  /authsec/oocmgr/*       – oath_oidc_configuration_manager        │
+│  /authsec/authmgr/*      – auth-manager (RBAC checks, group mgmt) │
+│  /authsec/exsvc/*        – external-service / mcp-service         │
+│  /authsec/migration/*    – authsec-migration (DB migration mgmt)  │
 │                                                                    │
-│  /.well-known/*      – OIDC discovery (must stay at root)         │
-│  /metrics            – Prometheus metrics                         │
+│  /.well-known/*          – OIDC discovery (must stay at root)     │
+│  /metrics                – Prometheus metrics                     │
 └────────────────────────────────────────────────────────────────────┘
          │
          ├── PostgreSQL (primary DB + per-tenant DBs)
@@ -65,6 +67,7 @@ All HTTP routes are served from a single `gin.Engine`. Each merged service's rou
 | `oath_oidc_configuration_manager` | `/authsec/oocmgr` | 7467 | OIDC provider config, Hydra client sync, SAML providers |
 | `auth-manager` | `/authsec/authmgr` | — | JWT verify/issue, RBAC permission checks, group management |
 | `external-service` (mcp-service) | `/authsec/exsvc` | — | External service registry with Vault-backed credentials |
+| `authsec-migration` | `/authsec/migration` | — | Database migration management (master DB + per-tenant DB) |
 
 ---
 
@@ -131,6 +134,7 @@ The server starts on port **7468** by default.
 | `REDIS_URL` | `""` | Redis connection URL (e.g. `redis://localhost:6379`) |
 | `ICP_SERVICE_URL` | `http://localhost:7001` | ICP/PKI provisioning service |
 | `REQUIRE_SERVER_AUTH` | `true` | Enforce inter-service auth check (`false` to disable in dev) |
+| `SKIP_MIGRATIONS` | `false` | Set to `true` to skip master DB migrations at startup |
 
 ### Optional – CORS
 
@@ -663,6 +667,29 @@ Formerly **external-service / mcp-service**. Manages registered external service
 
 ---
 
+### Migration Management (`/authsec/migration`)
+
+Formerly **authsec-migration** (standalone microservice). Manages master and per-tenant database migrations. All endpoints require JWT authentication.
+
+#### Master Database
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/authsec/migration/migrations/master/run` | Execute all pending master DB migrations |
+| `GET` | `/authsec/migration/migrations/master/status` | Get master DB migration status |
+
+#### Tenant Databases
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/authsec/migration/tenants` | List all tenants and their migration status |
+| `POST` | `/authsec/migration/tenants/create-db` | Create a tenant database and kick off migrations async |
+| `POST` | `/authsec/migration/tenants/migrate-all` | Run migrations for all tenants that are not yet `completed` |
+| `POST` | `/authsec/migration/tenants/:tenant_id/migrations/run` | Run migrations for a specific tenant |
+| `GET` | `/authsec/migration/tenants/:tenant_id/migrations/status` | Get migration status for a specific tenant |
+
+---
+
 ### Well-Known Endpoints
 
 Required at the root path by RFC 8414. These cannot be moved.
@@ -711,7 +738,7 @@ Configured via `DB_*` environment variables. Holds:
 - Audit log
 - Tenant registry (maps tenant IDs to their database names)
 
-### Tenant Databases
+### Per-Tenant Databases
 
 Each tenant gets its own PostgreSQL database. The connection is resolved dynamically using `config.GetTenantGORMDB(tenantID)` which looks up the database name in the primary DB's `tenants` table and opens a pooled connection.
 
@@ -719,16 +746,28 @@ Tenant tables include: end-users, OIDC identities, client registrations, externa
 
 ### Migrations
 
-SQL migrations are run automatically at startup via the `internal/migration/runner.go`. Schema migrations for merged services are in:
+Master DB migrations run automatically at startup (unless `SKIP_MIGRATIONS=true`). SQL files live under:
 
 ```
-internal/migration/
-  ├── runner.go              – generic SQL migration runner
-  ├── clients_migrations.go  – clients-microservice schema
-  ├── extsvc_migrations.go   – external-service schema + permissions
-  ├── hmgr_migrations.go     – hydra-service schema
-  └── oocmgr_migrations.go   – oidc-config-manager schema
+migrations/
+├── master/          – master DB schema (applied at boot)
+│   ├── 000_comprehensive_base_schema.sql
+│   ├── 001_create_fluent_bit_export_configs.sql
+│   ├── 002_add_migration_tracking_to_tenants.sql
+│   ├── 1004_dml_001_initial_data.sql
+│   └── 1005_dml_002_test_data.sql
+├── tenant/          – per-tenant DB schema (applied via migration API)
+│   ├── 000_tenant_template.sql
+│   ├── 001–010_*.sql
+│   └── ...
+└── permissions/
+    └── master/      – RBAC permission seed migrations (appended to master run)
+        └── 079–200_*.sql
 ```
+
+The runner (`internal/migration/runner.go`) tracks applied migrations in `migration_logs` (master DB), supports retry logic (3 attempts per file), and handles dollar-quoted PostgreSQL functions safely.
+
+Tenant databases are provisioned on demand via the `/authsec/migration` API — see [Migration Management](#migration-management-authsecmigration).
 
 ---
 
@@ -738,13 +777,30 @@ internal/migration/
 authsec/
 ├── cmd/main.go               – entry point, initialises all components
 ├── config/                   – configuration, DB connections, Vault, WebAuthn setup
-├── controllers/              – HTTP handlers for all merged services
-│   ├── authmgr_controller.go – auth-manager handlers (JWT verify, RBAC, groups)
-│   ├── clients_controller.go – client lifecycle management
-│   ├── extsvc_controller.go  – external service registry
-│   ├── hmgr_controller.go    – Hydra/SAML authentication flows
-│   ├── oocmgr_controller.go  – OIDC config management
-│   └── ...                   – user-flow controllers (auth, RBAC, OIDC, SCIM, …)
+├── controllers/              – HTTP handlers organised by concern
+│   ├── admin/                – admin-facing handlers (auth, tenants, RBAC, migration, …)
+│   │   ├── admin_auth_controller.go
+│   │   ├── admin_user_controller.go
+│   │   ├── migration_controller.go  – /authsec/migration API
+│   │   ├── permission_controller.go
+│   │   ├── roles_scoped_bindings_controller.go
+│   │   └── ...
+│   ├── enduser/              – end-user self-service handlers
+│   │   ├── enduser_auth_controller.go
+│   │   ├── enduser_controller.go
+│   │   ├── totp_controller.go
+│   │   └── ...
+│   ├── platform/             – cross-cutting / platform handlers
+│   │   ├── authmgr_controller.go
+│   │   ├── clients_controller.go
+│   │   ├── extsvc_controller.go
+│   │   ├── hmgr_controller.go
+│   │   ├── oocmgr_controller.go
+│   │   └── ...
+│   └── shared/               – shared helpers, health, AD/Entra sync
+│       ├── health_controller.go
+│       ├── ad_controller.go
+│       └── entra_controller.go
 ├── handlers/                 – WebAuthn/FIDO2 handlers (ported from webauthn-service)
 │   ├── webauthn_handler.go   – legacy flat handlers
 │   ├── admin_webauthn_handler.go
@@ -756,15 +812,19 @@ authsec/
 │   │   ├── models/rbac.go    – GORM models for auth-manager RBAC tables
 │   │   └── repo/rbac_repository.go – RBAC query interface
 │   ├── hydra/models/         – Hydra client / SAML models
-│   ├── migration/            – SQL migration runners per merged service
+│   ├── migration/            – migration runner, models, DB utilities
+│   │   ├── runner.go         – versioned SQL runner with retry + migration_logs
+│   │   ├── models.go         – MigrationLog, TenantInfo, status response types
+│   │   └── db_utils.go       – ConnectToTenantDB, CreateDatabase, IsValidDatabaseName
 │   ├── oocmgr/               – OIDC config manager repository + services
 │   ├── session/              – WebAuthn PostgreSQL session store
 │   └── clients/              – ICP PKI client, auth methods
+├── migrations/               – SQL migration files (master + tenant + permissions)
 ├── middlewares/              – CORS, JWT auth, rate limiting, tenant validation
 ├── models/                   – shared GORM models
 ├── monitoring/               – Prometheus metrics, audit log, structured logging
 ├── repository/               – shared repositories (MFA, clients RBAC, extsvc)
-├── routes/routes.go          – central route registration for all 7 services
+├── routes/routes.go          – central route registration for all 8 services
 ├── services/                 – business logic services
 └── vault/                    – HashiCorp Vault client interface
 ```
@@ -839,6 +899,8 @@ If you are migrating from standalone microservices, update your client URLs as f
 | `http://auth-manager/authmgr/verifyToken` | `http://authsec:7468/authsec/authmgr/token/verify` |
 | `http://auth-manager/authmgr/oidcToken` | `http://authsec:7468/authsec/authmgr/token/oidc` |
 | `http://external-svc/exsvc/services` | `http://authsec:7468/authsec/exsvc/services` |
+| `http://authsec/migration/migrations/master/run` | `http://authsec:7468/authsec/migration/migrations/master/run` |
+| `http://authsec/migration/tenants/:id/migrations/run` | `http://authsec:7468/authsec/migration/tenants/:id/migrations/run` |
 
 ### Backward-compatible aliases
 
