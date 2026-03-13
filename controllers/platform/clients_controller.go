@@ -224,7 +224,7 @@ func GetClientsByTenant(c *gin.Context) {
 	}
 
 	var clients []sharedmodels.Client
-	query := tenantDB.Where("tenant_id = ?", req.TenantID).Where("(deleted IS NULL OR deleted = FALSE)")
+	query := tenantDB.Where("tenant_id = ?", req.TenantID)
 
 	if req.ActiveOnly {
 		query = query.Where("active = ?", true)
@@ -430,7 +430,6 @@ func SetClientStatus(c *gin.Context) {
 		"active":     req.Active,
 		"status":     statusValue,
 		"updated_at": time.Now(),
-		"deleted":    false,
 	}
 
 	if err := tenantDB.Model(&sharedmodels.Client{}).
@@ -1214,8 +1213,9 @@ func clientsDeletedFlagsByClient(db *gorm.DB, clientIDs []uuid.UUID) (map[uuid.U
 	}
 
 	var rows []clientsDeletedRow
-	if err := db.Model(&sharedmodels.Client{}).
-		Select("client_id, COALESCE(deleted, FALSE) AS deleted").
+	// Use Unscoped so soft-deleted rows are visible, then derive the flag from deleted_at.
+	if err := db.Unscoped().Model(&sharedmodels.Client{}).
+		Select("client_id, (deleted_at IS NOT NULL) AS deleted").
 		Where("client_id IN ?", clientIDs).
 		Scan(&rows).Error; err != nil {
 		return nil, err

@@ -42,7 +42,7 @@ import (
 // @contact.name   AuthSec AI
 // @contact.url    https://authsec.ai
 // @contact.email  support@authsec.ai
-// @license.name  MIT
+// @license.name  Apache 2.0
 // @BasePath  /uflow
 func main() {
 	// Load .env file if present (optional, for development)

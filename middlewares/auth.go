@@ -56,6 +56,12 @@ func AuthMiddleware() gin.HandlerFunc {
 func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 	// Return a wrapped middleware that performs authentication locally (supporting multiple secrets)
 	return func(c *gin.Context) {
+		// Skip auth for CORS preflight requests so the global CORS middleware can respond
+		if c.Request.Method == http.MethodOptions {
+			c.Next()
+			return
+		}
+
 		tokenString, err := extractBearerToken(c)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})

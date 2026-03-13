@@ -158,6 +158,12 @@ func SetupRoutes(
 	r.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
 	r.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
 
+	// Catch-all OPTIONS handler so CORS preflight requests are answered for every
+	// path regardless of which method-specific route is registered.
+	r.OPTIONS("/*path", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
 	// Backward-compat: user-flow previously exposed this at the bare root so that
 	// existing webauthn-service clients did not need to change their URLs.
 	r.POST("/webauthn/mfa/loginStatus", userController.WebAuthnMFALoginStatus)
@@ -230,6 +236,7 @@ func SetupRoutes(
 		{
 			adminRBAC.POST("/roles", rolesScopedBindingsController.CreateRoleCompositeAdmin)
 			adminRBAC.GET("/roles", rolesScopedBindingsController.ListRolesAdmin)
+			adminRBAC.GET("/roles/:role_id", rolesScopedBindingsController.GetRoleAdmin)
 			adminRBAC.PUT("/roles/:role_id", rolesScopedBindingsController.UpdateRoleCompositeAdmin)
 			adminRBAC.DELETE("/roles/:role_id", rolesScopedBindingsController.DeleteRoleAdmin)
 			adminRBAC.POST("/bindings", rolesScopedBindingsController.AssignRoleScopedAdmin)
@@ -998,7 +1005,8 @@ func registerOocmgrRoutes(r gin.IRouter) {
 		oidc.POST("/delete-provider", ac.DeleteOIDCProvider)
 		oidc.POST("/templates", ac.GetProviderTemplates)
 		oidc.POST("/validate", ac.ValidateOIDCConfig)
-		oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
+		oidc.GET("/show-auth-providers", ac.ShowAuthProviders)
+	oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
 		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
 		oidc.POST("/edit-client-auth-provider", ac.EditAuthProvider)
 	}

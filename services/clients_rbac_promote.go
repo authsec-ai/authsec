@@ -59,13 +59,17 @@ func PromoteExternalServicePermissions(ctx context.Context, db *gorm.DB, tenantI
 		}
 	}
 
-	var adminRoleID uuid.UUID
+	var adminRoleIDStr string
 	if err := tx.Raw(`SELECT id FROM roles WHERE tenant_id = ? AND name = 'admin' LIMIT 1`, tenantID).
-		Scan(&adminRoleID).Error; err != nil {
+		Scan(&adminRoleIDStr).Error; err != nil {
 		return fmt.Errorf("fetch tenant admin role: %w", err)
 	}
-	if adminRoleID == uuid.Nil {
+	if adminRoleIDStr == "" {
 		return fmt.Errorf("admin role not found for tenant %s", tenantID.String())
+	}
+	adminRoleID, err := uuid.Parse(adminRoleIDStr)
+	if err != nil {
+		return fmt.Errorf("parse admin role id: %w", err)
 	}
 
 	for _, resource := range resources {

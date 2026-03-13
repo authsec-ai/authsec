@@ -56,7 +56,7 @@ type ClientListFilters struct {
 	Active         *bool
 	Page           int
 	Limit          int
-	IncludeDeleted *bool // When true, include soft-deleted clients (status='Deleted')
+	IncludeDeleted *bool // When true, include soft-deleted clients (deleted_at IS NOT NULL)
 }
 
 // CreateClient creates a new client using shared models
@@ -103,8 +103,7 @@ func (cl *ClientLibrary) CreateClient(req *ClientCreateRequest) (*sharedmodels.C
 // GetClient retrieves a client by ID with tenant validation
 func (cl *ClientLibrary) GetClient(id uuid.UUID, tenantID uuid.UUID) (*sharedmodels.Client, error) {
 	var client sharedmodels.Client
-	err := cl.db.Where("id = ? AND tenant_id = ? AND (deleted IS NULL OR deleted = FALSE)",
-		id, tenantID).First(&client).Error
+	err := cl.db.Where("id = ? AND tenant_id = ?", id, tenantID).First(&client).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("client not found")
@@ -128,26 +127,15 @@ func (cl *ClientLibrary) UpdateClient(id uuid.UUID, tenantID uuid.UUID, req *Cli
 	if req.Email != nil {
 		updates["email"] = req.Email
 	}
-	deletedSet := false
 	if req.Status != nil {
 		statusValue := strings.TrimSpace(*req.Status)
 		updates["status"] = statusValue
 		if strings.EqualFold(statusValue, sharedmodels.StatusDeleted) {
-			updates["deleted"] = true
 			updates["active"] = false
-		} else {
-			updates["deleted"] = false
 		}
-		deletedSet = true
 	}
 	if req.Active != nil {
 		updates["active"] = *req.Active
-		if *req.Active && !deletedSet {
-			updates["deleted"] = false
-		}
-		if !*req.Active && !deletedSet && req.Status == nil {
-			updates["deleted"] = false
-		}
 	}
 	if req.Tags != nil {
 		updates["tags"] = pq.StringArray(*req.Tags)
@@ -174,23 +162,22 @@ func (cl *ClientLibrary) UpdateClient(id uuid.UUID, tenantID uuid.UUID, req *Cli
 	return cl.GetClient(id, tenantID)
 }
 
-// DeleteClient soft deletes a client by marking it deleted
+// DeleteClient soft-deletes a client via GORM (sets deleted_at) and marks it inactive
 func (cl *ClientLibrary) DeleteClient(id uuid.UUID, tenantID uuid.UUID) error {
 	_, err := cl.GetClient(id, tenantID)
 	if err != nil {
 		return err
 	}
 
-	updates := map[string]interface{}{
-		"status":  sharedmodels.StatusDeleted,
-		"active":  false,
-		"deleted": true,
-	}
-
+	// Mark status/active first, then let GORM set deleted_at
 	if err := cl.db.Model(&sharedmodels.Client{}).
 		Where("id = ? AND tenant_id = ?", id, tenantID).
-		Updates(updates).Error; err != nil {
+		Updates(map[string]interface{}{"status": sharedmodels.StatusDeleted, "active": false}).Error; err != nil {
 		return fmt.Errorf("failed to delete client: %w", err)
+	}
+
+	if err := cl.db.Where("id = ? AND tenant_id = ?", id, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
+		return fmt.Errorf("failed to soft-delete client: %w", err)
 	}
 
 	return nil
@@ -198,13 +185,15 @@ func (cl *ClientLibrary) DeleteClient(id uuid.UUID, tenantID uuid.UUID) error {
 
 // ListClients retrieves clients with filtering and pagination
 func (cl *ClientLibrary) ListClients(filters *ClientListFilters) ([]sharedmodels.Client, int64, error) {
-	query := cl.db.Model(&sharedmodels.Client{}).
-		Where("tenant_id = ?", filters.TenantID)
+	base := cl.db.Model(&sharedmodels.Client{})
+	if filters.IncludeDeleted != nil && *filters.IncludeDeleted {
+		base = base.Unscoped()
+	}
+
+	query := base.Where("tenant_id = ?", filters.TenantID)
 
 	if filters.IncludeDeleted == nil || !*filters.IncludeDeleted {
-		query = query.
-			Where("(deleted IS NULL OR deleted = FALSE)").
-			Where("status != ?", sharedmodels.StatusDeleted)
+		query = query.Where("status != ?", sharedmodels.StatusDeleted)
 	}
 
 	if filters.Name != "" {
@@ -263,8 +252,7 @@ func (cl *ClientLibrary) DeactivateClient(id uuid.UUID, tenantID uuid.UUID) (*sh
 // GetClientByClientID retrieves a client by ClientID with tenant validation
 func (cl *ClientLibrary) GetClientByClientID(clientID uuid.UUID, tenantID uuid.UUID) (*sharedmodels.Client, error) {
 	var client sharedmodels.Client
-	err := cl.db.Where("client_id = ? AND tenant_id = ? AND (deleted IS NULL OR deleted = FALSE)",
-		clientID, tenantID).First(&client).Error
+	err := cl.db.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).First(&client).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("client not found")
@@ -292,26 +280,15 @@ func (cl *ClientLibrary) UpdateClientByClientID(clientID uuid.UUID, tenantID uui
 	if req.Email != nil {
 		updates["email"] = req.Email
 	}
-	deletedSet := false
 	if req.Status != nil {
 		statusValue := strings.TrimSpace(*req.Status)
 		updates["status"] = statusValue
 		if strings.EqualFold(statusValue, sharedmodels.StatusDeleted) {
-			updates["deleted"] = true
 			updates["active"] = false
-		} else {
-			updates["deleted"] = false
 		}
-		deletedSet = true
 	}
 	if req.Active != nil {
 		updates["active"] = *req.Active
-		if *req.Active && !deletedSet {
-			updates["deleted"] = false
-		}
-		if !*req.Active && !deletedSet && req.Status == nil {
-			updates["deleted"] = false
-		}
 	}
 	if req.Tags != nil {
 		updates["tags"] = pq.StringArray(*req.Tags)
@@ -338,7 +315,7 @@ func (cl *ClientLibrary) UpdateClientByClientID(clientID uuid.UUID, tenantID uui
 	return cl.GetClientByClientID(clientID, tenantID)
 }
 
-// DeleteClientByClientID soft deletes a client using client_id field
+// DeleteClientByClientID soft-deletes a client using client_id field
 func (cl *ClientLibrary) DeleteClientByClientID(clientID uuid.UUID, tenantID uuid.UUID) error {
 	c, err := cl.GetClientByClientID(clientID, tenantID)
 	if err != nil {
@@ -349,14 +326,14 @@ func (cl *ClientLibrary) DeleteClientByClientID(clientID uuid.UUID, tenantID uui
 		return fmt.Errorf("default client cannot be deleted")
 	}
 
-	updates := map[string]interface{}{
-		"status":  sharedmodels.StatusDeleted,
-		"active":  false,
-		"deleted": true,
+	if err := cl.db.Model(&sharedmodels.Client{}).
+		Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+		Updates(map[string]interface{}{"status": sharedmodels.StatusDeleted, "active": false}).Error; err != nil {
+		return fmt.Errorf("failed to delete client: %w", err)
 	}
 
-	if err := cl.db.Model(&sharedmodels.Client{}).Where("client_id = ? AND tenant_id = ?", clientID, tenantID).Updates(updates).Error; err != nil {
-		return fmt.Errorf("failed to delete client: %w", err)
+	if err := cl.db.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
+		return fmt.Errorf("failed to soft-delete client: %w", err)
 	}
 
 	return nil

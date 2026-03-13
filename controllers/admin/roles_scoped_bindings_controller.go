@@ -139,6 +139,35 @@ func (rc *RolesScopedBindingsController) ListRolesAdmin(c *gin.Context) {
 	rc.listRoles(c, config.DB, *tenantID)
 }
 
+// GetRoleAdmin godoc
+// @Summary Get Role by ID (Admin)
+// @Description Returns a single role with its permissions and assigned users. Uses the primary admin database.
+// @Tags RBAC: Roles & Bindings
+// @Produce json
+// @Security BearerAuth
+// @Param role_id path string true "Role ID (UUID)"
+// @Success 200 {object} RoleListItem
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /uflow/admin/roles/{role_id} [get]
+func (rc *RolesScopedBindingsController) GetRoleAdmin(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	roleIDStr := c.Param("role_id")
+	if _, err := uuid.Parse(roleIDStr); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role ID"})
+		return
+	}
+	// Inject role_id as query param so listRoles filters to this single role
+	c.Request.URL.RawQuery = "role_id=" + roleIDStr
+	rc.listRoles(c, config.DB, *tenantID)
+}
+
 // UpdateRoleCompositeAdmin godoc
 // @Summary Update Role (Admin)
 // @Description Uses the primary admin database. Transaction: update role then replace role_permissions.
