@@ -1109,7 +1109,7 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 	// ────────────────────────────────────────────────────────
 	migCtrl := adminCtrl.NewMigrationController()
 
-	mig := r.Group("/authsec/migration")
+	mig := r.Group("/migration")
 	{
 		// Master database migrations (admin JWT required)
 		master := mig.Group("/migrations/master")

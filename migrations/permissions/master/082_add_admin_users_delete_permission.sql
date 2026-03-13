@@ -1,5 +1,6 @@
 -- Migration 082: Add DELETE permission for users resource (modern RBAC schema)
 -- Fixed to match production tenants table (tenant_id NOT NULL, email NOT NULL, tenant_domain NOT NULL)
+-- Fixed: uses check-before-insert instead of ON CONFLICT ON CONSTRAINT (constraint may not exist yet)
 
 DO $$
 DECLARE
@@ -10,18 +11,14 @@ BEGIN
     VALUES (sys_tenant, sys_tenant, 'system@authsec.local', 'system.authsec.dev', 'System', NOW())
     ON CONFLICT (id) DO NOTHING;
 
-    -- Ensure delete permission exists
-    INSERT INTO permissions (id, tenant_id, resource, action, description, full_permission_string, created_at)
-    VALUES (
-        gen_random_uuid(),
-        sys_tenant,
-        'users',
-        'delete',
-        'Delete a user',
-        'users:delete',
-        NOW()
-    )
-    ON CONFLICT ON CONSTRAINT permissions_tenant_resource_action_key DO NOTHING;
+    -- Ensure users:delete permission exists (idempotent without requiring named constraint)
+    IF NOT EXISTS (
+        SELECT 1 FROM permissions
+        WHERE tenant_id = sys_tenant AND resource = 'users' AND action = 'delete'
+    ) THEN
+        INSERT INTO permissions (id, tenant_id, resource, action, description, created_at)
+        VALUES (gen_random_uuid(), sys_tenant, 'users', 'delete', 'Delete a user', NOW());
+    END IF;
 
     -- Link to admin role
     WITH ar AS (

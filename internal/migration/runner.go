@@ -165,6 +165,18 @@ func (mr *MigrationRunner) RunMigrations() error {
 		}
 	}
 
+	// Seed tenant self-reference row so DML migrations can resolve tenant_id.
+	if mr.dbType == "tenant" && mr.tenantID != nil {
+		seedSQL := `INSERT INTO tenants (id, tenant_id, status, created_at, updated_at)
+		            VALUES ($1::uuid, $1::uuid, 'active', NOW(), NOW())
+		            ON CONFLICT (id) DO NOTHING`
+		if _, err := mr.db.Exec(seedSQL, *mr.tenantID); err != nil {
+			log.Printf("[Migration] Warning: failed to seed tenant self-reference row (non-fatal): %v", err)
+		} else {
+			log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.tenantID)
+		}
+	}
+
 	allMigrations, err := mr.LoadMigrationFiles()
 	if err != nil {
 		return err
