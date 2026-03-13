@@ -19,6 +19,7 @@ import (
 
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
+	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -61,6 +62,9 @@ func main() {
 	// Run database migrations via the authsec-migration system
 	if err := migration.AutoMigrateMigrationLogs(config.DB); err != nil {
 		log.Printf("Warning: failed to create migration_logs table: %v", err)
+	}
+	if err := config.DB.AutoMigrate(platformCtrl.SpireAllModels...); err != nil {
+		log.Printf("Warning: failed to auto-migrate SPIRE tables: %v", err)
 	}
 	if os.Getenv("SKIP_MIGRATIONS") != "true" {
 		masterRunner := migration.NewMasterMigrationRunner(

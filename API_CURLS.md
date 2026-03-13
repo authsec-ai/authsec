@@ -2429,3 +2429,356 @@ Example response:
   ]
 }
 ```
+
+---
+
+## SPIRE Headless  `/authsec/spire`
+
+Formerly **spire-headless**. Provides SPIFFE workload identity, OIDC token issuance with cloud federation (AWS/Azure/GCP), and a built-in RBAC/ABAC policy engine.
+
+```bash
+WORKLOAD_ID="<workload-uuid>"
+POLICY_ID="<policy-uuid>"
+```
+
+### Health  `GET /authsec/spire/health`
+
+```bash
+curl "$BASE/authsec/spire/health"
+```
+
+### OIDC Discovery  `GET /authsec/spire/.well-known/openid-configuration`
+
+```bash
+curl "$BASE/authsec/spire/.well-known/openid-configuration"
+```
+
+### JWK Set  `GET /authsec/spire/.well-known/jwks.json`
+
+```bash
+curl "$BASE/authsec/spire/.well-known/jwks.json"
+```
+
+---
+
+### Workload Registry
+
+#### Register Workload  `POST /authsec/spire/registry/workloads`
+
+```bash
+curl -X POST "$BASE/authsec/spire/registry/workloads" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "spiffe_id": "spiffe://example.org/service/my-svc",
+    "selectors": [{"type": "k8s", "value": "ns:default/sa:my-svc"}],
+    "ttl": 3600
+  }'
+```
+
+#### Update Workload  `PUT /authsec/spire/registry/workloads/:id`
+
+```bash
+curl -X PUT "$BASE/authsec/spire/registry/workloads/$WORKLOAD_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ttl": 7200
+  }'
+```
+
+#### Delete Workload  `DELETE /authsec/spire/registry/workloads/:id`
+
+```bash
+curl -X DELETE "$BASE/authsec/spire/registry/workloads/$WORKLOAD_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### List Workloads  `GET /authsec/spire/registry/workloads`
+
+```bash
+curl "$BASE/authsec/spire/registry/workloads" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+### OIDC / Token Exchange
+
+#### Exchange Credentials for OIDC Token  `POST /authsec/spire/oidc/token`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/token" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subject": "spiffe://example.org/service/my-svc",
+    "audience": "https://target.example.com",
+    "ttl": 3600
+  }'
+```
+
+#### Introspect Token  `POST /authsec/spire/oidc/introspect`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/introspect" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<oidc-token>"}'
+```
+
+#### Revoke Token  `POST /authsec/spire/oidc/revoke`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/revoke" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<oidc-token>"}'
+```
+
+#### Exchange SPIFFE SVID for OIDC Token  `POST /authsec/spire/oidc/exchange/spiffe`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/exchange/spiffe" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "svid": "<jwt-svid>",
+    "audience": "https://target.example.com"
+  }'
+```
+
+#### Issue JWT-SVID  `POST /authsec/spire/oidc/issue/jwt-svid`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/issue/jwt-svid" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "spiffe_id": "spiffe://example.org/service/my-svc",
+    "audience": ["https://target.example.com"],
+    "ttl": 3600
+  }'
+```
+
+#### Generic Cloud Token Exchange  `POST /authsec/spire/oidc/exchange/cloud`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/exchange/cloud" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "aws",
+    "svid": "<jwt-svid>",
+    "role_arn": "arn:aws:iam::123456789012:role/my-role"
+  }'
+```
+
+#### Exchange for AWS STS Credentials  `POST /authsec/spire/oidc/exchange/aws`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/exchange/aws" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "svid": "<jwt-svid>",
+    "role_arn": "arn:aws:iam::123456789012:role/my-role",
+    "session_name": "my-session",
+    "duration": 3600
+  }'
+```
+
+#### Exchange for Azure AD Token  `POST /authsec/spire/oidc/exchange/azure`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/exchange/azure" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "svid": "<jwt-svid>",
+    "tenant_id": "<azure-tenant-id>",
+    "client_id": "<azure-client-id>",
+    "scope": "https://management.azure.com/.default"
+  }'
+```
+
+#### Exchange for GCP Access Token  `POST /authsec/spire/oidc/exchange/gcp`
+
+```bash
+curl -X POST "$BASE/authsec/spire/oidc/exchange/gcp" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "svid": "<jwt-svid>",
+    "service_account": "my-sa@my-project.iam.gserviceaccount.com",
+    "scopes": ["https://www.googleapis.com/auth/cloud-platform"]
+  }'
+```
+
+---
+
+### Policy Engine
+
+#### Create Policy  `POST /authsec/spire/policy`
+
+```bash
+curl -X POST "$BASE/authsec/spire/policy" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "allow-svc-read",
+    "rules": [
+      {"effect": "allow", "subject": "spiffe://example.org/service/my-svc", "action": "read", "resource": "data/*"}
+    ]
+  }'
+```
+
+#### List Policies  `GET /authsec/spire/policy`
+
+```bash
+curl "$BASE/authsec/spire/policy" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### Get Policy  `GET /authsec/spire/policy/:id`
+
+```bash
+curl "$BASE/authsec/spire/policy/$POLICY_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### Update Policy  `PUT /authsec/spire/policy/:id`
+
+```bash
+curl -X PUT "$BASE/authsec/spire/policy/$POLICY_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rules": [
+      {"effect": "allow", "subject": "spiffe://example.org/service/my-svc", "action": "read", "resource": "data/*"},
+      {"effect": "deny",  "subject": "spiffe://example.org/service/my-svc", "action": "delete", "resource": "data/*"}
+    ]
+  }'
+```
+
+#### Delete Policy  `DELETE /authsec/spire/policy/:id`
+
+```bash
+curl -X DELETE "$BASE/authsec/spire/policy/$POLICY_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### Evaluate Policy  `POST /authsec/spire/policy/evaluate`
+
+```bash
+curl -X POST "$BASE/authsec/spire/policy/evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy_id": "'"$POLICY_ID"'",
+    "subject": "spiffe://example.org/service/my-svc",
+    "action": "read",
+    "resource": "data/config.yaml"
+  }'
+```
+
+#### Batch Evaluate Policies  `POST /authsec/spire/policy/batch-evaluate`
+
+```bash
+curl -X POST "$BASE/authsec/spire/policy/batch-evaluate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      {"policy_id": "'"$POLICY_ID"'", "subject": "spiffe://example.org/service/svc-a", "action": "read",  "resource": "data/config.yaml"},
+      {"policy_id": "'"$POLICY_ID"'", "subject": "spiffe://example.org/service/svc-b", "action": "write", "resource": "data/secret.yaml"}
+    ]
+  }'
+```
+
+#### Test Policy (dry-run)  `POST /authsec/spire/policy/test`
+
+Evaluates a policy definition without persisting it.
+
+```bash
+curl -X POST "$BASE/authsec/spire/policy/test" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rules": [
+      {"effect": "allow", "subject": "spiffe://example.org/service/my-svc", "action": "read", "resource": "data/*"}
+    ],
+    "subject": "spiffe://example.org/service/my-svc",
+    "action": "read",
+    "resource": "data/config.yaml"
+  }'
+```
+
+---
+
+### SPIRE Role Bindings
+
+#### Bind Role  `POST /authsec/spire/roles/bind`
+
+```bash
+curl -X POST "$BASE/authsec/spire/roles/bind" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subject": "spiffe://example.org/service/my-svc",
+    "role": "reader",
+    "resource": "data/*"
+  }'
+```
+
+#### Unbind Role  `POST /authsec/spire/roles/unbind`
+
+```bash
+curl -X POST "$BASE/authsec/spire/roles/unbind" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subject": "spiffe://example.org/service/my-svc",
+    "role": "reader",
+    "resource": "data/*"
+  }'
+```
+
+#### List Role Bindings  `GET /authsec/spire/roles/bindings`
+
+```bash
+curl "$BASE/authsec/spire/roles/bindings" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Filter by subject
+curl "$BASE/authsec/spire/roles/bindings?subject=spiffe://example.org/service/my-svc" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+### Audit Logs
+
+#### Query Audit Logs  `GET /authsec/spire/audit/logs`
+
+```bash
+curl "$BASE/authsec/spire/audit/logs" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Filter by date range and actor
+curl "$BASE/authsec/spire/audit/logs?from=2026-01-01T00:00:00Z&to=2026-03-13T23:59:59Z&actor=spiffe://example.org/service/my-svc" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### Export Audit Logs  `GET /authsec/spire/audit/logs/export`
+
+```bash
+curl "$BASE/authsec/spire/audit/logs/export" \
+  -H "Authorization: Bearer $TOKEN" \
+  -o audit-logs.json
+
+# Export with filters
+curl "$BASE/authsec/spire/audit/logs/export?from=2026-01-01T00:00:00Z&format=csv" \
+  -H "Authorization: Bearer $TOKEN" \
+  -o audit-logs.csv
+```
