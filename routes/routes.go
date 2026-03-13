@@ -2,27 +2,30 @@
 //
 // All API routes are served under the /authsec prefix:
 //
-//   /authsec/auth/*          – admin and end-user authentication
-//   /authsec/webauthn/*      – WebAuthn/FIDO2 passkey flows
-//   /authsec/admin/*         – admin management (tenants, users, RBAC, OIDC, …)
-//   /authsec/user/*          – end-user self-service
-//   /authsec/oidc/*          – OIDC federation
-//   /authsec/scim/v2/*       – SCIM 2.0 provisioning
-//   /authsec/health          – health checks
-//   /authsec/debug/*         – debug helpers (dev only)
+//	/authsec/auth/*          – admin and end-user authentication
+//	/authsec/webauthn/*      – WebAuthn/FIDO2 passkey flows
+//	/authsec/admin/*         – admin management (tenants, users, RBAC, OIDC, …)
+//	/authsec/user/*          – end-user self-service
+//	/authsec/oidc/*          – OIDC federation
+//	/authsec/scim/v2/*       – SCIM 2.0 provisioning
+//	/authsec/health          – health checks
+//	/authsec/debug/*         – debug helpers (dev only)
 //
 // The well-known OIDC discovery endpoints remain at the root as required by RFC 8414:
-//   /.well-known/openid-configuration
-//   /.well-known/jwks.json
+//
+//	/.well-known/openid-configuration
+//	/.well-known/jwks.json
 //
 // All merged microservice routes are under /authsec:
-//   /authsec/uflow/*      – user flow (formerly user-flow)
-//   /authsec/webauthn/*   – WebAuthn/passkeys (formerly webauthn-service)
-//   /authsec/exsvc/*      – external services (formerly mcp-service/external-service)
-//   /authsec/clientms/*   – client management (formerly clients-microservice)
-//   /authsec/hmgr/*       – Hydra manager (formerly hydra-service)
-//   /authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
-//   /authsec/authmgr/*    – Auth manager (formerly auth-manager)
+//
+//	/authsec/uflow/*      – user flow (formerly user-flow)
+//	/authsec/webauthn/*   – WebAuthn/passkeys (formerly webauthn-service)
+//	/authsec/exsvc/*      – external services (formerly mcp-service/external-service)
+//	/authsec/clientms/*   – client management (formerly clients-microservice)
+//	/authsec/hmgr/*       – Hydra manager (formerly hydra-service)
+//	/authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
+//	/authsec/authmgr/*    – Auth manager (formerly auth-manager)
+//	/authsec/sdkmgr/*     – SDK manager (formerly sdk-manager Python service)
 package routes
 
 import (
@@ -31,12 +34,14 @@ import (
 
 	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
-	adminCtrl    "github.com/authsec-ai/authsec/controllers/admin"
-	userCtrl     "github.com/authsec-ai/authsec/controllers/enduser"
+	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
+	userCtrl "github.com/authsec-ai/authsec/controllers/enduser"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
-	sharedCtrl   "github.com/authsec-ai/authsec/controllers/shared"
+	sdkmgrCtrl "github.com/authsec-ai/authsec/controllers/sdkmgr"
+	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/middlewares"
+	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -639,6 +644,13 @@ func SetupRoutes(
 		registerAuthmgrRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
+		// SDK Manager (formerly sdk-manager Python service)
+		// Served under /authsec/sdkmgr.
+		// Backward-compat alias at bare /sdkmgr/* for existing SDKs.
+		// ────────────────────────────────────────────────────
+		registerSdkmgrRoutes(authsec, r)
+
+		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)
 		// Served under /authsec/exsvc.
 		// ────────────────────────────────────────────────────
@@ -1117,5 +1129,151 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 			tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
 			tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
 		}
+	}
+}
+
+// registerSdkmgrRoutes registers all SDK Manager routes under /sdkmgr.
+// Previously served by the standalone sdk-manager Python service.
+// Routes are registered on both the primary router (under /authsec) and
+// a backward-compatibility alias at the bare root so that existing SDKs
+// that target /sdkmgr/* continue to work during migration.
+func registerSdkmgrRoutes(r gin.IRouter, aliases ...gin.IRouter) {
+	// Initialise the MCP Auth service and run startup tasks.
+	mcpAuthSvc := sdkmgrSvc.NewMCPAuthService()
+	mcpAuthSvc.Initialize()
+	mcpAuthCtrl := sdkmgrCtrl.NewMCPAuthController(mcpAuthSvc)
+
+	servicesSvc := sdkmgrSvc.NewServicesService(mcpAuthSvc.SessionStore)
+	servicesCtrl := sdkmgrCtrl.NewServicesController(servicesSvc)
+
+	spireSvc := sdkmgrSvc.NewSPIREProxyService()
+	spireSvc.Initialize()
+	spireCtrl := sdkmgrCtrl.NewSPIREController(spireSvc)
+
+	dashSvc := sdkmgrSvc.NewDashboardService()
+	dashCtrl := sdkmgrCtrl.NewDashboardController(dashSvc)
+
+	mcpOAuthSvc := sdkmgrSvc.NewMCPOAuthService()
+	mcpOAuthCtrl := sdkmgrCtrl.NewMCPOAuthController(mcpOAuthSvc)
+
+	playgroundSvc := sdkmgrSvc.NewMCPPlaygroundService()
+	playgroundCtrl := sdkmgrCtrl.NewMCPPlaygroundController(playgroundSvc)
+
+	voiceSvc := sdkmgrSvc.NewVoiceClientService()
+	voiceCtrl := sdkmgrCtrl.NewVoiceController(voiceSvc)
+
+	devServerSvc := sdkmgrSvc.NewDevServerService(playgroundSvc)
+	devServerCtrl := sdkmgrCtrl.NewDevServerController(devServerSvc)
+
+	// Bind routes on the primary router and any backward-compat aliases.
+	routers := append([]gin.IRouter{r}, aliases...)
+	for _, router := range routers {
+		bindSdkmgrRoutes(router, mcpAuthCtrl, servicesCtrl, spireCtrl, dashCtrl,
+			mcpOAuthCtrl, playgroundCtrl, voiceCtrl, devServerCtrl)
+	}
+}
+
+// bindSdkmgrRoutes registers all sdkmgr endpoint groups on the given router.
+func bindSdkmgrRoutes(
+	r gin.IRouter,
+	mcpAuthCtrl *sdkmgrCtrl.MCPAuthController,
+	servicesCtrl *sdkmgrCtrl.ServicesController,
+	spireCtrl *sdkmgrCtrl.SPIREController,
+	dashCtrl *sdkmgrCtrl.DashboardController,
+	mcpOAuthCtrl *sdkmgrCtrl.MCPOAuthController,
+	playgroundCtrl *sdkmgrCtrl.MCPPlaygroundController,
+	voiceCtrl *sdkmgrCtrl.VoiceController,
+	devServerCtrl *sdkmgrCtrl.DevServerController,
+) {
+	// ── MCP Auth routes ──
+	mcpAuth := r.Group("/sdkmgr/mcp-auth")
+	{
+		mcpAuth.GET("/health", mcpAuthCtrl.Health)
+		mcpAuth.POST("/start", mcpAuthCtrl.Start)
+		mcpAuth.POST("/authenticate", mcpAuthCtrl.Authenticate)
+		mcpAuth.POST("/callback", mcpAuthCtrl.CallbackJSON)
+		mcpAuth.GET("/callback", mcpAuthCtrl.CallbackHTML)
+		mcpAuth.GET("/status/:session_id", mcpAuthCtrl.Status)
+		mcpAuth.GET("/sessions/status", mcpAuthCtrl.SessionsStatus)
+		mcpAuth.POST("/logout", mcpAuthCtrl.Logout)
+		mcpAuth.POST("/tools/list", mcpAuthCtrl.ToolsList)
+		mcpAuth.POST("/tools/call/:tool_name", mcpAuthCtrl.ToolCall)
+		mcpAuth.POST("/protect-tool", mcpAuthCtrl.ProtectTool)
+		mcpAuth.POST("/cleanup-sessions", mcpAuthCtrl.CleanupSessions)
+	}
+
+	// ── Services routes ──
+	services := r.Group("/sdkmgr/services")
+	{
+		services.GET("/health", servicesCtrl.Health)
+		services.POST("/credentials", servicesCtrl.GetCredentials)
+		services.POST("/user-details", servicesCtrl.GetUserDetails)
+	}
+
+	// ── SPIRE routes ──
+	spire := r.Group("/sdkmgr/spire")
+	{
+		spire.GET("/health", spireCtrl.Health)
+		spire.POST("/workload/initialize", spireCtrl.Initialize)
+		spire.POST("/workload/renew", spireCtrl.Renew)
+		spire.POST("/workload/status", spireCtrl.Status)
+		spire.GET("/validate-agent-connection", spireCtrl.ValidateConnection)
+	}
+
+	// ── Dashboard routes ──
+	dashboard := r.Group("/sdkmgr/dashboard")
+	{
+		dashboard.GET("/health", dashCtrl.Health)
+		dashboard.POST("/sessions", dashCtrl.Sessions)
+		dashboard.POST("/statistics", middlewares.AuthMiddleware(), dashCtrl.Statistics)
+		dashboard.POST("/users", dashCtrl.Users)
+		dashboard.POST("/admin-users", middlewares.AuthMiddleware(), dashCtrl.AdminUsers)
+	}
+
+	// ── MCP OAuth routes ──
+	playgroundOAuth := r.Group("/sdkmgr/playground/oauth")
+	{
+		playgroundOAuth.GET("/check-requirements", mcpOAuthCtrl.CheckRequirements)
+		playgroundOAuth.GET("/authorize", mcpOAuthCtrl.Authorize)
+		playgroundOAuth.GET("/callback", mcpOAuthCtrl.Callback)
+		playgroundOAuth.POST("/refresh", mcpOAuthCtrl.Refresh)
+	}
+
+	// ── MCP Playground routes ──
+	playground := r.Group("/sdkmgr/playground")
+	{
+		playground.GET("/health", playgroundCtrl.Health)
+		playground.POST("/conversations", playgroundCtrl.CreateConversation)
+		playground.GET("/conversations", playgroundCtrl.ListConversations)
+		playground.GET("/conversations/:id", playgroundCtrl.GetConversation)
+		playground.PATCH("/conversations/:id", playgroundCtrl.UpdateConversation)
+		playground.DELETE("/conversations/:id", playgroundCtrl.DeleteConversation)
+		playground.GET("/conversations/:id/messages", playgroundCtrl.GetMessages)
+		playground.POST("/conversations/:id/chat", playgroundCtrl.Chat)
+		playground.POST("/chat/stream", playgroundCtrl.ChatStream)
+		playground.POST("/conversations/:id/mcp-servers", playgroundCtrl.AddMCPServer)
+		playground.GET("/conversations/:id/mcp-servers", playgroundCtrl.ListMCPServers)
+		playground.POST("/conversations/:id/mcp-servers/:sid/disconnect", playgroundCtrl.DisconnectMCPServer)
+		playground.POST("/conversations/:id/mcp-servers/:sid/reconnect", playgroundCtrl.ReconnectMCPServer)
+		playground.DELETE("/conversations/:id/mcp-servers/:sid", playgroundCtrl.RemoveMCPServer)
+		playground.GET("/conversations/:id/mcp-servers/:sid/tools", playgroundCtrl.GetMCPTools)
+		playground.GET("/conversations/:id/tools", playgroundCtrl.GetAllConversationTools)
+	}
+
+	// ── Voice routes ──
+	voice := r.Group("/sdkmgr/voice")
+	{
+		voice.POST("/interact", voiceCtrl.Interact)
+		voice.POST("/poll", voiceCtrl.Poll)
+		voice.POST("/tts", voiceCtrl.TTS)
+	}
+
+	// ── Dev Server routes (auth required) ──
+	devServer := r.Group("/sdkmgr/playground/dev-server")
+	devServer.Use(middlewares.AuthMiddleware())
+	{
+		devServer.POST("/start", devServerCtrl.Start)
+		devServer.POST("/stop", devServerCtrl.Stop)
+		devServer.GET("/status", devServerCtrl.Status)
 	}
 }

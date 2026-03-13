@@ -56,7 +56,7 @@ type Config struct {
 	Environment string
 
 	// TOTP / encryption
-	TotpEncryptionKey      string // 64-hex-char AES-256 key for TOTP secrets at rest
+	TotpEncryptionKey       string // 64-hex-char AES-256 key for TOTP secrets at rest
 	SyncConfigEncryptionKey string // 64-hex-char AES-256 key for AD/Entra sync configs
 
 	// Twilio (SMS MFA / voice)
@@ -65,10 +65,10 @@ type Config struct {
 	TwilioFromNumber string
 
 	// SPIFFE / SVID OIDC
-	SpiffeOIDCIssuer      string
-	SpiffeJWKSKeyID       string
+	SpiffeOIDCIssuer       string
+	SpiffeJWKSKeyID        string
 	SpiffeRSAPrivateKeyB64 string
-	SpiffeTrustDomain     string
+	SpiffeTrustDomain      string
 
 	// Okta CIBA integration
 	OktaDomain       string
@@ -96,6 +96,28 @@ type Config struct {
 	HydraPublicURL      string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
 	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
 	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
+
+	// SDK-Manager migration (all optional)
+	OAuthAuthURL             string // OAuth authorization endpoint
+	OAuthTokenURL            string // OAuth token exchange endpoint
+	OAuthUserInfoURL         string // OAuth userinfo endpoint
+	PKCEChallenge            string // Pre-computed PKCE challenge (if static)
+	OAuthRedirectURI         string // Default OAuth redirect URI
+	OAuthRedirectURITemplate string // Redirect URI template with {tenant_id}
+	MCPToolTimeout           int    // MCP tool execution timeout in seconds (default 15)
+
+	// Azure OpenAI (for playground + voice)
+	AzureOpenAIKey           string
+	AzureOpenAIEndpoint      string
+	AzureOpenAIDeployment    string
+	AzureOpenAIVersion       string
+	AzureOpenAITTSDeployment string
+
+	// SDK behavior flags
+	SDKAlwaysExposeProtectedTools bool   // default true
+	SDKHideUnauthorizedTools      bool   // default false
+	SDKRequireSessionID           bool   // default false
+	SDKRedirectSource             string // "db" or "env"
 }
 
 var (
@@ -103,7 +125,7 @@ var (
 	CacheManager *monitoring.CacheManager
 	AuditLogger  *monitoring.AuditLogger
 	TokenService AuthManagerTokenService // Global token service using auth-manager patterns
-	
+
 	// Redis client singleton
 	redisClient *redis.Client
 	redisOnce   sync.Once
@@ -210,6 +232,33 @@ func LoadConfig() *Config {
 	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
 	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
 
+	// SDK-Manager migration config (all optional)
+	oauthAuthURL := getEnv("OAUTH_AUTH_URL", "")
+	oauthTokenURL := getEnv("OAUTH_TOKEN_URL", "")
+	oauthUserInfoURL := getEnv("OAUTH_USERINFO_URL", "")
+	pkceChallenge := getEnv("PKCE_CHALLENGE", "")
+	oauthRedirectURI := getEnv("OAUTH_REDIRECT_URI", "")
+	oauthRedirectURITemplate := getEnv("OAUTH_REDIRECT_URI_TEMPLATE", "")
+	mcpToolTimeout := 15
+	if v := os.Getenv("MCP_TOOL_TIMEOUT"); v != "" {
+		if parsed, err := fmt.Sscanf(v, "%d", &mcpToolTimeout); err != nil || parsed == 0 {
+			mcpToolTimeout = 15
+		}
+	}
+
+	// Azure OpenAI
+	azureOpenAIKey := getEnv("AZURE_OPENAI_API_KEY", "")
+	azureOpenAIEndpoint := getEnv("AZURE_OPENAI_ENDPOINT", "")
+	azureOpenAIDeployment := getEnv("AZURE_OPENAI_DEPLOYMENT", "")
+	azureOpenAIVersion := getEnv("AZURE_OPENAI_VERSION", "2024-02-15-preview")
+	azureOpenAITTSDeployment := getEnv("AZURE_OPENAI_TTS_DEPLOYMENT", "tts")
+
+	// SDK behavior flags
+	sdkAlwaysExposeProtectedTools := getEnv("AUTHSEC_ALWAYS_EXPOSE_PROTECTED_TOOLS", "true") == "true"
+	sdkHideUnauthorizedTools := getEnv("AUTHSEC_HIDE_UNAUTHORIZED_TOOLS", "false") == "true"
+	sdkRequireSessionID := getEnv("AUTHSEC_REQUIRE_SESSION_ID", "false") == "true"
+	sdkRedirectSource := getEnv("AUTHSEC_REDIRECT_SOURCE", "db")
+
 	// Validate critical variables
 	if dbName == "" || dbUser == "" || dbHost == "" || dbPort == "" {
 		log.Fatal("DB_NAME, DB_USER, DB_HOST, and DB_PORT are required")
@@ -268,6 +317,24 @@ func LoadConfig() *Config {
 		HydraPublicURL:          hydraPublicURL,
 		ReactAppURL:             reactAppURL,
 		IdentityProviderURL:     identityProviderURL,
+
+		// SDK-Manager migration
+		OAuthAuthURL:                  oauthAuthURL,
+		OAuthTokenURL:                 oauthTokenURL,
+		OAuthUserInfoURL:              oauthUserInfoURL,
+		PKCEChallenge:                 pkceChallenge,
+		OAuthRedirectURI:              oauthRedirectURI,
+		OAuthRedirectURITemplate:      oauthRedirectURITemplate,
+		MCPToolTimeout:                mcpToolTimeout,
+		AzureOpenAIKey:                azureOpenAIKey,
+		AzureOpenAIEndpoint:           azureOpenAIEndpoint,
+		AzureOpenAIDeployment:         azureOpenAIDeployment,
+		AzureOpenAIVersion:            azureOpenAIVersion,
+		AzureOpenAITTSDeployment:      azureOpenAITTSDeployment,
+		SDKAlwaysExposeProtectedTools: sdkAlwaysExposeProtectedTools,
+		SDKHideUnauthorizedTools:      sdkHideUnauthorizedTools,
+		SDKRequireSessionID:           sdkRequireSessionID,
+		SDKRedirectSource:             sdkRedirectSource,
 	}
 
 	return AppConfig
@@ -301,7 +368,7 @@ func GetRedisClient() *redis.Client {
 		if AppConfig == nil {
 			log.Println("Warning: Config not loaded, Redis client may use default configuration")
 		}
-		
+
 		// Get Redis configuration
 		redisURL := ""
 		if AppConfig != nil {
@@ -310,7 +377,7 @@ func GetRedisClient() *redis.Client {
 		if redisURL == "" {
 			redisURL = getEnv("REDIS_URL", "redis://localhost:6379")
 		}
-		
+
 		// Parse Redis URL or use default options
 		opt, err := redis.ParseURL(redisURL)
 		if err != nil {
@@ -322,9 +389,9 @@ func GetRedisClient() *redis.Client {
 				DB:       0,
 			}
 		}
-		
+
 		redisClient = redis.NewClient(opt)
-		
+
 		// Test connection
 		ctx := context.Background()
 		_, err = redisClient.Ping(ctx).Result()
@@ -335,7 +402,6 @@ func GetRedisClient() *redis.Client {
 			log.Println("Successfully connected to Redis")
 		}
 	})
-	
+
 	return redisClient
 }
-
