@@ -1365,71 +1365,6 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant database schema
-	tenantDBService, err := database.NewTenantDBService(db, config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, config.AppConfig.DBPort)
-	if err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create tenant DB service: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to setup tenant database"})
-		return
-	}
-
-	if _, err := tenantDBService.CreateTenantDatabase(pendingReg.TenantID.String()); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
-	}
-
-	// Create default client in tenant database
-	defaultClientID := pendingReg.ClientID
-	// defaultProjectID was already declared earlier
-
-	// Connect to tenant database to create default records (reuse tenantDBName from earlier)
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		tx.Rollback()
-		log.Printf("Failed to connect to tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-	defer tenantDB.Close()
-
-	// Create default client with Hydra client ID
-	hydraClientID := fmt.Sprintf("%s-main-client", defaultClientID.String())
-	clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())`
-	if _, err := tenantDB.Exec(clientInsert, defaultClientID, pendingReg.TenantID, defaultProjectID, pendingReg.TenantID, "Default Client", "Default client for admin user", hydraClientID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create default client: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default client"})
-		return
-	}
-
-	// Create tenant record in tenant database (required for FK constraint on projects table)
-	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, 'local', 'admin_registration', 'active', $5, $6, NOW(), NOW())`
-	if _, err := tenantDB.Exec(tenantInsert, pendingReg.TenantID, pendingReg.Email, pendingReg.PasswordHash,
-		fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName), pendingReg.TenantDomain, tenantDBName); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create tenant record in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant record in tenant database"})
-		return
-	}
-
-	// Create default project in tenant database (project was already created in global database)
-	projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
-	if _, err := tenantDB.Exec(projectInsert, defaultProjectID, pendingReg.TenantID, "Default Project", "Default project for admin user", pendingReg.TenantID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create default project in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default project in tenant database"})
-		return
-	}
-
 	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
 	tenantMappingInsert := `INSERT INTO tenant_mappings (tenant_id, client_id, created_at, updated_at)
 		VALUES ($1, $2, NOW(), NOW())
@@ -1442,17 +1377,6 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", pendingReg.TenantID.String(), pendingReg.ClientID.String())
-
-	// Create corresponding end user account in tenant database
-	if err := aac.createEndUserInTenantDB(tenantDB, &adminUser, defaultClientID, defaultProjectID, pendingReg); err != nil {
-		tx.Rollback()
-		log.Printf("Warning: Failed to create end user account in tenant database: %v", err)
-		// Don't fail the entire registration - admin can still use global admin account
-		// c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create end user account"})
-		// return
-	} else {
-		log.Printf("Successfully created end user account in tenant database for admin: %s", pendingReg.Email)
-	}
 
 	// Assign admin role BEFORE committing transaction (tenant-scoped)
 	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, pendingReg.TenantID)
@@ -1480,8 +1404,6 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign admin role"})
 		return
 	}
-	// Admin role assignment succeeded
-
 	// Delete pending registration
 	if err := aac.pendingRepo.DeletePendingRegistrationsByEmailTx(tx, input.Email); err != nil {
 		tx.Rollback()
@@ -1490,11 +1412,74 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Commit transaction (now includes role assignment)
+	// Commit global transaction so the migration service can see the tenant record
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
 		return
+	}
+
+	// Create tenant database and run migrations (must happen after commit so migration service can query the tenant)
+	// These are post-commit operations — global state is already committed, so failures here are
+	// logged as warnings and don't block the registration response.
+	log.Printf("Creating tenant database for: %s", pendingReg.TenantID.String())
+
+	defaultClientID := pendingReg.ClientID
+	tenantDBReady := false
+	tenantDBService, err := database.NewTenantDBService(db, config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, config.AppConfig.DBPort)
+	if err != nil {
+		log.Printf("Warning: Failed to create tenant DB service: %v", err)
+		log.Printf("Tenant database %s will need to be provisioned manually or on next login", tenantDBName)
+	} else {
+		if _, err := tenantDBService.CreateTenantDatabase(pendingReg.TenantID.String()); err != nil {
+			log.Printf("Warning: Failed to create tenant database: %v", err)
+			log.Printf("Tenant database %s will need to be provisioned manually or on next login", tenantDBName)
+		} else {
+			tenantDBReady = true
+		}
+	}
+
+	// Seed tenant database with default records (only if DB + migrations succeeded)
+	if tenantDBReady {
+		tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
+			config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
+
+		tenantDB, err := sql.Open("postgres", tenantDSN)
+		if err != nil {
+			log.Printf("Warning: Failed to connect to tenant database: %v", err)
+		} else {
+			defer tenantDB.Close()
+
+			// Create default client with Hydra client ID
+			hydraClientID := fmt.Sprintf("%s-main-client", defaultClientID.String())
+			clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
+				VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())`
+			if _, err := tenantDB.Exec(clientInsert, defaultClientID, pendingReg.TenantID, defaultProjectID, pendingReg.TenantID, "Default Client", "Default client for admin user", hydraClientID); err != nil {
+				log.Printf("Warning: Failed to create default client in tenant database: %v", err)
+			}
+
+			// Create tenant record in tenant database (required for FK constraint on projects table)
+			tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
+				VALUES ($1, $1, $2, $3, $4, 'local', 'admin_registration', 'active', $5, $6, NOW(), NOW())`
+			if _, err := tenantDB.Exec(tenantInsert, pendingReg.TenantID, pendingReg.Email, pendingReg.PasswordHash,
+				fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName), pendingReg.TenantDomain, tenantDBName); err != nil {
+				log.Printf("Warning: Failed to create tenant record in tenant database: %v", err)
+			}
+
+			// Create default project in tenant database
+			projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
+			if _, err := tenantDB.Exec(projectInsert, defaultProjectID, pendingReg.TenantID, "Default Project", "Default project for admin user", pendingReg.TenantID); err != nil {
+				log.Printf("Warning: Failed to create default project in tenant database: %v", err)
+			}
+
+			// Create corresponding end user account in tenant database
+			if err := aac.createEndUserInTenantDB(tenantDB, &adminUser, defaultClientID, defaultProjectID, pendingReg); err != nil {
+				log.Printf("Warning: Failed to create end user account in tenant database: %v", err)
+			} else {
+				log.Printf("Successfully created end user account in tenant database for admin: %s", pendingReg.Email)
+			}
+		}
 	}
 
 	// Save secret to Vault and register with Hydra

@@ -30,9 +30,9 @@ func NewHubSpotService(accessToken string) *HubSpotService {
 
 // hubSpotContactProperties represents the properties sent to HubSpot
 type hubSpotContactProperties struct {
-	Email                string `json:"email"`
-	TenantDomain         string `json:"tenant_domain"`
-	TenantID             string `json:"tenant_id"`
+	Email                string `json:"email,omitempty"`
+	TenantDomain         string `json:"tenant_domain,omitempty"`
+	TenantID             string `json:"tenant_id,omitempty"`
 	RegistrationDate string `json:"registration_date,omitempty"`
 	LifecycleStage   string `json:"lifecyclestage,omitempty"`
 }

@@ -318,7 +318,7 @@ func (r *TenantDeviceRepository) GetTenantUserByEmail(email string, clientID uui
 
 // UpdateTenantUserLastLogin updates the last_login timestamp for a user in tenant DB
 func (r *TenantDeviceRepository) UpdateTenantUserLastLogin(userID uuid.UUID) error {
-	now := time.Now().Unix()
+	now := time.Now()
 	return r.db.Model(&models.User{}).
 		Where("id = ?", userID).
 		Update("last_login", now).Error

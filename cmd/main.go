@@ -13,10 +13,7 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
-	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 
@@ -264,42 +261,14 @@ func validateWebAuthnEnvVars() error {
 	return nil
 }
 
-// setupCORS returns a CORS handler that covers both the user-flow and webauthn
-// origin requirements: localhost, authsec.dev subdomains, explicit env-configured
-// origins, and any verified custom domain from the tenant_domains table.
+// setupCORS returns a CORS handler that allows all origins.
+// AllowOriginFunc always returns true (echoes the specific origin back) so that
+// AllowCredentials: true works correctly — browsers reject wildcard "*" with credentials.
 func setupCORS() gin.HandlerFunc {
 	corsConfig := cors.DefaultConfig()
 
-	originsEnv := getEnv("CORS_ALLOWED_ORIGINS", "")
-	if originsEnv != "" {
-		corsConfig.AllowOrigins = splitAndTrim(originsEnv)
-		corsConfig.AllowWildcard = hasWildcard(corsConfig.AllowOrigins)
-	} else {
-		defaultOrigins, wildcard := buildDefaultOrigins()
-		corsConfig.AllowOrigins = defaultOrigins
-		corsConfig.AllowWildcard = wildcard
-	}
-
 	corsConfig.AllowOriginFunc = func(origin string) bool {
-		if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-			return true
-		}
-		if strings.HasSuffix(origin, ".authsec.dev") || origin == "https://authsec.dev" || origin == "http://authsec.dev" {
-			return true
-		}
-		for _, allowedOrigin := range corsConfig.AllowOrigins {
-			if origin == allowedOrigin {
-				return true
-			}
-			if strings.Contains(allowedOrigin, "*") {
-				pattern := strings.ReplaceAll(allowedOrigin, "*", ".*")
-				matched, _ := regexp.MatchString("^"+pattern+"$", origin)
-				if matched {
-					return true
-				}
-			}
-		}
-		return isVerifiedTenantDomain(origin)
+		return true
 	}
 
 	if methods := getEnv("CORS_ALLOWED_METHODS", ""); methods != "" {
@@ -314,6 +283,7 @@ func setupCORS() gin.HandlerFunc {
 		corsConfig.AllowHeaders = []string{
 			"Origin", "Content-Length", "Content-Type", "Authorization",
 			"X-Requested-With", "Accept", "Accept-Encoding", "Accept-Language",
+			"X-Tenant-ID", "X-CSRF-Token", "tenant_id",
 		}
 	}
 
@@ -324,30 +294,6 @@ func setupCORS() gin.HandlerFunc {
 	return cors.New(corsConfig)
 }
 
-func buildDefaultOrigins() ([]string, bool) {
-	originValue := strings.TrimSpace(getEnv("WEBAUTHN_ORIGIN", ""))
-	if originValue == "" {
-		return []string{"http://localhost:3000"}, false
-	}
-	parsed, err := url.Parse(originValue)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		origins := splitAndTrim(originValue)
-		return origins, hasWildcard(origins)
-	}
-	baseOrigin := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
-	origins := []string{baseOrigin}
-	hostWithoutPort := parsed.Host
-	if h, _, err := net.SplitHostPort(parsed.Host); err == nil {
-		hostWithoutPort = h
-	}
-	wildcardAdded := false
-	if isWildcardCandidate(hostWithoutPort) {
-		wildcardOrigin := fmt.Sprintf("%s://*.%s", parsed.Scheme, hostWithoutPort)
-		origins = append(origins, wildcardOrigin)
-		wildcardAdded = true
-	}
-	return uniqueStrings(origins), wildcardAdded
-}
 
 func splitAndTrim(csv string) []string {
 	values := strings.Split(csv, ",")
@@ -367,65 +313,3 @@ func splitAndTrim(csv string) []string {
 	return result
 }
 
-func uniqueStrings(values []string) []string {
-	result := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, v := range values {
-		if v == "" {
-			continue
-		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		result = append(result, v)
-	}
-	return result
-}
-
-func hasWildcard(values []string) bool {
-	for _, v := range values {
-		if strings.Contains(v, "*") {
-			return true
-		}
-	}
-	return false
-}
-
-func isWildcardCandidate(host string) bool {
-	if host == "" || host == "localhost" {
-		return false
-	}
-	if net.ParseIP(host) != nil {
-		return false
-	}
-	return strings.Contains(host, ".")
-}
-
-// isVerifiedTenantDomain checks the tenant_domains table to allow CORS for
-// verified custom domains. Uses the same global DB as the rest of the service.
-func isVerifiedTenantDomain(origin string) bool {
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	domain := parsed.Host
-	if h, _, err := net.SplitHostPort(domain); err == nil {
-		domain = h
-	}
-	if strings.HasSuffix(domain, ".authsec.dev") || domain == "authsec.dev" {
-		return false
-	}
-	if config.DB == nil {
-		return false
-	}
-	var count int64
-	err = config.DB.Table("tenant_domains").
-		Where("domain = ? AND is_verified = true", domain).
-		Count(&count).Error
-	if err != nil {
-		log.Printf("CORS: Error querying tenant_domains for domain %s: %v", domain, err)
-		return false
-	}
-	return count > 0
-}

@@ -1,13 +1,18 @@
 package database
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -68,24 +73,83 @@ func (s *TenantDBService) CreateTenantDatabase(tenantID string) (string, error) 
 	// Check if database already exists
 	if exists, err := s.databaseExists(dbName); err != nil {
 		return "", fmt.Errorf("failed to check if database exists: %w", err)
-	} else if exists {
-		log.Printf("Database %s already exists, skipping creation", dbName)
-		return dbName, nil
+	} else if !exists {
+		// Create the database
+		if err := s.createDatabase(dbName); err != nil {
+			return "", fmt.Errorf("failed to create database: %w", err)
+		}
+	} else {
+		log.Printf("Database %s already exists, will run migrations on it", dbName)
 	}
 
-	// Create the database
-	if err := s.createDatabase(dbName); err != nil {
-		return "", fmt.Errorf("failed to create database: %w", err)
-	}
-
-	// Apply tenant schema template
-	if err := s.applyTenantSchema(dbName); err != nil {
-		log.Printf("tenant database %s may require manual cleanup after schema error: %v", dbName, err)
-		return "", fmt.Errorf("failed to apply tenant schema: %w", err)
+	// Always run tenant migrations (idempotent) - handles retry case where DB exists but migrations failed
+	if err := s.RunTenantMigrations(tenantID); err != nil {
+		log.Printf("Failed to run tenant migrations for %s: %v", dbName, err)
+		return "", fmt.Errorf("failed to run tenant migrations: %w", err)
 	}
 
 	log.Printf("Successfully created tenant database: %s", dbName)
 	return dbName, nil
+}
+
+// RunTenantMigrations calls the migration API to run migrations on a tenant database.
+// Default target is the local authsec instance; override via MIGRATION_SERVICE_URL.
+func (s *TenantDBService) RunTenantMigrations(tenantID string) error {
+	migrationServiceURL := os.Getenv("MIGRATION_SERVICE_URL")
+	if migrationServiceURL == "" {
+		migrationServiceURL = "http://localhost:7468"
+	}
+
+	url := fmt.Sprintf("%s/authsec/migration/tenants/%s/migrations/run", migrationServiceURL, tenantID)
+	log.Printf("Calling migration service to run tenant migrations: %s", url)
+
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		statusCode, err := s.callMigrationService(url)
+		if err == nil {
+			log.Printf("Migration service successfully ran migrations for tenant %s", tenantID)
+			return nil
+		}
+
+		// Retry on 404 (tenant record may not be visible yet due to replication lag)
+		if statusCode == 404 && attempt < maxRetries {
+			log.Printf("Migration service returned 404 for tenant %s (attempt %d/%d), retrying after delay...", tenantID, attempt, maxRetries)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
+
+		return err
+	}
+
+	return fmt.Errorf("migration service failed after %d attempts for tenant %s", maxRetries, tenantID)
+}
+
+// callMigrationService makes a single POST call to the migration service.
+// Returns the HTTP status code and any error.
+func (s *TenantDBService) callMigrationService(url string) (int, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(nil))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create migration request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call migration service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var errResp map[string]interface{}
+		if err := json.Unmarshal(body, &errResp); err == nil {
+			return resp.StatusCode, fmt.Errorf("migration service returned %d: %v", resp.StatusCode, errResp)
+		}
+		return resp.StatusCode, fmt.Errorf("migration service returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	return resp.StatusCode, nil
 }
 
 // generateTenantDBName creates a database name from tenant ID

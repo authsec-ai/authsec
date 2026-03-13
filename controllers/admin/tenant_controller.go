@@ -316,6 +316,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	}
 
 	// Create tenant user using TenantWithHooks for automatic database creation
+	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(pendingReg.TenantID.String(), "-", "_"))
 	tenant := models.TenantWithHooks{
 		Tenant: models.Tenant{
 			ID:           pendingReg.TenantID, // Using TenantID as the primary ID
@@ -323,7 +324,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 			PasswordHash: pendingReg.PasswordHash, // Already hashed
 			Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 			TenantID:     pendingReg.TenantID,
-			TenantDB:     "",      // Will be set in AfterCreate hook
+			TenantDB:     tenantDBName,
 			Provider:     "local", // Default provider
 			Source:       "manual",
 			Status:       "active",
@@ -461,36 +462,37 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant database after successful tenant creation
-	log.Printf("Creating tenant database for: %s", tenant.TenantID.String())
+	// Clean up pending registration and OTP entries
+	uc.pendingRepo.DeletePendingRegistrationsByEmailTx(tx, input.Email)
+	uc.otpRepo.DeleteOTPsByEmailTx(tx, input.Email)
 
-	// Use the tenant database service from controller
-	if uc.tenantDBService == nil {
-		tx.Rollback()
-		log.Printf("Tenant database service not initialized")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to setup tenant database"})
-		return
-	}
-
-	// Create tenant database
-	dbName, err := uc.tenantDBService.CreateTenantDatabase(tenant.TenantID.String())
-	if err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
-	}
-
-	// Update tenant record with database name
-	if err := uc.tenantRepo.UpdateTenantDBTx(tx, tenant.TenantID, dbName); err != nil {
-		log.Printf("Tenant database %s may require manual cleanup after update error: %v", dbName, err)
-		tx.Rollback()
-		log.Printf("Failed to update tenant_db field: %v", err)
+	// Commit global transaction so the migration service can see the tenant record
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit registration transaction: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
 		return
 	}
 
-	log.Printf("Successfully created tenant database: %s", dbName)
+	// --- Post-commit operations (non-blocking) ---
+	// Global state is committed. Failures below are logged as warnings and don't block registration.
+
+	// Create tenant database and run migrations
+	log.Printf("Creating tenant database for: %s", tenant.TenantID.String())
+	dbName := tenantDBName
+	tenantDBReady := false
+
+	if uc.tenantDBService == nil {
+		log.Printf("Warning: Tenant database service not initialized")
+	} else {
+		var dbErr error
+		dbName, dbErr = uc.tenantDBService.CreateTenantDatabase(tenant.TenantID.String())
+		if dbErr != nil {
+			log.Printf("Warning: Failed to create tenant database: %v", dbErr)
+		} else {
+			tenantDBReady = true
+			log.Printf("Successfully created tenant database: %s", dbName)
+		}
+	}
 
 	// Provision PKI infrastructure via ICP service
 	log.Printf("Provisioning PKI for tenant: %s", tenant.TenantID.String())
@@ -504,78 +506,44 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		Domain:     tenant.TenantDomain,
 		TTL:        "87600h", // 10 years
 		MaxTTL:     "24h",    // Max certificate TTL
-		// Note: database_url not sent - ICP doesn't need tenant DB for PKI provisioning
 	})
-	if err != nil {
-		log.Printf(" PKI provisioning failed: %v", err)
-	}
 
 	if err != nil {
 		log.Printf("Warning: PKI provisioning failed: %v", err)
-		// Update tenant status to indicate PKI provisioning failure
-		if updateErr := uc.tenantRepo.UpdateTenantStatusTx(tx, tenant.TenantID, "pki_provisioning_failed"); updateErr != nil {
-			log.Printf("Failed to update tenant status: %v", updateErr)
-		}
-		// Continue - admin can retry PKI provisioning later
 	} else {
 		log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
-		// Update tenant with PKI information (vault_mount and ca_cert only)
-		// Note: database_url is not stored - it's generated on-demand from tenant_db
+		// Update tenant with PKI information (post-commit, direct update)
 		updateQuery := `UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE tenant_id = $3`
-		if _, err := tx.Exec(updateQuery, icpResp.PKIMount, icpResp.CACert, tenant.TenantID); err != nil {
+		if _, err := db.Exec(updateQuery, icpResp.PKIMount, icpResp.CACert, tenant.TenantID); err != nil {
 			log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 		}
 	}
 
-	// Create tenant record in tenant database (required for FK constraints)
-	if err := uc.createTenantRecordInTenantDB(dbName, tenant.Tenant); err != nil {
-		// Log the error but don't fail the registration
-		log.Printf("Warning: Failed to create tenant record in tenant database %s: %v", dbName, err)
-		log.Printf("Tenant database %s created successfully, but tenant record creation failed", dbName)
-		// Continue with tenant creation - admin can manually create tenant record later if needed
-	} else {
-		log.Printf("Successfully created tenant record in tenant database %s", dbName)
-	}
+	// Seed tenant database (only if DB + migrations succeeded)
+	if tenantDBReady {
+		if err := uc.createTenantRecordInTenantDB(dbName, tenant.Tenant); err != nil {
+			log.Printf("Warning: Failed to create tenant record in tenant database %s: %v", dbName, err)
+		} else {
+			log.Printf("Successfully created tenant record in tenant database %s", dbName)
+		}
 
-	// Create the user in the tenant database first
-	if err := uc.createUserInTenantDB(dbName, user, tenant.TenantID); err != nil {
-		// Log the error but don't delete the database - tenant creation should succeed
-		log.Printf("Warning: Failed to create user in tenant database %s: %v", dbName, err)
-		log.Printf("Tenant database %s created successfully, but user creation failed", dbName)
-		// Continue with tenant creation - admin can manually create users later if needed
-	} else {
-		log.Printf("Successfully created user %s in tenant database %s", user.Email, dbName)
-	}
+		if err := uc.createUserInTenantDB(dbName, user, tenant.TenantID); err != nil {
+			log.Printf("Warning: Failed to create user in tenant database %s: %v", dbName, err)
+		} else {
+			log.Printf("Successfully created user %s in tenant database %s", user.Email, dbName)
+		}
 
-	// Assign admin role to the created user in the tenant database
-	if err := uc.assignAdminRoleToUser(dbName, user.ID, tenant.TenantID); err != nil {
-		// Log the error but don't delete the database - tenant creation should succeed
-		log.Printf("Warning: Failed to assign admin role to user %s: %v", user.Email, err)
-		log.Printf("Tenant database %s created successfully, but admin role assignment failed", dbName)
-		// Continue with tenant creation - admin can manually assign roles later if needed
-	} else {
-		log.Printf("Successfully assigned admin role to user: %s", user.Email)
-	}
+		if err := uc.assignAdminRoleToUser(dbName, user.ID, tenant.TenantID); err != nil {
+			log.Printf("Warning: Failed to assign admin role to user %s: %v", user.Email, err)
+		} else {
+			log.Printf("Successfully assigned admin role to user: %s", user.Email)
+		}
 
-	// Create default client and assign default associations
-	if err := uc.createDefaultClientAndAssociations(dbName, tenant.TenantID, pendingReg.TenantID, user.ID, user.ProjectID); err != nil {
-		// Log the error but don't delete the database - tenant creation should succeed
-		log.Printf("Warning: Failed to create default client for user %s: %v", user.Email, err)
-		log.Printf("Tenant database %s created successfully, but default client creation failed", dbName)
-		// Continue with tenant creation - admin can manually create clients later if needed
-	} else {
-		log.Printf("Successfully created default client for user: %s", user.Email)
-	}
-
-	// Clean up pending registration and OTP entries
-	uc.pendingRepo.DeletePendingRegistrationsByEmailTx(tx, input.Email)
-	uc.otpRepo.DeleteOTPsByEmailTx(tx, input.Email)
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit registration transaction: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
-		return
+		if err := uc.createDefaultClientAndAssociations(dbName, tenant.TenantID, pendingReg.TenantID, user.ID, user.ProjectID); err != nil {
+			log.Printf("Warning: Failed to create default client for user %s: %v", user.Email, err)
+		} else {
+			log.Printf("Successfully created default client for user: %s", user.Email)
+		}
 	}
 
 	// Save secret to Vault and register with Hydra
