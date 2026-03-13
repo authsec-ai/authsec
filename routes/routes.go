@@ -651,6 +651,12 @@ func SetupRoutes(
 		registerSdkmgrRoutes(authsec, r)
 
 		// ────────────────────────────────────────────────────
+		// SPIRE Headless (formerly spire-headless microservice)
+		// Served under /authsec/spire.
+		// ────────────────────────────────────────────────────
+		registerSpireRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)
 		// Served under /authsec/exsvc.
 		// ────────────────────────────────────────────────────
@@ -1275,5 +1281,72 @@ func bindSdkmgrRoutes(
 		devServer.POST("/start", devServerCtrl.Start)
 		devServer.POST("/stop", devServerCtrl.Stop)
 		devServer.GET("/status", devServerCtrl.Status)
+	}
+}
+
+// registerSpireRoutes registers all SPIRE Headless routes under /spire.
+// Previously served by the standalone spire-headless microservice.
+func registerSpireRoutes(r gin.IRouter) {
+	sc := platformCtrl.NewSpireController()
+
+	spire := r.Group("/spire")
+
+	spire.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "healthy", "service": "spire-headless", "version": "1.0.0"})
+	})
+
+	// ── OIDC discovery (no auth required) ──
+	spire.GET("/.well-known/openid-configuration", sc.OIDCDiscovery)
+	spire.GET("/.well-known/jwks.json", sc.OIDCJWKSHandler)
+
+	// ── Registry ──
+	registry := spire.Group("/registry")
+	{
+		registry.POST("/workloads", sc.RegisterWorkload)
+		registry.PUT("/workloads/:id", sc.UpdateWorkload)
+		registry.DELETE("/workloads/:id", sc.DeleteWorkload)
+		registry.GET("/workloads", sc.ListWorkloads)
+	}
+
+	// ── OIDC token operations ──
+	oidc := spire.Group("/oidc")
+	{
+		oidc.POST("/token", sc.OIDCTokenExchange)
+		oidc.POST("/introspect", sc.OIDCIntrospect)
+		oidc.POST("/revoke", sc.OIDCRevoke)
+		oidc.POST("/exchange/spiffe", sc.OIDCExchangeSPIFFE)
+		oidc.POST("/issue/jwt-svid", sc.OIDCIssueJWTSVID)
+		oidc.POST("/exchange/cloud", sc.OIDCExchangeCloud)
+		oidc.POST("/exchange/aws", sc.OIDCExchangeAWS)
+		oidc.POST("/exchange/azure", sc.OIDCExchangeAzure)
+		oidc.POST("/exchange/gcp", sc.OIDCExchangeGCP)
+	}
+
+	// ── Policy engine ──
+	policy := spire.Group("/policy")
+	{
+		policy.POST("", sc.CreatePolicy)
+		policy.GET("", sc.ListPolicies)
+		policy.GET("/:id", sc.GetPolicy)
+		policy.PUT("/:id", sc.UpdatePolicy)
+		policy.DELETE("/:id", sc.DeletePolicy)
+		policy.POST("/evaluate", sc.EvaluatePolicy)
+		policy.POST("/batch-evaluate", sc.BatchEvaluatePolicy)
+		policy.POST("/test", sc.TestPolicy)
+	}
+
+	// ── Role bindings ──
+	roles := spire.Group("/roles")
+	{
+		roles.POST("/bind", sc.BindRole)
+		roles.POST("/unbind", sc.UnbindRole)
+		roles.GET("/bindings", sc.ListRoleBindings)
+	}
+
+	// ── Audit ──
+	audit := spire.Group("/audit")
+	{
+		audit.GET("/logs", sc.GetAuditLogs)
+		audit.GET("/logs/export", sc.ExportAuditLogs)
 	}
 }

@@ -1,6 +1,6 @@
 # AuthSec – Unified Authentication & Identity Monolith
 
-AuthSec is a single Go service that consolidates **seven formerly independent microservices** into one deployable binary. It handles the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, and external-service credentials.
+AuthSec is a single Go service that consolidates **eight formerly independent microservices** into one deployable binary. It handles the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, external-service credentials, and SPIFFE/SPIRE workload identity.
 
 ## Table of Contents
 
@@ -16,6 +16,7 @@ AuthSec is a single Go service that consolidates **seven formerly independent mi
   - [OIDC Config Manager (`/authsec/oocmgr`)](#oidc-config-manager-authsecoocmgr)
   - [Auth Manager (`/authsec/authmgr`)](#auth-manager-authsecauthmgr)
   - [External Services (`/authsec/exsvc`)](#external-services-authsecexsvc)
+  - [SPIRE Headless (`/authsec/spire`)](#spire-headless-authsecspire)
   - [Migration Management (`/authsec/migration`)](#migration-management-authsecmigration)
   - [Well-Known Endpoints](#well-known-endpoints)
   - [Metrics](#metrics)
@@ -41,6 +42,7 @@ AuthSec is a single Go service that consolidates **seven formerly independent mi
 │  /authsec/oocmgr/*       – oath_oidc_configuration_manager        │
 │  /authsec/authmgr/*      – auth-manager (RBAC checks, group mgmt) │
 │  /authsec/exsvc/*        – external-service / mcp-service         │
+│  /authsec/spire/*        – spire-headless (SPIFFE workload id)    │
 │  /authsec/migration/*    – authsec-migration (DB migration mgmt)  │
 │                                                                    │
 │  /.well-known/*          – OIDC discovery (must stay at root)     │
@@ -67,6 +69,7 @@ All HTTP routes are served from a single `gin.Engine`. Each merged service's rou
 | `oath_oidc_configuration_manager` | `/authsec/oocmgr` | 7467 | OIDC provider config, Hydra client sync, SAML providers |
 | `auth-manager` | `/authsec/authmgr` | — | JWT verify/issue, RBAC permission checks, group management |
 | `external-service` (mcp-service) | `/authsec/exsvc` | — | External service registry with Vault-backed credentials |
+| `spire-headless` | `/authsec/spire` | — | SPIFFE/SPIRE workload identity, OIDC token exchange, cloud federation (AWS/Azure/GCP), and RBAC/ABAC policy engine |
 | `authsec-migration` | `/authsec/migration` | — | Database migration management (master DB + per-tenant DB) |
 
 ---
@@ -667,6 +670,71 @@ Formerly **external-service / mcp-service**. Manages registered external service
 
 ---
 
+### SPIRE Headless (`/authsec/spire`)
+
+Formerly **spire-headless**. Provides SPIFFE workload identity, OIDC token issuance with cloud federation (AWS/Azure/GCP), and a built-in RBAC/ABAC policy engine. Connects to a SPIRE server via the SPIFFE Workload API socket when available; degrades gracefully if the socket is absent.
+
+#### Health & Discovery
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/authsec/spire/health` | Public | Health check |
+| `GET` | `/authsec/spire/.well-known/openid-configuration` | Public | OIDC discovery document |
+| `GET` | `/authsec/spire/.well-known/jwks.json` | Public | JWK Set (SPIRE signing keys) |
+
+#### Registry
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/authsec/spire/registry/workloads` | - | Register a SPIFFE workload |
+| `PUT` | `/authsec/spire/registry/workloads/:id` | - | Update a registered workload |
+| `DELETE` | `/authsec/spire/registry/workloads/:id` | - | Delete a workload registration |
+| `GET` | `/authsec/spire/registry/workloads` | - | List all registered workloads |
+
+#### OIDC Token Operations
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/authsec/spire/oidc/token` | - | Exchange credentials for an OIDC token |
+| `POST` | `/authsec/spire/oidc/introspect` | - | Introspect a token |
+| `POST` | `/authsec/spire/oidc/revoke` | - | Revoke a token |
+| `POST` | `/authsec/spire/oidc/exchange/spiffe` | - | Exchange a SPIFFE SVID for an OIDC token |
+| `POST` | `/authsec/spire/oidc/issue/jwt-svid` | - | Issue a JWT-SVID |
+| `POST` | `/authsec/spire/oidc/exchange/cloud` | - | Generic cloud token exchange |
+| `POST` | `/authsec/spire/oidc/exchange/aws` | - | Exchange for AWS STS credentials |
+| `POST` | `/authsec/spire/oidc/exchange/azure` | - | Exchange for Azure AD token |
+| `POST` | `/authsec/spire/oidc/exchange/gcp` | - | Exchange for GCP access token |
+
+#### Policy Engine
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/authsec/spire/policy` | - | Create a policy |
+| `GET` | `/authsec/spire/policy` | - | List policies |
+| `GET` | `/authsec/spire/policy/:id` | - | Get a policy |
+| `PUT` | `/authsec/spire/policy/:id` | - | Update a policy |
+| `DELETE` | `/authsec/spire/policy/:id` | - | Delete a policy |
+| `POST` | `/authsec/spire/policy/evaluate` | - | Evaluate a policy (single) |
+| `POST` | `/authsec/spire/policy/batch-evaluate` | - | Evaluate multiple policies in batch |
+| `POST` | `/authsec/spire/policy/test` | - | Dry-run a policy without persisting |
+
+#### Role Bindings
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/authsec/spire/roles/bind` | - | Bind a role to a subject |
+| `POST` | `/authsec/spire/roles/unbind` | - | Remove a role binding |
+| `GET` | `/authsec/spire/roles/bindings` | - | List role bindings |
+
+#### Audit
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/authsec/spire/audit/logs` | - | Query audit log entries |
+| `GET` | `/authsec/spire/audit/logs/export` | - | Export audit logs |
+
+---
+
 ### Migration Management (`/authsec/migration`)
 
 Formerly **authsec-migration** (standalone microservice). Manages master and per-tenant database migrations. All endpoints require JWT authentication.
@@ -899,6 +967,9 @@ If you are migrating from standalone microservices, update your client URLs as f
 | `http://auth-manager/authmgr/verifyToken` | `http://authsec:7468/authsec/authmgr/token/verify` |
 | `http://auth-manager/authmgr/oidcToken` | `http://authsec:7468/authsec/authmgr/token/oidc` |
 | `http://external-svc/exsvc/services` | `http://authsec:7468/authsec/exsvc/services` |
+| `http://spire-headless/registry/workloads` | `http://authsec:7468/authsec/spire/registry/workloads` |
+| `http://spire-headless/oidc/token` | `http://authsec:7468/authsec/spire/oidc/token` |
+| `http://spire-headless/policy` | `http://authsec:7468/authsec/spire/policy` |
 | `http://authsec/migration/migrations/master/run` | `http://authsec:7468/authsec/migration/migrations/master/run` |
 | `http://authsec/migration/tenants/:id/migrations/run` | `http://authsec:7468/authsec/migration/tenants/:id/migrations/run` |
 
