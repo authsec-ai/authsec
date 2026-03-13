@@ -29,6 +29,22 @@ import (
 	"gorm.io/datatypes"
 )
 
+// safeUUID safely converts an interface{} to uuid.UUID, handling both uuid.UUID and string types.
+func safeUUID(v interface{}) uuid.UUID {
+	switch val := v.(type) {
+	case uuid.UUID:
+		return val
+	case string:
+		parsed, err := uuid.Parse(val)
+		if err != nil {
+			return uuid.Nil
+		}
+		return parsed
+	default:
+		return uuid.Nil
+	}
+}
+
 func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (string, error) {
 	if adminUser == nil {
 		return "", errors.New("admin user is required")
@@ -1719,9 +1735,27 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 		return
 	}
 
-	// Get tenant domain
-	tenant, err := oc.tenantRepo.GetTenantByID(tenantID.(uuid.UUID).String())
+	// Safely extract tenant ID string
+	var tenantIDStr string
+	switch v := tenantID.(type) {
+	case uuid.UUID:
+		tenantIDStr = v.String()
+	case string:
+		tenantIDStr = v
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
+		return
+	}
+
+	tid, err := uuid.Parse(tenantIDStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
+		return
+	}
+
+	// Get tenant domain
+	tenant, tErr := oc.tenantRepo.GetTenantByID(tenantIDStr)
+	if tErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
 		return
 	}
@@ -1731,8 +1765,6 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 		TenantDomain: tenant.TenantDomain,
 		Provider:     input.Provider,
 	}
-
-	tid := tenantID.(uuid.UUID)
 	response, err := oc.oidcService.InitiateOIDCFlow(oidcInput, "link", &tid)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1770,7 +1802,7 @@ func (oc *OIDCController) GetLinkedIdentities(c *gin.Context) {
 		return
 	}
 
-	identities, err := oc.oidcService.GetIdentitiesByUser(tenantID.(uuid.UUID), userID.(uuid.UUID))
+	identities, err := oc.oidcService.GetIdentitiesByUser(safeUUID(tenantID), safeUUID(userID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get identities"})
 		return
@@ -1807,7 +1839,7 @@ func (oc *OIDCController) UnlinkIdentity(c *gin.Context) {
 		return
 	}
 
-	if err := oc.oidcService.UnlinkIdentity(tenantID.(uuid.UUID), userID.(uuid.UUID), provider); err != nil {
+	if err := oc.oidcService.UnlinkIdentity(safeUUID(tenantID), safeUUID(userID), provider); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

@@ -1,5 +1,6 @@
 -- Migration 079: Ensure users:active permission exists (modern RBAC schema)
 -- Fixed to match production tenants table (tenant_id NOT NULL, email NOT NULL, tenant_domain NOT NULL)
+-- Fixed: uses check-before-insert instead of ON CONFLICT ON CONSTRAINT (constraint may not exist yet)
 
 DO $$
 DECLARE
@@ -10,18 +11,14 @@ BEGIN
     VALUES (sys_tenant, sys_tenant, 'system@authsec.local', 'system.authsec.dev', 'System', NOW())
     ON CONFLICT (id) DO NOTHING;
 
-    -- Ensure users:active permission exists
-    INSERT INTO permissions (id, tenant_id, resource, action, description, full_permission_string, created_at)
-    VALUES (
-        gen_random_uuid(),
-        sys_tenant,
-        'users',
-        'active',
-        'Activate/deactivate users',
-        'users:active',
-        NOW()
-    )
-    ON CONFLICT ON CONSTRAINT permissions_tenant_resource_action_key DO NOTHING;
+    -- Ensure users:active permission exists (idempotent without requiring named constraint)
+    IF NOT EXISTS (
+        SELECT 1 FROM permissions
+        WHERE tenant_id = sys_tenant AND resource = 'users' AND action = 'active'
+    ) THEN
+        INSERT INTO permissions (id, tenant_id, resource, action, description, created_at)
+        VALUES (gen_random_uuid(), sys_tenant, 'users', 'active', 'Activate/deactivate users', NOW());
+    END IF;
 
     -- Link to admin role if present
     WITH ar AS (
