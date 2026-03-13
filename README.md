@@ -983,4 +983,4 @@ The following legacy paths are retained at the root for existing clients that ha
 
 ## License
 
-MIT © AuthSec AI
+Apache License 2.0 — see [LICENSE](LICENSE) for the full text.
