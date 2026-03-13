@@ -1,10 +1,7 @@
 package platform
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -166,17 +163,6 @@ type RegisterClientsRequest struct {
 	TenantDomain string `json:"react_app_url" binding:"required"`
 }
 
-type oocManagerPayload struct {
-	TenantID     string   `json:"tenant_id" validate:"required"`
-	OrgID        string   `json:"org_id" validate:"required"`
-	TenantName   string   `json:"tenant_name" validate:"required"`
-	ClientID     string   `json:"client_id" validate:"required"`
-	ClientSecret string   `json:"client_secret" validate:"required"`
-	RedirectURIs []string `json:"redirect_uris" validate:"required"`
-	Scopes       []string `json:"scopes,omitempty"`
-	CreatedBy    string   `json:"created_by"`
-}
-
 // ClientsDeleteCompleteRequest is the request body for hard-delete operations.
 type ClientsDeleteCompleteRequest struct {
 	TenantID string `json:"tenant_id" binding:"required"`
@@ -190,164 +176,22 @@ type ClientsStatusRequest struct {
 	Active   bool   `json:"active"`
 }
 
-type clientsProviderConfig struct {
-	ProviderName string   `json:"provider_name"`
-	DisplayName  string   `json:"display_name"`
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret"`
-	AuthURL      string   `json:"auth_url"`
-	TokenURL     string   `json:"token_url"`
-	UserInfoURL  string   `json:"user_info_url"`
-	Scopes       []string `json:"scopes"`
-	IsActive     bool     `json:"is_active"`
-}
-
-type clientsAddProviderRequest struct {
-	TenantID    string                `json:"tenant_id"`
-	ClientID    string                `json:"client_id"`
-	ReactAppURL string                `json:"react_app_url"`
-	Provider    clientsProviderConfig `json:"provider"`
-	CreatedBy   string                `json:"created_by"`
-}
-
-func getClientsOOCManagerURL() string {
-	if config.AppConfig != nil && config.AppConfig.OOCManagerURL != "" {
-		return config.AppConfig.OOCManagerURL
-	}
-	return "http://localhost:7467"
-}
 
 func clientsRegisterWithHydra(clientID, clientSecret, clientName, tenantID string, tenantDomain string) error {
-	oocManagerURL := getClientsOOCManagerURL()
-
-	payload := oocManagerPayload{
-		TenantID:     tenantID,
-		TenantName:   clientName,
-		ClientID:     fmt.Sprintf("%s-main-client", clientID),
-		ClientSecret: clientSecret,
-		RedirectURIs: []string{fmt.Sprintf("%s/oidc/auth/callback", tenantDomain)},
-		Scopes:       []string{"openid", "offline", "email", "profile"},
-		CreatedBy:    "system",
-	}
-
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal Hydra client data: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/oocmgr/tenant/create-base-client", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to Hydra: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("hydra API returned status %d", resp.StatusCode)
-	}
-
-	log.Printf("Successfully registered client %s-main-client with Hydra", clientID)
-	return nil
+	return services.RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenantDomain)
 }
 
 func clientsDeleteFromOOCManager(tenantID, clientID string) error {
-	oocManagerURL := getClientsOOCManagerURL()
-
-	log.Printf("[OOC-DELETE-START] Attempting to delete client from OOC Manager - Tenant: %s, Client: %s", tenantID, clientID)
-
-	deleteReq := ClientsDeleteCompleteRequest{
-		TenantID: tenantID,
-		ClientID: clientID,
+	log.Printf("[OOC-DELETE-START] Deleting Hydra clients for tenant=%s client=%s", tenantID, clientID)
+	if err := services.DeleteClientFromHydra(clientID); err != nil {
+		return err
 	}
-
-	jsonData, err := json.Marshal(deleteReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal delete request data: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/oocmgr/tenant/delete-complete", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	log.Printf("[OOC-DELETE-RESPONSE] Status: %d - Tenant: %s, Client: %s", resp.StatusCode, tenantID, clientID)
-
-	if resp.StatusCode == http.StatusNotFound {
-		log.Printf("[OOC-DELETE-404] Client not found in OOC Manager (expected for non-OIDC clients) - Tenant: %s, Client: %s", tenantID, clientID)
-		return nil
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OOC Manager API returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	log.Printf("[OOC-DELETE-SUCCESS] Successfully deleted client from OOC Manager - Tenant: %s, Client: %s", tenantID, clientID)
+	log.Printf("[OOC-DELETE-SUCCESS] Deleted Hydra clients for client=%s", clientID)
 	return nil
 }
 
 func clientsAddProvider(tenantID, clientID, reactAppURL, createdBy string) error {
-	oocManagerURL := getClientsOOCManagerURL()
-
-	providerReq := clientsAddProviderRequest{
-		TenantID:    tenantID,
-		ClientID:    clientID,
-		ReactAppURL: reactAppURL,
-		Provider: clientsProviderConfig{
-			ProviderName: "authsec",
-			DisplayName:  "AuthSec",
-			ClientID:     clientID,
-			ClientSecret: "dummy-secret-" + clientID,
-			AuthURL:      fmt.Sprintf("%s/oauth2/auth", reactAppURL),
-			TokenURL:     fmt.Sprintf("%s/oauth2/token", reactAppURL),
-			UserInfoURL:  fmt.Sprintf("%s/userinfo", reactAppURL),
-			Scopes:       []string{"openid", "profile", "email"},
-			IsActive:     true,
-		},
-		CreatedBy: createdBy,
-	}
-
-	jsonData, err := json.Marshal(providerReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal provider request data: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/oocmgr/oidc/add-provider", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OOC Manager API returned status %d", resp.StatusCode)
-	}
-
-	log.Printf("Successfully added AuthSec provider for client %s", clientID)
-	return nil
+	return services.AddProviderToClient(tenantID, clientID, reactAppURL, createdBy)
 }
 
 // GetClientsByTenant handles the legacy POST route for getting clients by tenant.

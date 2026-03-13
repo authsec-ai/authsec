@@ -25,6 +25,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
+	"github.com/authsec-ai/authsec/services"
 	sharedmodels "github.com/authsec-ai/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -534,64 +535,22 @@ func (ac *AuthmgrController) OIDCToken(c *gin.Context) {
 		return
 	}
 
-	introspection, err := authmgrValidateOIDCToken(req.OidcToken)
-	if err != nil || introspection == nil || introspection.Active == nil || !*introspection.Active {
-		errMsg := "invalid or inactive OIDC token"
-		if err != nil {
-			errMsg = err.Error()
-		}
-		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsg})
-		return
-	}
-
-	required := []string{"provider", "provider_id", "user_id", "tenant_id", "email"}
-	if err := authmgrValidateRequiredFields(introspection.Ext, required); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	provider, _ := authmgrSafeExtractString(introspection.Ext, "provider")
-	providerID, _ := authmgrSafeExtractString(introspection.Ext, "provider_id")
-	userID, _ := authmgrSafeExtractString(introspection.Ext, "user_id")
-	tenantID, _ := authmgrSafeExtractString(introspection.Ext, "tenant_id")
-	emailID, _ := authmgrSafeExtractString(introspection.Ext, "email")
-
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	clientID, projectID, err := authmgrLookupClientByEmail(ctx, tenantID, emailID)
+	tokenResp, err := services.IssueOIDCJWT(ctx, req.OidcToken)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "failed to retrieve tenant information"})
+		status := http.StatusUnauthorized
+		if strings.Contains(err.Error(), "missing required field") {
+			status = http.StatusBadRequest
+		} else if strings.Contains(err.Error(), "failed to generate token") {
+			status = http.StatusInternalServerError
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":   tenantID,
-		"project_id":  projectID,
-		"client_id":   clientID,
-		"email_id":    emailID,
-		"provider":    provider,
-		"provider_id": providerID,
-		"user_id":     userID,
-		"token_type":  "oidc",
-		"aud":         "authsec-api",
-		"iat":         time.Now().Unix(),
-		"exp":         time.Now().Add(24 * time.Hour).Unix(),
-		"iss":         "authsec-ai/auth-manager",
-		"jti":         uuid.New().String(),
-	})
-
-	tokenString, err := token.SignedString([]byte(config.AppConfig.JWTDefSecret))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
-		return
-	}
-
-	c.JSON(http.StatusOK, sharedmodels.TokenResponse{
-		AccessToken: tokenString,
-		TokenType:   "Bearer",
-		ExpiresIn:   24 * 60 * 60,
-	})
+	c.JSON(http.StatusOK, tokenResp)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

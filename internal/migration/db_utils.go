@@ -112,3 +112,21 @@ func AutoMigrateMigrationLogs(gormDB *gorm.DB) error {
 	}
 	return gormDB.AutoMigrate(&MigrationLog{})
 }
+
+// RunTenantMigrationsInProcess runs tenant migrations directly in-process without an HTTP round-trip.
+// masterDB is the raw master *sql.DB used for migration_logs tracking.
+// migrationsDir is the path to the tenant SQL migration files; pass "" to use the default resolved path.
+func RunTenantMigrationsInProcess(tenantID, host, port, user, password, dbName string, masterDB *sql.DB, migrationsDir string) error {
+	if migrationsDir == "" {
+		migrationsDir = MigrationsDir("tenant")
+	}
+
+	tenantDBConn, err := ConnectToTenantDB(host, port, user, password, dbName)
+	if err != nil {
+		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
+	}
+	defer tenantDBConn.Close()
+
+	runner := NewTenantMigrationRunner(tenantID, tenantDBConn, migrationsDir, masterDB)
+	return runner.RunMigrations()
+}

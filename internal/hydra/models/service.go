@@ -1,7 +1,6 @@
 package hydramodels
 
 import (
-	"bytes"
 	"context"
 	"crypto/rsa"
 	"encoding/base64"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -631,42 +631,13 @@ func (s *OAuthLoginService) GetUserInfo(ctx context.Context, provider *OIDCProvi
 }
 
 func (s *OAuthLoginService) GetUIAccessToken(ctx context.Context, req string) (*TokenResponse, error) {
-	tokenRequest := OIDCTokenRequest{OidcToken: req}
-
-	jsonData, err := json.Marshal(tokenRequest)
+	resp, err := services.IssueOIDCJWT(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/authmgr/oidcToken", config.AppConfig.OOCManagerURL),
-		bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make API call: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API call failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var tokenResponse TokenResponse
-	if err := json.Unmarshal(body, &tokenResponse); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-	return &tokenResponse, nil
+	return &TokenResponse{
+		AccessToken: resp.AccessToken,
+		TokenType:   resp.TokenType,
+		ExpiresIn:   int(resp.ExpiresIn),
+	}, nil
 }

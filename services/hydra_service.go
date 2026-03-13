@@ -7,11 +7,128 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	oocmgrdto "github.com/authsec-ai/authsec/internal/oocmgr/dto"
+	oocmgrrepo "github.com/authsec-ai/authsec/internal/oocmgr/repository"
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// hydraClient mirrors the Hydra admin API client object used for direct calls.
+type hydraClient struct {
+	ClientID      string                 `json:"client_id"`
+	ClientSecret  string                 `json:"client_secret,omitempty"`
+	ClientName    string                 `json:"client_name"`
+	GrantTypes    []string               `json:"grant_types"`
+	RedirectURIs  []string               `json:"redirect_uris"`
+	ResponseTypes []string               `json:"response_types"`
+	TokenEndpoint string                 `json:"token_endpoint_auth_method"`
+	Scope         string                 `json:"scope"`
+	Audience      []string               `json:"audience,omitempty"`
+	SubjectType   string                 `json:"subject_type,omitempty"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func hydraAdminURL() string {
+	return config.AppConfig.HydraAdminURL
+}
+
+func hydraAdminGetClient(clientID string) (*hydraClient, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID))
+	if err != nil {
+		return nil, fmt.Errorf("hydra get client: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hydra get client status %d", resp.StatusCode)
+	}
+	var c hydraClient
+	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+		return nil, fmt.Errorf("hydra get client decode: %w", err)
+	}
+	return &c, nil
+}
+
+func hydraAdminCreateClient(c hydraClient) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Post(
+		fmt.Sprintf("%s/admin/clients", hydraAdminURL()),
+		"application/json", bytes.NewBuffer(data),
+	)
+	if err != nil {
+		return fmt.Errorf("hydra create client: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra create client status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func hydraAdminUpdateClient(clientID string, c hydraClient) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("PUT", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("hydra update client: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra update client status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func hydraAdminDeleteClient(clientID string) error {
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("hydra delete client: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra delete client status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func hydraAdminGetAllClients() ([]hydraClient, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/admin/clients", hydraAdminURL()))
+	if err != nil {
+		return nil, fmt.Errorf("hydra get all clients: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hydra get all clients status %d", resp.StatusCode)
+	}
+	var clients []hydraClient
+	if err := json.NewDecoder(resp.Body).Decode(&clients); err != nil {
+		return nil, fmt.Errorf("hydra get all clients decode: %w", err)
+	}
+	return clients, nil
+}
+
+func oocmgrNormalizeProviderName(name string) string {
+	return strings.ToLower(strings.ReplaceAll(name, " ", "_"))
+}
 
 // OOCManager represents the request structure for OOC Manager API
 type OOCManager struct {
@@ -69,259 +186,155 @@ func generateServiceToken() (string, error) {
 	return tokenString, nil
 }
 
-// RegisterClientWithHydra registers the client with OOC Manager
-// This function creates an OAuth2 client via OOC Manager which then creates it in Hydra
+// RegisterClientWithHydra creates the tenant's main OAuth2 client directly in Hydra.
 func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenantDomain string) error {
-	// Get OOC Manager URL from config or environment
-	oocManagerURL := config.AppConfig.OOCManagerURL
-	if oocManagerURL == "" {
-		oocManagerURL = "http://localhost:7467" // fallback to default
+	mainClientID := fmt.Sprintf("%s-main-client", clientID)
+
+	// Skip if already exists
+	if existing, _ := hydraAdminGetClient(mainClientID); existing != nil {
+		log.Printf("Hydra client %s already exists, skipping creation", mainClientID)
+		return nil
 	}
 
-	oocManager := OOCManager{
-		TenantID:     tenantID,
-		TenantName:   clientName,
-		ClientID:     fmt.Sprintf("%s-main-client", clientID),
-		ClientSecret: clientSecret,
-		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
-		Scopes:       []string{"openid", "offline", "email", "profile"},
-		CreatedBy:    "system",
-	}
-
-	// Marshal to JSON
-	jsonData, err := json.Marshal(oocManager)
-	if err != nil {
-		return fmt.Errorf("failed to marshal OOC Manager client data: %w", err)
-	}
-
-	// Generate service token for authentication
-	token, err := generateServiceToken()
-	if err != nil {
-		return fmt.Errorf("failed to generate service token: %w", err)
-	}
-
-	// Create HTTP request
-	url := fmt.Sprintf("%s/oocmgr/tenant/create-base-client", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// Make the request
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Read response body for error details
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("OOC Manager error - Status: %d, Failed to read response body", resp.StatusCode)
-		} else {
-			log.Printf("OOC Manager error - Status: %d, Response: %s", resp.StatusCode, string(bodyBytes))
-		}
-		
-		// Log the request that was sent
-		requestJSON, _ := json.Marshal(oocManager)
-		log.Printf("OOC Manager request - URL: %s, Payload: %s", url, string(requestJSON))
-		
-		return fmt.Errorf("OOC Manager API returned status %d", resp.StatusCode)
-	}
-
-	log.Printf("Successfully registered client %s with OOC Manager", oocManager.ClientID)
-	return nil
-}
-
-// DeleteClientFromHydra removes a client via OOC Manager
-func DeleteClientFromHydra(clientID string) error {
-	// Get OOC Manager URL from config
-	oocManagerURL := config.AppConfig.OOCManagerURL
-	if oocManagerURL == "" {
-		oocManagerURL = "http://localhost:7467"
-	}
-
-	// Create request payload
-	payload := map[string]string{
-		"client_id": fmt.Sprintf("%s-main-client", clientID),
-	}
-
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal delete request: %w", err)
-	}
-
-	// Generate service token for authentication
-	token, err := generateServiceToken()
-	if err != nil {
-		return fmt.Errorf("failed to generate service token: %w", err)
-	}
-
-	// Create HTTP request
-	url := fmt.Sprintf("%s/oocmgr/tenant/delete-complete", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// Make the request
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OOC Manager API returned status %d during deletion", resp.StatusCode)
-	}
-
-	log.Printf("Successfully deleted client %s via OOC Manager", clientID)
-	return nil
-}
-
-// UpdateClientInHydra updates a client via OOC Manager
-func UpdateClientInHydra(clientID, secret, email, tenantID string) error {
-	// Get OOC Manager URL from config
-	oocManagerURL := config.AppConfig.OOCManagerURL
-	if oocManagerURL == "" {
-		oocManagerURL = "http://localhost:7467"
-	}
-
-	// Create update request payload
-	payload := map[string]interface{}{
-		"client_id":     fmt.Sprintf("%s-main-client", clientID),
-		"client_secret": secret,
-		"tenant_id":     tenantID,
-		"email":         email,
-	}
-
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal update request: %w", err)
-	}
-
-	// Generate service token for authentication
-	token, err := generateServiceToken()
-	if err != nil {
-		return fmt.Errorf("failed to generate service token: %w", err)
-	}
-
-	// Create HTTP request
-	url := fmt.Sprintf("%s/oocmgr/tenant/update-complete", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// Make the request
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OOC Manager API returned status %d during update", resp.StatusCode)
-	}
-
-	log.Printf("Successfully updated client %s via OOC Manager", clientID)
-	return nil
-}
-
-// AddProviderToClient adds a dummy AuthSec provider to a client via OOC Manager
-func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) error {
-	oocManagerURL := config.AppConfig.OOCManagerURL
-	if oocManagerURL == "" {
-		oocManagerURL = "http://localhost:7467"
-	}
-
-	// Create dummy AuthSec provider configuration
-	providerReq := AddProviderRequest{
-		TenantID:    tenantID,
-		ClientID:    clientID,
-		ReactAppURL: reactAppURL,
-		Provider: ProviderConfig{
-			ProviderName: "authsec",
-			DisplayName:  "AuthSec",
-			ClientID:     clientID,
-			ClientSecret: "dummy-secret-" + clientID,
-			AuthURL:      fmt.Sprintf("https://%s/oauth2/auth", reactAppURL),
-			TokenURL:     fmt.Sprintf("https://%s/oauth2/token", reactAppURL),
-			UserInfoURL:  fmt.Sprintf("https://%s/userinfo", reactAppURL),
-			Scopes:       []string{"openid", "profile", "email"},
-			IsActive:     true,
+	scopes := []string{"openid", "offline_access", "email", "profile"}
+	c := hydraClient{
+		ClientID:      mainClientID,
+		ClientSecret:  clientSecret,
+		ClientName:    fmt.Sprintf("%s Main OAuth Client", clientName),
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: "client_secret_post",
+		Scope:         strings.Join(scopes, " "),
+		Audience:      []string{},
+		SubjectType:   "public",
+		Metadata: map[string]interface{}{
+			"type":        "tenant_main_client",
+			"tenant_id":   clientID,
+			"c_id":        tenantID,
+			"tenant_name": clientName,
+			"created_at":  time.Now().Format(time.RFC3339),
+			"created_by":  "system",
 		},
-		CreatedBy: createdBy,
 	}
 
-	jsonData, err := json.Marshal(providerReq)
+	if err := hydraAdminCreateClient(c); err != nil {
+		return fmt.Errorf("failed to create Hydra client: %w", err)
+	}
+
+	// Best-effort: store mapping in master DB
+	thc := &oocmgrdto.TenantHydraClient{
+		TenantID: tenantID, TenantName: clientName,
+		HydraClientID: mainClientID, HydraClientSecret: clientSecret,
+		ClientName: fmt.Sprintf("%s Main OAuth Client", clientName),
+		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
+		Scopes: scopes, ClientType: "main", IsActive: true,
+		CreatedBy: "system", UpdatedBy: "system",
+	}
+	if err := oocmgrrepo.NewTenantHydraClientRepository().Create(thc); err != nil {
+		log.Printf("Warning: failed to store tenant-client mapping for %s: %v", mainClientID, err)
+	}
+
+	log.Printf("Successfully registered Hydra client %s", mainClientID)
+	return nil
+}
+
+// DeleteClientFromHydra removes all Hydra clients belonging to the tenant directly.
+func DeleteClientFromHydra(clientID string) error {
+	clients, err := hydraAdminGetAllClients()
 	if err != nil {
-		return fmt.Errorf("failed to marshal provider request data: %w", err)
+		return fmt.Errorf("failed to list Hydra clients: %w", err)
 	}
 
-	// Generate service token for authentication
-	token, err := generateServiceToken()
-	if err != nil {
-		return fmt.Errorf("failed to generate service token: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/oocmgr/oidc/add-provider", oocManagerURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to make HTTP request to OOC Manager: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Read response body for error details
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("OOC Manager add-provider error - Status: %d, Failed to read response body", resp.StatusCode)
-		} else {
-			log.Printf("OOC Manager add-provider error - Status: %d, Response: %s", resp.StatusCode, string(bodyBytes))
+	deleted := 0
+	for _, c := range clients {
+		cID, _ := c.Metadata["c_id"].(string)
+		tID, _ := c.Metadata["tenant_id"].(string)
+		if cID != clientID && tID != clientID {
+			continue
 		}
-		return fmt.Errorf("OOC Manager API returned status %d", resp.StatusCode)
+		if err := hydraAdminDeleteClient(c.ClientID); err != nil {
+			log.Printf("Warning: failed to delete Hydra client %s: %v", c.ClientID, err)
+		} else {
+			deleted++
+		}
 	}
 
-	log.Printf("Successfully added AuthSec provider for client %s", clientID)
+	log.Printf("Deleted %d Hydra client(s) for clientID=%s", deleted, clientID)
+	return nil
+}
+
+// UpdateClientInHydra updates the main Hydra client's secret directly.
+func UpdateClientInHydra(clientID, secret, email, tenantID string) error {
+	mainClientID := fmt.Sprintf("%s-main-client", clientID)
+	existing, err := hydraAdminGetClient(mainClientID)
+	if err != nil {
+		return fmt.Errorf("client %s not found in Hydra: %w", mainClientID, err)
+	}
+	existing.ClientSecret = secret
+	if err := hydraAdminUpdateClient(mainClientID, *existing); err != nil {
+		return fmt.Errorf("failed to update Hydra client %s: %w", mainClientID, err)
+	}
+	log.Printf("Successfully updated Hydra client %s", mainClientID)
+	return nil
+}
+
+// AddProviderToClient adds a dummy AuthSec OIDC provider client directly in Hydra.
+func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) error {
+	baseClientID := strings.TrimSuffix(clientID, "-main-client")
+	mainClientID := fmt.Sprintf("%s-main-client", baseClientID)
+
+	tenantClient, err := hydraAdminGetClient(mainClientID)
+	if err != nil {
+		return fmt.Errorf("base client %s not found in Hydra: %w", mainClientID, err)
+	}
+
+	providerName := "authsec"
+	oidcClientID := fmt.Sprintf("%s-%s-oidc", baseClientID, oocmgrNormalizeProviderName(providerName))
+	tenantName, _ := tenantClient.Metadata["tenant_name"].(string)
+
+	oidcClient := hydraClient{
+		ClientID:   oidcClientID,
+		ClientName: fmt.Sprintf("%s AuthSec OIDC Config", tenantName),
+		GrantTypes: []string{"client_credentials"},
+		Metadata: map[string]interface{}{
+			"type":          "oidc_provider",
+			"tenant_id":     baseClientID,
+			"c_id":          tenantID,
+			"provider_name": providerName,
+			"display_name":  "AuthSec",
+			"provider_config": map[string]interface{}{
+				"client_id":     clientID,
+				"client_secret": "dummy-secret-" + clientID,
+				"auth_url":      fmt.Sprintf("https://%s/oauth2/auth", reactAppURL),
+				"token_url":     fmt.Sprintf("https://%s/oauth2/token", reactAppURL),
+				"user_info_url": fmt.Sprintf("https://%s/userinfo", reactAppURL),
+				"scopes":        []string{"openid", "profile", "email"},
+			},
+			"is_active":    true,
+			"callback_url": fmt.Sprintf("%s/oidc/auth/callback/%s", reactAppURL, oocmgrNormalizeProviderName(providerName)),
+			"created_at":   time.Now().Format(time.RFC3339),
+			"created_by":   createdBy,
+		},
+	}
+
+	if err := hydraAdminCreateClient(oidcClient); err != nil {
+		return fmt.Errorf("failed to create OIDC provider client: %w", err)
+	}
+
+	// Best-effort: store mapping in master DB
+	thc := &oocmgrdto.TenantHydraClient{
+		TenantID: tenantID, TenantName: tenantName,
+		HydraClientID:     oidcClientID,
+		HydraClientSecret: "not-used-for-oidc-config",
+		ClientName:        fmt.Sprintf("%s AuthSec OIDC Config", tenantName),
+		ClientType:        "oidc_provider", ProviderName: providerName,
+		IsActive: true, CreatedBy: createdBy, UpdatedBy: createdBy,
+	}
+	if err := oocmgrrepo.NewTenantHydraClientRepository().Create(thc); err != nil {
+		log.Printf("Warning: failed to store OIDC provider mapping for %s: %v", oidcClientID, err)
+	}
+
+	log.Printf("Successfully added AuthSec provider client %s", oidcClientID)
 	return nil
 }

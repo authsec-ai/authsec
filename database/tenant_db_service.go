@@ -1,19 +1,15 @@
 package database
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"github.com/authsec-ai/authsec/internal/migration"
 	_ "github.com/lib/pq"
 )
 
@@ -92,64 +88,11 @@ func (s *TenantDBService) CreateTenantDatabase(tenantID string) (string, error) 
 	return dbName, nil
 }
 
-// RunTenantMigrations calls the migration API to run migrations on a tenant database.
-// Default target is the local authsec instance; override via MIGRATION_SERVICE_URL.
+// RunTenantMigrations runs tenant migrations in-process by calling the migration runner directly.
 func (s *TenantDBService) RunTenantMigrations(tenantID string) error {
-	migrationServiceURL := os.Getenv("MIGRATION_SERVICE_URL")
-	if migrationServiceURL == "" {
-		migrationServiceURL = "http://localhost:7468"
-	}
-
-	url := fmt.Sprintf("%s/authsec/migration/tenants/%s/migrations/run", migrationServiceURL, tenantID)
-	log.Printf("Calling migration service to run tenant migrations: %s", url)
-
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		statusCode, err := s.callMigrationService(url)
-		if err == nil {
-			log.Printf("Migration service successfully ran migrations for tenant %s", tenantID)
-			return nil
-		}
-
-		// Retry on 404 (tenant record may not be visible yet due to replication lag)
-		if statusCode == 404 && attempt < maxRetries {
-			log.Printf("Migration service returned 404 for tenant %s (attempt %d/%d), retrying after delay...", tenantID, attempt, maxRetries)
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
-			continue
-		}
-
-		return err
-	}
-
-	return fmt.Errorf("migration service failed after %d attempts for tenant %s", maxRetries, tenantID)
-}
-
-// callMigrationService makes a single POST call to the migration service.
-// Returns the HTTP status code and any error.
-func (s *TenantDBService) callMigrationService(url string) (int, error) {
-	req, err := http.NewRequest("POST", url, bytes.NewReader(nil))
-	if err != nil {
-		return 0, fmt.Errorf("failed to create migration request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to call migration service: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errResp map[string]interface{}
-		if err := json.Unmarshal(body, &errResp); err == nil {
-			return resp.StatusCode, fmt.Errorf("migration service returned %d: %v", resp.StatusCode, errResp)
-		}
-		return resp.StatusCode, fmt.Errorf("migration service returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	return resp.StatusCode, nil
+	dbName := s.generateTenantDBName(tenantID)
+	log.Printf("Running tenant migrations in-process for tenant %s (db: %s)", tenantID, dbName)
+	return migration.RunTenantMigrationsInProcess(tenantID, s.dbHost, s.dbPort, s.dbUser, s.dbPassword, dbName, s.masterDB.DB, "")
 }
 
 // generateTenantDBName creates a database name from tenant ID
