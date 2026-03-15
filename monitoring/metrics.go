@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"runtime"
 	"strconv"
 	"time"
 
@@ -215,9 +216,10 @@ func RecordTenantOperation(operation, result string) {
 // UpdateSystemMetrics updates system-level metrics
 func UpdateSystemMetrics() {
 	if metrics != nil {
-		// This would typically collect actual system metrics
-		// For now, we'll use placeholder values
-		metrics.Goroutines.Set(float64(0))  // Would get from runtime.NumGoroutine()
-		metrics.MemoryUsage.Set(float64(0)) // Would get from runtime memory stats
+		metrics.Goroutines.Set(float64(runtime.NumGoroutine()))
+
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		metrics.MemoryUsage.Set(float64(m.Alloc))
 	}
 }

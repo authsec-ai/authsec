@@ -2,6 +2,7 @@ package middlewares
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/authsec-ai/authsec/config"
@@ -41,8 +42,8 @@ func ValidateTenantFromToken() gin.HandlerFunc {
 
 		// Compare tenant IDs (case-insensitive)
 		if !strings.EqualFold(urlTenantID, tokenTenantStr) {
-			// EXCEPTION: Allow admins to access other tenants
-			if isAdminUser(c) {
+			// EXCEPTION: Allow admins to access other tenants only if explicitly enabled
+			if isAdminUser(c) && os.Getenv("ADMIN_CROSS_TENANT_ACCESS") == "true" {
 				// Admin accessing another tenant - log it for audit
 				logCrossTenantAccess(c, tokenTenantStr, urlTenantID)
 				c.Next()

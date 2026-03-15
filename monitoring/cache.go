@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 )
 
@@ -18,11 +18,11 @@ type CacheManager struct {
 
 // CacheItem represents a cached item with metadata
 type CacheItem struct {
-	Key        string      `json:"key"`
-	Value      interface{} `json:"value"`
+	Key        string        `json:"key"`
+	Value      interface{}   `json:"value"`
 	TTL        time.Duration `json:"ttl"`
-	CreatedAt  time.Time   `json:"created_at"`
-	AccessedAt time.Time   `json:"accessed_at"`
+	CreatedAt  time.Time     `json:"created_at"`
+	AccessedAt time.Time     `json:"accessed_at"`
 }
 
 // NewCacheManager creates a new Redis cache manager
@@ -45,6 +45,24 @@ func NewCacheManager(redisURL string) (*CacheManager, error) {
 		logger: GetLogger(),
 		ctx:    ctx,
 	}, nil
+}
+
+// scanKeys uses Redis SCAN (non-blocking) instead of KEYS to find matching keys
+func (cm *CacheManager) scanKeys(pattern string) ([]string, error) {
+	var allKeys []string
+	var cursor uint64
+	for {
+		keys, nextCursor, err := cm.client.Scan(cm.ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		allKeys = append(allKeys, keys...)
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return allKeys, nil
 }
 
 // Set stores a value in cache with TTL
@@ -235,7 +253,7 @@ func (cm *CacheManager) GetAuthToken(token string, dest interface{}) (bool, erro
 // InvalidateTenantCache invalidates all cache entries for a tenant
 func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 	pattern := "tenant:*:" + tenantID
-	keys, err := cm.client.Keys(cm.ctx, pattern).Result()
+	keys, err := cm.scanKeys(pattern)
 	if err != nil {
 		cm.logger.WithFields(logrus.Fields{
 			"tenant_id": tenantID,
@@ -272,7 +290,7 @@ func (cm *CacheManager) InvalidateUserCache(tenantID, userID string) error {
 	}
 
 	for _, pattern := range patterns {
-		keys, err := cm.client.Keys(cm.ctx, pattern).Result()
+		keys, err := cm.scanKeys(pattern)
 		if err != nil {
 			continue // Skip errors for individual patterns
 		}

@@ -24,7 +24,7 @@ import (
 
 func TestMain(m *testing.M) {
 	if err := testutils.MustSetDBEnvFromDockerCompose(); err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Warning: DB env setup failed (tests requiring DB will be skipped): %v\n", err)
 	}
 	os.Exit(m.Run())
 }

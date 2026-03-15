@@ -1,7 +1,9 @@
 package middlewares
 
 import (
+	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -42,9 +44,18 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 		// Check if token is blacklisted
 		blacklisted, err := checker.IsTokenBlacklisted(tokenString)
 		if err != nil {
-			// Log error but don't block request
-			// Token validation will happen in auth middleware
-			c.Next()
+			// Fail-closed by default: if we cannot verify the blacklist, reject the request
+			// Operators can set TOKEN_BLACKLIST_FAIL_OPEN=true to override
+			if os.Getenv("TOKEN_BLACKLIST_FAIL_OPEN") == "true" {
+				log.Printf("WARNING: Token blacklist check failed (fail-open enabled): %v", err)
+				c.Next()
+				return
+			}
+			log.Printf("ERROR: Token blacklist check failed (fail-closed): %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "Service temporarily unavailable",
+			})
+			c.Abort()
 			return
 		}
 		

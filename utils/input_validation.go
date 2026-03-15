@@ -8,6 +8,17 @@ import (
 	"unicode"
 )
 
+// Pre-compiled regex patterns for validation (avoids re-compilation on every call)
+var (
+	usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	uuidRegex     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	domainRegex   = regexp.MustCompile(`^([a-z0-9-]+\.)*[a-z0-9-]+\.[a-z]{2,}$`)
+	phoneRegex    = regexp.MustCompile(`^\+?[1-9]\d{1,14}$`)
+	otpRegex      = regexp.MustCompile(`^\d{6}$`)
+	clientIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	tenantIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,50}$`)
+)
+
 // Input validation utility to prevent injection attacks and enforce data quality
 
 // ValidateEmail validates email format using RFC 5322 standard
@@ -85,8 +96,7 @@ func ValidateUsername(username string) error {
 	}
 	
 	// Username should only contain alphanumeric characters, underscores, hyphens, and dots
-	validUsername := regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-	if !validUsername.MatchString(username) {
+	if !usernameRegex.MatchString(username) {
 		return fmt.Errorf("username can only contain letters, numbers, dots, underscores, and hyphens")
 	}
 	
@@ -99,8 +109,8 @@ func ValidatePassword(password string) error {
 		return fmt.Errorf("password is required")
 	}
 	
-	if len(password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters")
+	if len(password) < 10 {
+		return fmt.Errorf("password must be at least 10 characters")
 	}
 	
 	if len(password) > 128 {
@@ -149,9 +159,7 @@ func ValidateUUID(uuidStr string, fieldName string) error {
 		return fmt.Errorf("%s is required", fieldName)
 	}
 	
-	// UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-	validUUID := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	if !validUUID.MatchString(uuidStr) {
+	if !uuidRegex.MatchString(uuidStr) {
 		return fmt.Errorf("%s must be a valid UUID", fieldName)
 	}
 	
@@ -203,9 +211,7 @@ func ValidateDomain(domain string, fieldName string) error {
 		return fmt.Errorf("%s exceeds maximum length of 253 characters", fieldName)
 	}
 	
-	// Domain regex: only letters, numbers, hyphens, and dots
-	validDomain := regexp.MustCompile(`^([a-z0-9-]+\.)*[a-z0-9-]+\.[a-z]{2,}$`)
-	if !validDomain.MatchString(domain) {
+	if !domainRegex.MatchString(domain) {
 		return fmt.Errorf("%s must be a valid domain name", fieldName)
 	}
 	
@@ -239,9 +245,7 @@ func ValidatePhoneNumber(phone string, fieldName string, required bool) error {
 	phone = strings.ReplaceAll(phone, "(", "")
 	phone = strings.ReplaceAll(phone, ")", "")
 	
-	// E.164 format: +[country code][number], max 15 digits
-	validPhone := regexp.MustCompile(`^\+?[1-9]\d{1,14}$`)
-	if !validPhone.MatchString(phone) {
+	if !phoneRegex.MatchString(phone) {
 		return fmt.Errorf("%s must be a valid phone number in E.164 format (e.g., +12345678900)", fieldName)
 	}
 	
@@ -272,9 +276,7 @@ func ValidateOTPCode(code string) error {
 	
 	code = strings.TrimSpace(code)
 	
-	// OTP codes are typically 6 digits
-	validOTP := regexp.MustCompile(`^\d{6}$`)
-	if !validOTP.MatchString(code) {
+	if !otpRegex.MatchString(code) {
 		return fmt.Errorf("OTP code must be 6 digits")
 	}
 	
@@ -293,9 +295,7 @@ func ValidateClientID(clientID string) error {
 		return fmt.Errorf("client ID must be between 10 and 255 characters")
 	}
 	
-	// Client IDs should only contain safe characters
-	validClientID := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	if !validClientID.MatchString(clientID) {
+	if !clientIDRegex.MatchString(clientID) {
 		return fmt.Errorf("client ID contains invalid characters")
 	}
 	
@@ -311,14 +311,12 @@ func ValidateTenantID(tenantID string) error {
 	tenantID = strings.TrimSpace(tenantID)
 	
 	// Try UUID format first
-	validUUID := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	if validUUID.MatchString(tenantID) {
+	if uuidRegex.MatchString(tenantID) {
 		return nil
 	}
 	
 	// Otherwise allow alphanumeric with hyphens/underscores
-	validTenantID := regexp.MustCompile(`^[a-zA-Z0-9_-]{3,50}$`)
-	if !validTenantID.MatchString(tenantID) {
+	if !tenantIDRegex.MatchString(tenantID) {
 		return fmt.Errorf("tenant ID must be a valid UUID or alphanumeric identifier (3-50 characters)")
 	}
 	

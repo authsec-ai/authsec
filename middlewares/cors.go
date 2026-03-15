@@ -69,7 +69,7 @@ func CORSMiddleware() gin.HandlerFunc {
 		}
 
 		// Check if the origin is allowed
-		allowed := allowAll || len(originSet) == 0 // If no specific origins, implicitly allow all
+		allowed := allowAll // Only explicit "*" allows all origins; empty config blocks all
 		if !allowed {
 			// Check exact match first (origin may include protocol)
 			if _, ok := originSet[origin]; ok {

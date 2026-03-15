@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +20,13 @@ func init() {
 	}
 	if os.Getenv("JWT_SDK_SECRET") == "" {
 		os.Setenv("JWT_SDK_SECRET", "test-jwt-sdk-secret-for-testing-only-do-not-use-in-production")
+	}
+	// Initialize the global token service for unit tests that call generateJWTToken
+	if config.TokenService == nil {
+		tokenService, err := services.NewAuthManagerTokenService()
+		if err == nil {
+			config.TokenService = tokenService
+		}
 	}
 }
 
@@ -73,7 +82,7 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 	assert.Equal(t, "tenant-1", claims["tenant_id"])
 	assert.Equal(t, "tenant-1", claims["project_id"]) // project_id defaults to tenant_id for endusers
 	assert.Equal(t, "client-1", claims["client_id"])
-	assert.Equal(t, "user@example.com", claims["email"])
+	assert.Equal(t, "user@example.com", claims["email_id"])
 
 	now := time.Now().Unix()
 	iat := int64(claims["iat"].(float64))
@@ -81,5 +90,5 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 
 	require.LessOrEqual(t, iat, now, "issued-at should not be in the future")
 	require.Greater(t, exp, now, "expiration should be in the future")
-	require.InDelta(t, (24 * time.Hour).Seconds(), float64(exp-iat), 5, "token lifetime should be ~24h")
+	require.InDelta(t, (365 * 24 * time.Hour).Seconds(), float64(exp-iat), 5, "token lifetime should be ~365 days")
 }

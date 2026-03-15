@@ -22,8 +22,6 @@ ENV GONOPROXY=github.com/authsec-ai/*
 
 # ✅ Configure Git & netrc to use PAT for private repos
 RUN git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-    
- 
 
 # ✅ Copy source after token is configured
 COPY . ./
@@ -40,8 +38,8 @@ RUN go build -o /main ./cmd/main.go
 # ---------- Final Stage ----------
 FROM alpine:latest
 
-# Install runtime dependencies including PostgreSQL client for psql command
-RUN apk add --no-cache ca-certificates curl postgresql-client && update-ca-certificates
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates curl && update-ca-certificates
 
 # 🔐 Create non-root user with UID 1000
 RUN addgroup -g 1000 appgroup \
@@ -62,4 +60,8 @@ RUN chown -R 1000:1000 $APPHOME \
 USER 1000
 
 EXPOSE 7468
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:7468/authsec/uflow/health || exit 1
+
 CMD ["./main"]

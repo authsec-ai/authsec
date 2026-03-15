@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/authsec-ai/authsec/monitoring"
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 // AuthManagerTokenService interface for token generation using auth-manager patterns
@@ -34,6 +36,7 @@ type Config struct {
 	DBHost             string
 	DBPort             string
 	DBSchema           string
+	DBSSLMode          string
 	DatabaseURL        string
 	JWTDefSecret       string
 	JWTSdkSecret       string
@@ -139,16 +142,17 @@ func LoadConfig() *Config {
 
 	// Load individual database variables
 	dbName := getEnv("DB_NAME", "kloudone_db")
-	dbUser := getEnv("DB_USER", "asiffinal")
-	dbPassword := getEnv("DB_PASSWORD", "test1")
+	dbUser := getEnv("DB_USER", "")
+	dbPassword := getEnv("DB_PASSWORD", "")
 	dbHost := getEnv("DB_HOST", "postgres")
 	dbPort := getEnv("DB_PORT", "5432")
 	dbSchema := getEnv("DB_SCHEMA", "public")
+	dbSSLMode := getEnv("DB_SSL_MODE", "disable")
 
 	// Construct DatabaseURL
 	databaseURL := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable search_path=%s",
-		dbHost, dbUser, dbPassword, dbName, dbPort, dbSchema,
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s search_path=%s",
+		dbHost, dbUser, dbPassword, dbName, dbPort, dbSSLMode, dbSchema,
 	)
 
 	err := os.Setenv("DATABASE_URL", databaseURL)
@@ -158,8 +162,8 @@ func LoadConfig() *Config {
 
 	// Load other configuration variables
 	port := getEnv("PORT", "7468")
-	jwtSdkSecret := getEnv("JWT_SDK_SECRET", "authsecai")
-	jwtDefSecret := getEnv("JWT_DEF_SECRET", "authsecai")
+	jwtSdkSecret := getEnv("JWT_SDK_SECRET", "")
+	jwtDefSecret := getEnv("JWT_DEF_SECRET", "")
 	jwtSecret := getEnv("JWT_SECRET", "")
 	oocManagerURL := getEnv("OOC_MANAGER_URL", "http://localhost:7467")
 
@@ -275,6 +279,7 @@ func LoadConfig() *Config {
 		DBHost:                  dbHost,
 		DBPort:                  dbPort,
 		DBSchema:                dbSchema,
+		DBSSLMode:               dbSSLMode,
 		DatabaseURL:             databaseURL,
 		JWTDefSecret:            jwtDefSecret,
 		JWTSdkSecret:            jwtSdkSecret,
@@ -337,6 +342,23 @@ func LoadConfig() *Config {
 		SDKRedirectSource:             sdkRedirectSource,
 	}
 
+	// Validate required secrets are set — fail fast if missing (warn-only in test mode)
+	requiredSecrets := map[string]string{
+		"DB_USER":        dbUser,
+		"DB_PASSWORD":    dbPassword,
+		"JWT_SDK_SECRET": jwtSdkSecret,
+		"JWT_DEF_SECRET": jwtDefSecret,
+	}
+	for name, val := range requiredSecrets {
+		if val == "" {
+			if testing.Testing() {
+				log.Printf("WARNING: Required config %s is not set (test mode, continuing)", name)
+			} else {
+				log.Fatalf("CRITICAL: Required config %s is not set. Cannot start.", name)
+			}
+		}
+	}
+
 	return AppConfig
 }
 
@@ -348,12 +370,33 @@ func GetConfig() *Config {
 	return AppConfig
 }
 
+// sensitiveKeywords lists substrings that indicate a key holds a secret value.
+var sensitiveKeywords = []string{"SECRET", "PASSWORD", "TOKEN", "KEY", "CREDENTIAL"}
+
+func isSensitiveKey(key string) bool {
+	upper := strings.ToUpper(key)
+	for _, s := range sensitiveKeywords {
+		if strings.Contains(upper, s) {
+			return true
+		}
+	}
+	return false
+}
+
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
-		log.Printf("Loaded %s: %s", key, value)
+		if isSensitiveKey(key) {
+			log.Printf("Loaded %s: ***", key)
+		} else {
+			log.Printf("Loaded %s: %s", key, value)
+		}
 		return value
 	}
-	log.Printf("Using fallback for %s: %s", key, fallback)
+	if isSensitiveKey(key) {
+		log.Printf("Using fallback for %s: ***", key)
+	} else {
+		log.Printf("Using fallback for %s: %s", key, fallback)
+	}
 	return fallback
 }
 

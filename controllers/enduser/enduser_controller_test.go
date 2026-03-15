@@ -1014,9 +1014,18 @@ func TestEndUserController_generateAndSendCustomPasswordResetOTP(t *testing.T) {
 func TestAuthMiddleware_WithValidToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
+	// Use AuthMiddlewareWithConfig so the signing secret matches generateTestJWT()
+	testSecret := "7f9b2a3c8e6d4f1b9a0c3e7d2f5b8a1c9e3d6f2a4b7c8e0d1f9a2b3c"
+	authConfig := &middlewares.AuthConfig{
+		JWTSecret:        testSecret,
+		JWTDefaultSecret: testSecret,
+		ExpectedIssuer:   "authsec-ai/auth-manager",
+		ExpectedAudience: "authsec-api",
+	}
+
 	// Create a test route that requires authentication
 	r := gin.New()
-	r.Use(middlewares.AuthMiddleware())
+	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
 	r.GET("/protected", func(c *gin.Context) {
 		// Check if user info is properly extracted
 		tenantID, exists := c.Get("tenant_id")

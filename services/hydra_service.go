@@ -36,7 +36,11 @@ func hydraAdminURL() string {
 }
 
 func hydraAdminGetClient(clientID string) (*hydraClient, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID))
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := CircuitDoHydra(req)
 	if err != nil {
 		return nil, fmt.Errorf("hydra get client: %w", err)
 	}
@@ -56,10 +60,12 @@ func hydraAdminCreateClient(c hydraClient) error {
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Post(
-		fmt.Sprintf("%s/admin/clients", hydraAdminURL()),
-		"application/json", bytes.NewBuffer(data),
-	)
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := CircuitDoHydra(req)
 	if err != nil {
 		return fmt.Errorf("hydra create client: %w", err)
 	}
@@ -81,7 +87,7 @@ func hydraAdminUpdateClient(clientID string, c hydraClient) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := CircuitDoHydra(req)
 	if err != nil {
 		return fmt.Errorf("hydra update client: %w", err)
 	}
@@ -98,7 +104,7 @@ func hydraAdminDeleteClient(clientID string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := CircuitDoHydra(req)
 	if err != nil {
 		return fmt.Errorf("hydra delete client: %w", err)
 	}
@@ -111,7 +117,11 @@ func hydraAdminDeleteClient(clientID string) error {
 }
 
 func hydraAdminGetAllClients() ([]hydraClient, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/admin/clients", hydraAdminURL()))
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := CircuitDoHydra(req)
 	if err != nil {
 		return nil, fmt.Errorf("hydra get all clients: %w", err)
 	}
@@ -156,11 +166,11 @@ type ProviderConfig struct {
 
 // AddProviderRequest represents the request structure for adding a provider
 type AddProviderRequest struct {
-	TenantID     string         `json:"tenant_id"`
-	ClientID     string         `json:"client_id"`
-	ReactAppURL  string         `json:"react_app_url"`
-	Provider     ProviderConfig `json:"provider"`
-	CreatedBy    string         `json:"created_by"`
+	TenantID    string         `json:"tenant_id"`
+	ClientID    string         `json:"client_id"`
+	ReactAppURL string         `json:"react_app_url"`
+	Provider    ProviderConfig `json:"provider"`
+	CreatedBy   string         `json:"created_by"`
 }
 
 // generateServiceToken generates a JWT token for service-to-service authentication
@@ -226,9 +236,9 @@ func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenan
 	thc := &oocmgrdto.TenantHydraClient{
 		TenantID: tenantID, TenantName: clientName,
 		HydraClientID: mainClientID, HydraClientSecret: clientSecret,
-		ClientName: fmt.Sprintf("%s Main OAuth Client", clientName),
+		ClientName:   fmt.Sprintf("%s Main OAuth Client", clientName),
 		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
-		Scopes: scopes, ClientType: "main", IsActive: true,
+		Scopes:       scopes, ClientType: "main", IsActive: true,
 		CreatedBy: "system", UpdatedBy: "system",
 	}
 	if err := oocmgrrepo.NewTenantHydraClientRepository().Create(thc); err != nil {

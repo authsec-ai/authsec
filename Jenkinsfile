@@ -76,7 +76,7 @@ pipeline {
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:development"
                         env.DOCKER_IMAGE_PUBLIC = "" // Not used in dev
 
-                    } else if (env.BRANCH_NAME == 'staging' || env.BRANCH_NAME == 'staging') {
+                    } else if (env.BRANCH_NAME == 'staging' || env.BRANCH_NAME == 'develop') {
                         echo "Configuring for STAGING environment..."
                         env.IS_PROD_BRANCH = 'false'
                         env.AKS_ENV = 'authsec'
@@ -113,6 +113,42 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+            }
+        }
+
+        stage('Lint & Vet') {
+            steps {
+                sh '''
+                    export PATH=$PATH:/usr/local/go/bin
+                    go vet ./...
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    export PATH=$PATH:/usr/local/go/bin
+                    go test -count=1 -timeout 5m -coverprofile=coverage.out \
+                      $(go list ./... | grep -v /tests/integration) \
+                      2>&1 | tee test-output.txt
+
+                    # Extract total coverage percentage
+                    COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+                    echo "Total test coverage: ${COVERAGE}%"
+
+                    # Fail if coverage is below threshold
+                    THRESHOLD=50
+                    if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l)" -eq 1 ]; then
+                        echo "FAIL: Test coverage ${COVERAGE}% is below minimum ${THRESHOLD}%"
+                        exit 1
+                    fi
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'test-output.txt,coverage.out', fingerprint: true, allowEmptyArchive: true
+                }
             }
         }
         
@@ -275,12 +311,11 @@ pipeline {
             }
         }
 
-        stage('Delete Existing Pods') {
+        stage('Rolling Restart') {
             steps {
-                // Dynamically deletes pods in the correct namespace (Dev or Prod)
-                // Uses dynamic label to target specific service pods
-                echo "Restarting pods with label 'app=${APP_LABEL}' in ${K8S_NAMESPACE}..."
-                sh "kubectl delete pods -l app=${APP_LABEL} -n ${K8S_NAMESPACE} --ignore-not-found=true"
+                echo "Rolling restart of deployment '${APP_LABEL}' in ${K8S_NAMESPACE}..."
+                sh "kubectl rollout restart deployment/${APP_LABEL} -n ${K8S_NAMESPACE}"
+                sh "kubectl rollout status deployment/${APP_LABEL} -n ${K8S_NAMESPACE} --timeout=300s"
             }
         }
     }   

@@ -1,5 +1,9 @@
 # AuthSec – Unified Authentication & Identity Monolith
 
+![Go Version](https://img.shields.io/badge/Go-1.25-blue)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
+![Build](https://img.shields.io/badge/CI-Jenkins-orange)
+
 AuthSec is a single Go service that consolidates **eight formerly independent microservices** into one deployable binary. It handles the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, external-service credentials, and SPIFFE/SPIRE workload identity.
 
 ## Table of Contents

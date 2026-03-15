@@ -16,30 +16,40 @@ import (
 var seededTenantID uuid.UUID
 
 func TestMain(m *testing.M) {
-	if os.Getenv("RUN_INTEGRATION") != "1" {
-		log.Println("Skipping admin integration tests (set RUN_INTEGRATION=1 to enable)")
-		os.Exit(0)
-	}
+	if os.Getenv("RUN_INTEGRATION") == "1" {
+		dbName, cleanup, err := createAdminTempDB()
+		if err != nil {
+			log.Fatalf("Failed to create temp test database: %v", err)
+		}
+		defer cleanup()
 
-	dbName, cleanup, err := createAdminTempDB()
-	if err != nil {
-		log.Fatalf("Failed to create temp test database: %v", err)
-	}
-	defer cleanup()
+		// Set all required DB env vars for config.LoadConfig()
+		os.Setenv("DB_NAME", dbName)
+		if os.Getenv("DB_HOST") == "" {
+			os.Setenv("DB_HOST", "localhost")
+		}
+		if os.Getenv("DB_PORT") == "" {
+			os.Setenv("DB_PORT", "5432")
+		}
+		if os.Getenv("DB_USER") == "" {
+			os.Setenv("DB_USER", "postgres")
+		}
+		if os.Getenv("DB_PASSWORD") == "" {
+			os.Setenv("DB_PASSWORD", "postgres")
+		}
+		os.Unsetenv("SKIP_DB_INIT")
+		os.Unsetenv("SKIP_MIGRATIONS")
+		os.Unsetenv("SKIP_CONTROLLER_DB_SETUP")
+		os.Setenv("REQUIRE_SERVER_AUTH", "false")
+		os.Setenv("JWT_DEF_SECRET", "test-jwt-secret-key-for-testing-purposes-only")
+		os.Setenv("JWT_SDK_SECRET", "test-jwt-secret-key-for-testing-purposes-only")
 
-	os.Setenv("DB_NAME", dbName)
-	os.Unsetenv("SKIP_DB_INIT")
-	os.Unsetenv("SKIP_MIGRATIONS")
-	os.Unsetenv("SKIP_CONTROLLER_DB_SETUP")
-	os.Setenv("REQUIRE_SERVER_AUTH", "false")
-	os.Setenv("JWT_DEF_SECRET", "test-jwt-secret-key-for-testing-purposes-only")
-	os.Setenv("JWT_SDK_SECRET", "test-jwt-secret-key-for-testing-purposes-only")
+		cfg := config.LoadConfig()
+		config.InitDatabaseWithoutGORM(cfg)
 
-	cfg := config.LoadConfig()
-	config.InitDatabaseWithoutGORM(cfg)
-
-	if err := seedAdminTestData(dbName, cfg); err != nil {
-		log.Fatalf("Failed to seed test admin: %v", err)
+		if err := seedAdminTestData(dbName, cfg); err != nil {
+			log.Fatalf("Failed to seed test admin: %v", err)
+		}
 	}
 
 	code := m.Run()
@@ -102,6 +112,10 @@ func seedAdminTestData(dbName string, cfg *config.Config) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (tenant_id uuid PRIMARY KEY, email text, tenant_domain text, tenant_db text);`); err != nil {
 		return err
 	}
+
+	// Create users table (needed for group operations that look up users)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, email text, name text, provider text, password_hash text, client_id uuid, tenant_id uuid, tenant_domain text, active boolean DEFAULT true, temporary_password boolean DEFAULT false, temporary_password_expires_at timestamptz, failed_login_attempts integer DEFAULT 0, account_locked_at timestamptz, password_reset_required boolean DEFAULT false, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
+
 	_, _ = db.Exec(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_db text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id uuid;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id uuid;`)
@@ -114,12 +128,21 @@ func seedAdminTestData(dbName string, cfg *config.Config) error {
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS roles (id uuid PRIMARY KEY, tenant_id uuid, name text NOT NULL, description text, created_at timestamptz default now(), updated_at timestamptz default now(), UNIQUE(tenant_id,name));`)
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, tenant_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
 
+	// Create groups table (for group controller operations)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS groups (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, tenant_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
+
+	// Create user_groups table (for group-user membership)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS user_groups (user_id uuid NOT NULL, group_id uuid NOT NULL, tenant_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, group_id));`)
+
+	// Create projects table (for project controller operations)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS projects (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, user_id uuid, tenant_id uuid, active boolean DEFAULT true, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), deleted_at timestamptz);`)
+
 	_, _ = db.Exec(`INSERT INTO tenants (tenant_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, tenantID, "admin@test.local", "test.local", dbName)
 	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, tenant_id, tenant_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
 		userID, "admin@test.local", clientID, tenantID, "test.local")
 
 	var roleID uuid.UUID
-	if err := db.QueryRow(`INSERT INTO roles (id, tenant_id, name, description) VALUES ($1, $2, 'admin', 'admin role') ON CONFLICT ON CONSTRAINT roles_tenant_name_key DO UPDATE SET name=EXCLUDED.name RETURNING id`,
+	if err := db.QueryRow(`INSERT INTO roles (id, tenant_id, name, description) VALUES ($1, $2, 'admin', 'admin role') ON CONFLICT (tenant_id, name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
 		uuid.New(), tenantID).Scan(&roleID); err != nil {
 		return err
 	}
