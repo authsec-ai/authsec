@@ -26,8 +26,9 @@ var GlobalConnectionManager *ConnectionManager
 // InitializeDatabase initializes the master database connection without GORM
 func InitializeDatabase(dbHost, dbUser, dbPassword, dbName, dbPort string) (*DBConnection, error) {
 	// First, try to connect to postgres database to create the target database if needed
-	adminDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=postgres port=%s sslmode=disable TimeZone=UTC",
-		dbHost, dbUser, dbPassword, dbPort)
+	sslMode := getEnvOrDefault("DB_SSL_MODE", "disable")
+	adminDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=postgres port=%s sslmode=%s TimeZone=UTC",
+		dbHost, dbUser, dbPassword, dbPort, sslMode)
 
 	adminDB, err := sql.Open("postgres", adminDSN)
 	if err != nil {
@@ -50,8 +51,8 @@ func InitializeDatabase(dbHost, dbUser, dbPassword, dbName, dbPort string) (*DBC
 	}
 
 	// Now connect to the target database
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC search_path=public",
-		dbHost, dbUser, dbPassword, dbName, dbPort)
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC search_path=public",
+		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -144,9 +145,10 @@ func createTenantConnection(dbName string) (*DBConnection, error) {
 	dbUser := getEnvOrDefault("DB_USER", "asiffinal")
 	dbPassword := getEnvOrDefault("DB_PASSWORD", "test1")
 	dbPort := getEnvOrDefault("DB_PORT", "5432")
+	sslMode := getEnvOrDefault("DB_SSL_MODE", "disable")
 
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC search_path=public",
-		dbHost, dbUser, dbPassword, dbName, dbPort)
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC search_path=public",
+		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {

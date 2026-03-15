@@ -3,6 +3,7 @@ package middlewares
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -39,8 +40,8 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		}
 		c.Header("Content-Security-Policy", csp)
 
-		// HTTP Strict Transport Security (only if HTTPS)
-		if c.Request.TLS != nil {
+		// HTTP Strict Transport Security (HTTPS or behind reverse proxy, or forced in production)
+		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" || os.Getenv("FORCE_HSTS") == "true" || os.Getenv("ENVIRONMENT") == "production" {
 			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
 		}
 

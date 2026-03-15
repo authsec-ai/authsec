@@ -37,7 +37,7 @@ func TestCustomDomainRPIDPriority(t *testing.T) {
 			name:              "Standard dev domain should use dev.authsec.dev as RP ID",
 			origin:            "https://dev.authsec.dev",
 			setupCustomDomain: false,
-			expectedRPID:      "app.authsec.dev", // Falls back to app.authsec.dev
+			expectedRPID:      "dev.authsec.dev", // RPID matches origin host dynamically
 			shouldFail:        false,
 		},
 		{

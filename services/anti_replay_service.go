@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/context"
 )
 
@@ -53,7 +53,7 @@ func (ars *AntiReplayService) ValidateChallenge(challengeID string) error {
 	}
 
 	key := fmt.Sprintf("auth:challenge:%s", challengeID)
-	
+
 	// Check if challenge exists
 	status, err := ars.redisClient.Get(ars.ctx, key).Result()
 	if err == redis.Nil {
@@ -84,7 +84,7 @@ func (ars *AntiReplayService) ValidateNonce(nonce string) error {
 	}
 
 	key := fmt.Sprintf("auth:nonce:%s", nonce)
-	
+
 	// Check if nonce exists (has been used)
 	exists, err := ars.redisClient.Exists(ars.ctx, key).Result()
 	if err != nil {

@@ -31,6 +31,7 @@ package routes
 import (
 	"log"
 	"net/http"
+	"time"
 
 	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
@@ -185,9 +186,6 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		uflow := authsec.Group("/uflow")
 
-		// Debug endpoint to discover JWT secret (development only)
-		uflow.POST("/debug/jwt-secret", middlewares.DebugJWTSecret())
-
 		// Device activation page (public)
 		uflow.GET("/activate", deviceAuthController.ShowActivationPage)
 
@@ -295,8 +293,9 @@ func SetupRoutes(
 				notify.POST("/new-user-registration", endUserController.NotifyOwnerNewRegistration)
 			}
 
-			// Admin authentication
+			// Admin authentication (strict rate limit: 5 req/min)
 			adminAuth := auth.Group("/admin")
+			adminAuth.Use(middlewares.StrictAuthRateLimitMiddleware(5, time.Minute))
 			{
 				adminAuth.GET("/challenge", adminAuthController.GetAuthChallenge)
 				adminAuth.POST("/login/precheck", adminAuthController.AdminLoginPrecheck)
@@ -310,8 +309,9 @@ func SetupRoutes(
 				adminAuth.POST("/forgot-password/reset", adminAuthController.AdminResetPassword)
 			}
 
-			// End-user authentication
+			// End-user authentication (strict rate limit: 10 req/min)
 			enduserAuth := auth.Group("/enduser")
+			enduserAuth.Use(middlewares.StrictAuthRateLimitMiddleware(10, time.Minute))
 			{
 				enduserAuth.GET("/challenge", endUserAuthController.GetAuthChallenge)
 				enduserAuth.POST("/initiate-registration", endUserAuthController.InitiateRegistration)
@@ -1006,7 +1006,7 @@ func registerOocmgrRoutes(r gin.IRouter) {
 		oidc.POST("/templates", ac.GetProviderTemplates)
 		oidc.POST("/validate", ac.ValidateOIDCConfig)
 		oidc.GET("/show-auth-providers", ac.ShowAuthProviders)
-	oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
+		oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
 		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
 		oidc.POST("/edit-client-auth-provider", ac.EditAuthProvider)
 	}

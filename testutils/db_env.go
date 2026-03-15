@@ -100,7 +100,25 @@ func findComposePath() (string, error) {
 func setDBEnvFromDockerCompose() error {
 	composePath, err := findComposePath()
 	if err != nil {
-		return fmt.Errorf("locate docker-compose.yml: %w", err)
+		// Fallback: if DB env vars are already set, use them directly
+		if os.Getenv("DB_HOST") != "" && os.Getenv("DB_USER") != "" {
+			return nil
+		}
+		// Set sensible defaults for local testing
+		defaults := map[string]string{
+			"DB_HOST":     "localhost",
+			"DB_PORT":     "5432",
+			"DB_NAME":     "authsec",
+			"DB_USER":     "postgres",
+			"DB_PASSWORD": "postgres",
+			"DB_SCHEMA":   "public",
+		}
+		for k, v := range defaults {
+			if os.Getenv(k) == "" {
+				os.Setenv(k, v)
+			}
+		}
+		return nil
 	}
 
 	data, err := os.ReadFile(composePath)

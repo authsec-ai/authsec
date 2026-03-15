@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-
 	"github.com/authsec-ai/auth-manager/pkg/authz"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
@@ -71,7 +70,8 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 
 		claims, err := validateJWTToken(tokenString, cfg)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token", "details": err.Error()})
+			fmt.Printf("WARN: JWT validation failed: %v\n", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
 			c.Abort()
 			return
 		}
@@ -83,7 +83,8 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 
 		info, err := extractUserInfo(c)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to extract user info", "details": err.Error()})
+			fmt.Printf("WARN: Failed to extract user info from token: %v\n", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
 			c.Abort()
 			return
 		}
@@ -365,15 +366,15 @@ func validateClaims(claims jwt.MapClaims, cfg *AuthConfig) error {
 			return fmt.Errorf("invalid issuer: %s", iss)
 		}
 	}
-	// If no issuer claim, allow it (some legacy tokens may not have it)
+	// If no issuer claim, reject the token
+	if _, ok := claims["iss"]; !ok {
+		return fmt.Errorf("token missing required issuer (iss) claim")
+	}
 
-	// Validate audience - be lenient to support cross-service tokens
+	// Validate audience (always enforced; skip only if no audience is configured)
 	if audClaim, exists := claims["aud"]; exists {
-		if !validateAudience(audClaim, cfg.ExpectedAudience) {
-			// Log but don't reject - some services may use different audiences
-			if os.Getenv("GIN_MODE") != "release" {
-				fmt.Printf("DEBUG: Token audience mismatch, but accepting: %v\n", audClaim)
-			}
+		if cfg.ExpectedAudience != "" && !validateAudience(audClaim, cfg.ExpectedAudience) {
+			return fmt.Errorf("token audience mismatch")
 		}
 	}
 
@@ -968,10 +969,10 @@ func hasPerm(claims jwt.MapClaims, r, a string) bool {
 					switch acts := m["a"].(type) {
 					case []any:
 						for _, v := range acts {
-								s, _ := v.(string)
-								if s == a {
-									return true
-								}
+							s, _ := v.(string)
+							if s == a {
+								return true
+							}
 						}
 					case []string:
 						for _, act := range acts {
@@ -988,11 +989,11 @@ func hasPerm(claims jwt.MapClaims, r, a string) bool {
 			if mr, _ := m["r"].(string); mr == r {
 				if acts, ok := m["a"].([]any); ok {
 					for _, v := range acts {
-							s, _ := v.(string)
-							if s == a {
-								return true
-							}
+						s, _ := v.(string)
+						if s == a {
+							return true
 						}
+					}
 				}
 			}
 		}
@@ -1127,7 +1128,8 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		// Validate the token
 		claims, err := validateJWTToken(tokenString, cfg)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token", "details": err.Error()})
+			fmt.Printf("Token validation error: %v\n", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
 			c.Abort()
 			return
 		}

@@ -11,10 +11,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
@@ -28,7 +32,6 @@ import (
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
-	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -171,8 +174,8 @@ func main() {
 	// Metrics (must be first)
 	r.Use(monitoring.Middleware())
 
-	// CORS (shared config that handles both user-flow and webauthn origins)
-	r.Use(setupCORS())
+	// CORS (validates against CORS_ALLOW_ORIGIN config)
+	r.Use(middlewares.CORSMiddleware())
 
 	// Core middleware
 	r.Use(middlewares.RequestIDMiddleware())
@@ -239,9 +242,31 @@ func main() {
 		WithField("webauthn_rp_id", rpID).
 		Info("Starting AuthSec monolith")
 
-	if err := r.Run(":" + port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
 	}
+
+	// Start server in goroutine
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal for graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down server (30s grace period)...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced shutdown: %v", err)
+	}
+	log.Println("Server exited cleanly")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,40 +290,6 @@ func validateWebAuthnEnvVars() error {
 	return nil
 }
 
-// setupCORS returns a CORS handler that allows all origins.
-// AllowOriginFunc always returns true (echoes the specific origin back) so that
-// AllowCredentials: true works correctly — browsers reject wildcard "*" with credentials.
-func setupCORS() gin.HandlerFunc {
-	corsConfig := cors.DefaultConfig()
-
-	corsConfig.AllowOriginFunc = func(origin string) bool {
-		return true
-	}
-
-	if methods := getEnv("CORS_ALLOWED_METHODS", ""); methods != "" {
-		corsConfig.AllowMethods = splitAndTrim(methods)
-	} else {
-		corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-	}
-
-	if headers := getEnv("CORS_ALLOWED_HEADERS", ""); headers != "" {
-		corsConfig.AllowHeaders = splitAndTrim(headers)
-	} else {
-		corsConfig.AllowHeaders = []string{
-			"Origin", "Content-Length", "Content-Type", "Authorization",
-			"X-Requested-With", "Accept", "Accept-Encoding", "Accept-Language",
-			"X-Tenant-ID", "X-CSRF-Token", "tenant_id",
-		}
-	}
-
-	corsConfig.ExposeHeaders = []string{"X-Request-ID", "Content-Length"}
-	corsConfig.AllowCredentials = true
-	corsConfig.MaxAge = 12 * 3600
-
-	return cors.New(corsConfig)
-}
-
-
 func splitAndTrim(csv string) []string {
 	values := strings.Split(csv, ",")
 	result := make([]string, 0, len(values))
@@ -316,4 +307,3 @@ func splitAndTrim(csv string) []string {
 	}
 	return result
 }
-
