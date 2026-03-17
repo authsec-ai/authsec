@@ -1,15 +1,14 @@
-# AuthSec – Unified Authentication & Identity Monolith
+# AuthSec – Identity & Access Management Platform
 
 ![Go Version](https://img.shields.io/badge/Go-1.25-blue)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
-![Build](https://img.shields.io/badge/CI-Jenkins-orange)
 
-AuthSec is a single Go service that consolidates **eight formerly independent microservices** into one deployable binary. It handles the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, external-service credentials, and SPIFFE/SPIRE workload identity.
+AuthSec is a unified Go service for the complete identity lifecycle: authentication, MFA, OIDC federation, RBAC, SCIM provisioning, client management, external-service credentials, and SPIFFE/SPIRE workload identity — all served from a single binary.
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
-- [Merged Services](#merged-services)
+- [Modules](#modules)
 - [Quick Start](#quick-start)
 - [Environment Variables](#environment-variables)
 - [API Route Map](#api-route-map)
@@ -29,27 +28,27 @@ AuthSec is a single Go service that consolidates **eight formerly independent mi
 - [Internal Package Layout](#internal-package-layout)
 - [Background Workers](#background-workers)
 - [Building & Running](#building--running)
-- [Migration Notes (from microservices)](#migration-notes-from-microservices)
+- [Contributing](#contributing)
 
 ---
 
 ## Architecture Overview
 
-```
+```text
 ┌────────────────────────────────────────────────────────────────────┐
 │                          authsec  (port 7468)                      │
 │                                                                    │
-│  /authsec/uflow/*        – user-flow (auth, RBAC, OIDC, SCIM, …)  │
-│  /authsec/webauthn/*     – webauthn-service (passkeys, TOTP, SMS) │
-│  /authsec/clientms/*     – clients-microservice                   │
-│  /authsec/hmgr/*         – hydra-service                          │
-│  /authsec/oocmgr/*       – oath_oidc_configuration_manager        │
-│  /authsec/authmgr/*      – auth-manager (RBAC checks, group mgmt) │
-│  /authsec/exsvc/*        – external-service / mcp-service         │
-│  /authsec/spire/*        – spire-headless (SPIFFE workload id)    │
-│  /authsec/migration/*    – authsec-migration (DB migration mgmt)  │
+│  /authsec/uflow/*        – Auth, RBAC, OIDC federation, SCIM      │
+│  /authsec/webauthn/*     – Passkeys, TOTP, SMS MFA                │
+│  /authsec/clientms/*     – Client lifecycle management            │
+│  /authsec/hmgr/*         – Ory Hydra login/consent, SAML SSO      │
+│  /authsec/oocmgr/*       – OIDC provider config & Hydra sync      │
+│  /authsec/authmgr/*      – JWT verification, RBAC checks          │
+│  /authsec/exsvc/*        – External service registry              │
+│  /authsec/spire/*        – SPIFFE workload identity               │
+│  /authsec/migration/*    – Database migration management          │
 │                                                                    │
-│  /.well-known/*          – OIDC discovery (must stay at root)     │
+│  /.well-known/*          – OIDC discovery (RFC 8414 root path)    │
 │  /metrics                – Prometheus metrics                     │
 └────────────────────────────────────────────────────────────────────┘
          │
@@ -58,23 +57,23 @@ AuthSec is a single Go service that consolidates **eight formerly independent mi
          └── Redis (optional – permission cache, session cache)
 ```
 
-All HTTP routes are served from a single `gin.Engine`. Each merged service's routes live under its own sub-prefix so paths are globally unique and backwards-compatible aliases can be added trivially.
+All HTTP routes are served from a single `gin.Engine`. Each module's routes live under its own sub-prefix so paths are globally unique.
 
 ---
 
-## Merged Services
+## Modules
 
-| Original Service | Sub-prefix | Port (standalone) | Description |
-|---|---|---|---|
-| `user-flow` | `/authsec/uflow` | 7468 | Admin/enduser login, RBAC, OIDC federation, SCIM, TOTP, CIBA, voice auth |
-| `webauthn-service` | `/authsec/webauthn` | 8080 | WebAuthn/FIDO2 passkeys, TOTP setup, SMS MFA |
-| `clients-microservice` | `/authsec/clientms` | — | Hydra client lifecycle management |
-| `hydra-service` | `/authsec/hmgr` | — | Ory Hydra login/consent, SAML SSO, token exchange |
-| `oath_oidc_configuration_manager` | `/authsec/oocmgr` | 7467 | OIDC provider config, Hydra client sync, SAML providers |
-| `auth-manager` | `/authsec/authmgr` | — | JWT verify/issue, RBAC permission checks, group management |
-| `external-service` (mcp-service) | `/authsec/exsvc` | — | External service registry with Vault-backed credentials |
-| `spire-headless` | `/authsec/spire` | — | SPIFFE/SPIRE workload identity, OIDC token exchange, cloud federation (AWS/Azure/GCP), and RBAC/ABAC policy engine |
-| `authsec-migration` | `/authsec/migration` | — | Database migration management (master DB + per-tenant DB) |
+| Module | Sub-prefix | Description |
+| --- | --- | --- |
+| Core Auth & User Flow | `/authsec/uflow` | Admin/enduser login, RBAC, OIDC federation, SCIM, TOTP, CIBA, voice auth |
+| WebAuthn / Passkeys | `/authsec/webauthn` | WebAuthn/FIDO2 passkeys, TOTP setup, SMS MFA |
+| Client Management | `/authsec/clientms` | Hydra client lifecycle management |
+| Hydra Manager | `/authsec/hmgr` | Ory Hydra login/consent, SAML SSO, token exchange |
+| OIDC Config Manager | `/authsec/oocmgr` | OIDC provider config, Hydra client sync, SAML providers |
+| Auth Manager | `/authsec/authmgr` | JWT verify/issue, RBAC permission checks, group management |
+| External Services | `/authsec/exsvc` | External service registry with Vault-backed credentials |
+| SPIRE Headless | `/authsec/spire` | SPIFFE/SPIRE workload identity, OIDC token exchange, cloud federation (AWS/Azure/GCP), RBAC/ABAC policy engine |
+| Migration Management | `/authsec/migration` | Database migration management (master DB + per-tenant DB) |
 
 ---
 
@@ -115,12 +114,12 @@ The server starts on port **7468** by default.
 ### Required
 
 | Variable | Description | Example |
-|---|---|---|
-| `DB_NAME` | PostgreSQL database name | `kloudone_db` |
+| --- | --- | --- |
+| `DB_NAME` | PostgreSQL database name | `authsec_db` |
 | `DB_USER` | Database username | `authsec` |
-| `DB_PASSWORD` | Database password | `authsec@kloudone` |
+| `DB_PASSWORD` | Database password | `changeme` |
 | `DB_HOST` | Database host | `localhost` |
-| `DB_PORT` | Database port | `5433` |
+| `DB_PORT` | Database port | `5432` |
 | `WEBAUTHN_RP_NAME` | WebAuthn relying party display name | `AuthSec` |
 | `WEBAUTHN_RP_ID` | WebAuthn relying party ID (must match origin's hostname) | `app.authsec.dev` |
 | `WEBAUTHN_ORIGIN` | Allowed WebAuthn origin | `https://app.authsec.dev` |
@@ -128,16 +127,16 @@ The server starts on port **7468** by default.
 ### Optional – Core Service
 
 | Variable | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `PORT` | `7468` | HTTP listen port |
 | `GIN_MODE` | `debug` | Gin run mode (`debug` / `release` / `test`) |
 | `ENVIRONMENT` | `development` | Runtime label used by tenant domain checks (`development` / `production`) |
 | `DB_SCHEMA` | `public` | PostgreSQL schema |
-| `JWT_SECRET` | `""` | Primary JWT signing secret (ext-service routes, SPIFFE delegate, JWT debug middleware) |
-| `JWT_DEF_SECRET` | `authsecai` | Default JWT signing secret (admin / platform tokens) |
-| `JWT_SDK_SECRET` | `authsecai` | SDK JWT signing secret |
+| `JWT_SECRET` | `""` | Primary JWT signing secret (ext-service routes, SPIFFE delegate) |
+| `JWT_DEF_SECRET` | — | Default JWT signing secret (admin / platform tokens) |
+| `JWT_SDK_SECRET` | — | SDK JWT signing secret |
 | `BASE_URL` | `https://app.authsec.dev` | Base URL for OIDC callbacks and email links |
-| `TENANT_DOMAIN_SUFFIX` | `app.authsec.ai` | Suffix for auto-generated tenant sub-domains |
+| `TENANT_DOMAIN_SUFFIX` | — | Suffix for auto-generated tenant sub-domains |
 | `REDIS_URL` | `""` | Redis connection URL (e.g. `redis://localhost:6379`) |
 | `ICP_SERVICE_URL` | `http://localhost:7001` | ICP/PKI provisioning service |
 | `REQUIRE_SERVER_AUTH` | `true` | Enforce inter-service auth check (`false` to disable in dev) |
@@ -146,23 +145,22 @@ The server starts on port **7468** by default.
 ### Optional – CORS
 
 | Variable | Default | Description |
-|---|---|---|
-| `CORS_ALLOWED_ORIGINS` | (auto-detect from `WEBAUTHN_ORIGIN`) | Comma-separated allowed origins for the main Gin CORS middleware |
+| --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | (auto-detect from `WEBAUTHN_ORIGIN`) | Comma-separated allowed origins |
 | `CORS_ALLOWED_METHODS` | `GET,POST,PUT,PATCH,DELETE,OPTIONS` | Allowed HTTP methods |
 | `CORS_ALLOWED_HEADERS` | `Origin,Content-Type,Authorization,…` | Allowed request headers |
-| `CORS_ALLOW_ORIGIN` | (authsec.dev wildcard) | Legacy per-controller CORS origins (keep in sync with `CORS_ALLOWED_ORIGINS`) |
 
 ### Optional – Encryption Keys
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `TOTP_ENCRYPTION_KEY` | 64-hex-char AES-256 key for encrypting TOTP secrets at rest (required in production) |
 | `SYNC_CONFIG_ENCRYPTION_KEY` | 64-hex-char AES-256 key for encrypting AD/Entra sync configurations at rest |
 
 ### Optional – Twilio (SMS MFA / Voice)
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `TWILIO_ACCOUNT_SID` | Twilio account SID (e.g. `ACxxxxxxxx`) |
 | `TWILIO_AUTH_TOKEN` | Twilio auth token |
 | `TWILIO_FROM_NUMBER` | Sender phone number for SMS OTPs (e.g. `+10000000000`) |
@@ -170,12 +168,11 @@ The server starts on port **7468** by default.
 ### Optional – External Integrations
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `VAULT_ADDR` | HashiCorp Vault address (default: `http://localhost:8200`) |
 | `VAULT_TOKEN` | Vault root/service token |
 | `HYDRA_ADMIN_URL` | Ory Hydra admin API (default: `http://localhost:4445`) |
 | `HYDRA_PUBLIC_URL` | Ory Hydra public API (default: `http://localhost:4444`) |
-| `OOC_MANAGER_URL` | OIDC config manager internal URL (default: `http://localhost:7467`) |
 | `REACT_APP_URL` | Frontend app URL for redirects |
 | `IDENTITY_PROVIDER_URL` | Identity provider base URL |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | SMTP for email notifications |
@@ -187,7 +184,7 @@ The server starts on port **7468** by default.
 ### Optional – OIDC Token Validation
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `AUTH_EXPECT_ISS` | Expected `iss` claim when validating incoming OIDC tokens (empty = skip) |
 | `AUTH_EXPECT_AUD` | Expected `aud` claim when validating incoming OIDC tokens (empty = skip) |
 
@@ -196,7 +193,7 @@ The server starts on port **7468** by default.
 Required only when SPIFFE workload identity / delegate endpoints are used.
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `SPIFFE_OIDC_ISSUER` | Issuer URL embedded in SPIFFE OIDC tokens |
 | `SPIFFE_JWKS_KEY_ID` | Key ID used in the JWKS endpoint |
 | `SPIFFE_RSA_PRIVATE_KEY_B64` | Base64-encoded PEM RSA private key for signing SPIFFE JWTs |
@@ -207,7 +204,7 @@ Required only when SPIFFE workload identity / delegate endpoints are used.
 Required only when Okta is used as a CIBA provider.
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `OKTA_DOMAIN` | Okta domain (e.g. `dev-12345678.okta.com`) |
 | `OKTA_CLIENT_ID` | Okta application client ID |
 | `OKTA_CLIENT_SECRET` | Okta application client secret |
@@ -222,12 +219,10 @@ All application routes are under the `/authsec` prefix (except OIDC discovery an
 
 ### Core Auth & User Flow (`/authsec/uflow`)
 
-Formerly **user-flow** (port 7468).
-
 #### Health
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/uflow/health` | Comprehensive health check |
 | `GET` | `/authsec/uflow/health/tenant/:tenant_id` | Single tenant DB health |
 | `GET` | `/authsec/uflow/health/tenants` | All tenant DBs health |
@@ -235,7 +230,7 @@ Formerly **user-flow** (port 7468).
 #### Admin Authentication (`/authsec/uflow/auth/admin`)
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/uflow/auth/admin/challenge` | Get auth challenge |
 | `POST` | `/authsec/uflow/auth/admin/login/precheck` | Pre-login check |
 | `POST` | `/authsec/uflow/auth/admin/login/bootstrap` | Bootstrap first admin |
@@ -250,7 +245,7 @@ Formerly **user-flow** (port 7468).
 #### End-User Authentication (`/authsec/uflow/auth/enduser`)
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/uflow/auth/enduser/challenge` | Get challenge |
 | `POST` | `/authsec/uflow/auth/enduser/initiate-registration` | Start registration |
 | `POST` | `/authsec/uflow/auth/enduser/verify-otp` | Verify OTP + complete registration |
@@ -261,7 +256,7 @@ Formerly **user-flow** (port 7468).
 #### Device Authorization Grant – RFC 8628 (`/authsec/uflow/auth/device`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST` | `/authsec/uflow/auth/device/code` | Public | Device requests code |
 | `POST` | `/authsec/uflow/auth/device/token` | Public | Device polls for token |
 | `GET` | `/authsec/uflow/auth/device/activate/info` | Public | Get device info for UI |
@@ -271,7 +266,7 @@ Formerly **user-flow** (port 7468).
 #### Voice Authentication (`/authsec/uflow/auth/voice`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST` | `/authsec/uflow/auth/voice/initiate` | Public | Initiate voice auth |
 | `POST` | `/authsec/uflow/auth/voice/verify` | Public | Verify voice OTP |
 | `POST` | `/authsec/uflow/auth/voice/token` | Public | Get token with credentials |
@@ -284,7 +279,7 @@ Formerly **user-flow** (port 7468).
 #### TOTP – Platform (`/authsec/uflow/auth/totp`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST` | `/authsec/uflow/auth/totp/login` | Public | Login with TOTP |
 | `POST` | `/authsec/uflow/auth/totp/device-approve` | Public | Approve device with TOTP |
 | `POST` | `/authsec/uflow/auth/totp/register` | JWT | Register TOTP device |
@@ -298,7 +293,7 @@ Formerly **user-flow** (port 7468).
 #### CIBA – Platform (`/authsec/uflow/auth/ciba`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST` | `/authsec/uflow/auth/ciba/initiate` | Public | Initiate CIBA flow |
 | `POST` | `/authsec/uflow/auth/ciba/token` | Public | Poll for CIBA token |
 | `POST` | `/authsec/uflow/auth/ciba/respond` | JWT | Respond to CIBA request |
@@ -309,7 +304,7 @@ Formerly **user-flow** (port 7468).
 #### Tenant TOTP / CIBA (`/authsec/uflow/auth/tenant`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST` | `/authsec/uflow/auth/tenant/totp/login` | Public | Tenant TOTP login |
 | `POST` | `/authsec/uflow/auth/tenant/totp/register` | JWT+Tenant | Register tenant TOTP device |
 | `POST` | `/authsec/uflow/auth/tenant/totp/confirm` | JWT+Tenant | Confirm device |
@@ -327,7 +322,7 @@ Formerly **user-flow** (port 7468).
 #### OIDC Federation (`/authsec/uflow/oidc`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/authsec/uflow/oidc/providers` | Public | List OIDC providers |
 | `POST` | `/authsec/uflow/oidc/initiate` | Public | Initiate OIDC flow |
 | `POST` | `/authsec/uflow/oidc/register/initiate` | Public | Initiate OIDC registration |
@@ -346,7 +341,7 @@ Formerly **user-flow** (port 7468).
 Public endpoints (no auth required):
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `POST` | `/authsec/uflow/user/login` | Custom login |
 | `POST` | `/authsec/uflow/user/login/status` | Login status |
 | `POST` | `/authsec/uflow/user/saml/login` | SAML login |
@@ -361,7 +356,7 @@ Public endpoints (no auth required):
 Authenticated endpoints (JWT + tenant required):
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `POST` | `/authsec/uflow/user/clients/register` | Register client |
 | `GET` | `/authsec/uflow/user/clients` | List clients |
 | `GET` | `/authsec/uflow/user/enduser/:tenant_id/:user_id` | Get end-user |
@@ -390,7 +385,7 @@ Authenticated endpoints (JWT + tenant required):
 All admin endpoints require `JWT + admin:access + tenant validation`.
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/uflow/admin/tenants` | List tenants |
 | `POST` | `/authsec/uflow/admin/tenants` | Create tenant |
 | `PUT` | `/authsec/uflow/admin/tenants/:tenant_id` | Update tenant |
@@ -419,9 +414,10 @@ All admin endpoints require `JWT + admin:access + tenant validation`.
 #### Admin RBAC (`/authsec/uflow/admin` – scoped bindings)
 
 | Method | Path | Description |
-|---|---|---|
-| `POST` | `/authsec/uflow/admin/roles` | Create role composite |
+| --- | --- | --- |
+| `POST` | `/authsec/uflow/admin/roles` | Create role |
 | `GET` | `/authsec/uflow/admin/roles` | List roles |
+| `GET` | `/authsec/uflow/admin/roles/:role_id` | Get role by ID |
 | `PUT` | `/authsec/uflow/admin/roles/:role_id` | Update role |
 | `DELETE` | `/authsec/uflow/admin/roles/:role_id` | Delete role |
 | `POST` | `/authsec/uflow/admin/bindings` | Assign role (scoped) |
@@ -431,13 +427,14 @@ All admin endpoints require `JWT + admin:access + tenant validation`.
 | `DELETE` | `/authsec/uflow/admin/permissions/:id` | Delete permission |
 | `GET` | `/authsec/uflow/admin/permissions/resources` | List resources |
 | `GET/POST/PUT/DELETE` | `/authsec/uflow/admin/scopes` | Scope management |
+| `GET` | `/authsec/uflow/admin/scopes/mappings` | Get scope mappings |
 | `POST` | `/authsec/uflow/admin/policy/check` | Admin PDP check |
 | `GET/POST/PUT/DELETE` | `/authsec/uflow/admin/api_scopes` | API scope management |
 
 #### SCIM 2.0 (`/authsec/uflow/scim/v2`)
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/authsec/uflow/scim/v2/ServiceProviderConfig` | Public | Service provider config |
 | `GET` | `/authsec/uflow/scim/v2/Schemas` | Public | SCIM schemas |
 | `GET` | `/authsec/uflow/scim/v2/ResourceTypes` | Public | Resource types |
@@ -449,10 +446,8 @@ All admin endpoints require `JWT + admin:access + tenant validation`.
 
 ### WebAuthn / Passkeys (`/authsec/webauthn`)
 
-Formerly **webauthn-service** (port 8080).
-
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/webauthn/health` | Health check |
 | `POST` | `/authsec/webauthn/admin/mfa/status` | Admin MFA status |
 | `POST` | `/authsec/webauthn/admin/mfa/loginStatus` | Admin MFA login status |
@@ -468,10 +463,10 @@ Formerly **webauthn-service** (port 8080).
 | `POST` | `/authsec/webauthn/enduser/finishRegistration` | Finish end-user registration |
 | `POST` | `/authsec/webauthn/enduser/beginAuthentication` | Begin end-user authentication |
 | `POST` | `/authsec/webauthn/enduser/finishAuthentication` | Finish end-user authentication |
-| `POST` | `/authsec/webauthn/beginRegistration` | Legacy flat registration |
-| `POST` | `/authsec/webauthn/beginAuthentication` | Legacy flat authentication |
-| `POST` | `/authsec/webauthn/finishRegistration` | Legacy flat finish registration |
-| `POST` | `/authsec/webauthn/finishAuthentication` | Legacy flat finish authentication |
+| `POST` | `/authsec/webauthn/beginRegistration` | Registration (flat) |
+| `POST` | `/authsec/webauthn/beginAuthentication` | Authentication (flat) |
+| `POST` | `/authsec/webauthn/finishRegistration` | Finish registration (flat) |
+| `POST` | `/authsec/webauthn/finishAuthentication` | Finish authentication (flat) |
 | `POST` | `/authsec/webauthn/biometric/verifyBegin` | Begin biometric verify |
 | `POST` | `/authsec/webauthn/biometric/verifyFinish` | Finish biometric verify |
 | `POST` | `/authsec/webauthn/biometric/beginSetup` | Begin biometric setup |
@@ -495,10 +490,8 @@ Formerly **webauthn-service** (port 8080).
 
 ### Client Management (`/authsec/clientms`)
 
-Formerly **clients-microservice**.
-
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/authsec/clientms/health` | Public | Health check |
 | `GET` | `/authsec/clientms/swagger` | Public | API documentation |
 | `GET` | `/authsec/clientms/swagger/doc.json` | Public | OpenAPI spec |
@@ -515,18 +508,15 @@ Formerly **clients-microservice**.
 | `PATCH` | `/authsec/clientms/tenants/:tenantId/clients/:id/deactivate` | JWT | Deactivate client |
 | `POST` | `/authsec/clientms/tenants/:tenantId/clients/set-status` | JWT | Set status |
 | `GET` | `/authsec/clientms/admin/clients/` | JWT+Admin | Cross-tenant client list |
-| `POST` | `/authsec/clientms/oocmgr/tenant/delete-complete` | JWT | OOC tenant delete cascade |
 
 ---
 
 ### Hydra Manager (`/authsec/hmgr`)
 
-Formerly **hydra-service**.
-
 #### Public Endpoints
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/hmgr/health` | Health check |
 | `GET` | `/authsec/hmgr/login` | Login redirect |
 | `GET` | `/authsec/hmgr/consent` | Hydra consent handler |
@@ -544,7 +534,7 @@ Formerly **hydra-service**.
 #### Admin Endpoints (JWT required)
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/hmgr/admin/profile` | Get profile |
 | `PUT` | `/authsec/hmgr/admin/profile` | Update profile |
 | `GET/POST/PUT/DELETE` | `/authsec/hmgr/admin/users` | User management |
@@ -559,10 +549,8 @@ Formerly **hydra-service**.
 
 ### OIDC Config Manager (`/authsec/oocmgr`)
 
-Formerly **oath_oidc_configuration_manager** (port 7467).
-
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/oocmgr/health` | Health check |
 | `POST` | `/authsec/oocmgr/configure-complete-oidc` | Complete OIDC config |
 | `POST` | `/authsec/oocmgr/tenant/create-base-client` | Create base tenant client |
@@ -580,7 +568,7 @@ Formerly **oath_oidc_configuration_manager** (port 7467).
 | `POST` | `/authsec/oocmgr/oidc/delete-provider` | Delete provider |
 | `POST` | `/authsec/oocmgr/oidc/templates` | Get provider templates |
 | `POST` | `/authsec/oocmgr/oidc/validate` | Validate OIDC config |
-| `POST` | `/authsec/oocmgr/oidc/show-auth-providers` | Show auth providers |
+| `GET/POST` | `/authsec/oocmgr/oidc/show-auth-providers` | List auth providers |
 | `POST` | `/authsec/oocmgr/oidc/raw-hydra-dump` | Raw Hydra data dump (JWT) |
 | `POST` | `/authsec/oocmgr/oidc/edit-client-auth-provider` | Edit auth provider |
 | `POST` | `/authsec/oocmgr/saml/add-provider` | Add SAML provider |
@@ -600,12 +588,12 @@ Formerly **oath_oidc_configuration_manager** (port 7467).
 
 ### Auth Manager (`/authsec/authmgr`)
 
-Formerly **auth-manager**. Provides JWT verification, RBAC permission checks, and group management.
+Provides JWT verification, RBAC permission checks, and group management.
 
-#### Public Endpoints
+#### Health & Token Endpoints
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/authmgr/health` | Health check |
 | `POST` | `/authsec/authmgr/token/verify` | Verify JWT token |
 | `POST` | `/authsec/authmgr/token/generate` | Generate JWT token |
@@ -614,9 +602,9 @@ Formerly **auth-manager**. Provides JWT verification, RBAC permission checks, an
 #### Admin Endpoints (`/authsec/authmgr/admin`, JWT required)
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/authmgr/admin/profile` | Get profile |
-| `GET` | `/authsec/authmgr/admin/auth-status` | Auth status debug |
+| `GET` | `/authsec/authmgr/admin/auth-status` | Auth status |
 | `GET` | `/authsec/authmgr/admin/validate/token` | Validate token |
 | `GET` | `/authsec/authmgr/admin/validate/scope` | Validate scope |
 | `GET` | `/authsec/authmgr/admin/validate/resource` | Validate resource |
@@ -639,7 +627,7 @@ Formerly **auth-manager**. Provides JWT verification, RBAC permission checks, an
 #### User Endpoints (`/authsec/authmgr/user`, JWT required)
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/authmgr/user/profile` | Get profile |
 | `GET` | `/authsec/authmgr/user/auth-status` | Auth status |
 | `GET` | `/authsec/authmgr/user/validate/token` | Validate token |
@@ -657,10 +645,10 @@ Formerly **auth-manager**. Provides JWT verification, RBAC permission checks, an
 
 ### External Services (`/authsec/exsvc`)
 
-Formerly **external-service / mcp-service**. Manages registered external service integrations with Vault-backed credentials.
+Manages registered external service integrations with Vault-backed credentials.
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/authsec/exsvc/health` | Public | Health check |
 | `GET` | `/authsec/exsvc/debug/auth` | JWT | Debug JWT claims |
 | `GET` | `/authsec/exsvc/debug/test` | JWT | Connectivity test |
@@ -676,12 +664,12 @@ Formerly **external-service / mcp-service**. Manages registered external service
 
 ### SPIRE Headless (`/authsec/spire`)
 
-Formerly **spire-headless**. Provides SPIFFE workload identity, OIDC token issuance with cloud federation (AWS/Azure/GCP), and a built-in RBAC/ABAC policy engine. Connects to a SPIRE server via the SPIFFE Workload API socket when available; degrades gracefully if the socket is absent.
+Provides SPIFFE workload identity, OIDC token issuance with cloud federation (AWS/Azure/GCP), and a built-in RBAC/ABAC policy engine. Connects to a SPIRE server via the SPIFFE Workload API socket when available; degrades gracefully if the socket is absent.
 
 #### Health & Discovery
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `GET` | `/authsec/spire/health` | Public | Health check |
 | `GET` | `/authsec/spire/.well-known/openid-configuration` | Public | OIDC discovery document |
 | `GET` | `/authsec/spire/.well-known/jwks.json` | Public | JWK Set (SPIRE signing keys) |
@@ -689,74 +677,74 @@ Formerly **spire-headless**. Provides SPIFFE workload identity, OIDC token issua
 #### Registry
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/authsec/spire/registry/workloads` | - | Register a SPIFFE workload |
-| `PUT` | `/authsec/spire/registry/workloads/:id` | - | Update a registered workload |
-| `DELETE` | `/authsec/spire/registry/workloads/:id` | - | Delete a workload registration |
-| `GET` | `/authsec/spire/registry/workloads` | - | List all registered workloads |
+| --- | --- | --- | --- |
+| `POST` | `/authsec/spire/registry/workloads` | — | Register a SPIFFE workload |
+| `PUT` | `/authsec/spire/registry/workloads/:id` | — | Update a registered workload |
+| `DELETE` | `/authsec/spire/registry/workloads/:id` | — | Delete a workload registration |
+| `GET` | `/authsec/spire/registry/workloads` | — | List all registered workloads |
 
 #### OIDC Token Operations
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/authsec/spire/oidc/token` | - | Exchange credentials for an OIDC token |
-| `POST` | `/authsec/spire/oidc/introspect` | - | Introspect a token |
-| `POST` | `/authsec/spire/oidc/revoke` | - | Revoke a token |
-| `POST` | `/authsec/spire/oidc/exchange/spiffe` | - | Exchange a SPIFFE SVID for an OIDC token |
-| `POST` | `/authsec/spire/oidc/issue/jwt-svid` | - | Issue a JWT-SVID |
-| `POST` | `/authsec/spire/oidc/exchange/cloud` | - | Generic cloud token exchange |
-| `POST` | `/authsec/spire/oidc/exchange/aws` | - | Exchange for AWS STS credentials |
-| `POST` | `/authsec/spire/oidc/exchange/azure` | - | Exchange for Azure AD token |
-| `POST` | `/authsec/spire/oidc/exchange/gcp` | - | Exchange for GCP access token |
+| --- | --- | --- | --- |
+| `POST` | `/authsec/spire/oidc/token` | — | Exchange credentials for an OIDC token |
+| `POST` | `/authsec/spire/oidc/introspect` | — | Introspect a token |
+| `POST` | `/authsec/spire/oidc/revoke` | — | Revoke a token |
+| `POST` | `/authsec/spire/oidc/exchange/spiffe` | — | Exchange a SPIFFE SVID for an OIDC token |
+| `POST` | `/authsec/spire/oidc/issue/jwt-svid` | — | Issue a JWT-SVID |
+| `POST` | `/authsec/spire/oidc/exchange/cloud` | — | Generic cloud token exchange |
+| `POST` | `/authsec/spire/oidc/exchange/aws` | — | Exchange for AWS STS credentials |
+| `POST` | `/authsec/spire/oidc/exchange/azure` | — | Exchange for Azure AD token |
+| `POST` | `/authsec/spire/oidc/exchange/gcp` | — | Exchange for GCP access token |
 
 #### Policy Engine
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/authsec/spire/policy` | - | Create a policy |
-| `GET` | `/authsec/spire/policy` | - | List policies |
-| `GET` | `/authsec/spire/policy/:id` | - | Get a policy |
-| `PUT` | `/authsec/spire/policy/:id` | - | Update a policy |
-| `DELETE` | `/authsec/spire/policy/:id` | - | Delete a policy |
-| `POST` | `/authsec/spire/policy/evaluate` | - | Evaluate a policy (single) |
-| `POST` | `/authsec/spire/policy/batch-evaluate` | - | Evaluate multiple policies in batch |
-| `POST` | `/authsec/spire/policy/test` | - | Dry-run a policy without persisting |
+| --- | --- | --- | --- |
+| `POST` | `/authsec/spire/policy` | — | Create a policy |
+| `GET` | `/authsec/spire/policy` | — | List policies |
+| `GET` | `/authsec/spire/policy/:id` | — | Get a policy |
+| `PUT` | `/authsec/spire/policy/:id` | — | Update a policy |
+| `DELETE` | `/authsec/spire/policy/:id` | — | Delete a policy |
+| `POST` | `/authsec/spire/policy/evaluate` | — | Evaluate a policy (single) |
+| `POST` | `/authsec/spire/policy/batch-evaluate` | — | Evaluate multiple policies in batch |
+| `POST` | `/authsec/spire/policy/test` | — | Dry-run a policy without persisting |
 
 #### Role Bindings
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/authsec/spire/roles/bind` | - | Bind a role to a subject |
-| `POST` | `/authsec/spire/roles/unbind` | - | Remove a role binding |
-| `GET` | `/authsec/spire/roles/bindings` | - | List role bindings |
+| --- | --- | --- | --- |
+| `POST` | `/authsec/spire/roles/bind` | — | Bind a role to a subject |
+| `POST` | `/authsec/spire/roles/unbind` | — | Remove a role binding |
+| `GET` | `/authsec/spire/roles/bindings` | — | List role bindings |
 
 #### Audit
 
 | Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/authsec/spire/audit/logs` | - | Query audit log entries |
-| `GET` | `/authsec/spire/audit/logs/export` | - | Export audit logs |
+| --- | --- | --- | --- |
+| `GET` | `/authsec/spire/audit/logs` | — | Query audit log entries |
+| `GET` | `/authsec/spire/audit/logs/export` | — | Export audit logs |
 
 ---
 
 ### Migration Management (`/authsec/migration`)
 
-Formerly **authsec-migration** (standalone microservice). Manages master and per-tenant database migrations. All endpoints require JWT authentication.
+Manages master and per-tenant database migrations. All endpoints require JWT authentication.
 
 #### Master Database
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `POST` | `/authsec/migration/migrations/master/run` | Execute all pending master DB migrations |
 | `GET` | `/authsec/migration/migrations/master/status` | Get master DB migration status |
 
 #### Tenant Databases
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/authsec/migration/tenants` | List all tenants and their migration status |
 | `POST` | `/authsec/migration/tenants/create-db` | Create a tenant database and kick off migrations async |
-| `POST` | `/authsec/migration/tenants/migrate-all` | Run migrations for all tenants that are not yet `completed` |
+| `POST` | `/authsec/migration/tenants/migrate-all` | Run migrations for all tenants not yet completed |
 | `POST` | `/authsec/migration/tenants/:tenant_id/migrations/run` | Run migrations for a specific tenant |
 | `GET` | `/authsec/migration/tenants/:tenant_id/migrations/status` | Get migration status for a specific tenant |
 
@@ -767,33 +755,32 @@ Formerly **authsec-migration** (standalone microservice). Manages master and per
 Required at the root path by RFC 8414. These cannot be moved.
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/.well-known/openid-configuration` | OIDC discovery document |
 | `GET` | `/.well-known/jwks.json` | JWK Set (public signing keys) |
-| `POST` | `/webauthn/mfa/loginStatus` | Legacy WebAuthn MFA status (backward-compat) |
 
 ### Metrics
 
 | Method | Path | Description |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/metrics` | Prometheus metrics |
 
 ---
 
 ## Authentication & Middleware
 
-All routes with **JWT** authentication use the `AuthMiddleware` from `middlewares/auth.go`. The middleware:
+All routes with **JWT** authentication use `AuthMiddleware` from `middlewares/auth.go`. The middleware:
 
 1. Extracts the `Authorization: Bearer <token>` header.
 2. Validates the JWT signature against the configured `JWT_DEF_SECRET` / `JWT_SDK_SECRET`.
-3. Accepts tokens issued by `authsec-ai/auth-manager` as issuer.
+3. Accepts tokens with issuer `authsec-ai/auth-manager`.
 4. Sets claims into the gin context (`user_id`, `tenant_id`, `project_id`, `client_id`, `email`, `roles`, `scopes`).
 
-Routes marked **JWT+Tenant** additionally pass through `amMiddlewares.ValidateTenantFromToken()` which ensures the token's `tenant_id` claim matches the tenant being accessed.
+Routes marked **JWT+Tenant** additionally pass through `ValidateTenantFromToken()` which ensures the token's `tenant_id` claim matches the tenant being accessed.
 
-Routes marked **JWT+Admin** also enforce `middlewares.Require("admin", "access")`.
+Routes marked **JWT+Admin** also enforce `Require("admin", "access")`.
 
-Permission-gated routes (e.g. `external-service:create`) use `middlewares.Require(resource, action)` which performs a live RBAC check against the tenant database.
+Permission-gated routes (e.g. `external-service:create`) use `Require(resource, action)` which performs a live RBAC check against the tenant database.
 
 ---
 
@@ -804,6 +791,7 @@ AuthSec uses two categories of database connections:
 ### Primary Database
 
 Configured via `DB_*` environment variables. Holds:
+
 - Admin users, tenants, projects
 - Platform RBAC tables (`roles`, `permissions`, `role_bindings`, …)
 - WebAuthn sessions
@@ -820,7 +808,7 @@ Tenant tables include: end-users, OIDC identities, client registrations, externa
 
 Master DB migrations run automatically at startup (unless `SKIP_MIGRATIONS=true`). SQL files live under:
 
-```
+```text
 migrations/
 ├── master/          – master DB schema (applied at boot)
 │   ├── 000_comprehensive_base_schema.sql
@@ -845,7 +833,7 @@ Tenant databases are provisioned on demand via the `/authsec/migration` API — 
 
 ## Internal Package Layout
 
-```
+```text
 authsec/
 ├── cmd/main.go               – entry point, initialises all components
 ├── config/                   – configuration, DB connections, Vault, WebAuthn setup
@@ -853,7 +841,7 @@ authsec/
 │   ├── admin/                – admin-facing handlers (auth, tenants, RBAC, migration, …)
 │   │   ├── admin_auth_controller.go
 │   │   ├── admin_user_controller.go
-│   │   ├── migration_controller.go  – /authsec/migration API
+│   │   ├── migration_controller.go
 │   │   ├── permission_controller.go
 │   │   ├── roles_scoped_bindings_controller.go
 │   │   └── ...
@@ -873,20 +861,20 @@ authsec/
 │       ├── health_controller.go
 │       ├── ad_controller.go
 │       └── entra_controller.go
-├── handlers/                 – WebAuthn/FIDO2 handlers (ported from webauthn-service)
-│   ├── webauthn_handler.go   – legacy flat handlers
+├── handlers/                 – WebAuthn/FIDO2 handlers
+│   ├── webauthn_handler.go
 │   ├── admin_webauthn_handler.go
 │   ├── enduser_webauthn_handler.go
 │   ├── totp_handler.go
 │   └── sms_handler.go
 ├── internal/
 │   ├── authmgr/
-│   │   ├── models/rbac.go    – GORM models for auth-manager RBAC tables
-│   │   └── repo/rbac_repository.go – RBAC query interface
+│   │   ├── models/rbac.go    – GORM models for RBAC tables
+│   │   └── repo/rbac_repository.go
 │   ├── hydra/models/         – Hydra client / SAML models
 │   ├── migration/            – migration runner, models, DB utilities
 │   │   ├── runner.go         – versioned SQL runner with retry + migration_logs
-│   │   ├── models.go         – MigrationLog, TenantInfo, status response types
+│   │   ├── models.go
 │   │   └── db_utils.go       – ConnectToTenantDB, CreateDatabase, IsValidDatabaseName
 │   ├── oocmgr/               – OIDC config manager repository + services
 │   ├── session/              – WebAuthn PostgreSQL session store
@@ -896,7 +884,7 @@ authsec/
 ├── models/                   – shared GORM models
 ├── monitoring/               – Prometheus metrics, audit log, structured logging
 ├── repository/               – shared repositories (MFA, clients RBAC, extsvc)
-├── routes/routes.go          – central route registration for all 8 services
+├── routes/routes.go          – central route registration
 ├── services/                 – business logic services
 └── vault/                    – HashiCorp Vault client interface
 ```
@@ -908,7 +896,7 @@ authsec/
 The following goroutines start automatically at boot:
 
 | Worker | Interval | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | Audit log cleanup | 24 hours | Removes audit events older than 90 days |
 | System metrics | 30 seconds | Updates Prometheus system gauges (goroutines, memory, …) |
 | PKI retry worker | 5 minutes | Retries failed ICP/PKI provisioning operations |
@@ -949,39 +937,23 @@ curl http://localhost:7468/authsec/uflow/health
 ```
 
 Expected response:
+
 ```json
 {"status": "healthy", "database": "connected", "timestamp": "..."}
 ```
 
 ---
 
-## Migration Notes (from microservices)
+## Contributing
 
-If you are migrating from standalone microservices, update your client URLs as follows:
+Contributions are welcome! Please:
 
-| Old URL (standalone) | New URL (authsec monolith) |
-|---|---|
-| `http://user-flow:7468/auth/admin/login` | `http://authsec:7468/authsec/uflow/auth/admin/login` |
-| `http://user-flow:7468/user/login` | `http://authsec:7468/authsec/uflow/user/login` |
-| `http://webauthn-service:8080/webauthn/beginRegistration` | `http://authsec:7468/authsec/webauthn/beginRegistration` |
-| `http://webauthn-service:8080/webauthn/admin/beginRegistration` | `http://authsec:7468/authsec/webauthn/admin/beginRegistration` |
-| `http://clients-ms/clientms/tenants/:id/clients/getClients` | `http://authsec:7468/authsec/clientms/tenants/:id/clients/getClients` |
-| `http://hydra-svc/login` | `http://authsec:7468/authsec/hmgr/login` |
-| `http://oocmgr:7467/oocmgr/configure-complete-oidc` | `http://authsec:7468/authsec/oocmgr/configure-complete-oidc` |
-| `http://auth-manager/authmgr/verifyToken` | `http://authsec:7468/authsec/authmgr/token/verify` |
-| `http://auth-manager/authmgr/oidcToken` | `http://authsec:7468/authsec/authmgr/token/oidc` |
-| `http://external-svc/exsvc/services` | `http://authsec:7468/authsec/exsvc/services` |
-| `http://spire-headless/registry/workloads` | `http://authsec:7468/authsec/spire/registry/workloads` |
-| `http://spire-headless/oidc/token` | `http://authsec:7468/authsec/spire/oidc/token` |
-| `http://spire-headless/policy` | `http://authsec:7468/authsec/spire/policy` |
-| `http://authsec/migration/migrations/master/run` | `http://authsec:7468/authsec/migration/migrations/master/run` |
-| `http://authsec/migration/tenants/:id/migrations/run` | `http://authsec:7468/authsec/migration/tenants/:id/migrations/run` |
+1. Fork the repository and create a feature branch.
+2. Ensure `go build ./...` and `go test ./...` pass before opening a pull request.
+3. Keep pull requests focused — one feature or fix per PR.
+4. Follow the existing code style (standard Go formatting via `gofmt`).
 
-### Backward-compatible aliases
-
-The following legacy paths are retained at the root for existing clients that have not yet updated:
-
-- `POST /webauthn/mfa/loginStatus` — proxies to the WebAuthn MFA handler
+For significant changes, open an issue first to discuss the approach.
 
 ---
 
