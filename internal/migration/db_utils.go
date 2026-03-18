@@ -10,6 +10,117 @@ import (
 	"gorm.io/gorm"
 )
 
+// TemplateDBName is the name of the golden tenant template database.
+var TemplateDBName = "_authsec_tenant_template"
+
+// TemplateReady is set to true once SetupTenantTemplate completes successfully.
+var TemplateReady bool
+
+// templateCreds holds the master DB credentials used by template and clone operations.
+// Populated by InitTemplateCreds, called from main.go after config is loaded.
+var templateCreds struct {
+	host, port, user, password, sslMode string
+}
+
+// InitTemplateCreds stores the master DB credentials for template/clone operations.
+// Must be called before SetupTenantTemplate or CloneTenantDatabase.
+func InitTemplateCreds(host, port, user, password, sslMode string) {
+	templateCreds.host = host
+	templateCreds.port = port
+	templateCreds.user = user
+	templateCreds.password = password
+	templateCreds.sslMode = sslMode
+}
+
+// connectToPostgresDB opens a short-lived connection to the postgres maintenance database.
+func connectToPostgresDB() (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=postgres sslmode=%s",
+		templateCreds.host, templateCreds.port,
+		templateCreds.user, templateCreds.password,
+		templateCreds.sslMode,
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to postgres database: %w", err)
+	}
+	db.SetConnMaxLifetime(30 * time.Second)
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
+	}
+	return db, nil
+}
+
+// terminateDBConnections kills all active connections to the given database.
+func terminateDBConnections(db *sql.DB, dbName string) {
+	_, err := db.Exec(
+		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+		dbName,
+	)
+	if err != nil {
+		log.Printf("[Migration] Warning: failed to terminate connections to %s: %v", dbName, err)
+	}
+}
+
+// ConnectToNamedDB opens a raw sql.DB to the given database using template credentials.
+func ConnectToNamedDB(dbName string) (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		templateCreds.host, templateCreds.port,
+		templateCreds.user, templateCreds.password,
+		dbName, templateCreds.sslMode,
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(5)
+	db.SetConnMaxLifetime(30 * time.Second)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// CloneTenantDatabase creates a new database by cloning the golden template.
+// Returns (true, nil) if created, (false, nil) if it already existed.
+func CloneTenantDatabase(databaseName string) (bool, error) {
+	if !TemplateReady {
+		return false, fmt.Errorf("tenant template database is not ready")
+	}
+	if !IsValidDatabaseName(databaseName) {
+		return false, fmt.Errorf("invalid database name: %s", databaseName)
+	}
+
+	db, err := connectToPostgresDB()
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+
+	var exists bool
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", databaseName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check if database exists: %w", err)
+	}
+	if exists {
+		log.Printf("[Migration] Database %s already exists, skipping clone", databaseName)
+		return false, nil
+	}
+
+	terminateDBConnections(db, TemplateDBName)
+
+	createQuery := fmt.Sprintf("CREATE DATABASE %s WITH TEMPLATE %s ENCODING 'UTF8'", databaseName, TemplateDBName)
+	if _, err := db.Exec(createQuery); err != nil {
+		return false, fmt.Errorf("failed to clone database from template: %w", err)
+	}
+
+	log.Printf("[Migration] Cloned database %s from template %s", databaseName, TemplateDBName)
+	return true, nil
+}
+
 // ConnectToTenantDB opens a raw SQL connection to the named tenant database.
 func ConnectToTenantDB(host, port, user, password, databaseName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf(

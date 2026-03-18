@@ -153,6 +153,8 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize SPIFFE delegate controller: %v", err)
 	}
 
+	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
+
 	// ────────────────────────────────────────────────────────
 	// Well-known OIDC discovery – must remain at root (RFC 8414)
 	// ────────────────────────────────────────────────────────
@@ -476,6 +478,29 @@ func SetupRoutes(
 		scimToken.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
+		}
+
+		// ────────────────────────────────────────────────────
+		// Delegation policies
+		// ────────────────────────────────────────────────────
+		delegationAdmin := uflow.Group("/admin/me")
+		delegationAdmin.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		{
+			delegationAdmin.GET("/roles-permissions", delegationPolicyCtrl.GetMyRolesAndPermissions)
+		}
+
+		delegationPolicies := uflow.Group("/delegation-policies")
+		delegationPolicies.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			delegationPolicies.POST("", delegationPolicyCtrl.CreateDelegationPolicy)
+			delegationPolicies.GET("", delegationPolicyCtrl.ListDelegationPolicies)
+			delegationPolicies.GET("/:id", delegationPolicyCtrl.GetDelegationPolicy)
+			delegationPolicies.PUT("/:id", delegationPolicyCtrl.UpdateDelegationPolicy)
+			delegationPolicies.DELETE("/:id", delegationPolicyCtrl.DeleteDelegationPolicy)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1139,6 +1164,8 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		{
 			tenants.GET("", migCtrl.ListTenants)
 			tenants.POST("/create-db", migCtrl.CreateTenantDB)
+			tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
+			tenants.GET("/template-status", migCtrl.GetTemplateStatus)
 			tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
 			tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
 			tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
