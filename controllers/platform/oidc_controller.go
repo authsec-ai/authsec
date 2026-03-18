@@ -370,9 +370,20 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 		return
 	}
 
-	// Construct the URL
-	baseURL := "https://oauth.prod.authsec.ai/oauth2/auth"
-	redirectURI := fmt.Sprintf("https://%s/oidc/auth/callback", tenant.TenantDomain)
+	// Construct the URL from runtime config so localhost uses the local Hydra/UI pair.
+	baseURL := strings.TrimSpace(config.AppConfig.OAuthAuthURL)
+	if baseURL == "" {
+		baseURL = strings.TrimRight(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
+	}
+
+	redirectURI := strings.TrimSpace(config.AppConfig.OAuthRedirectURI)
+	if redirectURI == "" {
+		if config.AppConfig.ReactAppURL != "" {
+			redirectURI = strings.TrimRight(config.AppConfig.ReactAppURL, "/") + "/oidc/auth/callback"
+		} else {
+			redirectURI = fmt.Sprintf("https://%s/oidc/auth/callback", tenant.TenantDomain)
+		}
+	}
 
 	// Appending -main-client to the client_id for the OAuth provider as requested
 	// Internal DB lookup used the raw UUID, but external provider seems to expect the suffix

@@ -411,6 +411,11 @@ func (sc *ScopeController) DeleteUserScope(c *gin.Context) {
 // ========================================
 
 func (sc *ScopeController) listScopesInternal(c *gin.Context, sqlDB *sql.DB, tenantID string) {
+	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
+		return
+	}
+
 	query := `SELECT DISTINCT scope_name FROM scope_resource_mappings WHERE tenant_id = $1 ORDER BY scope_name`
 	rows, err := sqlDB.Query(query, tenantID)
 	if err != nil {
@@ -437,6 +442,11 @@ func (sc *ScopeController) listScopesInternal(c *gin.Context, sqlDB *sql.DB, ten
 }
 
 func (sc *ScopeController) getMappingsInternal(c *gin.Context, sqlDB *sql.DB, tenantID string) {
+	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
+		return
+	}
+
 	query := `
 		SELECT scope_name, array_agg(resource_name) 
 		FROM scope_resource_mappings 
@@ -476,6 +486,11 @@ func (sc *ScopeController) addScopeInternal(c *gin.Context, sqlDB *sql.DB, tenan
 	var input AddScopeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
 		return
 	}
 
@@ -545,6 +560,11 @@ func (sc *ScopeController) editScopeInternal(c *gin.Context, sqlDB *sql.DB, tena
 		return
 	}
 
+	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
+		return
+	}
+
 	tx, err := sqlDB.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to begin transaction"})
@@ -593,6 +613,11 @@ func (sc *ScopeController) editScopeInternal(c *gin.Context, sqlDB *sql.DB, tena
 }
 
 func (sc *ScopeController) deleteScopeInternal(c *gin.Context, sqlDB *sql.DB, tenantID string, scopeName string) {
+	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
+		return
+	}
+
 	// Check if scope exists for this tenant
 	var exists int
 	err := sqlDB.QueryRow("SELECT 1 FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2 LIMIT 1", scopeName, tenantID).Scan(&exists)
@@ -618,6 +643,29 @@ func (sc *ScopeController) deleteScopeInternal(c *gin.Context, sqlDB *sql.DB, te
 	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "Scope deleted successfully"})
+}
+
+func ensureScopeResourceMappingsSchema(sqlDB *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS scope_resource_mappings (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			tenant_id UUID NOT NULL,
+			scope_name TEXT NOT NULL DEFAULT '*',
+			resource_name TEXT NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_resource_mappings_tenant_scope_resource
+			ON scope_resource_mappings (tenant_id, scope_name, resource_name)`,
+	}
+
+	for _, statement := range statements {
+		if _, err := sqlDB.Exec(statement); err != nil {
+			return fmt.Errorf("scope_resource_mappings schema ensure failed: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // Helper to validate UUID

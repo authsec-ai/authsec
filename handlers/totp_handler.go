@@ -238,7 +238,13 @@ func (h *TOTPHandler) ConfirmTOTPSetup(c *gin.Context) {
 
 	// Save to MFA methods table
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	err = mfaRepo.EnableMethodWithBackupCodes(client.ID.String(), "totp", totpData, encryptedCodes, client.ID)
+	mfaLookupID := mfaPrimaryLookupID(client)
+	if mfaLookupID == "" {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "missing MFA subject identifier"})
+		return
+	}
+
+	err = mfaRepo.EnableMethodWithBackupCodes(mfaLookupID, "totp", totpData, encryptedCodes, client.ID)
 	if err != nil {
 		log.Printf("Failed to save TOTP method: %v", err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to enable TOTP"})
@@ -371,7 +377,13 @@ func (h *TOTPHandler) ConfirmSetup(c *gin.Context) {
 
 	// Save to MFA methods table
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	err = mfaRepo.EnableMethodWithBackupCodes(client.ID.String(), "totp", totpData, encryptedCodes, client.ID)
+	mfaLookupID := mfaPrimaryLookupID(client)
+	if mfaLookupID == "" {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "missing MFA subject identifier"})
+		return
+	}
+
+	err = mfaRepo.EnableMethodWithBackupCodes(mfaLookupID, "totp", totpData, encryptedCodes, client.ID)
 	if err != nil {
 		log.Printf("Failed to save TOTP method: %v", err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to enable TOTP"})
@@ -472,7 +484,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 	if req.BackupCode != "" {
 		// Verify backup code
 		mfaRepo := repositories.NewMFARepository(tenantDB)
-		method, err := mfaRepo.GetMethod(client.ID.String(), "totp")
+		method, methodLookupID, err := mfaGetMethod(mfaRepo, client, "totp")
 		if err != nil {
 			log.Printf("Failed to get TOTP method: %v", err)
 			c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to verify backup code"})
@@ -502,7 +514,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 				newCodes = append(newCodes, encryptedCodes[i+1:]...)
 
 				// Update backup codes
-				if err := mfaRepo.UpdateBackupCodes(client.ID.String(), "totp", newCodes); err != nil {
+				if err := mfaRepo.UpdateBackupCodes(methodLookupID, "totp", newCodes); err != nil {
 					log.Printf("Failed to update backup codes: %v", err)
 				}
 
@@ -530,7 +542,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 
 	// Verify regular TOTP code
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	method, err := mfaRepo.GetMethod(client.ID.String(), "totp")
+	method, methodLookupID, err := mfaGetMethod(mfaRepo, client, "totp")
 	if err != nil {
 		log.Printf("Failed to get TOTP method: %v", err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to verify TOTP"})
@@ -569,7 +581,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 
 	// Update MFA method last used
 	if err := tenantDB.Model(&sharedmodels.MFAMethod{}).
-		Where("client_id = ? AND method_type = ?", client.ID, "totp").
+		Where("client_id = ? AND method_type = ?", methodLookupID, "totp").
 		Update("last_used_at", time.Now()).Error; err != nil {
 		log.Printf("Failed to update MFA method last used: %v", err)
 	}
@@ -622,10 +634,10 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 	// Get TOTP method from MFA methods table
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	method, err := mfaRepo.GetMethod(client.ID.String(), "totp")
+	method, methodLookupID, err := mfaGetMethod(mfaRepo, client, "totp")
 	if err != nil || !method.Enabled {
 		// Check if user has other MFA methods available
-		availableMethods, _ := mfaRepo.GetUserMethods(client.ID.String())
+		availableMethods, _, _ := mfaGetUserMethods(mfaRepo, client)
 		if len(availableMethods) > 0 {
 			methodType := availableMethods[0].MethodType
 			log.Printf("TOTP not enabled for client: %s, but %s is available", req.Email, methodType)
@@ -641,11 +653,11 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 	// First, check if it's a backup code
 	if len(req.Code) == 8 || len(req.Code) == 9 { // 8 chars or with dash
-		if err := h.verifyBackupCode(mfaRepo, client.ID.String(), req.Code, method.BackupCodes); err == nil {
+		if err := h.verifyBackupCode(mfaRepo, methodLookupID, req.Code, method.BackupCodes); err == nil {
 			log.Printf("Backup code verified for: %s", req.Email)
 
 			// Update MFA verified status for backup code
-			h.updateMFAVerifiedStatus(tenantDB, req.TenantID)
+			h.updateMFAVerifiedStatus(tenantDB, client.ID.String())
 
 			response := AuthenticationResponse{
 				Success:  true,
@@ -681,7 +693,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 	// Validate TOTP code
 	if h.Service.ValidateCodeWithWindow(secret, req.Code, 1) {
 		// Update last used timestamp
-		mfaRepo.UpdateLastUsed(client.ID.String(), "totp")
+		mfaRepo.UpdateLastUsed(methodLookupID, "totp")
 
 		log.Printf("TOTP code verified for: %s", req.Email)
 

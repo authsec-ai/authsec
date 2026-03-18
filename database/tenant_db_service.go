@@ -65,13 +65,16 @@ func (s *TenantDBService) CreateTenantDatabase(tenantID string) (string, error) 
 	dbName := s.generateTenantDBName(tenantID)
 
 	log.Printf("Creating tenant database: %s for tenant: %s", dbName, tenantID)
+	s.updateTenantMigrationState(tenantID, dbName, "in_progress", nil)
 
 	// Check if database already exists
 	if exists, err := s.databaseExists(dbName); err != nil {
+		s.updateTenantMigrationState(tenantID, dbName, "failed", nil)
 		return "", fmt.Errorf("failed to check if database exists: %w", err)
 	} else if !exists {
 		// Create the database
 		if err := s.createDatabase(dbName); err != nil {
+			s.updateTenantMigrationState(tenantID, dbName, "failed", nil)
 			return "", fmt.Errorf("failed to create database: %w", err)
 		}
 	} else {
@@ -79,9 +82,16 @@ func (s *TenantDBService) CreateTenantDatabase(tenantID string) (string, error) 
 	}
 
 	// Always run tenant migrations (idempotent) - handles retry case where DB exists but migrations failed
-	if err := s.RunTenantMigrations(tenantID); err != nil {
+	status, err := s.runTenantMigrations(tenantID, dbName)
+	if err != nil {
+		s.updateTenantMigrationState(tenantID, dbName, "failed", nil)
 		log.Printf("Failed to run tenant migrations for %s: %v", dbName, err)
 		return "", fmt.Errorf("failed to run tenant migrations: %w", err)
+	}
+	if status != nil {
+		s.updateTenantMigrationState(tenantID, dbName, "completed", &status.LastMigration)
+	} else {
+		s.updateTenantMigrationState(tenantID, dbName, "completed", nil)
 	}
 
 	log.Printf("Successfully created tenant database: %s", dbName)
@@ -91,8 +101,53 @@ func (s *TenantDBService) CreateTenantDatabase(tenantID string) (string, error) 
 // RunTenantMigrations runs tenant migrations in-process by calling the migration runner directly.
 func (s *TenantDBService) RunTenantMigrations(tenantID string) error {
 	dbName := s.generateTenantDBName(tenantID)
+	_, err := s.runTenantMigrations(tenantID, dbName)
+	return err
+}
+
+func (s *TenantDBService) runTenantMigrations(tenantID, dbName string) (*migration.MigrationStatusResponse, error) {
 	log.Printf("Running tenant migrations in-process for tenant %s (db: %s)", tenantID, dbName)
-	return migration.RunTenantMigrationsInProcess(tenantID, s.dbHost, s.dbPort, s.dbUser, s.dbPassword, dbName, s.masterDB.DB, "")
+
+	tenantDBConn, err := migration.ConnectToTenantDB(s.dbHost, s.dbPort, s.dbUser, s.dbPassword, dbName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
+	}
+	defer tenantDBConn.Close()
+
+	runner := migration.NewTenantMigrationRunner(tenantID, tenantDBConn, migration.MigrationsDir("tenant"), s.masterDB.DB)
+	if err := runner.RunMigrations(); err != nil {
+		return nil, err
+	}
+
+	status, err := runner.GetMigrationStatus()
+	if err != nil {
+		log.Printf("Warning: failed to read migration status for tenant %s: %v", tenantID, err)
+		return nil, nil
+	}
+
+	return status, nil
+}
+
+func (s *TenantDBService) updateTenantMigrationState(tenantID, dbName, status string, lastMigration *int) {
+	if s.masterDB == nil || s.masterDB.DB == nil {
+		return
+	}
+
+	query := `UPDATE tenants
+		SET tenant_db = $1, migration_status = $2, updated_at = NOW()`
+	args := []interface{}{dbName, status}
+
+	if lastMigration != nil {
+		query += `, last_migration = $3 WHERE tenant_id = $4`
+		args = append(args, *lastMigration, tenantID)
+	} else {
+		query += ` WHERE tenant_id = $3`
+		args = append(args, tenantID)
+	}
+
+	if _, err := s.masterDB.DB.Exec(query, args...); err != nil {
+		log.Printf("Warning: failed to update tenant migration state for %s: %v", tenantID, err)
+	}
 }
 
 // generateTenantDBName creates a database name from tenant ID

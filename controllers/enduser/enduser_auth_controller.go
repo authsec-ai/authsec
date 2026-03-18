@@ -580,7 +580,10 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/auth/enduser/webauthn-callback [post]
 func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
-	var input models.WebAuthnCallbackInput
+	var input struct {
+		models.WebAuthnCallbackInput
+		ClientID string `json:"client_id,omitempty"`
+	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -611,7 +614,19 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email).First(&user).Error; err != nil {
+	userQuery := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email)
+	clientIDStr := ""
+	if strings.TrimSpace(input.ClientID) != "" {
+		clientUUID, parseErr := uuid.Parse(strings.TrimSpace(input.ClientID))
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
+			return
+		}
+		userQuery = userQuery.Where("client_id = ?", clientUUID)
+		clientIDStr = clientUUID.String()
+	}
+
+	if err := userQuery.First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 			return
@@ -626,8 +641,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	}
 
 	isFirstLogin := user.LastLogin == nil
-	clientIDStr := ""
-	if user.ClientID != uuid.Nil {
+	if clientIDStr == "" && user.ClientID != uuid.Nil {
 		clientIDStr = user.ClientID.String()
 	}
 
@@ -648,6 +662,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		"expires_in":   365 * 24 * 60 * 60,
 		"first_login":  isFirstLogin,
 		"tenant_id":    tenantIDStr,
+		"client_id":    clientIDStr,
 		"email":        user.Email,
 	}
 
@@ -656,6 +671,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		After: map[string]interface{}{
 			"email":       user.Email,
 			"tenant_id":   tenantIDStr,
+			"client_id":   clientIDStr,
 			"first_login": isFirstLogin,
 			"mfa_method":  "webauthn",
 		},
@@ -1050,10 +1066,18 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 	if len(mfaMethods) == 0 {
 		log.Printf("DEBUG EndUser: No MFA methods found in mfa_methods table for user %s, checking legacy tables", input.Email)
 
-		// First, check for TOTP secrets (TOTP has priority because it's domain-independent)
-		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`
+		// First, check for tenant TOTP secrets (tenant-scoped schema), then legacy totp_secrets.
 		var totpCount int
-		if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
+		totpQueries := []string{
+			`SELECT COUNT(*) FROM tenant_totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true AND is_active = true`,
+			`SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`,
+		}
+		for _, totpQuery := range totpQueries {
+			if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil {
+				break
+			}
+		}
+		if totpCount > 0 {
 			log.Printf("DEBUG EndUser: Found %d TOTP secrets for user %s", totpCount, input.Email)
 			// User has TOTP configured but not in mfa_methods table
 			mfaMethods = append(mfaMethods, map[string]interface{}{

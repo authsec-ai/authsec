@@ -483,6 +483,49 @@ func TestAssignRoleScoped_TenantWide_WildcardScope(t *testing.T) {
 	assert.Nil(t, dbScopeID, "Wildcard scope_id '*' should be stored as NULL")
 }
 
+func TestAssignRoleScoped_TenantWide_LegacyNamedWildcardScope(t *testing.T) {
+	db := setupRolesScopedTestDB(t)
+	tenantID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, tenantID)
+	router := setupRolesScopedTestRouter(db, tenantID)
+
+	roleID := uuid.New()
+	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), tenantID.String(), "manager", "Manager role").Error
+	require.NoError(t, err)
+
+	payload := BindingRequest{
+		UserID: userID.String(),
+		RoleID: roleID.String(),
+		Scope: &BindingScope{
+			Type: "master",
+			ID:   "*",
+		},
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "/bindings", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp BindingResponse
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Contains(t, resp.ScopeDescription, "Tenant-Wide")
+	assert.Contains(t, resp.ScopeDescription, "master")
+
+	var dbScopeType, dbScopeID *string
+	err = db.Raw(`SELECT scope_type, scope_id FROM role_bindings WHERE id = ?`, resp.ID).
+		Row().Scan(&dbScopeType, &dbScopeID)
+	require.NoError(t, err, "Should be able to read legacy wildcard binding from database")
+
+	assert.Nil(t, dbScopeType, "Legacy named wildcard scope_type should be normalized to NULL")
+	assert.Nil(t, dbScopeID, "Legacy named wildcard scope_id should be normalized to NULL")
+}
+
 func TestAssignRoleScoped_SpecificScope(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
 	tenantID := uuid.New()

@@ -421,6 +421,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     backup_eligible BOOLEAN DEFAULT false,
     backup_state BOOLEAN DEFAULT false,
     transports TEXT[],
+    rp_id VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE,
     updated_at TIMESTAMP WITH TIME ZONE,
     aaguid UUID

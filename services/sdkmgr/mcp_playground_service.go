@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -14,6 +16,25 @@ import (
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
+
+type mcpJSONRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	ID      string      `json:"id"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+}
+
+type mcpJSONRPCResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      string `json:"id"`
+	Result  struct {
+		Tools []map[string]interface{} `json:"tools"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
 
 // MCPPlaygroundService provides conversation CRUD, AI chat with tool calling,
 // and MCP server management. Translates sdk-manager's mcp_playground_service.py.
@@ -471,10 +492,17 @@ func (s *MCPPlaygroundService) AddMCPServer(
 		return nil, fmt.Errorf("failed to add MCP server: %w", err)
 	}
 
-	// TODO: Attempt actual MCP connection (streamable-http, SSE, stdio) and
-	// update is_connected. For now, mark as connected optimistically.
-	server.IsConnected = true
-	db.Model(&server).Update("is_connected", true)
+	if _, err := s.fetchMCPTools(server.ServerURL); err == nil {
+		server.IsConnected = true
+		if updateErr := db.Model(&server).Update("is_connected", true).Error; updateErr != nil {
+			return nil, fmt.Errorf("failed to update MCP server connection status: %w", updateErr)
+		}
+	} else {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"server_id":  server.ID,
+			"server_url": server.ServerURL,
+		}).Warn("unable to verify MCP server during add")
+	}
 
 	logrus.WithFields(logrus.Fields{"id": server.ID, "name": name}).Info("added MCP server to conversation")
 
@@ -540,10 +568,30 @@ func (s *MCPPlaygroundService) RemoveMCPServer(tenantID, conversationID, serverI
 
 // GetMCPTools returns tools from a specific MCP server.
 func (s *MCPPlaygroundService) GetMCPTools(tenantID, conversationID, serverID string) ([]map[string]interface{}, error) {
-	// TODO: Implement actual MCP tool discovery via the server's JSON-RPC endpoint.
-	// For now return an empty list; the actual protocol integration requires
-	// connecting to the MCP server and calling tools/list.
-	return []map[string]interface{}{}, nil
+	db, err := s.tenantDB(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	var server models.PlaygroundMCPServer
+	if err := db.Where("id = ? AND conversation_id = ?", serverID, conversationID).First(&server).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	tools, err := s.fetchMCPTools(server.ServerURL)
+	if err != nil {
+		_ = db.Model(&server).Update("is_connected", false).Error
+		return nil, err
+	}
+
+	if !server.IsConnected {
+		_ = db.Model(&server).Update("is_connected", true).Error
+	}
+
+	return tools, nil
 }
 
 // GetAllConversationTools returns tools from all connected MCP servers.
@@ -604,4 +652,94 @@ func mcpServerToMap(srv models.PlaygroundMCPServer) map[string]interface{} {
 		"is_connected":    srv.IsConnected,
 		"created_at":      srv.CreatedAt,
 	}
+}
+
+func (s *MCPPlaygroundService) fetchMCPTools(serverURL string) ([]map[string]interface{}, error) {
+	var lastErr error
+	for _, candidate := range mcpServerURLCandidates(serverURL) {
+		tools, err := fetchMCPToolsOnce(candidate)
+		if err == nil {
+			return tools, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no MCP server URL candidates available")
+	}
+	return nil, lastErr
+}
+
+func fetchMCPToolsOnce(serverURL string) ([]map[string]interface{}, error) {
+	payload, err := json.Marshal(mcpJSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      uuid.NewString(),
+		Method:  "tools/list",
+		Params:  map[string]interface{}{},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal MCP tools/list request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, serverURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("create MCP tools/list request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call MCP tools/list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read MCP tools/list response: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("MCP tools/list returned %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+
+	var rpcResp mcpJSONRPCResponse
+	if err := json.Unmarshal(body, &rpcResp); err != nil {
+		return nil, fmt.Errorf("decode MCP tools/list response: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("MCP tools/list error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+
+	return rpcResp.Result.Tools, nil
+}
+
+func mcpServerURLCandidates(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	candidates := []string{raw}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return candidates
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if host != "127.0.0.1" && host != "localhost" {
+		return candidates
+	}
+
+	rewritten := *parsed
+	if port := parsed.Port(); port != "" {
+		rewritten.Host = "host.docker.internal:" + port
+	} else {
+		rewritten.Host = "host.docker.internal"
+	}
+
+	alt := rewritten.String()
+	if alt != raw {
+		candidates = append(candidates, alt)
+	}
+	return candidates
 }

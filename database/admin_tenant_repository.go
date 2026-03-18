@@ -23,9 +23,9 @@ func NewAdminTenantRepository(db *DBConnection) *AdminTenantRepository {
 // GetAllTenants retrieves all tenants from global database
 func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		ORDER BY created_at DESC
 	`
@@ -69,9 +69,9 @@ func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
 // GetTenantByID retrieves a specific tenant by ID
 func (atr *AdminTenantRepository) GetTenantByID(tenantID string) (*models.Tenant, error) {
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		WHERE tenant_id = $1
 	`
@@ -109,9 +109,9 @@ func (atr *AdminTenantRepository) GetTenantByID(tenantID string) (*models.Tenant
 // GetTenantByClientID retrieves a tenant using a client_id via tenant_mappings table
 func (atr *AdminTenantRepository) GetTenantByClientID(clientID string) (*models.Tenant, error) {
 	query := `
-		SELECT t.id, t.tenant_id, t.tenant_db, t.email, t.username, t.password_hash,
-			t.provider, t.provider_id, t.avatar, t.name, t.source, t.status, t.last_login,
-			t.created_at, t.updated_at, t.tenant_domain
+		SELECT t.id, t.tenant_id, COALESCE(t.tenant_db, '') AS tenant_db, t.email, t.username, COALESCE(t.password_hash, '') AS password_hash,
+			COALESCE(t.provider, '') AS provider, t.provider_id, t.avatar, COALESCE(t.name, '') AS name, COALESCE(t.source, '') AS source, COALESCE(t.status, '') AS status, t.last_login,
+			t.created_at, t.updated_at, COALESCE(t.tenant_domain, '') AS tenant_domain
 		FROM tenants t
 		JOIN tenant_mappings tm ON t.id = tm.tenant_id
 		WHERE tm.client_id = $1
@@ -239,9 +239,9 @@ func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*model
 
 	// First try to find tenant via tenant_domains table (supports custom domains)
 	query := `
-		SELECT t.id, t.tenant_id, t.tenant_db, t.email, t.username, t.password_hash,
-			t.provider, t.provider_id, t.avatar, t.name, t.source, t.status, t.last_login,
-			t.created_at, t.updated_at, t.tenant_domain
+		SELECT t.id, t.tenant_id, COALESCE(t.tenant_db, '') AS tenant_db, t.email, t.username, COALESCE(t.password_hash, '') AS password_hash,
+			COALESCE(t.provider, '') AS provider, t.provider_id, t.avatar, COALESCE(t.name, '') AS name, COALESCE(t.source, '') AS source, COALESCE(t.status, '') AS status, t.last_login,
+			t.created_at, t.updated_at, COALESCE(t.tenant_domain, '') AS tenant_domain
 		FROM tenants t
 		INNER JOIN tenant_domains td ON t.tenant_id = td.tenant_id
 		WHERE LOWER(td.domain) = LOWER($1) AND td.is_verified = true
@@ -278,9 +278,9 @@ func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*model
 
 	// Fallback: try direct lookup in tenants.tenant_domain (legacy/backwards compatibility)
 	fallbackQuery := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		WHERE tenant_domain LIKE $1 OR tenant_domain = $2
 	`
@@ -433,7 +433,7 @@ func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.Adm
 // GetAdminUserByID retrieves an admin user by ID
 func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.AdminUser, error) {
 	query := `
-		SELECT id, email, username, password_hash, name, tenant_id, project_id,
+		SELECT id, email, username, COALESCE(password_hash, '') AS password_hash, name, tenant_id, project_id,
 			client_id, tenant_domain, provider, provider_id, avatar_url, active,
 			created_at, updated_at
 		FROM users

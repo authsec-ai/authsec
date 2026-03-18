@@ -1,0 +1,152 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./dev/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  vault:
+    image: hashicorp/vault:1.18
+    cap_add:
+      - IPC_LOCK
+    command: server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    healthcheck:
+      test: ["CMD", "sh", "-ec", "VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault status >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  vault-init:
+    image: hashicorp/vault:1.18
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    volumes:
+      - ./dev/vault:/work:ro
+    entrypoint: ["sh", "/work/init.sh"]
+    restart: "no"
+
+  hydra-migrate:
+    image: oryd/hydra:v2.2.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dev/hydra/hydra.yml:/etc/config/hydra/hydra.yml:ro
+    command: ["migrate", "sql", "--config", "/etc/config/hydra/hydra.yml", "-e", "--yes"]
+    restart: "no"
+
+  hydra:
+    image: oryd/hydra:v2.2.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hydra-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./dev/hydra/hydra.yml:/etc/config/hydra/hydra.yml:ro
+    command: ["serve", "all", "--dev", "--config", "/etc/config/hydra/hydra.yml"]
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4444/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  icp-mock:
+    image: python:3.12-alpine
+    working_dir: /srv
+    volumes:
+      - ./dev/icp-mock:/srv:ro
+    command: ["python", "-u", "/srv/server.py"]
+    ports:
+      - "7001:7001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7001/health', timeout=5).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  authsec:
+    image: authsec-local
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+      additional_contexts:
+        auth_manager: ${HOME}/go/pkg/mod/github.com/authsec-ai/auth-manager@v1.2.3
+        sharedmodels: ${HOME}/go/pkg/mod/github.com/authsec-ai/sharedmodels@v1.3.0
+    env_file:
+      - .env.compose
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
+      hydra:
+        condition: service_healthy
+      icp-mock:
+        condition: service_healthy
+    ports:
+      - "7468:7468"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7468/authsec/uflow/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  authsec-init:
+    image: authsec-local
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+      additional_contexts:
+        auth_manager: ${HOME}/go/pkg/mod/github.com/authsec-ai/auth-manager@v1.2.3
+        sharedmodels: ${HOME}/go/pkg/mod/github.com/authsec-ai/sharedmodels@v1.3.0
+    depends_on:
+      authsec:
+        condition: service_healthy
+    env_file:
+      - .env.compose
+    command: ["./authsec-seed"]
+    restart: "no"
+
+volumes:
+  postgres-data:

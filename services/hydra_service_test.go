@@ -16,6 +16,101 @@ func init() {
 	}
 }
 
+func TestHydraBuildURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		raw    string
+		suffix string
+		want   string
+	}{
+		{
+			name:   "bare production host gets https",
+			raw:    "test.example.com",
+			suffix: "/oidc/auth/callback",
+			want:   "https://test.example.com/oidc/auth/callback",
+		},
+		{
+			name:   "localhost origin keeps http",
+			raw:    "http://localhost:3000",
+			suffix: "/oidc/auth/callback",
+			want:   "http://localhost:3000/oidc/auth/callback",
+		},
+		{
+			name:   "bare localhost host gets http",
+			raw:    "localhost:3000",
+			suffix: "/oidc/auth/callback",
+			want:   "http://localhost:3000/oidc/auth/callback",
+		},
+		{
+			name:   "existing callback path is preserved",
+			raw:    "http://localhost:3000/oidc/auth/callback",
+			suffix: "/oidc/auth/callback",
+			want:   "http://localhost:3000/oidc/auth/callback",
+		},
+		{
+			name:   "oauth auth path is appended once",
+			raw:    "http://localhost:3000",
+			suffix: "/oauth2/auth",
+			want:   "http://localhost:3000/oauth2/auth",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hydraBuildURL(tt.raw, tt.suffix); got != tt.want {
+				t.Fatalf("hydraBuildURL(%q, %q) = %q, want %q", tt.raw, tt.suffix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHydraMainClientRedirectURIs(t *testing.T) {
+	original := config.AppConfig
+	config.AppConfig = &config.Config{BaseURL: "http://localhost:7468"}
+	t.Cleanup(func() {
+		config.AppConfig = original
+	})
+
+	got := hydraMainClientRedirectURIs("http://localhost:3000")
+	want := []string{
+		"http://localhost:3000/oidc/auth/callback",
+		"http://localhost:7468/authsec/sdkmgr/mcp-auth/callback",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("hydraMainClientRedirectURIs() len = %d, want %d (%v)", len(got), len(want), got)
+	}
+
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("hydraMainClientRedirectURIs()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHydraMainClient_UsesPublicPKCEClient(t *testing.T) {
+	client, err := hydraMainClient(
+		"client-123",
+		"secret-123",
+		"Local Demo",
+		"tenant-123",
+		"http://localhost:3000",
+	)
+	if err != nil {
+		t.Fatalf("hydraMainClient() error = %v", err)
+	}
+
+	if client.ClientID != "client-123-main-client" {
+		t.Fatalf("hydraMainClient() client id = %q", client.ClientID)
+	}
+	if client.TokenEndpoint != hydraMainClientTokenEndpointAuthMethod {
+		t.Fatalf("hydraMainClient() token endpoint = %q, want %q", client.TokenEndpoint, hydraMainClientTokenEndpointAuthMethod)
+	}
+	if len(client.RedirectURIs) != 1 || client.RedirectURIs[0] != "http://localhost:3000/oidc/auth/callback" {
+		t.Fatalf("hydraMainClient() redirect uris = %v", client.RedirectURIs)
+	}
+}
+
 func TestRegisterClientWithHydra_Success(t *testing.T) {
 	if config.AppConfig.JWTSdkSecret == "" {
 		t.Skip("skipping hydra client tests: JWTSdkSecret not configured")

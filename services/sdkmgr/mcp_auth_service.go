@@ -12,6 +12,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	models "github.com/authsec-ai/authsec/models/sdkmgr"
 	"github.com/sirupsen/logrus"
+	"gorm.io/datatypes"
 )
 
 // MCPAuthService is the core MCP authentication service.
@@ -49,15 +50,28 @@ func (s *MCPAuthService) HealthCheck() map[string]interface{} {
 // ---------- OAuth Flow ----------
 
 // StartOAuthFlow creates a new session with PKCE and returns the authorization URL.
-func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]interface{}, error) {
-	candidates := BuildClientIDCandidates(clientID)
-	resolvedClientID := clientID
-	if len(candidates) > 0 {
-		resolvedClientID = candidates[0]
+func (s *MCPAuthService) StartOAuthFlow(clientID, appName, returnURL string) (map[string]interface{}, error) {
+	rawClientID := strings.Trim(strings.TrimSpace(clientID), `"'`)
+	if rawClientID == "" {
+		return nil, fmt.Errorf("client_id is required")
+	}
+
+	oauthClientID := NormalizeClientID(rawClientID)
+	normalizedReturnURL := normalizeReturnURL(returnURL)
+	if strings.TrimSpace(returnURL) != "" && normalizedReturnURL == "" {
+		return nil, fmt.Errorf("invalid return_url")
 	}
 
 	session := models.NewOAuthSession()
-	session.ClientIdentifier = &resolvedClientID
+	session.ClientIdentifier = &rawClientID
+
+	if normalizedReturnURL != "" {
+		raw, _ := json.Marshal(map[string]interface{}{
+			"return_url": normalizedReturnURL,
+			"flow":       "inspector",
+		})
+		session.UserInfo = datatypes.JSON(raw)
+	}
 
 	// Generate PKCE parameters.
 	verifier, err := GenerateCodeVerifier()
@@ -85,11 +99,11 @@ func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]in
 	}
 
 	// Build authorization URL.
-	redirectURI := s.resolveRedirectURI(resolvedClientID)
+	redirectURI := s.resolveRedirectURI(rawClientID, normalizedReturnURL)
 
 	params := url.Values{
 		"response_type":         {"code"},
-		"client_id":             {resolvedClientID},
+		"client_id":             {oauthClientID},
 		"redirect_uri":          {redirectURI},
 		"scope":                 {"openid profile email"},
 		"state":                 {state},
@@ -99,9 +113,14 @@ func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]in
 
 	authURL := cfg.OAuthAuthURL + "?" + params.Encode()
 
-	truncatedID := resolvedClientID
+	truncatedID := rawClientID
 	if len(truncatedID) > 12 {
 		truncatedID = truncatedID[:8] + "..." + truncatedID[len(truncatedID)-4:]
+	}
+
+	redirectMode := "ui"
+	if normalizedReturnURL != "" {
+		redirectMode = "inspector"
 	}
 
 	return map[string]interface{}{
@@ -109,14 +128,17 @@ func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]in
 		"session_id":        session.SessionID,
 		"authorization_url": authURL,
 		"callback_url":      redirectURI,
-		"client_id_used":    resolvedClientID,
+		"client_id_used":    rawClientID,
+		"oauth_client_id":   oauthClientID,
 		"browser_opened":    false,
 		"app_name":          appName,
+		"return_url":        normalizedReturnURL,
+		"redirect_mode":     redirectMode,
 		"instructions": []string{
 			fmt.Sprintf("Your session ID: %s", session.SessionID),
 			fmt.Sprintf("Using client_id: %s", truncatedID),
 			"Browser should open automatically if configured, otherwise open authorization_url manually",
-			"If callback_url points to /sdkmgr/mcp-auth/callback, authentication completes automatically",
+			"If callback_url points to /authsec/sdkmgr/mcp-auth/callback, authentication completes automatically",
 			"After login, protected tools can use latest session automatically (session_id optional)",
 			"If your login flow returns a raw JWT instead, use oauth_authenticate as fallback",
 		},
@@ -202,15 +224,17 @@ func (s *MCPAuthService) HandleOAuthCallback(code, state, sessionID, clientID st
 		return nil, fmt.Errorf("invalid OAuth state")
 	}
 
-	resolvedClientID := clientID
-	if session.ClientIdentifier != nil && *session.ClientIdentifier != "" {
-		resolvedClientID = *session.ClientIdentifier
+	rawClientID := strings.Trim(strings.TrimSpace(clientID), `"'`)
+	if session.ClientIdentifier != nil && strings.TrimSpace(*session.ClientIdentifier) != "" {
+		rawClientID = strings.Trim(strings.TrimSpace(*session.ClientIdentifier), `"'`)
 	}
-	if resolvedClientID == "" {
+	if rawClientID == "" {
 		return nil, fmt.Errorf("missing client identifier in callback context")
 	}
 
-	redirectURI := s.resolveRedirectURI(resolvedClientID)
+	pendingReturnURL := extractPendingReturnURL(session)
+	redirectURI := s.resolveRedirectURI(rawClientID, pendingReturnURL)
+	oauthClientID := NormalizeClientID(rawClientID)
 	cfg := config.AppConfig
 
 	// Exchange code for token.
@@ -218,7 +242,7 @@ func (s *MCPAuthService) HandleOAuthCallback(code, state, sessionID, clientID st
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"redirect_uri":  {redirectURI},
-		"client_id":     {resolvedClientID},
+		"client_id":     {oauthClientID},
 		"code_verifier": {ptrStr(session.PKCEVerifier)},
 	}
 
@@ -265,10 +289,12 @@ func (s *MCPAuthService) HandleOAuthCallback(code, state, sessionID, clientID st
 	}
 
 	return map[string]interface{}{
-		"status":     "authenticated",
-		"session_id": session.SessionID,
-		"client_id":  resolvedClientID,
-		"flow":       "authorization_code_callback",
+		"status":          "authenticated",
+		"session_id":      session.SessionID,
+		"client_id":       rawClientID,
+		"oauth_client_id": oauthClientID,
+		"flow":            "authorization_code_callback",
+		"return_url":      pendingReturnURL,
 		"oauth": map[string]interface{}{
 			"code_received":         true,
 			"token_expires_in":      expiresIn,
@@ -328,18 +354,18 @@ func (s *MCPAuthService) CleanupSessions(clientID, appName, reason string) map[s
 		total += s.SessionStore.CleanupClientSessions(cid)
 	}
 	return map[string]interface{}{
-		"status":             "cleaned",
-		"client_id":          clientID,
-		"app_name":           appName,
-		"reason":             reason,
-		"sessions_cleaned":   total,
+		"status":           "cleaned",
+		"client_id":        clientID,
+		"app_name":         appName,
+		"reason":           reason,
+		"sessions_cleaned": total,
 	}
 }
 
 // ---------- Tools ----------
 
 // GetToolsList returns the available tools for an MCP client.
-func (s *MCPAuthService) GetToolsList(clientID, appName string, userTools []interface{}) map[string]interface{} {
+func (s *MCPAuthService) GetToolsList(clientID, appName, sessionID string, userTools []interface{}) map[string]interface{} {
 	oauthTools := s.ToolsManager.GetOAuthTools()
 	availableTools := make([]ToolSchema, len(oauthTools))
 	copy(availableTools, oauthTools)
@@ -371,11 +397,12 @@ func (s *MCPAuthService) GetToolsList(clientID, appName string, userTools []inte
 		hideUnauthorized = cfg.SDKHideUnauthorizedTools
 	}
 
-	// Check for active session.
-	sessions := s.SessionStore.GetActiveSessionsForClient(clientID)
 	var latestSession *models.OAuthSession
-	if len(sessions) > 0 {
-		latestSession = &sessions[0]
+	if sessionID != "" {
+		session := s.SessionStore.GetSession(sessionID)
+		if session != nil && session.IsActive && session.IsTokenValid() {
+			latestSession = session
+		}
 	}
 
 	// Compute accessible tools if we have session + metadata.
@@ -392,9 +419,11 @@ func (s *MCPAuthService) GetToolsList(clientID, appName string, userTools []inte
 		}
 	}
 
-	shouldFilter := !alwaysExpose && hideUnauthorized && latestSession != nil && latestSession.AccessibleTools != nil
+	if !alwaysExpose && hideUnauthorized {
+		if latestSession == nil {
+			return map[string]interface{}{"tools": availableTools}
+		}
 
-	if shouldFilter {
 		accessibleSet := make(map[string]bool)
 		for _, t := range latestSession.GetAccessibleToolsList() {
 			accessibleSet[t] = true
@@ -405,10 +434,12 @@ func (s *MCPAuthService) GetToolsList(clientID, appName string, userTools []inte
 				availableTools = append(availableTools, s.ToolsManager.GenerateUserToolSchemaFromMetadata(meta))
 			}
 		}
-	} else {
-		for _, meta := range toolMetaList {
-			availableTools = append(availableTools, s.ToolsManager.GenerateUserToolSchemaFromMetadata(meta))
-		}
+
+		return map[string]interface{}{"tools": availableTools}
+	}
+
+	for _, meta := range toolMetaList {
+		availableTools = append(availableTools, s.ToolsManager.GenerateUserToolSchemaFromMetadata(meta))
 	}
 
 	return map[string]interface{}{"tools": availableTools}
@@ -475,7 +506,8 @@ func (s *MCPAuthService) ExecuteOAuthTool(toolName, clientID, appName string, ar
 
 	switch toolName {
 	case "oauth_start":
-		result, err := s.StartOAuthFlow(clientID, appName)
+		returnURL, _ := arguments["return_url"].(string)
+		result, err := s.StartOAuthFlow(clientID, appName, returnURL)
 		if err != nil {
 			return wrapError(err.Error())
 		}
@@ -566,9 +598,12 @@ func (s *MCPAuthService) verifyToken(jwtToken string) map[string]interface{} {
 }
 
 // resolveRedirectURI determines the OAuth redirect URI for a given client.
-// Priority: OAuthRedirectURITemplate → OAuthRedirectURI → fallback.
-func (s *MCPAuthService) resolveRedirectURI(clientID string) string {
+// Inspector flows use the backend callback; browser preview/UI flows use the UI callback.
+func (s *MCPAuthService) resolveRedirectURI(clientID, returnURL string) string {
 	cfg := config.AppConfig
+	if returnURL != "" {
+		return buildMCPCallbackURL(cfg)
+	}
 	if cfg == nil {
 		return "http://localhost:3005/oauth/callback"
 	}
@@ -582,7 +617,80 @@ func (s *MCPAuthService) resolveRedirectURI(clientID string) string {
 	if cfg.OAuthRedirectURI != "" {
 		return cfg.OAuthRedirectURI
 	}
+	if cfg.ReactAppURL != "" {
+		return strings.TrimRight(cfg.ReactAppURL, "/") + "/oidc/auth/callback"
+	}
 	return "http://localhost:3005/oauth/callback"
+}
+
+func buildMCPCallbackURL(cfg *config.Config) string {
+	const fallback = "http://localhost:7468/authsec/sdkmgr/mcp-auth/callback"
+	if cfg == nil {
+		return fallback
+	}
+
+	value := strings.TrimSpace(cfg.BaseURL)
+	if value == "" {
+		return fallback
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return fallback
+	}
+
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	basePath := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case basePath == "":
+		parsed.Path = "/authsec/sdkmgr/mcp-auth/callback"
+	case strings.HasSuffix(basePath, "/authsec/sdkmgr/mcp-auth/callback"):
+		parsed.Path = basePath
+	case strings.HasSuffix(basePath, "/authsec"):
+		parsed.Path = basePath + "/sdkmgr/mcp-auth/callback"
+	default:
+		parsed.Path = basePath + "/authsec/sdkmgr/mcp-auth/callback"
+	}
+
+	return parsed.String()
+}
+
+func normalizeReturnURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ""
+	}
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	return parsed.String()
+}
+
+func extractPendingReturnURL(session *models.OAuthSession) string {
+	if session == nil {
+		return ""
+	}
+
+	info := session.GetUserInfoMap()
+	if info == nil {
+		return ""
+	}
+
+	value, _ := info["return_url"].(string)
+	return normalizeReturnURL(value)
 }
 
 // resolveActiveSession finds a usable session: explicit session_id first,

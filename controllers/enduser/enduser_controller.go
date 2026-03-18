@@ -1525,15 +1525,32 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		return
 	}
 
-	// Check if MFA is enabled
-	var user2 models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND mfa_enabled = ?", input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
-		// MFA is not enabled
-		var isFirstLogin bool
-		if user.Provider == "ad_sync" || user.Provider == "entra_id" {
-			isFirstLogin = true
-		} else {
-			isFirstLogin = user.LastLogin == nil
+	effectiveMethods, defaultMethod, err := resolveEffectiveEndUserMFAMethods(c, tenantDB, &user, clientUUID, tenantUUID)
+	if err != nil {
+		log.Printf("Failed to resolve effective MFA methods for %s: %v", user.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to inspect MFA state"})
+		return
+	}
+
+	var isFirstLogin bool
+	if user.Provider == "ad_sync" || user.Provider == "entra_id" {
+		isFirstLogin = true
+	} else {
+		isFirstLogin = user.LastLogin == nil
+	}
+
+	if len(effectiveMethods) == 0 {
+		token, err := config.TokenService.GenerateEndUserToken(
+			user.ID,
+			tenantUUID.String(),
+			clientUUID.String(),
+			user.Email,
+			[]string{"read", "write"},
+			365*24*time.Hour,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+			return
 		}
 
 		response := models.LoginResponse{
@@ -1541,25 +1558,105 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 			Email:       user.Email,
 			FirstLogin:  isFirstLogin,
 			OTPRequired: false,
+			MFARequired: false,
+			Token:       token,
 		}
 
 		c.JSON(http.StatusOK, response)
 		return
 	}
 
-	// MFA is enabled
-	isFirstLogin := user2.LastLogin == nil
-
-	// Prepare base response
-	response := models.LoginResponse{
-		TenantID:    user2.TenantID.String(),
-		Email:       user2.Email,
-		FirstLogin:  isFirstLogin,
-		OTPRequired: false,
+	methodNames := make([]string, 0, len(effectiveMethods))
+	for _, method := range effectiveMethods {
+		if methodType, ok := method["method_type"].(string); ok && methodType != "" {
+			methodNames = append(methodNames, methodType)
+		}
 	}
 
-	log.Printf("Returning user login for: %s - requires MFA verification", user.Email)
+	response := models.LoginResponse{
+		TenantID:    user.TenantID.String(),
+		Email:       user.Email,
+		FirstLogin:  isFirstLogin,
+		OTPRequired: false,
+		MFARequired: true,
+		MFAMethod:   defaultMethod,
+		Methods:     methodNames,
+	}
+
+	log.Printf("Returning user login for: %s - requires MFA verification via %v", user.Email, methodNames)
 	c.JSON(http.StatusOK, response)
+}
+
+func resolveEffectiveEndUserMFAMethods(c *gin.Context, tenantDB *gorm.DB, user *models.User, clientUUID, tenantUUID uuid.UUID) ([]map[string]interface{}, string, error) {
+	sqlDB, err := tenantDB.DB()
+	if err != nil {
+		return nil, "", err
+	}
+
+	rows, err := sqlDB.Query(`
+		SELECT method_type, is_primary
+		FROM mfa_methods
+		WHERE user_id = $1 AND client_id = $2 AND verified = true
+		ORDER BY is_primary DESC, created_at ASC
+	`, user.ID, clientUUID)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+
+	var methods []map[string]interface{}
+	defaultMethod := ""
+
+	for rows.Next() {
+		var methodType string
+		var isPrimary bool
+		if scanErr := rows.Scan(&methodType, &isPrimary); scanErr != nil {
+			continue
+		}
+		methods = append(methods, map[string]interface{}{
+			"method_type": methodType,
+			"is_primary":  isPrimary,
+		})
+		if defaultMethod == "" || isPrimary {
+			defaultMethod = methodType
+		}
+	}
+
+	if len(methods) > 0 {
+		return methods, defaultMethod, nil
+	}
+
+	var totpCount int
+	if err := sqlDB.QueryRow(`
+		SELECT COUNT(*)
+		FROM tenant_totp_secrets
+		WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true AND is_active = true
+	`, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
+		return []map[string]interface{}{{
+			"method_type": "totp",
+			"is_primary":  true,
+		}}, "totp", nil
+	}
+
+	currentDomain := c.Request.Host
+	if idx := strings.Index(currentDomain, ":"); idx != -1 {
+		currentDomain = currentDomain[:idx]
+	}
+
+	var credentialCount int
+	if err := sqlDB.QueryRow(`
+		SELECT COUNT(*)
+		FROM credentials
+		WHERE (user_id = $1 OR client_id = $2)
+		  AND (rp_id = $3 OR rp_id IS NULL)
+	`, user.ID, user.ClientID, currentDomain).Scan(&credentialCount); err == nil && credentialCount > 0 {
+		return []map[string]interface{}{{
+			"method_type": "webauthn",
+			"is_primary":  true,
+		}}, "webauthn", nil
+	}
+
+	return nil, "", nil
 }
 
 func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {

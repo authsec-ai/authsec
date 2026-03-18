@@ -139,6 +139,7 @@ CREATE TABLE public.credentials (
     transports text[],
     backup_eligible boolean DEFAULT false,
     backup_state boolean DEFAULT false,
+    rp_id character varying(255),
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now()
 );
@@ -203,12 +204,28 @@ CREATE TABLE public.mfa_methods (
 
 CREATE TABLE public.oauth_sessions (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    client_id uuid NOT NULL,
+    session_id character varying(36) NOT NULL,
+    user_email character varying(255),
+    user_info jsonb,
     access_token text,
     refresh_token text,
+    authorization_code text,
+    token_expires_at bigint,
+    created_at bigint NOT NULL,
+    last_activity bigint NOT NULL,
+    oauth_state character varying(255),
+    pkce_verifier text,
+    pkce_challenge text,
+    is_active boolean DEFAULT true,
+    client_identifier character varying(255),
+    org_id character varying(255),
+    tenant_id character varying(255),
+    user_id uuid,
+    client_id uuid,
+    provider character varying(100),
+    provider_id character varying(255),
+    accessible_tools jsonb,
     expires_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now()
 );
 
@@ -332,6 +349,20 @@ CREATE TABLE public.scopes (
     description text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone
+);
+
+
+--
+-- Name: scope_resource_mappings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scope_resource_mappings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    scope_name text DEFAULT '*'::text NOT NULL,
+    resource_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
 );
 
 
@@ -535,6 +566,9 @@ CREATE TABLE public.users (
     sync_source character varying(100),
     last_sync_at timestamp with time zone,
     is_synced_user boolean DEFAULT false,
+    failed_login_attempts integer DEFAULT 0,
+    account_locked_at timestamp with time zone,
+    password_reset_required boolean DEFAULT false,
     last_login timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
@@ -944,6 +978,22 @@ ALTER TABLE ONLY public.scopes
 
 ALTER TABLE ONLY public.scopes
     ADD CONSTRAINT scopes_tenant_id_name_key UNIQUE (tenant_id, name);
+
+
+--
+-- Name: scope_resource_mappings scope_resource_mappings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scope_resource_mappings
+    ADD CONSTRAINT scope_resource_mappings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scope_resource_mappings scope_resource_mappings_tenant_scope_resource_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scope_resource_mappings
+    ADD CONSTRAINT scope_resource_mappings_tenant_scope_resource_key UNIQUE (tenant_id, scope_name, resource_name);
 
 
 --
@@ -1363,6 +1413,16 @@ CREATE INDEX idx_mfa_methods_user_id ON public.mfa_methods USING btree (user_id)
 
 CREATE INDEX idx_oauth_sessions_client_id ON public.oauth_sessions USING btree (client_id);
 
+CREATE UNIQUE INDEX idx_oauth_sessions_session_id ON public.oauth_sessions USING btree (session_id);
+
+CREATE INDEX idx_oauth_sessions_client ON public.oauth_sessions USING btree (client_identifier) WHERE (is_active = true);
+
+CREATE INDEX idx_oauth_sessions_org_id ON public.oauth_sessions USING btree (org_id) WHERE (is_active = true);
+
+CREATE INDEX idx_oauth_sessions_state ON public.oauth_sessions USING btree (oauth_state) WHERE (is_active = true);
+
+CREATE INDEX idx_oauth_sessions_tenant ON public.oauth_sessions USING btree (tenant_id) WHERE (is_active = true);
+
 
 --
 -- Name: idx_oauth_sessions_user_id; Type: INDEX; Schema: public; Owner: -
@@ -1663,6 +1723,13 @@ CREATE INDEX idx_users_email ON public.users USING btree (email);
 --
 
 CREATE INDEX idx_users_external_id ON public.users USING btree (external_id);
+
+
+--
+-- Name: idx_users_account_locked; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_users_account_locked ON public.users USING btree (account_locked_at) WHERE (account_locked_at IS NOT NULL);
 
 
 --

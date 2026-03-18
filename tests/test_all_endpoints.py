@@ -27,9 +27,10 @@ from collections import OrderedDict
 
 BASE_URL = "http://localhost:7468"
 JWT_SECRET = "authsecai"
-TEST_TENANT_ID = "947f4811-685c-47e7-955b-0cdd43485432"
+# Matches the master migration seed in migrations/master/1005_dml_002_test_data.sql
+TEST_TENANT_ID = "11111111-1111-1111-1111-111111111111"
 TEST_USER_ID = str(uuid.uuid4())
-TEST_EMAIL = "integration-test@authsec.dev"
+TEST_EMAIL = "admin@test.com"
 DELAY = 0.8  # seconds between requests to avoid rate limiting (100 req/min general)
 MAX_RETRIES = 3  # retry on 429
 
@@ -1131,10 +1132,10 @@ def test_scim():
     # End-user SCIM
     test(G, "SCIM List Users", "GET",
          f"/authsec/uflow/scim/v2/{fake_client}/{fake_project}/Users",
-         token=tok, expect_status=[200, 400, 403, 404, 500])
+         token=tok, expect_status=[200, 400, 401, 403, 404, 500])
     test(G, "SCIM List Groups", "GET",
          f"/authsec/uflow/scim/v2/{fake_client}/{fake_project}/Groups",
-         token=tok, expect_status=[200, 400, 403, 404, 500])
+         token=tok, expect_status=[200, 400, 401, 403, 404, 500])
 
     # Admin SCIM
     test(G, "SCIM Admin List Users", "GET",

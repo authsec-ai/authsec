@@ -61,9 +61,9 @@ func (tr *TenantRepository) CreateTenant(tenant *models.Tenant) error {
 // GetTenantByEmail retrieves a tenant by email (case-insensitive)
 func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, error) {
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		WHERE LOWER(email) = LOWER($1)
 	`
@@ -118,9 +118,9 @@ func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, erro
 // GetTenantByTenantID retrieves a tenant by tenant_id
 func (tr *TenantRepository) GetTenantByTenantID(tenantID string) (*models.Tenant, error) {
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		WHERE tenant_id = $1
 	`
@@ -322,9 +322,9 @@ func (tr *TenantRepository) UpdateTenantDBTx(tx *sql.Tx, tenantID uuid.UUID, dbN
 // GetAllTenants retrieves all tenants from the database
 func (tr *TenantRepository) GetAllTenants() ([]*models.Tenant, error) {
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
+		SELECT id, tenant_id, COALESCE(tenant_db, '') AS tenant_db, email, username, COALESCE(password_hash, '') AS password_hash,
+			COALESCE(provider, '') AS provider, provider_id, avatar, COALESCE(name, '') AS name, COALESCE(source, '') AS source, COALESCE(status, '') AS status, last_login,
+			created_at, updated_at, COALESCE(tenant_domain, '') AS tenant_domain
 		FROM tenants
 		ORDER BY created_at DESC
 	`

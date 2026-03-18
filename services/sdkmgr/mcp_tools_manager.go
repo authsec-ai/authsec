@@ -40,6 +40,10 @@ func (m *MCPToolsManager) GetOAuthTools() []ToolSchema {
 						"type":        "boolean",
 						"description": "Open authorization URL in local browser automatically",
 					},
+					"return_url": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional browser return URL for MCP Inspector or another local client",
+					},
 				},
 				"required": []string{},
 			},
@@ -171,13 +175,7 @@ func (m *MCPToolsManager) GenerateUserToolSchemaFromMetadata(toolMeta interface{
 		}
 
 		// Ensure required array exists; add session_id if configured.
-		reqRaw, _ := ts.InputSchema["required"].([]interface{})
-		var required []string
-		for _, r := range reqRaw {
-			if s, ok := r.(string); ok {
-				required = append(required, s)
-			}
-		}
+		required := normalizeRequiredList(ts.InputSchema["required"])
 		if requireExplicitSessionID() && !contains(required, "session_id") {
 			required = append([]string{"session_id"}, required...)
 		}
@@ -201,4 +199,23 @@ func contains(ss []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeRequiredList(raw interface{}) []string {
+	switch v := raw.(type) {
+	case nil:
+		return []string{}
+	case []string:
+		return append([]string{}, v...)
+	case []interface{}:
+		required := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				required = append(required, s)
+			}
+		}
+		return required
+	default:
+		return []string{}
+	}
 }

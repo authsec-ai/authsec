@@ -1,10 +1,13 @@
 package sdkmgr
 
 import (
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	authdb "github.com/authsec-ai/authsec/database"
 	models "github.com/authsec-ai/authsec/models/sdkmgr"
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
@@ -85,8 +88,27 @@ func (s *OAuthSessionStore) saveToTenant(session *models.OAuthSession) error {
 	}
 
 	if err := tdb.Save(session).Error; err != nil {
-		logrus.WithError(err).Error("failed to save session to tenant DB")
-		return err
+		if s.shouldRepairTenantSessionSchema(err) {
+			logrus.WithError(err).WithField("tenant_id", tenantID).Warn("detected stale tenant oauth_sessions schema, running tenant migrations and retrying save once")
+			if repairErr := s.repairTenantSchema(tenantID); repairErr != nil {
+				logrus.WithError(repairErr).WithField("tenant_id", tenantID).Error("failed to repair tenant schema before retrying oauth session save")
+				return err
+			}
+
+			tdb, err = s.tenantDB(tenantID)
+			if err != nil {
+				logrus.WithError(err).WithField("tenant_id", tenantID).Error("failed to reopen tenant DB after schema repair")
+				return err
+			}
+
+			if retryErr := tdb.Save(session).Error; retryErr != nil {
+				logrus.WithError(retryErr).WithField("tenant_id", tenantID).Error("failed to save session to tenant DB after schema repair")
+				return retryErr
+			}
+		} else {
+			logrus.WithError(err).Error("failed to save session to tenant DB")
+			return err
+		}
 	}
 	logrus.WithFields(logrus.Fields{
 		"session_id": session.SessionID,
@@ -112,8 +134,30 @@ func (s *OAuthSessionStore) upsertTenantUser(tdb *gorm.DB, session *models.OAuth
 		return
 	}
 
-	var userName *string
+	userUUID, err := uuid.Parse(*session.UserID)
+	if err != nil {
+		logrus.WithError(err).WithField("user_id", *session.UserID).Warn("skipping tenant user upsert: invalid user UUID")
+		return
+	}
+
+	var tenantUUID *uuid.UUID
+	if session.TenantID != nil && *session.TenantID != "" {
+		if parsed, err := uuid.Parse(*session.TenantID); err == nil {
+			tenantUUID = &parsed
+		}
+	}
+
+	var clientUUID *uuid.UUID
 	info := session.GetUserInfoMap()
+	if info != nil {
+		if cid, ok := info["client_id"].(string); ok && cid != "" {
+			if parsed, err := uuid.Parse(cid); err == nil {
+				clientUUID = &parsed
+			}
+		}
+	}
+
+	var userName *string
 	if info != nil {
 		if n, ok := info["name"].(string); ok && n != "" {
 			userName = &n
@@ -123,10 +167,10 @@ func (s *OAuthSessionStore) upsertTenantUser(tdb *gorm.DB, session *models.OAuth
 	}
 
 	sql := `
-		INSERT INTO users (user_id, client_id, tenant_id, name, email, provider, provider_id,
+		INSERT INTO users (id, client_id, tenant_id, name, email, provider, provider_id,
 			active, last_login, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		ON CONFLICT (user_id) DO UPDATE SET
+		ON CONFLICT (id) DO UPDATE SET
 			last_login = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP,
 			active = EXCLUDED.active,
@@ -134,16 +178,133 @@ func (s *OAuthSessionStore) upsertTenantUser(tdb *gorm.DB, session *models.OAuth
 			provider = COALESCE(EXCLUDED.provider, users.provider),
 			provider_id = COALESCE(EXCLUDED.provider_id, users.provider_id)
 	`
-	tdb.Exec(sql,
-		*session.UserID,
-		session.ClientIdentifier,
-		session.TenantID,
+	result := tdb.Exec(sql,
+		userUUID,
+		clientUUID,
+		tenantUUID,
 		userName,
 		*session.UserEmail,
 		session.Provider,
 		session.ProviderID,
 		true,
 	)
+	if result.Error != nil {
+		logrus.WithError(result.Error).WithField("user_id", userUUID.String()).Warn("failed to upsert tenant user for oauth session")
+	}
+}
+
+func (s *OAuthSessionStore) shouldRepairTenantSessionSchema(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, `column "session_id"`) ||
+		strings.Contains(msg, "column session_id") ||
+		strings.Contains(msg, "created_at") && strings.Contains(msg, "timestamp with time zone")
+}
+
+func (s *OAuthSessionStore) repairTenantSchema(tenantID string) error {
+	dbService, err := authdb.NewTenantDBService(config.GetDatabase(), config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, config.AppConfig.DBPort)
+	if err != nil {
+		return err
+	}
+	defer dbService.Close()
+
+	if _, err = dbService.CreateTenantDatabase(tenantID); err != nil {
+		return err
+	}
+
+	tdb, err := s.tenantDB(tenantID)
+	if err != nil {
+		return err
+	}
+
+	return s.normalizeTenantOAuthSessionsSchema(tdb)
+}
+
+func (s *OAuthSessionStore) normalizeTenantOAuthSessionsSchema(db *gorm.DB) error {
+	statements := []string{
+		`ALTER TABLE oauth_sessions
+			ADD COLUMN IF NOT EXISTS session_id VARCHAR(36),
+			ADD COLUMN IF NOT EXISTS user_email VARCHAR(255),
+			ADD COLUMN IF NOT EXISTS user_info JSONB,
+			ADD COLUMN IF NOT EXISTS authorization_code TEXT,
+			ADD COLUMN IF NOT EXISTS token_expires_at BIGINT,
+			ADD COLUMN IF NOT EXISTS last_activity BIGINT,
+			ADD COLUMN IF NOT EXISTS oauth_state VARCHAR(255),
+			ADD COLUMN IF NOT EXISTS pkce_verifier TEXT,
+			ADD COLUMN IF NOT EXISTS pkce_challenge TEXT,
+			ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true,
+			ADD COLUMN IF NOT EXISTS client_identifier VARCHAR(255),
+			ADD COLUMN IF NOT EXISTS org_id VARCHAR(255),
+			ADD COLUMN IF NOT EXISTS provider VARCHAR(100),
+			ADD COLUMN IF NOT EXISTS provider_id VARCHAR(255),
+			ADD COLUMN IF NOT EXISTS accessible_tools JSONB,
+			ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(255)`,
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = 'oauth_sessions'
+				  AND column_name = 'id'
+			) THEN
+				UPDATE oauth_sessions
+				SET session_id = id::text
+				WHERE session_id IS NULL
+				  AND id IS NOT NULL;
+			END IF;
+		END $$;`,
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = 'oauth_sessions'
+				  AND column_name = 'created_at'
+				  AND data_type = 'timestamp with time zone'
+			) THEN
+				ALTER TABLE oauth_sessions
+					ALTER COLUMN created_at DROP DEFAULT,
+					ALTER COLUMN created_at TYPE BIGINT
+					USING COALESCE(
+						CASE WHEN created_at IS NOT NULL THEN EXTRACT(EPOCH FROM created_at)::BIGINT END,
+						last_activity,
+						EXTRACT(EPOCH FROM now())::BIGINT
+					);
+			END IF;
+		END $$;`,
+		`UPDATE oauth_sessions
+		SET last_activity = COALESCE(last_activity, created_at, EXTRACT(EPOCH FROM now())::BIGINT)
+		WHERE last_activity IS NULL`,
+		`UPDATE oauth_sessions
+		SET token_expires_at = EXTRACT(EPOCH FROM expires_at)::BIGINT
+		WHERE token_expires_at IS NULL
+		  AND expires_at IS NOT NULL`,
+		`ALTER TABLE oauth_sessions
+			ALTER COLUMN session_id SET NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_sessions_session_id
+			ON oauth_sessions(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_client
+			ON oauth_sessions(client_identifier) WHERE is_active = true`,
+		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_org_id
+			ON oauth_sessions(org_id) WHERE is_active = true`,
+		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_state
+			ON oauth_sessions(oauth_state) WHERE is_active = true`,
+		`CREATE INDEX IF NOT EXISTS idx_oauth_sessions_tenant
+			ON oauth_sessions(tenant_id) WHERE is_active = true`,
+	}
+
+	for _, stmt := range statements {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // GetSession looks up an active session by ID, searching master first then
@@ -297,9 +458,11 @@ func (s *OAuthSessionStore) GetActiveSessionsForClient(clientID string) []models
 // searchTenantDBs calls fn for each known tenant DB and returns the first
 // non-nil result.
 func (s *OAuthSessionStore) searchTenantDBs(fn func(*gorm.DB) *models.OAuthSession) *models.OAuthSession {
-	// Use the tenant repository to get all known tenants.
-	var tenantIDs []string
-	s.masterDB().Raw("SELECT tenant_id FROM tenants WHERE is_active = true").Scan(&tenantIDs)
+	tenantIDs, err := s.knownTenantIDs()
+	if err != nil {
+		logrus.WithError(err).Warn("failed to load tenant IDs during session search")
+		return nil
+	}
 
 	for _, tid := range tenantIDs {
 		tdb, err := s.tenantDB(tid)
@@ -317,8 +480,11 @@ func (s *OAuthSessionStore) searchTenantDBs(fn func(*gorm.DB) *models.OAuthSessi
 // forEachTenantDB iterates known tenant databases. If fn returns true,
 // iteration stops early.
 func (s *OAuthSessionStore) forEachTenantDB(fn func(db *gorm.DB, tenantID string) bool) {
-	var tenantIDs []string
-	s.masterDB().Raw("SELECT tenant_id FROM tenants WHERE is_active = true").Scan(&tenantIDs)
+	tenantIDs, err := s.knownTenantIDs()
+	if err != nil {
+		logrus.WithError(err).Warn("failed to load tenant IDs for iteration")
+		return
+	}
 
 	for _, tid := range tenantIDs {
 		tdb, err := s.tenantDB(tid)
@@ -330,4 +496,35 @@ func (s *OAuthSessionStore) forEachTenantDB(fn func(db *gorm.DB, tenantID string
 			return
 		}
 	}
+}
+
+func (s *OAuthSessionStore) knownTenantIDs() ([]string, error) {
+	rows, err := s.masterDB().Raw(`
+		SELECT tenant_id::text
+		FROM tenants
+		WHERE tenant_db IS NOT NULL
+		  AND tenant_db != ''
+		  AND (status IS NULL OR status = 'active')
+	`).Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tenantIDs := make([]string, 0, 8)
+	for rows.Next() {
+		var tenantID string
+		if scanErr := rows.Scan(&tenantID); scanErr != nil {
+			return nil, scanErr
+		}
+		if tenantID != "" {
+			tenantIDs = append(tenantIDs, tenantID)
+		}
+	}
+
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, rowsErr
+	}
+
+	return tenantIDs, nil
 }

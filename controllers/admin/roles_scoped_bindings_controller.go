@@ -68,6 +68,38 @@ type BindingScope struct {
 	ID   string `json:"id"`   // UUID of the resource or "*" for tenant-wide
 }
 
+func normalizeBindingScope(scope *BindingScope) (*string, *uuid.UUID, string, error) {
+	if scope == nil {
+		return nil, nil, "Tenant-Wide", nil
+	}
+
+	scopeTypeValue := strings.TrimSpace(scope.Type)
+	scopeIDValue := strings.TrimSpace(scope.ID)
+
+	// Legacy UI payloads send a scope name like "master" together with id="*".
+	// The role_bindings schema only supports tenant-wide (NULL/NULL) or a fully
+	// scoped pair (type + concrete resource UUID), so treat wildcard IDs as
+	// tenant-wide for backwards compatibility.
+	if scopeIDValue == "" || scopeIDValue == "*" {
+		if scopeTypeValue == "" || scopeTypeValue == "*" {
+			return nil, nil, "Tenant-Wide (wildcard)", nil
+		}
+		return nil, nil, fmt.Sprintf("Tenant-Wide (%s)", scopeTypeValue), nil
+	}
+
+	if scopeTypeValue == "" || scopeTypeValue == "*" {
+		return nil, nil, "", fmt.Errorf("invalid scope payload: scope.type must be provided when scope.id is a specific resource")
+	}
+
+	scopeID, err := uuid.Parse(scopeIDValue)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("invalid scope ID format (must be UUID or '*' for tenant-wide)")
+	}
+
+	scopeDesc := fmt.Sprintf("%s: %s", scopeTypeValue, scopeIDValue)
+	return &scopeTypeValue, &scopeID, scopeDesc, nil
+}
+
 // BindingResponse represents the response for a role binding creation.
 type BindingResponse struct {
 	ID               string `json:"id"`
@@ -158,14 +190,7 @@ func (rc *RolesScopedBindingsController) GetRoleAdmin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	roleIDStr := c.Param("role_id")
-	if _, err := uuid.Parse(roleIDStr); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role ID"})
-		return
-	}
-	// Inject role_id as query param so listRoles filters to this single role
-	c.Request.URL.RawQuery = "role_id=" + roleIDStr
-	rc.listRoles(c, config.DB, *tenantID)
+	rc.getRole(c, config.DB, *tenantID)
 }
 
 // UpdateRoleCompositeAdmin godoc
@@ -317,6 +342,39 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 		return
 	}
 	rc.listRoles(c, tenantDB, tenantUUID)
+}
+
+// GetRoleEndUser godoc
+// @Summary Get Role by ID (End User)
+// @Description Uses the tenant database. Returns a single role with its permissions and assigned users.
+// @Tags RBAC: Roles & Bindings
+// @Produce json
+// @Security BearerAuth
+// @Param role_id path string true "Role ID (UUID)"
+// @Success 200 {object} RoleListItem
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /uflow/user/rbac/roles/{role_id} [get]
+func (rc *RolesScopedBindingsController) GetRoleEndUser(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
+		return
+	}
+
+	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
+		return
+	}
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
+		return
+	}
+	rc.getRole(c, tenantDB, tenantUUID)
 }
 
 // UpdateRoleCompositeEndUser godoc
@@ -513,11 +571,33 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 }
 
 func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
-	resourceFilter := c.Query("resource")
-	roleFilter := c.Query("role_id")
-	userFilter := c.Query("user_id")
-	_ = c.Query("group_by") // Reserved for future grouping functionality
+	resp, err := rc.fetchRoleList(db, tenantID, c.Query("resource"), c.Query("role_id"), c.Query("user_id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list roles: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
 
+func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+	roleIDStr := c.Param("role_id")
+	if _, err := uuid.Parse(roleIDStr); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role ID"})
+		return
+	}
+	resp, err := rc.fetchRoleList(db, tenantID, c.Query("resource"), roleIDStr, c.Query("user_id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get role: " + err.Error()})
+		return
+	}
+	if len(resp) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found"})
+		return
+	}
+	c.JSON(http.StatusOK, resp[0])
+}
+
+func (rc *RolesScopedBindingsController) fetchRoleList(db *gorm.DB, tenantID uuid.UUID, resourceFilter, roleFilter, userFilter string) ([]RoleListItem, error) {
 	// Use a fresh session to avoid stale transaction states from connection pooling
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 
@@ -532,8 +612,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 		}
 	}
 	if err := roleQuery.Find(&roles).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list roles: " + err.Error()})
-		return
+		return nil, err
 	}
 
 	// Debug: Log the number of roles found
@@ -609,7 +688,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 		}
 	}
 
-	var resp []RoleListItem
+	resp := make([]RoleListItem, 0, len(roles))
 	for _, role := range roles {
 		resp = append(resp, RoleListItem{
 			ID:               role.ID.String(),
@@ -622,7 +701,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 		})
 	}
 
-	c.JSON(http.StatusOK, resp)
+	return resp, nil
 }
 
 func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
@@ -754,28 +833,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		return
 	}
 
-	var scopeType *string
-	var scopeID *uuid.UUID
-	scopeDesc := "Tenant-Wide"
-	if req.Scope != nil {
-		st := req.Scope.Type
-		// Handle wildcard scope: "*" or empty means tenant-wide (no specific scope)
-		if st != "" && st != "*" {
-			scopeType = &st
-		}
-		// Handle wildcard scope ID: "*" means tenant-wide (null scope_id)
-		if req.Scope.ID != "" && req.Scope.ID != "*" {
-			sid, err := uuid.Parse(req.Scope.ID)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Scope ID format (must be UUID or '*' for tenant-wide)"})
-				return
-			}
-			scopeID = &sid
-			scopeDesc = fmt.Sprintf("%s: %s", st, req.Scope.ID)
-		} else {
-			// Wildcard scope - tenant-wide
-			scopeDesc = "Tenant-Wide (wildcard)"
-		}
+	scopeType, scopeID, scopeDesc, err := normalizeBindingScope(req.Scope)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	conditionsJSON, _ := services.MapToJSON(req.Conditions)

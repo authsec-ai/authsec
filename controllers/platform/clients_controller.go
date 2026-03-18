@@ -38,12 +38,12 @@ type ClientsTenant struct {
 
 // ClientsTenantMapping maps tenants to clients.
 type ClientsTenantMapping struct {
-	ID       uuid.UUID     `json:"id" gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	TenantID string        `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	ClientID string        `json:"client_id" gorm:"uniqueIndex;not null"`
-	Tenant   ClientsTenant `json:"tenant"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
+	ID        uuid.UUID     `json:"id" gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
+	TenantID  string        `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	ClientID  string        `json:"client_id" gorm:"uniqueIndex;not null"`
+	Tenant    ClientsTenant `json:"tenant"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
 func (ClientsTenantMapping) TableName() string { return "tenant_mappings" }
@@ -175,7 +175,6 @@ type ClientsStatusRequest struct {
 	ClientID string `json:"client_id" binding:"required"`
 	Active   bool   `json:"active"`
 }
-
 
 func clientsRegisterWithHydra(clientID, clientSecret, clientName, tenantID string, tenantDomain string) error {
 	return services.RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenantDomain)
@@ -584,6 +583,9 @@ func RegisterClient(c *gin.Context) {
 
 	if err := services.SeedClientAdminRBAC(c.Request.Context(), config.DB, tenantUUID); err != nil {
 		log.Printf("Warning: failed to seed clients RBAC for tenant %s: %v", tenantUUID.String(), err)
+	}
+	if err := maybeSeedLocalDemoEndUser(tenantDB, client, input.TenantDomain); err != nil {
+		log.Printf("Warning: failed to seed local demo end-user for client %s: %v", client.ClientID.String(), err)
 	}
 
 	email := ""

@@ -49,6 +49,7 @@ type Config struct {
 	SMTPPort           string
 	SMTPUser           string
 	SMTPPassword       string
+	EmailDeliveryMode  string
 	TenantDomainSuffix string
 	CorsAllowOrigin    string
 	RedisURL           string
@@ -96,9 +97,10 @@ type Config struct {
 	HubSpotAccessToken string
 
 	// Hydra service fields
-	HydraPublicURL      string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
-	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
-	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
+	HydraPublicURL         string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
+	HydraPublicInternalURL string // Hydra public endpoint reachable from inside the container network
+	ReactAppURL            string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
+	IdentityProviderURL    string // Identity provider base URL for OIDC callbacks
 
 	// SDK-Manager migration (all optional)
 	OAuthAuthURL             string // OAuth authorization endpoint
@@ -187,6 +189,7 @@ func LoadConfig() *Config {
 	smtpPort := getEnv("SMTP_PORT", "")
 	smtpUser := getEnv("SMTP_USER", "")
 	smtpPassword := getEnv("SMTP_PASSWORD", "")
+	emailDeliveryMode := getEnv("EMAIL_DELIVERY_MODE", "smtp")
 
 	// Load Base URL for OIDC callbacks
 	baseURL := getEnv("BASE_URL", "https://app.authsec.dev")
@@ -233,6 +236,7 @@ func LoadConfig() *Config {
 
 	// Load Hydra service configuration
 	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
+	hydraPublicInternalURL := getEnv("HYDRA_PUBLIC_INTERNAL_URL", hydraPublicURL)
 	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
 	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
 
@@ -243,6 +247,21 @@ func LoadConfig() *Config {
 	pkceChallenge := getEnv("PKCE_CHALLENGE", "")
 	oauthRedirectURI := getEnv("OAUTH_REDIRECT_URI", "")
 	oauthRedirectURITemplate := getEnv("OAUTH_REDIRECT_URI_TEMPLATE", "")
+	if oauthAuthURL == "" && hydraPublicURL != "" {
+		oauthAuthURL = strings.TrimRight(hydraPublicURL, "/") + "/oauth2/auth"
+	}
+	if oauthTokenURL == "" {
+		tokenBaseURL := hydraPublicInternalURL
+		if tokenBaseURL == "" {
+			tokenBaseURL = hydraPublicURL
+		}
+		if tokenBaseURL != "" {
+			oauthTokenURL = strings.TrimRight(tokenBaseURL, "/") + "/oauth2/token"
+		}
+	}
+	if oauthRedirectURI == "" && reactAppURL != "" {
+		oauthRedirectURI = strings.TrimRight(reactAppURL, "/") + "/oidc/auth/callback"
+	}
 	mcpToolTimeout := 15
 	if v := os.Getenv("MCP_TOOL_TIMEOUT"); v != "" {
 		if parsed, err := fmt.Sscanf(v, "%d", &mcpToolTimeout); err != nil || parsed == 0 {
@@ -292,6 +311,7 @@ func LoadConfig() *Config {
 		SMTPPort:                smtpPort,
 		SMTPUser:                smtpUser,
 		SMTPPassword:            smtpPassword,
+		EmailDeliveryMode:       emailDeliveryMode,
 		TenantDomainSuffix:      tenantDomainSuffix,
 		CorsAllowOrigin:         corsAllowOrigin,
 		RedisURL:                redisURL,
@@ -320,6 +340,7 @@ func LoadConfig() *Config {
 		MicrosoftClientSecret:   microsoftClientSecret,
 		HubSpotAccessToken:      hubSpotAccessToken,
 		HydraPublicURL:          hydraPublicURL,
+		HydraPublicInternalURL:  hydraPublicInternalURL,
 		ReactAppURL:             reactAppURL,
 		IdentityProviderURL:     identityProviderURL,
 

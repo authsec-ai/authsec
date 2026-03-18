@@ -114,6 +114,7 @@ type TenantTOTPSecret struct {
 	LastUsed   *int64 `json:"last_used"`
 
 	// Status
+	IsVerified bool `json:"is_verified" gorm:"default:false;index"`
 	IsActive  bool `json:"is_active" gorm:"default:true;index"`
 	IsPrimary bool `json:"is_primary" gorm:"default:false"` // Preferred device for TOTP
 

@@ -175,6 +175,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	var req struct {
 		TenantID string `json:"tenant_id" binding:"required"`
 		Email    string `json:"email" binding:"required"`
+		ClientID string `json:"client_id,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -190,7 +191,13 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 	// Get end user by email and tenant
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+	var user *sharedmodels.User
+	clientID := strings.TrimSpace(req.ClientID)
+	if clientID != "" {
+		user, err = clientRepo.GetClientByEmailTenantAndClient(req.Email, req.TenantID, clientID)
+	} else {
+		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -202,7 +209,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	}
 
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	methods, _ := mfaRepo.GetUserMethods(user.ID.String())
+	methods, _, _ := mfaGetUserMethods(mfaRepo, user)
 
 	// Check for verified custom domain
 	globalDB, err := config.ConnectGlobalDB()
@@ -270,6 +277,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	tenantID := c.Query("tenant_id")
 	email := c.Query("email")
+	clientID := strings.TrimSpace(c.Query("client_id"))
 
 	if tenantID == "" || email == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email query parameters are required"})
@@ -284,7 +292,12 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 	// Get end user by email and tenant
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailAndTenant(&email, &tenantID, nil)
+	var user *sharedmodels.User
+	if clientID != "" {
+		user, err = clientRepo.GetClientByEmailTenantAndClient(email, tenantID, clientID)
+	} else {
+		user, err = clientRepo.GetClientByEmailAndTenant(&email, &tenantID, nil)
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -296,7 +309,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	}
 
 	mfaRepo := repositories.NewMFARepository(tenantDB)
-	methods, _ := mfaRepo.GetUserMethods(user.ID.String())
+	methods, _, _ := mfaGetUserMethods(mfaRepo, user)
 
 	// Check for verified custom domain
 	globalDB, err := config.ConnectGlobalDB()

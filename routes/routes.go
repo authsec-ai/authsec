@@ -530,6 +530,7 @@ func SetupRoutes(
 			user.DELETE("/enduser/delete_all/:tenant_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
 			user.POST("/rbac/roles", rolesScopedBindingsController.CreateRoleCompositeEndUser)
 			user.GET("/rbac/roles", rolesScopedBindingsController.ListRolesEndUser)
+			user.GET("/rbac/roles/:role_id", rolesScopedBindingsController.GetRoleEndUser)
 			user.PUT("/rbac/roles/:role_id", rolesScopedBindingsController.UpdateRoleCompositeEndUser)
 			user.DELETE("/rbac/roles/:role_id", rolesScopedBindingsController.DeleteRoleEndUser)
 			user.POST("/rbac/bindings", rolesScopedBindingsController.AssignRoleScopedEndUser)
@@ -885,6 +886,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 	{
 		// OIDC endpoints
 		pub.GET("/login/page-data", hmgrController.GetLoginPageDataHandler)
+		pub.POST("/login/complete-local", hmgrController.CompleteLocalLoginHandler)
 		pub.POST("/auth/initiate/:provider", hmgrController.InitiateAuthHandler)
 		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)

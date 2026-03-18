@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"net/smtp"
+	"os"
 	"strings"
 	"time"
 
@@ -31,23 +32,68 @@ func GenerateOTP() (string, error) {
 	return GenerateOTPFunc()
 }
 
-// SendOTPEmailFunc is the function variable for sending OTP emails, allowing for mocking in tests
-var SendOTPEmailFunc = func(email, otp string) error {
-	log.Printf("SendOTPEmail: preparing OTP email for %s", email)
-	// Email configuration from environment variables
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
+func emailDeliveryMode() string {
+	mode := ""
+	if config.AppConfig != nil {
+		mode = config.AppConfig.EmailDeliveryMode
+	}
+	if strings.TrimSpace(mode) == "" {
+		mode = os.Getenv("EMAIL_DELIVERY_MODE")
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "smtp"
+	}
+	return mode
+}
 
+func smtpConfig() (string, string, string, string) {
+	if config.AppConfig != nil {
+		return config.AppConfig.SMTPHost, config.AppConfig.SMTPPort, config.AppConfig.SMTPUser, config.AppConfig.SMTPPassword
+	}
+	return os.Getenv("SMTP_HOST"), os.Getenv("SMTP_PORT"), os.Getenv("SMTP_USER"), os.Getenv("SMTP_PASSWORD")
+}
+
+func sendEmail(kind, email, subject, body string) error {
+	switch emailDeliveryMode() {
+	case "log":
+		log.Printf("[%s][LOCAL EMAIL] to=%s subject=%q\n%s", kind, email, subject, body)
+		return nil
+	case "smtp":
+		// Use SMTP delivery below.
+	default:
+		log.Printf("%s: unknown EMAIL_DELIVERY_MODE %q, falling back to smtp", kind, emailDeliveryMode())
+	}
+
+	smtpHost, smtpPort, smtpUser, smtpPass := smtpConfig()
 	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendOTPEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
+		log.Printf("%s: incomplete SMTP configuration (host=%q port=%q user=%q)", kind, smtpHost, smtpPort, smtpUser)
 		return fmt.Errorf("SMTP configuration is incomplete")
 	}
 
-	log.Printf("SendOTPEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
+	log.Printf("%s: using SMTP host=%s port=%s user=%s", kind, smtpHost, smtpPort, smtpUser)
 
-	// Email content
+	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+
+	log.Printf("%s: attempting to send email to %s", kind, email)
+	err := smtp.SendMail(
+		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
+		auth,
+		smtpUser,
+		[]string{email},
+		[]byte(message),
+	)
+	if err != nil {
+		log.Printf("%s: failed to send email to %s: %v", kind, email, err)
+	} else {
+		log.Printf("%s: successfully sent email to %s", kind, email)
+	}
+	return err
+}
+
+// SendOTPEmailFunc is the function variable for sending OTP emails, allowing for mocking in tests
+var SendOTPEmailFunc = func(email, otp string) error {
 	subject := "Email Verification - Your OTP Code"
 	body := fmt.Sprintf(`
 Dear User,
@@ -61,29 +107,7 @@ If you didn't request this verification, please ignore this email.
 Best regards,
 Your App Team
     `, otp)
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
-
-	// SMTP authentication
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	// Send email
-	log.Printf("SendOTPEmail: attempting to send OTP email to %s", email)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
-
-	if err != nil {
-		log.Printf("SendOTPEmail: failed to send OTP email to %s: %v", email, err)
-	} else {
-		log.Printf("SendOTPEmail: successfully sent OTP email to %s", email)
-	}
-
-	return err
+	return sendEmail("SendOTPEmail", email, subject, body)
 }
 
 // SendOTPEmail sends OTP via email using the swappable function variable
@@ -95,21 +119,6 @@ func SendOTPEmail(email, otp string) error {
 
 // SendPasswordResetOTPEmailFunc is the function variable for sending password reset OTP emails
 var SendPasswordResetOTPEmailFunc = func(email, otp string) error {
-	log.Printf("SendPasswordResetOTPEmail: preparing password reset OTP email for %s", email)
-	// Email configuration from environment variables (same as existing function)
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendPasswordResetOTPEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
-
-	log.Printf("SendPasswordResetOTPEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
-
-	// Password reset email content
 	subject := "Password Reset - Your OTP Code"
 	body := fmt.Sprintf(`
 Dear User,
@@ -123,29 +132,7 @@ If you didn't request a password reset, please ignore this email or contact supp
 Best regards,
 Your App Team
     `, otp)
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
-
-	// SMTP authentication (same as existing function)
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	// Send email
-	log.Printf("SendPasswordResetOTPEmail: attempting to send password reset OTP email to %s", email)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
-
-	if err != nil {
-		log.Printf("SendPasswordResetOTPEmail: failed to send password reset OTP email to %s: %v", email, err)
-	} else {
-		log.Printf("SendPasswordResetOTPEmail: successfully sent password reset OTP email to %s", email)
-	}
-
-	return err
+	return sendEmail("SendPasswordResetOTPEmail", email, subject, body)
 }
 
 // SendPasswordResetOTPEmail sends password reset OTP via email using the swappable function variable
@@ -173,17 +160,6 @@ func GenerateTemporaryPassword() (string, error) {
 
 // SendTemporaryPasswordEmail sends temporary password via email
 func SendTemporaryPasswordEmail(email, tempPassword string) error {
-	// Email configuration from environment variables (same as existing function)
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
-
-	// Temporary password email content
 	subject := "Temporary Password - Account Access"
 	body := fmt.Sprintf(`
 Dear User,
@@ -202,38 +178,11 @@ If you did not request this password reset, please contact your administrator im
 Best regards,
 Your Security Team
     `, tempPassword)
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
-
-	// SMTP authentication (same as existing function)
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	// Send email
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
-
-	return err
+	return sendEmail("SendTemporaryPasswordEmail", email, subject, body)
 }
 
 // SendAdminInviteEmail sends a tailored invite email for admin users with login URL, username, and temp password.
 func SendAdminInviteEmail(email, username, tenantDomain, tempPassword string) error {
-	log.Printf("SendAdminInviteEmail: preparing admin invite email for %s", email)
-	// Email configuration from environment variables
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendAdminInviteEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
-
 	// Build login URL from tenant domain; fall back to base URL if tenant domain missing.
 	loginURL := strings.TrimSpace(tenantDomain)
 	if loginURL == "" {
@@ -242,8 +191,6 @@ func SendAdminInviteEmail(email, username, tenantDomain, tempPassword string) er
 	if loginURL != "" && !strings.HasPrefix(strings.ToLower(loginURL), "http") {
 		loginURL = "https://" + loginURL
 	}
-
-	log.Printf("SendAdminInviteEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
 
 	subject := "You have been invited to AuthSec"
 	body := fmt.Sprintf(`
@@ -262,48 +209,11 @@ If you did not expect this invite, contact your administrator.
 Regards,
 AuthSec Team
 `, username, tempPassword, loginURL)
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
-
-	// SMTP authentication
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	// Send email
-	log.Printf("SendAdminInviteEmail: attempting to send admin invite email to %s", email)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
-
-	if err != nil {
-		log.Printf("SendAdminInviteEmail: failed to send admin invite email to %s: %v", email, err)
-	} else {
-		log.Printf("SendAdminInviteEmail: successfully sent admin invite email to %s", email)
-	}
-
-	return err
+	return sendEmail("SendAdminInviteEmail", email, subject, body)
 }
 
 // SendAccountDeactivationEmail sends notification when user account is deactivated
 func SendAccountDeactivationEmail(email string) error {
-	log.Printf("SendAccountDeactivationEmail: preparing deactivation email for %s", email)
-	// Email configuration from environment variables
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendAccountDeactivationEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
-
-	log.Printf("SendAccountDeactivationEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
-
-	// Account deactivation email content
 	subject := "Account Deactivation Notice"
 	body := `
 Dear User,
@@ -317,47 +227,11 @@ If you have any questions or concerns, please reach out to our support team.
 Best regards,
 Your Security Team
     `
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
-
-	// SMTP authentication
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	// Send email
-	log.Printf("SendAccountDeactivationEmail: attempting to send deactivation email to %s", email)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
-
-	if err != nil {
-		log.Printf("SendAccountDeactivationEmail: failed to send deactivation email to %s: %v", email, err)
-	} else {
-		log.Printf("SendAccountDeactivationEmail: successfully sent deactivation email to %s", email)
-	}
-
-	return err
+	return sendEmail("SendAccountDeactivationEmail", email, subject, body)
 }
 
 // SendNewUserRegistrationNotificationEmail sends a notification to the tenant owner when a new user registers.
 func SendNewUserRegistrationNotificationEmail(ownerEmail, userName, userEmail, tenantDomain string) error {
-	log.Printf("SendNewUserRegistrationNotificationEmail: preparing notification email for owner %s", ownerEmail)
-
-	smtpHost := config.AppConfig.SMTPHost
-	smtpPort := config.AppConfig.SMTPPort
-	smtpUser := config.AppConfig.SMTPUser
-	smtpPass := config.AppConfig.SMTPPassword
-
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendNewUserRegistrationNotificationEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
-	}
-
-	log.Printf("SendNewUserRegistrationNotificationEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
-
 	subject := "New User Registration Notification"
 	body := fmt.Sprintf(`
 Hello,
@@ -374,25 +248,5 @@ If you did not expect this registration, please review your tenant settings.
 Regards,
 AuthSec Team
 `, userName, userEmail, tenantDomain, time.Now().UTC().Format(time.RFC1123))
-
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", ownerEmail, subject, body)
-
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	log.Printf("SendNewUserRegistrationNotificationEmail: attempting to send notification email to %s", ownerEmail)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{ownerEmail},
-		[]byte(message),
-	)
-
-	if err != nil {
-		log.Printf("SendNewUserRegistrationNotificationEmail: failed to send notification email to %s: %v", ownerEmail, err)
-	} else {
-		log.Printf("SendNewUserRegistrationNotificationEmail: successfully sent notification email to %s", ownerEmail)
-	}
-
-	return err
+	return sendEmail("SendNewUserRegistrationNotificationEmail", ownerEmail, subject, body)
 }

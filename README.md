@@ -108,6 +108,110 @@ go run ./cmd/
 
 The server starts on port **7468** by default.
 
+### Local Docker Compose
+
+The repo now includes a self-contained on-prem local stack for development:
+
+- `authsec` on `http://localhost:7468`
+- `hydra` public on `http://localhost:4444`
+- `hydra` admin on `http://localhost:4445`
+- `vault` on `http://localhost:8200`
+- `postgres` on `localhost:5432`
+- `redis` on `localhost:6379`
+- `icp-mock` on `http://localhost:7001`
+
+Start everything:
+
+```bash
+docker compose up -d --build
+```
+
+Run the included smoke test:
+
+```bash
+./scripts/smoke_local.sh
+```
+
+Compose also runs a one-shot `authsec-init` job that creates and migrates the seeded tenant DB for `11111111-1111-1111-1111-111111111111`, then seeds a real local admin account for the UI login flow:
+
+- email: `admin@test.com`
+- password: `test@Admin1234`
+- tenant domain: `test.authsec.dev`
+
+UI-created SDK/MCP clients are also given a deterministic local demo end-user account automatically so the Hydra login box can be exercised without synthetic JWTs:
+
+- email: `sdk.local@example.com`
+- password: `test@User1234`
+
+### Integrated SDK Manager Demo
+
+The supported local demo path is:
+
+1. Start the backend stack with `docker compose up -d --build`.
+2. Start `Authsec-ui` on `http://localhost:3000`.
+3. Sign in with the seeded admin account:
+   - email: `admin@test.com`
+   - password: `test@Admin1234`
+4. Create one `mcp_server` client in the UI onboarding flow and copy its `client_id`.
+5. Run either local MCP demo server with that `client_id`:
+
+TypeScript memory wrapper on `http://127.0.0.1:3005`:
+
+```bash
+cd ../sdk-authsec/packages/typescript-sdk
+AUTHSEC_CLIENT_ID=<UI_CLIENT_ID> \
+AUTHSEC_APP_NAME=ts-memory-demo \
+AUTHSEC_AUTH_SERVICE_URL=http://localhost:7468/authsec/sdkmgr/mcp-auth \
+AUTHSEC_SERVICES_URL=http://localhost:7468/authsec/sdkmgr/services \
+node examples/memory-authsec-wrapper.mjs
+```
+
+Python local demo on `http://127.0.0.1:3006`:
+
+```bash
+cd ../sdk-authsec/packages/python-sdk
+AUTHSEC_CLIENT_ID=<UI_CLIENT_ID> \
+AUTHSEC_APP_NAME=authsec-python-local-demo \
+AUTHSEC_AUTH_SERVICE_URL=http://localhost:7468/authsec/sdkmgr/mcp-auth \
+AUTHSEC_SERVICES_URL=http://localhost:7468/authsec/sdkmgr/services \
+PYTHONPATH=src \
+python3 examples/local_authsec_demo_server.py
+```
+
+6. In MCP Inspector, connect to the running server, call `oauth_start`, open the returned URL, sign in as `sdk.local@example.com`, complete the TOTP step, and return to Inspector.
+7. Verify `oauth_status` becomes `authenticated`, then call a protected tool.
+8. To test the backend playground path, create a conversation at `/authsec/sdkmgr/playground/conversations`, add the running MCP server URL to `/authsec/sdkmgr/playground/conversations/:id/mcp-servers`, and inspect tools with `/authsec/sdkmgr/playground/conversations/:id/mcp-servers/:sid/tools`.
+
+Stop the stack:
+
+```bash
+docker compose down
+```
+
+OTP and notification emails can be used locally without SMTP by setting `EMAIL_DELIVERY_MODE=log` (already configured in `.env.compose`). Payloads are printed to the AuthSec logs:
+
+```bash
+docker compose logs authsec | grep 'LOCAL EMAIL'
+```
+
+Top-level route groups exposed by the local stack:
+
+- `/.well-known/openid-configuration`
+- `/.well-known/jwks.json`
+- `/metrics`
+- `/authsec/uflow`
+- `/authsec/webauthn`
+- `/authsec/clientms`
+- `/authsec/hmgr`
+- `/authsec/oocmgr`
+- `/authsec/authmgr`
+- `/authsec/exsvc`
+- `/authsec/spire`
+- `/authsec/migration`
+- `/authsec/sdkmgr`
+
+Detailed per-endpoint paths remain documented below and in `API_CURLS.md`.
+
 ---
 
 ## Environment Variables
@@ -142,6 +246,7 @@ The server starts on port **7468** by default.
 | `ICP_SERVICE_URL` | `http://localhost:7001` | ICP/PKI provisioning service |
 | `REQUIRE_SERVER_AUTH` | `true` | Enforce inter-service auth check (`false` to disable in dev) |
 | `SKIP_MIGRATIONS` | `false` | Set to `true` to skip master DB migrations at startup |
+| `EMAIL_DELIVERY_MODE` | `smtp` | Email delivery mode for OTP/reset/invite flows (`smtp` or local `log`) |
 
 ### Optional – CORS
 
@@ -175,6 +280,7 @@ The server starts on port **7468** by default.
 | `VAULT_TOKEN` | Vault root/service token |
 | `HYDRA_ADMIN_URL` | Ory Hydra admin API (default: `http://localhost:4445`) |
 | `HYDRA_PUBLIC_URL` | Ory Hydra public API (default: `http://localhost:4444`) |
+| `HYDRA_PUBLIC_INTERNAL_URL` | Optional container-network Hydra public URL for server-side token exchange |
 | `OOC_MANAGER_URL` | OIDC config manager internal URL (default: `http://localhost:7467`) |
 | `REACT_APP_URL` | Frontend app URL for redirects |
 | `IDENTITY_PROVIDER_URL` | Identity provider base URL |

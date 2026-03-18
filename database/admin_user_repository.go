@@ -473,6 +473,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	fmt.Printf("UserFlow:Debug:: Query to get user for email %s: %s\n", email, strings.ReplaceAll(query, "\n", " "))
 	var (
 		username              sql.NullString
+		passwordHash          sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
 		tenantIDStr           sql.NullString
@@ -502,7 +503,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 		&user.ID,
 		&user.Email,
 		&username,
-		&user.PasswordHash,
+		&passwordHash,
 		&name,
 		&clientIDStr,
 		&tenantIDStr,
@@ -558,6 +559,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	// Assign nullable fields
 	if username.Valid {
 		user.Username = username.String
+	}
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
 	}
 	if name.Valid {
 		user.Name = name.String
@@ -689,6 +693,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...interface{}) (*models.AdminUser, error) {
 	var (
 		username              sql.NullString
+		passwordHash          sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
 		tenantIDStr           sql.NullString
@@ -718,7 +723,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 		&user.ID,
 		&user.Email,
 		&username,
-		&user.PasswordHash,
+		&passwordHash,
 		&name,
 		&clientIDStr,
 		&tenantIDStr,
@@ -769,6 +774,9 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	// Assign nullable fields
 	if username.Valid {
 		user.Username = username.String
+	}
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
 	}
 	if name.Valid {
 		user.Name = name.String
@@ -1077,6 +1085,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 
 	var (
 		username              sql.NullString
+		passwordHash          sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
 		tenantIDStr           sql.NullString
@@ -1106,7 +1115,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 		&user.ID,
 		&user.Email,
 		&username,
-		&user.PasswordHash,
+		&passwordHash,
 		&name,
 		&clientIDStr,
 		&tenantIDStr,
@@ -1159,6 +1168,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 	// Assign nullable fields
 	if username.Valid {
 		user.Username = username.String
+	}
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
 	}
 	if name.Valid {
 		user.Name = name.String
@@ -1249,6 +1261,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 
 	var (
 		username              sql.NullString
+		passwordHash          sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
 		tenantIDStr           sql.NullString
@@ -1278,7 +1291,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 		&user.ID,
 		&user.Email,
 		&username,
-		&user.PasswordHash,
+		&passwordHash,
 		&name,
 		&clientIDStr,
 		&tenantIDStr,
@@ -1332,6 +1345,9 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	// Assign nullable fields
 	if username.Valid {
 		user.Username = username.String
+	}
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
 	}
 	if name.Valid {
 		user.Name = name.String

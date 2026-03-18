@@ -1,0 +1,9 @@
+.git
+.gitignore
+.DS_Store
+.env
+test_results.html
+__pycache__/
+*.pyc
+tmp/
+vendor/

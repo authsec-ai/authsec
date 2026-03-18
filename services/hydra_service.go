@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -30,6 +32,8 @@ type hydraClient struct {
 	SubjectType   string                 `json:"subject_type,omitempty"`
 	Metadata      map[string]interface{} `json:"metadata,omitempty"`
 }
+
+const hydraMainClientTokenEndpointAuthMethod = "none"
 
 func hydraAdminURL() string {
 	return config.AppConfig.HydraAdminURL
@@ -140,6 +144,142 @@ func oocmgrNormalizeProviderName(name string) string {
 	return strings.ToLower(strings.ReplaceAll(name, " ", "_"))
 }
 
+func hydraDefaultScheme(rawHost string) string {
+	host := strings.TrimSpace(rawHost)
+	if host == "" {
+		return "https"
+	}
+
+	if strings.Contains(host, "://") {
+		if parsed, err := url.Parse(host); err == nil {
+			host = parsed.Host
+		}
+	}
+
+	if strings.Contains(host, "/") {
+		if parsed, err := url.Parse("https://" + host); err == nil {
+			host = parsed.Host
+		}
+	}
+
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return "http"
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() {
+			return "http"
+		}
+	}
+
+	return "https"
+}
+
+func hydraBuildURL(raw, suffix string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+
+	if !strings.Contains(value, "://") {
+		value = hydraDefaultScheme(value) + "://" + value
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	basePath := strings.TrimRight(parsed.Path, "/")
+	if suffix != "" {
+		if basePath == "" {
+			parsed.Path = suffix
+		} else if strings.HasSuffix(basePath, suffix) {
+			parsed.Path = basePath
+		} else {
+			parsed.Path = basePath + suffix
+		}
+	} else if basePath == "" {
+		parsed.Path = ""
+	} else {
+		parsed.Path = basePath
+	}
+
+	return parsed.String()
+}
+
+func hydraMainClientRedirectURIs(tenantDomain string) []string {
+	var redirects []string
+	seen := make(map[string]struct{})
+
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		redirects = append(redirects, value)
+	}
+
+	add(hydraBuildURL(tenantDomain, "/oidc/auth/callback"))
+	if config.AppConfig != nil {
+		add(hydraBuildURL(config.AppConfig.BaseURL, "/authsec/sdkmgr/mcp-auth/callback"))
+	}
+
+	return redirects
+}
+
+func hydraMainClient(clientID, clientSecret, clientName, tenantID, tenantDomain string) (hydraClient, error) {
+	redirectURIs := hydraMainClientRedirectURIs(tenantDomain)
+	if len(redirectURIs) == 0 {
+		return hydraClient{}, fmt.Errorf("failed to build redirect URI from %q", tenantDomain)
+	}
+
+	return hydraClient{
+		ClientID:      fmt.Sprintf("%s-main-client", clientID),
+		ClientSecret:  clientSecret,
+		ClientName:    fmt.Sprintf("%s Main OAuth Client", clientName),
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  redirectURIs,
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: hydraMainClientTokenEndpointAuthMethod,
+		Scope:         strings.Join([]string{"openid", "offline_access", "email", "profile"}, " "),
+		Audience:      []string{},
+		SubjectType:   "public",
+		Metadata: map[string]interface{}{
+			"type":        "tenant_main_client",
+			"tenant_id":   clientID,
+			"c_id":        tenantID,
+			"tenant_name": clientName,
+			"created_at":  time.Now().Format(time.RFC3339),
+			"created_by":  "system",
+		},
+	}, nil
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // OOCManager represents the request structure for OOC Manager API
 type OOCManager struct {
 	TenantID     string   `json:"tenant_id" validate:"required"`
@@ -198,37 +338,63 @@ func generateServiceToken() (string, error) {
 
 // RegisterClientWithHydra creates the tenant's main OAuth2 client directly in Hydra.
 func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenantDomain string) error {
-	mainClientID := fmt.Sprintf("%s-main-client", clientID)
+	desired, err := hydraMainClient(clientID, clientSecret, clientName, tenantID, tenantDomain)
+	if err != nil {
+		return err
+	}
+	mainClientID := desired.ClientID
+	redirectURIs := desired.RedirectURIs
+	scopes := strings.Fields(desired.Scope)
+	desiredClientName := desired.ClientName
 
-	// Skip if already exists
 	if existing, _ := hydraAdminGetClient(mainClientID); existing != nil {
+		needsUpdate := false
+
+		if existing.ClientName != desiredClientName {
+			existing.ClientName = desiredClientName
+			needsUpdate = true
+		}
+		if !stringSlicesEqual(existing.RedirectURIs, redirectURIs) {
+			existing.RedirectURIs = redirectURIs
+			needsUpdate = true
+		}
+		if existing.Scope == "" {
+			existing.Scope = strings.Join(scopes, " ")
+			needsUpdate = true
+		}
+		if len(existing.GrantTypes) == 0 {
+			existing.GrantTypes = []string{"authorization_code", "refresh_token"}
+			needsUpdate = true
+		}
+		if len(existing.ResponseTypes) == 0 {
+			existing.ResponseTypes = []string{"code"}
+			needsUpdate = true
+		}
+		if existing.TokenEndpoint != hydraMainClientTokenEndpointAuthMethod {
+			existing.TokenEndpoint = hydraMainClientTokenEndpointAuthMethod
+			needsUpdate = true
+		}
+
+		if needsUpdate {
+			if err := hydraAdminUpdateClient(mainClientID, *existing); err != nil {
+				return fmt.Errorf("failed to update Hydra client %s: %w", mainClientID, err)
+			}
+			if err := oocmgrrepo.NewTenantHydraClientRepository().UpdateByHydraClientID(mainClientID, map[string]interface{}{
+				"client_name":   desiredClientName,
+				"redirect_uris": redirectURIs,
+				"updated_by":    "system",
+			}); err != nil {
+				log.Printf("Warning: failed to update tenant-client mapping for %s: %v", mainClientID, err)
+			}
+			log.Printf("Hydra client %s existed with stale config; updated redirect URIs to %v", mainClientID, redirectURIs)
+			return nil
+		}
+
 		log.Printf("Hydra client %s already exists, skipping creation", mainClientID)
 		return nil
 	}
 
-	scopes := []string{"openid", "offline_access", "email", "profile"}
-	c := hydraClient{
-		ClientID:      mainClientID,
-		ClientSecret:  clientSecret,
-		ClientName:    fmt.Sprintf("%s Main OAuth Client", clientName),
-		GrantTypes:    []string{"authorization_code", "refresh_token"},
-		RedirectURIs:  []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
-		ResponseTypes: []string{"code"},
-		TokenEndpoint: "client_secret_post",
-		Scope:         strings.Join(scopes, " "),
-		Audience:      []string{},
-		SubjectType:   "public",
-		Metadata: map[string]interface{}{
-			"type":        "tenant_main_client",
-			"tenant_id":   clientID,
-			"c_id":        tenantID,
-			"tenant_name": clientName,
-			"created_at":  time.Now().Format(time.RFC3339),
-			"created_by":  "system",
-		},
-	}
-
-	if err := hydraAdminCreateClient(c); err != nil {
+	if err := hydraAdminCreateClient(desired); err != nil {
 		return fmt.Errorf("failed to create Hydra client: %w", err)
 	}
 
@@ -236,8 +402,8 @@ func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenan
 	thc := &oocmgrdto.TenantHydraClient{
 		TenantID: tenantID, TenantName: clientName,
 		HydraClientID: mainClientID, HydraClientSecret: clientSecret,
-		ClientName:   fmt.Sprintf("%s Main OAuth Client", clientName),
-		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
+		ClientName:   desiredClientName,
+		RedirectURIs: redirectURIs,
 		Scopes:       scopes, ClientType: "main", IsActive: true,
 		CreatedBy: "system", UpdatedBy: "system",
 	}
@@ -302,6 +468,13 @@ func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) erro
 	providerName := "authsec"
 	oidcClientID := fmt.Sprintf("%s-%s-oidc", baseClientID, oocmgrNormalizeProviderName(providerName))
 	tenantName, _ := tenantClient.Metadata["tenant_name"].(string)
+	authURL := hydraBuildURL(reactAppURL, "/oauth2/auth")
+	tokenURL := hydraBuildURL(reactAppURL, "/oauth2/token")
+	userInfoURL := hydraBuildURL(reactAppURL, "/userinfo")
+	callbackURL := hydraBuildURL(reactAppURL, "/oidc/auth/callback/"+oocmgrNormalizeProviderName(providerName))
+	if authURL == "" || tokenURL == "" || userInfoURL == "" || callbackURL == "" {
+		return fmt.Errorf("failed to build provider URLs from %q", reactAppURL)
+	}
 
 	oidcClient := hydraClient{
 		ClientID:   oidcClientID,
@@ -316,13 +489,13 @@ func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) erro
 			"provider_config": map[string]interface{}{
 				"client_id":     clientID,
 				"client_secret": "dummy-secret-" + clientID,
-				"auth_url":      fmt.Sprintf("https://%s/oauth2/auth", reactAppURL),
-				"token_url":     fmt.Sprintf("https://%s/oauth2/token", reactAppURL),
-				"user_info_url": fmt.Sprintf("https://%s/userinfo", reactAppURL),
+				"auth_url":      authURL,
+				"token_url":     tokenURL,
+				"user_info_url": userInfoURL,
 				"scopes":        []string{"openid", "profile", "email"},
 			},
 			"is_active":    true,
-			"callback_url": fmt.Sprintf("%s/oidc/auth/callback/%s", reactAppURL, oocmgrNormalizeProviderName(providerName)),
+			"callback_url": callbackURL,
 			"created_at":   time.Now().Format(time.RFC3339),
 			"created_by":   createdBy,
 		},

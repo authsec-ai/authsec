@@ -2035,10 +2035,18 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	if len(mfaMethods) == 0 {
 		log.Printf("DEBUG: No MFA methods found in mfa_methods table for user %s, checking legacy tables", input.Email)
 
-		// First, check for TOTP secrets (TOTP has priority because it's domain-independent)
-		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`
+		// First, check for tenant TOTP secrets (tenant-scoped schema), then legacy totp_secrets.
 		var totpCount int
-		if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
+		totpQueries := []string{
+			`SELECT COUNT(*) FROM tenant_totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true AND is_active = true`,
+			`SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`,
+		}
+		for _, totpQuery := range totpQueries {
+			if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil {
+				break
+			}
+		}
+		if totpCount > 0 {
 			log.Printf("DEBUG: Found %d TOTP secrets for user %s", totpCount, input.Email)
 			// User has TOTP configured but not in mfa_methods table
 			mfaMethods = append(mfaMethods, map[string]interface{}{

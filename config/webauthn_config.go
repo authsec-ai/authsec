@@ -16,7 +16,13 @@ import (
 // NormalizeRPID ensures the RP ID is a registrable domain (no scheme, no port).
 // If a full URL is provided, it extracts the hostname part.
 
-// ValidateSubdomainOrigin checks if an origin matches the allowed subdomain pattern
+func isLoopbackWebAuthnHost(host string) bool {
+	host = strings.Trim(strings.ToLower(host), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// ValidateSubdomainOrigin checks if an origin matches the allowed AuthSec patterns
+// or a local loopback origin used for development.
 func ValidateSubdomainOrigin(origin string) bool {
 	if origin == "" {
 		return false
@@ -28,13 +34,17 @@ func ValidateSubdomainOrigin(origin string) bool {
 		return false
 	}
 
-	// Must be HTTPS for production
+	host := strings.ToLower(u.Hostname())
+
+	// Local loopback origins are valid for dev WebAuthn flows.
+	if isLoopbackWebAuthnHost(host) {
+		return u.Scheme == "http" || u.Scheme == "https"
+	}
+
+	// Must be HTTPS for non-local origins.
 	if u.Scheme != "https" {
 		return false
 	}
-
-	// Check if it's a valid authsec.dev domain (app or staging)
-	host := u.Host
 
 	// Define allowed base domains
 	allowedDomains := []string{"app.authsec.dev", "stage.authsec.dev", "dev.authsec.dev", "app.authsec.ai", "stage.authsec.ai", "dev.authsec.ai"}
@@ -80,7 +90,11 @@ func CreateDynamicWebAuthnConfig(rpDisplayName, rpID, origin string) *webauthn.C
 var TOTPEncryptionKey []byte
 
 func init() {
-	keyHex := os.Getenv("TOTP_ENCRYPTION_key")
+	keyHex := os.Getenv("TOTP_ENCRYPTION_KEY")
+	if keyHex == "" {
+		// Backward-compatible fallback for earlier typoed env names.
+		keyHex = os.Getenv("TOTP_ENCRYPTION_key")
+	}
 	if keyHex == "" {
 		log.Println("[WARN] TOTP_ENCRYPTION_KEY not set, using default dev key.")
 		keyHex = "6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6"

@@ -23,8 +23,9 @@ func NewMCPAuthController(svc *sdkmgrSvc.MCPAuthService) *MCPAuthController {
 // ---------- Request types ----------
 
 type oauthStartRequest struct {
-	ClientID string `json:"client_id" binding:"required"`
-	AppName  string `json:"app_name" binding:"required"`
+	ClientID  string  `json:"client_id" binding:"required"`
+	AppName   string  `json:"app_name" binding:"required"`
+	ReturnURL *string `json:"return_url"`
 }
 
 type authenticateRequest struct {
@@ -43,6 +44,7 @@ type protectToolRequest struct {
 type toolsListRequest struct {
 	ClientID  string        `json:"client_id" binding:"required"`
 	AppName   string        `json:"app_name" binding:"required"`
+	SessionID string        `json:"session_id"`
 	UserTools []interface{} `json:"user_tools" binding:"required"`
 }
 
@@ -83,10 +85,11 @@ func (c *MCPAuthController) ToolsList(ctx *gin.Context) {
 	logrus.WithFields(logrus.Fields{
 		"client_id":  req.ClientID,
 		"app_name":   req.AppName,
+		"session_id": req.SessionID,
 		"tool_count": len(req.UserTools),
 	}).Info("tools list request")
 
-	result := c.Service.GetToolsList(req.ClientID, req.AppName, req.UserTools)
+	result := c.Service.GetToolsList(req.ClientID, req.AppName, req.SessionID, req.UserTools)
 	ctx.JSON(http.StatusOK, result)
 }
 
@@ -116,7 +119,12 @@ func (c *MCPAuthController) Start(ctx *gin.Context) {
 		return
 	}
 
-	result, err := c.Service.StartOAuthFlow(req.ClientID, req.AppName)
+	returnURL := ""
+	if req.ReturnURL != nil {
+		returnURL = *req.ReturnURL
+	}
+
+	result, err := c.Service.StartOAuthFlow(req.ClientID, req.AppName, returnURL)
 	if err != nil {
 		logrus.WithError(err).Error("OAuth start failed")
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -193,15 +201,24 @@ func (c *MCPAuthController) CallbackHTML(ctx *gin.Context) {
 	}
 
 	sid, _ := result["session_id"].(string)
+	returnURL, _ := result["return_url"].(string)
+	returnLink := `<p>You can return to MCP Inspector and call <code>oauth_status</code> or your protected tool.</p>`
+	redirectScript := ""
+	if returnURL != "" {
+		returnLink = fmt.Sprintf(`<p><a href="%s">Return to MCP Inspector</a></p>`, returnURL)
+		redirectScript = fmt.Sprintf(`<script>setTimeout(function(){ window.location.href = %q; }, 1200);</script>`, returnURL)
+	}
+
 	ctx.Data(http.StatusOK, "text/html; charset=utf-8", []byte(fmt.Sprintf(`
 		<html>
 		  <body style="font-family: sans-serif; padding: 24px;">
 		    <h2>Authentication Successful</h2>
 		    <p>Your OAuth session is authenticated.</p>
 		    <p><b>Session ID:</b> <code>%s</code></p>
-		    <p>You can return to MCP Inspector and call <code>oauth_status</code> or your protected tool.</p>
+		    %s
+		    %s
 		  </body>
-		</html>`, sid)))
+		</html>`, sid, returnLink, redirectScript)))
 }
 
 // Status handles GET /status/:session_id

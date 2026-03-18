@@ -17,6 +17,7 @@ import (
 	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	hydrautils "github.com/authsec-ai/authsec/internal/hydra/utils"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -125,6 +126,159 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		ClientName:     clientDetails.ClientName,
 		Providers:      oidcProviders,
 		BaseURL:        config.AppConfig.BaseURL,
+	})
+}
+
+// CompleteLocalLoginHandler bridges a locally authenticated end-user JWT into the
+// active Hydra login challenge so browser-based custom login can continue the
+// OAuth authorization flow.
+func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
+	var req struct {
+		LoginChallenge string `json:"login_challenge" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "invalid request body",
+		})
+		return
+	}
+
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "authorization header required",
+		})
+		return
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "invalid authorization header, expected Bearer token",
+		})
+		return
+	}
+
+	userClaims, err := validateUserJWT(parts[1])
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "invalid or expired user token",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	userID := claimString(userClaims, "user_id", claimString(userClaims, "sub", ""))
+	email := claimString(userClaims, "email_id", claimString(userClaims, "email", ""))
+	tenantID := claimString(userClaims, "tenant_id", "")
+	clientID := claimString(userClaims, "client_id", "")
+	projectID := claimString(userClaims, "project_id", "")
+
+	if userID == "" || email == "" || tenantID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "user token missing required claims",
+		})
+		return
+	}
+
+	loginRequest, err := ctrl.service.GetHydraLoginRequest(req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "failed to load hydra login request",
+		})
+		return
+	}
+
+	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "failed to load hydra client",
+		})
+		return
+	}
+
+	expectedClientID := strings.TrimSuffix(loginRequest.Client.ClientID, "-main-client")
+	if clientID != "" && expectedClientID != "" && !strings.EqualFold(clientID, expectedClientID) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"error":   "user token client does not match login challenge client",
+		})
+		return
+	}
+
+	if expectedTenantID, _ := clientDetails.Metadata["c_id"].(string); expectedTenantID != "" && !strings.EqualFold(expectedTenantID, tenantID) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"error":   "user token tenant does not match login challenge tenant",
+		})
+		return
+	}
+
+	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "failed to connect to tenant database",
+		})
+		return
+	}
+
+	var user models.User
+	if err := tenantDB.Where("id = ?", userID).First(&user).Error; err != nil {
+		if err := tenantDB.Where("LOWER(email) = LOWER(?)", email).First(&user).Error; err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "authenticated user not found in tenant database",
+			})
+			return
+		}
+	}
+
+	username := ""
+	if user.Username != nil {
+		username = *user.Username
+	}
+
+	ctx := map[string]interface{}{
+		"email":       user.Email,
+		"name":        user.Name,
+		"username":    username,
+		"provider":    user.Provider,
+		"provider_id": user.ProviderID,
+		"tenant_id":   user.TenantID,
+		"project_id":  user.ProjectID,
+		"client_id":   expectedClientID,
+		"avatar_url":  user.AvatarURL,
+	}
+	if projectID != "" {
+		ctx["project_id"] = projectID
+	}
+
+	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(req.LoginChallenge, user.ID.String(), ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "failed to accept hydra login request",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":        true,
+		"login_challenge": req.LoginChallenge,
+		"redirect_to":    acceptResponse.RedirectTo,
+		"client_id":      expectedClientID,
+		"tenant_id":      tenantID,
+		"email":          user.Email,
 	})
 }
 
@@ -700,7 +854,11 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 
 // ExchangeCodeForHydraTokens exchanges an authorization code for tokens with Hydra
 func (ctrl *HmgrController) ExchangeCodeForHydraTokens(ctx context.Context, clientID, clientSecret, code, redirectURI string) (*hydramodels.TokenResponse, error) {
-	tokenURL := fmt.Sprintf("%s/oauth2/token", config.AppConfig.HydraPublicURL)
+	hydraPublicURL := config.AppConfig.HydraPublicInternalURL
+	if hydraPublicURL == "" {
+		hydraPublicURL = config.AppConfig.HydraPublicURL
+	}
+	tokenURL := fmt.Sprintf("%s/oauth2/token", hydraPublicURL)
 
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")

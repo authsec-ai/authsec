@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache ca-certificates git && update-ca-certificates
+
+WORKDIR /src/authsec
+
+COPY . .
+COPY --from=auth_manager . /src/auth-manager
+COPY --from=sharedmodels . /src/sharedmodels
+
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+ENV GOARCH=amd64
+
+RUN go mod edit -replace=github.com/authsec-ai/auth-manager=/src/auth-manager
+RUN go mod edit -replace=github.com/authsec-ai/sharedmodels=/src/sharedmodels
+RUN go mod tidy
+
+RUN go build -o /out/authsec ./cmd/main.go
+RUN go build -o /out/authsec-seed ./cmd/local-seed
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl && update-ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /out/authsec /app/authsec
+COPY --from=builder /out/authsec-seed /app/authsec-seed
+COPY --from=builder /src/authsec/migrations /app/migrations
+
+EXPOSE 7468
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:7468/authsec/uflow/health || exit 1
+
+CMD ["./authsec"]

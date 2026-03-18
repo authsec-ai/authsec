@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	sharedmodels "github.com/authsec-ai/sharedmodels"
 	appmodels "github.com/authsec-ai/authsec/models"
 	util "github.com/authsec-ai/authsec/utils"
+	sharedmodels "github.com/authsec-ai/sharedmodels"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -80,6 +80,10 @@ func (r *GlobalRepository) GetTenantByID(tenantID string) (*sharedmodels.Tenant,
 
 // GetVerifiedCustomDomainForTenant returns the verified custom domain for a tenant, if any
 func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (string, error) {
+	if !r.DB.Migrator().HasTable("tenant_domains") {
+		return "", nil
+	}
+
 	var domain string
 	err := r.DB.Table("tenant_domains").
 		Select("domain").
@@ -99,6 +103,10 @@ func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (st
 
 // GetCustomDomainVerificationTime returns when the custom domain was verified
 func (r *GlobalRepository) GetCustomDomainVerificationTime(tenantID string) (*time.Time, error) {
+	if !r.DB.Migrator().HasTable("tenant_domains") {
+		return nil, nil
+	}
+
 	var domain appmodels.TenantDomain
 	err := r.DB.Table("tenant_domains").
 		Select("verified_at").
@@ -269,8 +277,12 @@ func (r *ClientRepository) GetClientByEmailAndTenant(email, tenantID, clientID *
 			return nil, err
 		}
 		// Fallback query without MFA condition
-		err = r.DB.Scopes(util.WithUsersMFAMethodArray).
-			Where("email = ? AND tenant_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+		fallbackQuery := r.DB.Scopes(util.WithUsersMFAMethodArray).
+			Where("email = ? AND tenant_id = ?", email, tenantID)
+		if clientID != nil && *clientID != "" {
+			fallbackQuery = fallbackQuery.Where("client_id = ?", *clientID)
+		}
+		err = fallbackQuery.First(&userWithJSONMFA).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				log.Printf("User not found in fallback query for email: %v", email)

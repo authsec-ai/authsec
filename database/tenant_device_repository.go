@@ -207,10 +207,30 @@ func (r *TenantDeviceRepository) GetTenantUserTOTPSecrets(userID, tenantID uuid.
 	return secrets, err
 }
 
+// GetTenantVerifiedTOTPSecrets retrieves all verified active TOTP secrets for a user in tenant DB
+func (r *TenantDeviceRepository) GetTenantVerifiedTOTPSecrets(userID, tenantID uuid.UUID) ([]models.TenantTOTPSecret, error) {
+	var secrets []models.TenantTOTPSecret
+	err := r.db.Where("user_id = ? AND tenant_id = ? AND is_active = ? AND is_verified = ?", userID, tenantID, true, true).
+		Order("is_primary DESC, created_at DESC").
+		Find(&secrets).Error
+	return secrets, err
+}
+
 // UpdateTenantTOTPSecret updates a TOTP secret in tenant DB
 func (r *TenantDeviceRepository) UpdateTenantTOTPSecret(secret *models.TenantTOTPSecret) error {
 	secret.UpdatedAt = time.Now().Unix()
 	return r.db.Save(secret).Error
+}
+
+// ConfirmTenantTOTPSecret marks a tenant TOTP secret as verified.
+func (r *TenantDeviceRepository) ConfirmTenantTOTPSecret(id, userID, tenantID uuid.UUID) error {
+	now := time.Now().Unix()
+	return r.db.Model(&models.TenantTOTPSecret{}).
+		Where("id = ? AND user_id = ? AND tenant_id = ?", id, userID, tenantID).
+		Updates(map[string]interface{}{
+			"is_verified": true,
+			"updated_at":  now,
+		}).Error
 }
 
 // DeleteTenantTOTPSecret soft deletes a TOTP secret by setting is_active to false
