@@ -87,12 +87,12 @@ func TestSecurityHeadersMiddleware_NoHSTSWithoutTLS(t *testing.T) {
 func TestSecurityHeadersMiddleware_OIDCCallbackCSP(t *testing.T) {
 	router := gin.New()
 	router.Use(SecurityHeadersMiddleware())
-	router.GET("/uflow/oidc/callback", func(c *gin.Context) {
+	router.GET("/authsec/uflow/oidc/callback", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/uflow/oidc/callback", nil)
+	req := httptest.NewRequest("GET", "/authsec/uflow/oidc/callback", nil)
 	router.ServeHTTP(w, req)
 
 	csp := w.Header().Get("Content-Security-Policy")

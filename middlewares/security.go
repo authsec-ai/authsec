@@ -31,7 +31,7 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		// Relaxed for OIDC callback page (needs inline script for OAuth redirect handling)
 		path := c.Request.URL.Path
 		var csp string
-		if strings.HasPrefix(path, "/uflow/oidc/callback") {
+		if strings.HasPrefix(path, "/authsec/uflow/oidc/callback") {
 			// Allow inline scripts for OAuth callback (postMessage to opener window)
 			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 		} else {

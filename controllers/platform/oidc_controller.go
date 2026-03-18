@@ -498,7 +498,7 @@ func (oc *OIDCController) InitiateLogin(c *gin.Context) {
 // @Success 200 {object} models.OIDCCallbackResponse
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
-// @Router /uflow/oidc/callback [get]
+// @Router /authsec/uflow/oidc/callback [get]
 func (oc *OIDCController) Callback(c *gin.Context) {
 	// This endpoint receives OAuth callback and redirects to frontend SPA with code/state
 	// The frontend will then call /exchange-code to complete the flow
@@ -756,23 +756,34 @@ func (oc *OIDCController) generateAndRespondWithToken(c *gin.Context, user *mode
 }
 
 func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, user *models.ExtendedUser, originDomain string) {
-	// This is a simplified version. A real implementation should check if the user is an admin
-	// and generate the appropriate token (admin vs enduser).
-	// For now, we assume an admin token is desired for OIDC users.
+	// user.TenantDomain is the authoritative workspace domain (e.g., papa.dev.authsec.dev).
+	// originDomain is just where the request came from (e.g., dev.authsec.dev for generic login).
+	// Always return the DB value so the frontend knows which workspace to redirect to.
+	tenantDomain := user.TenantDomain
+	log.Printf("DEBUG generateAndRespondWithTokenAndOrigin: tenantDomain='%s' (from DB), originDomain='%s'",
+		tenantDomain, originDomain)
 
-	// Prioritize origin domain over stored tenant domain
-	tenantDomain := originDomain
-	if tenantDomain == "" {
-		tenantDomain = user.TenantDomain
+	// Look up the AdminUser to generate a properly-scoped JWT
+	adminUser, err := oc.adminUserRepo.GetAdminUserByEmail(user.Email)
+	if err != nil {
+		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to look up admin user by email %s: %v", user.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load user account"})
+		return
 	}
-	log.Printf("DEBUG generateAndRespondWithTokenAndOrigin: Using tenantDomain='%s' (origin='%s', user.TenantDomain='%s')",
-		tenantDomain, originDomain, user.TenantDomain)
+
+	tokenStr, err := oc.generateAdminJWTToken(adminUser)
+	if err != nil {
+		log.Printf("ERROR generateAndRespondWithTokenAndOrigin: failed to generate JWT for user %s: %v", user.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate session token"})
+		return
+	}
 
 	c.JSON(http.StatusOK, models.LoginResponse{
 		TenantID:     user.TenantID.String(),
 		TenantDomain: tenantDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
+		Token:        tokenStr,
 	})
 }
 
@@ -1015,11 +1026,16 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 	log.Printf("Created default client in tenant DB: %s", clientID)
 
-	// Create tenant record in tenant database (required for FK constraint on projects table)
+	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())`
+		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
+		ON CONFLICT (id) DO UPDATE SET
+			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
+			source = EXCLUDED.source, status = EXCLUDED.status,
+			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
+			updated_at = NOW()`
 	if _, err := tenantDB.Exec(tenantInsert, tenantID, userInfo.Email, "", userInfo.Name, state.ProviderName, fullDomain, tenantDBName); err != nil {
-		log.Printf("Failed to create tenant record in tenant database: %v", err)
+		log.Printf("Failed to upsert tenant record in tenant database: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant record in tenant database"})
 		return
 	}
@@ -1570,11 +1586,16 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 	log.Printf("Created default client in tenant DB: %s", clientID)
 
-	// Create tenant record in tenant database (required for FK constraint on projects table)
+	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())`
+		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
+		ON CONFLICT (id) DO UPDATE SET
+			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
+			source = EXCLUDED.source, status = EXCLUDED.status,
+			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
+			updated_at = NOW()`
 	if _, err := tenantDB.Exec(tenantInsert, tenantID, input.Email, "", input.Name, input.Provider, fullDomain, tenantDBName); err != nil {
-		log.Printf("Failed to create tenant record in tenant database: %v", err)
+		log.Printf("Failed to upsert tenant record in tenant database: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant record in tenant database"})
 		return
 	}
@@ -1901,13 +1922,13 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	if defaultBaseURL == "" {
 		defaultBaseURL = "https://app.authsec.dev"
 	}
-	redirectURL := defaultBaseURL + "/uflow/oidc/callback"
+	redirectURL := defaultBaseURL + "/authsec/uflow/oidc/callback"
 
 	// Try to use tenant_domain from data first (this preserves the domain the user logged in from)
 	if tenantDomain, ok := data["tenant_domain"].(string); ok && tenantDomain != "" {
 		// Use the tenant domain that was passed in (from state or database)
 		// No validation needed - trust the domain from the state/database
-		redirectURL = "https://" + tenantDomain + "/uflow/oidc/callback"
+		redirectURL = "https://" + tenantDomain + "/authsec/uflow/oidc/callback"
 		log.Printf("DEBUG renderOAuthCallbackHTML: Using tenant_domain from data, redirectURL='%s'", redirectURL)
 	} else {
 		// Fallback: Try to extract from Host or X-Forwarded-Host header
@@ -1929,7 +1950,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 		// For platform domains, validate against allowlist
 		// For custom domains, trust them (they came from tenant_domains table via state)
 		if isAllowedFrontendDomain(frontendHost) || (!strings.HasSuffix(frontendHost, ".authsec.dev") && !strings.HasSuffix(frontendHost, ".authsec.ai")) {
-			redirectURL = "https://" + frontendHost + "/uflow/oidc/callback"
+			redirectURL = "https://" + frontendHost + "/authsec/uflow/oidc/callback"
 		}
 	}
 

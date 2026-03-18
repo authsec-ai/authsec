@@ -247,7 +247,7 @@ func (s *OIDCService) getCallbackURL() string {
 	if baseURL == "" {
 		baseURL = "https://app.authsec.dev"
 	}
-	callbackURL := fmt.Sprintf("%s/uflow/oidc/callback", baseURL)
+	callbackURL := fmt.Sprintf("%s/authsec/uflow/oidc/callback", baseURL)
 	log.Printf("DEBUG getCallbackURL: Using BASE_URL='%s', callbackURL='%s'", baseURL, callbackURL)
 	return callbackURL
 }
@@ -341,8 +341,8 @@ func (s *OIDCService) exchangeCodeForTokens(provider *models.OIDCProvider, code,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Token exchange failed with status %d", resp.StatusCode)
-		return nil, fmt.Errorf("token exchange failed with status %d", resp.StatusCode)
+		log.Printf("Token exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var tokens models.OIDCTokenResponse
@@ -407,18 +407,22 @@ func (s *OIDCService) getClientSecret(vaultPath string) (string, error) {
 	}
 
 	// Fallback to environment variables
-	envKey := strings.ToUpper(strings.ReplaceAll(vaultPath, "/", "_"))
-	envKey = strings.TrimPrefix(envKey, "SECRET_OIDC_")
-
 	switch {
 	case strings.Contains(strings.ToLower(vaultPath), "google"):
-		return config.AppConfig.GoogleClientSecret, nil
+		sec := config.AppConfig.GoogleClientSecret
+		log.Printf("DEBUG getClientSecret: vault_path=%q matched 'google', secret_empty=%v", vaultPath, sec == "")
+		return sec, nil
 	case strings.Contains(strings.ToLower(vaultPath), "github"):
-		return config.AppConfig.GitHubClientSecret, nil
+		sec := config.AppConfig.GitHubClientSecret
+		log.Printf("DEBUG getClientSecret: vault_path=%q matched 'github', secret_empty=%v", vaultPath, sec == "")
+		return sec, nil
 	case strings.Contains(strings.ToLower(vaultPath), "microsoft"):
-		return config.AppConfig.MicrosoftClientSecret, nil
+		sec := config.AppConfig.MicrosoftClientSecret
+		log.Printf("DEBUG getClientSecret: vault_path=%q matched 'microsoft', secret_empty=%v", vaultPath, sec == "")
+		return sec, nil
 	}
 
+	log.Printf("DEBUG getClientSecret: vault_path=%q did not match any known provider pattern", vaultPath)
 	return "", fmt.Errorf("client secret not found for path: %s", vaultPath)
 }
 

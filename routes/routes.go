@@ -154,6 +154,8 @@ func SetupRoutes(
 	}
 
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
+	agentCtrl := platformCtrl.NewAgentController()
+	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
 
 	// ────────────────────────────────────────────────────────
 	// Well-known OIDC discovery – must remain at root (RFC 8414)
@@ -504,6 +506,30 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
+		// AI agents (SPIRE identity + JWT-SVID delegation)
+		// ────────────────────────────────────────────────────
+		agents := uflow.Group("/admin/agents")
+		agents.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			agents.GET("", agentCtrl.ListAgents)
+			agents.GET("/:id", agentCtrl.GetAgent)
+			agents.POST("/:id/provision-identity", agentCtrl.ProvisionIdentity)
+			agents.DELETE("/:id/revoke-identity", agentCtrl.RevokeIdentity)
+			agents.POST("/:id/delegate-token", agentCtrl.DelegateToken)
+			agents.POST("/:id/revoke-token", sdkTokenCtrl.RevokeDelegationToken)
+		}
+
+		// SDK public endpoint — no auth middleware (client_id is the identity)
+		sdk := uflow.Group("/sdk")
+		{
+			sdk.GET("/delegation-token", sdkTokenCtrl.GetDelegationToken)
+		}
+
+		// ────────────────────────────────────────────────────
 		// End-user admin scopes
 		// ────────────────────────────────────────────────────
 		enduserAdmin := uflow.Group("/enduser")
@@ -674,6 +700,32 @@ func SetupRoutes(
 		// Served under /authsec/authmgr.
 		// ────────────────────────────────────────────────────
 		registerAuthmgrRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
+		// Migration API (formerly authsec-migration microservice)
+		// Served under /authsec/migration.
+		// ────────────────────────────────────────────────────
+		migCtrl := adminCtrl.NewMigrationController()
+		mig := authsec.Group("/migration")
+		{
+			master := mig.Group("/migrations/master")
+			master.Use(middlewares.AuthMiddleware())
+			{
+				master.POST("/run", migCtrl.RunMasterMigrations)
+				master.GET("/status", migCtrl.GetMasterMigrationStatus)
+			}
+			tenants := mig.Group("/tenants")
+			tenants.Use(middlewares.AuthMiddleware())
+			{
+				tenants.GET("", migCtrl.ListTenants)
+				tenants.POST("/create-db", migCtrl.CreateTenantDB)
+				tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
+				tenants.GET("/template-status", migCtrl.GetTemplateStatus)
+				tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
+				tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
+				tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
+			}
+		}
 
 		// ────────────────────────────────────────────────────
 		// SDK Manager (formerly sdk-manager Python service)
@@ -1142,35 +1194,6 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		user.GET("/permissions", ac.ListUserPermissions)
 	}
 
-	// ────────────────────────────────────────────────────────
-	// migration – database migration management API
-	// Formerly the standalone authsec-migration microservice.
-	// ────────────────────────────────────────────────────────
-	migCtrl := adminCtrl.NewMigrationController()
-
-	mig := r.Group("/migration")
-	{
-		// Master database migrations (admin JWT required)
-		master := mig.Group("/migrations/master")
-		master.Use(middlewares.AuthMiddleware())
-		{
-			master.POST("/run", migCtrl.RunMasterMigrations)
-			master.GET("/status", migCtrl.GetMasterMigrationStatus)
-		}
-
-		// Tenant database management
-		tenants := mig.Group("/tenants")
-		tenants.Use(middlewares.AuthMiddleware())
-		{
-			tenants.GET("", migCtrl.ListTenants)
-			tenants.POST("/create-db", migCtrl.CreateTenantDB)
-			tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
-			tenants.GET("/template-status", migCtrl.GetTemplateStatus)
-			tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
-			tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
-			tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
-		}
-	}
 }
 
 // registerSdkmgrRoutes registers all SDK Manager routes under /sdkmgr.
