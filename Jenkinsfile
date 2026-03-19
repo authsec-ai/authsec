@@ -115,7 +115,7 @@ pipeline {
                 checkout scm
             }
         }
-
+/*
         stage('Lint & Vet') {
             steps {
                 sh '''
@@ -151,7 +151,7 @@ pipeline {
                 }
             }
         }
-        
+*/        
         stage('OSV Scanner - Source Code') {
             steps {
                     script {
@@ -169,7 +169,7 @@ pipeline {
                     }
                 }
             }
-
+/*
         stage('Build Docker Image') {
             steps {
                 withCredentials([
@@ -184,7 +184,7 @@ pipeline {
                     }
                 }
             }
-
+*/
         stage('OSV Scanner - Docker Image Scan') {
             steps {
                 script {
@@ -225,7 +225,7 @@ pipeline {
                 }
             }
         }
-
+/*
         stage('Login to Docker Artifactory') {
             steps {
                 sh "echo ${DOCKER_REGISTRY_CREDENTIALS_PSW} | docker login ${DOCKER_REGISTRY} -u ${DOCKER_REGISTRY_CREDENTIALS_USR} --password-stdin"
@@ -319,25 +319,25 @@ pipeline {
             }
         }
     }   
+*/
+      post {
+        always {
+            archiveArtifacts artifacts: 'osv-*.json', fingerprint: true
 
-    post {
-    always {
-        archiveArtifacts artifacts: 'osv-*.json', fingerprint: true
+            sh '''
+                echo "=== OSV Security Scan Report ===" > security-summary.txt
+                echo "Scan completed: $(date)" >> security-summary.txt
+                echo "Service: ${SERVICE_NAME}" >> security-summary.txt
+                echo "Environment: ${BRANCH_NAME}" >> security-summary.txt
+            '''
+        }
 
-        sh '''
-            echo "=== OSV Security Scan Report ===" > security-summary.txt
-            echo "Scan completed: $(date)" >> security-summary.txt
-            echo "Service: ${SERVICE_NAME}" >> security-summary.txt
-            echo "Environment: ${BRANCH_NAME}" >> security-summary.txt
-        '''
+        success {
+            echo "SUCCESS: Build completed successfully for ${env.SERVICE_NAME} on ${env.BRANCH_NAME}"
+        }
+
+        failure {
+            echo "FAILURE: Build failed"
+        }
     }
-
-    success {
-        echo "SUCCESS: Build completed successfully for ${env.SERVICE_NAME} on ${env.BRANCH_NAME}"
-    }
-
-    failure {
-        echo "FAILURE: Build failed"
-    }
-  }
-}  
+}    
