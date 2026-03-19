@@ -115,43 +115,7 @@ pipeline {
                 checkout scm
             }
         }
-/*
-        stage('Lint & Vet') {
-            steps {
-                sh '''
-                    export PATH=$PATH:/usr/local/go/bin
-                    go vet ./...
-                '''
-            }
-        }
-
-        stage('Unit Tests') {
-            steps {
-                sh '''
-                    export PATH=$PATH:/usr/local/go/bin
-                    go test -count=1 -timeout 5m -coverprofile=coverage.out \
-                      $(go list ./... | grep -v /tests/integration) \
-                      2>&1 | tee test-output.txt
-
-                    # Extract total coverage percentage
-                    COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
-                    echo "Total test coverage: ${COVERAGE}%"
-
-                    # Fail if coverage is below threshold
-                    THRESHOLD=50
-                    if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l)" -eq 1 ]; then
-                        echo "FAIL: Test coverage ${COVERAGE}% is below minimum ${THRESHOLD}%"
-                        exit 1
-                    fi
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'test-output.txt,coverage.out', fingerprint: true, allowEmptyArchive: true
-                }
-            }
-        }
-*/        
+        
         stage('OSV Scanner - Source Code') {
             steps {
                     script {
@@ -169,23 +133,8 @@ pipeline {
                     }
                 }
             }
-/*
-        stage('Build Docker Image') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'sriramgithubtoken',
-                        usernameVariable: 'GITHUB_USER',
-                        passwordVariable: 'GITHUB_TOKEN'
-                    )
-                ]) {
-                        // Uses the DOCKER_IMAGE variable set in 'Initialize'
-                        sh "docker build --build-arg GITHUB_TOKEN=${GITHUB_TOKEN} -t ${env.DOCKER_IMAGE} ."
-                    }
-                }
-            }
-*/
-        stage('OSV Scanner - Docker Image Scan') {
+        
+            stage('OSV Scanner - Docker Image Scan') {
             steps {
                 script {
                     def scanExit = sh(
@@ -225,102 +174,8 @@ pipeline {
                 }
             }
         }
-/*
-        stage('Login to Docker Artifactory') {
-            steps {
-                sh "echo ${DOCKER_REGISTRY_CREDENTIALS_PSW} | docker login ${DOCKER_REGISTRY} -u ${DOCKER_REGISTRY_CREDENTIALS_USR} --password-stdin"
-            }
-        }
-
-        stage('Push Docker Image') {
-            steps {
-                sh "docker push ${env.DOCKER_IMAGE}"
-            }
-        }
-
-        stage('Logout from Docker Artifactory') {
-            steps {
-                sh "docker logout ${env.DOCKER_REGISTRY}"
-            }
-        }
-
-        // --- CONDITIONAL STAGE: ONLY RUNS ON PROD ---
-        stage('Push Public Image') {
-            when {
-                expression { return env.IS_PROD_BRANCH == 'true' }
-            }
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'authsec-public-repo', usernameVariable: 'USR', passwordVariable: 'PASS')]) {
-                    sh """
-                        echo "Logging in to PUBLIC registry"
-                        echo "\$PASS" | docker login ${DOCKER_REGISTRY_PUBLIC} -u "\$USR" --password-stdin
-
-                        docker tag ${env.DOCKER_IMAGE} ${DOCKER_IMAGE_PUBLIC}
-                        docker push ${DOCKER_IMAGE_PUBLIC}
-                        docker logout ${DOCKER_REGISTRY_PUBLIC}
-                    """
-                }
-            }
-        }
-
-        stage('Remove Docker Image') {
-            steps {
-                sh "docker rmi ${env.DOCKER_IMAGE} || true"
-                script {
-                    if (env.IS_PROD_BRANCH == 'true') {
-                         sh "docker rmi ${env.DOCKER_IMAGE_PUBLIC} || true"
-                    }
-                }
-            }
-        }
-
-
-        stage('Authenticate to AKS') {
-            steps {
-                script {
-
-                    def subscriptionId
-                    def resourceGroup
-                    def aksCluster
-
-                    if ("$AKS_ENV" == 'authsec') {
-                        echo 'AKS_ENV=authsec → using AUTHSEC cluster'
-                        subscriptionId = env.AZURE_SUBSCRIPTION_ID_SEC
-                        resourceGroup  = env.RESOURCE_GROUP_SEC
-                        aksCluster     = env.AKS_CLUSTER_SEC
-                    } else {
-                        subscriptionId = env.AZURE_SUBSCRIPTION_ID
-                        resourceGroup  = env.RESOURCE_GROUP
-                        aksCluster     = env.AKS_CLUSTER
-                    }
-
-                    sh """
-                        az login --service-principal \
-                          -u "$AZURE_CLIENT_ID" \
-                          -p "$AZURE_CLIENT_SECRET" \
-                          --tenant "$AZURE_TENANT_ID"
-
-                        az account set --subscription "$subscriptionId"
-
-                        az aks get-credentials \
-                          --resource-group "$resourceGroup" \
-                          --admin \
-                          --name "$aksCluster"
-                    """
-                }
-            }
-        }
-
-        stage('Rolling Restart') {
-            steps {
-                echo "Rolling restart of deployment '${APP_LABEL}' in ${K8S_NAMESPACE}..."
-                sh "kubectl rollout restart deployment/${APP_LABEL} -n ${K8S_NAMESPACE}"
-                sh "kubectl rollout status deployment/${APP_LABEL} -n ${K8S_NAMESPACE} --timeout=300s"
-            }
-        }
     }   
-*/
-      post {
+    post {
         always {
             archiveArtifacts artifacts: 'osv-*.json', fingerprint: true
 
@@ -340,4 +195,4 @@ pipeline {
             echo "FAILURE: Build failed"
         }
     }
-}    
+}
