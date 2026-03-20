@@ -501,12 +501,6 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────
 		// Delegation policies
 		// ────────────────────────────────────────────────────
-		delegationAdmin := uflow.Group("/admin/me")
-		delegationAdmin.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
-		{
-			delegationAdmin.GET("/roles-permissions", delegationPolicyCtrl.GetMyRolesAndPermissions)
-		}
-
 		delegationPolicies := uflow.Group("/delegation-policies")
 		delegationPolicies.Use(
 			middlewares.AuthMiddleware(),
