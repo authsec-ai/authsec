@@ -391,6 +391,151 @@ func (mc *MigrationController) ListTenants(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"total": len(items), "tenants": items})
 }
 
+// CreateTenantFromTemplate POST /authsec/migration/tenants/create-from-template
+// Clones the golden template DB to create a new tenant database — much faster than running migrations.
+func (mc *MigrationController) CreateTenantFromTemplate(c *gin.Context) {
+	var req migration.CreateTenantDBRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload", "details": err.Error()})
+		return
+	}
+
+	if !migration.TemplateReady {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Tenant template is not ready. Use the standard create-db endpoint instead.",
+		})
+		return
+	}
+
+	log.Printf("[MigrationController] Creating tenant DB from template for tenant: %s", req.TenantID)
+
+	var tenant migration.TenantInfo
+	if err := config.DB.Where("tenant_id = ?", req.TenantID).First(&tenant).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Tenant not found",
+			"details": fmt.Sprintf("No tenant record found for: %s", req.TenantID),
+		})
+		return
+	}
+
+	dbName := req.DatabaseName
+	if dbName == "" && tenant.TenantDB != nil && *tenant.TenantDB != "" {
+		dbName = *tenant.TenantDB
+	}
+	if dbName == "" {
+		dbName = migration.GenerateTenantDBName(req.TenantID)
+	}
+
+	if !migration.IsValidDatabaseName(dbName) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid database name format"})
+		return
+	}
+
+	if tenant.MigrationStatus != nil && *tenant.MigrationStatus == "completed" {
+		createdAt := time.Time{}
+		if tenant.CreatedAt != nil {
+			createdAt = *tenant.CreatedAt
+		}
+		c.JSON(http.StatusOK, migration.CreateTenantFromTemplateResponse{
+			TenantID:           tenant.TenantID.String(),
+			DatabaseName:       dbName,
+			MigrationStatus:    "completed",
+			CreatedAt:          createdAt,
+			ClonedFromTemplate: false,
+		})
+		return
+	}
+
+	cloneStart := time.Now()
+	created, err := migration.CloneTenantDatabase(dbName)
+	cloneDuration := time.Since(cloneStart).Milliseconds()
+
+	if err != nil {
+		log.Printf("[MigrationController] Failed to clone database %s from template: %v", dbName, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clone database from template", "details": err.Error()})
+		return
+	}
+
+	if !created {
+		log.Printf("[MigrationController] Database %s already existed", dbName)
+	}
+
+	config.DB.Model(&tenant).Updates(map[string]interface{}{
+		"tenant_db":        dbName,
+		"migration_status": "completed",
+		"updated_at":       time.Now().UTC(),
+	})
+
+	go mc.fixClonedTenantSelfReference(tenant.TenantID.String(), dbName)
+
+	createdAt := time.Time{}
+	if tenant.CreatedAt != nil {
+		createdAt = *tenant.CreatedAt
+	}
+
+	log.Printf("[MigrationController] Tenant DB cloned: %s (created=%v, duration=%dms)", dbName, created, cloneDuration)
+	c.JSON(http.StatusCreated, migration.CreateTenantFromTemplateResponse{
+		TenantID:           tenant.TenantID.String(),
+		DatabaseName:       dbName,
+		MigrationStatus:    "completed",
+		CreatedAt:          createdAt,
+		ClonedFromTemplate: true,
+		CloneDurationMS:    cloneDuration,
+	})
+}
+
+// GetTemplateStatus GET /authsec/migration/tenants/template-status
+func (mc *MigrationController) GetTemplateStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, migration.TemplateStatusResponse{
+		TemplateName: migration.TemplateDBName,
+		Ready:        migration.TemplateReady,
+	})
+}
+
+// fixClonedTenantSelfReference replaces the synthetic tenant UUID used during template build
+// with the real tenant UUID across key tables in the cloned database.
+func (mc *MigrationController) fixClonedTenantSelfReference(tenantID, dbName string) {
+	cfg := config.AppConfig
+	conn, err := migration.ConnectToTenantDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
+	if err != nil {
+		log.Printf("[MigrationController] fixClonedTenantSelfReference: failed to connect to %s: %v", dbName, err)
+		return
+	}
+	defer conn.Close()
+
+	const syntheticID = "00000000-0000-0000-0000-000000000001"
+
+	tx, err := conn.Begin()
+	if err != nil {
+		log.Printf("[MigrationController] fixClonedTenantSelfReference: begin tx failed on %s: %v", dbName, err)
+		return
+	}
+
+	if _, err := tx.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		log.Printf("[MigrationController] fixClonedTenantSelfReference: could not defer constraints: %v", err)
+	}
+
+	for _, query := range []string{
+		"UPDATE tenants SET id = $1::uuid, tenant_id = $1::uuid WHERE id = $2::uuid",
+		"UPDATE permissions SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+		"UPDATE roles SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+		"UPDATE users SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+		"UPDATE role_bindings SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+		"UPDATE service_accounts SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+	} {
+		if _, err := tx.Exec(query, tenantID, syntheticID); err != nil {
+			log.Printf("[MigrationController] fixClonedTenantSelfReference: query failed on %s: %v", dbName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[MigrationController] fixClonedTenantSelfReference: commit failed on %s: %v", dbName, err)
+		return
+	}
+
+	log.Printf("[MigrationController] fixClonedTenantSelfReference: updated %s with tenant ID %s", dbName, tenantID)
+}
+
 // runTenantMigrationsAsync runs tenant migrations in the background.
 func (mc *MigrationController) runTenantMigrationsAsync(tenantID, dbName string) {
 	log.Printf("[MigrationController] Starting async tenant migrations for: %s", tenantID)

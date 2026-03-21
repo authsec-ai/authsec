@@ -1675,9 +1675,14 @@ func (ac *OocmgrController) ShowAuthProviders(c *gin.Context) {
 		TenantID string `json:"tenant_id"`
 		ClientID string `json:"client_id"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "Invalid request", Message: err.Error(), Code: http.StatusBadRequest, Timestamp: time.Now()})
-		return
+	if c.Request.Method == http.MethodGet {
+		req.TenantID = c.Query("tenant_id")
+		req.ClientID = c.Query("client_id")
+	} else {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "Invalid request", Message: err.Error(), Code: http.StatusBadRequest, Timestamp: time.Now()})
+			return
+		}
 	}
 
 	if req.ClientID == "" {

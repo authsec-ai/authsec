@@ -89,6 +89,11 @@ func SetupRoutes(
 	scopeController := adminCtrl.NewScopeController()
 	apiScopesController := adminCtrl.NewAPIScopesController()
 
+	// AI Agent Delegation controllers
+	agentController := adminCtrl.NewAgentController()
+	delegationPolicyController := adminCtrl.NewDelegationPolicyController()
+	sdkTokenController := adminCtrl.NewSDKTokenController()
+
 	// Legacy / existing controllers
 	groupController := &adminCtrl.GroupController{}
 	endUserController := &userCtrl.EndUserController{}
@@ -255,6 +260,17 @@ func SetupRoutes(
 			adminRBAC.GET("/api_scopes/:scope_id", apiScopesController.GetAPIScopeAdmin)
 			adminRBAC.PUT("/api_scopes/:scope_id", apiScopesController.UpdateAPIScopeAdmin)
 			adminRBAC.DELETE("/api_scopes/:scope_id", apiScopesController.DeleteAPIScopeAdmin)
+
+			// AI Agent Management
+			adminRBAC.GET("/agents", agentController.ListAgents)
+			adminRBAC.GET("/agents/:id", agentController.GetAgent)
+			adminRBAC.POST("/agents/:id/provision-identity", agentController.ProvisionIdentity)
+			adminRBAC.DELETE("/agents/:id/revoke-identity", agentController.RevokeIdentity)
+			adminRBAC.POST("/agents/:id/delegate-token", agentController.DelegateToken)
+			adminRBAC.POST("/agents/:id/revoke-token", sdkTokenController.RevokeDelegationToken)
+
+			// Admin self-introspection (delegation UI)
+			adminRBAC.GET("/me/roles-permissions", delegationPolicyController.GetMyRolesAndPermissions)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -618,6 +634,31 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
+		// Delegation Policy CRUD (admin-authenticated)
+		// ────────────────────────────────────────────────────
+		delegationPolicies := uflow.Group("/delegation-policies")
+		delegationPolicies.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			delegationPolicies.POST("", delegationPolicyController.CreateDelegationPolicy)
+			delegationPolicies.GET("", delegationPolicyController.ListDelegationPolicies)
+			delegationPolicies.GET("/:id", delegationPolicyController.GetDelegationPolicy)
+			delegationPolicies.PUT("/:id", delegationPolicyController.UpdateDelegationPolicy)
+			delegationPolicies.DELETE("/:id", delegationPolicyController.DeleteDelegationPolicy)
+		}
+
+		// ────────────────────────────────────────────────────
+		// SDK Token Pull (public, authenticated by client_id)
+		// ────────────────────────────────────────────────────
+		sdk := uflow.Group("/sdk")
+		{
+			sdk.GET("/delegation-token", sdkTokenController.GetDelegationToken)
+		}
+
+		// ────────────────────────────────────────────────────
 		// Health checks
 		// ────────────────────────────────────────────────────
 		health := uflow.Group("/health")
@@ -650,6 +691,32 @@ func SetupRoutes(
 		// Served under /authsec/authmgr.
 		// ────────────────────────────────────────────────────
 		registerAuthmgrRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
+		// Migration API (formerly authsec-migration microservice)
+		// Served under /authsec/migration.
+		// ────────────────────────────────────────────────────
+		migCtrl := adminCtrl.NewMigrationController()
+		mig := authsec.Group("/migration")
+		{
+			master := mig.Group("/migrations/master")
+			master.Use(middlewares.AuthMiddleware())
+			{
+				master.POST("/run", migCtrl.RunMasterMigrations)
+				master.GET("/status", migCtrl.GetMasterMigrationStatus)
+			}
+			tenants := mig.Group("/tenants")
+			tenants.Use(middlewares.AuthMiddleware())
+			{
+				tenants.GET("", migCtrl.ListTenants)
+				tenants.POST("/create-db", migCtrl.CreateTenantDB)
+				tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
+				tenants.GET("/template-status", migCtrl.GetTemplateStatus)
+				tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
+				tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
+				tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
+			}
+		}
 
 		// ────────────────────────────────────────────────────
 		// SDK Manager (formerly sdk-manager Python service)
@@ -1119,33 +1186,6 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		user.GET("/permissions", ac.ListUserPermissions)
 	}
 
-	// ────────────────────────────────────────────────────────
-	// migration – database migration management API
-	// Formerly the standalone authsec-migration microservice.
-	// ────────────────────────────────────────────────────────
-	migCtrl := adminCtrl.NewMigrationController()
-
-	mig := r.Group("/migration")
-	{
-		// Master database migrations (admin JWT required)
-		master := mig.Group("/migrations/master")
-		master.Use(middlewares.AuthMiddleware())
-		{
-			master.POST("/run", migCtrl.RunMasterMigrations)
-			master.GET("/status", migCtrl.GetMasterMigrationStatus)
-		}
-
-		// Tenant database management
-		tenants := mig.Group("/tenants")
-		tenants.Use(middlewares.AuthMiddleware())
-		{
-			tenants.GET("", migCtrl.ListTenants)
-			tenants.POST("/create-db", migCtrl.CreateTenantDB)
-			tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
-			tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
-			tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
-		}
-	}
 }
 
 // registerSdkmgrRoutes registers all SDK Manager routes under /sdkmgr.

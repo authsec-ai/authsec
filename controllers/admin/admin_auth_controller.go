@@ -47,7 +47,6 @@ type ForgotPasswordInput struct {
 // ResetPasswordInput represents the input for password reset
 type ResetPasswordInput struct {
 	Email       string `json:"email" binding:"required,email"`
-	OTP         string `json:"otp" binding:"required"`
 	NewPassword string `json:"new_password" binding:"required,min=6"`
 } // NewAdminAuthController creates a new admin auth controller
 func NewAdminAuthController() (*AdminAuthController, error) {
@@ -1213,7 +1212,8 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 		return
 	}
 
-	// Update the user with new password hash
+	// Update the user with new password hash.
+	// UpdateAdminUser already appends updated_at internally — omit it here to avoid duplicate column.
 	updates := map[string]interface{}{
 		"password_hash":                 adminUser.PasswordHash,
 		"temporary_password":            false,
@@ -1221,7 +1221,6 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 		"failed_login_attempts":         0,
 		"account_locked_at":             nil,
 		"password_reset_required":       false,
-		"updated_at":                    time.Now(),
 	}
 
 	if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, updates); err != nil {

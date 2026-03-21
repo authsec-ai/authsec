@@ -90,3 +90,19 @@ type TenantMigrateResult struct {
 	Status       string `json:"status"`
 	Error        string `json:"error,omitempty"`
 }
+
+// CreateTenantFromTemplateResponse is returned by the create-from-template endpoint.
+type CreateTenantFromTemplateResponse struct {
+	TenantID           string    `json:"tenant_id"`
+	DatabaseName       string    `json:"database_name"`
+	MigrationStatus    string    `json:"migration_status"`
+	CreatedAt          time.Time `json:"created_at"`
+	ClonedFromTemplate bool      `json:"cloned_from_template"`
+	CloneDurationMS    int64     `json:"clone_duration_ms"`
+}
+
+// TemplateStatusResponse is returned by the template-status endpoint.
+type TemplateStatusResponse struct {
+	TemplateName string `json:"template_name"`
+	Ready        bool   `json:"ready"`
+}
