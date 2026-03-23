@@ -51,7 +51,7 @@ pipeline {
                     
                     // CHECK: Is this the production branch?
                     // Update 'authsec-prod' below if your production branch name is different
-                    if (env.BRANCH_NAME == 'prod' || env.BRANCH_NAME == 'production') {
+                    if (env.BRANCH_NAME == 'authsec-prod' || env.BRANCH_NAME == 'production') {
                         echo "Configuring for PRODUCTION environment..."
                         env.IS_PROD_BRANCH = 'true'
                         env.AKS_ENV = 'authsec'
@@ -63,7 +63,7 @@ pipeline {
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:production"
                         env.DOCKER_IMAGE_PUBLIC = "${env.DOCKER_REGISTRY_PUBLIC}/${SERVICE_NAME}:1.0.0" 
                         
-                    } else if (env.BRANCH_NAME == 'dev' || env.BRANCH_NAME == 'development') {
+                    } else if (env.BRANCH_NAME == 'authsec-dev' || env.BRANCH_NAME == 'development') {
                         echo "Configuring for DEVELOPMENT environment..."
                         env.IS_PROD_BRANCH = 'false'
                         env.AKS_ENV = 'authsec'
@@ -76,7 +76,7 @@ pipeline {
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:development"
                         env.DOCKER_IMAGE_PUBLIC = "" // Not used in dev
 
-                    } else if (env.BRANCH_NAME == 'staging' || env.BRANCH_NAME == 'develop') {
+                    } else if (env.BRANCH_NAME == 'authsec-staging' || env.BRANCH_NAME == 'staging') {
                         echo "Configuring for STAGING environment..."
                         env.IS_PROD_BRANCH = 'false'
                         env.AKS_ENV = 'authsec'
@@ -133,8 +133,23 @@ pipeline {
                     }
                 }
             }
-        
-            stage('OSV Scanner - Docker Image Scan') {
+
+        stage('Build Docker Image') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'sriramgithubtoken',
+                        usernameVariable: 'GITHUB_USER',
+                        passwordVariable: 'GITHUB_TOKEN'
+                    )
+                ]) {
+                        // Uses the DOCKER_IMAGE variable set in 'Initialize'
+                        sh "docker build --build-arg GITHUB_TOKEN=${GITHUB_TOKEN} -t ${env.DOCKER_IMAGE} ."
+                    }
+                }
+            }
+
+        stage('OSV Scanner - Docker Image Scan') {
             steps {
                 script {
                     def scanExit = sh(
@@ -174,25 +189,123 @@ pipeline {
                 }
             }
         }
+
+        stage('Login to Docker Artifactory') {
+            steps {
+                sh "echo ${DOCKER_REGISTRY_CREDENTIALS_PSW} | docker login ${DOCKER_REGISTRY} -u ${DOCKER_REGISTRY_CREDENTIALS_USR} --password-stdin"
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                sh "docker push ${env.DOCKER_IMAGE}"
+            }
+        }
+
+        stage('Logout from Docker Artifactory') {
+            steps {
+                sh "docker logout ${env.DOCKER_REGISTRY}"
+            }
+        }
+
+        // --- CONDITIONAL STAGE: ONLY RUNS ON PROD ---
+        stage('Push Public Image') {
+            when {
+                expression { return env.IS_PROD_BRANCH == 'true' }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'authsec-public-repo', usernameVariable: 'USR', passwordVariable: 'PASS')]) {
+                    sh """
+                        echo "Logging in to PUBLIC registry"
+                        echo "\$PASS" | docker login ${DOCKER_REGISTRY_PUBLIC} -u "\$USR" --password-stdin
+
+                        docker tag ${env.DOCKER_IMAGE} ${DOCKER_IMAGE_PUBLIC}
+                        docker push ${DOCKER_IMAGE_PUBLIC}
+                        docker logout ${DOCKER_REGISTRY_PUBLIC}
+                    """
+                }
+            }
+        }
+
+        stage('Remove Docker Image') {
+            steps {
+                sh "docker rmi ${env.DOCKER_IMAGE} || true"
+                script {
+                    if (env.IS_PROD_BRANCH == 'true') {
+                         sh "docker rmi ${env.DOCKER_IMAGE_PUBLIC} || true"
+                    }
+                }
+            }
+        }
+
+
+        stage('Authenticate to AKS') {
+            steps {
+                script {
+
+                    def subscriptionId
+                    def resourceGroup
+                    def aksCluster
+
+                    if ("$AKS_ENV" == 'authsec') {
+                        echo 'AKS_ENV=authsec → using AUTHSEC cluster'
+                        subscriptionId = env.AZURE_SUBSCRIPTION_ID_SEC
+                        resourceGroup  = env.RESOURCE_GROUP_SEC
+                        aksCluster     = env.AKS_CLUSTER_SEC
+                    } else {
+                        subscriptionId = env.AZURE_SUBSCRIPTION_ID
+                        resourceGroup  = env.RESOURCE_GROUP
+                        aksCluster     = env.AKS_CLUSTER
+                    }
+
+                    sh """
+                        rm -f /var/lib/jenkins/.kube/config
+                        mkdir -p /var/lib/jenkins/.kube
+                        az login --service-principal \
+                          -u "$AZURE_CLIENT_ID" \
+                          -p "$AZURE_CLIENT_SECRET" \
+                          --tenant "$AZURE_TENANT_ID"
+
+                        az account set --subscription "$subscriptionId"
+
+                        az aks get-credentials \
+                          --resource-group "$resourceGroup" \
+                          --admin \
+                          --name "$aksCluster" \
+                          --overwrite-existing
+                    """
+                }
+            }
+        }
+
+        stage('Delete Existing Pods') {
+            steps {
+                // Dynamically deletes pods in the correct namespace (Dev or Prod)
+                // Uses dynamic label to target specific service pods
+                echo "Restarting pods with label 'app=${APP_LABEL}' in ${K8S_NAMESPACE}..."
+                sh "kubectl delete pods -l app=${APP_LABEL} -n ${K8S_NAMESPACE} --ignore-not-found=true"
+            }
+        }
     }   
+
     post {
-        always {
-            archiveArtifacts artifacts: 'osv-*.json', fingerprint: true
+    always {
+        archiveArtifacts artifacts: 'osv-*.json', fingerprint: true
 
-            sh '''
-                echo "=== OSV Security Scan Report ===" > security-summary.txt
-                echo "Scan completed: $(date)" >> security-summary.txt
-                echo "Service: ${SERVICE_NAME}" >> security-summary.txt
-                echo "Environment: ${BRANCH_NAME}" >> security-summary.txt
-            '''
-        }
-
-        success {
-            echo "SUCCESS: Build completed successfully for ${env.SERVICE_NAME} on ${env.BRANCH_NAME}"
-        }
-
-        failure {
-            echo "FAILURE: Build failed"
-        }
+        sh '''
+            echo "=== OSV Security Scan Report ===" > security-summary.txt
+            echo "Scan completed: $(date)" >> security-summary.txt
+            echo "Service: ${SERVICE_NAME}" >> security-summary.txt
+            echo "Environment: ${BRANCH_NAME}" >> security-summary.txt
+        '''
     }
-}
+
+    success {
+        echo "SUCCESS: Build completed successfully for ${env.SERVICE_NAME} on ${env.BRANCH_NAME}"
+    }
+
+    failure {
+        echo "FAILURE: Build failed"
+    }
+  }
+}  
