@@ -120,8 +120,62 @@ CREATE TABLE public.clients (
     oidc_enabled boolean DEFAULT false,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    deleted_at timestamp with time zone
+    deleted_at timestamp with time zone,
+    deleted boolean DEFAULT false,
+    client_type varchar(255),
+    agent_type text,
+    spiffe_id text
 );
+
+--
+-- Name: delegation_policies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.delegation_policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    role_name text NOT NULL,
+    agent_type text NOT NULL,
+    allowed_permissions jsonb DEFAULT '[]'::jsonb,
+    max_ttl_seconds integer NOT NULL DEFAULT 3600,
+    enabled boolean NOT NULL DEFAULT true,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT uq_deleg_policy_tenant_role_agent UNIQUE (tenant_id, role_name, agent_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleg_policy_tenant_id ON public.delegation_policies(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_deleg_policy_lookup ON public.delegation_policies(tenant_id, role_name, agent_type, enabled);
+
+
+--
+-- Name: delegation_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.delegation_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    policy_id uuid REFERENCES public.delegation_policies(id) ON DELETE SET NULL,
+    token text NOT NULL,
+    spiffe_id text NOT NULL,
+    permissions jsonb NOT NULL DEFAULT '[]'::jsonb,
+    audience jsonb NOT NULL DEFAULT '[]'::jsonb,
+    expires_at timestamp with time zone NOT NULL,
+    delegated_by uuid NOT NULL,
+    ttl_seconds integer NOT NULL,
+    status text NOT NULL DEFAULT 'active',
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT uq_delegation_token_client UNIQUE (tenant_id, client_id),
+    CONSTRAINT chk_deleg_token_status CHECK (status IN ('active', 'expired', 'revoked'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleg_token_lookup ON public.delegation_tokens(tenant_id, client_id, status);
+CREATE INDEX IF NOT EXISTS idx_deleg_token_expires ON public.delegation_tokens(expires_at) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_deleg_token_policy ON public.delegation_tokens(policy_id);
+
 
 
 --

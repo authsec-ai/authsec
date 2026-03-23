@@ -837,6 +837,9 @@ func registerClientsRoutes(r gin.IRouter) {
 
 				clients.GET("/:id", platformCtrl.GetClient)
 
+				// Platform selector keys for UI (pre-filled key fields per platform)
+				clients.GET("/platform-selectors", platformCtrl.GetPlatformSelectorKeys)
+
 				clients.POST("/create", platformCtrl.RegisterClient)
 
 				clients.PUT("/:id", platformCtrl.UpdateClient)
@@ -1337,6 +1340,7 @@ func bindSdkmgrRoutes(
 // Previously served by the standalone spire-headless microservice.
 func registerSpireRoutes(r gin.IRouter) {
 	sc := platformCtrl.NewSpireController()
+	platformCtrl.SetSharedSpireController(sc)
 
 	spire := r.Group("/spire")
 

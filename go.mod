@@ -133,3 +133,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 )
+
+replace github.com/authsec-ai/sharedmodels => ../sharedmodels
