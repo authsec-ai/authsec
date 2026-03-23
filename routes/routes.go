@@ -159,7 +159,6 @@ func SetupRoutes(
 	}
 
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
-	agentCtrl := platformCtrl.NewAgentController()
 	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
 
 	// ────────────────────────────────────────────────────────
@@ -515,24 +514,6 @@ func SetupRoutes(
 			delegationPolicies.DELETE("/:id", delegationPolicyCtrl.DeleteDelegationPolicy)
 		}
 
-		// ────────────────────────────────────────────────────
-		// AI agents (SPIRE identity + JWT-SVID delegation)
-		// ────────────────────────────────────────────────────
-		agents := uflow.Group("/admin/agents")
-		agents.Use(
-			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
-		)
-		{
-			agents.GET("", agentCtrl.ListAgents)
-			agents.GET("/:id", agentCtrl.GetAgent)
-			agents.POST("/:id/provision-identity", agentCtrl.ProvisionIdentity)
-			agents.DELETE("/:id/revoke-identity", agentCtrl.RevokeIdentity)
-			agents.POST("/:id/delegate-token", agentCtrl.DelegateToken)
-			agents.POST("/:id/revoke-token", sdkTokenCtrl.RevokeDelegationToken)
-		}
-
 		// SDK public endpoint — no auth middleware (client_id is the identity)
 		sdk := uflow.Group("/sdk")
 		{
@@ -675,31 +656,6 @@ func SetupRoutes(
 			scimAdmin.PUT("/Users/:id", scimAdminController.ReplaceAdminUser)
 			scimAdmin.PATCH("/Users/:id", scimAdminController.PatchAdminUser)
 			scimAdmin.DELETE("/Users/:id", scimAdminController.DeleteAdminUser)
-		}
-
-		// ────────────────────────────────────────────────────
-		// Delegation Policy CRUD (admin-authenticated)
-		// ────────────────────────────────────────────────────
-		delegationPolicies = uflow.Group("/delegation-policies")
-		delegationPolicies.Use(
-			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
-		)
-		{
-			delegationPolicies.POST("", delegationPolicyController.CreateDelegationPolicy)
-			delegationPolicies.GET("", delegationPolicyController.ListDelegationPolicies)
-			delegationPolicies.GET("/:id", delegationPolicyController.GetDelegationPolicy)
-			delegationPolicies.PUT("/:id", delegationPolicyController.UpdateDelegationPolicy)
-			delegationPolicies.DELETE("/:id", delegationPolicyController.DeleteDelegationPolicy)
-		}
-
-		// ────────────────────────────────────────────────────
-		// SDK Token Pull (public, authenticated by client_id)
-		// ────────────────────────────────────────────────────
-		sdk = uflow.Group("/sdk")
-		{
-			sdk.GET("/delegation-token", sdkTokenController.GetDelegationToken)
 		}
 
 		// ────────────────────────────────────────────────────
