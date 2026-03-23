@@ -283,6 +283,82 @@ type SpireController struct {
 	trustDomain  string
 }
 
+// sharedSpireController is the singleton used by in-process callers (e.g. clients controller).
+var sharedSpireController *SpireController
+
+// SetSharedSpireController stores the singleton so other controllers can create entries in-process.
+func SetSharedSpireController(sc *SpireController) { sharedSpireController = sc }
+
+// RegisterAgentWorkload creates a SPIRE workload entry for an AI agent directly
+// via the in-process gRPC client. Returns the generated SPIFFE ID.
+func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selectors map[string]string) (string, error) {
+	sc := sharedSpireController
+	if sc == nil {
+		return "", fmt.Errorf("SPIRE controller not initialized")
+	}
+
+	spiffeID := fmt.Sprintf("/tenants/%s/agents/%s/%s", tenantID, agentType, clientID)
+
+	// Build SPIRE selectors from the user-supplied key-value pairs
+	var spireSelectors []*typespb.Selector
+	for key, value := range selectors {
+		// Split key like "k8s:ns" into type="k8s" value="ns:<user-value>"
+		// or "k8s:pod-label:app" into type="k8s" value="pod-label:app:<user-value>"
+		parts := strings.SplitN(key, ":", 2)
+		selectorType := parts[0]
+		selectorKey := ""
+		if len(parts) > 1 {
+			selectorKey = parts[1]
+		}
+		spireSelectors = append(spireSelectors, &typespb.Selector{
+			Type:  selectorType,
+			Value: fmt.Sprintf("%s:%s", selectorKey, value),
+		})
+	}
+
+	// Fallback: if no selectors provided, use a default owner-based selector
+	if len(spireSelectors) == 0 {
+		spireSelectors = []*typespb.Selector{
+			{Type: "k8s", Value: fmt.Sprintf("pod-label:owner:%s", clientID)},
+		}
+	}
+
+	// Save workload record to DB
+	w := SpireWorkload{
+		SpiffeID: spiffeID,
+		Owner:    clientID,
+	}
+	if err := sc.db.Create(&w).Error; err != nil {
+		return "", fmt.Errorf("failed to save workload record: %w", err)
+	}
+
+	// Create SPIRE entry via gRPC
+	if sc.entryClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		entry := &typespb.Entry{
+			SpiffeId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
+			ParentId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: fmt.Sprintf("/tenants/%s/agent", tenantID)},
+			Selectors:   spireSelectors,
+			X509SvidTtl: 3600,
+			StoreSvid:   true,
+		}
+		_, err := sc.entryClient.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{
+			Entries: []*typespb.Entry{entry},
+		})
+		if err != nil {
+			// Rollback DB record
+			sc.db.Delete(&w)
+			return "", fmt.Errorf("SPIRE entry creation failed: %w", err)
+		}
+	}
+
+	fullSpiffeID := fmt.Sprintf("spiffe://%s%s", sc.trustDomain, spiffeID)
+	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s", fullSpiffeID, tenantID, clientID)
+	return fullSpiffeID, nil
+}
+
 // NewSpireController creates and initialises the SPIRE controller.
 func NewSpireController() *SpireController {
 	sc := &SpireController{

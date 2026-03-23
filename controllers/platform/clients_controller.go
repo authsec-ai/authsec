@@ -147,20 +147,102 @@ type RegisterClientsResponse struct {
 	TenantID  string    `json:"tenant_id"`
 	ProjectID string    `json:"project_id"`
 	Name      string    `json:"name"`
-	SecretID  string    `json:"secret_id"`
+	SecretID  string    `json:"secret_id,omitempty"`
 	Email     string    `json:"email"`
 	Active    bool      `json:"active"`
+	SpiffeID  string    `json:"spiffe_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Message   string    `json:"message"`
 }
 
 // RegisterClientsRequest is the request payload for client registration.
 type RegisterClientsRequest struct {
-	Name         string `json:"name" binding:"required"`
-	Email        string `json:"email" binding:"required,email"`
-	TenantID     string `json:"tenant_id" binding:"required"`
-	ProjectID    string `json:"project_id" binding:"required"`
-	TenantDomain string `json:"react_app_url" binding:"required"`
+	Name         string            `json:"name" binding:"required,min=1,max=256"`
+	Email        string            `json:"email" binding:"required,email,max=512"`
+	TenantID     string            `json:"tenant_id" binding:"max=64"`
+	ProjectID    string            `json:"project_id" binding:"max=64"`
+	TenantDomain string            `json:"react_app_url" binding:"max=2048"`
+	ClientType   string            `json:"client_type,omitempty" binding:"max=100"`
+	AgentType    *string           `json:"agent_type,omitempty"`
+	Platform     string            `json:"platform,omitempty"`
+	Selectors    map[string]string `json:"selectors,omitempty"`
+}
+
+// platformSelectorKeys defines the pre-filled selector keys per platform.
+// The UI shows these as key fields; the user only fills in values.
+var platformSelectorKeys = map[string][]string{
+	"kubernetes": {
+		"k8s:ns",
+		"k8s:sa",
+		"k8s:pod-label:app",
+		"k8s:container-name",
+	},
+	"docker": {
+		"docker:label:app",
+		"docker:image-id",
+		"docker:container-id",
+	},
+	"unix": {
+		"unix:uid",
+		"unix:gid",
+	},
+}
+
+// GetPlatformSelectorKeys returns the allowed selector keys for a given platform.
+// The UI calls this to render pre-filled key fields with empty value inputs.
+func GetPlatformSelectorKeys(c *gin.Context) {
+	platform := strings.ToLower(c.Query("platform"))
+	if platform == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "platform query param is required"})
+		return
+	}
+	keys, ok := platformSelectorKeys[platform]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":               "unsupported platform",
+			"supported_platforms": []string{"kubernetes", "docker", "unix"},
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"platform": platform, "selector_keys": keys})
+}
+
+// validatePlatformSelectors checks that the supplied selector keys are valid for the platform.
+func validatePlatformSelectors(platform string, selectors map[string]string) error {
+	allowed, ok := platformSelectorKeys[strings.ToLower(platform)]
+	if !ok {
+		return fmt.Errorf("unsupported platform %q, must be one of: kubernetes, docker, unix", platform)
+	}
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		allowedSet[k] = true
+	}
+	for key := range selectors {
+		if !allowedSet[key] {
+			return fmt.Errorf("selector key %q is not valid for platform %q, allowed keys: %v", key, platform, allowed)
+		}
+	}
+	return nil
+}
+
+// buildPlatformSelectors validates user-supplied key-value selectors and returns the filtered map.
+func buildPlatformSelectors(platform string, selectors map[string]string) (map[string]string, error) {
+	if len(selectors) == 0 {
+		return nil, nil
+	}
+	if err := validatePlatformSelectors(platform, selectors); err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	for k, v := range selectors {
+		if v != "" {
+			result[k] = v
+		}
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
 }
 
 // ClientsDeleteCompleteRequest is the request body for hard-delete operations.
@@ -463,6 +545,7 @@ func SetClientStatus(c *gin.Context) {
 }
 
 // RegisterClient registers a new client (full registration with Hydra and Vault).
+// For AI agents (client_type=ai_agent), registers a SPIFFE workload identity instead.
 // @Security Bearer
 func RegisterClient(c *gin.Context) {
 	var input RegisterClientsRequest
@@ -487,13 +570,29 @@ func RegisterClient(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
 	}
-	projectUUID, err := uuid.Parse(input.ProjectID)
+
+	projectID := input.ProjectID
+	if projectID == "" {
+		projectID = tenantID
+	}
+	projectUUID, err := uuid.Parse(projectID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id"})
 		return
 	}
 
+	clientType := sharedmodels.ClientTypeApplication
+	if input.ClientType != "" {
+		clientType = input.ClientType
+	}
+
+	// AI agents don't get Hydra client IDs — their identity comes from SPIRE
 	clientID := uuid.New()
+	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
+	if clientType == sharedmodels.ClientTypeAIAgent {
+		hydraClientID = ""
+	}
+
 	client := sharedmodels.Client{
 		ID:            clientID,
 		ClientID:      clientID,
@@ -507,8 +606,10 @@ func RegisterClient(c *gin.Context) {
 		Active:        true,
 		MFAEnabled:    false,
 		MFAVerified:   false,
-		HydraClientID: fmt.Sprintf("%s-main-client", clientID.String()),
+		HydraClientID: hydraClientID,
 		OIDCEnabled:   false,
+		ClientType:    clientType,
+		AgentType:     input.AgentType,
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
 	}
@@ -538,26 +639,67 @@ func RegisterClient(c *gin.Context) {
 		return
 	}
 
-	secretID, err := config.SaveSecretToVault(client.TenantID.String(), client.ProjectID.String(), client.ClientID.String())
-	if err != nil {
-		fmt.Printf("Warning: failed to save secret to vault: %v\n", err)
-	}
-
-	if secretID != "" {
-		email := ""
-		if client.Email != nil {
-			email = *client.Email
-		}
-		if err := clientsRegisterWithHydra(client.ClientID.String(), secretID, email, client.TenantID.String(), input.TenantDomain); err != nil {
-			fmt.Printf("Warning: failed to register client with Hydra: %v\n", err)
+	// AI agents get SPIFFE identity from SPIRE; others get Hydra/Vault identity
+	secretID := ""
+	spiffeIDStr := ""
+	if clientType == sharedmodels.ClientTypeAIAgent {
+		// Validate and build platform selectors
+		platformSelectors, selectorErr := buildPlatformSelectors(input.Platform, input.Selectors)
+		if selectorErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": selectorErr.Error()})
+			return
 		}
 
-		createdBy := email
-		if createdBy == "" {
-			createdBy = "system"
+		agentTypeStr := ""
+		if client.AgentType != nil {
+			agentTypeStr = *client.AgentType
 		}
-		if err := clientsAddProvider(client.TenantID.String(), client.ClientID.String(), input.TenantDomain, createdBy); err != nil {
-			fmt.Printf("Warning: failed to add provider to client: %v\n", err)
+		if agentTypeStr == "" {
+			agentTypeStr = "ai_agent"
+		}
+
+		spiffeID, spireErr := RegisterAgentWorkload(
+			client.TenantID.String(),
+			client.ClientID.String(),
+			agentTypeStr,
+			input.Platform,
+			platformSelectors,
+		)
+		if spireErr != nil {
+			log.Printf("Warning: failed to register AI agent with SPIRE: %v", spireErr)
+			// Don't fail client creation — SPIFFE identity can be retried
+		} else {
+			spiffeIDStr = spiffeID
+			if updateErr := tenantDB.Model(&sharedmodels.Client{}).
+				Where("client_id = ?", client.ClientID).
+				Update("spiffe_id", spiffeID).Error; updateErr != nil {
+				log.Printf("Warning: failed to save spiffe_id to client: %v", updateErr)
+			}
+		}
+	} else {
+		// Standard path: Vault + Hydra + OIDC provider
+		var vaultErr error
+		secretID, vaultErr = config.SaveSecretToVault(client.TenantID.String(), client.ProjectID.String(), client.ClientID.String())
+		if vaultErr != nil {
+			log.Printf("Warning: failed to save secret to vault: %v", vaultErr)
+		}
+
+		if secretID != "" {
+			email := ""
+			if client.Email != nil {
+				email = *client.Email
+			}
+			if err := clientsRegisterWithHydra(client.ClientID.String(), secretID, email, client.TenantID.String(), input.TenantDomain); err != nil {
+				log.Printf("Warning: failed to register client with Hydra: %v", err)
+			}
+
+			createdBy := email
+			if createdBy == "" {
+				createdBy = "system"
+			}
+			if err := clientsAddProvider(client.TenantID.String(), client.ClientID.String(), input.TenantDomain, createdBy); err != nil {
+				log.Printf("Warning: failed to add provider to client: %v", err)
+			}
 		}
 	}
 
@@ -599,6 +741,7 @@ func RegisterClient(c *gin.Context) {
 		SecretID:  secretID,
 		Email:     email,
 		Active:    client.Active,
+		SpiffeID:  spiffeIDStr,
 		CreatedAt: client.CreatedAt,
 		Message:   "Client registered successfully",
 	})
