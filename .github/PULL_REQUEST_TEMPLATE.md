@@ -12,9 +12,9 @@
 
 <!-- How was this tested? -->
 
-- [ ] Unit tests pass (`go test ./...`)
+- [ ] `go build ./...` passes
 - [ ] `go vet ./...` clean
-- [ ] Manual testing (describe below)
+- [ ] Runtime curl checklist covered (see `docs/runtime-qa-curls.md`)
 
 ## Checklist
 
@@ -22,4 +22,3 @@
 - [ ] Self-reviewed the diff
 - [ ] No secrets or credentials committed
 - [ ] Updated documentation if needed
-- [ ] Added/updated tests for new behaviour

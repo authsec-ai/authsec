@@ -843,54 +843,6 @@ func (ur *UserRepository) checkProviderUniqueness(provider, providerID string, e
 	return nil
 }
 
-// GetUserMFAMethods retrieves enabled MFA methods for a user
-func (ur *UserRepository) GetUserMFAMethods(userID uuid.UUID, clientID uuid.UUID) ([]map[string]interface{}, error) {
-	query := `
-		SELECT method_type, display_name, description, method_data, is_primary, verified
-		FROM mfa_methods
-		WHERE user_id = $1 AND client_id = $2 AND enabled = true
-		ORDER BY is_primary DESC, enrolled_at ASC
-	`
-
-	rows, err := ur.db.Query(query, userID, clientID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query MFA methods: %w", err)
-	}
-	defer rows.Close()
-
-	var methods []map[string]interface{}
-	for rows.Next() {
-		var methodType, displayName, description string
-		var methodData []byte
-		var isPrimary, verified bool
-
-		err := rows.Scan(&methodType, &displayName, &description, &methodData, &isPrimary, &verified)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan MFA method: %w", err)
-		}
-
-		method := map[string]interface{}{
-			"method_type":  methodType,
-			"display_name": displayName,
-			"description":  description,
-			"is_primary":   isPrimary,
-			"verified":     verified,
-		}
-
-		// Parse method_data JSON if present
-		if len(methodData) > 0 {
-			var data map[string]interface{}
-			if err := json.Unmarshal(methodData, &data); err == nil {
-				method["method_data"] = data
-			}
-		}
-
-		methods = append(methods, method)
-	}
-
-	return methods, nil
-}
-
 // validateUserRelationships checks if referenced scopes, roles, groups, and resources exist
 func (ur *UserRepository) validateUserRelationships(user *models.ExtendedUser) error {
 	// Note: In sharedmodels.User v0.5.0, relationships are loaded via GORM associations

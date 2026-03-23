@@ -179,8 +179,6 @@ python3 examples/local_authsec_demo_server.py
 
 6. In MCP Inspector, connect to the running server, call `oauth_start`, open the returned URL, sign in as `sdk.local@example.com`, complete the TOTP step, and return to Inspector.
 7. Verify `oauth_status` becomes `authenticated`, then call a protected tool.
-8. To test the backend playground path, create a conversation at `/authsec/sdkmgr/playground/conversations`, add the running MCP server URL to `/authsec/sdkmgr/playground/conversations/:id/mcp-servers`, and inspect tools with `/authsec/sdkmgr/playground/conversations/:id/mcp-servers/:sid/tools`.
-
 Stop the stack:
 
 ```bash
@@ -582,16 +580,6 @@ All admin endpoints require `JWT + admin:access + tenant validation`.
 | `POST` | `/authsec/webauthn/biometric/confirmLoginSetup` | Confirm login biometric setup |
 | `POST` | `/authsec/webauthn/biometric/verifyLoginBegin` | Begin login biometric verify |
 | `POST` | `/authsec/webauthn/biometric/verifyLoginFinish` | Finish login biometric verify |
-| `POST` | `/authsec/webauthn/totp/beginLoginSetup` | Begin TOTP login setup |
-| `POST` | `/authsec/webauthn/totp/beginSetup` | Begin TOTP setup |
-| `POST` | `/authsec/webauthn/totp/confirmLoginSetup` | Confirm TOTP login setup |
-| `POST` | `/authsec/webauthn/totp/confirmSetup` | Confirm TOTP setup |
-| `POST` | `/authsec/webauthn/totp/verifyLogin` | Verify TOTP (login flow) |
-| `POST` | `/authsec/webauthn/totp/verify` | Verify TOTP |
-| `POST` | `/authsec/webauthn/sms/beginSetup` | Begin SMS setup |
-| `POST` | `/authsec/webauthn/sms/confirmSetup` | Confirm SMS setup |
-| `POST` | `/authsec/webauthn/sms/requestCode` | Request SMS code |
-| `POST` | `/authsec/webauthn/sms/verify` | Verify SMS code |
 
 ---
 
@@ -1056,7 +1044,7 @@ Expected response:
 Contributions are welcome! Please:
 
 1. Fork the repository and create a feature branch.
-2. Ensure `go build ./...` and `go test ./...` pass before opening a pull request.
+2. Ensure `go build ./...` passes and cover the runtime checklist in [`docs/runtime-qa-curls.md`](docs/runtime-qa-curls.md) before opening a pull request.
 3. Keep pull requests focused — one feature or fix per PR.
 4. Follow the existing code style (standard Go formatting via `gofmt`).
 

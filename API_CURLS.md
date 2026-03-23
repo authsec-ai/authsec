@@ -1003,21 +1003,22 @@ curl "$BASE/authsec/uflow/health"
 ### MFA Status
 
 ```bash
-# WebAuthn MFA login status (root-level)
-curl -X POST "$BASE/authsec/webauthn/mfa/loginStatus" \
+# Admin MFA status
+curl -X POST "$BASE/authsec/webauthn/admin/mfa/status" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","tenant_id":"'"$TENANT_ID"'"}'
+
+# End-user MFA status
+curl -X POST "$BASE/authsec/webauthn/enduser/mfa/status" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
-# Legacy flat endpoints
-curl -X POST "$BASE/authsec/webauthn/mfa/status" \
+# End-user MFA login status
+curl -X POST "$BASE/authsec/webauthn/enduser/mfa/loginStatus" \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
 
-curl -X POST "$BASE/authsec/webauthn/mfa/loginStatus" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
-
-curl "$BASE/authsec/webauthn/mfa/loginStatus?email=user@example.com&tenant_id=$TENANT_ID"
+curl "$BASE/authsec/webauthn/enduser/mfa/loginStatus?email=user@example.com&tenant_id=$TENANT_ID"
 ```
 
 ### Legacy WebAuthn Registration & Authentication
@@ -1170,64 +1171,6 @@ curl -X POST "$BASE/authsec/webauthn/enduser/finishAuthentication" \
   -H "Content-Type: application/json" \
   -H "Origin: https://app.authsec.dev" \
   -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","credential":{...}}'
-```
-
-### TOTP (WebAuthn service)  `/webauthn/totp`
-
-```bash
-# Begin login TOTP setup
-curl -X POST "$BASE/authsec/webauthn/totp/beginLoginSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'"}'
-
-# Begin TOTP setup
-curl -X POST "$BASE/authsec/webauthn/totp/beginSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
-
-# Confirm login TOTP setup
-curl -X POST "$BASE/authsec/webauthn/totp/confirmLoginSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","secret":"<base32>","code":"123456"}'
-
-# Confirm TOTP setup
-curl -X POST "$BASE/authsec/webauthn/totp/confirmSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","secret":"<base32>","code":"123456"}'
-
-# Verify login TOTP
-curl -X POST "$BASE/authsec/webauthn/totp/verifyLogin" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","code":"123456"}'
-
-# Verify TOTP
-curl -X POST "$BASE/authsec/webauthn/totp/verify" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","code":"123456"}'
-```
-
-### SMS MFA  `/webauthn/sms`
-
-```bash
-# Begin SMS setup (send code to phone)
-curl -X POST "$BASE/authsec/webauthn/sms/beginSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","phone_number":"+15551234567"}'
-
-# Confirm SMS setup
-curl -X POST "$BASE/authsec/webauthn/sms/confirmSetup" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","phone_number":"+15551234567","code":"123456"}'
-
-# Request SMS code (for login)
-curl -X POST "$BASE/authsec/webauthn/sms/requestCode" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'"}'
-
-# Verify SMS code
-curl -X POST "$BASE/authsec/webauthn/sms/verify" \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","tenant_id":"'"$TENANT_ID"'","client_id":"'"$CLIENT_ID"'","code":"123456"}'
 ```
 
 ---

@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/authsec-ai/authsec/monitoring"
@@ -111,7 +110,7 @@ type Config struct {
 	OAuthRedirectURITemplate string // Redirect URI template with {tenant_id}
 	MCPToolTimeout           int    // MCP tool execution timeout in seconds (default 15)
 
-	// Azure OpenAI (for playground + voice)
+	// Azure OpenAI (for voice)
 	AzureOpenAIKey           string
 	AzureOpenAIEndpoint      string
 	AzureOpenAIDeployment    string
@@ -372,11 +371,7 @@ func LoadConfig() *Config {
 	}
 	for name, val := range requiredSecrets {
 		if val == "" {
-			if testing.Testing() {
-				log.Printf("WARNING: Required config %s is not set (test mode, continuing)", name)
-			} else {
-				log.Fatalf("CRITICAL: Required config %s is not set. Cannot start.", name)
-			}
+			log.Fatalf("CRITICAL: Required config %s is not set. Cannot start.", name)
 		}
 	}
 

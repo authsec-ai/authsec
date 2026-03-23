@@ -14,13 +14,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // Local Credential struct with correct column mappings for 'credentials' table
 type Credential struct {
 	ID              uuid.UUID      `gorm:"type:uuid;primaryKey;default:gen_random_uuid();column:id"`
 	ClientID        uuid.UUID      `gorm:"type:uuid;not null;column:client_id"`
+	UserID          uuid.UUID      `gorm:"type:uuid;not null;column:user_id"`
 	CredentialID    []byte         `gorm:"not null;uniqueIndex;column:credential_id"`
 	PublicKey       []byte         `gorm:"not null;column:public_key"`
 	AttestationType string         `gorm:"not null;column:attestation_type"`
@@ -37,29 +37,6 @@ type Credential struct {
 // TableName returns the table name for the Credential model
 func (Credential) TableName() string {
 	return "credentials"
-}
-
-// WebAuthnCredential struct for 'webauthn_credentials' table
-type WebAuthnCredential struct {
-	ID              int            `gorm:"primaryKey;autoIncrement;column:id"`
-	UserID          uuid.UUID      `gorm:"type:uuid;column:user_id"`
-	CredentialID    string         `gorm:"not null;uniqueIndex;column:credential_id"`
-	PublicKey       string         `gorm:"not null;column:public_key"`
-	AttestationType string         `gorm:"column:attestation_type"`
-	Transports      pq.StringArray `gorm:"type:text[];column:transports"`
-	BackupEligible  bool           `gorm:"default:false;column:backup_eligible"`
-	BackupState     bool           `gorm:"default:false;column:backup_state"`
-	SignCount       int64          `gorm:"default:0;column:sign_count"`
-	UserPresent     bool           `gorm:"default:false;column:user_present"`
-	UserVerified    bool           `gorm:"default:false;column:user_verified"`
-	AAGUID          string         `gorm:"column:aaguid"`
-	CreatedAt       time.Time      `gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt       time.Time      `gorm:"autoUpdateTime;column:updated_at"`
-}
-
-// TableName returns the table name for the WebAuthnCredential model
-func (WebAuthnCredential) TableName() string {
-	return "webauthn_credentials"
 }
 
 type GlobalRepository struct {
@@ -80,10 +57,6 @@ func (r *GlobalRepository) GetTenantByID(tenantID string) (*sharedmodels.Tenant,
 
 // GetVerifiedCustomDomainForTenant returns the verified custom domain for a tenant, if any
 func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (string, error) {
-	if !r.DB.Migrator().HasTable("tenant_domains") {
-		return "", nil
-	}
-
 	var domain string
 	err := r.DB.Table("tenant_domains").
 		Select("domain").
@@ -103,10 +76,6 @@ func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (st
 
 // GetCustomDomainVerificationTime returns when the custom domain was verified
 func (r *GlobalRepository) GetCustomDomainVerificationTime(tenantID string) (*time.Time, error) {
-	if !r.DB.Migrator().HasTable("tenant_domains") {
-		return nil, nil
-	}
-
 	var domain appmodels.TenantDomain
 	err := r.DB.Table("tenant_domains").
 		Select("verified_at").
@@ -197,65 +166,7 @@ func (r *CredentialRepository) AddCredential(userID string, cred *webauthn.Crede
 		UpdatedAt:       time.Now(),                          // Update timestamp
 	}
 
-	// Omit columns if the DB schema hasn't been migrated yet
-	db := r.DB
-	mig := db.Migrator()
-	if !mig.HasColumn(&Credential{}, "backup_eligible") {
-		db = db.Omit("backup_eligible")
-	}
-	if !mig.HasColumn(&Credential{}, "backup_state") {
-		db = db.Omit("backup_state")
-	}
-
-	return db.Create(&credential).Error
-}
-
-// AddWebAuthnCredential saves credential to webauthn_credentials table
-func (r *CredentialRepository) AddWebAuthnCredential(userID string, cred *webauthn.Credential) error {
-	// Parse userID as UUID
-	userUUID, err := uuid.Parse(userID)
-	if err != nil {
-		return fmt.Errorf("invalid user ID format: %w", err)
-	}
-
-	// Convert credential ID bytes to hex string
-	credentialIDHex := fmt.Sprintf("%x", cred.ID)
-
-	// Convert public key bytes to hex string
-	publicKeyHex := fmt.Sprintf("%x", cred.PublicKey)
-
-	// Convert AAGUID bytes to hex string
-	var aaguidHex string
-	if len(cred.Authenticator.AAGUID) == 16 {
-		aaguidHex = fmt.Sprintf("%x", cred.Authenticator.AAGUID)
-	}
-
-	// Convert transports to string array
-	var transports pq.StringArray
-	if cred.Transport != nil {
-		transports = make(pq.StringArray, len(cred.Transport))
-		for i, transport := range cred.Transport {
-			transports[i] = string(transport)
-		}
-	}
-
-	webauthnCred := WebAuthnCredential{
-		UserID:          userUUID,
-		CredentialID:    credentialIDHex,
-		PublicKey:       publicKeyHex,
-		AttestationType: cred.AttestationType,
-		Transports:      transports,
-		BackupEligible:  cred.Flags.BackupEligible,
-		BackupState:     cred.Flags.BackupState,
-		SignCount:       int64(cred.Authenticator.SignCount),
-		UserPresent:     cred.Flags.UserPresent,
-		UserVerified:    cred.Flags.UserVerified,
-		AAGUID:          aaguidHex,
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
-	}
-
-	return r.DB.Create(&webauthnCred).Error
+	return r.DB.Create(&credential).Error
 }
 
 func (r *ClientRepository) GetClientByEmailAndTenant(email, tenantID, clientID *string) (*sharedmodels.User, error) {
@@ -400,17 +311,17 @@ func (r *ClientRepository) GetClientForTOTPLogin(email, tenantID string) (*share
 func (r *ClientRepository) SaveCredentialWithMFA(clientID uuid.UUID, cred *webauthn.Credential, method string) error {
 	tx := r.DB.Begin()
 
-	// Map webauthn.Credential → sharedmodels.Credential
-	credRecord := sharedmodels.Credential{
-		ID:              uuid.New(), // internal DB primary key
+	credRecord := Credential{
+		ID:              uuid.New(),
 		ClientID:        clientID,
-		CredentialID:    cred.ID, // from webauthn
+		UserID:          clientID,
+		CredentialID:    cred.ID,
 		PublicKey:       cred.PublicKey,
 		AttestationType: cred.AttestationType,
 		SignCount:       int64(cred.Authenticator.SignCount),
 		BackupEligible:  cred.Flags.BackupEligible,
 		BackupState:     cred.Flags.BackupState,
-		Transports:      pq.StringArray{}, // optional — fill if available
+		Transports:      pq.StringArray{},
 		CreatedAt:       time.Now().UTC(),
 		UpdatedAt:       time.Now().UTC(),
 	}
@@ -423,23 +334,6 @@ func (r *ClientRepository) SaveCredentialWithMFA(clientID uuid.UUID, cred *webau
 	}
 
 	if err := tx.Create(&credRecord).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	// Save MFA method
-	now := time.Now().UTC()
-	if err := tx.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "client_id"}, {Name: "method_type"}},
-		DoUpdates: clause.AssignmentColumns([]string{"enabled", "verified", "updated_at", "enrolled_at"}),
-	}).Create(&sharedmodels.MFAMethod{
-		ClientID:   clientID,
-		MethodType: method,
-		Enabled:    true,
-		Verified:   true,
-		EnrolledAt: now,
-		UpdatedAt:  now,
-	}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}

@@ -183,7 +183,8 @@ type UpdateUserRequest struct {
 
 // GetAuthURLInput represents input for constructing the Auth URL
 type GetAuthURLInput struct {
-	ClientID string `json:"client_id" binding:"required"`
+	ClientID    string `json:"client_id" binding:"required"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
 }
 
 // GetAuthURLResponse represents the output containing the constructed Auth URL

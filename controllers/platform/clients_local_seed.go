@@ -9,8 +9,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
-	repositories "github.com/authsec-ai/authsec/repository"
-	util "github.com/authsec-ai/authsec/utils"
 	sharedmodels "github.com/authsec-ai/sharedmodels"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -130,34 +128,14 @@ func normalizeLocalDemoTOTPSecret(raw string) string {
 }
 
 func seedLocalDemoTOTPMethod(tenantDB *gorm.DB, userID, clientID uuid.UUID, secret string) error {
-	encryptedSecret, err := util.EncryptString(secret)
-	if err != nil {
-		return fmt.Errorf("encrypt local demo TOTP secret: %w", err)
-	}
-
-	methodData := map[string]interface{}{
-		"secret_encrypted": encryptedSecret,
-		"issuer":           "AuthSec",
-		"algorithm":        "SHA1",
-		"digits":           6,
-		"period":           30,
-		"setup_completed":  time.Now().UTC(),
-	}
-
-	mfaRepo := repositories.NewMFARepository(tenantDB)
-	if err := mfaRepo.EnableMethod(clientID.String(), "totp", methodData, userID); err != nil {
-		return fmt.Errorf("seed local demo TOTP MFA method: %w", err)
-	}
-
-	return tenantDB.Model(&sharedmodels.MFAMethod{}).
-		Where("client_id = ? AND method_type = ?", clientID.String(), "totp").
-		Updates(map[string]interface{}{
-			"display_name": "Authenticator App",
-			"description":  "Seeded local SDK demo TOTP method",
-			"recommended":  true,
-			"is_primary":   true,
-			"verified":     true,
-			"enabled":      true,
-			"updated_at":   time.Now().UTC(),
-		}).Error
+	now := time.Now().Unix()
+	return tenantDB.Exec(`
+		INSERT INTO tenant_totp_secrets (
+			id, user_id, tenant_id, secret, device_name, device_type,
+			last_used, is_verified, is_active, is_primary, created_at, updated_at
+		)
+		SELECT gen_random_uuid(), ?, tenant_id, ?, ?, ?, NULL, true, true, true, ?, ?
+		FROM users
+		WHERE id = ?
+	`, userID, secret, "Authenticator App", "seeded-local-demo", now, now, userID).Error
 }

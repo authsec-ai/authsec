@@ -1053,17 +1053,17 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		deletedCounts["backup_codes"] = result.RowsAffected
 
-		// 4. Delete webauthn_credentials
+		// 4. Delete credentials
 
-		result = tx.Exec("DELETE FROM webauthn_credentials WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM credentials WHERE user_id = ?", userUUID)
 
 		if result.Error != nil {
 
-			return fmt.Errorf("failed to delete webauthn_credentials: %w", result.Error)
+			return fmt.Errorf("failed to delete credentials: %w", result.Error)
 
 		}
 
-		deletedCounts["webauthn_credentials"] = result.RowsAffected
+		deletedCounts["credentials"] = result.RowsAffected
 
 		// 5. Delete ciba_push_devices
 
@@ -1200,8 +1200,8 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 }
 
 type toggleEndUserActiveRequest struct {
-	TenantID string        `json:"tenant_id" binding:"required"`
-	UserID   string        `json:"user_id" binding:"required"`
+	TenantID string               `json:"tenant_id" binding:"required"`
+	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
@@ -1588,75 +1588,15 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 }
 
 func resolveEffectiveEndUserMFAMethods(c *gin.Context, tenantDB *gorm.DB, user *models.User, clientUUID, tenantUUID uuid.UUID) ([]map[string]interface{}, string, error) {
-	sqlDB, err := tenantDB.DB()
+	preferredMethod := ""
+	if user.MFADefaultMethod != nil {
+		preferredMethod = *user.MFADefaultMethod
+	}
+	state, err := services.ResolveMFAState(tenantDB, user.ID, clientUUID, tenantUUID, c.Request.Host, preferredMethod)
 	if err != nil {
 		return nil, "", err
 	}
-
-	rows, err := sqlDB.Query(`
-		SELECT method_type, is_primary
-		FROM mfa_methods
-		WHERE user_id = $1 AND client_id = $2 AND verified = true
-		ORDER BY is_primary DESC, created_at ASC
-	`, user.ID, clientUUID)
-	if err != nil {
-		return nil, "", err
-	}
-	defer rows.Close()
-
-	var methods []map[string]interface{}
-	defaultMethod := ""
-
-	for rows.Next() {
-		var methodType string
-		var isPrimary bool
-		if scanErr := rows.Scan(&methodType, &isPrimary); scanErr != nil {
-			continue
-		}
-		methods = append(methods, map[string]interface{}{
-			"method_type": methodType,
-			"is_primary":  isPrimary,
-		})
-		if defaultMethod == "" || isPrimary {
-			defaultMethod = methodType
-		}
-	}
-
-	if len(methods) > 0 {
-		return methods, defaultMethod, nil
-	}
-
-	var totpCount int
-	if err := sqlDB.QueryRow(`
-		SELECT COUNT(*)
-		FROM tenant_totp_secrets
-		WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true AND is_active = true
-	`, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
-		return []map[string]interface{}{{
-			"method_type": "totp",
-			"is_primary":  true,
-		}}, "totp", nil
-	}
-
-	currentDomain := c.Request.Host
-	if idx := strings.Index(currentDomain, ":"); idx != -1 {
-		currentDomain = currentDomain[:idx]
-	}
-
-	var credentialCount int
-	if err := sqlDB.QueryRow(`
-		SELECT COUNT(*)
-		FROM credentials
-		WHERE (user_id = $1 OR client_id = $2)
-		  AND (rp_id = $3 OR rp_id IS NULL)
-	`, user.ID, user.ClientID, currentDomain).Scan(&credentialCount); err == nil && credentialCount > 0 {
-		return []map[string]interface{}{{
-			"method_type": "webauthn",
-			"is_primary":  true,
-		}}, "webauthn", nil
-	}
-
-	return nil, "", nil
+	return state.MethodMaps(), state.DefaultMethod, nil
 }
 
 func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {

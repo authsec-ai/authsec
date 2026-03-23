@@ -21,6 +21,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	repositories "github.com/authsec-ai/authsec/repository"
+	"github.com/authsec-ai/authsec/services"
 	sharedmodels "github.com/authsec-ai/sharedmodels"
 )
 
@@ -124,17 +125,19 @@ func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 		return
 	}
 
-	if !user.MFAEnabled {
-		c.JSON(http.StatusOK, gin.H{"mfa_required": false})
+	preferredMethod := ""
+	if user.MFADefaultMethod != nil {
+		preferredMethod = *user.MFADefaultMethod
+	}
+	state, err := services.ResolveMFAState(globalDB, user.ID, user.ClientID, user.TenantID, "", preferredMethod)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to resolve MFA state"})
 		return
 	}
 
-	mfaRepo := repositories.NewMFARepository(globalDB)
-	methods, _ := mfaRepo.GetUserMethods(user.ID.String())
-
 	c.JSON(http.StatusOK, gin.H{
-		"mfa_required": true,
-		"methods":      methods,
+		"mfa_required": len(state.Methods) > 0,
+		"methods":      state.Methods,
 	})
 }
 
@@ -163,13 +166,15 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		return
 	}
 
-	if !user.MFAEnabled {
-		c.JSON(http.StatusOK, gin.H{"mfa_required": false})
+	preferredMethod := ""
+	if user.MFADefaultMethod != nil {
+		preferredMethod = *user.MFADefaultMethod
+	}
+	state, err := services.ResolveMFAState(globalDB, user.ID, user.ClientID, user.TenantID, c.Request.Host, preferredMethod)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to resolve MFA state"})
 		return
 	}
-
-	mfaRepo := repositories.NewMFARepository(globalDB)
-	methods, _ := mfaRepo.GetUserMethods(user.ID.String())
 
 	// Check for verified custom domain for this admin's tenant
 	globalRepo := repositories.NewGlobalRepository(globalDB)
@@ -179,8 +184,8 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"mfa_required": true,
-		"methods":      methods,
+		"mfa_required": len(state.Methods) > 0,
+		"methods":      state.Methods,
 	}
 
 	// If there's a verified custom domain, include it in the response
@@ -189,7 +194,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 		// Check if user has WebAuthn as an MFA method
 		hasWebAuthnMethod := false
-		for _, method := range methods {
+		for _, method := range state.Methods {
 			if method.MethodType == "webauthn" {
 				hasWebAuthnMethod = true
 				break
@@ -245,13 +250,15 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 		return
 	}
 
-	if !user.MFAEnabled {
-		c.JSON(http.StatusOK, gin.H{"mfa_required": false})
+	preferredMethod := ""
+	if user.MFADefaultMethod != nil {
+		preferredMethod = *user.MFADefaultMethod
+	}
+	state, err := services.ResolveMFAState(globalDB, user.ID, user.ClientID, user.TenantID, c.Request.Host, preferredMethod)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to resolve MFA state"})
 		return
 	}
-
-	mfaRepo := repositories.NewMFARepository(globalDB)
-	methods, _ := mfaRepo.GetUserMethods(user.ID.String())
 
 	// Check for verified custom domain for this admin's tenant
 	globalRepo := repositories.NewGlobalRepository(globalDB)
@@ -261,8 +268,8 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"mfa_required": true,
-		"methods":      methods,
+		"mfa_required": len(state.Methods) > 0,
+		"methods":      state.Methods,
 	}
 
 	// If there's a verified custom domain, include it in the response
@@ -271,7 +278,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 		// Check if user has WebAuthn as an MFA method
 		hasWebAuthnMethod := false
-		for _, method := range methods {
+		for _, method := range state.Methods {
 			if method.MethodType == "webauthn" {
 				hasWebAuthnMethod = true
 				break
@@ -562,6 +569,7 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	cred := repositories.Credential{
 		ID:              uuid.New(),
 		ClientID:        user.ID, // Use user.ID for admin users
+		UserID:          user.ID,
 		CredentialID:    credential.ID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: attestationType,
@@ -584,14 +592,6 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 		log.Printf("[%s] FinishRegistration: Failed to save credential - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save credential"})
 		return
-	}
-
-	// Enable MFA method
-	mfaRepo := repositories.NewMFARepository(globalDB)
-	if err := mfaRepo.EnableMethod(user.ID.String(), "webauthn", map[string]interface{}{
-		"credential_id": fmt.Sprintf("%x", credential.ID),
-	}, user.ID); err != nil {
-		log.Printf("[%s] FinishRegistration: Failed to enable MFA method - %v", reqID, err)
 	}
 
 	// Update user MFA settings
@@ -854,18 +854,6 @@ func (h *AdminWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	if err := clientRepo.UpdateCredentialFlags(credential.ID, credential.Flags.BackupEligible, credential.Flags.BackupState); err != nil {
 		log.Printf("[%s] FinishAuthentication: failed updating credential flags for user=%s: %v", reqID, user.Email, err)
 	}
-
-	// Update MFA last_used_at
-	mfaRepo := repositories.NewMFARepository(globalDB)
-	if err := globalDB.Table("mfa_methods").
-		Where("client_id = ? AND method_type = ?", user.ID, "webauthn").
-		Updates(map[string]interface{}{
-			"last_used_at": time.Now().UTC(),
-			"updated_at":   time.Now().UTC(),
-		}).Error; err != nil {
-		log.Printf("[%s] FinishAuthentication: failed updating MFA method for user=%s: %v", reqID, user.Email, err)
-	}
-	_ = mfaRepo // Keep reference to avoid unused variable warning
 
 	// Update user's last_login and first-login flags in global DB
 	now := time.Now().UTC()

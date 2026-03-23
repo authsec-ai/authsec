@@ -80,10 +80,23 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 	query := `
 		SELECT DISTINCT p.resource || ':' || p.action
 		FROM permissions p
-		INNER JOIN role_permissions rp ON p.id = rp.permission_id
-		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
-		WHERE rb.user_id::text = $1
-		AND rb.tenant_id::text = $2
+		JOIN (
+			SELECT rp.permission_id
+			FROM role_bindings rb
+			JOIN role_permissions rp ON rb.role_id = rp.role_id
+			WHERE rb.user_id::text = $1
+			  AND rb.tenant_id::text = $2
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+			UNION
+			SELECT sp.permission_id
+			FROM role_bindings rb
+			JOIN role_scopes rs ON rb.role_id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			WHERE rb.user_id::text = $1
+			  AND rb.tenant_id::text = $2
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+		) effective ON effective.permission_id = p.id
+		WHERE p.tenant_id::text = $2
 	`
 	rows, err := masterDB.DB.Query(query, userID, tenantID)
 	if err != nil {
@@ -219,10 +232,23 @@ func getUserResources(userID, tenantID string) ([]string, error) {
 	query := `
 		SELECT DISTINCT p.resource
 		FROM permissions p
-		INNER JOIN role_permissions rp ON p.id = rp.permission_id
-		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
-		WHERE rb.user_id::text = $1
-		AND rb.tenant_id::text = $2
+		JOIN (
+			SELECT rp.permission_id
+			FROM role_bindings rb
+			JOIN role_permissions rp ON rb.role_id = rp.role_id
+			WHERE rb.user_id::text = $1
+			  AND rb.tenant_id::text = $2
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+			UNION
+			SELECT sp.permission_id
+			FROM role_bindings rb
+			JOIN role_scopes rs ON rb.role_id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			WHERE rb.user_id::text = $1
+			  AND rb.tenant_id::text = $2
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+		) effective ON effective.permission_id = p.id
+		WHERE p.tenant_id::text = $2
 	`
 	rows, err := masterDB.DB.Query(query, userID, tenantID)
 	if err != nil {

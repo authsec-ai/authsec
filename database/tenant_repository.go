@@ -439,8 +439,8 @@ func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, 
 		return nil, err
 	}
 
-	// 5. Delete api_scopes for this tenant
-	if err := execDelete("api_scopes", "DELETE FROM api_scopes WHERE tenant_id = $1", tenantID); err != nil {
+	// 5. Delete scopes for this tenant
+	if err := execDelete("scopes", "DELETE FROM scopes WHERE tenant_id = $1", tenantID); err != nil {
 		return nil, err
 	}
 
@@ -454,8 +454,8 @@ func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, 
 		return nil, err
 	}
 
-	// 8. Delete webauthn_credentials for users in this tenant
-	if err := execDelete("webauthn_credentials", "DELETE FROM webauthn_credentials WHERE tenant_id = $1", tenantID); err != nil {
+	// 8. Delete credentials for users in this tenant
+	if err := execDelete("credentials", "DELETE FROM credentials WHERE user_id IN (SELECT id FROM users WHERE tenant_id = $1)", tenantID); err != nil {
 		return nil, err
 	}
 

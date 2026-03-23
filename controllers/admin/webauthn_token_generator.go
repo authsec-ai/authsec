@@ -87,8 +87,3 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 	// Return access token; refresh_token is empty in this flow (same as the HTTP handler)
 	return token, "", nil
 }
-
-// WebAuthnRegisterInternalForTest calls WebAuthnRegisterInternal for test access.
-func WebAuthnRegisterInternalForTest(clientID, email, tenantID string) (string, string, error) {
-	return WebAuthnRegisterInternal(clientID, email, tenantID)
-}

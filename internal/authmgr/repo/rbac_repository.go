@@ -1,10 +1,10 @@
 // Package authmgrrepo provides RBAC repository operations for the authmgr sub-service.
-// It is ported from auth-manager's internal/repo package and adapted to use
-// authsec's config.GetTenantGORMDB for database connectivity.
 package authmgrrepo
 
 import (
 	"context"
+	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,14 +13,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// Perm represents a resource with its allowed actions (used in authz checks).
 type Perm struct {
 	R string   `json:"r"`
 	A []string `json:"a"`
 }
 
-// FromScopes converts scope strings like ["invoice:read","invoice:write"] into
-// []Perm like [{R:"invoice", A:["read","write"]}].
 func FromScopes(scopeNames []string) []Perm {
 	type key struct{ r string }
 	m := map[key]map[string]struct{}{}
@@ -47,10 +44,9 @@ func FromScopes(scopeNames []string) []Perm {
 	return out
 }
 
-// DBProvider is a function that returns a GORM DB for a given tenantID.
-type DBProvider func(tenantID string) (*gorm.DB, error)
+type PrimaryDBProvider func() *gorm.DB
+type TenantDBProvider func(tenantID string) (*gorm.DB, error)
 
-// RBACRepository defines runtime permission/role check operations.
 type RBACRepository interface {
 	CheckPermission(ctx context.Context, tenantID, userID uuid.UUID, resource, action string) (bool, error)
 	CheckPermissionWithScope(ctx context.Context, tenantID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error)
@@ -62,154 +58,300 @@ type RBACRepository interface {
 }
 
 type rbacRepository struct {
-	dbProvider DBProvider
+	primaryProvider PrimaryDBProvider
+	tenantProvider  TenantDBProvider
 }
 
-// NewRBACRepository creates a new RBAC repository backed by the given DBProvider.
-func NewRBACRepository(dbProvider DBProvider) RBACRepository {
-	return &rbacRepository{dbProvider: dbProvider}
+func NewRBACRepository(primaryProvider PrimaryDBProvider, tenantProvider TenantDBProvider) RBACRepository {
+	return &rbacRepository{
+		primaryProvider: primaryProvider,
+		tenantProvider:  tenantProvider,
+	}
+}
+
+func (r *rbacRepository) candidateDBs(tenantID string) ([]*gorm.DB, error) {
+	dbs := make([]*gorm.DB, 0, 2)
+	if r.primaryProvider != nil {
+		if db := r.primaryProvider(); db != nil {
+			dbs = append(dbs, db)
+		}
+	}
+
+	if r.tenantProvider != nil {
+		tenantDB, err := r.tenantProvider(tenantID)
+		if err != nil {
+			if len(dbs) == 0 {
+				return nil, err
+			}
+			return dbs, nil
+		}
+		if tenantDB != nil {
+			dbs = append(dbs, tenantDB)
+		}
+	}
+
+	if len(dbs) == 0 {
+		return nil, errors.New("no database providers configured")
+	}
+	return dbs, nil
+}
+
+func (r *rbacRepository) checkAny(ctx context.Context, tenantID uuid.UUID, query string, args ...interface{}) (bool, error) {
+	dbs, err := r.candidateDBs(tenantID.String())
+	if err != nil {
+		return false, err
+	}
+
+	var lastErr error
+	for _, db := range dbs {
+		var count int64
+		if err := db.WithContext(ctx).Raw(query, args...).Scan(&count).Error; err != nil {
+			lastErr = err
+			continue
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+
+	return false, lastErr
 }
 
 func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID uuid.UUID, resource, action string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
-	if err != nil {
-		return false, err
-	}
-
-	var count int64
-	err = db.WithContext(ctx).
-		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
-		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("permissions.resource = ?", resource).
-		Where("permissions.action = ?", action).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
-		Count(&count).Error
-	return count > 0, err
+	return r.checkAny(ctx, tenantID, `
+		SELECT COUNT(*) FROM (
+			SELECT 1
+			FROM role_bindings rb
+			JOIN role_permissions rp ON rb.role_id = rp.role_id
+			JOIN permissions p ON rp.permission_id = p.id
+			WHERE rb.tenant_id = ?
+			  AND rb.user_id = ?
+			  AND p.tenant_id = ?
+			  AND p.resource = ?
+			  AND p.action = ?
+			  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+			UNION
+			SELECT 1
+			FROM role_bindings rb
+			JOIN role_scopes rs ON rb.role_id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			JOIN permissions p ON sp.permission_id = p.id
+			WHERE rb.tenant_id = ?
+			  AND rb.user_id = ?
+			  AND p.tenant_id = ?
+			  AND p.resource = ?
+			  AND p.action = ?
+			  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+		) effective
+	`, tenantID, userID, tenantID, resource, action, time.Now().UTC(), tenantID, userID, tenantID, resource, action, time.Now().UTC())
 }
 
 func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
-	if err != nil {
-		return false, err
-	}
-
-	query := db.WithContext(ctx).
-		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
-		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("permissions.resource = ?", resource).
-		Where("permissions.action = ?", action).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now())
-
+	var (
+		query string
+		args  []interface{}
+	)
 	if scopeID == nil {
-		query = query.Where("role_bindings.scope_id IS NULL")
+		query = `
+			SELECT COUNT(*) FROM (
+				SELECT 1
+				FROM role_bindings rb
+				JOIN role_permissions rp ON rb.role_id = rp.role_id
+				JOIN permissions p ON rp.permission_id = p.id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND p.tenant_id = ?
+				  AND p.resource = ?
+				  AND p.action = ?
+				  AND rb.scope_id IS NULL
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+				UNION
+				SELECT 1
+				FROM role_bindings rb
+				JOIN role_scopes rs ON rb.role_id = rs.role_id
+				JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+				JOIN permissions p ON sp.permission_id = p.id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND p.tenant_id = ?
+				  AND p.resource = ?
+				  AND p.action = ?
+				  AND rb.scope_id IS NULL
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+			) effective`
+		args = []interface{}{tenantID, userID, tenantID, resource, action, time.Now().UTC(), tenantID, userID, tenantID, resource, action, time.Now().UTC()}
 	} else {
-		query = query.Where("role_bindings.scope_id IS NULL OR (role_bindings.scope_id = ? AND role_bindings.scope_type = ?)", *scopeID, scopeType)
+		query = `
+			SELECT COUNT(*) FROM (
+				SELECT 1
+				FROM role_bindings rb
+				JOIN role_permissions rp ON rb.role_id = rp.role_id
+				JOIN permissions p ON rp.permission_id = p.id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND p.tenant_id = ?
+				  AND p.resource = ?
+				  AND p.action = ?
+				  AND (rb.scope_id IS NULL OR (rb.scope_id = ? AND rb.scope_type = ?))
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+				UNION
+				SELECT 1
+				FROM role_bindings rb
+				JOIN role_scopes rs ON rb.role_id = rs.role_id
+				JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+				JOIN permissions p ON sp.permission_id = p.id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND p.tenant_id = ?
+				  AND p.resource = ?
+				  AND p.action = ?
+				  AND (rb.scope_id IS NULL OR (rb.scope_id = ? AND rb.scope_type = ?))
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+			) effective`
+		args = []interface{}{
+			tenantID, userID, tenantID, resource, action, *scopeID, scopeType, time.Now().UTC(),
+			tenantID, userID, tenantID, resource, action, *scopeID, scopeType, time.Now().UTC(),
+		}
 	}
 
-	var count int64
-	err = query.Count(&count).Error
-	return count > 0, err
+	return r.checkAny(ctx, tenantID, query, args...)
 }
 
 func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID, scopeName, resource, action string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
-	if err != nil {
-		return false, err
-	}
-
-	var count int64
-	err = db.WithContext(ctx).
-		Table("scopes").
-		Joins("JOIN scope_permissions ON scopes.id = scope_permissions.scope_id").
-		Joins("JOIN permissions ON scope_permissions.permission_id = permissions.id").
-		Where("scopes.tenant_id = ?", tenantID).
-		Where("scopes.name = ?", scopeName).
-		Where("permissions.resource = ?", resource).
-		Where("permissions.action = ?", action).
-		Count(&count).Error
-	return count > 0, err
+	return r.checkAny(ctx, tenantID, `
+		SELECT COUNT(*)
+		FROM scopes s
+		JOIN scope_permissions sp ON s.id = sp.scope_id
+		JOIN permissions p ON sp.permission_id = p.id
+		WHERE s.tenant_id = ?
+		  AND s.name = ?
+		  AND s.usage IN ('oauth', 'both')
+		  AND p.tenant_id = ?
+		  AND p.resource = ?
+		  AND p.action = ?
+	`, tenantID, scopeName, tenantID, resource, action)
 }
 
 func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UUID, roleName string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
-	if err != nil {
-		return false, err
-	}
-
-	var count int64
-	err = db.WithContext(ctx).
-		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("roles.name = ?", roleName).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
-		Count(&count).Error
-	return count > 0, err
+	return r.checkAny(ctx, tenantID, `
+		SELECT COUNT(*)
+		FROM role_bindings
+		JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id
+		WHERE role_bindings.tenant_id = ?
+		  AND role_bindings.user_id = ?
+		  AND roles.name = ?
+		  AND (role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?)
+	`, tenantID, userID, roleName, time.Now().UTC())
 }
 
 func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID uuid.UUID, roleName, scopeType string, scopeID uuid.UUID) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
-	if err != nil {
-		return false, err
-	}
-
-	var count int64
-	err = db.WithContext(ctx).
-		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("roles.name = ?", roleName).
-		Where("role_bindings.scope_type = ?", scopeType).
-		Where("role_bindings.scope_id = ?", scopeID).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
-		Count(&count).Error
-	return count > 0, err
+	return r.checkAny(ctx, tenantID, `
+		SELECT COUNT(*)
+		FROM role_bindings
+		JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id
+		WHERE role_bindings.tenant_id = ?
+		  AND role_bindings.user_id = ?
+		  AND roles.name = ?
+		  AND role_bindings.scope_type = ?
+		  AND role_bindings.scope_id = ?
+		  AND (role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?)
+	`, tenantID, userID, roleName, scopeType, scopeID, time.Now().UTC())
 }
 
 func (r *rbacRepository) GetUserPermissions(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Permission, error) {
-	db, err := r.dbProvider(tenantID.String())
+	dbs, err := r.candidateDBs(tenantID.String())
 	if err != nil {
 		return nil, err
 	}
 
-	var permissions []authmgrmodels.Permission
-	err = db.WithContext(ctx).
-		Table("permissions").
-		Distinct("permissions.*").
-		Joins("JOIN role_permissions ON permissions.id = role_permissions.permission_id").
-		Joins("JOIN roles ON role_permissions.role_id = roles.id").
-		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
-		Find(&permissions).Error
-	return permissions, err
+	permissionsByID := make(map[uuid.UUID]authmgrmodels.Permission)
+	var lastErr error
+	for _, db := range dbs {
+		var permissions []authmgrmodels.Permission
+		if err := db.WithContext(ctx).Raw(`
+			SELECT DISTINCT p.id, p.tenant_id, p.resource, p.action, p.description, p.created_at, p.updated_at
+			FROM permissions p
+			JOIN (
+				SELECT rp.permission_id
+				FROM role_bindings rb
+				JOIN role_permissions rp ON rb.role_id = rp.role_id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+				UNION
+				SELECT sp.permission_id
+				FROM role_bindings rb
+				JOIN role_scopes rs ON rb.role_id = rs.role_id
+				JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+				WHERE rb.tenant_id = ?
+				  AND rb.user_id = ?
+				  AND (rb.expires_at IS NULL OR rb.expires_at > ?)
+			) effective ON effective.permission_id = p.id
+			WHERE p.tenant_id = ?
+			ORDER BY p.resource, p.action
+		`, tenantID, userID, time.Now().UTC(), tenantID, userID, time.Now().UTC(), tenantID).Scan(&permissions).Error; err != nil {
+			lastErr = err
+			continue
+		}
+		for _, permission := range permissions {
+			permissionsByID[permission.ID] = permission
+		}
+	}
+
+	merged := make([]authmgrmodels.Permission, 0, len(permissionsByID))
+	for _, permission := range permissionsByID {
+		merged = append(merged, permission)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Resource == merged[j].Resource {
+			return merged[i].Action < merged[j].Action
+		}
+		return merged[i].Resource < merged[j].Resource
+	})
+	if len(merged) == 0 {
+		return merged, lastErr
+	}
+	return merged, nil
 }
 
 func (r *rbacRepository) GetUserRoles(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Role, error) {
-	db, err := r.dbProvider(tenantID.String())
+	dbs, err := r.candidateDBs(tenantID.String())
 	if err != nil {
 		return nil, err
 	}
 
-	var roles []authmgrmodels.Role
-	err = db.WithContext(ctx).
-		Table("roles").
-		Distinct("roles.*").
-		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
-		Where("role_bindings.user_id = ?", userID).
-		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
-		Find(&roles).Error
-	return roles, err
+	rolesByID := make(map[uuid.UUID]authmgrmodels.Role)
+	var lastErr error
+	for _, db := range dbs {
+		var roles []authmgrmodels.Role
+		if err := db.WithContext(ctx).
+			Table("roles").
+			Distinct("roles.*").
+			Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
+			Where("role_bindings.tenant_id = ?", tenantID).
+			Where("role_bindings.user_id = ?", userID).
+			Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now().UTC()).
+			Find(&roles).Error; err != nil {
+			lastErr = err
+			continue
+		}
+		for _, role := range roles {
+			rolesByID[role.ID] = role
+		}
+	}
+
+	merged := make([]authmgrmodels.Role, 0, len(rolesByID))
+	for _, role := range rolesByID {
+		merged = append(merged, role)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Name == merged[j].Name {
+			return merged[i].ID.String() < merged[j].ID.String()
+		}
+		return merged[i].Name < merged[j].Name
+	})
+	if len(merged) == 0 {
+		return merged, lastErr
+	}
+	return merged, nil
 }

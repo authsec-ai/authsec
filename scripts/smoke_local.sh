@@ -92,8 +92,13 @@ check_status() {
   echo "OK ${name}: ${status}"
 }
 
-echo "Building and starting local stack..."
-compose up -d --build
+if [[ "${SMOKE_BUILD:-0}" == "1" ]] || ! docker image inspect authsec-local:latest >/dev/null 2>&1; then
+  echo "Building and starting local stack..."
+  compose up -d --build
+else
+  echo "Starting local stack..."
+  compose up -d
+fi
 
 wait_for "AuthSec" "http://localhost:7468/authsec/uflow/health"
 wait_for "Hydra" "http://localhost:4444/health/ready"
@@ -114,7 +119,6 @@ check_status "AuthMgr Health" "http://localhost:7468/authsec/authmgr/health" "20
 check_status "ExSvc Health" "http://localhost:7468/authsec/exsvc/health" "200"
 check_status "SPIRE Health" "http://localhost:7468/authsec/spire/health" "200"
 check_status "SDKMgr MCP Auth Health" "http://localhost:7468/authsec/sdkmgr/mcp-auth/health" "200"
-check_status "SDKMgr Playground Health" "http://localhost:7468/authsec/sdkmgr/playground/health" "200"
 check_status "UFlow Docs" "http://localhost:7468/authsec/uflow/docs" "200"
 check_status "ClientMS Swagger" "http://localhost:7468/authsec/clientms/swagger" "200"
 check_status "Migration Auth Gate" "http://localhost:7468/authsec/migration/tenants" "401"

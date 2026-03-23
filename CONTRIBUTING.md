@@ -27,21 +27,17 @@ Thank you for your interest in contributing to AuthSec! This guide explains how 
 - Follow standard Go conventions: <https://go.dev/doc/effective_go>.
 - Keep functions short and focused. Prefer returning errors over panicking.
 
-## Testing
+## Runtime QA
 
-```bash
-# Unit tests
-go test -race -count=1 ./...
-
-# Integration tests (requires running DB + Redis)
-go test -tags=integration -count=1 ./tests/integration/...
-```
+Use the manual API checklist in [`docs/runtime-qa-curls.md`](docs/runtime-qa-curls.md).
+It is the supported verification path for this repository and is intended to be
+imported into Postman or run directly with `curl`.
 
 ## Pull Request Process
 
 1. Fork the repository and create a feature branch from `main`.
 2. Make your changes in focused, well-described commits.
-3. Ensure all tests pass and `go vet` is clean.
+3. Ensure `go build ./...` succeeds, the runtime curl checklist is covered, and `go vet` is clean.
 4. Open a PR against `main` with a clear description of the change.
 5. At least one maintainer approval is required before merging.
 

@@ -43,12 +43,16 @@ type AuthmgrController struct {
 	rbacRepo authmgrrepo.RBACRepository
 }
 
-// NewAuthmgrController creates an AuthmgrController wired to authsec's tenant DB.
+// NewAuthmgrController creates an AuthmgrController that resolves RBAC from the
+// authoritative primary DB first and then falls back to the tenant DB.
 func NewAuthmgrController() *AuthmgrController {
 	return &AuthmgrController{
-		rbacRepo: authmgrrepo.NewRBACRepository(func(tenantID string) (*gorm.DB, error) {
-			return config.GetTenantGORMDB(tenantID)
-		}),
+		rbacRepo: authmgrrepo.NewRBACRepository(
+			func() *gorm.DB { return config.DB },
+			func(tenantID string) (*gorm.DB, error) {
+				return config.GetTenantGORMDB(tenantID)
+			},
+		),
 	}
 }
 
@@ -155,9 +159,18 @@ type authmgrAuthz struct {
 	Groups    []string
 }
 
+type authmgrGenerateTokenRequest struct {
+	TenantID  string  `json:"tenant_id" binding:"required"`
+	ProjectID string  `json:"project_id,omitempty"`
+	ClientID  string  `json:"client_id" binding:"required"`
+	SecretID  *string `json:"secret_id,omitempty"`
+	EmailID   string  `json:"email_id" binding:"required"`
+}
+
 // authmgrGetAuthz loads roles/scopes/groups for a user by trying the primary DB
-// first and then the tenant DB. Uses authsec's config.DB and GetTenantGORMDB.
-func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
+// first and then the tenant DB. Authorization is tenant+user scoped; project_id
+// is not part of the lookup.
+func authmgrGetAuthz(ctx context.Context, tenantID, email string) (*authmgrAuthz, error) {
 	if tenantID == "" || email == "" {
 		return nil, errors.New("tenantID and email are required")
 	}
@@ -168,7 +181,7 @@ func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email s
 
 	// Try primary DB first
 	if config.DB != nil {
-		authz, err := authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, projectID, clientID, email)
+		authz, err := authmgrLoadAuthzFromDB(ctx, config.DB, tid, email)
 		if err == nil && authz != nil && (len(authz.Roles) > 0 || len(authz.Scopes) > 0) {
 			return authz, nil
 		}
@@ -180,16 +193,16 @@ func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email s
 	if err != nil {
 		return nil, fmt.Errorf("resolve tenant db: %w", err)
 	}
-	return authmgrLoadAuthzFromDB(ctx, tenantDB, tid, tenantID, projectID, clientID, email)
+	return authmgrLoadAuthzFromDB(ctx, tenantDB, tid, email)
 }
 
-func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
+func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, email string) (*authmgrAuthz, error) {
 	var user sharedmodels.User
 	if err := db.WithContext(ctx).Where("email = ? AND tenant_id = ?", email, tid).First(&user).Error; err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
-	// Load roles via role_bindings
+	// Load roles via role_bindings, which is the authoritative RBAC mapping.
 	var roleBindings []struct {
 		RoleID   uuid.UUID
 		RoleName string
@@ -203,13 +216,7 @@ func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, ten
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > NOW()").
 		Scan(&roleBindings).Error
 	if err != nil {
-		// Legacy fallback
-		_ = db.WithContext(ctx).
-			Table("user_roles").
-			Select("user_roles.role_id, roles.name as role_name").
-			Joins("LEFT JOIN roles ON user_roles.role_id = roles.id").
-			Where("user_roles.user_id = ?", user.ID).
-			Scan(&roleBindings).Error
+		return nil, fmt.Errorf("load role bindings: %w", err)
 	}
 
 	roles := make([]string, 0)
@@ -221,20 +228,34 @@ func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, ten
 		roleIDs = append(roleIDs, rb.RoleID)
 	}
 
-	// Load scopes via permissions
+	// Load effective permissions as compatibility "scopes". Direct role permissions
+	// remain authoritative; role_scopes only add optional bundles.
 	var scopes []string
 	if len(roleIDs) > 0 {
-		var perms []struct {
-			Resource string
-			Action   string
-		}
-		if err := db.WithContext(ctx).Table("role_permissions").
-			Select("permissions.resource, permissions.action").
-			Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-			Where("role_permissions.role_id IN ?", roleIDs).
-			Scan(&perms).Error; err == nil {
-			for _, p := range perms {
-				scopes = append(scopes, fmt.Sprintf("%s:%s", p.Resource, p.Action))
+		rows, err := db.WithContext(ctx).Raw(`
+			SELECT DISTINCT p.resource, p.action
+			FROM permissions p
+			JOIN (
+				SELECT rp.permission_id
+				FROM role_permissions rp
+				WHERE rp.role_id IN ?
+				UNION
+				SELECT sp.permission_id
+				FROM role_scopes rs
+				JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+				WHERE rs.role_id IN ?
+			) effective ON effective.permission_id = p.id
+			WHERE p.tenant_id = ?
+			ORDER BY p.resource, p.action
+		`, roleIDs, roleIDs, tid).Rows()
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var resource string
+				var action string
+				if scanErr := rows.Scan(&resource, &action); scanErr == nil {
+					scopes = append(scopes, fmt.Sprintf("%s:%s", resource, action))
+				}
 			}
 		}
 	}
@@ -375,7 +396,7 @@ func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
 		return
 	}
 
-	authzData, err := authmgrGetAuthz(ctx, tenantID, projectID, clientID, email)
+	authzData, err := authmgrGetAuthz(ctx, tenantID, email)
 	if err != nil {
 		log.Printf("[authmgr GetAuthStatus] GetAuthz: %v", err)
 		authzData = &authmgrAuthz{}
@@ -424,8 +445,6 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	}
 
 	tenantID, _ := unverifiedClaims["tenant_id"].(string)
-	projectID, _ := unverifiedClaims["project_id"].(string)
-	clientID, _ := unverifiedClaims["client_id"].(string)
 	tokenType, _ := unverifiedClaims["token_type"].(string)
 
 	var signingSecret []byte
@@ -456,7 +475,7 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	authzData, err := authmgrGetAuthz(ctx, tenantID, projectID, clientID, emailID)
+	authzData, err := authmgrGetAuthz(ctx, tenantID, emailID)
 	if err != nil {
 		log.Printf("[authmgr VerifyToken] authz fetch failed: %v", err)
 		authzData = &authmgrAuthz{}
@@ -481,7 +500,7 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 
 // GenerateToken issues a JWT for the given credentials.
 func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
-	var req sharedmodels.TokenRequest
+	var req authmgrGenerateTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -500,9 +519,8 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		tokenType = "default"
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	jwtClaims := jwt.MapClaims{
 		"tenant_id":  req.TenantID,
-		"project_id": req.ProjectID,
 		"client_id":  req.ClientID,
 		"email_id":   req.EmailID,
 		"token_type": tokenType,
@@ -511,7 +529,11 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		"nbf":        time.Now().Unix(),
 		"exp":        time.Now().Add(24 * time.Hour).Unix(),
 		"iss":        "authsec-ai/auth-manager",
-	})
+	}
+	if req.ProjectID != "" && req.ProjectID != uuid.Nil.String() {
+		jwtClaims["project_id"] = req.ProjectID
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwtClaims)
 	token.Header["kid"] = tokenType
 
 	tokenString, err := token.SignedString(signingSecret)

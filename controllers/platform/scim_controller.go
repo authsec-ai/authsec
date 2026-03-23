@@ -2,6 +2,7 @@ package platform
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -35,22 +36,20 @@ func scimBaseURL(c *gin.Context) string {
 	if c.Request.TLS == nil {
 		scheme = "http"
 	}
-	// Include client_id and project_id in base URL if present (end-user routes)
 	clientID := c.Param("client_id")
 	projectID := c.Param("project_id")
-	if clientID != "" && projectID != "" {
-		return fmt.Sprintf("%s://%s/uflow/scim/v2/%s/%s", scheme, c.Request.Host, clientID, projectID)
+	if clientID != "" {
+		if projectID != "" {
+			return fmt.Sprintf("%s://%s/uflow/scim/v2/%s/%s", scheme, c.Request.Host, clientID, projectID)
+		}
+		return fmt.Sprintf("%s://%s/uflow/scim/v2/%s", scheme, c.Request.Host, clientID)
 	}
 	return fmt.Sprintf("%s://%s/uflow/scim/v2", scheme, c.Request.Host)
 }
 
-// getClientAndProjectID extracts and validates client_id and project_id from URL params
-func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
-	clientIDStr := c.Param("client_id")
-	projectIDStr := c.Param("project_id")
-
-	if clientIDStr == "" || projectIDStr == "" {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("client_id and project_id are required")
+func resolveClientAndProjectID(tenantDB *gorm.DB, tenantID, clientIDStr, projectIDStr string) (uuid.UUID, uuid.UUID, error) {
+	if clientIDStr == "" {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("client_id is required")
 	}
 
 	clientUUID, err := uuid.Parse(clientIDStr)
@@ -58,12 +57,43 @@ func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid client_id format: %w", err)
 	}
 
-	projectUUID, err := uuid.Parse(projectIDStr)
+	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid project_id format: %w", err)
+		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid tenant_id context: %w", err)
 	}
 
-	return clientUUID, projectUUID, nil
+	var client sharedmodels.Client
+	if err := tenantDB.Select("client_id", "project_id").
+		Where("tenant_id = ? AND client_id = ?", tenantUUID, clientUUID).
+		First(&client).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return uuid.Nil, uuid.Nil, fmt.Errorf("client not found")
+		}
+		return uuid.Nil, uuid.Nil, fmt.Errorf("failed to resolve client project_id: %w", err)
+	}
+
+	resolvedProjectID := client.ProjectID
+	if resolvedProjectID == uuid.Nil {
+		resolvedProjectID = tenantUUID
+	}
+
+	if projectIDStr != "" {
+		projectUUID, err := uuid.Parse(projectIDStr)
+		if err != nil {
+			return uuid.Nil, uuid.Nil, fmt.Errorf("invalid project_id format: %w", err)
+		}
+		if projectUUID != resolvedProjectID {
+			log.Printf("SCIM: ignoring legacy project_id %s for client %s; using stored project_id %s", projectUUID, clientUUID, resolvedProjectID)
+		}
+	}
+
+	return clientUUID, resolvedProjectID, nil
+}
+
+// getClientAndProjectID extracts client_id and resolves project_id from either the
+// URL or the tenant client record when the legacy project segment is omitted.
+func getClientAndProjectID(c *gin.Context, tenantDB *gorm.DB, tenantID string) (uuid.UUID, uuid.UUID, error) {
+	return resolveClientAndProjectID(tenantDB, tenantID, c.Param("client_id"), c.Param("project_id"))
 }
 
 // getTenantDB resolves the tenant DB from the JWT context
@@ -188,7 +218,7 @@ func (sc *SCIMController) GetResourceTypes(c *gin.Context) {
 // User Endpoints (End-User / Tenant DB)
 // ──────────────────────────────────────────────
 
-// ListUsers handles GET /scim/v2/:client_id/:project_id/Users
+// ListUsers handles GET /scim/v2/:client_id[/ :project_id]/Users
 func (sc *SCIMController) ListUsers(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -197,7 +227,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
+	clientUUID, _, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -242,7 +272,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, models.NewSCIMListResponse(resources, int(totalResults), startIndex, len(resources)))
 }
 
-// GetUser handles GET /scim/v2/:client_id/:project_id/Users/:id
+// GetUser handles GET /scim/v2/:client_id[/ :project_id]/Users/:id
 func (sc *SCIMController) GetUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -251,7 +281,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
+	clientUUID, _, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -277,7 +307,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 	c.JSON(http.StatusOK, models.UserToSCIMUser(user, scimBaseURL(c)))
 }
 
-// CreateUser handles POST /scim/v2/:client_id/:project_id/Users
+// CreateUser handles POST /scim/v2/:client_id[/ :project_id]/Users
 func (sc *SCIMController) CreateUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -286,7 +316,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, projectUUID, err := getClientAndProjectID(c)
+	clientUUID, projectUUID, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -397,7 +427,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.UserToSCIMUser(newUser, scimBaseURL(c)))
 }
 
-// ReplaceUser handles PUT /scim/v2/:client_id/:project_id/Users/:id
+// ReplaceUser handles PUT /scim/v2/:client_id[/ :project_id]/Users/:id
 func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -406,7 +436,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
+	clientUUID, _, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -476,7 +506,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	c.JSON(http.StatusOK, models.UserToSCIMUser(user, scimBaseURL(c)))
 }
 
-// PatchUser handles PATCH /scim/v2/:client_id/:project_id/Users/:id
+// PatchUser handles PATCH /scim/v2/:client_id[/ :project_id]/Users/:id
 func (sc *SCIMController) PatchUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -485,7 +515,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
+	clientUUID, _, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -550,7 +580,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	c.JSON(http.StatusOK, models.UserToSCIMUser(user, scimBaseURL(c)))
 }
 
-// DeleteUser handles DELETE /scim/v2/:client_id/:project_id/Users/:id
+// DeleteUser handles DELETE /scim/v2/:client_id[/ :project_id]/Users/:id
 func (sc *SCIMController) DeleteUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
@@ -559,7 +589,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
+	clientUUID, _, err := getClientAndProjectID(c, tenantDB, tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
@@ -595,12 +625,16 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 // Group Endpoints (End-User / Tenant DB)
 // ──────────────────────────────────────────────
 
-// ListGroups handles GET /scim/v2/:client_id/:project_id/Groups
+// ListGroups handles GET /scim/v2/:client_id[/ :project_id]/Groups
 func (sc *SCIMController) ListGroups(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -635,12 +669,16 @@ func (sc *SCIMController) ListGroups(c *gin.Context) {
 	c.JSON(http.StatusOK, models.NewSCIMListResponse(resources, int(totalResults), startIndex, len(resources)))
 }
 
-// GetGroup handles GET /scim/v2/:client_id/:project_id/Groups/:id
+// GetGroup handles GET /scim/v2/:client_id[/ :project_id]/Groups/:id
 func (sc *SCIMController) GetGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -667,12 +705,16 @@ func (sc *SCIMController) GetGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, models.TenantGroupToSCIMGroup(group, members, scimBaseURL(c)))
 }
 
-// CreateGroup handles POST /scim/v2/:client_id/:project_id/Groups
+// CreateGroup handles POST /scim/v2/:client_id[/ :project_id]/Groups
 func (sc *SCIMController) CreateGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -736,12 +778,16 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.TenantGroupToSCIMGroup(newGroup, members, scimBaseURL(c)))
 }
 
-// ReplaceGroup handles PUT /scim/v2/:client_id/:project_id/Groups/:id
+// ReplaceGroup handles PUT /scim/v2/:client_id[/ :project_id]/Groups/:id
 func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -802,12 +848,16 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, models.TenantGroupToSCIMGroup(group, members, scimBaseURL(c)))
 }
 
-// PatchGroup handles PATCH /scim/v2/:client_id/:project_id/Groups/:id
+// PatchGroup handles PATCH /scim/v2/:client_id[/ :project_id]/Groups/:id
 func (sc *SCIMController) PatchGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -881,12 +931,16 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, models.TenantGroupToSCIMGroup(group, members, scimBaseURL(c)))
 }
 
-// DeleteGroup handles DELETE /scim/v2/:client_id/:project_id/Groups/:id
+// DeleteGroup handles DELETE /scim/v2/:client_id[/ :project_id]/Groups/:id
 func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
 	tenantDB, tenantID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
+		return
+	}
+	if _, _, err := getClientAndProjectID(c, tenantDB, tenantID); err != nil {
+		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
 
@@ -1160,7 +1214,7 @@ func extractFilterValue(path string) string {
 // SCIMTokenRequest is the input for generating a SCIM Bearer token
 type SCIMTokenRequest struct {
 	ClientID  string `json:"client_id" binding:"required"`
-	ProjectID string `json:"project_id" binding:"required"`
+	ProjectID string `json:"project_id"`
 }
 
 // SCIMTokenResponse is the response containing the SCIM Bearer token and base URL
@@ -1190,19 +1244,23 @@ func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 
 	var input SCIMTokenRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "client_id and project_id are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "client_id is required"})
 		return
 	}
 
-	// Validate UUIDs
-	clientUUID, err := uuid.Parse(input.ClientID)
+	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid client_id format"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
 		return
 	}
-	_, err = uuid.Parse(input.ProjectID)
+
+	clientUUID, resolvedProjectUUID, err := resolveClientAndProjectID(tenantDB, tenantID, input.ClientID, input.ProjectID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id format"})
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "client not found") {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -1235,18 +1293,20 @@ func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 	if c.Request.TLS == nil {
 		scheme = "http"
 	}
-	baseURL := fmt.Sprintf("%s://%s/uflow/scim/v2/%s/%s", scheme, c.Request.Host, input.ClientID, input.ProjectID)
+	baseURL := fmt.Sprintf("%s://%s/uflow/scim/v2/%s", scheme, c.Request.Host, input.ClientID)
+	if input.ProjectID != "" {
+		baseURL = fmt.Sprintf("%s/%s", baseURL, resolvedProjectUUID.String())
+	}
 	expireAt := time.Now().Add(365 * 24 * time.Hour).Format(time.RFC3339)
 
 	log.Printf("SCIM: Generated SCIM token for tenant %s, client %s", tenantID, input.ClientID)
 
-	middlewares.Audit(c, "scim", tenantID, "generate_scim_token", &middlewares.AuditChanges{
-		After: map[string]interface{}{
-			"client_id":  input.ClientID,
-			"project_id": input.ProjectID,
-			"expire_at":  expireAt,
-		},
-	})
+	auditAfter := map[string]interface{}{
+		"client_id":  input.ClientID,
+		"project_id": resolvedProjectUUID.String(),
+		"expire_at":  expireAt,
+	}
+	middlewares.Audit(c, "scim", tenantID, "generate_scim_token", &middlewares.AuditChanges{After: auditAfter})
 
 	c.JSON(http.StatusOK, SCIMTokenResponse{
 		Token:    scimToken,

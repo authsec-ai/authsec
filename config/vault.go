@@ -13,6 +13,61 @@ import (
 
 var VaultClient *api.Client
 
+func clientSecretPath(tenantID, clientID string) string {
+	return fmt.Sprintf("kv/data/secret/%s/%s", tenantID, clientID)
+}
+
+func legacyClientSecretPath(tenantID, projectID, clientID string) string {
+	return fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
+}
+
+func clientSecretPaths(tenantID, projectID, clientID string) []string {
+	paths := []string{clientSecretPath(tenantID, clientID)}
+	if projectID != "" {
+		paths = append(paths, legacyClientSecretPath(tenantID, projectID, clientID))
+	}
+	return paths
+}
+
+func readSecretIDFromVaultPath(secretPath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	secret, err := VaultClient.Logical().ReadWithContext(ctx, secretPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read secret from Vault at path %s: %w", secretPath, err)
+	}
+
+	data, err := GetSecretData(secret)
+	if err != nil {
+		return "", fmt.Errorf("failed to extract secret data from Vault path %s: %w", secretPath, err)
+	}
+
+	secretID, ok := data["secret_id"].(string)
+	if !ok || secretID == "" {
+		return "", fmt.Errorf("secret_id not found in Vault at path %s", secretPath)
+	}
+
+	return secretID, nil
+}
+
+func writeSecretIDToVaultPath(secretPath, secretID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	requestData := map[string]interface{}{
+		"data": map[string]interface{}{
+			"secret_id": secretID,
+		},
+	}
+
+	if _, err := VaultClient.Logical().WriteWithContext(ctx, secretPath, requestData); err != nil {
+		return fmt.Errorf("failed to write secret to Vault at path %s: %w", secretPath, err)
+	}
+
+	return nil
+}
+
 func InitVault(cfg *Config) error {
 	config := api.DefaultConfig()
 
@@ -146,36 +201,31 @@ func HealthCheck() error {
 	return nil
 }
 
-// SecretInVault retrieves a secret from Vault for the specified tenant, project, and client
+// SecretInVault retrieves a client secret from Vault using the canonical path first
+// and falls back to the legacy project-scoped path for backward compatibility.
 func SecretInVault(tenantID, projectID, clientID string) (string, error) {
 	if VaultClient == nil {
 		return "", fmt.Errorf("vault client not initialized")
 	}
 
-	secretPath := fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	secret, err := VaultClient.Logical().ReadWithContext(ctx, secretPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read secret from Vault at path %s: %w", secretPath, err)
+	paths := clientSecretPaths(tenantID, projectID, clientID)
+	var lastErr error
+	for _, secretPath := range paths {
+		secretID, err := readSecretIDFromVaultPath(secretPath)
+		if err == nil {
+			return secretID, nil
+		}
+		lastErr = err
 	}
 
-	data, err := GetSecretData(secret)
-	if err != nil {
-		return "", fmt.Errorf("failed to extract secret data: %w", err)
+	if lastErr != nil {
+		return "", lastErr
 	}
-
-	secretID, ok := data["secret_id"].(string)
-	if !ok || secretID == "" {
-		return "", fmt.Errorf("secret_id not found in Vault at path %s", secretPath)
-	}
-
-	return secretID, nil
+	return "", fmt.Errorf("secret_id not found for tenant=%s client=%s", tenantID, clientID)
 }
 
-// SaveSecretToVault saves a secret to Vault under the specified tenant and project
+// SaveSecretToVault saves a client secret to the canonical tenant/client path and
+// mirrors it to the legacy tenant/project/client path when project_id is provided.
 func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 	if VaultClient == nil {
 		log.Println("ERROR: Vault client not initialized - VaultClient is nil")
@@ -192,14 +242,14 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 	// Debug: Check if we can access Vault
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	// First verify token is valid by doing a self-lookup
 	tokenInfo, err := VaultClient.Auth().Token().LookupSelfWithContext(ctx)
 	if err != nil {
 		log.Printf("Error: Vault token lookup failed: %v", err)
 		log.Printf("Vault Address: %s", VaultClient.Address())
 		log.Printf("Token (masked): %s", maskToken(VaultClient.Token()))
-		
+
 		// Provide more specific error guidance
 		if strings.Contains(err.Error(), "permission denied") {
 			log.Printf("ERROR: Token does not have 'read' capability on 'auth/token/lookup-self'")
@@ -213,14 +263,14 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 			log.Printf("  1. Run: scripts/setup_vault_policy.sh")
 			log.Printf("  2. Update Kubernetes secret: kubectl patch secret user-flow-secrets -n authsec -p '{\"data\":{\"vault-token\":\"<base64-token>\"}}'")
 		}
-		
+
 		return "", fmt.Errorf("failed to lookup token: %w", err)
 	}
-	
+
 	if tokenInfo != nil && tokenInfo.Data != nil {
 		if policies, ok := tokenInfo.Data["policies"].([]interface{}); ok {
 			log.Printf("Vault token validated. Policies: %v", policies)
-			
+
 			// Verify the token has the required policy
 			hasRequiredPolicy := false
 			for _, p := range policies {
@@ -229,7 +279,7 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 					break
 				}
 			}
-			
+
 			if !hasRequiredPolicy {
 				log.Printf("Warning: Token does not have 'user-flow-secrets' policy")
 				log.Printf("Current policies: %v", policies)
@@ -240,29 +290,21 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 
 	secretID := uuid.New().String()
 
-	// Use KV v2 secret engine which is mounted at "kv/" in this Vault instance
-	// Path format: kv/data/<path> where "data" is required for KV v2 API
-	// Full path: kv/data/secret/{tenant_id}/{project_id}/{client_id}
-	secretPath := fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
-
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel2()
-
-	// For KV v2 Logical API, data must be wrapped under "data" key
-	requestData := map[string]interface{}{
-		"data": map[string]interface{}{
-			"secret_id": secretID,
-		},
-	}
-
-	// Use Logical API (same as read function) instead of KVv2 API
-	_, err = VaultClient.Logical().WriteWithContext(ctx2, secretPath, requestData)
-	if err != nil {
+	secretPath := clientSecretPath(tenantID, clientID)
+	if err := writeSecretIDToVaultPath(secretPath, secretID); err != nil {
 		log.Printf("Error writing secret to Vault at path %s: %v", secretPath, err)
-		return "", fmt.Errorf("failed to write secret to Vault at path %s: %w", secretPath, err)
+		return "", err
 	}
 
 	log.Printf("Successfully saved secret %s to Vault at path %s", secretID, secretPath)
+
+	if projectID != "" {
+		legacyPath := legacyClientSecretPath(tenantID, projectID, clientID)
+		if err := writeSecretIDToVaultPath(legacyPath, secretID); err != nil {
+			log.Printf("Warning: failed to mirror secret %s to legacy Vault path %s: %v", secretID, legacyPath, err)
+		}
+	}
+
 	return secretID, nil
 }
 

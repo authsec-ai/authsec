@@ -170,10 +170,6 @@ func SetupRoutes(
 		c.Status(http.StatusNoContent)
 	})
 
-	// Backward-compat: user-flow previously exposed this at the bare root so that
-	// existing webauthn-service clients did not need to change their URLs.
-	r.POST("/webauthn/mfa/loginStatus", userController.WebAuthnMFALoginStatus)
-
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
@@ -599,24 +595,6 @@ func SetupRoutes(
 			scimDiscovery.GET("/ResourceTypes", scimController.GetResourceTypes)
 		}
 
-		// End-user provisioning
-		scimEndUser := uflow.Group("/scim/v2/:client_id/:project_id")
-		scimEndUser.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
-		{
-			scimEndUser.GET("/Users", scimController.ListUsers)
-			scimEndUser.GET("/Users/:id", scimController.GetUser)
-			scimEndUser.POST("/Users", scimController.CreateUser)
-			scimEndUser.PUT("/Users/:id", scimController.ReplaceUser)
-			scimEndUser.PATCH("/Users/:id", scimController.PatchUser)
-			scimEndUser.DELETE("/Users/:id", scimController.DeleteUser)
-			scimEndUser.GET("/Groups", scimController.ListGroups)
-			scimEndUser.GET("/Groups/:id", scimController.GetGroup)
-			scimEndUser.POST("/Groups", scimController.CreateGroup)
-			scimEndUser.PUT("/Groups/:id", scimController.ReplaceGroup)
-			scimEndUser.PATCH("/Groups/:id", scimController.PatchGroup)
-			scimEndUser.DELETE("/Groups/:id", scimController.DeleteGroup)
-		}
-
 		// Admin provisioning
 		scimAdmin := uflow.Group("/scim/v2/admin")
 		scimAdmin.Use(
@@ -632,6 +610,27 @@ func SetupRoutes(
 			scimAdmin.PATCH("/Users/:id", scimAdminController.PatchAdminUser)
 			scimAdmin.DELETE("/Users/:id", scimAdminController.DeleteAdminUser)
 		}
+
+		registerSCIMEndUserRoutes := func(group *gin.RouterGroup) {
+			group.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+			group.GET("/Users", scimController.ListUsers)
+			group.GET("/Users/:id", scimController.GetUser)
+			group.POST("/Users", scimController.CreateUser)
+			group.PUT("/Users/:id", scimController.ReplaceUser)
+			group.PATCH("/Users/:id", scimController.PatchUser)
+			group.DELETE("/Users/:id", scimController.DeleteUser)
+			group.GET("/Groups", scimController.ListGroups)
+			group.GET("/Groups/:id", scimController.GetGroup)
+			group.POST("/Groups", scimController.CreateGroup)
+			group.PUT("/Groups/:id", scimController.ReplaceGroup)
+			group.PATCH("/Groups/:id", scimController.PatchGroup)
+			group.DELETE("/Groups/:id", scimController.DeleteGroup)
+		}
+
+		// End-user provisioning supports both the canonical client-scoped path and the
+		// legacy client/project-scoped path for compatibility with existing SCIM connectors.
+		registerSCIMEndUserRoutes(uflow.Group("/scim/v2/:client_id"))
+		registerSCIMEndUserRoutes(uflow.Group("/scim/v2/:client_id/:project_id"))
 
 		// ────────────────────────────────────────────────────
 		// Delegation Policy CRUD (admin-authenticated)
@@ -700,13 +699,19 @@ func SetupRoutes(
 		mig := authsec.Group("/migration")
 		{
 			master := mig.Group("/migrations/master")
-			master.Use(middlewares.AuthMiddleware())
+			master.Use(
+				middlewares.AuthMiddleware(),
+				middlewares.Require("admin", "access"),
+			)
 			{
 				master.POST("/run", migCtrl.RunMasterMigrations)
 				master.GET("/status", migCtrl.GetMasterMigrationStatus)
 			}
 			tenants := mig.Group("/tenants")
-			tenants.Use(middlewares.AuthMiddleware())
+			tenants.Use(
+				middlewares.AuthMiddleware(),
+				middlewares.Require("admin", "access"),
+			)
 			{
 				tenants.GET("", migCtrl.ListTenants)
 				tenants.POST("/create-db", migCtrl.CreateTenantDB)
@@ -907,9 +912,6 @@ func registerWebAuthnRoutes(
 	}
 
 	// Legacy flat routes  →  /authsec/webauthn/*
-	router.POST("/mfa/status", webAuthnHandler.GetMFAStatus)
-	router.POST("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLogin)
-	router.GET("/mfa/loginStatus", webAuthnHandler.GetMFAStatusForLoginGET)
 	router.POST("/beginRegistration", webAuthnHandler.BeginRegistration)
 	router.POST("/beginAuthRegistration", webAuthnHandler.BeginWebAuthnRegistration)
 	router.POST("/finishRegistration", webAuthnHandler.FinishRegistration)
@@ -926,21 +928,6 @@ func registerWebAuthnRoutes(
 	router.POST("/biometric/verifyLoginBegin", webAuthnHandler.BeginBiometricLoginVerify)
 	router.POST("/biometric/verifyLoginFinish", webAuthnHandler.FinishBiometricLoginVerify)
 
-	// TOTP (legacy)
-	totpHandler := handlers.NewTOTPHandler()
-	router.POST("/totp/beginLoginSetup", totpHandler.BeginSetup)
-	router.POST("/totp/beginSetup", totpHandler.BeginTOTPSetup)
-	router.POST("/totp/confirmLoginSetup", totpHandler.ConfirmSetup)
-	router.POST("/totp/confirmSetup", totpHandler.ConfirmTOTPSetup)
-	router.POST("/totp/verifyLogin", totpHandler.VerifyLoginTOTP)
-	router.POST("/totp/verify", totpHandler.VerifyTOTP)
-
-	// SMS (legacy)
-	smsHandler := handlers.NewSMSHandler()
-	router.POST("/sms/beginSetup", smsHandler.BeginSMSSetup)
-	router.POST("/sms/confirmSetup", smsHandler.ConfirmSMSSetup)
-	router.POST("/sms/requestCode", smsHandler.RequestSMSCode)
-	router.POST("/sms/verify", smsHandler.VerifySMS)
 }
 
 // registerHmgrRoutes registers all Hydra Manager routes under /hmgr.
@@ -1209,23 +1196,13 @@ func registerSdkmgrRoutes(r gin.IRouter, aliases ...gin.IRouter) {
 	dashSvc := sdkmgrSvc.NewDashboardService()
 	dashCtrl := sdkmgrCtrl.NewDashboardController(dashSvc)
 
-	mcpOAuthSvc := sdkmgrSvc.NewMCPOAuthService()
-	mcpOAuthCtrl := sdkmgrCtrl.NewMCPOAuthController(mcpOAuthSvc)
-
-	playgroundSvc := sdkmgrSvc.NewMCPPlaygroundService()
-	playgroundCtrl := sdkmgrCtrl.NewMCPPlaygroundController(playgroundSvc)
-
 	voiceSvc := sdkmgrSvc.NewVoiceClientService()
 	voiceCtrl := sdkmgrCtrl.NewVoiceController(voiceSvc)
-
-	devServerSvc := sdkmgrSvc.NewDevServerService(playgroundSvc)
-	devServerCtrl := sdkmgrCtrl.NewDevServerController(devServerSvc)
 
 	// Bind routes on the primary router and any backward-compat aliases.
 	routers := append([]gin.IRouter{r}, aliases...)
 	for _, router := range routers {
-		bindSdkmgrRoutes(router, mcpAuthCtrl, servicesCtrl, spireCtrl, dashCtrl,
-			mcpOAuthCtrl, playgroundCtrl, voiceCtrl, devServerCtrl)
+		bindSdkmgrRoutes(router, mcpAuthCtrl, servicesCtrl, spireCtrl, dashCtrl, voiceCtrl)
 	}
 }
 
@@ -1236,10 +1213,7 @@ func bindSdkmgrRoutes(
 	servicesCtrl *sdkmgrCtrl.ServicesController,
 	spireCtrl *sdkmgrCtrl.SPIREController,
 	dashCtrl *sdkmgrCtrl.DashboardController,
-	mcpOAuthCtrl *sdkmgrCtrl.MCPOAuthController,
-	playgroundCtrl *sdkmgrCtrl.MCPPlaygroundController,
 	voiceCtrl *sdkmgrCtrl.VoiceController,
-	devServerCtrl *sdkmgrCtrl.DevServerController,
 ) {
 	// ── MCP Auth routes ──
 	mcpAuth := r.Group("/sdkmgr/mcp-auth")
@@ -1286,51 +1260,12 @@ func bindSdkmgrRoutes(
 		dashboard.POST("/admin-users", middlewares.AuthMiddleware(), dashCtrl.AdminUsers)
 	}
 
-	// ── MCP OAuth routes ──
-	playgroundOAuth := r.Group("/sdkmgr/playground/oauth")
-	{
-		playgroundOAuth.GET("/check-requirements", mcpOAuthCtrl.CheckRequirements)
-		playgroundOAuth.GET("/authorize", mcpOAuthCtrl.Authorize)
-		playgroundOAuth.GET("/callback", mcpOAuthCtrl.Callback)
-		playgroundOAuth.POST("/refresh", mcpOAuthCtrl.Refresh)
-	}
-
-	// ── MCP Playground routes ──
-	playground := r.Group("/sdkmgr/playground")
-	{
-		playground.GET("/health", playgroundCtrl.Health)
-		playground.POST("/conversations", playgroundCtrl.CreateConversation)
-		playground.GET("/conversations", playgroundCtrl.ListConversations)
-		playground.GET("/conversations/:id", playgroundCtrl.GetConversation)
-		playground.PATCH("/conversations/:id", playgroundCtrl.UpdateConversation)
-		playground.DELETE("/conversations/:id", playgroundCtrl.DeleteConversation)
-		playground.GET("/conversations/:id/messages", playgroundCtrl.GetMessages)
-		playground.POST("/conversations/:id/chat", playgroundCtrl.Chat)
-		playground.POST("/chat/stream", playgroundCtrl.ChatStream)
-		playground.POST("/conversations/:id/mcp-servers", playgroundCtrl.AddMCPServer)
-		playground.GET("/conversations/:id/mcp-servers", playgroundCtrl.ListMCPServers)
-		playground.POST("/conversations/:id/mcp-servers/:sid/disconnect", playgroundCtrl.DisconnectMCPServer)
-		playground.POST("/conversations/:id/mcp-servers/:sid/reconnect", playgroundCtrl.ReconnectMCPServer)
-		playground.DELETE("/conversations/:id/mcp-servers/:sid", playgroundCtrl.RemoveMCPServer)
-		playground.GET("/conversations/:id/mcp-servers/:sid/tools", playgroundCtrl.GetMCPTools)
-		playground.GET("/conversations/:id/tools", playgroundCtrl.GetAllConversationTools)
-	}
-
 	// ── Voice routes ──
 	voice := r.Group("/sdkmgr/voice")
 	{
 		voice.POST("/interact", voiceCtrl.Interact)
 		voice.POST("/poll", voiceCtrl.Poll)
 		voice.POST("/tts", voiceCtrl.TTS)
-	}
-
-	// ── Dev Server routes (auth required) ──
-	devServer := r.Group("/sdkmgr/playground/dev-server")
-	devServer.Use(middlewares.AuthMiddleware())
-	{
-		devServer.POST("/start", devServerCtrl.Start)
-		devServer.POST("/stop", devServerCtrl.Stop)
-		devServer.GET("/status", devServerCtrl.Status)
 	}
 }
 

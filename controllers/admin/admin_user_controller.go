@@ -57,8 +57,8 @@ type AdminUserListRequest struct {
 }
 
 type toggleAdminUserActiveRequest struct {
-	TenantID string        `json:"tenant_id" binding:"required"`
-	UserID   string        `json:"user_id" binding:"required"`
+	TenantID string               `json:"tenant_id" binding:"required"`
+	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
@@ -718,9 +718,9 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 		return
 	}
 
-	// 4. Delete webauthn_credentials
-	if err := execDelete("webauthn_credentials", "DELETE FROM webauthn_credentials WHERE user_id = $1", userUUID); err != nil {
-		logger.WithError(err).Error("Failed to delete webauthn_credentials")
+	// 4. Delete credentials
+	if err := execDelete("credentials", "DELETE FROM credentials WHERE user_id = $1", userUUID); err != nil {
+		logger.WithError(err).Error("Failed to delete credentials")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

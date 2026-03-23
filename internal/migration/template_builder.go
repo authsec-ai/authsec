@@ -1,8 +1,10 @@
 package migration
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -12,11 +14,15 @@ const syntheticTenantID = "00000000-0000-0000-0000-000000000001"
 var requiredTables = []string{
 	"tenants", "users", "roles", "permissions", "clients",
 	"role_bindings", "role_permissions", "service_accounts",
-	"api_scopes", "scope_permissions", "api_scope_permissions",
+	"scopes", "scope_permissions", "role_scopes",
 	"groups", "user_groups", "resources", "resource_methods",
-	"user_scopes", "client_roles", "credentials", "scopes",
+	"client_roles", "credentials",
 	"services", "projects", "group_roles", "client_resources",
-	"client_scopes", "client_groups", "user_roles",
+	"client_groups", "user_roles", "oauth_sessions",
+	"webauthn_sessions", "totp_secrets",
+	"device_codes", "device_tokens", "ciba_auth_requests",
+	"voice_sessions", "voice_identity_links", "voice_active_sessions",
+	"delegation_policies", "delegation_tokens",
 }
 
 // requiredColumns maps table -> columns that must exist after incremental migrations.
@@ -24,11 +30,8 @@ var requiredColumns = map[string][]string{
 	"users":         {"is_primary_admin"},
 	"permissions":   {"resource", "action"},
 	"role_bindings": {"username", "role_name"},
-}
-
-// requiredConstraints lists constraint names that must exist.
-var requiredConstraints = []string{
-	"users_tenant_id_id_unique",
+	"credentials":   {"user_id"},
+	"scopes":        {"usage"},
 }
 
 // SetupTenantTemplate drops and recreates the golden template DB, runs all
@@ -148,17 +151,12 @@ func verifyTemplateSchema(attempt int) error {
 		}
 	}
 
-	for _, constraint := range requiredConstraints {
-		var exists bool
-		if err := conn.QueryRow(
-			"SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = $1)",
-			constraint,
-		).Scan(&exists); err != nil {
-			return fmt.Errorf("query constraint %s: %w", constraint, err)
-		}
-		if !exists {
-			return fmt.Errorf("required constraint missing: %s", constraint)
-		}
+	hasUsersTenantIdentityKey, err := hasUniqueKey(conn, "users", []string{"tenant_id", "id"})
+	if err != nil {
+		return fmt.Errorf("query users unique key: %w", err)
+	}
+	if !hasUsersTenantIdentityKey {
+		return fmt.Errorf("required unique key missing: users(tenant_id,id)")
 	}
 
 	var tableCount int
@@ -181,4 +179,32 @@ func verifyTemplateSchema(attempt int) error {
 
 	log.Printf("[Migration] Template verify %d: %d tables, %d permissions — OK", attempt, tableCount, permCount)
 	return nil
+}
+
+func hasUniqueKey(conn dbQueryer, table string, columns []string) (bool, error) {
+	var exists bool
+	err := conn.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.table_constraints tc
+			JOIN information_schema.key_column_usage kcu
+			  ON tc.constraint_name = kcu.constraint_name
+			 AND tc.table_schema = kcu.table_schema
+			 AND tc.table_name = kcu.table_name
+			WHERE tc.table_schema = 'public'
+			  AND tc.table_name = $1
+			  AND tc.constraint_type = 'UNIQUE'
+			GROUP BY tc.constraint_name
+			HAVING array_agg(kcu.column_name::text ORDER BY kcu.ordinal_position) = $2::text[]
+		)
+	`, table, pqTextArray(columns)).Scan(&exists)
+	return exists, err
+}
+
+type dbQueryer interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+func pqTextArray(values []string) string {
+	return "{" + strings.Join(values, ",") + "}"
 }

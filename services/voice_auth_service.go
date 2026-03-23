@@ -476,7 +476,6 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 	now := time.Now().UTC()
 	claims := jwt.MapClaims{
 		"tenant_id":      tenant.ID.String(),
-		"project_id":     tenant.ID.String(),
 		"client_id":      user.ClientID.String(),
 		"email":          user.Email,
 		"sub":            user.ID.String(),
@@ -488,6 +487,9 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 		"voice_platform": voicePlatform,
 		"voice_user_id":  voiceUserID,
 		"device_info":    deviceInfo,
+	}
+	if user.ProjectID != uuid.Nil {
+		claims["project_id"] = user.ProjectID.String()
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

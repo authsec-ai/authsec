@@ -158,8 +158,8 @@ type RegisterClientsResponse struct {
 type RegisterClientsRequest struct {
 	Name         string `json:"name" binding:"required"`
 	Email        string `json:"email" binding:"required,email"`
-	TenantID     string `json:"tenant_id" binding:"required"`
-	ProjectID    string `json:"project_id" binding:"required"`
+	TenantID     string `json:"tenant_id,omitempty"`
+	ProjectID    string `json:"project_id,omitempty"`
 	TenantDomain string `json:"react_app_url" binding:"required"`
 }
 
@@ -486,10 +486,14 @@ func RegisterClient(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
 	}
-	projectUUID, err := uuid.Parse(input.ProjectID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id"})
-		return
+
+	projectUUID := tenantUUID
+	if input.ProjectID != "" {
+		projectUUID, err = uuid.Parse(input.ProjectID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id"})
+			return
+		}
 	}
 
 	clientID := uuid.New()

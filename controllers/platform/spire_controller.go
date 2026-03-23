@@ -193,20 +193,6 @@ type SpireRoleBinding struct {
 
 func (SpireRoleBinding) TableName() string { return "spire_role_bindings" }
 
-// SpireAllModels lists all GORM models for AutoMigrate.
-var SpireAllModels = []interface{}{
-	&SpireWorkload{},
-	&SpireOIDCToken{},
-	&SpirePolicy{},
-	&SpirePolicyRule{},
-	&SpirePolicySubject{},
-	&SpirePolicyResource{},
-	&SpirePolicyAction{},
-	&SpirePolicyCondition{},
-	&SpireAuditLog{},
-	&SpireRoleBinding{},
-}
-
 // ===== OIDC TYPES =====
 
 type spireOIDCConfig struct {
@@ -634,7 +620,7 @@ func (sc *SpireController) OIDCIntrospect(c *gin.Context) {
 		return
 	}
 	var oidcToken SpireOIDCToken
-	if err := p.db.Where("jti = ?", claims.JWTID).First(&oidcToken).Error; err == nil && oidcToken.Revoked {
+	if err := p.db.Where("jwt_id = ?", claims.JWTID).First(&oidcToken).Error; err == nil && oidcToken.Revoked {
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
@@ -667,7 +653,7 @@ func (sc *SpireController) OIDCRevoke(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
-	p.db.Model(&SpireOIDCToken{}).Where("jti = ?", claims.JWTID).Update("revoked", true)
+	p.db.Model(&SpireOIDCToken{}).Where("jwt_id = ?", claims.JWTID).Update("revoked", true)
 	c.JSON(http.StatusOK, gin.H{})
 }
 
@@ -1395,7 +1381,7 @@ func (p *spireOIDCProvider) validateJWTSVID(tokenString string) (*spireJWTSVIDCl
 	}
 	if claims, ok := token.Claims.(*spireJWTSVIDClaims); ok && token.Valid {
 		var record SpireOIDCToken
-		if p.db.Where("jti = ?", claims.JWTID).First(&record).Error == nil && record.Revoked {
+		if p.db.Where("jwt_id = ?", claims.JWTID).First(&record).Error == nil && record.Revoked {
 			return nil, fmt.Errorf("JWT-SVID has been revoked")
 		}
 		return claims, nil

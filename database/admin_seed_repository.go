@@ -1,14 +1,38 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
-// AdminSeedRepository handles per-tenant admin role/scopes/permissions seeding.
+// tenantAdminPermissionSeed is the minimal permission surface enforced by the
+// current route middleware. Keep this list aligned with middlewares.Require(...)
+// call sites rather than historical microservice permissions.
+type tenantAdminPermissionSeed struct {
+	Resource    string
+	Action      string
+	Description string
+}
+
+var tenantAdminPermissionSeeds = []tenantAdminPermissionSeed{
+	{Resource: "admin", Action: "access", Description: "Administrative access gate"},
+	{Resource: "admin", Action: "manage", Description: "Administrative management"},
+	{Resource: "users", Action: "delete", Description: "Delete admin and end-user accounts"},
+	{Resource: "tenants", Action: "delete", Description: "Delete tenant records"},
+	{Resource: "external-service", Action: "create", Description: "Create external service entries"},
+	{Resource: "external-service", Action: "read", Description: "Read external service entries"},
+	{Resource: "external-service", Action: "update", Description: "Update external service entries"},
+	{Resource: "external-service", Action: "delete", Description: "Delete external service entries"},
+	{Resource: "external-service", Action: "credentials", Description: "Read external service credentials"},
+	{Resource: "clients", Action: "admin", Description: "Administrative access to clients"},
+}
+
+// AdminSeedRepository handles per-tenant admin role/permissions seeding.
 type AdminSeedRepository struct {
 	db *DBConnection
 }
@@ -22,7 +46,8 @@ func NewAdminSeedRepository(db *DBConnection) *AdminSeedRepository {
 	return &AdminSeedRepository{db: db}
 }
 
-// EnsureAdminRoleAndPermissions creates admin role, default scopes, and permissions for a tenant and returns the role ID.
+// EnsureAdminRoleAndPermissions creates the admin role and minimal enforced
+// permissions for a tenant, then returns the role ID.
 func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissions(tenantID uuid.UUID) (uuid.UUID, error) {
 	return asr.ensureAdminRoleAndPermissions(asr.db.DB, tenantID)
 }
@@ -47,51 +72,22 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 	if err := exec.QueryRow(`
 		INSERT INTO roles (id, tenant_id, name, description, created_at, updated_at)
 		VALUES ($1, $2, 'admin', 'Administrator with full access', $3, $3)
-		ON CONFLICT (tenant_id, name) DO UPDATE SET updated_at = EXCLUDED.updated_at
+		ON CONFLICT (tenant_id, name) DO UPDATE
+		SET description = EXCLUDED.description,
+		    updated_at = EXCLUDED.updated_at
 		RETURNING id
 	`, roleID, tenantID, now).Scan(&roleID); err != nil {
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)
 	}
 
-	// Seed baseline permissions for admin role
-	permRows := []struct {
-		Resource string
-		Action   string
-	}{
-		{"admin", "access"},
-		{"users", "create"}, {"users", "read"}, {"users", "update"}, {"users", "delete"}, {"users", "manage"},
-		{"tenants", "create"}, {"tenants", "read"}, {"tenants", "update"}, {"tenants", "delete"}, {"tenants", "manage"},
-		{"projects", "create"}, {"projects", "read"}, {"projects", "update"}, {"projects", "delete"}, {"projects", "manage"},
-		{"roles", "create"}, {"roles", "read"}, {"roles", "update"}, {"roles", "delete"}, {"roles", "manage"},
-		{"permissions", "create"}, {"permissions", "read"}, {"permissions", "update"}, {"permissions", "delete"}, {"permissions", "manage"},
-		{"scopes", "create"}, {"scopes", "read"}, {"scopes", "update"}, {"scopes", "delete"}, {"scopes", "manage"},
-		{"role-bindings", "create"}, {"role-bindings", "read"}, {"role-bindings", "update"}, {"role-bindings", "delete"}, {"role-bindings", "manage"},
-		{"policy", "create"}, {"policy", "read"}, {"policy", "update"}, {"policy", "delete"}, {"policy", "manage"},
-		{"groups", "create"}, {"groups", "read"}, {"groups", "update"}, {"groups", "delete"}, {"groups", "manage"},
-		{"sync", "create"}, {"sync", "read"}, {"sync", "update"}, {"sync", "delete"}, {"sync", "manage"},
-		{"sync-configs", "create"}, {"sync-configs", "read"}, {"sync-configs", "update"}, {"sync-configs", "delete"}, {"sync-configs", "manage"},
-		{"oidc", "create"}, {"oidc", "read"}, {"oidc", "update"}, {"oidc", "delete"}, {"oidc", "manage"},
-		{"endusers", "create"}, {"endusers", "read"}, {"endusers", "update"}, {"endusers", "delete"}, {"endusers", "manage"},
-		{"clients", "create"}, {"clients", "read"}, {"clients", "update"}, {"clients", "delete"}, {"clients", "manage"},
-		{"user-endusers", "create"}, {"user-endusers", "read"}, {"user-endusers", "update"}, {"user-endusers", "delete"}, {"user-endusers", "manage"},
-		{"user-rbac-roles", "create"}, {"user-rbac-roles", "read"}, {"user-rbac-roles", "update"}, {"user-rbac-roles", "delete"}, {"user-rbac-roles", "manage"},
-		{"user-rbac-permissions", "create"}, {"user-rbac-permissions", "read"}, {"user-rbac-permissions", "update"}, {"user-rbac-permissions", "delete"}, {"user-rbac-permissions", "manage"},
-		{"user-rbac-scopes", "create"}, {"user-rbac-scopes", "read"}, {"user-rbac-scopes", "update"}, {"user-rbac-scopes", "delete"}, {"user-rbac-scopes", "manage"},
-		{"user-permissions", "create"}, {"user-permissions", "read"}, {"user-permissions", "update"}, {"user-permissions", "delete"}, {"user-permissions", "manage"},
-		{"user-groups", "create"}, {"user-groups", "read"}, {"user-groups", "update"}, {"user-groups", "delete"}, {"user-groups", "manage"},
-		{"user-clients", "create"}, {"user-clients", "read"}, {"user-clients", "update"}, {"user-clients", "delete"}, {"user-clients", "manage"},
-		{"user-projects", "create"}, {"user-projects", "read"}, {"user-projects", "update"}, {"user-projects", "delete"}, {"user-projects", "manage"},
-		{"scopes", "create"}, {"scopes", "read"}, {"scopes", "update"}, {"scopes", "delete"}, {"scopes", "manage_permissions"},
-		{"health", "read"},
-		{"external-service", "create"}, {"external-service", "read"}, {"external-service", "update"}, {"external-service", "delete"}, {"external-service", "credentials"}, {"external-service", "manage"},
-	}
-
-	for _, p := range permRows {
+	for _, p := range tenantAdminPermissionSeeds {
 		permID := uuid.New()
 		if err := exec.QueryRow(`
-			INSERT INTO permissions (id, tenant_id, resource, action, description, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (tenant_id, resource, action) DO UPDATE SET description = EXCLUDED.description
+			INSERT INTO permissions (id, tenant_id, resource, action, description, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $6)
+			ON CONFLICT (tenant_id, resource, action) DO UPDATE
+			SET description = EXCLUDED.description,
+			    updated_at = EXCLUDED.updated_at
 			RETURNING id
 		`, permID, tenantID, p.Resource, p.Action, fmt.Sprintf("%s %s", p.Resource, p.Action), now).Scan(&permID); err != nil {
 			return uuid.Nil, fmt.Errorf("ensure permission %s:%s: %w", p.Resource, p.Action, err)
@@ -104,8 +100,57 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 		`, roleID, permID); err != nil {
 			return uuid.Nil, fmt.Errorf("bind permission %s:%s: %w", p.Resource, p.Action, err)
 		}
-
 	}
 
 	return roleID, nil
+}
+
+// SeedTenantAdminRBAC seeds the minimal tenant RBAC surface used by the current
+// clients and external-service routes.
+func SeedTenantAdminRBAC(ctx context.Context, db *gorm.DB, tenantID uuid.UUID) error {
+	if db == nil {
+		return fmt.Errorf("db is required")
+	}
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("tenant_id is required")
+	}
+
+	tx := db.WithContext(ctx)
+	now := time.Now()
+
+	roleID := uuid.New()
+	if err := tx.Raw(`
+		INSERT INTO roles (id, tenant_id, name, description, created_at, updated_at)
+		VALUES (?, ?, 'admin', 'Tenant admin with full access', ?, ?)
+		ON CONFLICT (tenant_id, name) DO UPDATE
+		SET description = EXCLUDED.description,
+		    updated_at = EXCLUDED.updated_at
+		RETURNING id
+	`, roleID, tenantID, now, now).Scan(&roleID).Error; err != nil {
+		return fmt.Errorf("ensure admin role: %w", err)
+	}
+
+	for _, p := range tenantAdminPermissionSeeds {
+		permID := uuid.New()
+		if err := tx.Raw(`
+			INSERT INTO permissions (id, tenant_id, resource, action, description, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (tenant_id, resource, action) DO UPDATE
+			SET description = EXCLUDED.description,
+			    updated_at = EXCLUDED.updated_at
+			RETURNING id
+		`, permID, tenantID, p.Resource, p.Action, p.Description, now, now).Scan(&permID).Error; err != nil {
+			return fmt.Errorf("ensure permission %s:%s: %w", p.Resource, p.Action, err)
+		}
+
+		if err := tx.Exec(`
+			INSERT INTO role_permissions (role_id, permission_id)
+			VALUES (?, ?)
+			ON CONFLICT DO NOTHING
+		`, roleID, permID).Error; err != nil {
+			return fmt.Errorf("bind permission %s:%s: %w", p.Resource, p.Action, err)
+		}
+	}
+
+	return nil
 }

@@ -64,7 +64,13 @@ func GetConnectionDynamically(masterDB interface{}, userEmail *string, tenantID 
 	if userEmail != nil {
 		err = db.QueryRow("SELECT tenant_db FROM tenants WHERE email = $1", *userEmail).Scan(&tenantDBName)
 	} else {
-		err = db.QueryRow("SELECT tenant_db FROM tenants WHERE tenant_id = $1", *tenantID).Scan(&tenantDBName)
+		err = db.QueryRow(`
+			SELECT tenant_db
+			FROM tenants
+			WHERE tenant_id::text = $1 OR id::text = $1
+			ORDER BY CASE WHEN tenant_id::text = $1 THEN 0 ELSE 1 END
+			LIMIT 1
+		`, *tenantID).Scan(&tenantDBName)
 	}
 
 	if err != nil {

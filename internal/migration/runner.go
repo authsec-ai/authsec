@@ -25,12 +25,12 @@ type MigrationFile struct {
 
 // MigrationRunner executes versioned SQL migrations against a database.
 type MigrationRunner struct {
-	db            *sql.DB  // raw connection (target DB — master or tenant)
-	gormDB        *gorm.DB // used only for master DB migration_logs writes
+	db            *sql.DB
+	gormDB        *gorm.DB
 	migrationsDir string
-	dbType        string  // "master" or "tenant"
-	tenantID      *string // non-nil for tenant runners
-	masterDB      *sql.DB // used by tenant runners to write migration_logs
+	dbType        string
+	tenantID      *string
+	masterDB      *sql.DB
 }
 
 // NewMasterMigrationRunner creates a runner for the master database.
@@ -44,11 +44,10 @@ func NewMasterMigrationRunner(migrationsDir string, rawDB *sql.DB, gormDB *gorm.
 }
 
 // NewTenantMigrationRunner creates a runner for a tenant database.
-// masterDB is used solely for writing migration_logs (which live in the master DB).
+// masterDB is used solely for writing tenant migration logs to the master DB.
 func NewTenantMigrationRunner(tenantID string, tenantDBConn *sql.DB, migrationsDir string, masterDB *sql.DB) *MigrationRunner {
 	return &MigrationRunner{
 		db:            tenantDBConn,
-		gormDB:        nil,
 		migrationsDir: migrationsDir,
 		dbType:        "tenant",
 		tenantID:      &tenantID,
@@ -56,30 +55,21 @@ func NewTenantMigrationRunner(tenantID string, tenantDBConn *sql.DB, migrationsD
 	}
 }
 
-// LoadMigrationFiles loads and sorts all SQL files from the runner's migrations directory.
-// It also loads from a sibling permissions/<dbType> subdirectory when present.
+// LoadMigrationFiles loads and sorts all SQL files from the runner's V3 migrations directory.
 func (mr *MigrationRunner) LoadMigrationFiles() ([]MigrationFile, error) {
-	var migrations []MigrationFile
-
-	main, err := mr.loadMigrationsFromDir(mr.migrationsDir)
+	migrations, err := mr.loadMigrationsFromDir(mr.migrationsDir)
 	if err != nil {
 		return nil, err
 	}
-	migrations = append(migrations, main...)
 
-	// Load from permissions/<dbType>/ sibling directory
-	permDir := filepath.Join(filepath.Dir(mr.migrationsDir), "permissions", filepath.Base(mr.migrationsDir))
-	if _, err := os.Stat(permDir); err == nil {
-		perms, err := mr.loadMigrationsFromDir(permDir)
-		if err != nil {
-			log.Printf("[Migration] Warning: failed to load permission migrations from %s: %v", permDir, err)
-		} else {
-			log.Printf("[Migration] Loaded %d permission migrations from %s", len(perms), permDir)
-			migrations = append(migrations, perms...)
-		}
+	if err := validateUniqueVersions(mr.dbType, migrations); err != nil {
+		return nil, err
 	}
 
-	sort.Slice(migrations, func(i, j int) bool {
+	sort.SliceStable(migrations, func(i, j int) bool {
+		if migrations[i].Version == migrations[j].Version {
+			return migrations[i].FilePath < migrations[j].FilePath
+		}
 		return migrations[i].Version < migrations[j].Version
 	})
 
@@ -87,37 +77,68 @@ func (mr *MigrationRunner) LoadMigrationFiles() ([]MigrationFile, error) {
 	return migrations, nil
 }
 
-func (mr *MigrationRunner) loadMigrationsFromDir(dir string) ([]MigrationFile, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %w", dir, err)
+func validateUniqueVersions(dbType string, migrations []MigrationFile) error {
+	versionToFiles := make(map[int][]string)
+	for _, migration := range migrations {
+		versionToFiles[migration.Version] = append(versionToFiles[migration.Version], migration.FilePath)
 	}
 
-	var migrations []MigrationFile
+	var duplicates []string
+	for version, files := range versionToFiles {
+		if len(files) <= 1 {
+			continue
+		}
+		sort.Strings(files)
+		duplicates = append(duplicates, fmt.Sprintf("v%d: %s", version, strings.Join(files, ", ")))
+	}
+
+	if len(duplicates) == 0 {
+		return nil
+	}
+
+	sort.Strings(duplicates)
+	return fmt.Errorf("duplicate %s migration versions detected: %s", dbType, strings.Join(duplicates, "; "))
+}
+
+func filterRunnableMigrations(_ string, migrations []MigrationFile) []MigrationFile {
+	return migrations
+}
+
+func (mr *MigrationRunner) loadMigrationsFromDir(dir string) ([]MigrationFile, error) {
+	if !isV3MigrationDir(dir) {
+		return nil, fmt.Errorf("unsupported migration directory %q: only migrations/v3/<dbType> is allowed", dir)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read migration directory %s: %w", dir, err)
+	}
+
+	migrations := make([]MigrationFile, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" {
 			continue
 		}
 
+		path := filepath.Join(dir, entry.Name())
 		version, name, err := parseMigrationFileName(entry.Name())
 		if err != nil {
-			log.Printf("[Migration] Skipping invalid migration file %s: %v", entry.Name(), err)
-			continue
+			return nil, fmt.Errorf("parse V3 migration %s: %w", entry.Name(), err)
 		}
 
-		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		content, err := os.ReadFile(path)
 		if err != nil {
-			log.Printf("[Migration] Warning: failed to read %s: %v", entry.Name(), err)
-			continue
+			return nil, fmt.Errorf("read V3 migration %s: %w", entry.Name(), err)
 		}
 
 		migrations = append(migrations, MigrationFile{
 			Version:  version,
 			Name:     name,
-			FilePath: filepath.Join(dir, entry.Name()),
+			FilePath: path,
 			Content:  string(content),
 		})
 	}
+
 	return migrations, nil
 }
 
@@ -136,68 +157,39 @@ func parseMigrationFileName(filename string) (int, string, error) {
 	return version, parts[1], nil
 }
 
+func isV3MigrationDir(dir string) bool {
+	clean := filepath.ToSlash(filepath.Clean(dir))
+	return strings.HasSuffix(clean, "migrations/v3/master") || strings.HasSuffix(clean, "migrations/v3/tenant")
+}
+
 // RunMigrations executes all pending migrations with retry logic.
 func (mr *MigrationRunner) RunMigrations() error {
 	log.Printf("[Migration] Starting %s database migrations", mr.dbType)
-
-	// For tenant databases, execute the base template first if the schema doesn't exist yet.
-	if mr.dbType == "tenant" {
-		templatePath := filepath.Join(mr.migrationsDir, "000_tenant_template.sql")
-		if _, err := os.Stat(templatePath); err == nil {
-			var schemaExists bool
-			mr.db.QueryRow(
-				"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users')",
-			).Scan(&schemaExists)
-
-			if schemaExists {
-				log.Printf("[Migration] Tenant schema already exists, skipping template")
-			} else {
-				log.Printf("[Migration] Executing tenant base template")
-				content, err := os.ReadFile(templatePath)
-				if err != nil {
-					return fmt.Errorf("failed to read tenant template: %w", err)
-				}
-				if err := mr.executeSQLContent(string(content)); err != nil {
-					return fmt.Errorf("tenant template execution failed: %w", err)
-				}
-				log.Printf("[Migration] Tenant base template executed successfully")
-			}
-		}
-	}
-
-	// Seed tenant self-reference row so DML migrations can resolve tenant_id.
-	if mr.dbType == "tenant" && mr.tenantID != nil {
-		seedSQL := `INSERT INTO tenants (id, tenant_id, status, created_at, updated_at)
-		            VALUES ($1::uuid, $1::uuid, 'active', NOW(), NOW())
-		            ON CONFLICT (id) DO NOTHING`
-		if _, err := mr.db.Exec(seedSQL, *mr.tenantID); err != nil {
-			log.Printf("[Migration] Warning: failed to seed tenant self-reference row (non-fatal): %v", err)
-		} else {
-			log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.tenantID)
-		}
-	}
 
 	allMigrations, err := mr.LoadMigrationFiles()
 	if err != nil {
 		return err
 	}
-
-	// Filter version-0 template for tenant (already handled above)
-	var migrations []MigrationFile
-	for _, m := range allMigrations {
-		if mr.dbType == "tenant" && m.Version == 0 {
-			continue
-		}
-		migrations = append(migrations, m)
+	if err := mr.ensureBootstrapSafe(allMigrations); err != nil {
+		return err
 	}
 
+	migrations := filterRunnableMigrations(mr.dbType, allMigrations)
 	if len(migrations) == 0 {
 		log.Printf("[Migration] No migration files found for %s", mr.dbType)
 		return nil
 	}
 
 	const maxRetries = 3
-	executedCount, failedCount := 0, 0
+	executedCount := 0
+	tenantSeeded := false
+
+	if mr.dbType == "tenant" && mr.tenantID != nil && mr.isMigrationExecuted(0) {
+		if err := mr.seedTenantSelfReference(); err != nil {
+			return err
+		}
+		tenantSeeded = true
+	}
 
 	for _, m := range migrations {
 		if mr.isMigrationExecuted(m.Version) {
@@ -230,21 +222,63 @@ func (mr *MigrationRunner) RunMigrations() error {
 			}
 		}
 
-		if succeeded {
-			mr.logMigration(m.Version, m.Name, true, "", executionMS)
-		} else {
-			failedCount++
+		if !succeeded {
 			errMsg := fmt.Sprintf("FAILED after %d attempts: %v", maxRetries, lastErr)
 			log.Printf("[Migration] ERROR: %s v%d %s", mr.dbType, m.Version, errMsg)
 			mr.logMigration(m.Version, m.Name, false, errMsg, executionMS)
+			return fmt.Errorf("%s migration v%d (%s) failed: %w", mr.dbType, m.Version, m.Name, lastErr)
+		}
+
+		mr.logMigration(m.Version, m.Name, true, "", executionMS)
+
+		// Tenant seed data depends on the schema baseline existing first.
+		if mr.dbType == "tenant" && mr.tenantID != nil && !tenantSeeded && m.Version == 0 {
+			if err := mr.seedTenantSelfReference(); err != nil {
+				return err
+			}
+			tenantSeeded = true
 		}
 	}
 
-	log.Printf("[Migration] %s done: %d applied, %d failed", mr.dbType, executedCount, failedCount)
+	log.Printf("[Migration] %s done: %d applied, 0 failed", mr.dbType, executedCount)
+	return nil
+}
 
-	if failedCount > 0 {
-		return fmt.Errorf("%d out of %d %s migrations failed", failedCount, len(migrations), mr.dbType)
+func (mr *MigrationRunner) ensureBootstrapSafe(migrations []MigrationFile) error {
+	if len(migrations) == 0 {
+		return nil
 	}
+	if mr.isMigrationExecuted(migrations[0].Version) {
+		return nil
+	}
+
+	var existingTableCount int
+	if err := mr.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = 'public'
+		  AND table_type = 'BASE TABLE'
+		  AND table_name <> 'migration_logs'
+	`).Scan(&existingTableCount); err != nil {
+		return fmt.Errorf("check existing schema state: %w", err)
+	}
+
+	if existingTableCount > 0 {
+		return fmt.Errorf("%s database is not empty; V3 bootstrap requires a clean database", mr.dbType)
+	}
+
+	return nil
+}
+
+func (mr *MigrationRunner) seedTenantSelfReference() error {
+	seedSQL := `INSERT INTO tenants (id, tenant_id, email, tenant_domain, status, created_at, updated_at)
+	            VALUES ($1::uuid, $1::uuid, $2, $3, 'active', NOW(), NOW())
+	            ON CONFLICT (id) DO NOTHING`
+	seedEmail := fmt.Sprintf("bootstrap+%s@authsec.local", strings.ReplaceAll(*mr.tenantID, "-", ""))
+	if _, err := mr.db.Exec(seedSQL, *mr.tenantID, seedEmail, "authsec.local"); err != nil {
+		return fmt.Errorf("seed tenant self-reference row: %w", err)
+	}
+	log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.tenantID)
 	return nil
 }
 
@@ -280,6 +314,10 @@ func (mr *MigrationRunner) executeSQLContent(content string) error {
 
 // isMigrationExecuted returns true if the given version is already recorded as successful.
 func (mr *MigrationRunner) isMigrationExecuted(version int) bool {
+	if mr.dbType == "tenant" && mr.masterDB == nil {
+		return false
+	}
+
 	query := `SELECT COUNT(*) FROM migration_logs WHERE version = $1 AND db_type = $2 AND success = true`
 	args := []interface{}{version, mr.dbType}
 
@@ -295,7 +333,7 @@ func (mr *MigrationRunner) isMigrationExecuted(version int) bool {
 
 	var count int64
 	if err := queryDB.QueryRow(query, args...).Scan(&count); err != nil {
-		return false // table may not exist yet
+		return false
 	}
 	return count > 0
 }
@@ -317,7 +355,10 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 		return
 	}
 
-	// Fallback: write directly via raw SQL (used by tenant runners)
+	if mr.dbType == "tenant" && mr.masterDB == nil {
+		return
+	}
+
 	logDB := mr.db
 	if mr.masterDB != nil {
 		logDB = mr.masterDB
@@ -344,6 +385,7 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 	if err != nil {
 		return nil, err
 	}
+	migrations = filterRunnableMigrations(mr.dbType, migrations)
 
 	queryDB := mr.db
 	if mr.dbType == "tenant" && mr.masterDB != nil {
@@ -361,11 +403,11 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	var lastMigration int
 	var lastExecuted time.Time
-	queryDB.QueryRow(baseQuery+` ORDER BY version DESC LIMIT 1`, args...).Scan(&lastMigration, &lastExecuted)
+	_ = queryDB.QueryRow(baseQuery+` ORDER BY version DESC LIMIT 1`, args...).Scan(&lastMigration, &lastExecuted)
 
 	var executedCount int
 	countQuery := strings.Replace(baseQuery, "version, executed_at", "COUNT(*)", 1)
-	queryDB.QueryRow(countQuery, args...).Scan(&executedCount)
+	_ = queryDB.QueryRow(countQuery, args...).Scan(&executedCount)
 
 	status := "pending"
 	if executedCount == len(migrations) {
@@ -384,21 +426,57 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 	}, nil
 }
 
-// MigrationsDir resolves the canonical migrations directory path at runtime.
+// BackfillTenantMigrationLogs records successful tenant migrations for a cloned
+// database so status checks remain consistent with template-based provisioning.
+func BackfillTenantMigrationLogs(tenantID, migrationsDir string, masterDB *sql.DB) (int, int, error) {
+	if masterDB == nil {
+		return 0, 0, fmt.Errorf("master database connection is required")
+	}
+
+	runner := &MigrationRunner{
+		migrationsDir: migrationsDir,
+		dbType:        "tenant",
+		tenantID:      &tenantID,
+		masterDB:      masterDB,
+	}
+
+	migrations, err := runner.LoadMigrationFiles()
+	if err != nil {
+		return 0, 0, err
+	}
+	migrations = filterRunnableMigrations("tenant", migrations)
+
+	lastVersion := 0
+	inserted := 0
+	for _, migration := range migrations {
+		if migration.Version > lastVersion {
+			lastVersion = migration.Version
+		}
+		if runner.isMigrationExecuted(migration.Version) {
+			continue
+		}
+		runner.logMigration(migration.Version, migration.Name, true, "", 0)
+		inserted++
+	}
+
+	return lastVersion, inserted, nil
+}
+
+// MigrationsDir resolves the canonical V3 migrations directory path at runtime.
 func MigrationsDir(dbType string) string {
 	execPath, err := os.Executable()
 	if err == nil {
-		p := filepath.Join(filepath.Dir(execPath), "migrations", dbType)
-		if _, err := os.Stat(p); err == nil {
-			return p
+		v3 := filepath.Join(filepath.Dir(execPath), "migrations", "v3", dbType)
+		if _, err := os.Stat(v3); err == nil {
+			return v3
 		}
 	}
 	cwd, _ := os.Getwd()
-	p := filepath.Join(cwd, "migrations", dbType)
-	if _, err := os.Stat(p); err == nil {
-		return p
+	v3 := filepath.Join(cwd, "migrations", "v3", dbType)
+	if _, err := os.Stat(v3); err == nil {
+		return v3
 	}
-	return filepath.Join("migrations", dbType)
+	return filepath.Join("migrations", "v3", dbType)
 }
 
 // splitSQLStatements intelligently splits SQL into individual statements,
@@ -410,7 +488,6 @@ func splitSQLStatements(content string) []string {
 	i := 0
 
 	for i < len(runes) {
-		// Dollar-quoted string
 		if runes[i] == '$' {
 			if tag := extractDollarTag(runes, i); tag != "" {
 				for j := 0; j < len(tag); j++ {
@@ -435,7 +512,6 @@ func splitSQLStatements(content string) []string {
 			}
 		}
 
-		// Single-line comment
 		if i+1 < len(runes) && runes[i] == '-' && runes[i+1] == '-' {
 			for i < len(runes) && runes[i] != '\n' {
 				current.WriteRune(runes[i])
@@ -448,7 +524,6 @@ func splitSQLStatements(content string) []string {
 			continue
 		}
 
-		// Multi-line comment
 		if i+1 < len(runes) && runes[i] == '/' && runes[i+1] == '*' {
 			current.WriteRune(runes[i])
 			current.WriteRune(runes[i+1])
@@ -466,7 +541,6 @@ func splitSQLStatements(content string) []string {
 			continue
 		}
 
-		// Single-quoted string
 		if runes[i] == '\'' {
 			current.WriteRune(runes[i])
 			i++
@@ -486,7 +560,6 @@ func splitSQLStatements(content string) []string {
 			continue
 		}
 
-		// Statement terminator
 		if runes[i] == ';' {
 			if stmt := strings.TrimSpace(current.String()); stmt != "" {
 				statements = append(statements, stmt)

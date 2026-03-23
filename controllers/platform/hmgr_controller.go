@@ -289,6 +289,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	var req struct {
 		LoginChallenge string `json:"login_challenge"`
 		OriginDomain   string `json:"origin_domain,omitempty"`
+		RedirectURI    string `json:"redirect_uri,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -433,14 +434,17 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	}
 	state := base64.URLEncoding.EncodeToString(stateBytes)
 
-	if len(clientDetails.RedirectURIs) == 0 {
-		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
-			Success: false,
-			Error:   "No registered redirect URI found for client",
-		})
-		return
+	callbackURL := strings.TrimSpace(req.RedirectURI)
+	if callbackURL == "" {
+		if len(clientDetails.RedirectURIs) == 0 {
+			c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
+				Success: false,
+				Error:   "No registered redirect URI found for client",
+			})
+			return
+		}
+		callbackURL = clientDetails.RedirectURIs[0]
 	}
-	callbackURL := clientDetails.RedirectURIs[0]
 
 	oauthURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&scope=%s&response_type=code&state=%s",
 		authURL,
@@ -923,9 +927,26 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 		return
 	}
 
+	// Pick the best redirect URI for the login page redirect.
+	// When the request originates from localhost, prefer a localhost URI
+	// so the browser stays on the local stack instead of jumping to production.
+	reqHost := c.Request.Host
+	isLocal := strings.Contains(reqHost, "localhost") || strings.Contains(reqHost, "127.0.0.1")
+
 	var callbackURL string
 	for _, uri := range clientDetails.RedirectURIs {
-		if strings.HasSuffix(uri, "/oidc/auth/callback") {
+		if !strings.HasSuffix(uri, "/oidc/auth/callback") {
+			continue
+		}
+		uriIsLocal := strings.Contains(uri, "localhost") || strings.Contains(uri, "127.0.0.1")
+		if callbackURL == "" {
+			callbackURL = uri
+		}
+		if isLocal && uriIsLocal {
+			callbackURL = uri
+			break
+		}
+		if !isLocal && !uriIsLocal {
 			callbackURL = uri
 			break
 		}

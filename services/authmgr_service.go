@@ -56,9 +56,8 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		return nil, fmt.Errorf("failed to retrieve tenant information: %w", err)
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	jwtClaims := jwt.MapClaims{
 		"tenant_id":   tenantID,
-		"project_id":  projectID,
 		"client_id":   clientID,
 		"email_id":    emailID,
 		"provider":    provider,
@@ -70,7 +69,11 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		"exp":         time.Now().Add(24 * time.Hour).Unix(),
 		"iss":         "authsec-ai/auth-manager",
 		"jti":         uuid.New().String(),
-	})
+	}
+	if projectID != "" && projectID != uuid.Nil.String() {
+		jwtClaims["project_id"] = projectID
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwtClaims)
 
 	tokenString, err := token.SignedString([]byte(config.AppConfig.JWTDefSecret))
 	if err != nil {
@@ -113,7 +116,7 @@ func introspectOIDCToken(token string) (*sharedmodels.Introspection, error) {
 	}, nil
 }
 
-// authmgrLookupClient looks up client_id and project_id for an email within a tenant.
+// authmgrLookupClient looks up client_id and the optional project_id for an email within a tenant.
 func authmgrLookupClient(ctx context.Context, tenantID, email string) (string, string, error) {
 	if tenantID == "" || email == "" {
 		return "", "", errors.New("tenantID and email required")
@@ -129,7 +132,11 @@ func authmgrLookupClient(ctx context.Context, tenantID, email string) (string, s
 			Select("client_id", "project_id").
 			Where("tenant_id = ? AND email = ?", tid, email).
 			First(&user).Error; err == nil {
-			return user.ClientID.String(), user.ProjectID.String(), nil
+			projectID := ""
+			if user.ProjectID != uuid.Nil {
+				projectID = user.ProjectID.String()
+			}
+			return user.ClientID.String(), projectID, nil
 		}
 	}
 
@@ -144,5 +151,9 @@ func authmgrLookupClient(ctx context.Context, tenantID, email string) (string, s
 		First(&user).Error; err != nil {
 		return "", "", fmt.Errorf("client lookup: %w", err)
 	}
-	return user.ClientID.String(), user.ProjectID.String(), nil
+	projectID := ""
+	if user.ProjectID != uuid.Nil {
+		projectID = user.ProjectID.String()
+	}
+	return user.ClientID.String(), projectID, nil
 }

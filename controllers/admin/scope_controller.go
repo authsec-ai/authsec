@@ -1,675 +1,292 @@
 package admin
 
 import (
-	"database/sql"
-	"fmt"
+	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"gorm.io/gorm"
 )
 
-// ScopeController handles scope management
-type ScopeController struct{}
+type ScopeController struct {
+	service *scopeService
+}
 
-// NewScopeController creates a new scope controller
 func NewScopeController() *ScopeController {
-	return &ScopeController{}
+	return &ScopeController{service: newScopeService()}
 }
 
-// ScopeMapping represents a scope and its associated resources
-type ScopeMapping struct {
-	ScopeName string   `json:"scope_name"`
-	Resources []string `json:"resources"`
-}
+type ScopeMapping = scopeMappingRecord
 
-// AddScopeInput represents the input for adding a scope
 type AddScopeInput struct {
-	ScopeName string   `json:"scope_name" binding:"required"`
-	Resources []string `json:"resources"` // Resources are optional - empty means full scope ("*")
+	ScopeName           string   `json:"scope_name" binding:"required"`
+	Description         string   `json:"description"`
+	Usage               string   `json:"usage,omitempty"`
+	PermissionIDs       []string `json:"permission_ids,omitempty"`
+	MappedPermissionIDs []string `json:"mapped_permission_ids,omitempty"`
+	Resources           []string `json:"resources,omitempty"`
 }
 
-// EditScopeInput represents the input for editing a scope
 type EditScopeInput struct {
-	Resources []string `json:"resources" binding:"required"`
+	Description         string   `json:"description,omitempty"`
+	Usage               string   `json:"usage,omitempty"`
+	PermissionIDs       []string `json:"permission_ids,omitempty"`
+	MappedPermissionIDs []string `json:"mapped_permission_ids,omitempty"`
+	Resources           []string `json:"resources,omitempty"`
 }
 
-// ========================================
-// ADMIN ROUTES - Connect to MAIN/PRIMARY DB
-// ========================================
-
-// ListScopes godoc
-// @Summary List Scopes (Admin)
-// @Description Returns a list of all unique scope names from the main database
-// @Tags Admin: Scopes
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Success 200 {object} []string
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/admin/scopes [get]
 func (sc *ScopeController) ListScopes(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
-		return
-	}
-
-	// Use main database connection
-	sqlDB, err := config.DB.DB()
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-
-	sc.listScopesInternal(c, sqlDB, tenantID)
+	sc.listScopes(c, config.DB, *tenantID)
 }
 
-// GetMappings godoc
-// @Summary Get Scope Mappings (Admin)
-// @Description Returns a list of scopes and their associated resources from the main database
-// @Tags Admin: Scopes
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Success 200 {object} []ScopeMapping
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/admin/scopes/mappings [get]
 func (sc *ScopeController) GetMappings(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
-		return
-	}
-
-	// Use main database connection
-	sqlDB, err := config.DB.DB()
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-
-	sc.getMappingsInternal(c, sqlDB, tenantID)
+	sc.getMappings(c, config.DB, *tenantID)
 }
 
-// AddScope godoc
-// @Summary Add Scope (Admin)
-// @Description Adds a new scope with associated resources to the main database
-// @Tags Admin: Scopes
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param input body AddScopeInput true "Scope data"
-// @Success 201 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/admin/scopes [post]
 func (sc *ScopeController) AddScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
-		return
-	}
-
-	// Use main database connection
-	sqlDB, err := config.DB.DB()
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-
-	sc.addScopeInternal(c, sqlDB, tenantID)
+	sc.addScope(c, config.DB, *tenantID)
 }
 
-// EditScope godoc
-// @Summary Edit Scope (Admin)
-// @Description Updates the resources associated with a scope in the main database
-// @Tags Admin: Scopes
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param scope_name path string true "Scope Name"
-// @Param input body EditScopeInput true "Scope data"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/admin/scopes/{scope_name} [put]
 func (sc *ScopeController) EditScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	scopeName := c.Param("scope_name")
-	if !ok || tenantID == "" || scopeName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
-		return
-	}
-
-	// Use main database connection
-	sqlDB, err := config.DB.DB()
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-
-	sc.editScopeInternal(c, sqlDB, tenantID, scopeName)
+	sc.editScope(c, config.DB, *tenantID)
 }
 
-// DeleteScope godoc
-// @Summary Delete Scope (Admin)
-// @Description Deletes a scope and all its resource mappings from the main database
-// @Tags Admin: Scopes
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param scope_name path string true "Scope Name"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/admin/scopes/{scope_name} [delete]
 func (sc *ScopeController) DeleteScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	scopeName := c.Param("scope_name")
-	if !ok || tenantID == "" || scopeName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
-		return
-	}
-
-	// Use main database connection
-	sqlDB, err := config.DB.DB()
+	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-
-	sc.deleteScopeInternal(c, sqlDB, tenantID, scopeName)
+	sc.deleteScope(c, config.DB, *tenantID)
 }
 
-// ========================================
-// USER ROUTES - Connect to TENANT DB
-// ========================================
-
-// ListUserScopes godoc
-// @Summary List Scopes (End User)
-// @Description Returns a list of all unique scope names from the tenant database.
-// @Description
-// @Description **Authentication Requirements:**
-// @Description - `/uflow/user/scopes` - Requires authenticated **end-user JWT token**
-// @Description - `/uflow/enduser/scopes` - Requires **admin JWT token** with `admin:access` permission
-// @Tags User: Scopes
-// @Tags Admin: End-User Scopes
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Success 200 {object} []string
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/user/scopes [get]
-// @Router /uflow/enduser/scopes [get]
 func (sc *ScopeController) ListUserScopes(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
+	db, tenantID, ok := scopeTenantDB(c)
+	if !ok {
 		return
 	}
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
-		return
-	}
-
-	sc.listScopesInternal(c, sqlDB, tenantID)
+	sc.listScopes(c, db, tenantID)
 }
 
-// GetUserMappings godoc
-// @Summary Get Scope Mappings (End User)
-// @Description Returns a list of scopes and their associated resources from the tenant database.
-// @Description
-// @Description **Authentication Requirements:**
-// @Description - `/uflow/user/scopes/mappings` - Requires authenticated **end-user JWT token**
-// @Description - `/uflow/enduser/scopes/mappings` - Requires **admin JWT token** with `admin:access` permission
-// @Tags User: Scopes
-// @Tags Admin: End-User Scopes
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Success 200 {object} []ScopeMapping
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/user/scopes/mappings [get]
-// @Router /uflow/enduser/scopes/mappings [get]
 func (sc *ScopeController) GetUserMappings(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
+	db, tenantID, ok := scopeTenantDB(c)
+	if !ok {
 		return
 	}
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
-		return
-	}
-
-	sc.getMappingsInternal(c, sqlDB, tenantID)
+	sc.getMappings(c, db, tenantID)
 }
 
-// AddUserScope godoc
-// @Summary Add Scope (End User)
-// @Description Adds a new scope with associated resources to the tenant database.
-// @Description
-// @Description **Authentication Requirements:**
-// @Description - `/uflow/user/scopes` - Requires authenticated **end-user JWT token**
-// @Description - `/uflow/enduser/scopes` - Requires **admin JWT token** with `admin:access` permission
-// @Tags User: Scopes
-// @Tags Admin: End-User Scopes
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param input body AddScopeInput true "Scope data"
-// @Success 201 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/user/scopes [post]
-// @Router /uflow/enduser/scopes [post]
 func (sc *ScopeController) AddUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok || tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
+	db, tenantID, ok := scopeTenantDB(c)
+	if !ok {
 		return
 	}
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
-		return
-	}
-
-	sc.addScopeInternal(c, sqlDB, tenantID)
+	sc.addScope(c, db, tenantID)
 }
 
-// EditUserScope godoc
-// @Summary Edit Scope (End User)
-// @Description Updates the resources associated with a scope in the tenant database.
-// @Description
-// @Description **Authentication Requirements:**
-// @Description - `/uflow/user/scopes/{scope_name}` - Requires authenticated **end-user JWT token**
-// @Description - `/uflow/enduser/scopes/{scope_name}` - Requires **admin JWT token** with `admin:access` permission
-// @Tags User: Scopes
-// @Tags Admin: End-User Scopes
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param scope_name path string true "Scope Name"
-// @Param input body EditScopeInput true "Scope data"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/user/scopes/{scope_name} [put]
-// @Router /uflow/enduser/scopes/{scope_name} [put]
 func (sc *ScopeController) EditUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	scopeName := c.Param("scope_name")
-	if !ok || tenantID == "" || scopeName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
+	db, tenantID, ok := scopeTenantDB(c)
+	if !ok {
 		return
 	}
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
-		return
-	}
-
-	sc.editScopeInternal(c, sqlDB, tenantID, scopeName)
+	sc.editScope(c, db, tenantID)
 }
 
-// DeleteUserScope godoc
-// @Summary Delete Scope (End User)
-// @Description Deletes a scope and all its resource mappings from the tenant database.
-// @Description
-// @Description **Authentication Requirements:**
-// @Description - `/uflow/user/scopes/{scope_name}` - Requires authenticated **end-user JWT token**
-// @Description - `/uflow/enduser/scopes/{scope_name}` - Requires **admin JWT token** with `admin:access` permission
-// @Tags User: Scopes
-// @Tags Admin: End-User Scopes
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param tenant_id header string true "Tenant ID"
-// @Param scope_name path string true "Scope Name"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /uflow/user/scopes/{scope_name} [delete]
-// @Router /uflow/enduser/scopes/{scope_name} [delete]
 func (sc *ScopeController) DeleteUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	scopeName := c.Param("scope_name")
-	if !ok || tenantID == "" || scopeName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
+	db, tenantID, ok := scopeTenantDB(c)
+	if !ok {
 		return
 	}
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get database connection"})
-		return
-	}
-
-	sc.deleteScopeInternal(c, sqlDB, tenantID, scopeName)
+	sc.deleteScope(c, db, tenantID)
 }
 
-// ========================================
-// INTERNAL SHARED FUNCTIONS
-// ========================================
-
-func (sc *ScopeController) listScopesInternal(c *gin.Context, sqlDB *sql.DB, tenantID string) {
-	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
-		return
-	}
-
-	query := `SELECT DISTINCT scope_name FROM scope_resource_mappings WHERE tenant_id = $1 ORDER BY scope_name`
-	rows, err := sqlDB.Query(query, tenantID)
+func (sc *ScopeController) listScopes(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+	items, err := sc.service.listScopeItems(db, tenantID, []string{models.ScopeUsageInternal, models.ScopeUsageBoth}, "")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch scopes"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list scopes: " + err.Error()})
 		return
 	}
-	defer rows.Close()
-
-	var scopes []string
-	for rows.Next() {
-		var scopeName string
-		if err := rows.Scan(&scopeName); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan scope"})
-			return
-		}
-		scopes = append(scopes, scopeName)
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
 	}
-
-	if scopes == nil {
-		scopes = []string{}
-	}
-
-	c.JSON(http.StatusOK, scopes)
+	c.JSON(http.StatusOK, names)
 }
 
-func (sc *ScopeController) getMappingsInternal(c *gin.Context, sqlDB *sql.DB, tenantID string) {
-	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
-		return
-	}
-
-	query := `
-		SELECT scope_name, array_agg(resource_name) 
-		FROM scope_resource_mappings 
-		WHERE tenant_id = $1
-		GROUP BY scope_name 
-		ORDER BY scope_name
-	`
-	rows, err := sqlDB.Query(query, tenantID)
+func (sc *ScopeController) getMappings(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+	resp, err := sc.service.listScopeMappings(db, tenantID, []string{models.ScopeUsageInternal, models.ScopeUsageBoth})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch scope mappings"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list scope mappings: " + err.Error()})
 		return
 	}
-	defer rows.Close()
-
-	var mappings []ScopeMapping
-	for rows.Next() {
-		var scopeName string
-		var resources []string
-		if err := rows.Scan(&scopeName, (*pq.StringArray)(&resources)); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to scan mapping"})
-			return
-		}
-		mappings = append(mappings, ScopeMapping{
-			ScopeName: scopeName,
-			Resources: resources,
-		})
-	}
-
-	if mappings == nil {
-		mappings = []ScopeMapping{}
-	}
-
-	c.JSON(http.StatusOK, mappings)
+	c.JSON(http.StatusOK, resp)
 }
 
-func (sc *ScopeController) addScopeInternal(c *gin.Context, sqlDB *sql.DB, tenantID string) {
+func (sc *ScopeController) addScope(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
 	var input AddScopeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request payload: " + err.Error()})
+		return
+	}
+
+	usage, err := sc.service.normalizeUsage(input.Usage, models.ScopeUsageInternal, []string{models.ScopeUsageInternal, models.ScopeUsageBoth})
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
-		return
-	}
-
-	// Handle empty/blank resources as wildcard ("*" = full scope)
-	if len(input.Resources) == 0 {
-		input.Resources = []string{"*"}
-	}
-
-	tx, err := sqlDB.Begin()
+	permissionIDs, err := sc.service.resolvePermissionIDs(db, tenantID, input.PermissionIDs, input.MappedPermissionIDs, input.Resources)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to begin transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Check if scope already exists for this tenant
-	var exists int
-	err = tx.QueryRow("SELECT 1 FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2 LIMIT 1", input.ScopeName, tenantID).Scan(&exists)
-	if err == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Scope already exists"})
-		return
-	} else if err != sql.ErrNoRows {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Insert mappings
-	stmt, err := tx.Prepare("INSERT INTO scope_resource_mappings (tenant_id, scope_name, resource_name) VALUES ($1, $2, $3)")
+	resp, err := sc.service.createScope(db, tenantID, input.ScopeName, input.Description, usage, permissionIDs)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare statement"})
-		return
-	}
-	defer stmt.Close()
-
-	for _, resource := range input.Resources {
-		// Treat empty resource string as wildcard
-		if resource == "" {
-			resource = "*"
-		}
-		if _, err := stmt.Exec(tenantID, input.ScopeName, resource); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to add resource %s: %v", resource, err)})
+		errLower := strings.ToLower(err.Error())
+		if strings.Contains(errLower, "duplicate") || strings.Contains(errLower, "unique") {
+			c.JSON(http.StatusConflict, gin.H{"error": "scope name already exists"})
 			return
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create scope: " + err.Error()})
 		return
 	}
 
-	// Audit log: Scope created
-	middlewares.Audit(c, "scope", input.ScopeName, "create", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scope", resp.ID, "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"scope_name":      input.ScopeName,
-			"resources":       input.Resources,
-			"resources_count": len(input.Resources),
+			"scope_id":          resp.ID,
+			"name":              resp.Name,
+			"usage":             resp.Usage,
+			"permissions_count": resp.PermissionsLinked,
 		},
 	})
-
-	c.JSON(http.StatusCreated, gin.H{"message": "Scope created successfully"})
+	c.JSON(http.StatusCreated, gin.H{"message": "scope created successfully", "scope_id": resp.ID, "scope_name": resp.Name})
 }
 
-func (sc *ScopeController) editScopeInternal(c *gin.Context, sqlDB *sql.DB, tenantID string, scopeName string) {
+func (sc *ScopeController) editScope(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+	scopeName := strings.TrimSpace(c.Param("scope_name"))
+	if scopeName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope_name is required"})
+		return
+	}
+
 	var input EditScopeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request payload: " + err.Error()})
 		return
 	}
 
-	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
-		return
-	}
-
-	tx, err := sqlDB.Begin()
+	scope, err := sc.service.loadScopeByName(db, tenantID, scopeName, []string{models.ScopeUsageInternal, models.ScopeUsageBoth})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to begin transaction"})
-		return
-	}
-	defer tx.Rollback()
-
-	// Check if scope exists for this tenant
-	var exists int
-	err = tx.QueryRow("SELECT 1 FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2 LIMIT 1", scopeName, tenantID).Scan(&exists)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Scope not found"})
-		return
-	} else if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "scope not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load scope: " + err.Error()})
 		return
 	}
 
-	// Delete existing mappings for this scope and tenant
-	if _, err := tx.Exec("DELETE FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2", scopeName, tenantID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete existing mappings"})
-		return
+	var usagePtr *string
+	if strings.TrimSpace(input.Usage) != "" {
+		usage, err := sc.service.normalizeUsage(input.Usage, scope.Usage, []string{models.ScopeUsageInternal, models.ScopeUsageBoth})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		usagePtr = &usage
 	}
 
-	// Insert new mappings
-	stmt, err := tx.Prepare("INSERT INTO scope_resource_mappings (tenant_id, scope_name, resource_name) VALUES ($1, $2, $3)")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare statement"})
-		return
-	}
-	defer stmt.Close()
-
-	for _, resource := range input.Resources {
-		if _, err := stmt.Exec(tenantID, scopeName, resource); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to add resource %s: %v", resource, err)})
+	replacePermissions := input.PermissionIDs != nil || input.MappedPermissionIDs != nil || input.Resources != nil
+	permissionIDs := []uuid.UUID{}
+	if replacePermissions {
+		permissionIDs, err = sc.service.resolvePermissionIDs(db, tenantID, input.PermissionIDs, input.MappedPermissionIDs, input.Resources)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+	var descriptionPtr *string
+	if input.Description != "" {
+		description := input.Description
+		descriptionPtr = &description
+	}
+
+	resp, err := sc.service.updateScope(db, scope, nil, descriptionPtr, usagePtr, permissionIDs, replacePermissions)
+	if err != nil {
+		errLower := strings.ToLower(err.Error())
+		if strings.Contains(errLower, "duplicate") || strings.Contains(errLower, "unique") {
+			c.JSON(http.StatusConflict, gin.H{"error": "scope name already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update scope: " + err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Scope updated successfully"})
-}
-
-func (sc *ScopeController) deleteScopeInternal(c *gin.Context, sqlDB *sql.DB, tenantID string, scopeName string) {
-	if err := ensureScopeResourceMappingsSchema(sqlDB); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare scope mappings schema"})
-		return
-	}
-
-	// Check if scope exists for this tenant
-	var exists int
-	err := sqlDB.QueryRow("SELECT 1 FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2 LIMIT 1", scopeName, tenantID).Scan(&exists)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Scope not found"})
-		return
-	} else if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		return
-	}
-
-	// Delete scope mappings for this tenant
-	if _, err := sqlDB.Exec("DELETE FROM scope_resource_mappings WHERE scope_name = $1 AND tenant_id = $2", scopeName, tenantID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete scope"})
-		return
-	}
-
-	// Audit log: Scope deleted
-	middlewares.Audit(c, "scope", scopeName, "delete", &middlewares.AuditChanges{
-		Before: map[string]interface{}{
-			"scope_name": scopeName,
+	middlewares.Audit(c, "scope", resp.ID, "update", &middlewares.AuditChanges{
+		After: map[string]interface{}{
+			"scope_id":          resp.ID,
+			"name":              resp.Name,
+			"usage":             resp.Usage,
+			"permissions_count": resp.PermissionsLinked,
 		},
 	})
-
-	c.JSON(http.StatusOK, gin.H{"message": "Scope deleted successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": "scope updated successfully", "scope_id": resp.ID, "scope_name": resp.Name})
 }
 
-func ensureScopeResourceMappingsSchema(sqlDB *sql.DB) error {
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS scope_resource_mappings (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			tenant_id UUID NOT NULL,
-			scope_name TEXT NOT NULL DEFAULT '*',
-			resource_name TEXT NOT NULL,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-			updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_resource_mappings_tenant_scope_resource
-			ON scope_resource_mappings (tenant_id, scope_name, resource_name)`,
+func (sc *ScopeController) deleteScope(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+	scopeName := strings.TrimSpace(c.Param("scope_name"))
+	if scopeName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope_name is required"})
+		return
 	}
 
-	for _, statement := range statements {
-		if _, err := sqlDB.Exec(statement); err != nil {
-			return fmt.Errorf("scope_resource_mappings schema ensure failed: %w", err)
+	scope, err := sc.service.loadScopeByName(db, tenantID, scopeName, []string{models.ScopeUsageInternal, models.ScopeUsageBoth})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "scope not found"})
+			return
 		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load scope: " + err.Error()})
+		return
 	}
 
-	return nil
-}
+	if err := sc.service.deleteScope(db, scope); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete scope: " + err.Error()})
+		return
+	}
 
-// Helper to validate UUID
-func isValidUUID(u string) bool {
-	_, err := uuid.Parse(u)
-	return err == nil
+	middlewares.Audit(c, "scope", scope.ID.String(), "delete", &middlewares.AuditChanges{
+		Before: map[string]interface{}{
+			"name":  scope.Name,
+			"usage": scope.Usage,
+		},
+	})
+	c.JSON(http.StatusOK, gin.H{"message": "scope deleted successfully"})
 }

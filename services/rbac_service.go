@@ -2,8 +2,6 @@ package services
 
 import (
 	"fmt"
-	"log"
-	"strings"
 
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
@@ -87,21 +85,6 @@ func (s *RBACService) AssignRoleScoped(binding *models.RoleBinding) error {
 
 		// Insert into 'role_bindings'
 		if err := tx.Create(binding).Error; err != nil {
-			// Retry omitting optional denormalized columns when schema lacks them
-			// Check for PostgreSQL error codes and column name errors
-			errStr := strings.ToLower(err.Error())
-			if strings.Contains(errStr, "username") || 
-			   strings.Contains(errStr, "role_name") || 
-			   strings.Contains(errStr, "42703") { // PostgreSQL error code for "column does not exist"
-				log.Printf("[RBACService] Schema missing username/role_name columns, retrying with Omit: %v", err)
-				if retryErr := tx.Omit("Username", "RoleName").Create(binding).Error; retryErr == nil {
-					log.Printf("[RBACService] Successfully created role binding without denormalized columns")
-					return nil
-				} else {
-					log.Printf("[RBACService] Retry with Omit failed: %v", retryErr)
-					return retryErr
-				}
-			}
 			return err
 		}
 		return nil

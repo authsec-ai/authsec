@@ -20,7 +20,6 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
 	"github.com/fxamacker/cbor/v2"
@@ -773,11 +772,6 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 
 	log.Printf("[%s] FinishRegistration: Credential saved successfully", reqID)
 
-	// Step 11: Enable MFA
-	mfaRepo := repositories.NewMFARepository(db)
-	_ = mfaRepo.EnableMethod(client.ID.String(), "webauthn",
-		map[string]interface{}{"attestation_type": credential.AttestationType}, user.ID)
-
 	// Step 12: Update MFA flags
 	now := time.Now().UTC()
 	methods := pq.StringArray{"webauthn"}
@@ -1082,15 +1076,6 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	if err := clientRepo.UpdateCredentialFlags(credential.ID, credential.Flags.BackupEligible, credential.Flags.BackupState); err != nil {
 		log.Printf("[%s] FinishAuthentication: failed updating credential flags for user=%s: %v", reqID, user.Email, err)
 	}
-	if err := db.Model(&sharedmodels.MFAMethod{}).
-		Where("client_id = ? AND method_type = ?", user.ID, "webauthn").
-		Updates(map[string]interface{}{
-			"last_used_at": time.Now().UTC(),
-			"updated_at":   time.Now().UTC(),
-		}).Error; err != nil {
-		log.Printf("[%s] FinishAuthentication: failed updating MFA method for user=%s: %v", reqID, user.Email, err)
-	}
-
 	// Update user's last_login timestamp
 	if err := db.Model(&user).Update("last_login", time.Now().UTC()).Error; err != nil {
 		log.Printf("[%s] FinishAuthentication: failed updating last_login for user=%s: %v", reqID, user.Email, err)
@@ -1458,6 +1443,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 	cred := repositories.Credential{
 		ID:              uuid.New(),
 		ClientID:        webauthnUser.ID, // Use webauthnUser.ID to match FinishRegistration pattern
+		UserID:          webauthnUser.ID,
 		CredentialID:    credential.ID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: attestationType,
@@ -1477,15 +1463,6 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 		return
 	}
 	log.Printf("[%s] ConfirmBiometricSetup: Credential saved successfully with ID=%s", reqID, cred.ID.String())
-
-	// Enable MFA method
-	mfaRepo := repositories.NewMFARepository(db)
-	if err := mfaRepo.EnableMethod(webauthnUser.ID.String(), "webauthn", map[string]interface{}{
-		"credential_id":    fmt.Sprintf("%x", credential.ID),
-		"attestation_type": credential.AttestationType,
-	}, webauthnUser.ID); err != nil {
-		log.Printf("[%s] ConfirmBiometricSetup: failed to enable MFA method: %v", reqID, err)
-	}
 
 	// Update user MFA settings
 	methods := pq.StringArray{"webauthn"}
@@ -1582,226 +1559,6 @@ func (h *WebAuthnHandler) VerifyBiometricFinish(c *gin.Context) {
 	h.SessionManager.Delete(challengeKey)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-//
-// --- OTP Setup ---
-//
-
-func (h *WebAuthnHandler) BeginOTPSetup(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.TenantID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	// Generate OTP secret (TOTP)
-	secret := uuid.New().String() // replace with proper TOTP secret generator
-	now := time.Now()
-
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "otp",
-		MethodData: datatypes.JSON(json.RawMessage(fmt.Sprintf(`{"secret":"%s"}`, secret))),
-		Verified:   false,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save otp secret"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"secret": secret})
-}
-
-func (h *WebAuthnHandler) VerifyOTP(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-		Code     string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "otp").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "otp method not found"})
-		return
-	}
-
-	// TODO: verify TOTP code properly
-	if req.Code == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid otp"})
-		return
-	}
-
-	if err := db.Model(&mfa).Update("verified", true).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to update otp"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-//
-// --- SMS Setup ---
-//
-
-func (h *WebAuthnHandler) BeginSMSSetup(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-		Phone    string `json:"phone"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.TenantID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	now := time.Now()
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "sms",
-		MethodData: datatypes.JSON(json.RawMessage(fmt.Sprintf(`{"phone":"%s"}`, req.Phone))),
-		Verified:   false,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save sms"})
-		return
-	}
-
-	// TODO: send SMS code
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "sms code sent"})
-}
-
-func (h *WebAuthnHandler) VerifySMS(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-		Code     string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "sms").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "sms method not found"})
-		return
-	}
-
-	// TODO: verify SMS code properly
-	if req.Code == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid sms code"})
-		return
-	}
-
-	if err := db.Model(&mfa).Update("verified", true).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to update sms"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-//
-// --- Backup Codes ---
-//
-
-func (h *WebAuthnHandler) GenerateBackupCodes(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var userRecord appmodels.UserWithJSONMFAMethods
-	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.TenantID).First(&userRecord).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
-		return
-	}
-	user := userRecord.ToShared()
-
-	// generate backup codes
-	codes := []string{
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-		uuid.New().String()[:8],
-	}
-	codesJSON, _ := json.Marshal(codes)
-	now := time.Now()
-
-	mfa := sharedmodels.MFAMethod{
-		ID:         uuid.New(),
-		ClientID:   user.ClientID,
-		UserID:     &user.ID,
-		MethodType: "backup",
-		MethodData: datatypes.JSON(codesJSON),
-		Enabled:    true,
-		Verified:   true,
-		EnrolledAt: now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-
-	if err := db.Create(&mfa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to save backup codes"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"backup_codes": codes})
 }
 
 // BeginWebAuthnRegistration is a wrapper for backward compatibility with routes
@@ -1954,47 +1711,6 @@ func (h *WebAuthnHandler) BeginBiometricLoginVerify(c *gin.Context) {
 
 	log.Printf("[%s] BeginBiometricLoginVerify: session saved for key=%s", reqID, challengeKey)
 	c.JSON(http.StatusOK, options)
-}
-
-func (h *WebAuthnHandler) VerifyBackupCode(c *gin.Context) {
-	var req struct {
-		Email    string `json:"email"`
-		TenantID string `json:"tenant_id"`
-		Code     string `json:"code"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
-		return
-	}
-
-	// Resolve database (global vs tenant)
-	db := h.resolveDB(req.TenantID)
-
-	var mfa sharedmodels.MFAMethod
-	if err := db.Where("method_type = ? AND enabled = true", "backup").First(&mfa).Error; err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "backup codes not found"})
-		return
-	}
-
-	var codes []string
-	if err := json.Unmarshal(mfa.MethodData, &codes); err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "failed to parse backup codes"})
-		return
-	}
-
-	valid := false
-	for _, code := range codes {
-		if code == req.Code {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "invalid backup code"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 func extractChallengeFromBody(body []byte) (string, error) {

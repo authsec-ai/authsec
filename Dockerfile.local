@@ -16,10 +16,16 @@ ENV GOARCH=amd64
 
 RUN go mod edit -replace=github.com/authsec-ai/auth-manager=/src/auth-manager
 RUN go mod edit -replace=github.com/authsec-ai/sharedmodels=/src/sharedmodels
-RUN go mod tidy
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod tidy
 
-RUN go build -o /out/authsec ./cmd/main.go
-RUN go build -o /out/authsec-seed ./cmd/local-seed
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/authsec ./cmd/main.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/authsec-seed ./cmd/local-seed
 
 FROM alpine:3.20
 

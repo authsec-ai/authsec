@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -16,10 +15,8 @@ import (
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
-	"github.com/authsec-ai/authsec/utils"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 // TenantTOTPService handles TOTP authentication for tenant users
@@ -137,58 +134,6 @@ func (s *TenantTOTPService) generateTOTP(secret string, t int64) string {
 	return fmt.Sprintf("%06d", code)
 }
 
-type tenantLegacyTOTPRows struct {
-	ClientID   uuid.UUID
-	MethodData []byte
-}
-
-func (s *TenantTOTPService) validateLegacyMFATOTP(tenantDBConn *gorm.DB, user *models.User, totpCode string) (bool, error) {
-	var method tenantLegacyTOTPRows
-	if err := tenantDBConn.
-		Raw(`
-			SELECT client_id, method_data
-			FROM mfa_methods
-			WHERE user_id = ? AND method_type = 'totp' AND enabled = true AND verified = true
-			ORDER BY is_primary DESC, created_at ASC
-			LIMIT 1
-		`, user.ID).
-		Scan(&method).Error; err != nil {
-		return false, err
-	}
-
-	if len(method.MethodData) == 0 {
-		return false, nil
-	}
-
-	var totpData struct {
-		SecretEncrypted string `json:"secret_encrypted"`
-	}
-	if err := json.Unmarshal(method.MethodData, &totpData); err != nil {
-		return false, err
-	}
-	if totpData.SecretEncrypted == "" {
-		return false, nil
-	}
-
-	secret, err := utils.DecryptString(totpData.SecretEncrypted)
-	if err != nil {
-		return false, err
-	}
-	if !s.ValidateTOTPCode(secret, totpCode) {
-		return false, nil
-	}
-
-	if err := tenantDBConn.Exec(`
-		UPDATE mfa_methods
-		SET last_used_at = NOW(), updated_at = NOW()
-		WHERE user_id = ? AND method_type = 'totp'
-	`, user.ID).Error; err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
 // LoginWithTenantTOTP handles TOTP-only login for tenant users
 func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginRequest) (*models.TenantTOTPLoginResponse, error) {
 	// Step 1: Parse and validate client_id
@@ -236,33 +181,14 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 	}
 
 	// Step 6: Get user's verified tenant TOTP devices.
-	// If none exist, fall back to the legacy MFA-method-backed TOTP state that
-	// the current UI setup flow seeds into mfa_methods.
 	secrets, err := tenantRepo.GetTenantVerifiedTOTPSecrets(user.ID, tenantUUID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tenant TOTP devices: %w", err)
 	}
 	if len(secrets) == 0 {
-		valid, legacyErr := s.validateLegacyMFATOTP(tenantDB, user, req.TOTPCode)
-		if legacyErr != nil {
-			return nil, fmt.Errorf("failed to validate legacy tenant TOTP: %w", legacyErr)
-		}
-		if !valid {
-			return &models.TenantTOTPLoginResponse{
-				Success: false,
-				Message: "No verified TOTP devices registered for this user",
-			}, nil
-		}
-
-		token, err := s.generateJWTToken(user.ID, tenantUUID, user.Email)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate JWT token: %w", err)
-		}
-		tenantRepo.UpdateTenantUserLastLogin(user.ID)
 		return &models.TenantTOTPLoginResponse{
-			Success: true,
-			Token:   token,
-			Message: "Authentication successful",
+			Success: false,
+			Message: "No verified TOTP devices registered for this user",
 		}, nil
 	}
 
@@ -431,44 +357,6 @@ func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegist
 		return nil, fmt.Errorf("failed to confirm TOTP device: %w", err)
 	}
 
-	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", userID, tenantID).First(&user).Error; err != nil {
-		return nil, fmt.Errorf("failed to load user for TOTP confirmation: %w", err)
-	}
-
-	encryptedSecret, err := utils.EncryptString(secret.Secret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt tenant TOTP secret: %w", err)
-	}
-	methodData, err := json.Marshal(map[string]interface{}{
-		"secret_encrypted": encryptedSecret,
-		"issuer":           "AuthSec Tenant Auth",
-		"algorithm":        "SHA1",
-		"digits":           6,
-		"period":           30,
-		"setup_completed":  time.Now().UTC(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize tenant TOTP method data: %w", err)
-	}
-
-	if err := tenantDB.Exec(`
-		INSERT INTO mfa_methods (
-			user_id, client_id, method_type, is_primary, verified, enabled, method_data, created_at, updated_at
-		)
-		VALUES (?, ?, 'totp', ?, true, true, ?::jsonb, NOW(), NOW())
-		ON CONFLICT (client_id, method_type)
-		DO UPDATE SET
-			user_id = EXCLUDED.user_id,
-			is_primary = EXCLUDED.is_primary,
-			verified = true,
-			enabled = true,
-			method_data = EXCLUDED.method_data,
-			updated_at = NOW()
-	`, user.ID, user.ClientID, secret.IsPrimary, string(methodData)).Error; err != nil {
-		return nil, fmt.Errorf("failed to sync tenant TOTP into mfa_methods: %w", err)
-	}
-
 	if err := tenantDB.Exec(`
 		UPDATE users
 		SET
@@ -484,7 +372,7 @@ func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegist
 			END,
 			updated_at = NOW()
 		WHERE id = ? AND tenant_id = ?
-	`, user.ID, tenantID).Error; err != nil {
+	`, userID, tenantID).Error; err != nil {
 		return nil, fmt.Errorf("failed to sync tenant user MFA flags: %w", err)
 	}
 

@@ -30,14 +30,24 @@ func (ps *PermissionService) GetUserPermissions(userID, tenantID string) []Permi
 		SELECT DISTINCT
 			p.resource,
 			p.action
-		FROM role_bindings rb
-		JOIN roles ro ON rb.role_id = ro.id
-		JOIN role_permissions rp ON ro.id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE rb.user_id::text = $1
-		  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $2)
-		  AND (p.tenant_id IS NULL OR p.tenant_id::text = $2)
+		FROM permissions p
+		JOIN (
+			SELECT rp.permission_id
+			FROM role_bindings rb
+			JOIN role_permissions rp ON rb.role_id = rp.role_id
+			WHERE rb.user_id::text = $1
+			  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+			UNION
+			SELECT sp.permission_id
+			FROM role_bindings rb
+			JOIN role_scopes rs ON rb.role_id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			WHERE rb.user_id::text = $1
+			  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+		) effective ON effective.permission_id = p.id
+		WHERE (p.tenant_id IS NULL OR p.tenant_id::text = $2)
 		ORDER BY p.resource, p.action
 	`
 
@@ -77,14 +87,24 @@ func (ps *PermissionService) GetUserScopes(userID, tenantID string) []string {
 	query := `
 		SELECT DISTINCT
 			CONCAT(p.resource, ':', p.action) as scope_string
-		FROM role_bindings rb
-		JOIN roles ro ON rb.role_id = ro.id
-		JOIN role_permissions rp ON ro.id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE rb.user_id::text = $1
-		  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $2)
-		  AND (p.tenant_id IS NULL OR p.tenant_id::text = $2)
+		FROM permissions p
+		JOIN (
+			SELECT rp.permission_id
+			FROM role_bindings rb
+			JOIN role_permissions rp ON rb.role_id = rp.role_id
+			WHERE rb.user_id::text = $1
+			  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+			UNION
+			SELECT sp.permission_id
+			FROM role_bindings rb
+			JOIN role_scopes rs ON rb.role_id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			WHERE rb.user_id::text = $1
+			  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
+			  AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+		) effective ON effective.permission_id = p.id
+		WHERE (p.tenant_id IS NULL OR p.tenant_id::text = $2)
 		ORDER BY scope_string
 	`
 
@@ -130,14 +150,24 @@ func (ps *PermissionService) ResolvePermissionsFromRoles(roleNames []string, ten
 			p.resource,
 			p.action,
 			CONCAT(p.resource, ':', p.action) as scope_string
-		FROM roles ro
-		JOIN role_permissions rp ON ro.id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE ro.name IN (%s)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $1)
-		  AND (p.tenant_id IS NULL OR p.tenant_id::text = $1)
+		FROM permissions p
+		JOIN (
+			SELECT rp.permission_id
+			FROM roles ro
+			JOIN role_permissions rp ON ro.id = rp.role_id
+			WHERE ro.name IN (%s)
+			  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $1)
+			UNION
+			SELECT sp.permission_id
+			FROM roles ro
+			JOIN role_scopes rs ON ro.id = rs.role_id
+			JOIN scope_permissions sp ON rs.scope_id = sp.scope_id
+			WHERE ro.name IN (%s)
+			  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $1)
+		) effective ON effective.permission_id = p.id
+		WHERE (p.tenant_id IS NULL OR p.tenant_id::text = $1)
 		ORDER BY p.resource, p.action
-	`, strings.Join(placeholders, ","))
+	`, strings.Join(placeholders, ","), strings.Join(placeholders, ","))
 
 	rows, err := ps.db.Query(query, args...)
 	if err != nil {

@@ -235,6 +235,15 @@ func hydraMainClientRedirectURIs(tenantDomain string) []string {
 	add(hydraBuildURL(tenantDomain, "/oidc/auth/callback"))
 	if config.AppConfig != nil {
 		add(hydraBuildURL(config.AppConfig.BaseURL, "/authsec/sdkmgr/mcp-auth/callback"))
+		if config.AppConfig.ReactAppURL != "" {
+			add(hydraBuildURL(config.AppConfig.ReactAppURL, "/oidc/auth/callback"))
+		}
+		if config.AppConfig.Environment == "development" {
+			for _, port := range []string{"3000", "3001", "4200", "5173", "8080"} {
+				add(fmt.Sprintf("http://localhost:%s/callback", port))
+				add(fmt.Sprintf("http://localhost:%s/oidc/auth/callback", port))
+			}
+		}
 	}
 
 	return redirects

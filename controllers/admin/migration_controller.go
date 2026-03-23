@@ -1,9 +1,11 @@
 package admin
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -462,11 +464,11 @@ func (mc *MigrationController) CreateTenantFromTemplate(c *gin.Context) {
 
 	config.DB.Model(&tenant).Updates(map[string]interface{}{
 		"tenant_db":        dbName,
-		"migration_status": "completed",
+		"migration_status": "in_progress",
 		"updated_at":       time.Now().UTC(),
 	})
 
-	go mc.fixClonedTenantSelfReference(tenant.TenantID.String(), dbName)
+	go mc.finalizeClonedTenantDatabase(tenant.TenantID.String(), dbName)
 
 	createdAt := time.Time{}
 	if tenant.CreatedAt != nil {
@@ -477,7 +479,7 @@ func (mc *MigrationController) CreateTenantFromTemplate(c *gin.Context) {
 	c.JSON(http.StatusCreated, migration.CreateTenantFromTemplateResponse{
 		TenantID:           tenant.TenantID.String(),
 		DatabaseName:       dbName,
-		MigrationStatus:    "completed",
+		MigrationStatus:    "in_progress",
 		CreatedAt:          createdAt,
 		ClonedFromTemplate: true,
 		CloneDurationMS:    cloneDuration,
@@ -492,14 +494,52 @@ func (mc *MigrationController) GetTemplateStatus(c *gin.Context) {
 	})
 }
 
+func (mc *MigrationController) finalizeClonedTenantDatabase(tenantID, dbName string) {
+	if err := mc.fixClonedTenantSelfReference(tenantID, dbName); err != nil {
+		log.Printf("[MigrationController] finalizeClonedTenantDatabase: tenant rewrite failed for %s: %v", dbName, err)
+		config.DB.Model(&migration.TenantInfo{}).
+			Where("tenant_id = ?", tenantID).
+			Updates(map[string]interface{}{
+				"migration_status": "failed",
+				"updated_at":       time.Now().UTC(),
+			})
+		return
+	}
+
+	lastMigration, inserted, err := migration.BackfillTenantMigrationLogs(tenantID, mc.tenantMigrationsDir, config.Database.DB)
+	if err != nil {
+		log.Printf("[MigrationController] finalizeClonedTenantDatabase: migration log backfill failed for %s: %v", dbName, err)
+		config.DB.Model(&migration.TenantInfo{}).
+			Where("tenant_id = ?", tenantID).
+			Updates(map[string]interface{}{
+				"migration_status": "failed",
+				"updated_at":       time.Now().UTC(),
+			})
+		return
+	}
+
+	updates := map[string]interface{}{
+		"migration_status": "completed",
+		"updated_at":       time.Now().UTC(),
+	}
+	if lastMigration > 0 {
+		updates["last_migration"] = lastMigration
+	}
+
+	config.DB.Model(&migration.TenantInfo{}).
+		Where("tenant_id = ?", tenantID).
+		Updates(updates)
+
+	log.Printf("[MigrationController] finalizeClonedTenantDatabase: finalized %s for tenant %s (backfilled %d logs)", dbName, tenantID, inserted)
+}
+
 // fixClonedTenantSelfReference replaces the synthetic tenant UUID used during template build
-// with the real tenant UUID across key tables in the cloned database.
-func (mc *MigrationController) fixClonedTenantSelfReference(tenantID, dbName string) {
+// with the real tenant UUID across all tenant_id-bearing tables in the cloned database.
+func (mc *MigrationController) fixClonedTenantSelfReference(tenantID, dbName string) error {
 	cfg := config.AppConfig
 	conn, err := migration.ConnectToTenantDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
 	if err != nil {
-		log.Printf("[MigrationController] fixClonedTenantSelfReference: failed to connect to %s: %v", dbName, err)
-		return
+		return fmt.Errorf("connect cloned tenant db %s: %w", dbName, err)
 	}
 	defer conn.Close()
 
@@ -507,33 +547,74 @@ func (mc *MigrationController) fixClonedTenantSelfReference(tenantID, dbName str
 
 	tx, err := conn.Begin()
 	if err != nil {
-		log.Printf("[MigrationController] fixClonedTenantSelfReference: begin tx failed on %s: %v", dbName, err)
-		return
+		return fmt.Errorf("begin clone rewrite transaction for %s: %w", dbName, err)
 	}
+	defer tx.Rollback()
 
 	if _, err := tx.Exec("SET CONSTRAINTS ALL DEFERRED"); err != nil {
 		log.Printf("[MigrationController] fixClonedTenantSelfReference: could not defer constraints: %v", err)
 	}
 
-	for _, query := range []string{
-		"UPDATE tenants SET id = $1::uuid, tenant_id = $1::uuid WHERE id = $2::uuid",
-		"UPDATE permissions SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
-		"UPDATE roles SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
-		"UPDATE users SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
-		"UPDATE role_bindings SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
-		"UPDATE service_accounts SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
-	} {
+	if _, err := tx.Exec(
+		"UPDATE tenants SET id = $1::uuid, tenant_id = $1::uuid WHERE id = $2::uuid OR tenant_id = $2::uuid",
+		tenantID,
+		syntheticID,
+	); err != nil {
+		return fmt.Errorf("rewrite tenants self-reference in %s: %w", dbName, err)
+	}
+
+	tables, err := tablesWithColumn(tx, "tenant_id")
+	if err != nil {
+		return fmt.Errorf("list tenant_id tables in %s: %w", dbName, err)
+	}
+
+	for _, table := range tables {
+		if table == "tenants" {
+			continue
+		}
+		query := fmt.Sprintf(
+			"UPDATE %s SET tenant_id = $1::uuid WHERE tenant_id = $2::uuid",
+			quoteIdentifier(table),
+		)
 		if _, err := tx.Exec(query, tenantID, syntheticID); err != nil {
-			log.Printf("[MigrationController] fixClonedTenantSelfReference: query failed on %s: %v", dbName, err)
+			return fmt.Errorf("rewrite tenant_id in %s.%s: %w", dbName, table, err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("[MigrationController] fixClonedTenantSelfReference: commit failed on %s: %v", dbName, err)
-		return
+		return fmt.Errorf("commit clone rewrite for %s: %w", dbName, err)
 	}
 
 	log.Printf("[MigrationController] fixClonedTenantSelfReference: updated %s with tenant ID %s", dbName, tenantID)
+	return nil
+}
+
+func tablesWithColumn(tx *sql.Tx, columnName string) ([]string, error) {
+	rows, err := tx.Query(`
+		SELECT table_name
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND column_name = $1
+		ORDER BY table_name
+	`, columnName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+
+	return tables, rows.Err()
+}
+
+func quoteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 // runTenantMigrationsAsync runs tenant migrations in the background.
@@ -582,4 +663,3 @@ func (mc *MigrationController) runTenantMigrationsAsync(tenantID, dbName string)
 
 	log.Printf("[MigrationController] Async tenant migration completed for: %s", tenantID)
 }
-

@@ -4,9 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -213,79 +210,6 @@ func (s *TenantDBService) dropDatabase(dbName string) error {
 	}
 
 	return nil
-}
-
-// applyTenantSchema applies the tenant schema template to a new database using psql
-func (s *TenantDBService) applyTenantSchema(dbName string) error {
-	schemaFile, source, err := resolveTenantSchemaFiles()
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Applying tenant schema from %s to database %s", source, dbName)
-
-	// Find psql executable
-	psqlPath, err := exec.LookPath("psql")
-	if err != nil {
-		log.Printf("ERROR: psql not found in PATH: %v. PATH=%s", err, os.Getenv("PATH"))
-		return fmt.Errorf("psql not found: %w", err)
-	}
-	log.Printf("Found psql at: %s", psqlPath)
-
-	// Use psql command to apply schema - it properly handles PL/pgSQL functions and complex SQL
-	cmd := exec.Command(psqlPath, "-h", s.dbHost, "-p", s.dbPort, "-U", s.dbUser, "-d", dbName, "-f", schemaFile, "-v", "ON_ERROR_STOP=1")
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.dbPassword))
-
-	// Capture output directly for better error reporting
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("psql error output: %s", string(output))
-		return fmt.Errorf("failed to apply tenant schema using psql: %w", err)
-	}
-
-	log.Printf("Successfully applied tenant schema to database: %s", dbName)
-	return nil
-}
-
-func resolveTenantSchemaFiles() (string, string, error) {
-	// Try paths relative to current directory and parent directory (for tests)
-	basePaths := []string{".", ".."}
-	candidates := []string{
-		"schema/runtime_master_schema.sql",
-		"schema/generated_tenant_template.sql",
-		"templates/tenant_schema_template.sql",
-	}
-
-	for _, base := range basePaths {
-		for _, candidate := range candidates {
-			fullPath := filepath.Join(base, candidate)
-
-			// Check if file exists and is not empty
-			info, err := os.Stat(fullPath)
-			if err != nil {
-				continue
-			}
-			if info.Size() == 0 {
-				continue
-			}
-
-			// Return absolute path for reliability
-			absPath, err := filepath.Abs(fullPath)
-			if err != nil {
-				absPath = fullPath
-			}
-			return absPath, fullPath, nil
-		}
-	}
-
-	allPaths := make([]string, 0, len(basePaths)*len(candidates))
-	for _, base := range basePaths {
-		for _, candidate := range candidates {
-			allPaths = append(allPaths, filepath.Join(base, candidate))
-		}
-	}
-
-	return "", "", fmt.Errorf("no tenant schema SQL available (checked %s)", strings.Join(allPaths, ", "))
 }
 
 // isValidDatabaseName checks if database name contains only safe characters

@@ -45,16 +45,9 @@ func (s *ICPProvisioningService) ApplyICPTenantMigrations(tenantDBURL string) er
 		return fmt.Errorf("failed to ping tenant db: %w", err)
 	}
 
-	// Create ICP migrations tracking table if it doesn't exist
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS icp_tenant_migrations (
-			version INTEGER PRIMARY KEY,
-			name TEXT NOT NULL,
-			applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-		)
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create icp_tenant_migrations table: %w", err)
+	// V3 owns the schema; provisioning should not mutate it at runtime.
+	if _, err = db.Exec(`SELECT 1 FROM icp_tenant_migrations LIMIT 1`); err != nil {
+		return fmt.Errorf("icp_tenant_migrations table missing: %w", err)
 	}
 
 	// Resolve migrations path

@@ -23,7 +23,6 @@ import (
 
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
-	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -62,13 +61,6 @@ func main() {
 	// Initialise primary database
 	config.InitDatabaseWithoutGORM(cfg)
 
-	// Run database migrations via the authsec-migration system
-	if err := migration.AutoMigrateMigrationLogs(config.DB); err != nil {
-		log.Printf("Warning: failed to create migration_logs table: %v", err)
-	}
-	if err := config.DB.AutoMigrate(platformCtrl.SpireAllModels...); err != nil {
-		log.Printf("Warning: failed to auto-migrate SPIRE tables: %v", err)
-	}
 	if os.Getenv("SKIP_MIGRATIONS") != "true" {
 		masterRunner := migration.NewMasterMigrationRunner(
 			migration.MigrationsDir("master"),
@@ -76,16 +68,15 @@ func main() {
 			config.DB,
 		)
 		if err := masterRunner.RunMigrations(); err != nil {
-			log.Printf("Warning: master migrations encountered errors (service continuing): %v", err)
-		} else {
-			log.Println("Master migrations completed successfully")
+			log.Fatalf("Master migrations failed; refusing to start: %v", err)
 		}
+		log.Println("Master migrations completed successfully")
 
-		// Build the golden tenant template in the background so it is ready for fast cloning.
+		// Build the V3 tenant template in the background so it is ready for fast cloning.
 		migration.InitTemplateCreds(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBSSLMode)
 		go func() {
 			if err := migration.SetupTenantTemplate(migration.MigrationsDir("tenant")); err != nil {
-				log.Printf("Warning: tenant template setup failed (standard migration path remains available): %v", err)
+				log.Printf("Warning: tenant template setup failed: %v", err)
 			}
 		}()
 	}

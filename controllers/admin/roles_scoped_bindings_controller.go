@@ -940,49 +940,8 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 
 	var rows []bindingRow
 	if err := query.Order("role_bindings.created_at DESC").Find(&rows).Error; err != nil {
-		// Fallback for tenants without denormalized columns (e.g., role_bindings.username)
-		if strings.Contains(err.Error(), "role_bindings.username") || strings.Contains(err.Error(), "role_bindings.role_name") {
-			legacyQuery := freshDB.Table("role_bindings").
-				Select(`
-					role_bindings.id,
-					role_bindings.user_id,
-					role_bindings.service_account_id,
-					role_bindings.role_id,
-					COALESCE(roles.name, '') AS role_name,
-					role_bindings.scope_type,
-					role_bindings.scope_id,
-					role_bindings.conditions,
-					role_bindings.created_at,
-					role_bindings.expires_at,
-					COALESCE(users.username, '') AS username,
-					COALESCE(users.email, '') AS email
-				`).
-				Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
-				Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
-				Where("role_bindings.tenant_id = ?", tenantID)
-
-			if userIDFilter != "" {
-				if uid, parseErr := uuid.Parse(userIDFilter); parseErr == nil {
-					legacyQuery = legacyQuery.Where("role_bindings.user_id = ?", uid)
-				}
-			}
-			if roleIDFilter != "" {
-				if rid, parseErr := uuid.Parse(roleIDFilter); parseErr == nil {
-					legacyQuery = legacyQuery.Where("role_bindings.role_id = ?", rid)
-				}
-			}
-			if scopeTypeFilter != "" {
-				legacyQuery = legacyQuery.Where("role_bindings.scope_type = ?", scopeTypeFilter)
-			}
-
-			if legacyErr := legacyQuery.Order("role_bindings.created_at DESC").Find(&rows).Error; legacyErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list role bindings: " + legacyErr.Error()})
-				return
-			}
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list role bindings: " + err.Error()})
-			return
-		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list role bindings: " + err.Error()})
+		return
 	}
 
 	result := make([]RoleBindingListItem, 0, len(rows))

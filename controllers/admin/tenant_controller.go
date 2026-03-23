@@ -693,49 +693,21 @@ func (uc *UserController) Login(c *gin.Context) {
 		return
 	}
 
-	// Get the underlying SQL database connection
-	sqlDB, err := tenantDB.DB()
-	if err != nil {
-		log.Printf("Failed to get SQL database connection: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection error"})
-		return
-	}
-
-	// Check user's enabled MFA methods
 	var mfaMethods []map[string]interface{}
 	var defaultMFAMethod string
-
 	if !isFirstLogin {
-		// Query MFA methods from mfa_methods table
-		mfaQuery := `
-			SELECT method_type, is_primary
-			FROM mfa_methods
-			WHERE user_id = $1 AND client_id = $2 AND verified = true
-			ORDER BY is_primary DESC, created_at ASC
-		`
-		rows, queryErr := sqlDB.Query(mfaQuery, user.ID, user.ClientID)
-		if queryErr == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var methodType string
-				var isPrimary bool
-				if scanErr := rows.Scan(&methodType, &isPrimary); scanErr == nil {
-					mfaMethods = append(mfaMethods, map[string]interface{}{
-						"method_type": methodType,
-						"is_primary":  isPrimary,
-					})
-					// Set default method if this is the primary or first method
-					if defaultMFAMethod == "" || isPrimary {
-						defaultMFAMethod = methodType
-					}
-				}
-			}
+		preferredMethod := ""
+		if user.MFADefaultMethod != nil {
+			preferredMethod = *user.MFADefaultMethod
 		}
-
-		// If no MFA methods found in mfa_methods table, fall back to user's mfa_default_method field
-		if len(mfaMethods) == 0 && user.MFADefaultMethod != nil && *user.MFADefaultMethod != "" {
-			defaultMFAMethod = *user.MFADefaultMethod
+		mfaState, stateErr := services.ResolveMFAState(tenantDB, user.ID, user.ClientID, user.TenantID, c.Request.Host, preferredMethod)
+		if stateErr != nil {
+			log.Printf("Failed to resolve MFA state: %v", stateErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve MFA state"})
+			return
 		}
+		mfaMethods = mfaState.MethodMaps()
+		defaultMFAMethod = mfaState.DefaultMethod
 	}
 
 	// Prepare base response
@@ -1477,16 +1449,38 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 
 	// Handle credential storage if credential data is provided
 	if len(input.CredentialID) > 0 && len(input.PublicKey) > 0 {
+		currentDomain := strings.ToLower(c.Request.Host)
+		if idx := strings.Index(currentDomain, ":"); idx != -1 {
+			currentDomain = currentDomain[:idx]
+		}
+
+		clientID := user.ClientID
+		if clientID == uuid.Nil {
+			clientID = user.TenantID
+		}
 
 		// Insert credential into tenant database
 		credentialQuery := `
 			INSERT INTO credentials (
-				client_id, credential_id, public_key, attestation_type,
-				aaguid, sign_count, transports, backup_eligible, backup_state
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				user_id, client_id, credential_id, public_key, attestation_type,
+				aaguid, sign_count, transports, backup_eligible, backup_state, rp_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (credential_id) DO UPDATE SET
+				user_id = EXCLUDED.user_id,
+				client_id = EXCLUDED.client_id,
+				public_key = EXCLUDED.public_key,
+				attestation_type = EXCLUDED.attestation_type,
+				aaguid = EXCLUDED.aaguid,
+				sign_count = EXCLUDED.sign_count,
+				transports = EXCLUDED.transports,
+				backup_eligible = EXCLUDED.backup_eligible,
+				backup_state = EXCLUDED.backup_state,
+				rp_id = EXCLUDED.rp_id,
+				updated_at = NOW()
 		`
 		_, err = sqlDB.Exec(credentialQuery,
 			user.ID,
+			clientID,
 			input.CredentialID,
 			input.PublicKey,
 			input.AttestationType,
@@ -1495,6 +1489,7 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 			pq.Array(input.Transports),
 			input.BackupEligible,
 			input.BackupState,
+			currentDomain,
 		)
 		if err != nil {
 			log.Printf("Failed to store WebAuthn credential: %v", err)
@@ -1503,23 +1498,6 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 		}
 		log.Printf("WebAuthn credentials stored for user: %s", tenant.Email)
 
-		// Insert WebAuthn method into mfa_methods table
-		mfaMethodQuery := `
-			INSERT INTO mfa_methods (user_id, client_id, method_type, is_primary, verified, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (user_id, client_id, method_type) DO UPDATE SET
-				is_primary = EXCLUDED.is_primary,
-				verified = EXCLUDED.verified,
-				updated_at = EXCLUDED.updated_at
-		`
-		now := time.Now()
-		_, err = sqlDB.Exec(mfaMethodQuery, user.ID, user.ID, "webauthn", true, true, now, now)
-		if err != nil {
-			log.Printf("Failed to store WebAuthn MFA method: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store WebAuthn MFA method"})
-			return
-		}
-		log.Printf("WebAuthn MFA method registered for user: %s", tenant.Email)
 	} else {
 		log.Printf("WebAuthn registration confirmation received (no credential data) for user: %s", tenant.Email)
 	}
@@ -1982,118 +1960,18 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 		return
 	}
 
-	// Get the underlying SQL database connection
-	sqlDB, dbErr := tenantDB.DB()
-	if dbErr != nil {
-		log.Printf("Failed to get SQL DB connection: %v", dbErr)
+	preferredMethod := ""
+	if user.MFADefaultMethod != nil {
+		preferredMethod = *user.MFADefaultMethod
+	}
+	mfaState, stateErr := services.ResolveMFAState(tenantDB, user.ID, user.ClientID, tenantUUID, c.Request.Host, preferredMethod)
+	if stateErr != nil {
+		log.Printf("Failed to resolve MFA state: %v", stateErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check MFA status"})
 		return
 	}
-
-	// Query MFA methods from mfa_methods table
-	// Try with both user_id+client_id AND user_id only (fallback for OIDC users where client_id might vary)
-	mfaQuery := `
-		SELECT method_type, is_primary
-		FROM mfa_methods
-		WHERE user_id = $1 AND verified = true
-		  AND (client_id = $2 OR client_id = (SELECT tenant_id FROM users WHERE id = $1 LIMIT 1))
-		ORDER BY is_primary DESC, created_at ASC
-	`
-	log.Printf("DEBUG: Querying MFA methods for user_id=%s, client_id=%s, email=%s", user.ID, user.ClientID, input.Email)
-	rows, queryErr := sqlDB.Query(mfaQuery, user.ID, user.ClientID)
-	if queryErr != nil {
-		log.Printf("Failed to query MFA methods: %v", queryErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check MFA status"})
-		return
-	}
-	defer rows.Close()
-
-	var mfaMethods []map[string]interface{}
-	var defaultMFAMethod string
-
-	for rows.Next() {
-		var methodType string
-		var isPrimary bool
-		if scanErr := rows.Scan(&methodType, &isPrimary); scanErr == nil {
-			mfaMethods = append(mfaMethods, map[string]interface{}{
-				"method_type": methodType,
-				"is_primary":  isPrimary,
-			})
-			// Set default method if this is the primary or first method
-			if defaultMFAMethod == "" || isPrimary {
-				defaultMFAMethod = methodType
-			}
-		}
-	}
-
-	log.Printf("DEBUG: Found %d MFA methods for user %s: %v", len(mfaMethods), input.Email, mfaMethods)
-
-	// Track if re-registration is needed for current domain
-	requiresRegistration := false
-
-	// If no MFA methods found in mfa_methods table, check legacy tables as fallback
-	if len(mfaMethods) == 0 {
-		log.Printf("DEBUG: No MFA methods found in mfa_methods table for user %s, checking legacy tables", input.Email)
-
-		// First, check for tenant TOTP secrets (tenant-scoped schema), then legacy totp_secrets.
-		var totpCount int
-		totpQueries := []string{
-			`SELECT COUNT(*) FROM tenant_totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true AND is_active = true`,
-			`SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`,
-		}
-		for _, totpQuery := range totpQueries {
-			if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil {
-				break
-			}
-		}
-		if totpCount > 0 {
-			log.Printf("DEBUG: Found %d TOTP secrets for user %s", totpCount, input.Email)
-			// User has TOTP configured but not in mfa_methods table
-			mfaMethods = append(mfaMethods, map[string]interface{}{
-				"method_type": "totp",
-				"is_primary":  true,
-			})
-			defaultMFAMethod = "totp"
-		} else {
-			// No TOTP found, check for WebAuthn credentials
-			// Get current domain from request to check RP ID specific credentials
-			currentDomain := c.Request.Host
-			if idx := strings.Index(currentDomain, ":"); idx != -1 {
-				currentDomain = currentDomain[:idx] // strip port
-			}
-			log.Printf("DEBUG: No TOTP found, checking credentials for current domain/RP ID: %s", currentDomain)
-
-			// Check for credentials matching the current RP ID (domain)
-			// This ensures we only consider credentials registered on the current domain
-			credQuery := `SELECT COUNT(*) FROM credentials
-			              WHERE (user_id = $1 OR client_id = $2)
-			              AND (rp_id = $3 OR rp_id IS NULL)`
-			var credCount int
-			if err := sqlDB.QueryRow(credQuery, user.ID, user.ClientID, currentDomain).Scan(&credCount); err == nil && credCount > 0 {
-				log.Printf("DEBUG: Found %d credentials for RP ID '%s' for user %s", credCount, currentDomain, input.Email)
-				// User has credentials registered but not in mfa_methods table - treat as WebAuthn enabled
-				mfaMethods = append(mfaMethods, map[string]interface{}{
-					"method_type": "webauthn",
-					"is_primary":  true,
-				})
-				defaultMFAMethod = "webauthn"
-			} else {
-				// Check if user has credentials on other domains
-				otherDomainsQuery := `SELECT COUNT(*) FROM credentials
-				                      WHERE (user_id = $1 OR client_id = $2)
-				                      AND rp_id IS NOT NULL
-				                      AND rp_id != $3`
-				var otherCredCount int
-				if err := sqlDB.QueryRow(otherDomainsQuery, user.ID, user.ClientID, currentDomain).Scan(&otherCredCount); err == nil && otherCredCount > 0 {
-					log.Printf("DEBUG: User %s has %d credentials on other domains but not on %s - requires re-registration",
-						input.Email, otherCredCount, currentDomain)
-					// User has credentials on other domains but not this one
-					// Frontend should prompt for re-registration
-					requiresRegistration = true
-				}
-			}
-		}
-	}
+	mfaMethods := mfaState.MethodMaps()
+	defaultMFAMethod := mfaState.DefaultMethod
 
 	// Build response
 	response := gin.H{
@@ -2106,7 +1984,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	}
 
 	// Add requires_registration flag if user needs to re-register on this domain
-	if requiresRegistration {
+	if mfaState.RequiresRegistration {
 		response["requires_registration"] = true
 		response["message"] = "WebAuthn credentials required for this domain. Please complete registration."
 		log.Printf("DEBUG: Returning requires_registration=true for user %s on domain %s", input.Email, c.Request.Host)

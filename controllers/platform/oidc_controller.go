@@ -117,11 +117,8 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 		"exp":       now.Add(24 * time.Hour).Unix(),
 	}
 
-	// project_id is required for auth-manager GetAuthz() - default to tenant_id
 	if adminUser.ProjectID != nil && *adminUser.ProjectID != uuid.Nil {
 		claims["project_id"] = adminUser.ProjectID.String()
-	} else {
-		claims["project_id"] = tenantID // Default project_id to tenant_id for GetAuthz()
 	}
 	// client_id is optional but useful for context
 	if adminUser.ClientID != nil && *adminUser.ClientID != uuid.Nil {
@@ -376,7 +373,10 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 		baseURL = strings.TrimRight(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
 	}
 
-	redirectURI := strings.TrimSpace(config.AppConfig.OAuthRedirectURI)
+	redirectURI := strings.TrimSpace(input.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = strings.TrimSpace(config.AppConfig.OAuthRedirectURI)
+	}
 	if redirectURI == "" {
 		if config.AppConfig.ReactAppURL != "" {
 			redirectURI = strings.TrimRight(config.AppConfig.ReactAppURL, "/") + "/oidc/auth/callback"

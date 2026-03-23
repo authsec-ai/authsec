@@ -7,7 +7,6 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"gorm.io/gorm"
 )
 
 // TemplateDBName is the name of the golden tenant template database.
@@ -214,14 +213,6 @@ func GenerateTenantDBName(tenantID string) string {
 		}
 	}
 	return fmt.Sprintf("tenant_%s", clean)
-}
-
-// AutoMigrateMigrationLogs ensures the migration_logs table exists in the master DB.
-func AutoMigrateMigrationLogs(gormDB *gorm.DB) error {
-	if gormDB == nil {
-		return fmt.Errorf("GORM DB not initialized")
-	}
-	return gormDB.AutoMigrate(&MigrationLog{})
 }
 
 // RunTenantMigrationsInProcess runs tenant migrations directly in-process without an HTTP round-trip.
