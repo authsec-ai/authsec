@@ -14,6 +14,8 @@ github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa/go.mod h1:cEWa1L
 github.com/antihax/optional v1.0.0/go.mod h1:uupD/76wgC+ih3iEmQUL+0Ugr19nfwCT1kdvxnR2qWY=
 github.com/authsec-ai/auth-manager v1.2.3 h1:MfhxVSf0FfXt7MmdjcH15mBnXbJEzYf/wr+qkRDoork=
 github.com/authsec-ai/auth-manager v1.2.3/go.mod h1:k2JRm6U1LDlj65N8KSfSA6Pz+f663V/+QkhfbM7KV7U=
+github.com/authsec-ai/sharedmodels v1.5.1 h1:fo8dQhJrW3iTqioDZ0GQyr/SjwCj+huV2AJ3c/x0DFM=
+github.com/authsec-ai/sharedmodels v1.5.1/go.mod h1:KNcablMK30FZMJIXR2aRam/QJTZ1twH4nGgFUp3uvoU=
 github.com/beevik/etree v1.1.0/go.mod h1:r8Aw8JqVegEf0w2fDnATrX9VpkMcyFeM0FhwO62wh+A=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=

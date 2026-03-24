@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/authsec-ai/auth-manager v1.2.3
-	github.com/authsec-ai/sharedmodels v1.3.0
+	github.com/authsec-ai/sharedmodels v1.5.1
 	github.com/didip/tollbooth/v7 v7.0.2
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/gin-contrib/gzip v1.2.5
@@ -133,5 +133,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 )
-
-replace github.com/authsec-ai/sharedmodels => ../sharedmodels
