@@ -84,7 +84,7 @@ func main() {
 		// Build the golden tenant template in the background so it is ready for fast cloning.
 		migration.InitTemplateCreds(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBSSLMode)
 		go func() {
-			if err := migration.SetupTenantTemplate(migration.MigrationsDir("tenant")); err != nil {
+			if err := migration.SetupTenantTemplate(migration.MigrationsDir("tenant"), config.Database.DB); err != nil {
 				log.Printf("Warning: tenant template setup failed (standard migration path remains available): %v", err)
 			}
 		}()
