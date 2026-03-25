@@ -142,6 +142,7 @@ CREATE TABLE public.delegation_policies (
     created_by uuid,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT pk_delegation_policies PRIMARY KEY (id),
     CONSTRAINT uq_deleg_policy_tenant_role_agent UNIQUE (tenant_id, role_name, agent_type)
 );
 
