@@ -24,6 +24,7 @@ import (
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -197,8 +198,27 @@ func main() {
 	// Prometheus metrics endpoint
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	// All routes (user-flow + webauthn)
-	routes.SetupRoutes(r, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler)
+	// ── Bootstrap SPIRE identity service (merged from authsec-spire) ──
+	var spireDeps *spire.Dependencies
+	if config.Database != nil && config.Database.DB != nil {
+		spireCfg := &spire.BootstrapConfig{
+			MasterDB: config.Database.DB,
+		}
+		if config.VaultClient != nil {
+			spireCfg.VaultClient = config.VaultClient
+		}
+		deps, bootstrapErr := spire.Bootstrap(spireCfg)
+		if bootstrapErr != nil {
+			log.Printf("Warning: SPIRE identity service bootstrap failed (continuing without it): %v", bootstrapErr)
+		} else {
+			spireDeps = deps
+		}
+	} else {
+		log.Printf("Warning: Master database not available for SPIRE bootstrap")
+	}
+
+	// All routes (user-flow + webauthn + spire identity)
+	routes.SetupRoutes(r, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler, spireDeps)
 
 	// ─────────────────────────────────────────────────────────
 	// Phase 4: background workers

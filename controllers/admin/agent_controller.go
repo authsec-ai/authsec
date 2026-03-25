@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -129,7 +130,8 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 }
 
 // ProvisionIdentity creates a SPIRE workload entry for an AI agent.
-// authsec-spire generates the SPIFFE ID and returns it.
+// Uses the in-process RegisterAgentWorkload which writes to both master DB
+// (spire_workloads) and tenant DB (workload_entries), and registers with SPIRE via gRPC.
 // The SPIFFE ID is then written back to the client record.
 // POST /uflow/admin/agents/:id/provision-identity
 func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
@@ -186,17 +188,16 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
-	// Get auth token to pass to authsec-spire
-	authToken := extractBearerToken(c)
-
-	// Call authsec-spire to create the workload entry — it generates the SPIFFE ID
-	spireResp, err := ac.spireService.CreateAgentEntry(&services.CreateAgentEntryRequest{
-		TenantID:  tenantID.String(),
-		ClientID:  clientID,
-		AgentType: *agent.AgentType,
-		ParentID:  req.ParentID,
-		TTL:       req.TTL,
-	}, authToken)
+	// Use the in-process RegisterAgentWorkload instead of HTTP call to ICP_SERVICE_URL.
+	// This writes to both spire_workloads (master) and workload_entries (tenant),
+	// and registers with SPIRE server via gRPC if connected.
+	spiffeID, err := platformCtrl.RegisterAgentWorkload(
+		tenantID.String(),
+		clientID,
+		*agent.AgentType,
+		"", // platform — not provided in provision request
+		nil, // selectors — not provided in provision request
+	)
 	if err != nil {
 		log.Printf("[AgentController] Failed to create SPIRE entry for agent %s: %v", clientID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create SPIRE identity", "details": err.Error()})
@@ -206,28 +207,24 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 	// Write the SPIFFE ID back to the client record
 	updateResult := tenantDB.Table("clients").
 		Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
-		Update("spiffe_id", spireResp.SpiffeID)
+		Update("spiffe_id", spiffeID)
 	if updateResult.Error != nil {
 		log.Printf("[AgentController] Failed to update client spiffe_id: %v", updateResult.Error)
 	}
 
-	log.Printf("[AgentController] Agent %s provisioned: spiffe_id=%s entry_id=%s", clientID, spireResp.SpiffeID, spireResp.EntryID)
+	log.Printf("[AgentController] Agent %s provisioned: spiffe_id=%s", clientID, spiffeID)
 
 	// Audit log: agent identity provisioned
 	middlewares.Audit(c, "agent_identity", clientID, "provision", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"spiffe_id": spireResp.SpiffeID,
-			"entry_id":  spireResp.EntryID,
-			"parent_id": spireResp.ParentID,
+			"spiffe_id": spiffeID,
 		},
 	})
 
 	c.JSON(http.StatusCreated, gin.H{
-		"entry_id":  spireResp.EntryID,
-		"spiffe_id": spireResp.SpiffeID,
+		"spiffe_id": spiffeID,
 		"client_id": clientID,
 		"tenant_id": tenantID.String(),
-		"parent_id": spireResp.ParentID,
 		"message":   "SPIRE identity provisioned successfully",
 	})
 }

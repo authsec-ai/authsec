@@ -42,6 +42,7 @@ import (
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/internal/spire"
 	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -56,6 +57,7 @@ func SetupRoutes(
 	webAuthnHandler *handlers.WebAuthnHandler,
 	adminWebAuthnHandler *handlers.AdminWebAuthnHandler,
 	endUserWebAuthnHandler *handlers.EndUserWebAuthnHandler,
+	spireDeps *spire.Dependencies,
 ) {
 	// ────────────────────────────────────────────────────────
 	// CORS is already applied by the caller (main.go)
@@ -730,6 +732,15 @@ func SetupRoutes(
 		// Served under /authsec/spire.
 		// ────────────────────────────────────────────────────
 		registerSpireRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
+		// SPIRE Identity Service (merged from authsec-spire)
+		// Served under /authsec/spiresvc.
+		// ────────────────────────────────────────────────────
+		if spireDeps != nil {
+			spiresvc := authsec.Group("/spiresvc")
+			spire.RegisterRoutes(spiresvc, spireDeps)
+		}
 
 		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)

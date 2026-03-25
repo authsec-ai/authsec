@@ -825,11 +825,11 @@ ALTER TABLE ONLY public.clients
 
 
 --
--- Name: clients clients_hydra_client_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: clients clients_hydra_client_id_key; Type: INDEX; Schema: public; Owner: -
+-- Partial unique index: allows empty/NULL hydra_client_id (e.g. AI agent clients)
 --
 
-ALTER TABLE ONLY public.clients
-    ADD CONSTRAINT clients_hydra_client_id_key UNIQUE (hydra_client_id);
+CREATE UNIQUE INDEX clients_hydra_client_id_key ON public.clients (hydra_client_id) WHERE hydra_client_id != '';
 
 
 --
