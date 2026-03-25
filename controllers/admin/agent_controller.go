@@ -11,9 +11,9 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
+	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
-	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -21,13 +21,16 @@ import (
 // AgentController handles AI agent management: listing agents, provisioning
 // SPIRE identities, and issuing delegated JWT-SVIDs.
 type AgentController struct {
-	spireService *services.SpireService
+	jwtSvidSvc *spireservices.JWTSVIDService
 }
 
 func NewAgentController() *AgentController {
-	return &AgentController{
-		spireService: services.NewSpireService(),
-	}
+	return &AgentController{}
+}
+
+// SetJWTSVIDService injects the JWT-SVID service after bootstrap.
+func (ac *AgentController) SetJWTSVIDService(svc *spireservices.JWTSVIDService) {
+	ac.jwtSvidSvc = svc
 }
 
 // --- Request types ---
@@ -188,8 +191,8 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
-	// Use the in-process RegisterAgentWorkload instead of HTTP call to ICP_SERVICE_URL.
-	// This writes to both spire_workloads (master) and workload_entries (tenant),
+	// Register workload entry via the monolith's platform controller.
+	// Writes to both spire_workloads (master) and workload_entries (tenant),
 	// and registers with SPIRE server via gRPC if connected.
 	spiffeID, err := platformCtrl.RegisterAgentWorkload(
 		tenantID.String(),
@@ -378,18 +381,19 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		"client_id":   clientID,
 	}
 
-	// Get auth token to forward to authsec-spire
-	authToken := extractBearerToken(c)
-
-	// Issue JWT-SVID via authsec-spire
+	// Issue JWT-SVID directly via merged service
 	finalTTL := int(ttl.Seconds())
-	jwtResp, err := ac.spireService.IssueDelegatedJWTSVID(&services.IssueJWTSVIDRequest{
+	if ac.jwtSvidSvc == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "JWT-SVID service not initialized"})
+		return
+	}
+	jwtResp, err := ac.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
 		TenantID:     tenantID.String(),
 		SpiffeID:     *agent.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          finalTTL,
 		CustomClaims: customClaims,
-	}, authToken)
+	})
 	if err != nil {
 		log.Printf("[AgentController] Failed to issue JWT-SVID for agent %s: %v", clientID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to issue JWT-SVID", "details": err.Error()})

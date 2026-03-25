@@ -244,16 +244,27 @@ func main() {
 		}
 	}()
 
-	// PKI retry worker
-	icpToken, err := services.GenerateOIDCServiceToken()
-	if err != nil {
-		log.Printf("Warning: failed to generate ICP service token for PKI retry worker: %v", err)
-	} else {
-		icpClient := icp.NewClient(cfg.ICPServiceURL, icpToken)
-		icpService := services.NewICPProvisioningService(icpClient)
-		pkiWorker := services.NewPKIRetryWorker(config.GetDatabase(), icpService, 5*time.Minute)
-		pkiWorker.Start()
-		log.Printf("PKI retry worker started")
+	// PKI retry worker — uses in-process PKI service when available, falls back to HTTP
+	{
+		var icpService *services.ICPProvisioningService
+		if spireDeps != nil && spireDeps.PKIProvisioningSvc != nil {
+			icpService = services.NewICPProvisioningServiceInProcess(spireDeps.PKIProvisioningSvc)
+			log.Printf("PKI retry worker using in-process PKI service")
+		} else {
+			icpToken, tokenErr := services.GenerateOIDCServiceToken()
+			if tokenErr != nil {
+				log.Printf("Warning: failed to generate ICP service token for PKI retry worker: %v", tokenErr)
+			} else {
+				icpClient := icp.NewClient(cfg.ICPServiceURL, icpToken)
+				icpService = services.NewICPProvisioningService(icpClient)
+				log.Printf("PKI retry worker using HTTP ICP client (fallback)")
+			}
+		}
+		if icpService != nil {
+			pkiWorker := services.NewPKIRetryWorker(config.GetDatabase(), icpService, 5*time.Minute)
+			pkiWorker.Start()
+			log.Printf("PKI retry worker started")
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────

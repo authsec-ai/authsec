@@ -163,6 +163,26 @@ func SetupRoutes(
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
 	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
 
+	// ── Inject merged SPIRE services into controllers that need them ──
+	if spireDeps != nil {
+		// Agent controllers (admin + platform)
+		agentController.SetJWTSVIDService(spireDeps.JWTSVIDSvc)
+
+		platformAgentController := platformCtrl.NewAgentController()
+		platformAgentController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc)
+		_ = platformAgentController // used in platform routes below
+
+		// Delegation policy controllers (admin + platform)
+		delegationPolicyController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
+		delegationPolicyCtrl.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
+
+		// PKI provisioning — inject into tenant + OIDC controllers
+		if spireDeps.PKIProvisioningSvc != nil {
+			userController.SetPKIService(spireDeps.PKIProvisioningSvc)
+			oidcController.SetPKIService(spireDeps.PKIProvisioningSvc)
+		}
+	}
+
 	// ────────────────────────────────────────────────────────
 	// Well-known OIDC discovery – must remain at root (RFC 8414)
 	// ────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/spire/controllers"
 	"github.com/authsec-ai/authsec/internal/spire/middleware"
+	"github.com/authsec-ai/authsec/internal/spire/services"
 )
 
 // Dependencies holds all controller and middleware instances needed for routing.
@@ -23,6 +24,12 @@ type Dependencies struct {
 	JWTSVID         *controllers.JWTSVIDController
 	Bundle          *controllers.BundleController
 	PKIAdmin        *controllers.PKIAdminController
+
+	// Services (exposed for injection into existing monolith controllers)
+	PKIProvisioningSvc  *services.PKIProvisioningService
+	WorkloadEntrySvc    *services.WorkloadEntryService
+	JWTSVIDSvc          *services.JWTSVIDService
+	AgentSvc            *services.AgentService
 
 	// Middleware
 	JWTAuth   gin.HandlerFunc
