@@ -21,6 +21,7 @@ import (
 	// authrepo "github.com/authsec-ai/auth-manager/pkg/repo"
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
+	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -195,6 +196,13 @@ func NewOIDCController() (*OIDCController, error) {
 		tenantDBService:        tenantDBService,
 		icpProvisioningService: icpProvisioningService,
 	}, nil
+}
+
+// SetPKIService injects the in-process PKI provisioning service (replaces HTTP ICP client).
+func (oc *OIDCController) SetPKIService(pkiSvc *spireservices.PKIProvisioningService) {
+	if oc.icpProvisioningService != nil {
+		oc.icpProvisioningService.SetPKIService(pkiSvc)
+	}
 }
 
 // Initiate handles unified OIDC flow - automatically determines register vs login

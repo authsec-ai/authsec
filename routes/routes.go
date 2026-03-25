@@ -42,6 +42,7 @@ import (
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/internal/spire"
 	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -56,6 +57,7 @@ func SetupRoutes(
 	webAuthnHandler *handlers.WebAuthnHandler,
 	adminWebAuthnHandler *handlers.AdminWebAuthnHandler,
 	endUserWebAuthnHandler *handlers.EndUserWebAuthnHandler,
+	spireDeps *spire.Dependencies,
 ) {
 	// ────────────────────────────────────────────────────────
 	// CORS is already applied by the caller (main.go)
@@ -160,6 +162,26 @@ func SetupRoutes(
 
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
 	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
+
+	// ── Inject merged SPIRE services into controllers that need them ──
+	if spireDeps != nil {
+		// Agent controllers (admin + platform)
+		agentController.SetJWTSVIDService(spireDeps.JWTSVIDSvc)
+
+		platformAgentController := platformCtrl.NewAgentController()
+		platformAgentController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc)
+		_ = platformAgentController // used in platform routes below
+
+		// Delegation policy controllers (admin + platform)
+		delegationPolicyController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
+		delegationPolicyCtrl.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
+
+		// PKI provisioning — inject into tenant + OIDC controllers
+		if spireDeps.PKIProvisioningSvc != nil {
+			userController.SetPKIService(spireDeps.PKIProvisioningSvc)
+			oidcController.SetPKIService(spireDeps.PKIProvisioningSvc)
+		}
+	}
 
 	// ────────────────────────────────────────────────────────
 	// Well-known OIDC discovery – must remain at root (RFC 8414)
@@ -730,6 +752,15 @@ func SetupRoutes(
 		// Served under /authsec/spire.
 		// ────────────────────────────────────────────────────
 		registerSpireRoutes(authsec)
+
+		// ────────────────────────────────────────────────────
+		// SPIRE Identity Service (merged from authsec-spire)
+		// Served under /authsec/spiresvc.
+		// ────────────────────────────────────────────────────
+		if spireDeps != nil {
+			spiresvc := authsec.Group("/spiresvc")
+			spire.RegisterRoutes(spiresvc, spireDeps)
+		}
 
 		// ────────────────────────────────────────────────────
 		// External Service (formerly exsvc / mcp-service)

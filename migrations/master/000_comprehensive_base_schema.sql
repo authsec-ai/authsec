@@ -909,11 +909,10 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
 END $$;
 
--- Clients
-DO $$ BEGIN
-    ALTER TABLE clients ADD CONSTRAINT uni_clients_hydra_client_id UNIQUE (hydra_client_id);
-EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
-END $$;
+-- Clients: partial unique index — allows empty/NULL hydra_client_id (e.g. AI agent clients)
+DROP INDEX IF EXISTS uni_clients_hydra_client_id;
+ALTER TABLE clients DROP CONSTRAINT IF EXISTS uni_clients_hydra_client_id;
+CREATE UNIQUE INDEX IF NOT EXISTS uni_clients_hydra_client_id ON clients (hydra_client_id) WHERE hydra_client_id != '';
 
 -- Groups
 DO $$ BEGIN
