@@ -144,7 +144,7 @@ pipeline {
                     )
                 ]) {
                         // Uses the DOCKER_IMAGE variable set in 'Initialize'
-                        sh "docker build --secret id=github_token,env=GITHUB_TOKEN -t ${env.DOCKER_IMAGE} ."
+                        sh "DOCKER_BUILDKIT=1 docker build --secret id=github_token,env=GITHUB_TOKEN -t ${env.DOCKER_IMAGE} ."
                     }
                 }
             }
