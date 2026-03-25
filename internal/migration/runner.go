@@ -145,19 +145,18 @@ func (mr *MigrationRunner) RunMigrations() error {
 		templatePath := filepath.Join(mr.migrationsDir, "000_tenant_template.sql")
 		if _, err := os.Stat(templatePath); err == nil {
 			var schemaExists bool
-			mr.db.QueryRow(
+			if err := mr.db.QueryRow(
 				"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users')",
-			).Scan(&schemaExists)
+			).Scan(&schemaExists); err != nil {
+				log.Printf("[Migration] Warning: failed to check schema existence, will attempt template execution: %v", err)
+				schemaExists = false
+			}
 
 			if schemaExists {
 				log.Printf("[Migration] Tenant schema already exists, skipping template")
 			} else {
 				log.Printf("[Migration] Executing tenant base template")
-				content, err := os.ReadFile(templatePath)
-				if err != nil {
-					return fmt.Errorf("failed to read tenant template: %w", err)
-				}
-				if err := mr.executeSQLContent(string(content)); err != nil {
+				if err := mr.executeTemplateFile(templatePath); err != nil {
 					return fmt.Errorf("tenant template execution failed: %w", err)
 				}
 				log.Printf("[Migration] Tenant base template executed successfully")
@@ -234,8 +233,9 @@ func (mr *MigrationRunner) RunMigrations() error {
 			mr.logMigration(m.Version, m.Name, true, "", executionMS)
 		} else {
 			failedCount++
-			errMsg := fmt.Sprintf("FAILED after %d attempts: %v", maxRetries, lastErr)
-			log.Printf("[Migration] ERROR: %s v%d %s", mr.dbType, m.Version, errMsg)
+			errMsg := fmt.Sprintf("PANIC: Migration %d (%s) FAILED after %d attempts - %v",
+				m.Version, m.Name, maxRetries, lastErr)
+			log.Printf("[Migration] %s", errMsg)
 			mr.logMigration(m.Version, m.Name, false, errMsg, executionMS)
 		}
 	}
@@ -276,6 +276,29 @@ func (mr *MigrationRunner) executeSQLContent(content string) error {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+// executeTemplateFile reads and executes a tenant template SQL file with retry logic.
+func (mr *MigrationRunner) executeTemplateFile(templatePath string) error {
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template file: %w", err)
+	}
+
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := mr.executeSQLContent(string(content))
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[Migration] Template execution attempt %d/%d failed: %v", attempt, maxRetries, err)
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("template execution failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 // isMigrationExecuted returns true if the given version is already recorded as successful.
