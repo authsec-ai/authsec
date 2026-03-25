@@ -144,10 +144,7 @@ pipeline {
                     )
                 ]) {
                         // Uses the DOCKER_IMAGE variable set in 'Initialize'
-                        sh """
-                            docker buildx create --name jenkins-builder --use 2>/dev/null || docker buildx use jenkins-builder
-                            docker buildx build --secret id=github_token,env=GITHUB_TOKEN -t ${env.DOCKER_IMAGE} --load .
-                        """
+                        sh "docker build --secret id=github_token,env=GITHUB_TOKEN -t ${env.DOCKER_IMAGE} ."
                     }
                 }
             }
