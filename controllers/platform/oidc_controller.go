@@ -1,8 +1,12 @@
 package platform
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -389,19 +393,64 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 		oauthClientID = oauthClientID + "-main-client"
 	}
 
+	// Generate random state
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state"})
+		return
+	}
+	freshState := base64.RawURLEncoding.EncodeToString(stateBytes)
+
+	// Generate PKCE code_verifier and code_challenge (S256)
+	verifierBytes := make([]byte, 32)
+	if _, err := rand.Read(verifierBytes); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate code_verifier"})
+		return
+	}
+	codeVerifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
+	h := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
+
+	// Register verifier with the in-process PKCE store (hmgr is merged — no HTTP call needed)
+	pkcePayload, _ := json.Marshal(map[string]string{
+		"state":         freshState,
+		"code_verifier": codeVerifier,
+	})
+	hydraServiceURL := os.Getenv("HYDRA_SERVICE_URL")
+	if hydraServiceURL == "" {
+		hydraServiceURL = "http://localhost:7468/authsec"
+	}
+	pkceResp, pkceErr := http.Post(
+		hydraServiceURL+"/hmgr/pkce/store",
+		"application/json",
+		bytes.NewReader(pkcePayload),
+	)
+	if pkceErr != nil {
+		log.Printf("ERROR: Failed to store PKCE verifier: %v", pkceErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
+		return
+	}
+	pkceResp.Body.Close()
+	if pkceResp.StatusCode >= 300 {
+		log.Printf("ERROR: PKCE store returned %d", pkceResp.StatusCode)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
+		return
+	}
+
 	params := url.Values{}
 	params.Add("client_id", oauthClientID)
 	params.Add("response_type", "code")
 	params.Add("scope", "openid profile email")
 	params.Add("redirect_uri", redirectURI)
-	params.Add("state", "test-state-123")                                       // Hardcoded as per example
-	params.Add("code_challenge", "bqtF1ini4HEPUdQaIGqw1JVr7JgsO-y8Be1hxZUmedI") // Hardcoded as per example
+	params.Add("state", freshState)
+	params.Add("code_challenge", codeChallenge)
 	params.Add("code_challenge_method", "S256")
 
 	authURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
 	c.JSON(http.StatusOK, models.GetAuthURLResponse{
 		AuthURL: authURL,
+		State:   freshState,
 	})
 }
 

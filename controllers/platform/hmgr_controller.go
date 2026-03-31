@@ -7,10 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -22,6 +22,37 @@ import (
 	"gorm.io/datatypes"
 )
 
+// pkceEntry holds a code verifier with its expiry time.
+type pkceEntry struct {
+	verifier  string
+	expiresAt time.Time
+}
+
+// pkceStore maps state/login_challenge → pkceEntry (TTL: 8 minutes).
+var pkceStore sync.Map
+
+// storePKCEVerifier saves a code verifier associated with a state or login challenge.
+func storePKCEVerifier(key, codeVerifier string) {
+	pkceStore.Store(key, pkceEntry{
+		verifier:  codeVerifier,
+		expiresAt: time.Now().Add(8 * time.Minute),
+	})
+}
+
+// consumePKCEVerifier retrieves and deletes the stored code verifier.
+// Returns an empty string if not found or expired.
+func consumePKCEVerifier(key string) string {
+	val, ok := pkceStore.LoadAndDelete(key)
+	if !ok {
+		return ""
+	}
+	entry := val.(pkceEntry)
+	if time.Now().After(entry.expiresAt) {
+		return ""
+	}
+	return entry.verifier
+}
+
 // HmgrController handles hydra manager authentication requests
 type HmgrController struct {
 	service *hydramodels.OAuthLoginService
@@ -32,6 +63,26 @@ func NewHmgrController(cfg config.Config) *HmgrController {
 	return &HmgrController{
 		service: hydramodels.NewOAuthLoginService(cfg),
 	}
+}
+
+// StorePKCEVerifierHandler pre-registers a PKCE code_verifier from an external client
+// so it can be retrieved at token-exchange time.
+// POST /hmgr/pkce/store  { "state": "...", "code_verifier": "..." }
+func (ctrl *HmgrController) StorePKCEVerifierHandler(c *gin.Context) {
+	var req struct {
+		State        string `json:"state" binding:"required"`
+		CodeVerifier string `json:"code_verifier" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	if len(req.CodeVerifier) < 43 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "code_verifier must be at least 43 characters"})
+		return
+	}
+	storePKCEVerifier(req.State, req.CodeVerifier)
+	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 // GetLoginPageDataHandler handles the login page data request
@@ -62,7 +113,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		return
 	}
 
-	clientDetails, raw, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, hydramodels.LoginPageDataResponse{
 			Success: false,
@@ -70,7 +121,6 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		})
 		return
 	}
-	log.Print(raw)
 
 	tenantIDForOIDC, _ := clientDetails.Metadata["tenant_id"].(string)
 	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
@@ -135,6 +185,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	var req struct {
 		LoginChallenge string `json:"login_challenge"`
 		OriginDomain   string `json:"origin_domain,omitempty"`
+		CodeVerifier   string `json:"code_verifier,omitempty"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -153,6 +204,12 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		return
 	}
 
+	// Store the PKCE code_verifier by login_challenge so ExchangeTokenHandler can
+	// retrieve it later.
+	if req.CodeVerifier != "" {
+		storePKCEVerifier(req.LoginChallenge, req.CodeVerifier)
+	}
+
 	loginRequest, err := ctrl.service.GetHydraLoginRequest(req.LoginChallenge)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
@@ -162,7 +219,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		return
 	}
 
-	clientDetails, raw, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -170,7 +227,6 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		})
 		return
 	}
-	log.Print(raw)
 
 	tenantID, _ := clientDetails.Metadata["tenant_id"].(string)
 	providers, err := ctrl.service.GetOIDCProvidersForTenant(tenantID)

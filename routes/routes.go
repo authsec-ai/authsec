@@ -990,6 +990,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 		pub.POST("/auth/initiate/:provider", hmgrController.InitiateAuthHandler)
 		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
+		pub.POST("/pkce/store", hmgrController.StorePKCEVerifierHandler)
 
 		// SAML endpoints
 		pub.POST("/saml/initiate/:provider", hmgrController.InitiateSAMLAuthHandler)

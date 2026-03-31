@@ -160,6 +160,18 @@ func (mr *MigrationRunner) RunMigrations() error {
 					return fmt.Errorf("tenant template execution failed: %w", err)
 				}
 				log.Printf("[Migration] Tenant base template executed successfully")
+
+				// The template is a complete final-state dump — all incremental migrations
+				// are already baked in. Mark them all as executed so the runner skips them.
+				if allFiles, err := mr.LoadMigrationFiles(); err == nil {
+					for _, m := range allFiles {
+						if m.Version > 0 {
+							mr.logMigration(m.Version, m.Name, true, "", 0)
+						}
+					}
+					log.Printf("[Migration] Marked %d incremental migrations as already applied (included in template)", len(allFiles)-1)
+				}
+				return nil
 			}
 		}
 	}
