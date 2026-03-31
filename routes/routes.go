@@ -183,27 +183,25 @@ func SetupRoutes(
 		}
 	}
 
-	// ────────────────────────────────────────────────────────
-	// Well-known OIDC discovery – must remain at root (RFC 8414)
-	// ────────────────────────────────────────────────────────
-	r.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
-	r.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
-
 	// Catch-all OPTIONS handler so CORS preflight requests are answered for every
 	// path regardless of which method-specific route is registered.
 	r.OPTIONS("/*path", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
 
-	// Backward-compat: user-flow previously exposed this at the bare root so that
-	// existing webauthn-service clients did not need to change their URLs.
-	r.POST("/webauthn/mfa/loginStatus", userController.WebAuthnMFALoginStatus)
-
 	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
 	{
+		// ────────────────────────────────────────────────────────
+		// Well-known OIDC discovery (formerly spire-headless)
+		// ────────────────────────────────────────────────────────
+		authsec.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
+		authsec.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
+
+		// Backward-compat: webauthn-service previously exposed this at the bare root.
+		authsec.POST("/webauthn/mfa/loginStatus", userController.WebAuthnMFALoginStatus)
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
 		// Served under /authsec/webauthn (formerly webauthn-service).

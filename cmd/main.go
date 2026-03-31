@@ -196,7 +196,7 @@ func main() {
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 
 	// Prometheus metrics endpoint
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))
 
 	// ── Bootstrap SPIRE identity service (merged from authsec-spire) ──
 	var spireDeps *spire.Dependencies
