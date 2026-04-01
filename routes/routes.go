@@ -200,8 +200,6 @@ func SetupRoutes(
 		authsec.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
 		authsec.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
 
-		// Backward-compat: webauthn-service previously exposed this at the bare root.
-		authsec.POST("/webauthn/mfa/loginStatus", userController.WebAuthnMFALoginStatus)
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
 		// Served under /authsec/webauthn (formerly webauthn-service).
