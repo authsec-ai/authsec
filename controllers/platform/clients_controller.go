@@ -83,8 +83,9 @@ type ClientsWithMethods struct {
 
 // ClientsListResponse is the top-level payload returned by GetClients.
 type ClientsListResponse struct {
-	Clients    []ClientsWithMethods `json:"clients"`
-	Pagination ClientsPagination    `json:"pagination"`
+	Clients        []ClientsWithMethods `json:"clients"`
+	Pagination     ClientsPagination    `json:"pagination"`
+	HydraPublicURL string               `json:"hydra_public_url"`
 }
 
 func isClientsClientNotFoundError(err error) bool {
@@ -1020,6 +1021,7 @@ func GetClients(c *gin.Context) {
 			Total:      total,
 			TotalPages: totalPages,
 		},
+		HydraPublicURL: config.AppConfig.HydraPublicURL,
 	})
 }
 

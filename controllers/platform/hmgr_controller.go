@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -482,7 +483,22 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 
 	userInfo, err := ctrl.service.GetUserInfo(ctx, selectedProvider, accessToken)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to get user info: %w", err)
+		// For Microsoft, fall back to decoding the id_token instead of calling Graph API.
+		// Graph API requires User.Read permission which may not be granted; the id_token
+		// already contains sub/email/name/preferred_username from openid+profile+email scopes.
+		if strings.EqualFold(providerName, "microsoft") || strings.EqualFold(providerName, "azure") {
+			if idToken, ok := tokenResponse["id_token"].(string); ok && idToken != "" {
+				log.Printf("Microsoft Graph userinfo failed (%v), falling back to id_token", err)
+				userInfo, err = extractClaimsFromIDToken(idToken)
+				if err != nil {
+					return "", nil, fmt.Errorf("failed to extract claims from Microsoft id_token: %w", err)
+				}
+			} else {
+				return "", nil, fmt.Errorf("failed to get user info: %w", err)
+			}
+		} else {
+			return "", nil, fmt.Errorf("failed to get user info: %w", err)
+		}
 	}
 
 	user, userID, err := ctrl.ExtractUserFromProviderResponse(providerName, userInfo)
@@ -1551,6 +1567,25 @@ func (ctrl *HmgrController) GetProfileHandler(c *gin.Context) {
 }
 func (ctrl *HmgrController) UpdateProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "UpdateProfile endpoint - to be implemented"})
+}
+
+// extractClaimsFromIDToken decodes a JWT id_token without signature verification
+// and returns its claims as a map. Used as a fallback when the userinfo endpoint
+// is unavailable (e.g. Microsoft Graph 403 due to missing User.Read permission).
+func extractClaimsFromIDToken(idToken string) (map[string]interface{}, error) {
+	parts := strings.SplitN(idToken, ".", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid id_token format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode id_token payload: %w", err)
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal id_token claims: %w", err)
+	}
+	return claims, nil
 }
 
 // --- Helper functions ---

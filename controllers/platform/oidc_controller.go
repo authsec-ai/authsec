@@ -1082,6 +1082,14 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		return
 	}
 	log.Printf("Created default client in tenant DB: %s", clientID)
+	// Seed default groups and assign roles+groups to client (matches custom registration flow)
+	if err := oc.seedDefaultGroupsInTenantDB(tenantDB, tenantID); err != nil {
+		log.Printf("Warning: Failed to seed default groups in tenant DB: %v", err)
+	}
+	if err := oc.assignDefaultClientAssociations(tenantDB, clientID, tenantID); err != nil {
+		log.Printf("Warning: Failed to assign default associations to client: %v", err)
+	}
+
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
@@ -1642,6 +1650,14 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		return
 	}
 	log.Printf("Created default client in tenant DB: %s", clientID)
+	// Seed default groups and assign roles+groups to client (matches custom registration flow)
+	if err := oc.seedDefaultGroupsInTenantDB(tenantDB, tenantID); err != nil {
+		log.Printf("Warning: Failed to seed default groups in tenant DB: %v", err)
+	}
+	if err := oc.assignDefaultClientAssociations(tenantDB, clientID, tenantID); err != nil {
+		log.Printf("Warning: Failed to assign default associations to client: %v", err)
+	}
+
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
@@ -2188,6 +2204,76 @@ func isValidTenantDomainOrCustomDomain(domain string) bool {
 
 	// If no dot, treat as subdomain prefix - use original validation
 	return isValidTenantDomain(domain)
+}
+
+// seedDefaultGroupsInTenantDB copies default groups from master DB into tenant DB
+func (oc *OIDCController) seedDefaultGroupsInTenantDB(tenantDB *sql.DB, tenantID uuid.UUID) error {
+	masterDB := config.GetDatabase()
+	rows, err := masterDB.Query("SELECT name, description FROM groups")
+	if err != nil {
+		return fmt.Errorf("failed to fetch groups from master DB: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, description string
+		if err := rows.Scan(&name, &description); err != nil {
+			return fmt.Errorf("failed to scan group row: %w", err)
+		}
+		now := time.Now()
+		if _, err := tenantDB.Exec(
+			"INSERT INTO groups (name, description, tenant_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, tenant_id) DO NOTHING",
+			name, description, tenantID, now, now,
+		); err != nil {
+			return fmt.Errorf("failed to insert group %s: %w", name, err)
+		}
+	}
+	return rows.Err()
+}
+
+// assignDefaultClientAssociations assigns all roles and groups in the tenant DB to the given client
+func (oc *OIDCController) assignDefaultClientAssociations(tenantDB *sql.DB, clientID uuid.UUID, tenantID uuid.UUID) error {
+	// Assign all roles to client
+	roleRows, err := tenantDB.Query("SELECT id FROM roles WHERE tenant_id = $1", tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch role IDs: %w", err)
+	}
+	defer roleRows.Close()
+	for roleRows.Next() {
+		var roleID uuid.UUID
+		if err := roleRows.Scan(&roleID); err != nil {
+			return fmt.Errorf("failed to scan role ID: %w", err)
+		}
+		if _, err := tenantDB.Exec(
+			"INSERT INTO client_roles (client_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			clientID, roleID,
+		); err != nil {
+			return fmt.Errorf("failed to assign role %s to client: %w", roleID, err)
+		}
+	}
+	if err := roleRows.Err(); err != nil {
+		return err
+	}
+
+	// Assign all groups to client
+	groupRows, err := tenantDB.Query("SELECT id FROM groups WHERE tenant_id = $1", tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch group IDs: %w", err)
+	}
+	defer groupRows.Close()
+	for groupRows.Next() {
+		var groupID uuid.UUID
+		if err := groupRows.Scan(&groupID); err != nil {
+			return fmt.Errorf("failed to scan group ID: %w", err)
+		}
+		if _, err := tenantDB.Exec(
+			"INSERT INTO client_groups (client_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			clientID, groupID,
+		); err != nil {
+			return fmt.Errorf("failed to assign group %s to client: %w", groupID, err)
+		}
+	}
+	return groupRows.Err()
 }
 
 // assignAdminRoleToUser assigns admin role to a user in the tenant database
