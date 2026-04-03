@@ -211,7 +211,7 @@ func (mr *MigrationRunner) RunMigrations() error {
 	executedCount, failedCount := 0, 0
 
 	for _, m := range migrations {
-		if mr.isMigrationExecuted(m.Version) {
+		if mr.isMigrationExecuted(m.Version, m.Name) {
 			log.Printf("[Migration] %s v%d (%s) already applied, skipping", mr.dbType, m.Version, m.Name)
 			continue
 		}
@@ -313,15 +313,17 @@ func (mr *MigrationRunner) executeTemplateFile(templatePath string) error {
 	return fmt.Errorf("template execution failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-// isMigrationExecuted returns true if the given version is already recorded as successful.
-func (mr *MigrationRunner) isMigrationExecuted(version int) bool {
-	query := `SELECT COUNT(*) FROM migration_logs WHERE version = $1 AND db_type = $2 AND success = true`
-	args := []interface{}{version, mr.dbType}
+// isMigrationExecuted returns true if the given version+name combo is already recorded as successful.
+// Using both version and name prevents two files with the same numeric prefix (e.g. from different
+// subdirectories) from incorrectly skipping each other.
+func (mr *MigrationRunner) isMigrationExecuted(version int, name string) bool {
+	query := `SELECT COUNT(*) FROM migration_logs WHERE version = $1 AND name = $2 AND db_type = $3 AND success = true`
+	args := []interface{}{version, name, mr.dbType}
 
 	var queryDB *sql.DB
 	if mr.dbType == "tenant" && mr.masterDB != nil {
 		queryDB = mr.masterDB
-		query += ` AND tenant_id = $3`
+		query += ` AND tenant_id = $4`
 		args = append(args, *mr.tenantID)
 	} else {
 		queryDB = mr.db

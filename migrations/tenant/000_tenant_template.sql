@@ -1008,6 +1008,7 @@ CREATE TABLE public.delegation_policies (
     allowed_permissions jsonb DEFAULT '[]'::jsonb,
     max_ttl_seconds integer DEFAULT 3600 NOT NULL,
     enabled boolean DEFAULT true NOT NULL,
+    client_id uuid,
     created_by uuid,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
@@ -2601,7 +2602,8 @@ CREATE TABLE public.saml_callback_states (
     user_email character varying(255),
     user_name character varying(255),
     provider_name character varying(255),
-    tenant_id text,
+    tenant_id uuid,
+    client_id uuid,
     login_challenge text,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     expires_at timestamp without time zone NOT NULL
@@ -3325,13 +3327,14 @@ CREATE TABLE public.tenant_hydra_clients (
     tenant_name text NOT NULL,
     hydra_client_secret text NOT NULL,
     client_name text NOT NULL,
-    redirect_uris jsonb DEFAULT '[]'::jsonb NOT NULL,
+    redirect_uris text[] DEFAULT '{}'::text[] NOT NULL,
     scopes text[] DEFAULT ARRAY['openid'::text, 'profile'::text, 'email'::text] NOT NULL,
     client_type text NOT NULL,
     provider_name text,
     is_active boolean DEFAULT true NOT NULL,
     created_by text DEFAULT 'system'::text,
-    updated_by text DEFAULT 'system'::text
+    updated_by text DEFAULT 'system'::text,
+    deleted_at timestamp with time zone
 );
 
 
@@ -4627,14 +4630,6 @@ ALTER TABLE ONLY public.credentials
 
 
 --
--- Name: delegation_policies delegation_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
---
-
-ALTER TABLE ONLY public.delegation_policies
-    ADD CONSTRAINT delegation_policies_pkey PRIMARY KEY (id);
-
-
---
 -- Name: delegation_tokens delegation_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
@@ -5729,12 +5724,6 @@ ALTER TABLE ONLY public.api_scopes
     ADD CONSTRAINT uq_api_scopes_tenant_name UNIQUE (tenant_id, name);
 
 
---
--- Name: delegation_policies uq_deleg_policy_tenant_role_agent; Type: CONSTRAINT; Schema: public; Owner: authprod
---
-
-ALTER TABLE ONLY public.delegation_policies
-    ADD CONSTRAINT uq_deleg_policy_tenant_role_agent UNIQUE (tenant_id, role_name, agent_type);
 
 
 --

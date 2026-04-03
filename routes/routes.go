@@ -737,6 +737,16 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
+		// Purge (temporary dev/ops utility — remove before prod)
+		// Served under /authsec/admin/purge.
+		// ────────────────────────────────────────────────────
+		purgeCtrl := adminCtrl.NewPurgeController()
+		purge := authsec.Group("/admin/purge")
+		{
+			purge.DELETE("/user", purgeCtrl.PurgeUserByEmail)
+		}
+
+		// ────────────────────────────────────────────────────
 		// SDK Manager (formerly sdk-manager Python service)
 		// Served under /authsec/sdkmgr.
 		// Backward-compat alias at bare /sdkmgr/* for existing SDKs.
