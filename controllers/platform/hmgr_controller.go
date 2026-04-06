@@ -760,8 +760,21 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 		return
 	}
 
+	// Retrieve the stored PKCE code_verifier.
+	// Priority order:
+	//   1. Stored by state (GenerateLoginURLHandler path — backend-owned PKCE)
+	//   2. Stored by login_challenge (server-side flows)
+	//   3. Client-supplied in the request body (backward compat while React still owns PKCE)
+	codeVerifier := consumePKCEVerifier(req.State)
+	if codeVerifier == "" {
+		codeVerifier = consumePKCEVerifier(req.LoginChallenge)
+	}
+	if codeVerifier == "" {
+		codeVerifier = req.CodeVerifier
+	}
+
 	ctx := context.Background()
-	tokens, err := ctrl.ExchangeCodeForHydraTokens(ctx, clientID, clientSecret, req.Code, req.RedirectURI)
+	tokens, err := ctrl.ExchangeCodeForHydraTokens(ctx, clientID, clientSecret, req.Code, req.RedirectURI, codeVerifier)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to exchange code for tokens: " + err.Error()})
 		return
@@ -771,7 +784,7 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 }
 
 // ExchangeCodeForHydraTokens exchanges an authorization code for tokens with Hydra
-func (ctrl *HmgrController) ExchangeCodeForHydraTokens(ctx context.Context, clientID, clientSecret, code, redirectURI string) (*hydramodels.TokenResponse, error) {
+func (ctrl *HmgrController) ExchangeCodeForHydraTokens(ctx context.Context, clientID, clientSecret, code, redirectURI, codeVerifier string) (*hydramodels.TokenResponse, error) {
 	tokenURL := fmt.Sprintf("%s/oauth2/token", config.AppConfig.HydraPublicURL)
 
 	data := url.Values{}
@@ -780,7 +793,9 @@ func (ctrl *HmgrController) ExchangeCodeForHydraTokens(ctx context.Context, clie
 	data.Set("client_id", clientID)
 	data.Set("client_secret", clientSecret)
 	data.Set("redirect_uri", redirectURI)
-	data.Set("code_verifier", "CodVNfCTzCHJqkSDXn4Rr4b8j07H1gb8WLR1VZ-hq9s")
+	if codeVerifier != "" {
+		data.Set("code_verifier", codeVerifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
@@ -968,6 +983,13 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 	codeVerifier := hydrautils.GenerateCodeVerifier()
 	codeChallenge := hydrautils.GenerateCodeChallenge(codeVerifier)
 
+	// Store code_verifier server-side, keyed by state.
+	// The state value will be echoed back in the exchange-token request, allowing
+	// retrieval at token exchange time without ever exposing the verifier to the client.
+	if req.State != "" {
+		storePKCEVerifier(req.State, codeVerifier)
+	}
+
 	oauthURL := fmt.Sprintf("%s/oauth2/auth?client_id=%s&response_type=code&scope=openid+profile+email&redirect_uri=%s&state=%s&code_challenge=%s&code_challenge_method=S256",
 		config.AppConfig.HydraPublicURL,
 		tenantClientID,
@@ -982,11 +1004,6 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 		"oauth_url":        oauthURL,
 		"login_endpoint":   fmt.Sprintf("%s/login", config.AppConfig.BaseURL),
 		"react_login_url":  fmt.Sprintf("%s/oidc/login", config.AppConfig.ReactAppURL),
-		"pkce": map[string]interface{}{
-			"code_verifier":  codeVerifier,
-			"code_challenge": codeChallenge,
-			"method":         "S256",
-		},
 	})
 }
 

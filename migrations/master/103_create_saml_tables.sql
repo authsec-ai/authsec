@@ -18,7 +18,7 @@ CREATE INDEX IF NOT EXISTS idx_saml_sp_certificates_expires_at ON saml_sp_certif
 
 CREATE TABLE IF NOT EXISTS saml_requests (
     id VARCHAR(255) PRIMARY KEY,
-    login_challenge VARCHAR(255) NOT NULL,
+    login_challenge TEXT NOT NULL,
     tenant_id UUID NOT NULL,
     client_id UUID NOT NULL,
     provider_name VARCHAR(255) NOT NULL,
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS saml_requests (
 CREATE INDEX IF NOT EXISTS idx_saml_requests_login_challenge ON saml_requests(login_challenge);
 CREATE INDEX IF NOT EXISTS idx_saml_requests_tenant_id ON saml_requests(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_saml_requests_client_id ON saml_requests(client_id);
+CREATE INDEX IF NOT EXISTS idx_saml_requests_tenant_client ON saml_requests(tenant_id, client_id);
 CREATE INDEX IF NOT EXISTS idx_saml_requests_expires_at ON saml_requests(expires_at);
 
 CREATE TABLE IF NOT EXISTS saml_callback_states (

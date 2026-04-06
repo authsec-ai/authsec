@@ -800,8 +800,9 @@ func SetupRoutes(
 			c.JSON(200, gin.H{"status": "authenticated", "context_data": contextData})
 		})
 
+		// Dual-auth: accepts standard auth-manager JWT or SPIFFE JWT-SVID (for agent access).
 		extSvcs := exsvc.Group("/services")
-		extSvcs.Use(middlewares.AuthMiddleware())
+		extSvcs.Use(middlewares.SpiffeAuthMiddleware())
 		{
 			extSvcs.POST("", middlewares.Require("external-service", "create"), extSvcController.CreateExternalService)
 			extSvcs.GET("", middlewares.Require("external-service", "read"), extSvcController.ListExternalServices)

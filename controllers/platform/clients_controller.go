@@ -141,6 +141,34 @@ func getClientsUUIDFromContext(c *gin.Context, key string) (uuid.UUID, bool) {
 	}
 }
 
+// clientsGetAndValidateTenantID extracts the tenant ID from the JWT context and
+// cross-validates it against the URL path parameter ":tenantId" when both are present.
+// Returns 401 if the JWT has no tenant, 403 if URL and JWT tenants do not match.
+func clientsGetAndValidateTenantID(c *gin.Context) (uuid.UUID, bool) {
+	jwtTenantID, hasJWT := getClientsUUIDFromContext(c, "validated_tenant_id")
+
+	urlTenantRaw := c.Param("tenantId")
+	if hasJWT && urlTenantRaw != "" {
+		urlTenantID, err := uuid.Parse(urlTenantRaw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant ID in URL"})
+			return uuid.UUID{}, false
+		}
+		if jwtTenantID != urlTenantID {
+			log.Printf("[SECURITY] Tenant mismatch: JWT tenant=%s, URL tenant=%s, IP=%s",
+				jwtTenantID.String(), urlTenantID.String(), c.ClientIP())
+			c.JSON(http.StatusForbidden, gin.H{"error": "tenant ID mismatch between token and URL"})
+			return uuid.UUID{}, false
+		}
+		return jwtTenantID, true
+	}
+	if hasJWT {
+		return jwtTenantID, true
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
+	return uuid.UUID{}, false
+}
+
 // RegisterClientsResponse is the response payload for client registration.
 type RegisterClientsResponse struct {
 	ID        string    `json:"id"`
@@ -869,20 +897,8 @@ func CreateClient(c *gin.Context) {
 // @Router /clientms/tenants/{tenantId}/clients/getClients [get]
 // @Security Bearer
 func GetClients(c *gin.Context) {
-	tenantID, ok := getClientsUUIDFromContext(c, "validated_tenant_id")
+	tenantID, ok := clientsGetAndValidateTenantID(c)
 	if !ok {
-		if raw := c.Param("tenantId"); raw != "" {
-			parsed, err := uuid.Parse(raw)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant ID"})
-				return
-			}
-			tenantID = parsed
-			ok = true
-		}
-	}
-	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not provided"})
 		return
 	}
 
@@ -1037,9 +1053,8 @@ func GetClients(c *gin.Context) {
 // @Router /clientms/tenants/{tenantId}/clients/{id} [get]
 // @Security Bearer
 func GetClient(c *gin.Context) {
-	tenantID, ok := getClientsUUIDFromContext(c, "validated_tenant_id")
+	tenantID, ok := clientsGetAndValidateTenantID(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not found in context"})
 		return
 	}
 
@@ -1190,9 +1205,8 @@ func DeleteClient(c *gin.Context) {
 }
 
 func clientsHandleSoftDelete(c *gin.Context, logPrefix string) {
-	tenantID, ok := getClientsUUIDFromContext(c, "validated_tenant_id")
+	tenantID, ok := clientsGetAndValidateTenantID(c)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not found in context"})
 		return
 	}
 
