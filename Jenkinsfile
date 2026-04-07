@@ -63,14 +63,14 @@ pipeline {
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:production"
                         env.DOCKER_IMAGE_PUBLIC = "${env.DOCKER_REGISTRY_PUBLIC}/${SERVICE_NAME}:1.0.0" 
                         
-                    } else if (env.BRANCH_NAME == 'authsec-dev' || env.BRANCH_NAME == 'development') {
+                    } else if (env.BRANCH_NAME == 'authsec-dev' || env.BRANCH_NAME == 'development' || env.BRANCH_NAME == 'main') {
                         echo "Configuring for DEVELOPMENT environment..."
                         env.IS_PROD_BRANCH = 'false'
                         env.AKS_ENV = 'authsec'
                         
                         // Assuming you have a dev namespace. Change 'authsec-dev' if different.
                         env.K8S_NAMESPACE = 'authsec-dev'
-                        env.APP_LABEL = "dev2-${SERVICE_NAME}"
+                        env.APP_LABEL = "dev-${SERVICE_NAME}"
                         
                         // Dev images get unique tags so they don't overwrite prod
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:development"
@@ -89,19 +89,6 @@ pipeline {
                         env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:stage"
                         env.DOCKER_IMAGE_PUBLIC = "" // Not used in staging
 
-                    } else if (env.BRANCH_NAME == 'main' || env.BRANCH_NAME == 'master') {
-                        echo "Configuring for CURRENT PROD environment..."
-                        env.IS_PROD_BRANCH = 'false'
-                        env.AKS_ENV = 'authnull'
-                        
-                        // Assuming you have a authsec namespace. Change 'authsec' if different.
-                        env.K8S_NAMESPACE = 'authsec'
-                        env.APP_LABEL = "dev-${SERVICE_NAME}"
-                        
-                        // Dev images get unique tags so they don't overwrite prod
-                        env.DOCKER_IMAGE = "${env.DOCKER_REGISTRY}/${SERVICE_NAME}:latest"
-                        env.DOCKER_IMAGE_PUBLIC = "" // Not used in current prod
-                        
                     } else {
                         echo "No matching environment configuration found for branch: ${env.BRANCH_NAME}"
                         error "BUILD FAILED: Unrecognized branch for deployment."
