@@ -235,6 +235,18 @@ func main() {
 		}
 	}()
 
+	// Auth request context cleanup (expired bridge entries, runs every 10 minutes)
+	go func() {
+		authzCtxSvc := services.NewAuthorizationContextService(config.DB)
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := authzCtxSvc.CleanupExpired(); err != nil {
+				log.Printf("Warning: auth request context cleanup failed: %v", err)
+			}
+		}
+	}()
+
 	// System metrics update (every 30 seconds)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)

@@ -23,11 +23,12 @@ type Resource = sharedmodels.Resource
 
 // Hydra-specific models
 type HydraLoginRequest struct {
-	Challenge string `json:"challenge"`
-	Client    struct {
+	Challenge  string `json:"challenge"`
+	Client     struct {
 		ClientID string `json:"client_id"`
 	} `json:"client"`
-	Subject string `json:"subject"`
+	Subject    string `json:"subject"`
+	RequestURL string `json:"request_url"` // Full original /oauth2/auth?... URL — used to parse state for deterministic bridge binding
 }
 
 type HydraAcceptLoginRequest struct {
@@ -49,6 +50,8 @@ type HydraConsentRequest struct {
 	RequestedScope               []string               `json:"requested_scope"`
 	RequestedAccessTokenAudience []string               `json:"requested_access_token_audience"`
 	Subject                      string                 `json:"subject"`
+	LoginChallenge               string                 `json:"login_challenge"`
+	LoginSessionID               string                 `json:"login_session_id"`
 	Context                      map[string]interface{} `json:"context,omitempty"`
 }
 

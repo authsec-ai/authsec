@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "authsec-monolith",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/"],
+      "port": 7001
+    }
+  ]
+}

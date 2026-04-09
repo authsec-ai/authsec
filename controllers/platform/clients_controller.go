@@ -757,6 +757,23 @@ func RegisterClient(c *gin.Context) {
 		log.Printf("Warning: failed to seed clients RBAC for tenant %s: %v", tenantUUID.String(), err)
 	}
 
+	// Backward compat bridge: also write a resource_server row so
+	// the new MCP OAuth flow can discover this RS. Non-AI-agent clients only.
+	if clientType != sharedmodels.ClientTypeAIAgent && input.TenantDomain != "" {
+		rsService := services.NewResourceServerService(config.DB)
+		rsReq := services.CreateResourceServerRequest{
+			TenantID:           tenantUUID,
+			Name:               input.Name,
+			PublicBaseURL:       "https://" + input.TenantDomain,
+			ProtectedBasePath:  "/mcp",
+			ScopesSupported:    []string{},
+			RegistrationModes:  []string{"prereg", "cimd", "dcr"},
+		}
+		if _, _, rsErr := rsService.Create(rsReq, config.AppConfig.BaseURL); rsErr != nil {
+			log.Printf("Warning: backward compat RS bridge failed for client %s: %v", client.ClientID, rsErr)
+		}
+	}
+
 	email := ""
 	if client.Email != nil {
 		email = *client.Email

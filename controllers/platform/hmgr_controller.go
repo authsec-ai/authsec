@@ -18,6 +18,8 @@ import (
 	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	hydrautils "github.com/authsec-ai/authsec/internal/hydra/utils"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -56,14 +58,26 @@ func consumePKCEVerifier(key string) string {
 
 // HmgrController handles hydra manager authentication requests
 type HmgrController struct {
-	service *hydramodels.OAuthLoginService
+	service  *hydramodels.OAuthLoginService
+	authzCtx *services.AuthorizationContextService
+	rsService *services.ResourceServerService
+	scopeResolver *services.ScopeResolver
 }
 
 // NewHmgrController creates a new HmgrController
 func NewHmgrController(cfg config.Config) *HmgrController {
 	return &HmgrController{
-		service: hydramodels.NewOAuthLoginService(cfg),
+		service:       hydramodels.NewOAuthLoginService(cfg),
+		authzCtx:      services.NewAuthorizationContextService(config.DB),
+		rsService:     services.NewResourceServerService(config.DB),
+		scopeResolver: services.NewScopeResolver(),
 	}
+}
+
+// isNewMCPClient checks if a Hydra client ID belongs to the new MCP OAuth plane.
+func (ctrl *HmgrController) isNewMCPClient(hydraClientID string) bool {
+	_, err := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
+	return err == nil
 }
 
 // StorePKCEVerifierHandler pre-registers a PKCE code_verifier from an external client
@@ -114,7 +128,87 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		return
 	}
 
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	hydraClientID := loginRequest.Client.ClientID
+
+	// ── Dual-mode: new MCP path vs legacy path ──
+	if ctrl.isNewMCPClient(hydraClientID) {
+		// NEW MCP PATH: Resolve tenant from auth_request_contexts bridge table.
+		// Deterministic binding via server-generated context_id from Hydra's request_url.
+		// NO FALLBACK — fail closed if context_id not found.
+		contextID := ""
+		if loginRequest.RequestURL != "" {
+			if parsedURL, parseErr := url.Parse(loginRequest.RequestURL); parseErr == nil {
+				contextID = parsedURL.Query().Get("authsec_ctx")
+			} else {
+				log.Printf("[MCP_AUTH] GetLoginPageData: failed to parse request_url: %v", parseErr)
+			}
+		}
+		if contextID == "" {
+			log.Printf("[MCP_AUTH] GetLoginPageData: no authsec_ctx in request_url for client=%s challenge=%s", hydraClientID, loginChallenge)
+			c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "Missing authorization context (authsec_ctx not found in request_url)",
+			})
+			return
+		}
+
+		// BindByContextID is idempotent: re-reads on page refresh, binds on first visit.
+		arcCtx, bindErr := ctrl.authzCtx.BindByContextID(contextID, loginChallenge)
+		if bindErr != nil || arcCtx == nil {
+			log.Printf("[MCP_AUTH] GetLoginPageData: BindByContextID failed context_id=%s: %v", contextID, bindErr)
+			c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "Failed to resolve MCP auth context",
+			})
+			return
+		}
+
+		tenantIDForOIDC := arcCtx.TenantID
+		allProviders, err := ctrl.service.GetAllProvidersForTenant(tenantIDForOIDC, tenantIDForOIDC, hydraClientID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "Failed to get authentication providers",
+			})
+			return
+		}
+
+		if len(allProviders) == 0 {
+			c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "No authentication providers configured",
+			})
+			return
+		}
+
+		oidcProviders := make([]hydramodels.OIDCProvider, 0, len(allProviders))
+		for _, p := range allProviders {
+			providerConfig := map[string]interface{}{"type": p.Type}
+			for key, value := range p.Config {
+				providerConfig[key] = value
+			}
+			oidcProviders = append(oidcProviders, hydramodels.OIDCProvider{
+				ProviderName: p.ProviderName,
+				DisplayName:  p.DisplayName,
+				IsActive:     p.IsActive,
+				SortOrder:    p.SortOrder,
+				Config:       providerConfig,
+			})
+		}
+
+		c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
+			ClientID:       hydraClientID,
+			Success:        true,
+			LoginChallenge: loginChallenge,
+			ClientName:     "MCP Client",
+			Providers:      oidcProviders,
+			BaseURL:        config.AppConfig.BaseURL,
+		})
+		return
+	}
+
+	// LEGACY PATH: Resolve tenant from Hydra client metadata
+	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, hydramodels.LoginPageDataResponse{
 			Success: false,
@@ -135,7 +229,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		return
 	}
 
-	clientID := loginRequest.Client.ClientID
+	clientID := hydraClientID
 	allProviders, err := ctrl.service.GetAllProvidersForTenant(tenantIDForOIDC, realTenantID, clientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
@@ -169,7 +263,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
-		ClientID:       strings.TrimSuffix(loginRequest.Client.ClientID, "-main-client"),
+		ClientID:       strings.TrimSuffix(hydraClientID, "-main-client"),
 		Success:        true,
 		LoginChallenge: loginChallenge,
 		TenantName:     tenantName,
@@ -220,7 +314,9 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		return
 	}
 
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	hydraClientID := loginRequest.Client.ClientID
+
+	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -229,7 +325,22 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		return
 	}
 
-	tenantID, _ := clientDetails.Metadata["tenant_id"].(string)
+	// ── Dual-mode: resolve tenant from bridge table or Hydra metadata ──
+	var tenantID string
+	if ctrl.isNewMCPClient(hydraClientID) {
+		arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
+				Success: false,
+				Error:   "Failed to resolve MCP auth context",
+			})
+			return
+		}
+		tenantID = arcCtx.TenantID
+	} else {
+		tenantID, _ = clientDetails.Metadata["tenant_id"].(string)
+	}
+
 	providers, err := ctrl.service.GetOIDCProvidersForTenant(tenantID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
@@ -336,14 +447,21 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	}
 	state := base64.URLEncoding.EncodeToString(stateBytes)
 
-	if len(clientDetails.RedirectURIs) == 0 {
-		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
-			Success: false,
-			Error:   "No registered redirect URI found for client",
-		})
-		return
+	// For MCP clients, the registered RedirectURIs hold Codex's callback (e.g. http://localhost:11337/callback),
+	// NOT AuthSec's own callback handler. Use AuthSec's callback URL for IdP redirect.
+	var callbackURL string
+	if ctrl.isNewMCPClient(hydraClientID) {
+		callbackURL = config.AppConfig.BaseURL + "/authsec/hmgr/auth/callback"
+	} else {
+		if len(clientDetails.RedirectURIs) == 0 {
+			c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
+				Success: false,
+				Error:   "No registered redirect URI found for client",
+			})
+			return
+		}
+		callbackURL = clientDetails.RedirectURIs[0]
 	}
-	callbackURL := clientDetails.RedirectURIs[0]
 
 	oauthURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&scope=%s&response_type=code&state=%s",
 		authURL,
@@ -438,14 +556,27 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 		return "", nil, fmt.Errorf("failed to get login request: %w", err)
 	}
 
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
+	hydraClientID := loginRequest.Client.ClientID
+	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get client details: %w", err)
 	}
 
-	tenantID, _ := clientDetails.Metadata["tenant_id"].(string)
-	if tenantID == "" {
-		return "", nil, fmt.Errorf("missing tenant_id in client metadata")
+	// ── Dual-mode: resolve tenant from bridge table or Hydra metadata ──
+	var tenantID string
+	isMCP := ctrl.isNewMCPClient(hydraClientID)
+
+	if isMCP {
+		arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to resolve MCP auth context: %w", err)
+		}
+		tenantID = arcCtx.TenantID
+	} else {
+		tenantID, _ = clientDetails.Metadata["tenant_id"].(string)
+		if tenantID == "" {
+			return "", nil, fmt.Errorf("missing tenant_id in client metadata")
+		}
 	}
 
 	providers, err := ctrl.service.GetOIDCProvidersForTenant(tenantID)
@@ -465,10 +596,16 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 		return "", nil, fmt.Errorf("provider %s not found", providerName)
 	}
 
-	if len(clientDetails.RedirectURIs) == 0 {
-		return "", nil, fmt.Errorf("no registered redirect URI found for client")
+	// For MCP clients, use AuthSec's own callback URL (not the MCP client's redirect URI)
+	var redirectURI string
+	if isMCP {
+		redirectURI = config.AppConfig.BaseURL + "/authsec/hmgr/auth/callback"
+	} else {
+		if len(clientDetails.RedirectURIs) == 0 {
+			return "", nil, fmt.Errorf("no registered redirect URI found for client")
+		}
+		redirectURI = clientDetails.RedirectURIs[0]
 	}
-	redirectURI := clientDetails.RedirectURIs[0]
 
 	ctx := context.Background()
 	tokenResponse, err := ctrl.service.ExchangeCodeForTokens(ctx, selectedProvider, code, redirectURI)
@@ -484,8 +621,6 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 	userInfo, err := ctrl.service.GetUserInfo(ctx, selectedProvider, accessToken)
 	if err != nil {
 		// For Microsoft, fall back to decoding the id_token instead of calling Graph API.
-		// Graph API requires User.Read permission which may not be granted; the id_token
-		// already contains sub/email/name/preferred_username from openid+profile+email scopes.
 		if strings.EqualFold(providerName, "microsoft") || strings.EqualFold(providerName, "azure") {
 			if idToken, ok := tokenResponse["id_token"].(string); ok && idToken != "" {
 				log.Printf("Microsoft Graph userinfo failed (%v), falling back to id_token", err)
@@ -506,30 +641,41 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 		return "", nil, fmt.Errorf("failed to extract user info: %w", err)
 	}
 
-	parsedTenantID, err := uuid.Parse(clientDetails.Metadata["c_id"].(string))
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid tenant ID format (c_id): %w", err)
-	}
+	if isMCP {
+		// MCP path: use tenant from bridge table
+		parsedTenantID, err := uuid.Parse(tenantID)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid MCP tenant ID: %w", err)
+		}
+		user.TenantID = parsedTenantID
+		user.ClientID = parsedTenantID // MCP clients don't have a legacy client_id
+	} else {
+		// Legacy path: use Hydra client metadata
+		parsedTenantID, err := uuid.Parse(clientDetails.Metadata["c_id"].(string))
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid tenant ID format (c_id): %w", err)
+		}
 
-	clientIDStr, ok := clientDetails.Metadata["tenant_id"].(string)
-	if !ok || clientIDStr == "" {
-		return "", nil, fmt.Errorf("missing tenant_id in client metadata")
-	}
+		clientIDStr, ok := clientDetails.Metadata["tenant_id"].(string)
+		if !ok || clientIDStr == "" {
+			return "", nil, fmt.Errorf("missing tenant_id in client metadata")
+		}
 
-	parsedClientID, err := uuid.Parse(clientIDStr)
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid client ID format (tenant_id): %w", err)
-	}
+		parsedClientID, err := uuid.Parse(clientIDStr)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid client ID format (tenant_id): %w", err)
+		}
 
-	user.ClientID = parsedClientID
-	user.TenantID = parsedTenantID
+		user.ClientID = parsedClientID
+		user.TenantID = parsedTenantID
+	}
 
 	user, err = ctrl.service.CreateOrUpdateUser(accessToken, user)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create/update user: %w", err)
 	}
 
-	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, map[string]interface{}{
+	loginContext := map[string]interface{}{
 		"email":       user.Email,
 		"name":        user.Name,
 		"username":    user.Username,
@@ -538,7 +684,12 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 		"tenant_id":   user.TenantID,
 		"project_id":  user.ProjectID,
 		"avatar_url":  user.AvatarURL,
-	})
+	}
+	if isMCP {
+		loginContext["tenant_id"] = tenantID
+	}
+
+	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, loginContext)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to accept login request: %w", err)
 	}
@@ -846,6 +997,13 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 		return
 	}
 
+	// For MCP clients, redirect to AuthSec's own login page (not the MCP client's redirect URI)
+	if ctrl.isNewMCPClient(loginRequest.Client.ClientID) {
+		hmgrBaseURL := config.AppConfig.BaseURL + "/authsec/hmgr"
+		c.Redirect(http.StatusFound, fmt.Sprintf("%s/oidc/login?login_challenge=%s", hmgrBaseURL, loginChallenge))
+		return
+	}
+
 	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
 	if err != nil || len(clientDetails.RedirectURIs) == 0 {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{Success: false, Error: "No registered redirect URI found for client"})
@@ -905,6 +1063,66 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		return
 	}
 
+	hydraClientID := consentRequest.Client.ClientID
+
+	// ── Dual-mode: new MCP path uses ScopeResolver + RS audience ──
+	if ctrl.isNewMCPClient(hydraClientID) {
+		// Deterministic lookup by login_challenge (bound during login step).
+		// Hydra consent response includes login_challenge from the same auth session.
+		arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(consentRequest.LoginChallenge)
+		if err != nil {
+			c.String(http.StatusInternalServerError, "Failed to resolve MCP auth context for consent")
+			return
+		}
+
+		// Look up the resource server for scope intersection + audience
+		rs, err := ctrl.rsService.GetByID(arcCtx.ResourceServerID)
+		if err != nil {
+			c.String(http.StatusInternalServerError, "Failed to resolve resource server")
+			return
+		}
+
+		// Get the MCP OAuth client for scope resolver
+		mcpClient, _ := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
+
+		// 4-way scope intersection via ScopeResolver
+		grantedScopes := ctrl.scopeResolver.ResolveGrantableScopes(
+			consentRequest.RequestedScope,
+			rs,
+			mcpClient,
+			consentRequest.Subject,
+		)
+
+		// Accept consent with RS-specific audience and resolved scopes.
+		// Include context_id in session claims so the Token handler can recover it
+		// by introspecting the access token — no redirect_to parsing needed.
+		acceptResponse, err := ctrl.service.AcceptHydraConsentRequestMCP(
+			consentChallenge,
+			consentRequest,
+			grantedScopes,
+			[]string{rs.ResourceURI},
+			map[string]interface{}{
+				"tenant_id":          arcCtx.TenantID,
+				"resource_server_id": arcCtx.ResourceServerID,
+				"context_id":         arcCtx.ContextID, // KEY: Token handler extracts this via introspection
+			},
+		)
+		if err != nil {
+			c.String(http.StatusInternalServerError, "Failed to complete MCP consent")
+			return
+		}
+
+		// Mark consent completed. Token handler is the actual consumer.
+		_ = ctrl.authzCtx.MarkConsentCompleted(arcCtx.State)
+
+		log.Printf("[MCP_AUTH] ConsentHandler: consent completed context_id=%s client=%s rs=%s",
+			arcCtx.ContextID, hydraClientID, rs.ResourceURI)
+
+		c.Redirect(http.StatusFound, acceptResponse.RedirectTo)
+		return
+	}
+
+	// LEGACY PATH: grant all requested scopes/audiences
 	acceptResponse, err := ctrl.service.AcceptHydraConsentRequest(consentChallenge, consentRequest)
 	if err != nil {
 		c.String(http.StatusInternalServerError, "Failed to complete consent")

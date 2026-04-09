@@ -136,6 +136,21 @@ func hydraAdminGetAllClients() ([]hydraClient, error) {
 	return clients, nil
 }
 
+// RegisterHydraClientWithParams creates a Hydra client with full control over parameters.
+// Used by DCR and CIMD flows where the client needs specific audience and scope configuration.
+func RegisterHydraClientWithParams(clientID, clientName string, redirectURIs []string, audience []string, scope string) error {
+	return hydraAdminCreateClient(hydraClient{
+		ClientID:      clientID,
+		ClientName:    clientName,
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  redirectURIs,
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: "none",
+		Scope:         scope,
+		Audience:      audience,
+	})
+}
+
 func oocmgrNormalizeProviderName(name string) string {
 	return strings.ToLower(strings.ReplaceAll(name, " ", "_"))
 }

@@ -190,15 +190,56 @@ func SetupRoutes(
 	})
 
 	// ════════════════════════════════════════════════════════
+	// MCP OAuth Authorization Server (global endpoints)
+	// RFC 8414 AS Metadata + OAuth endpoints at root level
+	// ════════════════════════════════════════════════════════
+	oauthASController := platformCtrl.NewOAuthASController()
+	rsController := platformCtrl.NewResourceServerController()
+
+	// RFC 8414 — AS Metadata discovery (must be at root)
+	r.GET("/.well-known/oauth-authorization-server", oauthASController.ASMetadata)
+
+	// Global OAuth endpoints (unauthenticated — the OAuth flow itself handles authz)
+	oauth := r.Group("/oauth")
+	{
+		oauth.GET("/authorize", oauthASController.Authorize)
+		oauth.POST("/token", oauthASController.Token)
+		oauth.POST("/register", middlewares.StrictAuthRateLimitMiddleware(10, time.Minute), oauthASController.Register)
+		oauth.POST("/introspect", oauthASController.Introspect)
+		oauth.GET("/jwks", oauthASController.JWKS)
+		oauth.POST("/revoke", oauthASController.Revoke)
+	}
+
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
 	{
 		// ────────────────────────────────────────────────────────
-		// Well-known OIDC discovery (formerly spire-headless)
+		// Resource Server admin API (authenticated)
 		// ────────────────────────────────────────────────────────
-		authsec.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
-		authsec.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
+		resourceServers := authsec.Group("/resource-servers")
+		resourceServers.Use(middlewares.AuthMiddleware())
+		{
+			resourceServers.POST("", rsController.Create)
+			resourceServers.GET("", rsController.List)
+			resourceServers.GET("/:id", rsController.Get)
+			resourceServers.PUT("/:id", rsController.Update)
+			resourceServers.DELETE("/:id", rsController.Delete)
+			resourceServers.POST("/:id/rotate-introspection-secret", rsController.RotateIntrospectionSecret)
+			// Prereg admin (Bug 9)
+			resourceServers.POST("/:id/clients", rsController.PreRegisterClient)
+			resourceServers.GET("/:id/clients", rsController.ListClients)
+			resourceServers.DELETE("/:id/clients/:client_id", rsController.RevokeClient)
+			// CIMD redirect approval (Bug 10)
+			resourceServers.PUT("/:id/clients/:client_id/approve-redirects", rsController.ApproveRedirects)
+		}
+		// ────────────────────────────────────────────────────────
+		// SPIFFE/OIDC discovery — moved under /authsec/spire/ to
+		// avoid confusion with OAuth AS metadata at root /.well-known
+		// ────────────────────────────────────────────────────────
+		authsec.GET("/spire/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
+		authsec.GET("/spire/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
 
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
@@ -1225,6 +1266,24 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		user.GET("/check/permission-scoped", ac.CheckPermissionScoped)
 		user.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
 		user.GET("/permissions", ac.ListUserPermissions)
+	}
+
+	// ── /authsec/authz/* — canonical authorization validation endpoints ──
+	// These are the preferred paths for token/scope/resource validation.
+	// The /authmgr/* paths above remain for backward compatibility.
+	authz := r.Group("/authz")
+	authz.Use(middlewares.AuthMiddleware())
+	{
+		authz.GET("/validate/token", ac.ValidateToken)
+		authz.GET("/validate/scope", ac.ValidateScope)
+		authz.GET("/validate/resource", ac.ValidateResource)
+		authz.POST("/validate/permissions", ac.ValidatePermissions)
+		authz.GET("/check/permission", ac.CheckPermission)
+		authz.GET("/check/role", ac.CheckRole)
+		authz.GET("/check/role-resource", ac.CheckRoleResource)
+		authz.GET("/check/permission-scoped", ac.CheckPermissionScoped)
+		authz.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
+		authz.GET("/permissions", ac.ListUserPermissions)
 	}
 
 }
