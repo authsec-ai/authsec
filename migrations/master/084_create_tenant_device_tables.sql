@@ -37,9 +37,16 @@ CREATE INDEX IF NOT EXISTS idx_tenant_device_token_tenant ON tenant_device_token
 CREATE INDEX IF NOT EXISTS idx_tenant_device_token_active ON tenant_device_tokens(is_active);
 CREATE INDEX IF NOT EXISTS idx_tenant_device_token_device_token ON tenant_device_tokens(device_token);
 
-ALTER TABLE tenant_device_tokens
-ADD CONSTRAINT uq_tenant_device_id_tenant
-UNIQUE (id, tenant_id);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_tenant_device_id_tenant'
+          AND conrelid = 'tenant_device_tokens'::regclass
+    ) THEN
+        ALTER TABLE tenant_device_tokens ADD CONSTRAINT uq_tenant_device_id_tenant UNIQUE (id, tenant_id);
+    END IF;
+END $$;
 
 
 CREATE TABLE IF NOT EXISTS tenant_ciba_auth_requests (

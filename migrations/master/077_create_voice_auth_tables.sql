@@ -81,6 +81,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_voice_sessions_updated_at ON voice_sessions;
 CREATE TRIGGER trigger_voice_sessions_updated_at
     BEFORE UPDATE ON voice_sessions
     FOR EACH ROW
@@ -94,6 +95,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_voice_identity_links_updated_at ON voice_identity_links;
 CREATE TRIGGER trigger_voice_identity_links_updated_at
     BEFORE UPDATE ON voice_identity_links
     FOR EACH ROW

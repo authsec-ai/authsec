@@ -25,7 +25,7 @@ BEGIN
                     c.backup_state
                 FROM webauthn_credentials wc
                 INNER JOIN credentials c
-                    ON LOWER(wc.credential_id) = LOWER(encode(c.credential_id, ''hex''))
+                    ON LOWER(wc.credential_id) = LOWER(encode(c.credential_id, 'hex'))
             )
             UPDATE webauthn_credentials AS wc
             SET

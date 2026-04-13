@@ -46,6 +46,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_device_codes_updated_at ON device_codes;
 CREATE TRIGGER trigger_device_codes_updated_at
     BEFORE UPDATE ON device_codes
     FOR EACH ROW

@@ -6,7 +6,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Create users table with correct UUID schema
 -- REMOVED UNIQUE constraint on email to allow duplicate emails across different clients
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     client_id UUID,
     tenant_id UUID,

@@ -7,8 +7,8 @@ DECLARE
     sys_tenant CONSTANT uuid := '00000000-0000-0000-0000-000000000000';
 BEGIN
     -- Ensure system tenant exists
-    INSERT INTO tenants (id, tenant_id, name, email, created_at)
-    VALUES (sys_tenant, sys_tenant, 'System', 'system@authsec.internal', NOW())
+    INSERT INTO tenants (id, tenant_id, name, email, tenant_domain, created_at)
+    VALUES (sys_tenant, sys_tenant, 'System', 'system@authsec.internal', 'system', NOW())
     ON CONFLICT (id) DO NOTHING;
 
     -- Ensure users:active permission exists
