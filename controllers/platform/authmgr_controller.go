@@ -56,9 +56,9 @@ func NewAuthmgrController() *AuthmgrController {
 // Internal helpers (package-level, prefixed authmgr*)
 // ────────────────────────────────────────────────────────────────────────────
 
-// authmgrIsAdminPath returns true when the request path is the authmgr admin sub-path.
+// authmgrIsAdminPath returns true when the request path targets the canonical authz surface.
 func authmgrIsAdminPath(path string) bool {
-	return strings.Contains(path, "/authmgr/admin")
+	return strings.Contains(path, "/authz/")
 }
 
 // authmgrGetDBTypeFromPath returns "admin" or "tenant" for logging.

@@ -24,7 +24,7 @@ func NewResourceServerService(db *gorm.DB) *ResourceServerService {
 type CreateResourceServerRequest struct {
 	TenantID          uuid.UUID `json:"tenant_id"`
 	Name              string    `json:"name"`
-	PublicBaseURL      string    `json:"public_base_url"`
+	PublicBaseURL     string    `json:"public_base_url"`
 	ProtectedBasePath string    `json:"protected_base_path"`
 	ScopesSupported   []string  `json:"scopes_supported"`
 	RegistrationModes []string  `json:"registration_modes"`
@@ -82,13 +82,13 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 		TenantID:                req.TenantID,
 		Name:                    req.Name,
 		PublicBaseURL:           publicURL,
-		ProtectedBasePath:      basePath,
-		ResourceURI:            resourceURI,
-		ScopesSupported:        req.ScopesSupported,
-		RegistrationModes:      modes,
-		IntrospectionSecret:    "",                  // Not stored in plaintext for new rows
+		ProtectedBasePath:       basePath,
+		ResourceURI:             resourceURI,
+		ScopesSupported:         req.ScopesSupported,
+		RegistrationModes:       modes,
+		IntrospectionSecret:     "", // Not stored in plaintext for new rows
 		IntrospectionSecretHash: string(hashedSecret),
-		Active:                 true,
+		Active:                  true,
 	}
 
 	if err := s.db.Create(rs).Error; err != nil {
@@ -158,6 +158,7 @@ func (s *ResourceServerService) GetByIDAndTenant(id, tenantID string) (*models.R
 }
 
 // UpdateByTenant updates a resource server with tenant ownership check.
+// If public_base_url or protected_base_path change, resource_uri is recomputed.
 func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[string]interface{}) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
 	if err := s.db.Where("id = ? AND tenant_id = ?", id, tenantID).First(&rs).Error; err != nil {
@@ -166,6 +167,20 @@ func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[
 	if err := s.db.Model(&rs).Updates(updates).Error; err != nil {
 		return nil, err
 	}
+
+	// Recompute resource_uri if either component changed
+	_, urlChanged := updates["public_base_url"]
+	_, pathChanged := updates["protected_base_path"]
+	if urlChanged || pathChanged {
+		// Re-read to get the applied values
+		s.db.Where("id = ?", id).First(&rs)
+		newURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
+		if newURI != rs.ResourceURI {
+			s.db.Model(&rs).Update("resource_uri", newURI)
+			rs.ResourceURI = newURI
+		}
+	}
+
 	return &rs, nil
 }
 

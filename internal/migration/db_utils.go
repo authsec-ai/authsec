@@ -178,7 +178,7 @@ func CreateDatabase(host, port, user, password, databaseName string) (bool, erro
 		return false, nil
 	}
 
-	if _, err := adminDB.Exec(fmt.Sprintf("CREATE DATABASE %s WITH ENCODING 'UTF8' LC_COLLATE='en_US.UTF-8' LC_CTYPE='en_US.UTF-8'", databaseName)); err != nil {
+	if _, err := adminDB.Exec(fmt.Sprintf("CREATE DATABASE %s TEMPLATE template0 ENCODING 'UTF8'", databaseName)); err != nil {
 		return false, fmt.Errorf("failed to create database %s: %w", databaseName, err)
 	}
 

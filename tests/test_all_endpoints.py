@@ -253,19 +253,10 @@ def test_health_and_discovery():
     # OOCMgr health
     test(G, "OOCMgr Health", "GET", "/authsec/oocmgr/health", expect_status=200)
 
-    # AuthMgr health
-    test(G, "AuthMgr Health", "GET", "/authsec/authmgr/health", expect_status=200)
+    # AuthMgr health — removed (use /authsec/uflow/health for comprehensive checks)
 
     # ExSvc health
     test(G, "ExSvc Health", "GET", "/authsec/exsvc/health", expect_status=200)
-
-    # SDKMgr health checks (migrated to authsec Go monolith)
-    test(G, "SDKMgr MCP-Auth Health", "GET", "/authsec/sdkmgr/mcp-auth/health", expect_status=200)
-    test(G, "SDKMgr Services Health", "GET", "/authsec/sdkmgr/services/health", expect_status=200)
-    test(G, "SDKMgr SPIRE Health", "GET", "/authsec/sdkmgr/spire/health", expect_status=200)
-    test(G, "SDKMgr Dashboard Health", "GET", "/authsec/sdkmgr/dashboard/health", expect_status=200)
-    test(G, "SDKMgr Playground Health", "GET", "/authsec/sdkmgr/playground/health",
-         expect_status=200)
 
     # SCIM 2.0 Discovery
     test(G, "SCIM ServiceProviderConfig", "GET", "/authsec/uflow/scim/v2/ServiceProviderConfig",
@@ -901,81 +892,70 @@ def test_oocmgr():
          expect_status=OK)
 
 
-def test_authmgr():
-    """Phase 9: Auth Manager."""
-    G = "AuthMgr"
+def test_authz():
+    """Phase 9: Authorization & Token endpoints (/authz/*, /auth/token/*)."""
+    G = "Authz"
     tok = admin_jwt()
     OK = [200, 400, 403, 500]
 
-    # Public
-    test(G, "Token Verify", "POST", "/authsec/authmgr/token/verify",
+    # Public token endpoints
+    test(G, "Token Verify", "POST", "/authsec/auth/token/verify",
          body={"token": tok}, expect_status=OK)
-    test(G, "Token Generate", "POST", "/authsec/authmgr/token/generate",
+    test(G, "Token Generate", "POST", "/authsec/auth/token/generate",
          body={"email": TEST_EMAIL, "tenant_id": TEST_TENANT_ID},
          expect_status=OK)
-    test(G, "OIDC Token", "POST", "/authsec/authmgr/token/oidc",
+    test(G, "OIDC Token", "POST", "/authsec/auth/token/oidc",
          body={"code": "fake"}, expect_status=OK)
 
-    # Admin authenticated
-    test(G, "Admin Profile", "GET", "/authsec/authmgr/admin/profile",
+    # /authz/* — canonical authorization surface (authenticated)
+    test(G, "Profile", "GET", "/authsec/authz/profile",
          token=tok, expect_status=OK)
-    test(G, "Admin Auth Status", "GET", "/authsec/authmgr/admin/auth-status",
+    test(G, "Auth Status", "GET", "/authsec/authz/auth-status",
          token=tok, expect_status=OK)
-    test(G, "Admin Validate Token", "GET", "/authsec/authmgr/admin/validate/token",
+    test(G, "Validate Token", "GET", "/authsec/authz/validate/token",
          token=tok, expect_status=OK)
-    test(G, "Admin Validate Scope", "GET",
-         "/authsec/authmgr/admin/validate/scope?scope=openid",
+    test(G, "Validate Scope", "GET",
+         "/authsec/authz/validate/scope?scope=openid",
          token=tok, expect_status=OK)
-    test(G, "Admin Validate Resource", "GET",
-         "/authsec/authmgr/admin/validate/resource?resource=test",
+    test(G, "Validate Resource", "GET",
+         "/authsec/authz/validate/resource?resource=test",
          token=tok, expect_status=OK)
-    test(G, "Admin Validate Permissions", "POST",
-         "/authsec/authmgr/admin/validate/permissions",
+    test(G, "Validate Permissions", "POST",
+         "/authsec/authz/validate/permissions",
          body={"permissions": ["admin:access"]}, token=tok,
          expect_status=OK)
-    test(G, "Admin Check Permission", "GET",
-         "/authsec/authmgr/admin/check/permission?resource=admin&action=access",
+    test(G, "Check Permission", "GET",
+         "/authsec/authz/check/permission?resource=admin&action=access",
          token=tok, expect_status=OK)
-    test(G, "Admin Check Role", "GET",
-         "/authsec/authmgr/admin/check/role?role=admin",
+    test(G, "Check Role", "GET",
+         "/authsec/authz/check/role?role=admin",
          token=tok, expect_status=OK)
-    test(G, "Admin Check Role-Resource", "GET",
-         "/authsec/authmgr/admin/check/role-resource?role=admin&resource=test",
+    test(G, "Check Role-Resource", "GET",
+         "/authsec/authz/check/role-resource?role=admin&resource=test",
          token=tok, expect_status=OK)
-    test(G, "Admin Check Permission Scoped", "GET",
-         "/authsec/authmgr/admin/check/permission-scoped?resource=test&action=read&scope=openid",
+    test(G, "Check Permission Scoped", "GET",
+         "/authsec/authz/check/permission-scoped?resource=test&action=read&scope=openid",
          token=tok, expect_status=OK)
-    test(G, "Admin Check OAuth Scope", "GET",
-         "/authsec/authmgr/admin/check/oauth-scope?scope=openid",
+    test(G, "Check OAuth Scope", "GET",
+         "/authsec/authz/check/oauth-scope?scope=openid",
          token=tok, expect_status=OK)
-    test(G, "Admin List Permissions", "GET", "/authsec/authmgr/admin/permissions",
+    test(G, "List Permissions", "GET", "/authsec/authz/permissions",
          token=tok, expect_status=OK)
 
-    # Admin Groups
-    test(G, "Admin List Groups", "GET", "/authsec/authmgr/admin/groups",
+    # Group management
+    test(G, "List Groups", "GET", "/authsec/authz/groups",
          token=tok, expect_status=OK)
-    test(G, "Admin Create Group", "POST", "/authsec/authmgr/admin/groups",
-         body={"name": "test-authmgr-group", "description": "test"},
+    test(G, "Create Group", "POST", "/authsec/authz/groups",
+         body={"name": "test-authz-group", "description": "test"},
          token=tok, expect_status=[200, 201, 400, 403, 409])
 
-    # User authenticated
-    test(G, "User Profile", "GET", "/authsec/authmgr/user/profile",
-         token=tok, expect_status=OK)
-    test(G, "User Auth Status", "GET", "/authsec/authmgr/user/auth-status",
-         token=tok, expect_status=OK)
-    test(G, "User Validate Token", "GET", "/authsec/authmgr/user/validate/token",
-         token=tok, expect_status=OK)
-    test(G, "User List Permissions", "GET", "/authsec/authmgr/user/permissions",
-         token=tok, expect_status=OK)
-    test(G, "User Check Permission", "GET",
-         "/authsec/authmgr/user/check/permission?resource=test&action=read",
-         token=tok, expect_status=OK)
-
     # Auth enforcement
-    test(G, "Admin Profile → No-token 401", "GET", "/authsec/authmgr/admin/profile",
+    test(G, "Profile → No-token 401", "GET", "/authsec/authz/profile",
          expect_status=401)
-    test(G, "User Profile → No-token 401", "GET", "/authsec/authmgr/user/profile",
-         expect_status=401)
+    test(G, "Legacy authmgr removed", "GET", "/authsec/authmgr/admin/profile",
+         token=tok, expect_status=404)
+    test(G, "Legacy sdkmgr removed", "GET", "/authsec/sdkmgr/health",
+         token=tok, expect_status=404)
 
 
 def test_exsvc():
@@ -1012,117 +992,8 @@ def test_migration():
     # This phase is intentionally empty - migrations are tested via DB state.
     pass
 
-
-def test_sdkmgr():
-    """Phase 12: SDK Manager (migrated to authsec Go monolith)."""
-    G = "SDKMgr"
-    tok = admin_jwt()
-
-    # MCP Auth
-    test(G, "MCP Auth Start", "POST", "/authsec/sdkmgr/mcp-auth/start",
-         body={"client_id": "test-client", "tenant_id": TEST_TENANT_ID,
-               "app_name": "integration-test"},
-         expect_status=200)
-    test(G, "MCP Auth Status", "GET",
-         "/authsec/sdkmgr/mcp-auth/status/nonexistent-session",
-         expect_status=200)
-    test(G, "MCP Auth Sessions Status", "GET", "/authsec/sdkmgr/mcp-auth/sessions/status",
-         expect_status=200)
-    test(G, "MCP Auth Tools List", "POST", "/authsec/sdkmgr/mcp-auth/tools/list",
-         body={"session_id": "test"}, expect_status=400)
-    test(G, "MCP Auth Logout", "POST", "/authsec/sdkmgr/mcp-auth/logout",
-         body={"session_id": "test"}, expect_status=400)
-    test(G, "MCP Auth Cleanup", "POST", "/authsec/sdkmgr/mcp-auth/cleanup-sessions",
-         body={}, expect_status=400)
-    test(G, "MCP Auth Protect-Tool", "POST", "/authsec/sdkmgr/mcp-auth/protect-tool",
-         body={"tool_name": "test", "session_id": "test"},
-         expect_status=400)
-
-    # Services
-    test(G, "Get Credentials", "POST", "/authsec/sdkmgr/services/credentials",
-         body={"client_id": "test", "tenant_id": TEST_TENANT_ID},
-         expect_status=400)
-    test(G, "Get User Details", "POST", "/authsec/sdkmgr/services/user-details",
-         body={"email": "test@example.com", "tenant_id": TEST_TENANT_ID},
-         expect_status=400)
-
-    # SPIRE
-    test(G, "SPIRE Initialize", "POST", "/authsec/sdkmgr/spire/workload/initialize",
-         body={"workload_id": "test"}, expect_status=400)
-    test(G, "SPIRE Status", "POST", "/authsec/sdkmgr/spire/workload/status",
-         body={"workload_id": "test"}, expect_status=400)
-    test(G, "SPIRE Validate Connection", "GET",
-         "/authsec/sdkmgr/spire/validate-agent-connection",
-         expect_status=200)
-
-    # Dashboard
-    test(G, "Dashboard Sessions", "POST", "/authsec/sdkmgr/dashboard/sessions",
-         body={"tenant_id": TEST_TENANT_ID}, expect_status=200)
-    test(G, "Dashboard Statistics (JWT)", "POST", "/authsec/sdkmgr/dashboard/statistics",
-         body={"tenant_id": TEST_TENANT_ID}, token=tok, expect_status=[200, 401])
-    test(G, "Dashboard Users", "POST", "/authsec/sdkmgr/dashboard/users",
-         body={"tenant_id": TEST_TENANT_ID}, expect_status=200)
-    test(G, "Dashboard Admin-Users (JWT)", "POST", "/authsec/sdkmgr/dashboard/admin-users",
-         body={}, token=tok, expect_status=[200, 400, 401])
-    test(G, "Dashboard Statistics -> No-token 401", "POST",
-         "/authsec/sdkmgr/dashboard/statistics",
-         body={}, expect_status=401)
-
-    # Playground
-    test(G, "OAuth Check Requirements", "GET",
-         "/authsec/sdkmgr/playground/oauth/check-requirements",
-         expect_status=400)
-    s, resp = test(G, "Create Conversation", "POST",
-         "/authsec/sdkmgr/playground/conversations",
-         body={"tenant_id": TEST_TENANT_ID, "title": "Integration Test"},
-         expect_status=200)
-    conv = resp.get("conversation", {}) if isinstance(resp, dict) else {}
-    conv_id = conv.get("id", "") if isinstance(conv, dict) else ""
-
-    if conv_id:
-        test(G, "Get Conversation", "GET",
-             f"/authsec/sdkmgr/playground/conversations/{conv_id}?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-        test(G, "List Conversations", "GET",
-             f"/authsec/sdkmgr/playground/conversations?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-        test(G, "Get Messages", "GET",
-             f"/authsec/sdkmgr/playground/conversations/{conv_id}/messages?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-        test(G, "List MCP Servers", "GET",
-             f"/authsec/sdkmgr/playground/conversations/{conv_id}/mcp-servers?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-        test(G, "Get All Tools", "GET",
-             f"/authsec/sdkmgr/playground/conversations/{conv_id}/tools?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-        test(G, "Delete Conversation", "DELETE",
-             f"/authsec/sdkmgr/playground/conversations/{conv_id}?tenant_id={TEST_TENANT_ID}",
-             expect_status=200)
-
-    # Voice
-    test(G, "Voice Interact", "POST", "/authsec/sdkmgr/voice/interact",
-         body={"text": "hello", "tenant_id": TEST_TENANT_ID},
-         expect_status=400)
-    test(G, "Voice Poll", "POST", "/authsec/sdkmgr/voice/poll",
-         body={"session_id": "test"}, expect_status=400)
-    test(G, "Voice TTS", "POST", "/authsec/sdkmgr/voice/tts",
-         body={"text": "hello"}, expect_status=500)
-
-    # Dev Server (JWT required)
-    test(G, "Dev Server Status (JWT)", "GET",
-         "/authsec/sdkmgr/playground/dev-server/status",
-         token=tok, expect_status=[400, 401])
-    test(G, "Dev Server Status -> No-token 401", "GET",
-         "/authsec/sdkmgr/playground/dev-server/status",
-         expect_status=401)
-
-    # Backward compat (bare /sdkmgr)
-    test(G, "Backward compat: /sdkmgr/mcp-auth/health", "GET",
-         "/sdkmgr/mcp-auth/health", expect_status=200)
-
-
 def test_scim():
-    """Phase 13: SCIM 2.0 Provisioning."""
+    """Phase 12: SCIM 2.0 Provisioning."""
     G = "SCIM Provisioning"
     tok = admin_jwt()
     fake_client = str(uuid.uuid4())
@@ -1222,10 +1093,9 @@ def main():
         ("ClientMS", test_clientms),
         ("HydraMgr", test_hmgr),
         ("OOCMgr", test_oocmgr),
-        ("AuthMgr", test_authmgr),
+        ("Authz", test_authz),
         ("ExSvc", test_exsvc),
         ("Migration", test_migration),
-        ("SDKMgr", test_sdkmgr),
         ("SCIM Provisioning", test_scim),
     ]
 

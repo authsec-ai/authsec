@@ -12,20 +12,20 @@ import (
 // This is what developers register — their MCP server (the tool provider).
 // It is an OAuth 2.1 Resource Server, NOT an OAuth client.
 type ResourceServer struct {
-	ID                  uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID            uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	Name                string         `json:"name" gorm:"not null"`
-	PublicBaseURL       string         `json:"public_base_url" gorm:"not null"`
-	ProtectedBasePath   string         `json:"protected_base_path" gorm:"not null;default:'/mcp'"`
-	ResourceURI         string         `json:"resource_uri" gorm:"not null;uniqueIndex"`
-	ScopesSupported     pq.StringArray `json:"scopes_supported" gorm:"type:text[];default:'{}'"`
-	RegistrationModes   pq.StringArray `json:"registration_modes" gorm:"type:text[];default:'{dcr,cimd,prereg}'"`
-	IntrospectionSecret     string         `json:"-" gorm:""`                        // Legacy plaintext, cleared after backfill
-	IntrospectionSecretHash string         `json:"-" gorm:"type:text"`               // Bcrypt hash (primary for new rows)
-	Active              bool           `json:"active" gorm:"default:true"`
-	CreatedAt           time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt           time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	DeletedAt           gorm.DeletedAt `json:"-" gorm:"index"`
+	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	TenantID                uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	Name                    string         `json:"name" gorm:"not null"`
+	PublicBaseURL           string         `json:"public_base_url" gorm:"not null"`
+	ProtectedBasePath       string         `json:"protected_base_path" gorm:"not null;default:'/mcp'"`
+	ResourceURI             string         `json:"resource_uri" gorm:"not null;uniqueIndex"`
+	ScopesSupported         pq.StringArray `json:"scopes_supported" gorm:"type:text[];default:'{}'"`
+	RegistrationModes       pq.StringArray `json:"registration_modes" gorm:"type:text[];default:'{dcr,cimd,prereg}'"`
+	IntrospectionSecret     string         `json:"-" gorm:"column:introspection_secret"`               // Legacy plaintext, cleared after backfill
+	IntrospectionSecretHash string         `json:"-" gorm:"column:introspection_secret_hash;type:text"` // Bcrypt hash (primary for new rows)
+	Active                  bool           `json:"active" gorm:"default:true"`
+	CreatedAt               time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt               time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
+	DeletedAt               gorm.DeletedAt `json:"-" gorm:"index"`
 }
 
 func (ResourceServer) TableName() string {

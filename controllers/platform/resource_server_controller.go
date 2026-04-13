@@ -13,8 +13,8 @@ import (
 
 // ResourceServerController handles CRUD for MCP resource server registration.
 type ResourceServerController struct {
-	service   *services.ResourceServerService
-	oauthSvc  *services.OAuthASService
+	service  *services.ResourceServerService
+	oauthSvc *services.OAuthASService
 }
 
 func NewResourceServerController() *ResourceServerController {
@@ -105,9 +105,25 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 	}
 
 	id := c.Param("id")
-	var updates map[string]interface{}
-	if err := c.ShouldBindJSON(&updates); err != nil {
+	var raw map[string]interface{}
+	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	// Whitelist updatable fields — prevent overwriting id, tenant_id, secrets, deleted_at
+	allowed := map[string]bool{
+		"name": true, "public_base_url": true, "protected_base_path": true,
+		"scopes_supported": true, "registration_modes": true, "active": true,
+	}
+	updates := make(map[string]interface{})
+	for k, v := range raw {
+		if allowed[k] {
+			updates[k] = v
+		}
+	}
+	if len(updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no valid fields to update"})
 		return
 	}
 
