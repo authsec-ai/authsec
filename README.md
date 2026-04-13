@@ -17,7 +17,7 @@ AuthSec is a unified Go service for the complete identity lifecycle: authenticat
   - [Client Management (`/authsec/clientms`)](#client-management-authsecclientms)
   - [Hydra Manager (`/authsec/hmgr`)](#hydra-manager-authsechmgr)
   - [OIDC Config Manager (`/authsec/oocmgr`)](#oidc-config-manager-authsecoocmgr)
-  - [Auth Manager (`/authsec/authmgr`)](#auth-manager-authsecauthmgr)
+  - [Authorization (`/authsec/authz`, `/authsec/auth/token`)](#authorization-authsecauthz-authsecauthtoken)
   - [External Services (`/authsec/exsvc`)](#external-services-authsecexsvc)
   - [SPIRE Headless (`/authsec/spire`)](#spire-headless-authsecspire)
   - [Migration Management (`/authsec/migration`)](#migration-management-authsecmigration)
@@ -43,7 +43,8 @@ AuthSec is a unified Go service for the complete identity lifecycle: authenticat
 │  /authsec/clientms/*     – Client lifecycle management            │
 │  /authsec/hmgr/*         – Ory Hydra login/consent, SAML SSO      │
 │  /authsec/oocmgr/*       – OIDC provider config & Hydra sync      │
-│  /authsec/authmgr/*      – JWT verification, RBAC checks          │
+│  /authsec/authz/*        – JWT verification, RBAC checks          │
+│  /authsec/auth/token/*   – token helper endpoints                 │
 │  /authsec/exsvc/*        – External service registry              │
 │  /authsec/spire/*        – SPIFFE workload identity               │
 │  /authsec/migration/*    – Database migration management          │
@@ -70,7 +71,7 @@ All HTTP routes are served from a single `gin.Engine`. Each module's routes live
 | Client Management | `/authsec/clientms` | Hydra client lifecycle management |
 | Hydra Manager | `/authsec/hmgr` | Ory Hydra login/consent, SAML SSO, token exchange |
 | OIDC Config Manager | `/authsec/oocmgr` | OIDC provider config, Hydra client sync, SAML providers |
-| Auth Manager | `/authsec/authmgr` | JWT verify/issue, RBAC permission checks, group management |
+| Authorization | `/authsec/authz`, `/authsec/auth/token` | JWT verify/issue, RBAC permission checks, group management |
 | External Services | `/authsec/exsvc` | External service registry with Vault-backed credentials |
 | SPIRE Headless | `/authsec/spire` | SPIFFE/SPIRE workload identity, OIDC token exchange, cloud federation (AWS/Azure/GCP), RBAC/ABAC policy engine |
 | Migration Management | `/authsec/migration` | Database migration management (master DB + per-tenant DB) |
@@ -586,7 +587,7 @@ All admin endpoints require `JWT + admin:access + tenant validation`.
 
 ---
 
-### Auth Manager (`/authsec/authmgr`)
+### Authorization (`/authsec/authz`, `/authsec/auth/token`)
 
 Provides JWT verification, RBAC permission checks, and group management.
 
@@ -594,52 +595,34 @@ Provides JWT verification, RBAC permission checks, and group management.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/authsec/authmgr/health` | Health check |
-| `POST` | `/authsec/authmgr/token/verify` | Verify JWT token |
-| `POST` | `/authsec/authmgr/token/generate` | Generate JWT token |
-| `POST` | `/authsec/authmgr/token/oidc` | Exchange for OIDC token |
+| `POST` | `/authsec/auth/token/verify` | Verify JWT token |
+| `POST` | `/authsec/auth/token/generate` | Generate JWT token |
+| `POST` | `/authsec/auth/token/oidc` | Exchange for OIDC token |
 
-#### Admin Endpoints (`/authsec/authmgr/admin`, JWT required)
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/authsec/authmgr/admin/profile` | Get profile |
-| `GET` | `/authsec/authmgr/admin/auth-status` | Auth status |
-| `GET` | `/authsec/authmgr/admin/validate/token` | Validate token |
-| `GET` | `/authsec/authmgr/admin/validate/scope` | Validate scope |
-| `GET` | `/authsec/authmgr/admin/validate/resource` | Validate resource |
-| `POST` | `/authsec/authmgr/admin/validate/permissions` | Validate permissions |
-| `GET` | `/authsec/authmgr/admin/check/permission` | Check permission |
-| `GET` | `/authsec/authmgr/admin/check/role` | Check role |
-| `GET` | `/authsec/authmgr/admin/check/role-resource` | Check role resource |
-| `GET` | `/authsec/authmgr/admin/check/permission-scoped` | Check scoped permission |
-| `GET` | `/authsec/authmgr/admin/check/oauth-scope` | Check OAuth scope |
-| `GET` | `/authsec/authmgr/admin/permissions` | List user permissions |
-| `POST` | `/authsec/authmgr/admin/groups` | Create group |
-| `GET` | `/authsec/authmgr/admin/groups` | List groups |
-| `GET` | `/authsec/authmgr/admin/groups/:id` | Get group |
-| `PUT` | `/authsec/authmgr/admin/groups/:id` | Update group |
-| `DELETE` | `/authsec/authmgr/admin/groups/:id` | Delete group |
-| `POST` | `/authsec/authmgr/admin/groups/:id/users` | Add users to group |
-| `DELETE` | `/authsec/authmgr/admin/groups/:id/users` | Remove users from group |
-| `GET` | `/authsec/authmgr/admin/groups/:id/users` | List group users |
-
-#### User Endpoints (`/authsec/authmgr/user`, JWT required)
+#### Authenticated Endpoints (`/authsec/authz`, JWT required)
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/authsec/authmgr/user/profile` | Get profile |
-| `GET` | `/authsec/authmgr/user/auth-status` | Auth status |
-| `GET` | `/authsec/authmgr/user/validate/token` | Validate token |
-| `GET` | `/authsec/authmgr/user/validate/scope` | Validate scope |
-| `GET` | `/authsec/authmgr/user/validate/resource` | Validate resource |
-| `POST` | `/authsec/authmgr/user/validate/permissions` | Validate permissions |
-| `GET` | `/authsec/authmgr/user/check/permission` | Check permission |
-| `GET` | `/authsec/authmgr/user/check/role` | Check role |
-| `GET` | `/authsec/authmgr/user/check/role-resource` | Check role resource |
-| `GET` | `/authsec/authmgr/user/check/permission-scoped` | Check scoped permission |
-| `GET` | `/authsec/authmgr/user/check/oauth-scope` | Check OAuth scope |
-| `GET` | `/authsec/authmgr/user/permissions` | List user permissions |
+| `GET` | `/authsec/authz/profile` | Get profile |
+| `GET` | `/authsec/authz/auth-status` | Auth status |
+| `GET` | `/authsec/authz/validate/token` | Validate token |
+| `GET` | `/authsec/authz/validate/scope` | Validate scope |
+| `GET` | `/authsec/authz/validate/resource` | Validate resource |
+| `POST` | `/authsec/authz/validate/permissions` | Validate permissions |
+| `GET` | `/authsec/authz/check/permission` | Check permission |
+| `GET` | `/authsec/authz/check/role` | Check role |
+| `GET` | `/authsec/authz/check/role-resource` | Check role resource |
+| `GET` | `/authsec/authz/check/permission-scoped` | Check scoped permission |
+| `GET` | `/authsec/authz/check/oauth-scope` | Check OAuth scope |
+| `GET` | `/authsec/authz/permissions` | List user permissions |
+| `POST` | `/authsec/authz/groups` | Create group |
+| `GET` | `/authsec/authz/groups` | List groups |
+| `GET` | `/authsec/authz/groups/:id` | Get group |
+| `PUT` | `/authsec/authz/groups/:id` | Update group |
+| `DELETE` | `/authsec/authz/groups/:id` | Delete group |
+| `POST` | `/authsec/authz/groups/:id/users` | Add users to group |
+| `DELETE` | `/authsec/authz/groups/:id/users` | Remove users from group |
+| `GET` | `/authsec/authz/groups/:id/users` | List group users |
 
 ---
 

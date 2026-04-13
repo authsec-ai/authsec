@@ -24,12 +24,13 @@ import (
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
-	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
+	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
@@ -233,6 +234,20 @@ func main() {
 			if err := auditLogger.CleanupOldEvents(90 * 24 * time.Hour); err != nil {
 				monitoring.GetLogger().WithError(err).Error("Failed to cleanup old audit events")
 			}
+		}
+	}()
+
+	// Auth request context + PKCE verifier cleanup (expired entries, runs every 10 minutes)
+	go func() {
+		authzCtxSvc := services.NewAuthorizationContextService(config.DB)
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := authzCtxSvc.CleanupExpired(); err != nil {
+				log.Printf("Warning: auth request context cleanup failed: %v", err)
+			}
+			// Clean expired PKCE verifiers
+			config.DB.Where("expires_at < ?", time.Now()).Delete(&models.PKCEVerifier{})
 		}
 	}()
 

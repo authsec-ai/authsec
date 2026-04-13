@@ -1425,14 +1425,37 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 	// Handle logic based on MFA and login type
 	if !user.MFAEnabled {
 		log.Printf("MFA not enabled for user: %s - proceeding with login", user.Email)
-		// TODO: Generate and include token here if MFA is disabled (e.g., response.Token = generateJWT(user))
-		// For now, assuming token issuance is handled elsewhere or not required
+		authController, authErr := NewEndUserAuthController()
+		if authErr != nil {
+			log.Printf("failed to initialize end-user auth controller for custom login token issuance: %v", authErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize authentication flow"})
+			return
+		}
+
+		token, tokenErr := authController.generateJWTToken(
+			user.TenantID.String(),
+			clientID,
+			user.Email,
+			user.TenantDomain,
+			&user.ID,
+			tenantDB,
+		)
+		if tokenErr != nil {
+			log.Printf("failed to generate end-user token for OIDC login user=%s client_id=%s: %v", user.Email, clientID, tokenErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to issue login token"})
+			return
+		}
+
+		response.Token = token
+		response.MFARequired = false
 	} else if isFirstLogin {
 		log.Printf("First-time login for: %s - may require MFA setup", user.Email)
 		// TODO: Optionally generate temporary token or redirect to MFA enrollment
+		response.MFARequired = true
 	} else {
 		// Returning user with MFA enabled: require verification, no token yet
 		log.Printf("Returning user login for: %s - requires MFA verification", user.Email)
+		response.MFARequired = true
 		c.JSON(http.StatusOK, response)
 		return
 	}
@@ -1543,6 +1566,29 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 			OTPRequired: false,
 		}
 
+		authController, authErr := NewEndUserAuthController()
+		if authErr != nil {
+			log.Printf("failed to initialize end-user auth controller for custom login token issuance: %v", authErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize authentication flow"})
+			return
+		}
+
+		token, tokenErr := authController.generateJWTToken(
+			user.TenantID.String(),
+			input.ClientID,
+			user.Email,
+			user.TenantDomain,
+			&user.ID,
+			tenantDB,
+		)
+		if tokenErr != nil {
+			log.Printf("failed to generate end-user token for custom login user=%s client_id=%s: %v", user.Email, input.ClientID, tokenErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to issue login token"})
+			return
+		}
+		response.Token = token
+		response.MFARequired = false
+
 		c.JSON(http.StatusOK, response)
 		return
 	}
@@ -1556,6 +1602,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		Email:       user2.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
+		MFARequired: true,
 	}
 
 	log.Printf("Returning user login for: %s - requires MFA verification", user.Email)

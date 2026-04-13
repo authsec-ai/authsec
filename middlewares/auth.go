@@ -63,6 +63,7 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 
 		tokenString, err := extractBearerToken(c)
 		if err != nil {
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_request", error_description="missing or malformed bearer token"`)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 			c.Abort()
 			return
@@ -71,6 +72,7 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		claims, err := validateJWTToken(tokenString, cfg)
 		if err != nil {
 			fmt.Printf("WARN: JWT validation failed: %v\n", err)
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="token is expired or invalid"`)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
 			c.Abort()
 			return

@@ -24,8 +24,8 @@
 //	/authsec/clientms/*   – client management (formerly clients-microservice)
 //	/authsec/hmgr/*       – Hydra manager (formerly hydra-service)
 //	/authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
-//	/authsec/authmgr/*    – Auth manager (formerly auth-manager)
-//	/authsec/sdkmgr/*     – SDK manager (formerly sdk-manager Python service)
+//	/authsec/authz/*      – canonical authorization and RBAC surface
+//	/authsec/auth/token/* – token helper endpoints
 package routes
 
 import (
@@ -38,12 +38,10 @@ import (
 	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
 	userCtrl "github.com/authsec-ai/authsec/controllers/enduser"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
-	sdkmgrCtrl "github.com/authsec-ai/authsec/controllers/sdkmgr"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/internal/spire"
-	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -190,16 +188,50 @@ func SetupRoutes(
 	})
 
 	// ════════════════════════════════════════════════════════
+	// MCP OAuth Authorization Server (global endpoints)
+	// RFC 8414 AS Metadata + OAuth endpoints at root level
+	// ════════════════════════════════════════════════════════
+	oauthASController := platformCtrl.NewOAuthASController()
+	rsController := platformCtrl.NewResourceServerController()
+
+	// RFC 8414 — AS Metadata discovery (must be at root)
+	r.GET("/.well-known/oauth-authorization-server", oauthASController.ASMetadata)
+
+	// Global OAuth endpoints (unauthenticated — the OAuth flow itself handles authz)
+	oauth := r.Group("/oauth")
+	{
+		oauth.GET("/authorize", oauthASController.Authorize)
+		oauth.POST("/token", oauthASController.Token)
+		oauth.POST("/register", middlewares.StrictAuthRateLimitMiddleware(10, time.Minute), oauthASController.Register)
+		oauth.POST("/introspect", oauthASController.Introspect)
+		oauth.GET("/jwks", oauthASController.JWKS)
+		oauth.POST("/revoke", oauthASController.Revoke)
+	}
+
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
 	{
 		// ────────────────────────────────────────────────────────
-		// Well-known OIDC discovery (formerly spire-headless)
+		// Resource Server admin API (authenticated)
 		// ────────────────────────────────────────────────────────
-		authsec.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
-		authsec.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
-
+		resourceServers := authsec.Group("/resource-servers")
+		resourceServers.Use(middlewares.AuthMiddleware())
+		{
+			resourceServers.POST("", rsController.Create)
+			resourceServers.GET("", rsController.List)
+			resourceServers.GET("/:id", rsController.Get)
+			resourceServers.PUT("/:id", rsController.Update)
+			resourceServers.DELETE("/:id", rsController.Delete)
+			resourceServers.POST("/:id/rotate-introspection-secret", rsController.RotateIntrospectionSecret)
+			// Prereg admin (Bug 9)
+			resourceServers.POST("/:id/clients", rsController.PreRegisterClient)
+			resourceServers.GET("/:id/clients", rsController.ListClients)
+			resourceServers.DELETE("/:id/clients/:client_id", rsController.RevokeClient)
+			// CIMD redirect approval (Bug 10)
+			resourceServers.PUT("/:id/clients/:client_id/approve-redirects", rsController.ApproveRedirects)
+		}
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
 		// Served under /authsec/webauthn (formerly webauthn-service).
@@ -354,6 +386,7 @@ func SetupRoutes(
 				enduserAuth.POST("/initiate-registration", endUserAuthController.InitiateRegistration)
 				enduserAuth.POST("/verify-otp", endUserAuthController.VerifyOTPAndCompleteRegistration)
 				enduserAuth.POST("/login/precheck", endUserAuthController.EndUserLoginPrecheck)
+				enduserAuth.POST("/login", endUserAuthController.Login)
 				enduserAuth.POST("/webauthn-callback", endUserAuthController.WebAuthnCallback)
 				enduserAuth.POST("/delegate-svid", spiffeDelegateController.DelegateSVID)
 			}
@@ -705,8 +738,8 @@ func SetupRoutes(
 		registerOocmgrRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
-		// Auth Manager (formerly auth-manager)
-		// Served under /authsec/authmgr.
+		// Authorization and RBAC surface (implemented by the merged auth-manager logic)
+		// Served under /authsec/authz and /authsec/auth/token.
 		// ────────────────────────────────────────────────────
 		registerAuthmgrRoutes(authsec)
 
@@ -745,13 +778,6 @@ func SetupRoutes(
 		{
 			purge.DELETE("/user", purgeCtrl.PurgeUserByEmail)
 		}
-
-		// ────────────────────────────────────────────────────
-		// SDK Manager (formerly sdk-manager Python service)
-		// Served under /authsec/sdkmgr.
-		// Backward-compat alias at bare /sdkmgr/* for existing SDKs.
-		// ────────────────────────────────────────────────────
-		registerSdkmgrRoutes(authsec, r)
 
 		// ────────────────────────────────────────────────────
 		// SPIRE Headless (formerly spire-headless microservice)
@@ -994,6 +1020,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 	{
 		// OIDC endpoints
 		pub.GET("/login/page-data", hmgrController.GetLoginPageDataHandler)
+		pub.POST("/login/complete-local", hmgrController.CompleteLocalLoginHandler)
 		pub.POST("/auth/initiate/:provider", hmgrController.InitiateAuthHandler)
 		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
@@ -1159,219 +1186,51 @@ func registerOocmgrRoutes(r gin.IRouter) {
 	}
 }
 
-// registerAuthmgrRoutes registers all Auth Manager routes under /authmgr.
-// Previously served by the standalone auth-manager microservice.
+// registerAuthmgrRoutes registers all authorization-related routes.
+// /authz/* is the single canonical surface for validation, RBAC checks, and group management.
+// Legacy /authmgr/* routes have been removed — all consumers must migrate to /authz/*.
 func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
 
-	// Public / unauthenticated endpoints
-	authmgr := r.Group("/authmgr")
+	// Public / unauthenticated token endpoints (no /authmgr prefix — these are standalone)
+	tokenGroup := r.Group("/auth/token")
 	{
-		authmgr.GET("/health", ac.HealthCheck)
-		authmgr.POST("/token/verify", ac.VerifyToken)
-		authmgr.POST("/token/generate", ac.GenerateToken)
-		authmgr.POST("/token/oidc", ac.OIDCToken)
+		tokenGroup.POST("/verify", ac.VerifyToken)
+		tokenGroup.POST("/generate", ac.GenerateToken)
+		tokenGroup.POST("/oidc", ac.OIDCToken)
 	}
 
-	// Admin endpoints (protected by authsec AuthMiddleware)
-	admin := r.Group("/authmgr/admin")
-	admin.Use(middlewares.AuthMiddleware())
+	// ── /authz/* — single canonical authorization surface ──
+	authz := r.Group("/authz")
+	authz.Use(middlewares.AuthMiddleware())
 	{
-		admin.GET("/profile", ac.GetProfile)
-		admin.GET("/auth-status", ac.GetAuthStatus)
+		// Profile & status
+		authz.GET("/profile", ac.GetProfile)
+		authz.GET("/auth-status", ac.GetAuthStatus)
 
 		// Validation
-		admin.GET("/validate/token", ac.ValidateToken)
-		admin.GET("/validate/scope", ac.ValidateScope)
-		admin.GET("/validate/resource", ac.ValidateResource)
-		admin.POST("/validate/permissions", ac.ValidatePermissions)
+		authz.GET("/validate/token", ac.ValidateToken)
+		authz.GET("/validate/scope", ac.ValidateScope)
+		authz.GET("/validate/resource", ac.ValidateResource)
+		authz.POST("/validate/permissions", ac.ValidatePermissions)
 
 		// RBAC permission checks
-		admin.GET("/check/permission", ac.CheckPermission)
-		admin.GET("/check/role", ac.CheckRole)
-		admin.GET("/check/role-resource", ac.CheckRoleResource)
-		admin.GET("/check/permission-scoped", ac.CheckPermissionScoped)
-		admin.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
-		admin.GET("/permissions", ac.ListUserPermissions)
+		authz.GET("/check/permission", ac.CheckPermission)
+		authz.GET("/check/role", ac.CheckRole)
+		authz.GET("/check/role-resource", ac.CheckRoleResource)
+		authz.GET("/check/permission-scoped", ac.CheckPermissionScoped)
+		authz.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
+		authz.GET("/permissions", ac.ListUserPermissions)
 
 		// Group management
-		admin.POST("/groups", ac.CreateGroup)
-		admin.GET("/groups", ac.ListGroups)
-		admin.GET("/groups/:id", ac.GetGroup)
-		admin.PUT("/groups/:id", ac.UpdateGroup)
-		admin.DELETE("/groups/:id", ac.DeleteGroup)
-		admin.POST("/groups/:id/users", ac.AddUsersToGroup)
-		admin.DELETE("/groups/:id/users", ac.RemoveUsersFromGroup)
-		admin.GET("/groups/:id/users", ac.ListGroupUsers)
-	}
-
-	// User endpoints (protected by authsec AuthMiddleware)
-	user := r.Group("/authmgr/user")
-	user.Use(middlewares.AuthMiddleware())
-	{
-		user.GET("/profile", ac.GetProfile)
-		user.GET("/auth-status", ac.GetAuthStatus)
-
-		// Validation
-		user.GET("/validate/token", ac.ValidateToken)
-		user.GET("/validate/scope", ac.ValidateScope)
-		user.GET("/validate/resource", ac.ValidateResource)
-		user.POST("/validate/permissions", ac.ValidatePermissions)
-
-		// RBAC permission checks
-		user.GET("/check/permission", ac.CheckPermission)
-		user.GET("/check/role", ac.CheckRole)
-		user.GET("/check/role-resource", ac.CheckRoleResource)
-		user.GET("/check/permission-scoped", ac.CheckPermissionScoped)
-		user.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
-		user.GET("/permissions", ac.ListUserPermissions)
-	}
-
-}
-
-// registerSdkmgrRoutes registers all SDK Manager routes under /sdkmgr.
-// Previously served by the standalone sdk-manager Python service.
-// Routes are registered on both the primary router (under /authsec) and
-// a backward-compatibility alias at the bare root so that existing SDKs
-// that target /sdkmgr/* continue to work during migration.
-func registerSdkmgrRoutes(r gin.IRouter, aliases ...gin.IRouter) {
-	// Initialise the MCP Auth service and run startup tasks.
-	mcpAuthSvc := sdkmgrSvc.NewMCPAuthService()
-	mcpAuthSvc.Initialize()
-	mcpAuthCtrl := sdkmgrCtrl.NewMCPAuthController(mcpAuthSvc)
-
-	servicesSvc := sdkmgrSvc.NewServicesService(mcpAuthSvc.SessionStore)
-	servicesCtrl := sdkmgrCtrl.NewServicesController(servicesSvc)
-
-	spireSvc := sdkmgrSvc.NewSPIREProxyService()
-	spireSvc.Initialize()
-	spireCtrl := sdkmgrCtrl.NewSPIREController(spireSvc)
-
-	dashSvc := sdkmgrSvc.NewDashboardService()
-	dashCtrl := sdkmgrCtrl.NewDashboardController(dashSvc)
-
-	mcpOAuthSvc := sdkmgrSvc.NewMCPOAuthService()
-	mcpOAuthCtrl := sdkmgrCtrl.NewMCPOAuthController(mcpOAuthSvc)
-
-	playgroundSvc := sdkmgrSvc.NewMCPPlaygroundService()
-	playgroundCtrl := sdkmgrCtrl.NewMCPPlaygroundController(playgroundSvc)
-
-	voiceSvc := sdkmgrSvc.NewVoiceClientService()
-	voiceCtrl := sdkmgrCtrl.NewVoiceController(voiceSvc)
-
-	devServerSvc := sdkmgrSvc.NewDevServerService(playgroundSvc)
-	devServerCtrl := sdkmgrCtrl.NewDevServerController(devServerSvc)
-
-	// Bind routes on the primary router and any backward-compat aliases.
-	routers := append([]gin.IRouter{r}, aliases...)
-	for _, router := range routers {
-		bindSdkmgrRoutes(router, mcpAuthCtrl, servicesCtrl, spireCtrl, dashCtrl,
-			mcpOAuthCtrl, playgroundCtrl, voiceCtrl, devServerCtrl)
-	}
-}
-
-// bindSdkmgrRoutes registers all sdkmgr endpoint groups on the given router.
-func bindSdkmgrRoutes(
-	r gin.IRouter,
-	mcpAuthCtrl *sdkmgrCtrl.MCPAuthController,
-	servicesCtrl *sdkmgrCtrl.ServicesController,
-	spireCtrl *sdkmgrCtrl.SPIREController,
-	dashCtrl *sdkmgrCtrl.DashboardController,
-	mcpOAuthCtrl *sdkmgrCtrl.MCPOAuthController,
-	playgroundCtrl *sdkmgrCtrl.MCPPlaygroundController,
-	voiceCtrl *sdkmgrCtrl.VoiceController,
-	devServerCtrl *sdkmgrCtrl.DevServerController,
-) {
-	// ── MCP Auth routes ──
-	mcpAuth := r.Group("/sdkmgr/mcp-auth")
-	{
-		mcpAuth.GET("/health", mcpAuthCtrl.Health)
-		mcpAuth.POST("/start", mcpAuthCtrl.Start)
-		mcpAuth.POST("/authenticate", mcpAuthCtrl.Authenticate)
-		mcpAuth.POST("/callback", mcpAuthCtrl.CallbackJSON)
-		mcpAuth.GET("/callback", mcpAuthCtrl.CallbackHTML)
-		mcpAuth.GET("/status/:session_id", mcpAuthCtrl.Status)
-		mcpAuth.GET("/sessions/status", mcpAuthCtrl.SessionsStatus)
-		mcpAuth.POST("/logout", mcpAuthCtrl.Logout)
-		mcpAuth.POST("/tools/list", mcpAuthCtrl.ToolsList)
-		mcpAuth.POST("/tools/call/:tool_name", mcpAuthCtrl.ToolCall)
-		mcpAuth.POST("/protect-tool", mcpAuthCtrl.ProtectTool)
-		mcpAuth.POST("/cleanup-sessions", mcpAuthCtrl.CleanupSessions)
-	}
-
-	// ── Services routes ──
-	services := r.Group("/sdkmgr/services")
-	{
-		services.GET("/health", servicesCtrl.Health)
-		services.POST("/credentials", servicesCtrl.GetCredentials)
-		services.POST("/user-details", servicesCtrl.GetUserDetails)
-	}
-
-	// ── SPIRE routes ──
-	spire := r.Group("/sdkmgr/spire")
-	{
-		spire.GET("/health", spireCtrl.Health)
-		spire.POST("/workload/initialize", spireCtrl.Initialize)
-		spire.POST("/workload/renew", spireCtrl.Renew)
-		spire.POST("/workload/status", spireCtrl.Status)
-		spire.GET("/validate-agent-connection", spireCtrl.ValidateConnection)
-	}
-
-	// ── Dashboard routes ──
-	dashboard := r.Group("/sdkmgr/dashboard")
-	{
-		dashboard.GET("/health", dashCtrl.Health)
-		dashboard.POST("/sessions", dashCtrl.Sessions)
-		dashboard.POST("/statistics", middlewares.AuthMiddleware(), dashCtrl.Statistics)
-		dashboard.POST("/users", dashCtrl.Users)
-		dashboard.POST("/admin-users", middlewares.AuthMiddleware(), dashCtrl.AdminUsers)
-	}
-
-	// ── MCP OAuth routes ──
-	playgroundOAuth := r.Group("/sdkmgr/playground/oauth")
-	{
-		playgroundOAuth.GET("/check-requirements", mcpOAuthCtrl.CheckRequirements)
-		playgroundOAuth.GET("/authorize", mcpOAuthCtrl.Authorize)
-		playgroundOAuth.GET("/callback", mcpOAuthCtrl.Callback)
-		playgroundOAuth.POST("/refresh", mcpOAuthCtrl.Refresh)
-	}
-
-	// ── MCP Playground routes ──
-	playground := r.Group("/sdkmgr/playground")
-	{
-		playground.GET("/health", playgroundCtrl.Health)
-		playground.POST("/conversations", playgroundCtrl.CreateConversation)
-		playground.GET("/conversations", playgroundCtrl.ListConversations)
-		playground.GET("/conversations/:id", playgroundCtrl.GetConversation)
-		playground.PATCH("/conversations/:id", playgroundCtrl.UpdateConversation)
-		playground.DELETE("/conversations/:id", playgroundCtrl.DeleteConversation)
-		playground.GET("/conversations/:id/messages", playgroundCtrl.GetMessages)
-		playground.POST("/conversations/:id/chat", playgroundCtrl.Chat)
-		playground.POST("/chat/stream", playgroundCtrl.ChatStream)
-		playground.POST("/conversations/:id/mcp-servers", playgroundCtrl.AddMCPServer)
-		playground.GET("/conversations/:id/mcp-servers", playgroundCtrl.ListMCPServers)
-		playground.POST("/conversations/:id/mcp-servers/:sid/disconnect", playgroundCtrl.DisconnectMCPServer)
-		playground.POST("/conversations/:id/mcp-servers/:sid/reconnect", playgroundCtrl.ReconnectMCPServer)
-		playground.DELETE("/conversations/:id/mcp-servers/:sid", playgroundCtrl.RemoveMCPServer)
-		playground.GET("/conversations/:id/mcp-servers/:sid/tools", playgroundCtrl.GetMCPTools)
-		playground.GET("/conversations/:id/tools", playgroundCtrl.GetAllConversationTools)
-	}
-
-	// ── Voice routes ──
-	voice := r.Group("/sdkmgr/voice")
-	{
-		voice.POST("/interact", voiceCtrl.Interact)
-		voice.POST("/poll", voiceCtrl.Poll)
-		voice.POST("/tts", voiceCtrl.TTS)
-	}
-
-	// ── Dev Server routes (auth required) ──
-	devServer := r.Group("/sdkmgr/playground/dev-server")
-	devServer.Use(middlewares.AuthMiddleware())
-	{
-		devServer.POST("/start", devServerCtrl.Start)
-		devServer.POST("/stop", devServerCtrl.Stop)
-		devServer.GET("/status", devServerCtrl.Status)
+		authz.POST("/groups", ac.CreateGroup)
+		authz.GET("/groups", ac.ListGroups)
+		authz.GET("/groups/:id", ac.GetGroup)
+		authz.PUT("/groups/:id", ac.UpdateGroup)
+		authz.DELETE("/groups/:id", ac.DeleteGroup)
+		authz.POST("/groups/:id/users", ac.AddUsersToGroup)
+		authz.DELETE("/groups/:id/users", ac.RemoveUsersFromGroup)
+		authz.GET("/groups/:id/users", ac.ListGroupUsers)
 	}
 }
 

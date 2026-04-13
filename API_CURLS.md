@@ -2155,10 +2155,10 @@ curl -X POST "$BASE/authsec/oocmgr/clients/getClients" \
 
 ---
 
-## Auth Manager  `/authsec/authmgr`
+## Authorization  `/authsec/authz` and `/authsec/auth/token`
 
 > Formerly the standalone `auth-manager` microservice.  
-> Token endpoints are public; admin/user endpoints require a valid Bearer token.
+> Token endpoints are public under `/authsec/auth/token`; authorization endpoints require a valid Bearer token under `/authsec/authz`.
 
 ```bash
 BASE=http://localhost:8080
@@ -2167,181 +2167,175 @@ TENANT_ID="<tenant-uuid>"
 USER_ID="<user-uuid>"
 ```
 
-### Health  `GET /authsec/authmgr/health`
+### Verify Token  `POST /authsec/auth/token/verify`
 
 ```bash
-curl "$BASE/authsec/authmgr/health"
-```
-
-### Verify Token  `POST /authsec/authmgr/token/verify`
-
-```bash
-curl -X POST "$BASE/authsec/authmgr/token/verify" \
+curl -X POST "$BASE/authsec/auth/token/verify" \
   -H "Content-Type: application/json" \
   -d '{"token":"'"$TOKEN"'"}'
 ```
 
-### Generate Token  `POST /authsec/authmgr/token/generate`
+### Generate Token  `POST /authsec/auth/token/generate`
 
 ```bash
-curl -X POST "$BASE/authsec/authmgr/token/generate" \
+curl -X POST "$BASE/authsec/auth/token/generate" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","email_id":"user@example.com","client_id":"<client-uuid>","project_id":"<project-uuid>"}'
 ```
 
-### OIDC Token Exchange  `POST /authsec/authmgr/token/oidc`
+### OIDC Token Exchange  `POST /authsec/auth/token/oidc`
 
 ```bash
-curl -X POST "$BASE/authsec/authmgr/token/oidc" \
+curl -X POST "$BASE/authsec/auth/token/oidc" \
   -H "Content-Type: application/json" \
   -d '{"oidc_token":"<hydra-access-token>"}'
 ```
 
-### Get Profile  `GET /authsec/authmgr/admin/profile`
+### Get Profile  `GET /authsec/authz/profile`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/profile" \
+curl "$BASE/authsec/authz/profile" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Auth Status  `GET /authsec/authmgr/admin/auth-status`
+### Auth Status  `GET /authsec/authz/auth-status`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/auth-status?tenant_id=$TENANT_ID&email=user@example.com" \
+curl "$BASE/authsec/authz/auth-status?tenant_id=$TENANT_ID&email=user@example.com" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Validate Token  `GET /authsec/authmgr/admin/validate/token`
+### Validate Token  `GET /authsec/authz/validate/token`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/validate/token" \
+curl "$BASE/authsec/authz/validate/token" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Validate Scope  `GET /authsec/authmgr/admin/validate/scope`
+### Validate Scope  `GET /authsec/authz/validate/scope`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/validate/scope" \
+curl "$BASE/authsec/authz/validate/scope" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Validate Resource  `GET /authsec/authmgr/admin/validate/resource`
+### Validate Resource  `GET /authsec/authz/validate/resource`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/validate/resource" \
+curl "$BASE/authsec/authz/validate/resource" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Validate Permissions  `GET /authsec/authmgr/admin/validate/permissions`
+### Validate Permissions  `GET /authsec/authz/validate/permissions`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/validate/permissions" \
+curl "$BASE/authsec/authz/validate/permissions" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Check Permission  `GET /authsec/authmgr/admin/check/permission`
+### Check Permission  `GET /authsec/authz/check/permission`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/check/permission?resource=invoice&scope=read" \
+curl "$BASE/authsec/authz/check/permission?resource=invoice&scope=read" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Check Role  `GET /authsec/authmgr/admin/check/role`
+### Check Role  `GET /authsec/authz/check/role`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/check/role?role=admin" \
+curl "$BASE/authsec/authz/check/role?role=admin" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Check Role Resource  `GET /authsec/authmgr/admin/check/role-resource`
+### Check Role Resource  `GET /authsec/authz/check/role-resource`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/check/role-resource?role=editor&scope_type=project&resource_id=<resource-uuid>" \
+curl "$BASE/authsec/authz/check/role-resource?role=editor&scope_type=project&resource_id=<resource-uuid>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Check Permission Scoped  `GET /authsec/authmgr/admin/check/permission-scoped`
+### Check Permission Scoped  `GET /authsec/authz/check/permission-scoped`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/check/permission-scoped?resource=invoice&scope=write&scope_type=project&scope_id=<scope-uuid>" \
+curl "$BASE/authsec/authz/check/permission-scoped?resource=invoice&scope=write&scope_type=project&scope_id=<scope-uuid>" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Check OAuth Scope Permission  `GET /authsec/authmgr/admin/check/oauth-scope`
+### Check OAuth Scope Permission  `GET /authsec/authz/check/oauth-scope`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/check/oauth-scope?scope_name=invoice.read&resource=invoice&action=read" \
+curl "$BASE/authsec/authz/check/oauth-scope?scope_name=invoice.read&resource=invoice&action=read" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### List User Permissions  `GET /authsec/authmgr/admin/permissions`
+### List User Permissions  `GET /authsec/authz/permissions`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/permissions" \
+curl "$BASE/authsec/authz/permissions" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Create Groups  `POST /authsec/authmgr/admin/groups`
+### Create Groups  `POST /authsec/authz/groups`
 
 ```bash
-curl -X POST "$BASE/authsec/authmgr/admin/groups" \
+curl -X POST "$BASE/authsec/authz/groups" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","groups":["engineers","admins"]}'
 ```
 
-### List Groups  `GET /authsec/authmgr/admin/groups`
+### List Groups  `GET /authsec/authz/groups`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/groups?tenant_id=$TENANT_ID" \
+curl "$BASE/authsec/authz/groups?tenant_id=$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Get Group  `GET /authsec/authmgr/admin/groups/:id`
+### Get Group  `GET /authsec/authz/groups/:id`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/groups/1?tenant_id=$TENANT_ID" \
+curl "$BASE/authsec/authz/groups/1?tenant_id=$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Update Group  `PUT /authsec/authmgr/admin/groups/:id`
+### Update Group  `PUT /authsec/authz/groups/:id`
 
 ```bash
-curl -X PUT "$BASE/authsec/authmgr/admin/groups/1" \
+curl -X PUT "$BASE/authsec/authz/groups/1" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","name":"senior-engineers"}'
 ```
 
-### Delete Group  `DELETE /authsec/authmgr/admin/groups/:id`
+### Delete Group  `DELETE /authsec/authz/groups/:id`
 
 ```bash
-curl -X DELETE "$BASE/authsec/authmgr/admin/groups/1?tenant_id=$TENANT_ID" \
+curl -X DELETE "$BASE/authsec/authz/groups/1?tenant_id=$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-### Add Users to Group  `POST /authsec/authmgr/admin/groups/:id/users`
+### Add Users to Group  `POST /authsec/authz/groups/:id/users`
 
 ```bash
-curl -X POST "$BASE/authsec/authmgr/admin/groups/1/users" \
+curl -X POST "$BASE/authsec/authz/groups/1/users" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","user_ids":["'"$USER_ID"'"]}'
 ```
 
-### Remove Users from Group  `DELETE /authsec/authmgr/admin/groups/:id/users`
+### Remove Users from Group  `DELETE /authsec/authz/groups/:id/users`
 
 ```bash
-curl -X DELETE "$BASE/authsec/authmgr/admin/groups/1/users" \
+curl -X DELETE "$BASE/authsec/authz/groups/1/users" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"tenant_id":"'"$TENANT_ID"'","user_ids":["'"$USER_ID"'"]}'
 ```
 
-### List Group Users  `GET /authsec/authmgr/admin/groups/:id/users`
+### List Group Users  `GET /authsec/authz/groups/:id/users`
 
 ```bash
-curl "$BASE/authsec/authmgr/admin/groups/1/users?tenant_id=$TENANT_ID" \
+curl "$BASE/authsec/authz/groups/1/users?tenant_id=$TENANT_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 

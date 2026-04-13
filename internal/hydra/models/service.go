@@ -391,6 +391,78 @@ func (s *OAuthLoginService) AcceptHydraConsentRequest(consentChallenge string, c
 	return &acceptResponse, nil
 }
 
+// AcceptHydraConsentRequestMCP accepts a consent request for the new MCP OAuth path.
+// It uses the ScopeResolver-computed scopes and RS-specific audience instead of blindly
+// granting all requested scopes/audiences.
+func (s *OAuthLoginService) AcceptHydraConsentRequestMCP(
+	consentChallenge string,
+	consentRequest *HydraConsentRequest,
+	grantedScopes []string,
+	grantedAudience []string,
+	extraSessionClaims map[string]interface{},
+) (*HydraAcceptConsentResponse, error) {
+	userContext := make(map[string]interface{})
+	if consentRequest.Context != nil {
+		userContext = consentRequest.Context
+	}
+
+	accessTokenSession := map[string]interface{}{
+		"user_id":     consentRequest.Subject,
+		"email":       userContext["email"],
+		"name":        userContext["name"],
+		"provider":    userContext["provider"],
+		"provider_id": userContext["provider_id"],
+	}
+	// Merge extra session claims (tenant_id, resource_server_id)
+	for k, v := range extraSessionClaims {
+		accessTokenSession[k] = v
+	}
+
+	acceptRequest := HydraAcceptConsentRequest{
+		GrantScope:               grantedScopes,
+		GrantAccessTokenAudience: grantedAudience,
+		Remember:                 true,
+		RememberFor:              3600,
+		Session: map[string]interface{}{
+			"access_token": accessTokenSession,
+			"id_token": map[string]interface{}{
+				"user_id":     consentRequest.Subject,
+				"email":       userContext["email"],
+				"name":        userContext["name"],
+				"provider":    userContext["provider"],
+				"provider_id": userContext["provider_id"],
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(acceptRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	reqURL := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent/accept?consent_challenge=%s",
+		s.cfg.HydraAdminURL, consentChallenge)
+
+	req, err := http.NewRequest("PUT", reqURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var acceptResponse HydraAcceptConsentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&acceptResponse); err != nil {
+		return nil, err
+	}
+	return &acceptResponse, nil
+}
+
 func (s *OAuthLoginService) GetHydraClient(clientID string) (*HydraClient, string, error) {
 	reqURL := fmt.Sprintf("%s/admin/clients/%s", s.cfg.HydraAdminURL, clientID)
 

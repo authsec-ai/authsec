@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -134,6 +135,55 @@ func hydraAdminGetAllClients() ([]hydraClient, error) {
 		return nil, fmt.Errorf("hydra get all clients decode: %w", err)
 	}
 	return clients, nil
+}
+
+// PushAuthorizationRequest sends authorization params to Hydra via PAR (RFC 9126).
+// Server-to-server call using CircuitDoHydra. Returns (request_uri, expires_in_seconds, error).
+func PushAuthorizationRequest(params url.Values) (string, int, error) {
+	parURL := config.AppConfig.HydraPublicURL + "/oauth2/par"
+	req, err := http.NewRequest("POST", parURL, strings.NewReader(params.Encode()))
+	if err != nil {
+		return "", 0, fmt.Errorf("PAR build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("PAR request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		return "", 0, fmt.Errorf("PAR status %d: %s", resp.StatusCode, body)
+	}
+
+	var parResp struct {
+		RequestURI string `json:"request_uri"`
+		ExpiresIn  int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &parResp); err != nil {
+		return "", 0, fmt.Errorf("PAR decode: %w", err)
+	}
+	if parResp.RequestURI == "" {
+		return "", 0, fmt.Errorf("PAR response missing request_uri")
+	}
+	return parResp.RequestURI, parResp.ExpiresIn, nil
+}
+
+// RegisterHydraClientWithParams creates a Hydra client with full control over parameters.
+// Used by DCR and CIMD flows where the client needs specific audience and scope configuration.
+func RegisterHydraClientWithParams(clientID, clientName string, redirectURIs []string, audience []string, scope string) error {
+	return hydraAdminCreateClient(hydraClient{
+		ClientID:      clientID,
+		ClientName:    clientName,
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  redirectURIs,
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: "none",
+		Scope:         scope,
+		Audience:      audience,
+	})
 }
 
 func oocmgrNormalizeProviderName(name string) string {
