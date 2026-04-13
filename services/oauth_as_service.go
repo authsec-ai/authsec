@@ -22,10 +22,10 @@ import (
 )
 
 type OAuthASService struct {
-	db         *gorm.DB
-	authzCtx   *AuthorizationContextService
-	rsService  *ResourceServerService
-	jwksCache  *jwksCache
+	db        *gorm.DB
+	authzCtx  *AuthorizationContextService
+	rsService *ResourceServerService
+	jwksCache *jwksCache
 }
 
 func NewOAuthASService(db *gorm.DB) *OAuthASService {
@@ -39,25 +39,25 @@ func NewOAuthASService(db *gorm.DB) *OAuthASService {
 
 // ASMetadata returns the RFC 8414 Authorization Server Metadata.
 // Note: CIMD support is per-RS policy (via registration_modes), not globally advertised.
-// Clients discover CIMD availability from the RS's PRM response, not AS metadata.
-// This is a deliberate AuthSec v1 behavior — CIMD discoverability remains out-of-band/private.
+// AuthSec does not expose a CIMD-discovery extension in v1, so CIMD availability
+// remains out-of-band/private rather than discoverable from AS metadata.
 func (s *OAuthASService) ASMetadata(baseURL string) map[string]interface{} {
 	return map[string]interface{}{
-		"issuer":                                         baseURL,
-		"authorization_endpoint":                         baseURL + "/oauth/authorize",
-		"token_endpoint":                                 baseURL + "/oauth/token",
-		"registration_endpoint":                          baseURL + "/oauth/register",
-		"introspection_endpoint":                         baseURL + "/oauth/introspect",
-		"revocation_endpoint":                            baseURL + "/oauth/revoke",
-		"jwks_uri":                                       baseURL + "/oauth/jwks",
-		"response_types_supported":                       []string{"code"},
-		"response_modes_supported":                       []string{"query"},
-		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
-		"token_endpoint_auth_methods_supported":          []string{"none"},
-		"introspection_endpoint_auth_methods_supported":  []string{"client_secret_basic"},
-		"revocation_endpoint_auth_methods_supported":     []string{"none"},
-		"code_challenge_methods_supported":               []string{"S256"},
-		"resource_indicators_supported":                  true,
+		"issuer":                                        baseURL,
+		"authorization_endpoint":                        baseURL + "/oauth/authorize",
+		"token_endpoint":                                baseURL + "/oauth/token",
+		"registration_endpoint":                         baseURL + "/oauth/register",
+		"introspection_endpoint":                        baseURL + "/oauth/introspect",
+		"revocation_endpoint":                           baseURL + "/oauth/revoke",
+		"jwks_uri":                                      baseURL + "/oauth/jwks",
+		"response_types_supported":                      []string{"code"},
+		"response_modes_supported":                      []string{"query"},
+		"grant_types_supported":                         []string{"authorization_code"},
+		"token_endpoint_auth_methods_supported":         []string{"none"},
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic"},
+		"revocation_endpoint_auth_methods_supported":    []string{"none"},
+		"code_challenge_methods_supported":              []string{"S256"},
+		"resource_indicators_supported":                 true,
 	}
 }
 
@@ -101,11 +101,12 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		return nil, fmt.Errorf("store DCR client: %w", err)
 	}
 
-	// Create join row if RS is known
-	if rs != nil {
-		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "dcr"); err != nil {
-			return nil, fmt.Errorf("create DCR client registration: %w", err)
-		}
+	// RS is required — fail-closed if nil (defense-in-depth; controller validates this)
+	if rs == nil {
+		return nil, fmt.Errorf("resource server is required for DCR registration")
+	}
+	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "dcr"); err != nil {
+		return nil, fmt.Errorf("create DCR client registration: %w", err)
 	}
 
 	return client, nil
@@ -131,6 +132,11 @@ func (s *OAuthASService) StoreAuthRequestContext(ctx *models.AuthRequestContext)
 	return s.authzCtx.StoreAuthRequestContext(ctx)
 }
 
+// UpdateAuthRequestContextPAR sets the Hydra request_uri and aligned expiry after PAR.
+func (s *OAuthASService) UpdateAuthRequestContextPAR(state, requestURI string, expiresAt time.Time) error {
+	return s.authzCtx.UpdateAuthRequestContextPAR(state, requestURI, expiresAt)
+}
+
 // ConsumeAuthRequestContext marks context as consumed after token exchange.
 func (s *OAuthASService) ConsumeAuthRequestContext(state string) error {
 	return s.authzCtx.ConsumeAuthRequestContext(state)
@@ -140,21 +146,6 @@ func (s *OAuthASService) ConsumeAuthRequestContext(state string) error {
 // Requires consent_completed = true AND consumed = false. FAIL CLOSED.
 func (s *OAuthASService) GetAuthRequestContextByContextID(contextID string) (*models.AuthRequestContext, error) {
 	return s.authzCtx.GetAuthRequestContextByContextID(contextID)
-}
-
-// StoreGrantBinding stores a per-grant RS binding keyed by hash(refresh_token).
-func (s *OAuthASService) StoreGrantBinding(binding *models.MCPGrantBinding) error {
-	return s.authzCtx.StoreGrantBinding(binding)
-}
-
-// GetGrantBindingByRefreshHash looks up grant binding by refresh token hash.
-func (s *OAuthASService) GetGrantBindingByRefreshHash(hash string) (*models.MCPGrantBinding, error) {
-	return s.authzCtx.GetGrantBindingByRefreshHash(hash)
-}
-
-// UpdateGrantBindingRefreshHash updates the refresh token hash when Hydra rotates tokens.
-func (s *OAuthASService) UpdateGrantBindingRefreshHash(oldHash, newHash string) error {
-	return s.authzCtx.UpdateGrantBindingRefreshHash(oldHash, newHash)
 }
 
 // ValidateIntrospectionCredentials checks RS credentials for introspection.
@@ -321,6 +312,26 @@ func (s *OAuthASService) IntrospectViaHydraAdmin(token string) (map[string]inter
 	}
 
 	return result, nil
+}
+
+// RevokeHydraToken revokes a token via Hydra's public revocation endpoint.
+// Best-effort, fire-and-forget — errors are logged but not returned.
+func (s *OAuthASService) RevokeHydraToken(token string) {
+	form := url.Values{"token": {token}}
+	targetURL := config.AppConfig.HydraPublicURL + "/oauth2/revoke"
+	req, err := http.NewRequest("POST", targetURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		log.Printf("[MCP_AUTH] RevokeHydraToken: failed to create request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		log.Printf("[MCP_AUTH] RevokeHydraToken: Hydra unavailable: %v", err)
+		return
+	}
+	resp.Body.Close()
+	log.Printf("[MCP_AUTH] RevokeHydraToken: revoked orphaned token (status=%d)", resp.StatusCode)
 }
 
 // FetchJWKS returns the cached Hydra JWKS.
@@ -542,12 +553,12 @@ func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
 // --- DCR Request/Response types ---
 
 type DCRRequest struct {
-	ClientName   string   `json:"client_name"`
-	RedirectURIs []string `json:"redirect_uris"`
-	GrantTypes   []string `json:"grant_types"`
-	ResponseTypes []string `json:"response_types"`
-	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method"`
-	Resource     string   `json:"resource,omitempty"`
+	ClientName              string   `json:"client_name"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	GrantTypes              []string `json:"grant_types"`
+	ResponseTypes           []string `json:"response_types"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	Resource                string   `json:"resource"`
 }
 
 type DCRResponse struct {
@@ -557,6 +568,7 @@ type DCRResponse struct {
 	GrantTypes              []string `json:"grant_types"`
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	Resource                string   `json:"resource"`
 }
 
 // --- CIMD types ---
@@ -601,8 +613,8 @@ func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
 // --- JWKS cache ---
 
 type jwksCache struct {
-	mu       sync.RWMutex
-	data     json.RawMessage
+	mu        sync.RWMutex
+	data      json.RawMessage
 	fetchedAt time.Time
 }
 
