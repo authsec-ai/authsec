@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -49,19 +50,21 @@ func consumePKCEVerifier(key string) string {
 
 // HmgrController handles hydra manager authentication requests
 type HmgrController struct {
-	service       *hydramodels.OAuthLoginService
-	authzCtx      *services.AuthorizationContextService
-	rsService     *services.ResourceServerService
-	scopeResolver *services.ScopeResolver
+	service        *hydramodels.OAuthLoginService
+	authzCtx       *services.AuthorizationContextService
+	rsService      *services.ResourceServerService
+	scopeResolver  *services.ScopeResolver
+	consentService *services.ConsentService
 }
 
 // NewHmgrController creates a new HmgrController
 func NewHmgrController(cfg config.Config) *HmgrController {
 	return &HmgrController{
-		service:       hydramodels.NewOAuthLoginService(cfg),
-		authzCtx:      services.NewAuthorizationContextService(config.DB),
-		rsService:     services.NewResourceServerService(config.DB),
-		scopeResolver: services.NewScopeResolver(),
+		service:        hydramodels.NewOAuthLoginService(cfg),
+		authzCtx:       services.NewAuthorizationContextService(config.DB),
+		rsService:      services.NewResourceServerService(config.DB),
+		scopeResolver:  services.NewScopeResolver(config.DB),
+		consentService: services.NewConsentService(config.DB),
 	}
 }
 
@@ -262,6 +265,14 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		return
 	}
 
+	// Record auth_time on the auth context for OIDC max_age enforcement.
+	if mcpAuthCtx != nil {
+		now := time.Now()
+		if setErr := ctrl.authzCtx.SetAuthTime(mcpAuthCtx.State, now); setErr != nil {
+			log.Printf("[MCP_AUTH] AcceptLogin: SetAuthTime failed state=%s: %v", mcpAuthCtx.State, setErr)
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":         true,
 		"login_challenge": req.LoginChallenge,
@@ -359,6 +370,49 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		}
 
 		tenantIDForOIDC := arcCtx.TenantID
+
+		// OIDC prompt/max_age enforcement (OpenID Connect Core 1.0 §3.1.2.1)
+		if arcCtx.Prompt != nil {
+			switch *arcCtx.Prompt {
+			case "none":
+				// prompt=none: if Hydra says no existing session (Skip=false), reject login.
+				// Per OIDC Core §3.1.2.6, Hydra will redirect back with error=login_required
+				// when we reject the login. We reject via Hydra's reject-login API so the
+				// error flows through the standard OAuth redirect back to the client.
+				if !loginRequest.Skip {
+					log.Printf("[MCP_AUTH] GetLoginPageData: prompt=none but no session, rejecting login challenge=%s", loginChallenge)
+					rejectErr := ctrl.service.RejectHydraLoginRequest(loginChallenge, "login_required", "prompt=none requires an existing session")
+					if rejectErr != nil {
+						log.Printf("[MCP_AUTH] GetLoginPageData: RejectHydraLoginRequest failed: %v", rejectErr)
+					}
+					c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
+						Success: false,
+						Error:   "login_required",
+					})
+					return
+				}
+			case "login":
+				// prompt=login: force re-authentication even if session exists
+				// We do this by NOT auto-accepting the skip suggestion
+				loginRequest.Skip = false
+			}
+		}
+		if arcCtx.MaxAge != nil && loginRequest.Skip {
+			// max_age enforcement: if Hydra suggests Skip (session exists) but the session
+			// auth_time + max_age < now, force re-authentication.
+			// Check arcCtx.AuthTime if available from a previous session.
+			if arcCtx.AuthTime != nil {
+				elapsed := int(time.Since(*arcCtx.AuthTime).Seconds())
+				if elapsed > *arcCtx.MaxAge {
+					log.Printf("[MCP_AUTH] GetLoginPageData: max_age=%d exceeded (elapsed=%d), forcing re-auth challenge=%s",
+						*arcCtx.MaxAge, elapsed, loginChallenge)
+					loginRequest.Skip = false
+				}
+			}
+			// Also log for dev verification that Hydra is honoring max_age via PAR natively.
+			log.Printf("[MCP_AUTH] GetLoginPageData: max_age=%d skip=%v challenge=%s",
+				*arcCtx.MaxAge, loginRequest.Skip, loginChallenge)
+		}
 
 		// Resolve resource server name for the login page contract.
 		rsName := ""
@@ -871,6 +925,13 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 		"project_id":  user.ProjectID,
 		"avatar_url":  user.AvatarURL,
 	}
+	// Propagate email_verified from IdP userinfo (Google, Microsoft, etc. include this claim).
+	// Defaults to true for social logins since the IdP has verified the email.
+	if ev, ok := userInfo["email_verified"]; ok {
+		loginContext["email_verified"] = ev
+	} else {
+		loginContext["email_verified"] = true // Social provider implies verified email
+	}
 	if isMCP {
 		loginContext["tenant_id"] = tenantID
 	}
@@ -878,6 +939,16 @@ func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (st
 	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, loginContext)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to accept login request: %w", err)
+	}
+
+	// Record auth_time on the MCP auth context for OIDC max_age enforcement.
+	if isMCP {
+		if arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge); arcErr == nil {
+			now := time.Now()
+			if setErr := ctrl.authzCtx.SetAuthTime(arcCtx.State, now); setErr != nil {
+				log.Printf("[MCP_AUTH] ProcessOAuthCallback: SetAuthTime failed state=%s: %v", arcCtx.State, setErr)
+			}
+		}
 	}
 
 	finalRedirectURL := acceptResponse.RedirectTo
@@ -1238,6 +1309,9 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 // ConsentHandler handles consent requests
 func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 	consentChallenge := c.Query("consent_challenge")
+	if consentChallenge == "" && c.Request.Method == http.MethodPost {
+		consentChallenge = c.PostForm("consent_challenge")
+	}
 	if consentChallenge == "" {
 		c.String(http.StatusBadRequest, "Missing consent_challenge parameter")
 		return
@@ -1288,47 +1362,99 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		// Get the MCP OAuth client for scope resolver
 		mcpClient, _ := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
 
-		// v1 preserves requested scopes without additional policy intersection.
-		grantedScopes := ctrl.scopeResolver.ResolveGrantableScopes(
+		// 3-way intersection: requested ∩ RS-supported ∩ user-effective-scopes (RBAC)
+		grantedScopes, scopeErr := ctrl.scopeResolver.ResolveGrantableScopes(
+			c.Request.Context(),
+			arcCtx.TenantID, consentRequest.Subject, arcCtx.ResourceServerID,
 			consentRequest.RequestedScope,
 			rs,
 			mcpClient,
-			consentRequest.Subject,
 		)
-
-		// Accept consent with RS-specific audience and resolved scopes.
-		// Include context_id in session claims so the Token handler can recover it
-		// by introspecting the access token — no redirect_to parsing needed.
-		acceptResponse, err := ctrl.service.AcceptHydraConsentRequestMCP(
-			consentChallenge,
-			consentRequest,
-			grantedScopes,
-			[]string{rs.ResourceURI},
-			map[string]interface{}{
-				"tenant_id":          arcCtx.TenantID,
-				"resource_server_id": arcCtx.ResourceServerID,
-				"context_id":         arcCtx.ContextID, // KEY: Token handler extracts this via introspection
-			},
-		)
-		if err != nil {
-			log.Printf("[MCP_AUTH] ConsentHandler: AcceptHydraConsentRequestMCP failed consent_challenge=%s context_id=%s: %v",
-				consentChallenge, arcCtx.ContextID, err)
-			c.String(http.StatusInternalServerError, "Failed to complete MCP consent")
+		if scopeErr != nil {
+			log.Printf("[MCP_AUTH] ConsentHandler: scope resolution failed context_id=%s: %v", arcCtx.ContextID, scopeErr)
+			c.String(http.StatusInternalServerError, "Failed to resolve user permissions")
+			return
+		}
+		if len(grantedScopes) == 0 {
+			// Fail-closed: no grantable scopes → reject consent
+			log.Printf("[MCP_AUTH] ConsentHandler: no grantable scopes for user=%s rs=%s context_id=%s",
+				consentRequest.Subject, rs.ResourceURI, arcCtx.ContextID)
+			_, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge, "insufficient_scope", "user has no authorized scopes for this resource server")
+			if rejectErr != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: RejectHydraConsentRequest failed: %v", rejectErr)
+			}
+			c.String(http.StatusForbidden, "You do not have permission to access this resource server. Contact your administrator to request access.")
 			return
 		}
 
-		// Mark consent completed. Token handler requires this to release the token.
-		if markErr := ctrl.authzCtx.MarkConsentCompleted(arcCtx.State); markErr != nil {
-			log.Printf("[MCP_AUTH] ConsentHandler: MarkConsentCompleted failed state=%s context_id=%s: %v",
-				arcCtx.State, arcCtx.ContextID, markErr)
-			c.String(http.StatusInternalServerError, "Failed to finalize consent — please retry the authorization flow")
+		// Check for remembered consent: if an active grant covers all requested scopes
+		// and prompt != "consent", we can auto-accept without showing the consent screen.
+		forceConsent := arcCtx.Prompt != nil && *arcCtx.Prompt == "consent"
+		var existingGrant *models.OAuthConsentGrant
+		if !forceConsent && mcpClient != nil {
+			tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
+			subjectUUID, _ := uuid.Parse(consentRequest.Subject)
+			if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+				existingGrant, _ = ctrl.consentService.CheckExistingConsent(
+					tenantUUID, subjectUUID, mcpClient.ID, rs.ID, grantedScopes,
+				)
+			}
+		}
+
+		if c.Request.Method == http.MethodGet {
+			if existingGrant != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: remembered consent found grant_id=%s context_id=%s",
+					existingGrant.ID, arcCtx.ContextID)
+				if ctrl.finalizeMCPConsent(c, consentChallenge, consentRequest, arcCtx, rs, mcpClient, grantedScopes, true) {
+					return
+				}
+				return
+			}
+			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, grantedScopes)
 			return
 		}
 
-		log.Printf("[MCP_AUTH] ConsentHandler: consent completed context_id=%s client=%s rs=%s",
-			arcCtx.ContextID, hydraClientID, rs.ResourceURI)
+		if c.Request.PostForm == nil {
+			c.Request.ParseForm()
+		}
+		if c.PostForm("action") == "deny" {
+			rejectResponse, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge, "access_denied", "user denied consent")
+			if rejectErr != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: RejectHydraConsentRequest failed consent_challenge=%s: %v", consentChallenge, rejectErr)
+				c.String(http.StatusInternalServerError, "Failed to deny consent")
+				return
+			}
+			c.Redirect(http.StatusFound, rejectResponse.RedirectTo)
+			return
+		}
 
-		c.Redirect(http.StatusFound, acceptResponse.RedirectTo)
+		selectedSet := make(map[string]struct{})
+		for _, scope := range c.PostFormArray("grant_scope") {
+			selectedSet[scope] = struct{}{}
+		}
+
+		var selectedScopes []string
+		for _, scope := range grantedScopes {
+			if _, ok := selectedSet[scope]; ok {
+				selectedScopes = append(selectedScopes, scope)
+			}
+		}
+
+		if len(selectedScopes) == 0 {
+			rejectResponse, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge, "access_denied", "no scopes approved")
+			if rejectErr != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: RejectHydraConsentRequest(no scopes) failed consent_challenge=%s: %v", consentChallenge, rejectErr)
+				c.String(http.StatusInternalServerError, "Failed to deny consent")
+				return
+			}
+			c.Redirect(http.StatusFound, rejectResponse.RedirectTo)
+			return
+		}
+
+		remember := c.PostForm("remember") != ""
+		if ctrl.finalizeMCPConsent(c, consentChallenge, consentRequest, arcCtx, rs, mcpClient, selectedScopes, remember) {
+			return
+		}
 		return
 	}
 
@@ -1340,6 +1466,120 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 	}
 
 	c.Redirect(http.StatusFound, acceptResponse.RedirectTo)
+}
+
+func (ctrl *HmgrController) finalizeMCPConsent(
+	c *gin.Context,
+	consentChallenge string,
+	consentRequest *hydramodels.HydraConsentRequest,
+	arcCtx *models.AuthRequestContext,
+	rs *models.ResourceServer,
+	mcpClient *models.MCPOAuthClient,
+	grantedScopes []string,
+	remember bool,
+) bool {
+	var rsPermissions []string
+	for _, s := range grantedScopes {
+		if !services.IsOIDCCoreScope(s) {
+			rsPermissions = append(rsPermissions, s)
+		}
+	}
+
+	sessionClaims := map[string]interface{}{
+		"tenant_id":          arcCtx.TenantID,
+		"resource_server_id": arcCtx.ResourceServerID,
+		"context_id":         arcCtx.ContextID,
+		"auth_time":          time.Now().Unix(),
+		"permissions":        rsPermissions,
+		"rs_id":              arcCtx.ResourceServerID,
+	}
+	if consentRequest.Context != nil {
+		for _, key := range []string{"email", "email_verified", "name", "username", "avatar_url", "provider", "provider_id"} {
+			if v, ok := consentRequest.Context[key]; ok {
+				sessionClaims[key] = v
+			}
+		}
+	}
+
+	acceptResponse, err := ctrl.service.AcceptHydraConsentRequestMCP(
+		consentChallenge,
+		consentRequest,
+		grantedScopes,
+		[]string{rs.ResourceURI},
+		sessionClaims,
+	)
+	if err != nil {
+		log.Printf("[MCP_AUTH] ConsentHandler: AcceptHydraConsentRequestMCP failed consent_challenge=%s context_id=%s: %v",
+			consentChallenge, arcCtx.ContextID, err)
+		c.String(http.StatusInternalServerError, "Failed to complete MCP consent")
+		return false
+	}
+
+	if markErr := ctrl.authzCtx.MarkConsentCompleted(arcCtx.State); markErr != nil {
+		log.Printf("[MCP_AUTH] ConsentHandler: MarkConsentCompleted failed state=%s context_id=%s: %v",
+			arcCtx.State, arcCtx.ContextID, markErr)
+		c.String(http.StatusInternalServerError, "Failed to finalize consent — please retry the authorization flow")
+		return false
+	}
+
+	if remember && mcpClient != nil {
+		tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
+		subjectUUID, _ := uuid.Parse(consentRequest.Subject)
+		if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+			_, consentErr := ctrl.consentService.UpsertConsent(
+				tenantUUID, subjectUUID, mcpClient.ID, rs.ID,
+				grantedScopes, services.DefaultConsentTTL,
+			)
+			if consentErr != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: failed to store consent grant context_id=%s: %v",
+					arcCtx.ContextID, consentErr)
+			}
+		}
+	}
+
+	log.Printf("[MCP_AUTH] ConsentHandler: consent completed context_id=%s client=%s rs=%s remember=%v scopes=%d",
+		arcCtx.ContextID, consentRequest.Client.ClientID, rs.ResourceURI, remember, len(grantedScopes))
+
+	c.Redirect(http.StatusFound, acceptResponse.RedirectTo)
+	return true
+}
+
+func (ctrl *HmgrController) renderMCPConsentPage(
+	c *gin.Context,
+	consentChallenge string,
+	consentRequest *hydramodels.HydraConsentRequest,
+	grantedScopes []string,
+) {
+	grantedSet := make(map[string]struct{}, len(grantedScopes))
+	for _, scope := range grantedScopes {
+		grantedSet[scope] = struct{}{}
+	}
+
+	var builder strings.Builder
+	builder.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Access</title>")
+	builder.WriteString("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+	builder.WriteString("<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fb;color:#16202a;margin:0;padding:32px;}main{max-width:720px;margin:0 auto;background:#fff;border:1px solid #d7deea;border-radius:16px;padding:28px;box-shadow:0 10px 30px rgba(16,24,40,.08);}h1{margin:0 0 8px;font-size:28px;}p{margin:0 0 16px;line-height:1.5;color:#445468;}fieldset{border:none;padding:0;margin:20px 0;}label.scope{display:block;border:1px solid #d7deea;border-radius:12px;padding:14px 16px;margin:0 0 12px;background:#fbfcfe;}label.scope.disabled{opacity:.55;background:#f4f6fa;}label.scope strong{display:block;font-size:15px;}label.scope span{display:block;font-size:13px;margin-top:4px;color:#5b6978;}input[type=checkbox]{margin-right:12px;} .actions{display:flex;gap:12px;margin-top:24px;}button{border:none;border-radius:10px;padding:12px 18px;font-weight:600;cursor:pointer;}button.allow{background:#0f6fff;color:#fff;}button.deny{background:#edf1f7;color:#16202a;} .meta{font-size:13px;color:#66758a;margin-top:18px;}</style></head><body><main>")
+	builder.WriteString("<h1>Authorize access</h1>")
+	builder.WriteString("<p><strong>" + html.EscapeString(consentRequest.Client.ClientID) + "</strong> is requesting access to your resources.</p>")
+	builder.WriteString("<form method=\"post\" action=\"/authsec/hmgr/consent\">")
+	builder.WriteString("<input type=\"hidden\" name=\"consent_challenge\" value=\"" + html.EscapeString(consentChallenge) + "\">")
+	builder.WriteString("<fieldset><legend>Select the permissions to grant</legend>")
+
+	for _, scope := range consentRequest.RequestedScope {
+		if _, ok := grantedSet[scope]; ok {
+			builder.WriteString("<label class=\"scope\"><strong><input type=\"checkbox\" name=\"grant_scope\" value=\"" + html.EscapeString(scope) + "\" checked> " + html.EscapeString(scope) + "</strong><span>Allowed by your current role bindings.</span></label>")
+			continue
+		}
+		builder.WriteString("<label class=\"scope disabled\"><strong><input type=\"checkbox\" disabled> " + html.EscapeString(scope) + "</strong><span>Not currently allowed by your administrator-assigned roles.</span></label>")
+	}
+
+	builder.WriteString("</fieldset>")
+	builder.WriteString("<label class=\"scope\"><strong><input type=\"checkbox\" name=\"remember\" value=\"true\" checked> Remember this decision for 30 days</strong><span>Clearing this stores nothing beyond the current OAuth transaction.</span></label>")
+	builder.WriteString("<div class=\"actions\"><button class=\"allow\" type=\"submit\" name=\"action\" value=\"allow\">Allow selected</button><button class=\"deny\" type=\"submit\" name=\"action\" value=\"deny\">Deny</button></div>")
+	builder.WriteString("<p class=\"meta\">Only the checked scopes will be granted to this client.</p>")
+	builder.WriteString("</form></main></body></html>")
+
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(builder.String()))
 }
 
 // HealthHandler provides a health check endpoint

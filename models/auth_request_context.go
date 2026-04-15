@@ -33,8 +33,12 @@ type AuthRequestContext struct {
 	LoginChallenge   *string   `json:"login_challenge" gorm:"type:text;uniqueIndex"`
 	ConsentCompleted bool      `json:"consent_completed" gorm:"default:false"`
 	ExpiresAt        time.Time `json:"expires_at" gorm:"not null"`
-	Consumed         bool      `json:"consumed" gorm:"default:false"`
-	CreatedAt        time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	Consumed         bool       `json:"consumed" gorm:"default:false"`
+	Nonce            *string    `json:"nonce,omitempty" gorm:"type:text"`
+	Prompt           *string    `json:"prompt,omitempty" gorm:"type:varchar(64)"`
+	MaxAge           *int       `json:"max_age,omitempty" gorm:"type:integer"`
+	AuthTime         *time.Time `json:"auth_time,omitempty" gorm:"type:timestamp"`
+	CreatedAt        time.Time  `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 }
 
 func (AuthRequestContext) TableName() string {

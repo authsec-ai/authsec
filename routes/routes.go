@@ -193,11 +193,14 @@ func SetupRoutes(
 	// ════════════════════════════════════════════════════════
 	oauthASController := platformCtrl.NewOAuthASController()
 	rsController := platformCtrl.NewResourceServerController()
+	scopeMatrixController := platformCtrl.NewScopeMatrixController()
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.ASMetadata)
+	// OpenID Connect Discovery 1.0 — same superset metadata
+	r.GET("/.well-known/openid-configuration", oauthASController.OIDCDiscovery)
 
-	// Global OAuth endpoints (unauthenticated — the OAuth flow itself handles authz)
+	// Global OAuth + OIDC endpoints (unauthenticated — the OAuth flow itself handles authz)
 	oauth := r.Group("/oauth")
 	{
 		oauth.GET("/authorize", oauthASController.Authorize)
@@ -206,6 +209,19 @@ func SetupRoutes(
 		oauth.POST("/introspect", oauthASController.Introspect)
 		oauth.GET("/jwks", oauthASController.JWKS)
 		oauth.POST("/revoke", oauthASController.Revoke)
+		// OIDC endpoints
+		oauth.GET("/userinfo", oauthASController.Userinfo)
+		oauth.POST("/userinfo", oauthASController.Userinfo)
+		oauth.GET("/logout", oauthASController.EndSession)
+		// RFC 9126 — Pushed Authorization Request (public)
+		oauth.POST("/par", oauthASController.PAR)
+		// Consent grant management (user self-service, authenticated)
+		oauthSelfService := oauth.Group("")
+		oauthSelfService.Use(middlewares.AuthMiddleware())
+		{
+			oauthSelfService.GET("/consent-grants", oauthASController.ListUserConsentGrants)
+			oauthSelfService.DELETE("/consent-grants/:id", oauthASController.RevokeUserConsentGrant)
+		}
 	}
 
 	// ════════════════════════════════════════════════════════
@@ -231,6 +247,29 @@ func SetupRoutes(
 			resourceServers.DELETE("/:id/clients/:client_id", rsController.RevokeClient)
 			// CIMD redirect approval (Bug 10)
 			resourceServers.PUT("/:id/clients/:client_id/approve-redirects", rsController.ApproveRedirects)
+
+			// Scope matrix, tool discovery, and scope management
+			resourceServers.GET("/:id/scope-matrix", scopeMatrixController.GetScopeMatrix)
+			resourceServers.POST("/:id/rescan", scopeMatrixController.Rescan)
+			resourceServers.GET("/:id/scopes", scopeMatrixController.ListScopes)
+			resourceServers.POST("/:id/scopes", scopeMatrixController.CreateScope)
+			resourceServers.PUT("/:id/tool-scope-map", scopeMatrixController.UpdateToolScopeMap)
+		}
+
+		// Scope management (not RS-scoped)
+		scopes := authsec.Group("/scopes")
+		scopes.Use(middlewares.AuthMiddleware())
+		{
+			scopes.PUT("/:scope_id", scopeMatrixController.UpdateScope)
+			scopes.DELETE("/:scope_id", scopeMatrixController.DeleteScope)
+		}
+
+		// Admin consent grant management
+		consentGrants := authsec.Group("/consent-grants")
+		consentGrants.Use(middlewares.AuthMiddleware())
+		{
+			consentGrants.GET("", oauthASController.ListConsentGrants)
+			consentGrants.DELETE("/:id", oauthASController.RevokeConsentGrant)
 		}
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
@@ -1046,6 +1085,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 		// Common endpoints
 		pub.GET("/login", hmgrController.LoginRedirectHandler)
 		pub.GET("/consent", hmgrController.ConsentHandler)
+		pub.POST("/consent", hmgrController.ConsentHandler)
 		pub.GET("/health", hmgrController.HealthHandler)
 		pub.GET("/challenge", hmgrController.LoginChallengeHandler)
 	}

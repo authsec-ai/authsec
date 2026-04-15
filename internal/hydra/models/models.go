@@ -24,6 +24,7 @@ type Resource = sharedmodels.Resource
 // Hydra-specific models
 type HydraLoginRequest struct {
 	Challenge string `json:"challenge"`
+	Skip      bool   `json:"skip"` // True if Hydra has an existing authenticated session for this subject
 	Client    struct {
 		ClientID string `json:"client_id"`
 	} `json:"client"`

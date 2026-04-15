@@ -27,6 +27,8 @@ type MCPOAuthClient struct {
 	CIMDCachedAt            *time.Time     `json:"-" gorm:"column:cimd_cached_at"`
 	PendingRedirectURIs     pq.StringArray `json:"-" gorm:"type:text[];default:'{}'"`
 	RedirectReviewPending   bool           `json:"-" gorm:"default:false"`
+	PostLogoutRedirectURIs  pq.StringArray `json:"post_logout_redirect_uris,omitempty" gorm:"type:text[];default:'{}'"`
+	SupportsRefreshToken    bool           `json:"supports_refresh_token" gorm:"default:false"`
 	CreatedAt               time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt               time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 	DeletedAt               gorm.DeletedAt `json:"-" gorm:"index"`

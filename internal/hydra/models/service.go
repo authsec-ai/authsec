@@ -313,6 +313,81 @@ func (s *OAuthLoginService) AcceptHydraLoginRequestWithContext(loginChallenge, s
 	return &acceptResponse, nil
 }
 
+// RejectHydraLoginRequest rejects a login challenge with an OIDC-compliant error.
+// Used for prompt=none when no session exists (OIDC Core §3.1.2.6).
+func (s *OAuthLoginService) RejectHydraLoginRequest(loginChallenge, errorID, errorDescription string) error {
+	body := map[string]interface{}{
+		"error":             errorID,
+		"error_description": errorDescription,
+	}
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	reqURL := fmt.Sprintf("%s/admin/oauth2/auth/requests/login/reject?login_challenge=%s",
+		s.cfg.HydraAdminURL, loginChallenge)
+
+	req, err := http.NewRequest("PUT", reqURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Hydra reject login returned %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// RejectHydraConsentRequest rejects a consent challenge with an OAuth-compliant error.
+// Used when RBAC resolution determines the user has no grantable scopes (fail-closed).
+func (s *OAuthLoginService) RejectHydraConsentRequest(consentChallenge, errorID, errorDescription string) (*HydraAcceptConsentResponse, error) {
+	body := map[string]interface{}{
+		"error":             errorID,
+		"error_description": errorDescription,
+	}
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	reqURL := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent/reject?consent_challenge=%s",
+		s.cfg.HydraAdminURL, consentChallenge)
+
+	req, err := http.NewRequest("PUT", reqURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Hydra reject consent returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var rejectResponse HydraAcceptConsentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rejectResponse); err != nil {
+		return nil, err
+	}
+	return &rejectResponse, nil
+}
+
 func (s *OAuthLoginService) GetHydraConsentRequest(consentChallenge string) (*HydraConsentRequest, error) {
 	reqURL := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent?consent_challenge=%s",
 		s.cfg.HydraAdminURL, consentChallenge)

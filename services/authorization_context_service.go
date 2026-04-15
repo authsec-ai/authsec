@@ -135,12 +135,36 @@ func (s *AuthorizationContextService) GetActiveAuthRequestContextByContextID(con
 	return &ctx, nil
 }
 
+// GetActiveAuthRequestContextByHydraRequestURI retrieves a live auth context by Hydra request_uri.
+// Used to validate that a public PAR request_uri was minted by this AS for the resolved client.
+func (s *AuthorizationContextService) GetActiveAuthRequestContextByHydraRequestURI(requestURI string) (*models.AuthRequestContext, error) {
+	if requestURI == "" {
+		return nil, fmt.Errorf("empty request_uri")
+	}
+	var ctx models.AuthRequestContext
+	err := s.db.Where(
+		"hydra_request_uri = ? AND consumed = false AND expires_at > ?",
+		requestURI, time.Now(),
+	).First(&ctx).Error
+	if err != nil {
+		return nil, err
+	}
+	return &ctx, nil
+}
+
 // MarkConsentCompleted marks consent as done. No authorization code stored.
 // The Token handler uses introspection to recover context_id from Hydra session claims.
 func (s *AuthorizationContextService) MarkConsentCompleted(state string) error {
 	return s.db.Model(&models.AuthRequestContext{}).
 		Where("state = ?", state).
 		Update("consent_completed", true).Error
+}
+
+// SetAuthTime records when the user actually authenticated (OIDC Core §2).
+func (s *AuthorizationContextService) SetAuthTime(state string, authTime time.Time) error {
+	return s.db.Model(&models.AuthRequestContext{}).
+		Where("state = ?", state).
+		Update("auth_time", authTime).Error
 }
 
 // ConsumeAuthRequestContext atomically marks a context as consumed after token exchange.

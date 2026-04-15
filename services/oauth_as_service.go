@@ -2,11 +2,14 @@ package services
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
@@ -37,12 +41,13 @@ func NewOAuthASService(db *gorm.DB) *OAuthASService {
 	}
 }
 
-// ASMetadata returns the RFC 8414 Authorization Server Metadata.
-// Note: CIMD support is per-RS policy (via registration_modes), not globally advertised.
-// AuthSec does not expose a CIMD-discovery extension in v1, so CIMD availability
-// remains out-of-band/private rather than discoverable from AS metadata.
+// ASMetadata returns the OIDC Discovery / RFC 8414 Authorization Server Metadata.
+// This is a superset: OIDC Discovery 1.0 extends RFC 8414 with id_token, userinfo,
+// and session management fields. Both /.well-known/openid-configuration and
+// /.well-known/oauth-authorization-server serve this same document.
 func (s *OAuthASService) ASMetadata(baseURL string) map[string]interface{} {
 	return map[string]interface{}{
+		// RFC 8414 core
 		"issuer":                                        baseURL,
 		"authorization_endpoint":                        baseURL + "/oauth/authorize",
 		"token_endpoint":                                baseURL + "/oauth/token",
@@ -52,16 +57,33 @@ func (s *OAuthASService) ASMetadata(baseURL string) map[string]interface{} {
 		"jwks_uri":                                      baseURL + "/oauth/jwks",
 		"response_types_supported":                      []string{"code"},
 		"response_modes_supported":                      []string{"query"},
-		"grant_types_supported":                         []string{"authorization_code"},
+		"grant_types_supported":                         []string{"authorization_code", "refresh_token"},
 		"token_endpoint_auth_methods_supported":         []string{"none"},
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_basic"},
 		"revocation_endpoint_auth_methods_supported":    []string{"none"},
 		"code_challenge_methods_supported":              []string{"S256"},
 		"resource_indicators_supported":                 true,
+
+		// RFC 9126 — Pushed Authorization Requests
+		"pushed_authorization_request_endpoint": baseURL + "/oauth/par",
+		"require_pushed_authorization_requests": false,
+
+		// OIDC Discovery 1.0 extensions
+		"userinfo_endpoint":                     baseURL + "/oauth/userinfo",
+		"end_session_endpoint":                  baseURL + "/oauth/logout",
+		"scopes_supported":                      []string{"openid", "profile", "email", "offline_access"},
+		"subject_types_supported":               []string{"public"},
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+		"claims_supported": []string{
+			"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce",
+			"email", "email_verified", "name", "preferred_username", "picture",
+		},
 	}
 }
 
 // RegisterDCRClient creates a new OAuth client via Dynamic Client Registration (RFC 7591).
+// When the request includes OIDC scopes (openid, offline_access), the Hydra client and
+// MCPOAuthClient are configured to support id_token issuance and refresh_token grants.
 func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceServer) (*models.MCPOAuthClient, error) {
 	if rs != nil && !rs.AllowsRegistrationMode("dcr") {
 		return nil, fmt.Errorf("resource server does not allow DCR")
@@ -70,15 +92,18 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 	clientID := uuid.New().String()
 	hydraClientID := clientID
 
+	// Determine OIDC capabilities from requested scope
+	hydraScope, grantTypes, supportsRefresh := resolveOIDCClientCapabilities(req.Scope)
+
 	// Register in Hydra
 	err := hydraAdminCreateClient(hydraClient{
 		ClientID:      hydraClientID,
 		ClientName:    req.ClientName,
-		GrantTypes:    []string{"authorization_code"},
+		GrantTypes:    grantTypes,
 		RedirectURIs:  req.RedirectURIs,
 		ResponseTypes: []string{"code"},
 		TokenEndpoint: "none",
-		Scope:         "", // no OIDC defaults for MCP
+		Scope:         hydraScope,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("register hydra client for DCR: %w", err)
@@ -89,10 +114,13 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		HydraClientID:           hydraClientID,
 		ClientName:              req.ClientName,
 		RedirectURIs:            pq.StringArray(req.RedirectURIs),
-		GrantTypes:              pq.StringArray{"authorization_code"},
+		GrantTypes:              pq.StringArray(grantTypes),
 		ResponseTypes:           pq.StringArray{"code"},
 		TokenEndpointAuthMethod: "none",
+		Scope:                   req.Scope,
 		RegistrationType:        "dcr",
+		SupportsRefreshToken:    supportsRefresh,
+		PostLogoutRedirectURIs:  pq.StringArray(req.PostLogoutRedirectURIs),
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -146,6 +174,11 @@ func (s *OAuthASService) ConsumeAuthRequestContext(state string) error {
 // Requires consent_completed = true AND consumed = false. FAIL CLOSED.
 func (s *OAuthASService) GetAuthRequestContextByContextID(contextID string) (*models.AuthRequestContext, error) {
 	return s.authzCtx.GetAuthRequestContextByContextID(contextID)
+}
+
+// GetActiveAuthRequestContextByHydraRequestURI retrieves a live auth context by Hydra request_uri.
+func (s *OAuthASService) GetActiveAuthRequestContextByHydraRequestURI(requestURI string) (*models.AuthRequestContext, error) {
+	return s.authzCtx.GetActiveAuthRequestContextByHydraRequestURI(requestURI)
 }
 
 // ValidateIntrospectionCredentials checks RS credentials for introspection.
@@ -334,6 +367,26 @@ func (s *OAuthASService) RevokeHydraToken(token string) {
 	log.Printf("[MCP_AUTH] RevokeHydraToken: revoked orphaned token (status=%d)", resp.StatusCode)
 }
 
+// RevokeHydraLoginSession revokes all login sessions for a subject via Hydra admin API.
+// Used by RP-initiated logout (OIDC RP-Initiated Logout 1.0).
+func (s *OAuthASService) RevokeHydraLoginSession(subject string) error {
+	targetURL := config.AppConfig.HydraAdminURL + "/admin/oauth2/auth/sessions/login?subject=" + url.QueryEscape(subject)
+	req, err := http.NewRequest("DELETE", targetURL, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke request: %w", err)
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra admin unavailable: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("hydra returned status %d", resp.StatusCode)
+	}
+	log.Printf("[MCP_AUTH] RevokeHydraLoginSession: revoked sessions for sub=%s", subject)
+	return nil
+}
+
 // FetchJWKS returns the cached Hydra JWKS.
 func (s *OAuthASService) FetchJWKS() (json.RawMessage, error) {
 	return s.jwksCache.get()
@@ -386,16 +439,19 @@ func (s *OAuthASService) ResolveCIMDClient(cimdURL string) (*models.MCPOAuthClie
 		return existing, nil
 	}
 
-	// Create new CIMD client
+	// Create new CIMD client — scope is determined by the CIMD metadata document.
+	// Do NOT default to OIDC scopes; CIMD clients opt into OIDC by declaring scopes in their document.
 	hydraClientID := uuid.New().String()
+	cimdScope := cimdMeta.Scope // from CIMD document; empty = auth-code-only (MCP default)
+	cimdHydraScope, cimdGrantTypes, cimdSupportsRefresh := resolveOIDCClientCapabilities(cimdScope)
 	err = hydraAdminCreateClient(hydraClient{
 		ClientID:      hydraClientID,
 		ClientName:    cimdMeta.ClientName,
-		GrantTypes:    []string{"authorization_code"},
+		GrantTypes:    cimdGrantTypes,
 		RedirectURIs:  cimdMeta.RedirectURIs,
 		ResponseTypes: []string{"code"},
 		TokenEndpoint: "none",
-		Scope:         "",
+		Scope:         cimdHydraScope,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create Hydra client for CIMD: %w", err)
@@ -406,12 +462,14 @@ func (s *OAuthASService) ResolveCIMDClient(cimdURL string) (*models.MCPOAuthClie
 		HydraClientID:           hydraClientID,
 		ClientName:              cimdMeta.ClientName,
 		RedirectURIs:            pq.StringArray(cimdMeta.RedirectURIs),
-		GrantTypes:              pq.StringArray{"authorization_code"},
+		GrantTypes:              pq.StringArray(cimdGrantTypes),
 		ResponseTypes:           pq.StringArray{"code"},
 		TokenEndpointAuthMethod: "none",
+		Scope:                   cimdScope,
 		RegistrationType:        "cimd",
 		CIMDUrl:                 cimdURL,
 		CIMDCachedAt:            &now,
+		SupportsRefreshToken:    cimdSupportsRefresh,
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -431,14 +489,16 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 	clientID := uuid.New().String()
 	hydraClientID := clientID
 
+	hydraScope, grantTypes, supportsRefresh := resolveOIDCClientCapabilities(req.Scope)
+
 	err := hydraAdminCreateClient(hydraClient{
 		ClientID:      hydraClientID,
 		ClientName:    req.ClientName,
-		GrantTypes:    []string{"authorization_code"},
+		GrantTypes:    grantTypes,
 		RedirectURIs:  req.RedirectURIs,
 		ResponseTypes: []string{"code"},
 		TokenEndpoint: "none",
-		Scope:         "",
+		Scope:         hydraScope,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("register hydra client for prereg: %w", err)
@@ -449,10 +509,13 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 		HydraClientID:           hydraClientID,
 		ClientName:              req.ClientName,
 		RedirectURIs:            pq.StringArray(req.RedirectURIs),
-		GrantTypes:              pq.StringArray{"authorization_code"},
+		GrantTypes:              pq.StringArray(grantTypes),
 		ResponseTypes:           pq.StringArray{"code"},
 		TokenEndpointAuthMethod: "none",
+		Scope:                   req.Scope,
 		RegistrationType:        "prereg",
+		SupportsRefreshToken:    supportsRefresh,
+		PostLogoutRedirectURIs:  pq.StringArray(req.PostLogoutRedirectURIs),
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -533,15 +596,16 @@ func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
 	client.PendingRedirectURIs = nil
 	client.RedirectReviewPending = false
 
-	// Update Hydra client
+	// Update Hydra client — preserve OIDC capabilities
+	hydraScope, grantTypes, _ := resolveOIDCClientCapabilities(client.Scope)
 	err = hydraAdminUpdateClient(client.HydraClientID, hydraClient{
 		ClientID:      client.HydraClientID,
 		ClientName:    client.ClientName,
-		GrantTypes:    []string{"authorization_code"},
+		GrantTypes:    grantTypes,
 		RedirectURIs:  []string(client.RedirectURIs),
 		ResponseTypes: []string{"code"},
 		TokenEndpoint: "none",
-		Scope:         "",
+		Scope:         hydraScope,
 	})
 	if err != nil {
 		return fmt.Errorf("update Hydra client redirects: %w", err)
@@ -559,6 +623,8 @@ type DCRRequest struct {
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	Resource                string   `json:"resource"`
+	Scope                   string   `json:"scope"`
+	PostLogoutRedirectURIs  []string `json:"post_logout_redirect_uris,omitempty"`
 }
 
 type DCRResponse struct {
@@ -569,6 +635,36 @@ type DCRResponse struct {
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	Resource                string   `json:"resource"`
+	Scope                   string   `json:"scope,omitempty"`
+	PostLogoutRedirectURIs  []string `json:"post_logout_redirect_uris,omitempty"`
+}
+
+// resolveOIDCClientCapabilities determines Hydra client scope and grant types based on
+// the requested scope string. Returns (hydraScope, grantTypes, supportsRefreshToken).
+func resolveOIDCClientCapabilities(scope string) (string, []string, bool) {
+	grantTypes := []string{"authorization_code"}
+	supportsRefresh := false
+
+	if scope == "" {
+		return "", grantTypes, false
+	}
+
+	// Filter to only OIDC core scopes for the Hydra client
+	var hydraScopes []string
+	for _, s := range strings.Fields(scope) {
+		if IsOIDCCoreScope(s) {
+			hydraScopes = append(hydraScopes, s)
+		}
+		if s == "offline_access" {
+			supportsRefresh = true
+		}
+	}
+
+	if supportsRefresh {
+		grantTypes = append(grantTypes, "refresh_token")
+	}
+
+	return strings.Join(hydraScopes, " "), grantTypes, supportsRefresh
 }
 
 // --- CIMD types ---
@@ -578,6 +674,7 @@ type cimdDocument struct {
 	ClientName   string   `json:"client_name"`
 	LogoURI      string   `json:"logo_uri,omitempty"`
 	RedirectURIs []string `json:"redirect_uris"`
+	Scope        string   `json:"scope,omitempty"` // OIDC scopes the client opts into (e.g. "openid profile email")
 }
 
 func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
@@ -654,6 +751,228 @@ func (c *jwksCache) get() (json.RawMessage, error) {
 	c.data = json.RawMessage(body)
 	c.fetchedAt = time.Now()
 	return c.data, nil
+}
+
+// EnrichUserinfoClaims enriches session-based claims with data from the local user table and
+// OIDC identity repository. Falls back to session claims if DB lookups fail (graceful degradation).
+// The sub may be a UUID (AdminUser.ID) or a composite like "google-<providerUserID>".
+func (s *OAuthASService) EnrichUserinfoClaims(claims map[string]interface{}, sub string, scopeSet map[string]bool) {
+	if sub == "" {
+		return
+	}
+
+	// Try to load user by UUID (email/password logins use AdminUser.ID as sub)
+	userID, parseErr := uuid.Parse(sub)
+	if parseErr != nil {
+		// sub is not a UUID — could be a social login composite ID like "google-email-abc123".
+		// Session claims are sufficient for these; no local user row to enrich from.
+		return
+	}
+
+	var user models.AdminUser
+	if err := s.db.Where("id = ?", userID).First(&user).Error; err != nil {
+		log.Printf("[MCP_AUTH] EnrichUserinfoClaims: user lookup failed sub=%s: %v", sub, err)
+		return
+	}
+
+	// Enrich profile claims if not already set by session
+	if scopeSet["profile"] {
+		if _, exists := claims["name"]; !exists && user.Name != "" {
+			claims["name"] = user.Name
+		}
+		if _, exists := claims["preferred_username"]; !exists && user.Username != "" {
+			claims["preferred_username"] = user.Username
+		}
+		if _, exists := claims["picture"]; !exists && user.AvatarURL != "" {
+			claims["picture"] = user.AvatarURL
+		}
+		if !user.UpdatedAt.IsZero() {
+			claims["updated_at"] = user.UpdatedAt.Unix()
+		}
+	}
+
+	if scopeSet["email"] {
+		if _, exists := claims["email"]; !exists && user.Email != "" {
+			claims["email"] = user.Email
+		}
+	}
+
+	// Load most recent OIDC identity for federated claims
+	if user.TenantID != nil {
+		var identity models.OIDCUserIdentity
+		err := s.db.Where("user_id = ? AND tenant_id = ?", userID, *user.TenantID).
+			Order("last_login_at DESC NULLS LAST").
+			First(&identity).Error
+		if err == nil && identity.ProfileData != "" {
+			// Parse the JSONB profile_data for additional claims
+			var profileData map[string]interface{}
+			if jsonErr := json.Unmarshal([]byte(identity.ProfileData), &profileData); jsonErr == nil {
+				// Merge federated claims that aren't already set
+				if scopeSet["email"] {
+					if _, exists := claims["email_verified"]; !exists {
+						if ev, ok := profileData["email_verified"]; ok {
+							claims["email_verified"] = ev
+						}
+					}
+				}
+				if scopeSet["profile"] {
+					if _, exists := claims["given_name"]; !exists {
+						if v, ok := profileData["given_name"].(string); ok && v != "" {
+							claims["given_name"] = v
+						}
+					}
+					if _, exists := claims["family_name"]; !exists {
+						if v, ok := profileData["family_name"].(string); ok && v != "" {
+							claims["family_name"] = v
+						}
+					}
+					if _, exists := claims["locale"]; !exists {
+						if v, ok := profileData["locale"].(string); ok && v != "" {
+							claims["locale"] = v
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// VerifyIDTokenHint verifies an id_token JWT signature against the AS JWKS and returns the
+// "sub" claim. Used by EndSession to securely identify the subject for session revocation.
+// Unlike introspection (which is for access tokens), this validates the id_token signature directly.
+func (s *OAuthASService) VerifyIDTokenHint(idToken, expectedIssuer, expectedAudience string) (string, error) {
+	jwksData, err := s.jwksCache.get()
+	if err != nil {
+		return "", fmt.Errorf("fetch JWKS for id_token verification: %w", err)
+	}
+
+	// Parse JWKS
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			Kty string `json:"kty"`
+			Alg string `json:"alg"`
+			Use string `json:"use"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(jwksData, &jwks); err != nil {
+		return "", fmt.Errorf("parse JWKS: %w", err)
+	}
+
+	// Build a map of kid → RSA public key
+	keyMap := make(map[string]*rsa.PublicKey, len(jwks.Keys))
+	for _, k := range jwks.Keys {
+		if k.Kty != "RSA" || (k.Use != "" && k.Use != "sig") {
+			continue
+		}
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil {
+			continue
+		}
+		e := 0
+		for _, b := range eBytes {
+			e = e<<8 + int(b)
+		}
+		keyMap[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: e}
+	}
+
+	// Parse and verify the JWT
+	token, err := jwt.Parse(idToken, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		kid, _ := t.Header["kid"].(string)
+		if kid == "" {
+			// No kid — try the first available key
+			for _, k := range keyMap {
+				return k, nil
+			}
+			return nil, fmt.Errorf("no RSA keys in JWKS")
+		}
+		key, ok := keyMap[kid]
+		if !ok {
+			return nil, fmt.Errorf("kid %q not found in JWKS", kid)
+		}
+		return key, nil
+	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512"}))
+	if err != nil {
+		return "", fmt.Errorf("id_token verification failed: %w", err)
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return "", fmt.Errorf("invalid id_token claims")
+	}
+
+	if expectedIssuer != "" {
+		iss, _ := claims["iss"].(string)
+		if iss != expectedIssuer {
+			return "", fmt.Errorf("id_token issuer mismatch")
+		}
+	}
+
+	if expectedAudience != "" && !audienceContains(claims["aud"], expectedAudience) {
+		return "", fmt.Errorf("id_token audience mismatch")
+	}
+
+	expUnix, ok := numericClaimToInt64(claims["exp"])
+	if !ok {
+		return "", fmt.Errorf("id_token missing exp claim")
+	}
+	if time.Unix(expUnix, 0).Before(time.Now()) {
+		return "", fmt.Errorf("id_token expired")
+	}
+
+	sub, _ := claims["sub"].(string)
+	if sub == "" {
+		return "", fmt.Errorf("id_token missing sub claim")
+	}
+	return sub, nil
+}
+
+func audienceContains(raw interface{}, expected string) bool {
+	switch v := raw.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s == expected {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range v {
+			if item == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func numericClaimToInt64(raw interface{}) (int64, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case int32:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	}
+	return 0, false
 }
 
 // --- Helpers ---
