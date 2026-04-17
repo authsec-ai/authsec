@@ -18,7 +18,9 @@ import (
 // DeviceAuthController handles device authorization grant endpoints (RFC 8628)
 type DeviceAuthController struct {
 	deviceService *services.DeviceAuthService
+	oidcService   *services.OIDCService
 	tenantRepo    *database.AdminTenantRepository
+	userRepo      *database.UserRepository
 }
 
 // NewDeviceAuthController creates a new device authorization controller
@@ -41,7 +43,9 @@ func NewDeviceAuthController() (*DeviceAuthController, error) {
 
 	return &DeviceAuthController{
 		deviceService: services.NewDeviceAuthService(db, tenantDBService),
+		oidcService:   services.NewOIDCService(db),
 		tenantRepo:    database.NewAdminTenantRepository(db),
+		userRepo:      database.NewUserRepository(db),
 	}, nil
 }
 
@@ -342,6 +346,104 @@ func (ctrl *DeviceAuthController) ShowActivationPage(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "text/html; charset=utf-8", htmlContent)
+}
+
+// AuthorizeDeviceWithOIDC is the public endpoint for shield end-user login.
+// After the user authenticates via OIDC (SSO), the callback page sends:
+//   {user_code, oidc_code, state}
+// This endpoint exchanges the OIDC code for user identity, then authorizes
+// the device code — so the shield's poll gets the token.
+// No JWT required — the OIDC code exchange itself proves authentication.
+// @Router /uflow/auth/device/authorize-oidc [post]
+func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
+	var req models.DeviceAuthorizeOIDCRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body", "details": err.Error()})
+		return
+	}
+
+	if req.UserCode == "" || req.OIDCCode == "" || req.State == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_code, oidc_code, and state are required"})
+		return
+	}
+
+	// Step 1: Validate the user_code is still pending
+	dc, err := ctrl.deviceService.ValidateUserCode(req.UserCode)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or expired device code"})
+		return
+	}
+	_ = dc
+
+	// Step 2: Exchange the OIDC code for user identity
+	callbackInput := &models.OIDCCallbackInput{
+		Code:  req.OIDCCode,
+		State: req.State,
+	}
+	state, userInfo, err := ctrl.oidcService.HandleCallback(callbackInput)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "OIDC authentication failed", "details": err.Error()})
+		return
+	}
+
+	if userInfo == nil || userInfo.Email == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Could not retrieve user identity from OIDC provider"})
+		return
+	}
+
+	// Step 3: Resolve user in the tenant
+	var tenantID uuid.UUID
+	if state.TenantID != nil {
+		tenantID = *state.TenantID
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Could not determine tenant from OIDC state"})
+		return
+	}
+
+	user, err := ctrl.userRepo.GetUserByEmailAndTenant(userInfo.Email, tenantID)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace", "details": err.Error()})
+		return
+	}
+
+	// Step 4: Get tenant info
+	tenant, err := ctrl.tenantRepo.GetTenantByID(tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
+		return
+	}
+
+	// Step 5: client_id — resolve from tenant mappings if available
+	var clientID *uuid.UUID
+	// clientID will be nil here; AuthorizeDevice handles this gracefully
+
+	// Step 6: Authorize the device code with the user's identity
+	if err := ctrl.deviceService.AuthorizeDevice(
+		req.UserCode,
+		user.ID,
+		user.Email,
+		tenantID,
+		tenant.TenantDomain,
+		clientID,
+		true, // approved
+	); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to authorize device", "details": err.Error()})
+		return
+	}
+
+	middlewares.Audit(c, "device_auth", req.UserCode, "authorize_oidc", &middlewares.AuditChanges{
+		After: map[string]interface{}{
+			"user_code":  req.UserCode,
+			"user_email": user.Email,
+			"tenant_id":  tenantID.String(),
+			"method":     "oidc",
+		},
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "authorized",
+		"message": "Device authorized. The CLI will receive credentials shortly.",
+	})
 }
 
 // getActivationPageHTML returns inline HTML fallback if template file is not available

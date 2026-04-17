@@ -136,6 +136,14 @@ type DeviceAuthorizeRequest struct {
 	Approved bool   `json:"approved"` // true = approve, false = deny
 }
 
+// DeviceAuthorizeOIDCRequest is used by the shield end-user login flow.
+// After OIDC authentication, the callback page sends the user_code + OIDC code.
+type DeviceAuthorizeOIDCRequest struct {
+	UserCode string `json:"user_code" binding:"required"` // Code shown in shield terminal
+	OIDCCode string `json:"oidc_code" binding:"required"` // Authorization code from OIDC callback
+	State    string `json:"state" binding:"required"`      // OIDC state parameter
+}
+
 // DeviceAuthorizeResponse is returned by POST /device/authorize.
 type DeviceAuthorizeResponse struct {
 	Status string `json:"status"` // "authorized" or "denied"

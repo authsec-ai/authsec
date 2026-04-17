@@ -374,6 +374,9 @@ func SetupRoutes(
 				deviceAuth.POST("/verify", deviceAuthController.VerifyUserCode)
 				// /authorize: requires auth — browser posts approval/denial after login
 				deviceAuth.POST("/authorize", middlewares.AuthMiddleware(), deviceAuthController.AuthorizeDevice)
+				// /authorize-oidc: public — for end-user shield login via OIDC
+				// Takes {user_code, oidc_code, state} → exchanges OIDC code for identity → authorizes device
+				deviceAuth.POST("/authorize-oidc", deviceAuthController.AuthorizeDeviceWithOIDC)
 				// /verify-legacy: old authenticated verify endpoint (backwards compat)
 				deviceAuth.POST("/verify-legacy", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
 			}
