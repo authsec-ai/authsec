@@ -188,6 +188,42 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// GetPendingActions returns pending (non-expired) action requests for the authenticated user.
+// Filters by both tenant_id and user_id — only the user whose account triggered the action sees it.
+func (ctrl *AgentActionController) GetPendingActions(c *gin.Context) {
+	tenantID := ctrl.getTenantID(c)
+	if tenantID == (uuid.UUID{}) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
+		return
+	}
+
+	userIDStr, err := middlewares.ResolveUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	actions, err := ctrl.actionService.GetPendingActions(tenantID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending actions"})
+		return
+	}
+
+	if actions == nil {
+		actions = []models.AgentActionRequest{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"count":   len(actions),
+		"actions": actions,
+	})
+}
+
 // ========================================
 // Admin endpoints (JWT auth + admin role)
 // ========================================

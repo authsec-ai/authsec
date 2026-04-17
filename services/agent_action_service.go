@@ -394,6 +394,11 @@ func (s *AgentActionService) RespondToAction(
 	}, nil
 }
 
+// GetPendingActions returns all pending (non-expired) action requests for a specific user in a tenant.
+func (s *AgentActionService) GetPendingActions(tenantID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
+	return s.actionRepo.GetPendingActionsByUser(tenantID, userID)
+}
+
 // GetRiskPolicies retrieves all risk policies for a tenant
 func (s *AgentActionService) GetRiskPolicies(tenantID uuid.UUID) ([]models.RiskPolicy, error) {
 	return s.actionRepo.GetRiskPoliciesByTenant(tenantID)

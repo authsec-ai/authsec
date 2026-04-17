@@ -413,6 +413,76 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 	return &req, nil
 }
 
+// GetPendingActionsByUser returns all non-expired pending action requests for a specific user in a tenant.
+// Filters by both tenant_id and user_id so only the affected user sees their notifications.
+func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
+	now := time.Now().Unix()
+	query := `
+		SELECT id, action_req_id, tenant_id, user_id, user_email,
+		       agent_id, agent_name, agent_framework, session_id,
+		       action, resource, detail, metadata,
+		       risk_score, risk_level, risk_factors, matched_policy_id,
+		       status, approval_type, required_approvals, received_approvals,
+		       ciba_auth_req_id, device_token_id,
+		       expires_at, created_at, decided_at, last_polled_at
+		FROM agent_action_requests
+		WHERE tenant_id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > $3
+		ORDER BY created_at DESC
+	`
+
+	rows, err := r.db.Query(query, tenantID, userID, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending actions: %w", err)
+	}
+	defer rows.Close()
+
+	var results []models.AgentActionRequest
+	for rows.Next() {
+		var req models.AgentActionRequest
+		var metadataJSON, riskFactorsJSON []byte
+		var matchedPolicyID, deviceTokenID sql.NullString
+		var decidedAt, lastPolledAt sql.NullInt64
+
+		err := rows.Scan(
+			&req.ID, &req.ActionReqID, &req.TenantID, &req.UserID, &req.UserEmail,
+			&req.AgentID, &req.AgentName, &req.AgentFramework, &req.SessionID,
+			&req.Action, &req.Resource, &req.Detail, &metadataJSON,
+			&req.RiskScore, &req.RiskLevel, &riskFactorsJSON, &matchedPolicyID,
+			&req.Status, &req.ApprovalType, &req.RequiredApprovals, &req.ReceivedApprovals,
+			&req.CIBAAuthReqID, &deviceTokenID,
+			&req.ExpiresAt, &req.CreatedAt, &decidedAt, &lastPolledAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan pending action: %w", err)
+		}
+
+		if matchedPolicyID.Valid {
+			id := uuid.MustParse(matchedPolicyID.String)
+			req.MatchedPolicyID = &id
+		}
+		if deviceTokenID.Valid {
+			id := uuid.MustParse(deviceTokenID.String)
+			req.DeviceTokenID = &id
+		}
+		if decidedAt.Valid {
+			req.DecidedAt = &decidedAt.Int64
+		}
+		if lastPolledAt.Valid {
+			req.LastPolledAt = &lastPolledAt.Int64
+		}
+		if metadataJSON != nil {
+			json.Unmarshal(metadataJSON, &req.Metadata)
+		}
+		if riskFactorsJSON != nil {
+			json.Unmarshal(riskFactorsJSON, &req.RiskFactors)
+		}
+
+		results = append(results, req)
+	}
+
+	return results, nil
+}
+
 // UpdateActionRequestStatus updates the status of an action request
 func (r *AgentActionRepository) UpdateActionRequestStatus(actionReqID string, status string) error {
 	now := time.Now().Unix()
