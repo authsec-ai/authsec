@@ -370,7 +370,15 @@ func SetupRoutes(
 				deviceAuth.POST("/code", deviceAuthController.RequestDeviceCode)
 				deviceAuth.POST("/token", deviceAuthController.PollDeviceToken)
 				deviceAuth.GET("/activate/info", deviceAuthController.GetActivationInfo)
-				deviceAuth.POST("/verify", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
+				// /verify: public — activation page checks user_code before login
+				deviceAuth.POST("/verify", deviceAuthController.VerifyUserCode)
+				// /authorize: requires auth — browser posts approval/denial after login
+				deviceAuth.POST("/authorize", middlewares.AuthMiddleware(), deviceAuthController.AuthorizeDevice)
+				// /authorize-oidc: public — for end-user shield login via OIDC
+				// Takes {user_code, oidc_code, state} → exchanges OIDC code for identity → authorizes device
+				deviceAuth.POST("/authorize-oidc", deviceAuthController.AuthorizeDeviceWithOIDC)
+				// /verify-legacy: old authenticated verify endpoint (backwards compat)
+				deviceAuth.POST("/verify-legacy", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
 			}
 
 			// Voice Authentication
@@ -693,6 +701,7 @@ func SetupRoutes(
 			agentActions.POST("/evaluate", agentActionController.EvaluateAction)
 			agentActions.GET("/status", agentActionController.PollActionStatus)
 			agentActions.POST("/respond", agentActionController.RespondToAction)
+			agentActions.GET("/pending", agentActionController.GetPendingActions)
 		}
 
 		// Risk policy admin endpoints
