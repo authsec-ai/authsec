@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS saml_requests (
     expires_at TIMESTAMP NOT NULL
 );
 
+-- Ensure client_id column exists for tables that may have been created with an older schema
+ALTER TABLE saml_requests ADD COLUMN IF NOT EXISTS client_id UUID;
+
 CREATE INDEX IF NOT EXISTS idx_saml_requests_login_challenge ON saml_requests(login_challenge);
 CREATE INDEX IF NOT EXISTS idx_saml_requests_tenant_id ON saml_requests(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_saml_requests_client_id ON saml_requests(client_id);
@@ -45,6 +48,9 @@ CREATE TABLE IF NOT EXISTS saml_callback_states (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP NOT NULL
 );
+
+-- Ensure client_id column exists if table pre-existed with older schema
+ALTER TABLE saml_callback_states ADD COLUMN IF NOT EXISTS client_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_saml_callback_states_client_id ON saml_callback_states(client_id);
 CREATE INDEX IF NOT EXISTS idx_saml_callback_states_tenant_client ON saml_callback_states(tenant_id, client_id);

@@ -13,40 +13,63 @@ ALTER TABLE device_codes
     ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT,
     ADD COLUMN IF NOT EXISTS updated_at_epoch BIGINT;
 
--- Migrate existing data (convert TIMESTAMP to epoch)
-UPDATE device_codes SET
-    expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
-    last_polled_at_epoch = EXTRACT(EPOCH FROM last_polled_at)::BIGINT,
-    authorized_at_epoch = EXTRACT(EPOCH FROM authorized_at)::BIGINT,
-    created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
-    updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
-WHERE expires_at_epoch IS NULL;
+-- Migrate existing data (convert TIMESTAMP to epoch) only when source is still a timestamp type
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'device_codes' AND column_name = 'expires_at'
+          AND data_type NOT IN ('bigint', 'integer')
+    ) THEN
+        UPDATE device_codes SET
+            expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
+            last_polled_at_epoch = EXTRACT(EPOCH FROM last_polled_at)::BIGINT,
+            authorized_at_epoch = EXTRACT(EPOCH FROM authorized_at)::BIGINT,
+            created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
+            updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
+        WHERE expires_at_epoch IS NULL;
+    ELSE
+        RAISE NOTICE 'device_codes.expires_at already BIGINT, skipping epoch conversion';
+    END IF;
+END $$;
 
--- Drop old timestamp columns
-ALTER TABLE device_codes
-    DROP COLUMN IF EXISTS expires_at,
-    DROP COLUMN IF EXISTS last_polled_at,
-    DROP COLUMN IF EXISTS authorized_at,
-    DROP COLUMN IF EXISTS created_at,
-    DROP COLUMN IF EXISTS updated_at;
+-- Drop old TIMESTAMP columns only — do not drop already-converted BIGINT columns
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='expires_at' AND data_type NOT IN ('bigint','integer')) THEN
+        EXECUTE 'ALTER TABLE device_codes DROP COLUMN IF EXISTS expires_at, DROP COLUMN IF EXISTS last_polled_at, DROP COLUMN IF EXISTS authorized_at, DROP COLUMN IF EXISTS created_at, DROP COLUMN IF EXISTS updated_at';
+    END IF;
+END $$;
 
--- Rename epoch columns to original names
-ALTER TABLE device_codes
-    RENAME COLUMN expires_at_epoch TO expires_at;
-ALTER TABLE device_codes
-    RENAME COLUMN last_polled_at_epoch TO last_polled_at;
-ALTER TABLE device_codes
-    RENAME COLUMN authorized_at_epoch TO authorized_at;
-ALTER TABLE device_codes
-    RENAME COLUMN created_at_epoch TO created_at;
-ALTER TABLE device_codes
-    RENAME COLUMN updated_at_epoch TO updated_at;
+-- Rename epoch columns to original names (only when epoch column exists)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='expires_at_epoch') THEN
+        EXECUTE 'ALTER TABLE device_codes RENAME COLUMN expires_at_epoch TO expires_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='last_polled_at_epoch') THEN
+        EXECUTE 'ALTER TABLE device_codes RENAME COLUMN last_polled_at_epoch TO last_polled_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='authorized_at_epoch') THEN
+        EXECUTE 'ALTER TABLE device_codes RENAME COLUMN authorized_at_epoch TO authorized_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='created_at_epoch') THEN
+        EXECUTE 'ALTER TABLE device_codes RENAME COLUMN created_at_epoch TO created_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='updated_at_epoch') THEN
+        EXECUTE 'ALTER TABLE device_codes RENAME COLUMN updated_at_epoch TO updated_at';
+    END IF;
+END $$;
 
--- Add NOT NULL constraint and default for required columns
-ALTER TABLE device_codes
-    ALTER COLUMN expires_at SET NOT NULL,
-    ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-    ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+-- Set NOT NULL / defaults on BIGINT columns
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='device_codes' AND column_name='expires_at' AND data_type IN ('bigint','integer')) THEN
+        BEGIN EXECUTE 'ALTER TABLE device_codes ALTER COLUMN expires_at SET NOT NULL'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE device_codes ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE device_codes ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+    END IF;
+END $$;
 
 -- Recreate index on expires_at
 DROP INDEX IF EXISTS idx_device_codes_expires_at;
@@ -62,32 +85,55 @@ ALTER TABLE voice_sessions
     ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT,
     ADD COLUMN IF NOT EXISTS updated_at_epoch BIGINT;
 
-UPDATE voice_sessions SET
-    expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
-    verified_at_epoch = EXTRACT(EPOCH FROM verified_at)::BIGINT,
-    created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
-    updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
-WHERE expires_at_epoch IS NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'voice_sessions' AND column_name = 'expires_at'
+          AND data_type NOT IN ('bigint', 'integer')
+    ) THEN
+        UPDATE voice_sessions SET
+            expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
+            verified_at_epoch = EXTRACT(EPOCH FROM verified_at)::BIGINT,
+            created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
+            updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
+        WHERE expires_at_epoch IS NULL;
+    ELSE
+        RAISE NOTICE 'voice_sessions.expires_at already BIGINT, skipping epoch conversion';
+    END IF;
+END $$;
 
-ALTER TABLE voice_sessions
-    DROP COLUMN IF EXISTS expires_at,
-    DROP COLUMN IF EXISTS verified_at,
-    DROP COLUMN IF EXISTS created_at,
-    DROP COLUMN IF EXISTS updated_at;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='expires_at' AND data_type NOT IN ('bigint','integer')) THEN
+        EXECUTE 'ALTER TABLE voice_sessions DROP COLUMN IF EXISTS expires_at, DROP COLUMN IF EXISTS verified_at, DROP COLUMN IF EXISTS created_at, DROP COLUMN IF EXISTS updated_at';
+    END IF;
+END $$;
 
-ALTER TABLE voice_sessions
-    RENAME COLUMN expires_at_epoch TO expires_at;
-ALTER TABLE voice_sessions
-    RENAME COLUMN verified_at_epoch TO verified_at;
-ALTER TABLE voice_sessions
-    RENAME COLUMN created_at_epoch TO created_at;
-ALTER TABLE voice_sessions
-    RENAME COLUMN updated_at_epoch TO updated_at;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='expires_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_sessions RENAME COLUMN expires_at_epoch TO expires_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='verified_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_sessions RENAME COLUMN verified_at_epoch TO verified_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='created_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_sessions RENAME COLUMN created_at_epoch TO created_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='updated_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_sessions RENAME COLUMN updated_at_epoch TO updated_at';
+    END IF;
+END $$;
 
-ALTER TABLE voice_sessions
-    ALTER COLUMN expires_at SET NOT NULL,
-    ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-    ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_sessions' AND column_name='expires_at' AND data_type IN ('bigint','integer')) THEN
+        BEGIN EXECUTE 'ALTER TABLE voice_sessions ALTER COLUMN expires_at SET NOT NULL'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_sessions ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_sessions ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+    END IF;
+END $$;
 
 DROP INDEX IF EXISTS idx_voice_sessions_expires_at;
 CREATE INDEX idx_voice_sessions_expires_at ON voice_sessions(expires_at);
@@ -102,32 +148,55 @@ ALTER TABLE voice_identity_links
     ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT,
     ADD COLUMN IF NOT EXISTS updated_at_epoch BIGINT;
 
-UPDATE voice_identity_links SET
-    last_used_at_epoch = EXTRACT(EPOCH FROM last_used_at)::BIGINT,
-    linked_at_epoch = EXTRACT(EPOCH FROM linked_at)::BIGINT,
-    created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
-    updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
-WHERE created_at_epoch IS NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'voice_identity_links' AND column_name = 'created_at'
+          AND data_type NOT IN ('bigint', 'integer')
+    ) THEN
+        UPDATE voice_identity_links SET
+            last_used_at_epoch = EXTRACT(EPOCH FROM last_used_at)::BIGINT,
+            linked_at_epoch = EXTRACT(EPOCH FROM linked_at)::BIGINT,
+            created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
+            updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
+        WHERE created_at_epoch IS NULL;
+    ELSE
+        RAISE NOTICE 'voice_identity_links.created_at already BIGINT, skipping epoch conversion';
+    END IF;
+END $$;
 
-ALTER TABLE voice_identity_links
-    DROP COLUMN IF EXISTS last_used_at,
-    DROP COLUMN IF EXISTS linked_at,
-    DROP COLUMN IF EXISTS created_at,
-    DROP COLUMN IF EXISTS updated_at;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='created_at' AND data_type NOT IN ('bigint','integer')) THEN
+        EXECUTE 'ALTER TABLE voice_identity_links DROP COLUMN IF EXISTS last_used_at, DROP COLUMN IF EXISTS linked_at, DROP COLUMN IF EXISTS created_at, DROP COLUMN IF EXISTS updated_at';
+    END IF;
+END $$;
 
-ALTER TABLE voice_identity_links
-    RENAME COLUMN last_used_at_epoch TO last_used_at;
-ALTER TABLE voice_identity_links
-    RENAME COLUMN linked_at_epoch TO linked_at;
-ALTER TABLE voice_identity_links
-    RENAME COLUMN created_at_epoch TO created_at;
-ALTER TABLE voice_identity_links
-    RENAME COLUMN updated_at_epoch TO updated_at;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='last_used_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_identity_links RENAME COLUMN last_used_at_epoch TO last_used_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='linked_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_identity_links RENAME COLUMN linked_at_epoch TO linked_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='created_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_identity_links RENAME COLUMN created_at_epoch TO created_at';
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='updated_at_epoch') THEN
+        EXECUTE 'ALTER TABLE voice_identity_links RENAME COLUMN updated_at_epoch TO updated_at';
+    END IF;
+END $$;
 
-ALTER TABLE voice_identity_links
-    ALTER COLUMN linked_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-    ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-    ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_identity_links' AND column_name='created_at' AND data_type IN ('bigint','integer')) THEN
+        BEGIN EXECUTE 'ALTER TABLE voice_identity_links ALTER COLUMN linked_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_identity_links ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_identity_links ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+    END IF;
+END $$;
 
 -- ========================================
 -- voice_active_sessions table (if exists)
@@ -144,42 +213,43 @@ BEGIN
             ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT,
             ADD COLUMN IF NOT EXISTS updated_at_epoch BIGINT;
 
-        UPDATE voice_active_sessions SET
-            login_at_epoch = EXTRACT(EPOCH FROM login_at)::BIGINT,
-            last_activity_at_epoch = EXTRACT(EPOCH FROM last_activity_at)::BIGINT,
-            expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
-            revoked_at_epoch = EXTRACT(EPOCH FROM revoked_at)::BIGINT,
-            created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
-            updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
-        WHERE created_at_epoch IS NULL;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='created_at' AND data_type NOT IN ('bigint','integer')) THEN
+            UPDATE voice_active_sessions SET
+                login_at_epoch = EXTRACT(EPOCH FROM login_at)::BIGINT,
+                last_activity_at_epoch = EXTRACT(EPOCH FROM last_activity_at)::BIGINT,
+                expires_at_epoch = EXTRACT(EPOCH FROM expires_at)::BIGINT,
+                revoked_at_epoch = EXTRACT(EPOCH FROM revoked_at)::BIGINT,
+                created_at_epoch = EXTRACT(EPOCH FROM created_at)::BIGINT,
+                updated_at_epoch = EXTRACT(EPOCH FROM updated_at)::BIGINT
+            WHERE created_at_epoch IS NULL;
 
-        ALTER TABLE voice_active_sessions
-            DROP COLUMN IF EXISTS login_at,
-            DROP COLUMN IF EXISTS last_activity_at,
-            DROP COLUMN IF EXISTS expires_at,
-            DROP COLUMN IF EXISTS revoked_at,
-            DROP COLUMN IF EXISTS created_at,
-            DROP COLUMN IF EXISTS updated_at;
+            EXECUTE 'ALTER TABLE voice_active_sessions DROP COLUMN IF EXISTS login_at, DROP COLUMN IF EXISTS last_activity_at, DROP COLUMN IF EXISTS expires_at, DROP COLUMN IF EXISTS revoked_at, DROP COLUMN IF EXISTS created_at, DROP COLUMN IF EXISTS updated_at';
+        END IF;
 
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN login_at_epoch TO login_at;
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN last_activity_at_epoch TO last_activity_at;
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN expires_at_epoch TO expires_at;
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN revoked_at_epoch TO revoked_at;
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN created_at_epoch TO created_at;
-        ALTER TABLE voice_active_sessions
-            RENAME COLUMN updated_at_epoch TO updated_at;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='login_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN login_at_epoch TO login_at';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='last_activity_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN last_activity_at_epoch TO last_activity_at';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='expires_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN expires_at_epoch TO expires_at';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='revoked_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN revoked_at_epoch TO revoked_at';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='created_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN created_at_epoch TO created_at';
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='voice_active_sessions' AND column_name='updated_at_epoch') THEN
+            EXECUTE 'ALTER TABLE voice_active_sessions RENAME COLUMN updated_at_epoch TO updated_at';
+        END IF;
 
-        ALTER TABLE voice_active_sessions
-            ALTER COLUMN expires_at SET NOT NULL,
-            ALTER COLUMN login_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-            ALTER COLUMN last_activity_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-            ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-            ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+        BEGIN EXECUTE 'ALTER TABLE voice_active_sessions ALTER COLUMN expires_at SET NOT NULL'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_active_sessions ALTER COLUMN login_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_active_sessions ALTER COLUMN last_activity_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_active_sessions ALTER COLUMN created_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        BEGIN EXECUTE 'ALTER TABLE voice_active_sessions ALTER COLUMN updated_at SET DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT'; EXCEPTION WHEN OTHERS THEN NULL; END;
     END IF;
 END $$;
 

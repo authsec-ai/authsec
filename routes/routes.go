@@ -153,6 +153,12 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize tenant CIBA auth controller: %v", err)
 	}
 
+	// Initialize Agent Action Guard controller (human-in-the-loop approvals)
+	agentActionController, err := platformCtrl.NewAgentActionController()
+	if err != nil {
+		log.Fatalf("Failed to initialize agent action controller: %v", err)
+	}
+
 	tenantTOTPController := userCtrl.NewTenantTOTPController()
 
 	spiffeDelegateController, err := platformCtrl.NewSpiffeDelegateController()
@@ -364,7 +370,15 @@ func SetupRoutes(
 				deviceAuth.POST("/code", deviceAuthController.RequestDeviceCode)
 				deviceAuth.POST("/token", deviceAuthController.PollDeviceToken)
 				deviceAuth.GET("/activate/info", deviceAuthController.GetActivationInfo)
-				deviceAuth.POST("/verify", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
+				// /verify: public — activation page checks user_code before login
+				deviceAuth.POST("/verify", deviceAuthController.VerifyUserCode)
+				// /authorize: requires auth — browser posts approval/denial after login
+				deviceAuth.POST("/authorize", middlewares.AuthMiddleware(), deviceAuthController.AuthorizeDevice)
+				// /authorize-oidc: public — for end-user shield login via OIDC
+				// Takes {user_code, oidc_code, state} → exchanges OIDC code for identity → authorizes device
+				deviceAuth.POST("/authorize-oidc", deviceAuthController.AuthorizeDeviceWithOIDC)
+				// /verify-legacy: old authenticated verify endpoint (backwards compat)
+				deviceAuth.POST("/verify-legacy", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
 			}
 
 			// Voice Authentication
@@ -674,6 +688,57 @@ func SetupRoutes(
 			scimAdmin.PUT("/Users/:id", scimAdminController.ReplaceAdminUser)
 			scimAdmin.PATCH("/Users/:id", scimAdminController.PatchAdminUser)
 			scimAdmin.DELETE("/Users/:id", scimAdminController.DeleteAdminUser)
+		}
+
+		// ========================================
+		// Agent Action Guard routes (Human-in-the-Loop approvals for AI agents)
+		// ========================================
+
+		// Agent-facing endpoints (JWT auth required)
+		agentActions := uflow.Group("/agent/actions")
+		agentActions.Use(middlewares.AuthMiddleware())
+		{
+			agentActions.POST("/evaluate", agentActionController.EvaluateAction)
+			agentActions.GET("/status", agentActionController.PollActionStatus)
+			agentActions.POST("/respond", agentActionController.RespondToAction)
+			agentActions.GET("/pending", agentActionController.GetPendingActions)
+		}
+
+		// Risk policy admin endpoints
+		agentGuardAdmin := uflow.Group("/admin/risk-policies")
+		agentGuardAdmin.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentGuardAdmin.GET("", agentActionController.ListRiskPolicies)
+			agentGuardAdmin.POST("", agentActionController.CreateRiskPolicy)
+			agentGuardAdmin.PUT("/:id", agentActionController.UpdateRiskPolicy)
+			agentGuardAdmin.DELETE("/:id", agentActionController.DeleteRiskPolicy)
+		}
+
+		// Agent guard settings (admin)
+		agentGuardSettings := uflow.Group("/admin/agent-guard")
+		agentGuardSettings.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentGuardSettings.GET("/settings", agentActionController.GetSettings)
+			agentGuardSettings.PUT("/settings", agentActionController.UpdateSettings)
+		}
+
+		// Agent audit log (admin)
+		agentAudit := uflow.Group("/admin/agent-audit")
+		agentAudit.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentAudit.GET("", agentActionController.GetAuditLog)
 		}
 
 		// ────────────────────────────────────────────────────

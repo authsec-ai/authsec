@@ -62,15 +62,23 @@ BEGIN
     END IF;
 END$$;
 
--- Ensure role_bindings scope integrity check exists
+-- Ensure role_bindings scope integrity check exists.
+-- NOTE: Migration 071 drops this constraint. If existing data violates it, skip gracefully.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'role_bindings_chk_scope_integrity') THEN
-        ALTER TABLE role_bindings
-        ADD CONSTRAINT role_bindings_chk_scope_integrity CHECK (
-            (scope_type IS NULL AND scope_id IS NULL) OR
-            (scope_type IS NOT NULL AND scope_id IS NOT NULL)
-        );
+        BEGIN
+            ALTER TABLE role_bindings
+            ADD CONSTRAINT role_bindings_chk_scope_integrity CHECK (
+                (scope_type IS NULL AND scope_id IS NULL) OR
+                (scope_type IS NOT NULL AND scope_id IS NOT NULL)
+            );
+        EXCEPTION
+            WHEN check_violation THEN
+                RAISE NOTICE 'Skipping role_bindings_chk_scope_integrity: existing data violates constraint (dropped in migration 071)';
+            WHEN OTHERS THEN
+                RAISE NOTICE 'Could not add role_bindings_chk_scope_integrity: %', SQLERRM;
+        END;
     END IF;
 END$$;
 
