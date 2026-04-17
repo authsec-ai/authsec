@@ -1995,13 +1995,13 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	if defaultBaseURL == "" {
 		defaultBaseURL = "https://app.authsec.dev"
 	}
-	redirectURL := defaultBaseURL + "/uflow/oidc/callback"
+	redirectURL := defaultBaseURL + "/authsec/uflow/oidc/callback"
 
 	// Try to use tenant_domain from data first (this preserves the domain the user logged in from)
 	if tenantDomain, ok := data["tenant_domain"].(string); ok && tenantDomain != "" {
 		// Use the tenant domain that was passed in (from state or database)
 		// No validation needed - trust the domain from the state/database
-		redirectURL = "https://" + tenantDomain + "/uflow/oidc/callback"
+			redirectURL = "https://" + tenantDomain + "/authsec/uflow/oidc/callback"
 		log.Printf("DEBUG renderOAuthCallbackHTML: Using tenant_domain from data, redirectURL='%s'", redirectURL)
 	} else {
 		// Fallback: Try to extract from Host or X-Forwarded-Host header
@@ -2023,7 +2023,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 		// For platform domains, validate against allowlist
 		// For custom domains, trust them (they came from tenant_domains table via state)
 		if isAllowedFrontendDomain(frontendHost) || (!strings.HasSuffix(frontendHost, ".authsec.dev") && !strings.HasSuffix(frontendHost, ".authsec.ai")) {
-			redirectURL = "https://" + frontendHost + "/uflow/oidc/callback"
+			redirectURL = "https://" + frontendHost + "/authsec/uflow/oidc/callback"
 		}
 	}
 
