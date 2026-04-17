@@ -146,10 +146,19 @@ func (s *DeviceAuthService) AuthorizeDevice(
 		if tErr != nil {
 			return fmt.Errorf("tenant not found")
 		}
+
+		// Try end-user table first, then fall back to using JWT claims directly.
+		// Admin users (who authenticated via SSO) are not in the end-user 'users' table,
+		// but we already have their identity from the JWT — no lookup needed.
 		user, uErr := s.userRepo.GetUserByID(userID)
 		if uErr != nil {
-			return fmt.Errorf("user not found")
+			// User not in end-user table — use JWT claims directly
+			user = &models.ExtendedUser{}
+			user.ID = userID
+			user.Email = userEmail
+			user.TenantID = tenantID
 		}
+
 		accessToken, err = s.generateJWTToken(user, tenant, dc.Scopes, clientID)
 		if err != nil {
 			return fmt.Errorf("failed to generate access token: %w", err)
