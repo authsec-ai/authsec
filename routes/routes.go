@@ -86,8 +86,6 @@ func SetupRoutes(
 	rolesScopedBindingsController := adminCtrl.NewRolesScopedBindingsController()
 	authController := platformCtrl.NewAuthorizationController()
 	permissionController := adminCtrl.NewPermissionController()
-	scopeController := adminCtrl.NewScopeController()
-	apiScopesController := adminCtrl.NewAPIScopesController()
 
 	// AI Agent Delegation controllers
 	agentController := adminCtrl.NewAgentController()
@@ -256,6 +254,9 @@ func SetupRoutes(
 			resourceServers.PUT("/:id/tool-scope-map", scopeMatrixController.UpdateToolScopeMap)
 		}
 
+		// SDK policy endpoint (Basic auth with RS introspection credentials — no JWT middleware)
+		authsec.GET("/resource-servers/:id/sdk-policy", scopeMatrixController.SDKPolicy)
+
 		// Scope management (not RS-scoped)
 		scopes := authsec.Group("/scopes")
 		scopes.Use(middlewares.AuthMiddleware())
@@ -341,17 +342,7 @@ func SetupRoutes(
 			adminRBAC.DELETE("/permissions/:id", permissionController.DeletePermission)
 			adminRBAC.DELETE("/permissions", permissionController.DeletePermissionByBody)
 			adminRBAC.GET("/permissions/resources", permissionController.ShowResources)
-			adminRBAC.GET("/scopes", scopeController.ListScopes)
-			adminRBAC.GET("/scopes/mappings", scopeController.GetMappings)
-			adminRBAC.POST("/scopes", scopeController.AddScope)
-			adminRBAC.PUT("/scopes/:scope_name", scopeController.EditScope)
-			adminRBAC.DELETE("/scopes/:scope_name", scopeController.DeleteScope)
 			adminRBAC.POST("/policy/check", authController.PolicyDecisionPointCheckAdmin)
-			adminRBAC.POST("/api_scopes", apiScopesController.CreateAPIScopeAdmin)
-			adminRBAC.GET("/api_scopes", apiScopesController.ListAPIScopesAdmin)
-			adminRBAC.GET("/api_scopes/:scope_id", apiScopesController.GetAPIScopeAdmin)
-			adminRBAC.PUT("/api_scopes/:scope_id", apiScopesController.UpdateAPIScopeAdmin)
-			adminRBAC.DELETE("/api_scopes/:scope_id", apiScopesController.DeleteAPIScopeAdmin)
 
 			// AI Agent Management
 			adminRBAC.GET("/agents", agentController.ListAgents)
@@ -620,12 +611,6 @@ func SetupRoutes(
 			amMiddlewares.ValidateTenantFromToken(),
 		)
 		{
-			enduserAdmin.GET("/scopes", scopeController.ListUserScopes)
-			enduserAdmin.GET("/scopes/:tenant_id", scopeController.ListUserScopes)
-			enduserAdmin.GET("/scopes/mappings", scopeController.GetUserMappings)
-			enduserAdmin.POST("/scopes", scopeController.AddUserScope)
-			enduserAdmin.PUT("/scopes/:scope_name", scopeController.EditUserScope)
-			enduserAdmin.DELETE("/scopes/:scope_name", scopeController.DeleteUserScope)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -671,17 +656,7 @@ func SetupRoutes(
 			user.DELETE("/rbac/permissions/:id", permissionController.DeletePermissionEndUser)
 			user.DELETE("/rbac/permissions", permissionController.DeletePermissionEndUserByBody)
 			user.GET("/rbac/permissions/resources", permissionController.ShowResourcesEndUser)
-			user.GET("/scopes", scopeController.ListUserScopes)
-			user.GET("/scopes/mappings", scopeController.GetUserMappings)
-			user.POST("/scopes", scopeController.AddUserScope)
-			user.PUT("/scopes/:scope_name", scopeController.EditUserScope)
-			user.DELETE("/scopes/:scope_name", scopeController.DeleteUserScope)
 			user.POST("/rbac/policy/check", authController.PolicyDecisionPointCheckUser)
-			user.POST("/api_scopes", apiScopesController.CreateAPIScopeEndUser)
-			user.GET("/api_scopes", apiScopesController.ListAPIScopesEndUser)
-			user.GET("/api_scopes/:scope_id", apiScopesController.GetAPIScopeEndUser)
-			user.PUT("/api_scopes/:scope_id", apiScopesController.UpdateAPIScopeEndUser)
-			user.DELETE("/api_scopes/:scope_id", apiScopesController.DeleteAPIScopeEndUser)
 			user.GET("/permissions", permissionController.GetMyPermissions)
 			user.GET("/permissions/effective", permissionController.GetMyEffectivePermissions)
 			user.GET("/permissions/check", permissionController.CheckPermission)

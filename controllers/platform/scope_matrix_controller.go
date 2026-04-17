@@ -16,12 +16,14 @@ import (
 type ScopeMatrixController struct {
 	rsService      *services.ResourceServerService
 	scopeRegistry  *services.ScopeRegistryService
+	oauthService   *services.OAuthASService
 }
 
 func NewScopeMatrixController() *ScopeMatrixController {
 	return &ScopeMatrixController{
 		rsService:     services.NewResourceServerService(config.DB),
 		scopeRegistry: services.NewScopeRegistryService(config.DB),
+		oauthService:  services.NewOAuthASService(config.DB),
 	}
 }
 
@@ -300,4 +302,58 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 
 	_ = rsID // validated by middleware
 	c.JSON(http.StatusOK, gin.H{"status": "updated"})
+}
+
+// SDKPolicy returns a flat tool→scope mapping for SDK consumption.
+// GET /authsec/resource-servers/:id/sdk-policy
+//
+// Authenticated via HTTP Basic Auth using the RS introspection credentials
+// (introspection_client_id : introspection_secret) — the same credentials
+// the SDK already holds for token introspection.
+func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
+	clientID, secret, ok := c.Request.BasicAuth()
+	if !ok {
+		c.Header("WWW-Authenticate", `Basic realm="sdk-policy"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "resource server credentials required"})
+		return
+	}
+
+	rs, err := ctrl.oauthService.ValidateIntrospectionCredentials(clientID, secret)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	// Verify the authenticated RS matches the :id URL parameter
+	rsID := c.Param("id")
+	if rs.ID.String() != rsID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "credentials do not match the requested resource server"})
+		return
+	}
+
+	// Fetch MCP tools with their scope mappings (same query as GetScopeMatrix)
+	var tools []models.MCPTool
+	config.DB.Preload("Scopes").
+		Where("tenant_id = ? AND resource_server_id = ?", rs.TenantID, rs.ID).
+		Order("name").
+		Find(&tools)
+
+	// Build flat map: tool_name -> [scope_string, ...]
+	toolMap := make(map[string][]string, len(tools))
+	for _, tool := range tools {
+		var scopeStrings []string
+		for _, scope := range tool.Scopes {
+			scopeStrings = append(scopeStrings, scope.ScopeString)
+		}
+		if scopeStrings == nil {
+			scopeStrings = []string{}
+		}
+		toolMap[tool.Name] = scopeStrings
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"tools":       toolMap,
+		"fetched_at":  time.Now().UTC().Format(time.RFC3339),
+		"ttl_seconds": 300,
+	})
 }

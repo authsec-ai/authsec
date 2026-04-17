@@ -439,8 +439,8 @@ func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, 
 		return nil, err
 	}
 
-	// 5. Delete api_scopes for this tenant
-	if err := execDelete("api_scopes", "DELETE FROM api_scopes WHERE tenant_id = $1", tenantID); err != nil {
+	// 5. Delete oauth_scopes for this tenant (cascades to oauth_scope_permissions)
+	if err := execDelete("oauth_scopes", "DELETE FROM oauth_scopes WHERE tenant_id = $1", tenantID); err != nil {
 		return nil, err
 	}
 

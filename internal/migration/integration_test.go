@@ -90,7 +90,7 @@ func TestIntegration_MigrationVsTemplate_Parity(t *testing.T) {
 	t.Run("column_details_match", func(t *testing.T) {
 		keyTables := []string{
 			"users", "roles", "permissions", "role_bindings",
-			"clients", "api_scopes", "delegation_policies", "delegation_tokens",
+			"clients", "oauth_scopes", "delegation_policies", "delegation_tokens",
 		}
 		for _, table := range keyTables {
 			colsA := getPublicColumnDetails(t, dbA, table)

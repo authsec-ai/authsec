@@ -65,8 +65,8 @@ func MapToolsToScopes(tools []mcpclient.Tool, scopeStrings []string) ([]ToolScop
 				matched = true
 			}
 
-		// "<tool_name>:<action>" — flat format
-		case len(parts) == 2:
+		// "<tool_name>:<action>" — flat format (but NOT global wildcards like "tools:*")
+		case len(parts) == 2 && scope != "tools:*" && scope != "mcp:tools:*":
 			toolName := parts[0]
 			if toolNames[toolName] {
 				mappings = append(mappings, ToolScopeMapping{

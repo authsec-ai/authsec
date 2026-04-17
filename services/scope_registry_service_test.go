@@ -81,7 +81,7 @@ func TestGenerateDisplayName(t *testing.T) {
 		{"mcp:tools:calendar:write", "Tools - Calendar - Write"},
 		{"files:read", "Files - Read"},
 		{"openid", "Openid"},
-		{"admin:*", "All"},
+		{"admin:*", "Admin - All"},
 		{"tools:get_weather:invoke", "Get Weather - Invoke"},
 	}
 	for _, tt := range tests {

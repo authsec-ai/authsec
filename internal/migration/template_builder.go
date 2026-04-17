@@ -13,7 +13,7 @@ const syntheticTenantID = "00000000-0000-0000-0000-000000000001"
 var requiredTables = []string{
 	"tenants", "users", "roles", "permissions", "clients",
 	"role_bindings", "role_permissions", "service_accounts",
-	"api_scopes", "scope_permissions", "api_scope_permissions",
+	"oauth_scopes", "oauth_scope_permissions",
 	"groups", "user_groups", "resources", "resource_methods",
 	"user_scopes", "client_roles", "credentials", "scopes",
 	"services", "projects", "group_roles", "client_resources",

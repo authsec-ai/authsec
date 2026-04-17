@@ -504,7 +504,7 @@ func TestMasterMigrations_Flow(t *testing.T) {
 
 	coreTables := []string{
 		"tenants", "users", "roles", "permissions", "clients",
-		"migration_logs", "role_bindings", "api_scopes",
+		"migration_logs", "role_bindings", "oauth_scopes",
 		"delegation_policies", "delegation_tokens",
 	}
 
