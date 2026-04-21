@@ -1,7 +1,6 @@
 package platform
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -358,31 +356,8 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 	h := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
 
-	// Register verifier with the in-process PKCE store (hmgr is merged — no HTTP call needed)
-	pkcePayload, _ := json.Marshal(map[string]string{
-		"state":         freshState,
-		"code_verifier": codeVerifier,
-	})
-	hydraServiceURL := os.Getenv("HYDRA_SERVICE_URL")
-	if hydraServiceURL == "" {
-		hydraServiceURL = "http://localhost:7468/authsec"
-	}
-	pkceResp, pkceErr := http.Post(
-		hydraServiceURL+"/hmgr/pkce/store",
-		"application/json",
-		bytes.NewReader(pkcePayload),
-	)
-	if pkceErr != nil {
-		log.Printf("ERROR: Failed to store PKCE verifier: %v", pkceErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
-		return
-	}
-	pkceResp.Body.Close()
-	if pkceResp.StatusCode >= 300 {
-		log.Printf("ERROR: PKCE store returned %d", pkceResp.StatusCode)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
-		return
-	}
+	// Store verifier in the in-process PKCE store (hmgr is merged into the same binary).
+	StorePKCEVerifier(freshState, codeVerifier)
 
 	params := url.Values{}
 	params.Add("client_id", oauthClientID)

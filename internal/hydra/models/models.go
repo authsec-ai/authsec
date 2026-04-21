@@ -23,11 +23,12 @@ type Resource = sharedmodels.Resource
 
 // Hydra-specific models
 type HydraLoginRequest struct {
-	Challenge string `json:"challenge"`
-	Client    struct {
+	Challenge  string `json:"challenge"`
+	Client     struct {
 		ClientID string `json:"client_id"`
 	} `json:"client"`
-	Subject string `json:"subject"`
+	Subject    string `json:"subject"`
+	RequestURL string `json:"request_url"`
 }
 
 type HydraAcceptLoginRequest struct {
