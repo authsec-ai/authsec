@@ -26,7 +26,7 @@ type ProjectController struct{}
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/projects [post]
+// @Router /authsec/uflow/projects [post]
 func (pc *ProjectController) CreateProject(c *gin.Context) {
 	userID, err := middlewares.ResolveUserID(c)
 	if err != nil {
@@ -104,7 +104,7 @@ func (pc *ProjectController) CreateProject(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/projects [get]
+// @Router /authsec/uflow/projects [get]
 func (pc *ProjectController) ListProjects(c *gin.Context) {
 	userID, err := middlewares.ResolveUserID(c)
 	if err != nil {

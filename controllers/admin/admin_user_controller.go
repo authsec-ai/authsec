@@ -57,8 +57,8 @@ type AdminUserListRequest struct {
 }
 
 type toggleAdminUserActiveRequest struct {
-	TenantID string        `json:"tenant_id" binding:"required"`
-	UserID   string        `json:"user_id" binding:"required"`
+	TenantID string               `json:"tenant_id" binding:"required"`
+	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
@@ -107,8 +107,8 @@ func (auc *AdminUserController) ListTenants(c *gin.Context) {
 // @Param input body AdminUserListRequest false "Filter options including status"
 // @Success 200 {object} map[string]interface{}
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/users/list [get]
-// @Router /uflow/admin/users/list [post]
+// @Router /authsec/uflow/admin/users/list [get]
+// @Router /authsec/uflow/admin/users/list [post]
 func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logPrefix := "ListAdminUsers"
@@ -239,7 +239,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 // @Failure 403 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/users/active [post]
+// @Router /authsec/uflow/admin/users/active [post]
 func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logPrefix := "ToggleAdminUserActive"
@@ -416,7 +416,7 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 // @Failure 403 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/users/{user_id} [delete]
+// @Router /authsec/uflow/admin/users/{user_id} [delete]
 func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "delete_admin_user")
@@ -558,7 +558,7 @@ type DeleteAdminUserAllRequest struct {
 // @Failure 403 {object} map[string]string "Cannot delete primary admin or last admin"
 // @Failure 404 {object} map[string]string "Admin user not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/admin/users/delete_all [post]
+// @Router /authsec/uflow/admin/users/delete_all [post]
 func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "delete_admin_user_all")
@@ -834,7 +834,7 @@ func isPendingAdminInvite(user models.AdminUser) bool {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/enduser/list [post]
+// @Router /authsec/uflow/admin/enduser/list [post]
 func (auc *AdminUserController) ListEndUsersByTenant(c *gin.Context) {
 	var req TenantUserListRequest
 
@@ -1210,7 +1210,7 @@ func (auc *AdminUserController) fetchTenantUsers(tenantID uuid.UUID, clientID *u
 // @Failure 403 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/enduser/active [post]
+// @Router /authsec/uflow/admin/enduser/active [post]
 func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "toggle_enduser_active")
@@ -1348,7 +1348,7 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 // @Failure 403 {object} map[string]string "Permission denied"
 // @Failure 404 {object} map[string]string "Tenant not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /admin/tenants/{tenant_id} [delete]
+// @Router /authsec/uflow/admin/tenants/{tenant_id} [delete]
 func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	requestID := c.GetString("request_id")
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "delete_tenant")

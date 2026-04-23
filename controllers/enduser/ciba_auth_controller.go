@@ -59,7 +59,7 @@ func NewCIBAAuthController() (*CIBAAuthController, error) {
 // @Success 200 {object} models.CIBAInitiateResponse "CIBA request created, push notification sent"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/ciba/initiate [post]
+// @Router /authsec/uflow/auth/ciba/initiate [post]
 func (ctrl *CIBAAuthController) InitiateCIBAAuth(c *gin.Context) {
 	var req models.CIBAInitiateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -108,7 +108,7 @@ func (ctrl *CIBAAuthController) InitiateCIBAAuth(c *gin.Context) {
 // @Success 200 {object} models.CIBARespondResponse "Response recorded"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/ciba/respond [post]
+// @Router /authsec/uflow/auth/ciba/respond [post]
 func (ctrl *CIBAAuthController) RespondToCIBA(c *gin.Context) {
 	var req models.CIBARespondRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -148,7 +148,7 @@ func (ctrl *CIBAAuthController) RespondToCIBA(c *gin.Context) {
 // @Param request body models.CIBATokenRequest true "CIBA token request"
 // @Success 200 {object} models.CIBATokenResponse "Token issued or status returned"
 // @Failure 400 {object} map[string]string "Bad request"
-// @Router /uflow/auth/ciba/token [post]
+// @Router /authsec/uflow/auth/ciba/token [post]
 func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 	var req models.CIBATokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -190,7 +190,7 @@ func (ctrl *CIBAAuthController) PollCIBAToken(c *gin.Context) {
 // @Success 200 {object} models.DeviceTokenRegistrationResponse "Device registered"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/ciba/register-device [post]
+// @Router /authsec/uflow/auth/ciba/register-device [post]
 func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	var req models.DeviceTokenRegistrationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -254,7 +254,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 // @Success 200 {object} models.DeviceListResponse "Devices retrieved successfully"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/ciba/devices [get]
+// @Router /authsec/uflow/auth/ciba/devices [get]
 func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 	// Get user ID from JWT token
 	userIDStr, err := middlewares.ResolveUserID(c)
@@ -310,7 +310,7 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 404 {object} map[string]string "Device not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/ciba/devices/{device_id} [delete]
+// @Router /authsec/uflow/auth/ciba/devices/{device_id} [delete]
 func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 	deviceIDStr := c.Param("device_id")
 	deviceID, err := uuid.Parse(deviceIDStr)

@@ -58,7 +58,7 @@ func NewVoiceAuthController() (*VoiceAuthController, error) {
 // @Success 200 {object} models.VoiceInitiateResponse "Voice session created successfully"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/voice/initiate [post]
+// @Router /authsec/uflow/auth/voice/initiate [post]
 func (ctrl *VoiceAuthController) InitiateVoiceAuth(c *gin.Context) {
 	var req models.VoiceInitiateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -94,7 +94,7 @@ func (ctrl *VoiceAuthController) InitiateVoiceAuth(c *gin.Context) {
 // @Success 200 {object} models.VoiceVerifyResponse "Voice OTP verified"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/voice/verify [post]
+// @Router /authsec/uflow/auth/voice/verify [post]
 func (ctrl *VoiceAuthController) VerifyVoiceOTP(c *gin.Context) {
 	var req models.VoiceVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -129,7 +129,7 @@ func (ctrl *VoiceAuthController) VerifyVoiceOTP(c *gin.Context) {
 // @Success 200 {object} models.VoiceTokenResponse "Token issued successfully"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid credentials"
-// @Router /uflow/auth/voice/token [post]
+// @Router /authsec/uflow/auth/voice/token [post]
 func (ctrl *VoiceAuthController) GetTokenWithCredentials(c *gin.Context) {
 	var req models.VoiceTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -167,7 +167,7 @@ func (ctrl *VoiceAuthController) GetTokenWithCredentials(c *gin.Context) {
 // @Success 200 {object} models.VoiceLinkResponse "Voice assistant linked successfully"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/voice/link [post]
+// @Router /authsec/uflow/auth/voice/link [post]
 func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	var req models.VoiceLinkRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -242,7 +242,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 // @Success 200 {object} models.VoiceUnlinkResponse "Voice assistant unlinked successfully"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/voice/unlink [post]
+// @Router /authsec/uflow/auth/voice/unlink [post]
 func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	var req models.VoiceUnlinkRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -291,7 +291,7 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 // @Param Authorization header string true "Bearer JWT token"
 // @Success 200 {object} models.VoiceLinksListResponse "List of voice links"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/voice/links [get]
+// @Router /authsec/uflow/auth/voice/links [get]
 func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 	// Extract user info from JWT token
 	// Use ResolveUserID which handles both 'sub' and 'user_id' claims, and falls back to email lookup
@@ -344,7 +344,7 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 // @Param client_id query string false "Optional client_id to filter by"
 // @Success 200 {object} map[string]interface{} "List of pending device codes"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/voice/device-pending [get]
+// @Router /authsec/uflow/auth/voice/device-pending [get]
 func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 	tenantIDStr, exists := c.Get("tenant_id")
 	if !exists {
@@ -416,7 +416,7 @@ func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "Approval result"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
-// @Router /uflow/auth/voice/device-approve [post]
+// @Router /authsec/uflow/auth/voice/device-approve [post]
 func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	var req struct {
 		UserCode string `json:"user_code" binding:"required"`

@@ -15,6 +15,7 @@ import (
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
+	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/routes"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -40,6 +41,30 @@ var (
 
 	jwtDefSecret = "test-integration-jwt-def-secret-32chars!"
 	jwtSdkSecret = "test-integration-jwt-sdk-secret-32chars!"
+
+	// Workstream 3 — admin hardening test state
+	testResourceServerID uuid.UUID
+	testScopeID          uuid.UUID
+	testConsentGrantID   uuid.UUID
+	testOtherTenantID    uuid.UUID
+
+	// Foreign rows for ownership-check tests (real DB rows, not random UUIDs)
+	testOtherTenantRSID    uuid.UUID // RS owned by testOtherTenantID
+	testOtherTenantScopeID uuid.UUID // scope owned by testOtherTenantID's RS
+	testOtherTenantPermID  uuid.UUID // permission owned by testOtherTenantID
+	testOtherTenantToolID  uuid.UUID // MCP tool owned by testOtherTenantID's RS
+
+	// Second RS in testTenantID — for same-tenant cross-RS parent isolation test
+	testSecondRSID      uuid.UUID
+	testSecondRSScopeID uuid.UUID
+
+	// Workstream 4 — RBAC / Scope Bridge / Consent Truth test state
+	testW4RSID            uuid.UUID
+	testW4ScopeID         uuid.UUID // tools:w4:read — has full permission bridge
+	testW4NoBridgeScopeID uuid.UUID // tools:w4:write — no oauth_scope_permissions row
+	testW4RoleID          uuid.UUID
+	testW4MCPClientID     uuid.UUID
+	testW4ConsentGrantID  uuid.UUID
 )
 
 func TestMain(m *testing.M) {
@@ -62,6 +87,9 @@ func TestMain(m *testing.M) {
 	// Initialize database (mirrors cmd/main.go)
 	cfg := config.LoadConfig()
 	config.InitDatabaseWithoutGORM(cfg)
+
+	// Initialize audit logger so admin mutation tests can assert audit rows.
+	config.AuditLogger = monitoring.NewAuditLogger(config.DB)
 
 	// Run migrations
 	if err := migration.AutoMigrateMigrationLogs(config.DB); err != nil {
@@ -130,7 +158,7 @@ func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 	testRouter = gin.New()
 	testRouter.Use(gin.Recovery())
-	routes.SetupRoutes(testRouter, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler)
+	routes.SetupRoutes(testRouter, webAuthnHandler, adminWebAuthnHandler, endUserWebAuthnHandler, nil)
 
 	// Run tests
 	code := m.Run()

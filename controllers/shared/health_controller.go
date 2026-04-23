@@ -22,7 +22,7 @@ type HealthController struct{}
 // @Produce json
 // @Success 200 {object} map[string]interface{}
 // @Failure 503 {object} map[string]interface{}
-// @Router /uflow/health [get]
+// @Router /authsec/uflow/health [get]
 func (hc *HealthController) ComprehensiveHealthCheck(c *gin.Context) {
 	startTime := time.Now()
 	healthStatus := map[string]interface{}{
@@ -255,7 +255,7 @@ func (hc *HealthController) checkMetricsHealth() map[string]interface{} {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/health/tenant/{tenant_id} [get]
+// @Router /authsec/uflow/health/tenant/{tenant_id} [get]
 func (hc *HealthController) CheckTenantDatabase(c *gin.Context) {
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -305,7 +305,7 @@ func (hc *HealthController) CheckTenantDatabase(c *gin.Context) {
 // @Produce json
 // @Success 200 {object} map[string]interface{}
 // @Failure 500 {object} map[string]string
-// @Router /uflow/health/tenants [get]
+// @Router /authsec/uflow/health/tenants [get]
 func (hc *HealthController) CheckAllTenantDatabases(c *gin.Context) {
 	// Get all tenants with configured databases
 	var tenants []struct {

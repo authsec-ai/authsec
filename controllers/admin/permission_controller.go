@@ -77,7 +77,7 @@ type EndUserShowResourcesResponse struct {
 // @Success 200 {object} PermissionResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/permissions [post]
+// @Router /authsec/uflow/admin/permissions [post]
 func (pc *PermissionController) RegisterAtomicPermission(c *gin.Context) {
 	var req PermissionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -117,7 +117,7 @@ func (pc *PermissionController) RegisterAtomicPermission(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/permissions [post]
+// @Router /authsec/uflow/user/rbac/permissions [post]
 func (pc *PermissionController) RegisterAtomicPermissionEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -199,7 +199,7 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/permissions/{id} [delete]
+// @Router /authsec/uflow/admin/permissions/{id} [delete]
 func (pc *PermissionController) DeletePermission(c *gin.Context) {
 	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -259,7 +259,7 @@ func (pc *PermissionController) DeletePermission(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/permissions/{id} [delete]
+// @Router /authsec/uflow/user/rbac/permissions/{id} [delete]
 func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -320,7 +320,7 @@ func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/permissions [delete]
+// @Router /authsec/uflow/admin/permissions [delete]
 func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
 	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -385,7 +385,7 @@ func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/permissions [delete]
+// @Router /authsec/uflow/user/rbac/permissions [delete]
 func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -450,7 +450,7 @@ func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/permissions [get]
+// @Router /authsec/uflow/admin/permissions [get]
 func (pc *PermissionController) ListPermissions(c *gin.Context) {
 	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -478,7 +478,7 @@ func (pc *PermissionController) ListPermissions(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/permissions [get]
+// @Router /authsec/uflow/user/rbac/permissions [get]
 func (pc *PermissionController) ListPermissionsEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -608,7 +608,7 @@ func (pc *PermissionController) listPermissionsEndUser(c *gin.Context, db *gorm.
 // @Success 200 {object} AdminShowResourcesResponse
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/permissions/resources [get]
+// @Router /authsec/uflow/admin/permissions/resources [get]
 func (pc *PermissionController) ShowResources(c *gin.Context) {
 	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -633,7 +633,7 @@ func (pc *PermissionController) ShowResources(c *gin.Context) {
 // @Success 200 {object} EndUserShowResourcesResponse
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/permissions/resources [get]
+// @Router /authsec/uflow/user/rbac/permissions/resources [get]
 func (pc *PermissionController) ShowResourcesEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -676,7 +676,7 @@ func (pc *PermissionController) showResources(c *gin.Context, db *gorm.DB, tenan
 // @Success 200 {array} models.Permission
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/permissions [get]
+// @Router /authsec/uflow/user/permissions [get]
 func (pc *PermissionController) GetMyPermissions(c *gin.Context) {
 	userID, err := middlewares.ResolveUserID(c)
 	if err != nil {
@@ -708,7 +708,7 @@ func (pc *PermissionController) GetMyPermissions(c *gin.Context) {
 // @Success 200 {object} EffectivePermissionsResponse
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/permissions/effective [get]
+// @Router /authsec/uflow/user/permissions/effective [get]
 func (pc *PermissionController) GetMyEffectivePermissions(c *gin.Context) {
 	userID, err := middlewares.ResolveUserID(c)
 	if err != nil {
@@ -761,7 +761,7 @@ func (pc *PermissionController) GetMyEffectivePermissions(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/permissions/check [get]
+// @Router /authsec/uflow/user/permissions/check [get]
 func (pc *PermissionController) CheckPermission(c *gin.Context) {
 	// Get user ID from context
 	userID, err := middlewares.ResolveUserID(c)

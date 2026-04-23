@@ -79,6 +79,25 @@ func generateEndUserToken() string {
 	)
 }
 
+// generateNonAdminToken creates a JWT for the end user (same tenant, role: "user").
+// Use this to assert that non-admin callers receive 403 on admin-gated endpoints.
+func generateNonAdminToken() string {
+	return generateTokenForTenant(
+		testTenantID, testEndUserID, testEndUserEmail,
+		[]string{"user"},
+		testTenantDomain,
+	)
+}
+
+// generateOtherTenantAdminToken creates a JWT for an admin in a different tenant.
+// Use this to assert that cross-tenant callers receive 404 on ownership-checked endpoints.
+func generateOtherTenantAdminToken(otherTenantID uuid.UUID) string {
+	otherUserID := uuid.New()
+	otherEmail := "admin@other.authsec.local"
+	otherDomain := "other.authsec.local"
+	return generateTokenForTenant(otherTenantID, otherUserID, otherEmail, []string{"admin", "super_admin"}, otherDomain)
+}
+
 // generateExpiredToken creates an expired JWT token for auth rejection tests.
 func generateExpiredToken() string {
 	now := time.Now().Add(-2 * time.Hour)

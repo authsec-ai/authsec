@@ -96,7 +96,7 @@ func generateTemporaryPassword(length int) (string, error) {
 // @Failure 400 {object} map[string]interface{}
 // @Failure 409 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /uflow/admin/invite [post]
+// @Router /authsec/uflow/admin/invite [post]
 func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	var req InviteAdminRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -346,7 +346,7 @@ type CancelInviteResponse struct {
 // @Failure 403 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /uflow/admin/invite/cancel [post]
+// @Router /authsec/uflow/admin/invite/cancel [post]
 func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 	var req CancelInviteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -465,7 +465,7 @@ type ResendInviteResponse struct {
 // @Failure 403 {object} map[string]interface{}
 // @Failure 404 {object} map[string]interface{}
 // @Failure 500 {object} map[string]interface{}
-// @Router /uflow/admin/invite/resend [post]
+// @Router /authsec/uflow/admin/invite/resend [post]
 func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 	var req ResendInviteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -615,7 +615,7 @@ type ListPendingInvitesResponse struct {
 // @Produce json
 // @Success 200 {object} ListPendingInvitesResponse
 // @Failure 500 {object} map[string]interface{}
-// @Router /uflow/admin/invite/pending [get]
+// @Router /authsec/uflow/admin/invite/pending [get]
 func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 	// Get tenant_id from token
 	var tenantUUID uuid.UUID

@@ -82,7 +82,7 @@ type ADUser struct {
 // @Success 200 {object} object
 // @Failure 400 {object} models.ErrorResponse
 // @Failure 500 {object} models.ErrorResponse
-// @Router /uflow/ad/sync [post]
+// @Router /authsec/uflow/ad/sync [post]
 func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 	var input models.SyncUsersInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -184,7 +184,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} models.ErrorResponse
 // @Failure 500 {object} models.ErrorResponse
-// @Router /uflow/ad/test-network [post]
+// @Router /authsec/uflow/ad/test-network [post]
 func (asc *ADSyncController) TestNetworkConnection(c *gin.Context) {
 	var input map[string]string
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -232,7 +232,7 @@ func (asc *ADSyncController) TestNetworkConnection(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} models.ErrorResponse
 // @Failure 500 {object} models.ErrorResponse
-// @Router /uflow/ad/test-connection [post]
+// @Router /authsec/uflow/ad/test-connection [post]
 func (asc *ADSyncController) TestADConnection(c *gin.Context) {
 	var config models.ADSyncConfig
 	if err := c.ShouldBindJSON(&config); err != nil {

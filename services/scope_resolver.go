@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/authsec-ai/authsec/models"
@@ -20,6 +22,31 @@ var oidcCoreScopes = map[string]bool{
 	"offline_access": true,
 	"address":        true,
 	"phone":          true,
+}
+
+// BlockReason classifies why a requested scope was not granted.
+type BlockReason string
+
+const (
+	BlockNotInRSSupported BlockReason = "not_in_rs_supported"
+	BlockNoRBACBinding    BlockReason = "no_rbac_binding"
+	BlockOIDCNotAllowed   BlockReason = "oidc_not_allowed"
+)
+
+// ScopeDiagnostic records the resolution outcome for a single scope.
+type ScopeDiagnostic struct {
+	Scope   string      `json:"scope"`
+	Granted bool        `json:"granted"`
+	Reason  BlockReason `json:"reason,omitempty"`
+}
+
+// ScopeResolutionReport is the full diagnostic output of a scope resolution run.
+type ScopeResolutionReport struct {
+	Requested     []string          `json:"requested"`
+	RSSupported   []string          `json:"rs_supported"`
+	UserEffective []string          `json:"user_effective"`
+	Grantable     []string          `json:"grantable"`
+	Diagnostics   []ScopeDiagnostic `json:"diagnostics"`
 }
 
 // IsOIDCCoreScope returns true if the scope is an OIDC core scope.
@@ -59,11 +86,8 @@ func NewScopeResolver(db *gorm.DB) *ScopeResolver {
 	return &ScopeResolver{db: db}
 }
 
-// ResolveGrantableScopes performs the 3-way intersection:
-// requested ∩ RS-supported ∩ user-effective-scopes (from RBAC → oauth_scope_permissions).
-//
-// If the user has no RBAC bindings or no scope mappings, the result is empty (fail-closed).
-// OIDC core scopes bypass RBAC for OIDC-capable clients.
+// ResolveGrantableScopes performs the 3-way intersection and returns the grantable scope list.
+// Backward-compatible wrapper around ResolveWithReport.
 func (r *ScopeResolver) ResolveGrantableScopes(
 	ctx context.Context,
 	tenantID, userID, resourceServerID string,
@@ -71,27 +95,55 @@ func (r *ScopeResolver) ResolveGrantableScopes(
 	rs *models.ResourceServer,
 	client *models.MCPOAuthClient,
 ) ([]string, error) {
+	report, err := r.ResolveWithReport(ctx, tenantID, userID, resourceServerID, requestedScopes, rs, client)
+	if err != nil {
+		return nil, err
+	}
+	return report.Grantable, nil
+}
+
+// ResolveWithReport performs the 3-way intersection and returns a full diagnostic report.
+// All controller call sites must pass string-form UUIDs (.String()) to match this API.
+func (r *ScopeResolver) ResolveWithReport(
+	ctx context.Context,
+	tenantID, userID, resourceServerID string,
+	requestedScopes []string,
+	rs *models.ResourceServer,
+	client *models.MCPOAuthClient,
+) (*ScopeResolutionReport, error) {
 	isOIDC := clientIsOIDC(client)
 
-	// Build RS supported set
+	// Build RS supported set and snapshot for report
 	rsSupported := make(map[string]struct{})
+	var rsSupportedList []string
 	if rs != nil {
 		for _, s := range rs.ScopesSupported {
 			rsSupported[s] = struct{}{}
+			rsSupportedList = append(rsSupportedList, s)
 		}
 	}
 
-	// Resolve user's effective OAuth scopes from RBAC
+	// Resolve user's effective OAuth scopes from RBAC.
+	// Propagate DB/query errors to callers — transient failures must not be silently
+	// converted into empty RBAC sets and misreported as no_rbac_binding diagnostics.
 	userEffective, err := r.resolveUserEffectiveScopes(ctx, tenantID, userID, resourceServerID)
 	if err != nil {
 		log.Printf("[SCOPE_RESOLVER] RBAC scope resolution failed user=%s tenant=%s rs=%s: %v",
 			userID, tenantID, resourceServerID, err)
-		// Fail-closed: on error, grant no RS scopes (OIDC core still pass through)
-		userEffective = make(map[string]struct{})
+		return nil, fmt.Errorf("resolving user RBAC scopes: %w", err)
 	}
 
+	// Build sorted user_effective list for deterministic report output
+	var userEffectiveList []string
+	for s := range userEffective {
+		userEffectiveList = append(userEffectiveList, s)
+	}
+	sort.Strings(userEffectiveList)
+
 	seen := make(map[string]struct{}, len(requestedScopes))
-	var result []string
+	var grantable []string
+	var diagnostics []ScopeDiagnostic
+
 	for _, s := range requestedScopes {
 		if s == "" {
 			continue
@@ -99,29 +151,39 @@ func (r *ScopeResolver) ResolveGrantableScopes(
 		if _, ok := seen[s]; ok {
 			continue
 		}
+		seen[s] = struct{}{}
+
 		// OIDC core scopes pass through only when the client is OIDC-capable.
-		// These are AS-level, not RS-level, and bypass RBAC.
 		if oidcCoreScopes[s] {
 			if isOIDC {
-				seen[s] = struct{}{}
-				result = append(result, s)
+				grantable = append(grantable, s)
+				diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: true})
+			} else {
+				diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: false, Reason: BlockOIDCNotAllowed})
 			}
 			continue
 		}
-		// RS-specific scopes: 3-way intersection
-		// 1. Must be in RS supported set
+
+		// RS-specific scopes: 3-way intersection with explicit reason tracking
 		if _, ok := rsSupported[s]; !ok {
+			diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: false, Reason: BlockNotInRSSupported})
 			continue
 		}
-		// 2. Must be in user's effective scope set (from RBAC)
 		if _, ok := userEffective[s]; !ok {
+			diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: false, Reason: BlockNoRBACBinding})
 			continue
 		}
-		seen[s] = struct{}{}
-		result = append(result, s)
+		grantable = append(grantable, s)
+		diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: true})
 	}
 
-	return result, nil
+	return &ScopeResolutionReport{
+		Requested:     requestedScopes,
+		RSSupported:   rsSupportedList,
+		UserEffective: userEffectiveList,
+		Grantable:     grantable,
+		Diagnostics:   diagnostics,
+	}, nil
 }
 
 // resolveUserEffectiveScopes returns the set of OAuth scope strings the user is entitled to
@@ -129,6 +191,7 @@ func (r *ScopeResolver) ResolveGrantableScopes(
 //
 // Resolution chain: role_bindings → roles → role_permissions → permissions → oauth_scope_permissions → oauth_scopes
 //
+// Expired role bindings (expires_at <= NOW()) are excluded.
 // Also performs wildcard expansion: if the user has permission mapped to scope "tools:*",
 // all child scopes like "tools:weather:read" are included.
 func (r *ScopeResolver) resolveUserEffectiveScopes(
@@ -159,6 +222,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
 		Where("rb.user_id::text = ?", userID).
 		Where("(rb.tenant_id IS NULL OR rb.tenant_id = ?)", tenantUUID).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(ro.tenant_id IS NULL OR ro.tenant_id = ?)", tenantUUID).
 		Where("(p.tenant_id IS NULL OR p.tenant_id = ?)", tenantUUID).
 		Where("os.tenant_id = ? AND os.resource_server_id = ?", tenantUUID, rsUUID).
@@ -246,4 +310,67 @@ func ValidateRequestedScopes(scopes []string, rs *models.ResourceServer, client 
 		}
 	}
 	return invalid
+}
+
+// RSSpecificScopes filters out OIDC core scopes, returning only RS-specific scopes.
+// Used by the strict-subset enforcement logic in token exchange and refresh.
+func RSSpecificScopes(scopes []string) []string {
+	out := make([]string, 0, len(scopes))
+	for _, s := range scopes {
+		if s != "" && !oidcCoreScopes[s] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// PartitionScopes splits a scope list into OIDC core scopes and RS-specific scopes.
+// Used by introspection to avoid running RBAC resolution against OIDC-only tokens.
+func PartitionScopes(scopes []string) (oidc []string, rsSpecific []string) {
+	for _, s := range scopes {
+		if s == "" {
+			continue
+		}
+		if oidcCoreScopes[s] {
+			oidc = append(oidc, s)
+		} else {
+			rsSpecific = append(rsSpecific, s)
+		}
+	}
+	return
+}
+
+// ScopeSetEqual returns true when a and b contain exactly the same scope strings
+// (order-independent). Used for strict-subset detection at token exchange and refresh.
+func ScopeSetEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ScopesLost returns the RS-specific scopes that are present in granted but absent
+// from current. A non-empty result means partial scope loss has occurred.
+func ScopesLost(granted, current []string) []string {
+	currentSet := make(map[string]struct{}, len(current))
+	for _, s := range current {
+		currentSet[s] = struct{}{}
+	}
+	var lost []string
+	for _, s := range granted {
+		if _, ok := currentSet[s]; !ok {
+			lost = append(lost, s)
+		}
+	}
+	sort.Strings(lost)
+	return lost
 }

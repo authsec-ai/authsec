@@ -69,7 +69,7 @@ type AdminSyncResult struct {
 // @Success 200 {object} AdminSyncResult
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/admin-users/ad/sync [post]
+// @Router /authsec/uflow/admin/admin-users/ad/sync [post]
 func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	var input AdminSyncInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -193,7 +193,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 // @Success 200 {object} AdminSyncResult
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/admin-users/entra/sync [post]
+// @Router /authsec/uflow/admin/admin-users/entra/sync [post]
 func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	var input AdminSyncInput
 	if err := c.ShouldBindJSON(&input); err != nil {

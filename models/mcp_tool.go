@@ -18,6 +18,7 @@ type MCPTool struct {
 	InputSchema      json.RawMessage `json:"input_schema" gorm:"type:jsonb"`
 	Annotations      json.RawMessage `json:"annotations" gorm:"type:jsonb"`
 	DiscoveredAt     time.Time       `json:"discovered_at" gorm:"not null;default:now()"`
+	LastScanGeneration int           `json:"last_scan_generation" gorm:"not null;default:0"`
 
 	// Relations
 	Scopes []OAuthScope `json:"scopes,omitempty" gorm:"many2many:mcp_tool_scope_map;joinForeignKey:ToolID;joinReferences:ScopeID"`

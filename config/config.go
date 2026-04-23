@@ -53,7 +53,8 @@ type Config struct {
 	CorsAllowOrigin    string
 	RedisURL           string
 	ICPServiceURL      string // ICP service URL for PKI provisioning
-	BaseURL            string // Base URL for callbacks (e.g., https://app.authsec.dev)
+	BaseURL            string // Base URL for app/browser callbacks (e.g., https://dev.authsec.dev)
+	OAuthIssuerURL     string // Public OAuth/OIDC issuer base URL (e.g., https://dev.api.authsec.dev)
 
 	// Runtime environment ("development" | "production" | "staging")
 	Environment string
@@ -190,6 +191,7 @@ func LoadConfig() *Config {
 
 	// Load Base URL for OIDC callbacks
 	baseURL := getEnv("BASE_URL", "https://app.authsec.dev")
+	oauthIssuerURL := getEnv("OAUTH_ISSUER_URL", baseURL)
 
 	// Runtime environment
 	environment := getEnv("ENVIRONMENT", "development")
@@ -297,6 +299,7 @@ func LoadConfig() *Config {
 		RedisURL:                redisURL,
 		ICPServiceURL:           icpServiceURL,
 		BaseURL:                 baseURL,
+		OAuthIssuerURL:          oauthIssuerURL,
 		Environment:             environment,
 		TotpEncryptionKey:       totpEncryptionKey,
 		SyncConfigEncryptionKey: syncConfigEncryptionKey,
@@ -360,6 +363,16 @@ func LoadConfig() *Config {
 	}
 
 	return AppConfig
+}
+
+func (c *Config) OAuthBaseURL() string {
+	if c == nil {
+		return ""
+	}
+	if strings.TrimSpace(c.OAuthIssuerURL) != "" {
+		return strings.TrimRight(strings.TrimSpace(c.OAuthIssuerURL), "/")
+	}
+	return strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 }
 
 // ADD THIS: New getter function

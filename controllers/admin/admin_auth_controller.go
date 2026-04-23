@@ -80,7 +80,7 @@ func NewAdminAuthController() (*AdminAuthController, error) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid credentials or account disabled"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/login [post]
+// @Router /authsec/uflow/auth/admin/login [post]
 func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	startTime := time.Now()
 	requestID := c.GetString("request_id")
@@ -464,7 +464,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/login-hybrid [post]
+// @Router /authsec/uflow/auth/admin/login-hybrid [post]
 func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	startTime := time.Now()
 	requestID := c.GetString("request_id")
@@ -817,7 +817,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 409 {object} map[string]string "User or tenant already exists"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/register [post]
+// @Router /authsec/uflow/auth/admin/register [post]
 func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	var input RegisterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1021,7 +1021,7 @@ func (aac *AdminAuthController) assignAdminRoleToUser(userID uuid.UUID, tenantID
 // @Param input body ForgotPasswordInput true "Admin email for password reset"
 // @Success 200 {object} map[string]string "Reset code sent if email exists"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
-// @Router /uflow/auth/admin/forgot-password [post]
+// @Router /authsec/uflow/auth/admin/forgot-password [post]
 func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 	var input ForgotPasswordInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1114,7 +1114,7 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 // @Success 200 {object} map[string]string "OTP verified successfully"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid OTP"
-// @Router /uflow/auth/admin/forgot-password/verify-otp [post]
+// @Router /authsec/uflow/auth/admin/forgot-password/verify-otp [post]
 func (aac *AdminAuthController) AdminVerifyOTP(c *gin.Context) {
 	var input models.VerifyOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1181,7 +1181,7 @@ func (aac *AdminAuthController) AdminVerifyOTP(c *gin.Context) {
 // @Success 200 {object} map[string]string "Password reset successfully"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid verification"
-// @Router /uflow/auth/admin/forgot-password/reset [post]
+// @Router /authsec/uflow/auth/admin/forgot-password/reset [post]
 func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 	var input ResetPasswordInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1245,7 +1245,7 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid OTP"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/complete-registration [post]
+// @Router /authsec/uflow/auth/admin/complete-registration [post]
 func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	var input models.VerifyOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1570,7 +1570,7 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 // @Success 200 {object} models.AdminPrecheckResponse "Email validation result with tenant context"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/login/precheck [post]
+// @Router /authsec/uflow/auth/admin/login/precheck [post]
 func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 	var input models.AdminPrecheckInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1698,7 +1698,7 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 409 {object} map[string]string "Conflict - tenant or user already exists"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/login/bootstrap [post]
+// @Router /authsec/uflow/auth/admin/login/bootstrap [post]
 func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	var input models.AdminBootstrapInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1849,7 +1849,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 // @Produce json
 // @Success 200 {object} models.AuthChallenge "Challenge generated successfully"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/admin/challenge [get]
+// @Router /authsec/uflow/auth/admin/challenge [get]
 func (aac *AdminAuthController) GetAuthChallenge(c *gin.Context) {
 	challenge, err := aac.antiReplayService.GenerateChallenge()
 	if err != nil {

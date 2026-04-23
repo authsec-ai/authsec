@@ -42,7 +42,7 @@ type RevokeTokenRequest struct {
 // @Failure 400 {object} utils.ErrorResponse "Invalid request"
 // @Failure 401 {object} utils.ErrorResponse "Invalid or expired refresh token"
 // @Failure 500 {object} utils.ErrorResponse "Internal server error"
-// @Router /auth/refresh [post]
+// Legacy note: this controller is not mounted on the public router.
 func (tc *TokenController) RefreshToken(c *gin.Context) {
 	var req RefreshTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -71,7 +71,7 @@ func (tc *TokenController) RefreshToken(c *gin.Context) {
 // @Success 200 {object} map[string]string "Token revoked successfully"
 // @Failure 400 {object} utils.ErrorResponse "Invalid request"
 // @Failure 500 {object} utils.ErrorResponse "Internal server error"
-// @Router /auth/revoke [post]
+// Legacy note: this controller is not mounted on the public router.
 func (tc *TokenController) RevokeToken(c *gin.Context) {
 	var req RevokeTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -103,7 +103,7 @@ func (tc *TokenController) RevokeToken(c *gin.Context) {
 // @Success 200 {object} map[string]string "Logged out successfully"
 // @Failure 401 {object} utils.ErrorResponse "Unauthorized"
 // @Failure 500 {object} utils.ErrorResponse "Internal server error"
-// @Router /auth/logout [post]
+// Legacy note: this controller is not mounted on the public router.
 func (tc *TokenController) Logout(c *gin.Context) {
 	// Get user ID from JWT claims (set by auth middleware)
 	userIDStr, exists := c.Get("user_id")
@@ -144,7 +144,7 @@ func (tc *TokenController) Logout(c *gin.Context) {
 // @Success 200 {object} map[string]string "Token blacklisted successfully"
 // @Failure 401 {object} utils.ErrorResponse "Unauthorized"
 // @Failure 500 {object} utils.ErrorResponse "Internal server error"
-// @Router /auth/blacklist [post]
+// Legacy note: this controller is not mounted on the public router.
 func (tc *TokenController) BlacklistToken(c *gin.Context) {
 	// Get token from Authorization header
 	tokenString := c.GetHeader("Authorization")

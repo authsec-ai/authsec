@@ -50,7 +50,7 @@ func NewTOTPController() (*TOTPController, error) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/register [post]
+// @Router /authsec/uflow/auth/totp/register [post]
 func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 	var req models.TOTPRegistrationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -126,7 +126,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request or invalid code"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/confirm [post]
+// @Router /authsec/uflow/auth/totp/confirm [post]
 func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 	var req models.TOTPRegistrationConfirmRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -196,7 +196,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request or invalid code"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/verify [post]
+// @Router /authsec/uflow/auth/totp/verify [post]
 func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	var req models.TOTPVerificationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -294,7 +294,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 // @Success 200 {object} models.TOTPDeviceListResponse "Device list returned"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/devices [get]
+// @Router /authsec/uflow/auth/totp/devices [get]
 func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 	// Get user info from JWT token
 	userIDStr, err := middlewares.ResolveUserID(c)
@@ -347,7 +347,7 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/device/delete [post]
+// @Router /authsec/uflow/auth/totp/device/delete [post]
 func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 	var req models.TOTPDeviceDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -419,7 +419,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/device/primary [post]
+// @Router /authsec/uflow/auth/totp/device/primary [post]
 func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 	var req models.TOTPDeviceDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -489,7 +489,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 // @Success 200 {object} models.BackupCodeRegenerateResponse "New backup codes generated"
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/backup/regenerate [post]
+// @Router /authsec/uflow/auth/totp/backup/regenerate [post]
 func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 	// Get user info from JWT token
 	userIDStr, err := middlewares.ResolveUserID(c)
@@ -545,7 +545,7 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request or invalid TOTP"
 // @Failure 404 {object} map[string]string "User not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/login [post]
+// @Router /authsec/uflow/auth/totp/login [post]
 func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 	var req models.TOTPLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -612,7 +612,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request or invalid TOTP"
 // @Failure 404 {object} map[string]string "User or device code not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/totp/device-approve [post]
+// @Router /authsec/uflow/auth/totp/device-approve [post]
 func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 	var req models.TOTPDeviceApprovalRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

@@ -37,10 +37,39 @@ func NewOAuthASController() *OAuthASController {
 	}
 }
 
+// CanonicalIssuerOnly redirects discovery and OAuth requests to the configured
+// OAuth issuer host when they arrive on a different public host (for example the
+// SPA host). This keeps a single canonical issuer while still avoiding SPA HTML
+// on accidentally probed well-known or /oauth paths.
+func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		canonicalBase := config.AppConfig.OAuthBaseURL()
+		parsed, err := url.Parse(canonicalBase)
+		if err != nil || parsed.Host == "" {
+			c.Next()
+			return
+		}
+
+		requestHost := c.Request.Host
+		if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
+			requestHost = strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
+		}
+
+		if strings.EqualFold(requestHost, parsed.Host) {
+			c.Next()
+			return
+		}
+
+		target := strings.TrimSuffix(canonicalBase, "/") + c.Request.URL.RequestURI()
+		c.Redirect(http.StatusPermanentRedirect, target)
+		c.Abort()
+	}
+}
+
 // ASMetadata serves RFC 8414 Authorization Server Metadata.
 // GET /.well-known/oauth-authorization-server
 func (ctrl *OAuthASController) ASMetadata(c *gin.Context) {
-	baseURL := config.AppConfig.BaseURL
+	baseURL := config.AppConfig.OAuthBaseURL()
 	c.JSON(http.StatusOK, ctrl.service.ASMetadata(baseURL))
 }
 
@@ -48,7 +77,7 @@ func (ctrl *OAuthASController) ASMetadata(c *gin.Context) {
 // GET /.well-known/openid-configuration
 // Returns the same superset document as ASMetadata (OIDC Discovery is a superset of RFC 8414).
 func (ctrl *OAuthASController) OIDCDiscovery(c *gin.Context) {
-	baseURL := config.AppConfig.BaseURL
+	baseURL := config.AppConfig.OAuthBaseURL()
 	c.JSON(http.StatusOK, ctrl.service.ASMetadata(baseURL))
 }
 
@@ -72,27 +101,25 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "client_id required with request_uri"})
 			return
 		}
-		var oauthClient *models.MCPOAuthClient
-		var err error
-		if services.IsHTTPSURL(clientID) {
-			oauthClient, err = ctrl.service.GetOAuthClient(clientID)
-			if err != nil {
-				// CIMD client may exist but use the URL as client_id
-				oauthClient, err = ctrl.service.ResolveCIMDClient(clientID)
-			}
-		} else {
-			oauthClient, err = ctrl.service.GetOAuthClient(clientID)
-		}
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_client"})
-			return
-		}
+
+		// P1 ordering fix: validate the stored PAR reference FIRST before any client
+		// resolution. This prevents state-mutating CIMD upserts from running against an
+		// invalid, expired, or forged request_uri. Client lookup is read-only — no
+		// ResolveCIMDClient fallback (which creates/updates Hydra clients) is permitted here.
 		arcCtx, ctxErr := ctrl.service.GetActiveAuthRequestContextByHydraRequestURI(requestURI)
 		if ctxErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":             "invalid_request_uri",
 				"error_description": "request_uri is unknown or expired",
 			})
+			return
+		}
+
+		// Read-only client lookup. For PAR continuations the client must already exist in
+		// the DB — ResolveCIMDClient (which upserts a Hydra client) is explicitly excluded.
+		oauthClient, err := ctrl.service.GetOAuthClient(clientID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_client"})
 			return
 		}
 		if arcCtx.HydraClientID != oauthClient.HydraClientID {
@@ -102,6 +129,35 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 			})
 			return
 		}
+
+		// Re-check mutable RS + client state that may have changed since PAR was minted.
+		// The original policy was validated at PAR time; these three cheap DB reads close the
+		// window where an admin deactivates an RS, changes registration modes, or revokes a
+		// client registration between PAR issuance and the browser redirect to Hydra.
+		arcRS, rsErr := ctrl.rsService.GetByID(arcCtx.ResourceServerID)
+		if rsErr != nil || !arcRS.Active {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "resource server is no longer active",
+			})
+			return
+		}
+		if !arcRS.AllowsRegistrationMode(oauthClient.RegistrationType) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "resource server no longer allows this client registration type",
+			})
+			return
+		}
+		arcReg, arcRegErr := ctrl.service.GetClientRegistration(arcRS.ID, oauthClient.ID)
+		if arcRegErr != nil || arcReg.Status != "approved" {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "client authorization for this resource has been revoked",
+			})
+			return
+		}
+
 		hydraAuthURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
 		if config.AppConfig.OAuthAuthURL != "" {
 			hydraAuthURL = config.AppConfig.OAuthAuthURL
@@ -175,90 +231,16 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 		return
 	}
 
-	// 1. Look up resource server by resource URI
-	rs, err := ctrl.rsService.GetByResourceURI(resource)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown resource", "resource": resource})
+	// Resolve client + RS and enforce all policy gates in one shared pass — identical to PAR.
+	// validateOAuthPolicy is the single authoritative check for both entrypoints.
+	policy, pErr := ctrl.validateOAuthPolicy(clientID, resource, redirectURI, strings.Fields(scopeParam))
+	if pErr != nil {
+		c.JSON(pErr.Status, gin.H{"error": pErr.Code, "error_description": pErr.Description})
 		return
 	}
-
-	// 2. Resolve OAuth client (CIMD if HTTPS URL, else DCR/prereg lookup)
-	// Client resolution MUST happen before scope validation so OIDC capability can be checked.
-	var oauthClient *models.MCPOAuthClient
-	if services.IsHTTPSURL(clientID) {
-		// CIMD flow
-		if !rs.AllowsRegistrationMode("cimd") {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "resource server does not allow CIMD registration"})
-			return
-		}
-		oauthClient, err = ctrl.service.ResolveCIMDClient(clientID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to resolve CIMD client", "detail": err.Error()})
-			return
-		}
-		if redirectURI != "" && !containsString([]string(oauthClient.RedirectURIs), redirectURI) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_uri not registered in CIMD document"})
-			return
-		}
-		if _, err := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, "cimd"); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register CIMD client for resource"})
-			return
-		}
-	} else {
-		oauthClient, err = ctrl.service.GetOAuthClient(clientID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown client_id"})
-			return
-		}
-		// Validate redirect_uri against registered URIs (same check as CIMD branch)
-		if redirectURI != "" && !containsString([]string(oauthClient.RedirectURIs), redirectURI) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "redirect_uri not registered for this client"})
-			return
-		}
-	}
-
-	// 2b. Validate requested scopes against RS + client OIDC capability.
-	// OIDC core scopes (openid, profile, etc.) are rejected for non-OIDC clients.
-	if scopeParam != "" {
-		requestedScopes := strings.Split(scopeParam, " ")
-		if invalid := services.ValidateRequestedScopes(requestedScopes, rs, oauthClient); len(invalid) > 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_scope",
-				"error_description": "unsupported scope(s): " + strings.Join(invalid, ", "),
-			})
-			return
-		}
-	}
-
-	// 3. Check join table — all client types must have an existing approved registration.
-	// CIMD creates its join row at line 140 above; DCR/prereg create theirs at /oauth/register time.
-	reg, err := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
-	if err != nil || reg.Status != "approved" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "client not authorized for this resource"})
-		return
-	}
-
-	redirectURIToUse := redirectURI
-	switch len(oauthClient.RedirectURIs) {
-	case 0:
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_client",
-			"error_description": "client has no registered redirect_uri",
-		})
-		return
-	case 1:
-		if redirectURIToUse == "" {
-			redirectURIToUse = oauthClient.RedirectURIs[0]
-		}
-	default:
-		if redirectURIToUse == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_request",
-				"error_description": "redirect_uri is required for clients with multiple registered redirect URIs",
-			})
-			return
-		}
-	}
+	oauthClient := policy.Client
+	rs := policy.RS
+	redirectURIToUse := policy.RedirectURI
 
 	// 4. Generate server-side context_id for deterministic binding.
 	// This is NOT the client's state — it's an AuthSec-internal ID.
@@ -451,17 +433,28 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
-	// 2. Parse Hydra's token response
+	// 2. Parse Hydra's token response immediately — capture both tokens before any check
+	// so that every subsequent rejection path can revoke the full set synchronously.
 	var tokenResp map[string]interface{}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: failed to parse Hydra token response: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
+	accessToken, _ := tokenResp["access_token"].(string)
+	refreshToken, _ := tokenResp["refresh_token"].(string) // may be empty for non-OIDC clients
+
+	// revokeIssuedTokens revokes both tokens synchronously before a hard-denial response.
+	// Policy: 403 is always returned even if Hydra revocation fails (Hydra downtime must
+	// not become a bypass). Revocation errors are logged for operator awareness.
+	revokeIssuedTokens := func(label string) {
+		if err := ctrl.service.RevokeFullTokenSet(accessToken, refreshToken); err != nil {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: revocation failed (%s): %v — returning 403 regardless", label, err)
+		}
+	}
 
 	// 3. Extract context_id from the access token's session claims.
 	// Hydra embeds session claims in the JWT access token under "ext".
-	accessToken, _ := tokenResp["access_token"].(string)
 	contextID := extractContextIDFromToken(accessToken)
 
 	if contextID == "" {
@@ -476,8 +469,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	// 4. FAIL CLOSED: MCP authorization_code exchange MUST have a bound auth context.
 	if contextID == "" {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: no context_id in access token for client=%s", oauthClient.ClientID)
-		// Revoke the orphaned token Hydra just issued (best-effort)
-		go ctrl.service.RevokeHydraToken(accessToken)
+		revokeIssuedTokens("missing context_id")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
 			"error_description": "no authorization context found for this token exchange",
@@ -488,6 +480,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	arcCtx, err := ctrl.service.GetAuthRequestContextByContextID(contextID)
 	if err != nil || arcCtx == nil {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: context_id=%s not found or not ready: %v", contextID, err)
+		revokeIssuedTokens("context not found")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
 			"error_description": "authorization context not found or consent not completed",
@@ -498,6 +491,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	// 5. Validate redirect_uri (RFC 6749 §4.1.3: REQUIRED if sent in authorize request)
 	if arcCtx.RedirectURI != "" {
 		if redirectURI == "" {
+			revokeIssuedTokens("redirect_uri required but absent")
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":             "invalid_grant",
 				"error_description": "redirect_uri is required (was included in authorization request)",
@@ -506,6 +500,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		}
 		if redirectURI != arcCtx.RedirectURI {
 			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: redirect_uri mismatch for context_id=%s", contextID)
+			revokeIssuedTokens("redirect_uri mismatch")
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":             "invalid_grant",
 				"error_description": "redirect_uri mismatch",
@@ -516,6 +511,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 
 	// Validate resource (RFC 8707 §2.2: REQUIRED, must match authorization request)
 	if resourceParam == "" {
+		revokeIssuedTokens("resource param missing at exchange")
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "invalid_request",
 			"error_description": "resource parameter is required",
@@ -523,6 +519,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 	if resourceParam != arcCtx.ResourceURI {
+		revokeIssuedTokens("resource param mismatch at exchange")
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "invalid_grant",
 			"error_description": "resource parameter does not match authorization request",
@@ -534,12 +531,14 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	rs, rsErr := ctrl.rsService.GetByID(arcCtx.ResourceServerID)
 	if rsErr != nil {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: RS not found for context_id=%s rs_id=%s", contextID, arcCtx.ResourceServerID)
+		revokeIssuedTokens("RS not found at exchange")
 		c.JSON(http.StatusForbidden, gin.H{"error": "access_denied", "error_description": "resource server not found"})
 		return
 	}
 	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
 	if regErr != nil || reg.Status != "approved" {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: client not approved for RS context_id=%s", contextID)
+		revokeIssuedTokens("registration not approved at exchange")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
 			"error_description": "client registration for resource server is not approved",
@@ -547,30 +546,68 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
-	// 6b. Defense-in-depth: re-run RBAC scope resolution at token exchange time.
-	// If a role was revoked between consent and token exchange → fail-closed.
-	if arcCtx.RequestedScopes != "" {
-		tokenSubject := ""
-		if tokenInfo, introErr := ctrl.service.IntrospectViaHydraAdmin(accessToken); introErr == nil {
-			tokenSubject, _ = tokenInfo["sub"].(string)
+	// 6b. Defense-in-depth: strict-subset RBAC scope enforcement at token exchange time.
+	//
+	// FAIL-CLOSED: if Hydra admin introspection fails, or the token carries no subject/scope,
+	// we cannot confirm the user's current permissions — hard denial + full revocation.
+	// Hydra downtime must not become a bypass. Operators must monitor introspection failures.
+	//
+	// tokenScopes MUST come from Hydra's admin introspection of the issued access token —
+	// NOT from arcCtx.RequestedScopes. The user may have consented to a subset of the
+	// original request; using the request scopes would over-reject valid partial consents.
+	{
+		tokenInfo, introErr := ctrl.service.IntrospectViaHydraAdmin(accessToken)
+		if introErr != nil {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: Hydra admin introspection failed context_id=%s: %v — failing closed",
+				contextID, introErr)
+			revokeIssuedTokens("Hydra introspection failure at exchange")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "authorization server unavailable for permission verification",
+			})
+			return
 		}
-		if tokenSubject != "" {
-			requestedScopes := strings.Split(arcCtx.RequestedScopes, " ")
-			currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
-				c.Request.Context(),
-				arcCtx.TenantID, tokenSubject, arcCtx.ResourceServerID,
-				requestedScopes, rs, oauthClient,
-			)
-			if rbacErr != nil || len(currentScopes) == 0 {
-				log.Printf("[MCP_AUTH] tokenAuthCodeGrant: RBAC re-check failed or empty scopes context_id=%s sub=%s err=%v",
-					contextID, tokenSubject, rbacErr)
-				go ctrl.service.RevokeHydraToken(accessToken)
-				c.JSON(http.StatusForbidden, gin.H{
-					"error":             "insufficient_scope",
-					"error_description": "user permissions have been revoked since authorization",
-				})
-				return
-			}
+		tokenSubject, _ := tokenInfo["sub"].(string)
+		issuedScopeStr, _ := tokenInfo["scope"].(string)
+		if tokenSubject == "" || issuedScopeStr == "" {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: introspection returned no sub/scope context_id=%s — failing closed",
+				contextID)
+			revokeIssuedTokens("empty sub or scope in introspection response")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "token carries no subject or scope",
+			})
+			return
+		}
+		issuedScopes := strings.Fields(issuedScopeStr)
+		currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
+			c.Request.Context(),
+			arcCtx.TenantID, tokenSubject, arcCtx.ResourceServerID,
+			issuedScopes, rs, oauthClient,
+		)
+		if rbacErr != nil || len(currentScopes) == 0 {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: RBAC full revocation context_id=%s sub=%s err=%v",
+				contextID, tokenSubject, rbacErr)
+			revokeIssuedTokens("RBAC revocation (full loss)")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "insufficient_scope",
+				"error_description": "user permissions have been revoked since authorization",
+			})
+			return
+		}
+		// Strict-subset check: if any RS-specific scope in the issued token is no longer
+		// RBAC-grantable, deny. Partial scope loss is a hard denial (no narrowing).
+		issuedRS := services.RSSpecificScopes(issuedScopes)
+		currentRS := services.RSSpecificScopes(currentScopes)
+		if lost := services.ScopesLost(issuedRS, currentRS); len(lost) > 0 {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: partial scope loss context_id=%s sub=%s lost=%v",
+				contextID, tokenSubject, lost)
+			revokeIssuedTokens("partial scope loss at exchange")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "insufficient_scope",
+				"error_description": "user permissions have been partially revoked since authorization",
+			})
+			return
 		}
 	}
 
@@ -578,8 +615,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	// If this fails (already consumed = concurrent request), reject.
 	if err := ctrl.service.ConsumeAuthRequestContext(arcCtx.State); err != nil {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: consume failed context_id=%s: %v", contextID, err)
-		// Revoke the Hydra token since we can't safely return it
-		go ctrl.service.RevokeHydraToken(accessToken)
+		revokeIssuedTokens("context already consumed")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
 			"error_description": "authorization context already consumed",
@@ -650,42 +686,116 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
-	// RBAC re-check on refresh: if Hydra issued a new token, verify the user still has permissions.
-	// This closes the gap where an admin revokes a role but the user keeps refreshing.
-	if statusCode == http.StatusOK && resourceParam != "" {
-		var tokenResp map[string]interface{}
-		if jsonErr := json.Unmarshal(body, &tokenResp); jsonErr == nil {
-			accessToken, _ := tokenResp["access_token"].(string)
-			if accessToken != "" {
-				if tokenInfo, introErr := ctrl.service.IntrospectViaHydraAdmin(accessToken); introErr == nil {
-					sub, _ := tokenInfo["sub"].(string)
-					tokenScopeStr, _ := tokenInfo["scope"].(string)
-					if sub != "" && tokenScopeStr != "" {
-						rs, rsErr := ctrl.rsService.GetByResourceURI(resourceParam)
-						if rsErr == nil {
-							tokenScopes := strings.Split(tokenScopeStr, " ")
-							currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
-								c.Request.Context(),
-								rs.TenantID.String(), sub, rs.ID.String(),
-								tokenScopes, rs, oauthClient,
-							)
-							if rbacErr != nil || len(currentScopes) == 0 {
-								log.Printf("[MCP_AUTH] tokenRefreshGrant: RBAC revoked for sub=%s rs=%s", sub, resourceParam)
-								go ctrl.service.RevokeHydraToken(accessToken)
-								c.JSON(http.StatusForbidden, gin.H{
-									"error":             "insufficient_scope",
-									"error_description": "user permissions have been revoked",
-								})
-								return
-							}
-						}
-					}
-				}
-			}
+	// Hydra rejected the refresh token (e.g. expired, already used, unknown client).
+	// Proxy the error back as-is — no RBAC enforcement needed for non-200 responses.
+	if statusCode != http.StatusOK {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: Hydra rejected refresh client=%s resource=%s status=%d",
+			oauthClient.ClientID, resourceParam, statusCode)
+		writeProxiedResponse(c.Writer, statusCode, body, respHeader)
+		return
+	}
+
+	// statusCode == 200: Hydra issued a new token set.
+	//
+	// FAIL-CLOSED RBAC enforcement — ALL of the following steps are UNCONDITIONAL:
+	// every parse failure, introspection failure, or permission mismatch revokes the
+	// newly-issued token set synchronously and returns 403.
+	//
+	// Hydra downtime is NOT a bypass: if admin introspection is unreachable we cannot
+	// verify current user permissions, so we must deny. Operators must monitor
+	// revocation failure logs; Hydra token TTL is the backstop for revocation failures.
+	//
+	// The old refresh token was already consumed by Hydra before this point.
+	// Both new tokens (access + refresh) are revoked on any denial.
+
+	var refreshResp map[string]interface{}
+	if jsonErr := json.Unmarshal(body, &refreshResp); jsonErr != nil {
+		// Body is not parseable — cannot verify permissions. No tokens to revoke yet.
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: cannot parse Hydra 200 response: %v — failing closed", jsonErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	newAccessToken, _ := refreshResp["access_token"].(string)
+	newRefreshToken, _ := refreshResp["refresh_token"].(string)
+
+	// revokeRefreshed revokes both newly-issued tokens synchronously.
+	// 403 is always returned even when revocation itself fails — Hydra downtime must
+	// not become a bypass. The trade-off (live Hydra tokens vs. denied refresh) is
+	// accepted; operators must monitor revocation failure logs.
+	revokeRefreshed := func(label string) {
+		if err := ctrl.service.RevokeFullTokenSet(newAccessToken, newRefreshToken); err != nil {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: revocation failed (%s): %v — returning 403 regardless", label, err)
 		}
 	}
 
-	log.Printf("[MCP_AUTH] tokenRefreshGrant: client=%s resource=%s status=%d", oauthClient.ClientID, resourceParam, statusCode)
+	if newAccessToken == "" {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: Hydra 200 response missing access_token — failing closed")
+		revokeRefreshed("missing access_token in refresh response")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "authorization server returned invalid token response",
+		})
+		return
+	}
+
+	// Admin introspection is required to obtain the canonical issued scope and subject.
+	// Failure here (network, 5xx, circuit-open) → fail closed.
+	tokenInfo, introErr := ctrl.service.IntrospectViaHydraAdmin(newAccessToken)
+	if introErr != nil {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: admin introspect failed: %v — failing closed", introErr)
+		revokeRefreshed("admin introspect failure at refresh")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "authorization server unavailable for permission verification",
+		})
+		return
+	}
+
+	sub, _ := tokenInfo["sub"].(string)
+	issuedScopeStr, _ := tokenInfo["scope"].(string)
+	if sub == "" || issuedScopeStr == "" {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: introspect returned empty sub/scope — failing closed")
+		revokeRefreshed("empty sub or scope in refresh introspection response")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "token carries no subject or scope",
+		})
+		return
+	}
+
+	issuedScopes := strings.Fields(issuedScopeStr)
+	currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
+		c.Request.Context(),
+		rs.TenantID.String(), sub, rs.ID.String(),
+		issuedScopes, rs, oauthClient,
+	)
+	if rbacErr != nil || len(currentScopes) == 0 {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: RBAC fully revoked sub=%s rs=%s err=%v", sub, resourceParam, rbacErr)
+		revokeRefreshed("full RBAC loss on refresh")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "insufficient_scope",
+			"error_description": "user permissions have been revoked",
+		})
+		return
+	}
+
+	// Strict-subset: any RS-specific scope the refreshed token carries that RBAC no longer
+	// grants is a hard denial. Scope narrowing is not permitted at refresh time.
+	issuedRS := services.RSSpecificScopes(issuedScopes)
+	currentRS := services.RSSpecificScopes(currentScopes)
+	if lost := services.ScopesLost(issuedRS, currentRS); len(lost) > 0 {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: partial scope loss sub=%s rs=%s lost=%v", sub, resourceParam, lost)
+		revokeRefreshed("partial scope loss on refresh")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "insufficient_scope",
+			"error_description": "user permissions have been partially revoked",
+		})
+		return
+	}
+
+	// All checks passed — return the refreshed token set.
+	log.Printf("[MCP_AUTH] tokenRefreshGrant: success client=%s resource=%s", oauthClient.ClientID, resourceParam)
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
 
@@ -817,37 +927,79 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		return
 	}
 
-	// LIVE RBAC enforcement: re-resolve current permissions from RBAC at introspection time.
-	// This enables instant revocation — admin revokes a role → next MCP request → active: false.
+	// LIVE RBAC enforcement with OIDC-only token fix.
+	//
+	// Design principles:
+	//  1. sub and scope are REQUIRED for any active, audience-matched token. If either is
+	//     absent, we cannot enforce permissions — treat as inactive (fail closed).
+	//  2. OIDC core scopes (openid, profile, email, ...) are passed through without RBAC
+	//     resolution. Previously, passing nil client to ResolveGrantableScopes caused
+	//     clientIsOIDC(nil)==false → OIDC scopes treated as RS-specific → empty resolution
+	//     → active:false for valid OIDC-only tokens. Fixed by partitioning before resolution.
+	//  3. RS-specific scopes are subject to live RBAC resolution and strict-subset enforcement.
 	sub, _ := tokenInfo["sub"].(string)
 	tokenScopeStr, _ := tokenInfo["scope"].(string)
-	if sub != "" && tokenScopeStr != "" {
-		tokenScopes := strings.Split(tokenScopeStr, " ")
-		currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
+
+	// Fail closed: sub and scope are mandatory for enforcement. An active token missing
+	// either field is structurally invalid from AuthSec's perspective — return active:false
+	// rather than passing the raw Hydra payload through without a permission check.
+	if sub == "" || tokenScopeStr == "" {
+		log.Printf("[MCP_AUTH] Introspect: active token missing sub or scope sub=%q scope=%q — failing closed",
+			sub, tokenScopeStr)
+		c.JSON(http.StatusOK, gin.H{"active": false})
+		return
+	}
+
+	// Enforcement block runs unconditionally for all active, audience-matched tokens.
+	tokenScopes := strings.Fields(tokenScopeStr)
+	oidcScopes, rsScopes := services.PartitionScopes(tokenScopes)
+
+	var finalScopes []string
+
+	if len(rsScopes) > 0 {
+		// Run RBAC resolution only for the RS-specific portion of the token's scopes.
+		// Passing nil client is correct here: rsScopes contains no OIDC core scopes,
+		// so clientIsOIDC(nil)==false causes no incorrect exclusions.
+		currentRS, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 			c.Request.Context(),
 			rs.TenantID.String(), sub, rs.ID.String(),
-			tokenScopes,
+			rsScopes,
 			rs,
-			nil, // no client needed for introspection — OIDC core scopes pass through on their own
+			nil,
 		)
 		if rbacErr != nil {
 			log.Printf("[MCP_AUTH] Introspect: RBAC resolution failed sub=%s rs=%s: %v", sub, rs.ResourceURI, rbacErr)
-			// Fail-closed: RBAC error → treat as inactive
 			c.JSON(http.StatusOK, gin.H{"active": false})
 			return
 		}
-		if len(currentScopes) == 0 {
-			// Role was fully revoked → token is effectively inactive
-			log.Printf("[MCP_AUTH] Introspect: RBAC revoked all scopes sub=%s rs=%s", sub, rs.ResourceURI)
+		if len(currentRS) == 0 {
+			log.Printf("[MCP_AUTH] Introspect: RBAC revoked all RS scopes sub=%s rs=%s", sub, rs.ResourceURI)
 			c.JSON(http.StatusOK, gin.H{"active": false})
 			return
 		}
-		// Override scope in response with CURRENT RBAC-resolved permissions
-		tokenInfo["scope"] = strings.Join(currentScopes, " ")
-		// Update ext.permissions if present
-		if ext, ok := tokenInfo["ext"].(map[string]interface{}); ok {
-			ext["permissions"] = currentScopes
+		// Strict-subset: any RS scope the token carried that RBAC no longer grants → inactive.
+		if lost := services.ScopesLost(rsScopes, currentRS); len(lost) > 0 {
+			log.Printf("[MCP_AUTH] Introspect: partial RS scope loss sub=%s rs=%s lost=%v", sub, rs.ResourceURI, lost)
+			c.JSON(http.StatusOK, gin.H{"active": false})
+			return
 		}
+		finalScopes = append(oidcScopes, currentRS...)
+	} else {
+		// OIDC-only token (e.g. openid profile): no RS-specific scopes → no RBAC check.
+		// The token remains active as long as Hydra considers it active and the audience matches.
+		finalScopes = oidcScopes
+	}
+
+	if len(finalScopes) == 0 {
+		log.Printf("[MCP_AUTH] Introspect: no scopes remain after enforcement sub=%s rs=%s", sub, rs.ResourceURI)
+		c.JSON(http.StatusOK, gin.H{"active": false})
+		return
+	}
+
+	// Override scope in response with current live permissions
+	tokenInfo["scope"] = strings.Join(finalScopes, " ")
+	if ext, ok := tokenInfo["ext"].(map[string]interface{}); ok {
+		ext["permissions"] = finalScopes
 	}
 
 	c.JSON(http.StatusOK, tokenInfo)
@@ -986,7 +1138,7 @@ func (ctrl *OAuthASController) EndSession(c *gin.Context) {
 	// This is the correct approach for id_tokens — Hydra's introspection endpoint is for
 	// access tokens and may not recognize id_tokens.
 	if idTokenHint != "" {
-		sub, err := ctrl.service.VerifyIDTokenHint(idTokenHint, config.AppConfig.BaseURL, clientID)
+		sub, err := ctrl.service.VerifyIDTokenHint(idTokenHint, config.AppConfig.OAuthBaseURL(), clientID)
 		if err != nil {
 			log.Printf("[MCP_AUTH] EndSession: id_token_hint verification failed: %v", err)
 			// id_token_hint is optional per spec — proceed without subject
@@ -1085,38 +1237,16 @@ func (ctrl *OAuthASController) PAR(c *gin.Context) {
 		return
 	}
 
-	// Resolve client
-	oauthClient, rs, err := ctrl.resolveClientAndRS(clientID, resource)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
+	// Resolve client + RS and enforce all policy gates in one shared pass.
+	// validateOAuthPolicy is the single authoritative check for PAR and full-query Authorize.
+	policy, pErr := ctrl.validateOAuthPolicy(clientID, resource, redirectURI, strings.Fields(scopeParam))
+	if pErr != nil {
+		c.JSON(pErr.Status, gin.H{"error": pErr.Code, "error_description": pErr.Description})
 		return
 	}
-
-	// Validate scopes against RS + client OIDC capability
-	if scopeParam != "" {
-		requestedScopes := strings.Split(scopeParam, " ")
-		if invalid := services.ValidateRequestedScopes(requestedScopes, rs, oauthClient); len(invalid) > 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_scope",
-				"error_description": "unsupported scope(s): " + strings.Join(invalid, ", "),
-			})
-			return
-		}
-	}
-
-	// Validate redirect_uri
-	if redirectURI != "" && !containsString([]string(oauthClient.RedirectURIs), redirectURI) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "redirect_uri not registered"})
-		return
-	}
-	if redirectURI == "" {
-		if len(oauthClient.RedirectURIs) == 1 {
-			redirectURI = oauthClient.RedirectURIs[0]
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "redirect_uri required"})
-			return
-		}
-	}
+	oauthClient := policy.Client
+	rs := policy.RS
+	redirectURI = policy.RedirectURI
 
 	// Build auth context
 	contextID := uuid.New().String()
@@ -1200,40 +1330,133 @@ func (ctrl *OAuthASController) PAR(c *gin.Context) {
 	})
 }
 
-// resolveClientAndRS resolves the OAuth client (CIMD or DCR) and resource server.
-func (ctrl *OAuthASController) resolveClientAndRS(clientID, resource string) (*models.MCPOAuthClient, *models.ResourceServer, error) {
+// OAuthPolicyResult holds the validated policy state from validateOAuthPolicy.
+type OAuthPolicyResult struct {
+	Client      *models.MCPOAuthClient
+	RS          *models.ResourceServer
+	RedirectURI string // resolved (auto-selected for single-URI clients)
+}
+
+// policyError is a structured policy rejection that carries an HTTP status code,
+// an OAuth error code, and a human-readable description.
+type policyError struct {
+	Status      int
+	Code        string
+	Description string
+}
+
+func (e *policyError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Code, e.Description)
+}
+
+// validateOAuthPolicy is the single authoritative policy gate for all new OAuth
+// authorization requests — PAR and full-query Authorize (Branch B).
+//
+// Checks enforced in order (fail-closed):
+//  1. RS exists and is Active
+//  2. Client resolution: CIMD (HTTPS client_id) or DCR/prereg
+//  3. Exact registration-mode check: rs.AllowsRegistrationMode(client.RegistrationType)
+//     — prevents an RS that only allows "prereg" from admitting a "dcr" client even if
+//     both modes were once enabled.
+//  4. Client registration approval (join-table Status == "approved")
+//  5. Redirect URI validation (auto-selects single URI, requires explicit URI for multiples)
+//  6. Scope validation via services.ValidateRequestedScopes
+func (ctrl *OAuthASController) validateOAuthPolicy(
+	clientID, resource, redirectURI string,
+	requestedScopes []string,
+) (*OAuthPolicyResult, *policyError) {
+	// 1. RS resolution and active check
 	rs, err := ctrl.rsService.GetByResourceURI(resource)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unknown resource: %s", resource)
+		return nil, &policyError{http.StatusBadRequest, "invalid_request", "unknown resource: " + resource}
+	}
+	if !rs.Active {
+		return nil, &policyError{http.StatusForbidden, "access_denied", "resource server is inactive"}
 	}
 
+	// 2. Client resolution + exact registration-mode enforcement.
+	//
+	// For CIMD (HTTPS clientID): we know the intended type is "cimd" before any network
+	// call. Fail fast if cimd is not in the RS's RegistrationModes — avoids an unnecessary
+	// outbound fetch and gives a meaningful 403 rather than a network error.
+	//
+	// For DCR/prereg (non-HTTPS): resolve the client first to learn its actual
+	// RegistrationType, then enforce the mode check. This catches the case where an RS
+	// allows only ["prereg"] but an existing "dcr" client attempts to use it.
 	var oauthClient *models.MCPOAuthClient
-
 	if services.IsHTTPSURL(clientID) {
-		// CIMD flow
+		// Fast-path mode check before the outbound CIMD fetch
+		if !rs.AllowsRegistrationMode("cimd") {
+			return nil, &policyError{
+				http.StatusForbidden, "access_denied",
+				"resource server does not allow cimd registration",
+			}
+		}
 		resolved, cimdErr := ctrl.service.ResolveCIMDClient(clientID)
 		if cimdErr != nil {
-			return nil, nil, fmt.Errorf("CIMD resolution failed: %w", cimdErr)
+			return nil, &policyError{http.StatusBadRequest, "invalid_client", "failed to resolve CIMD client: " + cimdErr.Error()}
 		}
 		oauthClient = resolved
+		// Lazily create the join row for CIMD clients (idempotent)
 		if _, regErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, "cimd"); regErr != nil {
-			return nil, nil, fmt.Errorf("client registration failed: %w", regErr)
+			return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register CIMD client for resource"}
 		}
 	} else {
+		// DCR / prereg path: clientID is a UUID string
 		found, lookupErr := ctrl.service.GetOAuthClient(clientID)
 		if lookupErr != nil {
-			return nil, nil, fmt.Errorf("unknown client_id: %s", clientID)
+			return nil, &policyError{http.StatusBadRequest, "invalid_client", "unknown client_id"}
 		}
 		oauthClient = found
 	}
 
-	// Check approved registration
-	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
-	if regErr != nil || reg.Status != "approved" {
-		return nil, nil, fmt.Errorf("client not authorized for this resource")
+	// 3. Exact registration-mode enforcement for DCR/prereg clients.
+	// (CIMD was already checked with a fast-path in step 2 before the fetch.)
+	if !rs.AllowsRegistrationMode(oauthClient.RegistrationType) {
+		return nil, &policyError{
+			http.StatusForbidden, "access_denied",
+			fmt.Sprintf("resource server does not allow %s registration", oauthClient.RegistrationType),
+		}
 	}
 
-	return oauthClient, rs, nil
+	// 4. Client registration approval (join table)
+	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
+	if regErr != nil || reg.Status != "approved" {
+		return nil, &policyError{http.StatusForbidden, "access_denied", "client not authorized for this resource"}
+	}
+
+	// 5. Redirect URI resolution and validation
+	resolvedRedirectURI := redirectURI
+	switch len(oauthClient.RedirectURIs) {
+	case 0:
+		return nil, &policyError{http.StatusBadRequest, "invalid_client", "client has no registered redirect_uri"}
+	case 1:
+		if resolvedRedirectURI == "" {
+			resolvedRedirectURI = oauthClient.RedirectURIs[0]
+		} else if resolvedRedirectURI != oauthClient.RedirectURIs[0] {
+			return nil, &policyError{http.StatusBadRequest, "invalid_request", "redirect_uri not registered for this client"}
+		}
+	default:
+		if resolvedRedirectURI == "" {
+			return nil, &policyError{http.StatusBadRequest, "invalid_request",
+				"redirect_uri is required for clients with multiple registered redirect URIs"}
+		}
+		if !containsString([]string(oauthClient.RedirectURIs), resolvedRedirectURI) {
+			return nil, &policyError{http.StatusBadRequest, "invalid_request", "redirect_uri not registered for this client"}
+		}
+	}
+
+	// 6. Scope validation
+	if len(requestedScopes) > 0 {
+		if invalid := services.ValidateRequestedScopes(requestedScopes, rs, oauthClient); len(invalid) > 0 {
+			return nil, &policyError{
+				http.StatusBadRequest, "invalid_scope",
+				"unsupported scope(s): " + strings.Join(invalid, ", "),
+			}
+		}
+	}
+
+	return &OAuthPolicyResult{Client: oauthClient, RS: rs, RedirectURI: resolvedRedirectURI}, nil
 }
 
 // extractClaim extracts a string claim from Hydra ext session claims or top-level introspection.
@@ -1399,8 +1622,14 @@ func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 }
 
 // RevokeConsentGrant revokes a consent grant (admin).
-// DELETE /platform/consent-grants/:id
+// DELETE /authsec/consent-grants/:id
 func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
 	grantIDStr := c.Param("id")
 	grantID, err := uuid.Parse(grantIDStr)
 	if err != nil {
@@ -1408,11 +1637,14 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.consentService.RevokeConsent(grantID); err != nil {
+	// RevokeConsentByTenant enforces tenant ownership — cross-tenant revocations are rejected.
+	if err := ctrl.consentService.RevokeConsentByTenant(grantID, tenantID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "consent_grant_revoked", "oauth_consent_grant",
+		grantIDStr, http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 

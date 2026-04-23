@@ -43,7 +43,7 @@ type EndUserController struct{}
 // @Failure 404 {object} map[string]string
 // @Failure 409 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/clients/register [post]
+// @Router /authsec/uflow/user/clients/register [post]
 func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	var input models.RegisterClientsRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -170,7 +170,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/enduser/{tenant_id}/{user_id} [get]
+// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [get]
 type GetEndUsersFilter struct {
 	TenantID string `json:"tenant_id" binding:"required" validate:"required"`
 	Page     int    `json:"page,omitempty"`
@@ -297,8 +297,8 @@ func resolveEndUserLookup(identifier, clientIDParam string) (byID bool, userID u
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/enduser/list [get]
-// @Router /uflow/user/enduser/list [post]
+// @Router /authsec/uflow/user/enduser/list [get]
+// @Router /authsec/uflow/user/enduser/list [post]
 func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 	var filter GetEndUsersFilter
 
@@ -434,7 +434,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/enduser/databases [get]
+// @Router /authsec/uflow/user/enduser/databases [get]
 func (euc *EndUserController) GetTenantDatabases(c *gin.Context) {
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -490,7 +490,7 @@ func (euc *EndUserController) GetTenantDatabases(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/enduser/{tenant_id}/{user_id}/status [put]
+// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id}/status [put]
 func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -570,7 +570,7 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/enduser/{tenant_id}/{user_id} [put]
+// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [put]
 func (euc *EndUserController) UpdateUser(c *gin.Context) {
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -684,9 +684,9 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 // @Failure 500 {object} map[string]string
 
-// @Router /uflow/user/enduser/{tenant_id}/{user_id} [delete]
+// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [delete]
 
-// @Router /uflow/user/enduser/delete [post]
+// @Router /authsec/uflow/user/enduser/delete [post]
 
 func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
@@ -879,7 +879,7 @@ type DeleteUserAllRequest struct {
 
 // @Failure 500 {object} map[string]string "Internal server error"
 
-// @Router /uflow/user/enduser/delete_all [post]
+// @Router /authsec/uflow/user/enduser/delete_all [post]
 
 func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
@@ -1200,8 +1200,8 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 }
 
 type toggleEndUserActiveRequest struct {
-	TenantID string        `json:"tenant_id" binding:"required"`
-	UserID   string        `json:"user_id" binding:"required"`
+	TenantID string               `json:"tenant_id" binding:"required"`
+	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
@@ -1665,7 +1665,7 @@ func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /user/register/initiate [post]
+// @Router /authsec/uflow/user/register/initiate [post]
 func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 	var input models.CustomLoginRegister
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1805,7 +1805,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /user/register/complete [post]
+// @Router /authsec/uflow/user/register/complete [post]
 func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	var input struct {
 		Email    string `json:"email" binding:"required,email"`
@@ -2091,7 +2091,7 @@ func (tc *EndUserController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/forgot-password [post]
+// @Router /authsec/uflow/user/forgot-password [post]
 func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 	var input models.CustomForgotPasswordInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2171,7 +2171,7 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/forgot-password/verify-otp [post]
+// @Router /authsec/uflow/user/forgot-password/verify-otp [post]
 func (euc *EndUserController) CustomVerifyPasswordResetOTP(c *gin.Context) {
 	var input models.CustomVerifyPasswordResetOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2214,7 +2214,7 @@ func (euc *EndUserController) CustomVerifyPasswordResetOTP(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/forgot-password/reset [post]
+// @Router /authsec/uflow/user/forgot-password/reset [post]
 func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 	var input models.CustomResetPasswordInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2497,7 +2497,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/admin/reset-password [post]
+// @Router /authsec/uflow/user/admin/reset-password [post]
 func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 	var input models.AdminResetPasswordInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2657,7 +2657,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 // @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/clients [get]
+// @Router /authsec/uflow/user/clients [get]
 func (euc *EndUserController) GetClients(c *gin.Context) {
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
@@ -2783,7 +2783,7 @@ func (euc *EndUserController) GetClients(c *gin.Context) {
 // @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/clients/get [post]
+// @Router /authsec/uflow/user/clients/get [post]
 func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 	var req struct {
 		TenantID string `json:"tenant_id" binding:"required"`
@@ -2900,7 +2900,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 // @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/clientms/tenants/{tenant_id}/clients/getClients [post]
+// @Router /authsec/uflow/clientms/tenants/{tenant_id}/clients/getClients [post]
 func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 	// Get tenant_id from token
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
@@ -3010,7 +3010,7 @@ func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/auth/notify/new-user-registration [post]
+// @Router /authsec/uflow/auth/notify/new-user-registration [post]
 func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 	const ownerEmail = "a@authnull.com"
 

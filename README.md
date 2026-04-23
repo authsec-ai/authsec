@@ -12,6 +12,8 @@ AuthSec is a unified Go service for the complete identity lifecycle: authenticat
 - [Quick Start](#quick-start)
 - [Environment Variables](#environment-variables)
 - [API Route Map](#api-route-map)
+  - [OAuth Authorization Server (`/.well-known/*`, `/oauth/*`)](#oauth-authorization-server-well-known-oauth)
+  - [Resource Servers (`/authsec/resource-servers`)](#resource-servers-authsecresource-servers)
   - [Core Auth & User Flow (`/authsec/uflow`)](#core-auth--user-flow-authsecuflow)
   - [WebAuthn / Passkeys (`/authsec/webauthn`)](#webauthn--passkeys-authsecwebauthn)
   - [Client Management (`/authsec/clientms`)](#client-management-authsecclientms)
@@ -43,13 +45,15 @@ AuthSec is a unified Go service for the complete identity lifecycle: authenticat
 │  /authsec/clientms/*     – Client lifecycle management            │
 │  /authsec/hmgr/*         – Ory Hydra login/consent, SAML SSO      │
 │  /authsec/oocmgr/*       – OIDC provider config & Hydra sync      │
+│  /oauth/*                – OAuth AS, OIDC, PAR, JWKS, userinfo    │
+│  /authsec/resource-servers/* – MCP resource server admin surface  │
 │  /authsec/authz/*        – JWT verification, RBAC checks          │
 │  /authsec/auth/token/*   – token helper endpoints                 │
 │  /authsec/exsvc/*        – External service registry              │
 │  /authsec/spire/*        – SPIFFE workload identity               │
 │  /authsec/migration/*    – Database migration management          │
 │                                                                    │
-│  /.well-known/*          – OIDC discovery (RFC 8414 root path)    │
+│  /.well-known/*          – OAuth AS / OIDC discovery              │
 │  /metrics                – Prometheus metrics                     │
 └────────────────────────────────────────────────────────────────────┘
          │
@@ -71,6 +75,8 @@ All HTTP routes are served from a single `gin.Engine`. Each module's routes live
 | Client Management | `/authsec/clientms` | Hydra client lifecycle management |
 | Hydra Manager | `/authsec/hmgr` | Ory Hydra login/consent, SAML SSO, token exchange |
 | OIDC Config Manager | `/authsec/oocmgr` | OIDC provider config, Hydra client sync, SAML providers |
+| OAuth Authorization Server | `/.well-known/*`, `/oauth/*` | RFC 8414 / OIDC discovery, authorize, token, introspect, JWKS, PAR, userinfo |
+| Resource Servers | `/authsec/resource-servers` | MCP resource server registration, introspection secrets, nested OAuth clients, scope matrix |
 | Authorization | `/authsec/authz`, `/authsec/auth/token` | JWT verify/issue, RBAC permission checks, group management |
 | External Services | `/authsec/exsvc` | External service registry with Vault-backed credentials |
 | SPIRE Headless | `/authsec/spire` | SPIFFE/SPIRE workload identity, OIDC token exchange, cloud federation (AWS/Azure/GCP), RBAC/ABAC policy engine |
@@ -137,6 +143,7 @@ The server starts on port **7468** by default.
 | `JWT_DEF_SECRET` | — | Default JWT signing secret (admin / platform tokens) |
 | `JWT_SDK_SECRET` | — | SDK JWT signing secret |
 | `BASE_URL` | `https://app.authsec.dev` | Base URL for OIDC callbacks and email links |
+| `OAUTH_ISSUER_URL` | `BASE_URL` | Public OAuth/OIDC issuer and API base advertised in discovery and resource server metadata |
 | `TENANT_DOMAIN_SUFFIX` | — | Suffix for auto-generated tenant sub-domains |
 | `REDIS_URL` | `""` | Redis connection URL (e.g. `redis://localhost:6379`) |
 | `ICP_SERVICE_URL` | `http://localhost:7001` | ICP/PKI provisioning service |
@@ -216,7 +223,43 @@ Required only when Okta is used as a CIBA provider.
 
 ## API Route Map
 
-All application routes are under the `/authsec` prefix (except OIDC discovery and `/metrics`).
+All application routes are under the `/authsec` prefix except the root OAuth Authorization Server surface and `/metrics`.
+
+### OAuth Authorization Server (`/.well-known/*`, `/oauth/*`)
+
+These root-level endpoints are the public OAuth/OIDC contract and are the source of truth for MCP integrations.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
+| `GET` | `/.well-known/openid-configuration` | OIDC discovery document |
+| `GET` | `/oauth/authorize` | Authorization endpoint |
+| `POST` | `/oauth/token` | Token endpoint |
+| `POST` | `/oauth/introspect` | RFC 7662 token introspection |
+| `GET` | `/oauth/jwks` | JWKS endpoint for AuthSec-issued tokens |
+| `POST` | `/oauth/register` | Dynamic client registration |
+| `POST` | `/oauth/par` | Pushed authorization requests |
+| `GET/POST` | `/oauth/userinfo` | OIDC userinfo |
+| `GET` | `/oauth/logout` | RP-initiated logout |
+| `POST` | `/oauth/revoke` | OAuth revocation |
+
+### Resource Servers (`/authsec/resource-servers`)
+
+This is the canonical MCP protected-resource admin API.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/authsec/resource-servers` | Register a resource server and issue its one-time introspection secret |
+| `GET` | `/authsec/resource-servers` | List resource servers for the tenant |
+| `GET` | `/authsec/resource-servers/:id` | Get resource server details |
+| `PUT` | `/authsec/resource-servers/:id` | Update resource server details |
+| `DELETE` | `/authsec/resource-servers/:id` | Delete a resource server |
+| `POST` | `/authsec/resource-servers/:id/rotate-introspection-secret` | Rotate the introspection secret |
+| `POST` | `/authsec/resource-servers/:id/clients` | Pre-register an OAuth client for the resource server |
+| `GET` | `/authsec/resource-servers/:id/clients` | List nested OAuth clients |
+| `DELETE` | `/authsec/resource-servers/:id/clients/:client_id` | Revoke a nested OAuth client |
+| `GET` | `/authsec/resource-servers/:id/scope-matrix` | View tool-to-scope mappings |
+| `GET` | `/authsec/resource-servers/:id/sdk-policy` | Fetch SDK tool policy derived from the scope matrix |
 
 ### Core Auth & User Flow (`/authsec/uflow`)
 
@@ -735,12 +778,14 @@ Manages master and per-tenant database migrations. All endpoints require JWT aut
 
 ### Well-Known Endpoints
 
-Required at the root path by RFC 8414. These cannot be moved.
+Required at the root path by RFC 8414 / OIDC discovery. These cannot be moved.
 
 | Method | Path | Description |
 | --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | OAuth authorization server metadata |
 | `GET` | `/.well-known/openid-configuration` | OIDC discovery document |
-| `GET` | `/.well-known/jwks.json` | JWK Set (public signing keys) |
+
+OAuth signing keys are exposed at `/oauth/jwks`.
 
 ### Metrics
 

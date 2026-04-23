@@ -131,7 +131,7 @@ func validateTenantDomain(db *gorm.DB, tenantID uuid.UUID, providedDomain, origi
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/register/initiate [post]
+// @Router /authsec/uflow/register/initiate [post]
 func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	var input models.InitiateRegistrationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -261,7 +261,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/register/verify [post]
+// @Router /authsec/uflow/register/verify [post]
 func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	var input models.VerifyOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -635,7 +635,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/login [post]
+// @Router /authsec/uflow/login [post]
 func (uc *UserController) Login(c *gin.Context) {
 	var input models.LoginInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -807,7 +807,7 @@ func (uc *UserController) Login(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/login/webauthn-callback [post]
+// @Router /authsec/uflow/login/webauthn-callback [post]
 func (uc *UserController) WebAuthnCallback(c *gin.Context) {
 	var input models.WebAuthnCallbackInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -898,7 +898,7 @@ func (uc *UserController) WebAuthnCallback(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/login/verify-otp [post]
+// @Router /authsec/uflow/login/verify-otp [post]
 func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 	var input models.LoginVerifyOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -996,7 +996,7 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 // // @Success 200 {object} map[string]interface{}
 // // @Failure 400 {object} map[string]string
 // // @Failure 404 {object} map[string]string
-// // @Router /uflow/login/status [get]
+// // @Router /authsec/uflow/login/status [get]
 // func (uc *UserController) CheckLoginStatus(c *gin.Context) {
 // 	email := c.Query("email")
 // 	if email == "" {
@@ -1032,7 +1032,7 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/register/resend-otp [post]
+// @Router /authsec/uflow/register/resend-otp [post]
 func (uc *UserController) ResendOTP(c *gin.Context) {
 	var input models.ResendOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1172,7 +1172,7 @@ func (uc *UserController) AdminForgotPassword(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/forgot-password/verify-otp [post]
+// @Router /authsec/uflow/admin/forgot-password/verify-otp [post]
 func (uc *UserController) AdminVerifyPasswordResetOTP(c *gin.Context) {
 	var input models.AdminVerifyPasswordResetOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1214,7 +1214,7 @@ func (uc *UserController) AdminVerifyPasswordResetOTP(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/forgot-password/reset [post]
+// @Router /authsec/uflow/admin/forgot-password/reset [post]
 // Corrected AdminResetPassword function for UserController in tenant_controller.go
 
 func (uc *UserController) AdminResetPassword(c *gin.Context) {
@@ -1425,7 +1425,7 @@ func (uc *UserController) generateJWTToken(tenantID, projectID, clientID, emailI
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/webauthn/register [post]
+// @Router /authsec/uflow/webauthn/register [post]
 func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	var input models.WebAuthnRegistrationInput
 	if err := c.ShouldBindJSON(&input); err != nil {

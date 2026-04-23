@@ -23,6 +23,17 @@ type ResourceServer struct {
 	IntrospectionSecret     string         `json:"-" gorm:"column:introspection_secret"`               // Legacy plaintext, cleared after backfill
 	IntrospectionSecretHash string         `json:"-" gorm:"column:introspection_secret_hash;type:text"` // Bcrypt hash (primary for new rows)
 	Active                  bool           `json:"active" gorm:"default:true"`
+
+	// Scan lifecycle — ScanInProgress is internal and never exposed in API responses.
+	Status                   string     `json:"status" gorm:"type:text;not null;default:'pending_scan'"`
+	ScanGeneration           int        `json:"scan_generation" gorm:"not null;default:0"`
+	LastSuccessfulGeneration int        `json:"last_successful_generation" gorm:"not null;default:0"`
+	ScanInProgress           bool       `json:"-" gorm:"not null;default:false"`
+	LastScanStatus           *string    `json:"last_scan_status,omitempty" gorm:"type:text"`
+	LastScanError            *string    `json:"last_scan_error,omitempty" gorm:"type:text"`
+	LastScanStartedAt        *time.Time `json:"last_scan_started_at,omitempty"`
+	LastScanCompletedAt      *time.Time `json:"last_scan_completed_at,omitempty"`
+
 	CreatedAt               time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt               time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 	DeletedAt               gorm.DeletedAt `json:"-" gorm:"index"`

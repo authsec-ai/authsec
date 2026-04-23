@@ -11,10 +11,12 @@
 //	/authsec/health          – health checks
 //	/authsec/debug/*         – debug helpers (dev only)
 //
-// The well-known OIDC discovery endpoints remain at the root as required by RFC 8414:
+// The well-known OAuth/OIDC discovery endpoints remain at the root as required by RFC 8414
+// and OpenID Connect Discovery. They are advertised from the canonical OAuth issuer host.
 //
 //	/.well-known/openid-configuration
-//	/.well-known/jwks.json
+//	/.well-known/oauth-authorization-server
+//	/oauth/jwks
 //
 // All merged microservice routes are under /authsec:
 //
@@ -194,12 +196,13 @@ func SetupRoutes(
 	scopeMatrixController := platformCtrl.NewScopeMatrixController()
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
-	r.GET("/.well-known/oauth-authorization-server", oauthASController.ASMetadata)
+	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
 	// OpenID Connect Discovery 1.0 — same superset metadata
-	r.GET("/.well-known/openid-configuration", oauthASController.OIDCDiscovery)
+	r.GET("/.well-known/openid-configuration", oauthASController.CanonicalIssuerOnly(), oauthASController.OIDCDiscovery)
 
 	// Global OAuth + OIDC endpoints (unauthenticated — the OAuth flow itself handles authz)
 	oauth := r.Group("/oauth")
+	oauth.Use(oauthASController.CanonicalIssuerOnly())
 	{
 		oauth.GET("/authorize", oauthASController.Authorize)
 		oauth.POST("/token", oauthASController.Token)
@@ -231,7 +234,11 @@ func SetupRoutes(
 		// Resource Server admin API (authenticated)
 		// ────────────────────────────────────────────────────────
 		resourceServers := authsec.Group("/resource-servers")
-		resourceServers.Use(middlewares.AuthMiddleware())
+		resourceServers.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
 		{
 			resourceServers.POST("", rsController.Create)
 			resourceServers.GET("", rsController.List)
@@ -252,6 +259,7 @@ func SetupRoutes(
 			resourceServers.GET("/:id/scopes", scopeMatrixController.ListScopes)
 			resourceServers.POST("/:id/scopes", scopeMatrixController.CreateScope)
 			resourceServers.PUT("/:id/tool-scope-map", scopeMatrixController.UpdateToolScopeMap)
+			resourceServers.GET("/:id/scope-resolution-preview", scopeMatrixController.ScopeResolutionPreview)
 		}
 
 		// SDK policy endpoint (Basic auth with RS introspection credentials — no JWT middleware)
@@ -259,7 +267,11 @@ func SetupRoutes(
 
 		// Scope management (not RS-scoped)
 		scopes := authsec.Group("/scopes")
-		scopes.Use(middlewares.AuthMiddleware())
+		scopes.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
 		{
 			scopes.PUT("/:scope_id", scopeMatrixController.UpdateScope)
 			scopes.DELETE("/:scope_id", scopeMatrixController.DeleteScope)
@@ -267,7 +279,11 @@ func SetupRoutes(
 
 		// Admin consent grant management
 		consentGrants := authsec.Group("/consent-grants")
-		consentGrants.Use(middlewares.AuthMiddleware())
+		consentGrants.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
 		{
 			consentGrants.GET("", oauthASController.ListConsentGrants)
 			consentGrants.DELETE("/:id", oauthASController.RevokeConsentGrant)

@@ -1,7 +1,9 @@
 package services
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/authsec-ai/authsec/models"
@@ -9,6 +11,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// ErrInvalidParentScope is returned when parent_scope_id fails ownership/domain validation.
+// Handlers use errors.Is(err, ErrInvalidParentScope) to distinguish 400 from 404.
+var ErrInvalidParentScope = errors.New("parent_scope_id not found in this tenant/resource server")
 
 // ScopeRegistryService manages the OAuth scope catalog.
 type ScopeRegistryService struct {
@@ -166,13 +172,42 @@ func (s *ScopeRegistryService) Create(scope *models.OAuthScope) error {
 	return s.db.Create(scope).Error
 }
 
-// Update updates scope metadata and permission mappings.
-func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuthScopeRequest) (*models.OAuthScope, error) {
-	var scope models.OAuthScope
-	if err := s.db.First(&scope, "id = ?", scopeID).Error; err != nil {
-		return nil, err
+// ValidateParentScope verifies that parentScopeIDStr names a scope that exists within the
+// given tenant and resource-server domain, enforcing the hierarchy isolation rule:
+//
+//	RS-scoped scope (rsID != nil)  → parent must have the exact same resource_server_id
+//	tenant-global scope (rsID nil) → parent must also have resource_server_id IS NULL
+//
+// Returns the parsed UUID on success; returns ErrInvalidParentScope when the parent row
+// is not found (wrong tenant, wrong RS, or simply absent), and a wrapped parse error when
+// the string is not a valid UUID.
+func (s *ScopeRegistryService) ValidateParentScope(parentScopeIDStr string, tenantID uuid.UUID, rsID *uuid.UUID) (uuid.UUID, error) {
+	pid, err := uuid.Parse(parentScopeIDStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid parent_scope_id: %w", err)
 	}
+	q := s.db.Model(&models.OAuthScope{}).Where("id = ? AND tenant_id = ?", pid, tenantID)
+	if rsID != nil {
+		q = q.Where("resource_server_id = ?", *rsID)
+	} else {
+		q = q.Where("resource_server_id IS NULL")
+	}
+	var count int64
+	q.Count(&count)
+	if count == 0 {
+		return uuid.Nil, ErrInvalidParentScope
+	}
+	return pid, nil
+}
 
+// applyUpdate applies field updates and ownership-verified permission + parent sync.
+// tenantID is enforced on both parent_scope_id (same tenant+RS domain) and
+// permission_ids (tenant-owned or global). Callers must pass the already-fetched scope.
+func (s *ScopeRegistryService) applyUpdate(
+	scope *models.OAuthScope,
+	tenantID uuid.UUID,
+	req *models.UpdateOAuthScopeRequest,
+) (*models.OAuthScope, error) {
 	updates := map[string]interface{}{}
 	if req.DisplayName != "" {
 		updates["display_name"] = req.DisplayName
@@ -187,22 +222,22 @@ func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuth
 		updates["risk_level"] = req.RiskLevel
 	}
 	if req.ParentScopeID != "" {
-		pid, err := uuid.Parse(req.ParentScopeID)
+		pid, err := s.ValidateParentScope(req.ParentScopeID, tenantID, scope.ResourceServerID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid parent_scope_id: %w", err)
+			return nil, err
 		}
 		updates["parent_scope_id"] = pid
 	}
 
 	if len(updates) > 0 {
-		if err := s.db.Model(&scope).Updates(updates).Error; err != nil {
+		if err := s.db.Model(scope).Updates(updates).Error; err != nil {
 			return nil, err
 		}
 	}
 
-	// Update permission mappings if provided
+	// Re-sync permission mappings with tenant ownership filter.
 	if req.PermissionIDs != nil {
-		if err := s.db.Where("scope_id = ?", scopeID).Delete(&models.OAuthScopePermission{}).Error; err != nil {
+		if err := s.db.Where("scope_id = ?", scope.ID).Delete(&models.OAuthScopePermission{}).Error; err != nil {
 			return nil, err
 		}
 		for _, pidStr := range req.PermissionIDs {
@@ -210,12 +245,78 @@ func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuth
 			if err != nil {
 				continue
 			}
-			s.db.Create(&models.OAuthScopePermission{ScopeID: scopeID, PermissionID: pid})
+			// SECURITY: only link permissions owned by this tenant or globally scoped (tenant_id IS NULL).
+			// Never remove this filter — it prevents cross-tenant permission bridges.
+			var count int64
+			s.db.Model(&models.RBACPermission{}).
+				Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", pid, tenantID).
+				Count(&count)
+			if count == 0 {
+				log.Printf("[SCOPE_REGISTRY] applyUpdate: skipping permission %s (not owned by tenant %s)", pid, tenantID)
+				continue
+			}
+			s.db.Create(&models.OAuthScopePermission{ScopeID: scope.ID, PermissionID: pid})
 		}
 	}
 
-	s.db.Preload("Permissions").First(&scope, "id = ?", scopeID)
-	return &scope, nil
+	s.db.Preload("Permissions").First(scope, "id = ?", scope.ID)
+	return scope, nil
+}
+
+// Update updates scope metadata (no tenant ownership check — kept for internal use).
+func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuthScopeRequest) (*models.OAuthScope, error) {
+	var scope models.OAuthScope
+	if err := s.db.First(&scope, "id = ?", scopeID).Error; err != nil {
+		return nil, err
+	}
+	return s.applyUpdate(&scope, scope.TenantID, req)
+}
+
+// UpdateByTenant updates scope metadata only when the scope belongs to tenantID.
+func (s *ScopeRegistryService) UpdateByTenant(
+	scopeID, tenantID uuid.UUID,
+	req *models.UpdateOAuthScopeRequest,
+) (*models.OAuthScope, error) {
+	var scope models.OAuthScope
+	if err := s.db.First(&scope, "id = ? AND tenant_id = ?", scopeID, tenantID).Error; err != nil {
+		return nil, fmt.Errorf("scope not found")
+	}
+	return s.applyUpdate(&scope, tenantID, req)
+}
+
+// DeleteByTenant removes a scope only when it belongs to tenantID.
+func (s *ScopeRegistryService) DeleteByTenant(scopeID, tenantID uuid.UUID) error {
+	result := s.db.Where("id = ? AND tenant_id = ?", scopeID, tenantID).Delete(&models.OAuthScope{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("scope not found")
+	}
+	return nil
+}
+
+// LinkPermissionsTenantScoped writes oauth_scope_permissions rows for a newly created scope,
+// skipping any permission ID that doesn't belong to tenantID and isn't a global permission.
+// This is the only sanctioned write path to oauth_scope_permissions from external caller input.
+func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, tenantID uuid.UUID, permIDs []string) {
+	for _, pidStr := range permIDs {
+		pid, err := uuid.Parse(pidStr)
+		if err != nil {
+			continue
+		}
+		// SECURITY: only link permissions owned by this tenant or globally scoped (tenant_id IS NULL).
+		// Never remove this filter — it prevents cross-tenant permission bridges.
+		var count int64
+		s.db.Model(&models.RBACPermission{}).
+			Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", pid, tenantID).
+			Count(&count)
+		if count == 0 {
+			log.Printf("[SCOPE_REGISTRY] LinkPermissions: skipping permission %s (not owned by tenant %s)", pid, tenantID)
+			continue
+		}
+		s.db.Create(&models.OAuthScopePermission{ScopeID: scopeID, PermissionID: pid})
+	}
 }
 
 // Delete removes a scope from the registry.

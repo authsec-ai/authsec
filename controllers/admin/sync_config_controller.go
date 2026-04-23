@@ -27,7 +27,7 @@ type SyncConfigController struct{}
 // @Success 200 {object} models.SyncConfigResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/sync-configs/create [post]
+// @Router /authsec/uflow/admin/sync-configs/create [post]
 func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	var req models.CreateSyncConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -161,7 +161,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 // @Success 200 {object} models.SyncConfigResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/sync-configs/list [post]
+// @Router /authsec/uflow/admin/sync-configs/list [post]
 func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	var req models.ListSyncConfigsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -220,7 +220,7 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/sync-configs/update [post]
+// @Router /authsec/uflow/admin/sync-configs/update [post]
 func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	var req models.UpdateSyncConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -355,7 +355,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/sync-configs/delete [post]
+// @Router /authsec/uflow/admin/sync-configs/delete [post]
 func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	var req models.DeleteSyncConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

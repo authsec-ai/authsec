@@ -1,6 +1,9 @@
 package services
 
 import (
+	"errors"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -23,34 +26,82 @@ func NewConsentService(db *gorm.DB) *ConsentService {
 }
 
 // CheckExistingConsent looks for an active (non-expired, non-revoked) consent grant
-// that covers all requested scopes. Returns the grant if found, nil otherwise.
+// that covers all requestedScopes. It also validates each RS scope in the stored grant
+// against userEffectiveScopes (RBAC revocation) and rsSupportedScopes (RS withdrawal).
+// A stored grant containing a scope missing from either set is revoked in the DB (stale).
+//
+// Returns:
+//   - grant non-nil: valid, up-to-date grant found and covers all requestedScopes
+//   - stale true: a grant existed but was revoked (RBAC or RS withdrawal detected)
+//   - err non-nil: unexpected DB error (ErrRecordNotFound is normalized to nil, false, nil)
 func (s *ConsentService) CheckExistingConsent(
 	tenantID, userID, clientID, resourceServerID uuid.UUID,
 	requestedScopes []string,
-) (*models.OAuthConsentGrant, error) {
+	userEffectiveScopes []string,
+	rsSupportedScopes []string,
+) (*models.OAuthConsentGrant, bool, error) {
 	var grant models.OAuthConsentGrant
 	err := s.db.Where(
 		"tenant_id = ? AND user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
 		tenantID, userID, clientID, resourceServerID, time.Now(),
 	).First(&grant).Error
 
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil // no active grant — normal control flow, not an error
+	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// Check if granted scopes are a superset of requested scopes
+	// Build lookup sets for staleness check
+	effectiveSet := make(map[string]struct{}, len(userEffectiveScopes))
+	for _, s := range userEffectiveScopes {
+		effectiveSet[s] = struct{}{}
+	}
+	rsSet := make(map[string]struct{}, len(rsSupportedScopes))
+	for _, s := range rsSupportedScopes {
+		rsSet[s] = struct{}{}
+	}
+
+	// Staleness check: verify each RS scope in the stored grant is still grantable.
+	// OIDC core scopes are AS-level and not governed by RBAC or RS scopes_supported.
+	var staleScopes []string
+	for _, s := range grant.GrantedScopes {
+		if IsOIDCCoreScope(s) {
+			continue
+		}
+		if _, ok := effectiveSet[s]; !ok {
+			staleScopes = append(staleScopes, s+" (rbac_revoked)")
+			continue
+		}
+		if _, ok := rsSet[s]; !ok {
+			staleScopes = append(staleScopes, s+" (rs_withdrawn)")
+		}
+	}
+	if len(staleScopes) > 0 {
+		now := time.Now()
+		if err := s.db.Model(&grant).Update("revoked_at", now).Error; err != nil {
+			// The grant is stale but the revocation failed to persist — return the error
+			// so the caller knows the stale grant may still be active in the DB.
+			log.Printf("[CONSENT] grant %s revocation write failed (stale scopes: %v): %v", grant.ID, staleScopes, err)
+			return nil, false, fmt.Errorf("revoking stale grant %s: %w", grant.ID, err)
+		}
+		log.Printf("[CONSENT] grant %s revoked (stale scopes: %v)", grant.ID, staleScopes)
+		return nil, true, nil
+	}
+
+	// Coverage check: stored grant must cover all requested scopes
 	grantedSet := make(map[string]struct{}, len(grant.GrantedScopes))
 	for _, s := range grant.GrantedScopes {
 		grantedSet[s] = struct{}{}
 	}
 	for _, s := range requestedScopes {
 		if _, ok := grantedSet[s]; !ok {
-			// Requested scope not covered by existing consent — need re-consent
-			return nil, nil
+			return nil, false, nil // coverage gap → need re-consent
 		}
 	}
 
-	return &grant, nil
+	return &grant, false, nil
 }
 
 // UpsertConsent creates or updates a consent grant for the given (user x client x RS).
@@ -118,6 +169,21 @@ func (s *ConsentService) RevokeConsentByUser(grantID, userID uuid.UUID) error {
 		return gorm.ErrRecordNotFound
 	}
 	return result.Error
+}
+
+// RevokeConsentByTenant revokes a consent grant only when it belongs to tenantID (admin path).
+func (s *ConsentService) RevokeConsentByTenant(grantID, tenantID uuid.UUID) error {
+	now := time.Now()
+	result := s.db.Model(&models.OAuthConsentGrant{}).
+		Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", grantID, tenantID).
+		Update("revoked_at", now)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 // ListByUser returns all active (non-revoked) consent grants for a user.

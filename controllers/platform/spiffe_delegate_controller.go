@@ -123,7 +123,7 @@ type DelegateSVIDResponse struct {
 //	@Failure     400            {object}  map[string]string
 //	@Failure     401            {object}  map[string]string
 //	@Failure     500            {object}  map[string]string
-//	@Router      /uflow/auth/enduser/delegate-svid [post]
+//	@Router      /authsec/uflow/auth/enduser/delegate-svid [post]
 func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 	// 1. Extract the user's Bearer JWT from the Authorization header.
 	authHeader := c.GetHeader("Authorization")

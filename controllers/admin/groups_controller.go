@@ -52,7 +52,7 @@ type GroupItem struct {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups [post]
+// @Router /authsec/uflow/groups [post]
 func (gc *GroupController) AddUserDefinedGroups(c *gin.Context) {
 	var req GroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -127,7 +127,7 @@ func (gc *GroupController) AddUserDefinedGroups(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/map [post]
+// @Router /authsec/uflow/groups/map [post]
 func (gc *GroupController) MapGroupsToClient(c *gin.Context) {
 	var req models.MapGroupsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -167,7 +167,7 @@ func (gc *GroupController) MapGroupsToClient(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/map [delete]
+// @Router /authsec/uflow/groups/map [delete]
 func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 	var req models.RemoveGroupsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -208,7 +208,7 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/{tenant_id} [get]
+// @Router /authsec/uflow/groups/{tenant_id} [get]
 func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
@@ -238,7 +238,7 @@ func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/{tenant_id}/users/bulk [post]
+// @Router /authsec/uflow/groups/{tenant_id}/users/bulk [post]
 func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
@@ -291,7 +291,7 @@ func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/{tenant_id}/users/bulk [delete]
+// @Router /authsec/uflow/groups/{tenant_id}/users/bulk [delete]
 func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
@@ -344,7 +344,7 @@ func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups [delete]
+// @Router /authsec/uflow/groups [delete]
 func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -525,7 +525,7 @@ func uniqueStrings(values []string) []string {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/{id} [put]
+// @Router /authsec/uflow/groups/{id} [put]
 func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 	groupID := c.Param("id")
 	if groupID == "" {
@@ -576,7 +576,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/users/add [post]
+// @Router /authsec/uflow/groups/users/add [post]
 func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 	var req struct {
 		TenantID string   `json:"tenant_id" binding:"required"`
@@ -621,7 +621,7 @@ func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/users/remove [post]
+// @Router /authsec/uflow/groups/users/remove [post]
 func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 	var req struct {
 		TenantID string   `json:"tenant_id" binding:"required"`
@@ -665,7 +665,7 @@ func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/groups/users [get]
+// @Router /authsec/uflow/user/groups/users [get]
 func (gc *GroupController) GetMyGroups(c *gin.Context) {
 	userID, err := middlewares.ResolveUserID(c)
 	if err != nil {
@@ -719,7 +719,7 @@ func (gc *GroupController) GetMyGroups(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/groups/list [post]
+// @Router /authsec/uflow/admin/groups/list [post]
 func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 	var req AdminGroupListRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -771,7 +771,7 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/groups/{tenant_id}/{group_id}/users [get]
+// @Router /authsec/uflow/groups/{tenant_id}/{group_id}/users [get]
 func (gc *GroupController) GetGroupUsers(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)

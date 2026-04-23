@@ -801,7 +801,7 @@ func clientsUUIDFromValueOrContext(c *gin.Context, value, contextKey, field stri
 // @Success 201 {object} sharedmodels.Client
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /clientms/tenants/{tenantId}/clients/create [post]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/create [post]
 // @Security Bearer
 func CreateClient(c *gin.Context) {
 	tenantID, ok := getClientsUUIDFromContext(c, "validated_tenant_id")
@@ -893,7 +893,7 @@ func CreateClient(c *gin.Context) {
 // @Success 200 {object} ClientsListResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /clientms/tenants/{tenantId}/clients/getClients [get]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/getClients [get]
 // @Security Bearer
 func GetClients(c *gin.Context) {
 	tenantID, ok := clientsGetAndValidateTenantID(c)
@@ -1049,7 +1049,7 @@ func GetClients(c *gin.Context) {
 // @Param id path string true "Client ID"
 // @Success 200 {object} sharedmodels.Client
 // @Failure 404 {object} map[string]string
-// @Router /clientms/tenants/{tenantId}/clients/{id} [get]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id} [get]
 // @Security Bearer
 func GetClient(c *gin.Context) {
 	tenantID, ok := clientsGetAndValidateTenantID(c)
@@ -1098,7 +1098,7 @@ func GetClient(c *gin.Context) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} sharedmodels.Client
-// @Router /clientms/tenants/{tenantId}/clients/{id} [put]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id} [put]
 // @Security Bearer
 func UpdateClient(c *gin.Context) {
 	clientsHandleClientUpdate(c)
@@ -1112,7 +1112,7 @@ func UpdateClient(c *gin.Context) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} sharedmodels.Client
-// @Router /clientms/tenants/{tenantId}/clients/{id} [patch]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id} [patch]
 // @Security Bearer
 func EditClient(c *gin.Context) {
 	clientsHandleClientUpdate(c)
@@ -1185,7 +1185,7 @@ func clientsHandleClientUpdate(c *gin.Context) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} map[string]interface{}
-// @Router /clientms/tenants/{tenantId}/clients/{id}/soft-delete [patch]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id}/soft-delete [patch]
 // @Security Bearer
 func SoftDeleteClient(c *gin.Context) {
 	clientsHandleSoftDelete(c, "[SOFT-DELETE-PATCH]")
@@ -1197,7 +1197,7 @@ func SoftDeleteClient(c *gin.Context) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} map[string]interface{}
-// @Router /clientms/tenants/{tenantId}/clients/{id} [delete]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id} [delete]
 // @Security Bearer
 func DeleteClient(c *gin.Context) {
 	clientsHandleSoftDelete(c, "[SOFT-DELETE-DELETE]")
@@ -1258,7 +1258,7 @@ func clientsHandleSoftDelete(c *gin.Context, logPrefix string) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} map[string]interface{}
-// @Router /clientms/tenants/{tenantId}/clients/{id}/activate [patch]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id}/activate [patch]
 // @Security Bearer
 func ActivateClient(c *gin.Context) {
 	clientsUpdateClientStatus(c, sharedmodels.StatusActive)
@@ -1270,7 +1270,7 @@ func ActivateClient(c *gin.Context) {
 // @Param tenantId path string true "Tenant ID"
 // @Param id path string true "Client ID"
 // @Success 200 {object} map[string]interface{}
-// @Router /clientms/tenants/{tenantId}/clients/{id}/deactivate [patch]
+// @Router /authsec/clientms/tenants/{tenantId}/clients/{id}/deactivate [patch]
 // @Security Bearer
 func DeactivateClient(c *gin.Context) {
 	clientsUpdateClientStatus(c, sharedmodels.StatusInactive)

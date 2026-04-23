@@ -218,7 +218,7 @@ func (oc *OIDCController) SetPKIService(pkiSvc *spireservices.PKIProvisioningSer
 // @Param input body models.OIDCInitiateInput true "OIDC initiation request"
 // @Success 200 {object} models.OIDCInitiateResponse
 // @Failure 400 {object} map[string]string
-// @Router /uflow/oidc/initiate [post]
+// @Router /authsec/uflow/oidc/initiate [post]
 func (oc *OIDCController) Initiate(c *gin.Context) {
 	var input models.OIDCInitiateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -306,7 +306,7 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 // @Tags OIDC
 // @Param domain query string true "Tenant domain to check"
 // @Success 200 {object} map[string]interface{}
-// @Router /uflow/oidc/check-tenant [get]
+// @Router /authsec/uflow/oidc/check-tenant [get]
 func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 	domain := strings.ToLower(strings.TrimSpace(c.Query("domain")))
 
@@ -331,7 +331,7 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 // @Tags OIDC
 // @Produce json
 // @Success 200 {object} models.OIDCProviderListResponse
-// @Router /uflow/oidc/providers [get]
+// @Router /authsec/uflow/oidc/providers [get]
 func (oc *OIDCController) GetProviders(c *gin.Context) {
 	providers, err := oc.oidcService.GetActiveProviders()
 	if err != nil {
@@ -355,7 +355,7 @@ func (oc *OIDCController) GetProviders(c *gin.Context) {
 // @Success 200 {object} models.GetAuthURLResponse
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
-// @Router /uflow/oidc/auth-url [post]
+// @Router /authsec/uflow/oidc/auth-url [post]
 func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 	var input models.GetAuthURLInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -464,7 +464,7 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 // @Success 200 {object} models.OIDCInitiateResponse
 // @Failure 400 {object} map[string]string
 // @Failure 409 {object} map[string]string "Tenant domain already exists"
-// @Router /uflow/oidc/register/initiate [post]
+// @Router /authsec/uflow/oidc/register/initiate [post]
 func (oc *OIDCController) InitiateRegistration(c *gin.Context) {
 	var input models.OIDCInitiateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -512,7 +512,7 @@ func (oc *OIDCController) InitiateRegistration(c *gin.Context) {
 // @Success 200 {object} models.OIDCInitiateResponse
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string "Tenant not found"
-// @Router /uflow/oidc/login/initiate [post]
+// @Router /authsec/uflow/oidc/login/initiate [post]
 func (oc *OIDCController) InitiateLogin(c *gin.Context) {
 	var input models.OIDCInitiateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -641,7 +641,7 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid code or state"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/oidc/exchange-code [post]
+// @Router /authsec/uflow/oidc/exchange-code [post]
 func (oc *OIDCController) ExchangeCode(c *gin.Context) {
 	var input models.OIDCCallbackInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1090,7 +1090,6 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		log.Printf("Warning: Failed to assign default associations to client: %v", err)
 	}
 
-
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
@@ -1438,7 +1437,7 @@ func (oc *OIDCController) handleDiscoverCallback(c *gin.Context, state *models.O
 // @Param input body OIDCCompleteRegistrationInput true "Registration completion input"
 // @Success 200 {object} models.OIDCCallbackResponse
 // @Failure 400 {object} map[string]string
-// @Router /uflow/oidc/complete-registration [post]
+// @Router /authsec/uflow/oidc/complete-registration [post]
 func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	var input struct {
 		TenantDomain   string `json:"tenant_domain" binding:"required"`
@@ -1658,7 +1657,6 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		log.Printf("Warning: Failed to assign default associations to client: %v", err)
 	}
 
-
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
 	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
@@ -1808,7 +1806,7 @@ func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID uuid.U
 // @Success 200 {object} models.OIDCInitiateResponse
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
-// @Router /uflow/oidc/link [post]
+// @Router /authsec/uflow/oidc/link [post]
 func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 	// Get user from context (requires auth middleware)
 	userID, exists := c.Get("user_id")
@@ -1882,7 +1880,7 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 // @Produce json
 // @Success 200 {array} models.OIDCUserIdentity
 // @Failure 401 {object} map[string]string
-// @Router /uflow/oidc/identities [get]
+// @Router /authsec/uflow/oidc/identities [get]
 func (oc *OIDCController) GetLinkedIdentities(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -1913,7 +1911,7 @@ func (oc *OIDCController) GetLinkedIdentities(c *gin.Context) {
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
-// @Router /uflow/oidc/unlink/{provider} [delete]
+// @Router /authsec/uflow/oidc/unlink/{provider} [delete]
 func (oc *OIDCController) UnlinkIdentity(c *gin.Context) {
 	provider := c.Param("provider")
 	if provider == "" {
@@ -2001,7 +1999,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	if tenantDomain, ok := data["tenant_domain"].(string); ok && tenantDomain != "" {
 		// Use the tenant domain that was passed in (from state or database)
 		// No validation needed - trust the domain from the state/database
-			redirectURL = "https://" + tenantDomain + "/authsec/uflow/oidc/callback"
+		redirectURL = "https://" + tenantDomain + "/authsec/uflow/oidc/callback"
 		log.Printf("DEBUG renderOAuthCallbackHTML: Using tenant_domain from data, redirectURL='%s'", redirectURL)
 	} else {
 		// Fallback: Try to extract from Host or X-Forwarded-Host header
@@ -2016,7 +2014,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 		}
 
 		// Convert API domain to frontend domain
-		// dev2.api.authsec.dev -> dev.authsec.dev
+		// dev.api.authsec.dev -> dev.authsec.dev
 		// api.authsec.dev -> app.authsec.dev
 		frontendHost := convertAPIToFrontendDomain(host)
 
@@ -2064,20 +2062,18 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	c.String(http.StatusOK, html)
 }
 
-// convertAPIToFrontendDomain converts API domain to frontend domain
+// convertAPIToFrontendDomain converts API domain to frontend domain.
 // Examples:
-//   - dev2.authsec.dev -> dev.authsec.dev
-//   - dev2.api.authsec.dev -> dev.authsec.dev
+//   - dev.api.authsec.dev -> dev.authsec.dev
 //   - api.authsec.dev -> app.authsec.dev
 //   - localhost:8080 -> localhost:8080 (unchanged)
 func convertAPIToFrontendDomain(host string) string {
 	// Specific API to Frontend mappings
 	apiToFrontendMap := map[string]string{
 		// Dev environment (.authsec.dev)
-		"dev2.authsec.dev":     "dev.authsec.dev",     // Dev API -> Dev Frontend
-		"dev2.api.authsec.dev": "dev.authsec.dev",     // Dev API (with api subdomain) -> Dev Frontend
-		"api.authsec.dev":      "app.authsec.dev",     // Dev Prod API -> Dev Prod Frontend
-		"staging.authsec.dev":  "staging.authsec.dev", // Staging (if same)
+		"dev.api.authsec.dev": "dev.authsec.dev",     // Dev API -> Dev Frontend
+		"api.authsec.dev":     "app.authsec.dev",     // Legacy shared API -> app frontend
+		"staging.authsec.dev": "staging.authsec.dev", // Staging (if same)
 		// Prod environment (.authsec.ai)
 		"prod.api.authsec.ai": "app.authsec.ai", // Prod API -> Prod Frontend
 	}

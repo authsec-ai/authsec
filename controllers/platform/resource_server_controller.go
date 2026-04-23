@@ -49,13 +49,16 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 		return
 	}
 
-	baseURL := config.AppConfig.BaseURL
+	baseURL := config.AppConfig.OAuthBaseURL()
 	_, resp, err := ctrl.service.Create(req, baseURL)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_created", "resource_server",
+		resp.ID, http.StatusCreated, nil,
+		map[string]interface{}{"name": req.Name, "url": req.PublicBaseURL})
 	c.JSON(http.StatusCreated, resp)
 }
 
@@ -133,6 +136,8 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_updated", "resource_server",
+		id, http.StatusOK, nil, updates)
 	c.JSON(http.StatusOK, rs)
 }
 
@@ -150,6 +155,8 @@ func (ctrl *ResourceServerController) Delete(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
+	auditAdminMutation(c, tenantID.String(), "rs_deleted", "resource_server",
+		id, http.StatusNoContent, nil, nil)
 	c.JSON(http.StatusNoContent, nil)
 }
 
@@ -169,6 +176,8 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_introspection_secret_rotated", "resource_server",
+		id, http.StatusOK, nil, nil) // never log the secret value
 	c.JSON(http.StatusOK, gin.H{"introspection_secret": secret})
 }
 
@@ -205,6 +214,9 @@ func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_client_preregistered", "oauth_client",
+		client.ClientID, http.StatusCreated, nil,
+		map[string]interface{}{"rs_id": rsID, "client_name": client.ClientName})
 	c.JSON(http.StatusCreated, gin.H{
 		"client_id":   client.ClientID,
 		"client_name": client.ClientName,
@@ -258,6 +270,8 @@ func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_client_revoked", "oauth_client",
+		clientID, http.StatusOK, nil, map[string]interface{}{"rs_id": rsID})
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 
@@ -283,6 +297,8 @@ func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 		return
 	}
 
+	auditAdminMutation(c, tenantID.String(), "rs_client_redirects_approved", "oauth_client",
+		clientID, http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "redirects approved"})
 }
 

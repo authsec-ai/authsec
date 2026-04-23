@@ -124,7 +124,7 @@ type EntraIDService struct {
 // @Success 200 {object} EntraSyncResult
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/entra/sync [post]
+// @Router /authsec/uflow/entra/sync [post]
 func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 	var input EntraSyncInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -224,7 +224,7 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/entra/test-connection [post]
+// @Router /authsec/uflow/entra/test-connection [post]
 func (eic *EntraIDController) TestEntraIDConnection(c *gin.Context) {
 	var config EntraIDConfig
 	if err := c.ShouldBindJSON(&config); err != nil {
@@ -285,7 +285,7 @@ func (eic *EntraIDController) TestEntraIDConnection(c *gin.Context) {
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/entra/check-permissions [post]
+// @Router /authsec/uflow/entra/check-permissions [post]
 func (eic *EntraIDController) GetEntraIDPermissions(c *gin.Context) {
 	var config EntraIDConfig
 	if err := c.ShouldBindJSON(&config); err != nil {

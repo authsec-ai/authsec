@@ -55,6 +55,7 @@ type HmgrController struct {
 	rsService      *services.ResourceServerService
 	scopeResolver  *services.ScopeResolver
 	consentService *services.ConsentService
+	scopeRegistry  *services.ScopeRegistryService
 }
 
 // NewHmgrController creates a new HmgrController
@@ -65,6 +66,7 @@ func NewHmgrController(cfg config.Config) *HmgrController {
 		rsService:      services.NewResourceServerService(config.DB),
 		scopeResolver:  services.NewScopeResolver(config.DB),
 		consentService: services.NewConsentService(config.DB),
+		scopeRegistry:  services.NewScopeRegistryService(config.DB),
 	}
 }
 
@@ -1362,8 +1364,9 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		// Get the MCP OAuth client for scope resolver
 		mcpClient, _ := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
 
-		// 3-way intersection: requested ∩ RS-supported ∩ user-effective-scopes (RBAC)
-		grantedScopes, scopeErr := ctrl.scopeResolver.ResolveGrantableScopes(
+		// 3-way intersection: requested ∩ RS-supported ∩ user-effective-scopes (RBAC).
+		// ResolveWithReport is fail-closed: any error = no scopes granted.
+		report, scopeErr := ctrl.scopeResolver.ResolveWithReport(
 			c.Request.Context(),
 			arcCtx.TenantID, consentRequest.Subject, arcCtx.ResourceServerID,
 			consentRequest.RequestedScope,
@@ -1371,10 +1374,12 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			mcpClient,
 		)
 		if scopeErr != nil {
-			log.Printf("[MCP_AUTH] ConsentHandler: scope resolution failed context_id=%s: %v", arcCtx.ContextID, scopeErr)
+			log.Printf("[MCP_AUTH] ConsentHandler: ResolveWithReport failed context_id=%s: %v", arcCtx.ContextID, scopeErr)
 			c.String(http.StatusInternalServerError, "Failed to resolve user permissions")
 			return
 		}
+		// report is guaranteed non-nil past this point
+		grantedScopes := report.Grantable
 		if len(grantedScopes) == 0 {
 			// Fail-closed: no grantable scopes → reject consent
 			log.Printf("[MCP_AUTH] ConsentHandler: no grantable scopes for user=%s rs=%s context_id=%s",
@@ -1395,9 +1400,27 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
 			subjectUUID, _ := uuid.Parse(consentRequest.Subject)
 			if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
-				existingGrant, _ = ctrl.consentService.CheckExistingConsent(
-					tenantUUID, subjectUUID, mcpClient.ID, rs.ID, grantedScopes,
+				// Pass report.UserEffective (full RBAC set), NOT report.Grantable.
+				// Using the request-scoped grantable set would falsely revoke grants covering
+				// scopes the user still holds but didn't request in this particular flow.
+				var stale bool
+				var consentLookupErr error
+				existingGrant, stale, consentLookupErr = ctrl.consentService.CheckExistingConsent(
+					tenantUUID, subjectUUID, mcpClient.ID, rs.ID,
+					consentRequest.RequestedScope,
+					report.UserEffective,
+					rs.ScopesSupported,
 				)
+				if consentLookupErr != nil {
+					log.Printf("[MCP_AUTH] ConsentHandler: consent lookup failed user=%s rs=%s context_id=%s: %v",
+						consentRequest.Subject, rs.ResourceURI, arcCtx.ContextID, consentLookupErr)
+					c.String(http.StatusInternalServerError, "Failed to check existing consent")
+					return
+				}
+				if stale {
+					log.Printf("[MCP_AUTH] ConsentHandler: remembered consent revoked (stale) user=%s rs=%s",
+						consentRequest.Subject, rs.ResourceURI)
+				}
 			}
 		}
 
@@ -1410,7 +1433,14 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 				}
 				return
 			}
-			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, grantedScopes)
+			// Load scope metadata for enriched consent page rendering
+			tenantUUIDForMeta, _ := uuid.Parse(arcCtx.TenantID)
+			allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(tenantUUIDForMeta, rs.ID)
+			scopeMeta := make(map[string]*models.OAuthScope, len(allScopes))
+			for i := range allScopes {
+				scopeMeta[allScopes[i].ScopeString] = &allScopes[i]
+			}
+			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, report, scopeMeta)
 			return
 		}
 
@@ -1548,17 +1578,68 @@ func (ctrl *HmgrController) renderMCPConsentPage(
 	c *gin.Context,
 	consentChallenge string,
 	consentRequest *hydramodels.HydraConsentRequest,
-	grantedScopes []string,
+	report *services.ScopeResolutionReport,
+	scopeMeta map[string]*models.OAuthScope,
 ) {
-	grantedSet := make(map[string]struct{}, len(grantedScopes))
-	for _, scope := range grantedScopes {
-		grantedSet[scope] = struct{}{}
+	// Build a quick-lookup index from scope string → diagnostic for O(1) access per scope.
+	diagIndex := make(map[string]services.ScopeDiagnostic, len(report.Diagnostics))
+	for _, d := range report.Diagnostics {
+		diagIndex[d.Scope] = d
+	}
+
+	// riskBadgeColor maps risk levels to their badge background colors.
+	riskBadgeColor := func(level string) string {
+		switch strings.ToLower(level) {
+		case "low":
+			return "#2e7d32"
+		case "medium":
+			return "#f57c00"
+		case "high":
+			return "#e65100"
+		case "critical":
+			return "#b71c1c"
+		default:
+			return "#66758a"
+		}
+	}
+
+	// blockedReasonText returns a human-readable explanation for a block reason.
+	blockedReasonText := func(reason services.BlockReason) string {
+		switch reason {
+		case services.BlockNotInRSSupported:
+			return "This scope is not declared by the resource server."
+		case services.BlockNoRBACBinding:
+			return "You do not have a role binding that grants this scope."
+		case services.BlockOIDCNotAllowed:
+			return "OIDC scope not applicable to this client type."
+		default:
+			return "Not currently allowed by your administrator-assigned roles."
+		}
 	}
 
 	var builder strings.Builder
 	builder.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Access</title>")
 	builder.WriteString("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
-	builder.WriteString("<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fb;color:#16202a;margin:0;padding:32px;}main{max-width:720px;margin:0 auto;background:#fff;border:1px solid #d7deea;border-radius:16px;padding:28px;box-shadow:0 10px 30px rgba(16,24,40,.08);}h1{margin:0 0 8px;font-size:28px;}p{margin:0 0 16px;line-height:1.5;color:#445468;}fieldset{border:none;padding:0;margin:20px 0;}label.scope{display:block;border:1px solid #d7deea;border-radius:12px;padding:14px 16px;margin:0 0 12px;background:#fbfcfe;}label.scope.disabled{opacity:.55;background:#f4f6fa;}label.scope strong{display:block;font-size:15px;}label.scope span{display:block;font-size:13px;margin-top:4px;color:#5b6978;}input[type=checkbox]{margin-right:12px;} .actions{display:flex;gap:12px;margin-top:24px;}button{border:none;border-radius:10px;padding:12px 18px;font-weight:600;cursor:pointer;}button.allow{background:#0f6fff;color:#fff;}button.deny{background:#edf1f7;color:#16202a;} .meta{font-size:13px;color:#66758a;margin-top:18px;}</style></head><body><main>")
+	builder.WriteString(`<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f7fb;color:#16202a;margin:0;padding:32px;}
+main{max-width:720px;margin:0 auto;background:#fff;border:1px solid #d7deea;border-radius:16px;padding:28px;box-shadow:0 10px 30px rgba(16,24,40,.08);}
+h1{margin:0 0 8px;font-size:28px;}
+p{margin:0 0 16px;line-height:1.5;color:#445468;}
+fieldset{border:none;padding:0;margin:20px 0;}
+label.scope{display:block;border:1px solid #d7deea;border-radius:12px;padding:14px 16px;margin:0 0 12px;background:#fbfcfe;}
+label.scope.blocked{opacity:.65;background:#f4f6fa;border-color:#e0e4ed;}
+label.scope .scope-header{display:flex;align-items:center;gap:8px;}
+label.scope strong{font-size:15px;}
+label.scope .scope-desc{display:block;font-size:13px;margin-top:6px;color:#5b6978;}
+label.scope .scope-blocked-reason{display:block;font-size:12px;margin-top:4px;color:#c0392b;font-style:italic;}
+.risk-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;white-space:nowrap;}
+input[type=checkbox]{margin-right:8px;}
+.actions{display:flex;gap:12px;margin-top:24px;}
+button{border:none;border-radius:10px;padding:12px 18px;font-weight:600;cursor:pointer;}
+button.allow{background:#0f6fff;color:#fff;}
+button.deny{background:#edf1f7;color:#16202a;}
+.meta{font-size:13px;color:#66758a;margin-top:18px;}
+</style></head><body><main>`)
 	builder.WriteString("<h1>Authorize access</h1>")
 	builder.WriteString("<p><strong>" + html.EscapeString(consentRequest.Client.ClientID) + "</strong> is requesting access to your resources.</p>")
 	builder.WriteString("<form method=\"post\" action=\"/authsec/hmgr/consent\">")
@@ -1566,17 +1647,63 @@ func (ctrl *HmgrController) renderMCPConsentPage(
 	builder.WriteString("<fieldset><legend>Select the permissions to grant</legend>")
 
 	for _, scope := range consentRequest.RequestedScope {
-		if _, ok := grantedSet[scope]; ok {
-			builder.WriteString("<label class=\"scope\"><strong><input type=\"checkbox\" name=\"grant_scope\" value=\"" + html.EscapeString(scope) + "\" checked> " + html.EscapeString(scope) + "</strong><span>Allowed by your current role bindings.</span></label>")
-			continue
+		diag := diagIndex[scope]
+		meta := scopeMeta[scope]
+
+		// Display name: prefer registry metadata, fall back to raw scope string.
+		displayName := scope
+		if meta != nil && meta.DisplayName != "" {
+			displayName = meta.DisplayName
 		}
-		builder.WriteString("<label class=\"scope disabled\"><strong><input type=\"checkbox\" disabled> " + html.EscapeString(scope) + "</strong><span>Not currently allowed by your administrator-assigned roles.</span></label>")
+
+		// Description from registry metadata.
+		description := ""
+		if meta != nil {
+			description = meta.Description
+		}
+
+		// Risk badge from registry metadata.
+		riskLevel := ""
+		if meta != nil {
+			riskLevel = meta.RiskLevel
+		}
+
+		if diag.Granted {
+			builder.WriteString(`<label class="scope">`)
+			builder.WriteString(`<div class="scope-header">`)
+			builder.WriteString(`<input type="checkbox" name="grant_scope" value="` + html.EscapeString(scope) + `" checked>`)
+			builder.WriteString(`<strong>` + html.EscapeString(displayName) + `</strong>`)
+			if riskLevel != "" {
+				color := riskBadgeColor(riskLevel)
+				builder.WriteString(` <span class="risk-badge" style="background:` + color + `">` + html.EscapeString(riskLevel) + `</span>`)
+			}
+			builder.WriteString(`</div>`)
+			if description != "" {
+				builder.WriteString(`<span class="scope-desc">` + html.EscapeString(description) + `</span>`)
+			}
+			builder.WriteString(`</label>`)
+		} else {
+			builder.WriteString(`<label class="scope blocked">`)
+			builder.WriteString(`<div class="scope-header">`)
+			builder.WriteString(`<input type="checkbox" disabled>`)
+			builder.WriteString(`<strong>` + html.EscapeString(displayName) + `</strong>`)
+			if riskLevel != "" {
+				color := riskBadgeColor(riskLevel)
+				builder.WriteString(` <span class="risk-badge" style="background:` + color + `">` + html.EscapeString(riskLevel) + `</span>`)
+			}
+			builder.WriteString(`</div>`)
+			if description != "" {
+				builder.WriteString(`<span class="scope-desc">` + html.EscapeString(description) + `</span>`)
+			}
+			builder.WriteString(`<span class="scope-blocked-reason">` + html.EscapeString(blockedReasonText(diag.Reason)) + `</span>`)
+			builder.WriteString(`</label>`)
+		}
 	}
 
 	builder.WriteString("</fieldset>")
-	builder.WriteString("<label class=\"scope\"><strong><input type=\"checkbox\" name=\"remember\" value=\"true\" checked> Remember this decision for 30 days</strong><span>Clearing this stores nothing beyond the current OAuth transaction.</span></label>")
-	builder.WriteString("<div class=\"actions\"><button class=\"allow\" type=\"submit\" name=\"action\" value=\"allow\">Allow selected</button><button class=\"deny\" type=\"submit\" name=\"action\" value=\"deny\">Deny</button></div>")
-	builder.WriteString("<p class=\"meta\">Only the checked scopes will be granted to this client.</p>")
+	builder.WriteString(`<label class="scope"><div class="scope-header"><input type="checkbox" name="remember" value="true" checked><strong>Remember this decision for 30 days</strong></div><span class="scope-desc">Clearing this stores nothing beyond the current OAuth transaction.</span></label>`)
+	builder.WriteString(`<div class="actions"><button class="allow" type="submit" name="action" value="allow">Allow selected</button><button class="deny" type="submit" name="action" value="deny">Deny</button></div>`)
+	builder.WriteString(`<p class="meta">Only the checked scopes will be granted to this client.</p>`)
 	builder.WriteString("</form></main></body></html>")
 
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(builder.String()))

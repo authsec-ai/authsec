@@ -1,7 +1,9 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -347,24 +350,82 @@ func (s *OAuthASService) IntrospectViaHydraAdmin(token string) (map[string]inter
 	return result, nil
 }
 
-// RevokeHydraToken revokes a token via Hydra's public revocation endpoint.
+// RevokeHydraToken revokes a single token via Hydra's public revocation endpoint.
 // Best-effort, fire-and-forget — errors are logged but not returned.
+// Prefer RevokeFullTokenSet for post-Hydra rejection paths.
 func (s *OAuthASService) RevokeHydraToken(token string) {
+	if err := s.revokeOneToken(token); err != nil {
+		log.Printf("[MCP_AUTH] RevokeHydraToken: %v", err)
+	}
+}
+
+// revokeOneToken is the low-level synchronous revocation primitive.
+//
+// Error semantics:
+//   - Transport/circuit-breaker failure → error
+//   - Hydra responds with non-200 (e.g. 429 rate-limited, 503 unavailable) → error.
+//     RFC 7009 §2.2 requires the revocation endpoint to return HTTP 200 for any
+//     successfully processed request, including unknown tokens. A non-200 means the
+//     server did not process the revocation; the token may still be live.
+//   - Hydra responds with 200 → nil (revocation confirmed)
+func (s *OAuthASService) revokeOneToken(token string) error {
+	if token == "" {
+		return nil
+	}
 	form := url.Values{"token": {token}}
 	targetURL := config.AppConfig.HydraPublicURL + "/oauth2/revoke"
 	req, err := http.NewRequest("POST", targetURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		log.Printf("[MCP_AUTH] RevokeHydraToken: failed to create request: %v", err)
-		return
+		return fmt.Errorf("create revoke request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := CircuitDoHydra(req)
-	if err != nil {
-		log.Printf("[MCP_AUTH] RevokeHydraToken: Hydra unavailable: %v", err)
-		return
+
+	resp, circuitErr := CircuitDoHydra(req)
+	// Always drain and close the body. CircuitDoHydra returns (resp, err) for 5xx
+	// responses — the resp is non-nil even in the error path — so the body must be
+	// closed regardless of whether circuitErr is set.
+	if resp != nil {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		resp.Body.Close()
 	}
-	resp.Body.Close()
-	log.Printf("[MCP_AUTH] RevokeHydraToken: revoked orphaned token (status=%d)", resp.StatusCode)
+	if circuitErr != nil {
+		return fmt.Errorf("Hydra revoke transport/circuit error: %w", circuitErr)
+	}
+	// Any non-200 status is a revocation failure. 4xx responses (e.g. 429 Too Many
+	// Requests) are not caught by the circuit breaker but still indicate the token
+	// was not revoked. Return an error so the caller can log the failure and decide
+	// the denial policy (always 403 regardless, per plan).
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Hydra revoke returned non-200 status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// RevokeFullTokenSet revokes both the access token and refresh token (when present)
+// via Hydra's public revocation endpoint. Per RFC 7009, revoking a refresh token
+// cascades to all associated access tokens for that grant, but we also revoke the
+// access token explicitly as a defensive measure for opaque token deployments.
+//
+// Returns an error if either revocation call fails. The caller is responsible for
+// deciding the response to the client — the plan specifies that hard denials
+// (RBAC fail, missing context) must return 403 regardless of revocation outcome,
+// and revocation errors must be logged but must not change the 403 to a 502.
+func (s *OAuthASService) RevokeFullTokenSet(accessToken, refreshToken string) error {
+	var errs []error
+	// Revoke refresh token first: Hydra cascades this to all associated access tokens.
+	if refreshToken != "" {
+		if err := s.revokeOneToken(refreshToken); err != nil {
+			errs = append(errs, fmt.Errorf("refresh token revoke: %w", err))
+		}
+	}
+	// Also explicitly revoke access token (defensive — catches opaque token deployments
+	// where the cascade may not cover the specific access token instance).
+	if accessToken != "" {
+		if err := s.revokeOneToken(accessToken); err != nil {
+			errs = append(errs, fmt.Errorf("access token revoke: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // RevokeHydraLoginSession revokes all login sessions for a subject via Hydra admin API.
@@ -427,6 +488,11 @@ func (s *OAuthASService) ResolveCIMDClient(cimdURL string) (*models.MCPOAuthClie
 
 		// Bug 10: If redirect URIs changed, stage them for admin review instead of auto-applying.
 		if redirectsChanged {
+			// Validate structural correctness of incoming URIs before staging.
+			// Malformed URIs are rejected here to prevent them from reaching Hydra at approval time.
+			if err := validateRedirectURIs(cimdMeta.RedirectURIs); err != nil {
+				return nil, fmt.Errorf("CIMD document contains invalid redirect_uri: %w", err)
+			}
 			existing.PendingRedirectURIs = pq.StringArray(cimdMeta.RedirectURIs)
 			existing.RedirectReviewPending = true
 			// Do NOT update Hydra client — pending review
@@ -441,6 +507,12 @@ func (s *OAuthASService) ResolveCIMDClient(cimdURL string) (*models.MCPOAuthClie
 
 	// Create new CIMD client — scope is determined by the CIMD metadata document.
 	// Do NOT default to OIDC scopes; CIMD clients opt into OIDC by declaring scopes in their document.
+
+	// Validate redirect URIs structurally before creating the Hydra client.
+	if err := validateRedirectURIs(cimdMeta.RedirectURIs); err != nil {
+		return nil, fmt.Errorf("CIMD document contains invalid redirect_uri: %w", err)
+	}
+
 	hydraClientID := uuid.New().String()
 	cimdScope := cimdMeta.Scope // from CIMD document; empty = auth-code-only (MCP default)
 	cimdHydraScope, cimdGrantTypes, cimdSupportsRefresh := resolveOIDCClientCapabilities(cimdScope)
@@ -591,6 +663,12 @@ func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
 		return fmt.Errorf("no pending redirect changes")
 	}
 
+	// Validate staged redirect URIs structurally before promoting to Hydra.
+	// (They were validated when staged but re-validate here as a defence-in-depth.)
+	if err := validateRedirectURIs([]string(client.PendingRedirectURIs)); err != nil {
+		return fmt.Errorf("pending redirect URIs are invalid: %w", err)
+	}
+
 	// Copy pending → approved
 	client.RedirectURIs = client.PendingRedirectURIs
 	client.PendingRedirectURIs = nil
@@ -677,14 +755,95 @@ type cimdDocument struct {
 	Scope        string   `json:"scope,omitempty"` // OIDC scopes the client opts into (e.g. "openid profile email")
 }
 
+// blockedCIDRs is the set of IP ranges that CIMD fetch must never reach.
+// Covers loopback, RFC 1918 private, link-local (cloud metadata endpoints),
+// IPv6 ULA, unspecified, and shared address space (RFC 6598).
+var blockedCIDRs = mustParseCIDRs([]string{
+	"127.0.0.0/8",    // loopback IPv4
+	"::1/128",        // loopback IPv6
+	"10.0.0.0/8",     // RFC 1918
+	"172.16.0.0/12",  // RFC 1918
+	"192.168.0.0/16", // RFC 1918
+	"169.254.0.0/16", // link-local / cloud metadata (AWS 169.254.169.254, Azure, GCP)
+	"fd00::/8",       // IPv6 ULA
+	"0.0.0.0/8",      // unspecified
+	"100.64.0.0/10",  // shared address space (RFC 6598)
+})
+
+func mustParseCIDRs(cidrs []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CIDR %q: %v", cidr, err))
+		}
+		out = append(out, network)
+	}
+	return out
+}
+
+func isBlockedIP(ip net.IP) bool {
+	for _, network := range blockedCIDRs {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchCIMDDocument fetches and parses a CIMD metadata document from an HTTPS URL.
+// SSRF protection: resolves DNS before dialing and re-checks resolved IPs at connect
+// time (anti-rebinding). Rejects any URL that resolves to a reserved/private IP.
 func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
 	parsed, err := url.Parse(cimdURL)
 	if err != nil || parsed.Scheme != "https" {
 		return nil, fmt.Errorf("CIMD URL must be HTTPS: %s", cimdURL)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(cimdURL)
+	hostname := parsed.Hostname()
+
+	// Pre-resolve DNS and validate all returned IPs before opening a connection.
+	addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), hostname)
+	if err != nil {
+		return nil, fmt.Errorf("CIMD DNS resolution failed for %s: %w", hostname, err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("CIMD URL %s resolved to no addresses", hostname)
+	}
+	for _, addr := range addrs {
+		if isBlockedIP(addr.IP) {
+			return nil, fmt.Errorf("CIMD URL %s resolves to a reserved address (%s)", cimdURL, addr.IP)
+		}
+	}
+
+	// Custom transport: re-checks the resolved IP at dial time to prevent DNS rebinding
+	// (time-of-check / time-of-use gap between the pre-resolution above and connect).
+	baseDialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return nil, fmt.Errorf("invalid dial address %q: %w", address, splitErr)
+			}
+			ips, lookupErr := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if lookupErr != nil {
+				return nil, fmt.Errorf("CIMD dial DNS failed: %w", lookupErr)
+			}
+			for _, ip := range ips {
+				if isBlockedIP(ip.IP) {
+					return nil, fmt.Errorf("CIMD connect blocked: resolved to reserved IP %s", ip.IP)
+				}
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("CIMD dial: no addresses for %s", host)
+			}
+			return baseDialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second, Transport: transport}
+
+	resp, err := httpClient.Get(cimdURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch CIMD: %w", err)
 	}
@@ -705,6 +864,32 @@ func fetchCIMDDocument(cimdURL string) (*cimdDocument, error) {
 	}
 
 	return &doc, nil
+}
+
+// validateRedirectURIs checks redirect URIs for structural correctness before Hydra sync.
+//
+// Redirect URIs are callback identifiers — the AS never fetches them server-side during
+// the OAuth flow, so SSRF IP-blocklists do NOT apply here. Validation is structural only:
+// absolute URL, no fragment, https scheme (or http for localhost in dev).
+func validateRedirectURIs(uris []string) error {
+	for _, raw := range uris {
+		u, err := url.Parse(raw)
+		if err != nil || !u.IsAbs() {
+			return fmt.Errorf("redirect URI must be an absolute URL: %q", raw)
+		}
+		if u.Fragment != "" {
+			return fmt.Errorf("redirect URI must not contain a fragment: %q", raw)
+		}
+		if u.Scheme != "https" {
+			// Allow http only for localhost (existing repo policy for dev convenience).
+			// url.Hostname() strips brackets, so IPv6 loopback arrives as "::1" not "[::1]".
+			host := u.Hostname()
+			if u.Scheme != "http" || (host != "localhost" && host != "127.0.0.1" && host != "::1") {
+				return fmt.Errorf("redirect URI must use https (or http for localhost): %q", raw)
+			}
+		}
+	}
+	return nil
 }
 
 // --- JWKS cache ---

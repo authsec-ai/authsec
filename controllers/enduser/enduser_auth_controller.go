@@ -94,7 +94,7 @@ func (euac *EndUserAuthController) tenantMapping(clientID uuid.UUID) (uuid.UUID,
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 409 {object} map[string]string "Conflict - user already exists"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/initiate-registration [post]
+// @Router /authsec/uflow/auth/enduser/initiate-registration [post]
 func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 	var input models.CustomLoginRegister
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -189,7 +189,7 @@ func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid OTP"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/verify-otp [post]
+// @Router /authsec/uflow/auth/enduser/verify-otp [post]
 func (euac *EndUserAuthController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// For end-user registration, we create users directly without OTP verification
 	// This method can be used for password reset OTP verification instead
@@ -213,7 +213,7 @@ type EmailCheckInput struct {
 // @Failure 400 {object} map[string]string "Bad request - invalid email"
 // @Failure 404 {object} map[string]string "User not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/login/precheck [post]
+// @Router /authsec/uflow/auth/enduser/login/precheck [post]
 func (euac *EndUserAuthController) EndUserLoginPrecheck(c *gin.Context) {
 	var input EmailCheckInput
 
@@ -291,7 +291,7 @@ func (euac *EndUserAuthController) EndUserLoginPrecheck(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid credentials"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/login [post]
+// @Router /authsec/uflow/auth/enduser/login [post]
 func (euac *EndUserAuthController) Login(c *gin.Context) {
 	var input models.CustomLoginInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -500,7 +500,7 @@ func (euac *EndUserAuthController) Login(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - SAML user not found or provider does not end with -saml"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/user/saml/login [post]
+// @Router /authsec/uflow/user/saml/login [post]
 func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 	var input models.SAMLLoginInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -578,7 +578,7 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - authentication failed"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/webauthn-callback [post]
+// @Router /authsec/uflow/auth/enduser/webauthn-callback [post]
 func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	var input models.WebAuthnCallbackInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -675,7 +675,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid OTP"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/verify-login-otp [post]
+// @Router /authsec/uflow/auth/enduser/verify-login-otp [post]
 func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 	var input models.LoginVerifyOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -765,7 +765,7 @@ func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 // @Success 200 {object} map[string]string "OTP resent successfully"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/resend-otp [post]
+// @Router /authsec/uflow/auth/enduser/resend-otp [post]
 func (euac *EndUserAuthController) ResendOTP(c *gin.Context) {
 	var input models.ResendOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1205,7 +1205,7 @@ func (euac *EndUserAuthController) generateJWTToken(tenantID, clientID, emailID,
 // @Produce json
 // @Success 200 {object} models.AuthChallenge "Challenge generated successfully"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/enduser/challenge [get]
+// @Router /authsec/uflow/auth/enduser/challenge [get]
 func (euac *EndUserAuthController) GetAuthChallenge(c *gin.Context) {
 	challenge, err := euac.antiReplayService.GenerateChallenge()
 	if err != nil {

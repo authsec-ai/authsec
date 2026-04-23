@@ -42,7 +42,7 @@ func NewAuthorizationController() *AuthorizationController {
 // @Success 200 {object} PolicyCheckResponse
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/admin/policy/check [post]
+// @Router /authsec/uflow/admin/policy/check [post]
 func (ac *AuthorizationController) PolicyDecisionPointCheckAdmin(c *gin.Context) {
 	var req PolicyCheckRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -90,7 +90,7 @@ func (ac *AuthorizationController) PolicyDecisionPointCheckAdmin(c *gin.Context)
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /uflow/user/rbac/policy/check [post]
+// @Router /authsec/uflow/user/rbac/policy/check [post]
 func (ac *AuthorizationController) PolicyDecisionPointCheckUser(c *gin.Context) {
 	var req PolicyCheckRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

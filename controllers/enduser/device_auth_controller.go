@@ -54,7 +54,7 @@ func NewDeviceAuthController() (*DeviceAuthController, error) {
 // @Success 200 {object} models.DeviceCodeResponse "Device code created successfully"
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/device/code [post]
+// @Router /authsec/uflow/auth/device/code [post]
 func (ctrl *DeviceAuthController) RequestDeviceCode(c *gin.Context) {
 	var req models.DeviceCodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -91,7 +91,7 @@ func (ctrl *DeviceAuthController) RequestDeviceCode(c *gin.Context) {
 // @Param request body models.DeviceTokenRequest true "Device token request"
 // @Success 200 {object} models.DeviceTokenResponse "Token issued or status returned"
 // @Failure 400 {object} map[string]string "Bad request"
-// @Router /uflow/auth/device/token [post]
+// @Router /authsec/uflow/auth/device/token [post]
 func (ctrl *DeviceAuthController) PollDeviceToken(c *gin.Context) {
 	var req models.DeviceTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -131,7 +131,7 @@ func (ctrl *DeviceAuthController) PollDeviceToken(c *gin.Context) {
 // @Param user_code query string true "User code from device"
 // @Success 200 {object} models.DeviceActivationInfoResponse "Device activation information"
 // @Failure 400 {object} map[string]string "Bad request - invalid or expired code"
-// @Router /uflow/auth/device/activate/info [get]
+// @Router /authsec/uflow/auth/device/activate/info [get]
 func (ctrl *DeviceAuthController) GetActivationInfo(c *gin.Context) {
 	userCode := c.Query("user_code")
 	if userCode == "" {
@@ -161,7 +161,7 @@ func (ctrl *DeviceAuthController) GetActivationInfo(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid or missing token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /uflow/auth/device/verify [post]
+// @Router /authsec/uflow/auth/device/verify [post]
 func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 	var req models.DeviceVerificationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

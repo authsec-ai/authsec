@@ -39,7 +39,7 @@ type SyncContactRequest struct {
 // @Success 200 {object} map[string]interface{} "Contact synced successfully"
 // @Failure 400 {object} map[string]interface{} "Bad request - invalid input"
 // @Failure 500 {object} map[string]interface{} "HubSpot sync failed"
-// @Router /uflow/hubspot/contacts/sync [post]
+// @Router /authsec/uflow/hubspot/contacts/sync [post]
 func (hc *HubSpotController) SyncContact(c *gin.Context) {
 	var req SyncContactRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
