@@ -3,11 +3,11 @@ package services
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -66,10 +66,6 @@ func (s *OAuthASService) ASMetadata(baseURL string) map[string]interface{} {
 		"revocation_endpoint_auth_methods_supported":    []string{"none"},
 		"code_challenge_methods_supported":              []string{"S256"},
 		"resource_indicators_supported":                 true,
-
-		// RFC 9126 — Pushed Authorization Requests
-		"pushed_authorization_request_endpoint": baseURL + "/oauth/par",
-		"require_pushed_authorization_requests": false,
 
 		// OIDC Discovery 1.0 extensions
 		"userinfo_endpoint":                     baseURL + "/oauth/userinfo",

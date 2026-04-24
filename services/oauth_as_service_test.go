@@ -34,7 +34,6 @@ func TestOAuthASMetadataOIDCShape(t *testing.T) {
 	for _, field := range []string{
 		"userinfo_endpoint",
 		"end_session_endpoint",
-		"pushed_authorization_request_endpoint",
 		"scopes_supported",
 		"subject_types_supported",
 		"id_token_signing_alg_values_supported",
@@ -43,6 +42,12 @@ func TestOAuthASMetadataOIDCShape(t *testing.T) {
 		if meta[field] == nil {
 			t.Errorf("OIDC metadata field %q missing", field)
 		}
+	}
+	if _, ok := meta["pushed_authorization_request_endpoint"]; ok {
+		t.Fatalf("temporary no-PAR metadata must not advertise pushed_authorization_request_endpoint")
+	}
+	if _, ok := meta["require_pushed_authorization_requests"]; ok {
+		t.Fatalf("temporary no-PAR metadata must not advertise require_pushed_authorization_requests")
 	}
 
 	scopes, ok := meta["scopes_supported"].([]string)

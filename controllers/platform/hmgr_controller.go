@@ -317,20 +317,34 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 
 	// ── Dual-mode: new MCP path vs legacy path ──
 	if ctrl.isNewMCPClient(hydraClientID) {
-		// MCP PATH: Recover auth context via request_uri from Hydra's request_url.
-		// PAR (RFC 9126) ensures each auth flow has a unique request_uri.
-		// Deterministic — no heuristic fallback needed.
-
+		// Temporary no-PAR path: bind via authsec_ctx from Hydra's request_url.
+		// Legacy request_uri binding remains as a fallback for any in-flight flows minted
+		// before the bypass was deployed.
+		contextID := ""
 		requestURI := ""
 		if loginRequest.RequestURL != "" {
 			if parsedURL, parseErr := url.Parse(loginRequest.RequestURL); parseErr == nil {
+				contextID = parsedURL.Query().Get("authsec_ctx")
 				requestURI = parsedURL.Query().Get("request_uri")
 			}
 		}
 
 		var arcCtx *models.AuthRequestContext
-		if requestURI != "" {
-			// Primary path: PAR-based deterministic binding via request_uri
+		if contextID != "" {
+			// Primary path during the temporary bypass: authsec_ctx binds directly to ContextID.
+			var bindErr error
+			arcCtx, bindErr = ctrl.authzCtx.BindByContextID(contextID, loginChallenge)
+			if bindErr != nil || arcCtx == nil {
+				log.Printf("[MCP_AUTH] GetLoginPageData: BindByContextID failed ctx=%s: %v", contextID, bindErr)
+				c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
+					Success: false,
+					Error:   "Authorization context not found",
+				})
+				return
+			}
+			log.Printf("[MCP_AUTH] GetLoginPageData: using authsec_ctx=%s (temporary no-PAR flow)", contextID)
+		} else if requestURI != "" {
+			// Legacy fallback for already-issued PAR flows.
 			var bindErr error
 			arcCtx, bindErr = ctrl.authzCtx.BindByHydraRequestURI(requestURI, loginChallenge)
 			if bindErr != nil || arcCtx == nil {
@@ -342,33 +356,13 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 				return
 			}
 		} else {
-			// Legacy fallback: try authsec_ctx from request_url (pre-PAR flows, remove after next release)
-			contextID := ""
-			if loginRequest.RequestURL != "" {
-				if parsedURL, parseErr := url.Parse(loginRequest.RequestURL); parseErr == nil {
-					contextID = parsedURL.Query().Get("authsec_ctx")
-				}
-			}
-			if contextID == "" {
-				log.Printf("[MCP_AUTH] GetLoginPageData: no request_uri or authsec_ctx for client=%s challenge=%s",
-					hydraClientID, loginChallenge)
-				c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
-					Success: false,
-					Error:   "Authorization context not found",
-				})
-				return
-			}
-			var bindErr error
-			arcCtx, bindErr = ctrl.authzCtx.BindByContextID(contextID, loginChallenge)
-			if bindErr != nil || arcCtx == nil {
-				log.Printf("[MCP_AUTH] GetLoginPageData: legacy BindByContextID failed ctx=%s: %v", contextID, bindErr)
-				c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
-					Success: false,
-					Error:   "Authorization context not found",
-				})
-				return
-			}
-			log.Printf("[MCP_AUTH] GetLoginPageData: using legacy authsec_ctx=%s (pre-PAR flow)", contextID)
+			log.Printf("[MCP_AUTH] GetLoginPageData: no authsec_ctx or request_uri for client=%s challenge=%s",
+				hydraClientID, loginChallenge)
+			c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "Authorization context not found",
+			})
+			return
 		}
 
 		tenantIDForOIDC := arcCtx.TenantID

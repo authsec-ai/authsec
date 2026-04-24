@@ -84,6 +84,11 @@ func (ctrl *OAuthASController) OIDCDiscovery(c *gin.Context) {
 // Authorize handles the OAuth authorization request.
 // GET /oauth/authorize
 //
+// Temporary no-PAR bridge:
+//   - PAR is disabled at the public AuthSec surface for now.
+//   - AuthSec stores the auth context and redirects directly to Hydra /oauth2/auth.
+//   - authsec_ctx=contextID is the temporary correlation key consumed by hmgr.
+//
 // Hard rules:
 //   - Generates server-side context_id (never trusts client state for binding)
 //   - Only supports response_type=code
@@ -93,84 +98,18 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 	clientID := c.Query("client_id")
 	requestURI := c.Query("request_uri")
 
-	// RFC 9126 §4: If request_uri is present, the client already called /oauth/par.
-	// All authorization parameters are stored server-side — just look up the Hydra
-	// client_id from the AuthSec client and redirect to Hydra with the PAR reference.
+	// Temporary compatibility mode: public PAR is disabled while AuthSec is still backed
+	// by stock Hydra, which does not expose /oauth2/par. Reject request_uri explicitly
+	// instead of pretending to support RFC 9126.
 	if requestURI != "" {
-		if clientID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "client_id required with request_uri"})
-			return
-		}
-
-		// P1 ordering fix: validate the stored PAR reference FIRST before any client
-		// resolution. This prevents state-mutating CIMD upserts from running against an
-		// invalid, expired, or forged request_uri. Client lookup is read-only — no
-		// ResolveCIMDClient fallback (which creates/updates Hydra clients) is permitted here.
-		arcCtx, ctxErr := ctrl.service.GetActiveAuthRequestContextByHydraRequestURI(requestURI)
-		if ctxErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_request_uri",
-				"error_description": "request_uri is unknown or expired",
-			})
-			return
-		}
-
-		// Read-only client lookup. For PAR continuations the client must already exist in
-		// the DB — ResolveCIMDClient (which upserts a Hydra client) is explicitly excluded.
-		oauthClient, err := ctrl.service.GetOAuthClient(clientID)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_client"})
-			return
-		}
-		if arcCtx.HydraClientID != oauthClient.HydraClientID {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_request_uri",
-				"error_description": "request_uri does not belong to the supplied client",
-			})
-			return
-		}
-
-		// Re-check mutable RS + client state that may have changed since PAR was minted.
-		// The original policy was validated at PAR time; these three cheap DB reads close the
-		// window where an admin deactivates an RS, changes registration modes, or revokes a
-		// client registration between PAR issuance and the browser redirect to Hydra.
-		arcRS, rsErr := ctrl.rsService.GetByID(arcCtx.ResourceServerID)
-		if rsErr != nil || !arcRS.Active {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":             "access_denied",
-				"error_description": "resource server is no longer active",
-			})
-			return
-		}
-		if !arcRS.AllowsRegistrationMode(oauthClient.RegistrationType) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":             "access_denied",
-				"error_description": "resource server no longer allows this client registration type",
-			})
-			return
-		}
-		arcReg, arcRegErr := ctrl.service.GetClientRegistration(arcRS.ID, oauthClient.ID)
-		if arcRegErr != nil || arcReg.Status != "approved" {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":             "access_denied",
-				"error_description": "client authorization for this resource has been revoked",
-			})
-			return
-		}
-
-		hydraAuthURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
-		if config.AppConfig.OAuthAuthURL != "" {
-			hydraAuthURL = config.AppConfig.OAuthAuthURL
-		}
-		redirectParams := url.Values{
-			"client_id":   {oauthClient.HydraClientID},
-			"request_uri": {requestURI},
-		}
-		c.Redirect(http.StatusFound, hydraAuthURL+"?"+redirectParams.Encode())
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request_uri",
+			"error_description": "PAR is temporarily disabled; retry the authorization request without request_uri",
+		})
 		return
 	}
 
-	// Full authorize flow — all params on the query string (AuthSec pushes PAR internally)
+	// Temporary no-PAR authorize flow — AuthSec stores context and redirects to Hydra directly.
 	resource := c.Query("resource")
 	state := c.Query("state")
 	redirectURI := c.Query("redirect_uri")
@@ -276,72 +215,39 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 		return
 	}
 
-	// 6. Push authorization request to Hydra via PAR (RFC 9126, server-to-server)
-	parParams := url.Values{}
-	parParams.Set("client_id", oauthClient.HydraClientID)
-	parParams.Set("resource", resource)
-	parParams.Set("state", state)
-	parParams.Set("redirect_uri", redirectURIToUse)
-	parParams.Set("response_type", "code")
-	parParams.Set("response_mode", "query")
-	parParams.Set("code_challenge", codeChallenge)
-	parParams.Set("code_challenge_method", codeChallengeMethod)
-	if scopeParam != "" {
-		parParams.Set("scope", scopeParam)
-	}
-	// OIDC Core 1.0 — forward nonce/prompt/max_age to Hydra via PAR.
-	// Hydra uses nonce when minting id_token; prompt/max_age control login behavior.
-	if nonce != "" {
-		parParams.Set("nonce", nonce)
-	}
-	if prompt != "" {
-		parParams.Set("prompt", prompt)
-	}
-	if maxAgeStr != "" {
-		parParams.Set("max_age", maxAgeStr)
-	}
-	requestURI, parExpiresIn, err := services.PushAuthorizationRequest(parParams)
-	if err != nil {
-		log.Printf("[MCP_AUTH] Authorize: PAR failed: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":             "server_error",
-			"error_description": "failed to initiate authorization request",
-		})
-		return
-	}
-
-	// 7. Update context with Hydra request_uri and align expiry (compare-and-set)
-	alignedExpiry := ctx.ExpiresAt
-	if parExpiresIn > 0 {
-		parExpiry := time.Now().Add(time.Duration(parExpiresIn) * time.Second)
-		if parExpiry.Before(alignedExpiry) {
-			alignedExpiry = parExpiry
-		}
-	}
-	if updateErr := ctrl.service.UpdateAuthRequestContextPAR(ctx.State, requestURI, alignedExpiry); updateErr != nil {
-		// PAR succeeded but DB update failed — orphaned PAR object will expire in Hydra.
-		// Do NOT redirect. Fail closed.
-		log.Printf("[MCP_AUTH] Authorize: PAR succeeded but DB update failed state=%s request_uri=%s: %v",
-			ctx.State, requestURI, updateErr)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":             "server_error",
-			"error_description": "failed to persist authorization state",
-		})
-		return
-	}
-
-	log.Printf("[MCP_AUTH] Authorize: context_id=%s request_uri=%s client=%s resource=%s",
-		contextID, requestURI, clientID, resource)
-
-	// 8. Redirect browser with minimal params — only client_id + request_uri
+	// 6. Redirect directly to Hydra /oauth2/auth. Keep the client-supplied OAuth state
+	// flowing through Hydra and use authsec_ctx only as an internal correlation key.
 	hydraAuthURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
 	if config.AppConfig.OAuthAuthURL != "" {
 		hydraAuthURL = config.AppConfig.OAuthAuthURL
 	}
-	redirectParams := url.Values{
-		"client_id":   {oauthClient.HydraClientID},
-		"request_uri": {requestURI},
+	redirectParams := url.Values{}
+	redirectParams.Set("client_id", oauthClient.HydraClientID)
+	redirectParams.Set("resource", resource)
+	redirectParams.Set("state", state)
+	redirectParams.Set("redirect_uri", redirectURIToUse)
+	redirectParams.Set("response_type", "code")
+	redirectParams.Set("response_mode", "query")
+	redirectParams.Set("code_challenge", codeChallenge)
+	redirectParams.Set("code_challenge_method", codeChallengeMethod)
+	if scopeParam != "" {
+		redirectParams.Set("scope", scopeParam)
 	}
+	if nonce != "" {
+		redirectParams.Set("nonce", nonce)
+	}
+	if prompt != "" {
+		redirectParams.Set("prompt", prompt)
+	}
+	if maxAgeStr != "" {
+		redirectParams.Set("max_age", maxAgeStr)
+	}
+	redirectParams.Set("authsec_ctx", contextID)
+
+	log.Printf("[MCP_AUTH] Authorize: context_id=%s authsec_ctx=%s client=%s resource=%s",
+		contextID, contextID, clientID, resource)
+
+	// 7. Redirect browser with the full authorize request plus authsec_ctx bridge.
 	c.Redirect(http.StatusFound, hydraAuthURL+"?"+redirectParams.Encode())
 }
 
@@ -1195,139 +1101,13 @@ func (ctrl *OAuthASController) EndSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "logged_out"})
 }
 
-// PAR handles the public Pushed Authorization Request endpoint (RFC 9126).
-// POST /oauth/par
-//
-// Clients can push authorization parameters before redirecting to /oauth/authorize.
-// Returns a request_uri that can be used in the subsequent authorize redirect.
+// PAR is temporarily disabled while AuthSec is still backed by stock Hydra, which
+// does not expose /oauth2/par in self-hosted mode. A later AuthSec-owned PAR
+// implementation will re-enable this endpoint without depending on Hydra PAR.
 func (ctrl *OAuthASController) PAR(c *gin.Context) {
-	if c.Request.PostForm == nil {
-		c.Request.ParseForm()
-	}
-
-	clientID := c.PostForm("client_id")
-	resource := c.PostForm("resource")
-	state := c.PostForm("state")
-	redirectURI := c.PostForm("redirect_uri")
-	scopeParam := c.PostForm("scope")
-	responseType := c.PostForm("response_type")
-	codeChallenge := c.PostForm("code_challenge")
-	codeChallengeMethod := c.PostForm("code_challenge_method")
-	nonce := c.PostForm("nonce")
-	prompt := c.PostForm("prompt")
-	maxAgeStr := c.PostForm("max_age")
-
-	if clientID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "client_id required"})
-		return
-	}
-	if resource == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "resource parameter required"})
-		return
-	}
-	if state == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "state required"})
-		return
-	}
-	if responseType != "code" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported_response_type", "error_description": "response_type=code required"})
-		return
-	}
-	if codeChallenge == "" || codeChallengeMethod != "S256" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "PKCE S256 required"})
-		return
-	}
-
-	// Resolve client + RS and enforce all policy gates in one shared pass.
-	// validateOAuthPolicy is the single authoritative check for PAR and full-query Authorize.
-	policy, pErr := ctrl.validateOAuthPolicy(clientID, resource, redirectURI, strings.Fields(scopeParam))
-	if pErr != nil {
-		c.JSON(pErr.Status, gin.H{"error": pErr.Code, "error_description": pErr.Description})
-		return
-	}
-	oauthClient := policy.Client
-	rs := policy.RS
-	redirectURI = policy.RedirectURI
-
-	// Build auth context
-	contextID := uuid.New().String()
-	ctx := &models.AuthRequestContext{
-		State:            uuid.New().String(),
-		ContextID:        contextID,
-		HydraClientID:    oauthClient.HydraClientID,
-		ResourceServerID: rs.ID.String(),
-		TenantID:         rs.TenantID.String(),
-		ResourceURI:      rs.ResourceURI,
-		RedirectURI:      redirectURI,
-		RequestedScopes:  scopeParam,
-		ExpiresAt:        time.Now().Add(10 * time.Minute),
-	}
-	if nonce != "" {
-		ctx.Nonce = &nonce
-	}
-	if prompt != "" {
-		ctx.Prompt = &prompt
-	}
-	if maxAgeStr != "" {
-		if maxAgeInt, convErr := strconv.Atoi(maxAgeStr); convErr == nil {
-			ctx.MaxAge = &maxAgeInt
-		}
-	}
-	if err := ctrl.service.StoreAuthRequestContext(ctx); err != nil {
-		log.Printf("[MCP_AUTH] PAR: failed to store auth context: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
-		return
-	}
-
-	// Push to Hydra
-	parParams := url.Values{}
-	parParams.Set("client_id", oauthClient.HydraClientID)
-	parParams.Set("resource", resource)
-	parParams.Set("state", state)
-	parParams.Set("redirect_uri", redirectURI)
-	parParams.Set("response_type", "code")
-	parParams.Set("response_mode", "query")
-	parParams.Set("code_challenge", codeChallenge)
-	parParams.Set("code_challenge_method", codeChallengeMethod)
-	if scopeParam != "" {
-		parParams.Set("scope", scopeParam)
-	}
-	if nonce != "" {
-		parParams.Set("nonce", nonce)
-	}
-	if prompt != "" {
-		parParams.Set("prompt", prompt)
-	}
-	if maxAgeStr != "" {
-		parParams.Set("max_age", maxAgeStr)
-	}
-
-	requestURI, parExpiresIn, parErr := services.PushAuthorizationRequest(parParams)
-	if parErr != nil {
-		log.Printf("[MCP_AUTH] PAR: Hydra PAR failed: %v", parErr)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "server_error", "error_description": "failed to push authorization request"})
-		return
-	}
-
-	// Update context with PAR request_uri
-	alignedExpiry := ctx.ExpiresAt
-	if parExpiresIn > 0 {
-		parExpiry := time.Now().Add(time.Duration(parExpiresIn) * time.Second)
-		if parExpiry.Before(alignedExpiry) {
-			alignedExpiry = parExpiry
-		}
-	}
-	if updateErr := ctrl.service.UpdateAuthRequestContextPAR(ctx.State, requestURI, alignedExpiry); updateErr != nil {
-		log.Printf("[MCP_AUTH] PAR: DB update failed state=%s: %v", ctx.State, updateErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
-		return
-	}
-
-	log.Printf("[MCP_AUTH] PAR: context_id=%s request_uri=%s client=%s", contextID, requestURI, clientID)
-
-	c.JSON(http.StatusCreated, gin.H{
-		"request_uri": requestURI,
-		"expires_in":  parExpiresIn,
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error":             "unsupported_request",
+		"error_description": "PAR is temporarily disabled; use /oauth/authorize directly",
 	})
 }
 
