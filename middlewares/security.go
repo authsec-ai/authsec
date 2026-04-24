@@ -34,6 +34,13 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		if strings.HasPrefix(path, "/authsec/uflow/oidc/callback") {
 			// Allow inline scripts for OAuth callback (postMessage to opener window)
 			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+		} else if strings.HasPrefix(path, "/authsec/hmgr/consent") {
+			// The consent form POSTs to this endpoint. After acceptance, the server
+			// returns a 302 to the Hydra public URL so the browser can complete the
+			// OAuth flow. Modern browsers (Safari, Chrome) enforce form-action on the
+			// redirect chain, so the Hydra origin must be explicitly allowed.
+			hydraOrigin := hydraPublicOrigin()
+			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s;", hydraOrigin)
 		} else {
 			// Strict CSP for all other endpoints
 			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
@@ -105,6 +112,30 @@ func RequestIDMiddleware() gin.HandlerFunc {
 			logrus.WithFields(logFields).Error("Request failed")
 		}
 	}
+}
+
+// hydraPublicOrigin extracts the scheme+host from HYDRA_PUBLIC_URL so it can
+// be injected into the form-action CSP directive on consent pages. The browser
+// enforces form-action on the 302 redirect chain, so the Hydra origin must be
+// explicitly listed or Safari/Chrome will refuse to complete the OAuth flow.
+func hydraPublicOrigin() string {
+	raw := os.Getenv("HYDRA_PUBLIC_URL")
+	if raw == "" {
+		return ""
+	}
+	// Trim any trailing path — we only need the origin (scheme+host).
+	raw = strings.TrimRight(raw, "/")
+	// Strip any path component after the host.
+	for _, prefix := range []string{"https://", "http://"} {
+		if strings.HasPrefix(raw, prefix) {
+			rest := raw[len(prefix):]
+			if idx := strings.Index(rest, "/"); idx != -1 {
+				return prefix + rest[:idx]
+			}
+			return raw // no path, raw is already scheme+host
+		}
+	}
+	return raw
 }
 
 // TimeoutMiddleware adds request timeout handling
