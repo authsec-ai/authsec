@@ -805,12 +805,15 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 
 	tokenInfo, err := ctrl.service.IntrospectViaHydraAdmin(token)
 	if err != nil {
+		log.Printf("[MCP_AUTH] Introspect: Hydra admin introspection error rs=%s: %v", rs.ResourceURI, err)
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
 
 	active, _ := tokenInfo["active"].(bool)
 	if !active {
+		log.Printf("[MCP_AUTH] Introspect: Hydra reports token inactive rs=%s sub=%q aud=%v",
+			rs.ResourceURI, tokenInfo["sub"], tokenInfo["aud"])
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
@@ -909,6 +912,8 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		ext["permissions"] = finalScopes
 	}
 
+	log.Printf("[MCP_AUTH] Introspect: active=true sub=%s rs=%s scopes=%v aud=%v",
+		sub, rs.ResourceURI, finalScopes, tokenInfo["aud"])
 	c.JSON(http.StatusOK, tokenInfo)
 }
 
