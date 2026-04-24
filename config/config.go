@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -98,7 +99,9 @@ type Config struct {
 
 	// Hydra service fields
 	HydraPublicURL      string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
-	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
+	ReactAppURL         string // Deprecated legacy combined UI URL; use UIOrigin/UIBasePath instead
+	UIOrigin            string // Frontend origin for redirects (e.g., https://app.authsec.dev)
+	UIBasePath          string // Optional frontend base path (e.g., /authsec)
 	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
 
 	// SDK-Manager migration (all optional)
@@ -235,8 +238,15 @@ func LoadConfig() *Config {
 
 	// Load Hydra service configuration
 	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
+	publicUIOrigin := getEnv("PUBLIC_UI_ORIGIN", "")
+	publicUIBasePath := getEnv("PUBLIC_UI_BASE_PATH", "")
 	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
 	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
+
+	uiOrigin, uiBasePath, err := resolveUIConfig(publicUIOrigin, publicUIBasePath, reactAppURL)
+	if err != nil {
+		log.Fatalf("invalid UI redirect configuration: %v", err)
+	}
 
 	// SDK-Manager migration config (all optional)
 	oauthAuthURL := getEnv("OAUTH_AUTH_URL", "")
@@ -323,7 +333,9 @@ func LoadConfig() *Config {
 		MicrosoftClientSecret:   microsoftClientSecret,
 		HubSpotAccessToken:      hubSpotAccessToken,
 		HydraPublicURL:          hydraPublicURL,
-		ReactAppURL:             reactAppURL,
+		ReactAppURL:             strings.TrimRight(uiOrigin, "/") + uiBasePath,
+		UIOrigin:                uiOrigin,
+		UIBasePath:              uiBasePath,
 		IdentityProviderURL:     identityProviderURL,
 
 		// SDK-Manager migration
@@ -373,6 +385,34 @@ func (c *Config) OAuthBaseURL() string {
 		return strings.TrimRight(strings.TrimSpace(c.OAuthIssuerURL), "/")
 	}
 	return strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+}
+
+func (c *Config) UIBaseURL() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(c.UIOrigin), "/") + c.UIBasePath
+}
+
+func (c *Config) BuildUIRouteURL(route string, query url.Values) string {
+	if c == nil {
+		return ""
+	}
+
+	base, err := url.Parse(c.UIBaseURL())
+	if err != nil {
+		return ""
+	}
+
+	base.Path = joinURLPath(c.UIBasePath, route)
+	base.RawQuery = query.Encode()
+	return base.String()
+}
+
+func (c *Config) BuildUILoginURL(loginChallenge string) string {
+	query := url.Values{}
+	query.Set("login_challenge", loginChallenge)
+	return c.BuildUIRouteURL("/oidc/login", query)
 }
 
 // ADD THIS: New getter function

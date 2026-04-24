@@ -1252,8 +1252,7 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 
 	// For MCP clients, redirect to AuthSec's own login page (not the MCP client's redirect URI)
 	if ctrl.isNewMCPClient(loginRequest.Client.ClientID) {
-		loginUIBaseURL := strings.TrimSuffix(config.AppConfig.ReactAppURL, "/")
-		c.Redirect(http.StatusFound, fmt.Sprintf("%s/oidc/login?login_challenge=%s", loginUIBaseURL, loginChallenge))
+		c.Redirect(http.StatusFound, config.AppConfig.BuildUILoginURL(loginChallenge))
 		return
 	}
 
@@ -1299,7 +1298,13 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 		}
 	}
 
-	c.Redirect(http.StatusFound, fmt.Sprintf("%s/oidc/login?login_challenge=%s", baseURL, loginChallenge))
+	loginURL, err := config.BuildUILoginURLFromRedirectURI(callbackURL, loginChallenge)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{Success: false, Error: "Failed to build login redirect URL"})
+		return
+	}
+
+	c.Redirect(http.StatusFound, loginURL)
 }
 
 // ConsentHandler handles consent requests
@@ -1712,6 +1717,8 @@ func (ctrl *HmgrController) HealthHandler(c *gin.Context) {
 		"hydra_admin_url": config.AppConfig.HydraAdminURL,
 		"base_url":        config.AppConfig.BaseURL,
 		"react_app_url":   config.AppConfig.ReactAppURL,
+		"ui_origin":       config.AppConfig.UIOrigin,
+		"ui_base_path":    config.AppConfig.UIBasePath,
 	})
 }
 
@@ -1796,7 +1803,7 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 		"tenant_client_id": tenantClientID,
 		"oauth_url":        oauthURL,
 		"login_endpoint":   fmt.Sprintf("%s/login", config.AppConfig.BaseURL),
-		"react_login_url":  fmt.Sprintf("%s/oidc/login", config.AppConfig.ReactAppURL),
+		"react_login_url":  config.AppConfig.BuildUIRouteURL("/oidc/login", nil),
 	})
 }
 
@@ -1903,26 +1910,24 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 		return
 	}
 
-	frontendURL, err := url.Parse(redirectURI)
+	query := url.Values{}
+	query.Set("login_challenge", loginChallenge)
+	query.Set("success", "true")
+	query.Set("user_id", user.ID.String())
+	query.Set("user_email", user.Email)
+	query.Set("user_name", user.Name)
+	query.Set("provider", user.Provider)
+	query.Set("client_id", user.ClientID.String())
+	query.Set("tenant_id", user.TenantID.String())
+	query.Set("project_id", user.ProjectID.String())
+	query.Set("provider_id", user.ProviderID)
+	query.Set("active", fmt.Sprintf("%t", user.Active))
+
+	redirectURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid frontend URL"})
+		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to build frontend redirect URL"})
 		return
 	}
-
-	frontendBaseURL := fmt.Sprintf("%s://%s", frontendURL.Scheme, frontendURL.Host)
-	redirectURL := fmt.Sprintf("%s/oidc/login?login_challenge=%s&success=true&user_id=%s&user_email=%s&user_name=%s&provider=%s&client_id=%s&tenant_id=%s&project_id=%s&provider_id=%s&active=%t",
-		frontendBaseURL,
-		url.QueryEscape(loginChallenge),
-		url.QueryEscape(user.ID.String()),
-		url.QueryEscape(user.Email),
-		url.QueryEscape(user.Name),
-		url.QueryEscape(user.Provider),
-		url.QueryEscape(user.ClientID.String()),
-		url.QueryEscape(user.TenantID.String()),
-		url.QueryEscape(user.ProjectID.String()),
-		url.QueryEscape(user.ProviderID),
-		user.Active,
-	)
 
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, redirectURL, redirectURL))
@@ -1977,26 +1982,24 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 		return
 	}
 
-	frontendURL, err := url.Parse(redirectURI)
+	query := url.Values{}
+	query.Set("login_challenge", loginChallenge)
+	query.Set("success", "true")
+	query.Set("user_id", user.ID.String())
+	query.Set("user_email", user.Email)
+	query.Set("user_name", user.Name)
+	query.Set("provider", user.Provider)
+	query.Set("client_id", user.ClientID.String())
+	query.Set("tenant_id", user.TenantID.String())
+	query.Set("project_id", user.ProjectID.String())
+	query.Set("provider_id", user.ProviderID)
+	query.Set("active", fmt.Sprintf("%t", user.Active))
+
+	redirectURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid frontend URL"})
+		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to build frontend redirect URL"})
 		return
 	}
-
-	frontendBaseURL := fmt.Sprintf("%s://%s", frontendURL.Scheme, frontendURL.Host)
-	redirectURL := fmt.Sprintf("%s/oidc/login?login_challenge=%s&success=true&user_id=%s&user_email=%s&user_name=%s&provider=%s&client_id=%s&tenant_id=%s&project_id=%s&provider_id=%s&active=%t",
-		frontendBaseURL,
-		url.QueryEscape(loginChallenge),
-		url.QueryEscape(user.ID.String()),
-		url.QueryEscape(user.Email),
-		url.QueryEscape(user.Name),
-		url.QueryEscape(user.Provider),
-		url.QueryEscape(user.ClientID.String()),
-		url.QueryEscape(user.TenantID.String()),
-		url.QueryEscape(user.ProjectID.String()),
-		url.QueryEscape(user.ProviderID),
-		user.Active,
-	)
 
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, redirectURL, redirectURL))
