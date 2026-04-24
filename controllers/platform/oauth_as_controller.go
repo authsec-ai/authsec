@@ -827,23 +827,24 @@ func (ctrl *OAuthASController) Register(c *gin.Context) {
 		}
 	}
 
-	// resource is REQUIRED — DCR clients must bind to a specific RS at registration
-	if req.Resource == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_request",
-			"error_description": "resource parameter is required for dynamic client registration",
-		})
-		return
-	}
-
-	rs, err := ctrl.rsService.GetByResourceURI(req.Resource)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown resource", "resource": req.Resource})
-		return
-	}
-	if !rs.AllowsRegistrationMode("dcr") {
-		c.JSON(http.StatusForbidden, gin.H{"error": "resource server does not allow DCR"})
-		return
+	// resource is OPTIONAL at DCR time (RFC 7591 does not mandate it).
+	// Many real-world clients (e.g. Claude Code) omit it and pass the resource
+	// parameter at the /authorize call instead, per RFC 8707. When present we
+	// still honour it to bind the client to an RS up-front; when absent we
+	// register an unbound client and defer binding to /authorize, which already
+	// enforces the resource parameter.
+	var rs *models.ResourceServer
+	if req.Resource != "" {
+		var err error
+		rs, err = ctrl.rsService.GetByResourceURI(req.Resource)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown resource", "resource": req.Resource})
+			return
+		}
+		if !rs.AllowsRegistrationMode("dcr") {
+			c.JSON(http.StatusForbidden, gin.H{"error": "resource server does not allow DCR"})
+			return
+		}
 	}
 
 	client, err := ctrl.service.RegisterDCRClient(req, rs)
@@ -1419,9 +1420,23 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 		}
 	}
 
-	// 4. Client registration approval (join table)
+	// 4. Client registration approval (join table).
+	//
+	// DCR clients registered without a `resource` parameter (RFC 7591 strict;
+	// e.g. Claude Code) have no registration row yet. Since the RS has already
+	// passed the AllowsRegistrationMode("dcr") check above, lazily create the
+	// join row here — identical semantics to the CIMD lazy-registration path
+	// in step 2. For prereg clients, continue to require an existing approval.
 	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
-	if regErr != nil || reg.Status != "approved" {
+	if regErr != nil {
+		if oauthClient.RegistrationType == "dcr" {
+			if _, ensureErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, "dcr"); ensureErr != nil {
+				return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register DCR client for resource"}
+			}
+		} else {
+			return nil, &policyError{http.StatusForbidden, "access_denied", "client not authorized for this resource"}
+		}
+	} else if reg.Status != "approved" {
 		return nil, &policyError{http.StatusForbidden, "access_denied", "client not authorized for this resource"}
 	}
 

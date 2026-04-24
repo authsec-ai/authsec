@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,14 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrProtectedServer is returned when discovery hits an MCP endpoint that
+// responds with HTTP 401 + RFC 9728 bearer challenge (WWW-Authenticate with
+// resource_metadata). Semantically: the server is alive and properly protected
+// by OAuth, but we cannot call tools/list unauthenticated. Callers should treat
+// this as a successful "server is reachable and protected" outcome and commit
+// a zero-tool scan rather than a hard failure.
+var ErrProtectedServer = errors.New("mcp server is protected (401 with bearer challenge)")
 
 const (
 	maxResponseSize = 5 * 1024 * 1024 // 5MB
@@ -251,6 +260,18 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		wwwAuth := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		// RFC 9728 bearer challenge: protected server, reachable and well-formed.
+		// Treat as a distinct outcome so the caller can commit a zero-tool scan
+		// rather than mark the RS as failed.
+		if strings.Contains(strings.ToLower(wwwAuth), "bearer") {
+			return nil, ErrProtectedServer
+		}
+		return nil, fmt.Errorf("HTTP 401 from %s %s", method, endpoint)
 	}
 
 	if resp.StatusCode != http.StatusOK {

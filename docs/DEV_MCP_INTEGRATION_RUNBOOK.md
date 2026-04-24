@@ -39,6 +39,9 @@ Do not use:
    - POST `/oauth/introspect` returns JSON
    - `/authmgr/*` does not resolve
 7. Complete a real OAuth flow and verify the SDK accepts the returned token.
+https://20-106-226-245.sslip.io/mcp
+
+use this mcp sever
 
 ## Browser validation flow
 

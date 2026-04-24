@@ -132,12 +132,15 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		return nil, fmt.Errorf("store DCR client: %w", err)
 	}
 
-	// RS is required — fail-closed if nil (defense-in-depth; controller validates this)
-	if rs == nil {
-		return nil, fmt.Errorf("resource server is required for DCR registration")
-	}
-	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "dcr"); err != nil {
-		return nil, fmt.Errorf("create DCR client registration: %w", err)
+	// When rs is non-nil, bind the client to the RS up-front. When nil, the
+	// client is registered unbound; binding is deferred to /authorize, which
+	// enforces the resource parameter (RFC 8707) and creates the join row
+	// lazily at that point. This accommodates DCR clients (e.g. Claude Code)
+	// that follow RFC 7591 strictly and omit `resource` at registration time.
+	if rs != nil {
+		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "dcr"); err != nil {
+			return nil, fmt.Errorf("create DCR client registration: %w", err)
+		}
 	}
 
 	return client, nil

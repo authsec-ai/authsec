@@ -311,13 +311,30 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 	resourceURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
 	client := mcpclient.NewClient()
 	discovered, err := client.Discover(ctx, resourceURI)
+	// protectedServer: RFC 9728 bearer challenge on tools/list. Server is
+	// reachable and properly OAuth-protected. We cannot enumerate tools
+	// without a token, but this is NOT a discovery failure — it means the
+	// server correctly rejects anonymous access. Commit a zero-tool scan
+	// that advances last_successful_generation so sdk-policy can serve
+	// (empty policy = deny-all on the Go SDK side, which is the safe default).
+	protectedServer := false
 	if err != nil {
-		// tools/list failed — hard failure, nothing to commit.
-		// Pass nextGeneration so markScanFailed only updates the row if this scan
-		// still owns the lock (generation guard). Superseded scans are a no-op.
-		syncResult.FailureReason = err.Error()
-		s.markScanFailed(rs, nextGeneration, err.Error())
-		return syncResult, fmt.Errorf("MCP discovery failed: %w", err)
+		if errors.Is(err, mcpclient.ErrProtectedServer) {
+			protectedServer = true
+			if discovered == nil {
+				discovered = &mcpclient.DiscoveryResult{}
+			}
+			syncResult.Warnings = append(syncResult.Warnings,
+				"MCP server is protected (401 with bearer challenge) — committed zero-tool scan; tools will be discovered once a service token is configured")
+			err = nil
+		} else {
+			// tools/list failed — hard failure, nothing to commit.
+			// Pass nextGeneration so markScanFailed only updates the row if this scan
+			// still owns the lock (generation guard). Superseded scans are a no-op.
+			syncResult.FailureReason = err.Error()
+			s.markScanFailed(rs, nextGeneration, err.Error())
+			return syncResult, fmt.Errorf("MCP discovery failed: %w", err)
+		}
 	}
 
 	// prmFetched distinguishes:
@@ -534,6 +551,30 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 					"last_scan_error":             nil,
 					"last_scan_completed_at":      &now,
 					"scan_in_progress":            false,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("scan generation %d was superseded by a concurrent scan — discarding results", nextGeneration)
+			}
+			return nil
+		}
+		// Protected-server outcome: advance the serving pointer even though
+		// prmFetched is false. An empty policy is a valid policy (deny-all by
+		// default on the Go SDK side), and this is a definitive signal that
+		// the MCP server is alive and enforcing OAuth — far better than
+		// perpetually returning 503 from sdk-policy.
+		if protectedServer {
+			result := tx.Model(rs).
+				Where("id = ? AND scan_generation = ?", rs.ID, nextGeneration).
+				Updates(map[string]interface{}{
+					"last_successful_generation": nextGeneration,
+					"status":                     "degraded",
+					"last_scan_status":           "success",
+					"last_scan_error":            nil,
+					"last_scan_completed_at":     &now,
+					"scan_in_progress":           false,
 				})
 			if result.Error != nil {
 				return result.Error
