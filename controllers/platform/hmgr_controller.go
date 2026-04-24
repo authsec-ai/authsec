@@ -1363,12 +1363,22 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		// Get the MCP OAuth client for scope resolver
 		mcpClient, _ := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
 
+		// If no scopes were requested (e.g. Claude Code omits the scope parameter),
+		// default to all RS-supported scopes. This is standard OAuth AS behaviour:
+		// an absent scope parameter means "request all available scopes for this resource."
+		// The 3-way intersection with user-effective-scopes still enforces RBAC — the
+		// user only receives scopes they are actually permitted to hold.
+		requestedScopes := consentRequest.RequestedScope
+		if len(requestedScopes) == 0 {
+			requestedScopes = []string(rs.ScopesSupported)
+		}
+
 		// 3-way intersection: requested ∩ RS-supported ∩ user-effective-scopes (RBAC).
 		// ResolveWithReport is fail-closed: any error = no scopes granted.
 		report, scopeErr := ctrl.scopeResolver.ResolveWithReport(
 			c.Request.Context(),
 			arcCtx.TenantID, consentRequest.Subject, arcCtx.ResourceServerID,
-			consentRequest.RequestedScope,
+			requestedScopes,
 			rs,
 			mcpClient,
 		)
