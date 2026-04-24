@@ -1590,12 +1590,6 @@ func (ctrl *HmgrController) renderMCPConsentPage(
 	report *services.ScopeResolutionReport,
 	scopeMeta map[string]*models.OAuthScope,
 ) {
-	// Build a quick-lookup index from scope string → diagnostic for O(1) access per scope.
-	diagIndex := make(map[string]services.ScopeDiagnostic, len(report.Diagnostics))
-	for _, d := range report.Diagnostics {
-		diagIndex[d.Scope] = d
-	}
-
 	// riskBadgeColor maps risk levels to their badge background colors.
 	riskBadgeColor := func(level string) string {
 		switch strings.ToLower(level) {
@@ -1655,8 +1649,12 @@ button.deny{background:#edf1f7;color:#16202a;}
 	builder.WriteString("<input type=\"hidden\" name=\"consent_challenge\" value=\"" + html.EscapeString(consentChallenge) + "\">")
 	builder.WriteString("<fieldset><legend>Select the permissions to grant</legend>")
 
-	for _, scope := range consentRequest.RequestedScope {
-		diag := diagIndex[scope]
+	// Use report.Diagnostics as the authoritative scope list — this contains the
+	// already-defaulted requestedScopes (which may be rs.ScopesSupported when the
+	// client sent no scope parameter), so the consent page always shows something
+	// even when consentRequest.RequestedScope is empty.
+	for _, diag := range report.Diagnostics {
+		scope := diag.Scope
 		meta := scopeMeta[scope]
 
 		// Display name: prefer registry metadata, fall back to raw scope string.
