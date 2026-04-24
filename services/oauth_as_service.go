@@ -35,6 +35,15 @@ type OAuthASService struct {
 	jwksCache *jwksCache
 }
 
+var (
+	// ErrResourceInferenceUnavailable means no single compatible resource server
+	// could be determined for a client when the request omitted RFC 8707 resource.
+	ErrResourceInferenceUnavailable = errors.New("resource inference unavailable")
+	// ErrResourceInferenceAmbiguous means more than one compatible resource server
+	// matched, so the caller must send resource explicitly.
+	ErrResourceInferenceAmbiguous = errors.New("resource inference ambiguous")
+)
+
 func NewOAuthASService(db *gorm.DB) *OAuthASService {
 	return &OAuthASService{
 		db:        db,
@@ -155,6 +164,78 @@ func (s *OAuthASService) GetClientRegistration(rsID, clientID uuid.UUID) (*model
 // EnsureClientRegistration upserts a join row (used by CIMD).
 func (s *OAuthASService) EnsureClientRegistration(rsID, clientID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
 	return s.authzCtx.EnsureClientRegistration(rsID, clientID, regType)
+}
+
+// InferSingleResourceURIForClient resolves a missing RFC 8707 resource parameter
+// only when there is exactly one safe candidate.
+//
+// Compatibility rules:
+//   - Preferred source: exactly one approved active RS registration for the client.
+//   - DCR-only fallback: if the client is currently unbound and the deployment has
+//     exactly one active RS that allows DCR, use that single RS. This keeps single-
+//     resource developer setups interoperable with clients that omit `resource`.
+//   - Any 0 or >1 candidate outcome is treated as unavailable/ambiguous.
+func (s *OAuthASService) InferSingleResourceURIForClient(client *models.MCPOAuthClient) (string, error) {
+	if client == nil {
+		return "", ErrResourceInferenceUnavailable
+	}
+
+	resourceSet := make(map[string]struct{})
+
+	var regs []models.ResourceServerClientRegistration
+	if err := s.db.Where(&models.ResourceServerClientRegistration{
+		OAuthClientID: client.ID,
+		Status:        "approved",
+	}).Find(&regs).Error; err != nil {
+		return "", fmt.Errorf("list client registrations: %w", err)
+	}
+
+	for _, reg := range regs {
+		rs, err := s.rsService.GetByID(reg.ResourceServerID.String())
+		if err != nil || rs == nil || !rs.Active {
+			continue
+		}
+		resourceSet[rs.ResourceURI] = struct{}{}
+	}
+
+	switch len(resourceSet) {
+	case 1:
+		return onlyResourceURI(resourceSet), nil
+	case 0:
+		// Continue to the DCR compatibility fallback below.
+	default:
+		return "", ErrResourceInferenceAmbiguous
+	}
+
+	if client.RegistrationType != "dcr" {
+		return "", ErrResourceInferenceUnavailable
+	}
+
+	var servers []models.ResourceServer
+	if err := s.db.Where("active = ?", true).Find(&servers).Error; err != nil {
+		return "", fmt.Errorf("list active resource servers: %w", err)
+	}
+	for _, rs := range servers {
+		if rs.AllowsRegistrationMode("dcr") {
+			resourceSet[rs.ResourceURI] = struct{}{}
+		}
+	}
+
+	switch len(resourceSet) {
+	case 1:
+		return onlyResourceURI(resourceSet), nil
+	case 0:
+		return "", ErrResourceInferenceUnavailable
+	default:
+		return "", ErrResourceInferenceAmbiguous
+	}
+}
+
+func onlyResourceURI(resourceSet map[string]struct{}) string {
+	for resourceURI := range resourceSet {
+		return resourceURI
+	}
+	return ""
 }
 
 // StoreAuthRequestContext saves the bridge context before redirecting to Hydra.

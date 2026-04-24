@@ -3,6 +3,7 @@ package platform
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -130,8 +131,13 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 		return
 	}
 	if resource == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "resource parameter required (RFC 8707)"})
-		return
+		inferredResource, inferErr := ctrl.inferAuthorizeResource(clientID)
+		if inferErr != nil {
+			c.JSON(inferErr.Status, gin.H{"error": inferErr.Code, "error_description": inferErr.Description})
+			return
+		}
+		resource = inferredResource
+		log.Printf("[MCP_AUTH] Authorize: inferred resource=%s for client=%s (compatibility mode)", resource, clientID)
 	}
 	if state == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "state parameter required"})
@@ -415,14 +421,13 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		}
 	}
 
-	// Validate resource (RFC 8707 §2.2: REQUIRED, must match authorization request)
+	// Validate resource. In compatibility mode, clients that omit the redundant token-time
+	// resource parameter inherit the single resource that was already authorized and stored
+	// in the auth request context.
 	if resourceParam == "" {
-		revokeIssuedTokens("resource param missing at exchange")
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_request",
-			"error_description": "resource parameter is required",
-		})
-		return
+		resourceParam = arcCtx.ResourceURI
+		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: defaulted missing resource to stored auth context resource=%s context_id=%s",
+			resourceParam, contextID)
 	}
 	if resourceParam != arcCtx.ResourceURI {
 		revokeIssuedTokens("resource param mismatch at exchange")
@@ -555,11 +560,24 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 	resourceParam := c.PostForm("resource")
 
 	if resourceParam == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_request",
-			"error_description": "resource parameter required",
-		})
-		return
+		inferredResource, err := ctrl.service.InferSingleResourceURIForClient(oauthClient)
+		if err != nil {
+			if errors.Is(err, services.ErrResourceInferenceAmbiguous) {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error":             "invalid_request",
+					"error_description": "resource parameter required because client maps to multiple resource servers",
+				})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_request",
+				"error_description": "resource parameter required because client is not bound to a single resource server",
+			})
+			return
+		}
+		resourceParam = inferredResource
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: inferred missing resource=%s for client=%s (compatibility mode)",
+			resourceParam, oauthClient.ClientID)
 	}
 
 	// Validate resource if provided — must correspond to an RS the client is registered for.
@@ -1133,6 +1151,49 @@ type policyError struct {
 
 func (e *policyError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code, e.Description)
+}
+
+func (ctrl *OAuthASController) inferAuthorizeResource(clientID string) (string, *policyError) {
+	if services.IsHTTPSURL(clientID) {
+		return "", &policyError{
+			Status:      http.StatusBadRequest,
+			Code:        "invalid_request",
+			Description: "resource parameter required for HTTPS client_id",
+		}
+	}
+
+	oauthClient, err := ctrl.service.GetOAuthClient(clientID)
+	if err != nil {
+		return "", &policyError{
+			Status:      http.StatusBadRequest,
+			Code:        "invalid_client",
+			Description: "unknown client_id",
+		}
+	}
+
+	resourceURI, inferErr := ctrl.service.InferSingleResourceURIForClient(oauthClient)
+	if inferErr == nil {
+		return resourceURI, nil
+	}
+	if errors.Is(inferErr, services.ErrResourceInferenceAmbiguous) {
+		return "", &policyError{
+			Status:      http.StatusBadRequest,
+			Code:        "invalid_request",
+			Description: "resource parameter required because client maps to multiple resource servers",
+		}
+	}
+	if errors.Is(inferErr, services.ErrResourceInferenceUnavailable) {
+		return "", &policyError{
+			Status:      http.StatusBadRequest,
+			Code:        "invalid_request",
+			Description: "resource parameter required because client is not bound to a single resource server",
+		}
+	}
+	return "", &policyError{
+		Status:      http.StatusInternalServerError,
+		Code:        "server_error",
+		Description: "failed to infer resource server",
+	}
 }
 
 // validateOAuthPolicy is the single authoritative policy gate for all new OAuth

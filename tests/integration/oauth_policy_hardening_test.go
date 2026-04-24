@@ -225,6 +225,50 @@ func TestRegistrationTypeMismatch(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "dcr", "error body should mention the rejected registration type")
 }
 
+// Test 3b: Missing resource on /authorize is tolerated only when the client maps
+// to exactly one active approved RS. The redirect to Hydra must carry the inferred
+// resource so downstream login/consent stays audience-bound.
+func TestAuthorizeMissingResource_InfersSingleApprovedRS(t *testing.T) {
+	resourceURI := fmt.Sprintf("https://single-rs-%s.example.com/mcp", uuid.New().String()[:8])
+	rsID := insertTestRS(t, resourceURI, []string{"dcr"})
+
+	clientPublicID := uuid.New().String()
+	clientRowID := insertTestOAuthClient(t, clientPublicID, uuid.New().String(), "dcr", []string{"https://client.example.com/callback"})
+	insertClientRegistration(t, rsID, clientRowID, "approved", "dcr")
+
+	params := baseAuthorizeParams(resourceURI, clientPublicID, "https://client.example.com/callback")
+	params.Del("resource")
+
+	w := doAuthorizeRequest(params)
+
+	require.Equal(t, http.StatusFound, w.Code, "authorize should infer the single resource; body: %s", w.Body.String())
+	location := w.Header().Get("Location")
+	require.NotEmpty(t, location, "redirect location must be present")
+	assert.Contains(t, location, "resource="+url.QueryEscape(resourceURI))
+}
+
+// Test 3c: Missing resource on /authorize must still fail closed when the client
+// maps to multiple approved RS rows; the client must disambiguate with RFC 8707 resource.
+func TestAuthorizeMissingResource_AmbiguousAcrossMultipleRS(t *testing.T) {
+	resourceURI1 := fmt.Sprintf("https://multi-a-%s.example.com/mcp", uuid.New().String()[:8])
+	resourceURI2 := fmt.Sprintf("https://multi-b-%s.example.com/mcp", uuid.New().String()[:8])
+	rsID1 := insertTestRS(t, resourceURI1, []string{"dcr"})
+	rsID2 := insertTestRS(t, resourceURI2, []string{"dcr"})
+
+	clientPublicID := uuid.New().String()
+	clientRowID := insertTestOAuthClient(t, clientPublicID, uuid.New().String(), "dcr", []string{"https://client.example.com/callback"})
+	insertClientRegistration(t, rsID1, clientRowID, "approved", "dcr")
+	insertClientRegistration(t, rsID2, clientRowID, "approved", "dcr")
+
+	params := baseAuthorizeParams(resourceURI1, clientPublicID, "https://client.example.com/callback")
+	params.Del("resource")
+
+	w := doAuthorizeRequest(params)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, "authorize must fail closed when resource is ambiguous; body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "multiple resource servers")
+}
+
 // Test 4: CIMD client registered with redirect URI A; request uses URI B.
 func TestRedirectMismatch_CIMD(t *testing.T) {
 	resourceURI := fmt.Sprintf("https://redirect-cimd-%s.example.com/mcp", uuid.New().String()[:8])
@@ -366,7 +410,7 @@ func withMockHydra(t *testing.T, cfg mockHydraConfig) *mockHydraRecorder {
 			}
 		case r.URL.Path == "/oauth2/revoke" && r.Method == http.MethodPost:
 			// RFC 7009 §2.2: revocation endpoint returns 200 for any token (including unknown).
-			r.ParseForm()                 //nolint:errcheck
+			r.ParseForm() //nolint:errcheck
 			rec.record(r.FormValue("token"))
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{}`)) //nolint:errcheck
