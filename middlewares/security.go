@@ -41,7 +41,7 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 			//       → 302 localhost callback (CLI OAuth client — any port)
 			// All three destinations must be listed or Safari/Chrome blocks the chain.
 			hydraOrigin := hydraPublicOrigin()
-			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s http://localhost https://localhost;", hydraOrigin)
+			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s %s;", hydraOrigin, localLoopbackFormActionSources())
 		} else {
 			// Strict CSP for all other endpoints
 			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
@@ -137,6 +137,20 @@ func hydraPublicOrigin() string {
 		}
 	}
 	return raw
+}
+
+// localLoopbackFormActionSources returns the loopback origins used by OAuth desktop
+// callbacks. CSP host sources without an explicit port only match the default port
+// for the scheme, so localhost callbacks on ephemeral ports must use :*.
+func localLoopbackFormActionSources() string {
+	return strings.Join([]string{
+		"http://localhost:*",
+		"https://localhost:*",
+		"http://127.0.0.1:*",
+		"https://127.0.0.1:*",
+		"http://[::1]:*",
+		"https://[::1]:*",
+	}, " ")
 }
 
 // TimeoutMiddleware adds request timeout handling

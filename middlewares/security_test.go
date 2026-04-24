@@ -101,6 +101,35 @@ func TestSecurityHeadersMiddleware_OIDCCallbackCSP(t *testing.T) {
 	}
 }
 
+func TestSecurityHeadersMiddleware_ConsentCSPAllowsLoopbackWildcardPorts(t *testing.T) {
+	router := gin.New()
+	t.Setenv("HYDRA_PUBLIC_URL", "https://oauth.dev.authsec.dev")
+	router.Use(SecurityHeadersMiddleware())
+	router.POST("/authsec/hmgr/consent", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/authsec/hmgr/consent", nil)
+	router.ServeHTTP(w, req)
+
+	csp := w.Header().Get("Content-Security-Policy")
+	for _, expected := range []string{
+		"form-action 'self'",
+		"https://oauth.dev.authsec.dev",
+		"http://localhost:*",
+		"https://localhost:*",
+		"http://127.0.0.1:*",
+		"https://127.0.0.1:*",
+		"http://[::1]:*",
+		"https://[::1]:*",
+	} {
+		if !contains(csp, expected) {
+			t.Fatalf("consent CSP missing %q: %q", expected, csp)
+		}
+	}
+}
+
 func TestRequestIDMiddleware_GeneratesID(t *testing.T) {
 	router := gin.New()
 	router.Use(RequestIDMiddleware())
