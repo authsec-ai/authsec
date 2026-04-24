@@ -35,12 +35,13 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 			// Allow inline scripts for OAuth callback (postMessage to opener window)
 			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 		} else if strings.HasPrefix(path, "/authsec/hmgr/consent") {
-			// The consent form POSTs to this endpoint. After acceptance, the server
-			// returns a 302 to the Hydra public URL so the browser can complete the
-			// OAuth flow. Modern browsers (Safari, Chrome) enforce form-action on the
-			// redirect chain, so the Hydra origin must be explicitly allowed.
+			// form-action applies to the ENTIRE redirect chain from the form submit:
+			//   POST /authsec/hmgr/consent (self)
+			//     → 302 Hydra public URL   (completes OAuth authorization)
+			//       → 302 localhost callback (CLI OAuth client — any port)
+			// All three destinations must be listed or Safari/Chrome blocks the chain.
 			hydraOrigin := hydraPublicOrigin()
-			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s;", hydraOrigin)
+			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s http://localhost https://localhost;", hydraOrigin)
 		} else {
 			// Strict CSP for all other endpoints
 			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
