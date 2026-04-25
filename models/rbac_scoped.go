@@ -77,19 +77,21 @@ type ServiceAccount struct {
 
 // RoleBinding represents an assignment of a Role to a Principal (User or Service Account)
 type RoleBinding struct {
-	ID               uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID         *uuid.UUID      `json:"tenant_id" gorm:"type:uuid"`
-	UserID           *uuid.UUID      `json:"user_id" gorm:"type:uuid"`
-	Username         string          `json:"username" gorm:"type:text"`
-	ServiceAccountID *uuid.UUID      `json:"service_account_id" gorm:"type:uuid"`
-	RoleID           uuid.UUID       `json:"role_id" gorm:"type:uuid;not null"`
-	RoleName         string          `json:"role_name" gorm:"type:text"`
-	ScopeType        *string         `json:"scope_type" gorm:"type:text"`
-	ScopeID          *uuid.UUID      `json:"scope_id" gorm:"type:uuid"`
-	Conditions       json.RawMessage `json:"conditions" gorm:"type:jsonb;default:'{}'"`
-	ExpiresAt        *time.Time      `json:"expires_at"`
-	CreatedBy        *uuid.UUID      `json:"created_by" gorm:"type:uuid"`
-	CreatedAt        time.Time       `json:"created_at"`
+	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	TenantID           *uuid.UUID      `json:"tenant_id" gorm:"type:uuid"`
+	UserID             *uuid.UUID      `json:"user_id" gorm:"type:uuid"`
+	Username           string          `json:"username" gorm:"type:text"`
+	ServiceAccountID   *uuid.UUID      `json:"service_account_id" gorm:"type:uuid"`
+	RoleID             uuid.UUID       `json:"role_id" gorm:"type:uuid;not null"`
+	RoleName           string          `json:"role_name" gorm:"type:text"`
+	ScopeType          *string         `json:"scope_type" gorm:"type:text"`
+	ScopeID            *uuid.UUID      `json:"scope_id" gorm:"type:uuid"`
+	Conditions         json.RawMessage `json:"conditions" gorm:"type:jsonb;default:'{}'"`
+	AssignmentSource   string          `json:"assignment_source" gorm:"type:text;not null;default:'manual'"`
+	AssignmentMetadata json.RawMessage `json:"assignment_metadata" gorm:"type:jsonb;default:'{}'"`
+	ExpiresAt          *time.Time      `json:"expires_at"`
+	CreatedBy          *uuid.UUID      `json:"created_by" gorm:"type:uuid"`
+	CreatedAt          time.Time       `json:"created_at"`
 
 	// Relations
 	// We need to be careful with GORM relationships and composite keys.

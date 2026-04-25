@@ -6,6 +6,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -13,15 +14,24 @@ import (
 
 // ResourceServerController handles CRUD for MCP resource server registration.
 type ResourceServerController struct {
-	service  *services.ResourceServerService
-	oauthSvc *services.OAuthASService
+	service           *services.ResourceServerService
+	oauthSvc          *services.OAuthASService
+	onboardingService *services.ResourceServerOnboardingService
 }
 
 func NewResourceServerController() *ResourceServerController {
 	return &ResourceServerController{
-		service:  services.NewResourceServerService(config.DB),
-		oauthSvc: services.NewOAuthASService(config.DB),
+		service:           services.NewResourceServerService(config.DB),
+		oauthSvc:          services.NewOAuthASService(config.DB),
+		onboardingService: services.NewResourceServerOnboardingService(config.DB),
 	}
+}
+
+type resourceServerSummaryResponse struct {
+	models.ResourceServer
+	ClientCount          int64   `json:"client_count"`
+	AccessPolicyEnabled  bool    `json:"access_policy_enabled"`
+	AccessPolicyRoleName *string `json:"access_policy_role_name,omitempty"`
 }
 
 // Create registers a new resource server.
@@ -77,7 +87,17 @@ func (ctrl *ResourceServerController) List(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, servers)
+	summaries := make([]resourceServerSummaryResponse, 0, len(servers))
+	for i := range servers {
+		summary, buildErr := ctrl.buildSummary(&servers[i], tenantID.String())
+		if buildErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": buildErr.Error()})
+			return
+		}
+		summaries = append(summaries, *summary)
+	}
+
+	c.JSON(http.StatusOK, summaries)
 }
 
 // Get returns a single resource server by ID (tenant-scoped).
@@ -95,7 +115,12 @@ func (ctrl *ResourceServerController) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
-	c.JSON(http.StatusOK, rs)
+	summary, err := ctrl.buildSummary(rs, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, summary)
 }
 
 // Update modifies a resource server (tenant-scoped).
@@ -246,6 +271,119 @@ func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, clients)
+}
+
+// GetAccessPolicy returns the default access policy and role options for a resource server.
+// GET /authsec/resource-servers/:id/access-policy
+func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	if _, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	policy, err := ctrl.onboardingService.GetAccessPolicy(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, policy)
+}
+
+// UpdateAccessPolicy persists the backend-owned default access policy for a resource server.
+// PUT /authsec/resource-servers/:id/access-policy
+func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	if _, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	var req services.UpdateResourceServerAccessPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	policy, err := ctrl.onboardingService.UpdateAccessPolicy(rsID, tenantID.String(), req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "rs_access_policy_updated", "resource_server",
+		rsID, http.StatusOK, nil, policy)
+	c.JSON(http.StatusOK, policy)
+}
+
+// Validate runs live onboarding checks and persists the most recent validation state.
+// POST /authsec/resource-servers/:id/validate
+func (ctrl *ResourceServerController) Validate(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	clientCount, err := ctrl.onboardingService.CountRegisteredClients(rs.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	accessPolicyEnabled, _, err := ctrl.onboardingService.GetAccessPolicySummary(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := ctrl.onboardingService.ValidateResourceServer(rs, int(clientCount), accessPolicyEnabled)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "rs_validated", "resource_server",
+		rsID, http.StatusOK, nil, result)
+	c.JSON(http.StatusOK, result)
+}
+
+func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, tenantID string) (*resourceServerSummaryResponse, error) {
+	clientCount, err := ctrl.onboardingService.CountRegisteredClients(rs.ID)
+	if err != nil {
+		return nil, err
+	}
+	accessPolicyEnabled, accessPolicyRoleName, err := ctrl.onboardingService.GetAccessPolicySummary(rs.ID.String(), tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &resourceServerSummaryResponse{
+		ResourceServer:       *rs,
+		ClientCount:          clientCount,
+		AccessPolicyEnabled:  accessPolicyEnabled,
+		AccessPolicyRoleName: accessPolicyRoleName,
+	}, nil
 }
 
 // RevokeClient revokes a client's registration for a resource server.

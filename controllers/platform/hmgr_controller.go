@@ -50,23 +50,25 @@ func consumePKCEVerifier(key string) string {
 
 // HmgrController handles hydra manager authentication requests
 type HmgrController struct {
-	service        *hydramodels.OAuthLoginService
-	authzCtx       *services.AuthorizationContextService
-	rsService      *services.ResourceServerService
-	scopeResolver  *services.ScopeResolver
-	consentService *services.ConsentService
-	scopeRegistry  *services.ScopeRegistryService
+	service           *hydramodels.OAuthLoginService
+	authzCtx          *services.AuthorizationContextService
+	rsService         *services.ResourceServerService
+	onboardingService *services.ResourceServerOnboardingService
+	scopeResolver     *services.ScopeResolver
+	consentService    *services.ConsentService
+	scopeRegistry     *services.ScopeRegistryService
 }
 
 // NewHmgrController creates a new HmgrController
 func NewHmgrController(cfg config.Config) *HmgrController {
 	return &HmgrController{
-		service:        hydramodels.NewOAuthLoginService(cfg),
-		authzCtx:       services.NewAuthorizationContextService(config.DB),
-		rsService:      services.NewResourceServerService(config.DB),
-		scopeResolver:  services.NewScopeResolver(config.DB),
-		consentService: services.NewConsentService(config.DB),
-		scopeRegistry:  services.NewScopeRegistryService(config.DB),
+		service:           hydramodels.NewOAuthLoginService(cfg),
+		authzCtx:          services.NewAuthorizationContextService(config.DB),
+		rsService:         services.NewResourceServerService(config.DB),
+		onboardingService: services.NewResourceServerOnboardingService(config.DB),
+		scopeResolver:     services.NewScopeResolver(config.DB),
+		consentService:    services.NewConsentService(config.DB),
+		scopeRegistry:     services.NewScopeRegistryService(config.DB),
 	}
 }
 
@@ -1371,6 +1373,21 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		requestedScopes := consentRequest.RequestedScope
 		if len(requestedScopes) == 0 {
 			requestedScopes = []string(rs.ScopesSupported)
+		}
+
+		if applied, bindErr := ctrl.onboardingService.EnsureDefaultAccessBinding(
+			c.Request.Context(),
+			consentRequest.Subject,
+			arcCtx.TenantID,
+			rs,
+		); bindErr != nil {
+			log.Printf("[MCP_AUTH] ConsentHandler: EnsureDefaultAccessBinding failed context_id=%s rs=%s: %v",
+				arcCtx.ContextID, rs.ResourceURI, bindErr)
+			c.String(http.StatusInternalServerError, "Failed to prepare default access")
+			return
+		} else if applied {
+			log.Printf("[MCP_AUTH] ConsentHandler: default access binding created user=%s rs=%s context_id=%s",
+				consentRequest.Subject, rs.ResourceURI, arcCtx.ContextID)
 		}
 
 		// 3-way intersection: requested ∩ RS-supported ∩ user-effective-scopes (RBAC).

@@ -20,7 +20,7 @@ type ResourceServer struct {
 	ResourceURI             string         `json:"resource_uri" gorm:"not null;uniqueIndex"`
 	ScopesSupported         pq.StringArray `json:"scopes_supported" gorm:"type:text[];default:'{}'"`
 	RegistrationModes       pq.StringArray `json:"registration_modes" gorm:"type:text[];default:'{dcr,cimd,prereg}'"`
-	IntrospectionSecret     string         `json:"-" gorm:"column:introspection_secret"`               // Legacy plaintext, cleared after backfill
+	IntrospectionSecret     string         `json:"-" gorm:"column:introspection_secret"`                // Legacy plaintext, cleared after backfill
 	IntrospectionSecretHash string         `json:"-" gorm:"column:introspection_secret_hash;type:text"` // Bcrypt hash (primary for new rows)
 	Active                  bool           `json:"active" gorm:"default:true"`
 
@@ -33,10 +33,13 @@ type ResourceServer struct {
 	LastScanError            *string    `json:"last_scan_error,omitempty" gorm:"type:text"`
 	LastScanStartedAt        *time.Time `json:"last_scan_started_at,omitempty"`
 	LastScanCompletedAt      *time.Time `json:"last_scan_completed_at,omitempty"`
+	LastValidatedAt          *time.Time `json:"last_validated_at,omitempty" gorm:"type:timestamptz"`
+	LastValidationStatus     *string    `json:"last_validation_status,omitempty" gorm:"type:text"`
+	LastValidationError      *string    `json:"last_validation_error,omitempty" gorm:"type:text"`
 
-	CreatedAt               time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt               time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	DeletedAt               gorm.DeletedAt `json:"-" gorm:"index"`
+	CreatedAt time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 }
 
 func (ResourceServer) TableName() string {

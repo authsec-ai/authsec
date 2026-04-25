@@ -252,6 +252,9 @@ func SetupRoutes(
 			resourceServers.DELETE("/:id/clients/:client_id", rsController.RevokeClient)
 			// CIMD redirect approval (Bug 10)
 			resourceServers.PUT("/:id/clients/:client_id/approve-redirects", rsController.ApproveRedirects)
+			resourceServers.GET("/:id/access-policy", rsController.GetAccessPolicy)
+			resourceServers.PUT("/:id/access-policy", rsController.UpdateAccessPolicy)
+			resourceServers.POST("/:id/validate", rsController.Validate)
 
 			// Scope matrix, tool discovery, and scope management
 			resourceServers.GET("/:id/scope-matrix", scopeMatrixController.GetScopeMatrix)

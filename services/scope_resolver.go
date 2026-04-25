@@ -102,6 +102,18 @@ func (r *ScopeResolver) ResolveGrantableScopes(
 	return report.Grantable, nil
 }
 
+// HasEffectiveScopes reports whether the user currently has any RBAC-derived scopes for the resource server.
+func (r *ScopeResolver) HasEffectiveScopes(
+	ctx context.Context,
+	tenantID, userID, resourceServerID string,
+) (bool, error) {
+	userEffective, err := r.resolveUserEffectiveScopes(ctx, tenantID, userID, resourceServerID)
+	if err != nil {
+		return false, err
+	}
+	return len(userEffective) > 0, nil
+}
+
 // ResolveWithReport performs the 3-way intersection and returns a full diagnostic report.
 // All controller call sites must pass string-form UUIDs (.String()) to match this API.
 func (r *ScopeResolver) ResolveWithReport(
