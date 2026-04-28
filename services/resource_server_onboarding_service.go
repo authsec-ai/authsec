@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/sharedmodels"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -255,26 +257,85 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		return false, nil
 	}
 
-	// User-display lookup is best-effort: end-users live in tenant-specific
-	// databases (see GetConnectionDynamically in hmgr_controller — the login
-	// flow looks them up there), while admin users live in the master users
-	// table. Both paths can land here, so we attempt the master-DB lookup
-	// purely to enrich the role_binding row with email/username metadata. If
-	// the user isn't in the master table (typical for tenant end-users from
-	// MCP consent flows), we fall back to a placeholder. We do NOT bail out —
-	// the binding itself only needs userUUID + roleID + tenantUUID.
+	// User lookup + master mirror.
+	//
+	// Architecture: tenant end-users (the typical subject of MCP consent flows)
+	// live in tenant-specific databases reached via middlewares.GetConnectionDynamically.
+	// Admin users live in the master users table. The role_bindings table has
+	// a composite FK (tenant_id, user_id) -> users(tenant_id, id) on the
+	// master DB, so we MUST have a master users row for the user before
+	// creating the binding — otherwise the insert fails with FK violation
+	// (fk_rb_user, SQLSTATE 23503), which is exactly what we observed before.
+	//
+	// Strategy: try master first (fast path for admin users). On miss, look
+	// up the user in their tenant DB and mirror the canonical fields into
+	// master users with INSERT ... ON CONFLICT DO NOTHING so concurrent
+	// callers don't race. Then proceed with the binding.
 	var user models.ExtendedUser
 	username := ""
 	emailFallback := ""
-	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err != nil {
-		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: master user lookup miss user=%s: %v — proceeding with placeholder display name (typical for tenant end-users)",
-			userID, err)
-		username = userUUID.String()
-	} else {
+	masterErr := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error
+	if masterErr == nil {
 		if user.Username != nil {
 			username = *user.Username
 		}
 		emailFallback = user.Email
+	} else {
+		// Master miss — attempt tenant-DB lookup + mirror.
+		tenantDB, dbErr := middlewares.GetConnectionDynamically(s.db, nil, &tenantID)
+		if dbErr != nil {
+			log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: tenant DB unavailable user=%s tenant=%s: %v — skipping auto-bind",
+				userID, tenantID, dbErr)
+			return false, nil
+		}
+		var tenantUser sharedmodels.User
+		if err := tenantDB.Select(
+			"id", "tenant_id", "client_id", "project_id",
+			"email", "name", "username", "tenant_domain",
+			"provider", "provider_id", "avatar_url",
+		).Where("id = ?", userUUID).First(&tenantUser).Error; err != nil {
+			log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: tenant DB user lookup miss user=%s tenant=%s: %v — skipping auto-bind",
+				userID, tenantID, err)
+			return false, nil
+		}
+
+		// Mirror minimal fields into master users so the FK satisfies. Fields
+		// marked NOT NULL on sharedmodels.User: id, tenant_id, client_id,
+		// project_id, email, tenant_domain, provider, provider_id. We copy
+		// what we have and synthesize defaults for any column the tenant
+		// row left empty (provider defaults to 'local' upstream, but be
+		// defensive in case of legacy data).
+		provider := tenantUser.Provider
+		if provider == "" {
+			provider = "local"
+		}
+		providerID := tenantUser.ProviderID
+		if providerID == "" {
+			providerID = userUUID.String() // synth — never NULL, value just needs to be unique-stable
+		}
+		mirrorErr := s.db.Exec(`
+			INSERT INTO users
+				(id, tenant_id, client_id, project_id, email, name, username,
+				 tenant_domain, provider, provider_id, avatar_url, active,
+				 created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())
+			ON CONFLICT (id) DO NOTHING
+		`,
+			tenantUser.ID, tenantUser.TenantID, tenantUser.ClientID, tenantUser.ProjectID,
+			tenantUser.Email, tenantUser.Name, tenantUser.Username,
+			tenantUser.TenantDomain, provider, providerID, tenantUser.AvatarURL,
+		).Error
+		if mirrorErr != nil {
+			log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: master mirror failed user=%s tenant=%s: %v — skipping auto-bind",
+				userID, tenantID, mirrorErr)
+			return false, nil
+		}
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: mirrored tenant user into master users user=%s tenant=%s email=%s",
+			userID, tenantID, tenantUser.Email)
+		if tenantUser.Username != nil {
+			username = *tenantUser.Username
+		}
+		emailFallback = tenantUser.Email
 	}
 
 	var role models.RBACRole
