@@ -348,10 +348,20 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		return false, nil
 	}
 
+	// RS-scoped binding (audit hardening): default-access bindings now carry
+	// scope_type='resource_server' + scope_id=rs.ID so the resolver can
+	// distinguish them from tenant-wide bindings. Existing global bindings
+	// (scope_type IS NULL) keep working — the resolver accepts both forms.
+	rsScopeType := "resource_server"
+	rsScopeID := rs.ID
+
+	// De-dup against either the legacy global binding OR the new RS-scoped one
+	// to avoid creating a second row when the user already has the role.
 	var existingCount int64
 	if err := s.db.Model(&models.RoleBinding{}).
-		Where("tenant_id = ? AND user_id = ? AND role_id = ? AND scope_type IS NULL AND scope_id IS NULL",
-			tenantUUID, userUUID, role.ID).
+		Where("tenant_id = ? AND user_id = ? AND role_id = ?", tenantUUID, userUUID, role.ID).
+		Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = ? AND scope_id = ?)",
+			rsScopeType, rsScopeID).
 		Count(&existingCount).Error; err != nil {
 		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: existing binding count failed user=%s role=%s: %v — skipping auto-bind",
 			userID, role.ID, err)
@@ -376,6 +386,8 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		Username:           firstNonEmpty(username, emailFallback, userUUID.String()),
 		RoleID:             role.ID,
 		RoleName:           role.Name,
+		ScopeType:          &rsScopeType,
+		ScopeID:            &rsScopeID,
 		Conditions:         json.RawMessage([]byte("{}")),
 		AssignmentSource:   ResourceServerAccessAssignmentSource,
 		AssignmentMetadata: json.RawMessage(metadata),

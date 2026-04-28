@@ -223,6 +223,18 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 
 	// Single query: user → role_bindings → roles → role_permissions → permissions → oauth_scope_permissions → oauth_scopes
 	// This resolves the full RBAC chain to OAuth scope strings.
+	//
+	// RS-scope safety: bindings are accepted ONLY when their scope_type/scope_id
+	// either:
+	//   - is global (both NULL — applies tenant-wide), or
+	//   - is wildcard ('*' — explicit "all RSes" binding), or
+	//   - is RS-scoped to THIS RS (scope_type='resource_server' AND scope_id=rsUUID).
+	// A binding scoped to a DIFFERENT RS must not contribute scopes here, even
+	// though oauth_scopes.resource_server_id already filters the joined scope
+	// rows — without this, a binding to admin on RS-A would still grant
+	// admin-level access on RS-B because both roles likely share the
+	// "rs-{id}:admin" naming and admin role's permissions chain to the
+	// queried RS's scopes via oauth_scope_permissions.
 	var scopeStrings []string
 	err = r.db.WithContext(ctx).
 		Table("role_bindings rb").
@@ -238,6 +250,11 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Where("(ro.tenant_id IS NULL OR ro.tenant_id = ?)", tenantUUID).
 		Where("(p.tenant_id IS NULL OR p.tenant_id = ?)", tenantUUID).
 		Where("os.tenant_id = ? AND os.resource_server_id = ?", tenantUUID, rsUUID).
+		Where(`
+			rb.scope_type IS NULL
+			OR rb.scope_type = '*'
+			OR (rb.scope_type = 'resource_server' AND rb.scope_id::text = ?)
+		`, rsUUID.String()).
 		Pluck("os.scope_string", &scopeStrings).Error
 
 	if err != nil {

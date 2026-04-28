@@ -274,6 +274,13 @@ func SetupRoutes(
 			resourceServers.GET("/:id/drift-events", scopeMatrixController.DriftEvents)
 			resourceServers.POST("/:id/drift-events/:event_id/dismiss", scopeMatrixController.DismissDriftEvent)
 			resourceServers.POST("/:id/test-login", rsController.TestLogin)
+
+			// RS-scoped roles + bindings management
+			resourceServers.GET("/:id/roles", scopeMatrixController.ListRSRoles)
+			resourceServers.GET("/:id/bindings", scopeMatrixController.ListRSBindings)
+			resourceServers.POST("/:id/bindings", scopeMatrixController.CreateRSBinding)
+			resourceServers.DELETE("/:id/bindings/:binding_id", scopeMatrixController.DeleteRSBinding)
+			resourceServers.GET("/:id/eligible-users", scopeMatrixController.ListRSEndUsers)
 		}
 
 		// SDK endpoints (Basic auth with RS introspection credentials — no JWT middleware)

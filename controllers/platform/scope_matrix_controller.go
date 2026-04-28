@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -957,6 +958,31 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 		return
 	}
 
+	// Confirmation gate: marking a tool public bypasses scope enforcement on
+	// every token issued for this RS, so we require the admin to type the
+	// tool's exact name as a "are you sure?" gate. Toggling back to scoped
+	// (is_public=false) doesn't need confirmation — that's the safe direction.
+	if req.IsPublic {
+		expected := strings.TrimSpace(tool.Name)
+		got := strings.TrimSpace(req.ConfirmationToken)
+		if got == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":              "confirmation_token required",
+				"confirmation_hint":  "type the exact tool name to confirm",
+				"expected_tool_name": expected,
+			})
+			return
+		}
+		if got != expected {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":              "confirmation_token does not match tool name",
+				"confirmation_hint":  "type the exact tool name to confirm",
+				"expected_tool_name": expected,
+			})
+			return
+		}
+	}
+
 	userID := extractUserIDOptional(c)
 	updates := map[string]interface{}{
 		"is_public": req.IsPublic,
@@ -1076,6 +1102,354 @@ func (ctrl *ScopeMatrixController) DismissDriftEvent(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "dismissed"})
+}
+
+// ── Roles + Bindings (per-RS) ────────────────────────────────────────────────────────────────────
+
+// rsRoleSummary is the per-RS role list payload. Includes the auto-generated
+// rs-{id}:admin / :viewer / :readonly roles plus any custom roles whose name
+// starts with the rs-{id}: prefix.
+type rsRoleSummary struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	IsDefault   bool   `json:"is_default"`
+	Permissions int64  `json:"permissions"`
+	Bindings    int64  `json:"bindings"`
+}
+
+// ListRSRoles returns all roles associated with this RS (rs-{id}:* names).
+// GET /authsec/resource-servers/:id/roles
+func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
+
+	var roles []models.RBACRole
+	config.DB.Where("tenant_id = ? AND name LIKE ?", tenantID, prefix+"%").
+		Order("name ASC").Find(&roles)
+
+	// Fetch the policy default for the is_default flag.
+	var policy models.ResourceServerAccessPolicy
+	policyErr := config.DB.Where("resource_server_id = ? AND tenant_id = ?", rs.ID, tenantID).
+		First(&policy).Error
+	defaultRoleID := uuid.Nil
+	if policyErr == nil && policy.DefaultRoleID != nil {
+		defaultRoleID = *policy.DefaultRoleID
+	}
+
+	out := make([]rsRoleSummary, 0, len(roles))
+	for _, r := range roles {
+		var permCount int64
+		config.DB.Model(&models.RolePermission{}).Where("role_id = ?", r.ID).Count(&permCount)
+		var bindingCount int64
+		config.DB.Model(&models.RoleBinding{}).
+			Where("role_id = ? AND tenant_id = ?", r.ID, tenantID).
+			Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = 'resource_server' AND scope_id = ?)", rs.ID).
+			Count(&bindingCount)
+		out = append(out, rsRoleSummary{
+			ID:          r.ID.String(),
+			Name:        r.Name,
+			Description: r.Description,
+			IsDefault:   r.ID == defaultRoleID,
+			Permissions: permCount,
+			Bindings:    bindingCount,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"roles": out})
+}
+
+// rsBindingResponse is the per-binding payload for the RolesAccessTab.
+type rsBindingResponse struct {
+	ID         string  `json:"id"`
+	UserID     string  `json:"user_id"`
+	Username   string  `json:"username"`
+	UserEmail  string  `json:"user_email"`
+	RoleID     string  `json:"role_id"`
+	RoleName   string  `json:"role_name"`
+	ScopeType  *string `json:"scope_type"`
+	ScopeID    *string `json:"scope_id"`
+	CreatedAt  string  `json:"created_at"`
+	Source     string  `json:"assignment_source,omitempty"`
+}
+
+// ListRSBindings returns role_bindings that apply to this RS — either explicit
+// (scope_type='resource_server' AND scope_id=rs.ID) or global (scope_type IS NULL),
+// for any role whose name starts with rs-{id}: (i.e. RS-scoped roles only).
+// GET /authsec/resource-servers/:id/bindings
+func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
+
+	type row struct {
+		ID         uuid.UUID
+		UserID     *uuid.UUID
+		Username   string
+		UserEmail  string
+		RoleID     uuid.UUID
+		RoleName   string
+		ScopeType  *string
+		ScopeID    *uuid.UUID
+		CreatedAt  time.Time
+		Source     string
+	}
+	var rows []row
+	err = config.DB.
+		Table("role_bindings rb").
+		Select(`rb.id, rb.user_id, rb.username, COALESCE(u.email, '') AS user_email,
+			rb.role_id, rb.role_name, rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
+		Joins("JOIN roles ro ON ro.id = rb.role_id").
+		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.tenant_id = rb.tenant_id").
+		Where("rb.tenant_id = ?", tenantID).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
+		Where("ro.name LIKE ?", prefix+"%").
+		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
+		Order("rb.created_at DESC").
+		Scan(&rows).Error
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	out := make([]rsBindingResponse, 0, len(rows))
+	for _, r := range rows {
+		userIDStr := ""
+		if r.UserID != nil {
+			userIDStr = r.UserID.String()
+		}
+		var scopeIDStr *string
+		if r.ScopeID != nil {
+			s := r.ScopeID.String()
+			scopeIDStr = &s
+		}
+		out = append(out, rsBindingResponse{
+			ID:        r.ID.String(),
+			UserID:    userIDStr,
+			Username:  r.Username,
+			UserEmail: r.UserEmail,
+			RoleID:    r.RoleID.String(),
+			RoleName:  r.RoleName,
+			ScopeType: r.ScopeType,
+			ScopeID:   scopeIDStr,
+			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
+			Source:    r.Source,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"bindings": out})
+}
+
+// CreateRSBinding assigns a user to a role with scope_type='resource_server'
+// and scope_id=rs.ID. The user must already exist in master users (admin
+// users are there from signup; tenant end-users get mirrored on first
+// consent flow via EnsureDefaultAccessBinding).
+// POST /authsec/resource-servers/:id/bindings
+func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	var req struct {
+		UserID string `json:"user_id" binding:"required"`
+		RoleID string `json:"role_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id and role_id required"})
+		return
+	}
+	userUUID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	roleUUID, err := uuid.Parse(req.RoleID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+		return
+	}
+
+	// Verify the role belongs to this tenant and is RS-scoped (rs-{id}: prefix).
+	var role models.RBACRole
+	if err := config.DB.Where("id = ? AND tenant_id = ?", roleUUID, tenantID).First(&role).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
+		return
+	}
+	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
+	if !strings.HasPrefix(role.Name, prefix) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "role is not scoped to this resource server"})
+		return
+	}
+
+	// Verify the user exists in master users for this tenant.
+	var userRow struct {
+		ID    uuid.UUID
+		Email string
+		Name  string
+	}
+	if err := config.DB.Table("users").
+		Select("id, email, name").
+		Where("id = ? AND tenant_id = ?", userUUID, tenantID).
+		Take(&userRow).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "user not found in master users for this tenant",
+			"hint":  "tenant end-users are mirrored only after their first consent flow",
+		})
+		return
+	}
+
+	// Idempotent: don't create a duplicate.
+	rsScopeType := "resource_server"
+	rsScopeID := rs.ID
+	var existingCount int64
+	config.DB.Model(&models.RoleBinding{}).
+		Where("tenant_id = ? AND user_id = ? AND role_id = ?", tenantID, userUUID, roleUUID).
+		Where("scope_type = ? AND scope_id = ?", rsScopeType, rsScopeID).
+		Count(&existingCount)
+	if existingCount > 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "binding already exists for this user+role+rs"})
+		return
+	}
+
+	username := userRow.Name
+	if username == "" {
+		username = userRow.Email
+	}
+	tenantUUID := tenantID
+	binding := models.RoleBinding{
+		TenantID:         &tenantUUID,
+		UserID:           &userUUID,
+		Username:         username,
+		RoleID:           roleUUID,
+		RoleName:         role.Name,
+		ScopeType:        &rsScopeType,
+		ScopeID:          &rsScopeID,
+		Conditions:       json.RawMessage([]byte("{}")),
+		AssignmentSource: "manual_admin",
+		CreatedAt:        time.Now().UTC(),
+	}
+	if err := config.DB.Create(&binding).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "rs_binding_created", "role_binding",
+		binding.ID.String(), http.StatusCreated, nil,
+		map[string]interface{}{"user_id": userUUID, "role_id": roleUUID, "rs_id": rs.ID})
+	c.JSON(http.StatusCreated, gin.H{
+		"id":         binding.ID.String(),
+		"user_id":    userUUID.String(),
+		"role_id":    roleUUID.String(),
+		"role_name":  role.Name,
+		"scope_type": rsScopeType,
+		"scope_id":   rsScopeID.String(),
+	})
+}
+
+// DeleteRSBinding removes a role binding for this RS.
+// DELETE /authsec/resource-servers/:id/bindings/:binding_id
+func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	bindingID, err := uuid.Parse(c.Param("binding_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid binding_id"})
+		return
+	}
+
+	// Refuse to delete bindings that aren't actually scoped to this RS — defends
+	// against the resolver's accept-globals path being used as a delete vector
+	// for tenant-wide bindings.
+	res := config.DB.
+		Where("id = ? AND tenant_id = ?", bindingID, tenantID).
+		Where("scope_type = 'resource_server' AND scope_id = ?", rs.ID).
+		Delete(&models.RoleBinding{})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "binding not found or not scoped to this RS"})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "rs_binding_deleted", "role_binding",
+		bindingID.String(), http.StatusOK, nil, nil)
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// ListRSEndUsers lists end-users in the tenant DB so the RolesAccessTab can
+// populate its "Assign to user" dropdown. Reads from the tenant DB via
+// GetConnectionDynamically, with a small projection (no password hashes).
+// GET /authsec/resource-servers/:id/eligible-users
+func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	if _, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+	tenantStr := tenantID.String()
+	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantStr)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant DB unavailable"})
+		return
+	}
+	type u struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+		Name  string `json:"name"`
+	}
+	var users []u
+	tenantDB.Table("users").
+		Select("id::text AS id, email, COALESCE(NULLIF(name, ''), email) AS name").
+		Where("active = true").
+		Order("created_at DESC").Limit(200).Scan(&users)
+	c.JSON(http.StatusOK, gin.H{"users": users})
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────────────────────────────
