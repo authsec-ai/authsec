@@ -13,8 +13,9 @@
 --     and rely on direct bindings only.
 --
 -- This migration is idempotent (uses NOT EXISTS guards) and safe to re-run.
-
-BEGIN;
+-- Do NOT wrap in BEGIN/COMMIT — the migration runner already wraps each
+-- migration file in its own transaction, and a nested explicit COMMIT here
+-- breaks the outer transaction with "unexpected transaction status idle".
 
 -- ── 1. Create rs-{id}:viewer role for every RS that doesn't have one ──────────
 INSERT INTO roles (id, tenant_id, name, description, created_at, updated_at)
@@ -170,4 +171,3 @@ UPDATE mcp_tool_scope_map
  WHERE auto_matched = false
    AND (source IS NULL OR source = '');
 
-COMMIT;

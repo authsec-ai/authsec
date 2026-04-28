@@ -255,19 +255,26 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		return false, nil
 	}
 
+	// User-display lookup is best-effort: end-users live in tenant-specific
+	// databases (see GetConnectionDynamically in hmgr_controller — the login
+	// flow looks them up there), while admin users live in the master users
+	// table. Both paths can land here, so we attempt the master-DB lookup
+	// purely to enrich the role_binding row with email/username metadata. If
+	// the user isn't in the master table (typical for tenant end-users from
+	// MCP consent flows), we fall back to a placeholder. We do NOT bail out —
+	// the binding itself only needs userUUID + roleID + tenantUUID.
 	var user models.ExtendedUser
-	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err != nil {
-		// User row missing or unreadable. Don't 500 the consent flow over this —
-		// the user authenticated upstream so the row almost certainly exists,
-		// but if a column or join produces an oddity, fail open and let the
-		// existing scope-resolution path handle access (or correctly reject).
-		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: user lookup failed user=%s: %v — skipping auto-bind",
-			userID, err)
-		return false, nil
-	}
 	username := ""
-	if user.Username != nil {
-		username = *user.Username
+	emailFallback := ""
+	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err != nil {
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: master user lookup miss user=%s: %v — proceeding with placeholder display name (typical for tenant end-users)",
+			userID, err)
+		username = userUUID.String()
+	} else {
+		if user.Username != nil {
+			username = *user.Username
+		}
+		emailFallback = user.Email
 	}
 
 	var role models.RBACRole
@@ -305,7 +312,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	binding := models.RoleBinding{
 		TenantID:           &tenantUUID,
 		UserID:             &userUUID,
-		Username:           firstNonEmpty(username, user.Email),
+		Username:           firstNonEmpty(username, emailFallback, userUUID.String()),
 		RoleID:             role.ID,
 		RoleName:           role.Name,
 		Conditions:         json.RawMessage([]byte("{}")),
