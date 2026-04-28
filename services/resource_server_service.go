@@ -305,6 +305,16 @@ type DiscoverySyncResult struct {
 //
 // Always returns a non-nil *DiscoverySyncResult.
 func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.ResourceServer) (*DiscoverySyncResult, error) {
+	return s.DiscoverAndSyncWithToken(ctx, rs, "")
+}
+
+// DiscoverAndSyncWithToken is identical to DiscoverAndSync but lets the caller
+// supply a one-shot bearer token used for the synthetic tools/list call. This
+// is the "authenticated scan" path: when the MCP server requires a token to
+// list tools, an admin pastes one in the wizard and we forward it to the
+// scanner. The token is never persisted — it lives on the mcpclient for the
+// duration of this call only.
+func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs *models.ResourceServer, mcpBearerToken string) (*DiscoverySyncResult, error) {
 	syncResult := &DiscoverySyncResult{}
 
 	// ── Stage 1: Claim scan lock ────────────────────────────────────────────
@@ -336,7 +346,7 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 	// ── Stage 2: MCP Discovery (no DB locks held) ───────────────────────────
 	// Fix: use resourceURI (PublicBaseURL + ProtectedBasePath), not bare PublicBaseURL.
 	resourceURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
-	client := mcpclient.NewClient()
+	client := mcpclient.NewClient().WithBearerToken(mcpBearerToken)
 	discovered, err := client.Discover(ctx, resourceURI)
 	// protectedServer: RFC 9728 bearer challenge on tools/list. Server is
 	// reachable and properly OAuth-protected. We cannot enumerate tools

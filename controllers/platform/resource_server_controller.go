@@ -3,6 +3,7 @@ package platform
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -17,6 +18,7 @@ type ResourceServerController struct {
 	service           *services.ResourceServerService
 	oauthSvc          *services.OAuthASService
 	onboardingService *services.ResourceServerOnboardingService
+	driftService      *services.ResourceServerDriftService
 }
 
 func NewResourceServerController() *ResourceServerController {
@@ -24,6 +26,7 @@ func NewResourceServerController() *ResourceServerController {
 		service:           services.NewResourceServerService(config.DB),
 		oauthSvc:          services.NewOAuthASService(config.DB),
 		onboardingService: services.NewResourceServerOnboardingService(config.DB),
+		driftService:      services.NewResourceServerDriftService(config.DB),
 	}
 }
 
@@ -201,6 +204,18 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 		return
 	}
 
+	// Drift event: every SDK runtime that holds the OLD introspection secret
+	// will start failing token validation against AuthSec until it picks up
+	// the rotated value. Surface this in the workspace banner for ready RSes.
+	if rs, getErr := ctrl.service.GetByIDAndTenant(id, tenantID.String()); getErr == nil &&
+		rs != nil && rs.State == models.RSStateReady {
+		_ = ctrl.driftService.EmitEvent(
+			config.DB, rs.ID, models.DriftEventSecretRotated,
+			map[string]interface{}{"rotated_at": time.Now().UTC().Format(time.RFC3339)},
+			extractUserIDOptional(c),
+		)
+	}
+
 	auditAdminMutation(c, tenantID.String(), "rs_introspection_secret_rotated", "resource_server",
 		id, http.StatusOK, nil, nil) // never log the secret value
 	c.JSON(http.StatusOK, gin.H{"introspection_secret": secret})
@@ -307,10 +322,15 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 	}
 
 	rsID := c.Param("id")
-	if _, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
+
+	// Capture the prior enabled state so we can detect a transition to disabled.
+	priorPolicy, _ := ctrl.onboardingService.GetAccessPolicy(rsID, tenantID.String())
+	priorEnabled := priorPolicy != nil && priorPolicy.Enabled
 
 	var req services.UpdateResourceServerAccessPolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -322,6 +342,18 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Drift event: disabling the default access policy on a ready RS means
+	// new first-time users will no longer get auto-binding to viewer. End-user
+	// logins will start failing with insufficient_scope unless an admin grants
+	// them roles directly. Surface this in the workspace banner.
+	if rs.State == models.RSStateReady && priorEnabled && !policy.Enabled {
+		_ = ctrl.driftService.EmitEvent(
+			config.DB, rs.ID, models.DriftEventDefaultRoleDisabled,
+			map[string]interface{}{"prior_default_role": priorPolicy.DefaultRoleName},
+			extractUserIDOptional(c),
+		)
 	}
 
 	auditAdminMutation(c, tenantID.String(), "rs_access_policy_updated", "resource_server",

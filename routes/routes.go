@@ -268,6 +268,7 @@ func SetupRoutes(
 			resourceServers.GET("/:id/setup", scopeMatrixController.SetupChecklist)
 			resourceServers.GET("/:id/activation-preview", scopeMatrixController.ActivationPreview)
 			resourceServers.POST("/:id/activate", scopeMatrixController.Activate)
+			resourceServers.POST("/:id/tools", scopeMatrixController.CreateManualTool)
 			resourceServers.POST("/:id/tools/:tool_id/public", scopeMatrixController.MarkToolPublic)
 			resourceServers.GET("/:id/sdk-manifest-status", scopeMatrixController.SDKManifestStatus)
 			resourceServers.GET("/:id/drift-events", scopeMatrixController.DriftEvents)

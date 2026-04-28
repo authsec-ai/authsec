@@ -1735,7 +1735,10 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 	pendingReg := models.PendingRegistration{
 		Email:        input.Email,
 		PasswordHash: tempUser.PasswordHash,
-		FirstName:    input.Email, // Use email as first name for custom login
+		// Custom-login signup form does not collect names. Leave blank rather
+		// than pollute first_name with the email — the OTP-completion flow
+		// derives a sensible Name from the email local-part if these stay empty.
+		FirstName:    "",
 		LastName:     "",
 		TenantID:     tenantIDUUID,
 		ProjectID:    client.ProjectID,
@@ -1894,6 +1897,25 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
+	// Derive a display name. The custom-login signup form doesn't collect
+	// first/last name, and historically we wrote pendingReg.Email into the
+	// users.name column — which the admin UI then split on whitespace and
+	// surfaced as `first_name`, making "first_name" appear to equal the user's
+	// email. Use the email local-part as a friendlier default; if the pending
+	// registration captured an explicit first/last name (non-email), prefer
+	// that. The local-part is purely cosmetic and the UI can still let the
+	// user edit their name later.
+	displayName := strings.TrimSpace(pendingReg.FirstName + " " + pendingReg.LastName)
+	if displayName == "" || strings.Contains(displayName, "@") {
+		// Either nothing captured, or the legacy bug filled FirstName with
+		// the full email — fall back to the email local-part.
+		if at := strings.Index(pendingReg.Email, "@"); at > 0 {
+			displayName = pendingReg.Email[:at]
+		} else {
+			displayName = ""
+		}
+	}
+
 	// Create new user
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
@@ -1901,7 +1923,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 			ClientID:     pendingReg.ClientID,
 			TenantID:     pendingReg.TenantID,
 			ProjectID:    pendingReg.ProjectID,
-			Name:         pendingReg.Email,
+			Name:         displayName,
 			Email:        pendingReg.Email,
 			PasswordHash: pendingReg.PasswordHash,
 			TenantDomain: pendingReg.TenantDomain,

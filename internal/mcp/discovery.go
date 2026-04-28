@@ -31,7 +31,8 @@ const (
 
 // Client discovers tools and scopes from MCP servers.
 type Client struct {
-	httpClient *http.Client
+	httpClient  *http.Client
+	bearerToken string // optional; when set, injected as Authorization: Bearer <token>
 }
 
 // NewClient creates an MCP discovery client with SSRF-safe transport.
@@ -46,6 +47,20 @@ func NewClient() *Client {
 			Timeout:   requestTimeout,
 		},
 	}
+}
+
+// WithBearerToken returns a copy of the client that attaches the given bearer
+// token to MCP requests (initialize, tools/list, notifications/initialized).
+// Empty token returns the same client unchanged. The token is never persisted
+// — it lives only in this client's memory for the duration of the request.
+func (c *Client) WithBearerToken(token string) *Client {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return c
+	}
+	clone := *c
+	clone.bearerToken = token
+	return &clone
 }
 
 // Discover performs full MCP server discovery: PRM fetch + tools/list.
@@ -203,6 +218,9 @@ func (c *Client) mcpInitialize(ctx context.Context, endpoint string) (string, er
 	if sessionID != "" {
 		notifReq.Header.Set("Mcp-Session", sessionID)
 	}
+	if c.bearerToken != "" {
+		notifReq.Header.Set("Authorization", "Bearer "+c.bearerToken)
+	}
 	notifResp, err := c.httpClient.Do(notifReq)
 	if err == nil {
 		notifResp.Body.Close()
@@ -255,6 +273,9 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 	req.Header.Set("Accept", "application/json")
 	if sessionID != "" {
 		req.Header.Set("Mcp-Session", sessionID)
+	}
+	if c.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
 	}
 
 	resp, err := c.httpClient.Do(req)

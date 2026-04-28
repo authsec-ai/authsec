@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -133,6 +134,16 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 
 // Rescan re-discovers tools and scopes from the MCP server.
 // POST /authsec/resource-servers/:id/rescan
+//
+// Body (optional):
+//
+//	{ "mcp_token": "<bearer token>" }
+//
+// When mcp_token is present, it is forwarded to the MCP server's tools/list
+// call as Authorization: Bearer. The token is NEVER persisted — it lives on
+// the mcpclient for the duration of this request and is dropped immediately.
+// This is the "authenticated scan" path the wizard exposes for MCP servers
+// that require auth on tools/list.
 func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
@@ -147,11 +158,22 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 		return
 	}
 
+	// Pull optional one-shot bearer token from the request body. We tolerate
+	// an empty/missing body — the unauthenticated path still works.
+	var rescanReq struct {
+		MCPToken string `json:"mcp_token"`
+	}
+	if c.Request.ContentLength > 0 {
+		// Bind errors are non-fatal: an empty/malformed body just means
+		// "scan without a token". Don't 400 the wizard for that.
+		_ = c.ShouldBindJSON(&rescanReq)
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
 
 	// result is always non-nil — DiscoverAndSync guarantees this.
-	result, err := ctrl.rsService.DiscoverAndSync(ctx, rs)
+	result, err := ctrl.rsService.DiscoverAndSyncWithToken(ctx, rs, rescanReq.MCPToken)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, services.ErrScanInProgress) {
@@ -417,6 +439,20 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 
 		if m.Remove {
 			config.DB.Where("tool_id = ? AND scope_id = ?", toolID, scopeID).Delete(&models.MCPToolScopeMap{})
+
+			// Drift event: unmapping a tool's scope on a ready RS may break
+			// end-user logins that depended on this scope mapping. Surface it
+			// so the admin sees the change in the workspace banner.
+			if rs.State == models.RSStateReady {
+				_ = ctrl.driftService.EmitEvent(
+					config.DB, rsUUID, models.DriftEventToolUnmapped,
+					map[string]interface{}{
+						"tool_id":  toolID.String(),
+						"scope_id": scopeID.String(),
+					},
+					extractUserIDOptional(c),
+				)
+			}
 		} else {
 			// Correctness fix #7: upsert with source='admin_override' and auto_matched=false.
 			// FirstOrCreate kept the old auto_matched=true value on conflict — this fixes that.
@@ -798,6 +834,94 @@ func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, preview)
+}
+
+// CreateManualTool registers a tool that the admin types in by hand. This is
+// the wizard's "Path C: Manual entry" — the escape hatch for closed MCP servers
+// whose tools/list cannot be discovered automatically (no SDK manifest, no
+// authenticated scan working).
+// POST /authsec/resource-servers/:id/tools
+func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rsUUID, err := uuid.Parse(rsID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource server ID"})
+		return
+	}
+
+	// Verify the RS exists for this tenant.
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	var req struct {
+		Name            string `json:"name" binding:"required"`
+		Description     string `json:"description"`
+		InventorySource string `json:"inventory_source"` // optional; default 'manual'
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tool name is required"})
+		return
+	}
+	source := req.InventorySource
+	if source == "" {
+		source = models.InventorySourceManual
+	}
+	// Only manual is allowed via this endpoint — sdk_manifest goes through
+	// PutSDKManifest, mcp_scan through Rescan. Reject explicit overrides.
+	if source != models.InventorySourceManual {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "this endpoint only accepts inventory_source=manual"})
+		return
+	}
+
+	// Conflict check: a tool with this name from another source already exists.
+	// Don't silently overwrite — the wizard's whole point is letting admins see
+	// when paths are mixed.
+	var existing models.MCPTool
+	conflictErr := config.DB.
+		Where("tenant_id = ? AND resource_server_id = ? AND name = ?", tenantID, rsUUID, req.Name).
+		First(&existing).Error
+	if conflictErr == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "a tool with this name already exists for this RS",
+			"existing_source":  existing.InventorySource,
+			"existing_tool_id": existing.ID,
+		})
+		return
+	}
+
+	tool := models.MCPTool{
+		TenantID:         tenantID,
+		ResourceServerID: rsUUID,
+		Name:             req.Name,
+		Description:      req.Description,
+		InventorySource:  source,
+	}
+	if err := config.DB.Create(&tool).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "tool_added_manual", "mcp_tool",
+		tool.ID.String(), http.StatusCreated, nil,
+		map[string]interface{}{"tool_name": tool.Name})
+	c.JSON(http.StatusCreated, gin.H{
+		"tool_id":          tool.ID,
+		"name":             tool.Name,
+		"inventory_source": tool.InventorySource,
+	})
 }
 
 // MarkToolPublic sets is_public=true on a tool with admin acknowledgement.
