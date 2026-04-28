@@ -1311,19 +1311,22 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 		return
 	}
 
-	// Verify the user exists in master users for this tenant.
-	var userRow struct {
-		ID    uuid.UUID
-		Email string
-		Name  string
+	// Mirror tenant end-users into master on demand. Without this, admins
+	// can't pre-bind a user that hasn't gone through the OAuth consent flow
+	// yet — they'd hit the role_bindings FK violation. The helper inserts
+	// into master users with INSERT ON CONFLICT DO NOTHING when the user
+	// only exists in the tenant DB, then returns the canonical fields for
+	// binding metadata.
+	onboardingService := services.NewResourceServerOnboardingService(config.DB)
+	mirrored, err := onboardingService.EnsureMasterUserMirror(userUUID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
-	if err := config.DB.Table("users").
-		Select("id, email, name").
-		Where("id = ? AND tenant_id = ?", userUUID, tenantID).
-		Take(&userRow).Error; err != nil {
+	if mirrored == nil {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error": "user not found in master users for this tenant",
-			"hint":  "tenant end-users are mirrored only after their first consent flow",
+			"error": "user not found in tenant or master users for this tenant",
+			"hint":  "verify the user_id belongs to this tenant",
 		})
 		return
 	}
@@ -1341,9 +1344,12 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 		return
 	}
 
-	username := userRow.Name
+	username := mirrored.Username
 	if username == "" {
-		username = userRow.Email
+		username = mirrored.Email
+	}
+	if username == "" {
+		username = mirrored.ID.String()
 	}
 	tenantUUID := tenantID
 	binding := models.RoleBinding{

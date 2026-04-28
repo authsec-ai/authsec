@@ -218,6 +218,97 @@ func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerI
 	return row.Enabled, row.Name, nil
 }
 
+// MirroredUser is the minimal projection returned by EnsureMasterUserMirror —
+// just enough to populate role_binding metadata.
+type MirroredUser struct {
+	ID       uuid.UUID
+	Email    string
+	Username string
+	WasMirrored bool // true if we just inserted into master users
+}
+
+// EnsureMasterUserMirror returns a master `users` row for the given
+// (tenantID, userID), creating it from the tenant DB if needed.
+//
+// Why: role_bindings has FK (tenant_id, user_id) → users(tenant_id, id) on
+// the master DB, so any row touching role_bindings (consent auto-bind,
+// admin-driven RS bindings) needs the user reflected in master first.
+// Tenant end-users live in tenant DBs and only land in master after their
+// first OAuth consent flow — without this helper, admins can't pre-bind a
+// user before they've ever logged in.
+//
+// On master miss + tenant miss returns (nil, nil) so callers can decide
+// whether that's a soft skip or a hard error.
+func (s *ResourceServerOnboardingService) EnsureMasterUserMirror(
+	userUUID uuid.UUID,
+	tenantID string,
+) (*MirroredUser, error) {
+	// Fast path: user exists in master.
+	var user models.ExtendedUser
+	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err == nil {
+		un := ""
+		if user.Username != nil {
+			un = *user.Username
+		}
+		return &MirroredUser{ID: user.ID, Email: user.Email, Username: un, WasMirrored: false}, nil
+	}
+
+	// Master miss — pull from tenant DB and copy.
+	tenantDB, dbErr := middlewares.GetConnectionDynamically(s.db, nil, &tenantID)
+	if dbErr != nil {
+		log.Printf("[ONBOARDING] EnsureMasterUserMirror: tenant DB unavailable user=%s tenant=%s: %v",
+			userUUID, tenantID, dbErr)
+		return nil, nil
+	}
+	var tenantUser sharedmodels.User
+	if err := tenantDB.Select(
+		"id", "tenant_id", "client_id", "project_id",
+		"email", "name", "username", "tenant_domain",
+		"provider", "provider_id", "avatar_url",
+	).Where("id = ?", userUUID).First(&tenantUser).Error; err != nil {
+		log.Printf("[ONBOARDING] EnsureMasterUserMirror: tenant DB miss user=%s tenant=%s: %v",
+			userUUID, tenantID, err)
+		return nil, nil
+	}
+
+	provider := tenantUser.Provider
+	if provider == "" {
+		provider = "local"
+	}
+	providerID := tenantUser.ProviderID
+	if providerID == "" {
+		providerID = userUUID.String()
+	}
+	if err := s.db.Exec(`
+		INSERT INTO users
+			(id, tenant_id, client_id, project_id, email, name, username,
+			 tenant_domain, provider, provider_id, avatar_url, active,
+			 created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`,
+		tenantUser.ID, tenantUser.TenantID, tenantUser.ClientID, tenantUser.ProjectID,
+		tenantUser.Email, tenantUser.Name, tenantUser.Username,
+		tenantUser.TenantDomain, provider, providerID, tenantUser.AvatarURL,
+	).Error; err != nil {
+		log.Printf("[ONBOARDING] EnsureMasterUserMirror: master mirror failed user=%s tenant=%s: %v",
+			userUUID, tenantID, err)
+		return nil, err
+	}
+	log.Printf("[ONBOARDING] EnsureMasterUserMirror: mirrored tenant user into master users user=%s tenant=%s email=%s",
+		userUUID, tenantID, tenantUser.Email)
+	un := ""
+	if tenantUser.Username != nil {
+		un = *tenantUser.Username
+	}
+	return &MirroredUser{
+		ID:          tenantUser.ID,
+		Email:       tenantUser.Email,
+		Username:    un,
+		WasMirrored: true,
+	}, nil
+}
+
 func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context.Context, userID, tenantID string, rs *models.ResourceServer) (bool, error) {
 	if rs == nil {
 		return false, fmt.Errorf("resource server is required")
