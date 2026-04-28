@@ -223,6 +223,14 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 		return
 	}
 
+	// Coerce nil → [] so the JSON response is always an array, never null.
+	// Without this, GORM's empty-result Find leaves a nil slice, which Go
+	// marshals as JSON null — and the frontend's destructuring defaults
+	// (`{ data = [] }`) only catch undefined, not null, so consumers crash
+	// on .map / .length.
+	if scopes == nil {
+		scopes = []models.OAuthScope{}
+	}
 	c.JSON(http.StatusOK, scopes)
 }
 
@@ -1455,6 +1463,11 @@ func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 		Select("id::text AS id, email, COALESCE(NULLIF(name, ''), email) AS name").
 		Where("active = true").
 		Order("created_at DESC").Limit(200).Scan(&users)
+	// Always emit a JSON array, never null — destructuring defaults on the
+	// frontend catch undefined but not null.
+	if users == nil {
+		users = []u{}
+	}
 	c.JSON(http.StatusOK, gin.H{"users": users})
 }
 
