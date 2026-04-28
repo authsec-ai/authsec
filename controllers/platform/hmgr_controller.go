@@ -1362,6 +1362,34 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			return
 		}
 
+		// State gate (correctness fix #4): refuse consent for any RS that isn't
+		// 'ready'. Without this guard, needs_setup / scan_failed / pending_scan
+		// RSes still reach scope resolution and emit a cryptic
+		// "insufficient_scope" rejection, hiding the actual cause from the user.
+		// Empty state is treated as ready for back-compat with rows predating
+		// the state column.
+		if rs.State != "" && rs.State != models.RSStateReady {
+			log.Printf("[MCP_AUTH] ConsentHandler: rs not ready state=%s rs_id=%s context_id=%s",
+				rs.State, rs.ID, arcCtx.ContextID)
+			_, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge,
+				"service_not_yet_activated",
+				fmt.Sprintf("Resource server %s has not completed setup (state: %s).", rs.Name, rs.State))
+			if rejectErr != nil {
+				log.Printf("[MCP_AUTH] ConsentHandler: RejectHydraConsentRequest(state) failed: %v", rejectErr)
+			}
+			c.Header("Content-Type", "text/html; charset=utf-8")
+			c.String(http.StatusForbidden, `<!doctype html>
+<html><head><title>Service not activated</title></head>
+<body style="font-family:system-ui;max-width:560px;margin:80px auto;padding:0 16px;line-height:1.5">
+  <h1 style="margin:0 0 8px;font-size:20px">Service not yet activated</h1>
+  <p><strong>%s</strong> has not completed setup.</p>
+  <p style="color:#666">Current state: <code>%s</code>. Please contact your administrator to complete activation.</p>
+  <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+  <p style="color:#999;font-size:13px">AuthSec did not issue a token for this request.</p>
+</body></html>`, rs.Name, rs.State)
+			return
+		}
+
 		// Get the MCP OAuth client for scope resolver
 		mcpClient, _ := ctrl.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
 
@@ -1381,10 +1409,14 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			arcCtx.TenantID,
 			rs,
 		); bindErr != nil {
-			log.Printf("[MCP_AUTH] ConsentHandler: EnsureDefaultAccessBinding failed context_id=%s rs=%s: %v",
+			// Default access binding is best-effort. EnsureDefaultAccessBinding
+			// already logs and downgrades soft failures (missing role, user
+			// lookup, etc.) to nil error. Any error reaching here is unexpected
+			// — log and continue rather than 500 the consent flow. The downstream
+			// scope resolver will either find the user's existing bindings and
+			// grant them, or correctly reject with insufficient_scope.
+			log.Printf("[MCP_AUTH] ConsentHandler: EnsureDefaultAccessBinding errored context_id=%s rs=%s: %v — proceeding without auto-bind",
 				arcCtx.ContextID, rs.ResourceURI, bindErr)
-			c.String(http.StatusInternalServerError, "Failed to prepare default access")
-			return
 		} else if applied {
 			log.Printf("[MCP_AUTH] ConsentHandler: default access binding created user=%s rs=%s context_id=%s",
 				consentRequest.Subject, rs.ResourceURI, arcCtx.ContextID)
@@ -1431,9 +1463,15 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 				// scopes the user still holds but didn't request in this particular flow.
 				var stale bool
 				var consentLookupErr error
+				// Correctness fix #6: pass the *defaulted* requestedScopes (not
+				// consentRequest.RequestedScope), otherwise an empty original
+				// request matches narrow stored grants while finalize will grant
+				// the full defaulted set — silent overgrant. With requestedScopes,
+				// the lookup must find a stored grant covering the same effective
+				// scope set that finalize will issue.
 				existingGrant, stale, consentLookupErr = ctrl.consentService.CheckExistingConsent(
 					tenantUUID, subjectUUID, mcpClient.ID, rs.ID,
-					consentRequest.RequestedScope,
+					requestedScopes,
 					report.UserEffective,
 					rs.ScopesSupported,
 				)

@@ -2,7 +2,10 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -19,6 +22,7 @@ type ScopeMatrixController struct {
 	scopeRegistry *services.ScopeRegistryService
 	oauthService  *services.OAuthASService
 	scopeResolver *services.ScopeResolver
+	driftService  *services.ResourceServerDriftService
 }
 
 func NewScopeMatrixController() *ScopeMatrixController {
@@ -27,6 +31,7 @@ func NewScopeMatrixController() *ScopeMatrixController {
 		scopeRegistry: services.NewScopeRegistryService(config.DB),
 		oauthService:  services.NewOAuthASService(config.DB),
 		scopeResolver: services.NewScopeResolver(config.DB),
+		driftService:  services.NewResourceServerDriftService(config.DB),
 	}
 }
 
@@ -255,6 +260,13 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 		return
 	}
 
+	// Correctness fix #5: auto-create matching permission + bridge in same transaction.
+	// This ensures default roles can grant the scope at OAuth time without manual wiring.
+	autoCreateScopePermission(tenantID, scope)
+
+	// Correctness fix #4: keep scopes_supported in sync with oauth_scopes.
+	syncScopesSupported(rsUUID, tenantID)
+
 	// Link permissions with tenant ownership enforcement (skips foreign IDs silently).
 	if len(req.PermissionIDs) > 0 {
 		ctrl.scopeRegistry.LinkPermissionsTenantScoped(scope.ID, tenantID, req.PermissionIDs)
@@ -319,9 +331,27 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 		return
 	}
 
+	// Read scope before deletion to get RS info for drift event and scopes_supported sync.
+	var scope models.OAuthScope
+	config.DB.Where("id = ? AND tenant_id = ?", scopeID, tenantID).First(&scope)
+
 	if err := ctrl.scopeRegistry.DeleteByTenant(scopeID, tenantID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Sync scopes_supported after deletion.
+	if scope.ResourceServerID != nil {
+		syncScopesSupported(*scope.ResourceServerID, tenantID)
+
+		// Emit drift event if RS is ready (post-activation destructive edit).
+		var rs models.ResourceServer
+		if config.DB.Where("id = ?", *scope.ResourceServerID).First(&rs).Error == nil && rs.IsReady() {
+			adminUserID := extractUserIDOptional(c)
+			_ = ctrl.driftService.EmitEvent(nil, rs.ID, models.DriftEventScopeDeleted,
+				map[string]interface{}{"scope_id": scopeID.String(), "scope_string": scope.ScopeString},
+				adminUserID)
+		}
 	}
 
 	auditAdminMutation(c, tenantID.String(), "scope_deleted", "oauth_scope",
@@ -388,12 +418,14 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		if m.Remove {
 			config.DB.Where("tool_id = ? AND scope_id = ?", toolID, scopeID).Delete(&models.MCPToolScopeMap{})
 		} else {
-			mapping := models.MCPToolScopeMap{
-				ToolID:      toolID,
-				ScopeID:     scopeID,
-				AutoMatched: false,
-			}
-			config.DB.Where("tool_id = ? AND scope_id = ?", toolID, scopeID).FirstOrCreate(&mapping)
+			// Correctness fix #7: upsert with source='admin_override' and auto_matched=false.
+			// FirstOrCreate kept the old auto_matched=true value on conflict — this fixes that.
+			config.DB.Exec(`
+				INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
+				VALUES (?, ?, false, 'admin_override')
+				ON CONFLICT (tool_id, scope_id)
+				DO UPDATE SET source = 'admin_override', auto_matched = false
+			`, toolID, scopeID)
 		}
 		applied++
 	}
@@ -431,43 +463,615 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 		return
 	}
 
-	// Guard: only block when no successful scan has ever completed.
-	// During degraded or pending_scan (with a prior success) we serve the last
-	// good snapshot — consistent with "SDKPolicy reflects latest successful policy".
-	if rs.LastSuccessfulGeneration == 0 {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":  "resource server has not completed initial discovery",
-			"status": rs.Status,
+	// When RS is not ready, return state-aware response (deny-all signal for SDK).
+	// SDK consumers MUST treat policy_complete=false as deny-all.
+	if rs.State != models.RSStateReady {
+		reason := "rs_needs_setup"
+		if rs.State == models.RSStateScanFailed {
+			reason = "rs_scan_failed"
+		} else if rs.State == models.RSStatePendingScan {
+			reason = "rs_pending_scan"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"state":           rs.State,
+			"policy_complete": false,
+			"reason":          reason,
+			"rs_id":           rs.ID.String(),
+			"generation":      rs.LastSuccessfulGeneration,
+			"tools":           gin.H{},
+			"tool_policy":     []interface{}{},
+			"tool_metadata":   gin.H{},
+			"fetched_at":      time.Now().UTC().Format(time.RFC3339),
+			"ttl_seconds":     60,
 		})
 		return
 	}
 
-	// Fetch tools filtered to last_successful_generation only.
-	// This is the atomic serving snapshot committed by the last full scan.
-	var tools []models.MCPTool
-	config.DB.Preload("Scopes").
-		Where("tenant_id = ? AND resource_server_id = ? AND last_scan_generation = ?",
-			rs.TenantID, rs.ID, rs.LastSuccessfulGeneration).
-		Find(&tools)
+	// State == ready guarantees the activation gates passed (≥1 tool, ≥1 scope,
+	// every non-public tool mapped, viewer role populated). The legacy gen==0
+	// 503 check incorrectly blocked manifest-only and manual-only RSes whose
+	// tools were ingested without a discovery-driven generation bump — those
+	// flows never advance last_successful_generation, but the activation
+	// gates still confirm the policy is serveable.
 
-	// Build flat map: tool_name -> [scope_string, ...]
-	toolMap := make(map[string][]string, len(tools))
-	for _, tool := range tools {
+	// Fetch all tools across all inventory sources (mcp_scan, sdk_manifest, manual).
+	// The legacy generation filter is intentionally absent: every tool that
+	// survived activation is policy-effective regardless of which source put it
+	// in the inventory.
+	var allTools []models.MCPTool
+	config.DB.Preload("Scopes").
+		Where("tenant_id = ? AND resource_server_id = ?", rs.TenantID, rs.ID).
+		Find(&allTools)
+
+	// Legacy flat map: tool_name -> [scope_string, ...] (backwards compat)
+	toolMap := make(map[string][]string, len(allTools))
+	// New authoritative array: tool_policy
+	type toolPolicyEntry struct {
+		Name           string   `json:"name"`
+		IsPublic       bool     `json:"is_public"`
+		RequiredScopes []string `json:"required_scopes"`
+	}
+	toolPolicyArr := make([]toolPolicyEntry, 0, len(allTools))
+	// Tool metadata
+	type toolMetaEntry struct {
+		Annotations     json.RawMessage `json:"annotations,omitempty"`
+		InventorySource string          `json:"inventory_source"`
+	}
+	toolMeta := make(map[string]toolMetaEntry, len(allTools))
+
+	for _, tool := range allTools {
+		// Only admin_override mappings are runtime-effective.
+		var overrideMappings []models.MCPToolScopeMap
+		config.DB.Where("tool_id = ? AND source = 'admin_override'", tool.ID).Find(&overrideMappings)
+
+		var scopeIDs []uuid.UUID
+		for _, m := range overrideMappings {
+			scopeIDs = append(scopeIDs, m.ScopeID)
+		}
+
 		var scopeStrings []string
-		for _, scope := range tool.Scopes {
-			scopeStrings = append(scopeStrings, scope.ScopeString)
+		if len(scopeIDs) > 0 {
+			var scopes []models.OAuthScope
+			config.DB.Where("id IN ?", scopeIDs).Find(&scopes)
+			for _, s := range scopes {
+				scopeStrings = append(scopeStrings, s.ScopeString)
+			}
 		}
 		if scopeStrings == nil {
 			scopeStrings = []string{}
 		}
+
 		toolMap[tool.Name] = scopeStrings
+		toolPolicyArr = append(toolPolicyArr, toolPolicyEntry{
+			Name:           tool.Name,
+			IsPublic:       tool.IsPublic,
+			RequiredScopes: scopeStrings,
+		})
+		toolMeta[tool.Name] = toolMetaEntry{
+			Annotations:     tool.Annotations,
+			InventorySource: tool.InventorySource,
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tools":       toolMap,
-		"fetched_at":  time.Now().UTC().Format(time.RFC3339),
-		"ttl_seconds": 300,
+		"state":           rs.State,
+		"policy_complete": true,
+		"reason":          "",
+		"rs_id":           rs.ID.String(),
+		"generation":      rs.LastSuccessfulGeneration,
+		"tools":           toolMap,
+		"tool_policy":     toolPolicyArr,
+		"tool_metadata":   toolMeta,
+		"fetched_at":      time.Now().UTC().Format(time.RFC3339),
+		"ttl_seconds":     300,
 	})
+}
+
+// ── New wizard + workspace handlers ─────────────────────────────────────────────────────────────
+
+// PutSDKManifest receives a tool manifest PUT from the Go SDK and upserts tools.
+// PUT /authsec/resource-servers/:id/sdk-manifest  (Basic auth with RS introspection creds)
+func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
+	clientID, secret, ok := c.Request.BasicAuth()
+	if !ok {
+		c.Header("WWW-Authenticate", `Basic realm="sdk-manifest"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "resource server credentials required"})
+		return
+	}
+
+	rs, err := ctrl.oauthService.ValidateIntrospectionCredentials(clientID, secret)
+	if err != nil {
+		recordManifestAttempt(rs, models.ManifestAttemptAuthFailed, "invalid credentials", 0, "")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	rsID := c.Param("id")
+	if rs.ID.String() != rsID {
+		recordManifestAttempt(rs, models.ManifestAttemptAuthFailed, "credential RS mismatch", 0, "")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "credentials do not match the requested resource server"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 4*1024*1024))
+	if err != nil {
+		recordManifestAttempt(rs, models.ManifestAttemptServerError, "body read error", 0, "")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	var payload struct {
+		Tools []struct {
+			Name            string          `json:"name"`
+			Title           string          `json:"title"`
+			Description     string          `json:"description"`
+			InputSchema     json.RawMessage `json:"input_schema"`
+			Annotations     json.RawMessage `json:"annotations"`
+			SuggestedScopes []string        `json:"suggested_scopes"`
+		} `json:"tools"`
+		ManifestVersion string `json:"manifest_version"`
+		SDKBuildID      string `json:"sdk_build_id"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		recordManifestAttempt(rs, models.ManifestAttemptInvalidPayload, "invalid JSON: "+err.Error(), 0, "")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid manifest JSON"})
+		return
+	}
+	if len(payload.Tools) == 0 {
+		recordManifestAttempt(rs, models.ManifestAttemptEmptyToolList, "no tools in manifest", 0, payload.ManifestVersion)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "manifest must contain at least one tool"})
+		return
+	}
+
+	toolCount := len(payload.Tools)
+	upsertedCount := 0
+	for _, t := range payload.Tools {
+		existing := models.MCPTool{}
+		if config.DB.Where("resource_server_id = ? AND name = ? AND inventory_source = ?",
+			rs.ID, t.Name, models.InventorySourceSDKManifest).First(&existing).Error == nil {
+			config.DB.Model(&existing).Updates(map[string]interface{}{
+				"title":            t.Title,
+				"description":      t.Description,
+				"input_schema":     t.InputSchema,
+				"annotations":      t.Annotations,
+				"suggested_scopes": t.SuggestedScopes,
+			})
+		} else {
+			// Don't overwrite an existing mcp_scan or manual tool — just update suggested_scopes.
+			var conflictCount int64
+			config.DB.Model(&models.MCPTool{}).
+				Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).
+				Count(&conflictCount)
+			if conflictCount > 0 {
+				config.DB.Model(&models.MCPTool{}).
+					Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).
+					Update("suggested_scopes", t.SuggestedScopes)
+			} else {
+				newTool := models.MCPTool{
+					TenantID:         rs.TenantID,
+					ResourceServerID: rs.ID,
+					Name:             t.Name,
+					Title:            t.Title,
+					Description:      t.Description,
+					InputSchema:      t.InputSchema,
+					Annotations:      t.Annotations,
+					SuggestedScopes:  t.SuggestedScopes,
+					InventorySource:  models.InventorySourceSDKManifest,
+				}
+				config.DB.Create(&newTool)
+			}
+		}
+
+		// Upsert sdk_suggested scope mappings for each suggested scope.
+		if len(t.SuggestedScopes) > 0 {
+			var tool models.MCPTool
+			config.DB.Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).First(&tool)
+			for _, scopeStr := range t.SuggestedScopes {
+				var scope models.OAuthScope
+				if config.DB.Where("resource_server_id = ? AND scope_string = ?", rs.ID, scopeStr).First(&scope).Error == nil {
+					config.DB.Exec(`
+						INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
+						VALUES (?, ?, true, 'sdk_suggested')
+						ON CONFLICT (tool_id, scope_id) DO NOTHING
+					`, tool.ID, scope.ID)
+				}
+			}
+		}
+		upsertedCount++
+	}
+
+	// Advance the generation pointer on every successful manifest publish so:
+	//   - the /sdk-policy response carries a meaningful, monotonic generation
+	//     for SDK observability (instead of always 0 for manifest-only RSes),
+	//   - any future consumer that filters by last_scan_generation sees the
+	//     manifest-published tools tagged with the current generation.
+	// We do this in a single update so generation and tool tags stay consistent.
+	nextGen := rs.LastSuccessfulGeneration + 1
+	config.DB.Model(rs).Update("last_successful_generation", nextGen)
+	config.DB.Model(&models.MCPTool{}).
+		Where("resource_server_id = ? AND inventory_source = ?", rs.ID, models.InventorySourceSDKManifest).
+		Update("last_scan_generation", nextGen)
+
+	recordManifestAttemptWithVersion(rs, models.ManifestAttemptSuccess, "", toolCount, payload.ManifestVersion, payload.SDKBuildID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"tools_seen": upsertedCount,
+		"generation": nextGen,
+	})
+}
+
+// Activate completes RS setup and flips state to 'ready'.
+// POST /authsec/resource-servers/:id/activate
+func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource server ID"})
+		return
+	}
+
+	userID := extractUserIDRequired(c)
+	if userID == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id required"})
+		return
+	}
+
+	if err := ctrl.rsService.Activate(rsID, tenantID, *userID); err != nil {
+		var gateErr services.ActivationGateError
+		if errors.As(err, &gateErr) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":  "activation blocked",
+				"failed": gateErr.Failed,
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "rs_activated", "resource_server",
+		rsID.String(), http.StatusOK, nil, nil)
+	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+}
+
+// SetupChecklist returns wizard step completion status.
+// GET /authsec/resource-servers/:id/setup
+func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource server ID"})
+		return
+	}
+
+	steps, err := ctrl.rsService.SetupChecklist(rsID, tenantID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	// Compute can_activate from steps
+	canActivate := true
+	for _, s := range steps {
+		if s.Step < 6 && !s.Complete {
+			canActivate = false
+			break
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"steps":        steps,
+		"can_activate": canActivate,
+	})
+}
+
+// ActivationPreview returns the activation review summary card.
+// GET /authsec/resource-servers/:id/activation-preview
+func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource server ID"})
+		return
+	}
+
+	preview, err := ctrl.rsService.ActivationPreview(rsID, tenantID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, preview)
+}
+
+// MarkToolPublic sets is_public=true on a tool with admin acknowledgement.
+// POST /authsec/resource-servers/:id/tools/:tool_id/public
+func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	toolID, err := uuid.Parse(c.Param("tool_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tool ID"})
+		return
+	}
+
+	var req struct {
+		IsPublic          bool   `json:"is_public"`
+		ConfirmationToken string `json:"confirmation_token"` // typed confirmation for destructive tools
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	// Verify tool belongs to this tenant+RS.
+	var tool models.MCPTool
+	if err := config.DB.Where("id = ? AND tenant_id = ? AND resource_server_id = ?",
+		toolID, tenantID, rsID).First(&tool).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "tool not found"})
+		return
+	}
+
+	userID := extractUserIDOptional(c)
+	updates := map[string]interface{}{
+		"is_public": req.IsPublic,
+	}
+	if req.IsPublic && userID != nil {
+		updates["is_public_acknowledged_by"] = userID
+	}
+
+	if err := config.DB.Model(&tool).Updates(updates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, tenantID.String(), "tool_public_flag_set", "mcp_tool",
+		toolID.String(), http.StatusOK, nil,
+		map[string]interface{}{"is_public": req.IsPublic, "tool_name": tool.Name})
+	c.JSON(http.StatusOK, gin.H{"tool_id": toolID, "is_public": req.IsPublic})
+}
+
+// SDKManifestStatus returns the most-recent and most-recent-successful manifest attempt.
+// GET /authsec/resource-servers/:id/sdk-manifest-status
+func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	rsUUID, _ := uuid.Parse(rsID)
+
+	var lastAttempt models.ResourceServerManifestAttempt
+	lastAttemptExists := config.DB.
+		Where("rs_id = ?", rsUUID).
+		Order("attempted_at DESC").
+		First(&lastAttempt).Error == nil
+
+	var lastSuccess models.ResourceServerManifestAttempt
+	lastSuccessExists := config.DB.
+		Where("rs_id = ? AND status = ?", rsUUID, models.ManifestAttemptSuccess).
+		Order("attempted_at DESC").
+		First(&lastSuccess).Error == nil
+
+	c.JSON(http.StatusOK, gin.H{
+		"last_attempt":        maybeAttempt(lastAttemptExists, lastAttempt),
+		"last_success":        maybeAttempt(lastSuccessExists, lastSuccess),
+		"never_seen":          !lastSuccessExists,
+	})
+}
+
+// DriftEvents returns undismissed drift events for an RS.
+// GET /authsec/resource-servers/:id/drift-events
+func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	adminUserID := extractUserIDOptional(c)
+	if adminUserID == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id required"})
+		return
+	}
+
+	events, err := ctrl.driftService.ListUndismissed(rs.ID, *adminUserID, rs.SetupCompletedAt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+// DismissDriftEvent records a dismissal of a single drift event.
+// POST /authsec/resource-servers/:id/drift-events/:event_id/dismiss
+func (ctrl *ScopeMatrixController) DismissDriftEvent(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	eventID, err := uuid.Parse(c.Param("event_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid event ID"})
+		return
+	}
+
+	adminUserID := extractUserIDOptional(c)
+	if adminUserID == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id required"})
+		return
+	}
+
+	if err := ctrl.driftService.Dismiss(eventID, *adminUserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "dismissed"})
+}
+
+// ── Helper functions ──────────────────────────────────────────────────────────────────────────────
+
+// autoCreateScopePermission creates a matching permission + bridge for a scope (correctness #5).
+func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
+	perm := models.RBACPermission{}
+	if config.DB.Where("tenant_id = ? AND resource = ? AND action = ?",
+		tenantID, scope.ScopeString, "access").First(&perm).Error != nil {
+		perm = models.RBACPermission{
+			TenantID:    &tenantID,
+			Resource:    scope.ScopeString,
+			Action:      "access",
+			Description: fmt.Sprintf("OAuth scope: %s", scope.DisplayName),
+		}
+		config.DB.Create(&perm)
+	}
+
+	bridge := models.OAuthScopePermission{ScopeID: scope.ID, PermissionID: perm.ID}
+	config.DB.Where("scope_id = ? AND permission_id = ?", scope.ID, perm.ID).FirstOrCreate(&bridge)
+}
+
+// syncScopesSupported keeps resource_servers.scopes_supported in sync with oauth_scopes (correctness #4).
+func syncScopesSupported(rsID uuid.UUID, tenantID uuid.UUID) {
+	var scopeStrings []string
+	config.DB.Model(&models.OAuthScope{}).
+		Where("resource_server_id = ? AND tenant_id = ?", rsID, tenantID).
+		Pluck("scope_string", &scopeStrings)
+	if scopeStrings == nil {
+		scopeStrings = []string{}
+	}
+	config.DB.Model(&models.ResourceServer{}).
+		Where("id = ?", rsID).
+		Update("scopes_supported", scopeStrings)
+}
+
+// extractUserIDOptional tries to extract user ID from JWT claims without failing.
+func extractUserIDOptional(c *gin.Context) *uuid.UUID {
+	rawID, exists := c.Get("user_id")
+	if !exists {
+		return nil
+	}
+	switch v := rawID.(type) {
+	case string:
+		id, err := uuid.Parse(v)
+		if err != nil {
+			return nil
+		}
+		return &id
+	case uuid.UUID:
+		return &v
+	}
+	return nil
+}
+
+// extractUserIDRequired extracts user ID from JWT, returns nil if missing.
+func extractUserIDRequired(c *gin.Context) *uuid.UUID {
+	return extractUserIDOptional(c)
+}
+
+// recordManifestAttempt writes a ResourceServerManifestAttempt row.
+func recordManifestAttempt(rs *models.ResourceServer, status string, reason string, toolCount int, manifestVersion string) {
+	if rs == nil {
+		return
+	}
+	var reasonPtr *string
+	if reason != "" {
+		reasonPtr = &reason
+	}
+	var versionPtr *string
+	if manifestVersion != "" {
+		versionPtr = &manifestVersion
+	}
+	var countPtr *int
+	if toolCount > 0 {
+		countPtr = &toolCount
+	}
+	config.DB.Create(&models.ResourceServerManifestAttempt{
+		RSID:            rs.ID,
+		AttemptedAt:     time.Now().UTC(),
+		Status:          status,
+		Reason:          reasonPtr,
+		ToolCount:       countPtr,
+		ManifestVersion: versionPtr,
+	})
+}
+
+func recordManifestAttemptWithVersion(rs *models.ResourceServer, status string, reason string, toolCount int, manifestVersion string, sdkBuildID string) {
+	if rs == nil {
+		return
+	}
+	var reasonPtr *string
+	if reason != "" {
+		reasonPtr = &reason
+	}
+	var versionPtr *string
+	if manifestVersion != "" {
+		versionPtr = &manifestVersion
+	}
+	var buildPtr *string
+	if sdkBuildID != "" {
+		buildPtr = &sdkBuildID
+	}
+	tc := toolCount
+	config.DB.Create(&models.ResourceServerManifestAttempt{
+		RSID:            rs.ID,
+		AttemptedAt:     time.Now().UTC(),
+		Status:          status,
+		Reason:          reasonPtr,
+		ToolCount:       &tc,
+		ManifestVersion: versionPtr,
+		SDKBuildID:      buildPtr,
+	})
+}
+
+func maybeAttempt(exists bool, a models.ResourceServerManifestAttempt) interface{} {
+	if !exists {
+		return nil
+	}
+	return a
 }
 
 // ScopeResolutionPreview returns a full per-scope diagnostic report for a given user

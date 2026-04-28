@@ -263,10 +263,21 @@ func SetupRoutes(
 			resourceServers.POST("/:id/scopes", scopeMatrixController.CreateScope)
 			resourceServers.PUT("/:id/tool-scope-map", scopeMatrixController.UpdateToolScopeMap)
 			resourceServers.GET("/:id/scope-resolution-preview", scopeMatrixController.ScopeResolutionPreview)
+
+			// Setup wizard endpoints (JWT auth)
+			resourceServers.GET("/:id/setup", scopeMatrixController.SetupChecklist)
+			resourceServers.GET("/:id/activation-preview", scopeMatrixController.ActivationPreview)
+			resourceServers.POST("/:id/activate", scopeMatrixController.Activate)
+			resourceServers.POST("/:id/tools/:tool_id/public", scopeMatrixController.MarkToolPublic)
+			resourceServers.GET("/:id/sdk-manifest-status", scopeMatrixController.SDKManifestStatus)
+			resourceServers.GET("/:id/drift-events", scopeMatrixController.DriftEvents)
+			resourceServers.POST("/:id/drift-events/:event_id/dismiss", scopeMatrixController.DismissDriftEvent)
+			resourceServers.POST("/:id/test-login", rsController.TestLogin)
 		}
 
-		// SDK policy endpoint (Basic auth with RS introspection credentials — no JWT middleware)
+		// SDK endpoints (Basic auth with RS introspection credentials — no JWT middleware)
 		authsec.GET("/resource-servers/:id/sdk-policy", scopeMatrixController.SDKPolicy)
+		authsec.PUT("/resource-servers/:id/sdk-manifest", scopeMatrixController.PutSDKManifest)
 
 		// Scope management (not RS-scoped)
 		scopes := authsec.Group("/scopes")

@@ -101,11 +101,38 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 		IntrospectionSecretHash: string(hashedSecret),
 		Active:                  true,
 		Status:                  "pending_scan",
+		State:                   models.RSStatePendingScan,
 		ScanGeneration:          0,
 	}
 
-	if err := s.db.Create(rs).Error; err != nil {
-		return nil, nil, fmt.Errorf("create resource server: %w", err)
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(rs).Error; err != nil {
+			return fmt.Errorf("create resource server: %w", err)
+		}
+
+		// Auto-create viewer role and access policy (§3.3, §4.1 step 5).
+		viewerRole := &models.RBACRole{
+			TenantID:    &rs.TenantID,
+			Name:        fmt.Sprintf("rs-%s:viewer", rs.ID.String()),
+			Description: fmt.Sprintf("Default viewer role for %s (auto-generated)", rs.Name),
+		}
+		if err := tx.Create(viewerRole).Error; err != nil {
+			return fmt.Errorf("create viewer role: %w", err)
+		}
+
+		policy := &models.ResourceServerAccessPolicy{
+			TenantID:         rs.TenantID,
+			ResourceServerID: rs.ID,
+			Enabled:          true,
+			DefaultRoleID:    &viewerRole.ID,
+		}
+		if err := tx.Create(policy).Error; err != nil {
+			return fmt.Errorf("create access policy: %w", err)
+		}
+		return nil
+	})
+	if txErr != nil {
+		return nil, nil, txErr
 	}
 
 	// Trigger MCP discovery in background — populates scope registry and tool map.
@@ -423,21 +450,32 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 
 		for _, tool := range discovered.Tools {
 			existing := models.MCPTool{}
-			if err := tx.Where("resource_server_id = ? AND name = ?", rs.ID, tool.Name).
+			// Scope to mcp_scan only: never overwrite sdk_manifest or manual entries.
+			if err := tx.Where("resource_server_id = ? AND name = ? AND inventory_source = ?",
+				rs.ID, tool.Name, models.InventorySourceMCPScan).
 				First(&existing).Error; err == nil {
-				// Update existing tool, stamp new generation
+				// Update existing mcp_scan tool, stamp new generation.
 				if err := tx.Model(&existing).Updates(map[string]interface{}{
 					"title":               tool.Title,
 					"description":         tool.Description,
 					"input_schema":        tool.InputSchema,
 					"annotations":         tool.Annotations,
 					"last_scan_generation": nextGeneration,
+					"inventory_source":    models.InventorySourceMCPScan,
 				}).Error; err != nil {
 					return fmt.Errorf("update tool %s: %w", tool.Name, err)
 				}
 				upsertedToolIDs = append(upsertedToolIDs, existing.ID)
 				syncResult.ToolsUpdated++
 			} else {
+				// If a non-mcp_scan tool with this name already exists, skip — don't duplicate.
+				var conflictCount int64
+				tx.Model(&models.MCPTool{}).
+					Where("resource_server_id = ? AND name = ?", rs.ID, tool.Name).
+					Count(&conflictCount)
+				if conflictCount > 0 {
+					continue // sdk_manifest or manual entry wins; track as upserted so we don't delete it
+				}
 				newTool := models.MCPTool{
 					TenantID:           rs.TenantID,
 					ResourceServerID:   rs.ID,
@@ -447,6 +485,7 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 					InputSchema:        tool.InputSchema,
 					Annotations:        tool.Annotations,
 					LastScanGeneration: nextGeneration,
+					InventorySource:    models.InventorySourceMCPScan,
 				}
 				if err := tx.Create(&newTool).Error; err != nil {
 					return fmt.Errorf("create tool %s: %w", tool.Name, err)
@@ -461,12 +500,13 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 				"MCP server returned empty tools list")
 		}
 
-		// Stale tool deletion — only on full scan.
-		// Skipped on partial scan to preserve the old serving snapshot's integrity.
+		// Stale tool deletion — only on full scan, only mcp_scan-sourced tools.
+		// sdk_manifest and manual tools are never deleted by the scanner.
 		if prmFetched {
 			var staleToolIDs []uuid.UUID
 			staleQ := tx.Model(&models.MCPTool{}).
-				Where("resource_server_id = ? AND last_scan_generation < ?", rs.ID, nextGeneration)
+				Where("resource_server_id = ? AND last_scan_generation < ? AND inventory_source = ?",
+					rs.ID, nextGeneration, models.InventorySourceMCPScan)
 			if len(upsertedToolIDs) > 0 {
 				staleQ = staleQ.Where("id NOT IN ?", upsertedToolIDs)
 			}
@@ -522,8 +562,8 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 					FirstOrCreate(&mapping)
 			}
 
-			// ── 3d. Seed default roles (first scan only, inside transaction) ──
-			s.seedDefaultRoles(rs, NewScopeRegistryService(tx), tx)
+			// ── 3d. Reconcile default roles (inside transaction) ──
+			s.reconcileDefaultRoles(rs, NewScopeRegistryService(tx), tx)
 		}
 
 		// ── 3e. Commit lifecycle state atomically with tool/scope changes ─
@@ -535,9 +575,8 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 		now := time.Now().UTC()
 		if prmFetched {
 			// Full scan: advance the serving pointer.
-			// last_scan_status = "success" whenever last_successful_generation advances —
-			// even when warnings exist. "partial" is reserved exclusively for PRM-missing
-			// scans where the serving pointer does NOT advance.
+			// state always becomes 'needs_setup' after scan — admin must activate.
+			// Status retains 'ready'/'degraded' for backwards compat with older callers.
 			finalStatus := "ready"
 			if len(syncResult.Warnings) > 0 {
 				finalStatus = "degraded"
@@ -547,6 +586,7 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 				Updates(map[string]interface{}{
 					"last_successful_generation": nextGeneration,
 					"status":                     finalStatus,
+					"state":                      models.RSStateNeedsSetup,
 					"last_scan_status":            "success",
 					"last_scan_error":             nil,
 					"last_scan_completed_at":      &now,
@@ -560,22 +600,26 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 			}
 			return nil
 		}
-		// Protected-server outcome: advance the serving pointer even though
-		// prmFetched is false. An empty policy is a valid policy (deny-all by
-		// default on the Go SDK side), and this is a definitive signal that
-		// the MCP server is alive and enforcing OAuth — far better than
-		// perpetually returning 503 from sdk-policy.
+		// Protected-server outcome: DON'T advance last_successful_generation (option a).
+		// The prior serving snapshot (if any) continues to be served.
+		// State: if the RS is already 'ready', preserve it — protected scans after
+		// activation are normal (the RS legitimately requires auth for tools/list)
+		// and must not regress an activated RS to needs_setup. Only flip to
+		// needs_setup when the RS has not yet been activated.
 		if protectedServer {
+			updates := map[string]interface{}{
+				"status":                 "degraded",
+				"last_scan_status":       "success",
+				"last_scan_error":        nil,
+				"last_scan_completed_at": &now,
+				"scan_in_progress":       false,
+			}
+			if rs.State != models.RSStateReady {
+				updates["state"] = models.RSStateNeedsSetup
+			}
 			result := tx.Model(rs).
 				Where("id = ? AND scan_generation = ?", rs.ID, nextGeneration).
-				Updates(map[string]interface{}{
-					"last_successful_generation": nextGeneration,
-					"status":                     "degraded",
-					"last_scan_status":           "success",
-					"last_scan_error":            nil,
-					"last_scan_completed_at":     &now,
-					"scan_in_progress":           false,
-				})
+				Updates(updates)
 			if result.Error != nil {
 				return result.Error
 			}
@@ -585,16 +629,21 @@ func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.
 			return nil
 		}
 		// Partial scan (PRM unavailable): do NOT advance last_successful_generation.
-		// last_scan_status = "partial" exclusively means the serving pointer was NOT moved.
+		// Same state-preservation rule as protected scans — a partial scan against
+		// an already-ready RS is not a setup regression.
+		partialUpdates := map[string]interface{}{
+			"status":                 "degraded",
+			"last_scan_status":       "partial",
+			"last_scan_error":        nil,
+			"last_scan_completed_at": &now,
+			"scan_in_progress":       false,
+		}
+		if rs.State != models.RSStateReady {
+			partialUpdates["state"] = models.RSStateNeedsSetup
+		}
 		result := tx.Model(rs).
 			Where("id = ? AND scan_generation = ?", rs.ID, nextGeneration).
-			Updates(map[string]interface{}{
-				"status":                "degraded",
-				"last_scan_status":      "partial",
-				"last_scan_error":       nil,
-				"last_scan_completed_at": &now,
-				"scan_in_progress":      false,
-			})
+			Updates(partialUpdates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -664,25 +713,29 @@ func isScopeReadonly(scopeString string) bool {
 			!strings.HasSuffix(lower, ":*"))
 }
 
-// seedDefaultRoles creates "admin" (all scopes) and "readonly" (:read scopes) roles
-// for a resource server, keyed by RS UUID for stability across renames.
+// reconcileDefaultRoles creates or updates "admin", "readonly", and "viewer"
+// roles for a resource server. Unlike the old seedDefaultRoles, this does NOT
+// early-exit when roles already exist — it reconciles permissions so new/deleted
+// scopes are reflected in existing roles (correctness fix #6).
 //
-// Role names use the format rs-<rs_id>:admin and rs-<rs_id>:readonly.
-// Each role is checked and created independently so a partial previous run is recoverable.
+// Role names use rs-<rs_id>:admin / :readonly / :viewer. The "viewer" role is
+// created at RS-creation time (Create method) with zero perms; this function
+// is what populates it once scopes exist, otherwise activation gate
+// "step 5: default role grants ≥1 scope" stays false forever.
+//
 // Must be called with a transaction-scoped db so role creation is part of the
 // reconciliation commit.
-func (s *ResourceServerService) seedDefaultRoles(rs *models.ResourceServer, scopeRegistry *ScopeRegistryService, db *gorm.DB) {
+func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer, scopeRegistry *ScopeRegistryService, db *gorm.DB) {
 	adminRoleName := fmt.Sprintf("rs-%s:admin", rs.ID.String())
 	readonlyRoleName := fmt.Sprintf("rs-%s:readonly", rs.ID.String())
+	viewerRoleName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 
-	var existingAdmin, existingReadonly models.RBACRole
+	var existingAdmin, existingReadonly, existingViewer models.RBACRole
 	adminExists := db.Where("name = ? AND tenant_id = ?", adminRoleName, rs.TenantID).First(&existingAdmin).Error == nil
 	readonlyExists := db.Where("name = ? AND tenant_id = ?", readonlyRoleName, rs.TenantID).First(&existingReadonly).Error == nil
+	viewerExists := db.Where("name = ? AND tenant_id = ?", viewerRoleName, rs.TenantID).First(&existingViewer).Error == nil
 
-	if adminExists && readonlyExists {
-		log.Printf("[MCP_DISCOVERY] seedDefaultRoles: skipping (both roles exist) for RS %s", rs.Name)
-		return
-	}
+	// Removed early-exit: always reconcile permissions even when both roles exist.
 
 	scopes, err := scopeRegistry.ListByResourceServer(rs.TenantID, rs.ID)
 	if err != nil || len(scopes) == 0 {
@@ -724,10 +777,14 @@ func (s *ResourceServerService) seedDefaultRoles(rs *models.ResourceServer, scop
 		for _, permID := range allPermIDs {
 			db.FirstOrCreate(&models.RolePermission{RoleID: adminRole.ID, PermissionID: permID})
 		}
-		log.Printf("[MCP_DISCOVERY] seedDefaultRoles: created role %q (%d perms) for RS %s",
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: created role %q (%d perms) for RS %s",
 			adminRoleName, len(allPermIDs), rs.Name)
 	} else {
-		log.Printf("[MCP_DISCOVERY] seedDefaultRoles: skipping admin role (already exists) for RS %s", rs.Name)
+		// Reconcile: ensure role_permissions has all current scope permissions (add missing rows).
+		for _, permID := range allPermIDs {
+			db.FirstOrCreate(&models.RolePermission{RoleID: existingAdmin.ID, PermissionID: permID})
+		}
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: reconciled admin role for RS %s", rs.Name)
 	}
 
 	if !readonlyExists {
@@ -740,9 +797,305 @@ func (s *ResourceServerService) seedDefaultRoles(rs *models.ResourceServer, scop
 		for _, permID := range readPermIDs {
 			db.FirstOrCreate(&models.RolePermission{RoleID: readonlyRole.ID, PermissionID: permID})
 		}
-		log.Printf("[MCP_DISCOVERY] seedDefaultRoles: created role %q (%d perms) for RS %s",
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: created role %q (%d perms) for RS %s",
 			readonlyRoleName, len(readPermIDs), rs.Name)
 	} else {
-		log.Printf("[MCP_DISCOVERY] seedDefaultRoles: skipping readonly role (already exists) for RS %s", rs.Name)
+		// Reconcile: ensure role_permissions for readonly role matches current read-scope permissions.
+		for _, permID := range readPermIDs {
+			db.FirstOrCreate(&models.RolePermission{RoleID: existingReadonly.ID, PermissionID: permID})
+		}
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: reconciled readonly role for RS %s", rs.Name)
 	}
+
+	// Viewer role: default role assigned to first-time users via the access policy.
+	// Created at RS-creation time but populated lazily here once scopes exist.
+	// Viewer gets the same read-scope set as readonly — admins can later customize
+	// via the roles UI. The activation gate "step 5: default role grants ≥1 scope"
+	// depends on this populating viewer's role_permissions.
+	viewerPermIDs := readPermIDs
+	if len(viewerPermIDs) == 0 {
+		// No read-only scopes detected — fall back to all scopes so the gate
+		// can pass for RSes whose scope strings don't match the read-only heuristic.
+		viewerPermIDs = allPermIDs
+	}
+	if !viewerExists {
+		viewerRole := models.RBACRole{
+			TenantID:    &rs.TenantID,
+			Name:        viewerRoleName,
+			Description: fmt.Sprintf("Default viewer role for %s (auto-generated)", rs.Name),
+		}
+		db.Create(&viewerRole)
+		for _, permID := range viewerPermIDs {
+			db.FirstOrCreate(&models.RolePermission{RoleID: viewerRole.ID, PermissionID: permID})
+		}
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: created role %q (%d perms) for RS %s",
+			viewerRoleName, len(viewerPermIDs), rs.Name)
+	} else {
+		for _, permID := range viewerPermIDs {
+			db.FirstOrCreate(&models.RolePermission{RoleID: existingViewer.ID, PermissionID: permID})
+		}
+		log.Printf("[MCP_DISCOVERY] reconcileDefaultRoles: reconciled viewer role for RS %s", rs.Name)
+	}
+}
+
+// ── Activation gate ──────────────────────────────────────────────────────────────────────────────
+
+// ActivationGateError carries a structured list of failed gates so callers can
+// render a human-readable error and the wizard can highlight the blocking step.
+type ActivationGateError struct {
+	Failed []string `json:"failed"`
+}
+
+func (e ActivationGateError) Error() string {
+	return fmt.Sprintf("activation blocked: %v", e.Failed)
+}
+
+// ChecklistStep represents one wizard step's completion state.
+type ChecklistStep struct {
+	Step      int    `json:"step"`
+	Name      string `json:"name"`
+	Complete  bool   `json:"complete"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// SetupChecklist returns the step-by-step status for the wizard rail.
+func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUID) ([]ChecklistStep, error) {
+	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 1: Register (always complete once RS exists)
+	steps := []ChecklistStep{
+		{Step: 1, Name: "Register", Complete: true},
+	}
+
+	// Step 2: Tool inventory — ≥1 tool
+	var toolCount int64
+	s.db.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
+	steps = append(steps, ChecklistStep{
+		Step:     2,
+		Name:     "Tool inventory",
+		Complete: toolCount > 0,
+		Detail:   fmt.Sprintf("%d tools", toolCount),
+	})
+
+	// Step 3: Define scopes — ≥1 scope
+	var scopeCount int64
+	s.db.Model(&models.OAuthScope{}).Where("resource_server_id = ?", rs.ID).Count(&scopeCount)
+	steps = append(steps, ChecklistStep{
+		Step:     3,
+		Name:     "Define scopes",
+		Complete: scopeCount > 0,
+		Detail:   fmt.Sprintf("%d scopes", scopeCount),
+	})
+
+	// Step 4: Map tools — every non-public tool has ≥1 admin_override mapping
+	var unmappedCount int64
+	s.db.Raw(`
+		SELECT COUNT(*) FROM mcp_tools mt
+		 WHERE mt.resource_server_id = ?
+		   AND mt.is_public = false
+		   AND NOT EXISTS (
+			   SELECT 1 FROM mcp_tool_scope_map m
+			    WHERE m.tool_id = mt.id
+			      AND m.source = 'admin_override'
+		   )
+	`, rs.ID).Scan(&unmappedCount)
+	step4Complete := toolCount > 0 && unmappedCount == 0
+	steps = append(steps, ChecklistStep{
+		Step:     4,
+		Name:     "Map tools to scopes",
+		Complete: step4Complete,
+		Detail:   fmt.Sprintf("%d unmapped", unmappedCount),
+	})
+
+	// Step 5: Default role — viewer exists and has ≥1 scope
+	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
+	var viewerRole models.RBACRole
+	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil
+	var viewerPermCount int64
+	if viewerExists {
+		s.db.Model(&models.RolePermission{}).Where("role_id = ?", viewerRole.ID).Count(&viewerPermCount)
+	}
+	steps = append(steps, ChecklistStep{
+		Step:     5,
+		Name:     "Default role",
+		Complete: viewerExists && viewerPermCount > 0,
+		Detail:   fmt.Sprintf("viewer: %d scopes", viewerPermCount),
+	})
+
+	// Step 6: Activate
+	canActivate := toolCount > 0 && scopeCount > 0 && unmappedCount == 0 && viewerExists && viewerPermCount > 0
+	steps = append(steps, ChecklistStep{
+		Step:     6,
+		Name:     "Activate",
+		Complete: rs.State == models.RSStateReady,
+		Detail:   fmt.Sprintf("can_activate=%v", canActivate),
+	})
+
+	return steps, nil
+}
+
+// ActivationPreview returns the summary card shown before activation (§4.1 step 6).
+func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.UUID) (map[string]interface{}, error) {
+	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+	if err != nil {
+		return nil, err
+	}
+
+	var tools []models.MCPTool
+	s.db.Where("resource_server_id = ?", rs.ID).Find(&tools)
+
+	var scopes []models.OAuthScope
+	s.db.Where("resource_server_id = ?", rs.ID).Find(&scopes)
+
+	totalTools := len(tools)
+	publicTools := 0
+	mappedTools := 0
+	unmappedTools := 0
+	var publicToolNames []string
+
+	for _, t := range tools {
+		if t.IsPublic {
+			publicTools++
+			publicToolNames = append(publicToolNames, t.Name)
+		}
+		var overrideCount int64
+		s.db.Model(&models.MCPToolScopeMap{}).
+			Where("tool_id = ? AND source = 'admin_override'", t.ID).
+			Count(&overrideCount)
+		if t.IsPublic || overrideCount > 0 {
+			mappedTools++
+		} else {
+			unmappedTools++
+		}
+	}
+
+	// Scope counters
+	type scopeInfo struct {
+		ScopeString string `json:"scope_string"`
+		DisplayName string `json:"display_name"`
+		ToolCount   int64  `json:"tool_count"`
+	}
+	scopeInfos := make([]scopeInfo, 0, len(scopes))
+	for _, sc := range scopes {
+		var cnt int64
+		s.db.Model(&models.MCPToolScopeMap{}).
+			Where("scope_id = ? AND source = 'admin_override'", sc.ID).
+			Count(&cnt)
+		scopeInfos = append(scopeInfos, scopeInfo{
+			ScopeString: sc.ScopeString,
+			DisplayName: sc.DisplayName,
+			ToolCount:   cnt,
+		})
+	}
+
+	// Default role info
+	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
+	var viewerRole models.RBACRole
+	var viewerScopeStrings []string
+	if s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil {
+		var perms []models.RBACPermission
+		s.db.Joins("JOIN role_permissions rp ON rp.permission_id = permissions.id").
+			Where("rp.role_id = ?", viewerRole.ID).
+			Find(&perms)
+		for _, p := range perms {
+			viewerScopeStrings = append(viewerScopeStrings, p.Resource)
+		}
+	}
+
+	preview := map[string]interface{}{
+		"tools": map[string]interface{}{
+			"total":    totalTools,
+			"public":   publicTools,
+			"mapped":   mappedTools,
+			"unmapped": unmappedTools,
+		},
+		"scopes":             scopeInfos,
+		"scope_count":        len(scopes),
+		"default_role":       viewerName,
+		"viewer_scopes":      viewerScopeStrings,
+		"public_tool_names":  publicToolNames,
+		"first_time_user_grant": viewerScopeStrings,
+		"can_activate":       unmappedTools == 0 && totalTools > 0 && len(scopes) > 0 && len(viewerScopeStrings) > 0,
+	}
+	return preview, nil
+}
+
+// Activate flips state to 'ready' after verifying all gates. Returns
+// ActivationGateError if any gate fails.
+func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, activatedByUserID uuid.UUID) error {
+	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+	if err != nil {
+		return err
+	}
+
+	// Ensure default roles (admin/readonly/viewer) are reconciled against the
+	// current scope set BEFORE evaluating activation gates. Manual scope creation
+	// goes through the CreateScope controller and never triggers reconciliation
+	// from DiscoverAndSync, so without this call the viewer role stays empty
+	// and gate "step_5_viewer_role_empty" fails forever.
+	s.db.Transaction(func(tx *gorm.DB) error {
+		s.reconcileDefaultRoles(rs, NewScopeRegistryService(tx), tx)
+		return nil
+	})
+
+	var failed []string
+
+	// Gate 1: ≥1 tool
+	var toolCount int64
+	s.db.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
+	if toolCount == 0 {
+		failed = append(failed, "step_2_no_tools")
+	}
+
+	// Gate 2: ≥1 scope
+	var scopeCount int64
+	s.db.Model(&models.OAuthScope{}).Where("resource_server_id = ?", rs.ID).Count(&scopeCount)
+	if scopeCount == 0 {
+		failed = append(failed, "step_3_no_scopes")
+	}
+
+	// Gate 3: every non-public tool has ≥1 admin_override mapping
+	var unmappedCount int64
+	s.db.Raw(`
+		SELECT COUNT(*) FROM mcp_tools mt
+		 WHERE mt.resource_server_id = ?
+		   AND mt.is_public = false
+		   AND NOT EXISTS (
+			   SELECT 1 FROM mcp_tool_scope_map m
+			    WHERE m.tool_id = mt.id
+			      AND m.source = 'admin_override'
+		   )
+	`, rs.ID).Scan(&unmappedCount)
+	if unmappedCount > 0 {
+		failed = append(failed, fmt.Sprintf("step_4_unmapped_tool_count: %d", unmappedCount))
+	}
+
+	// Gate 4: viewer role has ≥1 scope
+	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
+	var viewerRole models.RBACRole
+	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil
+	if !viewerExists {
+		failed = append(failed, "step_5_no_viewer_role")
+	} else {
+		var viewerPermCount int64
+		s.db.Model(&models.RolePermission{}).Where("role_id = ?", viewerRole.ID).Count(&viewerPermCount)
+		if viewerPermCount == 0 {
+			failed = append(failed, "step_5_viewer_role_empty")
+		}
+	}
+
+	if len(failed) > 0 {
+		return ActivationGateError{Failed: failed}
+	}
+
+	now := time.Now().UTC()
+	return s.db.Model(rs).Updates(map[string]interface{}{
+		"state":              models.RSStateReady,
+		"status":             "ready",
+		"setup_completed_at": now,
+		"setup_completed_by": activatedByUserID,
+	}).Error
 }

@@ -24,6 +24,12 @@ type ResourceServer struct {
 	IntrospectionSecretHash string         `json:"-" gorm:"column:introspection_secret_hash;type:text"` // Bcrypt hash (primary for new rows)
 	Active                  bool           `json:"active" gorm:"default:true"`
 
+	// State is the new gated state machine: pending_scan → needs_setup → ready | scan_failed.
+	// Preserved alongside Status during migration; Status will be dropped in a follow-up.
+	State             string     `json:"state" gorm:"type:text;not null;default:'pending_scan'"`
+	SetupCompletedAt  *time.Time `json:"setup_completed_at,omitempty"`
+	SetupCompletedBy  *uuid.UUID `json:"setup_completed_by,omitempty" gorm:"type:uuid"`
+
 	// Scan lifecycle — ScanInProgress is internal and never exposed in API responses.
 	Status                   string     `json:"status" gorm:"type:text;not null;default:'pending_scan'"`
 	ScanGeneration           int        `json:"scan_generation" gorm:"not null;default:0"`
@@ -44,6 +50,19 @@ type ResourceServer struct {
 
 func (ResourceServer) TableName() string {
 	return "resource_servers"
+}
+
+// RS state constants.
+const (
+	RSStatePendingScan = "pending_scan"
+	RSStateNeedsSetup  = "needs_setup"
+	RSStateReady       = "ready"
+	RSStateScanFailed  = "scan_failed"
+)
+
+// IsReady returns true when the RS is fully activated and end-user OAuth is allowed.
+func (rs *ResourceServer) IsReady() bool {
+	return rs.State == RSStateReady
 }
 
 // AllowsRegistrationMode checks if the RS accepts the given client registration mode.

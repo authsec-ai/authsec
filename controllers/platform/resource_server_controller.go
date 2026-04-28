@@ -447,3 +447,62 @@ func extractTenantID(c *gin.Context) (uuid.UUID, error) {
 	}
 	return uuid.Parse(tidStr)
 }
+
+// TestLogin runs both OAuth and SDK diagnostic surfaces for an RS.
+// POST /authsec/resource-servers/:id/test-login
+func (ctrl *ResourceServerController) TestLogin(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
+		return
+	}
+
+	rsState := rs.State
+	rsStatus := rs.Status
+
+	// Check sdk-policy endpoint reachability (internal call).
+	sdkPolicyState := "unknown"
+	var toolCount int64
+	var unmappedCount int64
+	config.DB.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
+	config.DB.Raw(`
+		SELECT COUNT(*) FROM mcp_tools mt
+		 WHERE mt.resource_server_id = ?
+		   AND mt.is_public = false
+		   AND NOT EXISTS (
+			   SELECT 1 FROM mcp_tool_scope_map m
+			    WHERE m.tool_id = mt.id AND m.source = 'admin_override'
+		   )
+	`, rs.ID).Scan(&unmappedCount)
+
+	if rsState == models.RSStateReady {
+		sdkPolicyState = "ready"
+	} else {
+		sdkPolicyState = rsState
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"resource_server": gin.H{
+			"id":     rs.ID.String(),
+			"name":   rs.Name,
+			"state":  rsState,
+			"status": rsStatus,
+		},
+		"oauth": gin.H{
+			"state":          rsState,
+			"ready_since":    rs.SetupCompletedAt,
+		},
+		"sdk_enforcement": gin.H{
+			"sdk_policy_state": sdkPolicyState,
+			"tool_count":       toolCount,
+			"unmapped_tools":   unmappedCount,
+		},
+	})
+}

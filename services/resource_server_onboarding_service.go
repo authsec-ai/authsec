@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -243,7 +244,12 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 
 	hasAccess, err := s.scopeResolver.HasEffectiveScopes(ctx, tenantID, userID, rs.ID.String())
 	if err != nil {
-		return false, err
+		// Soft-fail: scope resolution is what the consent handler does next
+		// anyway. If scope resolver is broken here it'll be broken there too,
+		// and that path produces a friendlier rejection. Log and skip auto-bind.
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: HasEffectiveScopes errored user=%s rs=%s: %v — skipping auto-bind",
+			userID, rs.ID, err)
+		return false, nil
 	}
 	if hasAccess {
 		return false, nil
@@ -251,7 +257,13 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 
 	var user models.ExtendedUser
 	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err != nil {
-		return false, err
+		// User row missing or unreadable. Don't 500 the consent flow over this —
+		// the user authenticated upstream so the row almost certainly exists,
+		// but if a column or join produces an oddity, fail open and let the
+		// existing scope-resolution path handle access (or correctly reject).
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: user lookup failed user=%s: %v — skipping auto-bind",
+			userID, err)
+		return false, nil
 	}
 	username := ""
 	if user.Username != nil {
@@ -260,7 +272,12 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 
 	var role models.RBACRole
 	if err := s.db.Where("id = ? AND tenant_id = ?", *policy.DefaultRoleID, tenantUUID).First(&role).Error; err != nil {
-		return false, fmt.Errorf("default role not found")
+		// Stale access policy: pointer-to-deleted-role is a known edge case
+		// for RSes that predate the auto-viewer flow or where the admin
+		// deleted the default role manually. Don't 500 — log and skip.
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: default role %s not found for rs=%s: %v — skipping auto-bind",
+			*policy.DefaultRoleID, rs.ID, err)
+		return false, nil
 	}
 
 	var existingCount int64
@@ -268,7 +285,9 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		Where("tenant_id = ? AND user_id = ? AND role_id = ? AND scope_type IS NULL AND scope_id IS NULL",
 			tenantUUID, userUUID, role.ID).
 		Count(&existingCount).Error; err != nil {
-		return false, err
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: existing binding count failed user=%s role=%s: %v — skipping auto-bind",
+			userID, role.ID, err)
+		return false, nil
 	}
 	if existingCount > 0 {
 		return false, nil
@@ -295,7 +314,11 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		CreatedAt:          time.Now().UTC(),
 	}
 	if err := s.db.Create(&binding).Error; err != nil {
-		return false, err
+		// Constraint violations (FK, NOT NULL, unique) shouldn't 500 the consent.
+		// Log loudly; the user just won't get auto-binding this round.
+		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: binding create failed user=%s role=%s: %v — skipping auto-bind",
+			userID, role.ID, err)
+		return false, nil
 	}
 
 	return true, nil
