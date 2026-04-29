@@ -958,3 +958,4 @@ For significant changes, open an issue first to discuss the approach.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) for the full text.
+Version 3.0.0
