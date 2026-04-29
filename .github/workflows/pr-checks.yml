@@ -27,9 +27,7 @@ jobs:
       - name: Configure private module access
         env:
           TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -z "$TOKEN" ]; then echo "ERROR: GH_PAT secret is empty or not set"; exit 1; fi
-          git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
@@ -82,9 +80,7 @@ jobs:
       - name: Configure private module access
         env:
           TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -z "$TOKEN" ]; then echo "ERROR: GH_PAT secret is empty or not set"; exit 1; fi
-          git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
