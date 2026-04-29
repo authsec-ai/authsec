@@ -1,0 +1,71 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, authsec-dev, authsec-staging, authsec-prod]
+
+jobs:
+  # ── Unit tests (always run, no DB required) ─────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -short ./tests/unit/ -v
+
+  # ── Integration tests (opt-in via PR label "run-integration") ──────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-integration')
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: authsec
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: authsec
+      DB_SSLMODE: disable
+      RUN_INTEGRATION: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Integration tests
+        run: go test ./tests/unit/ ./tests/integration/... -v -timeout 120s

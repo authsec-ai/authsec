@@ -28,6 +28,7 @@ import (
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
+	"github.com/authsec-ai/authsec/internal/mtplugin"
 	session "github.com/authsec-ai/authsec/internal/session"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -82,13 +83,19 @@ func main() {
 			log.Println("Master migrations completed successfully")
 		}
 
-		// Build the golden tenant template in the background so it is ready for fast cloning.
-		migration.InitTemplateCreds(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBSSLMode)
-		go func() {
-			if err := migration.SetupTenantTemplate(migration.MigrationsDir("tenant"), config.Database.DB); err != nil {
-				log.Printf("Warning: tenant template setup failed (standard migration path remains available): %v", err)
-			}
-		}()
+	}
+
+	// mt-plugin: auto-detect the multi-tenant plugin via gRPC heartbeat.
+	// When MT_PLUGIN_GRPC_ADDR is set, authsec will notify mt-plugin after each
+	// admin registration so it can provision the tenant database asynchronously.
+	// Without the plugin, only one admin (single-tenant) is permitted.
+	if cfg.MtPluginAddr != "" {
+		mtClient := mtplugin.NewClient(cfg.MtPluginAddr)
+		mtClient.StartHeartbeat(context.Background(), 15*time.Second)
+		config.MTPluginClient = mtClient
+		log.Printf("[mtplugin] Heartbeat started for %s", cfg.MtPluginAddr)
+	} else {
+		log.Println("[mtplugin] MT_PLUGIN_GRPC_ADDR not set — single-tenant mode")
 	}
 
 	// Initialise auth-manager configuration

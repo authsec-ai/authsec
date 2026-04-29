@@ -52,12 +52,15 @@ AuthSec is a unified Go service for the complete identity lifecycle: authenticat
 │  /metrics                – Prometheus metrics                     │
 └────────────────────────────────────────────────────────────────────┘
          │
-         ├── PostgreSQL (primary DB + per-tenant DBs)
-         ├── HashiCorp Vault (secrets, OIDC provider credentials)
-         └── Redis (optional – permission cache, session cache)
+         ├── PostgreSQL (master DB — single database for all operations)
+         ├── mt-plugin (optional gRPC — multi-tenant DB management)
+         ├── HashiCorp Vault (optional — secrets, OIDC provider credentials)
+         └── Redis (optional — permission cache, session cache)
 ```
 
 All HTTP routes are served from a single `gin.Engine`. Each module's routes live under its own sub-prefix so paths are globally unique.
+
+authsec is a **single-tenant service by default**. All operations use the master PostgreSQL database. Multi-tenant support requires running the **mt-plugin** gRPC microservice and setting `MT_PLUGIN_GRPC_ADDR`.
 
 ---
 
@@ -82,9 +85,10 @@ All HTTP routes are served from a single `gin.Engine`. Each module's routes live
 ### Prerequisites
 
 - Go 1.25+
-- PostgreSQL 14+ (primary DB + tenant DBs)
-- HashiCorp Vault (optional but recommended for OIDC secrets)
-- Redis (optional, for caching)
+- PostgreSQL 15+ (master DB)
+- HashiCorp Vault (optional — recommended for OIDC secrets)
+- Redis (optional — caching)
+- mt-plugin (optional — required only for multi-tenant mode)
 
 ### Run locally
 
@@ -141,6 +145,7 @@ The server starts on port **7468** by default.
 | `ICP_SERVICE_URL` | `http://localhost:7001` | ICP/PKI provisioning service |
 | `REQUIRE_SERVER_AUTH` | `true` | Enforce inter-service auth check (`false` to disable in dev) |
 | `SKIP_MIGRATIONS` | `false` | Set to `true` to skip master DB migrations at startup |
+| `MT_PLUGIN_GRPC_ADDR` | `""` | mt-plugin gRPC address (e.g. `localhost:7469`); leave empty for single-tenant mode |
 
 ### Optional – CORS
 
@@ -729,24 +734,14 @@ Provides SPIFFE workload identity, OIDC token issuance with cloud federation (AW
 
 ### Migration Management (`/authsec/migration`)
 
-Manages master and per-tenant database migrations. All endpoints require JWT authentication.
+Manages master database migrations. All endpoints require JWT authentication.
 
-#### Master Database
+Tenant database provisioning and tenant migrations are handled by **mt-plugin**, not authsec.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/authsec/migration/migrations/master/run` | Execute all pending master DB migrations |
 | `GET` | `/authsec/migration/migrations/master/status` | Get master DB migration status |
-
-#### Tenant Databases
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/authsec/migration/tenants` | List all tenants and their migration status |
-| `POST` | `/authsec/migration/tenants/create-db` | Create a tenant database and kick off migrations async |
-| `POST` | `/authsec/migration/tenants/migrate-all` | Run migrations for all tenants not yet completed |
-| `POST` | `/authsec/migration/tenants/:tenant_id/migrations/run` | Run migrations for a specific tenant |
-| `GET` | `/authsec/migration/tenants/:tenant_id/migrations/status` | Get migration status for a specific tenant |
 
 ---
 
@@ -786,9 +781,7 @@ Permission-gated routes (e.g. `external-service:create`) use `Require(resource, 
 
 ## Database Configuration
 
-AuthSec uses two categories of database connections:
-
-### Primary Database
+AuthSec uses a single **master PostgreSQL database** for all operations.
 
 Configured via `DB_*` environment variables. Holds:
 
@@ -796,13 +789,9 @@ Configured via `DB_*` environment variables. Holds:
 - Platform RBAC tables (`roles`, `permissions`, `role_bindings`, …)
 - WebAuthn sessions
 - Audit log
-- Tenant registry (maps tenant IDs to their database names)
+- All end-user records, OIDC identities, client registrations, MFA state
 
-### Per-Tenant Databases
-
-Each tenant gets its own PostgreSQL database. The connection is resolved dynamically using `config.GetTenantGORMDB(tenantID)` which looks up the database name in the primary DB's `tenants` table and opens a pooled connection.
-
-Tenant tables include: end-users, OIDC identities, client registrations, external services, TOTP/SMS MFA state.
+Per-tenant database provisioning (creating isolated `tenant_<uuid>` PostgreSQL databases) is handled exclusively by **mt-plugin** when `MT_PLUGIN_GRPC_ADDR` is configured. authsec itself never creates or connects to per-tenant databases.
 
 ### Migrations
 
@@ -875,18 +864,25 @@ authsec/
 │   ├── migration/            – migration runner, models, DB utilities
 │   │   ├── runner.go         – versioned SQL runner with retry + migration_logs
 │   │   ├── models.go
-│   │   └── db_utils.go       – ConnectToTenantDB, CreateDatabase, IsValidDatabaseName
+│   │   └── db_utils.go       – ConnectToTenantDB, IsValidDatabaseName
+│   ├── mtplugin/             – gRPC client for mt-plugin microservice
+│   │   ├── client.go         – Client with 15s heartbeat, IsAvailable()
+│   │   └── proto/            – generated protobuf stubs
 │   ├── oocmgr/               – OIDC config manager repository + services
 │   ├── session/              – WebAuthn PostgreSQL session store
+│   ├── vault/                – HashiCorp Vault client interface + implementation
 │   └── clients/              – ICP PKI client, auth methods
-├── migrations/               – SQL migration files (master + tenant + permissions)
-├── middlewares/              – CORS, JWT auth, rate limiting, tenant validation
+├── migrations/               – SQL migration files (master + permissions)
+├── middlewares/              – CORS, JWT auth, rate limiting
 ├── models/                   – shared GORM models
 ├── monitoring/               – Prometheus metrics, audit log, structured logging
 ├── repository/               – shared repositories (MFA, clients RBAC, extsvc)
 ├── routes/routes.go          – central route registration
+├── scripts/                  – utility scripts (endpoint tests, agent demos)
 ├── services/                 – business logic services
-└── vault/                    – HashiCorp Vault client interface
+└── tests/
+    ├── unit/                 – unit tests (no DB required)
+    └── integration/          – integration tests (require RUN_INTEGRATION=1)
 ```
 
 ---
@@ -946,12 +942,14 @@ Expected response:
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
 
-1. Fork the repository and create a feature branch.
-2. Ensure `go build ./...` and `go test ./...` pass before opening a pull request.
-3. Keep pull requests focused — one feature or fix per PR.
-4. Follow the existing code style (standard Go formatting via `gofmt`).
+Quick checklist before opening a PR:
+
+1. `go vet ./...` passes
+2. `go test -short ./tests/unit/` passes
+3. Add the `run-integration` label on the PR if your change touches DB logic or auth flows
+4. Keep PRs focused — one feature or fix per PR
 
 For significant changes, open an issue first to discuss the approach.
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
@@ -53,7 +54,7 @@ type EditScopeInput struct {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/scopes [get]
 func (sc *ScopeController) ListScopes(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -81,7 +82,7 @@ func (sc *ScopeController) ListScopes(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/scopes/mappings [get]
 func (sc *ScopeController) GetMappings(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -110,7 +111,7 @@ func (sc *ScopeController) GetMappings(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/scopes [post]
 func (sc *ScopeController) AddScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -141,7 +142,7 @@ func (sc *ScopeController) AddScope(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/scopes/{scope_name} [put]
 func (sc *ScopeController) EditScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	scopeName := c.Param("scope_name")
 	if !ok || tenantID == "" || scopeName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
@@ -172,7 +173,7 @@ func (sc *ScopeController) EditScope(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/scopes/{scope_name} [delete]
 func (sc *ScopeController) DeleteScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	scopeName := c.Param("scope_name")
 	if !ok || tenantID == "" || scopeName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
@@ -212,7 +213,7 @@ func (sc *ScopeController) DeleteScope(c *gin.Context) {
 // @Router /uflow/user/scopes [get]
 // @Router /uflow/enduser/scopes [get]
 func (sc *ScopeController) ListUserScopes(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -253,7 +254,7 @@ func (sc *ScopeController) ListUserScopes(c *gin.Context) {
 // @Router /uflow/user/scopes/mappings [get]
 // @Router /uflow/enduser/scopes/mappings [get]
 func (sc *ScopeController) GetUserMappings(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -295,7 +296,7 @@ func (sc *ScopeController) GetUserMappings(c *gin.Context) {
 // @Router /uflow/user/scopes [post]
 // @Router /uflow/enduser/scopes [post]
 func (sc *ScopeController) AddUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID is required"})
 		return
@@ -339,7 +340,7 @@ func (sc *ScopeController) AddUserScope(c *gin.Context) {
 // @Router /uflow/user/scopes/{scope_name} [put]
 // @Router /uflow/enduser/scopes/{scope_name} [put]
 func (sc *ScopeController) EditUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	scopeName := c.Param("scope_name")
 	if !ok || tenantID == "" || scopeName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})
@@ -383,7 +384,7 @@ func (sc *ScopeController) EditUserScope(c *gin.Context) {
 // @Router /uflow/user/scopes/{scope_name} [delete]
 // @Router /uflow/enduser/scopes/{scope_name} [delete]
 func (sc *ScopeController) DeleteUserScope(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	scopeName := c.Param("scope_name")
 	if !ok || tenantID == "" || scopeName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID and Scope Name are required"})

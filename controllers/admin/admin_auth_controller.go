@@ -12,6 +12,7 @@ import (
 	// authrepo "github.com/authsec-ai/auth-manager/pkg/repo"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -853,6 +854,19 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
+	// Single-tenant guard: block a second admin when mt-plugin is not available.
+	if config.MTPluginClient == nil || !config.MTPluginClient.IsAvailable() {
+		db := config.GetDatabase()
+		var tenantCount int
+		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "Single-tenant mode: only one admin is allowed. " +
+					"Deploy the mt-plugin service and set MT_PLUGIN_GRPC_ADDR to enable multi-tenant registration.",
+			})
+			return
+		}
+	}
+
 	// Check if pending registration already exists
 	existingPending, err := aac.pendingRepo.GetPendingRegistration(input.Email)
 	if err == nil && existingPending != nil {
@@ -1418,70 +1432,24 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant database and run migrations (must happen after commit so migration service can query the tenant)
-	// These are post-commit operations — global state is already committed, so failures here are
-	// logged as warnings and don't block the registration response.
-	log.Printf("Creating tenant database for: %s", pendingReg.TenantID.String())
-
-	defaultClientID := pendingReg.ClientID
-	tenantDBReady := false
-	tenantDBService, err := database.NewTenantDBService(db, config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, config.AppConfig.DBPort)
-	if err != nil {
-		log.Printf("Warning: Failed to create tenant DB service: %v", err)
-		log.Printf("Tenant database %s will need to be provisioned manually or on next login", tenantDBName)
+	// Notify mt-plugin to provision the tenant database asynchronously.
+	// mt-plugin handles: CreateTenantDatabase → RunMigrations → SeedTenantDB → RegisterHydraClient.
+	// If mt-plugin is unavailable, the tenant record exists in master DB and DB provisioning
+	// can be retried later by starting the plugin.
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: pendingReg.TenantID.String(),
+			Email:    pendingReg.Email,
+			DbName:   tenantDBName,
+			ClientId: pendingReg.ClientID.String(),
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of admin registration: %v", err)
+		}
 	} else {
-		if _, err := tenantDBService.CreateTenantDatabase(pendingReg.TenantID.String()); err != nil {
-			log.Printf("Warning: Failed to create tenant database: %v", err)
-			log.Printf("Tenant database %s will need to be provisioned manually or on next login", tenantDBName)
-		} else {
-			tenantDBReady = true
-		}
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", pendingReg.TenantID.String())
 	}
 
-	// Seed tenant database with default records (only if DB + migrations succeeded)
-	if tenantDBReady {
-		tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-			config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
-
-		tenantDB, err := sql.Open("postgres", tenantDSN)
-		if err != nil {
-			log.Printf("Warning: Failed to connect to tenant database: %v", err)
-		} else {
-			defer tenantDB.Close()
-
-			// Create default client with Hydra client ID
-			hydraClientID := fmt.Sprintf("%s-main-client", defaultClientID.String())
-			clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-				VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())`
-			if _, err := tenantDB.Exec(clientInsert, defaultClientID, pendingReg.TenantID, defaultProjectID, pendingReg.TenantID, "Default Client", "Default client for admin user", hydraClientID); err != nil {
-				log.Printf("Warning: Failed to create default client in tenant database: %v", err)
-			}
-
-			// Create tenant record in tenant database (required for FK constraint on projects table)
-			tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-				VALUES ($1, $1, $2, $3, $4, 'local', 'admin_registration', 'active', $5, $6, NOW(), NOW())`
-			if _, err := tenantDB.Exec(tenantInsert, pendingReg.TenantID, pendingReg.Email, pendingReg.PasswordHash,
-				fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName), pendingReg.TenantDomain, tenantDBName); err != nil {
-				log.Printf("Warning: Failed to create tenant record in tenant database: %v", err)
-			}
-
-			// Create default project in tenant database
-			projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
-			if _, err := tenantDB.Exec(projectInsert, defaultProjectID, pendingReg.TenantID, "Default Project", "Default project for admin user", pendingReg.TenantID); err != nil {
-				log.Printf("Warning: Failed to create default project in tenant database: %v", err)
-			}
-
-			// Create corresponding end user account in tenant database
-			if err := aac.createEndUserInTenantDB(tenantDB, &adminUser, defaultClientID, defaultProjectID, pendingReg); err != nil {
-				log.Printf("Warning: Failed to create end user account in tenant database: %v", err)
-			} else {
-				log.Printf("Successfully created end user account in tenant database for admin: %s", pendingReg.Email)
-			}
-		}
-	}
-
-	// Save secret to Vault and register with Hydra
+	// Save secret to Vault and register with Hydra (single-admin OAuth setup)
 	secretID, err := config.SaveSecretToVault(pendingReg.TenantID.String(), pendingReg.ProjectID.String(), pendingReg.TenantID.String())
 	if err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)

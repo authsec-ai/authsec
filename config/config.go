@@ -10,10 +10,21 @@ import (
 	"testing"
 	"time"
 
+	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+// MTPluginClientIface is the contract between authsec and the mt-plugin gRPC client.
+// *mtplugin.Client satisfies this interface; tests use local mock structs.
+type MTPluginClientIface interface {
+	IsAvailable() bool
+	NotifyAdminRegistered(req *mtpluginpb.AdminRegisteredRequest) (*mtpluginpb.AdminRegisteredResponse, error)
+	ListTenants() (*mtpluginpb.ListTenantsResponse, error)
+	DeleteTenant(tenantID string) (*mtpluginpb.DeleteTenantResponse, error)
+	ResolveTenant(hostname string) (*mtpluginpb.ResolveByDomainResponse, error)
+}
 
 // AuthManagerTokenService interface for token generation using auth-manager patterns
 // This avoids import cycles while providing type-safe token generation
@@ -121,13 +132,19 @@ type Config struct {
 	SDKHideUnauthorizedTools      bool   // default false
 	SDKRequireSessionID           bool   // default false
 	SDKRedirectSource             string // "db" or "env"
+
+	// mt-plugin integration
+	// When set, authsec connects to the mt-plugin gRPC service for multi-tenant operations.
+	// Empty string means single-tenant mode (one admin, master DB only).
+	MtPluginAddr string // MT_PLUGIN_GRPC_ADDR (e.g. "localhost:7469")
 }
 
 var (
-	AppConfig    *Config
-	CacheManager *monitoring.CacheManager
-	AuditLogger  *monitoring.AuditLogger
-	TokenService AuthManagerTokenService // Global token service using auth-manager patterns
+	AppConfig       *Config
+	CacheManager    *monitoring.CacheManager
+	AuditLogger     *monitoring.AuditLogger
+	TokenService    AuthManagerTokenService // Global token service using auth-manager patterns
+	MTPluginClient  MTPluginClientIface      // nil when MT_PLUGIN_GRPC_ADDR is not configured
 
 	// Redis client singleton
 	redisClient *redis.Client
@@ -263,6 +280,9 @@ func LoadConfig() *Config {
 	sdkRequireSessionID := getEnv("AUTHSEC_REQUIRE_SESSION_ID", "false") == "true"
 	sdkRedirectSource := getEnv("AUTHSEC_REDIRECT_SOURCE", "db")
 
+	// mt-plugin gRPC address (empty = single-tenant mode)
+	mtPluginAddr := getEnv("MT_PLUGIN_GRPC_ADDR", "")
+
 	// Validate critical variables
 	if dbName == "" || dbUser == "" || dbHost == "" || dbPort == "" {
 		log.Fatal("DB_NAME, DB_USER, DB_HOST, and DB_PORT are required")
@@ -340,6 +360,7 @@ func LoadConfig() *Config {
 		SDKHideUnauthorizedTools:      sdkHideUnauthorizedTools,
 		SDKRequireSessionID:           sdkRequireSessionID,
 		SDKRedirectSource:             sdkRedirectSource,
+		MtPluginAddr:                  mtPluginAddr,
 	}
 
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)

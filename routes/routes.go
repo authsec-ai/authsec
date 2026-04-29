@@ -117,8 +117,6 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize SCIM admin controller: %v", err)
 	}
 
-	_ = middlewares.NewTenantResolutionMiddleware(config.GetDatabase())
-
 	oidcController, err := platformCtrl.NewOIDCController()
 	if err != nil {
 		log.Fatalf("Failed to initialize OIDC controller: %v", err)

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	repositories "github.com/authsec-ai/authsec/repository"
-	"github.com/authsec-ai/authsec/vault"
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
