@@ -21,6 +21,12 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: Configure private module access
+        run: git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+
+      - name: Download dependencies
+        run: go mod download
+
       - name: go vet
         run: go vet ./...
 
@@ -65,6 +71,12 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
+
+      - name: Configure private module access
+        run: git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+
+      - name: Download dependencies
+        run: go mod download
 
       - name: Integration tests
         run: go test ./tests/unit/ ./tests/integration/... -v -timeout 120s
