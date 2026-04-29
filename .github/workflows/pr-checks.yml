@@ -6,6 +6,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GOPRIVATE: github.com/authsec-ai/*
 
 jobs:
   # ── Unit tests (always run, no DB required) ─────────────────────────────────
@@ -22,7 +23,8 @@ jobs:
           cache: true
 
       - name: Configure private module access
-        run: git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
@@ -73,7 +75,8 @@ jobs:
           cache: true
 
       - name: Configure private module access
-        run: git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
