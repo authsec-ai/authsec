@@ -26,10 +26,10 @@ jobs:
 
       - name: Configure private module access
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${GH_PAT}@github.com" > ~/.git-credentials
+          if [ -z "$TOKEN" ]; then echo "ERROR: GH_PAT secret is empty or not set"; exit 1; fi
+          git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
@@ -81,10 +81,10 @@ jobs:
 
       - name: Configure private module access
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${GH_PAT}@github.com" > ~/.git-credentials
+          if [ -z "$TOKEN" ]; then echo "ERROR: GH_PAT secret is empty or not set"; exit 1; fi
+          git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
