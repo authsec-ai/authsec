@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	// "github.com/authsec-ai/authsec/services" // Temporarily commented out to resolve circular import
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"gorm.io/gorm"
 )
 

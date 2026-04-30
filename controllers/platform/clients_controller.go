@@ -13,7 +13,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/clients/library"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/services"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"

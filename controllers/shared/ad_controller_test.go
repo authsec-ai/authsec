@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/authsec-ai/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"

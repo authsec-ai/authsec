@@ -18,9 +18,8 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 
-	// authrepo "github.com/authsec-ai/auth-manager/pkg/repo"
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"

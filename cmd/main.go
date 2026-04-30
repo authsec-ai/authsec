@@ -21,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/spire"
@@ -97,11 +96,6 @@ func main() {
 	} else {
 		log.Println("[mtplugin] MT_PLUGIN_GRPC_ADDR not set — single-tenant mode")
 	}
-
-	// Initialise auth-manager configuration
-	authManagerConfig.LoadConfig()
-	authManagerConfig.SetDB(config.DB)
-	authManagerConfig.InitTenantDBResolver(config.DB, nil)
 
 	// Initialise Vault (optional; logs warning if not configured)
 	config.InitVault(cfg)

@@ -8,7 +8,7 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 )
 
 // Re-export shared model types used by hydra handlers

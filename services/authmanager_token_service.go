@@ -5,8 +5,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/authsec-ai/auth-manager/controllers"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -14,7 +13,6 @@ import (
 // AuthManagerTokenService provides centralized token generation using auth-manager library
 // This service wraps auth-manager's TokenController for programmatic token generation
 type AuthManagerTokenService struct {
-	tokenController  *controllers.TokenController
 	jwtDefaultSecret []byte // "default" key (KID: "default")
 	jwtSDKSecret     []byte // "sdk-agent" key (KID: "sdk-agent")
 }
@@ -32,7 +30,6 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 	}
 
 	return &AuthManagerTokenService{
-		tokenController:  controllers.NewTokenController(),
 		jwtDefaultSecret: []byte(defaultSecret),
 		jwtSDKSecret:     []byte(sdkSecret),
 	}, nil

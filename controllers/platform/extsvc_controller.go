@@ -13,7 +13,7 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/internal/vault"
-	"github.com/authsec-ai/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"

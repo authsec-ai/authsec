@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
@@ -113,7 +112,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		log.Printf("%s: tenant_id not found in authentication token", logPrefix)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
@@ -958,7 +957,7 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 // UpdateTenant updates an existing tenant
 func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return

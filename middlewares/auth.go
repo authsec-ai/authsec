@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/authsec-ai/auth-manager/pkg/authz"
+	authz "github.com/authsec-ai/authsec/internal/authz"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/models"

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	// authrepo "github.com/authsec-ai/auth-manager/pkg/repo"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
@@ -18,7 +17,7 @@ import (
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
