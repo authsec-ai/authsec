@@ -466,12 +466,12 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 				First(&existing).Error; err == nil {
 				// Update existing mcp_scan tool, stamp new generation.
 				if err := tx.Model(&existing).Updates(map[string]interface{}{
-					"title":               tool.Title,
-					"description":         tool.Description,
-					"input_schema":        tool.InputSchema,
-					"annotations":         tool.Annotations,
+					"title":                tool.Title,
+					"description":          tool.Description,
+					"input_schema":         tool.InputSchema,
+					"annotations":          tool.Annotations,
 					"last_scan_generation": nextGeneration,
-					"inventory_source":    models.InventorySourceMCPScan,
+					"inventory_source":     models.InventorySourceMCPScan,
 				}).Error; err != nil {
 					return fmt.Errorf("update tool %s: %w", tool.Name, err)
 				}
@@ -567,6 +567,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					ToolID:      tool.ID,
 					ScopeID:     scope.ID,
 					AutoMatched: true,
+					Source:      models.ScopeMapSourceSDKSuggested,
 				}
 				tx.Where("tool_id = ? AND scope_id = ?", tool.ID, scope.ID).
 					FirstOrCreate(&mapping)
@@ -597,10 +598,10 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					"last_successful_generation": nextGeneration,
 					"status":                     finalStatus,
 					"state":                      models.RSStateNeedsSetup,
-					"last_scan_status":            "success",
-					"last_scan_error":             nil,
-					"last_scan_completed_at":      &now,
-					"scan_in_progress":            false,
+					"last_scan_status":           "success",
+					"last_scan_error":            nil,
+					"last_scan_completed_at":     &now,
+					"scan_in_progress":           false,
 				})
 			if result.Error != nil {
 				return result.Error
@@ -698,11 +699,11 @@ func (s *ResourceServerService) markScanFailed(rs *models.ResourceServer, genera
 	s.db.Model(rs).
 		Where("id = ? AND scan_generation = ?", rs.ID, generation).
 		Updates(map[string]interface{}{
-			"status":                "degraded",
-			"last_scan_status":      &scanStatus,
-			"last_scan_error":       &reason,
+			"status":                 "degraded",
+			"last_scan_status":       &scanStatus,
+			"last_scan_error":        &reason,
 			"last_scan_completed_at": &now,
-			"scan_in_progress":      false,
+			"scan_in_progress":       false,
 		})
 }
 
@@ -860,12 +861,22 @@ func (e ActivationGateError) Error() string {
 	return fmt.Sprintf("activation blocked: %v", e.Failed)
 }
 
+func policyEffectiveToolQuery(db *gorm.DB, rs *models.ResourceServer) *gorm.DB {
+	return db.Model(&models.MCPTool{}).
+		Where(
+			"resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
+			rs.ID,
+			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
+			rs.LastSuccessfulGeneration,
+		)
+}
+
 // ChecklistStep represents one wizard step's completion state.
 type ChecklistStep struct {
-	Step      int    `json:"step"`
-	Name      string `json:"name"`
-	Complete  bool   `json:"complete"`
-	Detail    string `json:"detail,omitempty"`
+	Step     int    `json:"step"`
+	Name     string `json:"name"`
+	Complete bool   `json:"complete"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 // SetupChecklist returns the step-by-step status for the wizard rail.
@@ -882,7 +893,7 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUI
 
 	// Step 2: Tool inventory — ≥1 tool
 	var toolCount int64
-	s.db.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
+	policyEffectiveToolQuery(s.db, rs).Count(&toolCount)
 	steps = append(steps, ChecklistStep{
 		Step:     2,
 		Name:     "Tool inventory",
@@ -905,13 +916,14 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUI
 	s.db.Raw(`
 		SELECT COUNT(*) FROM mcp_tools mt
 		 WHERE mt.resource_server_id = ?
+		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
 		   AND mt.is_public = false
 		   AND NOT EXISTS (
 			   SELECT 1 FROM mcp_tool_scope_map m
 			    WHERE m.tool_id = mt.id
 			      AND m.source = 'admin_override'
 		   )
-	`, rs.ID).Scan(&unmappedCount)
+	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
 	step4Complete := toolCount > 0 && unmappedCount == 0
 	steps = append(steps, ChecklistStep{
 		Step:     4,
@@ -955,7 +967,7 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 	}
 
 	var tools []models.MCPTool
-	s.db.Where("resource_server_id = ?", rs.ID).Find(&tools)
+	policyEffectiveToolQuery(s.db, rs).Find(&tools)
 
 	var scopes []models.OAuthScope
 	s.db.Where("resource_server_id = ?", rs.ID).Find(&scopes)
@@ -964,7 +976,7 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 	publicTools := 0
 	mappedTools := 0
 	unmappedTools := 0
-	var publicToolNames []string
+	publicToolNames := make([]string, 0)
 
 	for _, t := range tools {
 		if t.IsPublic {
@@ -1004,7 +1016,7 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 	// Default role info
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
-	var viewerScopeStrings []string
+	viewerScopeStrings := make([]string, 0)
 	if s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil {
 		var perms []models.RBACPermission
 		s.db.Joins("JOIN role_permissions rp ON rp.permission_id = permissions.id").
@@ -1022,13 +1034,13 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 			"mapped":   mappedTools,
 			"unmapped": unmappedTools,
 		},
-		"scopes":             scopeInfos,
-		"scope_count":        len(scopes),
-		"default_role":       viewerName,
-		"viewer_scopes":      viewerScopeStrings,
-		"public_tool_names":  publicToolNames,
+		"scopes":                scopeInfos,
+		"scope_count":           len(scopes),
+		"default_role":          viewerName,
+		"viewer_scopes":         viewerScopeStrings,
+		"public_tool_names":     publicToolNames,
 		"first_time_user_grant": viewerScopeStrings,
-		"can_activate":       unmappedTools == 0 && totalTools > 0 && len(scopes) > 0 && len(viewerScopeStrings) > 0,
+		"can_activate":          unmappedTools == 0 && totalTools > 0 && len(scopes) > 0 && len(viewerScopeStrings) > 0,
 	}
 	return preview, nil
 }
@@ -1055,7 +1067,7 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, act
 
 	// Gate 1: ≥1 tool
 	var toolCount int64
-	s.db.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID).Count(&toolCount)
+	policyEffectiveToolQuery(s.db, rs).Count(&toolCount)
 	if toolCount == 0 {
 		failed = append(failed, "step_2_no_tools")
 	}
@@ -1072,13 +1084,14 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, act
 	s.db.Raw(`
 		SELECT COUNT(*) FROM mcp_tools mt
 		 WHERE mt.resource_server_id = ?
+		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
 		   AND mt.is_public = false
 		   AND NOT EXISTS (
 			   SELECT 1 FROM mcp_tool_scope_map m
 			    WHERE m.tool_id = mt.id
 			      AND m.source = 'admin_override'
 		   )
-	`, rs.ID).Scan(&unmappedCount)
+	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
 	if unmappedCount > 0 {
 		failed = append(failed, fmt.Sprintf("step_4_unmapped_tool_count: %d", unmappedCount))
 	}

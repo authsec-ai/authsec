@@ -55,12 +55,19 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 
 	rsUUID := rs.ID
 
-	// Get tools with their scope mappings, filtered to the last successful generation.
-	// This ensures clients see only the latest committed serving snapshot.
+	// Get tools with their scope mappings across policy-effective inventory.
+	// SDK manifest and manual tools are always eligible. MCP scan tools are
+	// only eligible from the last successful generation so partial/in-flight
+	// scans do not leak into admin review or runtime policy.
 	var tools []models.MCPTool
 	config.DB.Preload("Scopes").
-		Where("tenant_id = ? AND resource_server_id = ? AND last_scan_generation = ?",
-			tenantID, rsUUID, rs.LastSuccessfulGeneration).
+		Where(
+			"tenant_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
+			tenantID,
+			rsUUID,
+			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
+			rs.LastSuccessfulGeneration,
+		).
 		Order("name").
 		Find(&tools)
 
@@ -73,19 +80,25 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 
 	for _, tool := range tools {
 		tr := models.MCPToolResponse{
-			ID:          tool.ID.String(),
-			Name:        tool.Name,
-			Title:       tool.Title,
-			Description: tool.Description,
-			InputSchema: tool.InputSchema,
-			Annotations: tool.Annotations,
-			Scopes:      make([]models.ScopeMapEntry, 0), // initialize so JSON marshals as [] not null
+			ID:              tool.ID.String(),
+			Name:            tool.Name,
+			Title:           tool.Title,
+			Description:     tool.Description,
+			InputSchema:     tool.InputSchema,
+			Annotations:     tool.Annotations,
+			InventorySource: tool.InventorySource,
+			IsPublic:        tool.IsPublic,
+			Scopes:          make([]models.ScopeMapEntry, 0), // initialize so JSON marshals as [] not null
 		}
+		adminOverrideScopes := make(map[string]bool)
 
 		for _, scope := range tool.Scopes {
 			// Look up auto_matched from join table
 			var mapping models.MCPToolScopeMap
 			config.DB.Where("tool_id = ? AND scope_id = ?", tool.ID, scope.ID).First(&mapping)
+			if mapping.Source == models.ScopeMapSourceAdminOverride {
+				adminOverrideScopes[scope.ScopeString] = true
+			}
 
 			tr.Scopes = append(tr.Scopes, models.ScopeMapEntry{
 				ScopeID:     scope.ID.String(),
@@ -93,9 +106,17 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 				DisplayName: scope.DisplayName,
 				RiskLevel:   scope.RiskLevel,
 				AutoMatched: mapping.AutoMatched,
+				Source:      mapping.Source,
 			})
 			mappedScopeIDs[scope.ID] = true
 		}
+		pendingSuggestions := make([]string, 0, len(tool.SuggestedScopes))
+		for _, suggestedScope := range tool.SuggestedScopes {
+			if !adminOverrideScopes[suggestedScope] {
+				pendingSuggestions = append(pendingSuggestions, suggestedScope)
+			}
+		}
+		tr.SuggestedScopes = pendingSuggestions
 
 		toolResponses = append(toolResponses, tr)
 	}
@@ -116,15 +137,15 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"resource_server": gin.H{
-			"id":                        rs.ID.String(),
-			"name":                      rs.Name,
-			"url":                       rs.PublicBaseURL,
-			"status":                    rs.Status,
-			"last_scan_status":          rs.LastScanStatus,
-			"scan_generation":           rs.ScanGeneration,
+			"id":                         rs.ID.String(),
+			"name":                       rs.Name,
+			"url":                        rs.PublicBaseURL,
+			"status":                     rs.Status,
+			"last_scan_status":           rs.LastScanStatus,
+			"scan_generation":            rs.ScanGeneration,
 			"last_successful_generation": rs.LastSuccessfulGeneration,
-			"last_scan_started_at":      rs.LastScanStartedAt,
-			"last_scan_completed_at":    rs.LastScanCompletedAt,
+			"last_scan_started_at":       rs.LastScanStartedAt,
+			"last_scan_completed_at":     rs.LastScanCompletedAt,
 		},
 		"tools":           toolResponses,
 		"unmapped_scopes": unmappedScopes,
@@ -539,13 +560,19 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 	// flows never advance last_successful_generation, but the activation
 	// gates still confirm the policy is serveable.
 
-	// Fetch all tools across all inventory sources (mcp_scan, sdk_manifest, manual).
-	// The legacy generation filter is intentionally absent: every tool that
-	// survived activation is policy-effective regardless of which source put it
-	// in the inventory.
+	// Fetch policy-effective tools across inventory sources. SDK manifest and
+	// manual tools are always eligible; MCP scan tools must belong to the last
+	// successful generation so a partial later scan cannot appear in a ready
+	// SDK policy before admin review.
 	var allTools []models.MCPTool
 	config.DB.Preload("Scopes").
-		Where("tenant_id = ? AND resource_server_id = ?", rs.TenantID, rs.ID).
+		Where(
+			"tenant_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
+			rs.TenantID,
+			rs.ID,
+			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
+			rs.LastSuccessfulGeneration,
+		).
 		Find(&allTools)
 
 	// Legacy flat map: tool_name -> [scope_string, ...] (backwards compat)
@@ -731,8 +758,11 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 	//   - any future consumer that filters by last_scan_generation sees the
 	//     manifest-published tools tagged with the current generation.
 	// We do this in a single update so generation and tool tags stay consistent.
-	nextGen := rs.LastSuccessfulGeneration + 1
-	config.DB.Model(rs).Update("last_successful_generation", nextGen)
+	nextGen := max(rs.LastSuccessfulGeneration, rs.ScanGeneration) + 1
+	config.DB.Model(rs).Updates(map[string]interface{}{
+		"scan_generation":            nextGen,
+		"last_successful_generation": nextGen,
+	})
 	config.DB.Model(&models.MCPTool{}).
 		Where("resource_server_id = ? AND inventory_source = ?", rs.ID, models.InventorySourceSDKManifest).
 		Update("last_scan_generation", nextGen)
@@ -1040,9 +1070,9 @@ func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
 		First(&lastSuccess).Error == nil
 
 	c.JSON(http.StatusOK, gin.H{
-		"last_attempt":        maybeAttempt(lastAttemptExists, lastAttempt),
-		"last_success":        maybeAttempt(lastSuccessExists, lastSuccess),
-		"never_seen":          !lastSuccessExists,
+		"last_attempt": maybeAttempt(lastAttemptExists, lastAttempt),
+		"last_success": maybeAttempt(lastSuccessExists, lastSuccess),
+		"never_seen":   !lastSuccessExists,
 	})
 }
 
@@ -1180,16 +1210,16 @@ func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 
 // rsBindingResponse is the per-binding payload for the RolesAccessTab.
 type rsBindingResponse struct {
-	ID         string  `json:"id"`
-	UserID     string  `json:"user_id"`
-	Username   string  `json:"username"`
-	UserEmail  string  `json:"user_email"`
-	RoleID     string  `json:"role_id"`
-	RoleName   string  `json:"role_name"`
-	ScopeType  *string `json:"scope_type"`
-	ScopeID    *string `json:"scope_id"`
-	CreatedAt  string  `json:"created_at"`
-	Source     string  `json:"assignment_source,omitempty"`
+	ID        string  `json:"id"`
+	UserID    string  `json:"user_id"`
+	Username  string  `json:"username"`
+	UserEmail string  `json:"user_email"`
+	RoleID    string  `json:"role_id"`
+	RoleName  string  `json:"role_name"`
+	ScopeType *string `json:"scope_type"`
+	ScopeID   *string `json:"scope_id"`
+	CreatedAt string  `json:"created_at"`
+	Source    string  `json:"assignment_source,omitempty"`
 }
 
 // ListRSBindings returns role_bindings that apply to this RS — either explicit
@@ -1213,16 +1243,16 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
 
 	type row struct {
-		ID         uuid.UUID
-		UserID     *uuid.UUID
-		Username   string
-		UserEmail  string
-		RoleID     uuid.UUID
-		RoleName   string
-		ScopeType  *string
-		ScopeID    *uuid.UUID
-		CreatedAt  time.Time
-		Source     string
+		ID        uuid.UUID
+		UserID    *uuid.UUID
+		Username  string
+		UserEmail string
+		RoleID    uuid.UUID
+		RoleName  string
+		ScopeType *string
+		ScopeID   *uuid.UUID
+		CreatedAt time.Time
+		Source    string
 	}
 	var rows []row
 	err = config.DB.
