@@ -54,6 +54,15 @@ func RequireAll(needs ...Need) gin.HandlerFunc {
 			log.Printf("[AUTHZ RequireAll] Resource list enforcement disabled")
 		}
 
+		// Admin role bypass: admin users have implicit access to all protected resources.
+		// This mirrors the enrichClaimsFromDB behaviour that the old auth-manager applied
+		// before the route reached the authz middleware.
+		if hasRole(claims, "admin") {
+			log.Printf("[AUTHZ RequireAll] SUCCESS: admin role bypass for path %s", c.Request.URL.Path)
+			c.Next()
+			return
+		}
+
 		// All needs must pass (perms or scope fallback)
 		log.Printf("[AUTHZ RequireAll] Checking permissions for all needs")
 		for _, n := range needs {
@@ -113,6 +122,12 @@ func RequireAny(needs ...Need) gin.HandlerFunc {
 			log.Printf("[AUTHZ RequireAny] Resource list enforcement disabled")
 		}
 
+		if hasRole(claims, "admin") {
+			log.Printf("[AUTHZ RequireAny] SUCCESS: admin role bypass for path %s", c.Request.URL.Path)
+			c.Next()
+			return
+		}
+
 		log.Printf("[AUTHZ RequireAny] Checking permissions for at least one need")
 		for _, n := range needs {
 			hasPermCheck := hasPerm(claims, n.Resource, n.Action)
@@ -141,6 +156,24 @@ func denyInsufficientScope(c *gin.Context) {
 		"error":             "insufficient_scope",
 		"error_description": "token is valid but lacks required permissions",
 	})
+}
+
+func hasRole(claims jwt.MapClaims, role string) bool {
+	switch arr := claims["roles"].(type) {
+	case []any:
+		for _, r := range arr {
+			if s, ok := r.(string); ok && s == role {
+				return true
+			}
+		}
+	case []string:
+		for _, r := range arr {
+			if r == role {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasPerm(claims jwt.MapClaims, r, a string) bool {

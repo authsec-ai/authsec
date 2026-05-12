@@ -113,6 +113,9 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		ensureTenantContext(c)
 		ensureUserContextIdentifiers(c)
 
+		// Enrich claims with DB roles when JWT carries none (Hydra tokens don't include RBAC roles)
+		enrichRolesFromDB(c, claims)
+
 		c.Next()
 	}
 }
@@ -722,6 +725,49 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 	c.Set("user_info", userInfo)
 
 	return userID, nil
+}
+
+// enrichRolesFromDB loads the user's RBAC roles from the master DB and injects them into
+// the JWT claims map when the token itself carries no roles. Hydra-issued tokens don't
+// include internal RBAC roles, so this bridges the gap without changing token issuance.
+func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
+	if existing, _ := extractStringSlice(claims["roles"]); len(existing) > 0 {
+		return
+	}
+
+	userIDStr := getContextString(c, "user_id")
+	tenantIDStr := getContextString(c, "tenant_id")
+	if userIDStr == "" || tenantIDStr == "" {
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return
+	}
+	tenantID, err := uuid.Parse(tenantIDStr)
+	if err != nil {
+		return
+	}
+
+	dbConn := config.GetDatabase()
+	if dbConn == nil {
+		return
+	}
+
+	repo := database.NewAdminUserRepository(dbConn)
+	userRoles, err := repo.GetUserRoles(userID, tenantID)
+	if err != nil || len(userRoles) == 0 {
+		return
+	}
+
+	roleNames := make([]string, len(userRoles))
+	for i, r := range userRoles {
+		roleNames[i] = r.Name
+	}
+
+	claims["roles"] = roleNames
+	c.Set("roles", roleNames)
 }
 
 // ensureTenantContext makes sure tenant_id is available even when omitted from JWTs
