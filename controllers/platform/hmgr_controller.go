@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -84,6 +85,27 @@ func (ctrl *HmgrController) StorePKCEVerifierHandler(c *gin.Context) {
 	}
 	storePKCEVerifier(req.State, req.CodeVerifier)
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// ErrorHandler renders OAuth provider errors that Hydra redirects back to hmgr.
+func (ctrl *HmgrController) ErrorHandler(c *gin.Context) {
+	oauthError := html.EscapeString(c.Query("error"))
+	description := html.EscapeString(c.Query("error_description"))
+	if oauthError == "" {
+		oauthError = "oauth_error"
+	}
+	if description == "" {
+		description = "OAuth authorization failed."
+	}
+
+	c.Data(http.StatusBadRequest, "text/html; charset=utf-8", []byte(fmt.Sprintf(`
+		<html>
+		  <body style="font-family: sans-serif; padding: 24px;">
+		    <h2>Authentication Failed</h2>
+		    <p><b>%s</b></p>
+		    <p>%s</p>
+		  </body>
+		</html>`, oauthError, description)))
 }
 
 // GetLoginPageDataHandler handles the login page data request

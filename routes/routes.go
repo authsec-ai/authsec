@@ -41,8 +41,8 @@ import (
 	sdkmgrCtrl "github.com/authsec-ai/authsec/controllers/sdkmgr"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/internal/spire"
+	"github.com/authsec-ai/authsec/middlewares"
 	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -998,6 +998,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
 		pub.POST("/pkce/store", hmgrController.StorePKCEVerifierHandler)
+		pub.GET("/error", hmgrController.ErrorHandler)
 
 		// SAML endpoints
 		pub.POST("/saml/initiate/:provider", hmgrController.InitiateSAMLAuthHandler)

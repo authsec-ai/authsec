@@ -11,6 +11,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	models "github.com/authsec-ai/authsec/models/sdkmgr"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,7 +50,7 @@ func (s *MCPAuthService) HealthCheck() map[string]interface{} {
 // ---------- OAuth Flow ----------
 
 // StartOAuthFlow creates a new session with PKCE and returns the authorization URL.
-func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]interface{}, error) {
+func (s *MCPAuthService) StartOAuthFlow(clientID, appName string, requestedRedirectURI ...string) (map[string]interface{}, error) {
 	candidates := BuildClientIDCandidates(clientID)
 	resolvedClientID := clientID
 	if len(candidates) > 0 {
@@ -85,7 +86,7 @@ func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]in
 	}
 
 	// Build authorization URL.
-	redirectURI := s.resolveRedirectURI(resolvedClientID)
+	redirectURI := s.resolveRedirectURI(resolvedClientID, requestedRedirectURI...)
 
 	params := url.Values{
 		"response_type":         {"code"},
@@ -97,7 +98,11 @@ func (s *MCPAuthService) StartOAuthFlow(clientID, appName string) (map[string]in
 		"code_challenge_method": {"S256"},
 	}
 
-	authURL := cfg.OAuthAuthURL + "?" + params.Encode()
+	authEndpoint := s.resolveAuthEndpoint()
+	if authEndpoint == "" {
+		return nil, fmt.Errorf("OAuth authorization endpoint is not configured")
+	}
+	authURL := authEndpoint + "?" + params.Encode()
 
 	truncatedID := resolvedClientID
 	if len(truncatedID) > 12 {
@@ -328,11 +333,11 @@ func (s *MCPAuthService) CleanupSessions(clientID, appName, reason string) map[s
 		total += s.SessionStore.CleanupClientSessions(cid)
 	}
 	return map[string]interface{}{
-		"status":             "cleaned",
-		"client_id":          clientID,
-		"app_name":           appName,
-		"reason":             reason,
-		"sessions_cleaned":   total,
+		"status":           "cleaned",
+		"client_id":        clientID,
+		"app_name":         appName,
+		"reason":           reason,
+		"sessions_cleaned": total,
 	}
 }
 
@@ -475,7 +480,8 @@ func (s *MCPAuthService) ExecuteOAuthTool(toolName, clientID, appName string, ar
 
 	switch toolName {
 	case "oauth_start":
-		result, err := s.StartOAuthFlow(clientID, appName)
+		requestedRedirectURI := firstStringArg(arguments, "redirect_uri", "callback_url")
+		result, err := s.StartOAuthFlow(clientID, appName, requestedRedirectURI)
 		if err != nil {
 			return wrapError(err.Error())
 		}
@@ -565,16 +571,40 @@ func (s *MCPAuthService) verifyToken(jwtToken string) map[string]interface{} {
 	return claims
 }
 
+// resolveAuthEndpoint determines the OAuth authorization endpoint.
+func (s *MCPAuthService) resolveAuthEndpoint() string {
+	cfg := config.AppConfig
+	if cfg == nil {
+		return ""
+	}
+	if cfg.OAuthAuthURL != "" {
+		return cfg.OAuthAuthURL
+	}
+	if cfg.HydraPublicURL != "" {
+		return strings.TrimRight(cfg.HydraPublicURL, "/") + "/oauth2/auth"
+	}
+	return ""
+}
+
 // resolveRedirectURI determines the OAuth redirect URI for a given client.
-// Priority: OAuthRedirectURITemplate → OAuthRedirectURI → fallback.
-func (s *MCPAuthService) resolveRedirectURI(clientID string) string {
+// Priority: tenant_hydra_clients.redirect_uris when AUTHSEC_REDIRECT_SOURCE=db
+// (default), then OAuthRedirectURITemplate, OAuthRedirectURI, and local fallback.
+func (s *MCPAuthService) resolveRedirectURI(clientID string, requestedRedirectURI ...string) string {
 	cfg := config.AppConfig
 	if cfg == nil {
 		return "http://localhost:3005/oauth/callback"
 	}
 
-	// TODO: Phase 1 enhancement — query tenant_hydra_clients table when
-	// SDKRedirectSource == "db". For now, use env-based resolution.
+	requested := ""
+	if len(requestedRedirectURI) > 0 {
+		requested = strings.TrimSpace(requestedRedirectURI[0])
+	}
+
+	if strings.ToLower(strings.TrimSpace(cfg.SDKRedirectSource)) != "env" {
+		if redirectURI := s.resolveRedirectURIFromDB(clientID, requested); redirectURI != "" {
+			return redirectURI
+		}
+	}
 
 	if cfg.OAuthRedirectURITemplate != "" {
 		return strings.ReplaceAll(cfg.OAuthRedirectURITemplate, "{client_id}", clientID)
@@ -583,6 +613,90 @@ func (s *MCPAuthService) resolveRedirectURI(clientID string) string {
 		return cfg.OAuthRedirectURI
 	}
 	return "http://localhost:3005/oauth/callback"
+}
+
+func (s *MCPAuthService) resolveRedirectURIFromDB(clientID, requested string) string {
+	if config.DB == nil {
+		return ""
+	}
+
+	candidates := BuildClientIDCandidates(clientID)
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	type clientRedirects struct {
+		HydraClientID string         `gorm:"column:hydra_client_id"`
+		RedirectURIs  pq.StringArray `gorm:"column:redirect_uris"`
+	}
+
+	var rows []clientRedirects
+	err := config.DB.Table("tenant_hydra_clients").
+		Select("hydra_client_id, redirect_uris").
+		Where("hydra_client_id IN ? AND is_active = ? AND deleted_at IS NULL", candidates, true).
+		Order("created_at DESC").
+		Find(&rows).Error
+	if err != nil {
+		logrus.WithError(err).WithField("client_id", clientID).Warn("failed to resolve OAuth redirect URI from database")
+		return ""
+	}
+
+	for _, row := range rows {
+		if requested != "" && containsString(row.RedirectURIs, requested) {
+			return requested
+		}
+	}
+
+	for _, candidate := range candidates {
+		for _, row := range rows {
+			if row.HydraClientID != candidate {
+				continue
+			}
+			if redirectURI := firstNonEmptyString(row.RedirectURIs); redirectURI != "" {
+				return redirectURI
+			}
+		}
+	}
+
+	for _, row := range rows {
+		if redirectURI := firstNonEmptyString(row.RedirectURIs); redirectURI != "" {
+			return redirectURI
+		}
+	}
+
+	return ""
+}
+
+func firstStringArg(arguments map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		value, _ := arguments[key].(string)
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func containsString(values pq.StringArray, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmptyString(values pq.StringArray) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // resolveActiveSession finds a usable session: explicit session_id first,
