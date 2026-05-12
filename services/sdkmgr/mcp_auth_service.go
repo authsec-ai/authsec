@@ -1,6 +1,7 @@
 package sdkmgr
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -467,10 +468,9 @@ func (s *MCPAuthService) ProtectTool(sessionID *string, toolName, clientID, appN
 // ExecuteOAuthTool dispatches an oauth_* tool call.
 func (s *MCPAuthService) ExecuteOAuthTool(toolName, clientID, appName string, arguments map[string]interface{}) map[string]interface{} {
 	wrapResult := func(result interface{}) map[string]interface{} {
-		text, _ := json.MarshalIndent(result, "", "  ")
 		return map[string]interface{}{
 			"content": []map[string]interface{}{
-				{"type": "text", "text": string(text)},
+				{"type": "text", "text": marshalMCPToolText(result)},
 			},
 		}
 	}
@@ -552,6 +552,15 @@ func (s *MCPAuthService) ExecuteOAuthTool(toolName, clientID, appName string, ar
 
 // ---------- Internal helpers ----------
 
+func marshalMCPToolText(result interface{}) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(result)
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
 // verifyToken validates the JWT. In-process call replaces the HTTP call
 // the Python sdk-manager made to /authmgr/verifyToken.
 func (s *MCPAuthService) verifyToken(jwtToken string) map[string]interface{} {
@@ -627,7 +636,7 @@ func (s *MCPAuthService) resolveRedirectURIFromDB(clientID, requested string) st
 
 	type clientRedirects struct {
 		HydraClientID string         `gorm:"column:hydra_client_id"`
-		RedirectURIs  pq.StringArray `gorm:"column:redirect_uris"`
+		RedirectURIs  pq.StringArray `gorm:"column:redirect_uris;type:text[]"`
 	}
 
 	var rows []clientRedirects
