@@ -22,6 +22,7 @@ import (
 
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
+	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -930,23 +931,19 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		return
 	}
 
-	// Create tenant database
-	dbName, err := oc.tenantDBService.CreateTenantDatabase(tenantID.String())
-	if err != nil {
-		log.Printf("Failed to create tenant database: %v", err)
-		// Note: Main DB records created, tenant DB failed - may need cleanup
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
-	}
-	log.Printf("Created tenant database: %s", dbName)
-
-	// Update tenant record with database name
+	// tenantDBName is already set on the tenant record above.
+	// Notify mt-plugin to provision the actual database asynchronously.
 	mainDB := config.GetDatabase()
-	if _, err := mainDB.Exec("UPDATE tenants SET tenant_db = $1, updated_at = NOW() WHERE tenant_id = $2", dbName, tenantID); err != nil {
-		log.Printf("Warning: Failed to update tenant_db field: %v", err)
-		// Non-fatal - continue with registration
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: tenantID.String(),
+			Email:    userInfo.Email,
+			DbName:   tenantDBName,
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
+		}
 	} else {
-		log.Printf("Successfully updated tenant record with database name: %s", dbName)
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
 	}
 
 	// Provision PKI infrastructure via ICP service
@@ -1509,14 +1506,19 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant database
-	dbName, err := oc.tenantDBService.CreateTenantDatabase(tenantID.String())
-	if err != nil {
-		log.Printf("Failed to create tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
+	// tenantDBName is already set on the tenant record above.
+	// Notify mt-plugin to provision the actual database asynchronously.
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: tenantID.String(),
+			Email:    input.Email,
+			DbName:   tenantDBName,
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
+		}
+	} else {
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
 	}
-	log.Printf("Created tenant database: %s", dbName)
 
 	// Provision PKI infrastructure via ICP service
 	mainDB := config.GetDatabase()
