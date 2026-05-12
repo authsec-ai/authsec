@@ -352,7 +352,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	_, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
