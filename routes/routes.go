@@ -166,6 +166,10 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize SPIFFE delegate controller: %v", err)
 	}
 
+	// User-facing OAuth/OIDC discovery for MCP clients. Separate from the
+	// SPIRE federation document above — see mcp_oauth_discovery_controller.go.
+	mcpOAuthDiscoveryController := platformCtrl.NewMCPOAuthDiscoveryController(config.GetConfig())
+
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
 	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
 
@@ -202,9 +206,26 @@ func SetupRoutes(
 	{
 		// ────────────────────────────────────────────────────────
 		// Well-known OIDC discovery (formerly spire-headless)
+		// This document is consumed by SPIRE OIDC federation only.
+		// It advertises response_types=id_token and no authorization
+		// endpoint, which is correct for SPIRE but NOT spec-compliant
+		// for user-facing OAuth (MCP clients, etc.) — those use the
+		// /authsec/oauth/.well-known/* endpoints registered below.
 		// ────────────────────────────────────────────────────────
 		authsec.GET("/.well-known/openid-configuration", spiffeDelegateController.OIDCDiscovery)
 		authsec.GET("/.well-known/jwks.json", spiffeDelegateController.GetJWKS)
+
+		// ────────────────────────────────────────────────────────
+		// User-facing OAuth 2.1 / OIDC discovery for MCP clients.
+		// Spec-compliant per modelcontextprotocol.io authorization spec.
+		// Public, no auth — MCP clients fetch these before they have a
+		// token. See controllers/platform/mcp_oauth_discovery_controller.go.
+		// ────────────────────────────────────────────────────────
+		oauthDiscovery := authsec.Group("/oauth")
+		{
+			oauthDiscovery.GET("/.well-known/openid-configuration", mcpOAuthDiscoveryController.Discovery)
+			oauthDiscovery.GET("/.well-known/oauth-authorization-server", mcpOAuthDiscoveryController.Discovery)
+		}
 
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
