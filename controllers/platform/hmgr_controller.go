@@ -25,20 +25,34 @@ import (
 	"gorm.io/datatypes"
 )
 
-// storePKCEVerifier saves a code verifier to the database, keyed by state or login_challenge.
-// Database-backed: survives restarts, works in multi-instance deployments.
-func storePKCEVerifier(key, codeVerifier string) {
+// StorePKCEVerifier saves a code verifier to the database, keyed by state or
+// login_challenge. Database-backed (table mcp_pkce_verifiers): survives restarts
+// and works in multi-instance deployments. TTL: 30 minutes.
+//
+// Exported so other controllers in this package (e.g. oidc_controller) can
+// call it directly during the OAuth authorize step.
+func StorePKCEVerifier(key, codeVerifier string) {
+	log.Printf("[hmgr] PKCE store: key=%q verifier_len=%d", key, len(codeVerifier))
 	v := models.PKCEVerifier{
 		Key:       key,
 		Verifier:  codeVerifier,
-		ExpiresAt: time.Now().Add(8 * time.Minute),
+		ExpiresAt: time.Now().Add(30 * time.Minute),
 	}
-	// Upsert: overwrite if key already exists (e.g., page retry)
+	// Upsert: overwrite if key already exists (e.g. page retry).
 	config.DB.Where("key = ?", key).Assign(v).FirstOrCreate(&v)
 }
 
-// consumePKCEVerifier retrieves and deletes the stored code verifier from the database.
+// peekPKCEVerifier reads the stored code verifier without deleting it.
 // Returns an empty string if not found or expired.
+func peekPKCEVerifier(key string) string {
+	var v models.PKCEVerifier
+	if err := config.DB.Where("key = ? AND expires_at > ?", key, time.Now()).First(&v).Error; err != nil {
+		return ""
+	}
+	return v.Verifier
+}
+
+// consumePKCEVerifier retrieves and deletes the stored code verifier from the database.
 func consumePKCEVerifier(key string) string {
 	var v models.PKCEVerifier
 	if err := config.DB.Where("key = ? AND expires_at > ?", key, time.Now()).First(&v).Error; err != nil {
@@ -94,7 +108,7 @@ func (ctrl *HmgrController) StorePKCEVerifierHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "code_verifier must be at least 43 characters"})
 		return
 	}
-	storePKCEVerifier(req.State, req.CodeVerifier)
+	StorePKCEVerifier(req.State, req.CodeVerifier)
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -540,10 +554,24 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	// Store the PKCE code_verifier by login_challenge so ExchangeTokenHandler can
 	// retrieve it later.
 	if req.CodeVerifier != "" {
-		storePKCEVerifier(req.LoginChallenge, req.CodeVerifier)
+		StorePKCEVerifier(req.LoginChallenge, req.CodeVerifier)
 	}
 
 	loginRequest, err := ctrl.service.GetHydraLoginRequest(req.LoginChallenge)
+	// Copy the PKCE verifier stored by GetAuthURL (keyed by the original state
+	// from request_url) so it is also reachable via login_challenge.  This bridges
+	// the gap where GetAuthURL stores by state but ExchangeTokenHandler looks up
+	// by login_challenge first.
+	if req.CodeVerifier == "" && loginRequest != nil && loginRequest.RequestURL != "" {
+		if parsed, parseErr := url.Parse(loginRequest.RequestURL); parseErr == nil {
+			if origState := parsed.Query().Get("state"); origState != "" {
+				if v := peekPKCEVerifier(origState); v != "" {
+					StorePKCEVerifier(req.LoginChallenge, v)
+					log.Printf("[hmgr] PKCE bridged: state=%q → login_challenge=%q verifier_len=%d", origState, req.LoginChallenge, len(v))
+				}
+			}
+		}
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -1168,16 +1196,27 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 
 	// Retrieve the stored PKCE code_verifier.
 	// Priority order:
-	//   1. Stored by state (GenerateLoginURLHandler path — backend-owned PKCE)
+	//   1. Stored by state from the exchange request
 	//   2. Stored by login_challenge (server-side flows)
-	//   3. Client-supplied in the request body (backward compat while React still owns PKCE)
+	//   3. Stored by the original state from the Hydra request_url (cross-origin fallback)
+	//   4. Client-supplied in the request body
 	codeVerifier := consumePKCEVerifier(req.State)
 	if codeVerifier == "" {
 		codeVerifier = consumePKCEVerifier(req.LoginChallenge)
 	}
 	if codeVerifier == "" {
+		if reqURL := loginRequest.RequestURL; reqURL != "" {
+			if parsed, parseErr := url.Parse(reqURL); parseErr == nil {
+				if origState := parsed.Query().Get("state"); origState != "" && origState != req.State {
+					codeVerifier = consumePKCEVerifier(origState)
+				}
+			}
+		}
+	}
+	if codeVerifier == "" {
 		codeVerifier = req.CodeVerifier
 	}
+	log.Printf("[hmgr] PKCE final: verifier len=%d (state=%q)", len(codeVerifier), req.State)
 
 	ctx := context.Background()
 	tokens, err := ctrl.ExchangeCodeForHydraTokens(ctx, clientID, clientSecret, req.Code, req.RedirectURI, codeVerifier)
@@ -1846,7 +1885,7 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 	// The state value will be echoed back in the exchange-token request, allowing
 	// retrieval at token exchange time without ever exposing the verifier to the client.
 	if req.State != "" {
-		storePKCEVerifier(req.State, codeVerifier)
+		StorePKCEVerifier(req.State, codeVerifier)
 	}
 
 	hydraAuthURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"

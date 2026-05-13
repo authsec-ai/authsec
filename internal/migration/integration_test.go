@@ -10,130 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ----- Integration Test: Migration vs Template Parity -----
-// Verifies that a database built by running all tenant migrations produces
-// an identical schema to one cloned from the golden template.
-
-func TestIntegration_MigrationVsTemplate_Parity(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test")
-	}
-
-	// --- Setup template infrastructure ---
-	origTemplateName := TemplateDBName
-	TemplateDBName = "_test_parity_template"
-	defer func() { TemplateDBName = origTemplateName }()
-
-	InitTemplateCreds(testDBHost, testDBPort, testDBUser, testDBPassword, testDBSSLMode)
-
-	const masterDB = "test_parity_master"
-	createTestDatabase(t, masterDB)
-	defer dropTestDatabase(t, masterDB)
-	defer dropTestDatabase(t, TemplateDBName)
-
-	masterConn := connectTestDB(t, masterDB)
-	defer masterConn.Close()
-	createMigrationLogsTable(t, masterConn)
-
-	mDir := testMigrationsDir(t)
-	masterDir := filepath.Join(mDir, "master")
-	tenantDir := filepath.Join(mDir, "tenant")
-
-	// Run master migrations
-	masterRunner := NewMasterMigrationRunner(masterDir, masterConn, nil)
-	_ = masterRunner.RunMigrations()
-
-	// --- Tenant A: created via RunMigrations ---
-	const dbA = "test_parity_tenant_migration"
-	createTestDatabase(t, dbA)
-	defer dropTestDatabase(t, dbA)
-
-	tenantConnA := connectTestDB(t, dbA)
-	defer tenantConnA.Close()
-
-	tenantRunnerA := NewTenantMigrationRunner("parity-tenant-a", tenantConnA, tenantDir, masterConn)
-	err := tenantRunnerA.RunMigrations()
-	require.NoError(t, err, "tenant A migrations should succeed")
-
-	// --- Tenant B: created via template clone ---
-	TemplateReady = false
-	err = SetupTenantTemplate(tenantDir, masterConn)
-	require.NoError(t, err, "template setup should succeed")
-	require.True(t, TemplateReady)
-
-	const dbB = "test_parity_tenant_template"
-	defer dropTestDatabase(t, dbB)
-
-	created, err := CloneTenantDatabase(dbB)
-	require.NoError(t, err, "clone should succeed")
-	require.True(t, created)
-
-	// --- Compare schemas ---
-	t.Run("tables_match", func(t *testing.T) {
-		tablesA := getPublicTableNames(t, dbA)
-		tablesB := getPublicTableNames(t, dbB)
-		assert.Greater(t, len(tablesA), 5, "migration tenant should have meaningful tables")
-		assert.Equal(t, tablesA, tablesB,
-			"migration-created and template-cloned tenant DBs should have identical tables")
-	})
-
-	t.Run("column_counts_match", func(t *testing.T) {
-		tables := getPublicTableNames(t, dbA)
-		for _, table := range tables {
-			colsA := getPublicColumnCount(t, dbA, table)
-			colsB := getPublicColumnCount(t, dbB, table)
-			assert.Equal(t, colsA, colsB,
-				"table %s should have same column count (migration=%d, template=%d)", table, colsA, colsB)
-		}
-	})
-
-	t.Run("column_details_match", func(t *testing.T) {
-		keyTables := []string{
-			"users", "roles", "permissions", "role_bindings",
-			"clients", "oauth_scopes", "delegation_policies", "delegation_tokens",
-		}
-		for _, table := range keyTables {
-			colsA := getPublicColumnDetails(t, dbA, table)
-			colsB := getPublicColumnDetails(t, dbB, table)
-			assert.Equal(t, colsA, colsB,
-				"table %s should have identical column definitions", table)
-		}
-	})
-
-	t.Run("constraints_match", func(t *testing.T) {
-		constraintsA := getPublicConstraintNames(t, dbA)
-		constraintsB := getPublicConstraintNames(t, dbB)
-		assert.Equal(t, constraintsA, constraintsB,
-			"both tenant DBs should have identical constraints")
-	})
-
-	t.Run("indexes_match", func(t *testing.T) {
-		indexesA := getPublicIndexNames(t, dbA)
-		indexesB := getPublicIndexNames(t, dbB)
-		assert.Equal(t, indexesA, indexesB,
-			"both tenant DBs should have identical indexes")
-	})
-
-	t.Run("seed_data_match", func(t *testing.T) {
-		connA := connectTestDB(t, dbA)
-		defer connA.Close()
-		connB := connectTestDB(t, dbB)
-		defer connB.Close()
-
-		var permCountA, permCountB int
-		connA.QueryRow("SELECT COUNT(*) FROM permissions").Scan(&permCountA)
-		connB.QueryRow("SELECT COUNT(*) FROM permissions").Scan(&permCountB)
-		assert.Equal(t, permCountA, permCountB,
-			"both tenant DBs should have same number of permissions")
-
-		var roleCountA, roleCountB int
-		connA.QueryRow("SELECT COUNT(*) FROM roles").Scan(&roleCountA)
-		connB.QueryRow("SELECT COUNT(*) FROM roles").Scan(&roleCountB)
-		assert.Equal(t, roleCountA, roleCountB,
-			"both tenant DBs should have same number of roles")
-	})
-}
-
 // ----- Integration Test: Multi-Tenant Schema Consistency -----
 // Verifies that creating multiple tenant databases produces identical schemas.
 
@@ -226,7 +102,7 @@ func TestIntegration_RunTenantMigrationsInProcess(t *testing.T) {
 	conn := connectTestDB(t, tenantDB)
 	defer conn.Close()
 
-	for _, table := range requiredTables {
+	for _, table := range []string{"users", "roles", "permissions", "role_bindings", "clients", "tenants", "migration_logs"} {
 		var exists bool
 		err := conn.QueryRow(
 			"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1)",

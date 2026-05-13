@@ -16,10 +16,11 @@ import (
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/middlewares"
+	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -187,6 +188,21 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		}
 		if count > 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant domain already exists"})
+			return
+		}
+	}
+
+	// Single-tenant guard: block a second admin when mt-plugin is not available.
+	// When mt-plugin is available it will provision a separate tenant DB, so
+	// multiple admins are allowed.
+	if config.MTPluginClient == nil || !config.MTPluginClient.IsAvailable() {
+		db := config.GetDatabase()
+		var tenantCount int
+		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "Single-tenant mode: only one admin is allowed. " +
+					"Deploy the mt-plugin service and set MT_PLUGIN_GRPC_ADDR to enable multi-tenant registration.",
+			})
 			return
 		}
 	}
@@ -484,22 +500,18 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// --- Post-commit operations (non-blocking) ---
 	// Global state is committed. Failures below are logged as warnings and don't block registration.
 
-	// Create tenant database and run migrations
-	log.Printf("Creating tenant database for: %s", tenant.TenantID.String())
-	dbName := tenantDBName
-	tenantDBReady := false
-
-	if uc.tenantDBService == nil {
-		log.Printf("Warning: Tenant database service not initialized")
-	} else {
-		var dbErr error
-		dbName, dbErr = uc.tenantDBService.CreateTenantDatabase(tenant.TenantID.String())
-		if dbErr != nil {
-			log.Printf("Warning: Failed to create tenant database: %v", dbErr)
-		} else {
-			tenantDBReady = true
-			log.Printf("Successfully created tenant database: %s", dbName)
+	// Notify mt-plugin to provision the tenant database asynchronously.
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: tenant.TenantID.String(),
+			Email:    user.Email,
+			DbName:   tenantDBName,
+			ClientId: pendingReg.TenantID.String(),
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin: %v", err)
 		}
+	} else {
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for: %s", tenant.TenantID.String())
 	}
 
 	// Provision PKI infrastructure via ICP service
@@ -527,38 +539,11 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		}
 	}
 
-	// Seed tenant database (only if DB + migrations succeeded)
-	if tenantDBReady {
-		if err := uc.createTenantRecordInTenantDB(dbName, tenant.Tenant); err != nil {
-			log.Printf("Warning: Failed to create tenant record in tenant database %s: %v", dbName, err)
-		} else {
-			log.Printf("Successfully created tenant record in tenant database %s", dbName)
-		}
-
-		if err := uc.createUserInTenantDB(dbName, user, tenant.TenantID); err != nil {
-			log.Printf("Warning: Failed to create user in tenant database %s: %v", dbName, err)
-		} else {
-			log.Printf("Successfully created user %s in tenant database %s", user.Email, dbName)
-		}
-
-		if err := uc.assignAdminRoleToUser(dbName, user.ID, tenant.TenantID); err != nil {
-			log.Printf("Warning: Failed to assign admin role to user %s: %v", user.Email, err)
-		} else {
-			log.Printf("Successfully assigned admin role to user: %s", user.Email)
-		}
-
-		if err := uc.createDefaultClientAndAssociations(dbName, tenant.TenantID, pendingReg.TenantID, user.ID, user.ProjectID); err != nil {
-			log.Printf("Warning: Failed to create default client for user %s: %v", user.Email, err)
-		} else {
-			log.Printf("Successfully created default client for user: %s", user.Email)
-		}
-	}
-
 	// Save secret to Vault and register with Hydra
 	secretID, err := config.SaveSecretToVault(tenant.TenantID.String(), pendingReg.ProjectID.String(), pendingReg.TenantID.String())
 	if err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
-		log.Printf("User registration will continue without Vault secret storage for tenant: %s", dbName)
+		log.Printf("User registration will continue without Vault secret storage for tenant: %s", tenantDBName)
 		// Don't block user registration - they can still use the system without Vault integration
 		secretID = "" // Clear secretID so we don't attempt Hydra registration
 	}
@@ -567,11 +552,11 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	if secretID != "" {
 		if err := services.RegisterClientWithHydra(pendingReg.TenantID.String(), secretID, pendingReg.Email, pendingReg.TenantID.String(), pendingReg.TenantDomain); err != nil {
 			log.Printf("Warning: Failed to register client with Hydra: %v", err)
-			log.Printf("User registration will continue without Hydra client registration for tenant: %s", dbName)
+			log.Printf("User registration will continue without Hydra client registration for tenant: %s", tenantDBName)
 			// Don't block user registration - they can still use the system without OAuth integration
 		}
 	} else {
-		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", dbName)
+		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantDBName)
 	}
 
 	// Add dummy AuthSec provider for the client
@@ -581,7 +566,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	}
 	if err := services.AddProviderToClient(pendingReg.TenantID.String(), pendingReg.TenantID.String(), pendingReg.TenantDomain, createdBy); err != nil {
 		log.Printf("Warning: Failed to add provider to client: %v", err)
-		log.Printf("User registration will continue without provider setup for tenant: %s", dbName)
+		log.Printf("User registration will continue without provider setup for tenant: %s", tenantDBName)
 		// Don't block user registration - they can still use the system without provider integration
 	}
 

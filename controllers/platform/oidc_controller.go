@@ -1,7 +1,6 @@
 package platform
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,24 +12,22 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 
-	// authrepo "github.com/authsec-ai/auth-manager/pkg/repo"
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
+	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
+"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
 
@@ -55,95 +52,43 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 		return "", errors.New("admin user is required")
 	}
 
-	defaultSecret := os.Getenv("JWT_DEF_SECRET")
-	if defaultSecret == "" {
-		panic("CRITICAL: JWT_DEF_SECRET environment variable is not set. Cannot generate secure tokens.")
+	// Determine project_id for token
+	var projectID uuid.UUID
+	if adminUser.ProjectID != nil && *adminUser.ProjectID != uuid.Nil {
+		projectID = *adminUser.ProjectID
+	} else {
+		projectID = uuid.Nil
 	}
 
-	expectedIssuer := os.Getenv("AUTH_EXPECT_ISS")
-	if expectedIssuer == "" {
-		expectedIssuer = "authsec-ai/auth-manager"
+	// Fetch admin roles from database
+	var roles []string
+	if adminUser.TenantID != nil && *adminUser.TenantID != uuid.Nil {
+		rolesFromDB, err := oc.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.TenantID)
+		if err == nil {
+			roles = rolesFromDB
+		} else {
+			log.Printf("Warning: Failed to fetch admin roles for user %s: %v", adminUser.ID, err)
+		}
 	}
 
-	expectedAudience := os.Getenv("AUTH_EXPECT_AUD")
-	if expectedAudience == "" {
-		expectedAudience = "authsec-api"
-	}
-
-	roles, scopes, resources, dbPerms, err := oc.adminUserRepo.GetAdminUserAccessContext(adminUser.ID)
-	if err != nil {
-		log.Printf("WARN: failed to load admin RBAC context for user %s: %v", adminUser.ID.String(), err)
-	}
 	if len(roles) == 0 {
 		roles = []string{"admin"}
 	}
-	if scopes == nil {
-		scopes = []string{}
-	}
-	if resources == nil {
-		resources = []string{}
-	}
 
-	// Start with permissions from DB
-	perms := make([]string, 0)
-	if dbPerms != nil {
-		perms = append(perms, dbPerms...)
-	}
-
-	// Add permissions derived from scopes (if any)
-	// scopePerms := authrepo.FromScopes(scopes)
-	// if len(scopePerms) > 0 {
-	// 	perms = append(perms, scopePerms...)
-	// }
-
-	scopeString := strings.Join(scopes, " ")
-	if len(perms) > 0 {
-		scopeString += " " + strings.Join(perms, " ")
-	}
-	now := time.Now()
-
-	var tenantID string
-	if adminUser.TenantID != nil && *adminUser.TenantID != uuid.Nil {
-		tenantID = adminUser.TenantID.String()
-	} else {
-		// Fallback for global admins without a specific tenant ID
-		tenantID = "admin"
-	}
-
-	// Ultra-minimal token: identity only
-	// Auth-manager fetches roles/permissions from DB via GetAuthz() on every request
-	claims := jwt.MapClaims{
-		"sub":       adminUser.ID.String(),
-		"email":     adminUser.Email,
-		"tenant_id": tenantID,
-		"aud":       expectedAudience,
-		"iss":       expectedIssuer,
-		"iat":       now.Unix(),
-		"exp":       now.Add(24 * time.Hour).Unix(),
-	}
-
-	// project_id is required for auth-manager GetAuthz() - default to tenant_id
-	if adminUser.ProjectID != nil && *adminUser.ProjectID != uuid.Nil {
-		claims["project_id"] = adminUser.ProjectID.String()
-	} else {
-		claims["project_id"] = tenantID // Default project_id to tenant_id for GetAuthz()
-	}
-	// client_id is optional but useful for context
-	if adminUser.ClientID != nil && *adminUser.ClientID != uuid.Nil {
-		claims["client_id"] = adminUser.ClientID.String()
-	} else {
-		claims["client_id"] = tenantID // Default client_id to tenant_id
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	token.Header["kid"] = "default"
-
-	tokenString, err := token.SignedString([]byte(defaultSecret))
+	// Use centralized token service — same as email/password login path
+	token, err := config.TokenService.GenerateAdminToken(
+		adminUser.ID,
+		adminUser.Email,
+		projectID,
+		adminUser.TenantID,
+		adminUser.TenantDomain,
+		roles,
+	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to generate admin token: %w", err)
 	}
 
-	return tokenString, nil
+	return token, nil
 }
 
 // OIDCController handles OIDC authentication flows
@@ -411,31 +356,8 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 	h := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
 
-	// Register verifier with the in-process PKCE store (hmgr is merged — no HTTP call needed)
-	pkcePayload, _ := json.Marshal(map[string]string{
-		"state":         freshState,
-		"code_verifier": codeVerifier,
-	})
-	hydraServiceURL := os.Getenv("HYDRA_SERVICE_URL")
-	if hydraServiceURL == "" {
-		hydraServiceURL = "http://localhost:7468/authsec"
-	}
-	pkceResp, pkceErr := http.Post(
-		hydraServiceURL+"/hmgr/pkce/store",
-		"application/json",
-		bytes.NewReader(pkcePayload),
-	)
-	if pkceErr != nil {
-		log.Printf("ERROR: Failed to store PKCE verifier: %v", pkceErr)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
-		return
-	}
-	pkceResp.Body.Close()
-	if pkceResp.StatusCode >= 300 {
-		log.Printf("ERROR: PKCE store returned %d", pkceResp.StatusCode)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to register PKCE verifier"})
-		return
-	}
+	// Store verifier in the in-process PKCE store (hmgr is merged into the same binary).
+	StorePKCEVerifier(freshState, codeVerifier)
 
 	params := url.Values{}
 	params.Add("client_id", oauthClientID)
@@ -1009,23 +931,19 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		return
 	}
 
-	// Create tenant database
-	dbName, err := oc.tenantDBService.CreateTenantDatabase(tenantID.String())
-	if err != nil {
-		log.Printf("Failed to create tenant database: %v", err)
-		// Note: Main DB records created, tenant DB failed - may need cleanup
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
-	}
-	log.Printf("Created tenant database: %s", dbName)
-
-	// Update tenant record with database name
+	// tenantDBName is already set on the tenant record above.
+	// Notify mt-plugin to provision the actual database asynchronously.
 	mainDB := config.GetDatabase()
-	if _, err := mainDB.Exec("UPDATE tenants SET tenant_db = $1, updated_at = NOW() WHERE tenant_id = $2", dbName, tenantID); err != nil {
-		log.Printf("Warning: Failed to update tenant_db field: %v", err)
-		// Non-fatal - continue with registration
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: tenantID.String(),
+			Email:    userInfo.Email,
+			DbName:   tenantDBName,
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
+		}
 	} else {
-		log.Printf("Successfully updated tenant record with database name: %s", dbName)
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
 	}
 
 	// Provision PKI infrastructure via ICP service
@@ -1075,11 +993,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	// Create default client in tenant DB with Hydra client ID
 	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
 	clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())`
+		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
-		log.Printf("Failed to create default client in tenant DB: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default client"})
-		return
+		log.Printf("Warning: Failed to create default client in tenant DB: %v", err)
+		// Non-fatal - continue to set up Vault/Hydra
 	}
 	log.Printf("Created default client in tenant DB: %s", clientID)
 	// Seed default groups and assign roles+groups to client (matches custom registration flow)
@@ -1099,19 +1017,18 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
 			updated_at = NOW()`
 	if _, err := tenantDB.Exec(tenantInsert, tenantID, userInfo.Email, "", userInfo.Name, state.ProviderName, fullDomain, tenantDBName); err != nil {
-		log.Printf("Failed to upsert tenant record in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant record in tenant database"})
-		return
+		log.Printf("Warning: Failed to upsert tenant record in tenant database: %v", err)
+		// Non-fatal - continue to set up Vault/Hydra
 	}
 	log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
 
 	// Create default project in tenant database (project was already created in global database)
 	projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
+		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
-		log.Printf("Failed to create default project in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default project in tenant database"})
-		return
+		log.Printf("Warning: Failed to create default project in tenant database: %v", err)
+		// Non-fatal - continue to set up Vault/Hydra
 	}
 	log.Printf("Created default project in tenant DB: %s", projectID)
 
@@ -1121,9 +1038,8 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (client_id) DO NOTHING`
 	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
-		log.Printf("Failed to create tenant mapping: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant mapping"})
-		return
+		log.Printf("Warning: Failed to create tenant mapping: %v", err)
+		// Non-fatal - continue to set up Vault/Hydra
 	}
 	log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", tenantID.String(), clientID.String())
 
@@ -1156,7 +1072,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Create user in tenant database
-	if err := oc.createUserInTenantDB(tenantID, userID, clientID, fullDomain, state.ProviderName, userInfo); err != nil {
+	if err := oc.createUserInTenantDB(tenantID, userID, clientID, projectID, fullDomain, state.ProviderName, userInfo); err != nil {
 		log.Printf("Failed to create user in tenant DB: %v", err)
 		// Non-fatal for registration response
 	}
@@ -1176,6 +1092,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			log.Printf("Warning: Failed to register client with Hydra: %v", err)
 			log.Printf("OIDC registration will continue without Hydra client registration for tenant: %s", tenantID.String())
 			// Don't block OIDC registration - they can still use the system without OAuth integration
+		} else {
+			// Add default AuthSec OIDC provider so the tenant login page has an auth method
+			if err := services.AddProviderToClient(tenantID.String(), tenantID.String(), fullDomain, userInfo.Email); err != nil {
+				log.Printf("Warning: Failed to add AuthSec provider to client for tenant %s: %v", tenantID.String(), err)
+			}
 		}
 	} else {
 		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
@@ -1584,14 +1505,19 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant database
-	dbName, err := oc.tenantDBService.CreateTenantDatabase(tenantID.String())
-	if err != nil {
-		log.Printf("Failed to create tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant database"})
-		return
+	// tenantDBName is already set on the tenant record above.
+	// Notify mt-plugin to provision the actual database asynchronously.
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
+			TenantId: tenantID.String(),
+			Email:    input.Email,
+			DbName:   tenantDBName,
+		}); err != nil {
+			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
+		}
+	} else {
+		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
 	}
-	log.Printf("Created tenant database: %s", dbName)
 
 	// Provision PKI infrastructure via ICP service
 	mainDB := config.GetDatabase()
@@ -1640,15 +1566,16 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	defer tenantDB.Close()
 
 	// Create default client in tenant DB with Hydra client ID
+	// Non-fatal: Vault/Hydra registration must proceed even if tenant DB setup fails
 	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
 	clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())`
+		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
-		log.Printf("Failed to create default client in tenant DB: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default client"})
-		return
+		log.Printf("Warning: Failed to create default client in tenant DB: %v", err)
+	} else {
+		log.Printf("Created default client in tenant DB: %s", clientID)
 	}
-	log.Printf("Created default client in tenant DB: %s", clientID)
 	// Seed default groups and assign roles+groups to client (matches custom registration flow)
 	if err := oc.seedDefaultGroupsInTenantDB(tenantDB, tenantID); err != nil {
 		log.Printf("Warning: Failed to seed default groups in tenant DB: %v", err)
@@ -1666,21 +1593,20 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
 			updated_at = NOW()`
 	if _, err := tenantDB.Exec(tenantInsert, tenantID, input.Email, "", input.Name, input.Provider, fullDomain, tenantDBName); err != nil {
-		log.Printf("Failed to upsert tenant record in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant record in tenant database"})
-		return
+		log.Printf("Warning: Failed to upsert tenant record in tenant database: %v", err)
+	} else {
+		log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
 	}
-	log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
 
 	// Create default project in tenant database (project was already created in global database)
 	projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
+		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
-		log.Printf("Failed to create default project in tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create default project in tenant database"})
-		return
+		log.Printf("Warning: Failed to create default project in tenant database: %v", err)
+	} else {
+		log.Printf("Created default project in tenant DB: %s", projectID)
 	}
-	log.Printf("Created default project in tenant DB: %s", projectID)
 
 	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
 	globalDB := config.GetDatabase()
@@ -1688,16 +1614,14 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (client_id) DO NOTHING`
 	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
-		log.Printf("Failed to create tenant mapping: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant mapping"})
-		return
+		log.Printf("Warning: Failed to create tenant mapping: %v", err)
+	} else {
+		log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", tenantID.String(), clientID.String())
 	}
-	log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", tenantID.String(), clientID.String())
 
 	// Assign admin role to the created user in the tenant database
 	if err := oc.assignAdminRoleToUser(tenantDB, userID, tenantID); err != nil {
 		log.Printf("Warning: Failed to assign admin role to user %s in tenant DB: %v", input.Email, err)
-		// Non-fatal - continue with registration
 	} else {
 		log.Printf("Successfully assigned admin role to user in tenant DB: %s", input.Email)
 	}
@@ -1731,17 +1655,16 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	if len(strings.SplitN(input.Name, " ", 2)) > 1 {
 		userInfo.FamilyName = strings.SplitN(input.Name, " ", 2)[1]
 	}
-	if err := oc.createUserInTenantDB(tenantID, userID, clientID, fullDomain, input.Provider, userInfo); err != nil {
+	if err := oc.createUserInTenantDB(tenantID, userID, clientID, projectID, fullDomain, input.Provider, userInfo); err != nil {
 		log.Printf("Failed to create user in tenant DB: %v", err)
 	}
 
-	// Save secret to Vault and register with Hydra
+	// Save secret to Vault and register with Hydra — always runs regardless of tenant DB setup success
 	secretID, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String())
 	if err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
 		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
-		// Don't block OIDC registration - they can still use the system without Vault integration
-		secretID = "" // Clear secretID so we don't attempt Hydra registration
+		secretID = ""
 	}
 
 	// Register client with Hydra only when we have a secret to use
@@ -1749,7 +1672,11 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		if err := services.RegisterClientWithHydra(clientID.String(), secretID, input.Email, tenantID.String(), fullDomain); err != nil {
 			log.Printf("Warning: Failed to register client with Hydra: %v", err)
 			log.Printf("OIDC registration will continue without Hydra client registration for tenant: %s", tenantID.String())
-			// Don't block OIDC registration - they can still use the system without OAuth integration
+		} else {
+			// Add default AuthSec OIDC provider so the tenant login page has an auth method
+			if err := services.AddProviderToClient(tenantID.String(), tenantID.String(), fullDomain, input.Email); err != nil {
+				log.Printf("Warning: Failed to add AuthSec provider to client for tenant %s: %v", tenantID.String(), err)
+			}
 		}
 	} else {
 		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
@@ -1767,7 +1694,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 }
 
 // createUserInTenantDB creates the user record in the tenant's database
-func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID uuid.UUID, tenantDomain, provider string, userInfo *models.OIDCUserInfo) error {
+func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID, projectID uuid.UUID, tenantDomain, provider string, userInfo *models.OIDCUserInfo) error {
 	// Get tenant database connection
 	tenantIDStr := tenantID.String()
 	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
@@ -1775,10 +1702,10 @@ func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID uuid.U
 		return fmt.Errorf("failed to get tenant DB connection: %w", err)
 	}
 
-	// Create user in tenant DB - schema has: name (not first_name/last_name), active (not is_active)
+	// Create user in tenant DB
 	query := `
-		INSERT INTO users (id, email, name, tenant_id, client_id, tenant_domain, provider, provider_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
+		INSERT INTO users (id, email, name, tenant_id, client_id, project_id, tenant_domain, provider, provider_id, active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11)
 		ON CONFLICT (id) DO NOTHING
 	`
 
@@ -1792,7 +1719,7 @@ func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID uuid.U
 	}
 
 	now := time.Now()
-	result := tenantDB.Exec(query, userID, userInfo.Email, name, tenantID, clientID, tenantDomain, provider, userInfo.Sub, now, now)
+	result := tenantDB.Exec(query, userID, userInfo.Email, name, tenantID, clientID, projectID, tenantDomain, provider, userInfo.Sub, now, now)
 	return result.Error
 }
 

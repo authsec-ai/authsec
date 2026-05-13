@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -105,10 +104,6 @@ func TestMain(m *testing.M) {
 		log.Printf("Warning: master migrations encountered errors: %v", err)
 	}
 
-	// Initialize auth-manager config
-	authManagerConfig.LoadConfig()
-	authManagerConfig.SetDB(config.DB)
-	authManagerConfig.InitTenantDBResolver(config.DB, nil)
 
 	// Initialize token service
 	tokenService, err := services.NewAuthManagerTokenService()

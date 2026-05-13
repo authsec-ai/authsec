@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	hydra "github.com/ory/hydra-client-go/v2"

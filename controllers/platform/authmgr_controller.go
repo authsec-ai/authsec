@@ -26,7 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
 	"github.com/authsec-ai/authsec/services"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -43,11 +43,11 @@ type AuthmgrController struct {
 	rbacRepo authmgrrepo.RBACRepository
 }
 
-// NewAuthmgrController creates an AuthmgrController wired to authsec's tenant DB.
+// NewAuthmgrController creates an AuthmgrController wired to authsec's master DB.
 func NewAuthmgrController() *AuthmgrController {
 	return &AuthmgrController{
 		rbacRepo: authmgrrepo.NewRBACRepository(func(tenantID string) (*gorm.DB, error) {
-			return config.GetTenantGORMDB(tenantID)
+			return config.DB, nil
 		}),
 	}
 }
@@ -175,12 +175,7 @@ func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email s
 		log.Printf("[authmgr GetAuthz] primary DB miss for %s/%s, trying tenant DB: %v", tenantID, email, err)
 	}
 
-	// Fall back to tenant DB
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve tenant db: %w", err)
-	}
-	return authmgrLoadAuthzFromDB(ctx, tenantDB, tid, tenantID, projectID, clientID, email)
+	return authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, projectID, clientID, email)
 }
 
 func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
@@ -282,13 +277,8 @@ func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (st
 		}
 	}
 
-	// Fall back to tenant DB
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		return "", "", fmt.Errorf("tenant db: %w", err)
-	}
 	var user sharedmodels.User
-	if err := tenantDB.WithContext(ctx).
+	if err := config.DB.WithContext(ctx).
 		Select("client_id", "project_id").
 		Where("tenant_id = ? AND email = ?", tid, email).
 		First(&user).Error; err != nil {
@@ -885,11 +875,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant db unavailable", "details": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var created []sharedmodels.Group
 	for _, name := range req.Groups {
@@ -922,11 +908,7 @@ func (ac *AuthmgrController) ListGroups(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var groups []sharedmodels.Group
 	if err := db.Where("tenant_id = ? OR tenant_id IS NULL", tid).Find(&groups).Error; err != nil {
@@ -956,11 +938,7 @@ func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", uint(groupID), tid).First(&group).Error; err != nil {
@@ -994,11 +972,7 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
@@ -1038,11 +1012,7 @@ func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
@@ -1079,11 +1049,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
@@ -1137,11 +1103,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
@@ -1192,11 +1154,7 @@ func (ac *AuthmgrController) ListGroupUsers(c *gin.Context) {
 		return
 	}
 
-	db, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	db := config.DB
 
 	var group sharedmodels.Group
 	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).Preload("Users").First(&group).Error; err != nil {

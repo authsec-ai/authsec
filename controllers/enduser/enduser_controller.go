@@ -10,14 +10,13 @@ import (
 	"strings"
 	"time"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	hydra "github.com/ory/hydra-client-go/v2"
@@ -183,7 +182,7 @@ type GetEndUsersFilter struct {
 }
 
 func (euc *EndUserController) GetEndUser(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -436,7 +435,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/databases [get]
 func (euc *EndUserController) GetTenantDatabases(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
@@ -492,7 +491,7 @@ func (euc *EndUserController) GetTenantDatabases(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id}/status [put]
 func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -572,7 +571,7 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [put]
 func (euc *EndUserController) UpdateUser(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -690,7 +689,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 
 	if !ok {
 
@@ -2681,7 +2680,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/clients [get]
 func (euc *EndUserController) GetClients(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
@@ -2925,7 +2924,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 // @Router /authsec/uflow/clientms/tenants/{tenant_id}/clients/getClients [post]
 func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 	// Get tenant_id from token
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -3054,7 +3053,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 	}
 
 	// Extract tenant ID from JWT context
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return

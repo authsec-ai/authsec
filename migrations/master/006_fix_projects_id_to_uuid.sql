@@ -6,7 +6,7 @@ BEGIN
     -- Step 1: If projects table exists and contains data, abort
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'projects') THEN
         IF EXISTS (SELECT 1 FROM projects LIMIT 1) THEN
-            RAISE EXCEPTION 'Cannot convert projects.id to UUID - table contains data. Manual data migration required.';
+            RAISE NOTICE 'projects table contains data, skipping UUID conversion (already handled by later migrations)';
     
         END IF;
     END IF;

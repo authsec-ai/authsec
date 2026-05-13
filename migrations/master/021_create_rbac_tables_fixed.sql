@@ -162,27 +162,31 @@ INSERT INTO scopes (name, description, tenant_id)
 SELECT 'admin', 'Administrative access', NULL
 WHERE NOT EXISTS (SELECT 1 FROM scopes WHERE name = 'admin' AND tenant_id IS NULL);
 
--- Insert default permissions (admin role gets all permissions)
-INSERT INTO permissions (role_id, scope_id, resource, action)
-SELECT r.id, s.id, 'all', 'all'
-FROM roles r
-CROSS JOIN scopes s
-WHERE r.name = 'admin' AND r.tenant_id IS NULL
-ON CONFLICT DO NOTHING;
+-- Insert default permissions only when old-style schema (role_id column) still present.
+-- Migration 054 drops and recreates permissions with a tenant-scoped schema; after that
+-- these inserts are irrelevant and must not run.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'permissions' AND column_name = 'role_id'
+    ) THEN
+        INSERT INTO permissions (role_id, scope_id, resource, action)
+        SELECT r.id, s.id, 'all', 'all'
+        FROM roles r CROSS JOIN scopes s
+        WHERE r.name = 'admin' AND r.tenant_id IS NULL
+        ON CONFLICT DO NOTHING;
 
--- Insert permissions for user role (read/write on users and projects)
-INSERT INTO permissions (role_id, scope_id, resource, action)
-SELECT r.id, s.id, 'users', 'read'
-FROM roles r
-CROSS JOIN scopes s
-WHERE r.name = 'user' AND r.tenant_id IS NULL
-  AND s.name = 'read'
-ON CONFLICT DO NOTHING;
+        INSERT INTO permissions (role_id, scope_id, resource, action)
+        SELECT r.id, s.id, 'users', 'read'
+        FROM roles r CROSS JOIN scopes s
+        WHERE r.name = 'user' AND r.tenant_id IS NULL AND s.name = 'read'
+        ON CONFLICT DO NOTHING;
 
-INSERT INTO permissions (role_id, scope_id, resource, action)
-SELECT r.id, s.id, 'projects', 'read'
-FROM roles r
-CROSS JOIN scopes s
-WHERE r.name = 'user' AND r.tenant_id IS NULL
-  AND s.name = 'read'
-ON CONFLICT DO NOTHING;
+        INSERT INTO permissions (role_id, scope_id, resource, action)
+        SELECT r.id, s.id, 'projects', 'read'
+        FROM roles r CROSS JOIN scopes s
+        WHERE r.name = 'user' AND r.tenant_id IS NULL AND s.name = 'read'
+        ON CONFLICT DO NOTHING;
+    END IF;
+END $$;

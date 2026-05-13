@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -90,7 +89,7 @@ func (pc *PermissionController) RegisterAtomicPermission(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
@@ -201,7 +200,7 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions/{id} [delete]
 func (pc *PermissionController) DeletePermission(c *gin.Context) {
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
@@ -322,7 +321,7 @@ func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions [delete]
 func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
@@ -452,7 +451,7 @@ func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions [get]
 func (pc *PermissionController) ListPermissions(c *gin.Context) {
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
@@ -610,7 +609,7 @@ func (pc *PermissionController) listPermissionsEndUser(c *gin.Context, db *gorm.
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions/resources [get]
 func (pc *PermissionController) ShowResources(c *gin.Context) {
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return

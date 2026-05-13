@@ -12,7 +12,7 @@ import (
 var (
 	usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	uuidRegex     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	domainRegex   = regexp.MustCompile(`^([a-z0-9-]+\.)*[a-z0-9-]+\.[a-z]{2,}$`)
+	domainRegex   = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$`)
 	phoneRegex    = regexp.MustCompile(`^\+?[1-9]\d{1,14}$`)
 	otpRegex      = regexp.MustCompile(`^\d{6}$`)
 	clientIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)

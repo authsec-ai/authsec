@@ -24,7 +24,7 @@ import (
 	session "github.com/authsec-ai/authsec/internal/session"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	repositories "github.com/authsec-ai/authsec/repository"
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 )
 
 // EndUserWebAuthnHandler handles WebAuthn operations for end users

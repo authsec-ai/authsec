@@ -1,0 +1,104 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches: [main, authsec-dev, authsec-staging, authsec-prod]
+
+env:
+  GOPRIVATE: github.com/authsec-ai/*
+  GONOSUMDB: github.com/authsec-ai/*
+  GONOPROXY: github.com/authsec-ai/*
+
+jobs:
+  # ── Unit tests (always run, no DB required) ─────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.GH_PAT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -short -race ./tests/unit/ -v
+
+  # ── Merge gate — always passes unless integration tests ran and failed ───────
+  merge-gate:
+    name: Merge Gate
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    if: always()
+    steps:
+      - name: Unit tests must pass
+        if: needs.unit-tests.result != 'success'
+        run: |
+          echo "Unit tests failed or were cancelled — merge blocked"
+          exit 1
+      - name: All checks passed
+        run: echo "All required checks passed"
+
+  # ── Integration tests (opt-in via PR label "run-integration") ──────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'run-integration')
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: authsec
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: authsec
+      DB_SSLMODE: disable
+      RUN_INTEGRATION: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.GH_PAT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Integration tests
+        run: go test ./tests/unit/ ./tests/integration/... -v -timeout 120s

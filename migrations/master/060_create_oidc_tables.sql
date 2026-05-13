@@ -96,6 +96,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS oidc_providers_updated_at ON oidc_providers;
 CREATE TRIGGER oidc_providers_updated_at
     BEFORE UPDATE ON oidc_providers
     FOR EACH ROW
@@ -109,6 +110,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS oidc_user_identities_updated_at ON oidc_user_identities;
 CREATE TRIGGER oidc_user_identities_updated_at
     BEFORE UPDATE ON oidc_user_identities
     FOR EACH ROW

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -59,7 +59,7 @@ func DerefString(s *string) string {
 
 // ResolveTenantIDFromToken extracts tenant ID from context/token and returns a pointer UUID.
 func ResolveTenantIDFromToken(c *gin.Context) (*uuid.UUID, error) {
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		return nil, fmt.Errorf("Tenant ID not found in context")
 	}

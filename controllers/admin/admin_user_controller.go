@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
@@ -24,10 +23,9 @@ import (
 )
 
 type AdminUserController struct {
-	tenantRepo      *database.TenantRepository
-	userRepo        *database.UserRepository
-	adminUserRepo   *database.AdminUserRepository
-	tenantDBService *database.TenantDBService
+	tenantRepo    *database.TenantRepository
+	userRepo      *database.UserRepository
+	adminUserRepo *database.AdminUserRepository
 }
 
 var (
@@ -69,20 +67,10 @@ func NewAdminUserController() (*AdminUserController, error) {
 		return nil, fmt.Errorf("database not initialized")
 	}
 
-	// Get config for database parameters
-	cfg := config.GetConfig()
-
-	// Create tenant database service
-	tenantDBService, err := database.NewTenantDBService(db, cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
-	}
-
 	return &AdminUserController{
-		tenantRepo:      database.NewTenantRepository(db),
-		userRepo:        database.NewUserRepository(db),
-		adminUserRepo:   database.NewAdminUserRepository(db),
-		tenantDBService: tenantDBService,
+		tenantRepo:    database.NewTenantRepository(db),
+		userRepo:      database.NewUserRepository(db),
+		adminUserRepo: database.NewAdminUserRepository(db),
 	}, nil
 }
 
@@ -124,7 +112,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		log.Printf("%s: tenant_id not found in authentication token", logPrefix)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
@@ -969,7 +957,7 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 // UpdateTenant updates an existing tenant
 func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -1025,37 +1013,12 @@ func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 
 // GetTenantUsers retrieves all users for a specific tenant
 func (auc *AdminUserController) GetTenantUsers(c *gin.Context) {
-	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantIDStr, ok := amMiddlewares.GetTenantIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
-
-	tenantID, err := uuid.Parse(tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
-		return
-	}
-
-	// Get optional provider filter from query parameter
-	provider := c.Query("provider")
-
-	users, err := auc.fetchTenantUsers(tenantID, nil, provider)
-	if err != nil {
-		switch err {
-		case errTenantNotFound:
-			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
-		case errTenantDBNotSet:
-			log.Printf("GetTenantUsers: tenant %s missing tenant_db mapping", tenantIDStr)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant database not configured"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"users": users})
+	tenantIDStr := c.Param("tenant_id")
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error":     "Per-tenant user listing is managed by mt-plugin",
+		"tenant_id": tenantIDStr,
+		"hint":      "Configure MT_PLUGIN_GRPC_ADDR to enable multi-tenant operations",
+	})
 }
 
 func (auc *AdminUserController) fetchTenantUsers(tenantID uuid.UUID, clientID *uuid.UUID, provider string) ([]map[string]interface{}, error) {
@@ -1432,20 +1395,19 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	// Step 2: Drop the tenant database if it exists
 	databaseDropped := false
-	if tenantDB != "" && auc.tenantDBService != nil {
-		logger.WithField("tenant_db", tenantDB).Info("Step 2: Dropping tenant database")
-		if err := auc.tenantDBService.DropTenantDatabase(tenantDB); err != nil {
-			// Log the error but don't fail the entire operation
-			// The master data is already deleted, so we should report partial success
-			logger.WithError(err).Error("Failed to drop tenant database (master data already deleted)")
+	// Tenant DB deletion is managed by mt-plugin.
+	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
+		if _, err := config.MTPluginClient.DeleteTenant(tenantUUID.String()); err != nil {
+			logger.WithError(err).Warn("[mtplugin] Failed to delete tenant DB via plugin")
 			deletedCounts["tenant_database"] = 0
 		} else {
-			logger.Info("Successfully dropped tenant database")
+			logger.Info("[mtplugin] Tenant DB deletion delegated to mt-plugin")
 			databaseDropped = true
 			deletedCounts["tenant_database"] = 1
 		}
 	} else {
-		logger.Info("Step 2: No tenant database to drop")
+		logger.Info("[mtplugin] Plugin not available — tenant DB deletion skipped")
+		deletedCounts["tenant_database"] = 0
 	}
 
 	// Audit log the deletion

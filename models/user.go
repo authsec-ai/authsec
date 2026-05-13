@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/authsec-ai/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )

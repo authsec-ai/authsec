@@ -41,12 +41,12 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
-reported to the project maintainers at **security@authsec.ai**.
+reported to the project maintainers at **hello@authsec.ai**.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution
 
 This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org),
-version 2.1, available at
-<https://www.contributor-covenant.org/version/2/1/code_of_conduct/>.
+version 2.1, available at the
+[Contributor Covenant website](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).

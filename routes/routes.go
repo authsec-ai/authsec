@@ -35,7 +35,6 @@ import (
 	"net/http"
 	"time"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
 	userCtrl "github.com/authsec-ai/authsec/controllers/enduser"
@@ -115,8 +114,6 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize SCIM admin controller: %v", err)
 	}
 
-	_ = middlewares.NewTenantResolutionMiddleware(config.GetDatabase())
-
 	oidcController, err := platformCtrl.NewOIDCController()
 	if err != nil {
 		log.Fatalf("Failed to initialize OIDC controller: %v", err)
@@ -149,6 +146,12 @@ func SetupRoutes(
 	tenantCIBAController, err := userCtrl.NewTenantCIBAController()
 	if err != nil {
 		log.Fatalf("Failed to initialize tenant CIBA auth controller: %v", err)
+	}
+
+	// Initialize Agent Action Guard controller (human-in-the-loop approvals)
+	agentActionController, err := platformCtrl.NewAgentActionController()
+	if err != nil {
+		log.Fatalf("Failed to initialize agent action controller: %v", err)
 	}
 
 	tenantTOTPController := userCtrl.NewTenantTOTPController()
@@ -237,7 +240,7 @@ func SetupRoutes(
 		resourceServers.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			resourceServers.POST("", rsController.Create)
@@ -292,7 +295,7 @@ func SetupRoutes(
 		scopes.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			scopes.PUT("/:scope_id", scopeMatrixController.UpdateScope)
@@ -304,7 +307,7 @@ func SetupRoutes(
 		consentGrants.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			consentGrants.GET("", oauthASController.ListConsentGrants)
@@ -365,7 +368,7 @@ func SetupRoutes(
 		adminRBAC.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			adminRBAC.POST("/roles", rolesScopedBindingsController.CreateRoleCompositeAdmin)
@@ -412,7 +415,7 @@ func SetupRoutes(
 
 		// Authenticated OIDC endpoints
 		oidcAuth := uflow.Group("/oidc")
-		oidcAuth.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		oidcAuth.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			oidcAuth.POST("/link", oidcController.LinkIdentity)
 			oidcAuth.GET("/identities", oidcController.GetLinkedIdentities)
@@ -425,7 +428,7 @@ func SetupRoutes(
 		auth := uflow.Group("/auth")
 		{
 			notify := auth.Group("/notify")
-			notify.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+			notify.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 			{
 				notify.POST("/new-user-registration", endUserController.NotifyOwnerNewRegistration)
 			}
@@ -465,7 +468,15 @@ func SetupRoutes(
 				deviceAuth.POST("/code", deviceAuthController.RequestDeviceCode)
 				deviceAuth.POST("/token", deviceAuthController.PollDeviceToken)
 				deviceAuth.GET("/activate/info", deviceAuthController.GetActivationInfo)
-				deviceAuth.POST("/verify", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
+				// /verify: public — activation page checks user_code before login
+				deviceAuth.POST("/verify", deviceAuthController.VerifyUserCode)
+				// /authorize: requires auth — browser posts approval/denial after login
+				deviceAuth.POST("/authorize", middlewares.AuthMiddleware(), deviceAuthController.AuthorizeDevice)
+				// /authorize-oidc: public — for end-user shield login via OIDC
+				// Takes {user_code, oidc_code, state} → exchanges OIDC code for identity → authorizes device
+				deviceAuth.POST("/authorize-oidc", deviceAuthController.AuthorizeDeviceWithOIDC)
+				// /verify-legacy: old authenticated verify endpoint (backwards compat)
+				deviceAuth.POST("/verify-legacy", middlewares.AuthMiddleware(), deviceAuthController.VerifyDeviceCode)
 			}
 
 			// Voice Authentication
@@ -516,21 +527,21 @@ func SetupRoutes(
 			{
 				tenantCIBA.POST("/initiate", tenantCIBAController.InitiateTenantCIBA)
 				tenantCIBA.POST("/token", tenantCIBAController.PollTenantCIBAToken)
-				tenantCIBA.POST("/respond", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantCIBAController.RespondToTenantCIBA)
-				tenantCIBA.POST("/register-device", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantCIBAController.RegisterTenantDevice)
-				tenantCIBA.GET("/requests", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantCIBAController.GetTenantCIBARequests)
-				tenantCIBA.GET("/devices", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantCIBAController.ListTenantDevices)
-				tenantCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantCIBAController.DeleteTenantDevice)
+				tenantCIBA.POST("/respond", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RespondToTenantCIBA)
+				tenantCIBA.POST("/register-device", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RegisterTenantDevice)
+				tenantCIBA.GET("/requests", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.GetTenantCIBARequests)
+				tenantCIBA.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.ListTenantDevices)
+				tenantCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.DeleteTenantDevice)
 			}
 
 			tenantTOTP := tenantAuth.Group("/totp")
 			{
 				tenantTOTP.POST("/login", tenantTOTPController.LoginWithTenantTOTP)
-				tenantTOTP.POST("/register", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantTOTPController.RegisterTenantTOTPDevice)
-				tenantTOTP.POST("/confirm", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantTOTPController.ConfirmTenantTOTPDevice)
-				tenantTOTP.GET("/devices", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantTOTPController.GetTenantTOTPDevices)
-				tenantTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantTOTPController.DeleteTenantTOTPDevice)
-				tenantTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken(), tenantTOTPController.SetTenantPrimaryTOTPDevice)
+				tenantTOTP.POST("/register", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.RegisterTenantTOTPDevice)
+				tenantTOTP.POST("/confirm", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.ConfirmTenantTOTPDevice)
+				tenantTOTP.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.GetTenantTOTPDevices)
+				tenantTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.DeleteTenantTOTPDevice)
+				tenantTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.SetTenantPrimaryTOTPDevice)
 			}
 		}
 
@@ -541,7 +552,7 @@ func SetupRoutes(
 		admin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			admin.GET("/tenants", adminUserController.ListTenants)
@@ -576,7 +587,7 @@ func SetupRoutes(
 		adminPlatform.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			adminPlatform.GET("/oidc/providers", oidcController.GetAllProviders)
@@ -611,7 +622,7 @@ func SetupRoutes(
 
 		// SCIM token
 		scimToken := uflow.Group("/admin/scim")
-		scimToken.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
 		}
@@ -623,7 +634,7 @@ func SetupRoutes(
 		delegationPolicies.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			delegationPolicies.POST("", delegationPolicyCtrl.CreateDelegationPolicy)
@@ -646,7 +657,7 @@ func SetupRoutes(
 		enduserAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 		}
@@ -668,7 +679,7 @@ func SetupRoutes(
 			user.POST("/oidc/login", endUserController.OIDCLogin)
 		}
 
-		user.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			user.POST("/clients/register", endUserController.RegisterClient)
 			user.GET("/clients", endUserController.GetClients)
@@ -710,7 +721,7 @@ func SetupRoutes(
 		// HubSpot integration
 		// ────────────────────────────────────────────────────
 		hubspot := uflow.Group("/hubspot")
-		hubspot.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		hubspot.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			hubspot.POST("/contacts/sync", hubspotController.SyncContact)
 		}
@@ -729,7 +740,7 @@ func SetupRoutes(
 
 		// End-user provisioning
 		scimEndUser := uflow.Group("/scim/v2/:client_id/:project_id")
-		scimEndUser.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
+		scimEndUser.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			scimEndUser.GET("/Users", scimController.ListUsers)
 			scimEndUser.GET("/Users/:id", scimController.GetUser)
@@ -750,7 +761,7 @@ func SetupRoutes(
 		scimAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.Require("admin", "access"),
-			amMiddlewares.ValidateTenantFromToken(),
+			middlewares.ValidateTenantFromToken(),
 		)
 		{
 			scimAdmin.GET("/Users", scimAdminController.ListAdminUsers)
@@ -759,6 +770,57 @@ func SetupRoutes(
 			scimAdmin.PUT("/Users/:id", scimAdminController.ReplaceAdminUser)
 			scimAdmin.PATCH("/Users/:id", scimAdminController.PatchAdminUser)
 			scimAdmin.DELETE("/Users/:id", scimAdminController.DeleteAdminUser)
+		}
+
+		// ========================================
+		// Agent Action Guard routes (Human-in-the-Loop approvals for AI agents)
+		// ========================================
+
+		// Agent-facing endpoints (JWT auth required)
+		agentActions := uflow.Group("/agent/actions")
+		agentActions.Use(middlewares.AuthMiddleware())
+		{
+			agentActions.POST("/evaluate", agentActionController.EvaluateAction)
+			agentActions.GET("/status", agentActionController.PollActionStatus)
+			agentActions.POST("/respond", agentActionController.RespondToAction)
+			agentActions.GET("/pending", agentActionController.GetPendingActions)
+		}
+
+		// Risk policy admin endpoints
+		agentGuardAdmin := uflow.Group("/admin/risk-policies")
+		agentGuardAdmin.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentGuardAdmin.GET("", agentActionController.ListRiskPolicies)
+			agentGuardAdmin.POST("", agentActionController.CreateRiskPolicy)
+			agentGuardAdmin.PUT("/:id", agentActionController.UpdateRiskPolicy)
+			agentGuardAdmin.DELETE("/:id", agentActionController.DeleteRiskPolicy)
+		}
+
+		// Agent guard settings (admin)
+		agentGuardSettings := uflow.Group("/admin/agent-guard")
+		agentGuardSettings.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentGuardSettings.GET("/settings", agentActionController.GetSettings)
+			agentGuardSettings.PUT("/settings", agentActionController.UpdateSettings)
+		}
+
+		// Agent audit log (admin)
+		agentAudit := uflow.Group("/admin/agent-audit")
+		agentAudit.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			agentAudit.GET("", agentActionController.GetAuditLog)
 		}
 
 		// ────────────────────────────────────────────────────
