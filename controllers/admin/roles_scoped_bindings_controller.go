@@ -116,7 +116,7 @@ type RoleBindingListItem struct {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/roles [post]
+// @Router /uflow/admin/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -139,7 +139,7 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeAdmin(c *gin.Context
 // @Success 200 {array} RoleListItem
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/roles [get]
+// @Router /uflow/admin/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -161,7 +161,7 @@ func (rc *RolesScopedBindingsController) ListRolesAdmin(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/roles/{role_id} [get]
+// @Router /uflow/admin/roles/{role_id} [get]
 func (rc *RolesScopedBindingsController) GetRoleAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -252,7 +252,7 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/roles/{role_id} [put]
+// @Router /uflow/admin/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -273,7 +273,7 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeAdmin(c *gin.Context
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 404 {object} map[string]string "Role not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/admin/roles/{role_id} [delete]
+// @Router /uflow/admin/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -294,7 +294,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleAdmin(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/bindings [post]
+// @Router /uflow/admin/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -316,7 +316,7 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedAdmin(c *gin.Context) {
 // @Success 200 {array} RoleBindingListItem
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/admin/bindings [get]
+// @Router /uflow/admin/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDFromToken(c)
 	if err != nil {
@@ -340,7 +340,7 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/rbac/roles [post]
+// @Router /uflow/user/rbac/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -369,7 +369,7 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 // @Security BearerAuth
 // @Success 200 {array} RoleListItem "List of roles with assignment counts"
 // @Failure 401 {object} map[string]string
-// @Router /authsec/uflow/user/rbac/roles [get]
+// @Router /uflow/user/rbac/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -404,7 +404,7 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/rbac/roles/{role_id} [put]
+// @Router /uflow/user/rbac/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -437,7 +437,7 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Failure 404 {object} map[string]string "Role not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/user/rbac/roles/{role_id} [delete]
+// @Router /uflow/user/rbac/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -469,7 +469,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 // @Success 200 {object} BindingResponse "Binding ID, status, scope description, role name"
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
-// @Router /authsec/uflow/user/rbac/bindings [post]
+// @Router /uflow/user/rbac/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -502,7 +502,7 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 // @Success 200 {array} RoleBindingListItem
 // @Failure 401 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/rbac/bindings [get]
+// @Router /uflow/user/rbac/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
