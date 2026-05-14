@@ -28,6 +28,15 @@ func ValidateSubdomainOrigin(origin string) bool {
 		return false
 	}
 
+	// Local development escape hatch: allow http(s)://localhost[:port] and
+	// 127.0.0.1 when ENVIRONMENT=development.
+	if strings.ToLower(os.Getenv("ENVIRONMENT")) == "development" {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" {
+			return true
+		}
+	}
+
 	// Must be HTTPS for production
 	if u.Scheme != "https" {
 		return false
