@@ -229,10 +229,10 @@ CREATE TABLE IF NOT EXISTS oauth_scopes (
     UNIQUE (tenant_id, resource_server_id, scope_string)
 );
 
-CREATE INDEX idx_oauth_scopes_tenant ON oauth_scopes(tenant_id);
-CREATE INDEX idx_oauth_scopes_rs ON oauth_scopes(resource_server_id);
-CREATE INDEX idx_oauth_scopes_parent ON oauth_scopes(parent_scope_id);
-CREATE UNIQUE INDEX idx_oauth_scopes_tenant_global_scope
+CREATE INDEX IF NOT EXISTS idx_oauth_scopes_tenant ON oauth_scopes(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_scopes_rs ON oauth_scopes(resource_server_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_scopes_parent ON oauth_scopes(parent_scope_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_scopes_tenant_global_scope
     ON oauth_scopes(tenant_id, scope_string)
     WHERE resource_server_id IS NULL;
 
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS oauth_scope_permissions (
     PRIMARY KEY (scope_id, permission_id)
 );
 
-CREATE INDEX idx_oauth_scope_perms_permission ON oauth_scope_permissions(permission_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_scope_perms_permission ON oauth_scope_permissions(permission_id);
 
 -- Best-effort backfill from the legacy API scope model.
 -- Global API scopes become tenant-scoped oauth_scopes with no bound resource server.
@@ -366,8 +366,8 @@ CREATE TABLE IF NOT EXISTS mcp_tools (
     UNIQUE (resource_server_id, name)
 );
 
-CREATE INDEX idx_mcp_tools_tenant ON mcp_tools(tenant_id);
-CREATE INDEX idx_mcp_tools_rs ON mcp_tools(resource_server_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_tools_tenant ON mcp_tools(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_tools_rs ON mcp_tools(resource_server_id);
 
 -- Maps tools to the OAuth scopes that govern them.
 -- Auto-populated by naming convention matching; admin can override.
