@@ -81,20 +81,23 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 		return
 	}
 
-	q := mc.db.Where("tenant_id = ?", tenantID)
+	q := mc.db.Table("tenant_memberships AS tm").
+		Select("tm.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
+		Joins("LEFT JOIN users u ON u.tenant_id = tm.tenant_id AND u.id = tm.user_id").
+		Where("tm.tenant_id = ?", tenantID)
 	if s := c.Query("status"); s != "" {
-		q = q.Where("status = ?", s)
+		q = q.Where("tm.status = ?", s)
 	}
 	if t := c.Query("type"); t != "" {
-		q = q.Where("membership_type = ?", t)
+		q = q.Where("tm.membership_type = ?", t)
 	}
 
-	var members []models.TenantMembership
-	if err := q.Order("created_at DESC").Find(&members).Error; err != nil {
+	var rows []map[string]interface{}
+	if err := q.Order("tm.created_at DESC").Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list memberships", "detail": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": members, "count": len(members)})
+	c.JSON(http.StatusOK, gin.H{"items": rows, "count": len(rows)})
 }
 
 // GetMembership GET /v2/tenants/:tenant_id/memberships/:user_id
@@ -108,8 +111,13 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 		return
 	}
 
-	var m models.TenantMembership
-	if err := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).First(&m).Error; err != nil {
+	var row map[string]interface{}
+	err := mc.db.Table("tenant_memberships AS tm").
+		Select("tm.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
+		Joins("LEFT JOIN users u ON u.tenant_id = tm.tenant_id AND u.id = tm.user_id").
+		Where("tm.tenant_id = ? AND tm.user_id = ?", tenantID, userID).
+		Take(&row).Error
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "membership not found"})
 			return
@@ -117,7 +125,7 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, m)
+	c.JSON(http.StatusOK, row)
 }
 
 // createMembershipRequest is the payload for POST /memberships.
@@ -286,7 +294,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 	}
 
 	q := mc.db.Table("tenant_end_user_states AS s").
-		Select("s.*, u.email AS user_email, u.username AS user_username").
+		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
 		Where("s.tenant_id = ?", tenantID)
 	if v := c.Query("status"); v != "" {
@@ -319,8 +327,13 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 		return
 	}
 
-	var s models.TenantEndUserState
-	if err := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).First(&s).Error; err != nil {
+	var row map[string]interface{}
+	err := mc.db.Table("tenant_end_user_states AS s").
+		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
+		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
+		Where("s.tenant_id = ? AND s.user_id = ?", tenantID, userID).
+		Take(&row).Error
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "end-user state not found"})
 			return
@@ -328,7 +341,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, s)
+	c.JSON(http.StatusOK, row)
 }
 
 // updateEndUserRequest is the payload for PATCH /end-users/:user_id.
