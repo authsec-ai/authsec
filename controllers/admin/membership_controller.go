@@ -177,10 +177,13 @@ func (mc *MembershipController) CreateMembership(c *gin.Context) {
 		m.JoinedAt = &now
 	}
 
-	// Idempotent insert: ON CONFLICT (tenant_id, user_id) DO NOTHING (handled at app level).
-	if err := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).
-		FirstOrCreate(&m).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create membership", "detail": err.Error()})
+	result := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).FirstOrCreate(&m)
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create membership", "detail": result.Error.Error()})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusOK, m)
 		return
 	}
 	c.JSON(http.StatusCreated, m)
