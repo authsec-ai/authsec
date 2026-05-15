@@ -106,7 +106,7 @@ func (eupr *EndUserPermissionRepository) GetUserEffectivePermissions(userID uuid
 			-- Direct user roles
 			SELECT ur.role_id FROM user_roles ur WHERE ur.user_id = $1 AND ur.tenant_id = $2
 			UNION
-			-- Group roles
+			-- Group roles (TODO(phase-D): unify with role_bindings)
 			SELECT gr.role_id FROM group_roles gr
 			INNER JOIN user_groups ug ON gr.group_id = ug.group_id
 			WHERE ug.user_id = $1 AND ug.tenant_id = $2
@@ -150,7 +150,7 @@ WHERE p.role_id IN (
 -- Direct user roles
 SELECT ur.role_id FROM user_roles ur WHERE ur.user_id = $1 AND ur.tenant_id = $2
 UNION
--- Group roles
+-- Group roles (TODO(phase-D): unify with role_bindings)
 SELECT gr.role_id FROM group_roles gr
 INNER JOIN user_groups ug ON gr.group_id = ug.group_id
 WHERE ug.user_id = $1 AND ug.tenant_id = $2
@@ -183,7 +183,7 @@ WHERE r.id IN (
 -- Direct user roles
 SELECT ur.role_id FROM user_roles ur WHERE ur.user_id = $1 AND ur.tenant_id = $2
 UNION
--- Group roles
+-- Group roles (TODO(phase-D): unify with role_bindings)
 SELECT gr.role_id FROM group_roles gr
 INNER JOIN user_groups ug ON gr.group_id = ug.group_id
 WHERE ug.user_id = $1 AND ug.tenant_id = $2

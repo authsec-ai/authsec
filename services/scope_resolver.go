@@ -244,7 +244,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
 		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
-		Where("rb.user_id::text = ?", userID).
+		Where("(rb.user_id::text = ? OR rb.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id::text = ?))", userID, userID).
 		Where("(rb.tenant_id IS NULL OR rb.tenant_id = ?)", tenantUUID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(ro.tenant_id IS NULL OR ro.tenant_id = ?)", tenantUUID).
