@@ -140,40 +140,50 @@ type PolicyCheckResult struct {
 }
 
 func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, action string, scopeID *uuid.UUID) (*PolicyCheckResult, error) {
-	// Query role_bindings -> Join roles -> Join role_permissions -> Join permissions
-	// Match on Scope ID or NULL (Tenant-Wide)
+	// Phase A: principal can match a binding three ways:
+	//   1. Direct user binding:        rb.user_id = principalID
+	//   2. Group-mediated binding:     rb.group_id IN (groups the user belongs to)
+	//   3. Service-account binding:    rb.service_account_id = principalID
+	//
+	// Membership-status precheck runs first; suspended users / end users
+	// fail before any binding is considered.
+
+	if err := s.CheckPrincipalActive(principalID); err != nil {
+		return &PolicyCheckResult{
+			Allowed: false,
+			Trace:   fmt.Sprintf("Principal precheck failed: %s", err.Error()),
+		}, nil
+	}
 
 	var results []struct {
 		RoleName  string
 		BindingID uuid.UUID
+		Subject   string
 	}
 
-	// We need to check if there is ANY binding that grants this permission
-	// The query logic:
-	// Find bindings for this user OR service account
-	//   Where binding.scope_id matches requested scopeID OR binding.scope_id IS NULL
-	//   Join Role -> RolePermissions -> Permission
-	//   Where Permission matches resource AND action
-
-	// We handle the scope_id match carefully.
-	// If the request has a scope_id (e.g. project-alpha), we allow bindings that are EITHER:
-	// 1. Specific to project-alpha
-	// 2. Tenant-wide or Global (NULL scope_id)
+	// principalGroups subquery — groups this user belongs to. user_id is
+	// globally unique under the current users schema, so no tenant filter
+	// is required here.
+	principalGroups := s.db.Table("user_groups").Select("group_id").Where("user_id = ?", principalID)
 
 	query := s.db.Table("role_bindings rb").
-		Select("r.name as role_name, rb.id as binding_id").
+		Select(`r.name as role_name, rb.id as binding_id,
+			CASE
+				WHEN rb.user_id IS NOT NULL THEN 'user'
+				WHEN rb.group_id IS NOT NULL THEN 'group'
+				WHEN rb.service_account_id IS NOT NULL THEN 'service_account'
+				ELSE 'unknown'
+			END as subject`).
 		Joins("JOIN roles r ON rb.role_id = r.id").
 		Joins("JOIN role_permissions rp ON r.id = rp.role_id").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("(rb.user_id = ? OR rb.service_account_id = ?)", principalID, principalID).
-		Where("p.resource = ? AND p.action = ?", resource, action)
+		Where("(rb.user_id = ? OR rb.service_account_id = ? OR rb.group_id IN (?))", principalID, principalID, principalGroups).
+		Where("p.resource = ? AND p.action = ?", resource, action).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())")
 
 	if scopeID != nil {
 		query = query.Where("(rb.scope_id = ? OR rb.scope_id IS NULL)", scopeID)
 	} else {
-		// If checking for general access (no specific scope requested), we might only accept tenant-wide/global bindings?
-		// Or maybe any binding? usually PDP checks against a specific target.
-		// If target is tenant-level, then we check for NULL scope_id.
 		query = query.Where("rb.scope_id IS NULL")
 	}
 
@@ -184,7 +194,7 @@ func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, 
 	if len(results) > 0 {
 		return &PolicyCheckResult{
 			Allowed: true,
-			Trace:   fmt.Sprintf("Granted by Binding [%s] via Role [%s]", results[0].BindingID, results[0].RoleName),
+			Trace:   fmt.Sprintf("Granted by Binding [%s] via Role [%s] subject=%s", results[0].BindingID, results[0].RoleName, results[0].Subject),
 		}, nil
 	}
 
@@ -192,4 +202,94 @@ func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, 
 		Allowed: false,
 		Trace:   "No matching binding found",
 	}, nil
+}
+
+// CheckPrincipalActive enforces the membership-status precheck.
+//
+// Rules (Phase A):
+//   - If the principal has a tenant_memberships row, it must be status='active'.
+//     Suspended/left/invited members fail closed.
+//   - If the principal has a tenant_end_user_states row, it must be status='active'.
+//     Suspended end users fail closed.
+//   - Service accounts have no membership/end-user-state rows; pass through.
+//   - Users with neither row (legacy / unbackfilled) pass through with a log
+//     warning — Phase A backfill (migration 112) should have populated them.
+//
+// Returns nil on pass, error describing the failure otherwise.
+func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
+	// Check tenant_memberships — at most one row per (tenant, user) but a user
+	// may belong to multiple tenants in future. For Phase A we treat a single
+	// suspended row anywhere as a hard fail.
+	var membershipStatus string
+	row := s.db.Table("tenant_memberships").
+		Select("status").
+		Where("user_id = ?", principalID).
+		Limit(1).
+		Row()
+	if err := row.Scan(&membershipStatus); err == nil {
+		if membershipStatus != models.MembershipStatusActive {
+			return fmt.Errorf("membership not active (status=%s)", membershipStatus)
+		}
+	} else if err.Error() != "sql: no rows in result set" {
+		log.Printf("[RBACService] membership status lookup failed for %s: %v", principalID, err)
+	}
+
+	// Check tenant_end_user_states — same approach, fail closed on suspended.
+	var eusStatus string
+	row2 := s.db.Table("tenant_end_user_states").
+		Select("status").
+		Where("user_id = ?", principalID).
+		Limit(1).
+		Row()
+	if err := row2.Scan(&eusStatus); err == nil {
+		if eusStatus != models.EndUserStatusActive {
+			return fmt.Errorf("end-user state not active (status=%s)", eusStatus)
+		}
+	} else if err.Error() != "sql: no rows in result set" {
+		log.Printf("[RBACService] end-user-state lookup failed for %s: %v", principalID, err)
+	}
+
+	return nil
+}
+
+// EffectiveBinding is one row in the materialised list of role_bindings that
+// affect a given user — direct + via group + via service-account proxy. Used
+// by the Effective Access Explorer admin page.
+type EffectiveBinding struct {
+	BindingID uuid.UUID  `json:"binding_id"`
+	RoleID    uuid.UUID  `json:"role_id"`
+	RoleName  string     `json:"role_name"`
+	Subject   string     `json:"subject"` // user | group | service_account
+	SubjectID uuid.UUID  `json:"subject_id"`
+	ScopeType *string    `json:"scope_type"`
+	ScopeID   *uuid.UUID `json:"scope_id"`
+	ExpiresAt *string    `json:"expires_at,omitempty"`
+}
+
+// ListEffectiveBindings returns every role binding currently affecting a user.
+// Includes direct user bindings AND bindings on any group the user belongs to.
+// Expired bindings are excluded.
+func (s *RBACService) ListEffectiveBindings(userID uuid.UUID) ([]EffectiveBinding, error) {
+	var out []EffectiveBinding
+
+	principalGroups := s.db.Table("user_groups").Select("group_id").Where("user_id = ?", userID)
+
+	if err := s.db.Table("role_bindings rb").
+		Select(`rb.id as binding_id, rb.role_id, r.name as role_name,
+			CASE
+				WHEN rb.user_id IS NOT NULL THEN 'user'
+				WHEN rb.group_id IS NOT NULL THEN 'group'
+				WHEN rb.service_account_id IS NOT NULL THEN 'service_account'
+			END as subject,
+			COALESCE(rb.user_id, rb.group_id, rb.service_account_id) as subject_id,
+			rb.scope_type, rb.scope_id,
+			TO_CHAR(rb.expires_at, 'YYYY-MM-DD"T"HH24:MI:SSZ') as expires_at`).
+		Joins("JOIN roles r ON rb.role_id = r.id").
+		Where("rb.user_id = ? OR rb.group_id IN (?)", userID, principalGroups).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
+		Scan(&out).Error; err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }

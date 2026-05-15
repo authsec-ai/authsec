@@ -132,13 +132,16 @@ type RemoveGroupsRequest struct {
 	Groups   []string `json:"groups" binding:"required"`
 }
 
-// UserGroup represents the many-to-many relationship between users and groups
+// UserGroup represents the many-to-many relationship between users and groups.
+// Backed by migration 110_create_user_groups.sql.
+// Primary key is the (tenant_id, user_id, group_id) tuple so all rows are
+// tenant-scoped and the composite FK to users(tenant_id, id) is satisfied.
 type UserGroup struct {
-	UserID    uuid.UUID  `json:"user_id" gorm:"type:uuid;primaryKey;not null"`
-	GroupID   uuid.UUID  `json:"group_id" gorm:"type:uuid;primaryKey;not null"`
-	TenantID  *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`
-	CreatedAt time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt *time.Time `json:"updated_at,omitempty" gorm:"autoUpdateTime"`
+	TenantID uuid.UUID  `json:"tenant_id" gorm:"type:uuid;primaryKey;not null"`
+	UserID   uuid.UUID  `json:"user_id" gorm:"type:uuid;primaryKey;not null"`
+	GroupID  uuid.UUID  `json:"group_id" gorm:"type:uuid;primaryKey;not null"`
+	AddedAt  time.Time  `json:"added_at" gorm:"autoCreateTime"`
+	AddedBy  *uuid.UUID `json:"added_by,omitempty" gorm:"type:uuid"`
 }
 
 // TableName specifies the table name for UserGroup

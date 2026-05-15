@@ -93,6 +93,9 @@ func SetupRoutes(
 	delegationPolicyController := adminCtrl.NewDelegationPolicyController()
 	sdkTokenController := adminCtrl.NewSDKTokenController()
 
+	// Phase A: tenant memberships & end-user states
+	membershipController := adminCtrl.NewMembershipController()
+
 	// Legacy / existing controllers
 	groupController := &adminCtrl.GroupController{}
 	endUserController := &userCtrl.EndUserController{}
@@ -625,6 +628,39 @@ func SetupRoutes(
 		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
+		}
+
+		// ────────────────────────────────────────────────────
+		// Phase A v2: Tenant Memberships, End-User States, Effective Access
+		// New, object-first endpoints. The legacy /admin/* endpoints stay in
+		// place for backward compatibility; the UI rewrite layer points new
+		// pages at /v2/* and gradually drains the old ones.
+		// ────────────────────────────────────────────────────
+		v2 := uflow.Group("/v2")
+		v2.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			// Tenant memberships (operators)
+			v2.GET("/tenants/:tenant_id/memberships", membershipController.ListMembers)
+			v2.POST("/tenants/:tenant_id/memberships", membershipController.CreateMembership)
+			v2.GET("/tenants/:tenant_id/memberships/:user_id", membershipController.GetMembership)
+			v2.PATCH("/tenants/:tenant_id/memberships/:user_id", membershipController.UpdateMembership)
+			v2.DELETE("/tenants/:tenant_id/memberships/:user_id", membershipController.DeleteMembership)
+
+			// Tenant end-user states (consumers)
+			v2.GET("/tenants/:tenant_id/end-users", membershipController.ListEndUsers)
+			v2.GET("/tenants/:tenant_id/end-users/:user_id", membershipController.GetEndUser)
+			v2.PATCH("/tenants/:tenant_id/end-users/:user_id", membershipController.UpdateEndUser)
+			v2.POST("/tenants/:tenant_id/end-users/:user_id/suspend", membershipController.SuspendEndUser)
+			v2.POST("/tenants/:tenant_id/end-users/:user_id/reactivate", membershipController.ReactivateEndUser)
+
+			// Group-subject role bindings
+			v2.POST("/groups/:group_id/role-bindings", membershipController.BindGroupToRole)
+
+			// Effective access explorer
+			v2.GET("/users/:user_id/effective-access", membershipController.EffectiveAccess)
 		}
 
 		// ────────────────────────────────────────────────────

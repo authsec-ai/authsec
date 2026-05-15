@@ -75,12 +75,16 @@ type ServiceAccount struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
-// RoleBinding represents an assignment of a Role to a Principal (User or Service Account)
+// RoleBinding represents an assignment of a Role to a Principal
+// (User, Group, or Service Account). Migration 111 added group_id; exactly one
+// of UserID / GroupID / ServiceAccountID must be set, enforced by the
+// check_principal CHECK constraint on the table.
 type RoleBinding struct {
 	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	TenantID           *uuid.UUID      `json:"tenant_id" gorm:"type:uuid"`
 	UserID             *uuid.UUID      `json:"user_id" gorm:"type:uuid"`
 	Username           string          `json:"username" gorm:"type:text"`
+	GroupID            *uuid.UUID      `json:"group_id" gorm:"type:uuid"`
 	ServiceAccountID   *uuid.UUID      `json:"service_account_id" gorm:"type:uuid"`
 	RoleID             uuid.UUID       `json:"role_id" gorm:"type:uuid;not null"`
 	RoleName           string          `json:"role_name" gorm:"type:text"`
@@ -99,7 +103,37 @@ type RoleBinding struct {
 	// However, for simple referencing, standard ID referencing works if the DB constraint handles the integrity.
 	Role           *RBACRole       `json:"role,omitempty" gorm:"foreignKey:RoleID;references:ID"`
 	User           *ExtendedUser   `json:"user,omitempty" gorm:"foreignKey:UserID;references:ID"`
+	Group          *Group          `json:"group,omitempty" gorm:"foreignKey:GroupID;references:ID"`
 	ServiceAccount *ServiceAccount `json:"service_account,omitempty" gorm:"foreignKey:ServiceAccountID;references:ID"`
+}
+
+// SubjectType returns "user" | "group" | "service_account" based on which
+// principal column is set. Returns empty string if the row is malformed.
+func (rb *RoleBinding) SubjectType() string {
+	switch {
+	case rb.UserID != nil:
+		return "user"
+	case rb.GroupID != nil:
+		return "group"
+	case rb.ServiceAccountID != nil:
+		return "service_account"
+	default:
+		return ""
+	}
+}
+
+// SubjectID returns the non-nil principal id corresponding to SubjectType.
+func (rb *RoleBinding) SubjectID() *uuid.UUID {
+	switch {
+	case rb.UserID != nil:
+		return rb.UserID
+	case rb.GroupID != nil:
+		return rb.GroupID
+	case rb.ServiceAccountID != nil:
+		return rb.ServiceAccountID
+	default:
+		return nil
+	}
 }
 
 func (RoleBinding) TableName() string {
