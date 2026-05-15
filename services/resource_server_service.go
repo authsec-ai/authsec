@@ -47,9 +47,14 @@ type ResourceServerResponse struct {
 	JWKSURI               string   `json:"jwks_uri"`
 	IntrospectionEndpoint string   `json:"introspection_endpoint"`
 	IntrospectionSecret   string   `json:"introspection_secret,omitempty"`
-	ValidationMode        string   `json:"validation_mode"`
-	ScopesSupported       []string `json:"scopes_supported"`
-	Status                string   `json:"status"`
+	// SDK endpoints. Both use Basic auth keyed by (id : introspection_secret).
+	// Provided in the create response so the SDK Config can be assembled by
+	// pasting directly from this payload — no hand-written URLs.
+	ScopeMatrixURL  string   `json:"scope_matrix_url"`
+	ManifestURL     string   `json:"manifest_url"`
+	ValidationMode  string   `json:"validation_mode"`
+	ScopesSupported []string `json:"scopes_supported"`
+	Status          string   `json:"status"`
 }
 
 func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL string) (*models.ResourceServer, *ResourceServerResponse, error) {
@@ -152,6 +157,8 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 		JWKSURI:               baseURL + "/oauth/jwks",
 		IntrospectionEndpoint: baseURL + "/oauth/introspect",
 		IntrospectionSecret:   secret,
+		ScopeMatrixURL:        fmt.Sprintf("%s/authsec/resource-servers/%s/sdk-policy", baseURL, rs.ID.String()),
+		ManifestURL:           fmt.Sprintf("%s/authsec/resource-servers/%s/sdk-manifest", baseURL, rs.ID.String()),
 		ValidationMode:        "auto",
 		ScopesSupported:       rs.ScopesSupported,
 		Status:                rs.Status,
