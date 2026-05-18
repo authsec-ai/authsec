@@ -18,6 +18,7 @@ jobs:
         env:
           TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          git config --unset-all http.https://github.com/.extraheader || true
           git remote add public https://x-access-token:${TOKEN}@github.com/authsec-ai/authsec-ai.git
           git push public main --force
           git push public --tags --force
