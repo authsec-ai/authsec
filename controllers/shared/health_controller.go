@@ -5,10 +5,7 @@ import (
 	"runtime"
 	"time"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/gin-gonic/gin"
 )
@@ -257,44 +254,9 @@ func (hc *HealthController) checkMetricsHealth() map[string]interface{} {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/health/tenant/{tenant_id} [get]
 func (hc *HealthController) CheckTenantDatabase(c *gin.Context) {
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
-
-	// Try to get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"status":    "unhealthy",
-			"tenant_id": tenantID,
-			"error":     err.Error(),
-		})
-		return
-	}
-
-	// Test the connection with a simple query
-	if sqlDB, err := tenantDB.DB(); err == nil {
-		if err := sqlDB.Ping(); err == nil {
-			// Connection is healthy, check if we can query tables
-			var count int64
-			if err := tenantDB.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'").Scan(&count).Error; err == nil {
-				c.JSON(http.StatusOK, gin.H{
-					"status":      "healthy",
-					"tenant_id":   tenantID,
-					"table_count": count,
-					"message":     "Tenant database is accessible and healthy",
-				})
-				return
-			}
-		}
-	}
-
-	c.JSON(http.StatusInternalServerError, gin.H{
-		"status":    "unhealthy",
-		"tenant_id": tenantID,
-		"error":     "Failed to ping tenant database",
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "delegated",
+		"message": "Tenant database health checks are managed by mt-plugin",
 	})
 }
 
@@ -307,83 +269,8 @@ func (hc *HealthController) CheckTenantDatabase(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/health/tenants [get]
 func (hc *HealthController) CheckAllTenantDatabases(c *gin.Context) {
-	// Get all tenants with configured databases
-	var tenants []struct {
-		ID       string `json:"id"`
-		Email    string `json:"email"`
-		TenantDB string `json:"tenant_db"`
-	}
-
-	if err := config.DB.Table("tenants").
-		Select("id, email, tenant_db").
-		Where("tenant_db IS NOT NULL AND tenant_db != '' AND active = true").
-		Find(&tenants).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"status": "error",
-			"error":  "Failed to query tenants",
-		})
-		return
-	}
-
-	if len(tenants) == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"status":  "healthy",
-			"message": "No tenant databases configured",
-			"tenants": []interface{}{},
-		})
-		return
-	}
-
-	// Create database service for health checks
-	db := config.GetDatabase()
-	cfg := config.AppConfig
-	dbService, err := database.NewTenantDBService(db, cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"status": "error",
-			"error":  "Failed to create database service",
-		})
-		return
-	}
-	defer dbService.Close()
-
-	healthyCount := 0
-	unhealthyCount := 0
-	tenantStatus := make([]map[string]interface{}, 0, len(tenants))
-
-	// Check each tenant database
-	for _, tenant := range tenants {
-		status := map[string]interface{}{
-			"tenant_id": tenant.ID,
-			"email":     tenant.Email,
-			"database":  tenant.TenantDB,
-		}
-
-		if err := dbService.HealthCheck(tenant.TenantDB); err != nil {
-			status["status"] = "unhealthy"
-			status["error"] = err.Error()
-			unhealthyCount++
-		} else {
-			status["status"] = "healthy"
-			healthyCount++
-		}
-
-		tenantStatus = append(tenantStatus, status)
-	}
-
-	overallStatus := "healthy"
-	if unhealthyCount > 0 {
-		overallStatus = "degraded"
-		if healthyCount == 0 {
-			overallStatus = "unhealthy"
-		}
-	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"status":          overallStatus,
-		"total_tenants":   len(tenants),
-		"healthy_count":   healthyCount,
-		"unhealthy_count": unhealthyCount,
-		"tenant_status":   tenantStatus,
+		"status":  "delegated",
+		"message": "Tenant database health checks are managed by mt-plugin",
 	})
 }

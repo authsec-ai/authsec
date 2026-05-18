@@ -1,0 +1,23 @@
+name: Mirror to Public Repo
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  mirror:
+    name: Mirror main to Public
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Push to public repo
+        env:
+          TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          git remote add public https://x-access-token:${TOKEN}@github.com/authsec-ai/authsec-ai.git
+          git push public main --force
+          git push public --tags --force

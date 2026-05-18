@@ -12,9 +12,10 @@
 
 <!-- How was this tested? -->
 
-- [ ] Unit tests pass (`go test ./...`)
+- [ ] Unit tests pass (`go test -short ./tests/unit/`)
 - [ ] `go vet ./...` clean
 - [ ] Manual testing (describe below)
+- [ ] Add label `run-integration` to this PR to trigger integration tests in CI (requires a live DB)
 
 ## Checklist
 

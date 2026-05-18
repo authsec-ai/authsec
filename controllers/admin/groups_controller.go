@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	amMiddlewares "github.com/authsec-ai/auth-manager/pkg/middlewares"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
@@ -211,7 +210,7 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 // @Router /uflow/groups/{tenant_id} [get]
 func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -241,7 +240,7 @@ func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 // @Router /uflow/groups/{tenant_id}/users/bulk [post]
 func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -294,7 +293,7 @@ func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 // @Router /uflow/groups/{tenant_id}/users/bulk [delete]
 func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -353,7 +352,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	_, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
@@ -366,7 +365,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	}
 
 	// Override with token tenant_id for security
-	tenantID, _ = amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, _ = middlewares.GetTenantIDFromToken(c)
 
 	queryGroups := []string{}
 	queryGroups = append(queryGroups, c.QueryArray("group_ids")...)
@@ -774,7 +773,7 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 // @Router /uflow/groups/{tenant_id}/{group_id}/users [get]
 func (gc *GroupController) GetGroupUsers(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return

@@ -73,21 +73,33 @@ AuthSec is a unified authentication and identity platform delivered as a single 
 
 A backward-compatibility alias exists at the bare root `/sdkmgr/*` for legacy SDK clients.
 
+### Single-Tenant vs Multi-Tenant Mode
+
+authsec operates in **single-tenant mode** by default — one admin, one master database. Multi-tenant support is provided by the **mt-plugin** gRPC microservice. When `MT_PLUGIN_GRPC_ADDR` is configured and mt-plugin is reachable, authsec enables multi-tenant admin registration and delegates tenant database management to mt-plugin.
+
+| Mode | `MT_PLUGIN_GRPC_ADDR` | Second admin registration |
+| --- | --- | --- |
+| Single-tenant | Not set / unreachable | HTTP 409 Conflict |
+| Multi-tenant | Set and reachable | Allowed; mt-plugin creates tenant DB |
+
 ---
 
 ## Architecture
 
 ```
-Client → CORS/Rate-limit → Auth Middleware → Controller → DB / External Service
+Client → CORS/Rate-limit → Auth Middleware → Controller → config.DB (master)
+                                                        ↘ mt-plugin (gRPC, optional)
 ```
 
 **Key components:**
+
 - **Gin** HTTP framework
-- **PostgreSQL** for master DB (admin users, tenants, audit log) and per-tenant DBs
-- **Vault** (optional) for secret storage
-- **Redis** (optional) for caching
-- **SPIRE** for workload identity and JWT-SVIDs
-- **Hydra** (Ory) for OAuth2/OIDC federation
+- **PostgreSQL** master DB — admin users, tenants, audit log, all operations
+- **mt-plugin** (optional) — separate gRPC service for multi-tenant DB management
+- **Vault** (optional) — secret storage via `internal/vault`
+- **Redis** (optional) — caching
+- **SPIRE** — workload identity and JWT-SVIDs
+- **Hydra** (Ory) — OAuth2/OIDC federation
 
 ---
 
@@ -113,21 +125,23 @@ Routes explicitly marked **[Public]** require no authentication.
 |---|---|
 | Admin authentication routes | 5 requests / minute |
 | End-user authentication routes | 10 requests / minute |
-| All other routes | Global Mennov rate limiter (configurable) |
+| All other routes | Global Mennanov rate limiter (configurable) |
 
 ---
 
 ## Common Response Formats
 
 **Success (2xx)**
+
 ```json
 {
   "message": "...",
-  "data": { ... }
+  "data": { }
 }
 ```
 
 **Error (4xx / 5xx)**
+
 ```json
 {
   "error": "error_code",
@@ -151,6 +165,7 @@ All timestamps are **Unix epoch (seconds)** unless noted otherwise.
 | `DB_PASSWORD` | Yes | PostgreSQL password |
 | `DB_NAME` | Yes | Master database name |
 | `DB_SSLMODE` | No | SSL mode (`disable`, `require`, etc.) |
+| `MT_PLUGIN_GRPC_ADDR` | No | mt-plugin gRPC address (e.g. `localhost:7469`); omit for single-tenant mode |
 | `WEBAUTHN_RP_NAME` | Yes | Relying party display name |
 | `WEBAUTHN_RP_ID` | Yes | Relying party domain (e.g. `example.com`) |
 | `WEBAUTHN_ORIGIN` | Yes | Allowed origin (e.g. `https://example.com`) |

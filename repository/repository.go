@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	appmodels "github.com/authsec-ai/authsec/models"
 	util "github.com/authsec-ai/authsec/utils"
 	"github.com/go-webauthn/webauthn/webauthn"

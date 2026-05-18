@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )

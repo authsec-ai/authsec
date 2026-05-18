@@ -1,27 +1,18 @@
-# ---------- Builder Stage ----------
 FROM golang:1.25-alpine AS builder
 
-RUN apk add --no-cache git openssh ca-certificates && update-ca-certificates
+RUN apk add --no-cache ca-certificates && update-ca-certificates
 
 ENV APPHOME=/app
 WORKDIR $APPHOME
 
 ENV GIT_TERMINAL_PROMPT=0
-ENV GOPRIVATE=github.com/authsec-ai/*
-ENV GONOSUMDB=github.com/authsec-ai/*
-ENV GONOPROXY=github.com/authsec-ai/*
 
-# ✅ Copy ONLY dependency files first — this layer caches until go.mod/go.sum changes
 COPY go.mod go.sum ./
 
-# ✅ Configure git auth and download deps in one step — prevents stale token in cached layer
-RUN --mount=type=secret,id=github_token \
-    --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" && \
     go mod download && go mod verify
 
-# ✅ Now copy the rest of the source (changes here won't re-trigger downloads)
 COPY . ./
 
 ENV GOOS=linux
@@ -32,8 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -o /main ./cmd/main.go
 
-# ---------- Final Stage ----------
-FROM alpine:latest
+FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates curl && update-ca-certificates
 

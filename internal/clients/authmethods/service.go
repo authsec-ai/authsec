@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	sharedmodels "github.com/authsec-ai/sharedmodels"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
