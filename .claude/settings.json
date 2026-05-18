@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"c:\\\\Users\\\\Ritam Kumarb Kundu\\\\Desktop\\\\Broadcom\\\\authsec\" -ad)",
+      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/**)",
+      "Bash(go vet *)"
+    ]
+  }
+}

@@ -309,6 +309,15 @@ var sharedSpireController *SpireController
 // SetSharedSpireController stores the singleton so other controllers can create entries in-process.
 func SetSharedSpireController(sc *SpireController) { sharedSpireController = sc }
 
+// GetSharedSpireController returns the singleton set by SetSharedSpireController.
+// Used by the v2 identity-chaining controller to share signing key + issuer.
+func GetSharedSpireController() *SpireController { return sharedSpireController }
+
+// oidcProviderAccessor exposes the package-private OIDC provider to siblings
+// inside the platform package. Kept package-private (lowercase) so it's not
+// reachable from outside.
+func (sc *SpireController) oidcProviderAccessor() *spireOIDCProvider { return sc.oidcProvider }
+
 // RegisterAgentWorkload creates a SPIRE workload entry for an AI agent.
 // It writes to both the master DB (spire_workloads) and the tenant DB (workload_entries),
 // and optionally creates a SPIRE entry via gRPC if the server is connected.
