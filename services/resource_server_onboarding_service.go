@@ -345,6 +345,7 @@ func (s *ResourceServerOnboardingService) ValidateResourceServer(rs *models.Reso
 
 	metadataStatus, metadataMessage, metadataObserved := s.checkMetadataURL(rs.ResourceURI)
 	challengeStatus, challengeMessage, challengeObserved := s.checkMCPChallenge(rs.ResourceURI)
+	dcrAllowed := rs.AllowsRegistrationMode("dcr")
 
 	discoveryStatus := "failing"
 	discoveryMessage := "Run discovery to populate tool and scope state."
@@ -365,20 +366,31 @@ func (s *ResourceServerOnboardingService) ValidateResourceServer(rs *models.Reso
 	if clientCount > 0 {
 		clientReadyStatus = "passing"
 		clientReadyMessage = fmt.Sprintf("%d OAuth client registration(s) are available.", clientCount)
+	} else if dcrAllowed {
+		clientReadyStatus = "passing"
+		clientReadyMessage = "Dynamic client registration is enabled; pre-registered clients are optional."
 	}
 
 	browserReadyStatus := "failing"
 	browserReadyMessage := "Browser login is not ready yet."
-	if metadataStatus == "passing" && challengeStatus == "passing" && clientCount > 0 {
+	if metadataStatus == "passing" && challengeStatus == "passing" && (clientCount > 0 || dcrAllowed) {
 		browserReadyStatus = "passing"
-		browserReadyMessage = "Browser login prerequisites are satisfied."
+		if clientCount > 0 {
+			browserReadyMessage = "Browser login prerequisites are satisfied."
+		} else {
+			browserReadyMessage = "Browser login prerequisites are satisfied via dynamic client registration."
+		}
 	}
 
 	toolsListReadyStatus := "failing"
 	toolsListReadyMessage := "Tool filtering is not ready yet."
-	if rs.LastSuccessfulGeneration > 0 && clientCount > 0 {
+	if rs.LastSuccessfulGeneration > 0 && (clientCount > 0 || dcrAllowed) {
 		toolsListReadyStatus = "passing"
-		toolsListReadyMessage = "Tool discovery and client registration are ready for tools/list filtering."
+		if clientCount > 0 {
+			toolsListReadyMessage = "Tool discovery and client registration are ready for tools/list filtering."
+		} else {
+			toolsListReadyMessage = "Tool discovery is ready and dynamic client registration can supply clients on demand."
+		}
 	}
 
 	toolsCallReadyStatus := "failing"
@@ -403,7 +415,7 @@ func (s *ResourceServerOnboardingService) ValidateResourceServer(rs *models.Reso
 	var failureMessages []string
 	for _, check := range checks {
 		if check.Status != "passing" {
-			overallStatus = "failing"
+			overallStatus = "failed"
 			failureMessages = append(failureMessages, fmt.Sprintf("%s: %s", check.Label, check.Message))
 		}
 	}
@@ -413,7 +425,7 @@ func (s *ResourceServerOnboardingService) ValidateResourceServer(rs *models.Reso
 		"last_validated_at":      &now,
 		"last_validation_status": overallStatus,
 	}
-	if overallStatus == "failing" {
+	if overallStatus == "failed" {
 		errorMessage := strings.Join(failureMessages, " | ")
 		updates["last_validation_error"] = errorMessage
 	} else {
