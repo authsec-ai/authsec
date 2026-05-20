@@ -3,12 +3,14 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -397,8 +399,21 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		}
 	}
 
-	// Create SPIRE entry via gRPC (if server is connected)
-	if sc.entryClient != nil {
+	// Register with authsec-spire (HTTP) first — this is the supported path.
+	// Falls back to the legacy SPIRE gRPC client if HTTP is unavailable.
+	icpURL := spireGetenv("ICP_SERVICE_URL", "")
+	httpOK := false
+	if icpURL != "" {
+		if err := registerAgentEntryViaHTTP(icpURL, tenantID, clientID, agentType, parentID, selectors); err != nil {
+			log.Printf("[SPIRE] HTTP registration via %s failed: %v — will try gRPC fallback if configured", icpURL, err)
+		} else {
+			log.Printf("[SPIRE] Agent entry registered via HTTP at %s", icpURL)
+			httpOK = true
+		}
+	}
+
+	// Fallback: SPIRE gRPC entry creation (if server is connected and HTTP did not succeed).
+	if !httpOK && sc.entryClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
@@ -415,11 +430,12 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		if err != nil {
 			// Rollback DB records
 			sc.db.Delete(&w)
-			log.Printf("[SPIRE] SPIRE gRPC entry creation failed, rolled back DB records: %v", err)
+			log.Printf("[SPIRE] SPIRE gRPC entry creation failed (no HTTP fallback succeeded), rolled back DB records: %v", err)
 			return "", fmt.Errorf("SPIRE entry creation failed: %w", err)
 		}
-	} else {
-		log.Printf("[SPIRE] Warning: SPIRE gRPC entryClient is nil — workload entry saved to DB but not registered with SPIRE server. Set SPIRE_SERVER_ADDR to enable.")
+		log.Printf("[SPIRE] Agent entry registered via gRPC (legacy path)")
+	} else if !httpOK {
+		log.Printf("[SPIRE] Warning: neither HTTP (ICP_SERVICE_URL) nor gRPC (SPIRE_SERVER_ADDR) registration succeeded — workload entry saved to DB only.")
 	}
 
 	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s", fullSpiffeID, tenantID, clientID)
@@ -437,36 +453,42 @@ func NewSpireController() *SpireController {
 		sc.trustDomain = spireGetenv("SPIRE_TRUST_DOMAIN", "example.org")
 	}
 
-	// Initialize SPIRE entry client (optional — degrades gracefully)
+	// Initialize SPIRE entry client (optional — degrades gracefully).
+	// Set SPIRE_SERVER_ADDR=disabled to skip gRPC and run in DB-only mode;
+	// useful for local/dev deployments without a real SPIRE server.
 	spireAddr := spireGetenv("SPIRE_SERVER_ADDR", "spire-server:8081")
 	spiffeSocket := "/run/spire/sockets/workload_api.sock"
 	ctx := context.Background()
 
 	var conn *grpc.ClientConn
 	var err error
-	if _, statErr := os.Stat(spiffeSocket); statErr == nil {
-		source, srcErr := workloadapi.NewX509Source(ctx)
-		if srcErr == nil {
-			tlsCfg := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeAny())
-			conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
-			if err != nil {
-				log.Printf("[spire] mTLS gRPC connect failed: %v — falling back to insecure", err)
-			} else {
-				log.Printf("[spire] Using SPIFFE mTLS for SPIRE server connection")
+	if strings.EqualFold(spireAddr, "disabled") {
+		log.Printf("[spire] SPIRE_SERVER_ADDR=disabled — running in DB-only mode (no SPIRE gRPC registration)")
+	} else {
+		if _, statErr := os.Stat(spiffeSocket); statErr == nil {
+			source, srcErr := workloadapi.NewX509Source(ctx)
+			if srcErr == nil {
+				tlsCfg := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeAny())
+				conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+				if err != nil {
+					log.Printf("[spire] mTLS gRPC connect failed: %v — falling back to insecure", err)
+				} else {
+					log.Printf("[spire] Using SPIFFE mTLS for SPIRE server connection")
+				}
 			}
 		}
-	}
-	if conn == nil {
-		conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("[spire] Warning: failed to create SPIRE gRPC client: %v", err)
-		} else {
-			log.Printf("[spire] Using insecure gRPC for SPIRE server connection")
+		if conn == nil {
+			conn, err = grpc.NewClient(spireAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("[spire] Warning: failed to create SPIRE gRPC client: %v", err)
+			} else {
+				log.Printf("[spire] Using insecure gRPC for SPIRE server connection")
+			}
 		}
-	}
-	if conn != nil {
-		sc.grpcConn = conn
-		sc.entryClient = entryv1.NewEntryClient(conn)
+		if conn != nil {
+			sc.grpcConn = conn
+			sc.entryClient = entryv1.NewEntryClient(conn)
+		}
 	}
 
 	// Initialize OIDC provider
@@ -1608,4 +1630,54 @@ func spireGetenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// registerAgentEntryViaHTTP calls the authsec-spire (a.k.a. spire-headless)
+// HTTP API to create an agent workload entry. This is the supported path —
+// authsec-spire derives the SPIFFE ID from (tenant_id, client_id, agent_type)
+// and persists the entry. Returns nil on 2xx, otherwise a descriptive error.
+//
+// Endpoint contract (authsec-spire/internal/interfaces/http/dto/workload_entry.go):
+//
+//	POST {baseURL}/v1/entries/agent
+//	{ tenant_id, client_id, agent_type, parent_id, selectors?, ttl? }
+func registerAgentEntryViaHTTP(baseURL, tenantID, clientID, agentType, parentID string, selectors map[string]string) error {
+	body := map[string]interface{}{
+		"tenant_id":  tenantID,
+		"client_id":  clientID,
+		"agent_type": agentType,
+		"parent_id":  parentID,
+	}
+	if len(selectors) > 0 {
+		body["selectors"] = selectors
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := strings.TrimRight(baseURL, "/") + "/v1/entries/agent"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("transport: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, url, strings.TrimSpace(string(respBody)))
 }

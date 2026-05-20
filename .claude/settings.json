@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"c:\\\\Users\\\\Ritam Kumarb Kundu\\\\Desktop\\\\Broadcom\\\\authsec\" -ad)",
+      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/**)",
+      "Bash(go vet *)",
+      "Bash(git checkout *)",
+      "Bash(git restore *)",
+      "Bash(rm controllers/platform/identity_chain_controller.go migrations/master/107_create_identity_chain_tables.sql models/trusted_issuer.go)",
+      "Bash(mkdir -p \"c:/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-langchain/src/authsec_langchain\" \"c:/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-langchain/examples\" \"c:/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-langchain/tests\" && echo \"OK\")",
+      "Bash(python -m pip install -e \".[dev]\")",
+      "Bash(python -m pytest -v)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl logs *)",
+      "Bash(kubectl describe *)",
+      "Bash(findstr /N \"busybox image:\")",
+      "Bash(kubectl patch *)",
+      "Bash(kubectl rollout *)",
+      "Bash(findstr /I spire)",
+      "WebFetch(domain:docs.authsec.dev)",
+      "WebFetch(domain:docs.authsec.ai)",
+      "Read(//tmp/**)",
+      "Bash(kubectl exec *)",
+      "Bash(curl -fsSL https://docker-repo-public.authsec.ai/v2/spire-agent/tags/list)",
+      "Bash(kubectl run *)",
+      "Bash(kubectl wait *)",
+      "Bash(kubectl delete *)",
+      "Bash(kubectl set *)",
+      "Bash(docker version *)",
+      "Bash(docker run *)",
+      "Bash(docker push *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-langchain\\src",
+      "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-langchain",
+      "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-spire-agent\\icp_agent"
+    ]
+  }
+}
