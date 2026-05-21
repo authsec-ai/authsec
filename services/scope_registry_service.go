@@ -43,6 +43,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 			DisplayName:      generateDisplayName(scopeStr),
 			RiskLevel:        inferRiskLevel(scopeStr),
 			IsAutoDiscovered: true,
+			Source:           "discovered",
 		}
 
 		// Upsert: create if not exists, don't overwrite admin-edited fields

@@ -460,14 +460,22 @@ func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, tena
 	}
 
 	var rows []roleRow
+	// LEFT JOIN so roles with zero permissions (e.g. the freshly-created viewer
+	// role that exists before scopes have been discovered) still appear in the
+	// dropdown. The COUNT FILTER restricts the tally to permissions that come
+	// from this RS's scopes, while the role-name filter keeps the list to
+	// RS-scoped roles and the global admin/viewer/user roles.
+	rsRoleLike := "rs-" + resourceServerID.String() + ":%"
 	err := s.db.Table("roles r").
-		Select("DISTINCT r.id, r.name, r.description, r.is_system, COUNT(DISTINCT rp.permission_id) AS permissions").
-		Joins("JOIN role_permissions rp ON rp.role_id = r.id").
-		Joins("JOIN permissions p ON p.id = rp.permission_id").
-		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
-		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
+		Select(`DISTINCT r.id, r.name, r.description, r.is_system,
+			COUNT(DISTINCT rp.permission_id) FILTER (WHERE os.resource_server_id = ?) AS permissions`,
+			resourceServerID).
+		Joins("LEFT JOIN role_permissions rp ON rp.role_id = r.id").
+		Joins("LEFT JOIN permissions p ON p.id = rp.permission_id").
+		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
+		Joins("LEFT JOIN oauth_scopes os ON os.id = osp.scope_id AND os.tenant_id = ?", tenantID).
 		Where("r.tenant_id = ?", tenantID).
-		Where("os.resource_server_id = ? AND os.tenant_id = ?", resourceServerID, tenantID).
+		Where("r.name LIKE ? OR r.name IN ('admin','viewer','user')", rsRoleLike).
 		Group("r.id, r.name, r.description, r.is_system").
 		Order("r.name").
 		Scan(&rows).Error

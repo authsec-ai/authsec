@@ -21,6 +21,9 @@ type OAuthScope struct {
 	RiskLevel        string     `json:"risk_level" gorm:"type:text;not null;default:'low'"`
 	ParentScopeID    *uuid.UUID `json:"parent_scope_id" gorm:"type:uuid"`
 	IsAutoDiscovered bool       `json:"is_auto_discovered" gorm:"not null;default:false"`
+	// Source: 'discovered' | 'preset' | 'manifest' | 'manual'.
+	// New surface for the UI; superset of is_auto_discovered.
+	Source           string     `json:"source" gorm:"type:text;not null;default:'discovered'"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
 
@@ -75,6 +78,7 @@ type OAuthScopeResponse struct {
 	RiskLevel        string   `json:"risk_level"`
 	ParentScopeID    string   `json:"parent_scope_id,omitempty"`
 	IsAutoDiscovered bool     `json:"is_auto_discovered"`
+	Source           string   `json:"source,omitempty"`
 	ResourceServerID string   `json:"resource_server_id,omitempty"`
 	PermissionIDs    []string `json:"permission_ids,omitempty"`
 	ChildScopes      []string `json:"child_scopes,omitempty"`

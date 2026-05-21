@@ -85,14 +85,17 @@ type OIDCProvider struct {
 }
 
 type LoginPageDataResponse struct {
-	ClientID       string         `json:"client_id"`
-	Success        bool           `json:"success"`
-	LoginChallenge string         `json:"login_challenge"`
-	TenantName     string         `json:"tenant_name"`
-	ClientName     string         `json:"client_name"`
-	Providers      []OIDCProvider `json:"providers"`
-	BaseURL        string         `json:"base_url"`
-	Error          string         `json:"error,omitempty"`
+	ClientID          string         `json:"client_id"`
+	Success           bool           `json:"success"`
+	LoginChallenge    string         `json:"login_challenge"`
+	TenantName        string         `json:"tenant_name"`
+	ClientName        string         `json:"client_name"`
+	ClientType        string         `json:"client_type,omitempty"`
+	RedirectURIs      []string       `json:"redirect_uris,omitempty"`
+	Providers         []OIDCProvider `json:"providers"`
+	BaseURL           string         `json:"base_url"`
+	LocalLoginEnabled bool           `json:"local_login_enabled"`
+	Error             string         `json:"error,omitempty"`
 }
 
 type AuthInitiateResponse struct {

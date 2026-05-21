@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	authz "github.com/authsec-ai/authsec/internal/authz"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	authz "github.com/authsec-ai/authsec/internal/authz"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -414,15 +414,17 @@ func validateAudience(aud interface{}, expected string) bool {
 
 // UserInfo holds extracted user information from JWT claims
 type UserInfo struct {
-	TenantID  string
-	ProjectID string
-	ClientID  string
-	UserID    string
-	Email     string
-	Roles     []string
-	Groups    []string
-	Scopes    []string
-	Resources []string
+	TenantID              string
+	WorkspaceID           string
+	WorkspaceMembershipID string
+	ProjectID             string
+	ClientID              string
+	UserID                string
+	Email                 string
+	Roles                 []string
+	Groups                []string
+	Scopes                []string
+	Resources             []string
 }
 
 // extractUserInfo extracts user information from auth-manager claims
@@ -443,6 +445,14 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 	// Extract basic user info
 	if v, ok := claimsMap["tenant_id"].(string); ok {
 		info.TenantID = v
+	}
+	if v, ok := claimsMap["workspace_id"].(string); ok {
+		info.WorkspaceID = v
+	} else {
+		info.WorkspaceID = info.TenantID
+	}
+	if v, ok := claimsMap["workspace_membership_id"].(string); ok {
+		info.WorkspaceMembershipID = v
 	}
 	if v, ok := claimsMap["project_id"].(string); ok {
 		info.ProjectID = v
@@ -925,6 +935,12 @@ func stringFromAny(value interface{}) string {
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
 	// Set individual fields for backward compatibility
 	c.Set("tenant_id", userInfo.TenantID)
+	if userInfo.WorkspaceID != "" {
+		c.Set("workspace_id", userInfo.WorkspaceID)
+	}
+	if userInfo.WorkspaceMembershipID != "" {
+		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
+	}
 	c.Set("project_id", userInfo.ProjectID)
 	c.Set("client_id", userInfo.ClientID)
 	c.Set("user_id", userInfo.UserID)

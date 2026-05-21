@@ -72,6 +72,22 @@ func GetTenantIDFromToken(c *gin.Context) (string, bool) {
 	return tenantIDStr, ok
 }
 
+// GetWorkspaceIDFromToken returns the active workspace_id claim from the JWT.
+// During the tenant_id -> workspace_id rollout, callers can use this without
+// caring about the underlying claim — extractUserInfo sets workspace_id from
+// the explicit claim when present and falls back to tenant_id otherwise.
+func GetWorkspaceIDFromToken(c *gin.Context) (string, bool) {
+	workspaceID, exists := c.Get("workspace_id")
+	if exists {
+		if s, ok := workspaceID.(string); ok && s != "" {
+			return s, true
+		}
+	}
+	// Fallback: read tenant_id directly. Some auth paths set tenant_id but not
+	// workspace_id (e.g. legacy admin tokens issued before the rollout).
+	return GetTenantIDFromToken(c)
+}
+
 // isAdminUser checks if user has admin role
 func isAdminUser(c *gin.Context) bool {
 	roles, exists := c.Get("roles")

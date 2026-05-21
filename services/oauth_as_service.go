@@ -383,6 +383,13 @@ func (s *OAuthASService) ProxyFormToHydraPublicCapture(path string, form url.Val
 	proxyReq.Header = header.Clone()
 	proxyReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	proxyReq.Header.Del("Content-Length")
+	// Strip Accept-Encoding inherited from the upstream browser request. When this
+	// header is explicitly set, net/http disables transparent gzip decoding, and the
+	// caller would receive a raw compressed body (e.g. when Hydra is reached via a
+	// CDN that adds br/gzip) — making json.Unmarshal fail on the first byte. With
+	// the header removed, the Transport adds "Accept-Encoding: gzip" itself and
+	// transparently decodes the response.
+	proxyReq.Header.Del("Accept-Encoding")
 
 	resp, err := CircuitDoHydra(proxyReq)
 	if err != nil {
@@ -797,8 +804,10 @@ type DCRResponse struct {
 	PostLogoutRedirectURIs  []string `json:"post_logout_redirect_uris,omitempty"`
 }
 
-// resolveOIDCClientCapabilities determines Hydra client scope and grant types based on
-// the requested scope string. Returns (hydraScope, grantTypes, supportsRefreshToken).
+// resolveOIDCClientCapabilities determines the Hydra client scope and grant types.
+// Hydra must know every scope that may appear on /oauth2/auth; otherwise it
+// rejects the browser flow with invalid_scope before AuthSec can apply its own
+// RS/RBAC policy checks.
 func resolveOIDCClientCapabilities(scope string) (string, []string, bool) {
 	grantTypes := []string{"authorization_code"}
 	supportsRefresh := false
@@ -807,12 +816,14 @@ func resolveOIDCClientCapabilities(scope string) (string, []string, bool) {
 		return "", grantTypes, false
 	}
 
-	// Filter to only OIDC core scopes for the Hydra client
+	seen := make(map[string]struct{})
 	var hydraScopes []string
 	for _, s := range strings.Fields(scope) {
-		if IsOIDCCoreScope(s) {
-			hydraScopes = append(hydraScopes, s)
+		if _, ok := seen[s]; ok {
+			continue
 		}
+		seen[s] = struct{}{}
+		hydraScopes = append(hydraScopes, s)
 		if s == "offline_access" {
 			supportsRefresh = true
 		}

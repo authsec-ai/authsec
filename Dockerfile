@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache ca-certificates && update-ca-certificates
 
@@ -15,8 +15,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . ./
 
+# Honor buildkit TARGETARCH so the same Dockerfile produces amd64 or arm64 binaries.
+ARG TARGETARCH
 ENV GOOS=linux
-ENV GOARCH=amd64
+ENV GOARCH=${TARGETARCH}
 ENV CGO_ENABLED=0
 
 RUN --mount=type=cache,target=/go/pkg/mod \

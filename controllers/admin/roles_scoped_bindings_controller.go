@@ -42,12 +42,13 @@ type CreateRoleResponse struct {
 
 // RoleDetail is the full role response including all permissions.
 type RoleDetail struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Permissions []string `json:"permissions"`
-	UserIDs     []string `json:"user_ids,omitempty"`
-	Usernames   []string `json:"usernames,omitempty"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Description   string   `json:"description"`
+	Permissions   []string `json:"permissions"`
+	GrantedScopes []string `json:"granted_scopes,omitempty"`
+	UserIDs       []string `json:"user_ids,omitempty"`
+	Usernames     []string `json:"usernames,omitempty"`
 }
 
 // RoleListItem enriches a listed role with counts and user details.
@@ -209,6 +210,23 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 		permissions = append(permissions, p.Resource+":"+p.Action)
 	}
 
+	type scopeRow struct {
+		ScopeString string
+	}
+	var scopeRows []scopeRow
+	freshDB.Table("role_permissions rp").
+		Select("DISTINCT os.scope_string").
+		Joins("JOIN oauth_scope_permissions osp ON rp.permission_id = osp.permission_id").
+		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
+		Where("rp.role_id = ? AND os.tenant_id = ?", roleID, tenantID).
+		Order("os.scope_string ASC").
+		Find(&scopeRows)
+
+	grantedScopes := make([]string, 0, len(scopeRows))
+	for _, s := range scopeRows {
+		grantedScopes = append(grantedScopes, s.ScopeString)
+	}
+
 	type userRow struct {
 		UserID   uuid.UUID
 		Username string
@@ -230,12 +248,13 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 	}
 
 	c.JSON(http.StatusOK, RoleDetail{
-		ID:          role.ID.String(),
-		Name:        role.Name,
-		Description: role.Description,
-		Permissions: permissions,
-		UserIDs:     userIDs,
-		Usernames:   usernames,
+		ID:            role.ID.String(),
+		Name:          role.Name,
+		Description:   role.Description,
+		Permissions:   permissions,
+		GrantedScopes: grantedScopes,
+		UserIDs:       userIDs,
+		Usernames:     usernames,
 	})
 }
 
@@ -537,10 +556,14 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 	freshRBAC := services.NewRBACService(freshDB)
 
-	permUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	permUUIDs := make([]uuid.UUID, 0)
+	if len(req.PermissionIDs) > 0 || len(req.PermissionStrings) > 0 {
+		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		permUUIDs = resolvedPermUUIDs
 	}
 
 	role := &models.RBACRole{
@@ -719,10 +742,14 @@ func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB,
 	freshDB.Where("id = ? AND tenant_id = ?", roleID, tenantID).First(&oldRole)
 	freshDB.Model(&models.RolePermission{}).Where("role_id = ?", roleID).Count(&oldPermCount)
 
-	permUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	permUUIDs := make([]uuid.UUID, 0)
+	if len(req.PermissionIDs) > 0 || len(req.PermissionStrings) > 0 {
+		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		permUUIDs = resolvedPermUUIDs
 	}
 
 	if err := freshDB.Transaction(func(tx *gorm.DB) error {

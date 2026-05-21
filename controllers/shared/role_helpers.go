@@ -27,12 +27,14 @@ func ResolvePermissionUUIDs(db *gorm.DB, tenantID uuid.UUID, ids []string, permS
 	}
 
 	for _, ps := range permStrings {
-		parts := strings.FieldsFunc(ps, func(r rune) bool { return r == ':' || r == '.' })
-		if len(parts) != 2 {
+		sep := strings.LastIndexAny(ps, ":.")
+		if sep <= 0 || sep >= len(ps)-1 {
 			return nil, fmt.Errorf("invalid permission string: %s (expected resource:action)", ps)
 		}
+		resource := ps[:sep]
+		action := ps[sep+1:]
 		var perm models.RBACPermission
-		if err := db.Where("tenant_id = ? AND resource = ? AND action = ?", tenantID, parts[0], parts[1]).First(&perm).Error; err != nil {
+		if err := db.Where("tenant_id = ? AND resource = ? AND action = ?", tenantID, resource, action).First(&perm).Error; err != nil {
 			return nil, fmt.Errorf("permission not found: %s", ps)
 		}
 		result[perm.ID] = struct{}{}
@@ -68,6 +70,21 @@ func ResolveTenantIDFromToken(c *gin.Context) (*uuid.UUID, error) {
 		return nil, fmt.Errorf("Invalid tenant ID format")
 	}
 	return &tenantID, nil
+}
+
+// ResolveWorkspaceIDFromToken extracts the active workspace_id from the JWT.
+// Falls back to tenant_id during the tenant_id -> workspace_id rollout so
+// existing tokens continue to authorize correctly.
+func ResolveWorkspaceIDFromToken(c *gin.Context) (uuid.UUID, error) {
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("Workspace ID not found in context")
+	}
+	workspaceID, err := uuid.Parse(workspaceIDStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("Invalid workspace ID format")
+	}
+	return workspaceID, nil
 }
 
 // ParseUUIDs converts a slice of strings to UUIDs with field context for errors.

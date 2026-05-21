@@ -837,7 +837,7 @@ func TestUpdateRole_InvalidPayload(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestUpdateRole_RequiresPermissions(t *testing.T) {
+func TestUpdateRole_AllowsClearingPermissions(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
 	tenantID := uuid.New()
 	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
@@ -862,7 +862,8 @@ func TestUpdateRole_RequiresPermissions(t *testing.T) {
 	db.Raw("SELECT COUNT(*) FROM role_permissions WHERE role_id = ?", roleID.String()).Scan(&initialCount)
 	assert.Equal(t, int64(2), initialCount)
 
-	// Try to update the role with no permissions (should fail - permissions required)
+	// Update the role with no permissions. This is the "clear role" path used
+	// by the Access tab when a generated Viewer role should exist but grant nothing.
 	payload := CreateRoleRequest{
 		Name:          "role-no-perms",
 		Description:   "Role without permissions",
@@ -875,13 +876,12 @@ func TestUpdateRole_RequiresPermissions(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	// Should fail because permissions are required
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
 
-	// Verify original permissions are still intact
+	// Verify permissions were cleared.
 	var finalCount int64
 	db.Raw("SELECT COUNT(*) FROM role_permissions WHERE role_id = ?", roleID.String()).Scan(&finalCount)
-	assert.Equal(t, int64(2), finalCount)
+	assert.Equal(t, int64(0), finalCount)
 }
 
 // ==================================

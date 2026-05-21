@@ -166,6 +166,12 @@ func SetupRoutes(
 
 	delegationPolicyCtrl := platformCtrl.NewDelegationPolicyController()
 	sdkTokenCtrl := platformCtrl.NewSDKTokenController()
+	forbiddenLegacyRBACMutation := func(c *gin.Context) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "forbidden",
+			"message": "RBAC mutations are restricted to operator/admin APIs. Use /authsec/uflow/admin or the Application access APIs.",
+		})
+	}
 
 	// ── Inject merged SPIRE services into controllers that need them ──
 	if spireDeps != nil {
@@ -200,6 +206,7 @@ func SetupRoutes(
 	oauthASController := platformCtrl.NewOAuthASController()
 	rsController := platformCtrl.NewResourceServerController()
 	scopeMatrixController := platformCtrl.NewScopeMatrixController()
+	workspaceController := platformCtrl.NewWorkspaceController()
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
@@ -236,9 +243,27 @@ func SetupRoutes(
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
 	{
+		workspaces := authsec.Group("/workspaces")
+		workspaces.Use(middlewares.AuthMiddleware())
+		{
+			workspaces.POST("/:workspace_id/switch", workspaceController.SwitchWorkspace)
+		}
+
 		// ────────────────────────────────────────────────────────
 		// Resource Server admin API (authenticated)
 		// ────────────────────────────────────────────────────────
+		// Scope preset catalog (read-only, no tenant scoping — same 12 for everyone).
+		// Surfaced on the Create Application page.
+		scopePresets := authsec.Group("/scope-presets")
+		scopePresets.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			scopePresets.GET("", rsController.ScopePresets)
+		}
+
 		resourceServers := authsec.Group("/resource-servers")
 		resourceServers.Use(
 			middlewares.AuthMiddleware(),
@@ -639,6 +664,7 @@ func SetupRoutes(
 		v2 := uflow.Group("/v2")
 		v2.Use(
 			middlewares.AuthMiddleware(),
+			middlewares.Require("admin", "access"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -680,8 +706,10 @@ func SetupRoutes(
 			delegationPolicies.DELETE("/:id", delegationPolicyCtrl.DeleteDelegationPolicy)
 		}
 
-		// SDK public endpoint — no auth middleware (client_id is the identity)
+		// SDK delegation-token retrieval requires an authenticated caller.
+		// Bare client_id is not authentication.
 		sdk := uflow.Group("/sdk")
+		sdk.Use(middlewares.AuthMiddleware())
 		{
 			sdk.GET("/delegation-token", sdkTokenCtrl.GetDelegationToken)
 		}
@@ -730,16 +758,16 @@ func SetupRoutes(
 			user.POST("/enduser/delete", endUserController.DeleteEndUser)
 			user.DELETE("/enduser/:tenant_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
 			user.DELETE("/enduser/delete_all/:tenant_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
-			user.POST("/rbac/roles", rolesScopedBindingsController.CreateRoleCompositeEndUser)
+			user.POST("/rbac/roles", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/roles", rolesScopedBindingsController.ListRolesEndUser)
-			user.PUT("/rbac/roles/:role_id", rolesScopedBindingsController.UpdateRoleCompositeEndUser)
-			user.DELETE("/rbac/roles/:role_id", rolesScopedBindingsController.DeleteRoleEndUser)
-			user.POST("/rbac/bindings", rolesScopedBindingsController.AssignRoleScopedEndUser)
+			user.PUT("/rbac/roles/:role_id", forbiddenLegacyRBACMutation)
+			user.DELETE("/rbac/roles/:role_id", forbiddenLegacyRBACMutation)
+			user.POST("/rbac/bindings", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/bindings", rolesScopedBindingsController.ListRoleBindingsEndUser)
 			user.GET("/rbac/permissions", permissionController.ListPermissionsEndUser)
-			user.POST("/rbac/permissions", permissionController.RegisterAtomicPermissionEndUser)
-			user.DELETE("/rbac/permissions/:id", permissionController.DeletePermissionEndUser)
-			user.DELETE("/rbac/permissions", permissionController.DeletePermissionEndUserByBody)
+			user.POST("/rbac/permissions", forbiddenLegacyRBACMutation)
+			user.DELETE("/rbac/permissions/:id", forbiddenLegacyRBACMutation)
+			user.DELETE("/rbac/permissions", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/permissions/resources", permissionController.ShowResourcesEndUser)
 			user.POST("/rbac/policy/check", authController.PolicyDecisionPointCheckUser)
 			user.GET("/permissions", permissionController.GetMyPermissions)

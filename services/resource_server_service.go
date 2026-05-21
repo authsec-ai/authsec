@@ -38,15 +38,39 @@ type CreateResourceServerRequest struct {
 	ProtectedBasePath string    `json:"protected_base_path"`
 	ScopesSupported   []string  `json:"scopes_supported"`
 	RegistrationModes []string  `json:"registration_modes"`
+	// ApplicationType is one of models.ApplicationType* — mcp_server (default),
+	// ai_agent, clawbot, api_service. Optional; left empty defaults to mcp_server.
+	ApplicationType string `json:"application_type,omitempty"`
+	// ScopePresetID, if set and not "blank", seeds preset scopes for this RS.
+	ScopePresetID *string `json:"scope_preset_id,omitempty"`
+	// DefaultAccessEnabled controls the initial enabled flag on the auto-created
+	// access policy. Defaults to false (closed) per the wireframe redesign.
+	DefaultAccessEnabled *bool `json:"default_access_enabled,omitempty"`
+}
+
+// ValidApplicationType reports whether the supplied type is one of the
+// supported Application type constants. Empty string is treated as valid and
+// resolved to mcp_server by the caller.
+func ValidApplicationType(t string) bool {
+	switch t {
+	case "",
+		models.ApplicationTypeMCPServer,
+		models.ApplicationTypeAIAgent,
+		models.ApplicationTypeClawbot,
+		models.ApplicationTypeAPIService:
+		return true
+	default:
+		return false
+	}
 }
 
 type ResourceServerResponse struct {
-	ID                    string   `json:"id"`
-	IssuerURL             string   `json:"issuer_url"`
-	ResourceURL           string   `json:"resource_url"`
-	JWKSURI               string   `json:"jwks_uri"`
-	IntrospectionEndpoint string   `json:"introspection_endpoint"`
-	IntrospectionSecret   string   `json:"introspection_secret,omitempty"`
+	ID                    string `json:"id"`
+	IssuerURL             string `json:"issuer_url"`
+	ResourceURL           string `json:"resource_url"`
+	JWKSURI               string `json:"jwks_uri"`
+	IntrospectionEndpoint string `json:"introspection_endpoint"`
+	IntrospectionSecret   string `json:"introspection_secret,omitempty"`
 	// SDK endpoints. Both use Basic auth keyed by (id : introspection_secret).
 	// Provided in the create response so the SDK Config can be assembled by
 	// pasting directly from this payload — no hand-written URLs.
@@ -94,8 +118,15 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 		return nil, nil, fmt.Errorf("hash introspection secret: %w", hashErr)
 	}
 
+	appType := req.ApplicationType
+	if appType == "" {
+		appType = models.ApplicationTypeMCPServer
+	}
+
 	rs := &models.ResourceServer{
 		TenantID:                req.TenantID,
+		WorkspaceID:             &req.TenantID,
+		ApplicationType:         appType,
 		Name:                    req.Name,
 		PublicBaseURL:           publicURL,
 		ProtectedBasePath:       basePath,
@@ -125,14 +156,47 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 			return fmt.Errorf("create viewer role: %w", err)
 		}
 
+		// Default access is now closed (Enabled=false). Operators opt in by passing
+		// default_access_enabled=true at registration, or flip the policy from the
+		// Access tab after activation.
+		policyEnabled := false
+		if req.DefaultAccessEnabled != nil && *req.DefaultAccessEnabled {
+			policyEnabled = true
+		}
 		policy := &models.ResourceServerAccessPolicy{
 			TenantID:         rs.TenantID,
 			ResourceServerID: rs.ID,
-			Enabled:          true,
+			Enabled:          policyEnabled,
 			DefaultRoleID:    &viewerRole.ID,
 		}
 		if err := tx.Create(policy).Error; err != nil {
 			return fmt.Errorf("create access policy: %w", err)
+		}
+
+		// Seed preset scopes (idempotent — FirstOrCreate on the unique key).
+		// Skipped for "blank" and when no preset is selected. Scopes are tagged
+		// source="preset" so the UI can distinguish them from discovered ones.
+		if req.ScopePresetID != nil && *req.ScopePresetID != "" && *req.ScopePresetID != "blank" {
+			if preset, ok := GetScopePreset(*req.ScopePresetID); ok {
+				slug := SlugForApp(req.Name)
+				for _, ss := range ExpandPresetScopes(preset, slug) {
+					scope := models.OAuthScope{
+						TenantID:         req.TenantID,
+						ResourceServerID: &rs.ID,
+						ScopeString:      ss,
+						DisplayName:      ss,
+						RiskLevel:        inferRiskLevel(ss),
+						Source:           "preset",
+						IsAutoDiscovered: false,
+					}
+					if err := tx.Where(
+						"tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
+						req.TenantID, rs.ID, ss,
+					).FirstOrCreate(&scope).Error; err != nil {
+						return fmt.Errorf("seed preset scope %s: %w", ss, err)
+					}
+				}
+			}
 		}
 		return nil
 	})
@@ -186,6 +250,27 @@ func (s *ResourceServerService) GetByResourceURI(uri string) (*models.ResourceSe
 func (s *ResourceServerService) ListByTenant(tenantID string) ([]models.ResourceServer, error) {
 	var servers []models.ResourceServer
 	if err := s.db.Where("tenant_id = ? AND active = true", tenantID).Find(&servers).Error; err != nil {
+		return nil, err
+	}
+	return servers, nil
+}
+
+// ListByWorkspace returns Applications in a workspace, optionally filtered by
+// application_type. During the tenant_id -> workspace_id rollout this matches
+// rows where workspace_id = $1 OR (workspace_id IS NULL AND tenant_id = $1) so
+// unbackfilled rows are still surfaced to their owning workspace.
+//
+// applicationType is matched as a literal string ("" means no filter).
+func (s *ResourceServerService) ListByWorkspace(workspaceID string, applicationType string) ([]models.ResourceServer, error) {
+	var servers []models.ResourceServer
+	q := s.db.Where(
+		"(workspace_id = ? OR (workspace_id IS NULL AND tenant_id = ?)) AND active = true",
+		workspaceID, workspaceID,
+	)
+	if applicationType != "" {
+		q = q.Where("application_type = ?", applicationType)
+	}
+	if err := q.Find(&servers).Error; err != nil {
 		return nil, err
 	}
 	return servers, nil

@@ -244,6 +244,24 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 		return
 	}
 
+	// Backfill the auto-generated access permission bridge for older scopes that
+	// predate this behavior. Without this, the Access tab can display scopes but
+	// has no real permission strings to persist into role_permissions.
+	needsRefetch := false
+	for i := range scopes {
+		if len(scopes[i].Permissions) == 0 {
+			autoCreateScopePermission(tenantID, &scopes[i])
+			needsRefetch = true
+		}
+	}
+	if needsRefetch {
+		scopes, err = ctrl.scopeRegistry.ListByResourceServer(tenantID, rsUUID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	// Coerce nil → [] so the JSON response is always an array, never null.
 	// Without this, GORM's empty-result Find leaves a nil slice, which Go
 	// marshals as JSON null — and the frontend's destructuring defaults
@@ -291,6 +309,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 		Description:      req.Description,
 		Icon:             req.Icon,
 		RiskLevel:        req.RiskLevel,
+		Source:           "manual",
 	}
 	if scope.RiskLevel == "" {
 		scope.RiskLevel = "low"
@@ -735,18 +754,35 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 		}
 
 		// Upsert sdk_suggested scope mappings for each suggested scope.
+		// If a suggested scope isn't yet in the registry, seed it with
+		// source='manifest' so the UI can label its origin correctly.
 		if len(t.SuggestedScopes) > 0 {
 			var tool models.MCPTool
 			config.DB.Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).First(&tool)
 			for _, scopeStr := range t.SuggestedScopes {
 				var scope models.OAuthScope
-				if config.DB.Where("resource_server_id = ? AND scope_string = ?", rs.ID, scopeStr).First(&scope).Error == nil {
-					config.DB.Exec(`
-						INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
-						VALUES (?, ?, true, 'sdk_suggested')
-						ON CONFLICT (tool_id, scope_id) DO NOTHING
-					`, tool.ID, scope.ID)
+				err := config.DB.Where("tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
+					rs.TenantID, rs.ID, scopeStr).First(&scope).Error
+				if err != nil {
+					scope = models.OAuthScope{
+						TenantID:         rs.TenantID,
+						ResourceServerID: &rs.ID,
+						ScopeString:      scopeStr,
+						DisplayName:      scopeStr,
+						RiskLevel:        "low",
+						Source:           "manifest",
+						IsAutoDiscovered: false,
+					}
+					if createErr := config.DB.Create(&scope).Error; createErr != nil {
+						// best-effort — keep going
+						continue
+					}
 				}
+				config.DB.Exec(`
+					INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
+					VALUES (?, ?, true, 'sdk_suggested')
+					ON CONFLICT (tool_id, scope_id) DO NOTHING
+				`, tool.ID, scope.ID)
 			}
 		}
 		upsertedCount++

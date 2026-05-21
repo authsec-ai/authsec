@@ -94,6 +94,10 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid SPIFFE token"})
 			return
 		}
+		if !spiffeAudienceAllowed(verifiedClaims["aud"]) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "SPIFFE token audience mismatch"})
+			return
+		}
 
 		// Map SPIFFE "permissions" claim to the format expected by auth-manager.
 		if perms, ok := verifiedClaims["permissions"].([]interface{}); ok {
@@ -112,6 +116,45 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func spiffeAudienceAllowed(raw interface{}) bool {
+	expected := os.Getenv("AUTHSEC_SPIFFE_AUDIENCE")
+	if expected == "" {
+		expected = "authsec-api"
+	}
+
+	allowed := map[string]struct{}{}
+	for _, aud := range strings.Split(expected, ",") {
+		aud = strings.TrimSpace(aud)
+		if aud != "" {
+			allowed[aud] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+
+	switch aud := raw.(type) {
+	case string:
+		_, ok := allowed[aud]
+		return ok
+	case []string:
+		for _, item := range aud {
+			if _, ok := allowed[item]; ok {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, item := range aud {
+			if s, ok := item.(string); ok {
+				if _, allowed := allowed[s]; allowed {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // --- JWKS caching ---

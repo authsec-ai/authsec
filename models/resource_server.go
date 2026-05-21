@@ -14,6 +14,9 @@ import (
 type ResourceServer struct {
 	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	TenantID                uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID             *uuid.UUID     `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	ApplicationType         string         `json:"application_type" gorm:"type:text;not null;default:'mcp_server'"`
+	LegacyClientID          *uuid.UUID     `json:"legacy_client_id,omitempty" gorm:"type:uuid;index"`
 	Name                    string         `json:"name" gorm:"not null"`
 	PublicBaseURL           string         `json:"public_base_url" gorm:"not null"`
 	ProtectedBasePath       string         `json:"protected_base_path" gorm:"not null;default:'/mcp'"`
@@ -26,9 +29,9 @@ type ResourceServer struct {
 
 	// State is the new gated state machine: pending_scan → needs_setup → ready | scan_failed.
 	// Preserved alongside Status during migration; Status will be dropped in a follow-up.
-	State             string     `json:"state" gorm:"type:text;not null;default:'pending_scan'"`
-	SetupCompletedAt  *time.Time `json:"setup_completed_at,omitempty"`
-	SetupCompletedBy  *uuid.UUID `json:"setup_completed_by,omitempty" gorm:"type:uuid"`
+	State            string     `json:"state" gorm:"type:text;not null;default:'pending_scan'"`
+	SetupCompletedAt *time.Time `json:"setup_completed_at,omitempty"`
+	SetupCompletedBy *uuid.UUID `json:"setup_completed_by,omitempty" gorm:"type:uuid"`
 
 	// Scan lifecycle — ScanInProgress is internal and never exposed in API responses.
 	Status                   string     `json:"status" gorm:"type:text;not null;default:'pending_scan'"`
@@ -58,6 +61,13 @@ const (
 	RSStateNeedsSetup  = "needs_setup"
 	RSStateReady       = "ready"
 	RSStateScanFailed  = "scan_failed"
+)
+
+const (
+	ApplicationTypeMCPServer  = "mcp_server"
+	ApplicationTypeAIAgent    = "ai_agent"
+	ApplicationTypeClawbot    = "clawbot"
+	ApplicationTypeAPIService = "api_service"
 )
 
 // IsReady returns true when the RS is fully activated and end-user OAuth is allowed.

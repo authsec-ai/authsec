@@ -456,13 +456,15 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		}
 
 		c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
-			ClientID:       tenantIDForOIDC,
-			Success:        true,
-			LoginChallenge: loginChallenge,
-			TenantName:     tenantIDForOIDC,
-			ClientName:     rsName,
-			Providers:      oidcProviders,
-			BaseURL:        config.AppConfig.BaseURL,
+			ClientID:          tenantIDForOIDC,
+			Success:           true,
+			LoginChallenge:    loginChallenge,
+			TenantName:        tenantIDForOIDC,
+			ClientName:        rsName,
+			ClientType:        "mcp_dynamic_client",
+			Providers:         oidcProviders,
+			BaseURL:           config.AppConfig.BaseURL,
+			LocalLoginEnabled: true,
 		})
 		return
 	}
@@ -515,13 +517,16 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
-		ClientID:       strings.TrimSuffix(hydraClientID, "-main-client"),
-		Success:        true,
-		LoginChallenge: loginChallenge,
-		TenantName:     tenantName,
-		ClientName:     clientDetails.ClientName,
-		Providers:      oidcProviders,
-		BaseURL:        config.AppConfig.BaseURL,
+		ClientID:          strings.TrimSuffix(hydraClientID, "-main-client"),
+		Success:           true,
+		LoginChallenge:    loginChallenge,
+		TenantName:        tenantName,
+		ClientName:        clientDetails.ClientName,
+		ClientType:        "tenant_client",
+		RedirectURIs:      clientDetails.RedirectURIs,
+		Providers:         oidcProviders,
+		BaseURL:           config.AppConfig.BaseURL,
+		LocalLoginEnabled: true,
 	})
 }
 
@@ -1543,6 +1548,12 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			for i := range allScopes {
 				scopeMeta[allScopes[i].ScopeString] = &allScopes[i]
 			}
+			// Override the default consent CSP to include the OAuth client's registered
+			// redirect_uri origins. Browsers enforce form-action across the entire
+			// redirect chain, and the final hop after consent goes to the client
+			// redirect_uri (e.g. https://aditya.mcpauthz.com/applications/.../test).
+			// Without this, the consent form submit is blocked.
+			c.Header("Content-Security-Policy", middlewares.BuildConsentCSP(redirectURIOriginsFromClient(mcpClient)))
 			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, report, scopeMeta)
 			return
 		}
@@ -1808,6 +1819,31 @@ button.deny{background:#edf1f7;color:#16202a;}
 	builder.WriteString("</form></main></body></html>")
 
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(builder.String()))
+}
+
+// redirectURIOriginsFromClient returns the deduplicated scheme+host origins of
+// every redirect_uri registered for an MCP OAuth client. These are passed to
+// BuildConsentCSP so the consent form's redirect chain (which terminates at the
+// client's redirect_uri) is not blocked by the browser's form-action enforcement.
+func redirectURIOriginsFromClient(client *models.MCPOAuthClient) []string {
+	if client == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(client.RedirectURIs))
+	origins := make([]string, 0, len(client.RedirectURIs))
+	for _, raw := range client.RedirectURIs {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			continue
+		}
+		origin := parsed.Scheme + "://" + parsed.Host
+		if _, dup := seen[origin]; dup {
+			continue
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins
 }
 
 // HealthHandler provides a health check endpoint

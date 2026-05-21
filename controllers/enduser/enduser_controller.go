@@ -12,11 +12,11 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	hydra "github.com/ory/hydra-client-go/v2"
@@ -1703,10 +1703,9 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		}
 	}
 
-	// Fetch client details
-	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", input.ClientID, tenantID).First(&client).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find client: %v", err)})
+	projectID, err := euc.resolveCustomLoginProjectID(tenantDB, clientUUID, tenantUUID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -1740,7 +1739,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		FirstName:    "",
 		LastName:     "",
 		TenantID:     tenantIDUUID,
-		ProjectID:    client.ProjectID,
+		ProjectID:    projectID,
 		ClientID:     clientIDUUID,
 		ExpiresAt:    time.Now().Add(30 * time.Minute),    // Expires in 30 minutes to match OTP
 		TenantDomain: config.AppConfig.TenantDomainSuffix, // Use configured domain suffix (authsec.dev)
@@ -1781,6 +1780,15 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 
 	// Send OTP via email
 	if err := utils.SendOTPEmail(input.Email, otp); err != nil {
+		if strings.EqualFold(config.AppConfig.Environment, "development") && config.AppConfig.SMTPHost == "" {
+			log.Printf("Custom login registration initiated for %s with development OTP fallback: %s", input.Email, otp)
+			c.JSON(http.StatusOK, gin.H{
+				"message": fmt.Sprintf("Registration initiated. Development OTP: %s", otp),
+				"email":   input.Email,
+				"dev_otp": otp,
+			})
+			return
+		}
 		log.Printf("Failed to send OTP email: %v", err)
 		// Cleanup
 		db.Exec("DELETE FROM otp_entries WHERE email = $1", input.Email)
@@ -1889,10 +1897,8 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	// Fetch client details
-	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", input.ClientID, tenantID).First(&client).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find client: %v", err)})
+	if _, err := euc.resolveCustomLoginProjectID(tenantDB, pendingReg.ClientID, pendingReg.TenantID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -2098,6 +2104,32 @@ func (tc *EndUserController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error
 		return uuid.UUID{}, fmt.Errorf("failed to find tenant: %w", err)
 	}
 	return tenantMapping.TenantID, nil
+}
+
+func (tc *EndUserController) resolveCustomLoginProjectID(tenantDB *gorm.DB, clientID uuid.UUID, tenantID uuid.UUID) (uuid.UUID, error) {
+	var client models.Client
+	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).First(&client).Error; err == nil {
+		return client.ProjectID, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) && !strings.Contains(err.Error(), `relation "clients" does not exist`) {
+		return uuid.UUID{}, fmt.Errorf("failed to find client: %v", err)
+	}
+
+	if clientID != tenantID {
+		return uuid.UUID{}, fmt.Errorf("failed to find client")
+	}
+
+	var projectIDRaw string
+	if err := tenantDB.Raw("SELECT id::text FROM projects WHERE tenant_id = ? ORDER BY created_at ASC LIMIT 1", tenantID).Scan(&projectIDRaw).Error; err != nil {
+		return uuid.UUID{}, fmt.Errorf("failed to find default project: %v", err)
+	}
+	projectID, err := uuid.Parse(projectIDRaw)
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("failed to parse default project: %v", err)
+	}
+	if projectID == uuid.Nil {
+		return uuid.UUID{}, fmt.Errorf("failed to find default project")
+	}
+	return projectID, nil
 }
 
 // Add these methods to your EndUserController struct in enduser_controller.go

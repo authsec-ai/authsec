@@ -30,6 +30,7 @@ type MTPluginClientIface interface {
 // AuthManagerTokenService interface for token generation using auth-manager patterns
 // This avoids import cycles while providing type-safe token generation
 type AuthManagerTokenService interface {
+	GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, projectID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error)
 	GenerateAdminToken(adminUserID uuid.UUID, email string, projectID uuid.UUID, tenantID *uuid.UUID, tenantDomain string, roles []string) (string, error)
 	GenerateTenantUserToken(userID uuid.UUID, tenantID uuid.UUID, projectID uuid.UUID, email string, expiresIn time.Duration) (string, error)
 	GenerateEndUserToken(userID uuid.UUID, tenantID string, clientID string, email string, scopes []string, expiresIn time.Duration) (string, error)
@@ -144,11 +145,11 @@ type Config struct {
 }
 
 var (
-	AppConfig       *Config
-	CacheManager    *monitoring.CacheManager
-	AuditLogger     *monitoring.AuditLogger
-	TokenService    AuthManagerTokenService // Global token service using auth-manager patterns
-	MTPluginClient  MTPluginClientIface      // nil when MT_PLUGIN_GRPC_ADDR is not configured
+	AppConfig      *Config
+	CacheManager   *monitoring.CacheManager
+	AuditLogger    *monitoring.AuditLogger
+	TokenService   AuthManagerTokenService // Global token service using auth-manager patterns
+	MTPluginClient MTPluginClientIface     // nil when MT_PLUGIN_GRPC_ADDR is not configured
 
 	// Redis client singleton
 	redisClient *redis.Client

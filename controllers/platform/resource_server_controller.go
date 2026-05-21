@@ -37,6 +37,17 @@ type resourceServerSummaryResponse struct {
 	AccessPolicyRoleName *string `json:"access_policy_role_name,omitempty"`
 }
 
+// ScopePresets returns the hardcoded preset catalog surfaced on the Create
+// Application page. The same 12 presets are returned to every caller — no
+// per-tenant filtering. Endpoint:
+//
+//	GET /authsec/scope-presets
+//
+// Response shape: {"presets": [...]}.
+func (ctrl *ResourceServerController) ScopePresets(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"presets": services.ScopePresetCatalog})
+}
+
 // Create registers a new resource server.
 // POST /authsec/resource-servers
 func (ctrl *ResourceServerController) Create(c *gin.Context) {

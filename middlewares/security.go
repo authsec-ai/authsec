@@ -35,13 +35,12 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 			// Allow inline scripts for OAuth callback (postMessage to opener window)
 			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 		} else if strings.HasPrefix(path, "/authsec/hmgr/consent") {
-			// form-action applies to the ENTIRE redirect chain from the form submit:
-			//   POST /authsec/hmgr/consent (self)
-			//     → 302 Hydra public URL   (completes OAuth authorization)
-			//       → 302 localhost callback (CLI OAuth client — any port)
-			// All three destinations must be listed or Safari/Chrome blocks the chain.
-			hydraOrigin := hydraPublicOrigin()
-			csp = fmt.Sprintf("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' %s %s;", hydraOrigin, localLoopbackFormActionSources())
+			// Default CSP for the consent path. The handler overrides this just before
+			// rendering to add the registered redirect_uri origins of the OAuth client —
+			// browsers enforce form-action on the entire redirect chain, and the final
+			// hop is the client redirect_uri, which is dynamic per client and unknown
+			// to this middleware.
+			csp = BuildConsentCSP(nil)
 		} else {
 			// Strict CSP for all other endpoints
 			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
@@ -115,6 +114,25 @@ func RequestIDMiddleware() gin.HandlerFunc {
 	}
 }
 
+// BuildConsentCSP returns the Content-Security-Policy for the consent page.
+// extraFormActionSources are appended verbatim to the form-action directive —
+// callers pass the OAuth client's registered redirect_uri origins so the
+// redirect chain after the consent POST (which terminates at the client's
+// redirect_uri) is not blocked by the browser.
+func BuildConsentCSP(extraFormActionSources []string) string {
+	formAction := []string{"'self'"}
+	if hydra := hydraPublicOrigin(); hydra != "" {
+		formAction = append(formAction, hydra)
+	}
+	formAction = append(formAction, loopbackFormActionSources()...)
+	for _, src := range extraFormActionSources {
+		if src != "" {
+			formAction = append(formAction, src)
+		}
+	}
+	return "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action " + strings.Join(formAction, " ") + ";"
+}
+
 // hydraPublicOrigin extracts the scheme+host from HYDRA_PUBLIC_URL so it can
 // be injected into the form-action CSP directive on consent pages. The browser
 // enforces form-action on the 302 redirect chain, so the Hydra origin must be
@@ -139,18 +157,18 @@ func hydraPublicOrigin() string {
 	return raw
 }
 
-// localLoopbackFormActionSources returns the loopback origins used by OAuth desktop
+// loopbackFormActionSources returns the loopback origins used by OAuth desktop
 // callbacks. CSP host sources without an explicit port only match the default port
 // for the scheme, so localhost callbacks on ephemeral ports must use :*.
-func localLoopbackFormActionSources() string {
-	return strings.Join([]string{
+func loopbackFormActionSources() []string {
+	return []string{
 		"http://localhost:*",
 		"https://localhost:*",
 		"http://127.0.0.1:*",
 		"https://127.0.0.1:*",
 		"http://[::1]:*",
 		"https://[::1]:*",
-	}, " ")
+	}
 }
 
 // TimeoutMiddleware adds request timeout handling

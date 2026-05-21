@@ -37,15 +37,17 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 
 // TokenClaims represents the standard claims structure for auth-manager compatible tokens
 type TokenClaims struct {
-	TenantID     string
-	TenantDomain string      // Tenant domain for display/routing
-	ProjectID    string
-	ClientID     string
-	EmailID      string
-	UserID       *uuid.UUID
-	Scopes       []string
-	Roles        []string    // User roles for authorization
-	ExpiresIn    time.Duration
+	TenantID              string
+	WorkspaceID           string
+	WorkspaceMembershipID string
+	TenantDomain          string // Tenant domain for display/routing
+	ProjectID             string
+	ClientID              string
+	EmailID               string
+	UserID                *uuid.UUID
+	Scopes                []string
+	Roles                 []string // User roles for authorization
+	ExpiresIn             time.Duration
 }
 
 // GenerateToken generates a JWT token following auth-manager patterns
@@ -61,6 +63,26 @@ func (s *AuthManagerTokenService) GenerateToken(claims TokenClaims) (string, err
 // Used for service-to-service authentication
 func (s *AuthManagerTokenService) GenerateSDKToken(claims TokenClaims) (string, error) {
 	return s.generateTokenWithType(claims, "sdk-agent", s.jwtSDKSecret)
+}
+
+func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, projectID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error) {
+	if projectID == uuid.Nil {
+		projectID = workspaceID
+	}
+	if clientID == "" {
+		clientID = userID.String()
+	}
+
+	return s.GenerateToken(TokenClaims{
+		TenantID:              workspaceID.String(), // compatibility during tenant_id -> workspace_id rollout
+		WorkspaceID:           workspaceID.String(),
+		WorkspaceMembershipID: membershipID.String(),
+		ProjectID:             projectID.String(),
+		ClientID:              clientID,
+		EmailID:               email,
+		UserID:                &userID,
+		ExpiresIn:             expiresIn,
+	})
 }
 
 // Uses the same algorithm as auth-manager's TokenController.GenerateToken()
@@ -84,6 +106,12 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		"nbf":        now.Unix(),
 		"exp":        now.Add(expiresIn).Unix(),
 		"iss":        "authsec-ai/auth-manager",
+	}
+	if claims.WorkspaceID != "" {
+		jwtClaims["workspace_id"] = claims.WorkspaceID
+	}
+	if claims.WorkspaceMembershipID != "" {
+		jwtClaims["workspace_membership_id"] = claims.WorkspaceMembershipID
 	}
 
 	// Add optional user_id if provided
@@ -125,10 +153,10 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	// Auth-manager's TokenController.GenerateToken() requires Gin context
 	// Since we're using it programmatically, we replicate its logic here
 	// using the same signing secrets and algorithm
-	
+
 	tokenType := "default"
 	secret := s.jwtDefaultSecret
-	
+
 	if req.SecretID != nil {
 		tokenType = "sdk-agent"
 		secret = s.jwtSDKSecret
@@ -166,13 +194,13 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 	}
 
 	claims := TokenClaims{
-		TenantID:     tenantIDStr,   // Use actual tenant_id
-		TenantDomain: tenantDomain,  // Include tenant domain
+		TenantID:     tenantIDStr,  // Use actual tenant_id
+		TenantDomain: tenantDomain, // Include tenant domain
 		ProjectID:    projectID.String(),
 		ClientID:     adminUserID.String(),
 		EmailID:      email,
 		UserID:       &adminUserID,
-		Roles:        roles,         // Include admin roles
+		Roles:        roles, // Include admin roles
 		ExpiresIn:    24 * time.Hour,
 	}
 	return s.GenerateToken(claims)

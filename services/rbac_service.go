@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -90,9 +91,9 @@ func (s *RBACService) AssignRoleScoped(binding *models.RoleBinding) error {
 			// Retry omitting optional denormalized columns when schema lacks them
 			// Check for PostgreSQL error codes and column name errors
 			errStr := strings.ToLower(err.Error())
-			if strings.Contains(errStr, "username") || 
-			   strings.Contains(errStr, "role_name") || 
-			   strings.Contains(errStr, "42703") { // PostgreSQL error code for "column does not exist"
+			if strings.Contains(errStr, "username") ||
+				strings.Contains(errStr, "role_name") ||
+				strings.Contains(errStr, "42703") { // PostgreSQL error code for "column does not exist"
 				log.Printf("[RBACService] Schema missing username/role_name columns, retrying with Omit: %v", err)
 				if retryErr := tx.Omit("Username", "RoleName").Create(binding).Error; retryErr == nil {
 					log.Printf("[RBACService] Successfully created role binding without denormalized columns")
@@ -139,16 +140,44 @@ type PolicyCheckResult struct {
 	Trace   string
 }
 
-func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, action string, scopeID *uuid.UUID) (*PolicyCheckResult, error) {
-	// Phase A: principal can match a binding three ways:
-	//   1. Direct user binding:        rb.user_id = principalID
-	//   2. Group-mediated binding:     rb.group_id IN (groups the user belongs to)
-	//   3. Service-account binding:    rb.service_account_id = principalID
-	//
-	// Membership-status precheck runs first; suspended users / end users
-	// fail before any binding is considered.
+type PrincipalType string
 
-	if err := s.CheckPrincipalActive(principalID); err != nil {
+const (
+	PrincipalOperator    PrincipalType = "operator"
+	PrincipalEndUser     PrincipalType = "end_user"
+	PrincipalApplication PrincipalType = "application"
+)
+
+type PDPRequest struct {
+	WorkspaceID uuid.UUID
+
+	PrincipalType PrincipalType
+	PrincipalID   uuid.UUID
+
+	Resource string
+	Action   string
+
+	ApplicationID  *uuid.UUID
+	ScopeType      *string
+	ScopeID        *uuid.UUID
+	OAuthScopeName *string
+}
+
+func (s *RBACService) Check(ctx context.Context, req PDPRequest) (*PolicyCheckResult, error) {
+	if req.WorkspaceID == uuid.Nil {
+		return nil, fmt.Errorf("workspace_id required; migrate caller to PDPRequest")
+	}
+	if req.PrincipalID == uuid.Nil {
+		return nil, fmt.Errorf("principal_id is required")
+	}
+	if req.PrincipalType == "" {
+		return nil, fmt.Errorf("principal_type is required")
+	}
+	if strings.TrimSpace(req.Resource) == "" || strings.TrimSpace(req.Action) == "" {
+		return nil, fmt.Errorf("resource and action are required")
+	}
+
+	if err := s.CheckPrincipalActiveInWorkspace(req.WorkspaceID, req.PrincipalID); err != nil {
 		return &PolicyCheckResult{
 			Allowed: false,
 			Trace:   fmt.Sprintf("Principal precheck failed: %s", err.Error()),
@@ -161,12 +190,13 @@ func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, 
 		Subject   string
 	}
 
-	// principalGroups subquery — groups this user belongs to. user_id is
-	// globally unique under the current users schema, so no tenant filter
-	// is required here.
-	principalGroups := s.db.Table("user_groups").Select("group_id").Where("user_id = ?", principalID)
+	principalGroups := s.db.WithContext(ctx).
+		Table("user_groups").
+		Select("group_id").
+		Where("user_id = ?", req.PrincipalID).
+		Where("tenant_id = ?", req.WorkspaceID)
 
-	query := s.db.Table("role_bindings rb").
+	query := s.db.WithContext(ctx).Table("role_bindings rb").
 		Select(`r.name as role_name, rb.id as binding_id,
 			CASE
 				WHEN rb.user_id IS NOT NULL THEN 'user'
@@ -177,14 +207,23 @@ func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, 
 		Joins("JOIN roles r ON rb.role_id = r.id").
 		Joins("JOIN role_permissions rp ON r.id = rp.role_id").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("(rb.user_id = ? OR rb.service_account_id = ? OR rb.group_id IN (?))", principalID, principalID, principalGroups).
-		Where("p.resource = ? AND p.action = ?", resource, action).
+		Where("rb.tenant_id = ?", req.WorkspaceID).
+		Where("(r.tenant_id = ? OR r.tenant_id IS NULL)", req.WorkspaceID).
+		Where("(p.tenant_id = ? OR p.tenant_id IS NULL)", req.WorkspaceID).
+		Where("(rb.user_id = ? OR rb.service_account_id = ? OR rb.group_id IN (?))", req.PrincipalID, req.PrincipalID, principalGroups).
+		Where("p.resource = ? AND p.action = ?", req.Resource, req.Action).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())")
 
-	if scopeID != nil {
-		query = query.Where("(rb.scope_id = ? OR rb.scope_id IS NULL)", scopeID)
+	if req.ScopeID != nil {
+		query = query.Where("(rb.scope_id = ? OR rb.scope_id IS NULL)", *req.ScopeID)
 	} else {
 		query = query.Where("rb.scope_id IS NULL")
+	}
+	if req.ScopeType != nil && *req.ScopeType != "" {
+		query = query.Where("(rb.scope_type = ? OR rb.scope_type IS NULL)", *req.ScopeType)
+	}
+	if req.ApplicationID != nil {
+		query = query.Where("(rb.scope_id = ? OR rb.scope_id IS NULL)", *req.ApplicationID)
 	}
 
 	if err := query.Scan(&results).Error; err != nil {
@@ -194,14 +233,27 @@ func (s *RBACService) PolicyDecisionPointCheck(principalID uuid.UUID, resource, 
 	if len(results) > 0 {
 		return &PolicyCheckResult{
 			Allowed: true,
-			Trace:   fmt.Sprintf("Granted by Binding [%s] via Role [%s] subject=%s", results[0].BindingID, results[0].RoleName, results[0].Subject),
+			Trace:   fmt.Sprintf("Granted by Binding [%s] via Role [%s] subject=%s workspace=%s", results[0].BindingID, results[0].RoleName, results[0].Subject, req.WorkspaceID),
 		}, nil
 	}
 
 	return &PolicyCheckResult{
 		Allowed: false,
-		Trace:   "No matching binding found",
+		Trace:   "No matching workspace-scoped binding found",
 	}, nil
+}
+
+// PolicyDecisionPointCheck is the legacy PDP signature. All callers must move
+// to Check(ctx, PDPRequest{...}) which requires an explicit workspace_id; the
+// old signature has no workspace input and would silently authorize against
+// the global binding set, which is the cross-workspace leak pattern the v4
+// migration removes.
+//
+// Kept as a hard-fail stub for one release so any stragglers fail loudly in
+// CI/runtime rather than silently. Remove once no references exist anywhere
+// in the source tree.
+func (s *RBACService) PolicyDecisionPointCheck(_ uuid.UUID, _, _ string, _ *uuid.UUID) (*PolicyCheckResult, error) {
+	return nil, fmt.Errorf("PolicyDecisionPointCheck is removed; migrate caller to RBACService.Check(ctx, PDPRequest{...}) with an explicit workspace_id")
 }
 
 // CheckPrincipalActive enforces the membership-status precheck.
@@ -247,6 +299,41 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 		}
 	} else if err.Error() != "sql: no rows in result set" {
 		log.Printf("[RBACService] end-user-state lookup failed for %s: %v", principalID, err)
+	}
+
+	return nil
+}
+
+// CheckPrincipalActiveInWorkspace is the workspace-scoped version used by the
+// new PDP surface. During the workspace rollout, workspace_id maps to the
+// existing tenant_id storage column.
+func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID uuid.UUID) error {
+	var membershipStatus string
+	row := s.db.Table("tenant_memberships").
+		Select("status").
+		Where("tenant_id = ? AND user_id = ?", workspaceID, principalID).
+		Limit(1).
+		Row()
+	if err := row.Scan(&membershipStatus); err == nil {
+		if membershipStatus != models.MembershipStatusActive {
+			return fmt.Errorf("membership not active (status=%s)", membershipStatus)
+		}
+	} else if err.Error() != "sql: no rows in result set" {
+		log.Printf("[RBACService] workspace membership lookup failed for workspace=%s principal=%s: %v", workspaceID, principalID, err)
+	}
+
+	var eusStatus string
+	row2 := s.db.Table("tenant_end_user_states").
+		Select("status").
+		Where("tenant_id = ? AND user_id = ?", workspaceID, principalID).
+		Limit(1).
+		Row()
+	if err := row2.Scan(&eusStatus); err == nil {
+		if eusStatus != models.EndUserStatusActive {
+			return fmt.Errorf("end-user state not active (status=%s)", eusStatus)
+		}
+	} else if err.Error() != "sql: no rows in result set" {
+		log.Printf("[RBACService] workspace end-user-state lookup failed for workspace=%s principal=%s: %v", workspaceID, principalID, err)
 	}
 
 	return nil
