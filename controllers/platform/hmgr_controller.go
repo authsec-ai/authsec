@@ -1958,14 +1958,19 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 
 // --- SAML Handlers ---
 
-// InitiateSAMLAuthHandler initiates SAML authentication with a provider
+// InitiateSAMLAuthHandler initiates SAML authentication with a provider.
+//
+// Workspace gate (v4): the SAML provider must be backed by an
+// identity_providers row with status != 'disabled'. When the request carries
+// an Application context AND the Application has any policy rows, the
+// matching IDP must be in the enabled set (default-allow when empty).
 func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
-	providerName := c.Param("provider")
+	providerName := strings.ToLower(strings.TrimSpace(c.Param("provider")))
 
 	var req struct {
-		LoginChallenge string `json:"login_challenge" binding:"required"`
+		LoginChallenge string  `json:"login_challenge" binding:"required"`
+		ApplicationID  *string `json:"application_id,omitempty"`
 	}
-
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid request: " + err.Error()})
 		return
@@ -1988,16 +1993,66 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid client configuration - missing c_id"})
 		return
 	}
-
-	clientID := loginRequest.Client.ClientID
-	samlProvider, err := ctrl.service.GetSAMLProvider(realTenantID, providerName, clientID)
+	workspaceUUID, err := uuid.Parse(realTenantID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider not found: " + err.Error()})
+		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid workspace id"})
 		return
 	}
 
+	// Workspace IDP gate: resolve through identity_providers + saml_providers.
+	var resolved struct {
+		IdentityProviderID uuid.UUID
+		Status             string
+		SAMLID             uuid.UUID `gorm:"column:saml_id"`
+	}
+	err = config.DB.
+		Table("identity_providers ip").
+		Select("ip.id AS identity_provider_id, ip.status, sp.id AS saml_id").
+		Joins("JOIN saml_providers sp ON sp.id::text = ip.config_ref").
+		Where("ip.workspace_id = ?", workspaceUUID).
+		Where("ip.provider_type = ?", models.IdentityProviderSAML).
+		Where("sp.provider_name = ?", providerName).
+		First(&resolved).Error
+	if err != nil {
+		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider not enabled for workspace"})
+		return
+	}
+	if resolved.Status == "disabled" {
+		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider is disabled for workspace"})
+		return
+	}
+
+	// Optional Application gate.
+	if req.ApplicationID != nil && *req.ApplicationID != "" {
+		appUUID, err := uuid.Parse(*req.ApplicationID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid application_id"})
+			return
+		}
+		var policyCount int64
+		if err := config.DB.Table("application_identity_provider_policies").
+			Where("workspace_id = ? AND application_id = ?", workspaceUUID, appUUID).
+			Count(&policyCount).Error; err == nil && policyCount > 0 {
+			var enabledCount int64
+			config.DB.Table("application_identity_provider_policies").
+				Where("workspace_id = ? AND application_id = ? AND identity_provider_id = ? AND enabled = ?",
+					workspaceUUID, appUUID, resolved.IdentityProviderID, true).
+				Count(&enabledCount)
+			if enabledCount == 0 {
+				c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider not enabled for application"})
+				return
+			}
+		}
+	}
+
+	// Resolve full SAML provider row for issuer / SSO URL / cert.
+	samlProvider, err := ctrl.service.GetSAMLProvider(realTenantID, providerName)
+	if err != nil {
+		c.JSON(http.StatusNotFound, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider row missing"})
+		return
+	}
 	if !samlProvider.IsActive {
-		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Provider is not active"})
+		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "Provider is not active"})
 		return
 	}
 
@@ -2035,13 +2090,13 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 		return
 	}
 
-	assertion, loginChallenge, providerName, tenantID, _, err := ctrl.service.ValidateSAMLResponse(req.SAMLResponse, req.RelayState)
+	assertion, loginChallenge, providerName, workspaceID, err := ctrl.service.ValidateSAMLResponse(req.SAMLResponse, req.RelayState)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid SAML response: " + err.Error()})
 		return
 	}
 
-	redirectTo, user, err := ctrl.ProcessSAMLAssertion(assertion, loginChallenge, providerName, tenantID)
+	redirectTo, user, err := ctrl.ProcessSAMLAssertion(assertion, loginChallenge, providerName, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Authentication processing failed: " + err.Error()})
 		return
@@ -2082,10 +2137,12 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, redirectURL, redirectURL))
 }
 
-// HandleSAMLACSClientHandler handles client-specific ACS callback
+// HandleSAMLACSClientHandler handles workspace-scoped ACS callback. The legacy
+// per-client URL form (/saml/acs/:tenant_id/:client_id) is retained as a path
+// shape, but only the workspace_id segment is validated against the relay
+// state — per-Application restriction is enforced at initiate, not here.
 func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
-	tenantIDParam := c.Param("tenant_id")
-	clientIDParam := c.Param("client_id")
+	workspaceIDParam := c.Param("tenant_id")
 
 	var req hydramodels.SAMLCallbackRequest
 	if err := c.ShouldBind(&req); err != nil {
@@ -2098,22 +2155,18 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 		return
 	}
 
-	assertion, loginChallenge, providerName, tenantID, clientID, err := ctrl.service.ValidateSAMLResponse(req.SAMLResponse, req.RelayState)
+	assertion, loginChallenge, providerName, workspaceID, err := ctrl.service.ValidateSAMLResponse(req.SAMLResponse, req.RelayState)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid SAML response: " + err.Error()})
 		return
 	}
 
-	if tenantIDParam != tenantID {
-		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Tenant ID mismatch"})
-		return
-	}
-	if clientIDParam != clientID {
-		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Client ID mismatch"})
+	if workspaceIDParam != workspaceID {
+		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Workspace ID mismatch"})
 		return
 	}
 
-	redirectTo, user, err := ctrl.ProcessSAMLAssertion(assertion, loginChallenge, providerName, tenantID)
+	redirectTo, user, err := ctrl.ProcessSAMLAssertion(assertion, loginChallenge, providerName, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Authentication processing failed: " + err.Error()})
 		return
@@ -2252,24 +2305,17 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	return acceptResponse.RedirectTo, user, nil
 }
 
-// GetSAMLMetadataHandler returns SP metadata for a tenant and client
+// GetSAMLMetadataHandler returns workspace-scoped SP metadata.
+// v4: per-Application restriction is enforced via
+// application_identity_provider_policies, not by URL path scoping.
 func (ctrl *HmgrController) GetSAMLMetadataHandler(c *gin.Context) {
-	tenantIDStr := c.Param("tenant_id")
-	clientIDStr := c.Param("client_id")
-
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(c.Param("tenant_id"))
 	if err != nil {
-		c.XML(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.XML(http.StatusBadRequest, gin.H{"error": "Invalid workspace id"})
 		return
 	}
 
-	clientID, err := uuid.Parse(clientIDStr)
-	if err != nil {
-		c.XML(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
-		return
-	}
-
-	metadata, err := ctrl.service.GenerateSAMLMetadata(tenantID, clientID)
+	metadata, err := ctrl.service.GenerateSAMLMetadata(workspaceID)
 	if err != nil {
 		c.XML(http.StatusInternalServerError, gin.H{"error": "Failed to generate metadata"})
 		return
@@ -2279,200 +2325,12 @@ func (ctrl *HmgrController) GetSAMLMetadataHandler(c *gin.Context) {
 	c.String(http.StatusOK, metadata)
 }
 
-// CreateSAMLProviderHandler creates a new SAML provider
-func (ctrl *HmgrController) CreateSAMLProviderHandler(c *gin.Context) {
-	var req hydramodels.SAMLProviderConfig
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid request: " + err.Error()})
-		return
-	}
-
-	tenantID := c.GetString("tenant_id")
-	if tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Missing tenant_id"})
-		return
-	}
-
-	clientIDStr := c.GetString("client_id")
-	if clientIDStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Missing client_id"})
-		return
-	}
-
-	clientID, err := uuid.Parse(clientIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid client_id format"})
-		return
-	}
-
-	attributeMapping, _ := json.Marshal(req.AttributeMapping)
-	provider := &hydramodels.SAMLProvider{
-		ClientID:         clientID,
-		ProviderName:     req.ProviderName,
-		DisplayName:      req.DisplayName,
-		EntityID:         req.EntityID,
-		SSOURL:           req.SSOURL,
-		SLOURL:           req.SLOURL,
-		Certificate:      req.Certificate,
-		MetadataURL:      req.MetadataURL,
-		NameIDFormat:     req.NameIDFormat,
-		AttributeMapping: attributeMapping,
-		IsActive:         req.IsActive,
-		SortOrder:        req.SortOrder,
-	}
-
-	createdProvider, err := ctrl.service.CreateSAMLProvider(tenantID, provider)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to create SAML provider: " + err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusCreated, gin.H{"success": true, "provider": createdProvider})
-}
-
-// UpdateSAMLProviderHandler updates an existing SAML provider
-func (ctrl *HmgrController) UpdateSAMLProviderHandler(c *gin.Context) {
-	providerID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid provider ID"})
-		return
-	}
-
-	var req hydramodels.SAMLProviderConfig
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid request: " + err.Error()})
-		return
-	}
-
-	tenantID := c.GetString("tenant_id")
-	if tenantID == "" {
-		tenantID = c.GetHeader("X-Tenant-ID")
-	}
-	if tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Missing tenant_id"})
-		return
-	}
-
-	clientID := c.Query("client_id")
-	attributeMapping, _ := json.Marshal(req.AttributeMapping)
-	updates := &hydramodels.SAMLProvider{
-		ProviderName:     req.ProviderName,
-		DisplayName:      req.DisplayName,
-		EntityID:         req.EntityID,
-		SSOURL:           req.SSOURL,
-		SLOURL:           req.SLOURL,
-		Certificate:      req.Certificate,
-		MetadataURL:      req.MetadataURL,
-		NameIDFormat:     req.NameIDFormat,
-		AttributeMapping: attributeMapping,
-		IsActive:         req.IsActive,
-		SortOrder:        req.SortOrder,
-	}
-
-	updatedProvider, err := ctrl.service.UpdateSAMLProvider(tenantID, providerID, clientID, updates)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to update SAML provider: " + err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true, "provider": updatedProvider})
-}
-
-// DeleteSAMLProviderHandler deletes a SAML provider
-func (ctrl *HmgrController) DeleteSAMLProviderHandler(c *gin.Context) {
-	providerID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid provider ID"})
-		return
-	}
-
-	tenantID := c.GetString("tenant_id")
-	if tenantID == "" {
-		tenantID = c.GetHeader("X-Tenant-ID")
-	}
-	if tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Missing tenant_id"})
-		return
-	}
-
-	clientID := c.Query("client_id")
-	if err := ctrl.service.DeleteSAMLProvider(tenantID, providerID, clientID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to delete SAML provider: " + err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "SAML provider deleted successfully"})
-}
-
-// GetSAMLProvidersHandler lists all SAML providers for a tenant
-func (ctrl *HmgrController) GetSAMLProvidersHandler(c *gin.Context) {
-	tenantID := c.GetString("tenant_id")
-	if tenantID == "" {
-		tenantID = c.GetHeader("X-Tenant-ID")
-	}
-	if tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Missing tenant_id"})
-		return
-	}
-
-	clientID := c.Query("client_id")
-	providers, err := ctrl.service.GetSAMLProvidersForTenant(tenantID, clientID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to get SAML providers: " + err.Error()})
-		return
-	}
-
-	response := gin.H{
-		"success":   true,
-		"providers": providers,
-		"count":     len(providers),
-		"tenant_id": tenantID,
-	}
-	if clientID != "" {
-		response["filtered_by_client_id"] = clientID
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-// TestSAMLProviderHandler tests SAML provider configuration
-func (ctrl *HmgrController) TestSAMLProviderHandler(c *gin.Context) {
-	var req struct {
-		TenantID     string `json:"tenant_id" binding:"required"`
-		ProviderName string `json:"provider_name" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid request: " + err.Error()})
-		return
-	}
-
-	provider, err := ctrl.service.GetSAMLProvider(req.TenantID, req.ProviderName)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Provider not found: " + err.Error()})
-		return
-	}
-
-	cfg := ctrl.service.GetConfig()
-	metadataURL := fmt.Sprintf("%s/saml/metadata/%s/%s", cfg.BaseURL, provider.TenantID.String(), provider.ClientID.String())
-	acsURLShared := fmt.Sprintf("%s/saml/acs", cfg.BaseURL)
-	acsURLClient := fmt.Sprintf("%s/saml/acs/%s/%s", cfg.BaseURL, provider.TenantID.String(), provider.ClientID.String())
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"provider": gin.H{
-			"name":         provider.ProviderName,
-			"display_name": provider.DisplayName,
-			"entity_id":    provider.EntityID,
-			"sso_url":      provider.SSOURL,
-			"is_active":    provider.IsActive,
-			"client_id":    provider.ClientID.String(),
-		},
-		"sp_metadata_url": metadataURL,
-		"acs_url_client":  acsURLClient,
-		"acs_url_shared":  acsURLShared,
-	})
-}
+// Legacy SAML CRUD handlers (Create/Update/Delete/List/Test) have been removed.
+// SAML provider management now flows through:
+//   POST   /authsec/identity-providers          (provider_type='saml')
+//   PUT    /authsec/identity-providers/:id/status
+//   DELETE /authsec/identity-providers/:id
+// The login + ACS handlers below stay — they're the protocol-execution path.
 
 // --- Admin stub handlers ---
 

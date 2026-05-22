@@ -60,17 +60,72 @@ func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) 
 	return publicProviders, nil
 }
 
-// InitiateOIDCFlow starts the OIDC authentication flow
-// Returns the authorization URL to redirect the user to
+// InitiateOIDCFlow starts the OIDC authentication flow.
+//
+// Workspace gate (v4): when tenantID is set, the workspace must have an
+// identity_providers row with provider_type='oidc', status != 'disabled',
+// referencing an oidc_providers row with the requested provider_name. When
+// input.ApplicationID is set AND the Application has any
+// application_identity_provider_policies rows, the IDP must be in the enabled
+// set (default-allow when no policies exist).
 func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action string, tenantID *uuid.UUID) (*models.OIDCInitiateResponse, error) {
-	// Get provider configuration
-	provider, err := s.providerRepo.GetProviderByName(input.Provider)
-	if err != nil {
-		return nil, fmt.Errorf("provider not found: %s", input.Provider)
+	if tenantID == nil {
+		return nil, fmt.Errorf("workspace_id (tenant_id) is required for OIDC initiate")
 	}
+	workspaceID := *tenantID
 
-	if !provider.IsActive {
-		return nil, fmt.Errorf("provider %s is not active", input.Provider)
+	// Resolve provider through the workspace IDP gate. Find an identity_providers
+	// row for this workspace + the requested provider_name. Reject when the IDP
+	// is missing or disabled.
+	var resolved struct {
+		IdentityProviderID uuid.UUID
+		Status             string
+		ProviderModel      models.OIDCProvider `gorm:"embedded"`
+	}
+	err := config.DB.
+		Table("identity_providers ip").
+		Select(`ip.id  AS identity_provider_id,
+		        ip.status AS status,
+		        op.*`).
+		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
+		Where("ip.workspace_id = ?", workspaceID).
+		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
+		Where("op.provider_name = ?", input.Provider).
+		First(&resolved).Error
+	if err != nil {
+		return nil, fmt.Errorf("provider %q not enabled for workspace", input.Provider)
+	}
+	if resolved.Status == "disabled" {
+		return nil, fmt.Errorf("provider %q is disabled for workspace", input.Provider)
+	}
+	if !resolved.ProviderModel.IsActive {
+		return nil, fmt.Errorf("provider %q is inactive", input.Provider)
+	}
+	provider := &resolved.ProviderModel
+	provider.ID = resolved.ProviderModel.ID // explicit for clarity
+
+	// Optional Application gate: when input.ApplicationID is set, consult the
+	// application_identity_provider_policies whitelist. Empty policy table =
+	// default-allow.
+	if input.ApplicationID != nil {
+		var policyCount int64
+		if err := config.DB.Table("application_identity_provider_policies").
+			Where("workspace_id = ? AND application_id = ?", workspaceID, *input.ApplicationID).
+			Count(&policyCount).Error; err != nil {
+			return nil, fmt.Errorf("check application IDP policies: %w", err)
+		}
+		if policyCount > 0 {
+			var enabledCount int64
+			if err := config.DB.Table("application_identity_provider_policies").
+				Where("workspace_id = ? AND application_id = ? AND identity_provider_id = ? AND enabled = ?",
+					workspaceID, *input.ApplicationID, resolved.IdentityProviderID, true).
+				Count(&enabledCount).Error; err != nil {
+				return nil, fmt.Errorf("check application IDP enabled: %w", err)
+			}
+			if enabledCount == 0 {
+				return nil, fmt.Errorf("provider %q not enabled for application", input.Provider)
+			}
+		}
 	}
 
 	// Generate state token (for CSRF protection and tenant context)
@@ -86,28 +141,19 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	}
 	codeChallenge := generateCodeChallenge(codeVerifier)
 
-	// Mint a v4 signed state binding the workspace (and Application when
-	// known). The signed payload is persisted alongside the random state
-	// token so the callback can verify the workspace context out-of-band —
-	// see services/oidc_state.go.
-	var (
-		signedState   string
-		applicationID *uuid.UUID
-	)
-	if tenantID != nil {
-		// During the workspace transition workspaces.id == tenant_id, so the
-		// tenant pointer is the workspace identifier we want to bind to.
-		signedState, _, err = MintSignedState(*tenantID, applicationID)
-		if err != nil {
-			log.Printf("WARN: failed to mint signed OIDC state: %v", err)
-		}
+	// Mint a v4 signed state binding the workspace (and Application when known).
+	// Persisted alongside the random state token so the callback can verify the
+	// workspace context out-of-band.
+	signedState, _, err := MintSignedState(workspaceID, input.ApplicationID)
+	if err != nil {
+		log.Printf("WARN: failed to mint signed OIDC state: %v", err)
 	}
 
 	// Store state in database (expires in 10 minutes)
 	state := &models.OIDCState{
 		StateToken:    stateToken,
 		TenantID:      tenantID,
-		ApplicationID: applicationID,
+		ApplicationID: input.ApplicationID,
 		SignedState:   signedState,
 		TenantDomain:  input.TenantDomain,
 		OriginDomain:  s.requestOrigin, // Store origin domain for post-auth redirect
@@ -561,10 +607,32 @@ func fetchGitHubPrimaryEmail(accessToken string, client *http.Client) (string, e
 	return "", fmt.Errorf("no primary verified email found")
 }
 
-// GetSecretFromVault retrieves a secret from HashiCorp Vault
-// This is a placeholder - implement based on your Vault setup
+// GetSecretFromVault reads the `client_secret` value at the given Vault KV2
+// path. The path is the value stored on oidc_providers.client_secret_vault_path
+// which for v4 workspace-owned IDPs is built by config.WorkspaceIDPSecretPath.
+//
+// Returns an empty string + non-nil error when Vault is unconfigured or the
+// path has no value — the caller falls back to env vars in dev.
 func GetSecretFromVault(path string) (string, error) {
-	// TODO: Implement Vault integration
-	// For now, return empty to fall back to environment variables
-	return "", fmt.Errorf("vault not configured")
+	if config.VaultClient == nil {
+		return "", fmt.Errorf("vault client not initialized")
+	}
+	if path == "" {
+		return "", fmt.Errorf("vault path is empty")
+	}
+	secret, err := config.VaultClient.Logical().Read(path)
+	if err != nil {
+		return "", fmt.Errorf("read vault path %s: %w", path, err)
+	}
+	if secret == nil {
+		return "", fmt.Errorf("secret not found at %s", path)
+	}
+	data, err := config.GetSecretData(secret)
+	if err != nil {
+		return "", fmt.Errorf("decode vault data: %w", err)
+	}
+	if v, ok := data["client_secret"].(string); ok {
+		return v, nil
+	}
+	return "", fmt.Errorf("client_secret not present in vault entry %s", path)
 }

@@ -266,57 +266,72 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 	return secretID, nil
 }
 
-// SaveProviderSecretToVault stores provider credentials under a deterministic path.
-func SaveProviderSecretToVault(tenantID, providerName string, data map[string]interface{}) error {
+// Legacy tenant-keyed provider-secret helpers (SaveProviderSecretToVault,
+// DeleteProviderSecretFromVault, GetProviderSecretFromVault) were removed
+// alongside the legacy oocmgr OIDC endpoints. The workspace-scoped IDP secret
+// helpers below are the canonical surface.
+
+// WorkspaceIDPSecretPath returns the v4 workspace-scoped Vault path used to
+// store IDP credentials. Layout: kv/data/idp/workspace/<wsID>/<protocol>/<slug>
+// — e.g. kv/data/idp/workspace/abc.../oidc/google for a workspace's Google
+// OAuth client. The slug is the provider_name on the underlying provider
+// config row (oidc_providers.provider_name or saml_providers.provider_name).
+func WorkspaceIDPSecretPath(workspaceID, providerType, providerSlug string) string {
+	return fmt.Sprintf("kv/data/idp/workspace/%s/%s/%s", workspaceID, providerType, providerSlug)
+}
+
+// SaveWorkspaceIDPSecret writes the given map as the secret stored at the
+// canonical workspace IDP path. Overwrites any existing value at that path.
+func SaveWorkspaceIDPSecret(workspaceID, providerType, providerSlug string, data map[string]interface{}) error {
 	if VaultClient == nil {
 		return fmt.Errorf("vault client not initialized")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	path := fmt.Sprintf("kv/data/oidc/providers/%s/%s", tenantID, providerName)
+	path := WorkspaceIDPSecretPath(workspaceID, providerType, providerSlug)
 	payload := map[string]interface{}{"data": data}
 
 	if _, err := VaultClient.Logical().WriteWithContext(ctx, path, payload); err != nil {
-		return fmt.Errorf("failed to write provider secret to Vault at %s: %w", path, err)
+		return fmt.Errorf("failed to write workspace IDP secret to Vault at %s: %w", path, err)
 	}
 	return nil
 }
 
-// DeleteProviderSecretFromVault removes provider credentials from Vault.
-func DeleteProviderSecretFromVault(tenantID, providerName string) error {
-	if VaultClient == nil {
-		return fmt.Errorf("vault client not initialized")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	metadataPath := fmt.Sprintf("kv/metadata/oidc/providers/%s/%s", tenantID, providerName)
-	if _, err := VaultClient.Logical().DeleteWithContext(ctx, metadataPath); err != nil {
-		return fmt.Errorf("failed to delete provider secret metadata from Vault at %s: %w", metadataPath, err)
-	}
-	return nil
-}
-
-// GetProviderSecretFromVault retrieves provider credentials from Vault.
-func GetProviderSecretFromVault(tenantID, providerName string) (map[string]interface{}, error) {
+// GetWorkspaceIDPSecret reads the secret stored at the canonical workspace IDP
+// path and returns its data map. Returns ("secret not found") when the path
+// has no value.
+func GetWorkspaceIDPSecret(workspaceID, providerType, providerSlug string) (map[string]interface{}, error) {
 	if VaultClient == nil {
 		return nil, fmt.Errorf("vault client not initialized")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	path := fmt.Sprintf("kv/data/oidc/providers/%s/%s", tenantID, providerName)
+	path := WorkspaceIDPSecretPath(workspaceID, providerType, providerSlug)
 	secret, err := VaultClient.Logical().ReadWithContext(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read provider secret from Vault at %s: %w", path, err)
+		return nil, fmt.Errorf("failed to read workspace IDP secret from Vault at %s: %w", path, err)
 	}
 	if secret == nil {
 		return nil, fmt.Errorf("secret not found")
 	}
-	data, err := GetSecretData(secret)
-	if err != nil {
-		return nil, err
+	return GetSecretData(secret)
+}
+
+// DeleteWorkspaceIDPSecret removes the secret stored at the canonical
+// workspace IDP path (both current value and metadata, freeing all versions).
+func DeleteWorkspaceIDPSecret(workspaceID, providerType, providerSlug string) error {
+	if VaultClient == nil {
+		return fmt.Errorf("vault client not initialized")
 	}
-	return data, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	metadataPath := fmt.Sprintf("kv/metadata/idp/workspace/%s/%s/%s",
+		workspaceID, providerType, providerSlug)
+	if _, err := VaultClient.Logical().DeleteWithContext(ctx, metadataPath); err != nil {
+		return fmt.Errorf("failed to delete workspace IDP secret metadata at %s: %w", metadataPath, err)
+	}
+	return nil
 }

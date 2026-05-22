@@ -6,19 +6,22 @@ import (
 	"github.com/google/uuid"
 )
 
-// OIDCProvider represents a platform-level OIDC provider configuration
-// These are YOUR app's credentials for Google, GitHub, Microsoft
+// OIDCProvider represents a workspace-owned OIDC provider configuration.
+// Each workspace registers its own OAuth client (its own Google Cloud Console
+// app, its own GitHub OAuth app) with credentials kept in workspace-scoped
+// Vault paths. (workspace_id, provider_name) is the canonical key.
 type OIDCProvider struct {
 	ID                    uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	ProviderName          string    `json:"provider_name" gorm:"uniqueIndex;not null"`    // 'google', 'github', 'microsoft'
-	DisplayName           string    `json:"display_name" gorm:"not null"`                 // 'Google', 'GitHub', 'Microsoft'
-	ClientID              string    `json:"client_id" gorm:"not null"`                    // OAuth client ID
-	ClientSecretVaultPath string    `json:"client_secret_vault_path" gorm:"not null"`     // Vault path for secret
-	AuthorizationURL      string    `json:"authorization_url" gorm:"not null"`            // OAuth authorize endpoint
-	TokenURL              string    `json:"token_url" gorm:"not null"`                    // OAuth token endpoint
-	UserinfoURL           string    `json:"userinfo_url" gorm:"not null"`                 // OAuth userinfo endpoint
-	Scopes                string    `json:"scopes" gorm:"default:'openid email profile'"` // Space-separated scopes
-	IconURL               string    `json:"icon_url,omitempty"`                           // Provider icon for UI
+	WorkspaceID           uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:oidc_providers_provider_name_workspace_uq"`
+	ProviderName          string    `json:"provider_name" gorm:"not null;uniqueIndex:oidc_providers_provider_name_workspace_uq"` // 'google', 'github', 'microsoft', or operator-defined slug
+	DisplayName           string    `json:"display_name" gorm:"not null"`                                                        // operator label shown to end users
+	ClientID              string    `json:"client_id" gorm:"not null"`                                                           // OAuth client ID
+	ClientSecretVaultPath string    `json:"client_secret_vault_path" gorm:"not null"`                                            // Vault path for secret
+	AuthorizationURL      string    `json:"authorization_url" gorm:"not null"`                                                   // OAuth authorize endpoint
+	TokenURL              string    `json:"token_url" gorm:"not null"`                                                           // OAuth token endpoint
+	UserinfoURL           string    `json:"userinfo_url" gorm:"not null"`                                                        // OAuth userinfo endpoint
+	Scopes                string    `json:"scopes" gorm:"default:'openid email profile'"`                                        // Space-separated scopes
+	IconURL               string    `json:"icon_url,omitempty"`                                                                  // Provider icon for UI
 	IsActive              bool      `json:"is_active" gorm:"default:false"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
@@ -81,9 +84,10 @@ func (OIDCUserIdentity) TableName() string {
 
 // OIDCInitiateInput represents the input for initiating OIDC flow
 type OIDCInitiateInput struct {
-	TenantDomain  string `json:"tenant_domain"`               // e.g., 'ritam' (optional - empty = discover mode)
-	Provider      string `json:"provider" binding:"required"` // 'google', 'github', 'microsoft'
-	RedirectAfter string `json:"redirect_after,omitempty"`    // Optional: where to go after
+	TenantDomain  string     `json:"tenant_domain"`               // e.g., 'ritam' (optional - empty = discover mode)
+	Provider      string     `json:"provider" binding:"required"` // workspace's provider_name slug ('google', 'github', 'okta-acme', …)
+	RedirectAfter string     `json:"redirect_after,omitempty"`    // Optional: where to go after
+	ApplicationID *uuid.UUID `json:"application_id,omitempty"`    // Optional: Application this login targets; used by application_identity_provider_policies gate
 }
 
 // OIDCInitiateResponse represents the response for OIDC initiation

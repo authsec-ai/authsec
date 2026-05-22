@@ -575,43 +575,66 @@ func (s *OAuthLoginService) GetAllHydraClients() ([]HydraClient, error) {
 	return clients, nil
 }
 
-func (s *OAuthLoginService) GetOIDCProvidersForTenant(tenantID string) ([]OIDCProvider, error) {
-	clients, err := s.GetAllHydraClients()
+// GetOIDCProvidersForTenant returns the workspace's OIDC providers by joining
+// the v4 identity_providers + oidc_providers tables. The workspace_id passed
+// in is the workspace UUID (same as legacy tenant_id during the transition).
+// Returns providers whose identity_providers row exists and is not disabled.
+func (s *OAuthLoginService) GetOIDCProvidersForTenant(workspaceID string) ([]OIDCProvider, error) {
+	db := config.DB
+
+	type joinedRow struct {
+		ProviderName     string
+		DisplayName      string
+		ClientID         string
+		AuthorizationURL string
+		TokenURL         string
+		UserinfoURL      string
+		Scopes           string
+		IconURL          string
+		Status           string
+	}
+
+	var rows []joinedRow
+	err := db.
+		Table("oidc_providers op").
+		Select(`
+			op.provider_name AS provider_name,
+			COALESCE(NULLIF(ip.display_name, ''), op.display_name) AS display_name,
+			op.client_id AS client_id,
+			op.authorization_url AS authorization_url,
+			op.token_url AS token_url,
+			op.userinfo_url AS userinfo_url,
+			op.scopes AS scopes,
+			op.icon_url AS icon_url,
+			ip.status AS status`).
+		Joins(`JOIN identity_providers ip
+		         ON ip.workspace_id = op.workspace_id
+		        AND ip.provider_type = 'oidc'
+		        AND ip.config_ref = op.id::text`).
+		Where("op.workspace_id = ?", workspaceID).
+		Where("ip.status <> 'disabled'").
+		Order("op.provider_name ASC").
+		Scan(&rows).Error
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load workspace OIDC providers: %w", err)
 	}
 
-	var providers []OIDCProvider
-	for _, client := range clients {
-		if clientTenantID, ok := client.Metadata["tenant_id"].(string); ok && clientTenantID == tenantID {
-			if clientType, ok := client.Metadata["type"].(string); ok && clientType == "oidc_provider" {
-				providerName, _ := client.Metadata["provider_name"].(string)
-				displayName, _ := client.Metadata["display_name"].(string)
-				isActive, _ := client.Metadata["is_active"].(bool)
-				sortOrder, _ := client.Metadata["sort_order"].(float64)
-				callbackURL, _ := client.Metadata["callback_url"].(string)
-				providerConfig, _ := client.Metadata["provider_config"].(map[string]interface{})
-
-				if providerName != "" && isActive {
-					providers = append(providers, OIDCProvider{
-						ProviderName: providerName,
-						DisplayName:  displayName,
-						IsActive:     isActive,
-						SortOrder:    int(sortOrder),
-						CallbackURL:  callbackURL,
-						Config:       providerConfig,
-					})
-				}
-			}
-		}
-	}
-
-	for i := 0; i < len(providers)-1; i++ {
-		for j := i + 1; j < len(providers); j++ {
-			if providers[i].SortOrder > providers[j].SortOrder {
-				providers[i], providers[j] = providers[j], providers[i]
-			}
-		}
+	providers := make([]OIDCProvider, 0, len(rows))
+	for i, r := range rows {
+		providers = append(providers, OIDCProvider{
+			ProviderName: r.ProviderName,
+			DisplayName:  r.DisplayName,
+			IsActive:     r.Status != "disabled",
+			SortOrder:    i, // alphabetical; UI may override
+			Config: map[string]interface{}{
+				"client_id":         r.ClientID,
+				"authorization_url": r.AuthorizationURL,
+				"token_url":         r.TokenURL,
+				"user_info_url":     r.UserinfoURL,
+				"scopes":            r.Scopes,
+				"icon_url":          r.IconURL,
+			},
+		})
 	}
 	return providers, nil
 }

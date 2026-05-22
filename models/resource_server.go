@@ -49,6 +49,14 @@ type ResourceServer struct {
 	CreatedAt time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+
+	ToolsCount        int64  `json:"tools_count,omitempty" gorm:"-"`
+	ScopesCount       int64  `json:"scopes_count,omitempty" gorm:"-"`
+	RolesCount        int64  `json:"roles_count,omitempty" gorm:"-"`
+	BindingsCount     int64  `json:"bindings_count,omitempty" gorm:"-"`
+	EndUsersCount     int64  `json:"end_users_count,omitempty" gorm:"-"`
+	DefaultRoleName   string `json:"default_role_name,omitempty" gorm:"-"`
+	LatestAccessIssue string `json:"latest_access_issue,omitempty" gorm:"-"`
 }
 
 func (ResourceServer) TableName() string {

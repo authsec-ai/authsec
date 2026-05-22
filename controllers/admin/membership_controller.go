@@ -13,6 +13,7 @@ package admin
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -320,6 +321,118 @@ func (mc *MembershipController) DeleteMembership(c *gin.Context) {
 // tenant_end_user_states
 // ────────────────────────────────────────────────────────────────────
 
+type endUserAccessApplication struct {
+	ApplicationID string `json:"application_id"`
+	Name          string `json:"name"`
+	ResourceURI   string `json:"resource_uri"`
+	RoleID        string `json:"role_id"`
+	RoleName      string `json:"role_name"`
+	RoleLabel     string `json:"role_label"`
+	BindingID     string `json:"binding_id"`
+	ScopesCount   int64  `json:"scopes_count"`
+}
+
+func applicationRoleLabel(roleName string) string {
+	idx := strings.LastIndex(roleName, ":")
+	if idx >= 0 && idx < len(roleName)-1 {
+		roleName = roleName[idx+1:]
+	}
+	roleName = strings.TrimSpace(strings.ReplaceAll(roleName, "_", " "))
+	if roleName == "" {
+		return "Application role"
+	}
+	parts := strings.Fields(roleName)
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + strings.ToLower(part[1:])
+	}
+	return strings.Join(parts, " ")
+}
+
+func (mc *MembershipController) endUserAccessSnapshot(tenantID uuid.UUID, userID uuid.UUID) ([]endUserAccessApplication, string, int64) {
+	type row struct {
+		ApplicationID string
+		Name          string
+		ResourceURI   string
+		RoleID        string
+		RoleName      string
+		BindingID     string
+		ScopesCount   int64
+	}
+	var rows []row
+	err := mc.db.Table("role_bindings rb").
+		Select(`rs.id::text AS application_id, COALESCE(rs.name, '') AS name,
+			COALESCE(rs.resource_uri, '') AS resource_uri, rb.role_id::text AS role_id,
+			COALESCE(rb.role_name, ro.name, '') AS role_name, rb.id::text AS binding_id,
+			COUNT(DISTINCT osp.scope_id) AS scopes_count`).
+		Joins("JOIN roles ro ON ro.id = rb.role_id").
+		Joins("JOIN resource_servers rs ON rs.tenant_id = rb.tenant_id AND ro.name LIKE ('rs-' || rs.id::text || ':%')").
+		Joins("LEFT JOIN role_permissions rp ON rp.role_id = rb.role_id").
+		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
+		Where("rb.tenant_id = ? AND rb.user_id = ?", tenantID, userID).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
+		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = rs.id)").
+		Group("rs.id, rs.name, rs.resource_uri, rb.role_id, rb.role_name, ro.name, rb.id").
+		Order("rs.name ASC").
+		Scan(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return []endUserAccessApplication{}, "No application access", 0
+	}
+
+	apps := make([]endUserAccessApplication, 0, len(rows))
+	var totalScopes int64
+	for _, r := range rows {
+		totalScopes += r.ScopesCount
+		apps = append(apps, endUserAccessApplication{
+			ApplicationID: r.ApplicationID,
+			Name:          r.Name,
+			ResourceURI:   r.ResourceURI,
+			RoleID:        r.RoleID,
+			RoleName:      r.RoleName,
+			RoleLabel:     applicationRoleLabel(r.RoleName),
+			BindingID:     r.BindingID,
+			ScopesCount:   r.ScopesCount,
+		})
+	}
+
+	summary := apps[0].RoleLabel + " on " + apps[0].Name
+	if apps[0].ScopesCount == 1 {
+		summary += " · 1 scope"
+	} else {
+		summary += fmt.Sprintf(" · %d scopes", apps[0].ScopesCount)
+	}
+	if len(apps) > 1 {
+		summary += fmt.Sprintf(" · +%d more", len(apps)-1)
+	}
+
+	return apps, summary, totalScopes
+}
+
+func uuidFromMapValue(v interface{}) (uuid.UUID, bool) {
+	switch typed := v.(type) {
+	case uuid.UUID:
+		return typed, true
+	case string:
+		id, err := uuid.Parse(typed)
+		return id, err == nil
+	case []byte:
+		id, err := uuid.Parse(string(typed))
+		return id, err == nil
+	default:
+		return uuid.Nil, false
+	}
+}
+
+func (mc *MembershipController) decorateEndUserAccess(row map[string]interface{}, tenantID uuid.UUID, userID uuid.UUID) {
+	apps, summary, scopesCount := mc.endUserAccessSnapshot(tenantID, userID)
+	row["access_summary"] = summary
+	row["applications"] = apps
+	row["applications_count"] = len(apps)
+	row["effective_scopes_count"] = scopesCount
+}
+
 // ListEndUsers GET /v2/tenants/:tenant_id/end-users
 // Optional ?status=, ?plan_tier=, ?q=<email substring>.
 func (mc *MembershipController) ListEndUsers(c *gin.Context) {
@@ -347,6 +460,11 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list end users", "detail": err.Error()})
 		return
+	}
+	for _, row := range rows {
+		if userID, ok := uuidFromMapValue(row["user_id"]); ok {
+			mc.decorateEndUserAccess(row, tenantID, userID)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"items": rows, "count": len(rows)})
 }
@@ -376,6 +494,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	mc.decorateEndUserAccess(row, tenantID, userID)
 	c.JSON(http.StatusOK, row)
 }
 

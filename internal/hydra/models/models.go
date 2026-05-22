@@ -133,10 +133,13 @@ type OIDCTokenRequest struct {
 
 // SAML models
 
+// SAMLProvider is the underlying config row referenced by an identity_providers
+// row with provider_type='saml'. Scoped by workspace (tenant_id == workspace_id
+// during the rollout). Per-Application restriction is opt-in via
+// application_identity_provider_policies — not via a column here.
 type SAMLProvider struct {
 	ID               uuid.UUID      `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
 	TenantID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"tenant_id"`
-	ClientID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"client_id"`
 	ProviderName     string         `gorm:"type:varchar(255);not null;index:idx_saml_provider_unique;uniqueIndex:idx_saml_provider_unique" json:"provider_name"`
 	DisplayName      string         `gorm:"type:varchar(255);not null" json:"display_name"`
 	EntityID         string         `gorm:"type:varchar(500);not null" json:"entity_id"`
@@ -189,7 +192,6 @@ type SAMLRequest struct {
 	ID             string    `gorm:"type:varchar(255);primary_key" json:"id"`
 	LoginChallenge string    `gorm:"type:varchar(255);not null;index" json:"login_challenge"`
 	TenantID       uuid.UUID `gorm:"type:uuid;not null" json:"tenant_id"`
-	ClientID       uuid.UUID `gorm:"type:uuid;not null" json:"client_id"`
 	ProviderName   string    `gorm:"type:varchar(255);not null" json:"provider_name"`
 	RelayState     string    `gorm:"type:text" json:"relay_state"`
 	CreatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
@@ -257,7 +259,6 @@ type SAMLCallbackState struct {
 	UserName       string    `gorm:"type:varchar(255)" json:"user_name"`
 	ProviderName   string    `gorm:"type:varchar(255)" json:"provider_name"`
 	TenantID       uuid.UUID `gorm:"type:uuid" json:"tenant_id"`
-	ClientID       uuid.UUID `gorm:"type:uuid" json:"client_id"`
 	LoginChallenge string    `gorm:"type:text" json:"login_challenge"`
 	CreatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
 	ExpiresAt      time.Time `gorm:"not null" json:"expires_at"`

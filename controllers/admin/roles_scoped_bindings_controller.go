@@ -98,9 +98,33 @@ type RoleBindingListItem struct {
 	RoleName         string                 `json:"role_name"`
 	ScopeType        string                 `json:"scope_type,omitempty"`
 	ScopeID          string                 `json:"scope_id,omitempty"`
+	User             map[string]string      `json:"user,omitempty"`
+	Role             map[string]string      `json:"role,omitempty"`
+	Application      map[string]string      `json:"application,omitempty"`
+	Source           string                 `json:"source,omitempty"`
 	Conditions       map[string]interface{} `json:"conditions,omitempty"`
 	CreatedAt        string                 `json:"created_at"`
 	ExpiresAt        string                 `json:"expires_at,omitempty"`
+}
+
+func applicationRoleLabelForAdmin(roleName string) string {
+	if idx := strings.LastIndex(roleName, ":"); idx >= 0 && idx < len(roleName)-1 {
+		raw := roleName[idx+1:]
+		parts := strings.FieldsFunc(raw, func(r rune) bool {
+			return r == '-' || r == '_' || r == ':'
+		})
+		for i, part := range parts {
+			if part == "" {
+				continue
+			}
+			parts[i] = strings.ToUpper(part[:1]) + part[1:]
+		}
+		label := strings.Join(parts, " ")
+		if strings.TrimSpace(label) != "" {
+			return label
+		}
+	}
+	return roleName
 }
 
 // --- Admin endpoints (primary DB) ---
@@ -913,13 +937,22 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 			COALESCE(role_bindings.role_name, roles.name, '') AS role_name,
 			role_bindings.scope_type,
 			role_bindings.scope_id,
+			role_bindings.assignment_source,
 			role_bindings.conditions,
 			role_bindings.created_at,
 			role_bindings.expires_at,
-			COALESCE(users.email, '') AS email
+			COALESCE(users.email, '') AS email,
+			COALESCE(NULLIF(users.name, ''), users.email, users.username, '') AS user_name,
+			rs.id AS application_id,
+			COALESCE(rs.name, '') AS application_name,
+			COALESCE(rs.resource_uri, '') AS application_resource_uri
 		`).
 		Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
 		Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
+		Joins(`LEFT JOIN resource_servers rs ON rs.tenant_id = role_bindings.tenant_id AND (
+			(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
+			OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
+		)`).
 		Where("role_bindings.tenant_id = ?", tenantID)
 
 	if userIDFilter != "" {
@@ -945,10 +978,15 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 		RoleName         string          `gorm:"column:role_name"`
 		ScopeType        *string         `gorm:"column:scope_type"`
 		ScopeID          *uuid.UUID      `gorm:"column:scope_id"`
+		AssignmentSource string          `gorm:"column:assignment_source"`
 		Conditions       json.RawMessage `gorm:"column:conditions"`
 		CreatedAt        time.Time       `gorm:"column:created_at"`
 		ExpiresAt        *time.Time      `gorm:"column:expires_at"`
 		Email            string          `gorm:"column:email"`
+		UserName         string          `gorm:"column:user_name"`
+		ApplicationID    *uuid.UUID      `gorm:"column:application_id"`
+		ApplicationName  string          `gorm:"column:application_name"`
+		ApplicationURI   string          `gorm:"column:application_resource_uri"`
 	}
 
 	var rows []bindingRow
@@ -964,14 +1002,23 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 					COALESCE(roles.name, '') AS role_name,
 					role_bindings.scope_type,
 					role_bindings.scope_id,
+					role_bindings.assignment_source,
 					role_bindings.conditions,
 					role_bindings.created_at,
 					role_bindings.expires_at,
 					COALESCE(users.username, '') AS username,
-					COALESCE(users.email, '') AS email
+					COALESCE(users.email, '') AS email,
+					COALESCE(NULLIF(users.name, ''), users.email, users.username, '') AS user_name,
+					rs.id AS application_id,
+					COALESCE(rs.name, '') AS application_name,
+					COALESCE(rs.resource_uri, '') AS application_resource_uri
 				`).
 				Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
 				Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
+				Joins(`LEFT JOIN resource_servers rs ON rs.tenant_id = role_bindings.tenant_id AND (
+					(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
+					OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
+				)`).
 				Where("role_bindings.tenant_id = ?", tenantID)
 
 			if userIDFilter != "" {
@@ -1006,19 +1053,37 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 			Email:     r.Email,
 			RoleID:    r.RoleID.String(),
 			RoleName:  r.RoleName,
+			Source:    r.AssignmentSource,
 			CreatedAt: r.CreatedAt.Format(time.RFC3339),
 		}
 		if r.UserID != nil {
 			item.UserID = r.UserID.String()
+			item.User = map[string]string{
+				"id":    r.UserID.String(),
+				"email": r.Email,
+				"name":  r.UserName,
+			}
 		}
 		if r.ServiceAccountID != nil {
 			item.ServiceAccountID = r.ServiceAccountID.String()
+		}
+		item.Role = map[string]string{
+			"id":    r.RoleID.String(),
+			"name":  r.RoleName,
+			"label": applicationRoleLabelForAdmin(r.RoleName),
 		}
 		if r.ScopeType != nil {
 			item.ScopeType = *r.ScopeType
 		}
 		if r.ScopeID != nil {
 			item.ScopeID = r.ScopeID.String()
+		}
+		if r.ApplicationID != nil {
+			item.Application = map[string]string{
+				"id":           r.ApplicationID.String(),
+				"name":         r.ApplicationName,
+				"resource_uri": r.ApplicationURI,
+			}
 		}
 		if r.ExpiresAt != nil {
 			item.ExpiresAt = r.ExpiresAt.Format(time.RFC3339)

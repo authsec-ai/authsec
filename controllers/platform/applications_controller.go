@@ -118,6 +118,39 @@ func (ctrl *ApplicationsController) List(c *gin.Context) {
 		return
 	}
 
+	for i := range apps {
+		app := &apps[i]
+		config.DB.Table("mcp_tools").
+			Where("tenant_id = ? AND resource_server_id = ?", workspaceID, app.ID).
+			Count(&app.ToolsCount)
+		config.DB.Table("oauth_scopes").
+			Where("tenant_id = ? AND resource_server_id = ?", workspaceID, app.ID).
+			Count(&app.ScopesCount)
+		config.DB.Table("roles").
+			Where("tenant_id = ? AND name LIKE ?", workspaceID, "rs-"+app.ID.String()+":%").
+			Count(&app.RolesCount)
+		config.DB.Table("role_bindings rb").
+			Joins("JOIN roles r ON r.id = rb.role_id").
+			Where("rb.tenant_id = ?", workspaceID).
+			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
+			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
+			Count(&app.BindingsCount)
+		config.DB.Table("role_bindings rb").
+			Joins("JOIN roles r ON r.id = rb.role_id").
+			Where("rb.tenant_id = ? AND rb.user_id IS NOT NULL", workspaceID).
+			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
+			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
+			Select("COUNT(DISTINCT rb.user_id)").Scan(&app.EndUsersCount)
+		config.DB.Table("resource_server_access_policies p").
+			Select("COALESCE(r.name, '')").
+			Joins("LEFT JOIN roles r ON r.id = p.default_role_id").
+			Where("p.tenant_id = ? AND p.resource_server_id = ?", workspaceID, app.ID).
+			Scan(&app.DefaultRoleName)
+		if app.DefaultRoleName == "" {
+			app.LatestAccessIssue = "No default application role"
+		}
+	}
+
 	c.JSON(http.StatusOK, apps)
 }
 

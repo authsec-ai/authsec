@@ -208,6 +208,8 @@ func SetupRoutes(
 	workspaceController := platformCtrl.NewWorkspaceController()
 	applicationsController := platformCtrl.NewApplicationsController()
 	scimConnectionsController := adminCtrl.NewSCIMConnectionsController()
+	identityProvidersController := adminCtrl.NewIdentityProvidersController()
+	applicationIDPPoliciesController := adminCtrl.NewApplicationIDPPoliciesController()
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
@@ -383,7 +385,39 @@ func SetupRoutes(
 			applications.POST("/:id/bindings", scopeMatrixController.CreateRSBinding)
 			applications.DELETE("/:id/bindings/:binding_id", scopeMatrixController.DeleteRSBinding)
 			applications.GET("/:id/eligible-users", scopeMatrixController.ListRSEndUsers)
+			applications.GET("/:id/access/users", scopeMatrixController.ListApplicationAccessUsers)
+			applications.GET("/:id/users/:user_id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccess)
+
+			// Application↔IDP policy (optional whitelist; default-allow when empty).
+			applications.GET("/:id/identity-providers", applicationIDPPoliciesController.List)
+			applications.POST("/:id/identity-providers", applicationIDPPoliciesController.Add)
+			applications.DELETE("/:id/identity-providers/:idp_id", applicationIDPPoliciesController.Remove)
 		}
+
+		authsec.GET("/application-roles",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+			scopeMatrixController.ListApplicationRoles,
+		)
+		authsec.GET("/scope-catalog",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+			scopeMatrixController.ListScopeCatalog,
+		)
+		authsec.POST("/scope-catalog",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+			scopeMatrixController.CreateScopeCatalogEntry,
+		)
+		authsec.POST("/scope-catalog/:catalog_id/applications/:application_id",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+			scopeMatrixController.AttachScopeCatalogEntryToApplication,
+		)
 
 		// SCIM connection management (mint + revoke). Operators only —
 		// returns the plaintext token exactly once on Create. Drives the new
@@ -398,6 +432,24 @@ func SetupRoutes(
 			scimConnections.POST("", scimConnectionsController.Create)
 			scimConnections.GET("", scimConnectionsController.List)
 			scimConnections.DELETE("/:id", scimConnectionsController.Revoke)
+		}
+
+		// Workspace IDP management. One POST endpoint dispatches on
+		// provider_type (oidc | saml) and writes both the underlying provider
+		// config and the identity_providers row in one transaction. Workspace
+		// owner/admin only.
+		idps := authsec.Group("/identity-providers")
+		idps.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			idps.POST("", identityProvidersController.Create)
+			idps.GET("", identityProvidersController.List)
+			idps.GET("/:id", identityProvidersController.Get)
+			idps.PUT("/:id/status", identityProvidersController.UpdateStatus)
+			idps.DELETE("/:id", identityProvidersController.Delete)
 		}
 
 		// Scope management (not RS-scoped)
@@ -1200,22 +1252,13 @@ func registerHmgrRoutes(r gin.IRouter) {
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
 		pub.POST("/pkce/store", hmgrController.StorePKCEVerifierHandler)
 
-		// SAML endpoints
+		// SAML protocol endpoints. Provider management is now at
+		// /authsec/identity-providers (v4); the CRUD handlers under
+		// /hmgr/.../saml-providers have been removed.
 		pub.POST("/saml/initiate/:provider", hmgrController.InitiateSAMLAuthHandler)
 		pub.POST("/saml/acs", hmgrController.HandleSAMLACSHandler)
-		pub.POST("/saml/acs/:tenant_id/:client_id", hmgrController.HandleSAMLACSClientHandler)
-		pub.GET("/saml/metadata/:tenant_id/:client_id", hmgrController.GetSAMLMetadataHandler)
-		pub.POST("/saml/test-provider", hmgrController.TestSAMLProviderHandler)
-
-		// DEV ONLY: Temporary unauthenticated SAML provider management
-		// TODO: Remove in production - use /hmgr/admin/saml-providers instead
-		dev := pub.Group("/dev")
-		{
-			dev.GET("/saml-providers", hmgrController.GetSAMLProvidersHandler)
-			dev.POST("/saml-providers", hmgrController.CreateSAMLProviderHandler)
-			dev.PUT("/saml-providers/:id", hmgrController.UpdateSAMLProviderHandler)
-			dev.DELETE("/saml-providers/:id", hmgrController.DeleteSAMLProviderHandler)
-		}
+		pub.POST("/saml/acs/:tenant_id", hmgrController.HandleSAMLACSClientHandler)
+		pub.GET("/saml/metadata/:tenant_id", hmgrController.GetSAMLMetadataHandler)
 
 		// Common endpoints
 		pub.GET("/login", hmgrController.LoginRedirectHandler)
@@ -1245,11 +1288,7 @@ func registerHmgrRoutes(r gin.IRouter) {
 			admin.PUT("/tenants/:id", hmgrController.UpdateTenantHandler)
 			admin.DELETE("/tenants/:id", hmgrController.DeleteTenantHandler)
 
-			// SAML provider management
-			admin.GET("/saml-providers", hmgrController.GetSAMLProvidersHandler)
-			admin.POST("/saml-providers", hmgrController.CreateSAMLProviderHandler)
-			admin.PUT("/saml-providers/:id", hmgrController.UpdateSAMLProviderHandler)
-			admin.DELETE("/saml-providers/:id", hmgrController.DeleteSAMLProviderHandler)
+			// (SAML provider management moved to /authsec/identity-providers)
 
 			// Role and permission management
 			admin.GET("/roles", hmgrController.GetRolesHandler)
@@ -1286,8 +1325,8 @@ func registerOocmgrRoutes(r gin.IRouter) {
 
 	secured := v1.Group("/")
 
-	// ── Main configuration ──
-	secured.POST("/configure-complete-oidc", ac.CompleteOIDCConfiguration)
+	// (Legacy /configure-complete-oidc removed — workspace IDPs configured
+	// via /authsec/identity-providers.)
 
 	// ── Tenant management ──
 	tenant := secured.Group("/tenant")
@@ -1306,32 +1345,13 @@ func registerOocmgrRoutes(r gin.IRouter) {
 		configs.POST("/edit", ac.EditConfig)
 	}
 
-	// ── OIDC management ──
+	// Legacy /oocmgr/oidc and /oocmgr/saml provider-management routes have
+	// been removed. Workspace IDP lifecycle (both protocols) now lives at
+	// /authsec/identity-providers (v4). Hydra-specific diagnostic endpoints
+	// that survive are mounted directly here:
 	oidc := secured.Group("/oidc")
 	{
-		oidc.POST("/add-provider", ac.AddOIDCProviderToTenant)
-		oidc.POST("/get-config", ac.GetTenantOIDCConfig)
-		oidc.POST("/get-provider", ac.GetOIDCProvider)
-		oidc.POST("/get-provider-secret", ac.GetProviderSecret)
-		oidc.POST("/update-provider", ac.UpdateOIDCProvider)
-		oidc.POST("/delete-provider", ac.DeleteOIDCProvider)
-		oidc.POST("/templates", ac.GetProviderTemplates)
-		oidc.POST("/validate", ac.ValidateOIDCConfig)
-		oidc.GET("/show-auth-providers", ac.ShowAuthProviders)
-		oidc.POST("/show-auth-providers", ac.ShowAuthProviders)
 		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
-		oidc.POST("/edit-client-auth-provider", ac.EditAuthProvider)
-	}
-
-	// ── SAML management ──
-	saml := secured.Group("/saml")
-	{
-		saml.POST("/add-provider", ac.AddSAMLProvider)
-		saml.POST("/list-providers", ac.ListSAMLProviders)
-		saml.POST("/get-provider", ac.GetSAMLProvider)
-		saml.POST("/update-provider", ac.UpdateSAMLProvider)
-		saml.POST("/delete-provider", ac.DeleteSAMLProvider)
-		saml.POST("/templates", ac.GetSAMLProviderTemplates)
 	}
 
 	// ── Hydra client management ──
@@ -1342,11 +1362,8 @@ func registerOocmgrRoutes(r gin.IRouter) {
 		hydraClients.POST("/sync", ac.SyncHydraClients)
 	}
 
-	// ── Testing ──
-	test := v1.Group("/test")
-	{
-		test.POST("/oidc-flow", ac.TestOIDCFlow)
-	}
+	// (Legacy /test/oidc-flow removed — IDP smoke-testing now happens at the
+	// /authsec/identity-providers layer.)
 
 	// ── Stats ──
 	stats := v1.Group("/stats")

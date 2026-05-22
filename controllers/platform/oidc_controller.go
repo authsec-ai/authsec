@@ -229,6 +229,20 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 		log.Printf("DEBUG Initiate: Set requestOrigin='%s' for post-auth redirect", origin)
 	}
 
+	// v4: OIDC is workspace-owned. The discover and register flows have no
+	// resolved workspace at this point, so they can't gate on
+	// identity_providers. Refuse cleanly and direct the caller through the
+	// signup-via-email path; once the workspace exists, the owner configures
+	// OIDC via POST /authsec/identity-providers and subsequent users can log
+	// in via Google/etc.
+	if tenantID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  "OIDC login requires an existing workspace; specify tenant_domain for a known workspace, or sign up via email first.",
+			"action": action,
+		})
+		return
+	}
+
 	// Initiate OIDC flow
 	response, err := oc.oidcService.InitiateOIDCFlow(&input, action, tenantID)
 	if err != nil {
@@ -409,18 +423,12 @@ func (oc *OIDCController) InitiateRegistration(c *gin.Context) {
 		return
 	}
 
-	// Set request host for callback URL
-	oc.oidcService.SetRequestHost(c.Request.Host)
-
-	// Initiate OIDC flow with action "register"
-	response, err := oc.oidcService.InitiateOIDCFlow(&input, "register", nil)
-	if err != nil {
-		log.Printf("Failed to initiate OIDC registration: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, response)
+	// v4: OIDC providers are workspace-owned and configured AFTER the workspace
+	// exists. The "register a new tenant via OIDC" flow is no longer supported.
+	// Direct the operator through the email signup path instead.
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": "OIDC registration is unavailable; create the workspace via email signup, then configure OIDC providers from the workspace settings.",
+	})
 }
 
 // InitiateLogin starts OIDC login flow for existing tenant

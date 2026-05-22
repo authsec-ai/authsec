@@ -7,13 +7,14 @@ import (
 	"gorm.io/gorm"
 )
 
+// Identity provider type constants. Google is a flavor of OIDC distinguished
+// by oidc_providers.provider_name — it is NOT a distinct provider_type.
 const (
-	IdentityProviderGoogle = "google"
-	IdentityProviderOIDC   = "oidc"
-	IdentityProviderSAML   = "saml"
-	IdentityProviderAD     = "ad"
-	IdentityProviderEntra  = "entra"
-	IdentityProviderSCIM   = "scim"
+	IdentityProviderOIDC  = "oidc"
+	IdentityProviderSAML  = "saml"
+	IdentityProviderAD    = "ad"
+	IdentityProviderEntra = "entra"
+	IdentityProviderSCIM  = "scim"
 )
 
 type IdentityProvider struct {

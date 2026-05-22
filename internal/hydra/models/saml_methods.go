@@ -117,33 +117,27 @@ type SAMLAttributeValue struct {
 }
 
 // GetSAMLProvidersForTenant retrieves SAML providers for a workspace via the
-// workspace-owned identity_providers gate (v4 §12). When the workspace has
-// IDP rows configured (post-migration 119 backfill), only SAML providers
-// referenced by a non-disabled identity_providers row are returned. When
-// the IDP table is empty for this workspace, the function falls back to the
-// legacy is_active filter so deployments that haven't run the IDP backfill
-// keep working.
-func (s *OAuthLoginService) GetSAMLProvidersForTenant(tenantID string, clientID ...string) ([]Provider, error) {
+// GetSAMLProvidersForTenant returns the workspace's SAML providers by joining
+// identity_providers + saml_providers. Only rows whose identity_providers row
+// exists and is not disabled are returned. v4: client_id has been dropped from
+// saml_providers — per-Application restriction is enforced at initiate via
+// application_identity_provider_policies, not at list time.
+//
+// Variadic clientID is kept for source compatibility with legacy callers but
+// is ignored.
+func (s *OAuthLoginService) GetSAMLProvidersForTenant(workspaceID string, _ ...string) ([]Provider, error) {
 	db := config.DB
 
-	// workspaces.id == tenant_id during the transition (migration 115). Use
-	// the legacy column name here; once the rename lands this becomes
-	// workspace_id directly.
 	query := db.
 		Table("saml_providers sp").
 		Select("sp.*").
-		Joins(`LEFT JOIN identity_providers ip
+		Joins(`JOIN identity_providers ip
 		         ON ip.workspace_id = sp.tenant_id
 		        AND ip.provider_type = 'saml'
 		        AND ip.config_ref = sp.id::text`).
-		Where("sp.tenant_id = ?", tenantID).
+		Where("sp.tenant_id = ?", workspaceID).
 		Where("sp.is_active = ?", true).
-		Where("(ip.id IS NULL OR ip.status <> 'disabled')")
-
-	if len(clientID) > 0 && clientID[0] != "" {
-		trimmedClientID := strings.TrimSuffix(clientID[0], "-main-client")
-		query = query.Where("sp.client_id = ?", trimmedClientID)
-	}
+		Where("ip.status <> 'disabled'")
 
 	var samlProviders []SAMLProvider
 	if err := query.Order("sp.sort_order ASC").Find(&samlProviders).Error; err != nil {
@@ -163,7 +157,6 @@ func (s *OAuthLoginService) GetSAMLProvidersForTenant(tenantID string, clientID 
 				"sso_url":        sp.SSOURL,
 				"slo_url":        sp.SLOURL,
 				"name_id_format": sp.NameIDFormat,
-				"client_id":      sp.ClientID.String(),
 			},
 		})
 	}
@@ -207,20 +200,16 @@ func (s *OAuthLoginService) GetAllProvidersForTenant(tenantIDForOIDC string, rea
 	return allProviders, nil
 }
 
-// GetSAMLProvider retrieves a specific SAML provider by name and optionally client_id
-func (s *OAuthLoginService) GetSAMLProvider(tenantID, providerName string, clientID ...string) (*SAMLProvider, error) {
+// GetSAMLProvider retrieves a specific SAML provider by name within the
+// workspace. v4: client_id has been dropped from saml_providers — the
+// variadic clientID parameter is kept for source compatibility but ignored.
+func (s *OAuthLoginService) GetSAMLProvider(workspaceID, providerName string, _ ...string) (*SAMLProvider, error) {
 	db := config.DB
 
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
-	query := db.Where("tenant_id = ? AND provider_name = ?", tenantID, providerName)
-
-	if len(clientID) > 0 && clientID[0] != "" {
-		cid := strings.TrimSuffix(clientID[0], "-main-client")
-		query = query.Where("client_id = ?", cid)
-	}
-
 	var provider SAMLProvider
-	if err := query.First(&provider).Error; err != nil {
+	if err := db.Where("tenant_id = ? AND provider_name = ?", workspaceID, providerName).
+		First(&provider).Error; err != nil {
 		return nil, fmt.Errorf("SAML provider not found: %w", err)
 	}
 	return &provider, nil
@@ -231,8 +220,10 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	requestID := fmt.Sprintf("_%s", uuid.New().String())
 	issueInstant := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
-	spEntityID := fmt.Sprintf("%s/saml/metadata/%s/%s", s.cfg.BaseURL, provider.TenantID.String(), provider.ClientID.String())
-	acsURL := fmt.Sprintf("%s/saml/acs/%s/%s", s.cfg.BaseURL, provider.TenantID.String(), provider.ClientID.String())
+	// Workspace-scoped SP entity / ACS URL. Per-Application restriction is
+	// expressed via application_identity_provider_policies, not URL paths.
+	spEntityID := fmt.Sprintf("%s/saml/metadata/%s", s.cfg.BaseURL, provider.TenantID.String())
+	acsURL := fmt.Sprintf("%s/saml/acs/%s", s.cfg.BaseURL, provider.TenantID.String())
 
 	authnRequest := SAMLAuthnRequest{
 		ID:                          requestID,
@@ -268,15 +259,17 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	}
 
 	samlRequest := base64.StdEncoding.EncodeToString(deflatedBuf.Bytes())
-	relayState := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s:%s:%s",
-		loginChallenge, provider.ProviderName, provider.TenantID.String(), provider.ClientID.String())))
+	// Relay state encodes (loginChallenge, providerName, workspaceID).
+	// Per-Application restriction is enforced at initiate via
+	// application_identity_provider_policies, not via the relay state.
+	relayState := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s:%s",
+		loginChallenge, provider.ProviderName, provider.TenantID.String())))
 
 	db := config.DB
 	samlReq := SAMLRequest{
 		ID:             requestID,
 		LoginChallenge: loginChallenge,
 		TenantID:       provider.TenantID,
-		ClientID:       provider.ClientID,
 		ProviderName:   provider.ProviderName,
 		RelayState:     relayState,
 		CreatedAt:      time.Now(),
@@ -290,16 +283,20 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 }
 
 // ValidateSAMLResponse validates and parses a SAML response
-func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState string) (*SAMLAssertion, string, string, string, string, error) {
+// ValidateSAMLResponse parses + validates the SAML assertion. Returns
+// (assertion, loginChallenge, providerName, workspaceID, err).
+//
+// v4: client_id has been removed from the relay state. Per-Application
+// restriction is enforced at initiate via application_identity_provider_policies.
+func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState string) (*SAMLAssertion, string, string, string, error) {
 	relayBytes, err := base64.StdEncoding.DecodeString(relayState)
 	if err != nil {
-		return nil, "", "", "", "", fmt.Errorf("invalid relay state: %w", err)
+		return nil, "", "", "", fmt.Errorf("invalid relay state: %w", err)
 	}
 
-	parts := []byte(relayBytes)
-	relayParts := make([]string, 0)
+	relayParts := []string{}
 	current := ""
-	for _, b := range parts {
+	for _, b := range []byte(relayBytes) {
 		if b == ':' {
 			relayParts = append(relayParts, current)
 			current = ""
@@ -309,37 +306,41 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	}
 	relayParts = append(relayParts, current)
 
-	if len(relayParts) < 4 {
-		return nil, "", "", "", "", fmt.Errorf("invalid relay state format, expected 4 parts, got %d", len(relayParts))
+	if len(relayParts) < 3 {
+		return nil, "", "", "", fmt.Errorf("invalid relay state format, expected 3 parts, got %d", len(relayParts))
 	}
 
 	loginChallenge := relayParts[0]
 	providerName := relayParts[1]
-	tenantID := relayParts[2]
-	clientID := relayParts[3]
+	workspaceID := relayParts[2]
 
 	responseBytes, err := base64.StdEncoding.DecodeString(samlResponse)
 	if err != nil {
-		return nil, "", "", "", "", fmt.Errorf("failed to decode SAML response: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to decode SAML response: %w", err)
 	}
 
 	var samlResp SAMLResponseEnvelope
 	if err := xml.Unmarshal(responseBytes, &samlResp); err != nil {
-		return nil, "", "", "", "", fmt.Errorf("failed to unmarshal SAML response: %w", err)
+		return nil, "", "", "", fmt.Errorf("failed to unmarshal SAML response: %w", err)
 	}
 
 	if samlResp.Status.StatusCode.Value != "urn:oasis:names:tc:SAML:2.0:status:Success" {
-		return nil, "", "", "", "", fmt.Errorf("SAML authentication failed: %s", samlResp.Status.StatusCode.Value)
+		return nil, "", "", "", fmt.Errorf("SAML authentication failed: %s", samlResp.Status.StatusCode.Value)
 	}
 
-	provider, err := s.GetSAMLProvider(tenantID, providerName, clientID)
+	// Re-validate workspace IDP is still active. Pulled through the same
+	// workspace-gated path used at initiate — if the operator disabled the
+	// provider mid-flow, reject the callback.
+	provider, err := s.GetSAMLProvider(workspaceID, providerName)
 	if err != nil {
-		log.Printf("Failed to get SAML provider for entity ID validation: %v", err)
-	} else {
-		responseEntityID := samlResp.Assertion.Issuer.Value
-		if responseEntityID != provider.EntityID {
-			return nil, "", "", "", "", fmt.Errorf("SAML entity ID validation failed: response from unexpected identity provider")
-		}
+		return nil, "", "", "", fmt.Errorf("SAML provider lookup failed: %w", err)
+	}
+	if !provider.IsActive {
+		return nil, "", "", "", fmt.Errorf("SAML provider %q is not active", providerName)
+	}
+	responseEntityID := samlResp.Assertion.Issuer.Value
+	if responseEntityID != provider.EntityID {
+		return nil, "", "", "", fmt.Errorf("SAML entity ID validation failed: response from unexpected identity provider")
 	}
 
 	nameID := trimSpace(samlResp.Assertion.Subject.NameID.Value)
@@ -374,7 +375,7 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 		FirstName:  firstName,
 		LastName:   lastName,
 		Attributes: attributes,
-	}, loginChallenge, providerName, tenantID, clientID, nil
+	}, loginChallenge, providerName, workspaceID, nil
 }
 
 // GetOrCreateSPCertificate gets or creates SP certificate for tenant
@@ -443,15 +444,18 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLS
 }
 
 // GenerateSAMLMetadata generates SP metadata XML for a tenant and client
-func (s *OAuthLoginService) GenerateSAMLMetadata(tenantID, clientID uuid.UUID) (string, error) {
-	cert, err := s.GetOrCreateSPCertificate(tenantID)
+// GenerateSAMLMetadata returns workspace-scoped SP metadata XML.
+// v4: client_id is no longer in the metadata URL — per-Application
+// restriction is policy-table driven, not URL-encoded.
+func (s *OAuthLoginService) GenerateSAMLMetadata(workspaceID uuid.UUID) (string, error) {
+	cert, err := s.GetOrCreateSPCertificate(workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get SP certificate: %w", err)
 	}
 
-	entityID := fmt.Sprintf("%s/saml/metadata/%s/%s", s.cfg.BaseURL, tenantID.String(), clientID.String())
+	entityID := fmt.Sprintf("%s/saml/metadata/%s", s.cfg.BaseURL, workspaceID.String())
 	acsURLShared := fmt.Sprintf("%s/saml/acs", s.cfg.BaseURL)
-	acsURLTenantClient := fmt.Sprintf("%s/saml/acs/%s/%s", s.cfg.BaseURL, tenantID.String(), clientID.String())
+	acsURLWorkspace := fmt.Sprintf("%s/saml/acs/%s", s.cfg.BaseURL, workspaceID.String())
 	certData := extractCertificateData(cert.Certificate)
 
 	metadata := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -481,95 +485,14 @@ func (s *OAuthLoginService) GenerateSAMLMetadata(tenantID, clientID uuid.UUID) (
                                  Location="%s"
                                  index="2" />
   </md:SPSSODescriptor>
-</md:EntityDescriptor>`, entityID, certData, certData, acsURLTenantClient, acsURLShared)
+</md:EntityDescriptor>`, entityID, certData, certData, acsURLWorkspace, acsURLShared)
 
 	return metadata, nil
 }
 
-// CreateSAMLProvider creates a new SAML provider for a tenant and client
-func (s *OAuthLoginService) CreateSAMLProvider(tenantID string, provider *SAMLProvider) (*SAMLProvider, error) {
-	db := config.DB
-
-	provider.ProviderName = strings.ToLower(strings.TrimSpace(provider.ProviderName))
-	provider.TenantID, _ = uuid.Parse(tenantID)
-
-	if err := db.Create(provider).Error; err != nil {
-		return nil, fmt.Errorf("failed to create SAML provider: %w", err)
-	}
-	return provider, nil
-}
-
-// UpdateSAMLProvider updates an existing SAML provider
-func (s *OAuthLoginService) UpdateSAMLProvider(tenantID string, providerID uuid.UUID, clientID string, updates *SAMLProvider) (*SAMLProvider, error) {
-	db := config.DB
-
-	query := db.Where("id = ?", providerID)
-	if clientID != "" {
-		clientID = strings.TrimSuffix(clientID, "-main-client")
-		query = query.Where("client_id = ?", clientID)
-	}
-
-	var provider SAMLProvider
-	if err := query.First(&provider).Error; err != nil {
-		return nil, fmt.Errorf("SAML provider not found: %w", err)
-	}
-
-	if updates.ProviderName != "" {
-		provider.ProviderName = strings.ToLower(strings.TrimSpace(updates.ProviderName))
-	}
-	if updates.DisplayName != "" {
-		provider.DisplayName = updates.DisplayName
-	}
-	if updates.EntityID != "" {
-		provider.EntityID = updates.EntityID
-	}
-	if updates.SSOURL != "" {
-		provider.SSOURL = updates.SSOURL
-	}
-	if updates.SLOURL != "" {
-		provider.SLOURL = updates.SLOURL
-	}
-	if updates.Certificate != "" {
-		provider.Certificate = updates.Certificate
-	}
-	if updates.MetadataURL != "" {
-		provider.MetadataURL = updates.MetadataURL
-	}
-	if updates.NameIDFormat != "" {
-		provider.NameIDFormat = updates.NameIDFormat
-	}
-	if updates.AttributeMapping != nil {
-		provider.AttributeMapping = updates.AttributeMapping
-	}
-	provider.IsActive = updates.IsActive
-	provider.SortOrder = updates.SortOrder
-
-	if err := db.Save(&provider).Error; err != nil {
-		return nil, fmt.Errorf("failed to update SAML provider: %w", err)
-	}
-	return &provider, nil
-}
-
-// DeleteSAMLProvider deletes a SAML provider
-func (s *OAuthLoginService) DeleteSAMLProvider(tenantID string, providerID uuid.UUID, clientID string) error {
-	db := config.DB
-
-	query := db.Where("id = ?", providerID)
-	if clientID != "" {
-		clientID = strings.TrimSuffix(clientID, "-main-client")
-		query = query.Where("client_id = ?", clientID)
-	}
-
-	var provider SAMLProvider
-	if err := query.First(&provider).Error; err != nil {
-		return fmt.Errorf("SAML provider not found: %w", err)
-	}
-
-	if err := db.Delete(&provider).Error; err != nil {
-		return fmt.Errorf("failed to delete SAML provider: %w", err)
-	}
-	return nil
-}
+// Legacy CreateSAMLProvider / UpdateSAMLProvider / DeleteSAMLProvider methods
+// have been removed. SAML provider lifecycle is owned by
+// services.IdentityProviderService — see CreateSAML / UpdateStatus / Delete.
 
 // XML helper functions
 
