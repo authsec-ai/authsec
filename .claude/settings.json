@@ -28,12 +28,19 @@
       "Bash(kubectl set *)",
       "Bash(docker version *)",
       "Bash(docker run *)",
-      "Bash(docker push *)"
+      "Bash(docker push *)",
+      "Bash(python -m pip install --upgrade build twine)",
+      "Bash(rm -rf dist build *.egg-info)",
+      "Bash(python -m build)",
+      "Bash(python -m twine check dist/*)",
+      "Bash(kubectl apply *)",
+      "Bash(git log *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-langchain\\src",
       "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-langchain",
-      "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-spire-agent\\icp_agent"
+      "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-spire-agent\\icp_agent",
+      "\\tmp"
     ]
   }
 }
