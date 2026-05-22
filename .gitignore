@@ -1,0 +1,8 @@
+# Local Go build outputs
+/main
+*.test
+*.out
+
+# OS/editor noise
+.DS_Store
+
