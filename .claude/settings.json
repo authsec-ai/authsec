@@ -33,7 +33,8 @@
       "Bash(rm -rf dist build *.egg-info)",
       "Bash(python -m build)",
       "Bash(python -m twine check dist/*)",
-      "Bash(kubectl apply *)"
+      "Bash(kubectl apply *)",
+      "Bash(git log *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Ritam Kumarb Kundu\\Desktop\\Broadcom\\authsec\\authsec-langchain\\src",

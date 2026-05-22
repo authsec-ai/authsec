@@ -1641,6 +1641,10 @@ func spireGetenv(key, fallback string) string {
 //
 //	POST {baseURL}/v1/entries/agent
 //	{ tenant_id, client_id, agent_type, parent_id, selectors?, ttl? }
+//
+// The endpoint requires a Bearer JWT (or mTLS). We mint a short-lived HS256
+// service token signed with JWT_DEF_SECRET — the same secret authsec-spire
+// validates with (see authsec-spire/pkg/utils/jwt.go).
 func registerAgentEntryViaHTTP(baseURL, tenantID, clientID, agentType, parentID string, selectors map[string]string) error {
 	body := map[string]interface{}{
 		"tenant_id":  tenantID,
@@ -1667,6 +1671,13 @@ func registerAgentEntryViaHTTP(baseURL, tenantID, clientID, agentType, parentID 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Mint a service JWT and attach as Authorization: Bearer ...
+	serviceToken, err := mintSpireServiceJWT(tenantID, clientID)
+	if err != nil {
+		return fmt.Errorf("mint service jwt: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+serviceToken)
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1680,4 +1691,32 @@ func registerAgentEntryViaHTTP(baseURL, tenantID, clientID, agentType, parentID 
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, url, strings.TrimSpace(string(respBody)))
+}
+
+// mintSpireServiceJWT creates a short-lived HS256 JWT for authenticating to
+// authsec-spire. The secret is read from JWT_DEF_SECRET (the same env var
+// authsec-spire uses as its validation key — see authsec-spire config.go:227).
+//
+// Required claim: tenant_id. We also include user_id (the agent's client_id
+// acting as the "user" performing this registration), an admin role so the
+// downstream's CanDelegate() check passes, plus standard exp/iat/nbf.
+func mintSpireServiceJWT(tenantID, clientID string) (string, error) {
+	secret := os.Getenv("JWT_DEF_SECRET")
+	if secret == "" {
+		return "", fmt.Errorf("JWT_DEF_SECRET not set; cannot mint service token for authsec-spire")
+	}
+
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"tenant_id": tenantID,
+		"user_id":   clientID,
+		"role":      "admin",
+		"iss":       "authsec-monolith",
+		"aud":       "authsec-spire",
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),
+		"exp":       now.Add(2 * time.Minute).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
 }
