@@ -803,10 +803,7 @@ func AddUserDefinedGroups(tenantID string, groups []string) ([]models.TenantGrou
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	var createdGroups []models.TenantGroup
 	for _, groupName := range groups {
@@ -839,10 +836,7 @@ func MapGroupsToClient(tenantID, clientID string, groups []string) error {
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Find the user in tenant database
 	var user models.User
@@ -888,10 +882,7 @@ func RemoveGroupsFromClient(tenantID, clientID string, groups []string) error {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
@@ -927,10 +918,7 @@ func GetUserDefinedGroups(tenantID string) ([]models.TenantGroup, error) {
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	var groups []models.TenantGroup
 	// Query groups from tenant database
@@ -952,10 +940,7 @@ func DeleteUserDefinedGroups(tenantID string, groups []string) error {
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	return tenantDB.Where("id IN ? AND tenant_id = ?", groups, tenantUUID).Delete(&models.TenantGroup{}).Error
 }
@@ -971,10 +956,7 @@ func UpdateUserDefinedGroup(groupID, tenantID, name, description string) error {
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Parse group ID as UUID
 	groupUUID, err := uuid.Parse(groupID)
@@ -1002,10 +984,7 @@ func AddUserToGroups(tenantID, userID string, groups []string) error {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Parse user ID
 	userUUID, err := uuid.Parse(userID)
@@ -1052,10 +1031,7 @@ func RemoveUserFromGroups(tenantID, userID string, groups []string) error {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Parse user ID
 	userUUID, err := uuid.Parse(userID)
@@ -1098,10 +1074,7 @@ func GetUserGroups(tenantID, userID string) ([]models.TenantGroup, error) {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Parse user ID
 	userUUID, err := uuid.Parse(userID)
@@ -1144,10 +1117,7 @@ func fetchTenantGroupUsers(tenantID string) ([]groupUserSummary, error) {
 		return nil, fmt.Errorf("database connection not available")
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	users := make([]groupUserSummary, 0)
 	if err := tenantDB.Table("users").
@@ -1217,10 +1187,7 @@ func GetGroupUsers(tenantID, groupID string) ([]models.User, error) {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Parse group ID
 	groupUUID, err := uuid.Parse(groupID)
@@ -1252,10 +1219,7 @@ func AddUsersToGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid.UUID
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Verify the group exists
 	var group models.TenantGroup
@@ -1313,10 +1277,7 @@ func RemoveUsersFromGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Verify the group exists
 	var group models.TenantGroup

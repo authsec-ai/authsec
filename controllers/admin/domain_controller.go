@@ -31,19 +31,19 @@ type CreateDomainRequest struct {
 }
 
 type DomainResponse struct {
-	ID                    string `json:"id"`
-	TenantID              string `json:"tenant_id"`
-	Domain                string `json:"domain"`
-	Kind                  string `json:"kind"`
-	IsPrimary             bool   `json:"is_primary"`
-	IsVerified            bool   `json:"is_verified"`
-	VerificationMethod    string `json:"verification_method"`
-	VerificationToken     string `json:"verification_token"`
-	VerificationTXTName   string `json:"verification_txt_name,omitempty"`
-	VerificationTXTValue  string `json:"verification_txt_value,omitempty"`
-	VerifiedAt            string `json:"verified_at,omitempty"`
-	CreatedAt             string `json:"created_at"`
-	UpdatedAt             string `json:"updated_at"`
+	ID                   string `json:"id"`
+	TenantID             string `json:"tenant_id"`
+	Domain               string `json:"domain"`
+	Kind                 string `json:"kind"`
+	IsPrimary            bool   `json:"is_primary"`
+	IsVerified           bool   `json:"is_verified"`
+	VerificationMethod   string `json:"verification_method"`
+	VerificationToken    string `json:"verification_token"`
+	VerificationTXTName  string `json:"verification_txt_name,omitempty"`
+	VerificationTXTValue string `json:"verification_txt_value,omitempty"`
+	VerifiedAt           string `json:"verified_at,omitempty"`
+	CreatedAt            string `json:"created_at"`
+	UpdatedAt            string `json:"updated_at"`
 }
 
 func getTenantIDFromRequest(c *gin.Context) (uuid.UUID, error) {

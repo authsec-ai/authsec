@@ -228,14 +228,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		}
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &expectedTenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"error":   "failed to connect to tenant database",
-		})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("id = ?", userID).First(&user).Error; err != nil {
@@ -1180,11 +1173,7 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 
 	orgID := clientDetails.Metadata["c_id"].(string)
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &orgID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var client hydramodels.Client
 	tenantIDStr := clientDetails.Metadata["tenant_id"].(string)
@@ -1666,9 +1655,31 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 		return false
 	}
 
+	tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
+	subjectUUID, _ := uuid.Parse(consentRequest.Subject)
+	if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+		now := time.Now().UTC()
+		state := models.TenantEndUserState{
+			TenantID:       tenantUUID,
+			UserID:         subjectUUID,
+			Status:         models.EndUserStatusActive,
+			FirstConsentAt: now,
+			LastSeenAt:     &now,
+		}
+		if err := config.DB.
+			Where("tenant_id = ? AND user_id = ?", tenantUUID, subjectUUID).
+			Assign(map[string]interface{}{
+				"status":       models.EndUserStatusActive,
+				"last_seen_at": now,
+				"updated_at":   now,
+			}).
+			FirstOrCreate(&state).Error; err != nil {
+			log.Printf("[MCP_AUTH] ConsentHandler: failed to upsert end-user state tenant=%s user=%s context_id=%s: %v",
+				arcCtx.TenantID, consentRequest.Subject, arcCtx.ContextID, err)
+		}
+	}
+
 	if remember && mcpClient != nil {
-		tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
-		subjectUUID, _ := uuid.Parse(consentRequest.Subject)
 		if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
 			_, consentErr := ctrl.consentService.UpsertConsent(
 				tenantUUID, subjectUUID, mcpClient.ID, rs.ID,

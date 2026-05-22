@@ -8,7 +8,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -173,19 +172,15 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	// Step 8: Requires human approval — send push notification
 	actionRequest.Status = "pending"
 
-	tenantIDStr := tenantID.String()
-	tenantDB, tenantDBErr := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
+	tenantDB := config.DB
 
 	var deviceToken string
 	var deviceTokenID *uuid.UUID
 
-	if tenantDBErr == nil {
-		tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-		devices, devErr := tenantRepo.GetTenantDeviceTokensByUserID(userID, tenantID)
-		if devErr == nil && len(devices) > 0 {
-			deviceToken = devices[0].DeviceToken
-			deviceTokenID = &devices[0].ID
-		}
+	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	if devices, devErr := tenantRepo.GetTenantDeviceTokensByUserID(userID, tenantID); devErr == nil && len(devices) > 0 {
+		deviceToken = devices[0].DeviceToken
+		deviceTokenID = &devices[0].ID
 	}
 
 	if deviceToken == "" {
@@ -620,23 +615,23 @@ func (s *AgentActionService) writeAuditLog(req *models.AgentActionRequest, final
 	}
 
 	entry := &models.AgentActionAuditLog{
-		ID:              uuid.New(),
-		TenantID:        req.TenantID,
-		ActionRequestID: &req.ID,
-		AgentID:         req.AgentID,
-		AgentName:       req.AgentName,
-		UserID:          req.UserID,
-		UserEmail:       req.UserEmail,
-		Action:          req.Action,
-		Resource:        req.Resource,
-		Detail:          req.Detail,
-		Metadata:        req.Metadata,
-		RiskScore:       req.RiskScore,
-		RiskLevel:       req.RiskLevel,
-		FinalStatus:     finalStatus,
-		DecidedBy:       decidedByArray,
-		RequestedAt:     req.CreatedAt,
-		DecidedAt:       &now,
+		ID:                  uuid.New(),
+		TenantID:            req.TenantID,
+		ActionRequestID:     &req.ID,
+		AgentID:             req.AgentID,
+		AgentName:           req.AgentName,
+		UserID:              req.UserID,
+		UserEmail:           req.UserEmail,
+		Action:              req.Action,
+		Resource:            req.Resource,
+		Detail:              req.Detail,
+		Metadata:            req.Metadata,
+		RiskScore:           req.RiskScore,
+		RiskLevel:           req.RiskLevel,
+		FinalStatus:         finalStatus,
+		DecidedBy:           decidedByArray,
+		RequestedAt:         req.CreatedAt,
+		DecidedAt:           &now,
 		ExecutionDurationMs: durationMs,
 	}
 

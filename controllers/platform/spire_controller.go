@@ -31,6 +31,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/models"
 )
 
 // ===== MODELS =====
@@ -319,9 +320,38 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		return "", fmt.Errorf("SPIRE controller not initialized")
 	}
 
-	spiffeID := fmt.Sprintf("/tenants/%s/agents/%s/%s", tenantID, agentType, clientID)
+	// Resolve the Application ID via legacy_client_id mapping (migration 118).
+	// When an Application has been backfilled, we issue the v4 SPIFFE path:
+	//   spiffe://<trust-domain>/workspaces/{workspace_id}/applications/{application_id}
+	// Otherwise we fall back to the legacy /tenants/<id>/agents/<type>/<id>
+	// path so existing SPIRE entries continue to resolve during the
+	// transition. workspace_id == tenant_id from migration 115's backfill.
+	var (
+		applicationID    *uuid.UUID
+		workspaceUUIDStr = tenantID
+	)
+	if clientUUID, parseErr := uuid.Parse(clientID); parseErr == nil {
+		var rs models.ResourceServer
+		if err := config.DB.Select("id, workspace_id").
+			Where("legacy_client_id = ?", clientUUID).
+			First(&rs).Error; err == nil {
+			id := rs.ID
+			applicationID = &id
+			if rs.WorkspaceID != nil {
+				workspaceUUIDStr = rs.WorkspaceID.String()
+			}
+		}
+	}
+
+	var spiffeID, parentID string
+	if applicationID != nil {
+		spiffeID = fmt.Sprintf("/workspaces/%s/applications/%s", workspaceUUIDStr, applicationID.String())
+		parentID = fmt.Sprintf("spiffe://%s/workspaces/%s", sc.trustDomain, workspaceUUIDStr)
+	} else {
+		spiffeID = fmt.Sprintf("/tenants/%s/agents/%s/%s", tenantID, agentType, clientID)
+		parentID = fmt.Sprintf("spiffe://%s/tenants/%s/agent", sc.trustDomain, tenantID)
+	}
 	fullSpiffeID := fmt.Sprintf("spiffe://%s%s", sc.trustDomain, spiffeID)
-	parentID := fmt.Sprintf("spiffe://%s/tenants/%s/agent", sc.trustDomain, tenantID)
 
 	// Build SPIRE selectors from the user-supplied key-value pairs
 	var spireSelectors []*typespb.Selector
@@ -376,11 +406,8 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		return "", fmt.Errorf("invalid tenant_id: %w", err)
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		log.Printf("[SPIRE] Warning: failed to connect to tenant DB for workload entry: %v", err)
-		// Continue — master record and gRPC entry are still valuable
-	} else {
+	tenantDB := config.DB
+	{
 		entry := WorkloadEntry{
 			ID:        uuid.New(),
 			TenantID:  tenantUUID,
@@ -390,21 +417,28 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 			TTL:       3600,
 		}
 		if err := tenantDB.Create(&entry).Error; err != nil {
-			log.Printf("[SPIRE] Warning: failed to save workload entry to tenant DB: %v", err)
+			log.Printf("[SPIRE] Warning: failed to save workload entry: %v", err)
 			// Continue — don't fail the whole registration
 		} else {
-			log.Printf("[SPIRE] Workload entry saved to tenant DB: id=%s spiffe_id=%s", entry.ID, entry.SpiffeID)
+			log.Printf("[SPIRE] Workload entry saved: id=%s spiffe_id=%s", entry.ID, entry.SpiffeID)
 		}
 	}
 
-	// Create SPIRE entry via gRPC (if server is connected)
+	// Create SPIRE entry via gRPC (if server is connected). ParentId mirrors
+	// the chosen path family — workspace/application for backfilled apps,
+	// legacy tenants/agent for unbackfilled rows.
+	parentPath := fmt.Sprintf("/tenants/%s/agent", tenantID)
+	if applicationID != nil {
+		parentPath = fmt.Sprintf("/workspaces/%s", workspaceUUIDStr)
+	}
+
 	if sc.entryClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		entry := &typespb.Entry{
 			SpiffeId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: spiffeID},
-			ParentId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: fmt.Sprintf("/tenants/%s/agent", tenantID)},
+			ParentId:    &typespb.SPIFFEID{TrustDomain: sc.trustDomain, Path: parentPath},
 			Selectors:   spireSelectors,
 			X509SvidTtl: 3600,
 			StoreSvid:   true,
@@ -422,7 +456,32 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		log.Printf("[SPIRE] Warning: SPIRE gRPC entryClient is nil — workload entry saved to DB but not registered with SPIRE server. Set SPIRE_SERVER_ADDR to enable.")
 	}
 
-	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s", fullSpiffeID, tenantID, clientID)
+	// Persist a workspace-scoped Application SPIFFE identity record when we
+	// were able to resolve the legacy clients.id to a resource_servers.id.
+	// This is the v4 source of truth for SPIFFE → Application mapping; the
+	// existing spire_workloads/workload_entries rows remain for compatibility
+	// until the SPIRE controller is fully cut over to it.
+	if applicationID != nil {
+		if workspaceUUID, err := uuid.Parse(workspaceUUIDStr); err == nil {
+			identity := models.ApplicationSpiffeIdentity{
+				WorkspaceID:   workspaceUUID,
+				ApplicationID: *applicationID,
+				SpiffeID:      fullSpiffeID,
+				TrustDomain:   sc.trustDomain,
+				Selectors:     selectorsJSON,
+				Status:        "active",
+			}
+			// Upsert by unique spiffe_id so re-registration doesn't fail.
+			if err := sc.db.Where("spiffe_id = ?", fullSpiffeID).
+				Assign(identity).
+				FirstOrCreate(&identity).Error; err != nil {
+				log.Printf("[SPIRE] Warning: failed to persist application_spiffe_identities row: %v", err)
+			}
+		}
+	}
+
+	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s application=%v",
+		fullSpiffeID, tenantID, clientID, applicationID)
 	return fullSpiffeID, nil
 }
 

@@ -85,6 +85,21 @@ func main() {
 
 	}
 
+	// Hydra reconciler: walks mcp_oauth_clients rows whose Hydra sync failed
+	// previously and converges them. Disabled when AUTHSEC_DISABLE_HYDRA_RECONCILER=true
+	// (e.g. unit-test boots without a Hydra). Interval defaults to 5 minutes
+	// and can be overridden with AUTHSEC_HYDRA_RECONCILER_INTERVAL=2m.
+	if os.Getenv("AUTHSEC_DISABLE_HYDRA_RECONCILER") != "true" {
+		interval := 5 * time.Minute
+		if v := os.Getenv("AUTHSEC_HYDRA_RECONCILER_INTERVAL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				interval = d
+			}
+		}
+		reconciler := services.NewHydraReconciler(config.DB, interval)
+		go reconciler.Run(context.Background())
+	}
+
 	// mt-plugin: auto-detect the multi-tenant plugin via gRPC heartbeat.
 	// When MT_PLUGIN_GRPC_ADDR is set, authsec will notify mt-plugin after each
 	// admin registration so it can provision the tenant database asynchronously.

@@ -367,11 +367,7 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
@@ -396,11 +392,7 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
@@ -431,11 +423,7 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
@@ -464,11 +452,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
@@ -496,11 +480,7 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
@@ -529,11 +509,7 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context)
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})

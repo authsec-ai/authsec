@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
-	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
 	"github.com/authsec-ai/authsec/config"
+	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

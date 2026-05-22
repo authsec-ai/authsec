@@ -125,13 +125,16 @@ func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID
 		return false, err
 	}
 
+	// Canonical: oauth_scopes (workspace + resource_server-scoped) joined to
+	// permissions via oauth_scope_permissions. The legacy `scopes` and
+	// `scope_permissions` tables are gone.
 	var count int64
 	err = db.WithContext(ctx).
-		Table("scopes").
-		Joins("JOIN scope_permissions ON scopes.id = scope_permissions.scope_id").
-		Joins("JOIN permissions ON scope_permissions.permission_id = permissions.id").
-		Where("scopes.tenant_id = ?", tenantID).
-		Where("scopes.name = ?", scopeName).
+		Table("oauth_scopes").
+		Joins("JOIN oauth_scope_permissions ON oauth_scopes.id = oauth_scope_permissions.scope_id").
+		Joins("JOIN permissions ON oauth_scope_permissions.permission_id = permissions.id").
+		Where("oauth_scopes.tenant_id = ?", tenantID).
+		Where("oauth_scopes.scope_string = ?", scopeName).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
 		Count(&count).Error

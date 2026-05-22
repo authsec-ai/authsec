@@ -118,19 +118,19 @@ type DeviceTokenRegistrationResponse struct {
 
 // CIBAInitiateRequest - Initiate CIBA authentication (voice agent calls this)
 type CIBAInitiateRequest struct {
-	LoginHint      string   `json:"login_hint" binding:"required"`      // User email
-	BindingMessage string   `json:"binding_message,omitempty"`          // Message shown to user
-	ClientID       string   `json:"client_id,omitempty"`                // Optional client ID
-	Scopes         []string `json:"scopes,omitempty"`                   // OAuth scopes
+	LoginHint      string   `json:"login_hint" binding:"required"` // User email
+	BindingMessage string   `json:"binding_message,omitempty"`     // Message shown to user
+	ClientID       string   `json:"client_id,omitempty"`           // Optional client ID
+	Scopes         []string `json:"scopes,omitempty"`              // OAuth scopes
 }
 
 // CIBAInitiateResponse
 type CIBAInitiateResponse struct {
-	AuthReqID string `json:"auth_req_id"`           // Request ID for polling
-	ExpiresIn int    `json:"expires_in"`            // Seconds until expiration
-	Interval  int    `json:"interval"`              // Polling interval in seconds
-	Message   string `json:"message,omitempty"`     // Status message
-	Error     string `json:"error,omitempty"`       // Error code
+	AuthReqID        string `json:"auth_req_id"`                 // Request ID for polling
+	ExpiresIn        int    `json:"expires_in"`                  // Seconds until expiration
+	Interval         int    `json:"interval"`                    // Polling interval in seconds
+	Message          string `json:"message,omitempty"`           // Status message
+	Error            string `json:"error,omitempty"`             // Error code
 	ErrorDescription string `json:"error_description,omitempty"` // Error description
 }
 
@@ -155,12 +155,12 @@ type CIBATokenRequest struct {
 
 // CIBATokenResponse - Returns token or status
 type CIBATokenResponse struct {
-	AccessToken  string `json:"access_token,omitempty"`
-	TokenType    string `json:"token_type,omitempty"`
-	ExpiresIn    int    `json:"expires_in,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	Scope        string `json:"scope,omitempty"`
-	Error        string `json:"error,omitempty"`
+	AccessToken      string `json:"access_token,omitempty"`
+	TokenType        string `json:"token_type,omitempty"`
+	ExpiresIn        int    `json:"expires_in,omitempty"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	Scope            string `json:"scope,omitempty"`
+	Error            string `json:"error,omitempty"`
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 

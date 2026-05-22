@@ -2,8 +2,8 @@
 //
 // Two related resources live here:
 //
-//   • tenant_memberships      → operator-side identities (Owner/Admin/Member/...).
-//   • tenant_end_user_states  → consumer-side state (plan tier, suspension, …).
+//   - workspace_memberships   → operator-side identities (Owner/Admin/Member/...).
+//   - tenant_end_user_states  → consumer-side state (plan tier, suspension, …).
 //
 // Two distinct user kinds is a deliberate product decision (see
 // docs/USER_MANAGEMENT_AND_MCP_AUTHZ.md §2.3, §2.4). Members are who the
@@ -69,8 +69,17 @@ func parseUserID(c *gin.Context) (uuid.UUID, bool) {
 	return id, true
 }
 
+func (mc *MembershipController) workspaceRoleID(workspaceID uuid.UUID, roleName string) (uuid.UUID, error) {
+	var roleID uuid.UUID
+	err := mc.db.Table("roles").
+		Select("id").
+		Where("tenant_id = ? AND name = ?", workspaceID, roleName).
+		Take(&roleID).Error
+	return roleID, err
+}
+
 // ────────────────────────────────────────────────────────────────────
-// tenant_memberships
+// workspace_memberships
 // ────────────────────────────────────────────────────────────────────
 
 // ListMembers GET /v2/tenants/:tenant_id/memberships
@@ -81,19 +90,34 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 		return
 	}
 
-	q := mc.db.Table("tenant_memberships AS tm").
-		Select("tm.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
-		Joins("LEFT JOIN users u ON u.tenant_id = tm.tenant_id AND u.id = tm.user_id").
-		Where("tm.tenant_id = ?", tenantID)
+	q := mc.db.Table("workspace_memberships AS wm").
+		Select(`
+			wm.id,
+			wm.workspace_id AS tenant_id,
+			wm.user_id,
+			wm.status,
+			r.name AS membership_type,
+			'workspace' AS source,
+			wm.created_at AS joined_at,
+			wm.created_at,
+			wm.updated_at,
+			u.email AS user_email,
+			u.name AS user_name,
+			u.username AS user_username,
+			u.last_login AS user_last_login
+		`).
+		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
+		Joins("LEFT JOIN users u ON u.tenant_id = wm.workspace_id AND u.id = wm.user_id").
+		Where("wm.workspace_id = ?", tenantID)
 	if s := c.Query("status"); s != "" {
-		q = q.Where("tm.status = ?", s)
+		q = q.Where("wm.status = ?", s)
 	}
 	if t := c.Query("type"); t != "" {
-		q = q.Where("tm.membership_type = ?", t)
+		q = q.Where("r.name = ?", t)
 	}
 
 	var rows []map[string]interface{}
-	if err := q.Order("tm.created_at DESC").Scan(&rows).Error; err != nil {
+	if err := q.Order("wm.created_at DESC").Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list memberships", "detail": err.Error()})
 		return
 	}
@@ -112,10 +136,25 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 	}
 
 	var row map[string]interface{}
-	err := mc.db.Table("tenant_memberships AS tm").
-		Select("tm.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
-		Joins("LEFT JOIN users u ON u.tenant_id = tm.tenant_id AND u.id = tm.user_id").
-		Where("tm.tenant_id = ? AND tm.user_id = ?", tenantID, userID).
+	err := mc.db.Table("workspace_memberships AS wm").
+		Select(`
+			wm.id,
+			wm.workspace_id AS tenant_id,
+			wm.user_id,
+			wm.status,
+			r.name AS membership_type,
+			'workspace' AS source,
+			wm.created_at AS joined_at,
+			wm.created_at,
+			wm.updated_at,
+			u.email AS user_email,
+			u.name AS user_name,
+			u.username AS user_username,
+			u.last_login AS user_last_login
+		`).
+		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
+		Joins("LEFT JOIN users u ON u.tenant_id = wm.workspace_id AND u.id = wm.user_id").
+		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
 		Take(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -165,27 +204,19 @@ func (mc *MembershipController) CreateMembership(c *gin.Context) {
 	if status == "" {
 		status = models.MembershipStatusActive
 	}
-	source := strings.ToLower(strings.TrimSpace(req.Source))
-	if source == "" {
-		source = models.MembershipSourceAPI
+	roleID, err := mc.workspaceRoleID(tenantID, mtype)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace role not found", "detail": err.Error()})
+		return
 	}
 
-	actor := actorUserID(c) // set by auth middleware; helper below
-	m := models.TenantMembership{
-		TenantID:       tenantID,
-		UserID:         userID,
-		Status:         status,
-		MembershipType: mtype,
-		Source:         source,
-		ExternalID:     req.ExternalID,
-		InvitedBy:      actor,
+	m := models.WorkspaceMembership{
+		WorkspaceID: tenantID,
+		UserID:      userID,
+		RoleID:      roleID,
+		Status:      status,
 	}
-	if status == models.MembershipStatusActive {
-		now := timeNow()
-		m.JoinedAt = &now
-	}
-
-	result := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).FirstOrCreate(&m)
+	result := mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).FirstOrCreate(&m)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create membership", "detail": result.Error.Error()})
 		return
@@ -224,23 +255,23 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 	updates := map[string]interface{}{}
 	if req.Status != nil {
 		updates["status"] = *req.Status
-		if *req.Status == models.MembershipStatusSuspended {
-			updates["suspended_at"] = timeNow()
-		}
 	}
 	if req.MembershipType != nil {
-		updates["membership_type"] = *req.MembershipType
-	}
-	if req.ExternalID != nil {
-		updates["external_id"] = *req.ExternalID
+		mtype := strings.ToLower(strings.TrimSpace(*req.MembershipType))
+		roleID, err := mc.workspaceRoleID(tenantID, mtype)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace role not found", "detail": err.Error()})
+			return
+		}
+		updates["role_id"] = roleID
 	}
 	if len(updates) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
 		return
 	}
 
-	res := mc.db.Model(&models.TenantMembership{}).
-		Where("tenant_id = ? AND user_id = ?", tenantID, userID).
+	res := mc.db.Model(&models.WorkspaceMembership{}).
+		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -251,9 +282,13 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 		return
 	}
 
-	var m models.TenantMembership
-	_ = mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).First(&m).Error
-	c.JSON(http.StatusOK, m)
+	var row map[string]interface{}
+	_ = mc.db.Table("workspace_memberships AS wm").
+		Select("wm.id, wm.workspace_id AS tenant_id, wm.user_id, wm.status, r.name AS membership_type, 'workspace' AS source, wm.created_at AS joined_at, wm.created_at, wm.updated_at").
+		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
+		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
+		Take(&row).Error
+	c.JSON(http.StatusOK, row)
 }
 
 // DeleteMembership DELETE /v2/tenants/:tenant_id/memberships/:user_id
@@ -268,8 +303,8 @@ func (mc *MembershipController) DeleteMembership(c *gin.Context) {
 		return
 	}
 
-	res := mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).
-		Delete(&models.TenantMembership{})
+	res := mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).
+		Delete(&models.WorkspaceMembership{})
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed", "detail": res.Error.Error()})
 		return

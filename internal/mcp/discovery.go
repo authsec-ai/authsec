@@ -23,9 +23,9 @@ import (
 var ErrProtectedServer = errors.New("mcp server is protected (401 with bearer challenge)")
 
 const (
-	maxResponseSize = 5 * 1024 * 1024 // 5MB
-	connectTimeout  = 10 * time.Second
-	requestTimeout  = 30 * time.Second
+	maxResponseSize    = 5 * 1024 * 1024 // 5MB
+	connectTimeout     = 10 * time.Second
+	requestTimeout     = 30 * time.Second
 	mcpProtocolVersion = "2025-03-26"
 )
 
@@ -38,7 +38,7 @@ type Client struct {
 // NewClient creates an MCP discovery client with SSRF-safe transport.
 func NewClient() *Client {
 	transport := &http.Transport{
-		DialContext: ssrfSafeDialer(),
+		DialContext:         ssrfSafeDialer(),
 		TLSHandshakeTimeout: connectTimeout,
 	}
 	return &Client{

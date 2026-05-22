@@ -26,7 +26,7 @@ type Role struct {
 	TenantID    uuid.UUID `gorm:"type:uuid;not null"`
 	Name        string    `gorm:"not null"`
 	Description string
-	IsSystem    bool      `gorm:"default:false"`
+	IsSystem    bool `gorm:"default:false"`
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 

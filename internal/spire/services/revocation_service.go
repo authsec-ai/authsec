@@ -10,8 +10,8 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/database"
-	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 	infraRepos "github.com/authsec-ai/authsec/internal/spire/infrastructure/repositories"
+	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 )
 
 // RevocationService handles certificate revocation

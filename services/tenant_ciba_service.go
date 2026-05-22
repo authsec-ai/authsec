@@ -9,7 +9,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -94,12 +93,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	// 	}, nil
 	// }
 
-	// Step 4: Connect to tenant database
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Step 5: Look up user in tenant database
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
@@ -180,12 +174,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 
 // RespondToTenantCIBA handles user response to CIBA authentication request
 func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved bool, biometricVerified bool, userID, tenantID uuid.UUID) (*models.TenantCIBARespondResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -257,12 +246,7 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 		}, nil
 	}
 
-	// Connect to tenant database
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -355,12 +339,7 @@ func (s *TenantCIBAAuthService) generateJWTToken(userID, tenantID, clientID uuid
 
 // RegisterTenantDevice registers a device for push notifications in tenant context
 func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTokenRegistrationRequest, userID, tenantID uuid.UUID) (*models.TenantDeviceTokenRegistrationResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 

@@ -64,16 +64,9 @@ func GetDatabase() *database.DBConnection {
 	return Database
 }
 
-// GetTenantDatabase is kept as a compatibility shim while tenant-routing
-// callsites are removed. Product runtime is single-DB now, so this always
-// returns the primary connection.
-func GetTenantDatabase(tenantID string) (*database.DBConnection, error) {
-	return Database, nil
-}
-
-// GetTenantGORMDB is kept as a compatibility shim while tenant-routing
-// callsites are removed. Product runtime is single-DB now, so this always
-// returns the primary GORM connection.
-func GetTenantGORMDB(tenantID string) (*gorm.DB, error) {
-	return DB, nil
-}
+// Multi-tenant routing helpers (GetTenantDatabase, GetTenantGORMDB,
+// middlewares.GetConnectionDynamically, middlewares.ConnectToTenantDB,
+// middlewares.CloseTenantDB) have been removed. AuthSec is single-DB at the
+// product layer; tenant/workspace separation is row-level via WHERE predicates
+// against config.DB. Migration-only tooling in internal/migration still opens
+// per-tenant connections.

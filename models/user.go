@@ -57,9 +57,9 @@ type ExtendedUser struct {
 	IsSyncedUser bool       `json:"is_synced_user" gorm:"column:is_synced_user;default:false"`
 
 	// Brute force protection fields
-	FailedLoginAttempts int        `json:"failed_login_attempts" gorm:"column:failed_login_attempts;default:0"`
-	AccountLockedAt     *time.Time `json:"account_locked_at,omitempty" gorm:"column:account_locked_at"`
-	PasswordResetRequired bool     `json:"password_reset_required" gorm:"column:password_reset_required;default:false"`
+	FailedLoginAttempts   int        `json:"failed_login_attempts" gorm:"column:failed_login_attempts;default:0"`
+	AccountLockedAt       *time.Time `json:"account_locked_at,omitempty" gorm:"column:account_locked_at"`
+	PasswordResetRequired bool       `json:"password_reset_required" gorm:"column:password_reset_required;default:false"`
 }
 
 // TableName specifies the table name for ExtendedUser

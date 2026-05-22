@@ -16,13 +16,13 @@ import (
 // CIBAAuthService handles CIBA authentication business logic
 // Mirrors DeviceAuthService but uses push notifications instead of device codes
 type CIBAAuthService struct {
-	cibaRepo      *database.CIBAAuthRepository
-	userRepo      *database.UserRepository
-	tenantRepo    *database.AdminTenantRepository
-	pushService   *PushNotificationService
-	dbService     *database.TenantDBService
+	cibaRepo        *database.CIBAAuthRepository
+	userRepo        *database.UserRepository
+	tenantRepo      *database.AdminTenantRepository
+	pushService     *PushNotificationService
+	dbService       *database.TenantDBService
 	pollingInterval int
-	requestExpiry time.Duration
+	requestExpiry   time.Duration
 }
 
 // NewCIBAAuthService creates a new CIBA authentication service
@@ -32,13 +32,13 @@ func NewCIBAAuthService(
 	pushService *PushNotificationService,
 ) *CIBAAuthService {
 	return &CIBAAuthService{
-		cibaRepo:      database.NewCIBAAuthRepository(db),
-		userRepo:      database.NewUserRepository(db),
-		tenantRepo:    database.NewAdminTenantRepository(db),
-		pushService:   pushService,
-		dbService:     dbService,
-		pollingInterval: 5,                // 5 seconds minimum between polls
-		requestExpiry:   5 * time.Minute,  // Requests expire in 5 minutes
+		cibaRepo:        database.NewCIBAAuthRepository(db),
+		userRepo:        database.NewUserRepository(db),
+		tenantRepo:      database.NewAdminTenantRepository(db),
+		pushService:     pushService,
+		dbService:       dbService,
+		pollingInterval: 5,               // 5 seconds minimum between polls
+		requestExpiry:   5 * time.Minute, // Requests expire in 5 minutes
 	}
 }
 
@@ -339,7 +339,7 @@ func (s *CIBAAuthService) generateJWTToken(user *models.ExtendedUser, tenant *mo
 		tenant.ID,
 		user.Email,
 		scopes,
-		365 * 24 * time.Hour,
+		365*24*time.Hour,
 	)
 }
 

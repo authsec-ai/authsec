@@ -11,10 +11,10 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -44,13 +44,31 @@ func scimBaseURL(c *gin.Context) string {
 	return fmt.Sprintf("%s://%s/uflow/scim/v2", scheme, c.Request.Host)
 }
 
-// getClientAndProjectID extracts and validates client_id and project_id from URL params
+// getClientAndProjectID extracts and validates client_id and project_id from
+// URL params, falling back to context values set by SCIMConnectionAuth when
+// the request comes in through the new /scim/v2/c/:scim_connection_id route.
+// Returns an error only when neither URL nor context supplies both ids.
 func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 	clientIDStr := c.Param("client_id")
 	projectIDStr := c.Param("project_id")
 
+	if clientIDStr == "" {
+		if v, ok := c.Get("scim_default_client_id"); ok {
+			if s, ok := v.(string); ok {
+				clientIDStr = s
+			}
+		}
+	}
+	if projectIDStr == "" {
+		if v, ok := c.Get("scim_default_project_id"); ok {
+			if s, ok := v.(string); ok {
+				projectIDStr = s
+			}
+		}
+	}
+
 	if clientIDStr == "" || projectIDStr == "" {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("client_id and project_id are required")
+		return uuid.Nil, uuid.Nil, fmt.Errorf("client_id and project_id are required (either in URL or via scim_connection defaults)")
 	}
 
 	clientUUID, err := uuid.Parse(clientIDStr)
@@ -66,19 +84,15 @@ func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 	return clientUUID, projectUUID, nil
 }
 
-// getTenantDB resolves the tenant DB from the JWT context
+// getTenantDB resolves the active workspace ID from the JWT context and returns
+// the shared config.DB. The name is kept for backward compatibility with
+// callers; the tenant-DB-routing behavior was removed in Step 0.
 func getTenantDB(c *gin.Context) (*gorm.DB, string, error) {
 	tenantID, err := shared.RequireTenantID(c)
 	if err != nil {
 		return nil, "", fmt.Errorf("tenant not found in token")
 	}
-
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	return tenantDB, tenantID, nil
+	return config.DB, tenantID, nil
 }
 
 // ──────────────────────────────────────────────

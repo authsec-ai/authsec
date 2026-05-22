@@ -307,15 +307,15 @@ type TenantBackupCodeRegenerateResponse struct {
 // Tenant CIBA Error Codes (RFC 8628 + custom)
 // TenantDeviceSummary for API response (omits sensitive device_token)
 type TenantDeviceSummary struct {
-	ID          string  `json:"id"`
-	DeviceName  string  `json:"device_name,omitempty"`
-	Platform    string  `json:"platform"`
-	DeviceModel string  `json:"device_model,omitempty"`
-	AppVersion  string  `json:"app_version,omitempty"`
-	OSVersion   string  `json:"os_version,omitempty"`
-	IsActive    bool    `json:"is_active"`
-	LastUsed    *int64  `json:"last_used,omitempty"`
-	CreatedAt   int64   `json:"created_at"`
+	ID          string `json:"id"`
+	DeviceName  string `json:"device_name,omitempty"`
+	Platform    string `json:"platform"`
+	DeviceModel string `json:"device_model,omitempty"`
+	AppVersion  string `json:"app_version,omitempty"`
+	OSVersion   string `json:"os_version,omitempty"`
+	IsActive    bool   `json:"is_active"`
+	LastUsed    *int64 `json:"last_used,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
 }
 
 type TenantDeviceListResponse struct {

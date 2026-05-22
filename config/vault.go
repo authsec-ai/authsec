@@ -192,14 +192,14 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 	// Debug: Check if we can access Vault
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	// First verify token is valid by doing a self-lookup
 	tokenInfo, err := VaultClient.Auth().Token().LookupSelfWithContext(ctx)
 	if err != nil {
 		log.Printf("Error: Vault token lookup failed: %v", err)
 		log.Printf("Vault Address: %s", VaultClient.Address())
 		log.Printf("Token (masked): %s", maskToken(VaultClient.Token()))
-		
+
 		// Provide more specific error guidance
 		if strings.Contains(err.Error(), "permission denied") {
 			log.Printf("ERROR: Token does not have 'read' capability on 'auth/token/lookup-self'")
@@ -213,14 +213,14 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 			log.Printf("  1. Run: scripts/setup_vault_policy.sh")
 			log.Printf("  2. Update Kubernetes secret: kubectl patch secret user-flow-secrets -n authsec -p '{\"data\":{\"vault-token\":\"<base64-token>\"}}'")
 		}
-		
+
 		return "", fmt.Errorf("failed to lookup token: %w", err)
 	}
-	
+
 	if tokenInfo != nil && tokenInfo.Data != nil {
 		if policies, ok := tokenInfo.Data["policies"].([]interface{}); ok {
 			log.Printf("Vault token validated. Policies: %v", policies)
-			
+
 			// Verify the token has the required policy
 			hasRequiredPolicy := false
 			for _, p := range policies {
@@ -229,7 +229,7 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 					break
 				}
 			}
-			
+
 			if !hasRequiredPolicy {
 				log.Printf("Warning: Token does not have 'user-flow-secrets' policy")
 				log.Printf("Current policies: %v", policies)

@@ -12,12 +12,11 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
-	"github.com/authsec-ai/authsec/middlewares"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -642,19 +641,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 
 	fmt.Printf("[AdminLoginHybrid] Tenant FOUND: domain=%s, tenant_id=%s\n", input.TenantDomain, tenant.ID)
 
-	// Get tenant database connection
-	tenantIDStr := tenant.ID.String()
-	tenantGormDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		fmt.Printf("[AdminLoginHybrid] Failed to connect to tenant database: tenant_id=%s, error=%v\n", tenant.ID, err)
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "tenant database connection failed")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "tenant_db_connection_failed", "admin")
-
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantGormDB := config.DB
 
 	// Get raw SQL connection from GORM
 	tenantSQLDB, err := tenantGormDB.DB()

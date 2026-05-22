@@ -138,8 +138,8 @@ func (ctrl *DeviceAuthController) VerifyUserCode(c *gin.Context) {
 	dc, err := ctrl.deviceService.ValidateUserCode(req.UserCode)
 	if err != nil {
 		c.JSON(http.StatusOK, models.DeviceVerifyCodeResponse{
-			Valid:  false,
-			Error:  "invalid_code",
+			Valid: false,
+			Error: "invalid_code",
 		})
 		return
 	}
@@ -350,7 +350,9 @@ func (ctrl *DeviceAuthController) ShowActivationPage(c *gin.Context) {
 
 // AuthorizeDeviceWithOIDC is the public endpoint for shield end-user login.
 // After the user authenticates via OIDC (SSO), the callback page sends:
-//   {user_code, oidc_code, state}
+//
+//	{user_code, oidc_code, state}
+//
 // This endpoint exchanges the OIDC code for user identity, then authorizes
 // the device code — so the shield's poll gets the token.
 // No JWT required — the OIDC code exchange itself proves authentication.

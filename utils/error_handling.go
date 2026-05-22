@@ -17,32 +17,32 @@ const (
 	ErrMsgUnauthorized         = "Unauthorized access"
 	ErrMsgSessionExpired       = "Session expired"
 	ErrMsgAccountLocked        = "Account has been locked"
-	
+
 	// Authorization errors
-	ErrMsgForbidden            = "Access forbidden"
+	ErrMsgForbidden              = "Access forbidden"
 	ErrMsgInsufficientPermission = "Insufficient permissions"
-	
+
 	// Validation errors
 	ErrMsgInvalidInput         = "Invalid input provided"
 	ErrMsgValidationFailed     = "Validation failed"
 	ErrMsgMissingRequiredField = "Missing required field"
-	
+
 	// Resource errors
-	ErrMsgResourceNotFound     = "Resource not found"
-	ErrMsgResourceExists       = "Resource already exists"
-	ErrMsgResourceConflict     = "Resource conflict"
-	
+	ErrMsgResourceNotFound = "Resource not found"
+	ErrMsgResourceExists   = "Resource already exists"
+	ErrMsgResourceConflict = "Resource conflict"
+
 	// Server errors
-	ErrMsgInternalServerError  = "Internal server error"
-	ErrMsgServiceUnavailable   = "Service temporarily unavailable"
-	ErrMsgDatabaseError        = "Database operation failed"
-	
+	ErrMsgInternalServerError = "Internal server error"
+	ErrMsgServiceUnavailable  = "Service temporarily unavailable"
+	ErrMsgDatabaseError       = "Database operation failed"
+
 	// Rate limiting
-	ErrMsgTooManyRequests      = "Too many requests, please try again later"
-	
+	ErrMsgTooManyRequests = "Too many requests, please try again later"
+
 	// General errors
-	ErrMsgBadRequest           = "Bad request"
-	ErrMsgOperationFailed      = "Operation failed"
+	ErrMsgBadRequest      = "Bad request"
+	ErrMsgOperationFailed = "Operation failed"
 )
 
 // ErrorResponse represents a generic error response
@@ -62,18 +62,18 @@ func RespondWithError(c *gin.Context, statusCode int, publicMessage string, inte
 		"user_agent": c.Request.UserAgent(),
 		"status":     statusCode,
 	})
-	
+
 	// Add custom context fields
 	for key, value := range context {
 		logger = logger.WithField(key, value)
 	}
-	
+
 	if internalError != nil {
 		logger.WithError(internalError).Error("Request failed")
 	} else {
 		logger.Error("Request failed")
 	}
-	
+
 	// Send generic error to client
 	c.JSON(statusCode, ErrorResponse{
 		Error: publicMessage,
@@ -88,7 +88,7 @@ func RespondWithValidationError(c *gin.Context, fieldErrors map[string]string) {
 		"field_errors": fieldErrors,
 		"ip":           c.ClientIP(),
 	}).Warn("Validation failed")
-	
+
 	c.JSON(http.StatusBadRequest, ErrorResponse{
 		Error:   ErrMsgValidationFailed,
 		Details: fieldErrors,
@@ -142,35 +142,35 @@ func SanitizeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	
+
 	// Check for specific error types and return generic equivalents
 	errMsg := err.Error()
-	
+
 	// Database connection errors
 	if containsAny(errMsg, []string{"connection refused", "dial tcp", "no such host", "timeout"}) {
 		return errors.New("database connection failed")
 	}
-	
+
 	// SQL errors
 	if containsAny(errMsg, []string{"syntax error", "column", "table", "constraint", "duplicate key"}) {
 		return errors.New("database operation failed")
 	}
-	
+
 	// Authentication errors
 	if containsAny(errMsg, []string{"password", "credentials", "authentication", "unauthorized"}) {
 		return errors.New("authentication failed")
 	}
-	
+
 	// Vault/secrets errors
 	if containsAny(errMsg, []string{"vault", "secret", "token", "key"}) {
 		return errors.New("configuration service error")
 	}
-	
+
 	// Network errors
 	if containsAny(errMsg, []string{"network", "http", "TLS", "certificate"}) {
 		return errors.New("network error occurred")
 	}
-	
+
 	// Generic error
 	return errors.New("operation failed")
 }
@@ -186,9 +186,9 @@ func containsAny(s string, substrs []string) bool {
 }
 
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-	       (s == substr || len(s) > len(substr) && 
-	       anyIndexOf(s, substr) >= 0)
+	return len(s) >= len(substr) &&
+		(s == substr || len(s) > len(substr) &&
+			anyIndexOf(s, substr) >= 0)
 }
 
 func anyIndexOf(s, substr string) int {
@@ -220,11 +220,11 @@ func LogSecurityEvent(eventType string, context map[string]interface{}, severity
 		"event_type": eventType,
 		"severity":   severity,
 	})
-	
+
 	for key, value := range context {
 		logger = logger.WithField(key, value)
 	}
-	
+
 	switch severity {
 	case "critical":
 		logger.Error(fmt.Sprintf("SECURITY: %s", eventType))

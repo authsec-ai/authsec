@@ -17,9 +17,8 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
-
+	"github.com/authsec-ai/authsec/middlewares"
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
 	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
@@ -27,7 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
-"github.com/google/uuid"
+	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
 
@@ -1695,12 +1694,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 
 // createUserInTenantDB creates the user record in the tenant's database
 func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID, projectID uuid.UUID, tenantDomain, provider string, userInfo *models.OIDCUserInfo) error {
-	// Get tenant database connection
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return fmt.Errorf("failed to get tenant DB connection: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Create user in tenant DB
 	query := `

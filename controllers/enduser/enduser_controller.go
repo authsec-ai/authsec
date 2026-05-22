@@ -23,8 +23,11 @@ import (
 	"gorm.io/gorm"
 )
 
+// tenantConnectionProvider is a test seam — activation tests swap it for an
+// in-memory DB. In runtime it just returns config.DB; the tenant-routing
+// behavior was removed when the single-DB collapse landed.
 var (
-	tenantConnectionProvider = middlewares.GetConnectionDynamically
+	tenantConnectionProvider = func() *gorm.DB { return config.DB }
 	timeNow                  = time.Now
 )
 
@@ -62,11 +65,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	tenantID := input.TenantID
 	projectID := input.ProjectID
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	// Check if user with email already exists
 	// var existingClient models.Client
 	// if err := tenantDB.Where("email = ?", input.Email).First(&existingClient).Error; err == nil {
@@ -200,26 +199,20 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	normalizedTenantID := tenantID
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id format"})
 		return
 	}
 
-	normalizedTenantID = tenantUUID.String()
+	tenantDB := config.DB
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &normalizedTenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
-
-	// Fetch user with all associations
+	// Fetch user with all associations. Single-DB collapse means tenant
+	// isolation must come from explicit row-level predicates.
 	var user models.User
 	if lookupByID {
 		if err := tenantDB.Preload("Scopes").Preload("Roles").Preload("Groups").Preload("Resources").
-			Where("id = ?", userUUID).First(&user).Error; err != nil {
+			Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -229,7 +222,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		}
 	} else {
 		if err := tenantDB.Preload("Scopes").Preload("Roles").Preload("Groups").Preload("Resources").
-			Where("client_id = ? AND LOWER(email) = LOWER(?)", clientUUID, emailIdentifier).First(&user).Error; err != nil {
+			Where("tenant_id = ? AND client_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, clientUUID, emailIdentifier).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -357,12 +350,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIdentifier)
-	if err != nil {
-		log.Printf("GetEndUsers: failed to connect to tenant %s database: %v", tenantIdentifier, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Build query - no base tenant filter needed since we're in tenant-specific DB
 	query := tenantDB.Model(&models.User{})
@@ -423,59 +411,6 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-// GetTenantDatabases godoc
-// @Summary Get tenant database metadata
-// @Description Returns the tenant database mapping for the supplied tenant identifier
-// @Tags End-User Management
-// @Produce json
-// @Param tenant_id query string true "Tenant ID"
-// @Success 200 {object} map[string]interface{}
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/enduser/databases [get]
-func (euc *EndUserController) GetTenantDatabases(c *gin.Context) {
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
-		return
-	}
-
-	if config.DB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database connection not available"})
-		return
-	}
-
-	var tenant models.Tenant
-	if err := config.DB.Where("tenant_id = ? OR id::text = ?", tenantID, tenantID).First(&tenant).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "tenant not found"})
-			return
-		}
-		log.Printf("GetTenantDatabases: failed to load tenant %s: %v", tenantID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query tenant"})
-		return
-	}
-
-	info := gin.H{
-		"tenant_id":           tenant.TenantID.String(),
-		"tenant_db":           tenant.TenantDB,
-		"status":              tenant.Status,
-		"database_configured": tenant.TenantDB != "",
-		"database_reachable":  false,
-	}
-
-	if tenant.TenantDB != "" {
-		if _, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID); err == nil {
-			info["database_reachable"] = true
-		} else {
-			log.Printf("GetTenantDatabases: tenant %s database %s unreachable: %v", tenantID, tenant.TenantDB, err)
-		}
-	}
-
-	c.JSON(http.StatusOK, info)
-}
-
 // UpdateEndUserStatus godoc
 // @Summary Update end user status
 // @Description Updates the active status of an end user
@@ -515,11 +450,7 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Update user status
 	result := tenantDB.Model(&models.User{}).Where("id = ? AND tenant_id = ?", userUUID, tenantID).
@@ -595,11 +526,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Prepare update data
 	updateData := make(map[string]interface{})
@@ -765,17 +692,7 @@ func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
 	}
 
-	normalizedTenantID := tenantUUID.String()
-
-	tenantDB, err := tenantConnectionProvider(config.DB, nil, &normalizedTenantID)
-
-	if err != nil {
-
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-
-		return
-
-	}
+	tenantDB := tenantConnectionProvider()
 
 	userUUID, err := uuid.Parse(userID)
 
@@ -952,17 +869,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	}
 
-	tenantIDStr := tenantUUID.String()
-
-	tenantDB, err := tenantConnectionProvider(config.DB, nil, &tenantIDStr)
-
-	if err != nil {
-
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-
-		return
-
-	}
+	tenantDB := tenantConnectionProvider()
 
 	// Use fresh session to avoid stale transaction states
 
@@ -1257,13 +1164,7 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-
-	tenantDB, err := tenantConnectionProvider(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := tenantConnectionProvider()
 
 	if !active {
 		others, err := countOtherActiveEndUsers(tenantDB, tenantUUID, userUUID)
@@ -1361,11 +1262,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 	}
 
 	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 	clientID = strings.TrimSuffix(clientID, "-main-client")
 	// Find enduser details, prioritizing MFA-enabled check with client_id validation
 	var user models.User
@@ -1526,17 +1423,12 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		return
 	}
 
-	tenantID := tenantUUID.String()
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	// Single-DB collapse: tenant isolation must come from explicit predicates.
+	tenantDB := config.DB
 
 	// Find tenant user
 	var user models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -1549,7 +1441,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Check if MFA is enabled
 	var user2 models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND mfa_enabled = ?", input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND mfa_enabled = ?", tenantUUID, input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
 		// MFA is not enabled
 		var isFirstLogin bool
 		if user.Provider == "ad_sync" || user.Provider == "entra_id" {
@@ -1628,18 +1520,13 @@ func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {
 		return
 	}
 
-	tenantID := tenantUUID.String()
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	// Single-DB collapse: scope existence check by tenant_id explicitly.
+	tenantDB := config.DB
 
 	// Check if email already exists in main tenant table
 	var existingUser models.User
 	input.Email = strings.ToLower(input.Email)
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"custom", "ad_sync", "scim", "entra_id"}).First(&existingUser).Error; err == nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "scim", "entra_id"}).First(&existingUser).Error; err == nil {
 		// If user exists, check if it's ad_sync with empty password_hash
 		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
 			c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
@@ -1687,11 +1574,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 
 	tenantID := tenantUUID.String()
 	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 
 	// Check if email already exists
 	var existingUser models.User
@@ -1868,17 +1751,12 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	tenantID := pendingReg.TenantID.String()
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	// Single-DB collapse: scope by pendingReg.TenantID explicitly.
+	tenantDB := config.DB
 
 	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update
 	var adSyncUser models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.TenantID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
 		// Update the existing synced user's password_hash
 		if err := tenantDB.Model(&adSyncUser).Update("password_hash", pendingReg.PasswordHash).Error; err != nil {
 			log.Printf("Failed to update user password: %v", err)
@@ -1981,11 +1859,7 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 
 	tenantID := tenantUUID.String()
 	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 
 	// Check if email already exists in main tenant table
 	var existingUser models.User
@@ -2174,18 +2048,12 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 		return
 	}
 
-	tenantID := tenantUUID.String()
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		log.Printf("CustomForgotPassword: failed to connect to tenant database for tenant %s: %v", tenantUUID.String(), err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process request"})
-		return
-	}
+	// Single-DB collapse: scope user lookup by tenant_id explicitly.
+	tenantDB := config.DB
 
 	// Check if user exists with custom provider
 	var user models.User
-	if err := tenantDB.Where("email = ? AND provider IN (?) AND client_id = ? AND active = ?", input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Printf("User not found for forgot password request: %s", input.Email)
 		} else {
@@ -2303,18 +2171,12 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 		return
 	}
 
-	tenantID := tenantUUID.String()
-
-	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	// Single-DB collapse: scope password reset lookup by tenant_id explicitly.
+	tenantDB := config.DB
 
 	// Find the user in tenant database
 	var user models.User
-	if err := tenantDB.Where("email = ? AND provider IN (?) AND client_id = ? AND active = ?", input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
@@ -2463,11 +2325,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 	tenantID := tenantUUID.String()
 
 	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Find the user in tenant database
 	var user models.User
@@ -2574,11 +2432,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 	tenantID := tenantUUID.String()
 
 	// Get tenant database connection
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Find the user in tenant database
 	var user models.User
@@ -2761,11 +2615,7 @@ func (euc *EndUserController) GetClients(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Build query with base tenant filter
 	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", tenantID)
@@ -2877,11 +2727,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Build query with base tenant filter
 	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", req.TenantID)
@@ -3001,14 +2847,13 @@ func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
-	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("deleted_at IS NULL")
+	// Build query with base tenant filter — single-DB collapse means row-level
+	// isolation is the only boundary, so the tenant predicate must be explicit.
+	query := tenantDB.Model(&models.Client{}).
+		Where("tenant_id = ?", tenantID).
+		Where("deleted_at IS NULL")
 
 	// Add active filter if provided
 	if req.Active != nil {

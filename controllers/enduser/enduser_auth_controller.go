@@ -12,11 +12,11 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -115,12 +115,7 @@ func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 
 	var existingUser models.User
 	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, clientUUID, []string{"custom", "ad_sync", "entra_id"}).First(&existingUser).Error; err == nil {
@@ -353,12 +348,7 @@ func (euac *EndUserAuthController) Login(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, clientUUID, []string{"custom", "ad_sync", "entra_id"}).First(&user).Error; err != nil {
@@ -521,12 +511,7 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to connect to tenant database: %v", err)})
-		return
-	}
+	tenantDB := config.DB
 
 	// Find user by email and client_id, and verify the provider starts with saml-
 	var user models.User
@@ -604,11 +589,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	}
 
 	tenantIDStr := tenant.TenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email).First(&user).Error; err != nil {
@@ -702,16 +683,13 @@ func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-
 	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
 
+	tenantDB := config.DB
+
+	// Single-DB collapse: scope user lookup by tenant_id explicitly.
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email).First(&user).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, input.Email).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 			return
@@ -812,11 +790,7 @@ func (euac *EndUserAuthController) WebAuthnRegister(c *gin.Context) {
 	}
 
 	tenantIDStr := tenant.TenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email).First(&user).Error; err != nil {
@@ -983,15 +957,10 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND client_id = ?", input.Email, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("tenant_id = ? AND LOWER(email) = LOWER(?) AND client_id = ?", tenantUUID, input.Email, clientUUID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
@@ -1103,7 +1072,7 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 	// Build response
 	response := gin.H{
 		"email":        input.Email,
-		"tenant_id":    tenantIDStr,
+		"tenant_id":    tenantUUID.String(),
 		"client_id":    clientUUID.String(),
 		"first_login":  isFirstLogin,
 		"mfa_required": len(mfaMethods) > 0,

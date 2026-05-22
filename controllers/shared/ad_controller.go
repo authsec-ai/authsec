@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
@@ -141,12 +141,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 		return
 	}
 
-	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &input.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Sync users to database
 	for _, adUser := range adUsers {
@@ -585,12 +580,7 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 		return
 	}
 
-	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &input.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Process each user
 	for _, user := range input.Users {
@@ -750,10 +740,23 @@ func (asc *ADSyncController) loadStoredADConfig(configID, tenantID, clientID str
 		return models.ADSyncConfig{}, fmt.Errorf("invalid client_id format")
 	}
 
-	// Fetch configuration from database
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND client_id = ? AND sync_type = ?",
-		configUUID, tenantUUID, clientUUID, "active_directory").First(&syncConfig).Error; err != nil {
-		return models.ADSyncConfig{}, fmt.Errorf("sync configuration not found or not authorized")
+	// Fetch configuration from database with read-through against the
+	// workspace-owned identity_providers gate. When an IDP row exists for
+	// this sync_configurations row and it is disabled, the lookup fails
+	// even if sync_configurations.is_active is true — IDP status is the
+	// product source of truth post-migration 119.
+	if err := config.DB.
+		Table("sync_configurations sc").
+		Select("sc.*").
+		Joins(`LEFT JOIN identity_providers ip
+		         ON ip.workspace_id = sc.tenant_id
+		        AND ip.provider_type IN ('ad', 'entra')
+		        AND ip.config_ref = sc.id::text`).
+		Where("sc.id = ? AND sc.tenant_id = ? AND sc.client_id = ? AND sc.sync_type = ?",
+			configUUID, tenantUUID, clientUUID, "active_directory").
+		Where("(ip.id IS NULL OR ip.status <> 'disabled')").
+		First(&syncConfig).Error; err != nil {
+		return models.ADSyncConfig{}, fmt.Errorf("sync configuration not found, not authorized, or disabled via identity_providers")
 	}
 
 	// Check if config is active

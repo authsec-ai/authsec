@@ -86,10 +86,29 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	}
 	codeChallenge := generateCodeChallenge(codeVerifier)
 
+	// Mint a v4 signed state binding the workspace (and Application when
+	// known). The signed payload is persisted alongside the random state
+	// token so the callback can verify the workspace context out-of-band —
+	// see services/oidc_state.go.
+	var (
+		signedState   string
+		applicationID *uuid.UUID
+	)
+	if tenantID != nil {
+		// During the workspace transition workspaces.id == tenant_id, so the
+		// tenant pointer is the workspace identifier we want to bind to.
+		signedState, _, err = MintSignedState(*tenantID, applicationID)
+		if err != nil {
+			log.Printf("WARN: failed to mint signed OIDC state: %v", err)
+		}
+	}
+
 	// Store state in database (expires in 10 minutes)
 	state := &models.OIDCState{
 		StateToken:    stateToken,
 		TenantID:      tenantID,
+		ApplicationID: applicationID,
+		SignedState:   signedState,
 		TenantDomain:  input.TenantDomain,
 		OriginDomain:  s.requestOrigin, // Store origin domain for post-auth redirect
 		ProviderName:  input.Provider,
@@ -136,6 +155,27 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 		return nil, nil, fmt.Errorf("invalid or expired state: %w", err)
 	}
 	log.Printf("DEBUG HandleCallback: Found state: tenant_domain='%s', action='%s', provider='%s'", state.TenantDomain, state.Action, state.ProviderName)
+
+	// If the row carries a v4 signed-state payload, verify it before
+	// trusting the workspace/application columns. Mismatches mean either
+	// tampered state or a stale row that pre-dates the workspace_id
+	// rollout — log loudly and fail closed.
+	if state.SignedState != "" {
+		claims, verr := VerifySignedState(state.SignedState)
+		if verr != nil {
+			log.Printf("ERROR HandleCallback: signed state failed verification: %v", verr)
+			return nil, nil, fmt.Errorf("oidc state signature invalid: %w", verr)
+		}
+		if state.TenantID != nil && claims.WorkspaceID != *state.TenantID {
+			log.Printf("ERROR HandleCallback: signed workspace_id %s != row tenant_id %s",
+				claims.WorkspaceID, state.TenantID)
+			return nil, nil, fmt.Errorf("oidc state workspace mismatch")
+		}
+		if state.ApplicationID != nil && (claims.ApplicationID == nil || *claims.ApplicationID != *state.ApplicationID) {
+			log.Printf("ERROR HandleCallback: signed application_id mismatch")
+			return nil, nil, fmt.Errorf("oidc state application mismatch")
+		}
+	}
 
 	// Get provider configuration
 	provider, err := s.providerRepo.GetProviderByName(state.ProviderName)

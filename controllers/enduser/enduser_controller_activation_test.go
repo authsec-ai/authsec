@@ -277,9 +277,7 @@ func overrideTenantConnection(t *testing.T, db *gorm.DB) {
 	t.Cleanup(func() {
 		tenantConnectionProvider = original
 	})
-	tenantConnectionProvider = func(_ interface{}, _ *string, _ *string) (*gorm.DB, error) {
-		return db, nil
-	}
+	tenantConnectionProvider = func() *gorm.DB { return db }
 }
 
 func overrideTimeNow(t *testing.T) {

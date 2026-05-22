@@ -28,11 +28,11 @@ import (
 	// ✅ Use sharedmodels for DB structs
 	"github.com/authsec-ai/authsec/config"
 	adminCtrl "github.com/authsec-ai/authsec/controllers/admin"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	appmodels "github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	util "github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 )
 
 // AttestationObject represents decoded CBOR structure

@@ -52,11 +52,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var dt models.DelegationToken
 	result := tenantDB.
@@ -112,11 +108,7 @@ func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	result := tenantDB.Model(&models.DelegationToken{}).
 		Where("client_id::text = ? AND tenant_id = ? AND status = 'active'", clientID, tenantID).

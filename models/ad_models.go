@@ -20,8 +20,8 @@ type SyncUsersInput struct {
 	ClientID  string        `json:"client_id" binding:"required"`
 	ProjectID string        `json:"project_id" binding:"required"`
 	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
-	Config    *ADSyncConfig `json:"config,omitempty"`     // Or provide config directly (for backward compatibility)
-	DryRun    bool          `json:"dry_run,omitempty"`    // Preview changes without applying
+	Config    *ADSyncConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
+	DryRun    bool          `json:"dry_run,omitempty"`   // Preview changes without applying
 }
 
 // SyncResult represents the result of a sync operation using shared ErrorResponse

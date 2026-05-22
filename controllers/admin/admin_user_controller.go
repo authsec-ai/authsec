@@ -1215,14 +1215,7 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 
 	logger = logger.WithField("user_id", userUUID).WithField("tenant_id", tenantUUID).WithField("active", active)
 
-	// Connect to tenant database using middlewares.GetConnectionDynamically
-	tenantIDStr = tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		logger.WithError(err).Error("Failed to connect to tenant database")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Check if user exists
 	var user models.ExtendedUser

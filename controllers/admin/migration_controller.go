@@ -191,5 +191,3 @@ func (mc *MigrationController) GetTemplateStatus(c *gin.Context) {
 		Ready:        migration.TemplateReady,
 	})
 }
-
-

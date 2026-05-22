@@ -53,59 +53,5 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)
 	}
 
-	// Seed baseline permissions for admin role
-	permRows := []struct {
-		Resource string
-		Action   string
-	}{
-		{"admin", "access"},
-		{"users", "create"}, {"users", "read"}, {"users", "update"}, {"users", "delete"}, {"users", "manage"},
-		{"tenants", "create"}, {"tenants", "read"}, {"tenants", "update"}, {"tenants", "delete"}, {"tenants", "manage"},
-		{"projects", "create"}, {"projects", "read"}, {"projects", "update"}, {"projects", "delete"}, {"projects", "manage"},
-		{"roles", "create"}, {"roles", "read"}, {"roles", "update"}, {"roles", "delete"}, {"roles", "manage"},
-		{"permissions", "create"}, {"permissions", "read"}, {"permissions", "update"}, {"permissions", "delete"}, {"permissions", "manage"},
-		{"scopes", "create"}, {"scopes", "read"}, {"scopes", "update"}, {"scopes", "delete"}, {"scopes", "manage"},
-		{"role-bindings", "create"}, {"role-bindings", "read"}, {"role-bindings", "update"}, {"role-bindings", "delete"}, {"role-bindings", "manage"},
-		{"policy", "create"}, {"policy", "read"}, {"policy", "update"}, {"policy", "delete"}, {"policy", "manage"},
-		{"groups", "create"}, {"groups", "read"}, {"groups", "update"}, {"groups", "delete"}, {"groups", "manage"},
-		{"sync", "create"}, {"sync", "read"}, {"sync", "update"}, {"sync", "delete"}, {"sync", "manage"},
-		{"sync-configs", "create"}, {"sync-configs", "read"}, {"sync-configs", "update"}, {"sync-configs", "delete"}, {"sync-configs", "manage"},
-		{"oidc", "create"}, {"oidc", "read"}, {"oidc", "update"}, {"oidc", "delete"}, {"oidc", "manage"},
-		{"endusers", "create"}, {"endusers", "read"}, {"endusers", "update"}, {"endusers", "delete"}, {"endusers", "manage"},
-		{"clients", "create"}, {"clients", "read"}, {"clients", "update"}, {"clients", "delete"}, {"clients", "manage"},
-		{"user-endusers", "create"}, {"user-endusers", "read"}, {"user-endusers", "update"}, {"user-endusers", "delete"}, {"user-endusers", "manage"},
-		{"user-rbac-roles", "create"}, {"user-rbac-roles", "read"}, {"user-rbac-roles", "update"}, {"user-rbac-roles", "delete"}, {"user-rbac-roles", "manage"},
-		{"user-rbac-permissions", "create"}, {"user-rbac-permissions", "read"}, {"user-rbac-permissions", "update"}, {"user-rbac-permissions", "delete"}, {"user-rbac-permissions", "manage"},
-		{"user-rbac-scopes", "create"}, {"user-rbac-scopes", "read"}, {"user-rbac-scopes", "update"}, {"user-rbac-scopes", "delete"}, {"user-rbac-scopes", "manage"},
-		{"user-permissions", "create"}, {"user-permissions", "read"}, {"user-permissions", "update"}, {"user-permissions", "delete"}, {"user-permissions", "manage"},
-		{"user-groups", "create"}, {"user-groups", "read"}, {"user-groups", "update"}, {"user-groups", "delete"}, {"user-groups", "manage"},
-		{"user-clients", "create"}, {"user-clients", "read"}, {"user-clients", "update"}, {"user-clients", "delete"}, {"user-clients", "manage"},
-		{"user-projects", "create"}, {"user-projects", "read"}, {"user-projects", "update"}, {"user-projects", "delete"}, {"user-projects", "manage"},
-		{"scopes", "create"}, {"scopes", "read"}, {"scopes", "update"}, {"scopes", "delete"}, {"scopes", "manage_permissions"},
-		{"health", "read"},
-		{"external-service", "create"}, {"external-service", "read"}, {"external-service", "update"}, {"external-service", "delete"}, {"external-service", "credentials"}, {"external-service", "manage"},
-	}
-
-	for _, p := range permRows {
-		permID := uuid.New()
-		if err := exec.QueryRow(`
-			INSERT INTO permissions (id, tenant_id, resource, action, description, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (tenant_id, resource, action) DO UPDATE SET description = EXCLUDED.description
-			RETURNING id
-		`, permID, tenantID, p.Resource, p.Action, fmt.Sprintf("%s %s", p.Resource, p.Action), now).Scan(&permID); err != nil {
-			return uuid.Nil, fmt.Errorf("ensure permission %s:%s: %w", p.Resource, p.Action, err)
-		}
-
-		if _, err := exec.Exec(`
-			INSERT INTO role_permissions (role_id, permission_id)
-			VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, roleID, permID); err != nil {
-			return uuid.Nil, fmt.Errorf("bind permission %s:%s: %w", p.Resource, p.Action, err)
-		}
-
-	}
-
 	return roleID, nil
 }

@@ -133,10 +133,7 @@ func authmgrLookupClient(ctx context.Context, tenantID, email string) (string, s
 		}
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		return "", "", fmt.Errorf("tenant db: %w", err)
-	}
+	tenantDB := config.DB
 	var user sharedmodels.User
 	if err := tenantDB.WithContext(ctx).
 		Select("client_id", "project_id").

@@ -55,12 +55,12 @@ func RateLimitMiddleware() gin.HandlerFunc {
 		if httpError != nil {
 			// Rate limit exceeded
 			logrus.WithFields(logrus.Fields{
-				"request_id":  requestID,
-				"client_ip":   clientIP,
-				"path":        path,
-				"method":      c.Request.Method,
-				"limit_type":  limitType,
-				"user_agent":  c.GetHeader("User-Agent"),
+				"request_id": requestID,
+				"client_ip":  clientIP,
+				"path":       path,
+				"method":     c.Request.Method,
+				"limit_type": limitType,
+				"user_agent": c.GetHeader("User-Agent"),
 			}).Warn("Rate limit exceeded")
 
 			// The tollbooth library already sent the response, so we just need to abort
@@ -110,12 +110,12 @@ func TenantRateLimitMiddleware() gin.HandlerFunc {
 		if httpError != nil {
 			// Rate limit exceeded for this tenant
 			logrus.WithFields(logrus.Fields{
-				"request_id":  requestID,
-				"client_ip":   clientIP,
-				"tenant_id":   tenantID,
-				"path":        path,
-				"method":      c.Request.Method,
-				"user_agent":  c.GetHeader("User-Agent"),
+				"request_id": requestID,
+				"client_ip":  clientIP,
+				"tenant_id":  tenantID,
+				"path":       path,
+				"method":     c.Request.Method,
+				"user_agent": c.GetHeader("User-Agent"),
 			}).Warn("Tenant rate limit exceeded")
 
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{

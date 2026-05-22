@@ -29,10 +29,23 @@ type MCPOAuthClient struct {
 	RedirectReviewPending   bool           `json:"-" gorm:"default:false"`
 	PostLogoutRedirectURIs  pq.StringArray `json:"post_logout_redirect_uris,omitempty" gorm:"type:text[];default:'{}'"`
 	SupportsRefreshToken    bool           `json:"supports_refresh_token" gorm:"default:false"`
-	CreatedAt               time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt               time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	DeletedAt               gorm.DeletedAt `json:"-" gorm:"index"`
+	// SyncStatus tracks Hydra synchronisation: active | sync_error | pending_delete.
+	// The reconciler service walks non-'active' rows and re-attempts the Hydra
+	// side so we never strand a half-created/half-deleted client.
+	SyncStatus      string         `json:"sync_status" gorm:"type:text;not null;default:'active'"`
+	SyncLastError   *string        `json:"-" gorm:"type:text"`
+	SyncLastErrorAt *time.Time     `json:"-" gorm:"type:timestamptz"`
+	CreatedAt       time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt       time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
+	DeletedAt       gorm.DeletedAt `json:"-" gorm:"index"`
 }
+
+// MCPOAuthClient sync status constants.
+const (
+	MCPClientSyncActive        = "active"
+	MCPClientSyncError         = "sync_error"
+	MCPClientSyncPendingDelete = "pending_delete"
+)
 
 func (MCPOAuthClient) TableName() string {
 	return "mcp_oauth_clients"

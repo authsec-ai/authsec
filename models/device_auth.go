@@ -141,7 +141,7 @@ type DeviceAuthorizeRequest struct {
 type DeviceAuthorizeOIDCRequest struct {
 	UserCode string `json:"user_code" binding:"required"` // Code shown in shield terminal
 	OIDCCode string `json:"oidc_code" binding:"required"` // Authorization code from OIDC callback
-	State    string `json:"state" binding:"required"`      // OIDC state parameter
+	State    string `json:"state" binding:"required"`     // OIDC state parameter
 }
 
 // DeviceAuthorizeResponse is returned by POST /device/authorize.

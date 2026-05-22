@@ -8,11 +8,11 @@ type WorkloadEntry struct {
 	ID         string            `json:"id"`
 	TenantID   string            `json:"tenant_id"`
 	SpiffeID   string            `json:"spiffe_id"`
-	ParentID   string            `json:"parent_id"`   // Agent SPIFFE ID; empty = broadcast to all agents in tenant
-	Selectors  map[string]string `json:"selectors"`   // Workload selectors (k8s:ns, unix:uid, etc.)
-	TTL        *int              `json:"ttl"`          // Certificate TTL override (seconds), nil = use default
+	ParentID   string            `json:"parent_id"` // Agent SPIFFE ID; empty = broadcast to all agents in tenant
+	Selectors  map[string]string `json:"selectors"` // Workload selectors (k8s:ns, unix:uid, etc.)
+	TTL        *int              `json:"ttl"`       // Certificate TTL override (seconds), nil = use default
 	Admin      bool              `json:"admin"`
-	Downstream bool              `json:"downstream"`   // Can issue downstream identities
+	Downstream bool              `json:"downstream"` // Can issue downstream identities
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
 }

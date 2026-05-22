@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -181,11 +181,7 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 	}
 
 	// Connect to tenant database
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &input.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Sync users to database
 	for _, entraUser := range entraUsers {

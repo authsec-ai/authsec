@@ -113,9 +113,9 @@ type DeleteSyncConfigRequest struct {
 
 // SyncConfigResponse represents the response for sync configuration operations
 type SyncConfigResponse struct {
-	Success bool               `json:"success"`
-	Message string             `json:"message,omitempty"`
-	Data    *SyncConfiguration `json:"data,omitempty"`
+	Success bool                `json:"success"`
+	Message string              `json:"message,omitempty"`
+	Data    *SyncConfiguration  `json:"data,omitempty"`
 	Configs []SyncConfiguration `json:"configs,omitempty"`
 }
 

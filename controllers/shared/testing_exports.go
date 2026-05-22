@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-ldap/ldap/v3"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -89,7 +89,7 @@ func (es *EntraIDService) TokenExpiryForTest() time.Time {
 	return es.tokenExpiry
 }
 
-//SetSeededTenantID allows tests to set the seeded tenant ID.
+// SetSeededTenantID allows tests to set the seeded tenant ID.
 var SetSeededTenantID = func(id uuid.UUID) {
 	seededTenantID = id
 }

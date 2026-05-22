@@ -104,7 +104,6 @@ func TestMain(m *testing.M) {
 		log.Printf("Warning: master migrations encountered errors: %v", err)
 	}
 
-
 	// Initialize token service
 	tokenService, err := services.NewAuthManagerTokenService()
 	if err != nil {

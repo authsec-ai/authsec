@@ -11,17 +11,26 @@ import (
 // DelegationPolicy defines which roles can delegate trust to which AI agent types,
 // with optional permission scoping and TTL caps.
 type DelegationPolicy struct {
-	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID           uuid.UUID       `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
+	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
+	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
+	// WorkspaceID mirrors TenantID during the workspace transition. Backfilled
+	// by migration 122.
+	WorkspaceID        *uuid.UUID      `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
 	RoleName           string          `json:"role_name" gorm:"type:text;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
 	AgentType          string          `json:"agent_type" gorm:"type:text;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
 	AllowedPermissions json.RawMessage `json:"allowed_permissions" gorm:"type:jsonb;default:'[]'"`
 	MaxTTLSeconds      int             `json:"max_ttl_seconds" gorm:"default:3600"`
 	Enabled            bool            `json:"enabled" gorm:"default:true"`
-	ClientID           *uuid.UUID      `json:"client_id,omitempty" gorm:"type:uuid"`
-	CreatedBy          *uuid.UUID      `json:"created_by" gorm:"type:uuid"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
+	// ClientID is the legacy clients.id this policy was originally scoped to.
+	// New writes should prefer ApplicationID; ClientID is kept during the
+	// transition so existing rows continue to resolve.
+	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
+	// ApplicationID is the resource_servers.id that supersedes ClientID, populated
+	// by migration 118 via clients.id → resource_servers.legacy_client_id.
+	ApplicationID *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
+	CreatedBy     *uuid.UUID `json:"created_by" gorm:"type:uuid"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 func (DelegationPolicy) TableName() string {

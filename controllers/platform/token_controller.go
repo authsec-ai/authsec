@@ -1,10 +1,10 @@
 package platform
 
 import (
-	"net/http"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -49,7 +49,7 @@ func (tc *TokenController) RefreshToken(c *gin.Context) {
 		utils.RespondBadRequest(c, err)
 		return
 	}
-	
+
 	// Generate new access token
 	tokenPair, err := tc.tokenService.RefreshAccessToken(req.RefreshToken)
 	if err != nil {
@@ -58,7 +58,7 @@ func (tc *TokenController) RefreshToken(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, tokenPair)
 }
 
@@ -78,17 +78,17 @@ func (tc *TokenController) RevokeToken(c *gin.Context) {
 		utils.RespondBadRequest(c, err)
 		return
 	}
-	
+
 	err := tc.tokenService.RevokeToken(req.RefreshToken)
 	if err != nil {
 		utils.RespondInternalError(c, err)
 		return
 	}
-	
+
 	utils.LogSecurityEvent("token_revoked", map[string]interface{}{
 		"ip": c.ClientIP(),
 	}, "info")
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Token revoked successfully",
 	})
@@ -111,25 +111,25 @@ func (tc *TokenController) Logout(c *gin.Context) {
 		utils.RespondUnauthorized(c, nil)
 		return
 	}
-	
+
 	userID, err := uuid.Parse(userIDStr.(string))
 	if err != nil {
 		utils.RespondUnauthorized(c, err)
 		return
 	}
-	
+
 	// Revoke all user tokens
 	err = tc.tokenService.RevokeUserTokens(userID)
 	if err != nil {
 		utils.RespondInternalError(c, err)
 		return
 	}
-	
+
 	utils.LogSecurityEvent("user_logout", map[string]interface{}{
 		"user_id": userID.String(),
 		"ip":      c.ClientIP(),
 	}, "info")
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Logged out successfully",
 	})
@@ -152,23 +152,23 @@ func (tc *TokenController) BlacklistToken(c *gin.Context) {
 		utils.RespondUnauthorized(c, nil)
 		return
 	}
-	
+
 	// Remove "Bearer " prefix
 	if len(tokenString) > 7 && tokenString[:7] == "Bearer " {
 		tokenString = tokenString[7:]
 	}
-	
+
 	// Blacklist for remaining token lifetime (max 15 minutes for access tokens)
 	err := tc.tokenService.BlacklistAccessToken(tokenString, 15*60)
 	if err != nil {
 		utils.RespondInternalError(c, err)
 		return
 	}
-	
+
 	utils.LogSecurityEvent("access_token_blacklisted", map[string]interface{}{
 		"ip": c.ClientIP(),
 	}, "high")
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Token blacklisted successfully",
 	})
@@ -181,12 +181,12 @@ func InitializeTokenService() *services.TokenService {
 	if redisClient == nil {
 		panic("Redis client not initialized - token service requires Redis")
 	}
-	
+
 	// Get JWT secret from environment
 	jwtSecret := config.GetEnv("JWT_DEF_SECRET", "")
 	if jwtSecret == "" {
 		panic("JWT_DEF_SECRET not set - token service requires JWT secret")
 	}
-	
+
 	return services.NewTokenService(redisClient, jwtSecret)
 }

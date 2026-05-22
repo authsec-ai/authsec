@@ -1,10 +1,10 @@
 package sharedmodels
 
 import (
-"fmt"
-"strings"
+	"fmt"
+	"strings"
 
-"github.com/google/uuid"
+	"github.com/google/uuid"
 )
 
 // TenantDatabaseUtils provides utility functions for tenant database operations

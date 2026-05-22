@@ -8,8 +8,8 @@
 //   - auth-manager/controllers/validation_controller.go
 //   - auth-manager/controllers/system_controller.go
 //
-// DB access uses authsec's config.DB (primary GORM DB) and
-// config.GetTenantGORMDB(tenantID) (tenant GORM DB).
+// DB access uses authsec's config.DB (single shared GORM DB). Workspace
+// isolation is row-level via tenant_id/workspace_id predicates.
 // All audit logging uses log.Printf (no external audit package needed).
 package platform
 
@@ -25,8 +25,8 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
-	"github.com/authsec-ai/authsec/services"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -155,8 +155,8 @@ type authmgrAuthz struct {
 	Groups    []string
 }
 
-// authmgrGetAuthz loads roles/scopes/groups for a user by trying the primary DB
-// first and then the tenant DB. Uses authsec's config.DB and GetTenantGORMDB.
+// authmgrGetAuthz loads roles/scopes/groups for a user from the shared
+// config.DB, scoping by tenant_id at the row level.
 func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
 	if tenantID == "" || email == "" {
 		return nil, errors.New("tenantID and email are required")
@@ -198,13 +198,8 @@ func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, ten
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > NOW()").
 		Scan(&roleBindings).Error
 	if err != nil {
-		// Legacy fallback
-		_ = db.WithContext(ctx).
-			Table("user_roles").
-			Select("user_roles.role_id, roles.name as role_name").
-			Joins("LEFT JOIN roles ON user_roles.role_id = roles.id").
-			Where("user_roles.user_id = ?", user.ID).
-			Scan(&roleBindings).Error
+		log.Printf("[authmgr GetAuthz] role_bindings query failed for user %s: %v", user.ID, err)
+		// No legacy fallback — user_roles table has been retired.
 	}
 
 	roles := make([]string, 0)

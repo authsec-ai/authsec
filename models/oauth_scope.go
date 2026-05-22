@@ -11,8 +11,10 @@ import (
 // Each scope has metadata (display_name, risk_level, icon) for the consent UI,
 // and maps to internal RBAC permissions via oauth_scope_permissions.
 type OAuthScope struct {
-	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID         uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_oauth_scopes_unique"`
+	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_oauth_scopes_unique"`
+	// WorkspaceID mirrors TenantID during the workspace transition (migration 122).
+	WorkspaceID      *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
 	ResourceServerID *uuid.UUID `json:"resource_server_id" gorm:"type:uuid;uniqueIndex:idx_oauth_scopes_unique"`
 	ScopeString      string     `json:"scope_string" gorm:"type:text;not null;uniqueIndex:idx_oauth_scopes_unique"`
 	DisplayName      string     `json:"display_name" gorm:"type:text;not null"`
@@ -23,14 +25,14 @@ type OAuthScope struct {
 	IsAutoDiscovered bool       `json:"is_auto_discovered" gorm:"not null;default:false"`
 	// Source: 'discovered' | 'preset' | 'manifest' | 'manual'.
 	// New surface for the UI; superset of is_auto_discovered.
-	Source           string     `json:"source" gorm:"type:text;not null;default:'discovered'"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	Source    string    `json:"source" gorm:"type:text;not null;default:'discovered'"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	// Relations
-	Permissions  []RBACPermission `json:"permissions,omitempty" gorm:"many2many:oauth_scope_permissions;joinForeignKey:ScopeID;joinReferences:PermissionID"`
-	ParentScope  *OAuthScope      `json:"parent_scope,omitempty" gorm:"foreignKey:ParentScopeID"`
-	ChildScopes  []OAuthScope     `json:"child_scopes,omitempty" gorm:"foreignKey:ParentScopeID"`
+	Permissions []RBACPermission `json:"permissions,omitempty" gorm:"many2many:oauth_scope_permissions;joinForeignKey:ScopeID;joinReferences:PermissionID"`
+	ParentScope *OAuthScope      `json:"parent_scope,omitempty" gorm:"foreignKey:ParentScopeID"`
+	ChildScopes []OAuthScope     `json:"child_scopes,omitempty" gorm:"foreignKey:ParentScopeID"`
 }
 
 func (OAuthScope) TableName() string {

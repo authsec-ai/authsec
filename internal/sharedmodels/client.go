@@ -30,16 +30,16 @@ type Client struct {
 	MFAVerified      bool           `json:"mfa_verified" gorm:"default:false"`
 	Roles            []Role         `json:"roles" gorm:"many2many:client_roles;"`
 	// OIDC Integration Fields
-	HydraClientID string         `json:"hydra_client_id,omitempty" gorm:"type:text;uniqueIndex:uni_clients_hydra_client_id,where:hydra_client_id != ''"`
-	OIDCEnabled   bool           `json:"oidc_enabled" gorm:"column:oidc_enabled;default:false"`
+	HydraClientID string `json:"hydra_client_id,omitempty" gorm:"type:text;uniqueIndex:uni_clients_hydra_client_id,where:hydra_client_id != ''"`
+	OIDCEnabled   bool   `json:"oidc_enabled" gorm:"column:oidc_enabled;default:false"`
 	// AI Agent Delegation Fields
-	ClientType string  `json:"client_type" gorm:"type:text;default:'application'"`
-	AgentType  *string `json:"agent_type,omitempty" gorm:"type:text"`
-	SpiffeID   *string `json:"spiffe_id,omitempty" gorm:"type:text"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	DeletedAt     *time.Time `json:"deleted_at,omitempty" gorm:"index"`
-	Description  *string        `json:"description,omitempty" gorm:"type:text"`
+	ClientType  string     `json:"client_type" gorm:"type:text;default:'application'"`
+	AgentType   *string    `json:"agent_type,omitempty" gorm:"type:text"`
+	SpiffeID    *string    `json:"spiffe_id,omitempty" gorm:"type:text"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty" gorm:"index"`
+	Description *string    `json:"description,omitempty" gorm:"type:text"`
 	// Tenant relationship fields (optional, for future use)
 	TenantDB string `json:"tenant_db,omitempty" gorm:"-"` // Not stored, populated from auth-manager
 }

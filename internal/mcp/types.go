@@ -4,9 +4,9 @@ import "encoding/json"
 
 // ProtectedResourceMetadata represents RFC 9728 Protected Resource Metadata.
 type ProtectedResourceMetadata struct {
-	Resource             string   `json:"resource"`
-	AuthorizationServers []string `json:"authorization_servers"`
-	ScopesSupported      []string `json:"scopes_supported"`
+	Resource               string   `json:"resource"`
+	AuthorizationServers   []string `json:"authorization_servers"`
+	ScopesSupported        []string `json:"scopes_supported"`
 	BearerMethodsSupported []string `json:"bearer_methods_supported"`
 }
 

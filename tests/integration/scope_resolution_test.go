@@ -168,7 +168,7 @@ func TestConsentService_StaleGrant_Revoked(t *testing.T) {
 
 	safeGrant, safeStale, safeErr := cs.CheckExistingConsent(
 		testTenantID, testEndUserID, testW4MCPClientID, testW4RSID,
-		[]string{"tools:w4:read"},             // only read requested
+		[]string{"tools:w4:read"},                   // only read requested
 		[]string{"tools:w4:read", "tools:w4:write"}, // user still has write in RBAC
 		[]string{"tools:w4:read", "tools:w4:write"},
 	)

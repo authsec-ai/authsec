@@ -11,10 +11,10 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/database"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -39,14 +39,14 @@ func NewAdminSyncController() (*AdminSyncController, error) {
 
 // AdminSyncInput represents the input for syncing admin users
 type AdminSyncInput struct {
-	TenantID    string               `json:"tenant_id" binding:"required"`
-	ClientID    string               `json:"client_id,omitempty"`          // Optional client_id
-	ProjectID   string               `json:"project_id,omitempty"`         // Optional project_id
-	ConfigID    *string              `json:"config_id,omitempty"`          // ID of stored config to use
-	ADConfig    *models.ADSyncConfig `json:"ad_config,omitempty"`          // Direct AD config
-	EntraConfig *shared.EntraIDConfig       `json:"entra_config,omitempty"`       // Direct Entra config
-	SyncType    string               `json:"sync_type" binding:"required"` // "ad" or "entra_id"
-	DryRun      bool                 `json:"dry_run,omitempty"`
+	TenantID    string                `json:"tenant_id" binding:"required"`
+	ClientID    string                `json:"client_id,omitempty"`          // Optional client_id
+	ProjectID   string                `json:"project_id,omitempty"`         // Optional project_id
+	ConfigID    *string               `json:"config_id,omitempty"`          // ID of stored config to use
+	ADConfig    *models.ADSyncConfig  `json:"ad_config,omitempty"`          // Direct AD config
+	EntraConfig *shared.EntraIDConfig `json:"entra_config,omitempty"`       // Direct Entra config
+	SyncType    string                `json:"sync_type" binding:"required"` // "ad" or "entra_id"
+	DryRun      bool                  `json:"dry_run,omitempty"`
 }
 
 // AdminSyncResult represents the result of an admin sync operation
@@ -784,10 +784,20 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (m
 		return models.ADSyncConfig{}, fmt.Errorf("invalid tenant_id format")
 	}
 
-	// Fetch configuration from database
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND sync_type = ?",
-		configUUID, tenantUUID, "active_directory").First(&syncConfig).Error; err != nil {
-		return models.ADSyncConfig{}, fmt.Errorf("sync configuration not found or not authorized")
+	// Fetch configuration from database, gated on identity_providers status
+	// when an IDP row is present for this sync_configurations row.
+	if err := config.DB.
+		Table("sync_configurations sc").
+		Select("sc.*").
+		Joins(`LEFT JOIN identity_providers ip
+		         ON ip.workspace_id = sc.tenant_id
+		        AND ip.provider_type IN ('ad', 'entra')
+		        AND ip.config_ref = sc.id::text`).
+		Where("sc.id = ? AND sc.tenant_id = ? AND sc.sync_type = ?",
+			configUUID, tenantUUID, "active_directory").
+		Where("(ip.id IS NULL OR ip.status <> 'disabled')").
+		First(&syncConfig).Error; err != nil {
+		return models.ADSyncConfig{}, fmt.Errorf("sync configuration not found, not authorized, or disabled via identity_providers")
 	}
 
 	// Check if config is active

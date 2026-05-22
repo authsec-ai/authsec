@@ -26,7 +26,7 @@ import (
 // mcpServerConfig controls what the mock MCP server returns.
 type mcpServerConfig struct {
 	// PRM
-	prmEnabled     bool
+	prmEnabled      bool
 	scopesSupported []string
 
 	// Tools
@@ -192,7 +192,7 @@ func newService() *services.ResourceServerService {
 // T2: Full scan success advances last_successful_generation, status=ready.
 func TestDiscoverAndSync_FullScanSuccess(t *testing.T) {
 	srv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:weather:read", "tools:weather:list"},
 		tools: []map[string]string{
 			{"name": "get_weather", "description": "Get current weather"},
@@ -228,7 +228,7 @@ func TestDiscoverAndSync_FullScanSuccess(t *testing.T) {
 // T3: Stale tool removed on rescan.
 func TestDiscoverAndSync_StaleToolRemovedOnRescan(t *testing.T) {
 	srv1 := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:a:read", "tools:b:read"},
 		tools: []map[string]string{
 			{"name": "tool_a", "description": "Tool A"},
@@ -252,7 +252,7 @@ func TestDiscoverAndSync_StaleToolRemovedOnRescan(t *testing.T) {
 	// We need a new mock server that returns only tool_a but uses the same URL
 	// structure, so we update the RS URL to a new server.
 	srv2 := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:a:read"},
 		tools: []map[string]string{
 			{"name": "tool_a", "description": "Tool A"},
@@ -283,7 +283,7 @@ func TestDiscoverAndSync_StaleToolRemovedOnRescan(t *testing.T) {
 func TestDiscoverAndSync_PartialScanPRMUnavailable(t *testing.T) {
 	// First do a full scan to establish generation=1
 	fullSrv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:x:read"},
 		tools: []map[string]string{
 			{"name": "tool_x", "description": "Tool X"},
@@ -340,7 +340,7 @@ func TestDiscoverAndSync_PartialScanPRMUnavailable(t *testing.T) {
 // T11: Hard failure (tools/list error) — status=degraded, last_scan_status=failure.
 func TestDiscoverAndSync_HardFailure(t *testing.T) {
 	fullSrv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:x:read"},
 		tools: []map[string]string{
 			{"name": "tool_x", "description": "Tool X"},
@@ -395,9 +395,9 @@ func TestDiscoverAndSync_ConcurrentRescanBlocked(t *testing.T) {
 	// Manually set scan_in_progress=true with a recent timestamp to simulate an active scan
 	now := time.Now().UTC()
 	config.DB.Model(rs).Updates(map[string]interface{}{
-		"scan_in_progress":    true,
+		"scan_in_progress":     true,
 		"last_scan_started_at": now,
-		"scan_generation":     1,
+		"scan_generation":      1,
 	})
 
 	// Reload so the in-memory struct is current
@@ -419,8 +419,8 @@ func TestDiscoverAndSync_SupersededScanDoesNotClearNewerLock(t *testing.T) {
 	// Simulate: scan A claimed gen=3, then scan B stole the lock and advanced to gen=4.
 	// scan B is still running (scan_in_progress=true, gen=4).
 	config.DB.Model(rs).Updates(map[string]interface{}{
-		"scan_in_progress":    true,
-		"scan_generation":     4,
+		"scan_in_progress":     true,
+		"scan_generation":      4,
 		"last_scan_started_at": time.Now().UTC(),
 	})
 	rs = reloadRS(t, rs.ID)
@@ -439,7 +439,7 @@ func TestDiscoverAndSync_SupersededScanDoesNotClearNewerLock(t *testing.T) {
 // T16: Stale lock (>10 min) is stolen by a new scan.
 func TestDiscoverAndSync_StaleLockRecovery(t *testing.T) {
 	srv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:z:read"},
 		tools: []map[string]string{
 			{"name": "tool_z", "description": "Tool Z"},
@@ -453,9 +453,9 @@ func TestDiscoverAndSync_StaleLockRecovery(t *testing.T) {
 	// Simulate a crashed scan: scan_in_progress=true, started 15 minutes ago
 	staleTime := time.Now().UTC().Add(-15 * time.Minute)
 	config.DB.Model(rs).Updates(map[string]interface{}{
-		"scan_in_progress":    true,
+		"scan_in_progress":     true,
 		"last_scan_started_at": staleTime,
-		"scan_generation":     5,
+		"scan_generation":      5,
 	})
 	rs = reloadRS(t, rs.ID)
 
@@ -477,17 +477,17 @@ func TestSDKPolicy_503BeforeAnySuccessfulScan(t *testing.T) {
 	hash, _ := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.MinCost)
 
 	rs := &models.ResourceServer{
-		ID:                      uuid.New(),
-		TenantID:                testTenantID,
-		Name:                    "sdk-policy-test-" + uuid.New().String()[:8],
-		PublicBaseURL:           "https://localhost:9998",
-		ProtectedBasePath:       "/mcp",
-		ResourceURI:             fmt.Sprintf("https://localhost:9998/mcp/%s", uuid.New()),
-		RegistrationModes:       []string{"dcr"},
-		IntrospectionSecretHash: string(hash),
-		Active:                  true,
-		Status:                  "pending_scan",
-		ScanGeneration:          0,
+		ID:                       uuid.New(),
+		TenantID:                 testTenantID,
+		Name:                     "sdk-policy-test-" + uuid.New().String()[:8],
+		PublicBaseURL:            "https://localhost:9998",
+		ProtectedBasePath:        "/mcp",
+		ResourceURI:              fmt.Sprintf("https://localhost:9998/mcp/%s", uuid.New()),
+		RegistrationModes:        []string{"dcr"},
+		IntrospectionSecretHash:  string(hash),
+		Active:                   true,
+		Status:                   "pending_scan",
+		ScanGeneration:           0,
 		LastSuccessfulGeneration: 0,
 	}
 	require.NoError(t, config.DB.Create(rs).Error)
@@ -511,7 +511,7 @@ func TestSDKPolicy_503BeforeAnySuccessfulScan(t *testing.T) {
 // T13/T10: SDKPolicy returns 200 with last-good snapshot during degraded state.
 func TestSDKPolicy_ServesLastGoodSnapshotWhenDegraded(t *testing.T) {
 	srv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:snap:read"},
 		tools: []map[string]string{
 			{"name": "snap_tool", "description": "Snapshot tool"},
@@ -534,9 +534,9 @@ func TestSDKPolicy_ServesLastGoodSnapshotWhenDegraded(t *testing.T) {
 
 	// Now degrade the RS (simulate a subsequent failed scan)
 	config.DB.Model(rs).Updates(map[string]interface{}{
-		"status":            "degraded",
-		"scan_generation":   2,
-		"last_scan_status":  "failure",
+		"status":           "degraded",
+		"scan_generation":  2,
+		"last_scan_status": "failure",
 		// last_successful_generation stays at 1
 	})
 
@@ -561,7 +561,7 @@ func TestSDKPolicy_ServesLastGoodSnapshotWhenDegraded(t *testing.T) {
 // T14: GetScopeMatrix filters tools by last_successful_generation.
 func TestGetScopeMatrix_FiltersToolsByLastSuccessfulGeneration(t *testing.T) {
 	srv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:gen:read"},
 		tools: []map[string]string{
 			{"name": "gen_tool", "description": "Gen tool"},
@@ -614,7 +614,7 @@ func TestGetScopeMatrix_FiltersToolsByLastSuccessfulGeneration(t *testing.T) {
 // T22: scopes_supported is not wiped when PRM is unavailable.
 func TestDiscoverAndSync_ScopesNotWipedOnPRMFailure(t *testing.T) {
 	fullSrv := newMockMCPServer(mcpServerConfig{
-		prmEnabled:     true,
+		prmEnabled:      true,
 		scopesSupported: []string{"tools:preserve:read"},
 		tools: []map[string]string{
 			{"name": "preserve_tool", "description": "Preserve tool"},

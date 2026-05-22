@@ -87,8 +87,10 @@ WHERE NOT EXISTS (
     WHERE r.tenant_id = w.id AND r.name = seed.role_name
 );
 
--- Make every active legacy admin/member an owner during initial backfill to
--- avoid lockout. Later product flows can downgrade memberships explicitly.
+-- Backfill only actual workspace operators. End users must never become
+-- workspace members just because they share the tenant/workspace id.
+-- A user is an operator when they are the selected workspace owner, a primary
+-- admin, or they already have a tenant-wide non-resource-server role binding.
 INSERT INTO workspace_memberships (workspace_id, user_id, role_id, status, created_at, updated_at)
 SELECT DISTINCT
     w.id,
@@ -101,7 +103,57 @@ FROM workspaces w
 JOIN users u ON u.tenant_id = w.id
 JOIN roles r ON r.tenant_id = w.id AND r.name = 'owner'
 WHERE u.id IS NOT NULL
+  AND (
+      u.id = w.owner_user_id
+      OR u.is_primary_admin = TRUE
+      OR EXISTS (
+          SELECT 1
+          FROM role_bindings rb
+          JOIN roles bound_role ON bound_role.id = rb.role_id
+          WHERE rb.tenant_id = w.id
+            AND rb.user_id = u.id
+            AND rb.scope_type IS NULL
+            AND bound_role.name IN ('owner', 'admin', 'member')
+      )
+  )
 ON CONFLICT (workspace_id, user_id) DO NOTHING;
+
+-- Non-operator users under the workspace boundary are consumers. Preserve them
+-- as end-user state instead of polluting workspace_memberships.
+INSERT INTO tenant_end_user_states (tenant_id, user_id, status, first_consent_at, last_seen_at, created_at, updated_at)
+SELECT
+    u.tenant_id,
+    u.id,
+    CASE WHEN u.active THEN 'active' ELSE 'suspended' END,
+    COALESCE(
+        (SELECT MIN(og.created_at)
+         FROM oauth_consent_grants og
+         WHERE og.tenant_id = u.tenant_id AND og.user_id = u.id),
+        u.created_at,
+        now()
+    ),
+    u.last_login,
+    now(),
+    now()
+FROM users u
+JOIN workspaces w ON w.id = u.tenant_id
+WHERE u.deleted_at IS NULL
+  AND NOT (
+      u.id = w.owner_user_id
+      OR u.is_primary_admin = TRUE
+      OR EXISTS (
+          SELECT 1
+          FROM role_bindings rb
+          JOIN roles bound_role ON bound_role.id = rb.role_id
+          WHERE rb.tenant_id = w.id
+            AND rb.user_id = u.id
+            AND rb.scope_type IS NULL
+            AND bound_role.name IN ('owner', 'admin', 'member')
+      )
+  )
+ON CONFLICT (tenant_id, user_id) DO UPDATE
+SET last_seen_at = COALESCE(EXCLUDED.last_seen_at, tenant_end_user_states.last_seen_at),
+    updated_at = now();
 
 INSERT INTO workspace_migration_review (legacy_tenant_id, legacy_user_id, reason, payload)
 SELECT DISTINCT

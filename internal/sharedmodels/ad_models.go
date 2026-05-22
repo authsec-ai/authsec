@@ -12,19 +12,19 @@ type SyncUsersInput struct {
 	DryRun    bool         `json:"dry_run,omitempty"` // Preview changes without applying
 }
 
- type AgentSyncRequest struct {
+type AgentSyncRequest struct {
 	TenantID  string          `json:"tenant_id" binding:"required"`
 	ProjectID string          `json:"project_id" binding:"required"`
 	ClientID  string          `json:"client_id" binding:"required"`
 	Users     []AgentUserData `json:"users" binding:"required"`
 	DryRun    bool            `json:"dry_run,omitempty"`
-} 
+}
 
 // AgentSyncResponse represents the response for agent sync using shared response patterns
 type AgentSyncResponse struct {
-	Message        string `json:"message"`
-	UsersProcessed int    `json:"users_processed"`
-	UsersCreated   int    `json:"users_created"`
+	Message        string          `json:"message"`
+	UsersProcessed int             `json:"users_processed"`
+	UsersCreated   int             `json:"users_created"`
 	Errors         []ErrorResponse `json:"errors,omitempty"`
 }
 type ADSyncConfig struct {
@@ -58,9 +58,6 @@ type ADUser struct {
 	IsActive          bool              `json:"is_active"`
 }
 
-
- 
-
 // AgentUserData represents user data from AD Agent
 type AgentUserData struct {
 	ExternalID   string                 `json:"external_id"`
@@ -74,4 +71,3 @@ type AgentUserData struct {
 	IsSyncedUser bool                   `json:"is_synced_user"`
 	SyncSource   string                 `json:"sync_source"`
 }
- 

@@ -6,7 +6,7 @@ import (
 
 // AdminAuthMiddleware assumes AuthMiddleware has already run and enforces admin role membership.
 func AdminAuthMiddleware() gin.HandlerFunc {
-	return Require("admin", "access")
+	return RequireWorkspaceRole("owner", "admin")
 }
 
 // AdminPermissionMiddleware creates middleware to check specific admin permissions using auth-manager
@@ -34,7 +34,7 @@ func AdminPermissionMiddleware(requiredPermission string) gin.HandlerFunc {
 		action = "access"
 	}
 
-	requireAdmin := Require("admin", "access")
+	requireAdmin := RequireWorkspaceRole("owner", "admin")
 	requirePermission := Require(resource, action)
 
 	return func(c *gin.Context) {

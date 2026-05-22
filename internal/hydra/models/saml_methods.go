@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -117,22 +116,37 @@ type SAMLAttributeValue struct {
 	Value string `xml:",chardata"`
 }
 
-// GetSAMLProvidersForTenant retrieves SAML providers for a tenant from tenant database
+// GetSAMLProvidersForTenant retrieves SAML providers for a workspace via the
+// workspace-owned identity_providers gate (v4 §12). When the workspace has
+// IDP rows configured (post-migration 119 backfill), only SAML providers
+// referenced by a non-disabled identity_providers row are returned. When
+// the IDP table is empty for this workspace, the function falls back to the
+// legacy is_active filter so deployments that haven't run the IDP backfill
+// keep working.
 func (s *OAuthLoginService) GetSAMLProvidersForTenant(tenantID string, clientID ...string) ([]Provider, error) {
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
-	query := db.Where("is_active = ?", true)
+	// workspaces.id == tenant_id during the transition (migration 115). Use
+	// the legacy column name here; once the rename lands this becomes
+	// workspace_id directly.
+	query := db.
+		Table("saml_providers sp").
+		Select("sp.*").
+		Joins(`LEFT JOIN identity_providers ip
+		         ON ip.workspace_id = sp.tenant_id
+		        AND ip.provider_type = 'saml'
+		        AND ip.config_ref = sp.id::text`).
+		Where("sp.tenant_id = ?", tenantID).
+		Where("sp.is_active = ?", true).
+		Where("(ip.id IS NULL OR ip.status <> 'disabled')")
 
 	if len(clientID) > 0 && clientID[0] != "" {
 		trimmedClientID := strings.TrimSuffix(clientID[0], "-main-client")
-		query = query.Where("client_id = ?", trimmedClientID)
+		query = query.Where("sp.client_id = ?", trimmedClientID)
 	}
 
 	var samlProviders []SAMLProvider
-	if err := query.Order("sort_order ASC").Find(&samlProviders).Error; err != nil {
+	if err := query.Order("sp.sort_order ASC").Find(&samlProviders).Error; err != nil {
 		return nil, fmt.Errorf("failed to fetch SAML providers: %w", err)
 	}
 
@@ -195,10 +209,7 @@ func (s *OAuthLoginService) GetAllProvidersForTenant(tenantIDForOIDC string, rea
 
 // GetSAMLProvider retrieves a specific SAML provider by name and optionally client_id
 func (s *OAuthLoginService) GetSAMLProvider(tenantID, providerName string, clientID ...string) (*SAMLProvider, error) {
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
 	query := db.Where("tenant_id = ? AND provider_name = ?", tenantID, providerName)
@@ -477,10 +488,7 @@ func (s *OAuthLoginService) GenerateSAMLMetadata(tenantID, clientID uuid.UUID) (
 
 // CreateSAMLProvider creates a new SAML provider for a tenant and client
 func (s *OAuthLoginService) CreateSAMLProvider(tenantID string, provider *SAMLProvider) (*SAMLProvider, error) {
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
 	provider.ProviderName = strings.ToLower(strings.TrimSpace(provider.ProviderName))
 	provider.TenantID, _ = uuid.Parse(tenantID)
@@ -493,10 +501,7 @@ func (s *OAuthLoginService) CreateSAMLProvider(tenantID string, provider *SAMLPr
 
 // UpdateSAMLProvider updates an existing SAML provider
 func (s *OAuthLoginService) UpdateSAMLProvider(tenantID string, providerID uuid.UUID, clientID string, updates *SAMLProvider) (*SAMLProvider, error) {
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
 	query := db.Where("id = ?", providerID)
 	if clientID != "" {
@@ -547,10 +552,7 @@ func (s *OAuthLoginService) UpdateSAMLProvider(tenantID string, providerID uuid.
 
 // DeleteSAMLProvider deletes a SAML provider
 func (s *OAuthLoginService) DeleteSAMLProvider(tenantID string, providerID uuid.UUID, clientID string) error {
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
 	query := db.Where("id = ?", providerID)
 	if clientID != "" {

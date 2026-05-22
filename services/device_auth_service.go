@@ -36,7 +36,7 @@ func NewDeviceAuthService(db *database.DBConnection, dbService *database.TenantD
 		userRepo:        database.NewUserRepository(db),
 		dbService:       dbService,
 		verificationURI: verificationURI,
-		pollingInterval: 5,              // RFC 8628 recommended minimum
+		pollingInterval: 5,               // RFC 8628 recommended minimum
 		codeExpiry:      5 * time.Minute, // spec: 5 min (300s)
 	}
 }

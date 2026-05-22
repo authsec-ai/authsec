@@ -2,16 +2,16 @@
 //
 // Two distinct kinds of users coexist in AuthSec; this file models both:
 //
-//   1. TenantMembership — operators with operational rights inside the tenant
-//      (Owner, Admin, Member, Contractor, Service Operator, Readonly Auditor).
-//      One row per (tenant, user). Members are managed under Settings → Team
-//      in the admin UI and are the subject of admin-tier role bindings.
+//  1. TenantMembership — operators with operational rights inside the tenant
+//     (Owner, Admin, Member, Contractor, Service Operator, Readonly Auditor).
+//     One row per (tenant, user). Members are managed under Settings → Team
+//     in the admin UI and are the subject of admin-tier role bindings.
 //
-//   2. TenantEndUserState — consumers of a tenant's published Applications.
-//      End users have a global identity (currently the per-tenant users row;
-//      Phase D migrates this to a global identities table) and a tenant-scoped
-//      state object that captures plan tier, status, and rate-limit overrides.
-//      End users are NOT modeled as members.
+//  2. TenantEndUserState — consumers of a tenant's published Applications.
+//     End users have a global identity (currently the per-tenant users row;
+//     Phase D migrates this to a global identities table) and a tenant-scoped
+//     state object that captures plan tier, status, and rate-limit overrides.
+//     End users are NOT modeled as members.
 //
 // Backed by migrations 108 and 109.
 package models
@@ -35,12 +35,12 @@ const (
 // operator to a tenant. They are NOT the same thing as RBAC roles — a member
 // of type "admin" still needs a role binding to actually receive permissions.
 const (
-	MembershipTypeOwner            = "owner"
-	MembershipTypeAdmin            = "admin"
-	MembershipTypeMember           = "member"
-	MembershipTypeContractor       = "contractor"
-	MembershipTypeServiceOperator  = "service_operator"
-	MembershipTypeReadonlyAuditor  = "readonly_auditor"
+	MembershipTypeOwner           = "owner"
+	MembershipTypeAdmin           = "admin"
+	MembershipTypeMember          = "member"
+	MembershipTypeContractor      = "contractor"
+	MembershipTypeServiceOperator = "service_operator"
+	MembershipTypeReadonlyAuditor = "readonly_auditor"
 )
 
 // Membership source enum values — how the membership was created.

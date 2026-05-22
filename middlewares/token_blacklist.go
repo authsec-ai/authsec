@@ -22,7 +22,7 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		
+
 		// Get token from Authorization header
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -30,7 +30,7 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		
+
 		// Extract token
 		parts := strings.Split(authHeader, " ")
 		if len(parts) != 2 || parts[0] != "Bearer" {
@@ -38,9 +38,9 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		
+
 		tokenString := parts[1]
-		
+
 		// Check if token is blacklisted
 		blacklisted, err := checker.IsTokenBlacklisted(tokenString)
 		if err != nil {
@@ -58,7 +58,7 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		
+
 		if blacklisted {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "Token has been revoked",
@@ -66,7 +66,7 @@ func TokenBlacklistMiddleware(checker TokenBlacklistChecker) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		
+
 		c.Next()
 	}
 }

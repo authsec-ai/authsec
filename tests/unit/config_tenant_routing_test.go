@@ -13,7 +13,6 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	pb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // pluginMock is a shared test double for config.MTPluginClientIface.
@@ -53,54 +52,7 @@ func TestMTPluginClientIface_NilAssignable(t *testing.T) {
 	assert.Nil(t, c)
 }
 
-// ── GetTenantGORMDB ───────────────────────────────────────────────────────────
-
-func TestGetTenantGORMDB_NilPlugin_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, nil)
-
-	db, err := config.GetTenantGORMDB("any-tenant")
-	require.NoError(t, err)
-	assert.Equal(t, config.DB, db)
-}
-
-func TestGetTenantGORMDB_EmptyTenantID_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, &pluginMock{available: true})
-
-	db, err := config.GetTenantGORMDB("")
-	require.NoError(t, err)
-	assert.Equal(t, config.DB, db)
-}
-
-func TestGetTenantGORMDB_PluginUnavailable_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, &pluginMock{available: false})
-
-	db, err := config.GetTenantGORMDB("tenant-xyz")
-	require.NoError(t, err)
-	assert.Equal(t, config.DB, db)
-}
-
-// ── GetTenantDatabase ─────────────────────────────────────────────────────────
-
-func TestGetTenantDatabase_NilPlugin_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, nil)
-
-	conn, err := config.GetTenantDatabase("tenant-abc")
-	require.NoError(t, err)
-	assert.Equal(t, config.Database, conn)
-}
-
-func TestGetTenantDatabase_EmptyTenantID_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, &pluginMock{available: true})
-
-	conn, err := config.GetTenantDatabase("")
-	require.NoError(t, err)
-	assert.Equal(t, config.Database, conn)
-}
-
-func TestGetTenantDatabase_PluginUnavailable_ReturnsMasterDB(t *testing.T) {
-	swapPlugin(t, &pluginMock{available: false})
-
-	conn, err := config.GetTenantDatabase("tenant-xyz")
-	require.NoError(t, err)
-	assert.Equal(t, config.Database, conn)
-}
+// GetTenantGORMDB / GetTenantDatabase have been removed. AuthSec is single-DB
+// at the product layer — callers use config.DB / config.Database directly and
+// scope by workspace_id at row level. The MT plugin remains for tenant
+// lifecycle operations exercised by other tests in this package.

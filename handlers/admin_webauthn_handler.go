@@ -19,9 +19,9 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/config"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	repositories "github.com/authsec-ai/authsec/repository"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 )
 
 // min returns the smaller of two integers

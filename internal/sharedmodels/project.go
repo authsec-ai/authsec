@@ -7,11 +7,11 @@ import (
 )
 
 type Project struct {
-	ID          uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 	DeletedAt   *time.Time `json:"deleted_at,omitempty" gorm:"index"`
-	Name        string         `gorm:"not null"`
+	Name        string     `gorm:"not null"`
 	Description string
 	UserID      uuid.UUID `gorm:"type:uuid"`
 	TenantID    uuid.UUID `gorm:"type:uuid"`

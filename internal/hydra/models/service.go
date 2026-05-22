@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -194,10 +193,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 		return nil, fmt.Errorf("missing tenant_id or client_id in JWT token")
 	}
 
-	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant database: %w", err)
-	}
+	db := config.DB
 
 	var client Client
 	if err := db.Table("clients").Where("client_id = ? and tenant_id = ?", clientIDStr, tenantIDStr).First(&client).Error; err != nil {
@@ -205,7 +201,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	}
 
 	var existingUser User
-	err = db.Table("users").Where(
+	err := db.Table("users").Where(
 		"provider = ? AND provider_id = ? AND tenant_id = ? AND client_id = ?",
 		users.Provider, users.ProviderID, tenantID, clientID,
 	).First(&existingUser).Error

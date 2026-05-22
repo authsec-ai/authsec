@@ -142,6 +142,13 @@ type Config struct {
 	// When set, authsec connects to the mt-plugin gRPC service for multi-tenant operations.
 	// Empty string means single-tenant mode (one admin, master DB only).
 	MtPluginAddr string // MT_PLUGIN_GRPC_ADDR (e.g. "localhost:7469")
+
+	// OIDCStateHMACKey is the HMAC secret used to sign the OIDC state parameter
+	// (services.MintSignedState / VerifySignedState). Production deployments
+	// MUST set AUTHSEC_OIDC_STATE_HMAC_KEY to a 32+ byte random value. When
+	// empty, services/oidc_state.go falls back to JWTSecret so dev/local-k8s
+	// still works; the fallback logs a warning at startup.
+	OIDCStateHMACKey string // AUTHSEC_OIDC_STATE_HMAC_KEY
 }
 
 var (
@@ -296,6 +303,12 @@ func LoadConfig() *Config {
 	// mt-plugin gRPC address (empty = single-tenant mode)
 	mtPluginAddr := getEnv("MT_PLUGIN_GRPC_ADDR", "")
 
+	// OIDC state HMAC key — production deployments must supply this.
+	oidcStateHMACKey := getEnv("AUTHSEC_OIDC_STATE_HMAC_KEY", "")
+	if oidcStateHMACKey == "" && getEnv("APP_ENV", "") == "production" {
+		log.Println("WARNING: AUTHSEC_OIDC_STATE_HMAC_KEY is unset in production; signed OIDC state will fall back to JWTSecret. Set a 32+ byte random value for full protection.")
+	}
+
 	// Validate critical variables
 	if dbName == "" || dbUser == "" || dbHost == "" || dbPort == "" {
 		log.Fatal("DB_NAME, DB_USER, DB_HOST, and DB_PORT are required")
@@ -377,6 +390,7 @@ func LoadConfig() *Config {
 		SDKRequireSessionID:           sdkRequireSessionID,
 		SDKRedirectSource:             sdkRedirectSource,
 		MtPluginAddr:                  mtPluginAddr,
+		OIDCStateHMACKey:              oidcStateHMACKey,
 	}
 
 	// Validate required secrets are set — fail fast if missing (warn-only in test mode)

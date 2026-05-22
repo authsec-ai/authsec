@@ -26,10 +26,10 @@ type Dependencies struct {
 	PKIAdmin        *controllers.PKIAdminController
 
 	// Services (exposed for injection into existing monolith controllers)
-	PKIProvisioningSvc  *services.PKIProvisioningService
-	WorkloadEntrySvc    *services.WorkloadEntryService
-	JWTSVIDSvc          *services.JWTSVIDService
-	AgentSvc            *services.AgentService
+	PKIProvisioningSvc *services.PKIProvisioningService
+	WorkloadEntrySvc   *services.WorkloadEntryService
+	JWTSVIDSvc         *services.JWTSVIDService
+	AgentSvc           *services.AgentService
 
 	// Middleware
 	JWTAuth   gin.HandlerFunc

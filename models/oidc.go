@@ -33,15 +33,20 @@ func (OIDCProvider) TableName() string {
 // Used to pass tenant context through OAuth redirects
 type OIDCState struct {
 	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	StateToken    string     `json:"state_token" gorm:"uniqueIndex;not null"` // Random state for CSRF
-	TenantID      *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`    // NULL for new registration
-	TenantDomain  string     `json:"tenant_domain" gorm:"not null"`           // e.g., 'ritam'
+	StateToken    string     `json:"state_token" gorm:"uniqueIndex;not null"`            // Random state for CSRF
+	TenantID      *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`               // NULL for new registration
+	TenantDomain  string     `json:"tenant_domain" gorm:"not null"`                      // e.g., 'ritam'
 	OriginDomain  string     `json:"origin_domain,omitempty" gorm:"column:request_host"` // The actual domain user came from (maps to request_host column)
-	ProviderName  string     `json:"provider_name" gorm:"not null"`           // 'google', 'github', etc.
-	Action        string     `json:"action" gorm:"not null"`                  // 'login' or 'register'
-	CodeVerifier  string     `json:"code_verifier,omitempty"`                 // For PKCE
-	RedirectAfter string     `json:"redirect_after,omitempty"`                // Where to redirect after success
-	ExpiresAt     time.Time  `json:"expires_at" gorm:"not null"`              // State expiry
+	ProviderName  string     `json:"provider_name" gorm:"not null"`                      // 'google', 'github', etc.
+	Action        string     `json:"action" gorm:"not null"`                             // 'login' or 'register'
+	CodeVerifier  string     `json:"code_verifier,omitempty"`                            // For PKCE
+	RedirectAfter string     `json:"redirect_after,omitempty"`                           // Where to redirect after success
+	// SignedState is the workspace+application HMAC-signed payload that the
+	// callback verifies out-of-band via services.VerifySignedState.
+	// Nullable — empty for rows minted before migration 123.
+	SignedState   string     `json:"-" gorm:"type:text"`
+	ApplicationID *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
+	ExpiresAt     time.Time  `json:"expires_at" gorm:"not null"` // State expiry
 	CreatedAt     time.Time  `json:"created_at"`
 }
 

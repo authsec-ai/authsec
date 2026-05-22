@@ -129,14 +129,14 @@ func TestParseMigrationFileName(t *testing.T) {
 			wantName:    "dml_003_admin_permissions",
 		},
 		{
-			name:    "invalid - no underscore",
+			name:     "invalid - no underscore",
 			filename: "001.sql",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "invalid - non-numeric version",
+			name:     "invalid - non-numeric version",
 			filename: "abc_migration.sql",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 

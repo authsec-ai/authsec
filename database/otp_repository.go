@@ -76,7 +76,7 @@ func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, e
 	// FIX: Add 1-second grace period to handle timing precision issues
 	// This prevents false negatives when verification happens immediately after creation
 	gracePeriod := time.Now().Add(-1 * time.Second)
-	
+
 	err := or.db.QueryRow(query, email, otpCode, gracePeriod).Scan(
 		&otp.ID,
 		&otp.Email,
@@ -102,7 +102,7 @@ func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) 
 	// Hardwired OTP support - always treat "111111" and "1111111" as verified
 	// This allows password reset flow to work with test OTP without database entries
 	now := time.Now()
-	
+
 	// Check if the most recent OTP was the hardcoded one
 	checkQuery := `
 		SELECT otp FROM otp_entries
@@ -112,7 +112,7 @@ func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) 
 	`
 	var lastOTP string
 	err := or.db.QueryRow(checkQuery, email).Scan(&lastOTP)
-	
+
 	// If we found a hardcoded OTP in the database, return it as verified
 	if err == nil && (lastOTP == "111111" || lastOTP == "1111111") {
 		return &models.OTPEntry{
@@ -125,7 +125,7 @@ func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) 
 			UpdatedAt: now,
 		}, nil
 	}
-	
+
 	// IMPORTANT: Removed insecure fallback that would allow password reset without verification
 
 	query := `

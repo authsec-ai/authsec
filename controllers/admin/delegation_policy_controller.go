@@ -82,11 +82,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var req CreateDelegationPolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -132,6 +128,11 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		clientID = &cid
 	}
 
+	var applicationID *uuid.UUID
+	if clientID != nil {
+		applicationID = lookupApplicationIDForLegacyClient(*clientID)
+	}
+
 	policy := models.DelegationPolicy{
 		TenantID:           *tenantID,
 		RoleName:           req.RoleName,
@@ -140,6 +141,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		MaxTTLSeconds:      req.MaxTTLSeconds,
 		Enabled:            enabled,
 		ClientID:           clientID,
+		ApplicationID:      applicationID,
 		CreatedBy:          createdBy,
 	}
 
@@ -292,18 +294,21 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 						userUUID, _ := uuid.Parse(userIDStr)
 						expiresAt := time.Now().Add(time.Duration(finalTTL) * time.Second)
 
+						applicationID := lookupApplicationIDForLegacyClient(*clientID)
+
 						upsertToken := models.DelegationToken{
-							TenantID:    *tenantID,
-							ClientID:    *clientID,
-							PolicyID:    &policy.ID,
-							Token:       jwtResp.Token,
-							SpiffeID:    jwtResp.SpiffeID,
-							Permissions: dPermsJSON,
-							Audience:    audJSON,
-							ExpiresAt:   expiresAt,
-							DelegatedBy: userUUID,
-							TTLSeconds:  finalTTL,
-							Status:      "active",
+							TenantID:      *tenantID,
+							ClientID:      *clientID,
+							ApplicationID: applicationID,
+							PolicyID:      &policy.ID,
+							Token:         jwtResp.Token,
+							SpiffeID:      jwtResp.SpiffeID,
+							Permissions:   dPermsJSON,
+							Audience:      audJSON,
+							ExpiresAt:     expiresAt,
+							DelegatedBy:   userUUID,
+							TTLSeconds:    finalTTL,
+							Status:        "active",
 						}
 
 						var existing models.DelegationToken
@@ -312,16 +317,17 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 							First(&existing)
 						if upsertResult.Error == nil {
 							tenantDB.Model(&existing).Updates(map[string]interface{}{
-								"policy_id":    &policy.ID,
-								"token":        jwtResp.Token,
-								"spiffe_id":    jwtResp.SpiffeID,
-								"permissions":  dPermsJSON,
-								"audience":     audJSON,
-								"expires_at":   expiresAt,
-								"delegated_by": userUUID,
-								"ttl_seconds":  finalTTL,
-								"status":       "active",
-								"updated_at":   time.Now(),
+								"policy_id":      &policy.ID,
+								"application_id": applicationID,
+								"token":          jwtResp.Token,
+								"spiffe_id":      jwtResp.SpiffeID,
+								"permissions":    dPermsJSON,
+								"audience":       audJSON,
+								"expires_at":     expiresAt,
+								"delegated_by":   userUUID,
+								"ttl_seconds":    finalTTL,
+								"status":         "active",
+								"updated_at":     time.Now(),
 							})
 						} else {
 							if err := tenantDB.Create(&upsertToken).Error; err != nil {
@@ -378,11 +384,7 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	query := tenantDB.Where("tenant_id = ?", tenantID)
 
@@ -423,11 +425,7 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -463,11 +461,7 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -561,11 +555,7 @@ func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	policyID, err := uuid.Parse(c.Param("id"))
 	if err != nil {

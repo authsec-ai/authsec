@@ -6,8 +6,10 @@ import (
 	"os"
 	"strings"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 type Need struct{ Resource, Action string }
@@ -54,23 +56,20 @@ func RequireAll(needs ...Need) gin.HandlerFunc {
 			log.Printf("[AUTHZ RequireAll] Resource list enforcement disabled")
 		}
 
-		// Admin role bypass: admin users have implicit access to all protected resources.
-		// This mirrors the enrichClaimsFromDB behaviour that the old auth-manager applied
-		// before the route reached the authz middleware.
-		if hasRole(claims, "admin") {
-			log.Printf("[AUTHZ RequireAll] SUCCESS: admin role bypass for path %s", c.Request.URL.Path)
-			c.Next()
-			return
-		}
+		// Admin claim bypass removed. The canonical owner/admin/member roles
+		// seeded per workspace (migration 115) now carry explicit permissions;
+		// access is decided through the same hasPerm / hasScope path as every
+		// other principal. Tokens with `roles: ["admin"]` no longer skip checks.
 
 		// All needs must pass (perms or scope fallback)
 		log.Printf("[AUTHZ RequireAll] Checking permissions for all needs")
 		for _, n := range needs {
 			hasPermCheck := hasPerm(claims, n.Resource, n.Action)
 			hasScopeCheck := hasScope(claims, n.Resource+":"+n.Action)
-			result := hasPermCheck || hasScopeCheck
-			log.Printf("[AUTHZ RequireAll] Need Resource='%s', Action='%s': hasPerm=%t, hasScope=%t, result=%t",
-				n.Resource, n.Action, hasPermCheck, hasScopeCheck, result)
+			hasDBPermCheck := hasDBPermission(claims, n.Resource, n.Action)
+			result := hasPermCheck || hasScopeCheck || hasDBPermCheck
+			log.Printf("[AUTHZ RequireAll] Need Resource='%s', Action='%s': hasPerm=%t, hasScope=%t, hasDBPerm=%t, result=%t",
+				n.Resource, n.Action, hasPermCheck, hasScopeCheck, hasDBPermCheck, result)
 			if !result {
 				log.Printf("[AUTHZ RequireAll] FAIL: Need not satisfied - Resource='%s', Action='%s'", n.Resource, n.Action)
 				denyInsufficientScope(c)
@@ -122,19 +121,16 @@ func RequireAny(needs ...Need) gin.HandlerFunc {
 			log.Printf("[AUTHZ RequireAny] Resource list enforcement disabled")
 		}
 
-		if hasRole(claims, "admin") {
-			log.Printf("[AUTHZ RequireAny] SUCCESS: admin role bypass for path %s", c.Request.URL.Path)
-			c.Next()
-			return
-		}
+		// (Admin claim bypass removed — see RequireAll above for rationale.)
 
 		log.Printf("[AUTHZ RequireAny] Checking permissions for at least one need")
 		for _, n := range needs {
 			hasPermCheck := hasPerm(claims, n.Resource, n.Action)
 			hasScopeCheck := hasScope(claims, n.Resource+":"+n.Action)
-			result := hasPermCheck || hasScopeCheck
-			log.Printf("[AUTHZ RequireAny] Need Resource='%s', Action='%s': hasPerm=%t, hasScope=%t, result=%t",
-				n.Resource, n.Action, hasPermCheck, hasScopeCheck, result)
+			hasDBPermCheck := hasDBPermission(claims, n.Resource, n.Action)
+			result := hasPermCheck || hasScopeCheck || hasDBPermCheck
+			log.Printf("[AUTHZ RequireAny] Need Resource='%s', Action='%s': hasPerm=%t, hasScope=%t, hasDBPerm=%t, result=%t",
+				n.Resource, n.Action, hasPermCheck, hasScopeCheck, hasDBPermCheck, result)
 			if result {
 				log.Printf("[AUTHZ RequireAny] SUCCESS: Need satisfied - Resource='%s', Action='%s'", n.Resource, n.Action)
 				c.Next()
@@ -158,23 +154,60 @@ func denyInsufficientScope(c *gin.Context) {
 	})
 }
 
-func hasRole(claims jwt.MapClaims, role string) bool {
-	switch arr := claims["roles"].(type) {
-	case []any:
-		for _, r := range arr {
-			if s, ok := r.(string); ok && s == role {
-				return true
-			}
-		}
-	case []string:
-		for _, r := range arr {
-			if r == role {
-				return true
-			}
+func hasDBPermission(claims jwt.MapClaims, resource, action string) bool {
+	if config.DB == nil {
+		log.Printf("[AUTHZ hasDBPermission] DB not initialized")
+		return false
+	}
+
+	workspaceIDStr := firstClaimString(claims, "workspace_id", "tenant_id", "validated_tenant_id")
+	userIDStr := firstClaimString(claims, "user_id", "sub")
+	if workspaceIDStr == "" || userIDStr == "" {
+		log.Printf("[AUTHZ hasDBPermission] Missing workspace/user claim: workspace=%q user=%q", workspaceIDStr, userIDStr)
+		return false
+	}
+
+	workspaceID, err := uuid.Parse(workspaceIDStr)
+	if err != nil {
+		log.Printf("[AUTHZ hasDBPermission] Invalid workspace id %q: %v", workspaceIDStr, err)
+		return false
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		log.Printf("[AUTHZ hasDBPermission] Invalid user id %q: %v", userIDStr, err)
+		return false
+	}
+
+	var count int64
+	if err := config.DB.Table("role_bindings rb").
+		Joins("JOIN roles r ON r.id = rb.role_id").
+		Joins("JOIN role_permissions rp ON rp.role_id = r.id").
+		Joins("JOIN permissions p ON p.id = rp.permission_id").
+		Where("rb.user_id = ? AND rb.tenant_id = ?", userID, workspaceID).
+		Where("p.tenant_id = ? OR p.tenant_id IS NULL", workspaceID).
+		Where("(p.resource = ? OR p.resource = '*') AND (p.action = ? OR p.action = '*')", resource, action).
+		Where("rb.expires_at IS NULL OR rb.expires_at > NOW()").
+		Count(&count).Error; err != nil {
+		log.Printf("[AUTHZ hasDBPermission] DB permission check failed: %v", err)
+		return false
+	}
+
+	return count > 0
+}
+
+func firstClaimString(claims jwt.MapClaims, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := claims[key].(string); ok && value != "" {
+			return value
 		}
 	}
-	return false
+	return ""
 }
+
+// hasRole was previously used by the now-removed admin claim bypass in
+// RequireAll / RequireAny. Authorization now flows through hasPerm + hasScope
+// against the canonical permissions table. The function is kept as
+// `_ = hasRole` would obscure intent; deleted in favour of explicit removal.
 
 func hasPerm(claims jwt.MapClaims, r, a string) bool {
 	log.Printf("[AUTHZ hasPerm] Checking permission for Resource='%s', Action='%s'", r, a)

@@ -33,7 +33,7 @@ type ScopePreset struct {
 var ScopePresetCatalog = []ScopePreset{
 	{ID: "read_only", Name: "Read only", Category: "common",
 		Description: "Search / catalog / read-only servers",
-		Scopes: []PresetScopeDef{{Suffix: "<app>:read", Description: "Read operations", Risk: "low"}}},
+		Scopes:      []PresetScopeDef{{Suffix: "<app>:read", Description: "Read operations", Risk: "low"}}},
 	{ID: "read_write", Name: "Read + Write", Category: "common", Recommended: true,
 		Description: "Default for most MCP servers",
 		Scopes: []PresetScopeDef{

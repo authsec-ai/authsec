@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/internal/vault"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )

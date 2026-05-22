@@ -135,23 +135,23 @@ func Bootstrap(cfg *BootstrapConfig) (*Dependencies, error) {
 	logger.Info("SPIRE sub-module bootstrapped successfully")
 
 	return &Dependencies{
-		Health:          healthCtrl,
-		NodeAttestation: nodeAttestCtrl,
-		Agent:           agentCtrl,
-		Attestation:     attestCtrl,
-		Workload:        workloadCtrl,
-		Certificate:     certCtrl,
-		JWTSVID:         jwtSvidCtrl,
-		Bundle:          bundleCtrl,
-		PKIAdmin:        pkiAdminCtrl,
+		Health:             healthCtrl,
+		NodeAttestation:    nodeAttestCtrl,
+		Agent:              agentCtrl,
+		Attestation:        attestCtrl,
+		Workload:           workloadCtrl,
+		Certificate:        certCtrl,
+		JWTSVID:            jwtSvidCtrl,
+		Bundle:             bundleCtrl,
+		PKIAdmin:           pkiAdminCtrl,
 		PKIProvisioningSvc: pkiProvSvc,
 		WorkloadEntrySvc:   workloadEntrySvc,
 		JWTSVIDSvc:         jwtSvidSvc,
-		AgentSvc:            agentSvc,
-		JWTAuth:         jwtAuth,
-		AgentCert:       agentCert,
-		MTLSAuth:        mtlsAuth,
-		Logger:          logger,
+		AgentSvc:           agentSvc,
+		JWTAuth:            jwtAuth,
+		AgentCert:          agentCert,
+		MTLSAuth:           mtlsAuth,
+		Logger:             logger,
 	}, nil
 }
 

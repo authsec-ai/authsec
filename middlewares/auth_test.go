@@ -73,4 +73,3 @@ func TestValidateJWTToken_EmptySecrets(t *testing.T) {
 		t.Fatal("expected nil claims when all secrets are empty")
 	}
 }
-

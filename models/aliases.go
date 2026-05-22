@@ -6,10 +6,11 @@ import (
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/google/uuid"
 )
-//aa
+
+// aa
 type (
-	Tenant                               = sharedmodels.Tenant
-	RegisterResponse                     = sharedmodels.RegisterResponse
+	Tenant           = sharedmodels.Tenant
+	RegisterResponse = sharedmodels.RegisterResponse
 	// InitiateRegistrationInput is overridden locally to make FirstName and LastName optional
 	// Original: InitiateRegistrationInput = sharedmodels.InitiateRegistrationInput
 	InitiateRegistrationResponse         = sharedmodels.InitiateRegistrationResponse
@@ -68,12 +69,11 @@ type (
 	MapRolesRequest                      = sharedmodels.MapRolesRequest
 	// DeleteRolesRequest is overridden locally to support both "roles" and "role_ids" field names
 	// Original: DeleteRolesRequest = sharedmodels.DeleteRolesRequest
-	UserDefinedScopesRequest             = sharedmodels.UserDefinedScopesRequest
-	MapScopesRequest                     = sharedmodels.MapScopesRequest
-	DeleteScopesRequest                  = sharedmodels.DeleteScopesRequest
-	Service                              = sharedmodels.Service
-	Permission                           = sharedmodels.Permission
-	ResourceMethod                       = sharedmodels.ResourceMethod
+	UserDefinedScopesRequest = sharedmodels.UserDefinedScopesRequest
+	MapScopesRequest         = sharedmodels.MapScopesRequest
+	DeleteScopesRequest      = sharedmodels.DeleteScopesRequest
+	Service                  = sharedmodels.Service
+	Permission               = sharedmodels.Permission
 )
 
 // OTPEntry represents a stored one-time password record.
@@ -192,7 +192,6 @@ func (r *DeleteRolesRequest) GetRoles() []string {
 	}
 	return r.RoleIDs
 }
-
 
 // RegisterClientWithHydra is now implemented in hydra.go
 // No need to delegate to sharedmodels

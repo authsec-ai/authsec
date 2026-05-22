@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // ScopeMatrixController handles scope registry, tool discovery, and scope matrix APIs.
@@ -1258,6 +1258,145 @@ type rsBindingResponse struct {
 	Source    string  `json:"assignment_source,omitempty"`
 }
 
+// UpdateRSRoleScopeGrants replaces the Application-scope grants on one
+// Application-scoped role. The UI sends scope IDs, not permission IDs/strings;
+// the backend owns the scope -> permission translation through
+// oauth_scope_permissions.
+// PUT /authsec/applications/:id/roles/:role_id/scope-grants
+func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+
+	rsID := c.Param("id")
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	roleID, err := uuid.Parse(c.Param("role_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+		return
+	}
+
+	var req struct {
+		ScopeIDs []string `json:"scope_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	var role models.RBACRole
+	if err := config.DB.Where("id = ? AND tenant_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
+		return
+	}
+	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
+	if !strings.HasPrefix(role.Name, prefix) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "role is not scoped to this application"})
+		return
+	}
+
+	scopeIDs := make([]uuid.UUID, 0, len(req.ScopeIDs))
+	seenScopeIDs := map[uuid.UUID]struct{}{}
+	for _, raw := range req.ScopeIDs {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope_id: " + raw})
+			return
+		}
+		if _, ok := seenScopeIDs[parsed]; ok {
+			continue
+		}
+		seenScopeIDs[parsed] = struct{}{}
+		scopeIDs = append(scopeIDs, parsed)
+	}
+
+	var selectedScopes []models.OAuthScope
+	if len(scopeIDs) > 0 {
+		if err := config.DB.
+			Where("tenant_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+			Find(&selectedScopes).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if len(selectedScopes) != len(scopeIDs) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "one or more scopes do not belong to this application"})
+			return
+		}
+	}
+
+	var allAppPermissionIDs []uuid.UUID
+	if err := config.DB.
+		Table("oauth_scope_permissions osp").
+		Select("DISTINCT osp.permission_id").
+		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
+		Where("os.tenant_id = ? AND os.resource_server_id = ?", tenantID, rs.ID).
+		Scan(&allAppPermissionIDs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	selectedPermissionIDs := make([]uuid.UUID, 0)
+	if len(scopeIDs) > 0 {
+		if err := config.DB.
+			Table("oauth_scope_permissions").
+			Select("DISTINCT permission_id").
+			Where("scope_id IN ?", scopeIDs).
+			Scan(&selectedPermissionIDs).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		if len(allAppPermissionIDs) > 0 {
+			if err := tx.
+				Where("role_id = ? AND permission_id IN ?", roleID, allAppPermissionIDs).
+				Delete(&models.RolePermission{}).Error; err != nil {
+				return err
+			}
+		}
+		for _, permissionID := range selectedPermissionIDs {
+			if err := tx.FirstOrCreate(&models.RolePermission{
+				RoleID:       roleID,
+				PermissionID: permissionID,
+			}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	grantedScopeStrings := make([]string, 0, len(selectedScopes))
+	for _, scope := range selectedScopes {
+		grantedScopeStrings = append(grantedScopeStrings, scope.ScopeString)
+	}
+
+	auditAdminMutation(c, tenantID.String(), "application_role_scope_grants_updated", "role",
+		roleID.String(), http.StatusOK, nil,
+		map[string]interface{}{"application_id": rs.ID, "scope_count": len(scopeIDs)})
+	c.JSON(http.StatusOK, gin.H{
+		"role_id":           roleID.String(),
+		"role_name":         role.Name,
+		"scope_ids":         req.ScopeIDs,
+		"granted_scopes":    grantedScopeStrings,
+		"permissions_count": len(selectedPermissionIDs),
+	})
+}
+
 // ListRSBindings returns role_bindings that apply to this RS — either explicit
 // (scope_type='resource_server' AND scope_id=rs.ID) or global (scope_type IS NULL),
 // for any role whose name starts with rs-{id}: (i.e. RS-scoped roles only).
@@ -1516,12 +1655,7 @@ func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
-	tenantStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant DB unavailable"})
-		return
-	}
+	tenantDB := config.DB
 	type u struct {
 		ID    string `json:"id"`
 		Email string `json:"email"`

@@ -6,7 +6,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -280,12 +279,7 @@ func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 	}
 
 	// Connect to tenant database
-	tenantIDStr2 := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr2)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Get pending requests
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
@@ -336,12 +330,7 @@ func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr2 := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr2)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 	devices, err := tenantRepo.GetTenantDeviceTokensByUserID(userID, tenantID)
@@ -418,12 +407,7 @@ func (tcc *TenantCIBAController) DeleteTenantDevice(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr2 := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr2)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 	err = tenantRepo.DeactivateTenantDeviceToken(deviceID, userID, tenantID)

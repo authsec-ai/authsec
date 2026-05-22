@@ -23,10 +23,10 @@ func TestGetTenantIDFromToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cases := []struct {
-		name      string
-		setup     func(c *gin.Context)
-		wantStr   string
-		wantOK    bool
+		name    string
+		setup   func(c *gin.Context)
+		wantStr string
+		wantOK  bool
 	}{
 		{
 			name:    "tenant_id present and string-typed",

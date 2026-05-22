@@ -177,8 +177,8 @@ type JWTSVIDClaims struct {
 	Email    string `json:"email"`
 
 	// SPIFFE delegation metadata
-	AgentType  string `json:"agent_type"`
-	SpiffeID   string `json:"spiffe_id"` // same as sub for clarity
+	AgentType   string `json:"agent_type"`
+	SpiffeID    string `json:"spiffe_id"`    // same as sub for clarity
 	DelegatedBy string `json:"delegated_by"` // always "authsec-ai/user-flow"
 }
 

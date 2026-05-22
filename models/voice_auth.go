@@ -10,9 +10,9 @@ import (
 // Used for voice assistant authentication (Alexa, Google Assistant, Siri, etc.)
 // All timestamps are stored as Unix epoch (seconds)
 type VoiceSession struct {
-	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID      uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	ClientID      *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid;index"`
+	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	TenantID uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid;index"`
 
 	// Session identifier
 	SessionToken string `json:"session_token" gorm:"uniqueIndex;size:128;not null"`
@@ -110,35 +110,35 @@ type VoiceInitiateRequest struct {
 
 // VoiceInitiateResponse represents the response for voice initiation
 type VoiceInitiateResponse struct {
-	SessionToken string `json:"session_token"`        // Secret token for this session
-	VoiceOTP     string `json:"voice_otp"`            // Numeric code to speak (e.g., "8532")
-	ExpiresIn    int    `json:"expires_in"`           // Seconds until expiration
-	Message      string `json:"message,omitempty"`    // Human-readable message for voice assistant
+	SessionToken string `json:"session_token"`     // Secret token for this session
+	VoiceOTP     string `json:"voice_otp"`         // Numeric code to speak (e.g., "8532")
+	ExpiresIn    int    `json:"expires_in"`        // Seconds until expiration
+	Message      string `json:"message,omitempty"` // Human-readable message for voice assistant
 }
 
 // VoiceVerifyRequest represents a request to verify voice OTP
 type VoiceVerifyRequest struct {
-	SessionToken       string `json:"session_token" binding:"required"`
-	VoiceOTP           string `json:"voice_otp" binding:"required"`
-	VoiceConfirmation  bool   `json:"voice_confirmation"` // User confirmed via voice
+	SessionToken      string `json:"session_token" binding:"required"`
+	VoiceOTP          string `json:"voice_otp" binding:"required"`
+	VoiceConfirmation bool   `json:"voice_confirmation"` // User confirmed via voice
 }
 
 // VoiceVerifyResponse represents the response for voice verification
 type VoiceVerifyResponse struct {
-	Success          bool   `json:"success"`
-	Status           string `json:"status"` // 'verified', 'failed', 'expired'
-	Message          string `json:"message,omitempty"`
+	Success bool   `json:"success"`
+	Status  string `json:"status"` // 'verified', 'failed', 'expired'
+	Message string `json:"message,omitempty"`
 
 	// If linking to device flow
-	DeviceCode       string `json:"device_code,omitempty"`
-	UserCode         string `json:"user_code,omitempty"`
-	VerificationURI  string `json:"verification_uri,omitempty"`
+	DeviceCode      string `json:"device_code,omitempty"`
+	UserCode        string `json:"user_code,omitempty"`
+	VerificationURI string `json:"verification_uri,omitempty"`
 
 	// If direct token issuance (pre-linked voice identity)
-	AccessToken      string `json:"access_token,omitempty"`
-	RefreshToken     string `json:"refresh_token,omitempty"`
-	TokenType        string `json:"token_type,omitempty"`
-	ExpiresIn        int    `json:"expires_in,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenType    string `json:"token_type,omitempty"`
+	ExpiresIn    int    `json:"expires_in,omitempty"`
 }
 
 // VoiceTokenRequest represents a request for token using voice credentials
@@ -152,11 +152,11 @@ type VoiceTokenRequest struct {
 
 // VoiceTokenResponse represents the response for voice token request
 type VoiceTokenResponse struct {
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	TokenType    string `json:"token_type,omitempty"`
-	ExpiresIn    int    `json:"expires_in,omitempty"`
-	Error        string `json:"error,omitempty"`
+	AccessToken      string `json:"access_token,omitempty"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	TokenType        string `json:"token_type,omitempty"`
+	ExpiresIn        int    `json:"expires_in,omitempty"`
+	Error            string `json:"error,omitempty"`
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
@@ -301,9 +301,9 @@ type VoiceActiveSessionPublic struct {
 
 // VoiceActiveSessionsListResponse represents the list of active sessions
 type VoiceActiveSessionsListResponse struct {
-	Sessions     []VoiceActiveSessionPublic `json:"sessions"`
-	TotalCount   int                        `json:"total_count"`
-	ActiveCount  int                        `json:"active_count"`
+	Sessions    []VoiceActiveSessionPublic `json:"sessions"`
+	TotalCount  int                        `json:"total_count"`
+	ActiveCount int                        `json:"active_count"`
 }
 
 // VoiceSessionLogoutRequest represents a request to logout a specific session
@@ -319,9 +319,9 @@ type VoiceSessionLogoutResponse struct {
 
 // VoiceSessionLogoutAllResponse represents the response for logout all sessions
 type VoiceSessionLogoutAllResponse struct {
-	Success       bool   `json:"success"`
-	Message       string `json:"message"`
-	LoggedOutCount int   `json:"logged_out_count"`
+	Success        bool   `json:"success"`
+	Message        string `json:"message"`
+	LoggedOutCount int    `json:"logged_out_count"`
 }
 
 // ========================================

@@ -132,8 +132,20 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
-		// Rollback Hydra client
-		_ = hydraAdminDeleteClient(hydraClientID)
+		// Try to roll back Hydra. If the delete fails too, mark the row
+		// pending_delete (when present) so the reconciler retries — better
+		// than silently leaking a Hydra-side orphan.
+		if delErr := hydraAdminDeleteClient(hydraClientID); delErr != nil {
+			now := time.Now()
+			errStr := "rollback after authsec create failed: " + delErr.Error()
+			_ = s.db.Model(&models.MCPOAuthClient{}).
+				Where("hydra_client_id = ?", hydraClientID).
+				Updates(map[string]interface{}{
+					"sync_status":        models.MCPClientSyncPendingDelete,
+					"sync_last_error":    errStr,
+					"sync_last_error_at": now,
+				}).Error
+		}
 		return nil, fmt.Errorf("store DCR client: %w", err)
 	}
 
@@ -632,7 +644,17 @@ func (s *OAuthASService) ResolveCIMDClient(cimdURL string) (*models.MCPOAuthClie
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
-		_ = hydraAdminDeleteClient(hydraClientID)
+		if delErr := hydraAdminDeleteClient(hydraClientID); delErr != nil {
+			now := time.Now()
+			errStr := "rollback after authsec create failed: " + delErr.Error()
+			_ = s.db.Model(&models.MCPOAuthClient{}).
+				Where("hydra_client_id = ?", hydraClientID).
+				Updates(map[string]interface{}{
+					"sync_status":        models.MCPClientSyncPendingDelete,
+					"sync_last_error":    errStr,
+					"sync_last_error_at": now,
+				}).Error
+		}
 		return nil, fmt.Errorf("store CIMD client: %w", err)
 	}
 
@@ -678,7 +700,17 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
-		_ = hydraAdminDeleteClient(hydraClientID)
+		if delErr := hydraAdminDeleteClient(hydraClientID); delErr != nil {
+			now := time.Now()
+			errStr := "rollback after authsec create failed: " + delErr.Error()
+			_ = s.db.Model(&models.MCPOAuthClient{}).
+				Where("hydra_client_id = ?", hydraClientID).
+				Updates(map[string]interface{}{
+					"sync_status":        models.MCPClientSyncPendingDelete,
+					"sync_last_error":    errStr,
+					"sync_last_error_at": now,
+				}).Error
+		}
 		return nil, fmt.Errorf("store prereg client: %w", err)
 	}
 

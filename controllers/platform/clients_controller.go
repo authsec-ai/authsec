@@ -11,9 +11,8 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/clients/authmethods"
 	"github.com/authsec-ai/authsec/internal/clients/library"
-	"github.com/authsec-ai/authsec/middlewares"
-	"github.com/authsec-ai/authsec/services"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/services"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -321,17 +320,7 @@ func GetClientsByTenant(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &req.TenantID)
-	if err != nil {
-		log.Printf("Failed to get tenant DB connection: %v", err)
-		c.JSON(http.StatusInternalServerError, clientsErrorResponse{
-			Error:     "Database connection failed",
-			Message:   err.Error(),
-			Code:      http.StatusInternalServerError,
-			Timestamp: time.Now(),
-		})
-		return
-	}
+	tenantDB := config.DB
 
 	var clients []sharedmodels.Client
 	query := tenantDB.Where("tenant_id = ?", req.TenantID)
@@ -418,17 +407,7 @@ func DeleteCompleteClient(c *gin.Context) {
 		}
 	}
 
-	var tenantDB *gorm.DB
-	if config.DB != nil && config.DB.Dialector.Name() == "sqlite" {
-		tenantDB = config.DB
-	} else {
-		tenantDB, err = middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-		if err != nil {
-			log.Printf("[HARD-DELETE-ERROR] Failed to get tenant DB connection - Tenant: %s, Error: %v", input.TenantID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-			return
-		}
-	}
+	tenantDB := config.DB
 
 	tenantTx := tenantDB.Begin()
 	defer func() {
@@ -514,12 +493,7 @@ func SetClientStatus(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, clientsErrorResponse{Error: "Database connection failed", Message: err.Error(), Code: http.StatusInternalServerError, Timestamp: time.Now()})
-		return
-	}
+	tenantDB := config.DB
 
 	var client sharedmodels.Client
 	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientUUID, tenantUUID).First(&client).Error; err != nil {
@@ -642,12 +616,7 @@ func RegisterClient(c *gin.Context) {
 		UpdatedAt:     time.Now(),
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		log.Printf("Failed to get tenant DB connection: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	tx := tenantDB.Begin()
 	defer func() {
@@ -752,10 +721,6 @@ func RegisterClient(c *gin.Context) {
 		return
 	}
 
-	if err := services.SeedClientAdminRBAC(c.Request.Context(), config.DB, tenantUUID); err != nil {
-		log.Printf("Warning: failed to seed clients RBAC for tenant %s: %v", tenantUUID.String(), err)
-	}
-
 	email := ""
 	if client.Email != nil {
 		email = *client.Email
@@ -856,23 +821,13 @@ func CreateClient(c *gin.Context) {
 		OIDCEnabled:   oidcEnabled,
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("Failed to get tenant DB connection: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 	createdClient, err := clientLib.CreateClient(req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create client", "details": err.Error()})
 		return
-	}
-
-	if err := services.SeedClientAdminRBAC(c.Request.Context(), config.DB, tenantID); err != nil {
-		log.Printf("Warning: failed to seed clients RBAC for tenant %s: %v", tenantID.String(), err)
 	}
 
 	c.JSON(http.StatusCreated, createdClient)
@@ -966,23 +921,13 @@ func GetClients(c *gin.Context) {
 		IncludeDeleted: includeDeleted,
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("Failed to get tenant DB connection: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 	clients, total, err := clientLib.ListClients(filters)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch clients", "details": err.Error()})
 		return
-	}
-
-	if err := services.PromoteExternalServicePermissions(c.Request.Context(), config.DB, tenantID); err != nil {
-		log.Printf("Warning: failed to promote external-service permissions for tenant %s: %v", tenantID.String(), err)
 	}
 
 	totalPages := (total + int64(limit) - 1) / int64(limit)
@@ -1069,12 +1014,7 @@ func GetClient(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 	cl, err := clientLib.GetClientByClientID(clientID, tenantID)
@@ -1137,12 +1077,7 @@ func clientsHandleClientUpdate(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 	if _, err := clientLib.GetClientByClientID(clientID, tenantID); err != nil {
@@ -1221,13 +1156,7 @@ func clientsHandleSoftDelete(c *gin.Context, logPrefix string) {
 		return
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("%s Failed to get tenant DB connection - Tenant: %s, Error: %v", logPrefix, tenantIDStr, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 
@@ -1295,12 +1224,7 @@ func clientsUpdateClientStatus(c *gin.Context, status string) {
 		return
 	}
 
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	clientLib := library.NewClientLibrary(tenantDB)
 	active := status == sharedmodels.StatusActive

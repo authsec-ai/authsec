@@ -8,14 +8,14 @@ import (
 
 // SCIM Schema URIs
 const (
-	SCIMSchemaUser              = "urn:ietf:params:scim:schemas:core:2.0:User"
-	SCIMSchemaGroup             = "urn:ietf:params:scim:schemas:core:2.0:Group"
-	SCIMSchemaListResponse      = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
-	SCIMSchemaPatchOp           = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
-	SCIMSchemaError             = "urn:ietf:params:scim:api:messages:2.0:Error"
-	SCIMSchemaServiceProvider   = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"
-	SCIMSchemaSchema            = "urn:ietf:params:scim:schemas:core:2.0:Schema"
-	SCIMSchemaResourceType      = "urn:ietf:params:scim:schemas:core:2.0:ResourceType"
+	SCIMSchemaUser            = "urn:ietf:params:scim:schemas:core:2.0:User"
+	SCIMSchemaGroup           = "urn:ietf:params:scim:schemas:core:2.0:Group"
+	SCIMSchemaListResponse    = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
+	SCIMSchemaPatchOp         = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+	SCIMSchemaError           = "urn:ietf:params:scim:api:messages:2.0:Error"
+	SCIMSchemaServiceProvider = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"
+	SCIMSchemaSchema          = "urn:ietf:params:scim:schemas:core:2.0:Schema"
+	SCIMSchemaResourceType    = "urn:ietf:params:scim:schemas:core:2.0:ResourceType"
 )
 
 // SCIMMeta represents SCIM resource metadata
@@ -56,18 +56,18 @@ type SCIMMemberRef struct {
 
 // SCIMUser represents a SCIM 2.0 User resource
 type SCIMUser struct {
-	Schemas    []string       `json:"schemas"`
-	ID         string         `json:"id"`
-	ExternalID string         `json:"externalId,omitempty"`
-	UserName   string         `json:"userName"`
-	Name       *SCIMName      `json:"name,omitempty"`
-	DisplayName string        `json:"displayName,omitempty"`
-	Emails     []SCIMEmail    `json:"emails,omitempty"`
-	Active     bool           `json:"active"`
-	Groups     []SCIMGroupRef `json:"groups,omitempty"`
-	Title      string         `json:"title,omitempty"`
-	Department string         `json:"department,omitempty"`
-	Meta       *SCIMMeta      `json:"meta,omitempty"`
+	Schemas     []string       `json:"schemas"`
+	ID          string         `json:"id"`
+	ExternalID  string         `json:"externalId,omitempty"`
+	UserName    string         `json:"userName"`
+	Name        *SCIMName      `json:"name,omitempty"`
+	DisplayName string         `json:"displayName,omitempty"`
+	Emails      []SCIMEmail    `json:"emails,omitempty"`
+	Active      bool           `json:"active"`
+	Groups      []SCIMGroupRef `json:"groups,omitempty"`
+	Title       string         `json:"title,omitempty"`
+	Department  string         `json:"department,omitempty"`
+	Meta        *SCIMMeta      `json:"meta,omitempty"`
 }
 
 // SCIMGroup represents a SCIM 2.0 Group resource
@@ -112,16 +112,16 @@ type SCIMPatchRequest struct {
 
 // SCIMServiceProviderConfig represents the SCIM ServiceProviderConfig response
 type SCIMServiceProviderConfig struct {
-	Schemas               []string               `json:"schemas"`
-	DocumentationURI      string                 `json:"documentationUri,omitempty"`
-	Patch                 SCIMSupported           `json:"patch"`
-	Bulk                  SCIMBulkConfig          `json:"bulk"`
-	Filter                SCIMFilterConfig        `json:"filter"`
-	ChangePassword        SCIMSupported           `json:"changePassword"`
-	Sort                  SCIMSupported           `json:"sort"`
-	ETag                  SCIMSupported           `json:"etag"`
-	AuthenticationSchemes []SCIMAuthScheme        `json:"authenticationSchemes"`
-	Meta                  *SCIMMeta               `json:"meta,omitempty"`
+	Schemas               []string         `json:"schemas"`
+	DocumentationURI      string           `json:"documentationUri,omitempty"`
+	Patch                 SCIMSupported    `json:"patch"`
+	Bulk                  SCIMBulkConfig   `json:"bulk"`
+	Filter                SCIMFilterConfig `json:"filter"`
+	ChangePassword        SCIMSupported    `json:"changePassword"`
+	Sort                  SCIMSupported    `json:"sort"`
+	ETag                  SCIMSupported    `json:"etag"`
+	AuthenticationSchemes []SCIMAuthScheme `json:"authenticationSchemes"`
+	Meta                  *SCIMMeta        `json:"meta,omitempty"`
 }
 
 // SCIMSupported represents a boolean-supported feature

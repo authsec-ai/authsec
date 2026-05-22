@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/vault"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
-	"github.com/authsec-ai/authsec/internal/vault"
-	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -46,28 +46,28 @@ func NewExternalServiceController(master *gorm.DB) *ExternalServiceController {
 
 // ExternalServiceCreateRequest is the JSON body for POST /authsec/services.
 type ExternalServiceCreateRequest struct {
-	Name            string            `json:"name" validate:"required"`
-	Type            string            `json:"type"`
-	URL             string            `json:"url"`
-	Description     string            `json:"description"`
-	Tags            []string          `json:"tags"`
+	Name            string                    `json:"name" validate:"required"`
+	Type            string                    `json:"type"`
+	URL             string                    `json:"url"`
+	Description     string                    `json:"description"`
+	Tags            []string                  `json:"tags"`
 	ResourceID      ExternalServiceResourceID `json:"resource_id" validate:"required,uuid"`
-	AuthType        string            `json:"auth_type" validate:"required"`
-	AgentAccessible bool              `json:"agent_accessible"`
-	SecretData      map[string]string `json:"secret_data,omitempty"`
+	AuthType        string                    `json:"auth_type" validate:"required"`
+	AgentAccessible bool                      `json:"agent_accessible"`
+	SecretData      map[string]string         `json:"secret_data,omitempty"`
 }
 
 // ExternalServiceUpdateRequest is the JSON body for PUT /authsec/services/:id.
 type ExternalServiceUpdateRequest struct {
-	Name            *string           `json:"name,omitempty"`
-	Type            *string           `json:"type,omitempty"`
-	Description     *string           `json:"description,omitempty"`
-	URL             *string           `json:"url,omitempty"`
-	Tags            []string          `json:"tags,omitempty"`
+	Name            *string                    `json:"name,omitempty"`
+	Type            *string                    `json:"type,omitempty"`
+	Description     *string                    `json:"description,omitempty"`
+	URL             *string                    `json:"url,omitempty"`
+	Tags            []string                   `json:"tags,omitempty"`
 	ResourceID      *ExternalServiceResourceID `json:"resource_id,omitempty"`
-	AuthType        *string           `json:"auth_type,omitempty"`
-	AgentAccessible *bool             `json:"agent_accessible,omitempty"`
-	SecretData      map[string]string `json:"secret_data,omitempty"`
+	AuthType        *string                    `json:"auth_type,omitempty"`
+	AgentAccessible *bool                      `json:"agent_accessible,omitempty"`
+	SecretData      map[string]string          `json:"secret_data,omitempty"`
 }
 
 // ExternalServiceResourceID is a string UUID that also accepts positive integers over JSON.
@@ -305,12 +305,12 @@ func (ctl *ExternalServiceController) UpdateExternalService(c *gin.Context) {
 	}
 
 	updateInput := services.ExternalServiceUpdateInput{
-		Name:        req.Name,
-		Type:        req.Type,
-		URL:         req.URL,
-		Description: req.Description,
-		Tags:        req.Tags,
-		AuthType:    req.AuthType,
+		Name:            req.Name,
+		Type:            req.Type,
+		URL:             req.URL,
+		Description:     req.Description,
+		Tags:            req.Tags,
+		AuthType:        req.AuthType,
 		AgentAccessible: req.AgentAccessible,
 	}
 	if req.ResourceID != nil {

@@ -14,13 +14,12 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
-	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
-	"github.com/authsec-ai/authsec/middlewares"
 	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
+	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
-	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -677,14 +676,7 @@ func (uc *UserController) Login(c *gin.Context) {
 	// Check if this is first-time login by examining last_login column
 	isFirstLogin := user.LastLogin == nil
 
-	// Get tenant database connection for permission queries and MFA checks
-	tenantIDStr := user.TenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("Failed to connect to tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Get the underlying SQL database connection
 	sqlDB, err := tenantDB.DB()
@@ -1237,14 +1229,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 		return
 	}
 
-	// Get tenant database connection using the tenant ID from the found tenant
-	tenantIDStr := tenant.ID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("Failed to connect to tenant database for admin: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Find the corresponding user in the tenant database
 	var user models.User
@@ -1453,13 +1438,7 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 
 	log.Printf("[SECURITY] MFA verification confirmed for user: %s (tenant: %s)", tenant.Email, user.TenantID.String())
 
-	// Get tenant database connection for permissions and credentials
-	tenantIDStr := user.TenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Get the underlying SQL database connection
 	sqlDB, err := tenantDB.DB()
@@ -1940,13 +1919,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		log.Printf("Failed to connect to tenant database for MFA check: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check MFA status"})
-		return
-	}
+	tenantDB := config.DB
 
 	var user models.User
 	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND tenant_id = ?", input.Email, tenantUUID).First(&user).Error; err != nil {
@@ -2083,7 +2056,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	// Build response
 	response := gin.H{
 		"email":        input.Email,
-		"tenant_id":    tenantIDStr,
+		"tenant_id":    tenantUUID.String(),
 		"first_login":  isFirstLogin,
 		"mfa_required": len(mfaMethods) > 0,
 		"mfa_method":   defaultMFAMethod,

@@ -23,7 +23,6 @@
 //	/authsec/uflow/*      – user flow (formerly user-flow)
 //	/authsec/webauthn/*   – WebAuthn/passkeys (formerly webauthn-service)
 //	/authsec/exsvc/*      – external services (formerly mcp-service/external-service)
-//	/authsec/clientms/*   – client management (formerly clients-microservice)
 //	/authsec/hmgr/*       – Hydra manager (formerly hydra-service)
 //	/authsec/oocmgr/*     – OIDC config manager (formerly oath_oidc_configuration_manager)
 //	/authsec/authz/*      – canonical authorization and RBAC surface
@@ -207,6 +206,8 @@ func SetupRoutes(
 	rsController := platformCtrl.NewResourceServerController()
 	scopeMatrixController := platformCtrl.NewScopeMatrixController()
 	workspaceController := platformCtrl.NewWorkspaceController()
+	applicationsController := platformCtrl.NewApplicationsController()
+	scimConnectionsController := adminCtrl.NewSCIMConnectionsController()
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
@@ -257,7 +258,7 @@ func SetupRoutes(
 		scopePresets := authsec.Group("/scope-presets")
 		scopePresets.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -267,7 +268,7 @@ func SetupRoutes(
 		resourceServers := authsec.Group("/resource-servers")
 		resourceServers.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -308,6 +309,7 @@ func SetupRoutes(
 
 			// RS-scoped roles + bindings management
 			resourceServers.GET("/:id/roles", scopeMatrixController.ListRSRoles)
+			resourceServers.PUT("/:id/roles/:role_id/scope-grants", scopeMatrixController.UpdateRSRoleScopeGrants)
 			resourceServers.GET("/:id/bindings", scopeMatrixController.ListRSBindings)
 			resourceServers.POST("/:id/bindings", scopeMatrixController.CreateRSBinding)
 			resourceServers.DELETE("/:id/bindings/:binding_id", scopeMatrixController.DeleteRSBinding)
@@ -318,11 +320,91 @@ func SetupRoutes(
 		authsec.GET("/resource-servers/:id/sdk-policy", scopeMatrixController.SDKPolicy)
 		authsec.PUT("/resource-servers/:id/sdk-manifest", scopeMatrixController.PutSDKManifest)
 
+		// ────────────────────────────────────────────────────────
+		// Applications facade — preferred read/write surface.
+		// /authsec/applications is the new product-level API on top of the
+		// resource_servers physical table. The /resource-servers group above
+		// remains as a compatibility shim until SDK callers have migrated.
+		// Subresources without product-vs-protocol rename (tools, scopes,
+		// access-policy, validate, drift events, RS roles/bindings) are mounted
+		// at the same paths using the existing controllers — they're agnostic
+		// to the URL prefix.
+		// ────────────────────────────────────────────────────────
+		applications := authsec.Group("/applications")
+		applications.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			applications.POST("", applicationsController.Create)
+			applications.GET("", applicationsController.List)
+			applications.GET("/:id", applicationsController.Get)
+			applications.PUT("/:id", applicationsController.Update)
+			applications.DELETE("/:id", applicationsController.Delete)
+			applications.POST("/:id/rotate-introspection-secret", rsController.RotateIntrospectionSecret)
+
+			// OAuth client registrations — "connections" in product vocabulary.
+			applications.POST("/:id/connections", rsController.PreRegisterClient)
+			applications.GET("/:id/connections", applicationsController.ListConnections)
+			applications.DELETE("/:id/connections/:connection_id", applicationsController.RevokeConnection)
+
+			// Access policy + validate + access surface
+			applications.GET("/:id/access-policy", rsController.GetAccessPolicy)
+			applications.PUT("/:id/access-policy", rsController.UpdateAccessPolicy)
+			applications.GET("/:id/access", rsController.GetAccessPolicy) // alias used by the new UI
+			applications.POST("/:id/validate", rsController.Validate)
+			applications.POST("/:id/test", rsController.TestLogin)
+			applications.POST("/:id/launch", applicationsController.Launch)
+
+			// Scope matrix + tools (shared with /resource-servers)
+			applications.GET("/:id/scope-matrix", scopeMatrixController.GetScopeMatrix)
+			applications.POST("/:id/rescan", scopeMatrixController.Rescan)
+			applications.GET("/:id/scopes", scopeMatrixController.ListScopes)
+			applications.POST("/:id/scopes", scopeMatrixController.CreateScope)
+			applications.PUT("/:id/tool-scope-map", scopeMatrixController.UpdateToolScopeMap)
+			applications.GET("/:id/scope-resolution-preview", scopeMatrixController.ScopeResolutionPreview)
+			applications.GET("/:id/tools", scopeMatrixController.GetScopeMatrix) // tools view; consolidated with matrix for now
+			applications.POST("/:id/tools", scopeMatrixController.CreateManualTool)
+			applications.POST("/:id/tools/:tool_id/public", scopeMatrixController.MarkToolPublic)
+
+			// Setup wizard, drift, manifest
+			applications.GET("/:id/setup", scopeMatrixController.SetupChecklist)
+			applications.GET("/:id/activation-preview", scopeMatrixController.ActivationPreview)
+			applications.POST("/:id/activate", scopeMatrixController.Activate)
+			applications.GET("/:id/sdk-manifest-status", scopeMatrixController.SDKManifestStatus)
+			applications.GET("/:id/drift-events", scopeMatrixController.DriftEvents)
+			applications.POST("/:id/drift-events/:event_id/dismiss", scopeMatrixController.DismissDriftEvent)
+
+			// RS-scoped roles + bindings management
+			applications.GET("/:id/roles", scopeMatrixController.ListRSRoles)
+			applications.PUT("/:id/roles/:role_id/scope-grants", scopeMatrixController.UpdateRSRoleScopeGrants)
+			applications.GET("/:id/bindings", scopeMatrixController.ListRSBindings)
+			applications.POST("/:id/bindings", scopeMatrixController.CreateRSBinding)
+			applications.DELETE("/:id/bindings/:binding_id", scopeMatrixController.DeleteRSBinding)
+			applications.GET("/:id/eligible-users", scopeMatrixController.ListRSEndUsers)
+		}
+
+		// SCIM connection management (mint + revoke). Operators only —
+		// returns the plaintext token exactly once on Create. Drives the new
+		// /scim/v2/c/:scim_connection_id provisioning route.
+		scimConnections := authsec.Group("/scim-connections")
+		scimConnections.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			scimConnections.POST("", scimConnectionsController.Create)
+			scimConnections.GET("", scimConnectionsController.List)
+			scimConnections.DELETE("/:id", scimConnectionsController.Revoke)
+		}
+
 		// Scope management (not RS-scoped)
 		scopes := authsec.Group("/scopes")
 		scopes.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -334,7 +416,7 @@ func SetupRoutes(
 		consentGrants := authsec.Group("/consent-grants")
 		consentGrants.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -395,7 +477,7 @@ func SetupRoutes(
 		adminRBAC := uflow.Group("/admin")
 		adminRBAC.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -579,7 +661,7 @@ func SetupRoutes(
 		admin := uflow.Group("/admin")
 		admin.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -614,7 +696,7 @@ func SetupRoutes(
 		adminPlatform := uflow.Group("/admin")
 		adminPlatform.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -664,7 +746,7 @@ func SetupRoutes(
 		v2 := uflow.Group("/v2")
 		v2.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -695,7 +777,7 @@ func SetupRoutes(
 		delegationPolicies := uflow.Group("/delegation-policies")
 		delegationPolicies.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -720,7 +802,7 @@ func SetupRoutes(
 		enduserAdmin := uflow.Group("/enduser")
 		enduserAdmin.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -751,7 +833,6 @@ func SetupRoutes(
 			user.GET("/enduser/:tenant_id/:user_id", endUserController.GetEndUser)
 			user.POST("/enduser/list", endUserController.GetEndUsers)
 			user.GET("/enduser/list", endUserController.GetEndUsers)
-			user.GET("/enduser/databases", endUserController.GetTenantDatabases)
 			user.PUT("/enduser/:tenant_id/:user_id", endUserController.UpdateUser)
 			user.PUT("/enduser/:tenant_id/:user_id/status", endUserController.UpdateEndUserStatus)
 			user.POST("/enduser/active", endUserController.ActiveOrDeactiveEndUser)
@@ -802,29 +883,33 @@ func SetupRoutes(
 			scimDiscovery.GET("/ResourceTypes", scimController.GetResourceTypes)
 		}
 
-		// End-user provisioning
-		scimEndUser := uflow.Group("/scim/v2/:client_id/:project_id")
-		scimEndUser.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+		// Opaque connection-id route. The auth middleware loads
+		// scim_connections by the path id, verifies the Bearer token against
+		// the stored hash, and sets workspace/tenant context for downstream
+		// handlers. No client_id/project_id in URL — those come from the
+		// connection's default_client_id / default_project_id columns.
+		scimConn := uflow.Group("/scim/v2/c/:scim_connection_id")
+		scimConn.Use(middlewares.SCIMConnectionAuth())
 		{
-			scimEndUser.GET("/Users", scimController.ListUsers)
-			scimEndUser.GET("/Users/:id", scimController.GetUser)
-			scimEndUser.POST("/Users", scimController.CreateUser)
-			scimEndUser.PUT("/Users/:id", scimController.ReplaceUser)
-			scimEndUser.PATCH("/Users/:id", scimController.PatchUser)
-			scimEndUser.DELETE("/Users/:id", scimController.DeleteUser)
-			scimEndUser.GET("/Groups", scimController.ListGroups)
-			scimEndUser.GET("/Groups/:id", scimController.GetGroup)
-			scimEndUser.POST("/Groups", scimController.CreateGroup)
-			scimEndUser.PUT("/Groups/:id", scimController.ReplaceGroup)
-			scimEndUser.PATCH("/Groups/:id", scimController.PatchGroup)
-			scimEndUser.DELETE("/Groups/:id", scimController.DeleteGroup)
+			scimConn.GET("/Users", scimController.ListUsers)
+			scimConn.GET("/Users/:id", scimController.GetUser)
+			scimConn.POST("/Users", scimController.CreateUser)
+			scimConn.PUT("/Users/:id", scimController.ReplaceUser)
+			scimConn.PATCH("/Users/:id", scimController.PatchUser)
+			scimConn.DELETE("/Users/:id", scimController.DeleteUser)
+			scimConn.GET("/Groups", scimController.ListGroups)
+			scimConn.GET("/Groups/:id", scimController.GetGroup)
+			scimConn.POST("/Groups", scimController.CreateGroup)
+			scimConn.PUT("/Groups/:id", scimController.ReplaceGroup)
+			scimConn.PATCH("/Groups/:id", scimController.PatchGroup)
+			scimConn.DELETE("/Groups/:id", scimController.DeleteGroup)
 		}
 
 		// Admin provisioning
 		scimAdmin := uflow.Group("/scim/v2/admin")
 		scimAdmin.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -854,7 +939,7 @@ func SetupRoutes(
 		agentGuardAdmin := uflow.Group("/admin/risk-policies")
 		agentGuardAdmin.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -868,7 +953,7 @@ func SetupRoutes(
 		agentGuardSettings := uflow.Group("/admin/agent-guard")
 		agentGuardSettings.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -880,7 +965,7 @@ func SetupRoutes(
 		agentAudit := uflow.Group("/admin/agent-audit")
 		agentAudit.Use(
 			middlewares.AuthMiddleware(),
-			middlewares.Require("admin", "access"),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateTenantFromToken(),
 		)
 		{
@@ -896,12 +981,6 @@ func SetupRoutes(
 			health.GET("/tenant/:tenant_id", healthController.CheckTenantDatabase)
 			health.GET("/tenants", healthController.CheckAllTenantDatabases)
 		}
-
-		// ────────────────────────────────────────────────────
-		// Client Management (formerly clients-microservice)
-		// Served under /clientms to match the original service prefix.
-		// ────────────────────────────────────────────────────
-		registerClientsRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
 		// Hydra Manager (formerly hydra-service)
@@ -1026,91 +1105,8 @@ func SetupRoutes(
 			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/spiresvc/health"})
 		})
 		uflow.GET("/clients/clients/api/v1/health", func(c *gin.Context) {
-			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/clientms/api/v1/health"})
+			c.JSON(410, gin.H{"error": "clientms routes have been removed", "correct_url": "/authsec/applications"})
 		})
-	}
-}
-
-// registerClientsRoutes registers all client management routes under /clientms.
-// Previously served by the standalone clients-microservice.
-// Auth middleware is applied to all routes inside the /clientms group.
-func registerClientsRoutes(r gin.IRouter) {
-	redoclyHandler := func(c *gin.Context) {
-		html := `<!DOCTYPE html>
-					<html>
-					<head>
-						<title>Clients API Documentation</title>
-						<meta charset="utf-8"/>
-						<meta name="viewport" content="width=device-width, initial-scale=1">
-						<link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
-						<style>body { margin: 0; padding: 0; }</style>
-					</head>
-					<body>
-						<redoc spec-url='/clientms/swagger/doc.json'></redoc>
-						<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"> </script>
-					</body>
-					</html>`
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(200, html)
-	}
-
-	// Documentation endpoints (no auth required)
-	r.GET("/clientms/swagger", redoclyHandler)
-	r.GET("/clientms/swagger/index.html", redoclyHandler)
-	r.GET("/clientms/swagger/doc.json", ginSwagger.WrapHandler(swaggerFiles.Handler))
-
-	clientms := r.Group("/clientms")
-
-	// Health check (no auth required)
-	clientms.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "healthy", "service": "clients-microservice"})
-	})
-
-	// All API routes require JWT authentication
-	clientms.Use(middlewares.AuthMiddleware())
-	{
-		// Tenant-scoped client routes
-		tenantRoutes := clientms.Group("/tenants/:tenantId")
-		{
-			clients := tenantRoutes.Group("/clients")
-			{
-				clients.GET("/getClients", platformCtrl.GetClients)
-				clients.POST("/getClients", platformCtrl.GetClientsByTenant)
-
-				clients.GET("/:id", platformCtrl.GetClient)
-
-				// Platform selector keys for UI (pre-filled key fields per platform)
-				clients.GET("/platform-selectors", platformCtrl.GetPlatformSelectorKeys)
-
-				clients.POST("/create", platformCtrl.RegisterClient)
-
-				clients.PUT("/:id", platformCtrl.UpdateClient)
-				clients.PATCH("/:id", platformCtrl.EditClient)
-
-				clients.PATCH("/:id/soft-delete", platformCtrl.SoftDeleteClient)
-				clients.DELETE("/:id", platformCtrl.DeleteClient)
-
-				clients.POST("/delete-complete", platformCtrl.DeleteCompleteClient)
-
-				clients.PATCH("/:id/activate", platformCtrl.ActivateClient)
-				clients.PATCH("/:id/deactivate", platformCtrl.DeactivateClient)
-
-				clients.POST("/set-status", platformCtrl.SetClientStatus)
-			}
-		}
-
-		// Admin cross-tenant route (requires admin access)
-		adminClients := clientms.Group("/admin/clients")
-		adminClients.Use(middlewares.Require("clients", "admin"))
-		{
-			adminClients.GET("/", platformCtrl.GetClients)
-		}
-
-		// OOC Manager integration routes (internal service-to-service)
-		oocmgr := clientms.Group("/oocmgr")
-		{
-			oocmgr.POST("/tenant/delete-complete", platformCtrl.DeleteCompleteClient)
-		}
 	}
 }
 

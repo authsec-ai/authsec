@@ -10,25 +10,25 @@ import (
 
 // AuditEvent represents an auditable event
 type AuditEvent struct {
-	ID          uint      `json:"id" gorm:"primaryKey"`
-	RequestID   string    `json:"request_id" gorm:"index"`
-	TenantID    string    `json:"tenant_id" gorm:"index"`
-	UserID      string    `json:"user_id" gorm:"index"`
-	Action      string    `json:"action" gorm:"index"`
-	Resource    string    `json:"resource" gorm:"index"`
-	ResourceID  string    `json:"resource_id"`
-	Method      string    `json:"method"`
-	Path        string    `json:"path"`
-	UserAgent   string    `json:"user_agent"`
-	ClientIP    string    `json:"client_ip"`
-	StatusCode  int       `json:"status_code"`
-	Duration    int64     `json:"duration_ms"` // in milliseconds
-	OldValues   *string   `json:"old_values,omitempty" gorm:"type:jsonb"`
-	NewValues   *string   `json:"new_values,omitempty" gorm:"type:jsonb"`
-	Error       string    `json:"error,omitempty"`
-	Timestamp   time.Time `json:"timestamp" gorm:"index"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	RequestID  string    `json:"request_id" gorm:"index"`
+	TenantID   string    `json:"tenant_id" gorm:"index"`
+	UserID     string    `json:"user_id" gorm:"index"`
+	Action     string    `json:"action" gorm:"index"`
+	Resource   string    `json:"resource" gorm:"index"`
+	ResourceID string    `json:"resource_id"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	UserAgent  string    `json:"user_agent"`
+	ClientIP   string    `json:"client_ip"`
+	StatusCode int       `json:"status_code"`
+	Duration   int64     `json:"duration_ms"` // in milliseconds
+	OldValues  *string   `json:"old_values,omitempty" gorm:"type:jsonb"`
+	NewValues  *string   `json:"new_values,omitempty" gorm:"type:jsonb"`
+	Error      string    `json:"error,omitempty"`
+	Timestamp  time.Time `json:"timestamp" gorm:"index"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // AuditLogger handles audit logging operations

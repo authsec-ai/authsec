@@ -23,16 +23,16 @@ const (
 
 // MCPTool represents a tool discovered from an MCP server via tools/list.
 type MCPTool struct {
-	ID               uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID         uuid.UUID       `json:"tenant_id" gorm:"type:uuid;not null"`
-	ResourceServerID uuid.UUID       `json:"resource_server_id" gorm:"type:uuid;not null;uniqueIndex:idx_mcp_tools_rs_name"`
-	Name             string          `json:"name" gorm:"type:text;not null;uniqueIndex:idx_mcp_tools_rs_name"`
-	Title            string          `json:"title" gorm:"type:text"`
-	Description      string          `json:"description" gorm:"type:text"`
-	InputSchema      json.RawMessage `json:"input_schema" gorm:"type:jsonb"`
-	Annotations      json.RawMessage `json:"annotations" gorm:"type:jsonb"`
-	DiscoveredAt     time.Time       `json:"discovered_at" gorm:"not null;default:now()"`
-	LastScanGeneration int           `json:"last_scan_generation" gorm:"not null;default:0"`
+	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	TenantID           uuid.UUID       `json:"tenant_id" gorm:"type:uuid;not null"`
+	ResourceServerID   uuid.UUID       `json:"resource_server_id" gorm:"type:uuid;not null;uniqueIndex:idx_mcp_tools_rs_name"`
+	Name               string          `json:"name" gorm:"type:text;not null;uniqueIndex:idx_mcp_tools_rs_name"`
+	Title              string          `json:"title" gorm:"type:text"`
+	Description        string          `json:"description" gorm:"type:text"`
+	InputSchema        json.RawMessage `json:"input_schema" gorm:"type:jsonb"`
+	Annotations        json.RawMessage `json:"annotations" gorm:"type:jsonb"`
+	DiscoveredAt       time.Time       `json:"discovered_at" gorm:"not null;default:now()"`
+	LastScanGeneration int             `json:"last_scan_generation" gorm:"not null;default:0"`
 
 	// Inventory source: 'mcp_scan' | 'sdk_manifest' | 'manual'
 	InventorySource string `json:"inventory_source" gorm:"type:text;not null;default:'mcp_scan'"`
@@ -61,7 +61,7 @@ type MCPToolScopeMap struct {
 	ScopeID     uuid.UUID `json:"scope_id" gorm:"type:uuid;primaryKey"`
 	AutoMatched bool      `json:"auto_matched" gorm:"not null;default:true"`
 	// Source: 'sdk_suggested' (advisory only) | 'admin_override' (runtime-effective).
-	Source      string    `json:"source" gorm:"type:text;not null;default:'admin_override'"`
+	Source string `json:"source" gorm:"type:text;not null;default:'admin_override'"`
 }
 
 func (MCPToolScopeMap) TableName() string {
@@ -70,16 +70,16 @@ func (MCPToolScopeMap) TableName() string {
 
 // MCPToolResponse is the API response for a discovered tool.
 type MCPToolResponse struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Title           string            `json:"title"`
-	Description     string            `json:"description"`
-	InputSchema     json.RawMessage   `json:"input_schema,omitempty"`
-	Annotations     json.RawMessage   `json:"annotations,omitempty"`
-	Scopes          []ScopeMapEntry   `json:"scopes"`
-	InventorySource string            `json:"inventory_source"`
-	IsPublic        bool              `json:"is_public"`
-	SuggestedScopes []string          `json:"suggested_scopes,omitempty"`
+	ID              string          `json:"id"`
+	Name            string          `json:"name"`
+	Title           string          `json:"title"`
+	Description     string          `json:"description"`
+	InputSchema     json.RawMessage `json:"input_schema,omitempty"`
+	Annotations     json.RawMessage `json:"annotations,omitempty"`
+	Scopes          []ScopeMapEntry `json:"scopes"`
+	InventorySource string          `json:"inventory_source"`
+	IsPublic        bool            `json:"is_public"`
+	SuggestedScopes []string        `json:"suggested_scopes,omitempty"`
 }
 
 // ScopeMapEntry represents a scope mapped to a tool in the scope matrix.

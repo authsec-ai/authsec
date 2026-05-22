@@ -75,11 +75,7 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var agents []agentClient
 	query := tenantDB.Table("clients").
@@ -116,11 +112,7 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var agent agentClient
 	result := tenantDB.Table("clients").
@@ -158,11 +150,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Look up the agent client
 	var agent agentClient
@@ -265,11 +253,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Look up the agent
 	var agent agentClient
@@ -333,11 +317,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		req.TTLSeconds = 3600
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	// Look up the agent client
 	var agent agentClient
@@ -435,18 +415,21 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		policyID = &policy.ID
 	}
 
+	applicationID := lookupApplicationIDForLegacyClient(clientUUID)
+
 	upsertToken := models.DelegationToken{
-		TenantID:    *tenantID,
-		ClientID:    clientUUID,
-		PolicyID:    policyID,
-		Token:       jwtResp.Token,
-		SpiffeID:    jwtResp.SpiffeID,
-		Permissions: permsJSON,
-		Audience:    audJSON,
-		ExpiresAt:   expiresAt,
-		DelegatedBy: userUUID,
-		TTLSeconds:  finalTTL,
-		Status:      "active",
+		TenantID:      *tenantID,
+		ClientID:      clientUUID,
+		ApplicationID: applicationID,
+		PolicyID:      policyID,
+		Token:         jwtResp.Token,
+		SpiffeID:      jwtResp.SpiffeID,
+		Permissions:   permsJSON,
+		Audience:      audJSON,
+		ExpiresAt:     expiresAt,
+		DelegatedBy:   userUUID,
+		TTLSeconds:    finalTTL,
+		Status:        "active",
 	}
 
 	// Upsert: update if (tenant_id, client_id) exists, else insert
@@ -457,16 +440,17 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	if upsertResult.Error == nil {
 		// Update existing row
 		tenantDB.Model(&existing).Updates(map[string]interface{}{
-			"policy_id":    policyID,
-			"token":        jwtResp.Token,
-			"spiffe_id":    jwtResp.SpiffeID,
-			"permissions":  permsJSON,
-			"audience":     audJSON,
-			"expires_at":   expiresAt,
-			"delegated_by": userUUID,
-			"ttl_seconds":  finalTTL,
-			"status":       "active",
-			"updated_at":   time.Now(),
+			"policy_id":      policyID,
+			"application_id": applicationID,
+			"token":          jwtResp.Token,
+			"spiffe_id":      jwtResp.SpiffeID,
+			"permissions":    permsJSON,
+			"audience":       audJSON,
+			"expires_at":     expiresAt,
+			"delegated_by":   userUUID,
+			"ttl_seconds":    finalTTL,
+			"status":         "active",
+			"updated_at":     time.Now(),
 		})
 		log.Printf("[AgentController] Delegation token updated for agent %s", clientID)
 	} else {

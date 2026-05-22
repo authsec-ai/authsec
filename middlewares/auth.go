@@ -10,7 +10,6 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	authz "github.com/authsec-ai/authsec/internal/authz"
-	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -997,24 +996,35 @@ func checkPermissions(c *gin.Context, userInfo *UserInfo, resource, method strin
 		return nil
 	}
 
-	// If database is available, fall back to database-based checking
+	// Canonical fallback: query role_bindings → roles → role_permissions →
+	// permissions filtered by the workspace from the JWT (workspace_id falls
+	// back to tenant_id during the rollout). The legacy resource_methods /
+	// resources tables are gone.
 	if config.DB != nil {
-		// Parse tenant ID if present
-		var tenantID *uuid.UUID
-		if userInfo.TenantID != "" {
-			if id, err := uuid.Parse(userInfo.TenantID); err == nil {
-				tenantID = &id
+		workspaceIDStr := userInfo.WorkspaceID
+		if workspaceIDStr == "" {
+			workspaceIDStr = userInfo.TenantID
+		}
+		if workspaceIDStr != "" && userInfo.UserID != "" {
+			workspaceID, wErr := uuid.Parse(workspaceIDStr)
+			userID, uErr := uuid.Parse(userInfo.UserID)
+			if wErr == nil && uErr == nil {
+				var count int64
+				if err := config.DB.Table("role_bindings rb").
+					Joins("JOIN roles r ON r.id = rb.role_id").
+					Joins("JOIN role_permissions rp ON rp.role_id = r.id").
+					Joins("JOIN permissions p ON p.id = rp.permission_id").
+					Where("rb.user_id = ? AND rb.tenant_id = ?", userID, workspaceID).
+					Where("p.tenant_id = ? OR p.tenant_id IS NULL", workspaceID).
+					Where("p.resource = ? AND p.action = ?", resource, action).
+					Where("rb.expires_at IS NULL OR rb.expires_at > NOW()").
+					Count(&count).Error; err != nil {
+					return fmt.Errorf("permission check failed: %v", err)
+				}
+				if count > 0 {
+					return nil
+				}
 			}
-		}
-
-		// Check resource method access using the RBAC system
-		hasAccess, err := models.CheckResourceMethodAccess(config.DB, userInfo.Roles, method, resource, tenantID)
-		if err != nil {
-			return fmt.Errorf("permission check failed: %v", err)
-		}
-
-		if hasAccess {
-			return nil
 		}
 	}
 

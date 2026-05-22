@@ -124,11 +124,7 @@ func (pc *PermissionController) RegisterAtomicPermissionEndUser(c *gin.Context) 
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var req PermissionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -266,11 +262,7 @@ func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	permIDStr := c.Param("id")
 	permID, err := uuid.Parse(permIDStr)
@@ -392,11 +384,7 @@ func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 
 	var req PermissionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -485,11 +473,7 @@ func (pc *PermissionController) ListPermissionsEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	resource := c.Query("resource")
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -640,11 +624,7 @@ func (pc *PermissionController) ShowResourcesEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
+	tenantDB := config.DB
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})

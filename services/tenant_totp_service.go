@@ -13,7 +13,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 
 	"github.com/google/uuid"
@@ -163,12 +162,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 		}, nil
 	}
 
-	// Step 4: Connect to tenant database
-	tenantIDStr := tenantUUID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	// Step 5: Look up user in tenant database
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
@@ -230,12 +224,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 
 // RegisterTenantTOTPDevice registers a new TOTP device for tenant user
 func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegistrationRequest, userID, tenantID uuid.UUID, email string) (*models.TenantTOTPRegistrationResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -316,12 +305,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 
 // ConfirmTenantTOTPDevice confirms TOTP device registration after QR code scan
 func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegistrationConfirmRequest, userID, tenantID uuid.UUID) (*models.TenantTOTPRegistrationConfirmResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -360,12 +344,7 @@ func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegist
 
 // GetTenantTOTPDevices retrieves all TOTP devices for a tenant user
 func (s *TenantTOTPService) GetTenantTOTPDevices(userID, tenantID uuid.UUID) (*models.TenantTOTPDeviceListResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -385,12 +364,7 @@ func (s *TenantTOTPService) GetTenantTOTPDevices(userID, tenantID uuid.UUID) (*m
 
 // DeleteTenantTOTPDevice deletes a TOTP device for tenant user
 func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceDeleteRequest, userID, tenantID uuid.UUID) (*models.TenantTOTPDeviceDeleteResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
@@ -439,12 +413,7 @@ func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceD
 
 // SetTenantPrimaryTOTPDevice sets a TOTP device as primary for tenant user
 func (s *TenantTOTPService) SetTenantPrimaryTOTPDevice(req *models.TenantTOTPDeviceDeleteRequest, userID, tenantID uuid.UUID) (*models.TenantTOTPDeviceDeleteResponse, error) {
-	// Connect to tenant database
-	tenantIDStr := tenantID.String()
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
+	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 

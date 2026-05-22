@@ -101,10 +101,10 @@ type AgentActionRequest struct {
 	SessionID      string `json:"session_id,omitempty" gorm:"size:255;index"`
 
 	// Action details
-	Action   string     `json:"action" gorm:"size:255;not null"`
-	Resource string     `json:"resource" gorm:"size:255;not null"`
-	Detail   string     `json:"detail,omitempty" gorm:"type:text"`
-	Metadata JSONBMap   `json:"metadata" gorm:"type:jsonb;default:'{}'"`
+	Action   string   `json:"action" gorm:"size:255;not null"`
+	Resource string   `json:"resource" gorm:"size:255;not null"`
+	Detail   string   `json:"detail,omitempty" gorm:"type:text"`
+	Metadata JSONBMap `json:"metadata" gorm:"type:jsonb;default:'{}'"`
 
 	// Risk evaluation result
 	RiskScore       int        `json:"risk_score" gorm:"not null"`
@@ -235,9 +235,9 @@ type RiskFactor struct {
 // RiskEvaluation is the output of the risk engine
 type RiskEvaluation struct {
 	Score             int          `json:"score"`
-	Level             string       `json:"level"`            // low, medium, high, critical
+	Level             string       `json:"level"` // low, medium, high, critical
 	Factors           []RiskFactor `json:"factors"`
-	ApprovalType      string       `json:"approval_type"`    // auto, single, multi
+	ApprovalType      string       `json:"approval_type"` // auto, single, multi
 	RequiredApprovals int          `json:"required_approvals"`
 	MatchedPolicyID   *uuid.UUID   `json:"matched_policy_id,omitempty"`
 }
@@ -270,12 +270,12 @@ type AgentActionEvaluateRequest struct {
 // AgentActionEvaluateResponse - Returned after evaluation
 type AgentActionEvaluateResponse struct {
 	ActionReqID      string `json:"action_req_id"`
-	Status           string `json:"status"`                  // auto_approved, pending
+	Status           string `json:"status"` // auto_approved, pending
 	RiskScore        int    `json:"risk_score"`
 	RiskLevel        string `json:"risk_level"`
-	ApprovalType     string `json:"approval_type"`           // auto, single, multi
-	ExpiresIn        int    `json:"expires_in,omitempty"`    // seconds until expiry (if pending)
-	Interval         int    `json:"interval,omitempty"`      // polling interval (if pending)
+	ApprovalType     string `json:"approval_type"`        // auto, single, multi
+	ExpiresIn        int    `json:"expires_in,omitempty"` // seconds until expiry (if pending)
+	Interval         int    `json:"interval,omitempty"`   // polling interval (if pending)
 	Message          string `json:"message,omitempty"`
 	Error            string `json:"error,omitempty"`
 	ErrorDescription string `json:"error_description,omitempty"`
@@ -289,7 +289,7 @@ type AgentActionStatusRequest struct {
 // AgentActionStatusResponse - Current status of the action request
 type AgentActionStatusResponse struct {
 	ActionReqID      string `json:"action_req_id"`
-	Status           string `json:"status"`           // pending, auto_approved, approved, denied, expired, timed_out
+	Status           string `json:"status"` // pending, auto_approved, approved, denied, expired, timed_out
 	RiskScore        int    `json:"risk_score"`
 	RiskLevel        string `json:"risk_level"`
 	Decision         string `json:"decision,omitempty"` // approved, denied (final)
@@ -325,13 +325,13 @@ type RiskPolicyCreateRequest struct {
 	ResourcePattern    string `json:"resource_pattern,omitempty"`
 	EnvironmentPattern string `json:"environment_pattern,omitempty"`
 
-	BaseScore          int  `json:"base_score"`
-	ScopeBulkThreshold int  `json:"scope_bulk_threshold,omitempty"`
-	ScopeBulkModifier  int  `json:"scope_bulk_modifier,omitempty"`
-	PIIModifier        int  `json:"pii_modifier,omitempty"`
-	FinancialModifier  int  `json:"financial_modifier,omitempty"`
-	OffHoursModifier   int  `json:"off_hours_modifier,omitempty"`
-	FirstTimeModifier  int  `json:"first_time_modifier,omitempty"`
+	BaseScore          int `json:"base_score"`
+	ScopeBulkThreshold int `json:"scope_bulk_threshold,omitempty"`
+	ScopeBulkModifier  int `json:"scope_bulk_modifier,omitempty"`
+	PIIModifier        int `json:"pii_modifier,omitempty"`
+	FinancialModifier  int `json:"financial_modifier,omitempty"`
+	OffHoursModifier   int `json:"off_hours_modifier,omitempty"`
+	FirstTimeModifier  int `json:"first_time_modifier,omitempty"`
 
 	AutoApproveBelow          *int `json:"auto_approve_below,omitempty"`
 	RequireApprovalAbove      *int `json:"require_approval_above,omitempty"`
@@ -356,9 +356,9 @@ type RiskPolicyUpdateRequest struct {
 	OffHoursModifier   *int `json:"off_hours_modifier,omitempty"`
 	FirstTimeModifier  *int `json:"first_time_modifier,omitempty"`
 
-	AutoApproveBelow          *int  `json:"auto_approve_below,omitempty"`
-	RequireApprovalAbove      *int  `json:"require_approval_above,omitempty"`
-	RequireMultiApprovalAbove *int  `json:"require_multi_approval_above,omitempty"`
+	AutoApproveBelow          *int `json:"auto_approve_below,omitempty"`
+	RequireApprovalAbove      *int `json:"require_approval_above,omitempty"`
+	RequireMultiApprovalAbove *int `json:"require_multi_approval_above,omitempty"`
 
 	IsActive *bool `json:"is_active,omitempty"`
 	Priority *int  `json:"priority,omitempty"`

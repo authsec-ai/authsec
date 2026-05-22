@@ -7,6 +7,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/google/uuid"
 )
 
 // getUserRoleNames queries role_bindings to get all distinct role names for a user in a tenant.
@@ -42,20 +43,16 @@ func getUserRoleNames(userID, tenantID string) ([]string, error) {
 	return roleNames, nil
 }
 
-// findDelegationPolicy looks up an enabled delegation policy matching any of the user's roles
-// and the requested agent_type within a tenant. Queries the tenant's database.
+// findDelegationPolicy looks up an enabled delegation policy matching any of
+// the user's roles and the requested agent_type within a workspace. Single-DB
+// collapse: tenant_id is now a row predicate on config.DB.
 func findDelegationPolicy(tenantID string, roleNames []string, agentType string) (*models.DelegationPolicy, error) {
 	if len(roleNames) == 0 {
 		return nil, fmt.Errorf("user has no roles")
 	}
 
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("connect to tenant database: %w", err)
-	}
-
 	var policy models.DelegationPolicy
-	result := tenantDB.
+	result := config.DB.
 		Where("tenant_id::text = ? AND role_name IN ? AND agent_type = ? AND enabled = true",
 			tenantID, roleNames, agentType).
 		First(&policy)
@@ -99,12 +96,33 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 	return perms, nil
 }
 
-// validateClientActive checks that a client_id exists and is active in the clients table.
-// Queries the tenant's database where client records are stored.
+// lookupApplicationIDForLegacyClient resolves a legacy clients.id to its
+// matching resource_servers.id via the legacy_client_id mapping populated by
+// migration 118. Returns nil when no Application has been backfilled for the
+// given clients row — callers should fall back to ClientID during transition.
+func lookupApplicationIDForLegacyClient(clientID uuid.UUID) *uuid.UUID {
+	if clientID == uuid.Nil {
+		return nil
+	}
+	var appID uuid.UUID
+	row := config.DB.Table("resource_servers").
+		Select("id").
+		Where("legacy_client_id = ?", clientID).
+		Limit(1).
+		Row()
+	if err := row.Scan(&appID); err != nil {
+		return nil
+	}
+	return &appID
+}
+
+// validateClientActive checks that a client_id exists and is active in the
+// clients table for the given tenant/workspace. Single-DB collapse: queries
+// run against the shared config.DB connection.
 func validateClientActive(clientID, tenantID string) error {
-	tenantDB, err := config.GetTenantDatabase(tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
+	masterDB := config.GetDatabase()
+	if masterDB == nil {
+		return fmt.Errorf("master database not initialized")
 	}
 
 	query := `
@@ -116,8 +134,7 @@ func validateClientActive(clientID, tenantID string) error {
 		LIMIT 1
 	`
 	var id string
-	err = tenantDB.DB.QueryRow(query, clientID, tenantID).Scan(&id)
-	if err != nil {
+	if err := masterDB.DB.QueryRow(query, clientID, tenantID).Scan(&id); err != nil {
 		return fmt.Errorf("client %s not found or not active in tenant %s", clientID, tenantID)
 	}
 	return nil

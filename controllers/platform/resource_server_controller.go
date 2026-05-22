@@ -539,8 +539,8 @@ func (ctrl *ResourceServerController) TestLogin(c *gin.Context) {
 			"status": rsStatus,
 		},
 		"oauth": gin.H{
-			"state":          rsState,
-			"ready_since":    rs.SetupCompletedAt,
+			"state":       rsState,
+			"ready_since": rs.SetupCompletedAt,
 		},
 		"sdk_enforcement": gin.H{
 			"sdk_policy_state": sdkPolicyState,

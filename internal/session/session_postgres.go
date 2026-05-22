@@ -31,8 +31,6 @@ func NewPostgreSQLSessionManager(db *gorm.DB, migrationsDir string) *PostgreSQLS
 	return manager
 }
 
-
-
 // Save stores a WebAuthn session in PostgreSQL with 10-minute expiration
 func (s *PostgreSQLSessionManager) Save(key string, data *webauthn.SessionData) error {
 	// Serialize extensions if present
@@ -82,7 +80,7 @@ func (s *PostgreSQLSessionManager) Save(key string, data *webauthn.SessionData) 
 
 	// Delete existing session first, then insert new one (workaround for missing unique constraint)
 	s.db.Exec("DELETE FROM webauthn_sessions WHERE session_key = ?", session.SessionKey)
-	
+
 	result := s.db.Exec(`
 		INSERT INTO webauthn_sessions (session_key, challenge, user_id, user_verification, extensions, cred_params, allowed_credential_ids, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

@@ -15,10 +15,10 @@ import (
 // authsec uses it to notify mt-plugin about new admin registrations and
 // to query multi-tenant state when the plugin is available.
 type Client struct {
-	addr      string
-	conn      *grpc.ClientConn
+	addr       string
+	conn       *grpc.ClientConn
 	grpcClient pb.TenantPluginClient
-	available atomic.Bool
+	available  atomic.Bool
 }
 
 // NewClient creates a new mt-plugin gRPC client.

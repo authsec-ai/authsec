@@ -19,7 +19,6 @@ import (
 	oocmgrdto "github.com/authsec-ai/authsec/internal/oocmgr/dto"
 	oocmgrrepo "github.com/authsec-ai/authsec/internal/oocmgr/repository"
 	oocmgrsvc "github.com/authsec-ai/authsec/internal/oocmgr/service"
-	"github.com/authsec-ai/authsec/middlewares"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -112,12 +111,12 @@ func (s *OocmgrSAMLProvider) BeforeUpdate(_ *gorm.DB) error {
 // ===== REQUEST STRUCTS =====
 
 type oocmgrCompleteOIDCConfigRequest struct {
-	TenantID      string                      `json:"tenant_id"`
-	OrgID         string                      `json:"org_id"`
-	TenantName    string                      `json:"tenant_name"`
-	TenantClient  oocmgrTenantClientConfig    `json:"tenant_client"`
-	OIDCProviders []oocmgrOIDCProviderConfig  `json:"oidc_providers"`
-	CreatedBy     string                      `json:"created_by"`
+	TenantID      string                     `json:"tenant_id"`
+	OrgID         string                     `json:"org_id"`
+	TenantName    string                     `json:"tenant_name"`
+	TenantClient  oocmgrTenantClientConfig   `json:"tenant_client"`
+	OIDCProviders []oocmgrOIDCProviderConfig `json:"oidc_providers"`
+	CreatedBy     string                     `json:"created_by"`
 }
 
 type oocmgrTenantClientConfig struct {
@@ -311,8 +310,8 @@ func (ac *OocmgrController) CompleteOIDCConfiguration(c *gin.Context) {
 		providerHydraClient := &oocmgrdto.TenantHydraClient{
 			OrgID: req.OrgID, TenantID: req.TenantID, TenantName: req.TenantName,
 			HydraClientID: oidcClientID, HydraClientSecret: "not-used-for-oidc-config",
-			ClientName:   fmt.Sprintf("%s %s OIDC Config", req.TenantName, provider.DisplayName),
-			ClientType:   "oidc_provider", ProviderName: provider.ProviderName,
+			ClientName: fmt.Sprintf("%s %s OIDC Config", req.TenantName, provider.DisplayName),
+			ClientType: "oidc_provider", ProviderName: provider.ProviderName,
 			IsActive: provider.IsActive, CreatedBy: req.CreatedBy, UpdatedBy: req.CreatedBy,
 		}
 		if err := ac.tenantHydraClientRepo.Create(providerHydraClient); err != nil {
@@ -602,7 +601,7 @@ func (ac *OocmgrController) DeleteOIDCProvider(c *gin.Context) {
 	log.Printf("[oocmgr] DeleteOIDCProvider provider=%s tenant=%s", req.ProviderName, req.TenantID)
 	c.JSON(http.StatusOK, oocmgrdto.MessageResponse{
 		Message: "OIDC provider deleted successfully", Success: true,
-		Data: map[string]interface{}{"provider_name": req.ProviderName, "deleted_at": time.Now()},
+		Data:      map[string]interface{}{"provider_name": req.ProviderName, "deleted_at": time.Now()},
 		Timestamp: time.Now(),
 	})
 }
@@ -636,13 +635,7 @@ func (ac *OocmgrController) EditConfig(c *gin.Context) {
 		return
 	}
 
-	tenantID := req.TenantID
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, oocmgrdto.ErrorResponse{Error: "Failed to connect to tenant database", Message: err.Error(), Code: http.StatusInternalServerError, Timestamp: time.Now()})
-		return
-	}
-	c.Set("tenant_db", tenantDB)
+	c.Set("tenant_db", config.DB)
 
 	updatedConfig, err := ac.authService.EditConfig(c, &req)
 	if err != nil {
@@ -722,24 +715,24 @@ func (ac *OocmgrController) GetProviderTemplates(c *gin.Context) {
 	templates := map[string]map[string]interface{}{
 		"github": {
 			"provider_name": "github", "display_name": "GitHub",
-			"auth_url": "https://github.com/login/oauth/authorize",
-			"token_url": "https://github.com/login/oauth/access_token",
+			"auth_url":      "https://github.com/login/oauth/authorize",
+			"token_url":     "https://github.com/login/oauth/access_token",
 			"user_info_url": "https://api.github.com/user",
-			"scopes": []string{"user:email"}, "description": "GitHub OAuth integration",
+			"scopes":        []string{"user:email"}, "description": "GitHub OAuth integration",
 		},
 		"google": {
 			"provider_name": "google", "display_name": "Google",
-			"auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
-			"token_url": "https://oauth2.googleapis.com/token",
+			"auth_url":      "https://accounts.google.com/o/oauth2/v2/auth",
+			"token_url":     "https://oauth2.googleapis.com/token",
 			"user_info_url": "https://www.googleapis.com/oauth2/v2/userinfo",
-			"scopes": []string{"openid", "profile", "email"}, "description": "Google OAuth 2.0 integration",
+			"scopes":        []string{"openid", "profile", "email"}, "description": "Google OAuth 2.0 integration",
 		},
 		"linkedin": {
 			"provider_name": "linkedin", "display_name": "LinkedIn",
-			"auth_url": "https://www.linkedin.com/oauth/v2/authorization",
-			"token_url": "https://www.linkedin.com/oauth/v2/accessToken",
+			"auth_url":      "https://www.linkedin.com/oauth/v2/authorization",
+			"token_url":     "https://www.linkedin.com/oauth/v2/accessToken",
 			"user_info_url": "https://api.linkedin.com/v2/me",
-			"scopes": []string{"r_liteprofile", "r_emailaddress"}, "description": "LinkedIn OAuth 2.0 integration",
+			"scopes":        []string{"r_liteprofile", "r_emailaddress"}, "description": "LinkedIn OAuth 2.0 integration",
 		},
 		"microsoft": {
 			"provider_name": "microsoft", "display_name": "Microsoft",
@@ -752,55 +745,55 @@ func (ac *OocmgrController) GetProviderTemplates(c *gin.Context) {
 			"description":   "Microsoft Azure AD OAuth 2.0 integration (multi-tenant + personal accounts)",
 			"authority_types": map[string]map[string]string{
 				"common": {
-					"label": "Accounts in any organizational directory and personal Microsoft accounts",
-					"auth_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-					"token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+					"label":      "Accounts in any organizational directory and personal Microsoft accounts",
+					"auth_url":   "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+					"token_url":  "https://login.microsoftonline.com/common/oauth2/v2.0/token",
 					"issuer_url": "https://login.microsoftonline.com/common/v2.0",
-					"jwks_url": "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+					"jwks_url":   "https://login.microsoftonline.com/common/discovery/v2.0/keys",
 				},
 				"organizations": {
-					"label": "Accounts in any organizational directory",
-					"auth_url": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-					"token_url": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+					"label":      "Accounts in any organizational directory",
+					"auth_url":   "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+					"token_url":  "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
 					"issuer_url": "https://login.microsoftonline.com/organizations/v2.0",
-					"jwks_url": "https://login.microsoftonline.com/organizations/discovery/v2.0/keys",
+					"jwks_url":   "https://login.microsoftonline.com/organizations/discovery/v2.0/keys",
 				},
 				"consumers": {
-					"label": "Personal Microsoft accounts only",
-					"auth_url": "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
-					"token_url": "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+					"label":      "Personal Microsoft accounts only",
+					"auth_url":   "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+					"token_url":  "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
 					"issuer_url": "https://login.microsoftonline.com/consumers/v2.0",
-					"jwks_url": "https://login.microsoftonline.com/consumers/discovery/v2.0/keys",
+					"jwks_url":   "https://login.microsoftonline.com/consumers/discovery/v2.0/keys",
 				},
 				"tenant_specific": {
-					"label": "Accounts in this organizational directory only (single tenant)",
-					"auth_url": "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/authorize",
-					"token_url": "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+					"label":      "Accounts in this organizational directory only (single tenant)",
+					"auth_url":   "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/authorize",
+					"token_url":  "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
 					"issuer_url": "https://login.microsoftonline.com/{tenant_id}/v2.0",
-					"jwks_url": "https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys",
+					"jwks_url":   "https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys",
 				},
 			},
 		},
 		"okta": {
 			"provider_name": "okta", "display_name": "Okta",
-			"auth_url": "https://{your-okta-domain}/oauth2/v1/authorize",
-			"token_url": "https://{your-okta-domain}/oauth2/v1/token",
+			"auth_url":      "https://{your-okta-domain}/oauth2/v1/authorize",
+			"token_url":     "https://{your-okta-domain}/oauth2/v1/token",
 			"user_info_url": "https://{your-okta-domain}/oauth2/v1/userinfo",
-			"scopes": []string{"openid", "profile", "email"}, "description": "Okta OAuth 2.0 integration",
+			"scopes":        []string{"openid", "profile", "email"}, "description": "Okta OAuth 2.0 integration",
 		},
 		"auth0": {
 			"provider_name": "auth0", "display_name": "Auth0",
-			"auth_url": "https://{your-auth0-domain}/authorize",
-			"token_url": "https://{your-auth0-domain}/oauth/token",
+			"auth_url":      "https://{your-auth0-domain}/authorize",
+			"token_url":     "https://{your-auth0-domain}/oauth/token",
 			"user_info_url": "https://{your-auth0-domain}/userinfo",
-			"scopes": []string{"openid", "profile", "email"}, "description": "Auth0 OAuth 2.0 integration",
+			"scopes":        []string{"openid", "profile", "email"}, "description": "Auth0 OAuth 2.0 integration",
 		},
 		"custom": {
 			"provider_name": "custom-provider", "display_name": "Custom Provider",
-			"auth_url": "https://your-provider.com/oauth/authorize",
-			"token_url": "https://your-provider.com/oauth/token",
+			"auth_url":      "https://your-provider.com/oauth/authorize",
+			"token_url":     "https://your-provider.com/oauth/token",
 			"user_info_url": "https://your-provider.com/oauth/userinfo",
-			"scopes": []string{"openid", "profile", "email"}, "description": "Template for custom OAuth 2.0 provider",
+			"scopes":        []string{"openid", "profile", "email"}, "description": "Template for custom OAuth 2.0 provider",
 		},
 	}
 
@@ -890,11 +883,7 @@ func (ac *OocmgrController) GetClientsByTenant(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &req.TenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, oocmgrdto.ErrorResponse{Error: "Failed to connect to tenant database", Message: err.Error(), Code: http.StatusInternalServerError, Timestamp: time.Now()})
-		return
-	}
+	tenantDB := config.DB
 
 	type clientRow struct {
 		ClientID string `gorm:"column:client_id"`
@@ -1004,9 +993,9 @@ func (ac *OocmgrController) DeleteCompleteTenantConfig(c *gin.Context) {
 				if err := ac.deleteHydraClient(client.ClientID); err != nil {
 					if !req.Force {
 						c.JSON(http.StatusInternalServerError, oocmgrdto.ErrorResponse{
-							Error: "Failed to delete client",
+							Error:   "Failed to delete client",
 							Message: fmt.Sprintf("Failed to delete client %s: %v", client.ClientID, err),
-							Code: http.StatusInternalServerError, Timestamp: time.Now(),
+							Code:    http.StatusInternalServerError, Timestamp: time.Now(),
 						})
 						return
 					}
@@ -1104,7 +1093,7 @@ func (ac *OocmgrController) ListAllTenants(c *gin.Context) {
 
 	c.JSON(http.StatusOK, oocmgrdto.MessageResponse{
 		Message: "Tenants listed successfully", Success: true,
-		Data: map[string]interface{}{"tenants": tenantList, "count": len(tenantList)},
+		Data:      map[string]interface{}{"tenants": tenantList, "count": len(tenantList)},
 		Timestamp: time.Now(),
 	})
 }
@@ -1144,12 +1133,12 @@ func (ac *OocmgrController) CheckTenantExists(c *gin.Context) {
 
 func (ac *OocmgrController) UpdateCompleteTenantConfig(c *gin.Context) {
 	var req struct {
-		TenantID      string                      `json:"tenant_id"`
-		OrgID         string                      `json:"org_id"`
-		TenantName    *string                     `json:"tenant_name,omitempty"`
-		TenantClient  *oocmgrTenantClientConfig   `json:"tenant_client,omitempty"`
-		OIDCProviders []oocmgrOIDCProviderConfig  `json:"oidc_providers,omitempty"`
-		UpdatedBy     string                      `json:"updated_by"`
+		TenantID      string                     `json:"tenant_id"`
+		OrgID         string                     `json:"org_id"`
+		TenantName    *string                    `json:"tenant_name,omitempty"`
+		TenantClient  *oocmgrTenantClientConfig  `json:"tenant_client,omitempty"`
+		OIDCProviders []oocmgrOIDCProviderConfig `json:"oidc_providers,omitempty"`
+		UpdatedBy     string                     `json:"updated_by"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "Invalid request", Message: err.Error(), Code: http.StatusBadRequest, Timestamp: time.Now()})
@@ -1214,7 +1203,7 @@ func (ac *OocmgrController) UpdateCompleteTenantConfig(c *gin.Context) {
 		for _, provider := range req.OIDCProviders {
 			oidcClientID := fmt.Sprintf("%s-%s-oidc", req.TenantID, oocmgrNormalizeProviderName(provider.ProviderName))
 			oidcClient := oocmgrHydraClient{
-				ClientID: oidcClientID,
+				ClientID:   oidcClientID,
 				ClientName: fmt.Sprintf("%s %s OIDC Config", tenantName, provider.DisplayName),
 				GrantTypes: []string{"client_credentials"},
 				Metadata: map[string]interface{}{
@@ -1271,7 +1260,7 @@ func (ac *OocmgrController) UpdateCompleteTenantConfig(c *gin.Context) {
 		response["tenant_client"] = map[string]interface{}{
 			"client_id": updatedMainClient.ClientID, "client_name": updatedMainClient.ClientName,
 			"redirect_uris": updatedMainClient.RedirectURIs,
-			"scopes": strings.Split(updatedMainClient.Scope, " "), "updated": true,
+			"scopes":        strings.Split(updatedMainClient.Scope, " "), "updated": true,
 		}
 	}
 	if len(req.OIDCProviders) > 0 {
@@ -1370,9 +1359,9 @@ func (ac *OocmgrController) CreateBaseTenantClient(c *gin.Context) {
 	existingClient, _ := ac.getHydraClient(req.ClientID)
 	if existingClient != nil {
 		c.JSON(http.StatusConflict, oocmgrdto.ErrorResponse{
-			Error: "Tenant client already exists",
+			Error:   "Tenant client already exists",
 			Message: fmt.Sprintf("Client with ID %s already exists in Hydra", req.ClientID),
-			Code: http.StatusConflict, Timestamp: time.Now(),
+			Code:    http.StatusConflict, Timestamp: time.Now(),
 		})
 		return
 	}
@@ -1389,15 +1378,15 @@ func (ac *OocmgrController) CreateBaseTenantClient(c *gin.Context) {
 
 	tenantClient := oocmgrHydraClient{
 		ClientID: req.ClientID, ClientSecret: req.ClientSecret,
-		ClientName:    fmt.Sprintf("%s Main OAuth Client", req.TenantName),
-		GrantTypes:    []string{"authorization_code", "refresh_token"},
-		RedirectURIs:  req.RedirectURIs, TokenEndpoint: "client_secret_post",
+		ClientName:   fmt.Sprintf("%s Main OAuth Client", req.TenantName),
+		GrantTypes:   []string{"authorization_code", "refresh_token"},
+		RedirectURIs: req.RedirectURIs, TokenEndpoint: "client_secret_post",
 		ResponseTypes: []string{"code"}, Scope: strings.Join(scopes, " "),
 		Audience: []string{}, SubjectType: "public",
 		Metadata: map[string]interface{}{
-			"type": "tenant_main_client",
-			"tenant_id": strings.TrimSuffix(req.ClientID, "-main-client"),
-			"c_id":      strings.TrimSuffix(req.TenantID, "-main-client"),
+			"type":        "tenant_main_client",
+			"tenant_id":   strings.TrimSuffix(req.ClientID, "-main-client"),
+			"c_id":        strings.TrimSuffix(req.TenantID, "-main-client"),
 			"tenant_name": req.TenantName,
 			"created_at":  time.Now().Format(time.RFC3339), "created_by": req.CreatedBy,
 		},
@@ -1412,7 +1401,7 @@ func (ac *OocmgrController) CreateBaseTenantClient(c *gin.Context) {
 	thc := &oocmgrdto.TenantHydraClient{
 		TenantID: req.TenantID, TenantName: req.TenantName,
 		HydraClientID: req.ClientID, HydraClientSecret: req.ClientSecret,
-		ClientName: fmt.Sprintf("%s Main OAuth Client", req.TenantName),
+		ClientName:   fmt.Sprintf("%s Main OAuth Client", req.TenantName),
 		RedirectURIs: req.RedirectURIs, Scopes: scopes,
 		ClientType: "main", IsActive: true, CreatedBy: req.CreatedBy, UpdatedBy: req.CreatedBy,
 	}
@@ -1453,9 +1442,9 @@ func (ac *OocmgrController) AddOIDCProviderToTenant(c *gin.Context) {
 	tenantClient, err := ac.getHydraClient(mainClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, oocmgrdto.ErrorResponse{
-			Error: "Tenant not found",
+			Error:   "Tenant not found",
 			Message: fmt.Sprintf("No base client found for tenant %s. Create base client first.", req.ClientID),
-			Code: http.StatusNotFound, Timestamp: time.Now(),
+			Code:    http.StatusNotFound, Timestamp: time.Now(),
 		})
 		return
 	}
@@ -1487,7 +1476,7 @@ func (ac *OocmgrController) AddOIDCProviderToTenant(c *gin.Context) {
 	oocmgrResolveMicrosoftAuthorityURLs(&req.Provider)
 
 	oidcClient := oocmgrHydraClient{
-		ClientID: oidcClientID,
+		ClientID:   oidcClientID,
 		ClientName: fmt.Sprintf("%s %s OIDC Config", tenantName, req.Provider.DisplayName),
 		GrantTypes: []string{"client_credentials"},
 		Metadata: map[string]interface{}{
@@ -1521,8 +1510,8 @@ func (ac *OocmgrController) AddOIDCProviderToTenant(c *gin.Context) {
 	thc := &oocmgrdto.TenantHydraClient{
 		TenantID: req.TenantID, TenantName: tenantName,
 		HydraClientID: oidcClientID, HydraClientSecret: "not-used-for-oidc-config",
-		ClientName:   fmt.Sprintf("%s %s OIDC Config", tenantName, req.Provider.DisplayName),
-		ClientType:   "oidc_provider", ProviderName: req.Provider.ProviderName,
+		ClientName: fmt.Sprintf("%s %s OIDC Config", tenantName, req.Provider.DisplayName),
+		ClientType: "oidc_provider", ProviderName: req.Provider.ProviderName,
 		IsActive: req.Provider.IsActive, CreatedBy: req.CreatedBy, UpdatedBy: req.CreatedBy,
 	}
 	if err := ac.tenantHydraClientRepo.Create(thc); err != nil {
@@ -1536,7 +1525,7 @@ func (ac *OocmgrController) AddOIDCProviderToTenant(c *gin.Context) {
 			"tenant_id": req.TenantID, "provider_name": req.Provider.ProviderName,
 			"display_name": req.Provider.DisplayName, "client_id": oidcClientID,
 			"callback_url": fmt.Sprintf("%s/oidc/auth/callback/%s", req.ReactAppURL, oocmgrNormalizeProviderName(req.Provider.ProviderName)),
-			"is_active": req.Provider.IsActive, "created_at": time.Now(),
+			"is_active":    req.Provider.IsActive, "created_at": time.Now(),
 		},
 		Timestamp: time.Now(),
 	})
@@ -1617,7 +1606,7 @@ func (ac *OocmgrController) SyncHydraClients(c *gin.Context) {
 		Message: "Hydra clients sync completed", Success: true,
 		Data: map[string]interface{}{
 			"total_hydra_clients": len(hydraClients),
-			"synced_clients": syncedCount, "missing_mappings": missingCount,
+			"synced_clients":      syncedCount, "missing_mappings": missingCount,
 		},
 		Timestamp: time.Now(),
 	})
@@ -2195,7 +2184,7 @@ func (ac *OocmgrController) AddSAMLProvider(c *gin.Context) {
 			EntityID: provider.EntityID, SSOURL: provider.SSOURL, SLOURL: provider.SLOURL,
 			MetadataURL: provider.MetadataURL, NameIDFormat: provider.NameIDFormat,
 			AttributeMapping: oocmgrJSONToMap(provider.AttributeMapping),
-			IsActive: provider.IsActive, SortOrder: provider.SortOrder,
+			IsActive:         provider.IsActive, SortOrder: provider.SortOrder,
 			CreatedAt: provider.CreatedAt.Format(time.RFC3339),
 			UpdatedAt: provider.UpdatedAt.Format(time.RFC3339),
 		},
@@ -2234,7 +2223,7 @@ func (ac *OocmgrController) ListSAMLProviders(c *gin.Context) {
 			DisplayName: p.DisplayName, EntityID: p.EntityID, SSOURL: p.SSOURL,
 			SLOURL: p.SLOURL, MetadataURL: p.MetadataURL, NameIDFormat: p.NameIDFormat,
 			AttributeMapping: oocmgrJSONToMap(p.AttributeMapping),
-			IsActive: p.IsActive, SortOrder: p.SortOrder,
+			IsActive:         p.IsActive, SortOrder: p.SortOrder,
 			CreatedAt: p.CreatedAt.Format(time.RFC3339), UpdatedAt: p.UpdatedAt.Format(time.RFC3339),
 		})
 	}
@@ -2280,7 +2269,7 @@ func (ac *OocmgrController) GetSAMLProvider(c *gin.Context) {
 			DisplayName: provider.DisplayName, EntityID: provider.EntityID, SSOURL: provider.SSOURL,
 			SLOURL: provider.SLOURL, MetadataURL: provider.MetadataURL, NameIDFormat: provider.NameIDFormat,
 			AttributeMapping: oocmgrJSONToMap(provider.AttributeMapping),
-			IsActive: provider.IsActive, SortOrder: provider.SortOrder,
+			IsActive:         provider.IsActive, SortOrder: provider.SortOrder,
 			CreatedAt: provider.CreatedAt.Format(time.RFC3339), UpdatedAt: provider.UpdatedAt.Format(time.RFC3339),
 		},
 	})
@@ -2375,7 +2364,7 @@ func (ac *OocmgrController) UpdateSAMLProvider(c *gin.Context) {
 			DisplayName: provider.DisplayName, EntityID: provider.EntityID, SSOURL: provider.SSOURL,
 			SLOURL: provider.SLOURL, MetadataURL: provider.MetadataURL, NameIDFormat: provider.NameIDFormat,
 			AttributeMapping: oocmgrJSONToMap(provider.AttributeMapping),
-			IsActive: provider.IsActive, SortOrder: provider.SortOrder,
+			IsActive:         provider.IsActive, SortOrder: provider.SortOrder,
 			CreatedAt: provider.CreatedAt.Format(time.RFC3339), UpdatedAt: provider.UpdatedAt.Format(time.RFC3339),
 		},
 	})
@@ -2792,12 +2781,12 @@ func (ac *OocmgrController) oocmgrCreateNewProviderForEdit(c *gin.Context, req e
 
 // ===== PACKAGE-LEVEL HELPERS =====
 
-func oocmgrGetTenantDB(orgID string) (*gorm.DB, error) {
-	tenantDB, err := middlewares.GetConnectionDynamically(config.DB, nil, &orgID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant connection: %w", err)
-	}
-	return tenantDB, nil
+// oocmgrGetTenantDB is a vestigial helper from the multi-tenant era. The
+// single-DB collapse removed tenant routing, so this always returns the shared
+// config.DB. Kept for backward compatibility with callers — remove once they're
+// inlined.
+func oocmgrGetTenantDB(_ string) (*gorm.DB, error) {
+	return config.DB, nil
 }
 
 func oocmgrJSONToMap(jsonData datatypes.JSON) map[string]interface{} {
@@ -2900,9 +2889,9 @@ func oocmgrSanitizeHydraClientForDump(client oocmgrHydraClient) map[string]inter
 	output := map[string]interface{}{
 		"client_id": client.ClientID, "client_name": client.ClientName,
 		"grant_types": client.GrantTypes, "redirect_uris": client.RedirectURIs,
-		"response_types": client.ResponseTypes,
+		"response_types":             client.ResponseTypes,
 		"token_endpoint_auth_method": client.TokenEndpoint,
-		"scope": client.Scope, "subject_type": client.SubjectType, "audience": client.Audience,
+		"scope":                      client.Scope, "subject_type": client.SubjectType, "audience": client.Audience,
 	}
 	if client.ClientSecret != "" {
 		output["client_secret"] = "***hidden***"
