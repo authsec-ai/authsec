@@ -2,10 +2,8 @@ package services
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1287,12 +1285,6 @@ func numericClaimToInt64(raw interface{}) (int64, bool) {
 
 func IsHTTPSURL(s string) bool {
 	return strings.HasPrefix(s, "https://")
-}
-
-func generateClientID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 func stringSlicesEqual(a, b []string) bool {

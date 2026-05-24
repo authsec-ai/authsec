@@ -55,17 +55,3 @@ func MatchScope(have []string, needed string) bool {
 	}
 	return false
 }
-
-// dedupe returns a new slice with duplicates removed, preserving first-seen order.
-func dedupe(in []string) []string {
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	return out
-}

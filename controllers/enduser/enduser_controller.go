@@ -211,7 +211,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 	// isolation must come from explicit row-level predicates.
 	var user models.User
 	if lookupByID {
-		if err := tenantDB.Preload("Scopes").Preload("Roles").Preload("Groups").Preload("Resources").
+		if err := tenantDB.Preload("Groups").
 			Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
@@ -221,7 +221,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 			return
 		}
 	} else {
-		if err := tenantDB.Preload("Scopes").Preload("Roles").Preload("Groups").Preload("Resources").
+		if err := tenantDB.Preload("Groups").
 			Where("tenant_id = ? AND client_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, clientUUID, emailIdentifier).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
@@ -390,7 +390,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 
 	// Fetch users with pagination and all associations
 	var users []models.User
-	if err := query.Preload("Scopes").Preload("Roles").Preload("Groups").Preload("Resources").
+	if err := query.Preload("Groups").
 		Order("created_at DESC").
 		Offset(offset).Limit(filter.Limit).Find(&users).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch users"})

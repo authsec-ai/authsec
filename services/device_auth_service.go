@@ -17,14 +17,13 @@ type DeviceAuthService struct {
 	deviceRepo      *database.DeviceAuthRepository
 	tenantRepo      *database.AdminTenantRepository
 	userRepo        *database.UserRepository
-	dbService       *database.TenantDBService
 	verificationURI string
 	pollingInterval int // minimum seconds between polling attempts
 	codeExpiry      time.Duration
 }
 
 // NewDeviceAuthService creates a new device authorization service
-func NewDeviceAuthService(db *database.DBConnection, dbService *database.TenantDBService) *DeviceAuthService {
+func NewDeviceAuthService(db *database.DBConnection) *DeviceAuthService {
 	verificationURI := os.Getenv("DEVICE_VERIFICATION_URI")
 	if verificationURI == "" {
 		verificationURI = "https://app.authsec.ai/activate"
@@ -34,7 +33,6 @@ func NewDeviceAuthService(db *database.DBConnection, dbService *database.TenantD
 		deviceRepo:      database.NewDeviceAuthRepository(db),
 		tenantRepo:      database.NewAdminTenantRepository(db),
 		userRepo:        database.NewUserRepository(db),
-		dbService:       dbService,
 		verificationURI: verificationURI,
 		pollingInterval: 5,               // RFC 8628 recommended minimum
 		codeExpiry:      5 * time.Minute, // spec: 5 min (300s)

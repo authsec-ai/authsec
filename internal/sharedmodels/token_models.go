@@ -17,30 +17,10 @@ type Role struct {
 	Permissions []Permission `json:"permissions,omitempty" gorm:"many2many:role_permissions;joinForeignKey:RoleID;joinReferences:PermissionID"`
 }
 
-type Scope struct {
-	ID          uuid.UUID    `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID    uuid.UUID    `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_scopes_tenant_name"`
-	Name        string       `json:"name" gorm:"type:text;not null;uniqueIndex:idx_scopes_tenant_name"`
-	Description string       `json:"description" gorm:"type:text"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
-	Permissions []Permission `json:"permissions,omitempty" gorm:"many2many:scope_permissions;joinForeignKey:ScopeID;joinReferences:PermissionID"`
-}
-
 type Group struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`
 	Name        string     `json:"name" gorm:"uniqueIndex;not null"`
-	Description string     `json:"description"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
-}
-
-type Resource struct {
-	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`
-	Name        string     `json:"name" gorm:"uniqueIndex;not null"`
-	Type        string     `json:"type"`
 	Description string     `json:"description"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   *time.Time `json:"updated_at,omitempty"`

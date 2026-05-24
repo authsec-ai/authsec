@@ -2,8 +2,6 @@ package platform
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -22,7 +20,6 @@ import (
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"gorm.io/datatypes"
 )
 
 // StorePKCEVerifier saves a code verifier to the database, keyed by state or
@@ -40,16 +37,6 @@ func StorePKCEVerifier(key, codeVerifier string) {
 	}
 	// Upsert: overwrite if key already exists (e.g. page retry).
 	config.DB.Where("key = ?", key).Assign(v).FirstOrCreate(&v)
-}
-
-// peekPKCEVerifier reads the stored code verifier without deleting it.
-// Returns an empty string if not found or expired.
-func peekPKCEVerifier(key string) string {
-	var v models.PKCEVerifier
-	if err := config.DB.Where("key = ? AND expires_at > ?", key, time.Now()).First(&v).Error; err != nil {
-		return ""
-	}
-	return v.Verifier
 }
 
 // consumePKCEVerifier retrieves and deletes the stored code verifier from the database.
@@ -71,6 +58,11 @@ type HmgrController struct {
 	scopeResolver     *services.ScopeResolver
 	consentService    *services.ConsentService
 	scopeRegistry     *services.ScopeRegistryService
+	// oidcSvc is the v4 OIDC service. InitiateAuthHandler delegates the
+	// upstream-IdP redirect logic here so we use the workspace gate, signed
+	// state, Vault-backed secrets, and PKCE on the upstream IdP — all the
+	// security guarantees that the deleted v3 hmgr code never had.
+	oidcSvc *services.OIDCService
 }
 
 // NewHmgrController creates a new HmgrController
@@ -83,6 +75,7 @@ func NewHmgrController(cfg config.Config) *HmgrController {
 		scopeResolver:     services.NewScopeResolver(config.DB),
 		consentService:    services.NewConsentService(config.DB),
 		scopeRegistry:     services.NewScopeRegistryService(config.DB),
+		oidcSvc:           services.NewOIDCService(config.GetDatabase()),
 	}
 }
 
@@ -523,7 +516,19 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 	})
 }
 
-// InitiateAuthHandler initiates authentication with a provider
+// InitiateAuthHandler is the thin v4 entry shim for end-user OIDC logins
+// driven by a Hydra login_challenge.
+//
+// It resolves the workspace (and optional Application) from the
+// AuthRequestContext bound to the login_challenge, then delegates to
+// services.OIDCService.InitiateOIDCFlow with Action="hydra_login" so the
+// callback at /authsec/uflow/oidc/callback can call Hydra accept-login at
+// the end of the flow. The v4 service enforces the workspace gate, the
+// optional Application policy, HMAC-signed state, PKCE on the upstream
+// IdP, and Vault-backed client_secret.
+//
+// All legacy code (Hydra-client-metadata provider lookup, base64 plaintext
+// state, DB-stored client_secret) has been deleted.
 func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	providerName := c.Param("provider")
 
@@ -532,7 +537,6 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		OriginDomain   string `json:"origin_domain,omitempty"`
 		CodeVerifier   string `json:"code_verifier,omitempty"`
 	}
-
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -540,7 +544,6 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		})
 		return
 	}
-
 	if req.LoginChallenge == "" {
 		c.JSON(http.StatusBadRequest, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -549,108 +552,40 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		return
 	}
 
-	// Store the PKCE code_verifier by login_challenge so ExchangeTokenHandler can
-	// retrieve it later.
+	// Preserve the PKCE verifier the SPA stashed against the Hydra
+	// login_challenge — the token-exchange path still needs it.
 	if req.CodeVerifier != "" {
 		StorePKCEVerifier(req.LoginChallenge, req.CodeVerifier)
 	}
 
-	loginRequest, err := ctrl.service.GetHydraLoginRequest(req.LoginChallenge)
-	// Copy the PKCE verifier stored by GetAuthURL (keyed by the original state
-	// from request_url) so it is also reachable via login_challenge.  This bridges
-	// the gap where GetAuthURL stores by state but ExchangeTokenHandler looks up
-	// by login_challenge first.
-	if req.CodeVerifier == "" && loginRequest != nil && loginRequest.RequestURL != "" {
-		if parsed, parseErr := url.Parse(loginRequest.RequestURL); parseErr == nil {
-			if origState := parsed.Query().Get("state"); origState != "" {
-				if v := peekPKCEVerifier(origState); v != "" {
-					StorePKCEVerifier(req.LoginChallenge, v)
-					log.Printf("[hmgr] PKCE bridged: state=%q → login_challenge=%q verifier_len=%d", origState, req.LoginChallenge, len(v))
-				}
-			}
-		}
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
-			Success: false,
-			Error:   "Failed to get login request",
-		})
-		return
-	}
-
-	hydraClientID := loginRequest.Client.ClientID
-
-	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
-	if err != nil {
+	// Resolve workspace + optional Application from the auth context. The
+	// GetLoginPageDataHandler already bound the context to this challenge.
+	arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
+	if err != nil || arcCtx == nil {
 		c.JSON(http.StatusNotFound, hydramodels.AuthInitiateResponse{
 			Success: false,
-			Error:   "Client not found",
+			Error:   "Auth context not found for login_challenge",
 		})
 		return
 	}
-
-	// ── Dual-mode: resolve tenant from bridge table or Hydra metadata ──
-	var tenantID string
-	if ctrl.isNewMCPClient(hydraClientID) {
-		arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
-				Success: false,
-				Error:   "Failed to resolve MCP auth context",
-			})
-			return
-		}
-		tenantID = arcCtx.TenantID
-	} else {
-		tenantID, _ = clientDetails.Metadata["tenant_id"].(string)
-	}
-
-	providers, err := ctrl.service.GetOIDCProvidersForTenant(tenantID)
-	if err != nil {
+	workspaceID, parseErr := uuid.Parse(arcCtx.TenantID)
+	if parseErr != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
 			Success: false,
-			Error:   "Failed to get OIDC providers",
+			Error:   "Invalid workspace ID on auth context",
 		})
 		return
 	}
-
-	var selectedProvider *hydramodels.OIDCProvider
-	for _, provider := range providers {
-		if strings.EqualFold(provider.ProviderName, providerName) {
-			selectedProvider = &provider
-			break
+	var appID *uuid.UUID
+	if arcCtx.ResourceServerID != "" {
+		if id, perr := uuid.Parse(arcCtx.ResourceServerID); perr == nil && id != uuid.Nil {
+			appID = &id
 		}
 	}
 
-	if selectedProvider == nil {
-		c.JSON(http.StatusNotFound, hydramodels.AuthInitiateResponse{
-			Success: false,
-			Error:   "Provider not found",
-		})
-		return
-	}
-
-	if !selectedProvider.IsActive {
-		c.JSON(http.StatusBadRequest, hydramodels.AuthInitiateResponse{
-			Success: false,
-			Error:   "Provider is not active",
-		})
-		return
-	}
-
-	providerConfig := selectedProvider.Config
-	clientID, _ := providerConfig["client_id"].(string)
-	authURL, _ := providerConfig["auth_url"].(string)
-	scopes, _ := providerConfig["scopes"].([]interface{})
-
-	scopeStrings := make([]string, len(scopes))
-	for i, scope := range scopes {
-		scopeStrings[i] = scope.(string)
-	}
-
-	nonce := hydrautils.GenerateCodeVerifier()
+	// Stash the request origin on the v4 service so it lands on OIDCState
+	// for the eventual post-auth redirect.
 	originDomain := req.OriginDomain
-
 	if originDomain == "" {
 		originDomain = c.GetHeader("X-Forwarded-Host")
 	}
@@ -662,487 +597,36 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		}
 	}
 	if originDomain == "" {
-		if referer := c.GetHeader("Referer"); referer != "" {
-			if u, err := url.Parse(referer); err == nil {
-				originDomain = u.Host
-			}
-		}
-	}
-	if originDomain == "" {
 		originDomain = c.Request.Host
 	}
+	ctrl.oidcSvc.SetRequestOrigin(originDomain)
 
-	if originDomain != "" && tenantID != "" {
-		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, tenantID)
-		if err == nil && len(verifiedDomains) > 0 {
-			isVerified := false
-			for _, d := range verifiedDomains {
-				if strings.HasSuffix(originDomain, d) || strings.EqualFold(d, originDomain) {
-					isVerified = true
-					break
-				}
-			}
-			if !isVerified {
-				isDev := strings.Contains(originDomain, "localhost") || strings.Contains(originDomain, "127.0.0.1")
-				if !isDev {
-					c.JSON(http.StatusForbidden, hydramodels.AuthInitiateResponse{
-						Success: false,
-						Error:   "Origin domain not verified for this tenant",
-					})
-					return
-				}
-			}
-		}
-	}
-
-	stateData := map[string]string{
-		"login_challenge": req.LoginChallenge,
-		"nonce":           nonce,
-		"provider":        providerName,
-		"origin_domain":   originDomain,
-	}
-	stateBytes, err := json.Marshal(stateData)
+	// Delegate to the v4 service. Action="hydra_login" tells the callback at
+	// /authsec/uflow/oidc/callback to accept the Hydra challenge and 302
+	// the browser to whatever URL Hydra returns (typically back to the
+	// OAuth client app's redirect_uri with an authorization code).
+	resp, err := ctrl.oidcSvc.InitiateOIDCFlow(&models.OIDCInitiateInput{
+		Provider:       providerName,
+		TenantDomain:   c.Request.Host,
+		ApplicationID:  appID,
+		LoginChallenge: req.LoginChallenge,
+	}, "hydra_login", &workspaceID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
+		// Workspace gate or Application policy rejected. Surface as 403 so
+		// the UI's catch block shows the right error to the user.
+		c.JSON(http.StatusForbidden, hydramodels.AuthInitiateResponse{
 			Success: false,
-			Error:   "Failed to generate state",
+			Error:   err.Error(),
 		})
 		return
 	}
-	state := base64.URLEncoding.EncodeToString(stateBytes)
-
-	// For MCP clients, the registered RedirectURIs hold Codex's callback (e.g. http://localhost:11337/callback),
-	// NOT AuthSec's own callback handler. Use AuthSec's callback URL for IdP redirect.
-	var callbackURL string
-	if ctrl.isNewMCPClient(hydraClientID) {
-		callbackURL = config.AppConfig.BaseURL + "/authsec/hmgr/auth/callback"
-	} else {
-		if len(clientDetails.RedirectURIs) == 0 {
-			c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
-				Success: false,
-				Error:   "No registered redirect URI found for client",
-			})
-			return
-		}
-		callbackURL = clientDetails.RedirectURIs[0]
-	}
-
-	oauthURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&scope=%s&response_type=code&state=%s",
-		authURL,
-		clientID,
-		url.QueryEscape(callbackURL),
-		url.QueryEscape(strings.Join(scopeStrings, " ")),
-		url.QueryEscape(state),
-	)
 
 	c.JSON(http.StatusOK, hydramodels.AuthInitiateResponse{
 		Success:  true,
-		AuthURL:  oauthURL,
-		State:    state,
+		AuthURL:  resp.RedirectURL,
+		State:    resp.State,
 		Provider: providerName,
 	})
-}
-
-// HandleCallbackHandler processes the OAuth callback
-func (ctrl *HmgrController) HandleCallbackHandler(c *gin.Context) {
-	var req struct {
-		Code  string `json:"code"`
-		State string `json:"state"`
-		Error string `json:"error,omitempty"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{
-			Success: false,
-			Error:   "Invalid request body: " + err.Error(),
-		})
-		return
-	}
-
-	if req.Error != "" {
-		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{
-			Success: false,
-			Error:   fmt.Sprintf("OAuth provider error: %s", req.Error),
-		})
-		return
-	}
-
-	if req.Code == "" || req.State == "" {
-		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{
-			Success: false,
-			Error:   "Missing required parameters: code or state",
-		})
-		return
-	}
-
-	redirectTo, userInfo, err := ctrl.ProcessOAuthCallback(req.Code, req.State)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{
-			Success: false,
-			Error:   "Authentication processing failed: " + err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, hydramodels.CallbackValidationResponse{
-		Success:    true,
-		RedirectTo: redirectTo,
-		UserInfo:   userInfo,
-	})
-}
-
-// ProcessOAuthCallback processes the OAuth callback logic
-func (ctrl *HmgrController) ProcessOAuthCallback(code, receivedState string) (string, *hydramodels.User, error) {
-	var stateData map[string]string
-
-	stateBytes, err := base64.URLEncoding.DecodeString(receivedState)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to decode state: %w", err)
-	}
-
-	if err := json.Unmarshal(stateBytes, &stateData); err != nil {
-		return "", nil, fmt.Errorf("failed to unmarshal state: %w", err)
-	}
-
-	loginChallenge := stateData["login_challenge"]
-	providerName := stateData["provider"]
-	originDomain := stateData["origin_domain"]
-
-	if loginChallenge == "" {
-		return "", nil, fmt.Errorf("missing login_challenge in state")
-	}
-	if providerName == "" {
-		return "", nil, fmt.Errorf("missing provider in state")
-	}
-
-	loginRequest, err := ctrl.service.GetHydraLoginRequest(loginChallenge)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to get login request: %w", err)
-	}
-
-	hydraClientID := loginRequest.Client.ClientID
-	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to get client details: %w", err)
-	}
-
-	// ── Dual-mode: resolve tenant from bridge table or Hydra metadata ──
-	var tenantID string
-	isMCP := ctrl.isNewMCPClient(hydraClientID)
-
-	if isMCP {
-		arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge)
-		if err != nil {
-			return "", nil, fmt.Errorf("failed to resolve MCP auth context: %w", err)
-		}
-		tenantID = arcCtx.TenantID
-	} else {
-		tenantID, _ = clientDetails.Metadata["tenant_id"].(string)
-		if tenantID == "" {
-			return "", nil, fmt.Errorf("missing tenant_id in client metadata")
-		}
-	}
-
-	providers, err := ctrl.service.GetOIDCProvidersForTenant(tenantID)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to get OIDC providers: %w", err)
-	}
-
-	var selectedProvider *hydramodels.OIDCProvider
-	for _, provider := range providers {
-		if strings.EqualFold(provider.ProviderName, providerName) {
-			selectedProvider = &provider
-			break
-		}
-	}
-
-	if selectedProvider == nil {
-		return "", nil, fmt.Errorf("provider %s not found", providerName)
-	}
-
-	// For MCP clients, use AuthSec's own callback URL (not the MCP client's redirect URI)
-	var redirectURI string
-	if isMCP {
-		redirectURI = config.AppConfig.BaseURL + "/authsec/hmgr/auth/callback"
-	} else {
-		if len(clientDetails.RedirectURIs) == 0 {
-			return "", nil, fmt.Errorf("no registered redirect URI found for client")
-		}
-		redirectURI = clientDetails.RedirectURIs[0]
-	}
-
-	ctx := context.Background()
-	tokenResponse, err := ctrl.service.ExchangeCodeForTokens(ctx, selectedProvider, code, redirectURI)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to exchange code for tokens: %w", err)
-	}
-
-	accessToken, ok := tokenResponse["access_token"].(string)
-	if !ok || accessToken == "" {
-		return "", nil, fmt.Errorf("no access token in response")
-	}
-
-	userInfo, err := ctrl.service.GetUserInfo(ctx, selectedProvider, accessToken)
-	if err != nil {
-		// For Microsoft, fall back to decoding the id_token instead of calling Graph API.
-		if strings.EqualFold(providerName, "microsoft") || strings.EqualFold(providerName, "azure") {
-			if idToken, ok := tokenResponse["id_token"].(string); ok && idToken != "" {
-				log.Printf("Microsoft Graph userinfo failed (%v), falling back to id_token", err)
-				userInfo, err = extractClaimsFromIDToken(idToken)
-				if err != nil {
-					return "", nil, fmt.Errorf("failed to extract claims from Microsoft id_token: %w", err)
-				}
-			} else {
-				return "", nil, fmt.Errorf("failed to get user info: %w", err)
-			}
-		} else {
-			return "", nil, fmt.Errorf("failed to get user info: %w", err)
-		}
-	}
-
-	user, userID, err := ctrl.ExtractUserFromProviderResponse(providerName, userInfo)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to extract user info: %w", err)
-	}
-
-	if isMCP {
-		// MCP path: use tenant from bridge table
-		parsedTenantID, err := uuid.Parse(tenantID)
-		if err != nil {
-			return "", nil, fmt.Errorf("invalid MCP tenant ID: %w", err)
-		}
-		user.TenantID = parsedTenantID
-		user.ClientID = parsedTenantID // MCP clients don't have a legacy client_id
-	} else {
-		// Legacy path: use Hydra client metadata
-		parsedTenantID, err := uuid.Parse(clientDetails.Metadata["c_id"].(string))
-		if err != nil {
-			return "", nil, fmt.Errorf("invalid tenant ID format (c_id): %w", err)
-		}
-
-		clientIDStr, ok := clientDetails.Metadata["tenant_id"].(string)
-		if !ok || clientIDStr == "" {
-			return "", nil, fmt.Errorf("missing tenant_id in client metadata")
-		}
-
-		parsedClientID, err := uuid.Parse(clientIDStr)
-		if err != nil {
-			return "", nil, fmt.Errorf("invalid client ID format (tenant_id): %w", err)
-		}
-
-		user.ClientID = parsedClientID
-		user.TenantID = parsedTenantID
-	}
-
-	user, err = ctrl.service.CreateOrUpdateUser(accessToken, user)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to create/update user: %w", err)
-	}
-
-	loginContext := map[string]interface{}{
-		"email":       user.Email,
-		"name":        user.Name,
-		"username":    user.Username,
-		"provider":    user.Provider,
-		"provider_id": user.ProviderID,
-		"tenant_id":   user.TenantID,
-		"project_id":  user.ProjectID,
-		"avatar_url":  user.AvatarURL,
-	}
-	// Propagate email_verified from IdP userinfo (Google, Microsoft, etc. include this claim).
-	// Defaults to true for social logins since the IdP has verified the email.
-	if ev, ok := userInfo["email_verified"]; ok {
-		loginContext["email_verified"] = ev
-	} else {
-		loginContext["email_verified"] = true // Social provider implies verified email
-	}
-	if isMCP {
-		loginContext["tenant_id"] = tenantID
-	}
-
-	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, loginContext)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to accept login request: %w", err)
-	}
-
-	// Record auth_time on the MCP auth context for OIDC max_age enforcement.
-	if isMCP {
-		if arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge); arcErr == nil {
-			now := time.Now()
-			if setErr := ctrl.authzCtx.SetAuthTime(arcCtx.State, now); setErr != nil {
-				log.Printf("[MCP_AUTH] ProcessOAuthCallback: SetAuthTime failed state=%s: %v", arcCtx.State, setErr)
-			}
-		}
-	}
-
-	finalRedirectURL := acceptResponse.RedirectTo
-	safeOriginDomain := hmgrGetSafeOriginDomainForRedirect(acceptResponse.RedirectTo, originDomain)
-	if safeOriginDomain != "" {
-		finalRedirectURL = hmgrReplaceRedirectDomain(acceptResponse.RedirectTo, safeOriginDomain)
-	}
-
-	return finalRedirectURL, user, nil
-}
-
-// ExtractUserFromProviderResponse extracts user information from provider response
-func (ctrl *HmgrController) ExtractUserFromProviderResponse(providerName string, userInfo map[string]interface{}) (*hydramodels.User, string, error) {
-	var userID, email, name, username, avatarURL, providerUserID string
-
-	switch strings.ToLower(providerName) {
-	case "github":
-		if id, ok := userInfo["id"].(float64); ok {
-			providerUserID = fmt.Sprintf("%.0f", id)
-			userID = fmt.Sprintf("github-%.0f", id)
-		} else if id, ok := userInfo["id"].(int); ok {
-			providerUserID = fmt.Sprintf("%d", id)
-			userID = fmt.Sprintf("github-%d", id)
-		} else if idStr, ok := userInfo["id"].(string); ok {
-			providerUserID = idStr
-			userID = fmt.Sprintf("github-%s", idStr)
-		}
-		if emailVal, exists := userInfo["email"]; exists && emailVal != nil {
-			email, _ = emailVal.(string)
-		}
-		name, _ = userInfo["name"].(string)
-		username, _ = userInfo["login"].(string)
-		avatarURL, _ = userInfo["avatar_url"].(string)
-		if email == "" && username != "" {
-			email = fmt.Sprintf("%s@users.noreply.github.com", username)
-		}
-
-	case "google":
-		if sub, ok := userInfo["sub"].(string); ok && sub != "" {
-			providerUserID = sub
-			userID = fmt.Sprintf("google-%s", sub)
-		}
-		email, _ = userInfo["email"].(string)
-		name, _ = userInfo["name"].(string)
-		if givenName, ok1 := userInfo["given_name"].(string); ok1 {
-			if familyName, ok2 := userInfo["family_name"].(string); ok2 {
-				name = fmt.Sprintf("%s %s", givenName, familyName)
-			}
-		}
-		if email != "" {
-			username = strings.Split(email, "@")[0]
-		}
-		avatarURL, _ = userInfo["picture"].(string)
-
-	case "linkedin":
-		if id, ok := userInfo["id"].(string); ok && id != "" {
-			providerUserID = id
-			userID = fmt.Sprintf("linkedin-%s", id)
-		}
-		email, _ = userInfo["emailAddress"].(string)
-		if firstName, ok := userInfo["localizedFirstName"].(string); ok {
-			if lastName, ok := userInfo["localizedLastName"].(string); ok {
-				name = fmt.Sprintf("%s %s", firstName, lastName)
-			} else {
-				name = firstName
-			}
-		}
-		if email != "" {
-			username = strings.Split(email, "@")[0]
-		}
-
-	case "microsoft", "azure":
-		if id, ok := userInfo["id"].(string); ok && id != "" {
-			providerUserID = id
-			userID = fmt.Sprintf("microsoft-%s", id)
-		} else if oid, ok := userInfo["oid"].(string); ok && oid != "" {
-			providerUserID = oid
-			userID = fmt.Sprintf("microsoft-%s", oid)
-		} else if sub, ok := userInfo["sub"].(string); ok && sub != "" {
-			providerUserID = sub
-			userID = fmt.Sprintf("microsoft-%s", sub)
-		}
-		email, _ = userInfo["email"].(string)
-		if email == "" {
-			email, _ = userInfo["mail"].(string)
-		}
-		if email == "" {
-			email, _ = userInfo["userPrincipalName"].(string)
-		}
-		if email == "" {
-			email, _ = userInfo["preferred_username"].(string)
-		}
-		name, _ = userInfo["displayName"].(string)
-		if name == "" {
-			name, _ = userInfo["name"].(string)
-		}
-		username, _ = userInfo["mailNickname"].(string)
-		if username == "" && email != "" {
-			username = strings.Split(email, "@")[0]
-		}
-
-	default:
-		if sub, ok := userInfo["sub"].(string); ok && sub != "" {
-			providerUserID = sub
-			userID = fmt.Sprintf("%s-%s", providerName, sub)
-		} else if id, ok := userInfo["id"].(string); ok && id != "" {
-			providerUserID = id
-			userID = fmt.Sprintf("%s-%s", providerName, id)
-		} else if id, ok := userInfo["id"].(float64); ok {
-			providerUserID = fmt.Sprintf("%.0f", id)
-			userID = fmt.Sprintf("%s-%.0f", providerName, id)
-		}
-		email, _ = userInfo["email"].(string)
-		name, _ = userInfo["name"].(string)
-		username, _ = userInfo["username"].(string)
-		if username == "" {
-			username, _ = userInfo["preferred_username"].(string)
-		}
-		avatarURL, _ = userInfo["avatar_url"].(string)
-		if avatarURL == "" {
-			avatarURL, _ = userInfo["picture"].(string)
-		}
-	}
-
-	if userID == "" || providerUserID == "" {
-		if email != "" {
-			hash := sha256.Sum256([]byte(email))
-			providerUserID = fmt.Sprintf("email-%x", hash[:8])
-			userID = fmt.Sprintf("%s-%s", providerName, providerUserID)
-		} else if username != "" {
-			hash := sha256.Sum256([]byte(username))
-			providerUserID = fmt.Sprintf("username-%x", hash[:8])
-			userID = fmt.Sprintf("%s-%s", providerName, providerUserID)
-		} else {
-			return nil, "", fmt.Errorf("unable to extract user identifier from provider response")
-		}
-	}
-
-	if username == "" && email != "" {
-		username = strings.Split(email, "@")[0]
-	}
-	if name == "" {
-		if username != "" {
-			name = username
-		} else if email != "" {
-			name = email
-		}
-	}
-	if email == "" {
-		return nil, "", fmt.Errorf("no email found in provider response from %s", providerName)
-	}
-
-	userInfoJSON, err := json.Marshal(userInfo)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to marshal user info: %w", err)
-	}
-
-	now := time.Now()
-	user := &hydramodels.User{
-		Email:        email,
-		Username:     &username,
-		Name:         name,
-		Provider:     providerName,
-		ProviderID:   providerUserID,
-		ProviderData: datatypes.JSON(userInfoJSON),
-		AvatarURL:    &avatarURL,
-		LastLogin:    &now,
-		Active:       true,
-	}
-	return user, userID, nil
 }
 
 // ExchangeTokenHandler handles token exchange requests
@@ -2387,84 +1871,4 @@ func (ctrl *HmgrController) GetProfileHandler(c *gin.Context) {
 }
 func (ctrl *HmgrController) UpdateProfileHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "UpdateProfile endpoint - to be implemented"})
-}
-
-// extractClaimsFromIDToken decodes a JWT id_token without signature verification
-// and returns its claims as a map. Used as a fallback when the userinfo endpoint
-// is unavailable (e.g. Microsoft Graph 403 due to missing User.Read permission).
-func extractClaimsFromIDToken(idToken string) (map[string]interface{}, error) {
-	parts := strings.SplitN(idToken, ".", 3)
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid id_token format")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode id_token payload: %w", err)
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal id_token claims: %w", err)
-	}
-	return claims, nil
-}
-
-// --- Helper functions ---
-
-func hmgrReplaceRedirectDomain(redirectURL, newDomain string) string {
-	u, err := url.Parse(redirectURL)
-	if err != nil {
-		return redirectURL
-	}
-	normalizedDomain := hmgrNormalizeHost(newDomain)
-	if normalizedDomain == "" {
-		return redirectURL
-	}
-	u.Host = normalizedDomain
-	if !strings.Contains(normalizedDomain, "localhost") && !strings.Contains(normalizedDomain, "127.0.0.1") {
-		u.Scheme = "https"
-	}
-	return u.String()
-}
-
-func hmgrGetSafeOriginDomainForRedirect(redirectURL, originDomain string) string {
-	normalizedOrigin := hmgrNormalizeHost(originDomain)
-	if normalizedOrigin == "" {
-		return ""
-	}
-
-	u, err := url.Parse(redirectURL)
-	if err != nil {
-		return ""
-	}
-
-	redirectURIParam := u.Query().Get("redirect_uri")
-	if redirectURIParam != "" {
-		parsedRedirectURI, err := url.Parse(redirectURIParam)
-		if err != nil {
-			return ""
-		}
-		redirectURIHost := hmgrNormalizeHost(parsedRedirectURI.Host)
-		if redirectURIHost == "" || !strings.EqualFold(redirectURIHost, normalizedOrigin) {
-			return ""
-		}
-	}
-	return normalizedOrigin
-}
-
-func hmgrNormalizeHost(raw string) string {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return ""
-	}
-	if strings.Contains(v, "://") {
-		if parsed, err := url.Parse(v); err == nil {
-			v = parsed.Host
-		}
-	}
-	if strings.Contains(v, "/") {
-		if parsed, err := url.Parse("https://" + v); err == nil {
-			v = parsed.Host
-		}
-	}
-	return strings.TrimSpace(v)
 }

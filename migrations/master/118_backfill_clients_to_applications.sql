@@ -1,2 +1,0 @@
--- Migration: 118_backfill_clients_to_applications.sql
--- intentionally empty: legacy backfill no longer needed (no users)

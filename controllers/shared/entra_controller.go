@@ -522,14 +522,6 @@ func (s *EntraIDService) fetchUsersPage(url string) ([]GraphUser, string, error)
 	return usersResp.Value, usersResp.ODataNextLink, nil
 }
 
-// Helper function for Go versions that don't have min built-in
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (s *EntraIDService) checkPermissions() (map[string]interface{}, error) {
 	// Stubbed response for tests
 	if isTestTenant(s.config.TenantID) {

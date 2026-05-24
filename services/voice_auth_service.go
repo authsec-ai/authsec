@@ -22,20 +22,18 @@ type VoiceAuthService struct {
 	deviceRepo     *database.DeviceAuthRepository
 	tenantRepo     *database.AdminTenantRepository
 	userRepo       *database.UserRepository
-	dbService      *database.TenantDBService
 	deviceService  *DeviceAuthService
 	sessionExpiry  time.Duration
 	maxOTPAttempts int
 }
 
 // NewVoiceAuthService creates a new voice authentication service
-func NewVoiceAuthService(db *database.DBConnection, dbService *database.TenantDBService, deviceService *DeviceAuthService) *VoiceAuthService {
+func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthService) *VoiceAuthService {
 	return &VoiceAuthService{
 		voiceRepo:      database.NewVoiceAuthRepository(db),
 		deviceRepo:     database.NewDeviceAuthRepository(db),
 		tenantRepo:     database.NewAdminTenantRepository(db),
 		userRepo:       database.NewUserRepository(db),
-		dbService:      dbService,
 		deviceService:  deviceService,
 		sessionExpiry:  3 * time.Minute, // Voice sessions expire quickly (3 minutes)
 		maxOTPAttempts: 5,
@@ -444,19 +442,6 @@ func (s *VoiceAuthService) ListVoiceLinks(tenantID uuid.UUID, userID uuid.UUID) 
 	}
 
 	return &models.VoiceLinksListResponse{Links: publicLinks}, nil
-}
-
-// generateJWTToken generates a JWT token using THE SAME logic as enduser login
-// This EXACTLY mirrors the token generation in controllers/enduser_auth_controller.go
-func (s *VoiceAuthService) generateJWTToken(user *models.ExtendedUser, tenant *models.Tenant, scopes []string) (string, error) {
-	// Use centralized auth-manager token service
-	return config.TokenService.GenerateVoiceAuthToken(
-		user.ID,
-		tenant.ID,
-		user.Email,
-		scopes,
-		24*time.Hour,
-	)
 }
 
 // generateJWTTokenWithSession generates a JWT token with additional session tracking claims

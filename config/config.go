@@ -11,21 +11,10 @@ import (
 	"testing"
 	"time"
 
-	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
-
-// MTPluginClientIface is the contract between authsec and the mt-plugin gRPC client.
-// *mtplugin.Client satisfies this interface; tests use local mock structs.
-type MTPluginClientIface interface {
-	IsAvailable() bool
-	NotifyAdminRegistered(req *mtpluginpb.AdminRegisteredRequest) (*mtpluginpb.AdminRegisteredResponse, error)
-	ListTenants() (*mtpluginpb.ListTenantsResponse, error)
-	DeleteTenant(tenantID string) (*mtpluginpb.DeleteTenantResponse, error)
-	ResolveTenant(hostname string) (*mtpluginpb.ResolveByDomainResponse, error)
-}
 
 // AuthManagerTokenService interface for token generation using auth-manager patterns
 // This avoids import cycles while providing type-safe token generation
@@ -54,7 +43,6 @@ type Config struct {
 	JWTDefSecret       string
 	JWTSdkSecret       string
 	JWTSecret          string // Primary JWT secret (ext-service / hydra-service / SPIFFE delegate)
-	OOCManagerURL      string
 	VaultAddr          string
 	VaultToken         string
 	HydraAdminURL      string
@@ -138,11 +126,6 @@ type Config struct {
 	SDKRequireSessionID           bool   // default false
 	SDKRedirectSource             string // "db" or "env"
 
-	// mt-plugin integration
-	// When set, authsec connects to the mt-plugin gRPC service for multi-tenant operations.
-	// Empty string means single-tenant mode (one admin, master DB only).
-	MtPluginAddr string // MT_PLUGIN_GRPC_ADDR (e.g. "localhost:7469")
-
 	// OIDCStateHMACKey is the HMAC secret used to sign the OIDC state parameter
 	// (services.MintSignedState / VerifySignedState). Production deployments
 	// MUST set AUTHSEC_OIDC_STATE_HMAC_KEY to a 32+ byte random value. When
@@ -152,11 +135,10 @@ type Config struct {
 }
 
 var (
-	AppConfig      *Config
-	CacheManager   *monitoring.CacheManager
-	AuditLogger    *monitoring.AuditLogger
-	TokenService   AuthManagerTokenService // Global token service using auth-manager patterns
-	MTPluginClient MTPluginClientIface     // nil when MT_PLUGIN_GRPC_ADDR is not configured
+	AppConfig    *Config
+	CacheManager *monitoring.CacheManager
+	AuditLogger  *monitoring.AuditLogger
+	TokenService AuthManagerTokenService // Global token service using auth-manager patterns
 
 	// Redis client singleton
 	redisClient *redis.Client
@@ -194,7 +176,6 @@ func LoadConfig() *Config {
 	jwtSdkSecret := getEnv("JWT_SDK_SECRET", "")
 	jwtDefSecret := getEnv("JWT_DEF_SECRET", "")
 	jwtSecret := getEnv("JWT_SECRET", "")
-	oocManagerURL := getEnv("OOC_MANAGER_URL", "http://localhost:7467")
 
 	vaultAddr := getEnv("VAULT_ADDR", "http://localhost:8200")
 	vaultToken := getEnv("VAULT_TOKEN", "")
@@ -300,9 +281,6 @@ func LoadConfig() *Config {
 	sdkRequireSessionID := getEnv("AUTHSEC_REQUIRE_SESSION_ID", "false") == "true"
 	sdkRedirectSource := getEnv("AUTHSEC_REDIRECT_SOURCE", "db")
 
-	// mt-plugin gRPC address (empty = single-tenant mode)
-	mtPluginAddr := getEnv("MT_PLUGIN_GRPC_ADDR", "")
-
 	// OIDC state HMAC key — production deployments must supply this.
 	oidcStateHMACKey := getEnv("AUTHSEC_OIDC_STATE_HMAC_KEY", "")
 	if oidcStateHMACKey == "" && getEnv("APP_ENV", "") == "production" {
@@ -330,7 +308,6 @@ func LoadConfig() *Config {
 		JWTDefSecret:            jwtDefSecret,
 		JWTSdkSecret:            jwtSdkSecret,
 		JWTSecret:               jwtSecret,
-		OOCManagerURL:           oocManagerURL,
 		VaultAddr:               vaultAddr,
 		VaultToken:              vaultToken,
 		HydraAdminURL:           hydraAdminURL,
@@ -389,7 +366,6 @@ func LoadConfig() *Config {
 		SDKHideUnauthorizedTools:      sdkHideUnauthorizedTools,
 		SDKRequireSessionID:           sdkRequireSessionID,
 		SDKRedirectSource:             sdkRedirectSource,
-		MtPluginAddr:                  mtPluginAddr,
 		OIDCStateHMACKey:              oidcStateHMACKey,
 	}
 

@@ -14,7 +14,6 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
-	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
@@ -33,7 +32,6 @@ type UserController struct {
 	userRepo               *database.UserRepository
 	otpRepo                *database.OTPRepository
 	pendingRepo            *database.PendingRegistrationRepository
-	tenantDBService        *database.TenantDBService
 	permissionSvc          *services.PermissionService
 	icpProvisioningService *services.ICPProvisioningService
 }
@@ -47,12 +45,6 @@ func NewUserController() (*UserController, error) {
 
 	// Get config for database parameters
 	cfg := config.GetConfig()
-
-	// Create tenant database service
-	tenantDBService, err := database.NewTenantDBService(db, cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
-	}
 
 	// Initialize ICP client and provisioning service
 	// Generate service-to-service JWT token for ICP
@@ -68,7 +60,6 @@ func NewUserController() (*UserController, error) {
 		userRepo:               database.NewUserRepository(db),
 		otpRepo:                database.NewOTPRepository(db),
 		pendingRepo:            database.NewPendingRegistrationRepository(db),
-		tenantDBService:        tenantDBService,
 		permissionSvc:          services.NewPermissionService(db.DB), // Use the underlying sql.DB
 		icpProvisioningService: icpProvisioningService,
 	}, nil
@@ -191,16 +182,13 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		}
 	}
 
-	// Single-tenant guard: block a second admin when mt-plugin is not available.
-	// When mt-plugin is available it will provision a separate tenant DB, so
-	// multiple admins are allowed.
-	if config.MTPluginClient == nil || !config.MTPluginClient.IsAvailable() {
+	// Single-tenant guard: only one admin/tenant is permitted.
+	{
 		db := config.GetDatabase()
 		var tenantCount int
 		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
-				"error": "Single-tenant mode: only one admin is allowed. " +
-					"Deploy the mt-plugin service and set MT_PLUGIN_GRPC_ADDR to enable multi-tenant registration.",
+				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
 			return
 		}
@@ -499,19 +487,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// --- Post-commit operations (non-blocking) ---
 	// Global state is committed. Failures below are logged as warnings and don't block registration.
 
-	// Notify mt-plugin to provision the tenant database asynchronously.
-	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
-		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
-			TenantId: tenant.TenantID.String(),
-			Email:    user.Email,
-			DbName:   tenantDBName,
-			ClientId: pendingReg.TenantID.String(),
-		}); err != nil {
-			log.Printf("[mtplugin] Warning: failed to notify mt-plugin: %v", err)
-		}
-	} else {
-		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for: %s", tenant.TenantID.String())
-	}
+	// Single-tenant: no per-tenant DB provisioning. Workspace lives in master DB.
 
 	// Provision PKI infrastructure via ICP service
 	log.Printf("Provisioning PKI for tenant: %s", tenant.TenantID.String())
@@ -1338,20 +1314,6 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	})
 }
 
-var jwtDefaultSecret []byte
-
-func getDefaultJWTSecret() string {
-	// Lazy initialization to allow tests to set environment variables
-	if jwtDefaultSecret == nil {
-		secret := os.Getenv("JWT_DEF_SECRET")
-		if secret == "" {
-			panic("CRITICAL: JWT_DEF_SECRET environment variable is not set. Cannot generate secure tokens.")
-		}
-		jwtDefaultSecret = []byte(secret)
-	}
-	return string(jwtDefaultSecret)
-}
-
 // generateJWTToken generates a JWT token for authenticated users
 // Ultra-minimal token: identity only - auth-manager fetches roles/permissions from DB via GetAuthz() on every request
 func (uc *UserController) generateJWTToken(tenantID, projectID, clientID, emailID string, roles []string, userID *uuid.UUID, tenantDB ...*sql.DB) (string, error) {
@@ -1549,354 +1511,6 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
-}
-
-// createTenantRecordInTenantDB creates the tenant record in the tenant database
-func (uc *UserController) createTenantRecordInTenantDB(dbName string, tenant models.Tenant) error {
-	// Get config for database connection
-	cfg := config.GetConfig()
-
-	// Connect to the tenant database
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		dbName,
-		cfg.DBPort,
-	)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
-	}
-	defer tenantDB.Close()
-
-	// Test the connection
-	if err := tenantDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping tenant database %s: %w", dbName, err)
-	}
-
-	// Check if tenant record already exists
-	var exists int
-	checkTenantQuery := `SELECT 1 FROM tenants WHERE id = $1`
-	err = tenantDB.QueryRow(checkTenantQuery, tenant.ID).Scan(&exists)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing tenant: %w", err)
-	}
-
-	// Only insert if the tenant record doesn't already exist
-	if err == sql.ErrNoRows {
-		// Insert tenant record in tenant database (matches pattern from admin_auth_controller.go and oidc_controller.go)
-		tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-			VALUES ($1, $1, $2, $3, $4, $5, $6, 'active', $7, $8, NOW(), NOW())`
-
-		_, err = tenantDB.Exec(tenantInsert,
-			tenant.TenantID,
-			tenant.Email,
-			tenant.PasswordHash,
-			tenant.Name,
-			tenant.Provider,
-			tenant.Source,
-			tenant.TenantDomain,
-			tenant.TenantDB,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create tenant record in tenant database: %w", err)
-		}
-	}
-
-	log.Printf("Successfully created tenant record %s in tenant database %s", tenant.Email, dbName)
-	return nil
-}
-
-// createUserInTenantDB creates a user record in the tenant database
-func (uc *UserController) createUserInTenantDB(dbName string, user models.ExtendedUser, tenantID uuid.UUID) error {
-	// Get config for database connection
-	cfg := config.GetConfig()
-
-	// Connect to the tenant database
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		dbName,
-		cfg.DBPort,
-	)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
-	}
-	defer tenantDB.Close()
-
-	// Test the connection
-	if err := tenantDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping tenant database %s: %w", dbName, err)
-	}
-
-	// Check if user already exists
-	var exists int
-	checkUserQuery := `SELECT 1 FROM users WHERE id = $1`
-	err = tenantDB.QueryRow(checkUserQuery, user.ID).Scan(&exists)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing user: %w", err)
-	}
-
-	// Only insert if the user doesn't already exist
-	if err == sql.ErrNoRows {
-		insertUserQuery := `
-			INSERT INTO users (
-				id, client_id, tenant_id, project_id, email, name, username, password_hash,
-				tenant_domain, provider, active, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11, $12)
-		`
-		now := time.Now()
-		_, err = tenantDB.Exec(insertUserQuery,
-			user.ID,
-			user.TenantID,
-			user.TenantID,
-			user.ProjectID,
-			user.Email,
-			user.Name,
-			user.Username,
-			user.PasswordHash,
-			"app.authsec.dev", // default tenant domain
-			user.Provider,
-			now,
-			now,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create user in tenant database: %w", err)
-		}
-	}
-
-	log.Printf("Successfully created user %s in tenant database %s", user.Email, dbName)
-	return nil
-}
-
-// assignAdminRoleToUser assigns the admin role to a user in the tenant database
-func (uc *UserController) assignAdminRoleToUser(dbName string, userID uuid.UUID, tenantID uuid.UUID) error {
-	// Get config for database connection
-	cfg := config.GetConfig()
-
-	// Connect to the tenant database
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		dbName,
-		cfg.DBPort,
-	)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
-	}
-	defer tenantDB.Close()
-
-	// Test the connection
-	if err := tenantDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping tenant database %s: %w", dbName, err)
-	}
-
-	// Insert admin role if it doesn't exist (check first to avoid deferrable constraint issues)
-	var adminRoleID uuid.UUID
-	checkRoleExistsQuery := `SELECT id FROM roles WHERE name = 'admin' AND tenant_id = $1`
-	err = tenantDB.QueryRow(checkRoleExistsQuery, tenantID).Scan(&adminRoleID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Role doesn't exist, insert it
-			insertRoleQuery := `INSERT INTO roles (name, description, tenant_id) VALUES ('admin', 'Administrator role with full access', $1) RETURNING id`
-			err = tenantDB.QueryRow(insertRoleQuery, tenantID).Scan(&adminRoleID)
-			if err != nil {
-				return fmt.Errorf("failed to insert admin role: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to check existing admin role: %w", err)
-		}
-	}
-
-	// Assign admin role via role_bindings (user_roles is deprecated)
-	checkBindingQuery := `SELECT 1 FROM role_bindings WHERE user_id = $1 AND role_id = $2 AND tenant_id = $3 AND scope_type IS NULL`
-	var exists int
-	err = tenantDB.QueryRow(checkBindingQuery, userID, adminRoleID, tenantID).Scan(&exists)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing role binding: %w", err)
-	}
-
-	// Only insert if the role binding doesn't already exist
-	if err == sql.ErrNoRows {
-		assignBindingQuery := `INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, NULL, NOW(), NOW())`
-		_, err = tenantDB.Exec(assignBindingQuery, uuid.New(), tenantID, userID, adminRoleID)
-		if err != nil {
-			return fmt.Errorf("failed to create admin role binding: %w", err)
-		}
-	}
-
-	// Note: End-user permissions are NOT seeded here.
-	// Tenants create their own permissions via the /uflow/user/rbac/permissions API.
-	// Admin permissions are seeded in the main DB via migration 116.
-
-	log.Printf("Successfully assigned admin role to user %s in tenant database %s", userID, dbName)
-	return nil
-}
-
-// createDefaultClientAndAssociations creates a default client and assigns all default associations
-func (uc *UserController) createDefaultClientAndAssociations(dbName string, tenantID uuid.UUID, clientID uuid.UUID, userID uuid.UUID, projectID uuid.UUID) error {
-	// Get config for database connection
-	cfg := config.GetConfig()
-
-	// Connect to the tenant database
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		cfg.DBHost,
-		cfg.DBUser,
-		cfg.DBPassword,
-		dbName,
-		cfg.DBPort,
-	)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
-	}
-	defer tenantDB.Close()
-
-	// Test the connection
-	if err := tenantDB.Ping(); err != nil {
-		return fmt.Errorf("failed to ping tenant database %s: %w", dbName, err)
-	}
-
-	// Create default client record with Hydra client ID
-	clientName := "Default Client"
-	clientDescription := "Default client created automatically for admin user"
-	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
-
-	insertClientQuery := `
-		INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING`
-	_, err = tenantDB.Exec(insertClientQuery, tenantID, tenantID, projectID, tenantID, clientName, clientDescription, hydraClientID)
-	if err != nil {
-		return fmt.Errorf("failed to create default client: %w", err)
-	}
-
-	// Fetch all default Groups from master database and create them in tenant database
-	if err := uc.createDefaultEntitiesInTenantDB(tenantDB, "groups", tenantID); err != nil {
-		return fmt.Errorf("failed to create default groups: %w", err)
-	}
-
-	// Assign all default associations to the client
-	if err := uc.assignDefaultAssociationsToClient(tenantDB, clientID, tenantID); err != nil {
-		return fmt.Errorf("failed to assign default associations to client: %w", err)
-	}
-
-	log.Printf("Successfully created default client and associations for tenant %s in database %s", tenantID, dbName)
-	return nil
-}
-
-// createDefaultEntitiesInTenantDB fetches entities from master DB and creates them in tenant DB
-func (uc *UserController) createDefaultEntitiesInTenantDB(tenantDB *sql.DB, entityType string, tenantID uuid.UUID) error {
-	var query string
-	var insertQuery string
-
-	switch entityType {
-
-	case "roles":
-		query = "SELECT name, description FROM roles"
-		insertQuery = "INSERT INTO roles (name, description, tenant_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, tenant_id) DO NOTHING"
-	case "groups":
-		query = "SELECT name, description FROM groups"
-		insertQuery = "INSERT INTO groups (name, description, tenant_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, tenant_id) DO NOTHING"
-	default:
-		return fmt.Errorf("unknown entity type: %s", entityType)
-	}
-
-	// Get master database connection
-	masterDB := config.GetDatabase()
-
-	rows, err := masterDB.Query(query)
-	if err != nil {
-		return fmt.Errorf("failed to fetch %s from master DB: %w", entityType, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var name, description string
-
-		if err := rows.Scan(&name, &description); err != nil {
-			return fmt.Errorf("failed to scan %s row: %w", entityType, err)
-		}
-
-		now := time.Now()
-		_, err = tenantDB.Exec(insertQuery, name, description, tenantID, now, now)
-		if err != nil {
-			return fmt.Errorf("failed to insert %s %s: %w", entityType, name, err)
-		}
-	}
-
-	return rows.Err()
-}
-
-// assignDefaultAssociationsToClient assigns all default scopes, roles, groups, and resources to a client
-func (uc *UserController) assignDefaultAssociationsToClient(tenantDB *sql.DB, clientID uuid.UUID, tenantID uuid.UUID) error {
-
-	// Assign all roles to client
-	if err := uc.assignEntityToClient(tenantDB, "roles", "client_roles", clientID, tenantID); err != nil {
-		return fmt.Errorf("failed to assign roles to client: %w", err)
-	}
-
-	// Assign all groups to client
-	if err := uc.assignEntityToClient(tenantDB, "groups", "client_groups", clientID, tenantID); err != nil {
-		return fmt.Errorf("failed to assign groups to client: %w", err)
-	}
-
-	return nil
-}
-
-// assignEntityToClient assigns all entities of a type to a client
-func (uc *UserController) assignEntityToClient(tenantDB *sql.DB, entityTable string, associationTable string, clientID uuid.UUID, tenantID uuid.UUID) error {
-	// Whitelist allowed table names to prevent SQL injection
-	allowedEntityTables := map[string]bool{
-		"roles":  true,
-		"groups": true,
-	}
-	allowedAssociationTables := map[string]bool{
-		"client_roles":  true,
-		"client_groups": true,
-	}
-
-	if !allowedEntityTables[entityTable] {
-		return fmt.Errorf("invalid entity table name: %s", entityTable)
-	}
-	if !allowedAssociationTables[associationTable] {
-		return fmt.Errorf("invalid association table name: %s", associationTable)
-	}
-
-	// Get all entity IDs for this tenant
-	query := fmt.Sprintf("SELECT id FROM %s WHERE tenant_id = $1", entityTable)
-	rows, err := tenantDB.Query(query, tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to fetch %s IDs: %w", entityTable, err)
-	}
-	defer rows.Close()
-
-	// Insert associations
-	insertQuery := fmt.Sprintf("INSERT INTO %s (client_id, %s_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-		associationTable, entityTable[:len(entityTable)-1]) // Remove 's' from table name for column name
-
-	for rows.Next() {
-		var entityID uuid.UUID
-		if err := rows.Scan(&entityID); err != nil {
-			return fmt.Errorf("failed to scan %s ID: %w", entityTable, err)
-		}
-
-		_, err = tenantDB.Exec(insertQuery, clientID, entityID)
-		if err != nil {
-			return fmt.Errorf("failed to assign %s %s to client: %w", entityTable, entityID, err)
-		}
-	}
-
-	return rows.Err()
 }
 
 // WebAuthnMFALoginStatus checks if a user has WebAuthn MFA configured

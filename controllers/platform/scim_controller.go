@@ -24,11 +24,6 @@ import (
 // SCIMController handles SCIM 2.0 provisioning endpoints for end-users (tenant DB)
 type SCIMController struct{}
 
-// scimContentType sets the proper SCIM content type header
-func scimContentType(c *gin.Context) {
-	c.Header("Content-Type", "application/scim+json; charset=utf-8")
-}
-
 // scimBaseURL returns the base URL for SCIM resource locations
 func scimBaseURL(c *gin.Context) string {
 	scheme := "https"

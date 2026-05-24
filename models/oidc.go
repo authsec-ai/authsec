@@ -49,8 +49,12 @@ type OIDCState struct {
 	// Nullable — empty for rows minted before migration 123.
 	SignedState   string     `json:"-" gorm:"type:text"`
 	ApplicationID *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
-	ExpiresAt     time.Time  `json:"expires_at" gorm:"not null"` // State expiry
-	CreatedAt     time.Time  `json:"created_at"`
+	// LoginChallenge is non-empty only for Action=="hydra_login" — the v4
+	// end-user OIDC flow that completes a Hydra login challenge. The callback
+	// uses this to call Hydra accept-login at the end of the dance.
+	LoginChallenge string    `json:"-" gorm:"type:text"`
+	ExpiresAt      time.Time `json:"expires_at" gorm:"not null"` // State expiry
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // TableName specifies the table name for OIDCState
@@ -88,6 +92,11 @@ type OIDCInitiateInput struct {
 	Provider      string     `json:"provider" binding:"required"` // workspace's provider_name slug ('google', 'github', 'okta-acme', …)
 	RedirectAfter string     `json:"redirect_after,omitempty"`    // Optional: where to go after
 	ApplicationID *uuid.UUID `json:"application_id,omitempty"`    // Optional: Application this login targets; used by application_identity_provider_policies gate
+	// LoginChallenge is the Hydra OAuth login_challenge token, set only when
+	// the OIDC flow is being driven by a Hydra-managed end-user login (the
+	// hmgr/auth/initiate shim). The v4 callback uses it to call Hydra
+	// accept-login and complete the upstream OAuth flow.
+	LoginChallenge string `json:"login_challenge,omitempty"`
 }
 
 // OIDCInitiateResponse represents the response for OIDC initiation

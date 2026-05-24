@@ -613,25 +613,11 @@ func (dc *DelegationPolicyController) GetMyRolesAndPermissions(c *gin.Context) {
 		return
 	}
 
-	// Get all tenant scopes
-	scopes, err := getTenantScopes(tid)
-	if err != nil {
-		scopes = []string{} // non-fatal, return empty
-	}
-
-	// Get all tenant resources
-	resources, err := getTenantResources(tid)
-	if err != nil {
-		resources = []string{} // non-fatal, return empty
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":     userID,
 		"tenant_id":   tid,
 		"roles":       roles,
 		"permissions": permissions,
-		"scopes":      scopes,
-		"resources":   resources,
 	})
 }
 

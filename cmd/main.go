@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +25,6 @@ import (
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
-	"github.com/authsec-ai/authsec/internal/mtplugin"
 	session "github.com/authsec-ai/authsec/internal/session"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -98,19 +96,6 @@ func main() {
 		}
 		reconciler := services.NewHydraReconciler(config.DB, interval)
 		go reconciler.Run(context.Background())
-	}
-
-	// mt-plugin: auto-detect the multi-tenant plugin via gRPC heartbeat.
-	// When MT_PLUGIN_GRPC_ADDR is set, authsec will notify mt-plugin after each
-	// admin registration so it can provision the tenant database asynchronously.
-	// Without the plugin, only one admin (single-tenant) is permitted.
-	if cfg.MtPluginAddr != "" {
-		mtClient := mtplugin.NewClient(cfg.MtPluginAddr)
-		mtClient.StartHeartbeat(context.Background(), 15*time.Second)
-		config.MTPluginClient = mtClient
-		log.Printf("[mtplugin] Heartbeat started for %s", cfg.MtPluginAddr)
-	} else {
-		log.Println("[mtplugin] MT_PLUGIN_GRPC_ADDR not set — single-tenant mode")
 	}
 
 	// Initialise Vault (optional; logs warning if not configured)
@@ -359,22 +344,4 @@ func validateWebAuthnEnvVars() error {
 		}
 	}
 	return nil
-}
-
-func splitAndTrim(csv string) []string {
-	values := strings.Split(csv, ",")
-	result := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, v := range values {
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			continue
-		}
-		if _, ok := seen[trimmed]; ok {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		result = append(result, trimmed)
-	}
-	return result
 }

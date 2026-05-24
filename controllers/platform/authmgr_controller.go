@@ -30,7 +30,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	hydra "github.com/ory/hydra-client-go/v2"
 	"gorm.io/gorm"
 )
 
@@ -79,70 +78,6 @@ func authmgrGetStringFromCtx(c *gin.Context, key string) string {
 		return s
 	}
 	return ""
-}
-
-// authmgrSafeExtractString safely pulls a string from a map[string]interface{}.
-func authmgrSafeExtractString(data map[string]interface{}, key string) (string, error) {
-	if data == nil {
-		return "", fmt.Errorf("data map is nil")
-	}
-	value, exists := data[key]
-	if !exists {
-		return "", fmt.Errorf("key '%s' not found", key)
-	}
-	s, ok := value.(string)
-	if !ok || s == "" {
-		return "", fmt.Errorf("key '%s' is not a non-empty string", key)
-	}
-	return s, nil
-}
-
-// authmgrValidateRequiredFields returns an error if any required field is missing.
-func authmgrValidateRequiredFields(data map[string]interface{}, required []string) error {
-	var missing []string
-	for _, f := range required {
-		if _, ok := data[f]; !ok {
-			missing = append(missing, f)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required OIDC fields: %v", missing)
-	}
-	return nil
-}
-
-// authmgrIsSubset returns true when every element of subset is in superset.
-func authmgrIsSubset(subset, superset []string) bool {
-	set := make(map[string]bool, len(superset))
-	for _, s := range superset {
-		set[s] = true
-	}
-	for _, s := range subset {
-		if !set[s] {
-			return false
-		}
-	}
-	return true
-}
-
-// authmgrConvertSlice converts []interface{} to []string.
-func authmgrConvertSlice(data interface{}) []string {
-	if data == nil {
-		return []string{}
-	}
-	switch v := data.(type) {
-	case []interface{}:
-		out := make([]string, 0, len(v))
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	case []string:
-		return v
-	}
-	return []string{}
 }
 
 // ── clientsvc equivalent: DB-based authz lookup ─────────────────────────────
@@ -280,37 +215,6 @@ func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (st
 		return "", "", fmt.Errorf("client lookup: %w", err)
 	}
 	return user.ClientID.String(), user.ProjectID.String(), nil
-}
-
-// ── JWT helpers ──────────────────────────────────────────────────────────────
-
-// authmgrValidateOIDCToken introspects a Hydra OIDC token and returns claims.
-func authmgrValidateOIDCToken(token string) (*sharedmodels.Introspection, error) {
-	hydraAdminURL := config.AppConfig.HydraAdminURL
-	if hydraAdminURL == "" {
-		return nil, errors.New("hydra admin URL not configured")
-	}
-	if strings.HasPrefix(hydraAdminURL, "http://") {
-		hydraAdminURL = hydraAdminURL[7:]
-	}
-	cfg := hydra.NewConfiguration()
-	cfg.Host = hydraAdminURL
-	cfg.Scheme = "http"
-	client := hydra.NewAPIClient(cfg)
-
-	resp, httpResp, err := client.OAuth2API.IntrospectOAuth2Token(context.Background()).Token(token).Execute()
-	if err != nil {
-		return nil, fmt.Errorf("introspect: %w", err)
-	}
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("introspect status: %s", httpResp.Status)
-	}
-	return &sharedmodels.Introspection{
-		Active:   &resp.Active,
-		Scope:    *resp.Scope,
-		ClientID: *resp.ClientId,
-		Ext:      resp.Ext,
-	}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────

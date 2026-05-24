@@ -87,10 +87,7 @@ type User struct {
 	ProviderData     datatypes.JSON `json:"provider_data,omitempty" gorm:"type:jsonb"`
 	AvatarURL        *string        `json:"avatar_url,omitempty" gorm:"type:text"`
 	Active           bool           `json:"active" gorm:"default:true;index"`
-	Scopes           []Scope        `json:"scopes" gorm:"many2many:user_scopes;"`
-	Roles            []Role         `json:"roles" gorm:"many2many:user_roles;"`
 	Groups           []Group        `json:"groups" gorm:"many2many:user_groups;"`
-	Resources        []Resource     `json:"resources" gorm:"many2many:user_resources;"`
 	MFAEnabled       bool           `json:"mfa_enabled" gorm:"default:false;not null"`
 	MFAMethod        pq.StringArray `json:"mfa_method,omitempty" gorm:"type:text[]"`
 	MFADefaultMethod *string        `json:"mfa_default_method,omitempty" gorm:"type:text"`

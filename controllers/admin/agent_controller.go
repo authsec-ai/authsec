@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -463,13 +462,4 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		"audience":    req.Audience,
 		"ttl_seconds": finalTTL,
 	})
-}
-
-// extractBearerToken gets the Bearer token from the Authorization header.
-func extractBearerToken(c *gin.Context) string {
-	auth := c.GetHeader("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
-	}
-	return ""
 }

@@ -219,12 +219,15 @@ func NewOIDCStateRepository(db *DBConnection) *OIDCStateRepository {
 	return &OIDCStateRepository{db: db}
 }
 
-// CreateState creates a new OIDC state entry
+// CreateState creates a new OIDC state entry. v4 columns (application_id,
+// signed_state, login_challenge — added in migration 128) are written here;
+// pre-v4 callers can leave them empty and they'll be NULL in the DB.
 func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 	query := `
 		INSERT INTO oidc_states (state_token, tenant_id, tenant_domain, request_host, provider_name,
-		                         action, code_verifier, redirect_after, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		                         action, code_verifier, redirect_after, expires_at, created_at,
+		                         application_id, signed_state, login_challenge)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
 	`
 
@@ -233,44 +236,54 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 		state.CreatedAt = now
 	}
 
-	log.Printf("DEBUG CreateState: Inserting state with OriginDomain='%s' (will be stored in request_host)", state.OriginDomain)
-	log.Printf("DEBUG CreateState: All params - StateToken=%s, TenantID=%v, TenantDomain=%s, OriginDomain=%s, ProviderName=%s, Action=%s",
-		state.StateToken, state.TenantID, state.TenantDomain, state.OriginDomain, state.ProviderName, state.Action)
-
-	// Use sql.NullString for proper NULL handling
 	requestHostParam := sql.NullString{
 		String: state.OriginDomain,
 		Valid:  state.OriginDomain != "",
 	}
-	log.Printf("DEBUG CreateState: requestHostParam={String: '%s', Valid: %v}", requestHostParam.String, requestHostParam.Valid)
+	signedStateParam := sql.NullString{
+		String: state.SignedState,
+		Valid:  state.SignedState != "",
+	}
+	loginChallengeParam := sql.NullString{
+		String: state.LoginChallenge,
+		Valid:  state.LoginChallenge != "",
+	}
+	var applicationIDParam interface{} // either uuid string or nil for NULL
+	if state.ApplicationID != nil {
+		applicationIDParam = state.ApplicationID.String()
+	}
 
 	err := r.db.QueryRow(query,
 		state.StateToken,
 		state.TenantID,
 		state.TenantDomain,
-		requestHostParam, // Maps to request_host column
+		requestHostParam,
 		state.ProviderName,
 		state.Action,
 		state.CodeVerifier,
 		state.RedirectAfter,
 		state.ExpiresAt,
 		state.CreatedAt,
+		applicationIDParam,
+		signedStateParam,
+		loginChallengeParam,
 	).Scan(&state.ID)
 
 	if err != nil {
 		log.Printf("ERROR CreateState: Failed to insert state: %v", err)
-	} else {
-		log.Printf("DEBUG CreateState: Successfully inserted state with ID=%s", state.ID)
 	}
-
 	return err
 }
 
-// GetStateByToken retrieves a valid (non-expired) state by token
+// GetStateByToken retrieves a valid (non-expired) state by token. Reads the
+// v4 columns (application_id, signed_state, login_challenge) added by
+// migration 128; older rows where these are NULL come back with empty values
+// and the callback branches accordingly.
 func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCState, error) {
 	query := `
 		SELECT id, state_token, tenant_id, tenant_domain, request_host, provider_name,
-		       action, code_verifier, redirect_after, expires_at, created_at
+		       action, code_verifier, redirect_after, expires_at, created_at,
+		       application_id, signed_state, login_challenge
 		FROM oidc_states
 		WHERE state_token = $1 AND expires_at > $2
 	`
@@ -278,6 +291,7 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 	state := &models.OIDCState{}
 	var tenantID sql.NullString
 	var requestHost, codeVerifier, redirectAfter sql.NullString
+	var applicationID, signedState, loginChallenge sql.NullString
 
 	err := r.db.QueryRow(query, stateToken, time.Now()).Scan(
 		&state.ID,
@@ -291,6 +305,9 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 		&redirectAfter,
 		&state.ExpiresAt,
 		&state.CreatedAt,
+		&applicationID,
+		&signedState,
+		&loginChallenge,
 	)
 
 	if err != nil {
@@ -306,15 +323,23 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 	}
 	if requestHost.Valid {
 		state.OriginDomain = requestHost.String
-		log.Printf("DEBUG GetStateByToken: Read request_host='%s' from DB, set OriginDomain='%s'", requestHost.String, state.OriginDomain)
-	} else {
-		log.Printf("DEBUG GetStateByToken: request_host is NULL in DB")
 	}
 	if codeVerifier.Valid {
 		state.CodeVerifier = codeVerifier.String
 	}
 	if redirectAfter.Valid {
 		state.RedirectAfter = redirectAfter.String
+	}
+	if applicationID.Valid {
+		if id, perr := uuid.Parse(applicationID.String); perr == nil {
+			state.ApplicationID = &id
+		}
+	}
+	if signedState.Valid {
+		state.SignedState = signedState.String
+	}
+	if loginChallenge.Valid {
+		state.LoginChallenge = loginChallenge.String
 	}
 
 	return state, nil

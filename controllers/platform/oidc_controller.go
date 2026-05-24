@@ -21,7 +21,7 @@ import (
 	"github.com/authsec-ai/authsec/middlewares"
 
 	icp "github.com/authsec-ai/authsec/internal/clients/icp"
-	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
+	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	spireservices "github.com/authsec-ai/authsec/internal/spire/services"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -97,8 +97,11 @@ type OIDCController struct {
 	userRepo               *database.UserRepository
 	adminUserRepo          *database.AdminUserRepository
 	pendingRepo            *database.PendingRegistrationRepository
-	tenantDBService        *database.TenantDBService
 	icpProvisioningService *services.ICPProvisioningService
+	// hydraLoginSvc completes the Hydra login_challenge dance when the OIDC
+	// flow is being driven by an upstream OAuth client (Action=="hydra_login").
+	hydraLoginSvc *hydramodels.OAuthLoginService
+	authzCtx      *services.AuthorizationContextService
 }
 
 // NewOIDCController creates a new OIDC controller
@@ -106,17 +109,6 @@ func NewOIDCController() (*OIDCController, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized")
-	}
-
-	tenantDBService, err := database.NewTenantDBService(
-		db,
-		config.AppConfig.DBHost,
-		config.AppConfig.DBUser,
-		config.AppConfig.DBPassword,
-		config.AppConfig.DBPort,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
 	}
 
 	// Initialize ICP client and provisioning service
@@ -141,8 +133,9 @@ func NewOIDCController() (*OIDCController, error) {
 		userRepo:               database.NewUserRepository(db),
 		adminUserRepo:          database.NewAdminUserRepository(db),
 		pendingRepo:            database.NewPendingRegistrationRepository(db),
-		tenantDBService:        tenantDBService,
 		icpProvisioningService: icpProvisioningService,
+		hydraLoginSvc:          hydramodels.NewOAuthLoginService(*config.AppConfig),
+		authzCtx:               services.NewAuthorizationContextService(config.DB),
 	}, nil
 }
 
@@ -530,6 +523,17 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 		return
 	}
 
+	// hydra_login fast-path: the user is completing an upstream OAuth flow
+	// driven by Hydra (via the hmgr/auth/initiate shim). Handle the entire
+	// callback server-side — exchange the code, resolve the user, accept the
+	// Hydra login challenge, 302 the browser to Hydra's redirect_to. No SPA
+	// round-trip needed because the user's final destination is the OAuth
+	// client app, not our admin UI.
+	if pre, perr := oc.oidcService.GetStateByToken(state); perr == nil && pre != nil && pre.Action == "hydra_login" {
+		oc.handleHydraLoginCallback(c, code, state)
+		return
+	}
+
 	// Retrieve the state from database to get tenant_domain for proper redirect
 	oidcState, err := oc.oidcService.GetStateByToken(state)
 	data := gin.H{
@@ -557,6 +561,148 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 	// Pass the code and state to frontend for SPA flow
 	// Frontend will call POST /uflow/oidc/exchange-code with these parameters
 	renderOAuthCallbackHTML(c, data)
+}
+
+// handleHydraLoginCallback completes an end-user OIDC login that was kicked
+// off by a Hydra login_challenge (the hmgr/auth/initiate shim). Server-side
+// flow: verify state + exchange code (via OIDCService.HandleCallback), resolve
+// the local user inside the workspace, link the oidc_user_identity if new,
+// then call Hydra accept-login and 302 the browser to Hydra's redirect_to.
+//
+// No SPA round-trip — the user's final destination is the OAuth client app,
+// not our admin UI.
+func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateToken string) {
+	state, userInfo, err := oc.oidcService.HandleCallback(&models.OIDCCallbackInput{
+		Code:  code,
+		State: stateToken,
+	})
+	if err != nil {
+		log.Printf("hydra_login callback: HandleCallback failed: %v", err)
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	if state.TenantID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "workspace_id missing from OIDC state"})
+		return
+	}
+	if state.LoginChallenge == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "login_challenge missing from OIDC state"})
+		return
+	}
+
+	workspaceID := *state.TenantID
+
+	// 1. Resolve the local user by IdP identity first, fall back to email.
+	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(
+		workspaceID, state.ProviderName, userInfo.Sub)
+
+	var user *models.ExtendedUser
+	if identity != nil {
+		user, err = oc.userRepo.GetUserByID(identity.UserID)
+		if err != nil {
+			log.Printf("hydra_login callback: GetUserByID(%s) failed: %v", identity.UserID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "user lookup failed"})
+			return
+		}
+		_ = oc.oidcService.UpdateLastLogin(identity.ID)
+	} else {
+		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
+		if err != nil {
+			// The end-user authenticated with their IdP but isn't a known
+			// member of this workspace. We do NOT auto-create — workspace
+			// admin must invite them first. Surface a clear error.
+			log.Printf("hydra_login callback: no user for email=%s in workspace=%s", userInfo.Email, workspaceID)
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "User not found in this workspace. Contact your administrator.",
+			})
+			return
+		}
+		// Cross-tenant collision: this IdP identity already belongs to a
+		// different account anywhere in the system. Refuse to silently
+		// hijack it.
+		if existing, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub); existing != nil && existing.UserID != user.ID {
+			c.JSON(http.StatusConflict, gin.H{
+				"success": false,
+				"error":   "This social login is already linked to another account.",
+			})
+			return
+		}
+		// Link or refresh the identity. The unique constraint on
+		// (tenant_id, user_id, provider_name) means a row may already
+		// exist with a stale provider_user_id (e.g. from initial admin
+		// signup that stored a different sub format). Best-effort:
+		// insert; on conflict, do nothing — the existing row is fine for
+		// completing the Hydra login. Don't block auth on identity
+		// bookkeeping.
+		profileJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
+		if err := oc.oidcService.CreateIdentity(&models.OIDCUserIdentity{
+			TenantID:       workspaceID,
+			UserID:         user.ID,
+			ProviderName:   state.ProviderName,
+			ProviderUserID: userInfo.Sub,
+			Email:          userInfo.Email,
+			ProfileData:    string(profileJSON),
+		}); err != nil {
+			// Treat duplicate-key as a no-op — we already have a row for
+			// this (tenant, user, provider) tuple. Any other error is
+			// logged but doesn't block the login.
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate key") ||
+				strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+				log.Printf("hydra_login callback: oidc_user_identities row already exists for user=%s provider=%s — using existing link", user.ID, state.ProviderName)
+			} else {
+				log.Printf("hydra_login callback: CreateIdentity failed (non-fatal): %v", err)
+			}
+		}
+	}
+
+	// 2. Accept the Hydra login challenge with the local user as subject.
+	hydraCtx := map[string]interface{}{
+		"tenant_id":    workspaceID.String(),
+		"workspace_id": workspaceID.String(),
+		"email":        user.Email,
+		"name":         userInfo.Name,
+		"provider":     state.ProviderName,
+		"auth_method":  "oidc_federated",
+	}
+	if state.ApplicationID != nil {
+		hydraCtx["application_id"] = state.ApplicationID.String()
+	}
+	// Propagate the auth_request_contexts.context_id so the consent handler
+	// can re-resolve the workspace+application binding when Hydra issues a
+	// fresh consent_challenge that doesn't pair 1:1 with the original
+	// login_challenge. The login_challenge lookup is the primary path; this
+	// is the safety-net fallback (see hmgr_controller.ConsentHandler).
+	if arcCtx, lookupErr := oc.authzCtx.GetAuthRequestContextByLoginChallenge(state.LoginChallenge); lookupErr == nil && arcCtx != nil && arcCtx.ContextID != "" {
+		hydraCtx["context_id"] = arcCtx.ContextID
+	}
+	arcCtx, err := oc.authzCtx.GetAuthRequestContextByLoginChallenge(state.LoginChallenge)
+	if err != nil || arcCtx == nil {
+		log.Printf("hydra_login callback: auth context lookup failed login_challenge=%s: %v", state.LoginChallenge, err)
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "authorization context not found for login challenge"})
+		return
+	}
+	hydraCtx["context_id"] = arcCtx.ContextID
+	hydraCtx["resource_server_id"] = arcCtx.ResourceServerID
+	hydraCtx["resource_uri"] = arcCtx.ResourceURI
+
+	accept, err := oc.hydraLoginSvc.AcceptHydraLoginRequestWithContext(
+		state.LoginChallenge, user.ID.String(), hydraCtx)
+	if err != nil {
+		log.Printf("hydra_login callback: AcceptHydraLoginRequestWithContext failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "failed to accept hydra login"})
+		return
+	}
+	if accept == nil || accept.RedirectTo == "" {
+		log.Printf("hydra_login callback: Hydra returned empty redirect_to")
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "hydra did not return a redirect"})
+		return
+	}
+
+	// 3. Hydra is in charge of the rest of the OAuth dance — bounce the
+	// browser to whatever URL it gave us (usually back to the OAuth client
+	// app's redirect_uri with an authorization code).
+	c.Redirect(http.StatusFound, accept.RedirectTo)
 }
 
 // ExchangeCode handles the code exchange for SPAs
@@ -735,10 +881,6 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 			"message": "No account found for this email in this workspace. Please contact your administrator.",
 		})
 	}
-}
-
-func (oc *OIDCController) generateAndRespondWithToken(c *gin.Context, user *models.ExtendedUser) {
-	oc.generateAndRespondWithTokenAndOrigin(c, user, "")
 }
 
 func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, user *models.ExtendedUser, originDomain string) {
@@ -938,20 +1080,8 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		return
 	}
 
-	// tenantDBName is already set on the tenant record above.
-	// Notify mt-plugin to provision the actual database asynchronously.
+	// Single-tenant: no per-tenant DB provisioning. The workspace lives in master DB.
 	mainDB := config.GetDatabase()
-	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
-		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
-			TenantId: tenantID.String(),
-			Email:    userInfo.Email,
-			DbName:   tenantDBName,
-		}); err != nil {
-			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
-		}
-	} else {
-		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
-	}
 
 	// Provision PKI infrastructure via ICP service
 	if oc.icpProvisioningService != nil {
@@ -1139,223 +1269,6 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	})
 }
 
-// handleLoginCallback processes login after OIDC callback
-// Login from tenant subdomain (e.g., ritam.app.authsec.dev) - user must exist in this tenant
-func (oc *OIDCController) handleLoginCallback(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
-	log.Printf("DEBUG handleLoginCallback: state.TenantDomain='%s', state.TenantID=%v", state.TenantDomain, state.TenantID)
-
-	if state.TenantID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID missing from state"})
-		return
-	}
-
-	// Get tenant info first
-	tenant, err := oc.tenantRepo.GetTenantByID(state.TenantID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant info"})
-		return
-	}
-
-	log.Printf("DEBUG handleLoginCallback: Found tenant with tenant_domain='%s' from database", tenant.TenantDomain)
-
-	// Check if user has OIDC identity in this tenant
-	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(*state.TenantID, state.ProviderName, userInfo.Sub)
-
-	var user *models.ExtendedUser
-
-	if identity != nil {
-		// User has OIDC identity - get user by ID
-		user, err = oc.userRepo.GetUserByID(identity.UserID)
-		if err != nil {
-			log.Printf("Failed to get user by identity: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user info"})
-			return
-		}
-		// Update last login
-		if err := oc.oidcService.UpdateLastLogin(identity.ID); err != nil {
-			log.Printf("Failed to update last login: %v", err)
-		}
-	} else {
-		// No OIDC identity in this tenant. Check if user exists by email in this tenant.
-		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, *state.TenantID)
-		if err != nil {
-			// User doesn't exist in this tenant at all - REJECT
-			log.Printf("OIDC Login: User %s not found in tenant %s - rejecting", userInfo.Email, state.TenantDomain)
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":   "User not found",
-				"message": "No account found with this email in this workspace. Please contact your administrator.",
-			})
-			return
-		}
-
-		// Before linking, check if this OIDC identity is already in use globally.
-		existingGlobalIdentity, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
-		if existingGlobalIdentity != nil {
-			log.Printf("OIDC Login Conflict: User %s in tenant %s tried to link an OIDC identity that is already linked to user %s in tenant %s.",
-				user.ID, *state.TenantID, existingGlobalIdentity.UserID, existingGlobalIdentity.TenantID)
-			c.JSON(http.StatusConflict, gin.H{
-				"error":   "Social login already linked",
-				"message": "This social login is already linked to another user account. Please use a different login method or contact support.",
-			})
-			return
-		}
-
-		// User exists by email but no OIDC identity - link the OIDC provider
-		log.Printf("OIDC Login: Linking provider %s to existing user %s in tenant %s", state.ProviderName, userInfo.Email, *state.TenantID)
-		profileDataJSON, _ := json.Marshal(map[string]interface{}{
-			"name":    userInfo.Name,
-			"picture": userInfo.Picture,
-		})
-		newIdentity := &models.OIDCUserIdentity{
-			TenantID:       *state.TenantID,
-			UserID:         user.ID,
-			ProviderName:   state.ProviderName,
-			ProviderUserID: userInfo.Sub,
-			Email:          userInfo.Email,
-			ProfileData:    string(profileDataJSON),
-		}
-		if err := oc.oidcService.CreateIdentity(newIdentity); err != nil {
-			log.Printf("Failed to create OIDC identity during login link: %v", err)
-			// Now that we have upsert, this failure is more serious.
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link social login."})
-			return
-		}
-	}
-
-	// Check if first login (before last_login gets updated in the response or elsewhere)
-	isFirstLogin := user.LastLogin == nil
-
-	// Determine login domain - prioritize origin domain (where user came from) over tenant domain
-	// This is important for custom domains (e.g., test.auth-sec.org vs test.app.authsec.dev)
-	loginDomain := state.OriginDomain
-	if loginDomain == "" {
-		loginDomain = state.TenantDomain
-	}
-	if loginDomain == "" {
-		loginDomain = tenant.TenantDomain
-	}
-	log.Printf("DEBUG handleLoginCallback: loginDomain='%s' (origin='%s', state.TenantDomain='%s', tenant.TenantDomain='%s')",
-		loginDomain, state.OriginDomain, state.TenantDomain, tenant.TenantDomain)
-
-	// Audit log: OIDC login successful
-	middlewares.Audit(c, "oidc", user.ID.String(), "login", &middlewares.AuditChanges{
-		After: map[string]interface{}{
-			"tenant_id":     state.TenantID.String(),
-			"tenant_domain": loginDomain,
-			"user_id":       user.ID.String(),
-			"email":         user.Email,
-			"provider":      state.ProviderName,
-			"first_login":   isFirstLogin,
-		},
-	})
-
-	// Return HTML page that communicates with frontend
-	log.Printf("DEBUG handleLoginCallback: Calling renderOAuthCallbackHTML with tenant_domain='%s'", loginDomain)
-	renderOAuthCallbackHTML(c, map[string]interface{}{
-		"success":       true,
-		"message":       "Login successful",
-		"tenant_domain": loginDomain,
-		"tenant_id":     state.TenantID.String(),
-		"client_id":     user.ClientID.String(),
-		"first_login":   isFirstLogin,
-	})
-}
-
-// handleDiscoverCallback handles the OIDC callback for discover mode
-// This is used when user comes from app.authsec.dev without specifying a tenant
-// Flow: Check if user email exists in main DB → if yes, auto-login; if no, prompt for domain to register
-func (oc *OIDCController) handleDiscoverCallback(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
-	// First, check if user with this email already exists in main DB (users table)
-	existingUser, err := oc.userRepo.GetUserByEmail(userInfo.Email)
-
-	if err == nil && existingUser != nil {
-		// User EXISTS by email - auto-login to their tenant
-		log.Printf("OIDC Discover: Found existing user by email %s in tenant %s", userInfo.Email, existingUser.TenantID)
-
-		// Get tenant info
-		tenant, err := oc.tenantRepo.GetTenantByID(existingUser.TenantID.String())
-		if err != nil {
-			log.Printf("Failed to get tenant info: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant info"})
-			return
-		}
-
-		// Check if OIDC identity exists globally (constraint is on provider_name + provider_user_id)
-		existingIdentity, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
-		if existingIdentity != nil {
-			// Identity exists - just update last login
-			if err := oc.oidcService.UpdateLastLogin(existingIdentity.ID); err != nil {
-				log.Printf("Failed to update last login: %v", err)
-			}
-			log.Printf("Updated last login for existing OIDC identity: %s", userInfo.Email)
-		} else {
-			// Identity doesn't exist - create new one
-			profileDataJSON, _ := json.Marshal(map[string]interface{}{
-				"name":    userInfo.Name,
-				"picture": userInfo.Picture,
-			})
-			identity := &models.OIDCUserIdentity{
-				TenantID:       existingUser.TenantID,
-				UserID:         existingUser.ID,
-				ProviderName:   state.ProviderName,
-				ProviderUserID: userInfo.Sub,
-				Email:          userInfo.Email,
-				ProfileData:    string(profileDataJSON),
-			}
-			if err := oc.oidcService.CreateIdentity(identity); err != nil {
-				log.Printf("Failed to create OIDC identity for existing user: %v", err)
-				// Non-fatal, continue with login
-			} else {
-				log.Printf("Created OIDC identity link for existing user %s", userInfo.Email)
-			}
-		}
-
-		// Check if first login (before last_login gets updated)
-		isFirstLogin := existingUser.LastLogin == nil
-
-		// Determine redirect domain - prioritize origin domain over tenant domain
-		redirectDomain := state.OriginDomain
-		if redirectDomain == "" {
-			redirectDomain = tenant.TenantDomain
-		}
-		log.Printf("DEBUG handleDiscoverCallback: redirectDomain='%s' (origin='%s', tenant='%s')",
-			redirectDomain, state.OriginDomain, tenant.TenantDomain)
-
-		// Return HTML page that communicates with frontend
-		renderOAuthCallbackHTML(c, map[string]interface{}{
-			"success":       true,
-			"message":       "Login successful - redirecting to your workspace",
-			"tenant_domain": redirectDomain,
-			"tenant_id":     existingUser.TenantID.String(),
-			"client_id":     existingUser.ClientID.String(),
-			"first_login":   isFirstLogin,
-		})
-		return
-	}
-
-	// User DOES NOT EXIST by email - need to register with a new tenant domain
-	// Return special response asking frontend to prompt for tenant domain
-	log.Printf("OIDC Discover: No existing user found for email %s, prompting for tenant domain", userInfo.Email)
-	log.Printf("DEBUG handleDiscoverCallback (new user): OriginDomain='%s' for redirect after registration", state.OriginDomain)
-
-	// Return HTML page that communicates with frontend
-	// Pass origin_domain so frontend knows where to redirect back after registration
-	renderOAuthCallbackHTML(c, map[string]interface{}{
-		"success":          false,
-		"needs_domain":     true,
-		"message":          "No existing account found. Please choose a workspace name to create your account.",
-		"provider":         state.ProviderName,
-		"email":            userInfo.Email,
-		"name":             userInfo.Name,
-		"picture":          userInfo.Picture,
-		"provider_user_id": userInfo.Sub,
-		"tenant_id":        nil,
-		"client_id":        nil,
-		"origin_domain":    state.OriginDomain, // Pass origin for redirect after registration
-		// Frontend should call /uflow/oidc/complete-registration with tenant_domain
-	})
-}
-
 // CompleteRegistration completes registration after discover mode found no existing user
 // @Summary Complete OIDC registration after discover
 // @Description Completes registration for a new user after discover mode, with chosen tenant domain
@@ -1512,19 +1425,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// tenantDBName is already set on the tenant record above.
-	// Notify mt-plugin to provision the actual database asynchronously.
-	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
-		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
-			TenantId: tenantID.String(),
-			Email:    input.Email,
-			DbName:   tenantDBName,
-		}); err != nil {
-			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of OIDC registration: %v", err)
-		}
-	} else {
-		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", tenantID.String())
-	}
+	// Single-tenant: no per-tenant DB provisioning.
 
 	// Provision PKI infrastructure via ICP service
 	mainDB := config.GetDatabase()

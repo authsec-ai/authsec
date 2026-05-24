@@ -15,7 +15,6 @@ import (
 
 // TenantCIBAAuthService handles CIBA authentication for tenant users
 type TenantCIBAAuthService struct {
-	tenantRepo      *database.TenantDeviceRepository
 	adminTenantRepo *database.AdminTenantRepository
 	pushService     *PushNotificationService
 	pollingInterval int

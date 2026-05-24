@@ -395,7 +395,7 @@ func (tr *TenantRepository) UpdateTenantStatusTx(tx *sql.Tx, tenantID uuid.UUID,
 }
 
 // DeleteTenant permanently deletes a tenant and all related data from the master database.
-// Note: This does NOT delete the tenant database - call TenantDBService.DropTenantDatabase separately.
+// Single-tenant collapse: there is no per-tenant database to drop separately.
 func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, error) {
 	deletedCounts := make(map[string]int64)
 

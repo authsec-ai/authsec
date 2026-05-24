@@ -149,19 +149,20 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 		log.Printf("WARN: failed to mint signed OIDC state: %v", err)
 	}
 
-	// Store state in database (expires in 10 minutes)
+	// Store state in database (expires in 30 minutes)
 	state := &models.OIDCState{
-		StateToken:    stateToken,
-		TenantID:      tenantID,
-		ApplicationID: input.ApplicationID,
-		SignedState:   signedState,
-		TenantDomain:  input.TenantDomain,
-		OriginDomain:  s.requestOrigin, // Store origin domain for post-auth redirect
-		ProviderName:  input.Provider,
-		Action:        action, // "login" or "register"
-		CodeVerifier:  codeVerifier,
-		RedirectAfter: input.RedirectAfter,
-		ExpiresAt:     time.Now().Add(30 * time.Minute),
+		StateToken:     stateToken,
+		TenantID:       tenantID,
+		ApplicationID:  input.ApplicationID,
+		SignedState:    signedState,
+		TenantDomain:   input.TenantDomain,
+		OriginDomain:   s.requestOrigin, // Store origin domain for post-auth redirect
+		ProviderName:   input.Provider,
+		Action:         action, // "login" | "register" | "discover" | "hydra_login"
+		CodeVerifier:   codeVerifier,
+		RedirectAfter:  input.RedirectAfter,
+		LoginChallenge: input.LoginChallenge, // populated only for action=="hydra_login"
+		ExpiresAt:      time.Now().Add(30 * time.Minute),
 	}
 	log.Printf("DEBUG InitiateOIDCFlow: Creating state with origin_domain='%s' (request_host column)", s.requestOrigin)
 

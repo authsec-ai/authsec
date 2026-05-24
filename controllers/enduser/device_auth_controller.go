@@ -30,19 +30,8 @@ func NewDeviceAuthController() (*DeviceAuthController, error) {
 		return nil, fmt.Errorf("database not initialized")
 	}
 
-	tenantDBService, err := database.NewTenantDBService(
-		db,
-		config.AppConfig.DBHost,
-		config.AppConfig.DBUser,
-		config.AppConfig.DBPassword,
-		config.AppConfig.DBPort,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
-	}
-
 	return &DeviceAuthController{
-		deviceService: services.NewDeviceAuthService(db, tenantDBService),
+		deviceService: services.NewDeviceAuthService(db),
 		oidcService:   services.NewOIDCService(db),
 		tenantRepo:    database.NewAdminTenantRepository(db),
 		userRepo:      database.NewUserRepository(db),

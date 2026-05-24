@@ -1386,22 +1386,10 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	logger.WithField("deleted_counts", deletedCounts).Info("Successfully deleted tenant data from master database")
 
-	// Step 2: Drop the tenant database if it exists
-	databaseDropped := false
-	// Tenant DB deletion is managed by mt-plugin.
-	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
-		if _, err := config.MTPluginClient.DeleteTenant(tenantUUID.String()); err != nil {
-			logger.WithError(err).Warn("[mtplugin] Failed to delete tenant DB via plugin")
-			deletedCounts["tenant_database"] = 0
-		} else {
-			logger.Info("[mtplugin] Tenant DB deletion delegated to mt-plugin")
-			databaseDropped = true
-			deletedCounts["tenant_database"] = 1
-		}
-	} else {
-		logger.Info("[mtplugin] Plugin not available — tenant DB deletion skipped")
-		deletedCounts["tenant_database"] = 0
-	}
+	// Step 2: Single-tenant deployment — no per-tenant database to drop.
+	// Workspace data lives in master DB and was removed in Step 1.
+	databaseDropped := true
+	deletedCounts["tenant_database"] = 0
 
 	// Audit log the deletion
 	if config.AuditLogger != nil {

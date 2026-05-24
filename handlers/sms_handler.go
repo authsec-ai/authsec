@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -70,12 +69,6 @@ func extractRPIDFromOrigin(origin string) string {
 	// This allows each custom domain to have its own RP ID scope
 	log.Printf("extractRPIDFromOrigin: Using custom domain RP ID: %s for origin: %s", host, origin)
 	return host
-}
-
-// computeRPIDHash computes SHA-256 hash of RP ID (needed to match against credentials)
-func computeRPIDHash(rpID string) []byte {
-	hash := sha256.Sum256([]byte(rpID))
-	return hash[:]
 }
 
 // hasWebAuthnCredentialsForRPID checks if a user has any WebAuthn credentials

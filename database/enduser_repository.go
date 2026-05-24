@@ -20,11 +20,6 @@ func NewEndUserRepository(db interface{}) *EndUserRepository {
 	return &EndUserRepository{db: db}
 }
 
-// setDB sets the database connection (for dynamic tenant connections)
-func (eur *EndUserRepository) setDB(db interface{}) {
-	eur.db = db
-}
-
 // executeQuery executes a query on the current database connection
 func (eur *EndUserRepository) executeQuery(query string, args ...interface{}) (*sql.Rows, error) {
 	switch db := eur.db.(type) {

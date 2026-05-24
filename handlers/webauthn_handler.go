@@ -120,12 +120,6 @@ type CredentialResponse struct {
 	ClientDataJSON string `json:"clientDataJSON"`
 }
 
-var reqBody struct {
-	Email      string              `json:"email"`
-	TenantID   string              `json:"tenant_id"`
-	Credential CredentialContainer `json:"credential"`
-}
-
 type AuthenticatorResponse struct {
 	AttestationObject string `json:"attestationObject"`
 	ClientDataJSON    string `json:"clientDataJSON"`
@@ -254,11 +248,6 @@ func extractChallengeFromClientData(base64urlClientData string) (string, error) 
 	}
 	// IMPORTANT: return challenge as-is, not decoded/re-encoded
 	return clientData.Challenge, nil
-}
-
-// logProtocolError logs WebAuthn protocol errors with details
-func logProtocolError(operation string, err error) {
-	log.Printf("[WebAuthn] %s error: %v", operation, err)
 }
 
 // ---------- Finish Biometric Verify ----------
@@ -591,13 +580,6 @@ func (h *WebAuthnHandler) BeginRegistration(c *gin.Context) {
 // @Failure      400 {object} ErrorResponse
 // @Failure      500 {object} ErrorResponse
 // @Router       /webauthn/finishRegistration [post]
-func safeBytes(in []byte) []byte {
-	if in == nil {
-		return []byte{}
-	}
-	return in
-}
-
 func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	reqID := uuid.New().String()
 	log.Printf("[%s] FinishRegistration: START", reqID)
@@ -1995,28 +1977,4 @@ func (h *WebAuthnHandler) VerifyBackupCode(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-func extractChallengeFromBody(body []byte) (string, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(body, &root); err != nil {
-		return "", fmt.Errorf("bad json: %w", err)
-	}
-	credVal, ok := root["credential"]
-	var cred map[string]interface{}
-	if ok {
-		cred, _ = credVal.(map[string]interface{})
-	} else {
-		cred = root // maybe the credential is the root
-	}
-	respVal, ok := cred["response"]
-	if !ok {
-		return "", errors.New("response missing")
-	}
-	resp, _ := respVal.(map[string]interface{})
-	cdj, _ := resp["clientDataJSON"].(string)
-	if cdj == "" {
-		return "", errors.New("clientDataJSON missing")
-	}
-	return extractChallengeFromClientData(cdj)
 }

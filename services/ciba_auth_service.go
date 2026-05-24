@@ -20,7 +20,6 @@ type CIBAAuthService struct {
 	userRepo        *database.UserRepository
 	tenantRepo      *database.AdminTenantRepository
 	pushService     *PushNotificationService
-	dbService       *database.TenantDBService
 	pollingInterval int
 	requestExpiry   time.Duration
 }
@@ -28,7 +27,6 @@ type CIBAAuthService struct {
 // NewCIBAAuthService creates a new CIBA authentication service
 func NewCIBAAuthService(
 	db *database.DBConnection,
-	dbService *database.TenantDBService,
 	pushService *PushNotificationService,
 ) *CIBAAuthService {
 	return &CIBAAuthService{
@@ -36,7 +34,6 @@ func NewCIBAAuthService(
 		userRepo:        database.NewUserRepository(db),
 		tenantRepo:      database.NewAdminTenantRepository(db),
 		pushService:     pushService,
-		dbService:       dbService,
 		pollingInterval: 5,               // 5 seconds minimum between polls
 		requestExpiry:   5 * time.Minute, // Requests expire in 5 minutes
 	}

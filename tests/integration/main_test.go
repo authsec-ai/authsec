@@ -190,7 +190,6 @@ func setTestEnv(dbName string) {
 	os.Setenv("TOTP_ENCRYPTION_KEY", "6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6")
 
 	os.Setenv("HYDRA_ADMIN_URL", "http://localhost:4445")
-	os.Setenv("OOC_MANAGER_URL", "http://localhost:7467")
 
 	os.Unsetenv("SKIP_DB_INIT")
 	os.Unsetenv("SKIP_MIGRATIONS")

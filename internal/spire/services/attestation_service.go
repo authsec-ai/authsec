@@ -243,39 +243,6 @@ func (s *AttestationService) generateSpiffeID(tenantID string, selectors map[str
 	return base
 }
 
-// getOrCreateWorkload retrieves or creates a workload
-func (s *AttestationService) getOrCreateWorkload(
-	ctx context.Context,
-	tenantID, spiffeID string,
-	selectors map[string]string,
-	vaultRole, attestationType string,
-) (*models.Workload, error) {
-	// Try to find existing workload
-	workload, err := s.workloadRepo.GetBySpiffeID(ctx, tenantID, spiffeID)
-	if err == nil {
-		return workload, nil
-	}
-
-	// Create new workload
-	workload = &models.Workload{
-		ID:              uuid.New().String(),
-		TenantID:        tenantID,
-		SpiffeID:        spiffeID,
-		Selectors:       selectors,
-		VaultRole:       vaultRole,
-		Status:          "active",
-		AttestationType: attestationType,
-	}
-
-	if err := s.workloadRepo.Create(ctx, workload); err != nil {
-		return nil, errors.NewInternalError("Failed to create workload", err)
-	}
-
-	s.logger.WithFields(logrus.Fields{"workload_id": workload.ID, "spiffe_id": spiffeID}).Info("Created new workload")
-
-	return workload, nil
-}
-
 // getOrCreateWorkloadInRepo retrieves or creates a workload using a specific repository
 func (s *AttestationService) getOrCreateWorkloadInRepo(
 	ctx context.Context,

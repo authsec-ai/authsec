@@ -14,7 +14,6 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	oocmgrdto "github.com/authsec-ai/authsec/internal/oocmgr/dto"
 	oocmgrrepo "github.com/authsec-ai/authsec/internal/oocmgr/repository"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // hydraClient mirrors the Hydra admin API client object used for direct calls.
@@ -221,29 +220,6 @@ type AddProviderRequest struct {
 	ReactAppURL string         `json:"react_app_url"`
 	Provider    ProviderConfig `json:"provider"`
 	CreatedBy   string         `json:"created_by"`
-}
-
-// generateServiceToken generates a JWT token for service-to-service authentication
-func generateServiceToken() (string, error) {
-	secret := config.AppConfig.JWTSdkSecret
-	if secret == "" {
-		return "", fmt.Errorf("JWT_SDK_SECRET not configured")
-	}
-
-	// Create token with claims
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"service": "user-flow",
-		"iat":     time.Now().Unix(),
-		"exp":     time.Now().Add(5 * time.Minute).Unix(), // Short-lived service token
-	})
-
-	// Sign the token
-	tokenString, err := token.SignedString([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("failed to sign service token: %w", err)
-	}
-
-	return tokenString, nil
 }
 
 // RegisterClientWithHydra creates the tenant's main OAuth2 client directly in Hydra.

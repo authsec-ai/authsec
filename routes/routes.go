@@ -1247,8 +1247,10 @@ func registerHmgrRoutes(r gin.IRouter) {
 		// OIDC endpoints
 		pub.GET("/login/page-data", hmgrController.GetLoginPageDataHandler)
 		pub.POST("/login/complete-local", hmgrController.CompleteLocalLoginHandler)
+		// OIDC initiate is a thin v4 delegate. The callback lives at
+		// /authsec/uflow/oidc/callback (server-side, no SPA round-trip);
+		// the legacy /hmgr/auth/callback handler was deleted.
 		pub.POST("/auth/initiate/:provider", hmgrController.InitiateAuthHandler)
-		pub.POST("/auth/callback", hmgrController.HandleCallbackHandler)
 		pub.POST("/auth/exchange-token", hmgrController.ExchangeTokenHandler)
 		pub.POST("/pkce/store", hmgrController.StorePKCEVerifierHandler)
 
@@ -1325,56 +1327,21 @@ func registerOocmgrRoutes(r gin.IRouter) {
 
 	secured := v1.Group("/")
 
-	// (Legacy /configure-complete-oidc removed — workspace IDPs configured
-	// via /authsec/identity-providers.)
-
-	// ── Tenant management ──
-	tenant := secured.Group("/tenant")
-	{
-		tenant.POST("/create-base-client", ac.CreateBaseTenantClient)
-		tenant.POST("/check-exists", ac.CheckTenantExists)
-		tenant.POST("/list-all", ac.ListAllTenants)
-		tenant.POST("/delete-complete", ac.DeleteCompleteTenantConfig)
-		tenant.POST("/update-complete", ac.UpdateCompleteTenantConfig)
-		tenant.POST("/login-page-data", ac.GetTenantLoginPageData)
-	}
-
-	// ── Config management ──
-	configs := secured.Group("/config")
-	{
-		configs.POST("/edit", ac.EditConfig)
-	}
-
-	// Legacy /oocmgr/oidc and /oocmgr/saml provider-management routes have
-	// been removed. Workspace IDP lifecycle (both protocols) now lives at
-	// /authsec/identity-providers (v4). Hydra-specific diagnostic endpoints
-	// that survive are mounted directly here:
+	// v4: legacy tenant-CRUD / config-edit / per-tenant Hydra-client lookups
+	// have all been removed. The IDP lifecycle moved to /authsec/identity-providers.
+	// Workspace lifecycle moved to /authsec/uflow/admin and /authsec/applications.
+	//
+	// The only surviving operator-facing surfaces under /oocmgr are:
+	//   * /oocmgr/oidc/raw-hydra-dump   — raw Hydra-client dump for debugging
+	//   * /oocmgr/hydra-clients/sync    — reconcile MCP client rows with Hydra
 	oidc := secured.Group("/oidc")
 	{
 		oidc.POST("/raw-hydra-dump", middlewares.AuthMiddleware(), ac.DumpHydraRawData)
 	}
 
-	// ── Hydra client management ──
 	hydraClients := secured.Group("/hydra-clients")
 	{
-		hydraClients.POST("/list", ac.ListTenantHydraClients)
-		hydraClients.POST("/get-by-tenant", ac.GetTenantHydraClients)
 		hydraClients.POST("/sync", ac.SyncHydraClients)
-	}
-
-	// (Legacy /test/oidc-flow removed — IDP smoke-testing now happens at the
-	// /authsec/identity-providers layer.)
-
-	// ── Stats ──
-	stats := v1.Group("/stats")
-	{
-		stats.POST("/tenant", ac.GetTenantStats)
-	}
-
-	// ── Clients ──
-	oocmgrClients := v1.Group("/clients")
-	{
-		oocmgrClients.POST("/getClients", ac.GetClientsByTenant)
 	}
 }
 

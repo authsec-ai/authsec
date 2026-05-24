@@ -6,11 +6,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// Permission mirrors the canonical permissions table created in migration 054.
-// The full legacy resource_methods / scope_permissions / api_scopes tree has
-// been retired; this struct exists only so the GORM many-to-many declarations
-// on Role and Scope compile. Authorization decisions go through
-// services.RBACService.Check, not this struct.
+// Permission is the canonical v4 permission row: tenant_id + resource + action.
+// Authorization decisions go through services.RBACService.Check.
 type Permission struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_permissions_tenant_resource_action"`
 	TenantID    *uuid.UUID `json:"tenant_id" gorm:"type:uuid;uniqueIndex:idx_permissions_tenant_resource_action"`

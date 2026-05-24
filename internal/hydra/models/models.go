@@ -17,9 +17,7 @@ type Client = sharedmodels.Client
 type Tenant = sharedmodels.Tenant
 type Project = sharedmodels.Project
 type Role = sharedmodels.Role
-type Scope = sharedmodels.Scope
 type Group = sharedmodels.Group
-type Resource = sharedmodels.Resource
 
 // Hydra-specific models
 type HydraLoginRequest struct {

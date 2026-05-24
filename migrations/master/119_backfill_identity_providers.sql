@@ -1,2 +1,0 @@
--- Migration: 119_backfill_identity_providers.sql
--- intentionally empty: legacy backfill no longer needed (no users)

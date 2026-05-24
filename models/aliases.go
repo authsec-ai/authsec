@@ -51,8 +51,6 @@ type (
 	User                                 = sharedmodels.User
 	Client                               = sharedmodels.Client
 	Role                                 = sharedmodels.Role
-	Scope                                = sharedmodels.Scope
-	Resource                             = sharedmodels.Resource
 	MFAMethod                            = sharedmodels.MFAMethod
 	Credential                           = sharedmodels.Credential
 	Introspection                        = sharedmodels.Introspection
@@ -62,18 +60,8 @@ type (
 	UserDefinedGroupsRequest             = sharedmodels.UserDefinedGroupsRequest
 	MapGroupsRequest                     = sharedmodels.MapGroupsRequest
 	DeleteGroupsRequest                  = sharedmodels.DeleteGroupsRequest
-	UserDefinedResourcesRequest          = sharedmodels.UserDefinedResourcesRequest
-	MapResourcesRequest                  = sharedmodels.MapResourcesRequest
-	DeleteResourcesRequest               = sharedmodels.DeleteResourcesRequest
-	UserDefinedRolesRequest              = sharedmodels.UserDefinedRolesRequest
-	MapRolesRequest                      = sharedmodels.MapRolesRequest
-	// DeleteRolesRequest is overridden locally to support both "roles" and "role_ids" field names
-	// Original: DeleteRolesRequest = sharedmodels.DeleteRolesRequest
-	UserDefinedScopesRequest = sharedmodels.UserDefinedScopesRequest
-	MapScopesRequest         = sharedmodels.MapScopesRequest
-	DeleteScopesRequest      = sharedmodels.DeleteScopesRequest
-	Service                  = sharedmodels.Service
-	Permission               = sharedmodels.Permission
+	Service                              = sharedmodels.Service
+	Permission                           = sharedmodels.Permission
 )
 
 // OTPEntry represents a stored one-time password record.

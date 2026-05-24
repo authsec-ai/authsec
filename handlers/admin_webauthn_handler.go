@@ -24,14 +24,6 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
-// min returns the smaller of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // AdminWebAuthnHandler handles WebAuthn operations for admin users
 // Uses global database for all operations
 type AdminWebAuthnHandler struct {

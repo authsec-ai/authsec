@@ -532,56 +532,6 @@ func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, ten
 	c.JSON(http.StatusOK, resp)
 }
 
-// listPermissionsEndUser returns permissions with role names for end-user context
-func (pc *PermissionController) listPermissionsEndUser(c *gin.Context, db *gorm.DB, tenantID uuid.UUID, resource string) {
-	var perms []models.RBACPermission
-	query := db.Where("tenant_id = ?", tenantID)
-	if resource != "" {
-		query = query.Where("resource = ?", resource)
-	}
-	if err := query.Find(&perms).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list permissions: " + err.Error()})
-		return
-	}
-
-	// Get role names for each permission
-	type roleRow struct {
-		PermissionID uuid.UUID
-		RoleName     string
-	}
-	var roleRows []roleRow
-	_ = db.Table("role_permissions rp").
-		Select("rp.permission_id, r.name as role_name").
-		Joins("JOIN roles r ON rp.role_id = r.id").
-		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("p.tenant_id = ?", tenantID).
-		Scan(&roleRows)
-
-	// Build map of permission_id -> role names
-	roleMap := map[uuid.UUID][]string{}
-	for _, row := range roleRows {
-		roleMap[row.PermissionID] = append(roleMap[row.PermissionID], row.RoleName)
-	}
-
-	resp := make([]EndUserPermissionResponse, 0, len(perms))
-	for _, p := range perms {
-		fullPermStr := fmt.Sprintf("%s:%s", p.Resource, p.Action)
-		roles := roleMap[p.ID]
-		if roles == nil {
-			roles = []string{}
-		}
-		resp = append(resp, EndUserPermissionResponse{
-			Resource:             p.Resource,
-			Action:               p.Action,
-			FullPermissionString: fullPermStr,
-			Description:          p.Description,
-			RoleNames:            roles,
-		})
-	}
-
-	c.JSON(http.StatusOK, resp)
-}
-
 // ShowResources godoc
 // @Summary List Resources (Admin)
 // @Description Returns unique resource names from the permissions table for the authenticated tenant.

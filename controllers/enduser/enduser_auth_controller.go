@@ -28,7 +28,6 @@ type EndUserAuthController struct {
 	tenantRepo        *database.TenantRepository
 	otpRepo           *database.OTPRepository
 	pendingRepo       *database.PendingRegistrationRepository
-	tenantDBService   *database.TenantDBService
 	antiReplayService *services.AntiReplayService
 }
 
@@ -44,20 +43,10 @@ func NewEndUserAuthController() (*EndUserAuthController, error) {
 		return nil, fmt.Errorf("redis client not initialized")
 	}
 
-	// Get config for database parameters
-	cfg := config.GetConfig()
-
-	// Create tenant database service
-	tenantDBService, err := database.NewTenantDBService(db, cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
-	}
-
 	return &EndUserAuthController{
 		tenantRepo:        database.NewTenantRepository(db),
 		otpRepo:           database.NewOTPRepository(db),
 		pendingRepo:       database.NewPendingRegistrationRepository(db),
-		tenantDBService:   tenantDBService,
 		antiReplayService: services.NewAntiReplayService(redisClient),
 	}, nil
 }

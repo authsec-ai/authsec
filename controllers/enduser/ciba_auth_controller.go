@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -26,17 +25,6 @@ func NewCIBAAuthController() (*CIBAAuthController, error) {
 		return nil, fmt.Errorf("database not initialized")
 	}
 
-	tenantDBService, err := database.NewTenantDBService(
-		db,
-		config.AppConfig.DBHost,
-		config.AppConfig.DBUser,
-		config.AppConfig.DBPassword,
-		config.AppConfig.DBPort,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant DB service: %w", err)
-	}
-
 	// Initialize push notification service (optional - if not configured, will return error in response)
 	pushService, err := services.NewPushNotificationService()
 	if err != nil {
@@ -45,7 +33,7 @@ func NewCIBAAuthController() (*CIBAAuthController, error) {
 	}
 
 	return &CIBAAuthController{
-		cibaService: services.NewCIBAAuthService(db, tenantDBService, pushService),
+		cibaService: services.NewCIBAAuthService(db, pushService),
 	}, nil
 }
 

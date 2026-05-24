@@ -54,13 +54,6 @@ type jsonRPCError struct {
 	Message string `json:"message"`
 }
 
-// initializeResult is the MCP server's initialize response.
-type initializeResult struct {
-	ProtocolVersion string          `json:"protocolVersion"`
-	Capabilities    json.RawMessage `json:"capabilities"`
-	ServerInfo      json.RawMessage `json:"serverInfo"`
-}
-
 // toolsListResult is the MCP server's tools/list response.
 type toolsListResult struct {
 	Tools      []Tool `json:"tools"`

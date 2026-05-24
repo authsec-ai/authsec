@@ -11,7 +11,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
-	mtpluginpb "github.com/authsec-ai/authsec/internal/mtplugin/proto"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -840,14 +839,14 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Single-tenant guard: block a second admin when mt-plugin is not available.
-	if config.MTPluginClient == nil || !config.MTPluginClient.IsAvailable() {
+	// Single-tenant guard: authsec runs as a single-workspace deployment.
+	// Only one admin/tenant is permitted; reject any subsequent registration.
+	{
 		db := config.GetDatabase()
 		var tenantCount int
 		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
-				"error": "Single-tenant mode: only one admin is allowed. " +
-					"Deploy the mt-plugin service and set MT_PLUGIN_GRPC_ADDR to enable multi-tenant registration.",
+				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
 			return
 		}
@@ -981,35 +980,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		"email":   input.Email,
 		"otp":     otp, // Include OTP in response for testing purposes (remove in production)
 	})
-}
-
-// assignAdminRoleToUser assigns the admin role to a user with the tenant scope populated
-func (aac *AdminAuthController) assignAdminRoleToUser(userID uuid.UUID, tenantID uuid.UUID) error {
-	db := config.GetDatabase()
-	if db == nil {
-		return fmt.Errorf("database not initialized")
-	}
-
-	roleID, err := aac.adminUserRepo.EnsureAdminRole(tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to ensure admin role: %w", err)
-	}
-
-	// Insert into role_bindings (user_roles is deprecated)
-	// scope_type and scope_id are NULL for tenant-wide role assignments
-	_, err = db.Exec(`
-		INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-		SELECT $1, $2, $3, $4, NULL, NULL, $5, $5
-		WHERE NOT EXISTS (
-			SELECT 1 FROM role_bindings
-			WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
-		)
-	`, uuid.New(), tenantID, userID, roleID, time.Now())
-	if err != nil {
-		return fmt.Errorf("failed to assign admin role: %w", err)
-	}
-
-	return nil
 }
 
 // AdminForgotPassword handles admin password reset request
@@ -1418,22 +1388,8 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Notify mt-plugin to provision the tenant database asynchronously.
-	// mt-plugin handles: CreateTenantDatabase → RunMigrations → SeedTenantDB → RegisterHydraClient.
-	// If mt-plugin is unavailable, the tenant record exists in master DB and DB provisioning
-	// can be retried later by starting the plugin.
-	if config.MTPluginClient != nil && config.MTPluginClient.IsAvailable() {
-		if _, err := config.MTPluginClient.NotifyAdminRegistered(&mtpluginpb.AdminRegisteredRequest{
-			TenantId: pendingReg.TenantID.String(),
-			Email:    pendingReg.Email,
-			DbName:   tenantDBName,
-			ClientId: pendingReg.ClientID.String(),
-		}); err != nil {
-			log.Printf("[mtplugin] Warning: failed to notify mt-plugin of admin registration: %v", err)
-		}
-	} else {
-		log.Printf("[mtplugin] Plugin not available — tenant DB provisioning deferred for tenant: %s", pendingReg.TenantID.String())
-	}
+	// Single-tenant: no per-tenant DB provisioning. The master DB row above is
+	// the workspace; all workspace-scoped tables key off tenant_id.
 
 	// Save secret to Vault and register with Hydra (single-admin OAuth setup)
 	secretID, err := config.SaveSecretToVault(pendingReg.TenantID.String(), pendingReg.ProjectID.String(), pendingReg.TenantID.String())
@@ -1819,39 +1775,4 @@ func (aac *AdminAuthController) GetAuthChallenge(c *gin.Context) {
 		"expires_at": challenge.ExpiresAt.Unix(),
 		"created_at": challenge.CreatedAt.Unix(),
 	})
-}
-
-// createEndUserInTenantDB creates a corresponding end user account in the tenant database
-// This allows admins to also authenticate as end users within their tenant
-func (aac *AdminAuthController) createEndUserInTenantDB(tenantDB *sql.DB, adminUser *models.ExtendedUser, clientID, projectID uuid.UUID, pendingReg *models.PendingRegistration) error {
-	// Create end user with same credentials as admin
-	endUserInsert := `
-		INSERT INTO users (id, client_id, tenant_id, project_id, email, name, username, 
-			password_hash, tenant_domain, provider, provider_id, active, 
-			created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())
-		ON CONFLICT (email, client_id) DO NOTHING
-	`
-
-	username := pendingReg.Email
-	_, err := tenantDB.Exec(endUserInsert,
-		adminUser.ID,        // Use same ID as admin user for consistency
-		clientID,            // client_id
-		pendingReg.TenantID, // tenant_id
-		projectID,           // project_id
-		pendingReg.Email,    // email
-		fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName), // name
-		username,                // username
-		pendingReg.PasswordHash, // password_hash (same as admin)
-		pendingReg.TenantDomain, // tenant_domain
-		"local",                 // provider
-		pendingReg.Email,        // provider_id
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to insert end user in tenant database: %w", err)
-	}
-
-	log.Printf("Created end user account in tenant database: email=%s, user_id=%s", pendingReg.Email, adminUser.ID.String())
-	return nil
 }
