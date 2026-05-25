@@ -44,6 +44,11 @@ func NewOAuthASController() *OAuthASController {
 // on accidentally probed well-known or /oauth paths.
 func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodOptions {
+			c.Next()
+			return
+		}
+
 		canonicalBase := config.AppConfig.OAuthBaseURL()
 		parsed, err := url.Parse(canonicalBase)
 		if err != nil || parsed.Host == "" {
