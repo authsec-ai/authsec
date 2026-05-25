@@ -121,7 +121,25 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 		toolResponses = append(toolResponses, tr)
 	}
 
-	// Find unmapped scopes (initialize as empty slice so JSON marshals as [] not null)
+	// `scopes` — the full list of OAuth scopes registered against this RS.
+	// Returned to the UI so the Tool detail sidebar can compute PER-TOOL
+	// available scopes ("scopes for this app NOT yet mapped to *this* tool").
+	// The legacy `unmapped_scopes` (below) reports scopes mapped to no tool at
+	// all (global), which is a strictly smaller set and would hide already-
+	// mapped-elsewhere scopes from the per-tool picker.
+	allScopes := make([]models.OAuthScopeResponse, 0, len(scopes))
+	for _, scope := range scopes {
+		allScopes = append(allScopes, models.OAuthScopeResponse{
+			ID:               scope.ID.String(),
+			ScopeString:      scope.ScopeString,
+			DisplayName:      scope.DisplayName,
+			RiskLevel:        scope.RiskLevel,
+			IsAutoDiscovered: scope.IsAutoDiscovered,
+		})
+	}
+
+	// Find unmapped scopes (initialize as empty slice so JSON marshals as [] not null).
+	// Kept for back-compat with any caller that already reads this field.
 	unmappedScopes := make([]models.OAuthScopeResponse, 0)
 	for _, scope := range scopes {
 		if !mappedScopeIDs[scope.ID] {
@@ -148,6 +166,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 			"last_scan_completed_at":     rs.LastScanCompletedAt,
 		},
 		"tools":           toolResponses,
+		"scopes":          allScopes,
 		"unmapped_scopes": unmappedScopes,
 		"total_scopes":    len(scopes),
 		"total_tools":     len(tools),
