@@ -6362,6 +6362,14 @@ ALTER TABLE ONLY public.voice_sessions
 -- ============================================================================
 -- Seed data: system tenant + base permissions + role bindings
 -- ============================================================================
+-- IMPORTANT: pg_dump set `search_path = ''` at the top of this file (line 42)
+-- so every schema object reference above is `public.<name>`. The seed blocks
+-- below were authored against the default search_path and use unqualified
+-- names like `INSERT INTO tenants`. Restore the public schema on the path
+-- so those resolve; otherwise the bootstrap fails with
+-- `ERROR: relation "tenants" does not exist`.
+SET search_path TO public;
+
 -- Migration 103: Add permissions for User Flow Service
 -- Fixed to use production schema (no resources table, permissions uses tenant_id/resource/action)
 -- Fixed: uses check-before-insert instead of ON CONFLICT ON CONSTRAINT (constraint may not exist yet)
@@ -6591,7 +6599,10 @@ CREATE TABLE public.scope_catalog_entries (
     updated_at timestamp with time zone DEFAULT now()
 );
 
-ALTER TABLE public.scope_catalog_entries OWNER TO authsec;
+-- OWNER intentionally not set here; pg_dump used `OWNER TO -` (anonymous)
+-- everywhere else in this file, so the table inherits the role that ran the
+-- bootstrap (authdev on dev, authsec on prod). Hard-coding either name breaks
+-- the opposite environment.
 
 ALTER TABLE ONLY public.scope_catalog_entries
     ADD CONSTRAINT scope_catalog_entries_pkey PRIMARY KEY (id);
