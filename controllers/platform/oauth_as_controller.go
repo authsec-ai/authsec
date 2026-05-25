@@ -1404,8 +1404,36 @@ func containsString(slice []string, s string) bool {
 	return false
 }
 
+// proxyResponseSkipHeaders are headers that must NOT be copied from the upstream
+// (Hydra) response to the client. The AuthSec CORS middleware owns CORS headers
+// — copying Hydra's `Access-Control-Allow-Origin: *` on top of the middleware's
+// per-origin value produces two header values, which browsers reject with
+// "header contains multiple values". The hop-by-hop headers are scrubbed for
+// correctness when proxying.
+var proxyResponseSkipHeaders = map[string]struct{}{
+	"Access-Control-Allow-Origin":      {},
+	"Access-Control-Allow-Methods":     {},
+	"Access-Control-Allow-Headers":     {},
+	"Access-Control-Allow-Credentials": {},
+	"Access-Control-Expose-Headers":    {},
+	"Access-Control-Max-Age":           {},
+	// Hop-by-hop / framing — let the response writer set these correctly.
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+	"Content-Length":      {},
+}
+
 func writeProxiedResponse(w http.ResponseWriter, statusCode int, body []byte, respHeader http.Header) {
 	for k, vv := range respHeader {
+		if _, skip := proxyResponseSkipHeaders[http.CanonicalHeaderKey(k)]; skip {
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
