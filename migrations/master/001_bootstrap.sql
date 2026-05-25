@@ -519,9 +519,11 @@ CREATE TABLE public.oauth_scopes (
     risk_level text DEFAULT 'low'::text NOT NULL,
     parent_scope_id uuid,
     is_auto_discovered boolean DEFAULT false NOT NULL,
+    source text DEFAULT 'discovered'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT oauth_scopes_risk_level_check CHECK ((risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT oauth_scopes_source_check CHECK ((source = ANY (ARRAY['discovered'::text, 'preset'::text, 'manifest'::text, 'manual'::text]))),
     workspace_id uuid,
     CONSTRAINT oauth_scopes_pkey PRIMARY KEY (id),
     CONSTRAINT oauth_scopes_tenant_id_resource_server_id_scope_string_key UNIQUE (tenant_id, resource_server_id, scope_string)
