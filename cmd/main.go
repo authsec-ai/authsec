@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -62,12 +61,23 @@ func main() {
 	// Initialise primary database
 	config.InitDatabaseWithoutGORM(cfg)
 
-	// Run database migrations via the authsec-migration system
+	// Schema ownership boundary:
+	//
+	//   - `migration_logs` is the ONLY table GORM AutoMigrate is allowed to
+	//     create. It's a chicken-and-egg: the SQL migration runner needs the
+	//     table to exist so it can record migration outcomes, but the table
+	//     itself can't be created by a recorded migration. AutoMigrate handles it.
+	//
+	//   - Every other table — including all spire_*, application tables,
+	//     workspaces/IDPs, MCP, RBAC, etc. — is owned by SQL files under
+	//     migrations/master/. The migration runner applies them in version order.
+	//
+	//   - If you ever regenerate 001_bootstrap.sql via pg_dump, you MUST strip
+	//     the migration_logs CREATE TABLE / PK / index statements — otherwise
+	//     the bootstrap collides with AutoMigrateMigrationLogs and aborts on a
+	//     fresh DB. See the header of 001_bootstrap.sql for the exact list.
 	if err := migration.AutoMigrateMigrationLogs(config.DB); err != nil {
 		log.Printf("Warning: failed to create migration_logs table: %v", err)
-	}
-	if err := config.DB.AutoMigrate(platformCtrl.SpireAllModels...); err != nil {
-		log.Printf("Warning: failed to auto-migrate SPIRE tables: %v", err)
 	}
 	if os.Getenv("SKIP_MIGRATIONS") != "true" {
 		masterRunner := migration.NewMasterMigrationRunner(

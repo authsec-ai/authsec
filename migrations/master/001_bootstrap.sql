@@ -10,19 +10,21 @@
 --
 -- This file is idempotent for first-run on a fresh database. To bring up a
 -- new authsec deployment:
---   1. Provision a fresh Postgres database (no schema, no migration_logs).
---   2. Start the authsec backend — internal/migration/runner.go will pick
---      this file up, execute it, and write a single row to migration_logs.
+--   1. Provision a fresh Postgres database (no schema).
+--   2. Start the authsec backend — cmd/main.go calls
+--      `migration.AutoMigrateMigrationLogs` to create the migration_logs
+--      table via GORM, then internal/migration/runner.go applies this file
+--      and writes a single success row to migration_logs.
 --   3. Subsequent v4 migrations land as 002_*.sql, 003_*.sql, etc.
 --
--- Legacy tables that came along for the ride (api_scopes, ciba_requests,
--- group_roles, role_scopes, saml_callback_states, saml_requests,
--- saml_sp_certificates, user_auth_preferences, clients, tenant_hydra_clients,
--- external_service_migrations, schema_migrations stripped, oauth_sessions,
--- services, monthly_usage, billing_subscriptions, processed_webhook_events,
--- workspace_migration_review) are kept for now to avoid surprise breakage
--- of code paths I haven't audited 100%. They can be dropped via a follow-up
--- 002_drop_legacy_tables.sql once the new cluster is stable.
+-- IMPORTANT — GORM/SQL schema ownership boundary:
+--   `migration_logs` is the ONLY table owned by GORM AutoMigrate (it must
+--   exist before this bootstrap can record its own outcome). EVERY other
+--   table — including the spire_* family — lives in this SQL file.
+--   If you regenerate this bootstrap via pg_dump, you MUST strip the
+--   CREATE TABLE / pkey / index statements for `migration_logs` before
+--   committing, otherwise it collides with AutoMigrateMigrationLogs on a
+--   fresh DB. See cmd/main.go for the matching comment.
 -- ============================================================================
 
 --
@@ -946,21 +948,9 @@ CREATE TABLE public.mfa_methods (
 );
 
 
---
--- Name: migration_logs; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.migration_logs (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    version bigint NOT NULL,
-    name character varying(255) NOT NULL,
-    executed_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    success boolean DEFAULT false NOT NULL,
-    error_msg text,
-    db_type character varying(50) NOT NULL,
-    tenant_id character varying(255),
-    execution_ms bigint DEFAULT 0 NOT NULL
-);
+-- migration_logs table is created by the Go migration runner via GORM AutoMigrate
+-- BEFORE this bootstrap runs (internal/migration/db_utils.go:AutoMigrateMigrationLogs).
+-- DO NOT add a CREATE TABLE for it here — it would collide and abort the bootstrap.
 
 
 --
@@ -3131,12 +3121,7 @@ ALTER TABLE ONLY public.mfa_methods
     ADD CONSTRAINT mfa_methods_pkey PRIMARY KEY (id);
 
 
---
--- Name: migration_logs migration_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.migration_logs
-    ADD CONSTRAINT migration_logs_pkey PRIMARY KEY (id);
+-- migration_logs primary key is managed by GORM AutoMigrate (see comment above).
 
 
 --
@@ -4438,18 +4423,10 @@ CREATE INDEX idx_mfa_methods_type ON public.mfa_methods USING btree (method_type
 CREATE INDEX idx_mfa_methods_user_id ON public.mfa_methods USING btree (user_id);
 
 
---
--- Name: idx_migration_logs_tenant_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_migration_logs_tenant_id ON public.migration_logs USING btree (tenant_id);
-
-
---
--- Name: idx_migration_logs_version; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_migration_logs_version ON public.migration_logs USING btree (version);
+-- migration_logs indexes — add them defensively in case GORM AutoMigrate didn't
+-- create them (older runner versions only created the table, not the helper indexes).
+CREATE INDEX IF NOT EXISTS idx_migration_logs_tenant_id ON public.migration_logs USING btree (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_migration_logs_version   ON public.migration_logs USING btree (version);
 
 
 --
