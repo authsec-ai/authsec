@@ -907,12 +907,18 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	// Generate UUIDs for admin user
 	adminUUID := uuid.New()
 
-	// Create pending registration
+	// Create pending registration.
+	// ProjectID is generated up-front and persisted on pending_registrations so
+	// the verify-otp handler reuses the same UUID when inserting the Default
+	// Project row. Previously this was uuid.Nil ("admin doesn't belong to a
+	// project") — but downstream end-user signup calls resolveCustomLoginProjectID
+	// which reads the first project's id and rejects uuid.Nil. Generate a real
+	// UUID here so the project row inserted at verify-otp time is queryable.
 	pendingReg := &models.PendingRegistration{
 		Email:        input.Email,
 		PasswordHash: hashedPassword,
 		TenantID:     adminUUID,
-		ProjectID:    uuid.Nil,  // Admin users don't belong to a specific project
+		ProjectID:    uuid.New(),
 		ClientID:     adminUUID, // Same as tenant for admin
 		TenantDomain: tenantDomain,
 		ExpiresAt:    time.Now().Add(24 * time.Hour), // 24 hours for admin registration
@@ -1689,12 +1695,13 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 			return
 		}
 	} else {
-		// Create new pending registration
+		// Create new pending registration.
+		// ProjectID is generated up-front; see comment in AdminRegister above.
 		pendingReg := &models.PendingRegistration{
 			Email:        input.Email,
 			PasswordHash: hashedPassword,
 			TenantID:     tenantID,
-			ProjectID:    uuid.Nil,
+			ProjectID:    uuid.New(),
 			ClientID:     clientID,
 			TenantDomain: tenantDomain,
 			ExpiresAt:    time.Now().Add(24 * time.Hour),
