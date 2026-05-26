@@ -2259,6 +2259,9 @@ BEGIN
     VALUES (sys_tenant, sys_tenant, 'system@authsec.local', 'system.authsec.dev', 'System', NOW())
     ON CONFLICT (id) DO NOTHING;
 
+    -- Note: system workspace seed is in a separate DO block below the
+    -- workspaces CREATE TABLE (this block runs before that table exists).
+
     -- Ensure users:delete permission exists
     IF NOT EXISTS (
         SELECT 1 FROM permissions
@@ -2486,6 +2489,21 @@ CREATE UNIQUE INDEX idx_scope_catalog_workspace_key
 
 CREATE INDEX idx_scope_catalog_workspace_id
     ON public.scope_catalog_entries USING btree (workspace_id);
+
+-- Phase 2 (tenant → workspace migration): seed the system workspace mirroring
+-- the system tenant. Both rows share UUID 00000000-...000. Future phases drop
+-- the tenants table; the system workspace stays as the anchor for
+-- platform-level permissions/role bindings.
+-- Placed AFTER the workspaces CREATE TABLE — earlier Migration 103 seeds
+-- run before this table exists.
+DO $$
+DECLARE
+    sys_tenant CONSTANT uuid := '00000000-0000-0000-0000-000000000000';
+BEGIN
+    INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, created_at, updated_at)
+    VALUES (sys_tenant, 'System', NULL, sys_tenant, 'team', NOW(), NOW())
+    ON CONFLICT (id) DO NOTHING;
+END $$;
 
 -- Migration 200: RBAC permissions for authsec-migration service
 -- Fixed to use production permissions schema (tenant_id, resource, action) instead of old (resource_id, action)

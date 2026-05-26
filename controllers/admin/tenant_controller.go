@@ -408,6 +408,36 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		return
 	}
 
+	// Phase 2 (tenant → workspace migration): mirror the tenant into a workspace
+	// row with the SAME UUID. Future phases migrate every reader to workspace_id
+	// and eventually drop the tenants table. Slug = first component of the
+	// tenant domain; name = full name (or email fallback).
+	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
+	workspaceName := strings.TrimSpace(fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName))
+	if workspaceName == "" {
+		workspaceName = pendingReg.Email
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'personal', NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`, tenant.TenantID, workspaceName, workspaceSlug, user.ID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to create workspace: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
+		return
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+		ON CONFLICT (workspace_id, user_id) DO NOTHING
+	`, uuid.New(), tenant.TenantID, user.ID, adminRoleID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to create workspace_membership: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace membership"})
+		return
+	}
+
 	// Create tenant-wide admin role binding (user_roles is deprecated, use role_bindings)
 	if _, err := tx.Exec(`
 		INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)

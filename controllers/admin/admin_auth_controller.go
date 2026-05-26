@@ -1379,6 +1379,42 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to assign admin role"})
 		return
 	}
+
+	// Phase 2 (tenant → workspace migration): mirror the tenant row into a
+	// workspace row with the SAME UUID. Future phases will move every reader
+	// from tenant_id → workspace_id and eventually drop the tenants table.
+	// Workspace name = admin's full name; slug = first component of the tenant
+	// domain (e.g. "aditya.dev.authsec.dev" → "aditya"). Slug is allowed to be
+	// NULL — the bootstrap check constraint only rejects reserved values.
+	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
+	workspaceName := strings.TrimSpace(fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName))
+	if workspaceName == "" {
+		workspaceName = pendingReg.Email
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'personal', NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`, pendingReg.TenantID, workspaceName, workspaceSlug, adminUser.ID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to create workspace: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
+		return
+	}
+
+	// Bind the admin user to the workspace with the admin role. This is what
+	// the v4 IDP / MCP / SCIM code reads when it filters by workspace_id.
+	if _, err := tx.Exec(`
+		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+		ON CONFLICT (workspace_id, user_id) DO NOTHING
+	`, uuid.New(), pendingReg.TenantID, adminUser.ID, roleID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to create workspace_membership: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace membership"})
+		return
+	}
+
 	// Delete pending registration
 	if err := aac.pendingRepo.DeletePendingRegistrationsByEmailTx(tx, input.Email); err != nil {
 		tx.Rollback()

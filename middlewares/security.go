@@ -160,14 +160,21 @@ func hydraPublicOrigin() string {
 // loopbackFormActionSources returns the loopback origins used by OAuth desktop
 // callbacks. CSP host sources without an explicit port only match the default port
 // for the scheme, so localhost callbacks on ephemeral ports must use :*.
+//
+// IPv6 literals (e.g. "http://[::1]:*") are intentionally excluded — the CSP3
+// host-source grammar does not permit port-wildcards with bracketed IPv6 hosts,
+// and every browser silently rejects them with the warning
+//
+//	"form-action contains an invalid source: http://[::1]:*"
+//
+// Native OAuth clients that bind to [::1] should be reached via localhost (the
+// dual-stack resolver) instead.
 func loopbackFormActionSources() []string {
 	return []string{
 		"http://localhost:*",
 		"https://localhost:*",
 		"http://127.0.0.1:*",
 		"https://127.0.0.1:*",
-		"http://[::1]:*",
-		"https://[::1]:*",
 	}
 }
 

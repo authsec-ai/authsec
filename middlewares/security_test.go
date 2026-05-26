@@ -121,8 +121,8 @@ func TestSecurityHeadersMiddleware_ConsentCSPAllowsLoopbackWildcardPorts(t *test
 		"https://localhost:*",
 		"http://127.0.0.1:*",
 		"https://127.0.0.1:*",
-		"http://[::1]:*",
-		"https://[::1]:*",
+		// IPv6 loopback entries intentionally not emitted — CSP grammar
+		// rejects port-wildcards on bracketed IPv6 hosts.
 	} {
 		if !contains(csp, expected) {
 			t.Fatalf("consent CSP missing %q: %q", expected, csp)

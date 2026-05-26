@@ -93,6 +93,25 @@ func main() {
 
 	}
 
+	// Phase 2 (tenant → workspace migration): assert tenants and workspaces are
+	// in lockstep on every boot. Admin signup writes both rows in one tx, so
+	// drift is a real bug — surface it loud rather than letting downstream code
+	// silently return empty IDP/SCIM/MCP results because workspace_id is NULL.
+	//
+	// This log is the breadcrumb future phases (4, 6) use to know when every
+	// existing tenant has a matching workspace. Once the audit passes for a
+	// full week, the tenants table can be dropped without backfill.
+	{
+		var tenants, workspaces int64
+		_ = config.Database.DB.QueryRow("SELECT count(*) FROM tenants").Scan(&tenants)
+		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
+		if tenants == workspaces {
+			log.Printf("[migration:phase2] tenants=%d workspaces=%d (in lockstep)", tenants, workspaces)
+		} else {
+			log.Printf("[migration:phase2] DRIFT — tenants=%d workspaces=%d. New signups create both rows; pre-existing tenants need a one-time backfill OR a fresh DB wipe.", tenants, workspaces)
+		}
+	}
+
 	// Hydra reconciler: walks mcp_oauth_clients rows whose Hydra sync failed
 	// previously and converges them. Disabled when AUTHSEC_DISABLE_HYDRA_RECONCILER=true
 	// (e.g. unit-test boots without a Hydra). Interval defaults to 5 minutes
@@ -210,6 +229,12 @@ func main() {
 
 	// Prometheus metrics endpoint
 	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))
+
+	// favicon.ico — browsers automatically request this for every HTML page,
+	// including backend-served pages like /authsec/hmgr/consent. Return 204
+	// No Content so it stops appearing as a console 404. Keep it tiny — no
+	// asset bytes shipped, just a quiet "nothing here".
+	r.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	// ── Bootstrap SPIRE identity service (merged from authsec-spire) ──
 	var spireDeps *spire.Dependencies
