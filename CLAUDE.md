@@ -1,54 +1,134 @@
-# AuthSec — Multi-Tenant Removal Progress
+# AuthSec — Working Notes for AI Agents
 
-This file tracks the refactoring of authsec from a multi-tenant system to a
-single-tenant system. All multi-tenant logic moves to the `mt-plugin` microservice.
+This file is the canonical orientation for Claude Code (and any other AI agent
+working in this repo). It supersedes earlier docs about the mt-plugin /
+multi-tenant-removal migration — that work is done and the mt-plugin
+infrastructure has been deleted.
 
-## Summary of Changes
+Read this before touching the database, the bootstrap, or anything that smells
+like tenant/workspace scoping.
 
-authsec becomes a strict single-tenant service:
-- Always uses master DB (`config.DB`) for all operations
-- One admin allowed; second admin blocked with HTTP 409 unless mt-plugin is available
-- `MTPluginClient` is the only connection point to mt-plugin (gRPC)
-- No tenant DB creation, no dynamic DB switching, no tenant resolution middleware
+---
 
-## Phase 1 — Delete Multi-Tenant Files
-- [x] `services/tenant_db_service.go` → DELETED (moved to mt-plugin)
-- [x] `database/tenant_db_service.go` → REPLACED with stub (returns errors)
-- [x] `internal/migration/template_builder.go` → DELETED (moved to mt-plugin)
-- [x] `middlewares/tenant_resolution.go` → DELETED
-- [x] `middlewares/tenant_validation.go` → DELETED
-- [x] `middlewares/tenant_context_middleware.go` → DELETED
+## Where we are right now
 
-## Phase 2 — Add MTPluginClient
-- [x] `internal/mtplugin/proto/` — generated gRPC stubs
-- [x] `internal/mtplugin/client.go` — gRPC client + 15s heartbeat
-- [x] `config/config.go` — add `MtPluginAddr` field (MT_PLUGIN_GRPC_ADDR env)
+AuthSec is a single-deployment Go/Gin backend that fronts ORY Hydra for OAuth
+2.1 / OIDC, plus an admin/end-user identity stack. There is exactly one
+PostgreSQL database (`config.DB`). No tenant DBs, no dynamic switching, no
+mt-plugin gRPC client. If you find references to `MTPluginClient`,
+`MT_PLUGIN_GRPC_ADDR`, `tenant_db_service`, or `template_builder`, they are
+stale — flag and delete.
 
-## Phase 3 — Strip Multi-Tenant from Existing Files
-- [x] `middlewares/tenant.go` — removed TenantDBManager, GetConnectionDynamically, databaseExists
-- [x] `config/database.go` — removed GetTenantDatabase, GetTenantGORMDB
-- [x] `cmd/main.go` — removed SetupTenantTemplate goroutine; added MTPluginClient init
-- [x] `controllers/admin/admin_auth_controller.go` — removed tenant DB creation; added 409 guard
-- [x] `controllers/admin/tenant_controller.go` — removed tenant DB calls, delegates to plugin
-- [x] `controllers/admin/migration_controller.go` — removed CreateTenantDB and tenant migration
-- [x] `routes/routes.go` — removed tenant middleware
+The active migration in flight is **tenant → workspace**. The 10-day plan lives
+at:
 
-## Phase 4 — Replace GetConnectionDynamically in All Controllers
-Replace every `GetConnectionDynamically()` call with `config.DB` (master DB):
-- [x] `controllers/admin/api_scopes_controller.go`
-- [x] `controllers/admin/scope_controller.go`
-- [x] `controllers/admin/admin_user_controller.go`
-- [x] All other callers resolved (grep confirms zero remaining)
-
-## Phase 5 — Verify
-- [x] `go build ./...` passes
-- [x] `go vet ./...` passes
-- [x] `go test -short ./...` passes (only pre-existing DB connectivity failure in ad_controller_test)
-- [ ] Single-tenant mode: first admin → OK; second admin → 409
-- [ ] With mt-plugin: second admin → OK (plugin creates tenant DB)
-
-## ENV Changes
-New variable:
 ```
-MT_PLUGIN_GRPC_ADDR=localhost:7469   # empty = single-tenant, no plugin
+/Users/pc/.claude/plans/no-no-there-would-compiled-puffin.md
 ```
+
+That file is authoritative for what comes next. Always reread it before
+starting a phase — don't rely on memory of the plan.
+
+**Status (2026-05-26):**
+
+- Phase 1 (stable baseline + bug sweep) — done
+- Phase 2 (workspace creation in signup, lockstep with tenants) — done, shipped
+  in commit `50a6157`
+- Phase 3 (JWT carries `workspace_id` always) — **next**
+
+Until Phase 6 lands, both `tenants` and `workspaces` exist; `workspaces.id ==
+tenants.id` by construction (admin signup writes both rows in one
+transaction). The startup log line `[migration:phase2] tenants=N workspaces=N
+(in lockstep)` confirms the invariant on every boot.
+
+---
+
+## Schema ownership — hard rule
+
+There is **one** source of truth for the schema:
+
+```
+migrations/master/001_bootstrap.sql
+```
+
+This file is hand-curated, single-state (no ALTER patches, no migration chain).
+It currently sits around 2.5k lines and creates all 81 tables in their final
+v4 shape, with every column, index, FK, and seed inlined.
+
+GORM `AutoMigrate` is allowed for **exactly one** table: `migration_logs`. That
+table records bootstrap runs. Everything else — including every model struct
+in `models/` — is read-only from GORM's perspective. The structs describe what
+SQL already created.
+
+### When a schema bug surfaces (forward-only rule)
+
+If a table is missing a column the code expects, or a column has the wrong
+type, **edit the `CREATE TABLE` block in `001_bootstrap.sql` in place.** Then:
+
+1. Commit + push
+2. Wait for Jenkins to build the new image
+3. Wipe the dev DB
+4. Restart the pod
+5. Re-run the smoke flow
+
+Do NOT:
+
+- Add an `ALTER TABLE` patch file (`002_fix_x.sql`, `003_fix_y.sql`, …)
+- Add `db.AutoMigrate(&SomeModel{})` to make GORM add the column
+- Add the missing column back to GORM tags hoping AutoMigrate picks it up
+
+The user has stated this explicitly and repeatedly: wiping is free, backfills
+and patch chains are not. Move forward, never sideways.
+
+Example we've already done: `oauth_scopes.source` was missing from bootstrap →
+added the column inline to the `CREATE TABLE public.oauth_scopes` block with
+default `'discovered'` and the CHECK constraint, wiped, retested.
+
+---
+
+## The tenant → workspace migration in one paragraph
+
+The legacy `tenants` table mixed three concerns: workspace identity
+(`tenant_domain`, `vault_mount`, `ca_cert`), admin identity (`email`,
+`password_hash`, `provider`), and a scope ID that 17 other tables FK back to.
+`workspaces` was introduced as the v4 replacement but never made authoritative
+— the table sat empty in production while `tenants` did all the work. The
+10-day plan walks workspaces forward in additive phases (write workspace rows,
+emit workspace_id in JWTs, switch reads, dual-emit JSON), then drops `tenants`
+and the `tenant_id` columns in one big wipe at Phase 6, then cleans up the
+remaining `tenant_*` table names in Phases 7–9, and final-sweeps the Go code
+in Phase 10. The only two surviving "tenant" mentions at end-state are the
+legacy MFA routes `/auth/tenant/totp/*` and `/auth/tenant/ciba/*`.
+
+If you're touching tenant_id or workspace_id today, **open the plan file** and
+match what you're doing to the current phase. Don't freelance ahead of phase.
+
+---
+
+## Cluster / deploy quick reference
+
+- Cluster: Azure AKS, cluster name `authsec`
+- Backend namespace: `authsec-dev`, deployment `dev-authsec`
+- Database namespace: `database-dev`, pod `postgresql-dev-primary-0`,
+  user/db `authdev`/`authdev`, password at
+  `/opt/bitnami/postgresql/secrets/password` inside the pod
+- CI: Jenkins builds `docker-repo.authsec.ai/authsec:authsec-dev-<N>-<SHA>` and
+  retags `:development`; deploy is `kubectl set image`
+- Wipe-and-rebootstrap is the standard recovery move; the user does this
+  freely and has said "i will wipe 1000 times if needed"
+
+`git push` is the only blocker — every other tool action is pre-authorized.
+**Never push without an explicit per-command instruction.**
+
+---
+
+## Anti-patterns to refuse
+
+- `ALTER TABLE` patch files in `migrations/master/` — edit the CREATE inline
+- `AutoMigrate(&AnythingExceptMigrationLogs{})` in `cmd/main.go`
+- Reintroducing `tenant_db_service`, `MTPluginClient`, dynamic DB switching
+- Backfilling data from `tenants` into `workspaces` (we just keep them in
+  lockstep until Phase 6 drops the old one)
+- Renaming routes `/auth/tenant/totp/*` or `/auth/tenant/ciba/*` — these are
+  the documented legacy exception
+- Adding tests the user didn't ask for (memory note `feedback_no_unprompted_tests`)
