@@ -21,6 +21,13 @@ import (
 	"gorm.io/gorm"
 )
 
+// countTenantUsers returns the total number of users for a tenant using a raw GORM count.
+func countTenantUsers(tenantID uuid.UUID) (int64, error) {
+	var count int64
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", tenantID).Scan(&count).Error
+	return count, err
+}
+
 // tenantConnectionProvider is a test seam — activation tests swap it for an
 // in-memory DB. In runtime it just returns config.DB; the tenant-routing
 // behavior was removed when the single-DB collapse landed.
@@ -30,6 +37,145 @@ var (
 )
 
 type EndUserController struct{}
+
+// RegisterEndUser godoc
+// @Summary Register a new end user in tenant database
+// @Description Registers a new end user in the specified tenant database with all default associations
+// @Tags EndUser
+// @Accept json
+// @Produce json
+// @Param register body object true "End user registration data"
+// @Success 201 {object} object
+// @Failure 400 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Failure 409 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /authsec/uflow/user/clients/register [post]
+func (euc *EndUserController) RegisterClient(c *gin.Context) {
+	var input models.RegisterClientsRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var tenant models.Tenant
+	if config.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
+		return
+	}
+	if err := config.DB.Where("tenant_id = ?", input.TenantID).First(&tenant).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+		return
+	}
+	// Parse UUIDs
+	tenantID := input.TenantID
+	projectID := input.ProjectID
+	// Connect to tenant database
+	tenantDB := config.DB
+	// Check if user with email already exists
+	// var existingClient models.Client
+	// if err := tenantDB.Where("email = ?", input.Email).First(&existingClient).Error; err == nil {
+	// 	c.JSON(http.StatusConflict, gin.H{"error": "user with this email already exists"})
+	// 	return
+	// }
+
+	// Generate unique IDs
+	clientID := uuid.New()
+
+	// Create new user with all required data
+	client := models.Client{
+		ID:        clientID,
+		ClientID:  clientID,
+		TenantID:  uuid.MustParse(tenantID),
+		ProjectID: uuid.MustParse(projectID),
+		Name:      input.Name,
+		Email:     shared.StringPtr(input.Email),
+		Active:    true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	// Gate: check total-user limit before creating the account.
+	tenantIDForGate := uuid.MustParse(tenantID)
+	if currentCount, countErr := countTenantUsers(tenantIDForGate); countErr == nil {
+		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), tenantID, int(currentCount)); billErr != nil {
+			log.Printf("[REGISTER] billing check failed (fail-open) tenant=%s: %v", tenantID, billErr)
+		} else if !resp.Allowed {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error":        "user limit reached",
+				"current":      resp.Current,
+				"limit":        resp.Limit,
+				"plan":         resp.PlanID,
+				"upgrade_hint": resp.UpgradeHint,
+			})
+			return
+		}
+	}
+
+	// Start transaction for client creation and associations
+	tx := tenantDB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Create the user record
+	if err := tx.Create(&client).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
+		return
+	}
+
+	// Assign default associations (scopes, roles, groups, resources)
+
+	// Commit the transaction
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit transaction"})
+		return
+	}
+
+	// Save secret to vault (optional - based on your requirements)
+	secretID, err := config.SaveSecretToVault(client.TenantID.String(), client.ProjectID.String(), client.ClientID.String())
+	if err != nil {
+		// Log the error but don't fail the registration
+		fmt.Printf("Warning: failed to save secret to vault: %v\n", err)
+	}
+
+	// Register client with Hydra (optional - based on your requirements)
+	if secretID != "" {
+		if err := services.RegisterClientWithHydra(client.ClientID.String(), secretID, *client.Email, client.TenantID.String(), tenant.TenantDomain); err != nil {
+			// Log the error but don't fail the registration
+			fmt.Printf("Warning: failed to register client with Hydra: %v\n", err)
+		}
+	}
+
+	// Audit log: Client registered
+	middlewares.Audit(c, "client", client.ClientID.String(), "register", &middlewares.AuditChanges{
+		After: map[string]interface{}{
+			"client_id":  client.ClientID.String(),
+			"tenant_id":  client.TenantID.String(),
+			"project_id": client.ProjectID.String(),
+			"name":       client.Name,
+			"email":      *client.Email,
+		},
+	})
+
+	// Return success response
+	response := models.RegisterClientsResponse{
+		ID:        client.ID.String(),
+		ClientID:  client.ClientID.String(),
+		TenantID:  client.TenantID.String(),
+		ProjectID: client.ProjectID.String(),
+		Name:      client.Name,
+		SecretID:  secretID,
+		Email:     *client.Email, // Dereference pointer
+		Active:    client.Active,
+		CreatedAt: client.CreatedAt,
+		Message:   "Client registered successfully",
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
 
 // GetEndUser godoc
 // @Summary Get end user
@@ -1731,6 +1877,37 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 		return
 	}
 
+<<<<<<< HEAD
+=======
+	// Create new user with all required data
+	clientIDUUID, err := uuid.Parse(input.ClientID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
+		return
+	}
+	tenantIDUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
+		return
+	}
+
+	// Gate: check total-user limit before creating the account.
+	if currentCount, countErr := countTenantUsers(tenantIDUUID); countErr == nil {
+		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), tenantIDUUID.String(), int(currentCount)); billErr != nil {
+			log.Printf("[REGISTER] billing check failed (fail-open) tenant=%s: %v", tenantIDUUID, billErr)
+		} else if !resp.Allowed {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error":        "user limit reached",
+				"current":      resp.Current,
+				"limit":        resp.Limit,
+				"plan":         resp.PlanID,
+				"upgrade_hint": resp.UpgradeHint,
+			})
+			return
+		}
+	}
+
+>>>>>>> 55de446 (feat: gate user creation on total-user count via billing service)
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
 			ID:           uuid.New(),

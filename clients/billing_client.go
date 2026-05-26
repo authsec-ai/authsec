@@ -37,11 +37,10 @@ func NewBillingClient(baseURL, sdkSecret string) *BillingClient {
 	}
 }
 
-// CheckAndIncrementMAU checks MAU entitlement and atomically increments if allowed.
-// Returns allowed=true, limit=-1 when billing service is not configured.
-// On network error it logs and returns allowed=true (fail-open) so a transient billing
-// outage never blocks end-user authentication.
-func (c *BillingClient) CheckAndIncrementMAU(ctx context.Context, tenantID string) (*MAUEntitlementResponse, error) {
+// CheckTotalUsers checks whether the tenant can add one more user given currentCount.
+// Returns allowed=true, limit=-1 when billing service is not configured (OSS mode).
+// Fails open on network errors so a billing outage never blocks user registration.
+func (c *BillingClient) CheckTotalUsers(ctx context.Context, tenantID string, currentCount int) (*MAUEntitlementResponse, error) {
 	if c.baseURL == "" {
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, nil
 	}
@@ -51,9 +50,9 @@ func (c *BillingClient) CheckAndIncrementMAU(ctx context.Context, tenantID strin
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, fmt.Errorf("billing: generate service token: %w", err)
 	}
 
-	body, _ := json.Marshal(map[string]string{"tenant_id": tenantID})
+	body, _ := json.Marshal(map[string]any{"tenant_id": tenantID, "current_count": currentCount})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/v1/billing/usage/mau/increment", bytes.NewReader(body))
+		c.baseURL+"/api/v1/billing/entitlement/total-users", bytes.NewReader(body))
 	if err != nil {
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, err
 	}

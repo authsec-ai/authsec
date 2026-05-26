@@ -1062,34 +1062,6 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	subjectUUID, _ := uuid.Parse(consentRequest.Subject)
 	if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
 		now := time.Now().UTC()
-
-		// Gate: check MAU entitlement only for users not yet active this calendar month.
-		// Users already active this month are let through without an extra billing call.
-		monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-		var existing models.TenantEndUserState
-		isNewMAU := true
-		if err := config.DB.Where("tenant_id = ? AND user_id = ?", tenantUUID, subjectUUID).
-			First(&existing).Error; err == nil &&
-			existing.LastSeenAt != nil &&
-			!existing.LastSeenAt.Before(monthStart) {
-			isNewMAU = false
-		}
-
-		if isNewMAU {
-			mauResp, mauErr := ctrl.billingClient.CheckAndIncrementMAU(c.Request.Context(), arcCtx.TenantID)
-			if mauErr != nil {
-				log.Printf("[MCP_AUTH] ConsentHandler: billing MAU check failed (fail-open) tenant=%s user=%s: %v",
-					arcCtx.TenantID, consentRequest.Subject, mauErr)
-			} else if !mauResp.Allowed {
-				log.Printf("[MCP_AUTH] ConsentHandler: MAU limit reached tenant=%s plan=%s current=%d limit=%d",
-					arcCtx.TenantID, mauResp.PlanID, mauResp.Current, mauResp.Limit)
-				c.String(http.StatusPaymentRequired,
-					"Monthly active user limit reached (%d/%d on %s plan). %s",
-					mauResp.Current, mauResp.Limit, mauResp.PlanID, mauResp.UpgradeHint)
-				return false
-			}
-		}
-
 		state := models.TenantEndUserState{
 			WorkspaceID:    tenantUUID,
 			UserID:         subjectUUID,

@@ -24,6 +24,12 @@ import (
 // SCIMController handles SCIM 2.0 provisioning endpoints for end-users (tenant DB)
 type SCIMController struct{}
 
+func countSCIMTenantUsers(tenantID uuid.UUID) (int64, error) {
+	var count int64
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", tenantID).Scan(&count).Error
+	return count, err
+}
+
 // scimBaseURL returns the base URL for SCIM resource locations
 func scimBaseURL(c *gin.Context) string {
 	scheme := "https"
@@ -313,6 +319,17 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 	email := input.GetPrimaryEmail()
 	tenantUUID, _ := uuid.Parse(tenantID)
 
+	// Gate: check total-user limit before provisioning.
+	if currentCount, countErr := countSCIMTenantUsers(tenantUUID); countErr == nil {
+		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), tenantID, int(currentCount)); billErr != nil {
+			log.Printf("[SCIM] billing check failed (fail-open) tenant=%s: %v", tenantID, billErr)
+		} else if !resp.Allowed {
+			c.JSON(http.StatusPaymentRequired, models.NewSCIMError("402",
+				fmt.Sprintf("user limit reached (%d/%d on %s plan). %s", resp.Current, resp.Limit, resp.PlanID, resp.UpgradeHint), ""))
+			return
+		}
+	}
+
 	// Check if user already exists — scoped by workspace_id
 	var existing models.ExtendedUser
 	if err := tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", email, input.ExternalID, tenantUUID).First(&existing).Error; err == nil {
@@ -355,7 +372,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		User: sharedmodels.User{
 			ID:           uuid.New(),
 			ClientID:     clientUUID,
-			WorkspaceID:     tenantUUID,
+			WorkspaceID:  tenantUUID,
 			ProjectID:    projectUUID,
 			Name:         input.GetDisplayName(),
 			Username:     &userName,
@@ -701,11 +718,11 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 	}
 
 	newGroup := models.TenantGroup{
-		ID:        uuid.New(),
-		Name:      input.DisplayName,
-		WorkspaceID:  tenantUUID,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:          uuid.New(),
+		Name:        input.DisplayName,
+		WorkspaceID: tenantUUID,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
 
 	if err := tenantDB.Create(&newGroup).Error; err != nil {

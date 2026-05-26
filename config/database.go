@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/authsec-ai/authsec/clients"
 	"github.com/authsec-ai/authsec/database"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -16,6 +17,10 @@ var Database *database.DBConnection
 
 // DB is the GORM instance for controllers (migrations disabled)
 var DB *gorm.DB
+
+// BillingClient is the package-level client for the billing service.
+// It is a no-op when BILLING_SERVICE_URL is unset (OSS / single-tenant mode).
+var BillingClient *clients.BillingClient
 
 // InitDatabaseWithoutGORM initializes the database connection using the native SQL driver.
 // Migrations are NOT run here; call RunStartupMigrations (in main.go) separately.

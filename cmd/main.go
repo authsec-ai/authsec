@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/authsec-ai/authsec/clients"
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
@@ -60,6 +61,9 @@ func main() {
 
 	// Initialise primary database
 	config.InitDatabaseWithoutGORM(cfg)
+
+	// Initialise billing client (no-op when BILLING_SERVICE_URL is unset)
+	config.BillingClient = clients.NewBillingClient(cfg.BillingServiceURL, cfg.JWTSdkSecret)
 
 	// Schema ownership boundary:
 	//
