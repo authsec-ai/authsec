@@ -42,7 +42,7 @@ func (ctrl *BundleController) GetBundle(c *gin.Context) {
 
 	c.JSON(http.StatusOK, dto.BundleResponse{
 		CABundle: bundle,
-		TenantID: tenantID,
+		WorkspaceID: tenantID,
 	})
 }
 

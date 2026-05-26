@@ -22,7 +22,7 @@ func NewClientLibrary(db *gorm.DB) *ClientLibrary {
 
 // ClientCreateRequest represents the data needed to create a client record.
 type ClientCreateRequest struct {
-	TenantID      uuid.UUID
+	WorkspaceID      uuid.UUID
 	ProjectID     uuid.UUID
 	OwnerID       uuid.UUID
 	OrgID         uuid.UUID
@@ -48,7 +48,7 @@ type ClientUpdateRequest struct {
 
 // ClientListFilters represents filters for listing clients.
 type ClientListFilters struct {
-	TenantID       uuid.UUID
+	WorkspaceID       uuid.UUID
 	Status         string
 	Tags           []string
 	Name           string
@@ -74,7 +74,7 @@ func (cl *ClientLibrary) CreateClient(req *ClientCreateRequest) (*sharedmodels.C
 	client := &sharedmodels.Client{
 		ID:            uuid.New(),
 		ClientID:      clientID,
-		TenantID:      req.TenantID,
+		WorkspaceID:      req.WorkspaceID,
 		ProjectID:     req.ProjectID,
 		OwnerID:       req.OwnerID,
 		OrgID:         req.OrgID,
@@ -190,7 +190,7 @@ func (cl *ClientLibrary) ListClients(filters *ClientListFilters) ([]sharedmodels
 		base = base.Unscoped()
 	}
 
-	query := base.Where("tenant_id = ?", filters.TenantID)
+	query := base.Where("tenant_id = ?", filters.WorkspaceID)
 
 	if filters.IncludeDeleted == nil || !*filters.IncludeDeleted {
 		query = query.Where("status != ?", sharedmodels.StatusDeleted)

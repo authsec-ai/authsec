@@ -85,7 +85,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		"expires_at":  dt.ExpiresAt,
 		"ttl_seconds": dt.TTLSeconds,
 		"client_id":   dt.ClientID,
-		"tenant_id":   dt.TenantID,
+		"tenant_id":   dt.WorkspaceID,
 		"status":      dt.Status,
 		"issued_at":   dt.CreatedAt,
 		"updated_at":  dt.UpdatedAt,

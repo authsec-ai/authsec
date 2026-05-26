@@ -720,9 +720,9 @@ func SetupRoutes(
 		{
 			admin.GET("/tenants", adminUserController.ListTenants)
 			admin.POST("/tenants", adminUserController.CreateTenant)
-			admin.PUT("/tenants/:tenant_id", adminUserController.UpdateTenant)
-			admin.DELETE("/tenants/:tenant_id", middlewares.Require("tenants", "delete"), adminUserController.DeleteTenant)
-			admin.GET("/tenants/:tenant_id/users", adminUserController.GetTenantUsers)
+			admin.PUT("/tenants/:workspace_id", adminUserController.UpdateTenant)
+			admin.DELETE("/tenants/:workspace_id", middlewares.Require("tenants", "delete"), adminUserController.DeleteTenant)
+			admin.GET("/tenants/:workspace_id/users", adminUserController.GetTenantUsers)
 			admin.GET("/users/list", adminUserController.ListAdminUsers)
 			admin.POST("/users/list", adminUserController.ListAdminUsers)
 			admin.DELETE("/users/:user_id", middlewares.Require("users", "delete"), adminUserController.DeleteAdminUser)
@@ -733,7 +733,7 @@ func SetupRoutes(
 			admin.POST("/invite/resend", adminInviteController.ResendInvite)
 			admin.GET("/invite/pending", adminInviteController.ListPendingInvites)
 
-			adminDomains := admin.Group("/tenants/:tenant_id/domains")
+			adminDomains := admin.Group("/tenants/:workspace_id/domains")
 			adminDomains.Use(middlewares.ExtractTenantFromPath())
 			{
 				adminDomains.POST("", domainController.CreateDomain)
@@ -762,11 +762,11 @@ func SetupRoutes(
 			adminPlatform.POST("/groups/map", groupController.MapGroupsToClient)
 			adminPlatform.POST("/groups/list", groupController.ListTenantGroupsForAdmin)
 			adminPlatform.DELETE("/groups/map", groupController.RemoveGroupsFromClient)
-			adminPlatform.GET("/groups/:tenant_id", groupController.GetUserDefinedGroups)
+			adminPlatform.GET("/groups/:workspace_id", groupController.GetUserDefinedGroups)
 			adminPlatform.PUT("/groups/:id", groupController.UpdateUserDefinedGroup)
 			adminPlatform.DELETE("/groups", groupController.DeleteUserDefinedGroups)
-			adminPlatform.POST("/groups/:tenant_id/users/bulk", groupController.AddUsersToGroup)
-			adminPlatform.DELETE("/groups/:tenant_id/users/bulk", groupController.RemoveUsersFromGroup)
+			adminPlatform.POST("/groups/:workspace_id/users/bulk", groupController.AddUsersToGroup)
+			adminPlatform.DELETE("/groups/:workspace_id/users/bulk", groupController.RemoveUsersFromGroup)
 			adminPlatform.POST("/enduser/active", adminUserController.ToggleEndUserActive)
 			adminPlatform.POST("/ad/sync", adSyncController.SyncADUsers)
 			adminPlatform.POST("/ad/test-connection", adSyncController.TestADConnection)
@@ -804,18 +804,18 @@ func SetupRoutes(
 		)
 		{
 			// Tenant memberships (operators)
-			v2.GET("/tenants/:tenant_id/memberships", membershipController.ListMembers)
-			v2.POST("/tenants/:tenant_id/memberships", membershipController.CreateMembership)
-			v2.GET("/tenants/:tenant_id/memberships/:user_id", membershipController.GetMembership)
-			v2.PATCH("/tenants/:tenant_id/memberships/:user_id", membershipController.UpdateMembership)
-			v2.DELETE("/tenants/:tenant_id/memberships/:user_id", membershipController.DeleteMembership)
+			v2.GET("/tenants/:workspace_id/memberships", membershipController.ListMembers)
+			v2.POST("/tenants/:workspace_id/memberships", membershipController.CreateMembership)
+			v2.GET("/tenants/:workspace_id/memberships/:user_id", membershipController.GetMembership)
+			v2.PATCH("/tenants/:workspace_id/memberships/:user_id", membershipController.UpdateMembership)
+			v2.DELETE("/tenants/:workspace_id/memberships/:user_id", membershipController.DeleteMembership)
 
 			// Tenant end-user states (consumers)
-			v2.GET("/tenants/:tenant_id/end-users", membershipController.ListEndUsers)
-			v2.GET("/tenants/:tenant_id/end-users/:user_id", membershipController.GetEndUser)
-			v2.PATCH("/tenants/:tenant_id/end-users/:user_id", membershipController.UpdateEndUser)
-			v2.POST("/tenants/:tenant_id/end-users/:user_id/suspend", membershipController.SuspendEndUser)
-			v2.POST("/tenants/:tenant_id/end-users/:user_id/reactivate", membershipController.ReactivateEndUser)
+			v2.GET("/tenants/:workspace_id/end-users", membershipController.ListEndUsers)
+			v2.GET("/tenants/:workspace_id/end-users/:user_id", membershipController.GetEndUser)
+			v2.PATCH("/tenants/:workspace_id/end-users/:user_id", membershipController.UpdateEndUser)
+			v2.POST("/tenants/:workspace_id/end-users/:user_id/suspend", membershipController.SuspendEndUser)
+			v2.POST("/tenants/:workspace_id/end-users/:user_id/reactivate", membershipController.ReactivateEndUser)
 
 			// Group-subject role bindings
 			v2.POST("/groups/:group_id/role-bindings", membershipController.BindGroupToRole)
@@ -883,15 +883,15 @@ func SetupRoutes(
 			user.POST("/clients/register", endUserController.RegisterClient)
 			user.GET("/clients", endUserController.GetClients)
 			user.POST("/clients/get", endUserController.GetClientsPost)
-			user.GET("/enduser/:tenant_id/:user_id", endUserController.GetEndUser)
+			user.GET("/enduser/:workspace_id/:user_id", endUserController.GetEndUser)
 			user.POST("/enduser/list", endUserController.GetEndUsers)
 			user.GET("/enduser/list", endUserController.GetEndUsers)
-			user.PUT("/enduser/:tenant_id/:user_id", endUserController.UpdateUser)
-			user.PUT("/enduser/:tenant_id/:user_id/status", endUserController.UpdateEndUserStatus)
+			user.PUT("/enduser/:workspace_id/:user_id", endUserController.UpdateUser)
+			user.PUT("/enduser/:workspace_id/:user_id/status", endUserController.UpdateEndUserStatus)
 			user.POST("/enduser/active", endUserController.ActiveOrDeactiveEndUser)
 			user.POST("/enduser/delete", endUserController.DeleteEndUser)
-			user.DELETE("/enduser/:tenant_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
-			user.DELETE("/enduser/delete_all/:tenant_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
+			user.DELETE("/enduser/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteEndUser)
+			user.DELETE("/enduser/delete_all/:workspace_id/:user_id", middlewares.Require("users", "delete"), endUserController.DeleteUserAll)
 			user.POST("/rbac/roles", forbiddenLegacyRBACMutation)
 			user.GET("/rbac/roles", rolesScopedBindingsController.ListRolesEndUser)
 			user.PUT("/rbac/roles/:role_id", forbiddenLegacyRBACMutation)
@@ -910,7 +910,7 @@ func SetupRoutes(
 			user.POST("/groups/users/add", groupController.AddUserToGroups)
 			user.POST("/groups/users/remove", groupController.RemoveUserFromGroups)
 			user.GET("/groups/users", groupController.GetMyGroups)
-			user.GET("/groups/:tenant_id/:group_id/users", groupController.GetGroupUsers)
+			user.GET("/groups/:workspace_id/:group_id/users", groupController.GetGroupUsers)
 			user.POST("/admin/change-password", endUserController.AdminChangeUserPassword)
 			user.POST("/admin/reset-password", endUserController.AdminResetUserPassword)
 		}
@@ -1031,7 +1031,7 @@ func SetupRoutes(
 		health := uflow.Group("/health")
 		{
 			health.GET("", healthController.ComprehensiveHealthCheck)
-			health.GET("/tenant/:tenant_id", healthController.CheckTenantDatabase)
+			health.GET("/tenant/:workspace_id", healthController.CheckTenantDatabase)
 			health.GET("/tenants", healthController.CheckAllTenantDatabases)
 		}
 
@@ -1074,8 +1074,8 @@ func SetupRoutes(
 				tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
 				tenants.GET("/template-status", migCtrl.GetTemplateStatus)
 				tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
-				tenants.POST("/:tenant_id/migrations/run", migCtrl.RunTenantMigrations)
-				tenants.GET("/:tenant_id/migrations/status", migCtrl.GetTenantMigrationStatus)
+				tenants.POST("/:workspace_id/migrations/run", migCtrl.RunTenantMigrations)
+				tenants.GET("/:workspace_id/migrations/status", migCtrl.GetTenantMigrationStatus)
 			}
 		}
 
@@ -1260,8 +1260,8 @@ func registerHmgrRoutes(r gin.IRouter) {
 		// /hmgr/.../saml-providers have been removed.
 		pub.POST("/saml/initiate/:provider", hmgrController.InitiateSAMLAuthHandler)
 		pub.POST("/saml/acs", hmgrController.HandleSAMLACSHandler)
-		pub.POST("/saml/acs/:tenant_id", hmgrController.HandleSAMLACSClientHandler)
-		pub.GET("/saml/metadata/:tenant_id", hmgrController.GetSAMLMetadataHandler)
+		pub.POST("/saml/acs/:workspace_id", hmgrController.HandleSAMLACSClientHandler)
+		pub.GET("/saml/metadata/:workspace_id", hmgrController.GetSAMLMetadataHandler)
 
 		// Common endpoints
 		pub.GET("/login", hmgrController.LoginRedirectHandler)

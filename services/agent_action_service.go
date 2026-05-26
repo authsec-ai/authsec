@@ -121,7 +121,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	actionRequest := &models.AgentActionRequest{
 		ID:          uuid.New(),
 		ActionReqID: actionReqID,
-		TenantID:    tenantID,
+		WorkspaceID:    tenantID,
 		UserID:      userID,
 		UserEmail:   userEmail,
 
@@ -403,7 +403,7 @@ func (s *AgentActionService) GetRiskPolicies(tenantID uuid.UUID) ([]models.RiskP
 func (s *AgentActionService) CreateRiskPolicy(tenantID uuid.UUID, req *models.RiskPolicyCreateRequest) (*models.RiskPolicy, error) {
 	policy := &models.RiskPolicy{
 		ID:                        uuid.New(),
-		TenantID:                  tenantID,
+		WorkspaceID:                  tenantID,
 		Name:                      req.Name,
 		Description:               req.Description,
 		ActionPattern:             req.ActionPattern,
@@ -616,7 +616,7 @@ func (s *AgentActionService) writeAuditLog(req *models.AgentActionRequest, final
 
 	entry := &models.AgentActionAuditLog{
 		ID:                  uuid.New(),
-		TenantID:            req.TenantID,
+		WorkspaceID:            req.WorkspaceID,
 		ActionRequestID:     &req.ID,
 		AgentID:             req.AgentID,
 		AgentName:           req.AgentName,

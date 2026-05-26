@@ -321,7 +321,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 	}
 
 	scope := &models.OAuthScope{
-		TenantID:         tenantID,
+		WorkspaceID:      tenantID,
 		ResourceServerID: &rsUUID,
 		ScopeString:      req.ScopeString,
 		DisplayName:      req.DisplayName,
@@ -606,7 +606,7 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 	config.DB.Preload("Scopes").
 		Where(
 			"tenant_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
-			rs.TenantID,
+			rs.WorkspaceID,
 			rs.ID,
 			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
 			rs.LastSuccessfulGeneration,
@@ -735,7 +735,9 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 
 	toolCount := len(payload.Tools)
 	upsertedCount := 0
+	appSlug := services.SlugForApp(rs.Name)
 	for _, t := range payload.Tools {
+		canonicalSuggestedScopes := services.CanonicalAuthSecScopes(t.SuggestedScopes, appSlug)
 		existing := models.MCPTool{}
 		if config.DB.Where("resource_server_id = ? AND name = ? AND inventory_source = ?",
 			rs.ID, t.Name, models.InventorySourceSDKManifest).First(&existing).Error == nil {
@@ -744,7 +746,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 				"description":      t.Description,
 				"input_schema":     t.InputSchema,
 				"annotations":      t.Annotations,
-				"suggested_scopes": t.SuggestedScopes,
+				"suggested_scopes": canonicalSuggestedScopes,
 			})
 		} else {
 			// Don't overwrite an existing mcp_scan or manual tool — just update suggested_scopes.
@@ -755,36 +757,35 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 			if conflictCount > 0 {
 				config.DB.Model(&models.MCPTool{}).
 					Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).
-					Update("suggested_scopes", t.SuggestedScopes)
+					Update("suggested_scopes", canonicalSuggestedScopes)
 			} else {
 				newTool := models.MCPTool{
-					TenantID:         rs.TenantID,
+					WorkspaceID:      rs.WorkspaceID,
 					ResourceServerID: rs.ID,
 					Name:             t.Name,
 					Title:            t.Title,
 					Description:      t.Description,
 					InputSchema:      t.InputSchema,
 					Annotations:      t.Annotations,
-					SuggestedScopes:  t.SuggestedScopes,
+					SuggestedScopes:  canonicalSuggestedScopes,
 					InventorySource:  models.InventorySourceSDKManifest,
 				}
 				config.DB.Create(&newTool)
 			}
 		}
 
-		// Upsert sdk_suggested scope mappings for each suggested scope.
-		// If a suggested scope isn't yet in the registry, seed it with
-		// source='manifest' so the UI can label its origin correctly.
-		if len(t.SuggestedScopes) > 0 {
+		// Upsert sdk_suggested scope mappings for each canonical AuthSec scope.
+		// Server-defined/legacy suggested scopes are ignored.
+		if len(canonicalSuggestedScopes) > 0 {
 			var tool models.MCPTool
 			config.DB.Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).First(&tool)
-			for _, scopeStr := range t.SuggestedScopes {
+			for _, scopeStr := range canonicalSuggestedScopes {
 				var scope models.OAuthScope
-				err := config.DB.Where("tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
-					rs.TenantID, rs.ID, scopeStr).First(&scope).Error
+				err := config.DB.Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID, scopeStr).First(&scope).Error
 				if err != nil {
 					scope = models.OAuthScope{
-						TenantID:         rs.TenantID,
+						WorkspaceID:      rs.WorkspaceID,
 						ResourceServerID: &rs.ID,
 						ScopeString:      scopeStr,
 						DisplayName:      scopeStr,
@@ -806,6 +807,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 		}
 		upsertedCount++
 	}
+	syncScopesSupported(rs.ID, rs.WorkspaceID)
 
 	// Advance the generation pointer on every successful manifest publish so:
 	//   - the /sdk-policy response carries a meaningful, monotonic generation
@@ -997,7 +999,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	}
 
 	tool := models.MCPTool{
-		TenantID:         tenantID,
+		WorkspaceID:      tenantID,
 		ResourceServerID: rsUUID,
 		Name:             req.Name,
 		Description:      req.Description,
@@ -1929,10 +1931,8 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		}
 	}
 
-	workspaceID := tenantID
 	role := models.RBACRole{
-		TenantID:    &tenantID,
-		WorkspaceID: &workspaceID,
+		WorkspaceID: &tenantID,
 		Name:        roleName,
 		Description: strings.TrimSpace(req.Description),
 		IsSystem:    false,
@@ -1956,7 +1956,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 			err := tx.Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).First(&policy).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				policy = models.ResourceServerAccessPolicy{
-					TenantID:          tenantID,
+					WorkspaceID:       tenantID,
 					ResourceServerID:  rs.ID,
 					Enabled:           true,
 					DefaultRoleID:     &role.ID,
@@ -1989,8 +1989,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 				username = row.ID.String()
 			}
 			binding := models.RoleBinding{
-				TenantID:         &tenantID,
-				WorkspaceID:      &workspaceID,
+				WorkspaceID:      &tenantID,
 				UserID:           &userID,
 				Username:         username,
 				RoleID:           role.ID,
@@ -2272,8 +2271,7 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 	}
 
 	scope := models.OAuthScope{
-		TenantID:         tenantID,
-		WorkspaceID:      &tenantID,
+		WorkspaceID:      tenantID,
 		ResourceServerID: &appID,
 		ScopeString:      entry.Key,
 		DisplayName:      entry.DisplayName,
@@ -2617,7 +2615,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	}
 	tenantUUID := tenantID
 	binding := models.RoleBinding{
-		TenantID:         &tenantUUID,
+		WorkspaceID:      &tenantUUID,
 		UserID:           &userUUID,
 		Username:         username,
 		RoleID:           roleUUID,
@@ -2730,7 +2728,7 @@ func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
 	if config.DB.Where("tenant_id = ? AND resource = ? AND action = ?",
 		tenantID, scope.ScopeString, "access").First(&perm).Error != nil {
 		perm = models.RBACPermission{
-			TenantID:    &tenantID,
+			WorkspaceID: &tenantID,
 			Resource:    scope.ScopeString,
 			Action:      "access",
 			Description: fmt.Sprintf("OAuth scope: %s", scope.DisplayName),
@@ -2746,7 +2744,8 @@ func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
 func syncScopesSupported(rsID uuid.UUID, tenantID uuid.UUID) {
 	var scopeStrings []string
 	config.DB.Model(&models.OAuthScope{}).
-		Where("resource_server_id = ? AND tenant_id = ?", rsID, tenantID).
+		Where("resource_server_id = ? AND (workspace_id = ? OR tenant_id = ?)", rsID, tenantID, tenantID).
+		Order("scope_string ASC").
 		Pluck("scope_string", &scopeStrings)
 	if scopeStrings == nil {
 		scopeStrings = []string{}

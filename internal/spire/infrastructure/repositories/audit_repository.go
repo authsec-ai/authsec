@@ -44,7 +44,7 @@ func (r *PostgresAuditRepository) Create(ctx context.Context, log *models.AuditL
 
 	_, err = r.db.ExecContext(ctx, query,
 		log.ID,
-		log.TenantID,
+		log.WorkspaceID,
 		log.EventType,
 		log.WorkloadID,
 		log.CertificateID,
@@ -135,7 +135,7 @@ func (r *PostgresAuditRepository) queryAuditLogs(ctx context.Context, query stri
 
 		err := rows.Scan(
 			&log.ID,
-			&log.TenantID,
+			&log.WorkspaceID,
 			&log.EventType,
 			&log.WorkloadID,
 			&log.CertificateID,

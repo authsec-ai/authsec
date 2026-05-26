@@ -122,8 +122,8 @@ func (r *TenantHydraClientRepository) ListAll(req *oocmgrdto.GetTenantHydraClien
 	if req.OrgID != "" {
 		query = query.Where("org_id = ?", req.OrgID)
 	}
-	if req.TenantID != "" {
-		query = query.Where("tenant_id = ?", req.TenantID)
+	if req.WorkspaceID != "" {
+		query = query.Where("tenant_id = ?", req.WorkspaceID)
 	}
 	if req.ClientType != "" {
 		query = query.Where("client_type = ?", req.ClientType)

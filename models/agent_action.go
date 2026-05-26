@@ -13,7 +13,7 @@ import (
 // RiskPolicy defines a rule for scoring agent actions
 type RiskPolicy struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
 	// Rule matching
 	Name               string `json:"name" gorm:"size:100;not null"`
@@ -56,7 +56,7 @@ func (RiskPolicy) TableName() string {
 // AgentGuardSettings holds tenant-level defaults for risk thresholds
 type AgentGuardSettings struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
 
 	AutoApproveBelow          int `json:"auto_approve_below" gorm:"default:30"`
 	RequireApprovalAbove      int `json:"require_approval_above" gorm:"default:31"`
@@ -90,7 +90,7 @@ type AgentActionRequest struct {
 	ActionReqID string    `json:"action_req_id" gorm:"uniqueIndex;size:255;not null"`
 
 	// Tenant + user context
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
 	UserEmail string    `json:"user_email" gorm:"size:255;not null"`
 
@@ -179,7 +179,7 @@ func (AgentActionDecision) TableName() string {
 // AgentActionAuditLog is an immutable record of agent actions and outcomes
 type AgentActionAuditLog struct {
 	ID              uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID        uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID        uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ActionRequestID *uuid.UUID `json:"action_request_id,omitempty" gorm:"type:uuid"`
 
 	// Snapshot

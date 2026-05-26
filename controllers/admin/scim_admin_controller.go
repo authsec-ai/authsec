@@ -231,7 +231,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 		Email:        strings.ToLower(email),
 		Username:     input.UserName,
 		Name:         input.GetDisplayName(),
-		TenantID:     &tenantUUID,
+		WorkspaceID:     &tenantUUID,
 		Provider:     "scim",
 		ProviderID:   input.UserName,
 		ProviderData: providerData,
@@ -514,7 +514,7 @@ func (sac *SCIMAdminController) fetchAdminUser(db *database.DBConnection, userID
 	if providerID.Valid {
 		user.ProviderID = providerID.String
 	}
-	user.TenantID = &tenantID
+	user.WorkspaceID = &tenantID
 
 	return &user, nil
 }

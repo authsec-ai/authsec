@@ -16,7 +16,7 @@ type ADSyncConfig struct {
 
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
-	TenantID  string        `json:"tenant_id" binding:"required"`
+	WorkspaceID  string        `json:"workspace_id" binding:"required"`
 	ClientID  string        `json:"client_id" binding:"required"`
 	ProjectID string        `json:"project_id" binding:"required"`
 	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
@@ -50,7 +50,7 @@ type ADUser struct {
 
 // AgentSyncRequest represents the request from AD Agent
 type AgentSyncRequest struct {
-	TenantID  string          `json:"tenant_id" binding:"required"`
+	WorkspaceID  string          `json:"workspace_id" binding:"required"`
 	ProjectID string          `json:"project_id" binding:"required"`
 	ClientID  string          `json:"client_id" binding:"required"`
 	Users     []AgentUserData `json:"users" binding:"required"`

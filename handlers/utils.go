@@ -14,6 +14,6 @@ type AuthenticationResponse struct {
 	Success  bool   `json:"success"`
 	Message  string `json:"message"`
 	Method   string `json:"method"`
-	TenantID string `json:"tenant_id"`
+	WorkspaceID string `json:"workspace_id"`
 	Email    string `json:"email"`
 }

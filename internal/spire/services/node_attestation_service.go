@@ -29,7 +29,7 @@ type NodeAttestationService struct {
 
 // NodeAttestRequest represents a node attestation request
 type NodeAttestRequest struct {
-	TenantID        string
+	WorkspaceID        string
 	NodeID          string
 	AttestationType string
 	Evidence        map[string]interface{}
@@ -74,13 +74,13 @@ func NewNodeAttestationService(
 // Attest performs node attestation and issues Agent SVID
 func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequest) (*NodeAttestResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":        req.TenantID,
+		"tenant_id":        req.WorkspaceID,
 		"node_id":          req.NodeID,
 		"attestation_type": req.AttestationType,
 	}).Info("Node attestation started")
 
 	// 1. Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		return nil, errors.NewNotFoundError("Tenant not found", err)
 	}
@@ -111,10 +111,10 @@ func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequ
 	}
 
 	// 4. Generate SPIFFE ID for agent
-	spiffeID := s.generateAgentSpiffeID(req.TenantID, req.NodeID)
+	spiffeID := s.generateAgentSpiffeID(req.WorkspaceID, req.NodeID)
 
 	// 5. Ensure Vault PKI role allows URI SANs (automatic configuration)
-	if err := s.ensureVaultRoleConfigured(ctx, tenant.VaultMount, req.TenantID); err != nil {
+	if err := s.ensureVaultRoleConfigured(ctx, tenant.VaultMount, req.WorkspaceID); err != nil {
 		s.logger.WithFields(logrus.Fields{
 			"vault_mount": tenant.VaultMount,
 		}).WithError(err).Error("Failed to configure Vault PKI role")
@@ -136,9 +136,9 @@ func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequ
 	}
 
 	// 6. Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, req.TenantID)
+	tenantDB, err := s.connManager.GetTenantDB(ctx, req.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", req.TenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("tenant_id", req.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
@@ -147,7 +147,7 @@ func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequ
 
 	// 7. Create or update agent record
 	// Check if agent already exists
-	existingAgent, err := agentRepo.GetByTenantAndNode(ctx, req.TenantID, req.NodeID)
+	existingAgent, err := agentRepo.GetByTenantAndNode(ctx, req.WorkspaceID, req.NodeID)
 	if err == nil {
 		// Agent exists, update it
 		existingAgent.SpiffeID = spiffeID
@@ -178,7 +178,7 @@ func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequ
 	// Agent doesn't exist, create new
 	agent := &models.Agent{
 		ID:                uuid.New().String(),
-		TenantID:          req.TenantID,
+		WorkspaceID:          req.WorkspaceID,
 		NodeID:            req.NodeID,
 		SpiffeID:          spiffeID,
 		AttestationType:   req.AttestationType,

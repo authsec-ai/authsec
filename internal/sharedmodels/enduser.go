@@ -39,7 +39,7 @@ type OIDCLoginResponse struct {
 type Client struct {
 	ID        string    `json:"id" gorm:"primaryKey"`
 	ClientID  string    `json:"client_id" gorm:"uniqueIndex;not null"`
-	TenantID  string    `json:"tenant_id" gorm:"not null;index"`
+	WorkspaceID  string    `json:"workspace_id" gorm:"not null;index"`
 	ProjectID string    `json:"project_id" gorm:"not null;index"`
 	Name      string    `json:"name"`
 	Active    bool      `json:"active" gorm:"default:true;index"`
@@ -54,7 +54,7 @@ type Client struct {
 /*
 type Client struct {
 	ID        uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID  uuid.UUID      `json:"tenant_id" gorm:"not null;type:uuid;index:idx_clients_tenant_org" binding:"required"`
+	WorkspaceID  uuid.UUID      `json:"workspace_id" gorm:"not null;type:uuid;index:idx_clients_tenant_org" binding:"required"`
 	OwnerID   uuid.UUID      `json:"owner_id" gorm:"not null;type:uuid;index:idx_clients_owner" binding:"required"`    // Maps to ClientID in auth-manager
 	ProjectID uuid.UUID      `json:"project_id" gorm:"not null;uniqueIndex"`
 	Roles     []Role         `json:"roles" gorm:"many2many:client_roles;"`
@@ -75,7 +75,7 @@ type Client struct {
 type User struct {
 	ID               uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_users_tenant_id_id"`
 	ClientID         uuid.UUID      `json:"client_id" gorm:"type:uuid;not null;index"`
-	TenantID         uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null;index:idx_users_tenant_id;uniqueIndex:idx_users_tenant_id_id;uniqueIndex:idx_users_email_tenant"`
+	WorkspaceID         uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index:idx_users_tenant_id;uniqueIndex:idx_users_tenant_id_id;uniqueIndex:idx_users_email_tenant"`
 	ProjectID        uuid.UUID      `json:"project_id" gorm:"type:uuid;not null;index"`
 	Name             string         `json:"name"`
 	Username         *string        `json:"username,omitempty" gorm:"type:text"`

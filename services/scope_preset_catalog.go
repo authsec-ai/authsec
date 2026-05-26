@@ -33,18 +33,25 @@ type ScopePreset struct {
 var ScopePresetCatalog = []ScopePreset{
 	{ID: "read_only", Name: "Read only", Category: "common",
 		Description: "Search / catalog / read-only servers",
-		Scopes:      []PresetScopeDef{{Suffix: "<app>:read", Description: "Read operations", Risk: "low"}}},
+		Scopes: []PresetScopeDef{
+			{Suffix: "<app>:read", Description: "Read operations", Risk: "low"},
+			{Suffix: "<app>:tools:read", Description: "List and call read-only tools", Risk: "low"},
+		}},
 	{ID: "read_write", Name: "Read + Write", Category: "common", Recommended: true,
 		Description: "Default for most MCP servers",
 		Scopes: []PresetScopeDef{
 			{Suffix: "<app>:read", Description: "Read operations", Risk: "low"},
 			{Suffix: "<app>:write", Description: "Write operations", Risk: "medium"},
+			{Suffix: "<app>:tools:read", Description: "List and call read-only tools", Risk: "low"},
+			{Suffix: "<app>:tools:write", Description: "Call mutating tools", Risk: "medium"},
 		}},
 	{ID: "read_write_admin", Name: "Read + Write + Admin", Category: "common",
 		Description: "Adds destructive / privileged actions",
 		Scopes: []PresetScopeDef{
 			{Suffix: "<app>:read", Description: "Read operations", Risk: "low"},
 			{Suffix: "<app>:write", Description: "Write operations", Risk: "medium"},
+			{Suffix: "<app>:tools:read", Description: "List and call read-only tools", Risk: "low"},
+			{Suffix: "<app>:tools:write", Description: "Call mutating tools", Risk: "medium"},
 			{Suffix: "<app>:admin", Description: "Administrative actions", Risk: "critical"},
 		}},
 	{ID: "per_resource_crud", Name: "Per-resource CRUD", Category: "common",
@@ -148,9 +155,11 @@ func SlugForApp(name string) string {
 	return out
 }
 
-// ExpandPresetScopes returns the scope strings for a preset with <app>
-// expanded to the supplied slug. Suffixes that still contain <resource> after
-// app expansion are skipped — they are template hints, not concrete scopes.
+// ExpandPresetScopes returns canonical AuthSec scope strings for a preset with
+// <app> expanded to the supplied slug. Domain presets are also namespaced under
+// the app slug so server-defined scope vocabularies never become authoritative.
+// Suffixes that still contain <resource> after app expansion are skipped — they
+// are template hints, not concrete scopes.
 func ExpandPresetScopes(preset *ScopePreset, appSlug string) []string {
 	if preset == nil {
 		return nil
@@ -161,6 +170,9 @@ func ExpandPresetScopes(preset *ScopePreset, appSlug string) []string {
 		if strings.Contains(expanded, "<resource>") {
 			// Template only — not a concrete scope.
 			continue
+		}
+		if appSlug != "" && !strings.HasPrefix(expanded, appSlug+":") {
+			expanded = appSlug + ":" + expanded
 		}
 		out = append(out, expanded)
 	}

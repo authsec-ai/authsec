@@ -28,7 +28,7 @@ func (s *RBACService) ListPermissions(resource string) ([]models.RBACPermission,
 		query = query.Where("resource = ?", resource)
 	}
 	// This implementation assumes listing all permissions the context has access to.
-	// If needed, we can add TenantID filter as an argument.
+	// If needed, we can add WorkspaceID filter as an argument.
 	if err := query.Find(&permissions).Error; err != nil {
 		return nil, err
 	}

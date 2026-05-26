@@ -48,7 +48,7 @@ func (r *AgentActionRepository) CreateRiskPolicy(policy *models.RiskPolicy) erro
 
 	_, err := r.db.Exec(query,
 		policy.ID,
-		policy.TenantID,
+		policy.WorkspaceID,
 		policy.Name,
 		policy.Description,
 		policy.ActionPattern,
@@ -101,7 +101,7 @@ func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]m
 	for rows.Next() {
 		var p models.RiskPolicy
 		err := rows.Scan(
-			&p.ID, &p.TenantID, &p.Name, &p.Description,
+			&p.ID, &p.WorkspaceID, &p.Name, &p.Description,
 			&p.ActionPattern, &p.ResourcePattern, &p.EnvironmentPattern,
 			&p.BaseScore, &p.ScopeBulkThreshold, &p.ScopeBulkModifier,
 			&p.PIIModifier, &p.FinancialModifier, &p.OffHoursModifier, &p.FirstTimeModifier,
@@ -132,7 +132,7 @@ func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, tenantID u
 
 	var p models.RiskPolicy
 	err := r.db.QueryRow(query, policyID, tenantID).Scan(
-		&p.ID, &p.TenantID, &p.Name, &p.Description,
+		&p.ID, &p.WorkspaceID, &p.Name, &p.Description,
 		&p.ActionPattern, &p.ResourcePattern, &p.EnvironmentPattern,
 		&p.BaseScore, &p.ScopeBulkThreshold, &p.ScopeBulkModifier,
 		&p.PIIModifier, &p.FinancialModifier, &p.OffHoursModifier, &p.FirstTimeModifier,
@@ -173,7 +173,7 @@ func (r *AgentActionRepository) UpdateRiskPolicy(policy *models.RiskPolicy) erro
 		policy.PIIModifier, policy.FinancialModifier, policy.OffHoursModifier, policy.FirstTimeModifier,
 		policy.AutoApproveBelow, policy.RequireApprovalAbove, policy.RequireMultiApprovalAbove,
 		policy.IsActive, policy.Priority, policy.UpdatedAt,
-		policy.ID, policy.TenantID,
+		policy.ID, policy.WorkspaceID,
 	)
 
 	if err != nil {
@@ -228,7 +228,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 
 	var s models.AgentGuardSettings
 	err := r.db.QueryRow(query, tenantID).Scan(
-		&s.ID, &s.TenantID,
+		&s.ID, &s.WorkspaceID,
 		&s.AutoApproveBelow, &s.RequireApprovalAbove, &s.RequireMultiApprovalAbove,
 		&s.ApprovalTimeoutSeconds, &s.PollingIntervalSeconds,
 		&s.BusinessHoursStart, &s.BusinessHoursEnd, &s.BusinessHoursTimezone,
@@ -248,7 +248,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 	now := time.Now().Unix()
 	s = models.AgentGuardSettings{
 		ID:                        uuid.New(),
-		TenantID:                  tenantID,
+		WorkspaceID:                  tenantID,
 		AutoApproveBelow:          30,
 		RequireApprovalAbove:      31,
 		RequireMultiApprovalAbove: 81,
@@ -275,7 +275,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 	`
 
 	_, err = r.db.Exec(insertQuery,
-		s.ID, s.TenantID,
+		s.ID, s.WorkspaceID,
 		s.AutoApproveBelow, s.RequireApprovalAbove, s.RequireMultiApprovalAbove,
 		s.ApprovalTimeoutSeconds, s.PollingIntervalSeconds,
 		s.BusinessHoursStart, s.BusinessHoursEnd, s.BusinessHoursTimezone,
@@ -310,7 +310,7 @@ func (r *AgentActionRepository) UpdateSettings(settings *models.AgentGuardSettin
 		settings.ApprovalTimeoutSeconds, settings.PollingIntervalSeconds,
 		settings.BusinessHoursStart, settings.BusinessHoursEnd, settings.BusinessHoursTimezone,
 		settings.DefaultApproverUserID, settings.RequireBiometric,
-		settings.UpdatedAt, settings.TenantID,
+		settings.UpdatedAt, settings.WorkspaceID,
 	)
 
 	if err != nil {
@@ -352,7 +352,7 @@ func (r *AgentActionRepository) CreateActionRequest(req *models.AgentActionReque
 	`
 
 	_, err = r.db.Exec(query,
-		req.ID, req.ActionReqID, req.TenantID, req.UserID, req.UserEmail,
+		req.ID, req.ActionReqID, req.WorkspaceID, req.UserID, req.UserEmail,
 		req.AgentID, req.AgentName, req.AgentFramework, req.SessionID,
 		req.Action, req.Resource, req.Detail, metadataJSON,
 		req.RiskScore, req.RiskLevel, riskFactorsJSON, req.MatchedPolicyID,
@@ -386,7 +386,7 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 	var metadataJSON, riskFactorsJSON []byte
 
 	err := r.db.QueryRow(query, actionReqID).Scan(
-		&req.ID, &req.ActionReqID, &req.TenantID, &req.UserID, &req.UserEmail,
+		&req.ID, &req.ActionReqID, &req.WorkspaceID, &req.UserID, &req.UserEmail,
 		&req.AgentID, &req.AgentName, &req.AgentFramework, &req.SessionID,
 		&req.Action, &req.Resource, &req.Detail, &metadataJSON,
 		&req.RiskScore, &req.RiskLevel, &riskFactorsJSON, &req.MatchedPolicyID,
@@ -444,7 +444,7 @@ func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, user
 		var decidedAt, lastPolledAt sql.NullInt64
 
 		err := rows.Scan(
-			&req.ID, &req.ActionReqID, &req.TenantID, &req.UserID, &req.UserEmail,
+			&req.ID, &req.ActionReqID, &req.WorkspaceID, &req.UserID, &req.UserEmail,
 			&req.AgentID, &req.AgentName, &req.AgentFramework, &req.SessionID,
 			&req.Action, &req.Resource, &req.Detail, &metadataJSON,
 			&req.RiskScore, &req.RiskLevel, &riskFactorsJSON, &matchedPolicyID,
@@ -621,7 +621,7 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 	`
 
 	_, err = r.db.Exec(query,
-		entry.ID, entry.TenantID, entry.ActionRequestID,
+		entry.ID, entry.WorkspaceID, entry.ActionRequestID,
 		entry.AgentID, entry.AgentName, entry.UserID, entry.UserEmail,
 		entry.Action, entry.Resource, entry.Detail, metadataJSON,
 		entry.RiskScore, entry.RiskLevel, entry.FinalStatus, decidedByJSON,
@@ -670,7 +670,7 @@ func (r *AgentActionRepository) GetAuditLog(tenantID uuid.UUID, page, perPage in
 		var metadataJSON, decidedByJSON []byte
 
 		err := rows.Scan(
-			&e.ID, &e.TenantID, &e.ActionRequestID,
+			&e.ID, &e.WorkspaceID, &e.ActionRequestID,
 			&e.AgentID, &e.AgentName, &e.UserID, &e.UserEmail,
 			&e.Action, &e.Resource, &e.Detail, &metadataJSON,
 			&e.RiskScore, &e.RiskLevel, &e.FinalStatus, &decidedByJSON,

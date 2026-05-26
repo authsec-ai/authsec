@@ -27,7 +27,7 @@ func NewClient(baseURL, token string) *Client {
 
 // ProvisionPKIRequest represents PKI provisioning request to ICP
 type ProvisionPKIRequest struct {
-	TenantID   string `json:"tenant_id"`
+	WorkspaceID   string `json:"workspace_id"`
 	CommonName string `json:"common_name"`
 	Domain     string `json:"domain"`
 	TTL        string `json:"ttl"`
@@ -36,7 +36,7 @@ type ProvisionPKIRequest struct {
 
 // ProvisionPKIResponse represents PKI provisioning response from ICP
 type ProvisionPKIResponse struct {
-	TenantID    string `json:"tenant_id"`
+	WorkspaceID    string `json:"workspace_id"`
 	PKIMount    string `json:"pki_mount"`
 	CACert      string `json:"ca_cert"`
 	RoleCreated string `json:"role_created"`
@@ -45,7 +45,7 @@ type ProvisionPKIResponse struct {
 
 // ProvisionPKI provisions PKI infrastructure for a tenant
 func (c *Client) ProvisionPKI(ctx context.Context, req *ProvisionPKIRequest) (*ProvisionPKIResponse, error) {
-	url := fmt.Sprintf("%s/admin/pki/provision/%s", c.baseURL, req.TenantID)
+	url := fmt.Sprintf("%s/admin/pki/provision/%s", c.baseURL, req.WorkspaceID)
 
 	body, err := json.Marshal(req)
 	fmt.Println(string(body))

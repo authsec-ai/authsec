@@ -51,7 +51,7 @@ func NewMembershipController() *MembershipController {
 // ────────────────────────────────────────────────────────────────────
 
 func parseTenantID(c *gin.Context) (uuid.UUID, bool) {
-	raw := c.Param("tenant_id")
+	raw := c.Param("workspace_id")
 	id, err := uuid.Parse(raw)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id", "detail": err.Error()})
@@ -559,7 +559,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	if res.RowsAffected == 0 {
 		// Upsert if it doesn't exist (an end user can be edited before their first consent in Phase A admin tooling).
 		s := models.TenantEndUserState{
-			TenantID: tenantID,
+			WorkspaceID: tenantID,
 			UserID:   userID,
 			Status:   models.EndUserStatusActive,
 		}
@@ -619,7 +619,7 @@ func (mc *MembershipController) ReactivateEndUser(c *gin.Context) {
 // A simpler shape than the legacy AssignRoleScopedAdmin handler: subject is
 // always the group identified in the URL.
 type bindGroupToRoleRequest struct {
-	TenantID  string                 `json:"tenant_id" binding:"required"`
+	WorkspaceID  string                 `json:"workspace_id" binding:"required"`
 	RoleID    string                 `json:"role_id"   binding:"required"`
 	ScopeType *string                `json:"scope_type,omitempty"`
 	ScopeID   *string                `json:"scope_id,omitempty"`
@@ -642,7 +642,7 @@ func (mc *MembershipController) BindGroupToRole(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "detail": err.Error()})
 		return
 	}
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id", "detail": err.Error()})
 		return
@@ -655,7 +655,7 @@ func (mc *MembershipController) BindGroupToRole(c *gin.Context) {
 
 	binding := models.RoleBinding{
 		ID:        uuid.New(),
-		TenantID:  &tenantID,
+		WorkspaceID:  &tenantID,
 		GroupID:   &groupID,
 		RoleID:    roleID,
 		ScopeType: req.ScopeType,

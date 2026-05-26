@@ -8,7 +8,7 @@ import (
 
 // Request models for client registration
 type RegisterClientsRequest struct {
-	TenantID  string `json:"tenant_id" binding:"required"`
+	WorkspaceID  string `json:"workspace_id" binding:"required"`
 	ProjectID string `json:"project_id" binding:"required"`
 	Name      string `json:"name" binding:"required"`
 	Email     string `json:"email" binding:"required"`
@@ -17,7 +17,7 @@ type RegisterClientsRequest struct {
 type RegisterClientsResponse struct {
 	ID        string    `json:"id"`
 	ClientID  string    `json:"client_id"`
-	TenantID  string    `json:"tenant_id"`
+	WorkspaceID  string    `json:"workspace_id"`
 	ProjectID string    `json:"project_id"`
 	Name      string    `json:"name"`
 	SecretID  string    `json:"secret_id,omitempty"`
@@ -104,7 +104,7 @@ type CustomResetPasswordResponse struct {
 
 // Admin password management models
 type AdminChangePasswordInput struct {
-	TenantID    string `json:"tenant_id" binding:"required"`
+	WorkspaceID    string `json:"workspace_id" binding:"required"`
 	UserID      string `json:"user_id,omitempty"`
 	Email       string `json:"email,omitempty"`
 	NewPassword string `json:"new_password" binding:"required"`
@@ -114,11 +114,11 @@ type AdminChangePasswordResponse struct {
 	Message  string `json:"message"`
 	UserID   string `json:"user_id"`
 	Email    string `json:"email"`
-	TenantID string `json:"tenant_id"`
+	WorkspaceID string `json:"workspace_id"`
 }
 
 type AdminResetPasswordInput struct {
-	TenantID  string `json:"tenant_id" binding:"required"`
+	WorkspaceID  string `json:"workspace_id" binding:"required"`
 	UserID    string `json:"user_id,omitempty"`
 	Email     string `json:"email,omitempty"`
 	SendEmail bool   `json:"send_email,omitempty"`
@@ -128,7 +128,7 @@ type AdminResetPasswordResponse struct {
 	Message           string `json:"message"`
 	UserID            string `json:"user_id"`
 	Email             string `json:"email"`
-	TenantID          string `json:"tenant_id"`
+	WorkspaceID          string `json:"workspace_id"`
 	TemporaryPassword string `json:"temporary_password,omitempty"`
 	EmailSent         bool   `json:"email_sent"`
 }

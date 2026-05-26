@@ -72,13 +72,13 @@ func TestGetScopePreset(t *testing.T) {
 func TestExpandPresetScopes(t *testing.T) {
 	t.Parallel()
 
-	// read_write: two <app> placeholders, no <resource> placeholders.
+	// read_write: all concrete scopes are namespaced under <app>.
 	rw, ok := GetScopePreset("read_write")
 	if !ok {
 		t.Fatal("read_write preset missing")
 	}
 	got := ExpandPresetScopes(rw, "github_mcp")
-	want := []string{"github_mcp:read", "github_mcp:write"}
+	want := []string{"github_mcp:read", "github_mcp:write", "github_mcp:tools:read", "github_mcp:tools:write"}
 	if !equalStringSlices(got, want) {
 		t.Errorf("ExpandPresetScopes(read_write) = %v, want %v", got, want)
 	}
@@ -90,10 +90,10 @@ func TestExpandPresetScopes(t *testing.T) {
 		t.Errorf("ExpandPresetScopes(per_resource_crud) expected 0 concrete scopes, got %v", got)
 	}
 
-	// code_repos: domain-shape, suffixes contain no <app>; slug should not appear.
+	// code_repos: domain-shape suffixes are still namespaced under the app slug.
 	cr, _ := GetScopePreset("code_repos")
 	got = ExpandPresetScopes(cr, "anything")
-	want = []string{"repo:read", "pr:write", "repo:admin"}
+	want = []string{"anything:repo:read", "anything:pr:write", "anything:repo:admin"}
 	if !equalStringSlices(got, want) {
 		t.Errorf("ExpandPresetScopes(code_repos) = %v, want %v", got, want)
 	}

@@ -40,9 +40,9 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	}
 
 	payload := map[string]interface{}{
-		"tenant_id": tenantID.String(),
-		"user_id":   userID.String(),
-		"active":    true,
+		"workspace_id": tenantID.String(),
+		"user_id":      userID.String(),
+		"active":       true,
 	}
 
 	body, _ := json.Marshal(payload)
@@ -90,8 +90,8 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	}
 
 	payload := map[string]string{
-		"tenant_id": tenantID.String(),
-		"user_id":   userID.String(),
+		"workspace_id": tenantID.String(),
+		"user_id":      userID.String(),
 	}
 
 	body, _ := json.Marshal(payload)
@@ -102,7 +102,7 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
 	setTokenClaimsInContext(c, tenantID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{TenantID: tenantID.String()})
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID.String()})
 
 	controller.DeleteEndUser(c)
 
@@ -142,9 +142,9 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	}
 
 	payload := map[string]interface{}{
-		"tenant_id": tenantID.String(),
-		"user_id":   userID.String(),
-		"active":    "false",
+		"workspace_id": tenantID.String(),
+		"user_id":      userID.String(),
+		"active":       "false",
 	}
 
 	body, _ := json.Marshal(payload)
@@ -183,9 +183,9 @@ func TestActiveOrDeactiveEndUser_BlocksLastActive(t *testing.T) {
 	overrideConfigDB(t, db)
 
 	payload := map[string]interface{}{
-		"tenant_id": tenantID.String(),
-		"user_id":   userID.String(),
-		"active":    false,
+		"workspace_id": tenantID.String(),
+		"user_id":      userID.String(),
+		"active":       false,
 	}
 
 	body, _ := json.Marshal(payload)
@@ -220,15 +220,15 @@ func TestDeleteEndUser_BlocksLastActive(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 
 	body, _ := json.Marshal(map[string]string{
-		"tenant_id": tenantID.String(),
-		"user_id":   userID.String(),
+		"workspace_id": tenantID.String(),
+		"user_id":      userID.String(),
 	})
 
 	c.Request = httptest.NewRequest("DELETE", "/uflow/user/enduser/delete", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
 	setTokenClaimsInContext(c, tenantID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{TenantID: tenantID.String()})
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID.String()})
 
 	controller.DeleteEndUser(c)
 

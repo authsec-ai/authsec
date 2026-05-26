@@ -9,7 +9,7 @@ import (
 // SyncConfiguration represents a stored directory sync configuration
 type SyncConfiguration struct {
 	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index:idx_sync_configs_tenant_id"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index:idx_sync_configs_tenant_id"`
 	ClientID  uuid.UUID `json:"client_id" gorm:"type:uuid;not null;index:idx_sync_configs_client_id"`
 	ProjectID uuid.UUID `json:"project_id" gorm:"type:uuid;not null"`
 
@@ -58,7 +58,7 @@ func (SyncConfiguration) TableName() string {
 
 // CreateSyncConfigRequest represents the request to create a new sync configuration
 type CreateSyncConfigRequest struct {
-	TenantID    string `json:"tenant_id" binding:"required"`
+	WorkspaceID    string `json:"workspace_id" binding:"required"`
 	ClientID    string `json:"client_id" binding:"required"`
 	ProjectID   string `json:"project_id" binding:"required"`
 	SyncType    string `json:"sync_type" binding:"required"` // 'active_directory' or 'entra_id'
@@ -74,7 +74,7 @@ type CreateSyncConfigRequest struct {
 
 // EntraIDSyncConfig represents Entra ID sync configuration
 type EntraIDSyncConfig struct {
-	TenantID     string   `json:"tenant_id" binding:"required"`
+	WorkspaceID     string   `json:"workspace_id" binding:"required"`
 	ClientID     string   `json:"client_id" binding:"required"`
 	ClientSecret string   `json:"client_secret" binding:"required"`
 	Scopes       []string `json:"scopes,omitempty"`
@@ -83,7 +83,7 @@ type EntraIDSyncConfig struct {
 
 // ListSyncConfigsRequest represents the request to list sync configurations
 type ListSyncConfigsRequest struct {
-	TenantID string  `json:"tenant_id" binding:"required"`
+	WorkspaceID string  `json:"workspace_id" binding:"required"`
 	ClientID string  `json:"client_id" binding:"required"`
 	SyncType *string `json:"sync_type,omitempty"` // Optional filter: 'active_directory' or 'entra_id'
 }
@@ -91,7 +91,7 @@ type ListSyncConfigsRequest struct {
 // UpdateSyncConfigRequest represents the request to update a sync configuration
 type UpdateSyncConfigRequest struct {
 	ID          string  `json:"id" binding:"required"`
-	TenantID    string  `json:"tenant_id" binding:"required"`
+	WorkspaceID    string  `json:"workspace_id" binding:"required"`
 	ClientID    string  `json:"client_id" binding:"required"`
 	ConfigName  *string `json:"config_name,omitempty"`
 	Description *string `json:"description,omitempty"`
@@ -107,7 +107,7 @@ type UpdateSyncConfigRequest struct {
 // DeleteSyncConfigRequest represents the request to delete a sync configuration
 type DeleteSyncConfigRequest struct {
 	ID       string `json:"id" binding:"required"`
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id" binding:"required"`
 }
 
@@ -122,7 +122,7 @@ type SyncConfigResponse struct {
 // SyncWithStoredConfigRequest represents the request to sync using stored credentials
 type SyncWithStoredConfigRequest struct {
 	ConfigID string `json:"config_id" binding:"required"`
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id" binding:"required"`
 	DryRun   bool   `json:"dry_run,omitempty"`
 }

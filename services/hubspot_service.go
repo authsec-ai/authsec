@@ -32,7 +32,7 @@ func NewHubSpotService(accessToken string) *HubSpotService {
 type hubSpotContactProperties struct {
 	Email            string `json:"email,omitempty"`
 	TenantDomain     string `json:"tenant_domain,omitempty"`
-	TenantID         string `json:"tenant_id,omitempty"`
+	WorkspaceID         string `json:"workspace_id,omitempty"`
 	RegistrationDate string `json:"registration_date,omitempty"`
 	LifecycleStage   string `json:"lifecyclestage,omitempty"`
 }
@@ -77,7 +77,7 @@ func (s *HubSpotService) SyncContact(email, tenantDomain, tenantID string) (stri
 		Properties: hubSpotContactProperties{
 			Email:            email,
 			TenantDomain:     tenantDomain,
-			TenantID:         tenantID,
+			WorkspaceID:         tenantID,
 			RegistrationDate: today,
 			LifecycleStage:   "lead",
 		},
@@ -100,7 +100,7 @@ func (s *HubSpotService) SyncContact(email, tenantDomain, tenantID string) (stri
 
 		err = s.updateContact(contactID, hubSpotContactProperties{
 			TenantDomain:     tenantDomain,
-			TenantID:         tenantID,
+			WorkspaceID:         tenantID,
 			RegistrationDate: today,
 		})
 		if err != nil {

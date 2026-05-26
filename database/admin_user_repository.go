@@ -89,7 +89,7 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(tenantID uuid.U
 			&user.PasswordHash,
 			&user.Name,
 			&user.ClientID,
-			&user.TenantID,
+			&user.WorkspaceID,
 			&user.ProjectID,
 			&user.TenantDomain,
 			&user.Provider,
@@ -405,7 +405,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 		user.CreatedAt,
 		user.UpdatedAt,
 		user.ClientID,
-		user.TenantID,
+		user.WorkspaceID,
 		user.ProjectID,
 		user.TenantDomain,
 	)
@@ -415,8 +415,8 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	}
 
 	tenantID := uuid.Nil
-	if user.TenantID != nil {
-		tenantID = *user.TenantID
+	if user.WorkspaceID != nil {
+		tenantID = *user.WorkspaceID
 	}
 
 	roleID, err := aur.EnsureAdminRole(tenantID)
@@ -621,7 +621,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	}
 
 	user.ClientID = clientID
-	user.TenantID = tenantID
+	user.WorkspaceID = tenantID
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -831,7 +831,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	}
 
 	user.ClientID = clientID
-	user.TenantID = tenantID
+	user.WorkspaceID = tenantID
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -865,7 +865,7 @@ func (aur *AdminUserRepository) GetAdminUserByID(id uuid.UUID) (*models.AdminUse
 		&user.PasswordHash,
 		&user.Name,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.TenantDomain,
 		&user.Provider,
@@ -997,7 +997,7 @@ func (aur *AdminUserRepository) GetAllAdminUsers() ([]models.AdminUser, error) {
 			&user.PasswordHash,
 			&user.Name,
 			&user.ClientID,
-			&user.TenantID,
+			&user.WorkspaceID,
 			&user.ProjectID,
 			&user.TenantDomain,
 			&user.Provider,
@@ -1221,7 +1221,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 	}
 
 	user.ClientID = clientID
-	user.TenantID = tenantIDParsed
+	user.WorkspaceID = tenantIDParsed
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -1394,7 +1394,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	}
 
 	user.ClientID = clientID
-	user.TenantID = tenantID
+	user.WorkspaceID = tenantID
 	user.ProjectID = projectID
 
 	// Get configured providers for this tenant/client
@@ -1406,13 +1406,13 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	}
 
 	// Query tenant configuration for available providers
-	if user.TenantID != nil {
+	if user.WorkspaceID != nil {
 		providerQuery := `
 			SELECT DISTINCT provider_name
 			FROM oauth_configs
 			WHERE tenant_id = $1 AND enabled = true
 		`
-		rows, err := aur.db.Query(providerQuery, user.TenantID)
+		rows, err := aur.db.Query(providerQuery, user.WorkspaceID)
 		if err == nil {
 			defer rows.Close()
 			for rows.Next() {

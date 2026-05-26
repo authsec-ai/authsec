@@ -34,7 +34,7 @@ type ErrorDetail struct {
 // BundleResponse represents the CA bundle response
 type BundleResponse struct {
 	CABundle string `json:"ca_bundle"`
-	TenantID string `json:"tenant_id"`
+	WorkspaceID string `json:"workspace_id"`
 }
 
 // ListWorkloadsResponse represents the HTTP response for listing workloads

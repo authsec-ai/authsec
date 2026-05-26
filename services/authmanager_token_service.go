@@ -37,7 +37,6 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 
 // TokenClaims represents the standard claims structure for auth-manager compatible tokens
 type TokenClaims struct {
-	TenantID              string
 	WorkspaceID           string
 	WorkspaceMembershipID string
 	TenantDomain          string // Tenant domain for display/routing
@@ -74,7 +73,6 @@ func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, works
 	}
 
 	return s.GenerateToken(TokenClaims{
-		TenantID:              workspaceID.String(), // Phase 3: tenant_id stays dual-emitted until Phase 8
 		WorkspaceID:           workspaceID.String(),
 		WorkspaceMembershipID: membershipID.String(),
 		ProjectID:             projectID.String(),
@@ -96,17 +94,17 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 	// Phase 3 (tenant → workspace migration): every token now carries workspace_id
 	// unconditionally. tenant_id is still emitted in lockstep for backward compatibility
 	// until Phase 8 drops it. If a caller forgot to set WorkspaceID (legacy code path
-	// still passing only TenantID), mirror tenant_id into workspace_id — by construction
+	// still passing only WorkspaceID), mirror tenant_id into workspace_id — by construction
 	// tenants.id == workspaces.id (see admin signup transaction).
 	workspaceID := claims.WorkspaceID
 	if workspaceID == "" {
-		workspaceID = claims.TenantID
+		workspaceID = claims.WorkspaceID
 	}
 
 	// Build JWT claims following auth-manager's exact pattern
 	// Reference: github.com/authsec-ai/auth-manager/controllers/token_controller.go
 	jwtClaims := jwt.MapClaims{
-		"tenant_id":    claims.TenantID,
+		"tenant_id":    claims.WorkspaceID,
 		"workspace_id": workspaceID,
 		"project_id":   claims.ProjectID,
 		"client_id":    claims.ClientID,
@@ -173,8 +171,8 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	now := time.Now()
 	// Phase 3: emit workspace_id alongside tenant_id (mirror — they're equal UUIDs by construction).
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":    req.TenantID,
-		"workspace_id": req.TenantID,
+		"tenant_id":    req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,
@@ -204,7 +202,7 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 	}
 
 	claims := TokenClaims{
-		TenantID:     tenantIDStr,  // Use actual tenant_id
+		WorkspaceID:     tenantIDStr,  // Use actual tenant_id
 		TenantDomain: tenantDomain, // Include tenant domain
 		ProjectID:    projectID.String(),
 		ClientID:     adminUserID.String(),
@@ -225,7 +223,7 @@ func (s *AuthManagerTokenService) GenerateTenantUserToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: projectID.String(),
 		ClientID:  userID.String(),
 		EmailID:   email,
@@ -245,7 +243,7 @@ func (s *AuthManagerTokenService) GenerateEndUserToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID,
+		WorkspaceID:  tenantID,
 		ProjectID: tenantID, // Default project_id = tenant_id for endusers
 		ClientID:  clientID,
 		EmailID:   email,
@@ -265,7 +263,7 @@ func (s *AuthManagerTokenService) GenerateVoiceAuthToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: tenantID.String(), // Default project_id = tenant_id for voice auth
 		ClientID:  userID.String(),
 		EmailID:   email,
@@ -285,7 +283,7 @@ func (s *AuthManagerTokenService) GenerateDeviceAuthToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: tenantID.String(), // Default project_id = tenant_id for device auth
 		ClientID:  userID.String(),
 		EmailID:   email,
@@ -305,7 +303,7 @@ func (s *AuthManagerTokenService) GenerateCIBAToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: tenantID.String(), // Default project_id = tenant_id for CIBA
 		ClientID:  userID.String(),
 		EmailID:   email,
@@ -326,7 +324,7 @@ func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: tenantID.String(),
 		ClientID:  clientID.String(),
 		EmailID:   email,
@@ -345,7 +343,7 @@ func (s *AuthManagerTokenService) GenerateTOTPToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		ProjectID: tenantID.String(),
 		ClientID:  userID.String(),
 		EmailID:   email,

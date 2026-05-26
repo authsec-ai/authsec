@@ -40,7 +40,7 @@ func NewWorkloadController(
 // AttestWorkload handles POST /spire/v1/workload/attest
 func (ctrl *WorkloadController) AttestWorkload(c *gin.Context) {
 	var req struct {
-		TenantID  string            `json:"tenant_id"`
+		WorkspaceID  string            `json:"workspace_id"`
 		AgentID   string            `json:"agent_id"`
 		Selectors map[string]string `json:"selectors"`
 	}
@@ -49,7 +49,7 @@ func (ctrl *WorkloadController) AttestWorkload(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -70,27 +70,27 @@ func (ctrl *WorkloadController) AttestWorkload(c *gin.Context) {
 	}
 
 	ctrl.logger.WithFields(logrus.Fields{
-		"tenant_id":      req.TenantID,
+		"tenant_id":      req.WorkspaceID,
 		"agent_id":       req.AgentID,
 		"selector_count": len(req.Selectors),
 	}).Info("Workload attestation request received")
 
 	svcReq := &services.AttestWorkloadRequest{
-		TenantID:  req.TenantID,
+		WorkspaceID:  req.WorkspaceID,
 		AgentID:   req.AgentID,
 		Selectors: req.Selectors,
 	}
 
 	svidResp, err := ctrl.attestationService.AttestWorkload(c.Request.Context(), svcReq)
 	if err != nil {
-		ctrl.logger.WithError(err).WithField("tenant_id", req.TenantID).Error("Workload attestation failed")
+		ctrl.logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Error("Workload attestation failed")
 		ctrl.sendError(c, errors.NewBadRequestError("Attestation failed: "+err.Error(), err))
 		return
 	}
 
 	ctrl.logger.WithFields(logrus.Fields{
 		"spiffe_id": svidResp.SpiffeID,
-		"tenant_id": req.TenantID,
+		"tenant_id": req.WorkspaceID,
 	}).Info("Workload SVID issued successfully")
 
 	c.JSON(http.StatusOK, gin.H{
@@ -105,7 +105,7 @@ func (ctrl *WorkloadController) AttestWorkload(c *gin.Context) {
 // RevokeWorkloadSVID handles POST /spire/v1/workload/revoke
 func (ctrl *WorkloadController) RevokeWorkloadSVID(c *gin.Context) {
 	var req struct {
-		TenantID     string `json:"tenant_id"`
+		WorkspaceID     string `json:"workspace_id"`
 		SerialNumber string `json:"serial_number"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -113,7 +113,7 @@ func (ctrl *WorkloadController) RevokeWorkloadSVID(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -123,11 +123,11 @@ func (ctrl *WorkloadController) RevokeWorkloadSVID(c *gin.Context) {
 	}
 
 	ctrl.logger.WithFields(logrus.Fields{
-		"tenant_id":     req.TenantID,
+		"tenant_id":     req.WorkspaceID,
 		"serial_number": req.SerialNumber,
 	}).Info("Workload SVID revocation request received")
 
-	if err := ctrl.attestationService.RevokeWorkloadSVID(c.Request.Context(), req.TenantID, req.SerialNumber); err != nil {
+	if err := ctrl.attestationService.RevokeWorkloadSVID(c.Request.Context(), req.WorkspaceID, req.SerialNumber); err != nil {
 		ctrl.logger.WithError(err).WithField("serial_number", req.SerialNumber).Error("Workload SVID revocation failed")
 		ctrl.sendError(c, errors.NewInternalError("Revocation failed: "+err.Error(), err))
 		return
@@ -152,14 +152,14 @@ func (ctrl *WorkloadController) CreateEntry(c *gin.Context) {
 	}
 
 	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, req.TenantID); err != nil {
+	if err := ctrl.validateTenantOwnership(c, req.WorkspaceID); err != nil {
 		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
 		return
 	}
 
 	// Convert DTO to domain model
 	entry := &models.WorkloadEntry{
-		TenantID:   req.TenantID,
+		WorkspaceID:   req.WorkspaceID,
 		SpiffeID:   req.SpiffeID,
 		ParentID:   req.ParentID,
 		Selectors:  req.Selectors,
@@ -188,32 +188,32 @@ func (ctrl *WorkloadController) CreateAgentEntry(c *gin.Context) {
 	}
 
 	// Validate required fields
-	if req.TenantID == "" || req.ClientID == "" || req.AgentType == "" {
+	if req.WorkspaceID == "" || req.ClientID == "" || req.AgentType == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id, client_id, and agent_type are required", nil))
 		return
 	}
 
 	// Validate tenant ownership
-	if err := ctrl.validateTenantOwnership(c, req.TenantID); err != nil {
+	if err := ctrl.validateTenantOwnership(c, req.WorkspaceID); err != nil {
 		ctrl.sendError(c, errors.NewForbiddenError("Tenant ownership validation failed", err))
 		return
 	}
 
 	// Generate SPIFFE ID: spiffe://<tenant_id>/agent/<client_id>/<agent_type>
-	spiffeID := "spiffe://" + req.TenantID + "/agent/" + req.ClientID + "/" + req.AgentType
+	spiffeID := "spiffe://" + req.WorkspaceID + "/agent/" + req.ClientID + "/" + req.AgentType
 
 	// Build selectors with authsec-specific selectors
 	selectors := map[string]string{
 		"authsec:client_id":  req.ClientID,
 		"authsec:agent_type": req.AgentType,
-		"authsec:tenant_id":  req.TenantID,
+		"authsec:tenant_id":  req.WorkspaceID,
 	}
 	for k, v := range req.Selectors {
 		selectors[k] = v
 	}
 
 	entry := &models.WorkloadEntry{
-		TenantID:  req.TenantID,
+		WorkspaceID:  req.WorkspaceID,
 		SpiffeID:  spiffeID,
 		ParentID:  req.ParentID,
 		Selectors: selectors,
@@ -233,7 +233,7 @@ func (ctrl *WorkloadController) CreateAgentEntry(c *gin.Context) {
 	c.JSON(http.StatusCreated, dto.CreateAgentEntryResponse{
 		EntryID:   createdEntry.ID,
 		SpiffeID:  createdEntry.SpiffeID,
-		TenantID:  createdEntry.TenantID,
+		WorkspaceID:  createdEntry.WorkspaceID,
 		ClientID:  req.ClientID,
 		ParentID:  createdEntry.ParentID,
 		Selectors: createdEntry.Selectors,
@@ -335,7 +335,7 @@ func (ctrl *WorkloadController) ListEntries(c *gin.Context) {
 	}
 
 	filter := &models.WorkloadEntryFilter{
-		TenantID:        tenantID,
+		WorkspaceID:        tenantID,
 		ParentID:        parentID,
 		SpiffeID:        searchValue,
 		SpiffeIDPartial: usePartialSearch,
@@ -433,7 +433,7 @@ func (ctrl *WorkloadController) UpdateEntry(c *gin.Context) {
 
 	entry := &models.WorkloadEntry{
 		ID:         entryID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		SpiffeID:   req.SpiffeID,
 		ParentID:   req.ParentID,
 		Selectors:  req.Selectors,
@@ -486,7 +486,7 @@ func (ctrl *WorkloadController) DeleteEntry(c *gin.Context) {
 func (ctrl *WorkloadController) toEntryResponse(entry *models.WorkloadEntry) *dto.WorkloadEntryResponse {
 	return &dto.WorkloadEntryResponse{
 		ID:         entry.ID,
-		TenantID:   entry.TenantID,
+		WorkspaceID:   entry.WorkspaceID,
 		SpiffeID:   entry.SpiffeID,
 		ParentID:   entry.ParentID,
 		Selectors:  entry.Selectors,

@@ -2,7 +2,7 @@ package dto
 
 // NodeAttestRequest represents a node attestation request
 type NodeAttestRequest struct {
-	TenantID        string                 `json:"tenant_id"`
+	WorkspaceID        string                 `json:"workspace_id"`
 	NodeID          string                 `json:"node_id"`
 	AttestationType string                 `json:"attestation_type"` // "kubernetes", "tpm", "aws"
 	Evidence        map[string]interface{} `json:"evidence"`

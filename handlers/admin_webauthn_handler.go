@@ -165,7 +165,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 	// Check for verified custom domain for this admin's tenant
 	globalRepo := repositories.NewGlobalRepository(globalDB)
-	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(user.TenantID.String())
+	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(user.WorkspaceID.String())
 	if err != nil {
 		log.Printf("GetMFAStatusForLogin: Error checking custom domain: %v", err)
 	}
@@ -247,7 +247,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 	// Check for verified custom domain for this admin's tenant
 	globalRepo := repositories.NewGlobalRepository(globalDB)
-	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(user.TenantID.String())
+	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(user.WorkspaceID.String())
 	if err != nil {
 		log.Printf("GetMFAStatusForLoginGET: Error checking custom domain: %v", err)
 	}

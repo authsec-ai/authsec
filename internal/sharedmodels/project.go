@@ -14,7 +14,7 @@ type Project struct {
 	Name        string     `gorm:"not null"`
 	Description string
 	UserID      uuid.UUID `gorm:"type:uuid"`
-	TenantID    uuid.UUID `gorm:"type:uuid"`
+	WorkspaceID    uuid.UUID `gorm:"type:uuid"`
 	Active      bool      `gorm:"default:true"`
 }
 
@@ -32,7 +32,7 @@ type ProjectResponse struct {
 	Name        string     `json:"name"`
 	Description string     `json:"description"`
 	UserID      uuid.UUID  `json:"user_id"`
-	TenantID    uuid.UUID  `json:"tenant_id"`
+	WorkspaceID    uuid.UUID  `json:"workspace_id"`
 	Active      bool       `json:"active"`
 	User        struct {
 		ID    uuid.UUID `json:"id"`

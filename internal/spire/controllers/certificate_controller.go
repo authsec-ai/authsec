@@ -40,7 +40,7 @@ func (ctrl *CertificateController) Renew(c *gin.Context) {
 	}
 
 	// Validate request
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -54,7 +54,7 @@ func (ctrl *CertificateController) Renew(c *gin.Context) {
 	}
 
 	serviceReq := &services.RenewRequest{
-		TenantID:       req.TenantID,
+		WorkspaceID:       req.WorkspaceID,
 		WorkloadID:     req.WorkloadID,
 		CSR:            req.CSR,
 		OldCertificate: req.OldCertificate,
@@ -85,7 +85,7 @@ func (ctrl *CertificateController) Revoke(c *gin.Context) {
 	}
 
 	// Validate request
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -95,7 +95,7 @@ func (ctrl *CertificateController) Revoke(c *gin.Context) {
 	}
 
 	serviceReq := &services.RevokeRequest{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		SerialNumber: req.SerialNumber,
 		Reason:       req.Reason,
 		IPAddress:    c.ClientIP(),

@@ -9,7 +9,7 @@ import (
 
 type TenantDomain struct {
 	ID                   uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID             uuid.UUID  `gorm:"type:uuid;not null"`
+	WorkspaceID             uuid.UUID  `gorm:"type:uuid;not null"`
 	Domain               string     `gorm:"type:varchar(255);not null;uniqueIndex"`
 	Kind                 string     `gorm:"type:varchar(32);not null;default:'custom'"`
 	IsPrimary            bool       `gorm:"type:boolean;not null;default:false"`

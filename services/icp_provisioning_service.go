@@ -199,9 +199,9 @@ func (s *ICPProvisioningService) resolveICPMigrationsPath() (string, error) {
 func (s *ICPProvisioningService) ProvisionPKI(ctx context.Context, req *icp.ProvisionPKIRequest) (*icp.ProvisionPKIResponse, error) {
 	// Prefer in-process merged service (no HTTP round-trip)
 	if s.pkiService != nil {
-		log.Printf("Provisioning PKI in-process for tenant: %s", req.TenantID)
+		log.Printf("Provisioning PKI in-process for tenant: %s", req.WorkspaceID)
 		spireResp, err := s.pkiService.ProvisionPKI(ctx, &spireservices.ProvisionPKIRequest{
-			TenantID:       req.TenantID,
+			WorkspaceID:       req.WorkspaceID,
 			CommonName:     req.CommonName,
 			AllowedDomains: req.Domain,
 			TTL:            req.TTL,
@@ -212,7 +212,7 @@ func (s *ICPProvisioningService) ProvisionPKI(ctx context.Context, req *icp.Prov
 		}
 		log.Printf("In-process PKI provisioning successful - PKI Mount: %s", spireResp.PKIMount)
 		return &icp.ProvisionPKIResponse{
-			TenantID:    spireResp.TenantID,
+			WorkspaceID:    spireResp.WorkspaceID,
 			PKIMount:    spireResp.PKIMount,
 			CACert:      spireResp.CACert,
 			RoleCreated: spireResp.RoleCreated,
@@ -225,7 +225,7 @@ func (s *ICPProvisioningService) ProvisionPKI(ctx context.Context, req *icp.Prov
 		return nil, fmt.Errorf("no PKI service available (neither in-process nor HTTP client configured)")
 	}
 
-	log.Printf("Provisioning PKI via HTTP for tenant: %s", req.TenantID)
+	log.Printf("Provisioning PKI via HTTP for tenant: %s", req.WorkspaceID)
 	resp, err := s.icpClient.ProvisionPKI(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("ICP provisioning failed: %w", err)
@@ -240,7 +240,7 @@ func (s *ICPProvisioningService) RetryPKIProvisioning(ctx context.Context, tenan
 	log.Printf("Retrying PKI provisioning for tenant: %s", tenantID)
 
 	req := &icp.ProvisionPKIRequest{
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		CommonName: commonName,
 		Domain:     domain,
 		TTL:        "87600h", // 10 years

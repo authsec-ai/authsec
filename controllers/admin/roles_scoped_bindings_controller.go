@@ -568,7 +568,7 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 
 	role := &models.RBACRole{
 		ID:          uuid.New(), // Explicitly generate UUID to ensure it's available in response
-		TenantID:    &tenantID,
+		WorkspaceID:    &tenantID,
 		Name:        req.Name,
 		Description: req.Description,
 	}
@@ -582,8 +582,8 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 	}
 
 	// Debug: Verify role was created with correct tenant_id
-	if role.TenantID != nil {
-		log.Printf("[CreateRole] Role created successfully with tenant_id: %s", role.TenantID.String())
+	if role.WorkspaceID != nil {
+		log.Printf("[CreateRole] Role created successfully with tenant_id: %s", role.WorkspaceID.String())
 	} else {
 		log.Printf("[CreateRole] WARNING: Role created but tenant_id is NULL!")
 	}
@@ -880,7 +880,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 
 	binding := &models.RoleBinding{
 		ID:         uuid.New(), // Generate UUID in Go, don't rely on DB default
-		TenantID:   &tenantID,
+		WorkspaceID:   &tenantID,
 		UserID:     &userID,
 		Username:   shared.DerefString(user.Username),
 		RoleID:     roleID,

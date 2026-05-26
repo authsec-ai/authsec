@@ -226,6 +226,7 @@ func main() {
 	r.Use(middlewares.MennovRateLimitMiddleware())
 	// exclude /authsec/metrics from compression so Prometheus can scrape it
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/authsec/metrics"})))
+	r.Use(middlewares.WorkspaceContractCompatibility())
 
 	// Prometheus metrics endpoint
 	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))

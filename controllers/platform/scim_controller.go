@@ -357,7 +357,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		User: sharedmodels.User{
 			ID:           uuid.New(),
 			ClientID:     clientUUID,
-			TenantID:     tenantUUID,
+			WorkspaceID:     tenantUUID,
 			ProjectID:    projectUUID,
 			Name:         input.GetDisplayName(),
 			Username:     &userName,
@@ -708,7 +708,7 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 	newGroup := models.TenantGroup{
 		ID:        uuid.New(),
 		Name:      input.DisplayName,
-		TenantID:  tenantUUID,
+		WorkspaceID:  tenantUUID,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}

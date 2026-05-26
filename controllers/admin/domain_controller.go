@@ -32,7 +32,7 @@ type CreateDomainRequest struct {
 
 type DomainResponse struct {
 	ID                   string `json:"id"`
-	TenantID             string `json:"tenant_id"`
+	WorkspaceID             string `json:"workspace_id"`
 	Domain               string `json:"domain"`
 	Kind                 string `json:"kind"`
 	IsPrimary            bool   `json:"is_primary"`
@@ -82,7 +82,7 @@ func getUserIDFromRequest(c *gin.Context) *uuid.UUID {
 func domainToResponse(td *database.TenantDomain) DomainResponse {
 	resp := DomainResponse{
 		ID:                 td.ID.String(),
-		TenantID:           td.TenantID.String(),
+		WorkspaceID:           td.WorkspaceID.String(),
 		Domain:             td.Domain,
 		Kind:               td.Kind,
 		IsPrimary:          td.IsPrimary,
@@ -159,7 +159,7 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 		return
 	}
 
-	if td.TenantID != tenantID {
+	if td.WorkspaceID != tenantID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to access this domain"})
 		return
 	}
@@ -243,7 +243,7 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.TenantID != tenantID {
+	if td.WorkspaceID != tenantID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to verify this domain"})
 		return
 	}
@@ -289,7 +289,7 @@ func (dc *DomainController) SetPrimaryDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.TenantID != tenantID {
+	if td.WorkspaceID != tenantID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to modify this domain"})
 		return
 	}
@@ -341,7 +341,7 @@ func (dc *DomainController) DeleteDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.TenantID != tenantID {
+	if td.WorkspaceID != tenantID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to delete this domain"})
 		return
 	}

@@ -13,8 +13,7 @@ import (
 // It is an OAuth 2.1 Resource Server, NOT an OAuth client.
 type ResourceServer struct {
 	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID                uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	WorkspaceID             *uuid.UUID     `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID             uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ApplicationType         string         `json:"application_type" gorm:"type:text;not null;default:'mcp_server'"`
 	LegacyClientID          *uuid.UUID     `json:"legacy_client_id,omitempty" gorm:"type:uuid;index"`
 	Name                    string         `json:"name" gorm:"not null"`

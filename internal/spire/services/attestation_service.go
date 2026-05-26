@@ -79,7 +79,7 @@ func (s *AttestationService) getTenantRepositories(ctx context.Context, tenantID
 
 // AttestRequest represents an attestation request
 type AttestRequest struct {
-	TenantID        string
+	WorkspaceID        string
 	CSR             string
 	AttestationType string
 	Selectors       map[string]string
@@ -100,29 +100,29 @@ type AttestResponse struct {
 
 // Attest performs workload attestation and issues a certificate
 func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*AttestResponse, error) {
-	s.logger.WithFields(logrus.Fields{"tenant_id": req.TenantID, "attestation_type": req.AttestationType}).Info("Starting attestation")
+	s.logger.WithFields(logrus.Fields{"tenant_id": req.WorkspaceID, "attestation_type": req.AttestationType}).Info("Starting attestation")
 
 	// Get tenant-specific repositories (connected to tenant's database)
-	workloadRepo, certRepo, policyRepo, auditRepo, err := s.getTenantRepositories(ctx, req.TenantID)
+	workloadRepo, certRepo, policyRepo, auditRepo, err := s.getTenantRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
 	// Try to get tenant from local database (optional - tenant may only exist in user-flow DB)
-	tenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
 	var vaultMount string
 
 	if err != nil {
 		// Tenant doesn't exist in ICP database - this is OK
-		s.logger.WithField("tenant_id", req.TenantID).Info("Tenant not found in ICP database, using request parameters")
+		s.logger.WithField("tenant_id", req.WorkspaceID).Info("Tenant not found in ICP database, using request parameters")
 
 		// Use provided vault_mount or generate default
 		if req.VaultMount != "" {
 			vaultMount = req.VaultMount
 		} else {
 			// Generate default vault mount path
-			vaultMount = fmt.Sprintf("pki/%s", req.TenantID)
+			vaultMount = fmt.Sprintf("pki/%s", req.WorkspaceID)
 		}
 	} else {
 		// Tenant exists - validate and use stored values
@@ -153,13 +153,13 @@ func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*A
 	}
 
 	// Find matching policy (optional - use defaults if not found)
-	policy, err := policyRepo.FindMatchingPolicy(ctx, req.TenantID, req.AttestationType, req.Selectors)
+	policy, err := policyRepo.FindMatchingPolicy(ctx, req.WorkspaceID, req.AttestationType, req.Selectors)
 	var vaultRole string
 	var ttl int
 
 	if err != nil {
 		// No policy found - use defaults
-		s.logger.WithField("tenant_id", req.TenantID).Info("No matching policy found, using defaults")
+		s.logger.WithField("tenant_id", req.WorkspaceID).Info("No matching policy found, using defaults")
 		vaultRole = "workload" // Default role created during PKI provisioning
 		ttl = 86400            // 24 hours default
 	} else {
@@ -168,10 +168,10 @@ func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*A
 	}
 
 	// Generate SPIFFE ID
-	spiffeID := s.generateSpiffeID(req.TenantID, req.Selectors)
+	spiffeID := s.generateSpiffeID(req.WorkspaceID, req.Selectors)
 
 	// Create or get workload (using tenant-specific repo)
-	workload, err := s.getOrCreateWorkloadInRepo(ctx, workloadRepo, req.TenantID, spiffeID, req.Selectors, vaultRole, req.AttestationType)
+	workload, err := s.getOrCreateWorkloadInRepo(ctx, workloadRepo, req.WorkspaceID, spiffeID, req.Selectors, vaultRole, req.AttestationType)
 	if err != nil {
 		s.auditAttestationWithRepo(ctx, auditRepo, req, spiffeID, false, "failed to create workload")
 		return nil, err
@@ -198,7 +198,7 @@ func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*A
 	// Store certificate
 	cert := &models.Certificate{
 		ID:           uuid.New().String(),
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		WorkloadID:   workload.ID,
 		SerialNumber: vaultResp.SerialNumber,
 		SpiffeID:     spiffeID,
@@ -260,7 +260,7 @@ func (s *AttestationService) getOrCreateWorkloadInRepo(
 	// Create new workload
 	workload = &models.Workload{
 		ID:              uuid.New().String(),
-		TenantID:        tenantID,
+		WorkspaceID:        tenantID,
 		SpiffeID:        spiffeID,
 		Selectors:       selectors,
 		VaultRole:       vaultRole,
@@ -280,7 +280,7 @@ func (s *AttestationService) getOrCreateWorkloadInRepo(
 // auditAttestation creates an audit log entry for attestation
 func (s *AttestationService) auditAttestation(ctx context.Context, req *AttestRequest, spiffeID string, success bool, errorMsg string) {
 	audit := &models.AuditLog{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		EventType:    models.EventAttest,
 		SpiffeID:     spiffeID,
 		Success:      success,
@@ -308,7 +308,7 @@ func (s *AttestationService) auditAttestationWithRepo(
 	errorMsg string,
 ) {
 	audit := &models.AuditLog{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		EventType:    models.EventAttest,
 		SpiffeID:     spiffeID,
 		Success:      success,

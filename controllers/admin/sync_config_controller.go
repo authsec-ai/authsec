@@ -52,7 +52,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	}
 
 	// Parse UUIDs
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
@@ -71,7 +71,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	// Create sync configuration
 	syncConfig := models.SyncConfiguration{
 		ID:          uuid.New(),
-		TenantID:    tenantID,
+		WorkspaceID:    tenantID,
 		ClientID:    clientID,
 		ProjectID:   projectID,
 		SyncType:    req.SyncType,
@@ -103,7 +103,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt Entra ID config if applicable
 	if req.SyncType == "entra_id" && req.EntraConfig != nil {
-		syncConfig.EntraTenantID = req.EntraConfig.TenantID
+		syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
 		syncConfig.EntraClientID = req.EntraConfig.ClientID
 		syncConfig.EntraSkipVerify = req.EntraConfig.SkipVerify
 
@@ -135,7 +135,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 		After: map[string]interface{}{
 			"config_name": syncConfig.ConfigName,
 			"sync_type":   syncConfig.SyncType,
-			"tenant_id":   syncConfig.TenantID.String(),
+			"tenant_id":   syncConfig.WorkspaceID.String(),
 			"client_id":   syncConfig.ClientID.String(),
 			"is_active":   syncConfig.IsActive,
 		},
@@ -170,7 +170,7 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	}
 
 	// Parse UUIDs
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
@@ -234,7 +234,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
@@ -292,8 +292,8 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 
 	// Update Entra ID config if provided
 	if req.EntraConfig != nil && syncConfig.SyncType == "entra_id" {
-		if req.EntraConfig.TenantID != "" {
-			syncConfig.EntraTenantID = req.EntraConfig.TenantID
+		if req.EntraConfig.WorkspaceID != "" {
+			syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
 		}
 		if req.EntraConfig.ClientID != "" {
 			syncConfig.EntraClientID = req.EntraConfig.ClientID
@@ -328,7 +328,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		After: map[string]interface{}{
 			"config_name": syncConfig.ConfigName,
 			"sync_type":   syncConfig.SyncType,
-			"tenant_id":   syncConfig.TenantID.String(),
+			"tenant_id":   syncConfig.WorkspaceID.String(),
 			"client_id":   syncConfig.ClientID.String(),
 			"is_active":   syncConfig.IsActive,
 		},
@@ -369,7 +369,7 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return

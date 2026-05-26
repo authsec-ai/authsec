@@ -48,7 +48,7 @@ type JWTClaims struct {
 		OrgID      string `json:"org_id"`
 		Provider   string `json:"provider"`
 		ProviderID string `json:"provider_id"`
-		TenantID   string `json:"tenant_id"`
+		WorkspaceID   string `json:"workspace_id"`
 		UserID     string `json:"user_id"`
 	} `json:"ext"`
 	IssuedAt  int64    `json:"iat"`
@@ -183,7 +183,7 @@ func DecodeJWTToken(tokenString string) (*JWTClaims, error) {
 }
 
 func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) (*User, error) {
-	tenantID := users.TenantID
+	tenantID := users.WorkspaceID
 	clientID := users.ClientID
 	tenantIDStr := tenantID.String()
 	clientIDStr := strings.TrimSuffix(clientID.String(), "-main-client")
@@ -223,7 +223,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	user := &User{
 		ID:           uuid.New(),
 		ClientID:     clientID,
-		TenantID:     tenantID,
+		WorkspaceID:     tenantID,
 		ProjectID:    client.ProjectID,
 		Name:         *users.Username,
 		Username:     nil,

@@ -111,8 +111,8 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group addition",
 			input: models.UserDefinedGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{"Developers", "Administrators", "Users"},
+				WorkspaceID: tenantID,
+				Groups:      []string{"Developers", "Administrators", "Users"},
 			},
 			expectedStatus: http.StatusOK,
 			expectedBody: map[string]interface{}{
@@ -128,15 +128,15 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "Invalid request payload: Key: 'GroupRequest.TenantID' Error:Field validation for 'TenantID' failed on the 'required' tag",
+				"error": "Invalid request payload: Key: 'GroupRequest.WorkspaceID' Error:Field validation for 'TenantID' failed on the 'required' tag",
 			},
 			setupMocks: func() {},
 		},
 		{
 			name: "empty groups list",
 			input: models.UserDefinedGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{},
+				WorkspaceID: tenantID,
+				Groups:      []string{},
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
@@ -147,8 +147,8 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 		{
 			name: "database error",
 			input: models.UserDefinedGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{"Developers"},
+				WorkspaceID: tenantID,
+				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody: map[string]interface{}{
@@ -209,9 +209,9 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 		{
 			name: "successful mapping",
 			input: models.MapGroupsRequest{
-				TenantID: tenantID,
-				ClientID: tenantID,
-				Groups:   []string{"Developers"},
+				WorkspaceID: tenantID,
+				ClientID:    tenantID,
+				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusOK,
 			expectedBody:   map[string]interface{}{"message": "Groups mapped to client successfully"},
@@ -227,9 +227,9 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 		{
 			name: "database error",
 			input: models.MapGroupsRequest{
-				TenantID: tenantID,
-				ClientID: tenantID,
-				Groups:   []string{"Developers"},
+				WorkspaceID: tenantID,
+				ClientID:    tenantID,
+				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody:   map[string]interface{}{"error": "Failed to map groups to client: database connection not available"},
@@ -294,9 +294,9 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 		{
 			name: "successful removal",
 			input: models.RemoveGroupsRequest{
-				TenantID: tenantID,
-				ClientID: tenantID,
-				Groups:   []string{"Developers"},
+				WorkspaceID: tenantID,
+				ClientID:    tenantID,
+				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusOK,
 			expectedBody:   map[string]interface{}{"message": "Groups removed from client successfully"},
@@ -312,9 +312,9 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 		{
 			name: "database error",
 			input: models.RemoveGroupsRequest{
-				TenantID: tenantID,
-				ClientID: tenantID,
-				Groups:   []string{"Developers"},
+				WorkspaceID: tenantID,
+				ClientID:    tenantID,
+				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody:   map[string]interface{}{"error": "Failed to remove groups from client: database connection not available"},
@@ -451,8 +451,8 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group deletion",
 			input: models.DeleteGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{uuid.New().String()},
+				WorkspaceID: tenantID,
+				Groups:      []string{uuid.New().String()},
 			},
 			expectedStatus: http.StatusOK,
 			expectedBody:   map[string]interface{}{"message": "Groups deleted successfully"},
@@ -461,8 +461,8 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group deletion - single group",
 			input: models.DeleteGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{uuid.New().String()},
+				WorkspaceID: tenantID,
+				Groups:      []string{uuid.New().String()},
 			},
 			expectedStatus: http.StatusOK,
 			expectedBody:   map[string]interface{}{"message": "Groups deleted successfully"},
@@ -480,8 +480,8 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "empty groups list",
 			input: models.DeleteGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{},
+				WorkspaceID: tenantID,
+				Groups:      []string{},
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody:   map[string]interface{}{"error": "At least one group-id is required"},
@@ -490,8 +490,8 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "database error",
 			input: models.DeleteGroupsRequest{
-				TenantID: tenantID,
-				Groups:   []string{"GroupToDelete"},
+				WorkspaceID: tenantID,
+				Groups:      []string{"GroupToDelete"},
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody:   map[string]interface{}{"error": "Failed to delete groups: database connection not available"},
@@ -509,8 +509,8 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 				c.Set("tenant_id", tenantID)
 			}
 
-			if tt.input.TenantID == "" && tt.setTenant && tenantID != "" {
-				tt.input.TenantID = tenantID
+			if tt.input.WorkspaceID == "" && tt.setTenant && tenantID != "" {
+				tt.input.WorkspaceID = tenantID
 			}
 
 			origDB := config.DB

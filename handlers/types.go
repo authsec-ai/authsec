@@ -40,7 +40,7 @@ type ErrorResponse struct {
 
 // SMS Request/Response structs
 type SMSSetupRequest struct {
-	TenantID    string `json:"tenant_id" binding:"required"`
+	WorkspaceID    string `json:"workspace_id" binding:"required"`
 	ClientID    string `json:"client_id" binding:"required"`
 	Email       string `json:"email" binding:"required,email"`
 	PhoneNumber string `json:"phone_number" binding:"required"`
@@ -55,7 +55,7 @@ type SMSSetupResponse struct {
 }
 
 type SMSConfirmRequest struct {
-	TenantID    string `json:"tenant_id" binding:"required"`
+	WorkspaceID    string `json:"workspace_id" binding:"required"`
 	ClientID    string `json:"client_id" binding:"required"`
 	Email       string `json:"email" binding:"required,email"`
 	PhoneNumber string `json:"phone_number" binding:"required"`
@@ -69,7 +69,7 @@ type SMSConfirmResponse struct {
 }
 
 type RequestSMSCodeRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 }
@@ -83,7 +83,7 @@ type SMSCodeResponse struct {
 }
 
 type VerifySMSRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 	Code     string `json:"code" binding:"required"`
@@ -91,7 +91,7 @@ type VerifySMSRequest struct {
 
 // TOTP Request/Response structs
 type TOTPSetupRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id,omitempty"`
 	Email    string `json:"email" binding:"required,email"`
 }
@@ -106,7 +106,7 @@ type TOTPSetupResponse struct {
 }
 
 type TOTPConfirmRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id,omitempty"`
 	Email    string `json:"email" binding:"required,email"`
 	Secret   string `json:"secret" binding:"required"`
@@ -120,7 +120,7 @@ type TOTPConfirmResponse struct {
 }
 
 type TOTPVerifyRequest struct {
-	TenantID   string `json:"tenant_id" binding:"required"`
+	WorkspaceID   string `json:"workspace_id" binding:"required"`
 	ClientID   string `json:"client_id,omitempty"`
 	Email      string `json:"email" binding:"required,email"`
 	Code       string `json:"code"`
@@ -129,7 +129,7 @@ type TOTPVerifyRequest struct {
 
 // TOTPLoginVerifyRequest for login verification (doesn't require client_id)
 type TOTPLoginVerifyRequest struct {
-	TenantID   string `json:"tenant_id" binding:"required"`
+	WorkspaceID   string `json:"workspace_id" binding:"required"`
 	Email      string `json:"email" binding:"required,email"`
 	Code       string `json:"code"`
 	BackupCode string `json:"backup_code"`
@@ -137,17 +137,17 @@ type TOTPLoginVerifyRequest struct {
 
 // WebAuthn Request/Response structs
 type BeginRegistrationRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 }
 
 type BeginAuthenticationRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 }
 
 type FinishAuthenticationRequest struct {
-	TenantID   string                               `json:"tenant_id" binding:"required"`
+	WorkspaceID   string                               `json:"workspace_id" binding:"required"`
 	Email      string                               `json:"email" binding:"required,email"`
 	Credential protocol.CredentialAssertionResponse `json:"credential" binding:"required"`
 }

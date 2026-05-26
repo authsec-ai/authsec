@@ -121,7 +121,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 	}
 
 	policy := models.DelegationPolicy{
-		TenantID:           *tenantID,
+		WorkspaceID:           *tenantID,
 		RoleName:           req.RoleName,
 		AgentType:          req.AgentType,
 		AllowedPermissions: permsJSON,
@@ -188,7 +188,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 							trustDomain, tenantID.String(), agentTypeStr, clientID.String())
 
 						entry := &spiremodels.WorkloadEntry{
-							TenantID:  tenantID.String(),
+							WorkspaceID:  tenantID.String(),
 							SpiffeID:  newSpiffeID,
 							ParentID:  parentID,
 							Selectors: map[string]string{"authsec:client_id": clientID.String(), "authsec:agent_type": agentTypeStr},
@@ -262,7 +262,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 
 					finalTTL := int(ttlDuration.Seconds())
 					jwtResp, jwtErr := dc.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
-						TenantID:     tenantID.String(),
+						WorkspaceID:     tenantID.String(),
 						SpiffeID:     resolvedSpiffeID,
 						Audience:     audience,
 						TTL:          finalTTL,
@@ -284,7 +284,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 						applicationID := lookupApplicationIDForLegacyClient(*clientID)
 
 						upsertToken := models.DelegationToken{
-							TenantID:      *tenantID,
+							WorkspaceID:      *tenantID,
 							ClientID:      *clientID,
 							ApplicationID: applicationID,
 							PolicyID:      &policy.ID,

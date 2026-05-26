@@ -37,7 +37,7 @@ func (OIDCProvider) TableName() string {
 type OIDCState struct {
 	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	StateToken    string     `json:"state_token" gorm:"uniqueIndex;not null"`            // Random state for CSRF
-	TenantID      *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`               // NULL for new registration
+	WorkspaceID      *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`               // NULL for new registration
 	TenantDomain  string     `json:"tenant_domain" gorm:"not null"`                      // e.g., 'ritam'
 	OriginDomain  string     `json:"origin_domain,omitempty" gorm:"column:request_host"` // The actual domain user came from (maps to request_host column)
 	ProviderName  string     `json:"provider_name" gorm:"not null"`                      // 'google', 'github', etc.
@@ -66,7 +66,7 @@ func (OIDCState) TableName() string {
 // Allows lookup: "Does this Google user exist in this tenant?"
 type OIDCUserIdentity struct {
 	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID       uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID       uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
 	ProviderName   string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
 	ProviderUserID string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)

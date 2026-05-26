@@ -5,7 +5,7 @@ import "time"
 // AttestationPolicy defines rules for workload attestation
 type AttestationPolicy struct {
 	ID              string                 `json:"id" db:"id"`
-	TenantID        string                 `json:"tenant_id" db:"tenant_id"`
+	WorkspaceID        string                 `json:"workspace_id" db:"tenant_id"`
 	Name            string                 `json:"name" db:"name"`
 	Description     string                 `json:"description" db:"description"`
 	AttestationType string                 `json:"attestation_type" db:"attestation_type"`

@@ -53,7 +53,7 @@ func NewRenewalService(
 
 // RenewRequest represents a renewal request
 type RenewRequest struct {
-	TenantID       string
+	WorkspaceID       string
 	WorkloadID     string
 	CSR            string
 	OldCertificate string // For validation
@@ -72,12 +72,12 @@ type RenewResponse struct {
 // Renew renews a certificate
 func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":   req.TenantID,
+		"tenant_id":   req.WorkspaceID,
 		"workload_id": req.WorkloadID,
 	}).Info("Starting certificate renewal")
 
 	// Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		s.auditRenewal(ctx, req, false, err.Error())
 		return nil, err
@@ -89,14 +89,14 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 	}
 
 	// Get tenant-specific repositories
-	workloadRepo, certRepo, _, err := s.getTenantRepositories(ctx, req.TenantID)
+	workloadRepo, certRepo, _, err := s.getTenantRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
 	// Get workload
-	workload, err := workloadRepo.GetByID(ctx, req.TenantID, req.WorkloadID)
+	workload, err := workloadRepo.GetByID(ctx, req.WorkspaceID, req.WorkloadID)
 	if err != nil {
 		s.auditRenewal(ctx, req, false, "workload not found")
 		return nil, errors.NewNotFoundError("Workload not found", err)
@@ -109,7 +109,7 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 
 	// Validate old certificate if provided
 	if req.OldCertificate != "" {
-		if err := s.validateOldCertificate(ctx, req.TenantID, req.WorkloadID, req.OldCertificate); err != nil {
+		if err := s.validateOldCertificate(ctx, req.WorkspaceID, req.WorkloadID, req.OldCertificate); err != nil {
 			s.auditRenewal(ctx, req, false, "old certificate validation failed")
 			return nil, err
 		}
@@ -153,7 +153,7 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 	// Store new certificate
 	cert := &models.Certificate{
 		ID:           uuid.New().String(),
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		WorkloadID:   workload.ID,
 		SerialNumber: vaultResp.SerialNumber,
 		SpiffeID:     workload.SpiffeID,
@@ -240,7 +240,7 @@ func (s *RenewalService) validateOldCertificate(ctx context.Context, tenantID, w
 // auditRenewal creates an audit log entry for renewal
 func (s *RenewalService) auditRenewal(ctx context.Context, req *RenewRequest, success bool, errorMsg string) {
 	audit := &models.AuditLog{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		EventType:    models.EventRenew,
 		WorkloadID:   req.WorkloadID,
 		Success:      success,

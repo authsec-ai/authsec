@@ -202,7 +202,7 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 		ContextID:        contextID,
 		HydraClientID:    oauthClient.HydraClientID,
 		ResourceServerID: rs.ID.String(),
-		TenantID:         rs.TenantID.String(),
+		WorkspaceID:         rs.WorkspaceID.String(),
 		ResourceURI:      rs.ResourceURI,
 		RedirectURI:      redirectURIToUse,
 		RequestedScopes:  scopeParam,
@@ -498,7 +498,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		issuedScopes := strings.Fields(issuedScopeStr)
 		currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 			c.Request.Context(),
-			arcCtx.TenantID, tokenSubject, arcCtx.ResourceServerID,
+			arcCtx.WorkspaceID, tokenSubject, arcCtx.ResourceServerID,
 			issuedScopes, rs, oauthClient,
 		)
 		if rbacErr != nil || len(currentScopes) == 0 {
@@ -696,7 +696,7 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 	issuedScopes := strings.Fields(issuedScopeStr)
 	currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 		c.Request.Context(),
-		rs.TenantID.String(), sub, rs.ID.String(),
+		rs.WorkspaceID.String(), sub, rs.ID.String(),
 		issuedScopes, rs, oauthClient,
 	)
 	if rbacErr != nil || len(currentScopes) == 0 {
@@ -895,7 +895,7 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		// so clientIsOIDC(nil)==false causes no incorrect exclusions.
 		currentRS, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 			c.Request.Context(),
-			rs.TenantID.String(), sub, rs.ID.String(),
+			rs.WorkspaceID.String(), sub, rs.ID.String(),
 			rsScopes,
 			rs,
 			nil,

@@ -9,7 +9,7 @@ type HealthResponse struct {
 
 // ProfileResponse represents the user profile response
 type ProfileResponse struct {
-	TenantID  string      `json:"tenant_id"`
+	WorkspaceID  string      `json:"workspace_id"`
 	ProjectID string      `json:"project_id"`
 	ClientID  string      `json:"client_id"`
 	EmailID   string      `json:"email_id"`
@@ -25,7 +25,7 @@ type ValidationResponse struct {
 	Message   string      `json:"message"`
 	Service   string      `json:"service,omitempty"`
 	Purpose   string      `json:"purpose,omitempty"`
-	TenantID  string      `json:"tenant_id,omitempty"`
+	WorkspaceID  string      `json:"workspace_id,omitempty"`
 	ProjectID string      `json:"project_id,omitempty"`
 	ClientID  string      `json:"client_id,omitempty"`
 	Scopes    interface{} `json:"scopes,omitempty"`

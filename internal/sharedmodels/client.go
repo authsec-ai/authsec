@@ -13,7 +13,7 @@ import (
 type Client struct {
 	ID               uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	ClientID         uuid.UUID      `json:"client_id" gorm:"type:uuid;not null;uniqueIndex"`
-	TenantID         uuid.UUID      `json:"tenant_id" gorm:"type:uuid;not null" binding:"required"`
+	WorkspaceID      uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null" binding:"required"`
 	ProjectID        uuid.UUID      `json:"project_id" gorm:"type:uuid;not null"`
 	OwnerID          uuid.UUID      `json:"owner_id" gorm:"type:uuid;not null" binding:"required"`
 	OrgID            uuid.UUID      `json:"org_id" gorm:"type:uuid;not null"`
@@ -60,12 +60,12 @@ const (
 
 // ClientListFilters for server-side filtering
 type ClientListFilters struct {
-	TenantID uuid.UUID `form:"tenant_id" binding:"required"`
-	Status   string    `form:"status"`
-	Tags     string    `form:"tags"` // CSV string for tags filtering
-	Name     string    `form:"name"`
-	Page     int       `form:"page,default=1"`
-	Limit    int       `form:"limit,default=10"`
+	WorkspaceID uuid.UUID `form:"workspace_id" binding:"required"`
+	Status      string    `form:"status"`
+	Tags        string    `form:"tags"` // CSV string for tags filtering
+	Name        string    `form:"name"`
+	Page        int       `form:"page,default=1"`
+	Limit       int       `form:"limit,default=10"`
 }
 
 // GetTagsArray parses CSV tags into array

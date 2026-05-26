@@ -30,7 +30,7 @@ func NewTokenService(redisClient *redis.Client, jwtSecret string) *TokenService 
 type RefreshToken struct {
 	Token     string    `json:"token"`
 	UserID    uuid.UUID `json:"user_id"`
-	TenantID  uuid.UUID `json:"tenant_id"`
+	WorkspaceID  uuid.UUID `json:"workspace_id"`
 	ExpiresAt time.Time `json:"expires_at"`
 	CreatedAt time.Time `json:"created_at"`
 }

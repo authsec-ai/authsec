@@ -384,8 +384,8 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 
 	// Step 3: Resolve user in the tenant
 	var tenantID uuid.UUID
-	if state.TenantID != nil {
-		tenantID = *state.TenantID
+	if state.WorkspaceID != nil {
+		tenantID = *state.WorkspaceID
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Could not determine tenant from OIDC state"})
 		return

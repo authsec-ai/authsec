@@ -80,7 +80,7 @@ func (mc *MigrationController) RunTenantMigrations(c *gin.Context) {
 
 // GetTenantMigrationStatus GET /authsec-migration/tenants/:tenant_id/migrations/status
 func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
-	tenantID := c.Param("tenant_id")
+	tenantID := c.Param("workspace_id")
 
 	var tenant migration.TenantInfo
 	if err := config.DB.Where("tenant_id = ?", tenantID).First(&tenant).Error; err != nil {
@@ -100,7 +100,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 
 	if dbName == "" {
 		c.JSON(http.StatusOK, gin.H{
-			"tenant_id":        tenant.TenantID.String(),
+			"tenant_id":        tenant.WorkspaceID.String(),
 			"migration_status": migStatus,
 			"last_migration":   tenant.LastMigration,
 		})
@@ -111,7 +111,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	tenantDBConn, err := migration.ConnectToTenantDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
-			"tenant_id":        tenant.TenantID.String(),
+			"tenant_id":        tenant.WorkspaceID.String(),
 			"database_name":    dbName,
 			"migration_status": migStatus,
 			"last_migration":   tenant.LastMigration,
@@ -130,7 +130,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":        tenant.TenantID.String(),
+		"tenant_id":        tenant.WorkspaceID.String(),
 		"database_name":    dbName,
 		"migration_status": migStatus,
 		"status":           status,
@@ -156,7 +156,7 @@ func (mc *MigrationController) ListTenants(c *gin.Context) {
 	items := make([]migration.TenantListItem, 0, len(tenants))
 	for _, t := range tenants {
 		item := migration.TenantListItem{
-			TenantID:      t.TenantID.String(),
+			WorkspaceID:      t.WorkspaceID.String(),
 			Email:         t.Email,
 			TenantDomain:  t.TenantDomain,
 			LastMigration: t.LastMigration,

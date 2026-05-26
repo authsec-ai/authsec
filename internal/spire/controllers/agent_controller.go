@@ -90,7 +90,7 @@ func (ctrl *AgentController) RenewAgent(c *gin.Context) {
 	// Call service
 	serviceReq := &services.AgentRenewRequest{
 		AgentID:  req.AgentID,
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		CSR:      req.CSR,
 	}
 

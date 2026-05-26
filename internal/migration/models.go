@@ -15,7 +15,7 @@ type MigrationLog struct {
 	Success     bool      `gorm:"not null;default:false"                          json:"success"`
 	ErrorMsg    string    `gorm:"type:text"                                       json:"error_msg,omitempty"`
 	DBType      string    `gorm:"type:varchar(50);not null"                       json:"db_type"`
-	TenantID    *string   `gorm:"type:varchar(255);index"                         json:"tenant_id,omitempty"`
+	WorkspaceID    *string   `gorm:"type:varchar(255);index"                         json:"workspace_id,omitempty"`
 	ExecutionMS int64     `gorm:"not null;default:0"                              json:"execution_ms"`
 }
 
@@ -24,7 +24,7 @@ func (MigrationLog) TableName() string { return "migration_logs" }
 // MigrationStatusResponse is returned by GetMigrationStatus.
 type MigrationStatusResponse struct {
 	DBType          string    `json:"db_type"`
-	TenantID        *string   `json:"tenant_id,omitempty"`
+	WorkspaceID        *string   `json:"workspace_id,omitempty"`
 	LastMigration   int       `json:"last_migration"`
 	TotalMigrations int       `json:"total_migrations"`
 	Status          string    `json:"status"`
@@ -33,14 +33,14 @@ type MigrationStatusResponse struct {
 
 // CreateTenantDBRequest is the payload for the create-tenant-db endpoint.
 type CreateTenantDBRequest struct {
-	TenantID     string `json:"tenant_id"     binding:"required"`
+	WorkspaceID     string `json:"workspace_id"     binding:"required"`
 	DatabaseName string `json:"database_name,omitempty"`
 	TenantDomain string `json:"tenant_domain,omitempty"`
 }
 
 // CreateTenantDBResponse is the response for the create-tenant-db endpoint.
 type CreateTenantDBResponse struct {
-	TenantID        string    `json:"tenant_id"`
+	WorkspaceID        string    `json:"workspace_id"`
 	DatabaseName    string    `json:"database_name"`
 	MigrationStatus string    `json:"migration_status"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -51,7 +51,7 @@ type CreateTenantDBResponse struct {
 // Not managed by GORM auto-migrate; the table already exists in production.
 type TenantInfo struct {
 	ID              uuid.UUID  `gorm:"type:uuid;primary_key"                  json:"id"`
-	TenantID        uuid.UUID  `gorm:"type:uuid;not null;unique"              json:"tenant_id"`
+	WorkspaceID        uuid.UUID  `gorm:"type:uuid;not null;unique"              json:"workspace_id"`
 	TenantDB        *string    `gorm:"type:text"                              json:"tenant_db"`
 	Email           string     `gorm:"type:text;not null"                     json:"email"`
 	TenantDomain    string     `gorm:"type:text;not null"                     json:"tenant_domain"`
@@ -66,7 +66,7 @@ func (TenantInfo) TableName() string { return "tenants" }
 
 // TenantListItem is a lightweight tenant representation for list responses.
 type TenantListItem struct {
-	TenantID        string `json:"tenant_id"`
+	WorkspaceID        string `json:"workspace_id"`
 	Email           string `json:"email"`
 	TenantDomain    string `json:"tenant_domain"`
 	DatabaseName    string `json:"database_name"`
@@ -85,7 +85,7 @@ type MigrateAllResponse struct {
 
 // TenantMigrateResult is the per-tenant outcome within a MigrateAllResponse.
 type TenantMigrateResult struct {
-	TenantID     string `json:"tenant_id"`
+	WorkspaceID     string `json:"workspace_id"`
 	DatabaseName string `json:"database_name"`
 	Status       string `json:"status"`
 	Error        string `json:"error,omitempty"`
@@ -93,7 +93,7 @@ type TenantMigrateResult struct {
 
 // CreateTenantFromTemplateResponse is returned by the create-from-template endpoint.
 type CreateTenantFromTemplateResponse struct {
-	TenantID           string    `json:"tenant_id"`
+	WorkspaceID           string    `json:"workspace_id"`
 	DatabaseName       string    `json:"database_name"`
 	MigrationStatus    string    `json:"migration_status"`
 	CreatedAt          time.Time `json:"created_at"`

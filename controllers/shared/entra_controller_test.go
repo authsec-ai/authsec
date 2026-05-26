@@ -38,11 +38,11 @@ func TestEntraIDController_SyncEntraIDUsers(t *testing.T) {
 		{
 			name: "successful sync",
 			input: EntraSyncInput{
-				TenantID:  uuid.New().String(),
-				ClientID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ClientID:    uuid.New().String(),
+				ProjectID:   uuid.New().String(),
 				Config: &EntraIDConfig{
-					TenantID:     "test-tenant-id",
+					WorkspaceID:  "test-tenant-id",
 					ClientID:     "test-client-id",
 					ClientSecret: "test-client-secret",
 					Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -58,11 +58,11 @@ func TestEntraIDController_SyncEntraIDUsers(t *testing.T) {
 		{
 			name: "dry run",
 			input: EntraSyncInput{
-				TenantID:  uuid.New().String(),
-				ClientID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ClientID:    uuid.New().String(),
+				ProjectID:   uuid.New().String(),
 				Config: &EntraIDConfig{
-					TenantID:     "test-tenant-id",
+					WorkspaceID:  "test-tenant-id",
 					ClientID:     "test-client-id",
 					ClientSecret: "test-client-secret",
 					Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -86,11 +86,11 @@ func TestEntraIDController_SyncEntraIDUsers(t *testing.T) {
 		{
 			name: "authentication failure",
 			input: EntraSyncInput{
-				TenantID:  uuid.New().String(),
-				ClientID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ClientID:    uuid.New().String(),
+				ProjectID:   uuid.New().String(),
 				Config: &EntraIDConfig{
-					TenantID:     "invalid-tenant",
+					WorkspaceID:  "invalid-tenant",
 					ClientID:     "invalid-client",
 					ClientSecret: "invalid-secret",
 					SkipVerify:   true,
@@ -145,7 +145,7 @@ func TestEntraIDController_TestEntraIDConnection(t *testing.T) {
 		{
 			name: "successful connection test",
 			input: EntraIDConfig{
-				TenantID:     "test-tenant-id",
+				WorkspaceID:  "test-tenant-id",
 				ClientID:     "test-client-id",
 				ClientSecret: "test-client-secret",
 				Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -164,7 +164,7 @@ func TestEntraIDController_TestEntraIDConnection(t *testing.T) {
 		{
 			name: "authentication failure",
 			input: EntraIDConfig{
-				TenantID:     "invalid-tenant",
+				WorkspaceID:  "invalid-tenant",
 				ClientID:     "invalid-client",
 				ClientSecret: "invalid-secret",
 				SkipVerify:   true,
@@ -226,7 +226,7 @@ func TestEntraIDController_GetEntraIDPermissions(t *testing.T) {
 		{
 			name: "successful permissions check",
 			input: EntraIDConfig{
-				TenantID:     "test-tenant-id",
+				WorkspaceID:  "test-tenant-id",
 				ClientID:     "test-client-id",
 				ClientSecret: "test-client-secret",
 				Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -240,7 +240,7 @@ func TestEntraIDController_GetEntraIDPermissions(t *testing.T) {
 		{
 			name: "authentication failure",
 			input: EntraIDConfig{
-				TenantID:     "invalid-tenant",
+				WorkspaceID:  "invalid-tenant",
 				ClientID:     "invalid-client",
 				ClientSecret: "invalid-secret",
 				SkipVerify:   true,
@@ -283,7 +283,7 @@ func TestEntraIDController_newEntraIDService(t *testing.T) {
 	controller := &EntraIDController{}
 
 	config := &EntraIDConfig{
-		TenantID:     "test-tenant-id",
+		WorkspaceID:  "test-tenant-id",
 		ClientID:     "test-client-id",
 		ClientSecret: "test-client-secret",
 		Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -303,7 +303,7 @@ func TestEntraIDService_authenticate(t *testing.T) {
 	t.Skip("Skipping EntraID service tests in this run")
 	service := &EntraIDService{
 		config: &EntraIDConfig{
-			TenantID:     "test-tenant-id",
+			WorkspaceID:  "test-tenant-id",
 			ClientID:     "test-client-id",
 			ClientSecret: "test-client-secret",
 			Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -360,7 +360,7 @@ func TestEntraIDService_fetchEntraIDUsers(t *testing.T) {
 	t.Skip("Skipping EntraID service tests in this run")
 	service := &EntraIDService{
 		config: &EntraIDConfig{
-			TenantID:     "test-tenant-id",
+			WorkspaceID:  "test-tenant-id",
 			ClientID:     "test-client-id",
 			ClientSecret: "test-client-secret",
 			Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -432,7 +432,7 @@ func TestEntraIDService_fetchUsersWithLimit(t *testing.T) {
 	t.Skip("Skipping EntraID service tests in this run")
 	service := &EntraIDService{
 		config: &EntraIDConfig{
-			TenantID:     "test-tenant-id",
+			WorkspaceID:  "test-tenant-id",
 			ClientID:     "test-client-id",
 			ClientSecret: "test-client-secret",
 			Scopes:       []string{"https://graph.microsoft.com/.default"},
@@ -495,7 +495,7 @@ func TestEntraIDService_checkPermissions(t *testing.T) {
 	t.Skip("Skipping EntraID service tests in this run")
 	service := &EntraIDService{
 		config: &EntraIDConfig{
-			TenantID:     "test-tenant-id",
+			WorkspaceID:  "test-tenant-id",
 			ClientID:     "test-client-id",
 			ClientSecret: "test-client-secret",
 			Scopes:       []string{"https://graph.microsoft.com/.default"},

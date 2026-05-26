@@ -45,7 +45,7 @@ func (ar *AuthRepository) CreateConfig(c *gin.Context, cfg *oocmgrdto.OAuthOIDCC
 
 	var existing oocmgrdto.OAuthOIDCConfiguration
 	result := tenantDB.Where("name = ? AND org_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-		cfg.Name, cfg.OrgID, cfg.TenantID).First(&existing)
+		cfg.Name, cfg.OrgID, cfg.WorkspaceID).First(&existing)
 	if result.Error == nil {
 		return nil, fmt.Errorf("configuration with name '%s' already exists for this organization", cfg.Name)
 	}
@@ -70,7 +70,7 @@ func (ar *AuthRepository) GetConfigs(c *gin.Context, req *oocmgrdto.GetConfigsRe
 	}
 
 	query := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
-		Where("tenant_id = ? AND org_id = ?", req.TenantID, req.OrgID)
+		Where("tenant_id = ? AND org_id = ?", req.WorkspaceID, req.OrgID)
 
 	if req.ConfigType != "" {
 		query = query.Where("config_type = ?", req.ConfigType)
@@ -100,7 +100,7 @@ func (ar *AuthRepository) GetConfigByID(c *gin.Context, req *oocmgrdto.GetConfig
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
 	if err := tenantDB.Where("id = ? AND tenant_id = ? AND org_id = ?",
-		req.ID, req.TenantID, req.OrgID).First(&cfg).Error; err != nil {
+		req.ID, req.WorkspaceID, req.OrgID).First(&cfg).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("configuration not found")
 		}
@@ -117,7 +117,7 @@ func (ar *AuthRepository) GetConfigByName(c *gin.Context, req *oocmgrdto.GetConf
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
 	if err := tenantDB.Where("name = ? AND tenant_id = ? AND org_id = ?",
-		req.Name, req.TenantID, req.OrgID).First(&cfg).Error; err != nil {
+		req.Name, req.WorkspaceID, req.OrgID).First(&cfg).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("configuration not found")
 		}
@@ -135,7 +135,7 @@ func (ar *AuthRepository) UpdateConfig(c *gin.Context, req *oocmgrdto.UpdateConf
 	}
 
 	if err := tenantDB.Where("id = ? AND tenant_id = ? AND org_id = ?",
-		req.ID, req.TenantID, req.OrgID).First(&cfg).Error; err != nil {
+		req.ID, req.WorkspaceID, req.OrgID).First(&cfg).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("configuration not found")
 		}
@@ -146,7 +146,7 @@ func (ar *AuthRepository) UpdateConfig(c *gin.Context, req *oocmgrdto.UpdateConf
 	if req.Name != nil {
 		var existing oocmgrdto.OAuthOIDCConfiguration
 		result := tenantDB.Where("name = ? AND org_id = ? AND tenant_id = ? AND id != ? AND deleted_at IS NULL",
-			*req.Name, req.OrgID, req.TenantID, req.ID).First(&existing)
+			*req.Name, req.OrgID, req.WorkspaceID, req.ID).First(&existing)
 		if result.Error == nil {
 			return nil, fmt.Errorf("configuration with name '%s' already exists for this organization", *req.Name)
 		}
@@ -170,7 +170,7 @@ func (ar *AuthRepository) UpdateConfig(c *gin.Context, req *oocmgrdto.UpdateConf
 	}
 
 	if err := tenantDB.Where("id = ? AND tenant_id = ? AND org_id = ?",
-		req.ID, req.TenantID, req.OrgID).First(&cfg).Error; err != nil {
+		req.ID, req.WorkspaceID, req.OrgID).First(&cfg).Error; err != nil {
 		return nil, fmt.Errorf("failed to reload updated configuration: %w", err)
 	}
 	return &cfg, nil
@@ -183,7 +183,7 @@ func (ar *AuthRepository) DeleteConfig(c *gin.Context, req *oocmgrdto.DeleteConf
 		return fmt.Errorf("failed to get tenant database: %w", err)
 	}
 	result := tenantDB.Where("id = ? AND tenant_id = ? AND org_id = ?",
-		req.ID, req.TenantID, req.OrgID).Delete(&oocmgrdto.OAuthOIDCConfiguration{})
+		req.ID, req.WorkspaceID, req.OrgID).Delete(&oocmgrdto.OAuthOIDCConfiguration{})
 	if result.Error != nil {
 		return fmt.Errorf("failed to delete configuration: %w", result.Error)
 	}
@@ -204,7 +204,7 @@ func (ar *AuthRepository) GetTenantConfigs(c *gin.Context, req *oocmgrdto.GetTen
 	}
 
 	query := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
-		Where("tenant_id = ? AND org_id = ?", req.TenantID, req.OrgID)
+		Where("tenant_id = ? AND org_id = ?", req.WorkspaceID, req.OrgID)
 	if req.ActiveOnly {
 		query = query.Where("is_active = ?", true)
 	}
@@ -232,7 +232,7 @@ func (ar *AuthRepository) GetConfigsByType(c *gin.Context, req *oocmgrdto.GetCon
 	}
 
 	query := tenantDB.Where("tenant_id = ? AND org_id = ? AND config_type = ?",
-		req.TenantID, req.OrgID, req.ConfigType)
+		req.WorkspaceID, req.OrgID, req.ConfigType)
 	if req.ActiveOnly {
 		query = query.Where("is_active = ?", true)
 	}
@@ -251,7 +251,7 @@ func (ar *AuthRepository) CheckTenantHasConfig(c *gin.Context, req *oocmgrdto.Ch
 	}
 
 	query := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
-		Where("tenant_id = ? AND org_id = ? AND config_type = ?", req.TenantID, req.OrgID, req.ConfigType)
+		Where("tenant_id = ? AND org_id = ? AND config_type = ?", req.WorkspaceID, req.OrgID, req.ConfigType)
 	if req.ActiveOnly {
 		query = query.Where("is_active = ?", true)
 	}
@@ -262,7 +262,7 @@ func (ar *AuthRepository) CheckTenantHasConfig(c *gin.Context, req *oocmgrdto.Ch
 		HasConfig:  count > 0,
 		Count:      count,
 		ConfigType: req.ConfigType,
-		TenantID:   req.TenantID,
+		WorkspaceID:   req.WorkspaceID,
 		OrgID:      req.OrgID,
 		ActiveOnly: req.ActiveOnly,
 	}, nil
@@ -304,7 +304,7 @@ func (ar *AuthRepository) DeactivateOtherConfigs(c *gin.Context, tenantID, orgID
 // GetConfigStats returns statistics about configurations for a tenant.
 func (ar *AuthRepository) GetConfigStats(c *gin.Context, req *oocmgrdto.GetConfigStatsRequest) (*oocmgrdto.ConfigStatsResponse, error) {
 	stats := &oocmgrdto.ConfigStatsResponse{
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		OrgID:    req.OrgID,
 		ByType:   make(map[string]int64),
 	}
@@ -315,13 +315,13 @@ func (ar *AuthRepository) GetConfigStats(c *gin.Context, req *oocmgrdto.GetConfi
 	}
 
 	if err := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
-		Where("tenant_id = ? AND org_id = ?", req.TenantID, req.OrgID).
+		Where("tenant_id = ? AND org_id = ?", req.WorkspaceID, req.OrgID).
 		Count(&stats.Total).Error; err != nil {
 		return nil, fmt.Errorf("failed to count total configurations: %w", err)
 	}
 
 	if err := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
-		Where("tenant_id = ? AND org_id = ? AND is_active = ?", req.TenantID, req.OrgID, true).
+		Where("tenant_id = ? AND org_id = ? AND is_active = ?", req.WorkspaceID, req.OrgID, true).
 		Count(&stats.Active).Error; err != nil {
 		return nil, fmt.Errorf("failed to count active configurations: %w", err)
 	}
@@ -329,7 +329,7 @@ func (ar *AuthRepository) GetConfigStats(c *gin.Context, req *oocmgrdto.GetConfi
 
 	rows, err := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
 		Select("config_type, COUNT(*) as count").
-		Where("tenant_id = ? AND org_id = ?", req.TenantID, req.OrgID).
+		Where("tenant_id = ? AND org_id = ?", req.WorkspaceID, req.OrgID).
 		Group("config_type").Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get configuration counts by type: %w", err)

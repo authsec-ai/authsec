@@ -137,7 +137,7 @@ type OIDCTokenRequest struct {
 // application_identity_provider_policies — not via a column here.
 type SAMLProvider struct {
 	ID               uuid.UUID      `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	TenantID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"tenant_id"`
+	WorkspaceID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"workspace_id"`
 	ProviderName     string         `gorm:"type:varchar(255);not null;index:idx_saml_provider_unique;uniqueIndex:idx_saml_provider_unique" json:"provider_name"`
 	DisplayName      string         `gorm:"type:varchar(255);not null" json:"display_name"`
 	EntityID         string         `gorm:"type:varchar(500);not null" json:"entity_id"`
@@ -170,7 +170,7 @@ func (s *SAMLProvider) BeforeUpdate(tx *gorm.DB) error {
 
 type SAMLSPCertificate struct {
 	ID          uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	TenantID    uuid.UUID `gorm:"type:uuid;not null;unique;index" json:"tenant_id"`
+	WorkspaceID    uuid.UUID `gorm:"type:uuid;not null;unique;index" json:"workspace_id"`
 	Certificate string    `gorm:"type:text;not null" json:"certificate"`
 	PrivateKey  string    `gorm:"type:text;not null" json:"private_key"`
 	CreatedAt   time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
@@ -189,7 +189,7 @@ func (s *SAMLSPCertificate) BeforeCreate(tx *gorm.DB) error {
 type SAMLRequest struct {
 	ID             string    `gorm:"type:varchar(255);primary_key" json:"id"`
 	LoginChallenge string    `gorm:"type:varchar(255);not null;index" json:"login_challenge"`
-	TenantID       uuid.UUID `gorm:"type:uuid;not null" json:"tenant_id"`
+	WorkspaceID       uuid.UUID `gorm:"type:uuid;not null" json:"workspace_id"`
 	ProviderName   string    `gorm:"type:varchar(255);not null" json:"provider_name"`
 	RelayState     string    `gorm:"type:text" json:"relay_state"`
 	CreatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
@@ -256,7 +256,7 @@ type SAMLCallbackState struct {
 	UserEmail      string    `gorm:"type:varchar(255)" json:"user_email"`
 	UserName       string    `gorm:"type:varchar(255)" json:"user_name"`
 	ProviderName   string    `gorm:"type:varchar(255)" json:"provider_name"`
-	TenantID       uuid.UUID `gorm:"type:uuid" json:"tenant_id"`
+	WorkspaceID       uuid.UUID `gorm:"type:uuid" json:"workspace_id"`
 	LoginChallenge string    `gorm:"type:text" json:"login_challenge"`
 	CreatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
 	ExpiresAt      time.Time `gorm:"not null" json:"expires_at"`

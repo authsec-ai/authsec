@@ -78,7 +78,7 @@ func (pc *ProjectController) CreateProject(c *gin.Context) {
 		Name:        reloadedProject.Name,
 		Description: reloadedProject.Description,
 		UserID:      reloadedProject.UserID,
-		TenantID:    reloadedProject.TenantID,
+		WorkspaceID:    reloadedProject.WorkspaceID,
 		Active:      reloadedProject.Active,
 	}
 
@@ -140,7 +140,7 @@ func (pc *ProjectController) ListProjects(c *gin.Context) {
 			Name:        p.Name,
 			Description: p.Description,
 			UserID:      p.UserID,
-			TenantID:    p.TenantID,
+			WorkspaceID:    p.WorkspaceID,
 			Active:      p.Active,
 		}
 

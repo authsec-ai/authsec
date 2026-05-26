@@ -57,12 +57,12 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	if err := config.DB.Where("tenant_id = ?", input.TenantID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("tenant_id = ?", input.WorkspaceID).First(&tenant).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 	// Parse UUIDs
-	tenantID := input.TenantID
+	tenantID := input.WorkspaceID
 	projectID := input.ProjectID
 	// Connect to tenant database
 	tenantDB := config.DB
@@ -80,7 +80,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	client := models.Client{
 		ID:        clientID,
 		ClientID:  clientID,
-		TenantID:  uuid.MustParse(tenantID),
+		WorkspaceID:  uuid.MustParse(tenantID),
 		ProjectID: uuid.MustParse(projectID),
 		Name:      input.Name,
 		Email:     shared.StringPtr(input.Email),
@@ -113,7 +113,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	}
 
 	// Save secret to vault (optional - based on your requirements)
-	secretID, err := config.SaveSecretToVault(client.TenantID.String(), client.ProjectID.String(), client.ClientID.String())
+	secretID, err := config.SaveSecretToVault(client.WorkspaceID.String(), client.ProjectID.String(), client.ClientID.String())
 	if err != nil {
 		// Log the error but don't fail the registration
 		fmt.Printf("Warning: failed to save secret to vault: %v\n", err)
@@ -121,7 +121,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 
 	// Register client with Hydra (optional - based on your requirements)
 	if secretID != "" {
-		if err := services.RegisterClientWithHydra(client.ClientID.String(), secretID, *client.Email, client.TenantID.String(), tenant.TenantDomain); err != nil {
+		if err := services.RegisterClientWithHydra(client.ClientID.String(), secretID, *client.Email, client.WorkspaceID.String(), tenant.TenantDomain); err != nil {
 			// Log the error but don't fail the registration
 			fmt.Printf("Warning: failed to register client with Hydra: %v\n", err)
 		}
@@ -131,7 +131,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	middlewares.Audit(c, "client", client.ClientID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"client_id":  client.ClientID.String(),
-			"tenant_id":  client.TenantID.String(),
+			"tenant_id":  client.WorkspaceID.String(),
 			"project_id": client.ProjectID.String(),
 			"name":       client.Name,
 			"email":      *client.Email,
@@ -142,7 +142,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	response := models.RegisterClientsResponse{
 		ID:        client.ID.String(),
 		ClientID:  client.ClientID.String(),
-		TenantID:  client.TenantID.String(),
+		WorkspaceID:  client.WorkspaceID.String(),
 		ProjectID: client.ProjectID.String(),
 		Name:      client.Name,
 		SecretID:  secretID,
@@ -170,7 +170,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [get]
 type GetEndUsersFilter struct {
-	TenantID string `json:"tenant_id" binding:"required" validate:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required" validate:"required"`
 	Page     int    `json:"page,omitempty"`
 	Limit    int    `json:"limit,omitempty"`
 	Active   *bool  `json:"active,omitempty"`
@@ -232,7 +232,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		}
 	}
 
-	if user.TenantID != uuid.Nil && !strings.EqualFold(user.TenantID.String(), tenantID) {
+	if user.WorkspaceID != uuid.Nil && !strings.EqualFold(user.WorkspaceID.String(), tenantID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "user does not belong to tenant"})
 		return
 	}
@@ -331,7 +331,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 	offset := (filter.Page - 1) * filter.Limit
 
 	// Determine tenant identifier: prefer request filter, fall back to authenticated context
-	tenantIdentifier := filter.TenantID
+	tenantIdentifier := filter.WorkspaceID
 	if tenantIdentifier == "" {
 		if tenantVal, exists := c.Get("workspace_id"); exists {
 			if tenantStr, ok := tenantVal.(string); ok && tenantStr != "" {
@@ -343,7 +343,7 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
 		return
 	}
-	filter.TenantID = tenantIdentifier
+	filter.WorkspaceID = tenantIdentifier
 
 	// Connect to tenant database
 	if config.DB == nil {
@@ -658,7 +658,7 @@ func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
 	userInfo := middlewares.GetUserInfo(c)
 
-	if userInfo == nil || strings.TrimSpace(userInfo.TenantID) == "" {
+	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
 
 		c.JSON(http.StatusForbidden, gin.H{"error": "tenant scope is required"})
 
@@ -666,7 +666,7 @@ func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
 	}
 
-	if !strings.EqualFold(strings.TrimSpace(userInfo.TenantID), tenantID) {
+	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), tenantID) {
 
 		c.JSON(http.StatusForbidden, gin.H{"error": "cross-tenant deletion is not allowed"})
 
@@ -764,7 +764,7 @@ func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 // DeleteUserAllRequest is the request body for hard delete
 
 type DeleteUserAllRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 
 	UserID string `json:"user_id" binding:"required"`
 }
@@ -809,7 +809,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	}
 
-	tenantID := strings.TrimSpace(req.TenantID)
+	tenantID := strings.TrimSpace(req.WorkspaceID)
 
 	userID := strings.TrimSpace(req.UserID)
 
@@ -825,7 +825,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	userInfo := middlewares.GetUserInfo(c)
 
-	if userInfo == nil || strings.TrimSpace(userInfo.TenantID) == "" {
+	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
 
 		c.JSON(http.StatusForbidden, gin.H{"error": "tenant scope is required"})
 
@@ -833,7 +833,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	}
 
-	if !strings.EqualFold(strings.TrimSpace(userInfo.TenantID), tenantID) {
+	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), tenantID) {
 
 		c.JSON(http.StatusForbidden, gin.H{"error": "cross-tenant deletion is not allowed"})
 
@@ -1106,7 +1106,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 }
 
 type toggleEndUserActiveRequest struct {
-	TenantID string               `json:"tenant_id" binding:"required"`
+	WorkspaceID string               `json:"workspace_id" binding:"required"`
 	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
@@ -1133,7 +1133,7 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 		return
 	}
 
-	tenantID := strings.TrimSpace(req.TenantID)
+	tenantID := strings.TrimSpace(req.WorkspaceID)
 	userID := strings.TrimSpace(req.UserID)
 	if tenantID == "" || userID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and user_id are required"})
@@ -1302,7 +1302,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	if user.TenantID != tenantIDUUID {
+	if user.WorkspaceID != tenantIDUUID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant mismatch in credentials"})
 		return
 	}
@@ -1312,7 +1312,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 
 	// Prepare base response
 	response := models.LoginResponse{
-		TenantID:    user.TenantID.String(),
+		WorkspaceID:    user.WorkspaceID.String(),
 		Email:       user.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -1329,7 +1329,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		}
 
 		token, tokenErr := authController.generateJWTToken(
-			user.TenantID.String(),
+			user.WorkspaceID.String(),
 			clientID,
 			user.Email,
 			user.TenantDomain,
@@ -1451,7 +1451,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		}
 
 		response := models.LoginResponse{
-			TenantID:    user.TenantID.String(),
+			WorkspaceID:    user.WorkspaceID.String(),
 			Email:       user.Email,
 			FirstLogin:  isFirstLogin,
 			OTPRequired: false,
@@ -1465,7 +1465,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		}
 
 		token, tokenErr := authController.generateJWTToken(
-			user.TenantID.String(),
+			user.WorkspaceID.String(),
 			input.ClientID,
 			user.Email,
 			user.TenantDomain,
@@ -1489,7 +1489,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Prepare base response
 	response := models.LoginResponse{
-		TenantID:    user2.TenantID.String(),
+		WorkspaceID:    user2.WorkspaceID.String(),
 		Email:       user2.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -1621,7 +1621,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		// derives a sensible Name from the email local-part if these stay empty.
 		FirstName:    "",
 		LastName:     "",
-		TenantID:     tenantIDUUID,
+		WorkspaceID:     tenantIDUUID,
 		ProjectID:    projectID,
 		ClientID:     clientIDUUID,
 		ExpiresAt:    time.Now().Add(30 * time.Minute),    // Expires in 30 minutes to match OTP
@@ -1631,7 +1631,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, tenant_id, project_id, client_id, tenant_domain, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
 	if _, err := db.Exec(insertQuery, pendingReg.Email, pendingReg.PasswordHash, pendingReg.FirstName, pendingReg.LastName,
-		pendingReg.TenantID, pendingReg.ProjectID, pendingReg.ClientID, pendingReg.TenantDomain, pendingReg.ExpiresAt); err != nil {
+		pendingReg.WorkspaceID, pendingReg.ProjectID, pendingReg.ClientID, pendingReg.TenantDomain, pendingReg.ExpiresAt); err != nil {
 		log.Printf("Failed to create pending registration: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
 		return
@@ -1739,7 +1739,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, tenant_id, project_id, client_id, tenant_domain, expires_at
 		FROM pending_registrations WHERE email = $1`, input.Email).Scan(
 		&pendingReg.Email, &pendingReg.PasswordHash, &pendingReg.FirstName, &pendingReg.LastName,
-		&pendingReg.TenantID, &pendingReg.ProjectID, &pendingReg.ClientID, &pendingReg.TenantDomain, &pendingReg.ExpiresAt)
+		&pendingReg.WorkspaceID, &pendingReg.ProjectID, &pendingReg.ClientID, &pendingReg.TenantDomain, &pendingReg.ExpiresAt)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Registration session expired. Please initiate registration again"})
 		return
@@ -1751,12 +1751,12 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	// Single-DB collapse: scope by pendingReg.TenantID explicitly.
+	// Single-DB collapse: scope by pendingReg.WorkspaceID explicitly.
 	tenantDB := config.DB
 
 	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update
 	var adSyncUser models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.TenantID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
+	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.WorkspaceID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
 		// Update the existing synced user's password_hash
 		if err := tenantDB.Model(&adSyncUser).Update("password_hash", pendingReg.PasswordHash).Error; err != nil {
 			log.Printf("Failed to update user password: %v", err)
@@ -1775,7 +1775,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	if _, err := euc.resolveCustomLoginProjectID(tenantDB, pendingReg.ClientID, pendingReg.TenantID); err != nil {
+	if _, err := euc.resolveCustomLoginProjectID(tenantDB, pendingReg.ClientID, pendingReg.WorkspaceID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -1804,7 +1804,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		User: sharedmodels.User{
 			ID:           uuid.New(),
 			ClientID:     pendingReg.ClientID,
-			TenantID:     pendingReg.TenantID,
+			WorkspaceID:     pendingReg.WorkspaceID,
 			ProjectID:    pendingReg.ProjectID,
 			Name:         displayName,
 			Email:        pendingReg.Email,
@@ -1941,7 +1941,7 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 		User: sharedmodels.User{
 			ID:           uuid.New(),
 			ClientID:     clientIDUUID,
-			TenantID:     tenantIDUUID,
+			WorkspaceID:     tenantIDUUID,
 			ProjectID:    client.ProjectID, // Already UUID
 			Name:         input.Email,      // Use email as name if Name field doesn't exist
 			Email:        input.Email,
@@ -1977,7 +1977,7 @@ func (tc *EndUserController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error
 	if err := config.DB.Where("client_id = ?", clientID).First(&tenantMapping).Error; err != nil {
 		return uuid.UUID{}, fmt.Errorf("failed to find tenant: %w", err)
 	}
-	return tenantMapping.TenantID, nil
+	return tenantMapping.WorkspaceID, nil
 }
 
 func (tc *EndUserController) resolveCustomLoginProjectID(tenantDB *gorm.DB, clientID uuid.UUID, tenantID uuid.UUID) (uuid.UUID, error) {
@@ -2317,7 +2317,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 	}
 
 	// Parse tenant ID
-	tenantUUID, err := uuid.Parse(input.TenantID)
+	tenantUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -2393,7 +2393,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 		"message":   "User password changed successfully",
 		"user_id":   user.ID.String(),
 		"email":     user.Email,
-		"tenant_id": user.TenantID.String(),
+		"tenant_id": user.WorkspaceID.String(),
 	})
 }
 
@@ -2424,7 +2424,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 	}
 
 	// Parse tenant ID
-	tenantUUID, err := uuid.Parse(input.TenantID)
+	tenantUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -2520,7 +2520,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 		"message":            "User password reset successfully",
 		"user_id":            user.ID.String(),
 		"email":              user.Email,
-		"tenant_id":          user.TenantID.String(),
+		"tenant_id":          user.WorkspaceID.String(),
 		"temporary_password": tempPassword,
 		"email_sent":         emailSent,
 	})
@@ -2532,7 +2532,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully. Temporary password included in response",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"tenant_id":          user.TenantID.String(),
+			"tenant_id":          user.WorkspaceID.String(),
 			"temporary_password": tempPassword,
 			"email_sent":         emailSent,
 		})
@@ -2543,7 +2543,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"tenant_id":          user.TenantID.String(),
+			"tenant_id":          user.WorkspaceID.String(),
 			"temporary_password": "Sent via email",
 			"email_sent":         emailSent,
 		})
@@ -2652,7 +2652,7 @@ func (euc *EndUserController) GetClients(c *gin.Context) {
 		response := models.RegisterClientsResponse{
 			ID:        client.ID.String(),
 			ClientID:  client.ClientID.String(),
-			TenantID:  client.TenantID.String(),
+			WorkspaceID:  client.WorkspaceID.String(),
 			ProjectID: client.ProjectID.String(),
 			Name:      client.Name,
 			Email:     email,
@@ -2689,7 +2689,7 @@ func (euc *EndUserController) GetClients(c *gin.Context) {
 // @Router /authsec/uflow/user/clients/get [post]
 func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id" binding:"required"`
+		WorkspaceID string `json:"workspace_id" binding:"required"`
 		Page     int    `json:"page,omitempty"`
 		Limit    int    `json:"limit,omitempty"`
 		Active   *bool  `json:"active,omitempty"`
@@ -2730,7 +2730,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", req.TenantID)
+	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", req.WorkspaceID)
 
 	// Apply filters
 	if req.Active != nil {
@@ -2764,7 +2764,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 		response := models.RegisterClientsResponse{
 			ID:        client.ID.String(),
 			ClientID:  client.ClientID.String(),
-			TenantID:  client.TenantID.String(),
+			WorkspaceID:  client.WorkspaceID.String(),
 			ProjectID: client.ProjectID.String(),
 			Name:      client.Name,
 			Email:     email,

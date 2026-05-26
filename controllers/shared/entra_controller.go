@@ -27,7 +27,7 @@ type EntraIDController struct{}
 
 // EntraIDConfig holds configuration for Entra ID connection
 type EntraIDConfig struct {
-	TenantID     string   `json:"tenant_id" binding:"required"`
+	WorkspaceID     string   `json:"workspace_id" binding:"required"`
 	ClientID     string   `json:"client_id" binding:"required"`
 	ClientSecret string   `json:"client_secret" binding:"required"`
 	Scopes       []string `json:"scopes,omitempty"`
@@ -36,7 +36,7 @@ type EntraIDConfig struct {
 
 // EntraSyncInput represents the input for syncing users from Entra ID
 type EntraSyncInput struct {
-	TenantID  string         `json:"tenant_id" binding:"required"`
+	WorkspaceID  string         `json:"workspace_id" binding:"required"`
 	ClientID  string         `json:"client_id" binding:"required"`
 	ProjectID string         `json:"project_id" binding:"required"`
 	ConfigID  *string        `json:"config_id,omitempty"` // ID of stored config to use
@@ -138,7 +138,7 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 
 	if input.ConfigID != nil && *input.ConfigID != "" {
 		// Load config from database
-		entraConfig, err = eic.loadStoredEntraConfig(*input.ConfigID, input.TenantID, input.ClientID)
+		entraConfig, err = eic.loadStoredEntraConfig(*input.ConfigID, input.WorkspaceID, input.ClientID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "Failed to load stored configuration",
@@ -185,7 +185,7 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 
 	// Sync users to database
 	for _, entraUser := range entraUsers {
-		if err := eic.syncEntraUserToDatabase(tenantDB, entraUser, input.TenantID, input.ClientID, input.ProjectID); err != nil {
+		if err := eic.syncEntraUserToDatabase(tenantDB, entraUser, input.WorkspaceID, input.ClientID, input.ProjectID); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Failed to sync user %s: %v", entraUser.Mail, err))
 			continue
 		}
@@ -193,12 +193,12 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 	}
 
 	log.Printf("Entra ID sync completed for tenant %s: %d users processed, %d created, %d errors",
-		input.TenantID, result.UsersFound, result.UsersCreated, len(result.Errors))
+		input.WorkspaceID, result.UsersFound, result.UsersCreated, len(result.Errors))
 
 	// Audit log: Entra ID sync completed
-	middlewares.Audit(c, "entra_sync", input.TenantID, "sync_users", &middlewares.AuditChanges{
+	middlewares.Audit(c, "entra_sync", input.WorkspaceID, "sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":     input.TenantID,
+			"tenant_id":     input.WorkspaceID,
 			"client_id":     input.ClientID,
 			"project_id":    input.ProjectID,
 			"users_found":   result.UsersFound,
@@ -266,7 +266,7 @@ func (eic *EntraIDController) TestEntraIDConnection(c *gin.Context) {
 		"success":      true,
 		"message":      "Successfully connected to Entra ID",
 		"users_found":  len(users),
-		"tenant_id":    config.TenantID,
+		"tenant_id":    config.WorkspaceID,
 		"sample_users": sampleUsers,
 	})
 }
@@ -320,8 +320,8 @@ func (eic *EntraIDController) NewEntraIDService(config *EntraIDConfig) *EntraIDS
 
 func (s *EntraIDService) authenticate() error {
 	// Short-circuit for test tenants to avoid real network calls in unit tests.
-	if isTestTenant(s.config.TenantID) {
-		if s.config.TenantID == "invalid-tenant" {
+	if isTestTenant(s.config.WorkspaceID) {
+		if s.config.WorkspaceID == "invalid-tenant" {
 			return fmt.Errorf("authentication failed")
 		}
 		s.accessToken = "test-token"
@@ -334,7 +334,7 @@ func (s *EntraIDService) authenticate() error {
 		return nil
 	}
 
-	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", s.config.TenantID)
+	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", s.config.WorkspaceID)
 
 	// Default scopes
 	scopes := s.config.Scopes
@@ -387,11 +387,11 @@ func (s *EntraIDService) authenticate() error {
 
 func (s *EntraIDService) FetchEntraIDUsers() ([]EntraIDUser, error) {
 	// Stubbed response for tests to avoid external calls
-	if isTestTenant(s.config.TenantID) {
+	if isTestTenant(s.config.WorkspaceID) {
 		if err := s.authenticate(); err != nil {
 			return nil, err
 		}
-		if s.config.TenantID == "test-tenant-id" {
+		if s.config.WorkspaceID == "test-tenant-id" {
 			return []EntraIDUser{
 				{
 					ID:                "user1-id",
@@ -461,7 +461,7 @@ func (s *EntraIDService) FetchEntraIDUsers() ([]EntraIDUser, error) {
 
 func (s *EntraIDService) fetchUsersWithLimit(limit int) ([]GraphUser, error) {
 	// Stubbed response for tests
-	if isTestTenant(s.config.TenantID) {
+	if isTestTenant(s.config.WorkspaceID) {
 		if err := s.authenticate(); err != nil {
 			return nil, err
 		}
@@ -524,7 +524,7 @@ func (s *EntraIDService) fetchUsersPage(url string) ([]GraphUser, string, error)
 
 func (s *EntraIDService) checkPermissions() (map[string]interface{}, error) {
 	// Stubbed response for tests
-	if isTestTenant(s.config.TenantID) {
+	if isTestTenant(s.config.WorkspaceID) {
 		if err := s.authenticate(); err != nil {
 			return nil, err
 		}
@@ -645,7 +645,7 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 			User: sharedmodels.User{
 				ID:           uuid.New(),
 				ClientID:     clientUUID,
-				TenantID:     tenantUUID,
+				WorkspaceID:     tenantUUID,
 				ProjectID:    projectUUID,
 				Name:         entraUser.DisplayName,
 				Username:     &entraUser.MailNickname,
@@ -759,7 +759,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 
 	// Build EntraIDConfig
 	entraConfig := EntraIDConfig{
-		TenantID:     syncConfig.EntraTenantID,
+		WorkspaceID:     syncConfig.EntraTenantID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

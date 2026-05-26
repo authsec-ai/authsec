@@ -62,7 +62,7 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 	log.Printf("[WebAuthnBridge] MFA verification confirmed for email=%s, tenantID=%s", email, tenantID)
 
 	// Parse UUIDs
-	tenantUUID, err := uuid.Parse(tenant.TenantID.String())
+	tenantUUID, err := uuid.Parse(tenant.WorkspaceID.String())
 	if err != nil {
 		return "", "", fmt.Errorf("invalid tenant_id: %w", err)
 	}

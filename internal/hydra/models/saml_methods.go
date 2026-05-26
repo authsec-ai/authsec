@@ -222,8 +222,8 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 
 	// Workspace-scoped SP entity / ACS URL. Per-Application restriction is
 	// expressed via application_identity_provider_policies, not URL paths.
-	spEntityID := fmt.Sprintf("%s/saml/metadata/%s", s.cfg.BaseURL, provider.TenantID.String())
-	acsURL := fmt.Sprintf("%s/saml/acs/%s", s.cfg.BaseURL, provider.TenantID.String())
+	spEntityID := fmt.Sprintf("%s/saml/metadata/%s", s.cfg.BaseURL, provider.WorkspaceID.String())
+	acsURL := fmt.Sprintf("%s/saml/acs/%s", s.cfg.BaseURL, provider.WorkspaceID.String())
 
 	authnRequest := SAMLAuthnRequest{
 		ID:                          requestID,
@@ -263,13 +263,13 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	// Per-Application restriction is enforced at initiate via
 	// application_identity_provider_policies, not via the relay state.
 	relayState := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s:%s",
-		loginChallenge, provider.ProviderName, provider.TenantID.String())))
+		loginChallenge, provider.ProviderName, provider.WorkspaceID.String())))
 
 	db := config.DB
 	samlReq := SAMLRequest{
 		ID:             requestID,
 		LoginChallenge: loginChallenge,
-		TenantID:       provider.TenantID,
+		WorkspaceID:       provider.WorkspaceID,
 		ProviderName:   provider.ProviderName,
 		RelayState:     relayState,
 		CreatedAt:      time.Now(),
@@ -431,7 +431,7 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLS
 	}
 
 	newCert := SAMLSPCertificate{
-		TenantID:    tenantID,
+		WorkspaceID:    tenantID,
 		Certificate: string(certPEM),
 		PrivateKey:  encryptedPrivateKey,
 		ExpiresAt:   time.Now().AddDate(1, 0, 0),

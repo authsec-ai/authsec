@@ -100,9 +100,9 @@ func TestADSyncController_SyncADUsers(t *testing.T) {
 		{
 			name: "successful sync",
 			input: models.SyncUsersInput{
-				TenantID:  uuid.New().String(),
-				ClientID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ClientID:    uuid.New().String(),
+				ProjectID:   uuid.New().String(),
 				Config: &models.ADSyncConfig{
 					Server:     "test.ad.com:389",
 					Username:   "testuser",
@@ -130,9 +130,9 @@ func TestADSyncController_SyncADUsers(t *testing.T) {
 		{
 			name: "dry run",
 			input: models.SyncUsersInput{
-				TenantID:  uuid.New().String(),
-				ClientID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ClientID:    uuid.New().String(),
+				ProjectID:   uuid.New().String(),
 				Config: &models.ADSyncConfig{
 					Server:     "test.ad.com:389",
 					Username:   "testuser",
@@ -331,9 +331,9 @@ func TestADSyncController_AgentSyncUsers(t *testing.T) {
 		{
 			name: "successful agent sync",
 			input: models.AgentSyncRequest{
-				TenantID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
-				ClientID:  uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ProjectID:   uuid.New().String(),
+				ClientID:    uuid.New().String(),
 				Users: []models.AgentUserData{
 					{
 						ExternalID:   uuid.New().String(),
@@ -361,9 +361,9 @@ func TestADSyncController_AgentSyncUsers(t *testing.T) {
 		{
 			name: "dry run agent sync",
 			input: models.AgentSyncRequest{
-				TenantID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
-				ClientID:  uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
+				ProjectID:   uuid.New().String(),
+				ClientID:    uuid.New().String(),
 				Users: []models.AgentUserData{
 					{
 						ExternalID:   uuid.New().String(),
@@ -617,7 +617,7 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 					User: sharedmodels.User{
 						ID:           uuid.New(),
 						ClientID:     clientID,
-						TenantID:     tenantID,
+						WorkspaceID:  tenantID,
 						ProjectID:    projectID,
 						Name:         "Existing User",
 						Username:     strPtr(tt.adUser.Username),
@@ -702,7 +702,7 @@ func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
 					User: sharedmodels.User{
 						ID:           uuid.New(),
 						ClientID:     clientID,
-						TenantID:     tenantID,
+						WorkspaceID:  tenantID,
 						ProjectID:    projectID,
 						Name:         "Existing Agent",
 						Username:     strPtr(tt.agentUser.Username),

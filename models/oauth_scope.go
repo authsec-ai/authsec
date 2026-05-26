@@ -12,9 +12,8 @@ import (
 // and maps to internal RBAC permissions via oauth_scope_permissions.
 type OAuthScope struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_oauth_scopes_unique"`
-	// WorkspaceID mirrors TenantID during the workspace transition (migration 122).
-	WorkspaceID      *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_oauth_scopes_unique"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition (migration 122).
 	ResourceServerID *uuid.UUID `json:"resource_server_id" gorm:"type:uuid;uniqueIndex:idx_oauth_scopes_unique"`
 	ScopeString      string     `json:"scope_string" gorm:"type:text;not null;uniqueIndex:idx_oauth_scopes_unique"`
 	DisplayName      string     `json:"display_name" gorm:"type:text;not null"`

@@ -43,7 +43,7 @@ type InviteAdminRequest struct {
 	LastName     string `json:"last_name"`
 	Username     string `json:"username" binding:"required"`
 	ClientID     string `json:"client_id"`
-	TenantID     string `json:"tenant_id"`
+	WorkspaceID     string `json:"workspace_id"`
 	ProjectID    string `json:"project_id"`
 	TenantDomain string `json:"tenant_domain"`
 }
@@ -66,7 +66,7 @@ type InvitedUserPayload struct {
 	Email        string `json:"email"`
 	Username     string `json:"username"`
 	ClientID     string `json:"client_id,omitempty"`
-	TenantID     string `json:"tenant_id,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
 	TenantDomain string `json:"tenant_domain,omitempty"`
 }
@@ -187,8 +187,8 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	var tenantIDPtr *uuid.UUID
-	if strings.TrimSpace(req.TenantID) != "" {
-		tenantUUID, parseErr := uuid.Parse(req.TenantID)
+	if strings.TrimSpace(req.WorkspaceID) != "" {
+		tenantUUID, parseErr := uuid.Parse(req.WorkspaceID)
 		if parseErr != nil {
 			log.Printf("User-flow: invalid tenant_id format: %v", parseErr)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
@@ -221,7 +221,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		CreatedAt:                  time.Now(),
 		UpdatedAt:                  time.Now(),
 		ClientID:                   clientIDPtr,
-		TenantID:                   tenantIDPtr,
+		WorkspaceID:                   tenantIDPtr,
 		ProjectID:                  projectIDPtr,
 		TenantDomain:               strings.TrimSpace(req.TenantDomain),
 	}
@@ -308,7 +308,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			Email:        adminUser.Email,
 			Username:     adminUser.Username,
 			ClientID:     uuidOrEmpty(adminUser.ClientID),
-			TenantID:     uuidOrEmpty(adminUser.TenantID),
+			WorkspaceID:     uuidOrEmpty(adminUser.WorkspaceID),
 			ProjectID:    uuidOrEmpty(adminUser.ProjectID),
 			TenantDomain: adminUser.TenantDomain,
 		},
@@ -385,7 +385,7 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 	}
 
 	// Verify the user belongs to the same tenant
-	if user.TenantID != nil && tenantUUID != uuid.Nil && *user.TenantID != tenantUUID {
+	if user.WorkspaceID != nil && tenantUUID != uuid.Nil && *user.WorkspaceID != tenantUUID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot cancel invite for user in different tenant"})
 		return
 	}
@@ -502,7 +502,7 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 	}
 
 	// Verify the user belongs to the same tenant
-	if user.TenantID != nil && tenantUUID != uuid.Nil && *user.TenantID != tenantUUID {
+	if user.WorkspaceID != nil && tenantUUID != uuid.Nil && *user.WorkspaceID != tenantUUID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot resend invite for user in different tenant"})
 		return
 	}

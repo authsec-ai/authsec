@@ -44,7 +44,7 @@ type AdminPrecheckResponse struct {
 	Exists             bool     `json:"exists"`
 	DisplayName        string   `json:"display_name,omitempty"`
 	TenantDomain       string   `json:"tenant_domain,omitempty"`
-	TenantID           string   `json:"tenant_id,omitempty"`
+	WorkspaceID           string   `json:"workspace_id,omitempty"`
 	NextStep           string   `json:"next_step"` // "login", "bootstrap", "register"
 	RequiresPassword   bool     `json:"requires_password"`
 	AvailableProviders []string `json:"available_providers,omitempty"`
@@ -63,7 +63,7 @@ type AdminBootstrapInput struct {
 type AdminBootstrapResponse struct {
 	Message      string `json:"message"`
 	Status       string `json:"status"` // "pending_verification", "success"
-	TenantID     string `json:"tenant_id,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
 	TenantDomain string `json:"tenant_domain,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 }

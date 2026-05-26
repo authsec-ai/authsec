@@ -60,7 +60,7 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 	_, err := ur.db.Exec(query,
 		user.ID,
 		user.ClientID,
-		user.TenantID,
+		user.WorkspaceID,
 		user.ProjectID,
 		user.Name,
 		user.Username,
@@ -105,7 +105,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 	err := ur.db.QueryRow(query, email).Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&username,
@@ -180,7 +180,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 	err := ur.db.QueryRow(query, email, clientID).Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&username,
@@ -253,7 +253,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, tenantID uuid.UU
 	err := ur.db.QueryRow(query, email, tenantID).Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&username,
@@ -326,7 +326,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 	err := ur.db.QueryRow(query, userID).Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&username,
@@ -401,7 +401,7 @@ func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*model
 	err := ur.db.QueryRow(query, provider, providerID).Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&username,
@@ -564,7 +564,7 @@ func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset i
 		err := rows.Scan(
 			&user.ID,
 			&user.ClientID,
-			&user.TenantID,
+			&user.WorkspaceID,
 			&user.ProjectID,
 			&user.Name,
 			&username,
@@ -697,7 +697,7 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 	_, err := tx.Exec(query,
 		user.ID,
 		user.ClientID,
-		user.TenantID,
+		user.WorkspaceID,
 		user.ProjectID,
 		user.Name,
 		user.Username,
@@ -770,7 +770,7 @@ func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) err
 	if user.ClientID == uuid.Nil {
 		return fmt.Errorf("client_id is required")
 	}
-	if user.TenantID == uuid.Nil {
+	if user.WorkspaceID == uuid.Nil {
 		return fmt.Errorf("tenant_id is required")
 	}
 	// Note: project_id is optional and can be nil for admin users

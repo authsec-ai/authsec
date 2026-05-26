@@ -41,7 +41,7 @@ func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
 		var tenant models.Tenant
 		err := rows.Scan(
 			&tenant.ID,
-			&tenant.TenantID,
+			&tenant.WorkspaceID,
 			&tenant.TenantDB,
 			&tenant.Email,
 			&tenant.Username,
@@ -79,7 +79,7 @@ func (atr *AdminTenantRepository) GetTenantByID(tenantID string) (*models.Tenant
 	var tenant models.Tenant
 	err := atr.db.QueryRow(query, tenantID).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&tenant.Username,
@@ -120,7 +120,7 @@ func (atr *AdminTenantRepository) GetTenantByClientID(clientID string) (*models.
 	var tenant models.Tenant
 	err := atr.db.QueryRow(query, clientID).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&tenant.Username,
@@ -169,7 +169,7 @@ created_at, updated_at, tenant_domain)
 
 	_, err := atr.db.Exec(query,
 		tenant.ID,
-		tenant.TenantID,
+		tenant.WorkspaceID,
 		tenant.TenantDB,
 		tenant.Email,
 		tenant.Username,
@@ -251,7 +251,7 @@ func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*model
 	var tenant models.Tenant
 	err := atr.db.QueryRow(query, tenantDomain).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&tenant.Username,
@@ -270,7 +270,7 @@ func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*model
 
 	// If found via tenant_domains, return it
 	if err == nil {
-		log.Printf("DEBUG GetTenantByDomain: Found tenant via tenant_domains table: tenant_id=%s, tenant_domain=%s", tenant.TenantID, tenant.TenantDomain)
+		log.Printf("DEBUG GetTenantByDomain: Found tenant via tenant_domains table: tenant_id=%s, tenant_domain=%s", tenant.WorkspaceID, tenant.TenantDomain)
 		return &tenant, nil
 	}
 
@@ -288,7 +288,7 @@ func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*model
 	// Support both full domain and subdomain prefix
 	err = atr.db.QueryRow(fallbackQuery, tenantDomain+"%", tenantDomain).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&tenant.Username,
@@ -342,7 +342,7 @@ func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, tenant *models.Tena
 
 	_, err := tx.Exec(query,
 		tenant.ID,
-		tenant.TenantID,
+		tenant.WorkspaceID,
 		tenant.TenantDB,
 		tenant.Email,
 		tenant.Username,
@@ -411,7 +411,7 @@ func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.Adm
 		user.Username,
 		user.PasswordHash,
 		user.Name,
-		user.TenantID,
+		user.WorkspaceID,
 		user.ProjectID,
 		user.ClientID,
 		user.TenantDomain,
@@ -471,7 +471,7 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 
 	if tenantID.Valid {
 		id, _ := uuid.Parse(tenantID.String)
-		user.TenantID = &id
+		user.WorkspaceID = &id
 	}
 	if projectID.Valid {
 		id, _ := uuid.Parse(projectID.String)

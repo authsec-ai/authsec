@@ -5,7 +5,7 @@ import "time"
 // Agent represents an attested agent (node) identity
 type Agent struct {
 	ID                string            `json:"id"`
-	TenantID          string            `json:"tenant_id"`
+	WorkspaceID          string            `json:"workspace_id"`
 	NodeID            string            `json:"node_id"`
 	SpiffeID          string            `json:"spiffe_id"`
 	AttestationType   string            `json:"attestation_type"`

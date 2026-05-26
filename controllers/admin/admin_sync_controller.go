@@ -39,7 +39,7 @@ func NewAdminSyncController() (*AdminSyncController, error) {
 
 // AdminSyncInput represents the input for syncing admin users
 type AdminSyncInput struct {
-	TenantID    string                `json:"tenant_id" binding:"required"`
+	WorkspaceID    string                `json:"workspace_id" binding:"required"`
 	ClientID    string                `json:"client_id,omitempty"`          // Optional client_id
 	ProjectID   string                `json:"project_id,omitempty"`         // Optional project_id
 	ConfigID    *string               `json:"config_id,omitempty"`          // ID of stored config to use
@@ -78,7 +78,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	}
 
 	// Validate tenant ID
-	tenantUUID, err := uuid.Parse(input.TenantID)
+	tenantUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -107,7 +107,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	var adConfig models.ADSyncConfig
 	if input.ConfigID != nil && *input.ConfigID != "" {
 		// Load config from database
-		adConfig, err = asc.loadStoredADConfig(*input.ConfigID, input.TenantID)
+		adConfig, err = asc.loadStoredADConfig(*input.ConfigID, input.WorkspaceID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "Failed to load stored configuration",
@@ -165,13 +165,13 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	}
 
 	log.Printf("AD admin sync completed for tenant %s: %d users processed, %d created, %d updated, %d errors",
-		input.TenantID, result.UsersFound, result.UsersCreated, result.UsersUpdated, len(result.Errors))
+		input.WorkspaceID, result.UsersFound, result.UsersCreated, result.UsersUpdated, len(result.Errors))
 
 	// Audit log: AD admin sync completed
-	middlewares.Audit(c, "admin_sync", input.TenantID, "ad_sync", &middlewares.AuditChanges{
+	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "ad_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "active_directory",
-			"tenant_id":     input.TenantID,
+			"tenant_id":     input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -202,7 +202,7 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	}
 
 	// Validate tenant ID
-	tenantUUID, err := uuid.Parse(input.TenantID)
+	tenantUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -231,7 +231,7 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	var entraConfig shared.EntraIDConfig
 	if input.ConfigID != nil && *input.ConfigID != "" {
 		// Load config from database
-		entraConfig, err = asc.loadStoredEntraConfig(*input.ConfigID, input.TenantID)
+		entraConfig, err = asc.loadStoredEntraConfig(*input.ConfigID, input.WorkspaceID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "Failed to load stored configuration",
@@ -290,13 +290,13 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	}
 
 	log.Printf("Entra ID admin sync completed for tenant %s: %d users processed, %d created, %d updated, %d errors",
-		input.TenantID, result.UsersFound, result.UsersCreated, result.UsersUpdated, len(result.Errors))
+		input.WorkspaceID, result.UsersFound, result.UsersCreated, result.UsersUpdated, len(result.Errors))
 
 	// Audit log: Entra ID admin sync completed
-	middlewares.Audit(c, "admin_sync", input.TenantID, "entra_sync", &middlewares.AuditChanges{
+	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "entra_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "entra_id",
-			"tenant_id":     input.TenantID,
+			"tenant_id":     input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -405,7 +405,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 	}
 	if tenantIDVal.Valid && tenantIDVal.String != "" {
 		if parsed, err := uuid.Parse(tenantIDVal.String); err == nil {
-			existingUser.TenantID = &parsed
+			existingUser.WorkspaceID = &parsed
 		}
 	}
 	if projectIDStr.Valid && projectIDStr.String != "" {
@@ -434,7 +434,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 			Username:     adUser.Username,
 			Name:         adUser.DisplayName,
 			ClientID:     clientID,
-			TenantID:     &tenantID,
+			WorkspaceID:     &tenantID,
 			ProjectID:    projectID,
 			Provider:     "ad_sync",
 			ProviderID:   adUser.UserPrincipalName,
@@ -599,7 +599,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 	}
 	if tenantIDVal.Valid && tenantIDVal.String != "" {
 		if parsed, err := uuid.Parse(tenantIDVal.String); err == nil {
-			existingUser.TenantID = &parsed
+			existingUser.WorkspaceID = &parsed
 		}
 	}
 	if projectIDStr.Valid && projectIDStr.String != "" {
@@ -632,7 +632,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 			Username:     entraUser.MailNickname,
 			Name:         entraUser.DisplayName,
 			ClientID:     clientID,
-			TenantID:     &tenantID,
+			WorkspaceID:     &tenantID,
 			ProjectID:    projectID,
 			Provider:     "entra_id",
 			ProviderID:   entraUser.UserPrincipalName,
@@ -733,14 +733,14 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 			existingTenant.Status,
 			now,
 			adminUser.Email,
-			*adminUser.TenantID,
+			*adminUser.WorkspaceID,
 		)
 
 		if err != nil {
 			return fmt.Errorf("failed to update tenant entry: %w", err)
 		}
 
-		log.Printf("Updated tenant entry for admin user %s with tenant_id %s", adminUser.Email, adminUser.TenantID)
+		log.Printf("Updated tenant entry for admin user %s with tenant_id %s", adminUser.Email, adminUser.WorkspaceID)
 		return nil
 	}
 
@@ -748,7 +748,7 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 	// This creates a new row in tenants table with the new email but same tenant configuration
 	tenant := &sharedmodels.Tenant{
 		ID:           uuid.New(),
-		TenantID:     *adminUser.TenantID, // Same tenant_id as existing tenant
+		WorkspaceID:     *adminUser.WorkspaceID, // Same tenant_id as existing tenant
 		Email:        adminUser.Email,     // New email from synced user
 		Username:     &adminUser.Username,
 		Name:         adminUser.Name,
@@ -766,7 +766,7 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 	}
 
 	log.Printf("Created new tenant entry for admin user %s with tenant_id %s (shares same tenant_db: %s)",
-		adminUser.Email, adminUser.TenantID, existingTenant.TenantDB)
+		adminUser.Email, adminUser.WorkspaceID, existingTenant.TenantDB)
 	return nil
 }
 
@@ -867,7 +867,7 @@ func (asc *AdminSyncController) loadStoredEntraConfig(configID, tenantID string)
 
 	// Build shared.EntraIDConfig
 	entraConfig := shared.EntraIDConfig{
-		TenantID:     syncConfig.EntraTenantID,
+		WorkspaceID:     syncConfig.EntraTenantID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

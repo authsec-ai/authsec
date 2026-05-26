@@ -11,7 +11,7 @@ import (
 // All timestamps are stored as Unix epoch (seconds)
 type VoiceSession struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid;index"`
 
 	// Session identifier
@@ -66,7 +66,7 @@ func (v *VoiceSession) CanRetryOTP() bool {
 // All timestamps are stored as Unix epoch (seconds)
 type VoiceIdentityLink struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
 	// Voice assistant identity
 	VoicePlatform string `json:"voice_platform" gorm:"size:50;not null;index"` // 'alexa', 'google', 'siri'
@@ -236,7 +236,7 @@ func IsValidVoicePlatform(platform string) bool {
 // All timestamps are stored as Unix epoch (seconds)
 type VoiceActiveSession struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
 
 	// User identity

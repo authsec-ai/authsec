@@ -34,7 +34,7 @@ func (r *TOTPRepository) CreateTOTPSecret(secret *models.TOTPSecret) error {
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 	_, err := r.db.Exec(query,
-		secret.ID, secret.UserID, secret.TenantID, secret.Secret,
+		secret.ID, secret.UserID, secret.WorkspaceID, secret.Secret,
 		secret.DeviceName, secret.DeviceType, secret.IsActive,
 		secret.IsPrimary, secret.CreatedAt, secret.UpdatedAt,
 	)
@@ -52,7 +52,7 @@ func (r *TOTPRepository) UpdateTOTPSecret(secret *models.TOTPSecret) error {
 
 	_, err := r.db.Exec(query,
 		secret.DeviceName, secret.IsActive, secret.IsPrimary,
-		secret.UpdatedAt, secret.ID, secret.UserID, secret.TenantID,
+		secret.UpdatedAt, secret.ID, secret.UserID, secret.WorkspaceID,
 	)
 	return err
 }
@@ -171,7 +171,7 @@ func (r *TOTPRepository) CreateBackupCode(code *models.BackupCode) error {
 		INSERT INTO totp_backup_codes (id, user_id, tenant_id, code, is_used, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`
 
-	_, err := r.db.Exec(query, code.ID, code.UserID, code.TenantID, code.Code, code.IsUsed, code.CreatedAt)
+	_, err := r.db.Exec(query, code.ID, code.UserID, code.WorkspaceID, code.Code, code.IsUsed, code.CreatedAt)
 	return err
 }
 
@@ -191,7 +191,7 @@ func (r *TOTPRepository) GetUserBackupCodes(userID uuid.UUID, tenantID uuid.UUID
 	var codes []models.BackupCode
 	for rows.Next() {
 		var c models.BackupCode
-		err := rows.Scan(&c.ID, &c.UserID, &c.TenantID, &c.Code, &c.IsUsed, &c.CreatedAt, &c.UsedAt)
+		err := rows.Scan(&c.ID, &c.UserID, &c.WorkspaceID, &c.Code, &c.IsUsed, &c.CreatedAt, &c.UsedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -219,7 +219,7 @@ func (r *TOTPRepository) DeleteBackupCodes(userID uuid.UUID, tenantID uuid.UUID)
 func (r *TOTPRepository) scanTOTPSecret(row scanner) (*models.TOTPSecret, error) {
 	var s models.TOTPSecret
 	err := row.Scan(
-		&s.ID, &s.UserID, &s.TenantID, &s.Secret, &s.DeviceName, &s.DeviceType,
+		&s.ID, &s.UserID, &s.WorkspaceID, &s.Secret, &s.DeviceName, &s.DeviceType,
 		&s.LastUsed, &s.IsActive, &s.IsPrimary, &s.CreatedAt, &s.UpdatedAt,
 	)
 	if err != nil {

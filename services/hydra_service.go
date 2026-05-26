@@ -191,7 +191,7 @@ func oocmgrNormalizeProviderName(name string) string {
 
 // OOCManager represents the request structure for OOC Manager API
 type OOCManager struct {
-	TenantID     string   `json:"tenant_id" validate:"required"`
+	WorkspaceID     string   `json:"workspace_id" validate:"required"`
 	TenantName   string   `json:"tenant_name" validate:"required"`
 	ClientID     string   `json:"client_id" validate:"required"`
 	ClientSecret string   `json:"client_secret" validate:"required"`
@@ -215,7 +215,7 @@ type ProviderConfig struct {
 
 // AddProviderRequest represents the request structure for adding a provider
 type AddProviderRequest struct {
-	TenantID    string         `json:"tenant_id"`
+	WorkspaceID    string         `json:"workspace_id"`
 	ClientID    string         `json:"client_id"`
 	ReactAppURL string         `json:"react_app_url"`
 	Provider    ProviderConfig `json:"provider"`
@@ -260,7 +260,7 @@ func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenan
 
 	// Best-effort: store mapping in master DB
 	thc := &oocmgrdto.TenantHydraClient{
-		TenantID: tenantID, TenantName: clientName,
+		WorkspaceID: tenantID, TenantName: clientName,
 		HydraClientID: mainClientID, HydraClientSecret: clientSecret,
 		ClientName:   fmt.Sprintf("%s Main OAuth Client", clientName),
 		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
@@ -360,7 +360,7 @@ func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) erro
 
 	// Best-effort: store mapping in master DB
 	thc := &oocmgrdto.TenantHydraClient{
-		TenantID: tenantID, TenantName: tenantName,
+		WorkspaceID: tenantID, TenantName: tenantName,
 		HydraClientID:     oidcClientID,
 		HydraClientSecret: "not-used-for-oidc-config",
 		ClientName:        fmt.Sprintf("%s AuthSec OIDC Config", tenantName),

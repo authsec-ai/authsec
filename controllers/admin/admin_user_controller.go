@@ -35,7 +35,7 @@ var (
 
 // TenantUserListRequest represents payload for listing tenant users
 type TenantUserListRequest struct {
-	TenantID  string `json:"tenant_id" binding:"required"`
+	WorkspaceID  string `json:"workspace_id" binding:"required"`
 	Page      int    `json:"page"`
 	Limit     int    `json:"limit"`
 	ClientID  string `json:"client_id"`
@@ -47,7 +47,7 @@ type TenantUserListRequest struct {
 type AdminUserListRequest struct {
 	Status    string `json:"status"`     // Filter by status: "pending" or "active"
 	Provider  string `json:"provider"`   // Filter by provider
-	TenantID  string `json:"tenant_id"`  // Optional (usually from JWT)
+	WorkspaceID  string `json:"workspace_id"`  // Optional (usually from JWT)
 	ClientID  string `json:"client_id"`  // Optional
 	ProjectID string `json:"project_id"` // Optional
 	Page      int    `json:"page"`       // Pagination
@@ -55,7 +55,7 @@ type AdminUserListRequest struct {
 }
 
 type toggleAdminUserActiveRequest struct {
-	TenantID string               `json:"tenant_id" binding:"required"`
+	WorkspaceID string               `json:"workspace_id" binding:"required"`
 	UserID   string               `json:"user_id" binding:"required"`
 	Active   *shared.FlexibleBool `json:"active" binding:"required"`
 }
@@ -176,8 +176,8 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 		}
 
 		// Fetch and add roles for this user
-		if user.TenantID != nil {
-			roles, err := auc.adminUserRepo.GetUserRoles(user.ID, *user.TenantID)
+		if user.WorkspaceID != nil {
+			roles, err := auc.adminUserRepo.GetUserRoles(user.ID, *user.WorkspaceID)
 			if err != nil {
 				log.Printf("%s: failed to get roles for user %s: %v", logPrefix, user.ID, err)
 				payload["roles"] = []interface{}{} // Return empty array on error
@@ -271,9 +271,9 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	}
 
 	// Validate and parse tenant ID
-	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.TenantID))
+	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.TenantID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
@@ -294,8 +294,8 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	}
 
 	// Validate tenant ownership
-	if adminUser.TenantID == nil || !strings.EqualFold(adminUser.TenantID.String(), tenantUUID.String()) {
-		logger.WithField("admin_tenant_id", adminUser.TenantID).Warn("Admin user belongs to different tenant")
+	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), tenantUUID.String()) {
+		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}
@@ -429,13 +429,13 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 
 	// Get authenticated user info
 	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil || strings.TrimSpace(userInfo.TenantID) == "" {
+	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
 		logger.Warn("Missing tenant scope in request")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Tenant scope is required"})
 		return
 	}
 
-	userTenant := strings.TrimSpace(userInfo.TenantID)
+	userTenant := strings.TrimSpace(userInfo.WorkspaceID)
 	logger = logger.WithField("tenant_id", userTenant)
 
 	// Fetch admin user to delete
@@ -452,8 +452,8 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	// Validate tenant ownership
-	if adminUser.TenantID == nil || !strings.EqualFold(adminUser.TenantID.String(), userTenant) {
-		logger.WithField("admin_tenant_id", adminUser.TenantID).Warn("Admin user belongs to different tenant")
+	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), userTenant) {
+		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}
@@ -529,7 +529,7 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 
 // DeleteAdminUserAllRequest is the request body for hard delete
 type DeleteAdminUserAllRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	UserID   string `json:"user_id" binding:"required"`
 }
 
@@ -568,9 +568,9 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	}
 
 	// Validate and parse tenant ID
-	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.TenantID))
+	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.TenantID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
@@ -586,13 +586,13 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 
 	// Get authenticated user info to validate tenant ownership
 	userInfo := middlewares.GetUserInfo(c)
-	if userInfo == nil || strings.TrimSpace(userInfo.TenantID) == "" {
+	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
 		logger.Warn("Missing tenant scope in request")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Tenant scope is required"})
 		return
 	}
 
-	if !strings.EqualFold(strings.TrimSpace(userInfo.TenantID), tenantUUID.String()) {
+	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), tenantUUID.String()) {
 		logger.Warn("Cross-tenant deletion attempted")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cross-tenant deletion is not allowed"})
 		return
@@ -612,8 +612,8 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	}
 
 	// Validate tenant ownership
-	if adminUser.TenantID == nil || !strings.EqualFold(adminUser.TenantID.String(), tenantUUID.String()) {
-		logger.WithField("admin_tenant_id", adminUser.TenantID).Warn("Admin user belongs to different tenant")
+	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), tenantUUID.String()) {
+		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}
@@ -831,7 +831,7 @@ func (auc *AdminUserController) ListEndUsersByTenant(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, err := uuid.Parse(req.TenantID)
+	tenantUUID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -924,7 +924,7 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 	tenantID := uuid.New()
 	tenant := &models.Tenant{
 		ID:           tenantID,
-		TenantID:     tenantID,
+		WorkspaceID:     tenantID,
 		Email:        input.Email,
 		Username:     &input.Username,
 		PasswordHash: hashedPassword,
@@ -1013,7 +1013,7 @@ func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 
 // GetTenantUsers retrieves all users for a specific tenant
 func (auc *AdminUserController) GetTenantUsers(c *gin.Context) {
-	tenantIDStr := c.Param("tenant_id")
+	tenantIDStr := c.Param("workspace_id")
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error":     "Per-tenant user listing is managed by mt-plugin",
 		"tenant_id": tenantIDStr,
@@ -1205,10 +1205,10 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 	}
 
 	// Validate and parse tenant ID
-	tenantIDStr := strings.TrimSpace(req.TenantID)
+	tenantIDStr := strings.TrimSpace(req.WorkspaceID)
 	tenantUUID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.TenantID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
@@ -1310,7 +1310,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "delete_tenant")
 
 	// Get tenant_id from path parameter
-	tenantIDParam := c.Param("tenant_id")
+	tenantIDParam := c.Param("workspace_id")
 	if tenantIDParam == "" {
 		logger.Warn("Missing tenant_id parameter")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
@@ -1339,12 +1339,12 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	// Must be either:
 	// 1. A super admin (tenant_id is "admin" or empty)
 	// 2. The primary admin of the tenant being deleted
-	isSuperAdmin := userInfo.TenantID == "" || userInfo.TenantID == "admin"
-	isPrimaryAdminOfTenant := strings.EqualFold(userInfo.TenantID, tenantUUID.String())
+	isSuperAdmin := userInfo.WorkspaceID == "" || userInfo.WorkspaceID == "admin"
+	isPrimaryAdminOfTenant := strings.EqualFold(userInfo.WorkspaceID, tenantUUID.String())
 
 	if !isSuperAdmin && !isPrimaryAdminOfTenant {
 		logger.WithFields(map[string]interface{}{
-			"requester_tenant": userInfo.TenantID,
+			"requester_tenant": userInfo.WorkspaceID,
 			"target_tenant":    tenantUUID.String(),
 		}).Warn("Permission denied: not authorized to delete this tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Only super admins or the tenant's primary admin can delete a tenant"})

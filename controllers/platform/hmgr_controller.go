@@ -185,7 +185,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 			})
 			return
 		}
-		if !strings.EqualFold(arcCtx.TenantID, tenantID) {
+		if !strings.EqualFold(arcCtx.WorkspaceID, tenantID) {
 			c.JSON(http.StatusForbidden, gin.H{
 				"success": false,
 				"error":   "user token tenant does not match login challenge tenant",
@@ -193,7 +193,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 			return
 		}
 		mcpAuthCtx = arcCtx
-		expectedTenantID = arcCtx.TenantID
+		expectedTenantID = arcCtx.WorkspaceID
 	} else {
 		clientDetails, _, hydraErr := ctrl.service.GetHydraClient(hydraClientID)
 		if hydraErr != nil {
@@ -245,7 +245,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"username":    username,
 		"provider":    user.Provider,
 		"provider_id": user.ProviderID,
-		"tenant_id":   user.TenantID,
+		"tenant_id":   user.WorkspaceID,
 		"project_id":  user.ProjectID,
 		"client_id":   expectedClientID,
 		"avatar_url":  user.AvatarURL,
@@ -367,7 +367,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 			return
 		}
 
-		tenantIDForOIDC := arcCtx.TenantID
+		tenantIDForOIDC := arcCtx.WorkspaceID
 
 		// OIDC prompt/max_age enforcement (OpenID Connect Core 1.0 §3.1.2.1)
 		if arcCtx.Prompt != nil {
@@ -568,7 +568,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 		})
 		return
 	}
-	workspaceID, parseErr := uuid.Parse(arcCtx.TenantID)
+	workspaceID, parseErr := uuid.Parse(arcCtx.WorkspaceID)
 	if parseErr != nil {
 		c.JSON(http.StatusInternalServerError, hydramodels.AuthInitiateResponse{
 			Success: false,
@@ -923,7 +923,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		if applied, bindErr := ctrl.onboardingService.EnsureDefaultAccessBinding(
 			c.Request.Context(),
 			consentRequest.Subject,
-			arcCtx.TenantID,
+			arcCtx.WorkspaceID,
 			rs,
 		); bindErr != nil {
 			// Default access binding is best-effort. EnsureDefaultAccessBinding
@@ -943,7 +943,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		// ResolveWithReport is fail-closed: any error = no scopes granted.
 		report, scopeErr := ctrl.scopeResolver.ResolveWithReport(
 			c.Request.Context(),
-			arcCtx.TenantID, consentRequest.Subject, arcCtx.ResourceServerID,
+			arcCtx.WorkspaceID, consentRequest.Subject, arcCtx.ResourceServerID,
 			requestedScopes,
 			rs,
 			mcpClient,
@@ -972,7 +972,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		forceConsent := arcCtx.Prompt != nil && *arcCtx.Prompt == "consent"
 		var existingGrant *models.OAuthConsentGrant
 		if !forceConsent && mcpClient != nil {
-			tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
+			tenantUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
 			subjectUUID, _ := uuid.Parse(consentRequest.Subject)
 			if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
 				// Pass report.UserEffective (full RBAC set), NOT report.Grantable.
@@ -1015,7 +1015,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 				return
 			}
 			// Load scope metadata for enriched consent page rendering
-			tenantUUIDForMeta, _ := uuid.Parse(arcCtx.TenantID)
+			tenantUUIDForMeta, _ := uuid.Parse(arcCtx.WorkspaceID)
 			allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(tenantUUIDForMeta, rs.ID)
 			scopeMeta := make(map[string]*models.OAuthScope, len(allScopes))
 			for i := range allScopes {
@@ -1103,7 +1103,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	}
 
 	sessionClaims := map[string]interface{}{
-		"tenant_id":          arcCtx.TenantID,
+		"tenant_id":          arcCtx.WorkspaceID,
 		"resource_server_id": arcCtx.ResourceServerID,
 		"context_id":         arcCtx.ContextID,
 		"auth_time":          time.Now().Unix(),
@@ -1139,12 +1139,12 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 		return false
 	}
 
-	tenantUUID, _ := uuid.Parse(arcCtx.TenantID)
+	tenantUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
 	subjectUUID, _ := uuid.Parse(consentRequest.Subject)
 	if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
 		now := time.Now().UTC()
 		state := models.TenantEndUserState{
-			TenantID:       tenantUUID,
+			WorkspaceID:       tenantUUID,
 			UserID:         subjectUUID,
 			Status:         models.EndUserStatusActive,
 			FirstConsentAt: now,
@@ -1159,7 +1159,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 			}).
 			FirstOrCreate(&state).Error; err != nil {
 			log.Printf("[MCP_AUTH] ConsentHandler: failed to upsert end-user state tenant=%s user=%s context_id=%s: %v",
-				arcCtx.TenantID, consentRequest.Subject, arcCtx.ContextID, err)
+				arcCtx.WorkspaceID, consentRequest.Subject, arcCtx.ContextID, err)
 		}
 	}
 
@@ -1375,7 +1375,7 @@ func (ctrl *HmgrController) LoginChallengeHandler(c *gin.Context) {
 // GenerateLoginURLHandler generates a login URL for testing
 func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 	var req struct {
-		TenantID    string `json:"tenant_id"`
+		WorkspaceID    string `json:"workspace_id"`
 		OrgID       string `json:"org_id"`
 		RedirectURI string `json:"redirect_uri"`
 		State       string `json:"state"`
@@ -1394,7 +1394,7 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 
 	var tenantClientID string
 	for _, client := range clients {
-		if tenantID, ok := client.Metadata["tenant_id"].(string); ok && tenantID == req.TenantID {
+		if tenantID, ok := client.Metadata["tenant_id"].(string); ok && tenantID == req.WorkspaceID {
 			if orgID, ok := client.Metadata["org_id"].(string); ok && orgID == req.OrgID {
 				if clientType, ok := client.Metadata["type"].(string); ok && clientType == "tenant_main_client" {
 					tenantClientID = client.ClientID
@@ -1606,7 +1606,7 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 	query.Set("user_name", user.Name)
 	query.Set("provider", user.Provider)
 	query.Set("client_id", user.ClientID.String())
-	query.Set("tenant_id", user.TenantID.String())
+	query.Set("tenant_id", user.WorkspaceID.String())
 	query.Set("project_id", user.ProjectID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
@@ -1626,7 +1626,7 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 // shape, but only the workspace_id segment is validated against the relay
 // state — per-Application restriction is enforced at initiate, not here.
 func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
-	workspaceIDParam := c.Param("tenant_id")
+	workspaceIDParam := c.Param("workspace_id")
 
 	var req hydramodels.SAMLCallbackRequest
 	if err := c.ShouldBind(&req); err != nil {
@@ -1676,7 +1676,7 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 	query.Set("user_name", user.Name)
 	query.Set("provider", user.Provider)
 	query.Set("client_id", user.ClientID.String())
-	query.Set("tenant_id", user.TenantID.String())
+	query.Set("tenant_id", user.WorkspaceID.String())
 	query.Set("project_id", user.ProjectID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
@@ -1763,7 +1763,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		Provider:   "saml-" + providerName,
 		ProviderID: nameID,
 		ClientID:   parsedClientID,
-		TenantID:   parsedTenantID,
+		WorkspaceID:   parsedTenantID,
 		Active:     true,
 	}
 
@@ -1779,7 +1779,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		"username":    user.Username,
 		"provider":    user.Provider,
 		"provider_id": user.ProviderID,
-		"tenant_id":   user.TenantID,
+		"tenant_id":   user.WorkspaceID,
 		"client_id":   user.ClientID,
 	})
 	if err != nil {
@@ -1793,7 +1793,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 // v4: per-Application restriction is enforced via
 // application_identity_provider_policies, not by URL path scoping.
 func (ctrl *HmgrController) GetSAMLMetadataHandler(c *gin.Context) {
-	workspaceID, err := uuid.Parse(c.Param("tenant_id"))
+	workspaceID, err := uuid.Parse(c.Param("workspace_id"))
 	if err != nil {
 		c.XML(http.StatusBadRequest, gin.H{"error": "Invalid workspace id"})
 		return
@@ -1837,10 +1837,10 @@ func (ctrl *HmgrController) CreateTenantHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"message": "CreateTenant endpoint - to be implemented"})
 }
 func (ctrl *HmgrController) UpdateTenantHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "UpdateTenant endpoint - to be implemented", "tenant_id": c.Param("id")})
+	c.JSON(http.StatusOK, gin.H{"message": "UpdateTenant endpoint - to be implemented", "workspace_id": c.Param("id")})
 }
 func (ctrl *HmgrController) DeleteTenantHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"message": "DeleteTenant endpoint - to be implemented", "tenant_id": c.Param("id")})
+	c.JSON(http.StatusOK, gin.H{"message": "DeleteTenant endpoint - to be implemented", "workspace_id": c.Param("id")})
 }
 func (ctrl *HmgrController) GetRolesHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "GetRoles endpoint - to be implemented", "roles": []interface{}{}})

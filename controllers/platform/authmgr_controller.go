@@ -247,7 +247,7 @@ func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 
 // GetAuthStatus returns auth debug info for a tenant/email combination.
 func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	email := c.Query("email")
 	if tenantID == "" || email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and email are required"})
@@ -391,8 +391,8 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 
 	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":    req.TenantID,
-		"workspace_id": req.TenantID,
+		"tenant_id":    req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,
@@ -770,7 +770,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(req.TenantID)
+	tenantID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
@@ -784,7 +784,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		if db.Where("name = ? AND (tenant_id = ? OR tenant_id IS NULL)", name, tenantID).First(&existing).Error == nil {
 			continue
 		}
-		g := sharedmodels.Group{TenantID: &tenantID, Name: name}
+		g := sharedmodels.Group{WorkspaceID: &tenantID, Name: name}
 		if err := db.Create(&g).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group", "details": err.Error()})
 			return
@@ -792,13 +792,13 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		created = append(created, g)
 	}
 
-	log.Printf("[authmgr CreateGroup] tenant=%s created %d groups", req.TenantID, len(created))
+	log.Printf("[authmgr CreateGroup] tenant=%s created %d groups", req.WorkspaceID, len(created))
 	c.JSON(http.StatusCreated, gin.H{"message": "groups created", "groups": created, "count": len(created)})
 }
 
 // ListGroups lists all groups for a tenant.
 func (ac *AuthmgrController) ListGroups(c *gin.Context) {
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	if tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
 		return
@@ -822,7 +822,7 @@ func (ac *AuthmgrController) ListGroups(c *gin.Context) {
 // GetGroup retrieves a specific group by ID.
 func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 	idParam := c.Param("id")
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	if tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
 		return
@@ -853,7 +853,7 @@ func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		TenantID    string `json:"tenant_id" binding:"required"`
+		WorkspaceID    string `json:"workspace_id" binding:"required"`
 		Name        string `json:"name"`
 		Description string `json:"description"`
 	}
@@ -867,7 +867,7 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.TenantID)
+	tid, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
@@ -896,7 +896,7 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 // DeleteGroup removes a group from the tenant database.
 func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 	idParam := c.Param("id")
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	if tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
 		return
@@ -931,7 +931,7 @@ func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		TenantID string   `json:"tenant_id" binding:"required"`
+		WorkspaceID string   `json:"workspace_id" binding:"required"`
 		UserIDs  []string `json:"user_ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -944,7 +944,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.TenantID)
+	tid, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
@@ -985,7 +985,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		TenantID string   `json:"tenant_id" binding:"required"`
+		WorkspaceID string   `json:"workspace_id" binding:"required"`
 		UserIDs  []string `json:"user_ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -998,7 +998,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.TenantID)
+	tid, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
 		return
@@ -1038,7 +1038,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 // ListGroupUsers returns users belonging to a group.
 func (ac *AuthmgrController) ListGroupUsers(c *gin.Context) {
 	idParam := c.Param("id")
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	if tenantID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
 		return

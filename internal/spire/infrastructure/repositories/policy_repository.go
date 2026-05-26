@@ -52,7 +52,7 @@ func (r *PostgresPolicyRepository) Create(ctx context.Context, policy *models.At
 
 	_, err = r.db.ExecContext(ctx, query,
 		policy.ID,
-		policy.TenantID,
+		policy.WorkspaceID,
 		policy.Name,
 		policy.Description,
 		policy.AttestationType,
@@ -90,7 +90,7 @@ func (r *PostgresPolicyRepository) Update(ctx context.Context, policy *models.At
 
 	result, err := r.db.ExecContext(ctx, query,
 		policy.ID,
-		policy.TenantID,
+		policy.WorkspaceID,
 		policy.Name,
 		policy.Description,
 		policy.AttestationType,
@@ -184,7 +184,7 @@ func (r *PostgresPolicyRepository) scanPolicy(ctx context.Context, query string,
 
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(
 		&policy.ID,
-		&policy.TenantID,
+		&policy.WorkspaceID,
 		&policy.Name,
 		&policy.Description,
 		&policy.AttestationType,
@@ -226,7 +226,7 @@ func (r *PostgresPolicyRepository) queryPolicies(ctx context.Context, query stri
 
 		err := rows.Scan(
 			&policy.ID,
-			&policy.TenantID,
+			&policy.WorkspaceID,
 			&policy.Name,
 			&policy.Description,
 			&policy.AttestationType,

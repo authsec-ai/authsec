@@ -33,7 +33,7 @@ func NewWorkloadEntryService(
 // CreateEntry creates a new workload entry
 func (s *WorkloadEntryService) CreateEntry(ctx context.Context, entry *models.WorkloadEntry) (*models.WorkloadEntry, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id": entry.TenantID,
+		"tenant_id": entry.WorkspaceID,
 		"spiffe_id": entry.SpiffeID,
 		"parent_id": entry.ParentID,
 	}).Info("Creating workload entry")
@@ -44,9 +44,9 @@ func (s *WorkloadEntryService) CreateEntry(ctx context.Context, entry *models.Wo
 	}
 
 	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, entry.TenantID)
+	tenantDB, err := s.connManager.GetTenantDB(ctx, entry.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", entry.TenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("tenant_id", entry.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
 
@@ -54,7 +54,7 @@ func (s *WorkloadEntryService) CreateEntry(ctx context.Context, entry *models.Wo
 	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
 
 	// Check if entry with same SPIFFE ID already exists
-	existing, err := repo.GetBySpiffeID(ctx, entry.TenantID, entry.SpiffeID)
+	existing, err := repo.GetBySpiffeID(ctx, entry.WorkspaceID, entry.SpiffeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check existing entry: %w", err)
 	}
@@ -98,7 +98,7 @@ func (s *WorkloadEntryService) GetEntry(ctx context.Context, tenantID, entryID s
 	}
 
 	// Verify entry belongs to tenant
-	if entry.TenantID != tenantID {
+	if entry.WorkspaceID != tenantID {
 		return nil, fmt.Errorf("workload entry does not belong to tenant")
 	}
 
@@ -108,14 +108,14 @@ func (s *WorkloadEntryService) GetEntry(ctx context.Context, tenantID, entryID s
 // ListEntries retrieves workload entries based on filter
 func (s *WorkloadEntryService) ListEntries(ctx context.Context, filter *models.WorkloadEntryFilter) ([]*models.WorkloadEntry, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id": filter.TenantID,
+		"tenant_id": filter.WorkspaceID,
 		"parent_id": filter.ParentID,
 	}).Info("Listing workload entries")
 
 	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, filter.TenantID)
+	tenantDB, err := s.connManager.GetTenantDB(ctx, filter.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", filter.TenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("tenant_id", filter.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
 
@@ -129,7 +129,7 @@ func (s *WorkloadEntryService) ListEntries(ctx context.Context, filter *models.W
 	}
 
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id": filter.TenantID,
+		"tenant_id": filter.WorkspaceID,
 		"count":     len(entries),
 	}).Info("Workload entries retrieved")
 
@@ -167,7 +167,7 @@ func (s *WorkloadEntryService) ListEntriesByParent(ctx context.Context, tenantID
 func (s *WorkloadEntryService) UpdateEntry(ctx context.Context, entry *models.WorkloadEntry) (*models.WorkloadEntry, error) {
 	s.logger.WithFields(logrus.Fields{
 		"id":        entry.ID,
-		"tenant_id": entry.TenantID,
+		"tenant_id": entry.WorkspaceID,
 	}).Info("Updating workload entry")
 
 	// Validate entry
@@ -176,9 +176,9 @@ func (s *WorkloadEntryService) UpdateEntry(ctx context.Context, entry *models.Wo
 	}
 
 	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, entry.TenantID)
+	tenantDB, err := s.connManager.GetTenantDB(ctx, entry.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", entry.TenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("tenant_id", entry.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
 
@@ -193,7 +193,7 @@ func (s *WorkloadEntryService) UpdateEntry(ctx context.Context, entry *models.Wo
 	if existing == nil {
 		return nil, fmt.Errorf("workload entry not found: %s", entry.ID)
 	}
-	if existing.TenantID != entry.TenantID {
+	if existing.WorkspaceID != entry.WorkspaceID {
 		return nil, fmt.Errorf("workload entry does not belong to tenant")
 	}
 
@@ -232,7 +232,7 @@ func (s *WorkloadEntryService) DeleteEntry(ctx context.Context, tenantID, entryI
 	if existing == nil {
 		return fmt.Errorf("workload entry not found: %s", entryID)
 	}
-	if existing.TenantID != tenantID {
+	if existing.WorkspaceID != tenantID {
 		return fmt.Errorf("workload entry does not belong to tenant")
 	}
 
@@ -249,12 +249,12 @@ func (s *WorkloadEntryService) DeleteEntry(ctx context.Context, tenantID, entryI
 // CountEntries returns the total count of workload entries matching the filter
 // This is used for pagination to show accurate total count
 func (s *WorkloadEntryService) CountEntries(ctx context.Context, filter *models.WorkloadEntryFilter) (int, error) {
-	s.logger.WithField("tenant_id", filter.TenantID).Debug("Counting workload entries")
+	s.logger.WithField("tenant_id", filter.WorkspaceID).Debug("Counting workload entries")
 
 	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, filter.TenantID)
+	tenantDB, err := s.connManager.GetTenantDB(ctx, filter.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", filter.TenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("tenant_id", filter.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return 0, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
 

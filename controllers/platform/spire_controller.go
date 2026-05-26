@@ -50,7 +50,7 @@ func (SpireWorkload) TableName() string { return "spire_workloads" }
 // so that SPIRE agents can look up and attest workloads.
 type WorkloadEntry struct {
 	ID           uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID     uuid.UUID       `json:"tenant_id" gorm:"type:uuid;not null"`
+	WorkspaceID  uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
 	SpiffeID     string          `json:"spiffe_id" gorm:"type:varchar(512);uniqueIndex;not null"`
 	ParentID     string          `json:"parent_id" gorm:"type:varchar(512);not null"`
 	Selectors    json.RawMessage `json:"selectors" gorm:"type:jsonb;not null"`
@@ -337,7 +337,7 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 			First(&rs).Error; err == nil {
 			id := rs.ID
 			applicationID = &id
-			if rs.WorkspaceID != nil {
+			if rs.WorkspaceID != uuid.Nil {
 				workspaceUUIDStr = rs.WorkspaceID.String()
 			}
 		}
@@ -409,12 +409,12 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	tenantDB := config.DB
 	{
 		entry := WorkloadEntry{
-			ID:        uuid.New(),
-			TenantID:  tenantUUID,
-			SpiffeID:  fullSpiffeID,
-			ParentID:  parentID,
-			Selectors: selectorsJSON,
-			TTL:       3600,
+			ID:          uuid.New(),
+			WorkspaceID: tenantUUID,
+			SpiffeID:    fullSpiffeID,
+			ParentID:    parentID,
+			Selectors:   selectorsJSON,
+			TTL:         3600,
 		}
 		if err := tenantDB.Create(&entry).Error; err != nil {
 			log.Printf("[SPIRE] Warning: failed to save workload entry: %v", err)
@@ -1027,9 +1027,9 @@ func (sc *SpireController) OIDCExchangeAzure(c *gin.Context) {
 		return
 	}
 	var req struct {
-		TenantID   string `json:"tenant_id" binding:"required"`
-		ResourceID string `json:"resource_id,omitempty"`
-		Scope      string `json:"scope,omitempty"`
+		WorkspaceID string `json:"workspace_id" binding:"required"`
+		ResourceID  string `json:"resource_id,omitempty"`
+		Scope       string `json:"scope,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
@@ -1038,7 +1038,7 @@ func (sc *SpireController) OIDCExchangeAzure(c *gin.Context) {
 	if req.ResourceID == "" {
 		req.ResourceID = "https://management.azure.com/"
 	}
-	audience := "https://login.microsoftonline.com/" + req.TenantID + "/v2.0"
+	audience := "https://login.microsoftonline.com/" + req.WorkspaceID + "/v2.0"
 	jwtSVID := sc.extractBearerToken(c)
 	if jwtSVID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})

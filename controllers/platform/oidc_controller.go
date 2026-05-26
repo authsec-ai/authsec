@@ -61,8 +61,8 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 
 	// Fetch admin roles from database
 	var roles []string
-	if adminUser.TenantID != nil && *adminUser.TenantID != uuid.Nil {
-		rolesFromDB, err := oc.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.TenantID)
+	if adminUser.WorkspaceID != nil && *adminUser.WorkspaceID != uuid.Nil {
+		rolesFromDB, err := oc.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.WorkspaceID)
 		if err == nil {
 			roles = rolesFromDB
 		} else {
@@ -79,7 +79,7 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 		adminUser.ID,
 		adminUser.Email,
 		projectID,
-		adminUser.TenantID,
+		adminUser.WorkspaceID,
 		adminUser.TenantDomain,
 		roles,
 	)
@@ -189,8 +189,8 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 		if err == nil && existingTenant != nil {
 			// Tenant exists → LOGIN flow (user must exist in this tenant)
 			action = "login"
-			tenantID = &existingTenant.TenantID
-			log.Printf("OIDC: Tenant '%s' found (tenant_id=%s), initiating LOGIN flow", input.TenantDomain, existingTenant.TenantID)
+			tenantID = &existingTenant.WorkspaceID
+			log.Printf("OIDC: Tenant '%s' found (tenant_id=%s), initiating LOGIN flow", input.TenantDomain, existingTenant.WorkspaceID)
 		} else {
 			// Tenant doesn't exist → REGISTER flow (create new tenant)
 			action = "register"
@@ -456,7 +456,7 @@ func (oc *OIDCController) InitiateLogin(c *gin.Context) {
 	oc.oidcService.SetRequestHost(c.Request.Host)
 
 	// Initiate OIDC flow with action "login" and tenant ID
-	response, err := oc.oidcService.InitiateOIDCFlow(&input, "login", &tenant.TenantID)
+	response, err := oc.oidcService.InitiateOIDCFlow(&input, "login", &tenant.WorkspaceID)
 	if err != nil {
 		log.Printf("Failed to initiate OIDC login: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -581,7 +581,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": err.Error()})
 		return
 	}
-	if state.TenantID == nil {
+	if state.WorkspaceID == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "workspace_id missing from OIDC state"})
 		return
 	}
@@ -590,7 +590,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		return
 	}
 
-	workspaceID := *state.TenantID
+	workspaceID := *state.WorkspaceID
 
 	// 1. Resolve the local user by IdP identity first, fall back to email.
 	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(
@@ -637,7 +637,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		// bookkeeping.
 		profileJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 		if err := oc.oidcService.CreateIdentity(&models.OIDCUserIdentity{
-			TenantID:       workspaceID,
+			WorkspaceID:       workspaceID,
 			UserID:         user.ID,
 			ProviderName:   state.ProviderName,
 			ProviderUserID: userInfo.Sub,
@@ -768,20 +768,20 @@ func (oc *OIDCController) ExchangeCode(c *gin.Context) {
 
 // handleLoginAndGenerateToken is a modified version of handleLoginCallback for the SPA flow
 func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
-	if state.TenantID == nil {
+	if state.WorkspaceID == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID missing from state"})
 		return
 	}
 
 	// Get tenant info first
-	_, err := oc.tenantRepo.GetTenantByID(state.TenantID.String())
+	_, err := oc.tenantRepo.GetTenantByID(state.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant info"})
 		return
 	}
 
 	// Check if user has OIDC identity in this tenant
-	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(*state.TenantID, state.ProviderName, userInfo.Sub)
+	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(*state.WorkspaceID, state.ProviderName, userInfo.Sub)
 
 	var user *models.ExtendedUser
 
@@ -796,7 +796,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 		oc.oidcService.UpdateLastLogin(identity.ID)
 	} else {
 		// No OIDC identity - check if user exists by email in this tenant
-		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, *state.TenantID)
+		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, *state.WorkspaceID)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace"})
 			return
@@ -812,7 +812,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 		// User exists by email but no OIDC identity - link the OIDC provider
 		profileDataJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 		newIdentity := &models.OIDCUserIdentity{
-			TenantID:       *state.TenantID,
+			WorkspaceID:       *state.WorkspaceID,
 			UserID:         user.ID,
 			ProviderName:   state.ProviderName,
 			ProviderUserID: userInfo.Sub,
@@ -840,7 +840,7 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 		if existingIdentity == nil {
 			profileDataJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 			identity := &models.OIDCUserIdentity{
-				TenantID:       existingUser.TenantID,
+				WorkspaceID:       existingUser.WorkspaceID,
 				UserID:         existingUser.ID,
 				ProviderName:   state.ProviderName,
 				ProviderUserID: userInfo.Sub,
@@ -907,7 +907,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 	}
 
 	c.JSON(http.StatusOK, models.LoginResponse{
-		TenantID:     user.TenantID.String(),
+		WorkspaceID:     user.WorkspaceID.String(),
 		TenantDomain: tenantDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
@@ -921,7 +921,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	existingIdentity, err := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
 	if err == nil && existingIdentity != nil {
 		// User already registered with this provider - redirect to their tenant
-		tenant, _ := oc.tenantRepo.GetTenantByID(existingIdentity.TenantID.String())
+		tenant, _ := oc.tenantRepo.GetTenantByID(existingIdentity.WorkspaceID.String())
 		if tenant != nil {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":         "Account already exists",
@@ -934,7 +934,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create new tenant and user
 	// Note: In admin registration pattern, tenant_id = client_id for the default client
-	// tenantID is used for tenant.TenantID (business key)
+	// tenantID is used for tenant.WorkspaceID (business key)
 	// tenant.ID (primary key) is auto-generated and used for FK references
 	tenantID := uuid.New()
 	projectID := uuid.New()
@@ -958,7 +958,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
 		ID:           tenantID, // Use same ID for both id and tenant_id for simplicity
-		TenantID:     tenantID,
+		WorkspaceID:     tenantID,
 		TenantDB:     tenantDBName,
 		Email:        userInfo.Email,
 		Username:     &username,
@@ -994,7 +994,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			Name:         userInfo.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			TenantID:     tenantID,
+			WorkspaceID:     tenantID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     state.ProviderName,
@@ -1091,7 +1091,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			TenantID:   tenantID.String(),
+			WorkspaceID:   tenantID.String(),
 			CommonName: fmt.Sprintf("%s Root CA", userInfo.Name),
 			Domain:     fullDomain,
 			TTL:        "87600h", // 10 years
@@ -1195,7 +1195,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	})
 
 	identity := &models.OIDCUserIdentity{
-		TenantID:       tenantID,
+		WorkspaceID:       tenantID,
 		UserID:         userID,
 		ProviderName:   state.ProviderName,
 		ProviderUserID: userInfo.Sub,
@@ -1339,7 +1339,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
 		ID:           tenantID, // Use same ID for both id and tenant_id for simplicity
-		TenantID:     tenantID,
+		WorkspaceID:     tenantID,
 		TenantDB:     tenantDBName,
 		Email:        input.Email,
 		Username:     &username,
@@ -1375,7 +1375,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			Name:         input.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			TenantID:     tenantID,
+			WorkspaceID:     tenantID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     input.Provider,
@@ -1436,7 +1436,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			TenantID:   tenantID.String(),
+			WorkspaceID:   tenantID.String(),
 			CommonName: fmt.Sprintf("%s Root CA", input.Name),
 			Domain:     fullDomain,
 			TTL:        "87600h", // 10 years
@@ -1541,7 +1541,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	})
 
 	identity := &models.OIDCUserIdentity{
-		TenantID:       tenantID,
+		WorkspaceID:       tenantID,
 		UserID:         userID,
 		ProviderName:   input.Provider,
 		ProviderUserID: input.ProviderUserID,

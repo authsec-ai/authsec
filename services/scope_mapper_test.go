@@ -101,6 +101,37 @@ func TestMapToolsToScopes_GlobalWildcard(t *testing.T) {
 	}
 }
 
+func TestMapToolsToScopes_AuthSecCanonicalGlobalToolScope(t *testing.T) {
+	tools := makeTools("get_weather", "set_alert")
+	scopes := []string{"demo:tools:read"}
+
+	mappings, unmapped := MapToolsToScopes(tools, scopes)
+
+	if len(mappings) != 2 {
+		t.Fatalf("expected canonical global tool scope to map to every tool, got %d", len(mappings))
+	}
+	if len(unmapped) != 0 {
+		t.Fatalf("expected 0 unmapped, got %v", unmapped)
+	}
+}
+
+func TestMapToolsToScopes_AuthSecCanonicalPerToolScope(t *testing.T) {
+	tools := makeTools("get-weather", "set_alert")
+	scopes := []string{"demo:tool:get_weather:invoke"}
+
+	mappings, unmapped := MapToolsToScopes(tools, scopes)
+
+	if len(mappings) != 1 {
+		t.Fatalf("expected one per-tool mapping, got %d", len(mappings))
+	}
+	if mappings[0].ToolName != "get-weather" {
+		t.Fatalf("expected original tool name, got %q", mappings[0].ToolName)
+	}
+	if len(unmapped) != 0 {
+		t.Fatalf("expected 0 unmapped, got %v", unmapped)
+	}
+}
+
 func TestMapToolsToScopes_MCPGlobalWildcard(t *testing.T) {
 	tools := makeTools("get_weather", "set_alert")
 	scopes := []string{"mcp:tools:*"}

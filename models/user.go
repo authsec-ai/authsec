@@ -13,7 +13,7 @@ import (
 // TenantMapping represents the mapping between tenants and clients
 type TenantMapping struct {
 	ID        uuid.UUID `json:"id" gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ClientID  uuid.UUID `json:"client_id" gorm:"type:uuid;uniqueIndex;not null"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -21,7 +21,7 @@ type TenantMapping struct {
 
 // LoginResponse represents the response for login operations
 type LoginResponse struct {
-	TenantID         string   `json:"tenant_id"`
+	WorkspaceID         string   `json:"workspace_id"`
 	TenantDomain     string   `json:"tenant_domain,omitempty"`
 	Email            string   `json:"email"`
 	FirstLogin       bool     `json:"first_login"`
@@ -37,7 +37,7 @@ type LoginResponse struct {
 type LoginVerifyOTPInput struct {
 	Email    string `json:"email" binding:"required,email"`
 	OTP      string `json:"otp" binding:"required,len=6"`
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 }
 
 // LoginVerifyOTPResponse represents the response for login OTP verification
@@ -95,7 +95,7 @@ type AdminUser struct {
 	PasswordHash               string          `json:"-" gorm:"column:password_hash;not null"`
 	Name                       string          `json:"name"`
 	ClientID                   *uuid.UUID      `json:"client_id,omitempty" gorm:"column:client_id"`
-	TenantID                   *uuid.UUID      `json:"tenant_id,omitempty" gorm:"column:tenant_id"`
+	WorkspaceID                   *uuid.UUID      `json:"workspace_id,omitempty" gorm:"column:tenant_id"`
 	ProjectID                  *uuid.UUID      `json:"project_id,omitempty" gorm:"column:project_id"`
 	TenantDomain               string          `json:"tenant_domain,omitempty" gorm:"column:tenant_domain"`
 	Provider                   string          `json:"provider,omitempty" gorm:"column:provider;default:'local'"`
@@ -152,7 +152,7 @@ func (u *AdminUser) CheckPassword(password string) bool {
 type RoleAssignmentRequest struct {
 	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null"`
-	TenantID  string    `json:"tenant_id" gorm:"type:varchar(255);not null"`
+	WorkspaceID  string    `json:"workspace_id" gorm:"type:varchar(255);not null"`
 	RoleID    uuid.UUID `json:"role_id" gorm:"type:uuid;not null"`
 	Reason    string    `json:"reason" gorm:"type:text"`
 	Status    string    `json:"status" gorm:"type:varchar(50);default:'pending'"` // pending, approved, rejected

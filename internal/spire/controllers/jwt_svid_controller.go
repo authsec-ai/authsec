@@ -65,7 +65,7 @@ func NewJWTSVIDController(service *services.JWTSVIDService, logger *logrus.Entry
 // IssueJWTSVID handles POST /spire/v1/jwt/issue
 func (ctrl *JWTSVIDController) IssueJWTSVID(c *gin.Context) {
 	var req struct {
-		TenantID     string                 `json:"tenant_id"`
+		WorkspaceID     string                 `json:"workspace_id"`
 		SpiffeID     string                 `json:"spiffe_id"`
 		Audience     []string               `json:"audience"`
 		TTL          int                    `json:"ttl"`
@@ -77,7 +77,7 @@ func (ctrl *JWTSVIDController) IssueJWTSVID(c *gin.Context) {
 	}
 
 	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		SpiffeID:     req.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          req.TTL,
@@ -98,7 +98,7 @@ func (ctrl *JWTSVIDController) IssueJWTSVID(c *gin.Context) {
 // ValidateJWTSVID handles POST /spire/v1/jwt/validate
 func (ctrl *JWTSVIDController) ValidateJWTSVID(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id"`
+		WorkspaceID string `json:"workspace_id"`
 		Token    string `json:"token"`
 		Audience string `json:"audience"`
 	}
@@ -108,7 +108,7 @@ func (ctrl *JWTSVIDController) ValidateJWTSVID(c *gin.Context) {
 	}
 
 	validResp, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		Token:    req.Token,
 		Audience: req.Audience,
 	})
@@ -175,7 +175,7 @@ func (ctrl *JWTSVIDController) GetJWTBundle(c *gin.Context) {
 //  4. TTL is capped to prevent long-lived delegated tokens
 func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
 	var req struct {
-		TenantID     string                 `json:"tenant_id"`
+		WorkspaceID     string                 `json:"workspace_id"`
 		SpiffeID     string                 `json:"spiffe_id"`
 		Audience     []string               `json:"audience"`
 		TTL          int                    `json:"ttl"`
@@ -191,7 +191,7 @@ func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
 	claims, _ := middleware.GetSpireClaims(c)
 
 	// Validate delegation authorization
-	if err := ctrl.validateDelegationAuth(claims, callerTenantID, req.TenantID, req.SpiffeID); err != nil {
+	if err := ctrl.validateDelegationAuth(claims, callerTenantID, req.WorkspaceID, req.SpiffeID); err != nil {
 		ctrl.sendError(c, errors.NewForbiddenError(err.Error(), err))
 		return
 	}
@@ -229,7 +229,7 @@ func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
 	}
 
 	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		SpiffeID:     req.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          req.TTL,
@@ -251,7 +251,7 @@ func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
 // Renews an existing valid JWT-SVID by issuing a new token with the same claims.
 func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id"`
+		WorkspaceID string `json:"workspace_id"`
 		Token    string `json:"token"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -259,14 +259,14 @@ func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" || req.Token == "" {
+	if req.WorkspaceID == "" || req.Token == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id and token are required", nil))
 		return
 	}
 
 	// Validate the existing token (without audience check)
 	validResp, err := ctrl.service.ValidateJWTSVID(c.Request.Context(), &services.ValidateJWTSVIDRequest{
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		Token:    req.Token,
 	})
 	if err != nil {
@@ -310,7 +310,7 @@ func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 
 	// Re-issue with same claims, fresh TTL
 	svidResp, err := ctrl.service.IssueJWTSVID(c.Request.Context(), &services.IssueJWTSVIDRequest{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		SpiffeID:     spiffeID,
 		Audience:     audience,
 		TTL:          defaultMaxDelegatedTTL,

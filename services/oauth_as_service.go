@@ -1104,9 +1104,9 @@ func (s *OAuthASService) EnrichUserinfoClaims(claims map[string]interface{}, sub
 	}
 
 	// Load most recent OIDC identity for federated claims
-	if user.TenantID != nil {
+	if user.WorkspaceID != nil {
 		var identity models.OIDCUserIdentity
-		err := s.db.Where("user_id = ? AND tenant_id = ?", userID, *user.TenantID).
+		err := s.db.Where("user_id = ? AND tenant_id = ?", userID, *user.WorkspaceID).
 			Order("last_login_at DESC NULLS LAST").
 			First(&identity).Error
 		if err == nil && identity.ProfileData != "" {

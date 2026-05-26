@@ -52,7 +52,7 @@ func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agen
 	}
 
 	_, err = r.db.ExecContext(ctx, query,
-		agent.ID, agent.TenantID, agent.NodeID, agent.SpiffeID,
+		agent.ID, agent.WorkspaceID, agent.NodeID, agent.SpiffeID,
 		agent.AttestationType, nodeSelectorsJSON, agent.CertificateSerial,
 		agent.Status, agent.ClusterName, agent.LastSeen, lastHeartbeat,
 		agent.CreatedAt, agent.UpdatedAt,
@@ -65,7 +65,7 @@ func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agen
 
 	r.logger.WithFields(logrus.Fields{
 		"agent_id":  agent.ID,
-		"tenant_id": agent.TenantID,
+		"tenant_id": agent.WorkspaceID,
 		"spiffe_id": agent.SpiffeID,
 	}).Info("Agent created")
 
@@ -88,7 +88,7 @@ func (r *PostgresAgentRepository) GetByID(ctx context.Context, id string) (*mode
 	var lastHeartbeat sql.NullTime
 
 	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&agent.ID, &agent.TenantID, &agent.NodeID, &agent.SpiffeID,
+		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
 		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
 		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
 		&agent.CreatedAt, &agent.UpdatedAt,
@@ -136,7 +136,7 @@ func (r *PostgresAgentRepository) GetBySpiffeID(ctx context.Context, spiffeID st
 	var lastHeartbeat sql.NullTime
 
 	err := r.db.QueryRowContext(ctx, query, spiffeID).Scan(
-		&agent.ID, &agent.TenantID, &agent.NodeID, &agent.SpiffeID,
+		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
 		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
 		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
 		&agent.CreatedAt, &agent.UpdatedAt,
@@ -184,7 +184,7 @@ func (r *PostgresAgentRepository) GetByTenantAndNode(ctx context.Context, tenant
 	var lastHeartbeat sql.NullTime
 
 	err := r.db.QueryRowContext(ctx, query, tenantID, nodeID).Scan(
-		&agent.ID, &agent.TenantID, &agent.NodeID, &agent.SpiffeID,
+		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
 		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
 		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
 		&agent.CreatedAt, &agent.UpdatedAt,
@@ -317,7 +317,7 @@ func (r *PostgresAgentRepository) ListByTenant(ctx context.Context, tenantID str
 		var nodeSelectorsJSON []byte
 
 		err := rows.Scan(
-			&agent.ID, &agent.TenantID, &agent.NodeID, &agent.SpiffeID,
+			&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
 			&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
 			&agent.Status, &agent.LastSeen, &agent.CreatedAt, &agent.UpdatedAt,
 		)

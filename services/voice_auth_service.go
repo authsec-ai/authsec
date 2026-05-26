@@ -98,7 +98,7 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 	// Create voice session
 	session := &models.VoiceSession{
 		ID:            uuid.New(),
-		TenantID:      tenantID,
+		WorkspaceID:      tenantID,
 		ClientID:      &clientID, // Store client_id from request
 		SessionToken:  sessionToken,
 		VoiceOTP:      voiceOTP,
@@ -181,7 +181,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 	// OTP verified successfully
 	// Check if voice user is pre-linked to an account
 	if session.VoicePlatform != "" && session.VoiceUserID != "" {
-		link, err := s.voiceRepo.FindVoiceIdentityLink(session.TenantID, session.VoicePlatform, session.VoiceUserID)
+		link, err := s.voiceRepo.FindVoiceIdentityLink(session.WorkspaceID, session.VoicePlatform, session.VoiceUserID)
 		if err == nil && link.IsActive {
 			// User is pre-linked - can issue token directly
 			s.voiceRepo.UpdateVoiceIdentityLinkLastUsed(link.ID)
@@ -197,7 +197,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 			}
 
 			// Get tenant info
-			tenant, err := s.tenantRepo.GetTenantByID(session.TenantID.String())
+			tenant, err := s.tenantRepo.GetTenantByID(session.WorkspaceID.String())
 			if err != nil {
 				return &models.VoiceVerifyResponse{
 					Success: false,
@@ -251,7 +251,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 	}
 
 	// Get tenant info
-	tenant, err := s.tenantRepo.GetTenantByID(session.TenantID.String())
+	tenant, err := s.tenantRepo.GetTenantByID(session.WorkspaceID.String())
 	if err != nil {
 		return &models.VoiceVerifyResponse{
 			Success: false,
@@ -382,7 +382,7 @@ func (s *VoiceAuthService) LinkVoiceIdentity(tenantID uuid.UUID, userID uuid.UUI
 	// Create link
 	link := &models.VoiceIdentityLink{
 		ID:            uuid.New(),
-		TenantID:      tenantID,
+		WorkspaceID:      tenantID,
 		VoicePlatform: req.VoicePlatform,
 		VoiceUserID:   req.VoiceUserID,
 		VoiceUserName: req.VoiceUserName,

@@ -132,7 +132,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	cibaRequest := &models.TenantCIBAAuthRequest{
 		AuthReqID:      authReqID,
 		UserID:         user.ID,
-		TenantID:       tenantUUID,
+		WorkspaceID:       tenantUUID,
 		UserEmail:      strings.ToLower(req.Email),
 		ClientID:       &clientUUID,
 		DeviceTokenID:  device.ID,
@@ -371,7 +371,7 @@ func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTok
 	deviceToken := &models.TenantDeviceToken{
 		ID:          uuid.New(),
 		UserID:      userID,
-		TenantID:    tenantID,
+		WorkspaceID:    tenantID,
 		DeviceToken: req.DeviceToken,
 		Platform:    req.Platform,
 		DeviceName:  req.DeviceName,

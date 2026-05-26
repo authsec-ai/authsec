@@ -60,7 +60,7 @@ func (r *PostgresWorkloadEntryRepository) Create(ctx context.Context, entry *mod
 
 	_, err = r.db.ExecContext(ctx, query,
 		entry.ID,
-		entry.TenantID,
+		entry.WorkspaceID,
 		entry.SpiffeID,
 		entry.ParentID,
 		selectorsJSON,
@@ -99,7 +99,7 @@ func (r *PostgresWorkloadEntryRepository) GetByID(ctx context.Context, id string
 
 	err := r.db.QueryRowContext(ctx, query, id).Scan(
 		&entry.ID,
-		&entry.TenantID,
+		&entry.WorkspaceID,
 		&entry.SpiffeID,
 		&entry.ParentID,
 		&selectorsJSON,
@@ -140,7 +140,7 @@ func (r *PostgresWorkloadEntryRepository) GetBySpiffeID(ctx context.Context, ten
 
 	err := r.db.QueryRowContext(ctx, query, tenantID, spiffeID).Scan(
 		&entry.ID,
-		&entry.TenantID,
+		&entry.WorkspaceID,
 		&entry.SpiffeID,
 		&entry.ParentID,
 		&selectorsJSON,
@@ -175,7 +175,7 @@ func (r *PostgresWorkloadEntryRepository) List(ctx context.Context, filter *mode
 		FROM workload_entries
 		WHERE tenant_id = $1
 	`
-	args := []interface{}{filter.TenantID}
+	args := []interface{}{filter.WorkspaceID}
 	argCount := 1
 
 	// Add optional filters
@@ -235,7 +235,7 @@ func (r *PostgresWorkloadEntryRepository) List(ctx context.Context, filter *mode
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		r.logger.WithError(err).WithField("tenant_id", filter.TenantID).Error("Failed to list workload entries")
+		r.logger.WithError(err).WithField("tenant_id", filter.WorkspaceID).Error("Failed to list workload entries")
 		return nil, fmt.Errorf("failed to list workload entries: %w", err)
 	}
 	defer rows.Close()
@@ -247,7 +247,7 @@ func (r *PostgresWorkloadEntryRepository) List(ctx context.Context, filter *mode
 
 		err := rows.Scan(
 			&entry.ID,
-			&entry.TenantID,
+			&entry.WorkspaceID,
 			&entry.SpiffeID,
 			&entry.ParentID,
 			&selectorsJSON,
@@ -285,7 +285,7 @@ func (r *PostgresWorkloadEntryRepository) Count(ctx context.Context, filter *mod
 		FROM workload_entries
 		WHERE tenant_id = $1
 	`
-	args := []interface{}{filter.TenantID}
+	args := []interface{}{filter.WorkspaceID}
 	argCount := 1
 
 	// Add optional filters (same as List method)
@@ -329,7 +329,7 @@ func (r *PostgresWorkloadEntryRepository) Count(ctx context.Context, filter *mod
 	var count int
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
-		r.logger.WithError(err).WithField("tenant_id", filter.TenantID).Error("Failed to count workload entries")
+		r.logger.WithError(err).WithField("tenant_id", filter.WorkspaceID).Error("Failed to count workload entries")
 		return 0, fmt.Errorf("failed to count workload entries: %w", err)
 	}
 
@@ -360,7 +360,7 @@ func (r *PostgresWorkloadEntryRepository) ListByParent(ctx context.Context, tena
 
 		err := rows.Scan(
 			&entry.ID,
-			&entry.TenantID,
+			&entry.WorkspaceID,
 			&entry.SpiffeID,
 			&entry.ParentID,
 			&selectorsJSON,
@@ -544,7 +544,7 @@ func (r *PostgresWorkloadEntryRepository) FindMatchingEntries(ctx context.Contex
 
 		err := rows.Scan(
 			&entry.ID,
-			&entry.TenantID,
+			&entry.WorkspaceID,
 			&entry.SpiffeID,
 			&entry.ParentID,
 			&entrySelectorsJSON,

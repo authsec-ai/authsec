@@ -348,7 +348,7 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 			Success:     success,
 			ErrorMsg:    errorMsg,
 			DBType:      mr.dbType,
-			TenantID:    mr.tenantID,
+			WorkspaceID:    mr.tenantID,
 			ExecutionMS: executionMS,
 		})
 		return
@@ -413,7 +413,7 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	return &MigrationStatusResponse{
 		DBType:          mr.dbType,
-		TenantID:        mr.tenantID,
+		WorkspaceID:        mr.tenantID,
 		LastMigration:   lastMigration,
 		TotalMigrations: len(migrations),
 		Status:          status,

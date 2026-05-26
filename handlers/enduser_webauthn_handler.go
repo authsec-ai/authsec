@@ -132,7 +132,7 @@ func (h *EndUserWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context)
 // GetMFAStatus returns the MFA status for end users
 func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 	var req struct {
-		TenantID string  `json:"tenant_id" binding:"required"`
+		WorkspaceID string  `json:"workspace_id" binding:"required"`
 		Email    string  `json:"email" binding:"required"`
 		ClientID *string `json:"client_id"` // Optional
 	}
@@ -142,7 +142,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
 		return
@@ -150,7 +150,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 
 	// Get end user by email and tenant
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+	user, err := clientRepo.GetClientByEmailAndTenant(&req.Email, &req.WorkspaceID, nil)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -173,7 +173,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 // GetMFAStatusForLogin returns MFA status for end-user login flow
 func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id" binding:"required"`
+		WorkspaceID string `json:"workspace_id" binding:"required"`
 		Email    string `json:"email" binding:"required"`
 	}
 
@@ -182,7 +182,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
 		return
@@ -190,7 +190,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 	// Get end user by email and tenant
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+	user, err := clientRepo.GetClientByEmailAndTenant(&req.Email, &req.WorkspaceID, nil)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -217,7 +217,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	}
 
 	globalRepo := repositories.NewGlobalRepository(globalDB)
-	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(req.TenantID)
+	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(req.WorkspaceID)
 	if err != nil {
 		log.Printf("GetMFAStatusForLogin: Error checking custom domain: %v", err)
 	}
@@ -268,7 +268,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 // GetMFAStatusForLoginGET returns MFA status for end-user login via GET
 func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
-	tenantID := c.Query("tenant_id")
+	tenantID := c.Query("workspace_id")
 	email := c.Query("email")
 
 	if tenantID == "" || email == "" {
@@ -374,7 +374,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 // @Router       /webauthn/enduser/beginRegistration [post]
 func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id" binding:"required"`
+		WorkspaceID string `json:"workspace_id" binding:"required"`
 		Email    string `json:"email" binding:"required"`
 		ClientID string `json:"client_id" binding:"required"`
 	}
@@ -384,7 +384,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
 		return
@@ -392,14 +392,14 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Get end user by email, tenant, and client_id
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailTenantAndClient(req.Email, req.TenantID, req.ClientID)
+	user, err := clientRepo.GetClientByEmailTenantAndClient(req.Email, req.WorkspaceID, req.ClientID)
 	if err != nil {
 		// User not found - create new user for first-time registration
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("BeginRegistration: User not found, creating new user for email=%s, tenant=%s, client=%s", req.Email, req.TenantID, req.ClientID)
+			log.Printf("BeginRegistration: User not found, creating new user for email=%s, tenant=%s, client=%s", req.Email, req.WorkspaceID, req.ClientID)
 
 			// Parse tenant_id and client_id as UUIDs
-			tenantUUID, err := uuid.Parse(req.TenantID)
+			tenantUUID, err := uuid.Parse(req.WorkspaceID)
 			if err != nil {
 				log.Printf("BeginRegistration: Invalid tenant_id format: %v", err)
 				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid tenant_id format"})
@@ -417,7 +417,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 			newUser := &sharedmodels.User{
 				ID:        uuid.New(),
 				ClientID:  clientUUID,
-				TenantID:  tenantUUID,
+				WorkspaceID:  tenantUUID,
 				Email:     req.Email,
 				Active:    true,
 				Provider:  "local",
@@ -482,14 +482,14 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Store session data using tenant-specific session manager
 	reqID := uuid.New().String()
-	sessionManager, err := h.getTenantSessionManager(req.TenantID)
+	sessionManager, err := h.getTenantSessionManager(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] BeginRegistration: Failed to get session manager - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to initialize session"})
 		return
 	}
 
-	challengeKey := buildChallengeKey("registration", req.Email, req.TenantID)
+	challengeKey := buildChallengeKey("registration", req.Email, req.WorkspaceID)
 	if err := sessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginRegistration: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
@@ -513,7 +513,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 // @Router       /webauthn/enduser/finishRegistration [post]
 func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	var req struct {
-		TenantID   string          `json:"tenant_id" binding:"required"`
+		WorkspaceID   string          `json:"workspace_id" binding:"required"`
 		Email      string          `json:"email" binding:"required"`
 		ClientID   string          `json:"client_id" binding:"required"`
 		Credential json.RawMessage `json:"credential" binding:"required"`
@@ -525,7 +525,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 
 	reqID := uuid.New().String()
-	log.Printf("[%s] FinishRegistration: Starting for email=%s, tenant=%s", reqID, req.Email, req.TenantID)
+	log.Printf("[%s] FinishRegistration: Starting for email=%s, tenant=%s", reqID, req.Email, req.WorkspaceID)
 	log.Printf("[%s] FinishRegistration: Received credential data length: %d bytes", reqID, len(req.Credential))
 	previewLen := len(req.Credential)
 	if previewLen > 200 {
@@ -533,7 +533,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 	log.Printf("[%s] FinishRegistration: Credential data preview: %s", reqID, string(req.Credential[:previewLen]))
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: DB connect failed - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
@@ -542,7 +542,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 
 	// Get end user by email, tenant, and client_id
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailTenantAndClient(req.Email, req.TenantID, req.ClientID)
+	user, err := clientRepo.GetClientByEmailTenantAndClient(req.Email, req.WorkspaceID, req.ClientID)
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: User not found - %v", reqID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -550,14 +550,14 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 
 	// Get session data using tenant-specific session manager
-	sessionManager, err := h.getTenantSessionManager(req.TenantID)
+	sessionManager, err := h.getTenantSessionManager(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: Failed to get session manager - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to initialize session"})
 		return
 	}
 
-	challengeKey := buildChallengeKey("registration", req.Email, req.TenantID)
+	challengeKey := buildChallengeKey("registration", req.Email, req.WorkspaceID)
 	sessionData, found := sessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishRegistration: No session found for key=%s", reqID, challengeKey)
@@ -725,7 +725,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"tenant_id":     req.TenantID,
+		"tenant_id":     req.WorkspaceID,
 	})
 
 	log.Printf("[%s] FinishRegistration: Completed successfully", reqID)
@@ -752,7 +752,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	log.Printf("[%s] BeginAuthentication: START", reqID)
 
 	var req struct {
-		TenantID string  `json:"tenant_id" binding:"required"`
+		WorkspaceID string  `json:"workspace_id" binding:"required"`
 		Email    string  `json:"email" binding:"required"`
 		ClientID *string `json:"client_id"` // Optional
 	}
@@ -763,7 +763,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 		return
 	}
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] BeginAuthentication: DB connect failed - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
@@ -774,12 +774,12 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	clientRepo := repositories.NewClientRepository(tenantDB)
 	var user *sharedmodels.User
 	if req.ClientID != nil && *req.ClientID != "" {
-		user, err = clientRepo.GetClientByEmailTenantAndClient(req.Email, req.TenantID, *req.ClientID)
+		user, err = clientRepo.GetClientByEmailTenantAndClient(req.Email, req.WorkspaceID, *req.ClientID)
 	} else {
-		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.WorkspaceID, nil)
 	}
 	if err != nil {
-		log.Printf("[%s] BeginAuthentication: user not found email=%s tenant_id=%s err=%v", reqID, req.Email, req.TenantID, err)
+		log.Printf("[%s] BeginAuthentication: user not found email=%s tenant_id=%s err=%v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -823,21 +823,21 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	}
 
 	// Save session data using tenant-specific session manager
-	sessionManager, err := h.getTenantSessionManager(req.TenantID)
+	sessionManager, err := h.getTenantSessionManager(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] BeginAuthentication: Failed to get session manager - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to initialize session"})
 		return
 	}
 
-	challengeKey := buildChallengeKey("authentication", req.Email, req.TenantID)
+	challengeKey := buildChallengeKey("authentication", req.Email, req.WorkspaceID)
 	if err := sessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginAuthentication: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
 		return
 	}
 
-	log.Printf("[%s] BeginAuthentication: session saved for email=%s tenant_id=%s", reqID, req.Email, req.TenantID)
+	log.Printf("[%s] BeginAuthentication: session saved for email=%s tenant_id=%s", reqID, req.Email, req.WorkspaceID)
 	c.JSON(http.StatusOK, options)
 }
 
@@ -855,7 +855,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 // @Router       /webauthn/enduser/finishAuthentication [post]
 func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	var req struct {
-		TenantID   string          `json:"tenant_id" binding:"required"`
+		WorkspaceID   string          `json:"workspace_id" binding:"required"`
 		Email      string          `json:"email" binding:"required"`
 		ClientID   *string         `json:"client_id"` // Optional
 		Credential json.RawMessage `json:"credential" binding:"required"`
@@ -870,7 +870,7 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	log.Printf("[%s] FinishAuthentication: START", reqID)
 	log.Printf("[%s] FinishAuthentication: Received credential data length: %d bytes", reqID, len(req.Credential))
 
-	tenantDB, err := h.resolveDB(req.TenantID)
+	tenantDB, err := h.resolveDB(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] FinishAuthentication: DB connect failed - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
@@ -878,14 +878,14 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	}
 
 	// Load session using tenant-specific session manager
-	sessionManager, err := h.getTenantSessionManager(req.TenantID)
+	sessionManager, err := h.getTenantSessionManager(req.WorkspaceID)
 	if err != nil {
 		log.Printf("[%s] FinishAuthentication: Failed to get session manager - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to initialize session"})
 		return
 	}
 
-	challengeKey := buildChallengeKey("authentication", req.Email, req.TenantID)
+	challengeKey := buildChallengeKey("authentication", req.Email, req.WorkspaceID)
 	sessionData, found := sessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishAuthentication: no session found for key=%s", reqID, challengeKey)
@@ -918,12 +918,12 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	clientRepo := repositories.NewClientRepository(tenantDB)
 	var user *sharedmodels.User
 	if clientID != "" {
-		user, err = clientRepo.GetClientByEmailTenantAndClient(req.Email, req.TenantID, clientID)
+		user, err = clientRepo.GetClientByEmailTenantAndClient(req.Email, req.WorkspaceID, clientID)
 	} else {
-		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.TenantID, nil)
+		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.WorkspaceID, nil)
 	}
 	if err != nil {
-		log.Printf("[%s] FinishAuthentication: user lookup failed for email=%s tenant=%s: %v", reqID, req.Email, req.TenantID, err)
+		log.Printf("[%s] FinishAuthentication: user lookup failed for email=%s tenant=%s: %v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -1032,7 +1032,7 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "authenticate", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"tenant_id":     req.TenantID,
+		"tenant_id":     req.WorkspaceID,
 		"email":         user.Email,
 	})
 

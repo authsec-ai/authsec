@@ -6,7 +6,7 @@ import (
 
 // WebAuthnRegistrationInput represents the input for WebAuthn credential registration
 type WebAuthnRegistrationInput struct {
-	TenantID           uuid.UUID  `json:"tenant_id" binding:"required"`
+	WorkspaceID           uuid.UUID  `json:"workspace_id" binding:"required"`
 	Email              string     `json:"email" binding:"required,email"`
 	CredentialID       []byte     `json:"credential_id,omitempty"`
 	PublicKey          []byte     `json:"public_key,omitempty"`

@@ -137,7 +137,7 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 	device := &models.TOTPSecret{
 		ID:         uuid.New(),
 		UserID:     userID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		Secret:     secret,
 		DeviceName: deviceName,
 		DeviceType: deviceType,
@@ -154,7 +154,7 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 	for _, code := range backupCodes {
 		backupCode := &models.BackupCode{
 			UserID:   userID,
-			TenantID: tenantID,
+			WorkspaceID: tenantID,
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
@@ -289,7 +289,7 @@ func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, tenantID uuid.UUID
 	for _, code := range backupCodes {
 		backupCode := &models.BackupCode{
 			UserID:   userID,
-			TenantID: tenantID,
+			WorkspaceID: tenantID,
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
@@ -314,7 +314,7 @@ func (s *TOTPService) LoginWithTOTP(email string, totpCode string) (*uuid.UUID, 
 // Returns true if TOTP code is valid
 func (s *TOTPService) LoginWithTOTPWithUser(user *models.ExtendedUser, totpCode string) (bool, error) {
 	// Get user's TOTP devices
-	devices, err := s.totpRepo.GetUserTOTPSecrets(user.ID, user.TenantID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(user.ID, user.WorkspaceID)
 	if err != nil {
 		return false, err
 	}

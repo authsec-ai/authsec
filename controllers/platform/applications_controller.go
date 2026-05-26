@@ -74,7 +74,7 @@ func (ctrl *ApplicationsController) Create(c *gin.Context) {
 	}
 
 	svcReq := services.CreateResourceServerRequest{
-		TenantID:             workspaceID,
+		WorkspaceID:             workspaceID,
 		Name:                 req.Name,
 		PublicBaseURL:        req.PublicBaseURL,
 		ProtectedBasePath:    req.ProtectedBasePath,

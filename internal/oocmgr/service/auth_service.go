@@ -29,7 +29,7 @@ func (as *AuthService) CreateConfig(c *gin.Context, req *oocmgrdto.CreateConfigR
 		ID:          uuid.New(),
 		Name:        req.Name,
 		OrgID:       req.OrgID,
-		TenantID:    req.TenantID,
+		WorkspaceID:    req.WorkspaceID,
 		ConfigType:  req.ConfigType,
 		ConfigFiles: oocmgrdto.JSONMap(req.ConfigFiles),
 		IsActive:    req.IsActive,
@@ -98,7 +98,7 @@ func (as *AuthService) EditConfig(c *gin.Context, req *oocmgrdto.EditConfigReque
 
 	getReq := &oocmgrdto.GetConfigByIDRequest{
 		ID:       req.ID,
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		OrgID:    req.OrgID,
 	}
 	existing, err := as.authRepo.GetConfigByID(c, getReq)
@@ -114,7 +114,7 @@ func (as *AuthService) EditConfig(c *gin.Context, req *oocmgrdto.EditConfigReque
 	updateReq := &oocmgrdto.UpdateConfigRequest{
 		ID:          req.ID,
 		OrgID:       req.OrgID,
-		TenantID:    req.TenantID,
+		WorkspaceID:    req.WorkspaceID,
 		Name:        &name,
 		ConfigFiles: req.ConfigFiles,
 		IsActive:    &isActive,
@@ -139,7 +139,7 @@ func (as *AuthService) validateCreateConfigRequest(req *oocmgrdto.CreateConfigRe
 	if req.OrgID == uuid.Nil.String() {
 		return fmt.Errorf("organization ID is required")
 	}
-	if req.TenantID == uuid.Nil.String() {
+	if req.WorkspaceID == uuid.Nil.String() {
 		return fmt.Errorf("tenant ID is required")
 	}
 	if req.ConfigType == "" {
@@ -163,7 +163,7 @@ func (as *AuthService) validateUpdateConfigRequest(req *oocmgrdto.UpdateConfigRe
 	if req.ID == uuid.Nil {
 		return fmt.Errorf("configuration ID is required")
 	}
-	if req.TenantID == uuid.Nil.String() {
+	if req.WorkspaceID == uuid.Nil.String() {
 		return fmt.Errorf("tenant ID is required")
 	}
 	if req.OrgID == uuid.Nil.String() {
@@ -176,7 +176,7 @@ func (as *AuthService) validateEditConfigRequest(req *oocmgrdto.EditConfigReques
 	if req.ID == uuid.Nil {
 		return fmt.Errorf("configuration ID is required")
 	}
-	if req.TenantID == uuid.Nil.String() {
+	if req.WorkspaceID == uuid.Nil.String() {
 		return fmt.Errorf("tenant ID is required")
 	}
 	if req.OrgID == uuid.Nil.String() {

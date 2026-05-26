@@ -76,7 +76,7 @@ func (r *PostgresCertificateRepository) Create(ctx context.Context, cert *models
 
 	_, err = r.db.ExecContext(ctx, query,
 		cert.ID,
-		cert.TenantID,
+		cert.WorkspaceID,
 		cert.WorkloadID,
 		cert.SerialNumber,
 		cert.SHA256Fingerprint,
@@ -107,7 +107,7 @@ func (r *PostgresCertificateRepository) Update(ctx context.Context, cert *models
 
 	result, err := r.db.ExecContext(ctx, query,
 		cert.ID,
-		cert.TenantID,
+		cert.WorkspaceID,
 		cert.Status,
 		cert.RevokedAt,
 	)
@@ -189,7 +189,7 @@ func (r *PostgresCertificateRepository) scanCertificate(ctx context.Context, que
 
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(
 		&cert.ID,
-		&cert.TenantID,
+		&cert.WorkspaceID,
 		&cert.WorkloadID,
 		&cert.SerialNumber,
 		&cert.SHA256Fingerprint,
@@ -238,7 +238,7 @@ func (r *PostgresCertificateRepository) queryCertificates(ctx context.Context, q
 
 		err := rows.Scan(
 			&cert.ID,
-			&cert.TenantID,
+			&cert.WorkspaceID,
 			&cert.WorkloadID,
 			&cert.SerialNumber,
 			&cert.SHA256Fingerprint,

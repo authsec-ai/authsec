@@ -5,7 +5,7 @@ import "time"
 // AgentRenewRequest represents an agent SVID renewal request
 type AgentRenewRequest struct {
 	AgentID  string `json:"agent_id"`
-	TenantID string `json:"tenant_id,omitempty"` // Optional: for non-mTLS environments
+	WorkspaceID string `json:"workspace_id,omitempty"` // Optional: for non-mTLS environments
 	CSR      string `json:"csr"`
 }
 

@@ -54,7 +54,7 @@ func (r *VoiceAuthRepository) CreateVoiceSession(session *models.VoiceSession) e
 
 	_, err = r.db.Exec(query,
 		session.ID,
-		session.TenantID,
+		session.WorkspaceID,
 		session.ClientID,
 		session.SessionToken,
 		session.VoiceOTP,
@@ -91,7 +91,7 @@ func (r *VoiceAuthRepository) FindVoiceSessionByToken(sessionToken string) (*mod
 
 	err := r.db.QueryRow(query, sessionToken).Scan(
 		&vs.ID,
-		&vs.TenantID,
+		&vs.WorkspaceID,
 		&clientID,
 		&vs.SessionToken,
 		&vs.VoiceOTP,
@@ -270,7 +270,7 @@ func (r *VoiceAuthRepository) CreateVoiceIdentityLink(link *models.VoiceIdentity
 
 	_, err := r.db.Exec(query,
 		link.ID,
-		link.TenantID,
+		link.WorkspaceID,
 		link.VoicePlatform,
 		link.VoiceUserID,
 		link.VoiceUserName,
@@ -302,7 +302,7 @@ func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePla
 
 	err := r.db.QueryRow(query, tenantID, voicePlatform, voiceUserID).Scan(
 		&link.ID,
-		&link.TenantID,
+		&link.WorkspaceID,
 		&link.VoicePlatform,
 		&link.VoiceUserID,
 		&voiceUserName,
@@ -361,7 +361,7 @@ func (r *VoiceAuthRepository) ListVoiceIdentityLinks(tenantID uuid.UUID, userID 
 
 		err := rows.Scan(
 			&link.ID,
-			&link.TenantID,
+			&link.WorkspaceID,
 			&link.VoicePlatform,
 			&link.VoiceUserID,
 			&voiceUserName,
@@ -514,7 +514,7 @@ func (r *VoiceAuthRepository) CreateVoiceActiveSession(session *models.VoiceActi
 
 	_, err = r.db.Exec(query,
 		session.ID,
-		session.TenantID,
+		session.WorkspaceID,
 		session.ClientID,
 		session.UserID,
 		session.UserEmail,
@@ -778,7 +778,7 @@ func (r *VoiceAuthRepository) scanVoiceActiveSession(row *sql.Row) (*models.Voic
 
 	err := row.Scan(
 		&session.ID,
-		&session.TenantID,
+		&session.WorkspaceID,
 		&clientID,
 		&session.UserID,
 		&session.UserEmail,
@@ -853,7 +853,7 @@ func (r *VoiceAuthRepository) scanVoiceActiveSessionRow(rows *sql.Rows) (*models
 
 	err := rows.Scan(
 		&session.ID,
-		&session.TenantID,
+		&session.WorkspaceID,
 		&clientID,
 		&session.UserID,
 		&session.UserEmail,
@@ -994,7 +994,7 @@ func (r *VoiceAuthRepository) ListPendingVoiceSessions(tenantID uuid.UUID) ([]mo
 
 		err := rows.Scan(
 			&vs.ID,
-			&vs.TenantID,
+			&vs.WorkspaceID,
 			&clientID,
 			&vs.SessionToken,
 			&vs.VoiceOTP,

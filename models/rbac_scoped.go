@@ -11,9 +11,8 @@ import (
 // RBACRole represents a role in the RBAC system
 type RBACRole struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID *uuid.UUID `json:"tenant_id" gorm:"type:uuid;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
-	// WorkspaceID mirrors TenantID during the workspace transition (migration 122).
-	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition (migration 122).
 	Name        string     `json:"name" gorm:"type:text;not null;uniqueIndex:idx_roles_tenant_name"`
 	Description string     `json:"description" gorm:"type:text"`
 	IsSystem    bool       `json:"is_system" gorm:"default:false"`
@@ -38,9 +37,8 @@ func (r *RBACRole) BeforeCreate(tx *gorm.DB) error {
 // RBACPermission represents an atomic resource-action capability
 type RBACPermission struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID *uuid.UUID `json:"tenant_id" gorm:"type:uuid;uniqueIndex:idx_permissions_tenant_resource_action"`
-	// WorkspaceID mirrors TenantID during the workspace transition (migration 122).
-	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_permissions_tenant_resource_action"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition (migration 122).
 	Resource    string     `json:"resource" gorm:"type:text;not null;uniqueIndex:idx_permissions_tenant_resource_action"`
 	Action      string     `json:"action" gorm:"type:text;not null;uniqueIndex:idx_permissions_tenant_resource_action"`
 	Description string     `json:"description" gorm:"type:text"`
@@ -72,7 +70,7 @@ func (RolePermission) TableName() string {
 // ServiceAccount represents a non-human identity
 type ServiceAccount struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID    *uuid.UUID `json:"tenant_id" gorm:"type:uuid;uniqueIndex:idx_sa_tenant_id"`
+	WorkspaceID    *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_sa_tenant_id"`
 	Name        string     `json:"name" gorm:"type:text;not null"`
 	Description string     `json:"description" gorm:"type:text"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -85,9 +83,8 @@ type ServiceAccount struct {
 // check_principal CHECK constraint on the table.
 type RoleBinding struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID *uuid.UUID `json:"tenant_id" gorm:"type:uuid"`
-	// WorkspaceID mirrors TenantID during the workspace transition (migration 122).
-	WorkspaceID        *uuid.UUID      `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition (migration 122).
 	UserID             *uuid.UUID      `json:"user_id" gorm:"type:uuid"`
 	Username           string          `json:"username" gorm:"type:text"`
 	GroupID            *uuid.UUID      `json:"group_id" gorm:"type:uuid"`

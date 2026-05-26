@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,7 +33,7 @@ func NewResourceServerService(db *gorm.DB) *ResourceServerService {
 }
 
 type CreateResourceServerRequest struct {
-	TenantID          uuid.UUID `json:"tenant_id"`
+	WorkspaceID       uuid.UUID `json:"workspace_id"`
 	Name              string    `json:"name"`
 	PublicBaseURL     string    `json:"public_base_url"`
 	ProtectedBasePath string    `json:"protected_base_path"`
@@ -122,16 +123,17 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	if appType == "" {
 		appType = models.ApplicationTypeMCPServer
 	}
+	appSlug := SlugForApp(req.Name)
+	canonicalRequestedScopes := CanonicalAuthSecScopes(req.ScopesSupported, appSlug)
 
 	rs := &models.ResourceServer{
-		TenantID:                req.TenantID,
-		WorkspaceID:             &req.TenantID,
+		WorkspaceID:             req.WorkspaceID,
 		ApplicationType:         appType,
 		Name:                    req.Name,
 		PublicBaseURL:           publicURL,
 		ProtectedBasePath:       basePath,
 		ResourceURI:             resourceURI,
-		ScopesSupported:         req.ScopesSupported,
+		ScopesSupported:         canonicalRequestedScopes,
 		RegistrationModes:       modes,
 		IntrospectionSecret:     "", // Not stored in plaintext for new rows
 		IntrospectionSecretHash: string(hashedSecret),
@@ -148,7 +150,7 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 
 		// Auto-create viewer role and access policy (§3.3, §4.1 step 5).
 		viewerRole := &models.RBACRole{
-			TenantID:    &rs.TenantID,
+			WorkspaceID: &rs.WorkspaceID,
 			Name:        fmt.Sprintf("rs-%s:viewer", rs.ID.String()),
 			Description: fmt.Sprintf("Default viewer role for %s (auto-generated)", rs.Name),
 		}
@@ -164,7 +166,7 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 			policyEnabled = true
 		}
 		policy := &models.ResourceServerAccessPolicy{
-			TenantID:         rs.TenantID,
+			WorkspaceID:      rs.WorkspaceID,
 			ResourceServerID: rs.ID,
 			Enabled:          policyEnabled,
 			DefaultRoleID:    &viewerRole.ID,
@@ -178,10 +180,9 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 		// source="preset" so the UI can distinguish them from discovered ones.
 		if req.ScopePresetID != nil && *req.ScopePresetID != "" && *req.ScopePresetID != "blank" {
 			if preset, ok := GetScopePreset(*req.ScopePresetID); ok {
-				slug := SlugForApp(req.Name)
-				for _, ss := range ExpandPresetScopes(preset, slug) {
+				for _, ss := range ExpandPresetScopes(preset, appSlug) {
 					scope := models.OAuthScope{
-						TenantID:         req.TenantID,
+						WorkspaceID:      req.WorkspaceID,
 						ResourceServerID: &rs.ID,
 						ScopeString:      ss,
 						DisplayName:      ss,
@@ -190,14 +191,36 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 						IsAutoDiscovered: false,
 					}
 					if err := tx.Where(
-						"tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
-						req.TenantID, rs.ID, ss,
+						"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+						req.WorkspaceID, req.WorkspaceID, rs.ID, ss,
 					).FirstOrCreate(&scope).Error; err != nil {
 						return fmt.Errorf("seed preset scope %s: %w", ss, err)
 					}
 				}
 			}
 		}
+		for _, ss := range canonicalRequestedScopes {
+			scope := models.OAuthScope{
+				WorkspaceID:      req.WorkspaceID,
+				ResourceServerID: &rs.ID,
+				ScopeString:      ss,
+				DisplayName:      ss,
+				RiskLevel:        inferRiskLevel(ss),
+				Source:           "manual",
+				IsAutoDiscovered: false,
+			}
+			if err := tx.Where(
+				"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+				req.WorkspaceID, req.WorkspaceID, rs.ID, ss,
+			).FirstOrCreate(&scope).Error; err != nil {
+				return fmt.Errorf("seed canonical scope %s: %w", ss, err)
+			}
+		}
+		supported, err := syncSupportedScopesFromRegistry(tx, req.WorkspaceID, rs.ID)
+		if err != nil {
+			return err
+		}
+		rs.ScopesSupported = supported
 		return nil
 	})
 	if txErr != nil {
@@ -229,6 +252,47 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	}
 
 	return rs, resp, nil
+}
+
+// CanonicalAuthSecScopes returns the subset of scopes that already follow the
+// AuthSec-owned application namespace. Server-defined and OIDC scopes are
+// treated as legacy hints and ignored.
+func CanonicalAuthSecScopes(scopes []string, appSlug string) []string {
+	if appSlug == "" {
+		return nil
+	}
+	prefix := appSlug + ":"
+	seen := make(map[string]struct{}, len(scopes))
+	out := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" || !strings.HasPrefix(scope, prefix) {
+			continue
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		out = append(out, scope)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func syncSupportedScopesFromRegistry(tx *gorm.DB, workspaceID, rsID uuid.UUID) (pq.StringArray, error) {
+	var scopeStrings []string
+	if err := tx.Model(&models.OAuthScope{}).
+		Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
+		Order("scope_string ASC").
+		Pluck("scope_string", &scopeStrings).Error; err != nil {
+		return nil, fmt.Errorf("sync supported scopes from registry: %w", err)
+	}
+	if err := tx.Model(&models.ResourceServer{}).
+		Where("id = ?", rsID).
+		Update("scopes_supported", pq.StringArray(scopeStrings)).Error; err != nil {
+		return nil, fmt.Errorf("update scopes_supported: %w", err)
+	}
+	return pq.StringArray(scopeStrings), nil
 }
 
 func (s *ResourceServerService) GetByID(id string) (*models.ResourceServer, error) {
@@ -476,40 +540,47 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 
 		// ── 3a. Scope reconciliation (full scan only) ─────────────────────
 		if prmFetched {
-			currentScopeStrings := discovered.PRM.ScopesSupported // may be []
+			appSlug := SlugForApp(rs.Name)
+			legacyScopeCount := len(discovered.PRM.ScopesSupported)
+			currentScopeStrings := CanonicalAuthSecScopes(discovered.PRM.ScopesSupported, appSlug)
+			legacyScopeCount -= len(currentScopeStrings)
+			if legacyScopeCount > 0 {
+				syncResult.Warnings = append(syncResult.Warnings,
+					fmt.Sprintf("ignored %d server-declared legacy scope(s); AuthSec canonical scopes are authoritative", legacyScopeCount))
+			}
 
 			scopeRegistry := NewScopeRegistryService(tx)
 
 			// Count existing auto-discovered scopes before upsert
 			var beforeCount int64
 			tx.Model(&models.OAuthScope{}).
-				Where("tenant_id = ? AND resource_server_id = ? AND is_auto_discovered = true",
-					rs.TenantID, rs.ID).Count(&beforeCount)
+				Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID).Count(&beforeCount)
 
 			if len(currentScopeStrings) > 0 {
-				if _, err := scopeRegistry.SyncFromPRM(rs.TenantID, rs.ID, currentScopeStrings); err != nil {
+				if _, err := scopeRegistry.SyncFromPRM(rs.WorkspaceID, rs.ID, currentScopeStrings); err != nil {
 					return fmt.Errorf("scope sync: %w", err)
 				}
 			}
 
 			var afterCount int64
 			tx.Model(&models.OAuthScope{}).
-				Where("tenant_id = ? AND resource_server_id = ? AND is_auto_discovered = true",
-					rs.TenantID, rs.ID).Count(&afterCount)
+				Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID).Count(&afterCount)
 			syncResult.ScopesAdded = int(afterCount - beforeCount)
 
 			// Find stale auto-discovered scopes (not in current PRM list)
 			var staleAutoScopes []models.OAuthScope
 			if len(currentScopeStrings) > 0 {
 				tx.Where(
-					"tenant_id = ? AND resource_server_id = ? AND is_auto_discovered = true AND scope_string NOT IN ?",
-					rs.TenantID, rs.ID, currentScopeStrings,
+					"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true AND scope_string NOT IN ?",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID, currentScopeStrings,
 				).Find(&staleAutoScopes)
 			} else {
 				// PRM legitimately returned empty — remove ALL auto-discovered scopes
 				tx.Where(
-					"tenant_id = ? AND resource_server_id = ? AND is_auto_discovered = true",
-					rs.TenantID, rs.ID,
+					"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID,
 				).Find(&staleAutoScopes)
 			}
 
@@ -538,10 +609,13 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 				}
 			}
 
-			// Update scopes_supported to reflect PRM (only on full scan)
-			if err := tx.Model(rs).Update("scopes_supported", pq.StringArray(currentScopeStrings)).Error; err != nil {
-				return fmt.Errorf("update scopes_supported: %w", err)
+			// Keep scopes_supported aligned to AuthSec-owned OAuth scopes, not to
+			// arbitrary MCP/PRM scope declarations from the server.
+			supportedScopes, err := syncSupportedScopesFromRegistry(tx, rs.WorkspaceID, rs.ID)
+			if err != nil {
+				return err
 			}
+			rs.ScopesSupported = supportedScopes
 		} else {
 			syncResult.Warnings = append(syncResult.Warnings,
 				"PRM unavailable — scope registry and scopes_supported not modified")
@@ -579,7 +653,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					continue // sdk_manifest or manual entry wins; track as upserted so we don't delete it
 				}
 				newTool := models.MCPTool{
-					TenantID:           rs.TenantID,
+					WorkspaceID:        rs.WorkspaceID,
 					ResourceServerID:   rs.ID,
 					Name:               tool.Name,
 					Title:              tool.Title,
@@ -634,7 +708,10 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 		// Full replace: clear then re-apply. This ensures stale convention matches
 		// (e.g., a scope that disappeared from PRM) don't linger on surviving tools.
 		if prmFetched {
-			currentScopeStrings := discovered.PRM.ScopesSupported
+			currentScopeStrings, err := scopesForResourceServer(tx, rs.WorkspaceID, rs.ID)
+			if err != nil {
+				return err
+			}
 
 			if len(upsertedToolIDs) > 0 {
 				tx.Where("tool_id IN ? AND auto_matched = true", upsertedToolIDs).
@@ -651,8 +728,8 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					continue
 				}
 				var scope models.OAuthScope
-				if tx.Where("tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
-					rs.TenantID, rs.ID, m.ScopeString).First(&scope).Error != nil {
+				if tx.Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+					rs.WorkspaceID, rs.WorkspaceID, rs.ID, m.ScopeString).First(&scope).Error != nil {
 					continue
 				}
 				mapping := models.MCPToolScopeMap{
@@ -775,6 +852,17 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 	return syncResult, nil
 }
 
+func scopesForResourceServer(tx *gorm.DB, workspaceID, rsID uuid.UUID) ([]string, error) {
+	var scopeStrings []string
+	if err := tx.Model(&models.OAuthScope{}).
+		Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
+		Order("scope_string ASC").
+		Pluck("scope_string", &scopeStrings).Error; err != nil {
+		return nil, fmt.Errorf("list resource server scopes: %w", err)
+	}
+	return scopeStrings, nil
+}
+
 // markScanFailed updates RS status to degraded on a hard failure.
 //
 // The generation parameter MUST be the scan_generation value this scan claimed in
@@ -834,13 +922,13 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 	viewerRoleName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 
 	var existingAdmin, existingReadonly, existingViewer models.RBACRole
-	adminExists := db.Where("name = ? AND tenant_id = ?", adminRoleName, rs.TenantID).First(&existingAdmin).Error == nil
-	readonlyExists := db.Where("name = ? AND tenant_id = ?", readonlyRoleName, rs.TenantID).First(&existingReadonly).Error == nil
-	viewerExists := db.Where("name = ? AND tenant_id = ?", viewerRoleName, rs.TenantID).First(&existingViewer).Error == nil
+	adminExists := db.Where("name = ? AND tenant_id = ?", adminRoleName, rs.WorkspaceID).First(&existingAdmin).Error == nil
+	readonlyExists := db.Where("name = ? AND tenant_id = ?", readonlyRoleName, rs.WorkspaceID).First(&existingReadonly).Error == nil
+	viewerExists := db.Where("name = ? AND tenant_id = ?", viewerRoleName, rs.WorkspaceID).First(&existingViewer).Error == nil
 
 	// Removed early-exit: always reconcile permissions even when both roles exist.
 
-	scopes, err := scopeRegistry.ListByResourceServer(rs.TenantID, rs.ID)
+	scopes, err := scopeRegistry.ListByResourceServer(rs.WorkspaceID, rs.ID)
 	if err != nil || len(scopes) == 0 {
 		return
 	}
@@ -850,14 +938,14 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 	var readPermIDs []uuid.UUID
 	for _, scope := range scopes {
 		perm := models.RBACPermission{
-			TenantID:    &rs.TenantID,
+			WorkspaceID: &rs.WorkspaceID,
 			Resource:    scope.ScopeString,
 			Action:      "access",
 			Description: fmt.Sprintf("OAuth scope: %s", scope.DisplayName),
 		}
 		existing := models.RBACPermission{}
 		if err := db.Where("tenant_id = ? AND resource = ? AND action = ?",
-			rs.TenantID, perm.Resource, perm.Action).First(&existing).Error; err == nil {
+			rs.WorkspaceID, perm.Resource, perm.Action).First(&existing).Error; err == nil {
 			perm = existing
 		} else {
 			db.Create(&perm)
@@ -872,7 +960,7 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 
 	if !adminExists {
 		adminRole := models.RBACRole{
-			TenantID:    &rs.TenantID,
+			WorkspaceID: &rs.WorkspaceID,
 			Name:        adminRoleName,
 			Description: fmt.Sprintf("Full access to %s (auto-generated)", rs.Name),
 		}
@@ -892,7 +980,7 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 
 	if !readonlyExists {
 		readonlyRole := models.RBACRole{
-			TenantID:    &rs.TenantID,
+			WorkspaceID: &rs.WorkspaceID,
 			Name:        readonlyRoleName,
 			Description: fmt.Sprintf("Read-only access to %s (auto-generated)", rs.Name),
 		}
@@ -923,7 +1011,7 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 	}
 	if !viewerExists {
 		viewerRole := models.RBACRole{
-			TenantID:    &rs.TenantID,
+			WorkspaceID: &rs.WorkspaceID,
 			Name:        viewerRoleName,
 			Description: fmt.Sprintf("Default viewer role for %s (auto-generated)", rs.Name),
 		}
@@ -1027,7 +1115,7 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUI
 	// Step 5: Default role — viewer exists and has ≥1 scope
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
-	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil
+	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
 	var viewerPermCount int64
 	if viewerExists {
 		s.db.Model(&models.RolePermission{}).Where("role_id = ?", viewerRole.ID).Count(&viewerPermCount)
@@ -1109,7 +1197,7 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
 	viewerScopeStrings := make([]string, 0)
-	if s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil {
+	if s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil {
 		var perms []models.RBACPermission
 		s.db.Joins("JOIN role_permissions rp ON rp.permission_id = permissions.id").
 			Where("rp.role_id = ?", viewerRole.ID).
@@ -1191,7 +1279,7 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, act
 	// Gate 4: viewer role has ≥1 scope
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
-	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.TenantID).First(&viewerRole).Error == nil
+	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
 	if !viewerExists {
 		failed = append(failed, "step_5_no_viewer_role")
 	} else {

@@ -62,7 +62,7 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	req.TenantID = tenantID
+	req.WorkspaceID = tenantID
 
 	if req.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})

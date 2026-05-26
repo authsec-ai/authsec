@@ -27,7 +27,7 @@ type AgentRenewalService struct {
 // AgentRenewRequest represents an agent renewal request
 type AgentRenewRequest struct {
 	AgentID  string
-	TenantID string // Optional: for non-mTLS environments
+	WorkspaceID string // Optional: for non-mTLS environments
 	CSR      string
 }
 
@@ -99,7 +99,7 @@ func (s *AgentRenewalService) Renew(ctx context.Context, req *AgentRenewRequest)
 	}
 
 	// Verify agent belongs to the authenticated tenant
-	if agent.TenantID != tenantID {
+	if agent.WorkspaceID != tenantID {
 		return nil, errors.NewForbiddenError("Agent does not belong to authenticated tenant", nil)
 	}
 

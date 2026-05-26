@@ -56,10 +56,10 @@ func TestEndUserController_RegisterClient(t *testing.T) {
 		{
 			name: "successful registration",
 			input: models.RegisterClientsRequest{
-				TenantID:  uuid.New().String(),
-				ProjectID: uuid.New().String(),
-				Name:      "Test Client",
-				Email:     "test@example.com",
+				WorkspaceID: uuid.New().String(),
+				ProjectID:   uuid.New().String(),
+				Name:        "Test Client",
+				Email:       "test@example.com",
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody: map[string]interface{}{
@@ -80,10 +80,10 @@ func TestEndUserController_RegisterClient(t *testing.T) {
 		{
 			name: "tenant not found",
 			input: models.RegisterClientsRequest{
-				TenantID:  "invalid-uuid",
-				ProjectID: uuid.New().String(),
-				Name:      "Test Client",
-				Email:     "test@example.com",
+				WorkspaceID: "invalid-uuid",
+				ProjectID:   uuid.New().String(),
+				Name:        "Test Client",
+				Email:       "test@example.com",
 			},
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody: map[string]interface{}{
@@ -243,9 +243,9 @@ func TestEndUserController_GetEndUsers(t *testing.T) {
 		{
 			name: "successful users retrieval",
 			input: GetEndUsersFilter{
-				TenantID: uuid.New().String(),
-				Page:     1,
-				Limit:    10,
+				WorkspaceID: uuid.New().String(),
+				Page:        1,
+				Limit:       10,
 			},
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -266,8 +266,8 @@ func TestEndUserController_GetEndUsers(t *testing.T) {
 		{
 			name: "invalid client_id format",
 			input: GetEndUsersFilter{
-				TenantID: uuid.New().String(),
-				ClientID: "invalid-uuid",
+				WorkspaceID: uuid.New().String(),
+				ClientID:    "invalid-uuid",
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
@@ -409,8 +409,8 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 		{
 			name: "successful deletion",
 			input: map[string]string{
-				"tenant_id": uuid.New().String(),
-				"user_id":   uuid.New().String(),
+				"workspace_id": uuid.New().String(),
+				"user_id":      uuid.New().String(),
 			},
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -423,7 +423,7 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 		{
 			name: "missing required fields",
 			input: map[string]string{
-				"tenant_id": uuid.New().String(),
+				"workspace_id": uuid.New().String(),
 				// Missing user_id
 			},
 			expectedStatus: http.StatusBadRequest,
@@ -435,8 +435,8 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 		{
 			name: "user not found",
 			input: map[string]string{
-				"tenant_id": uuid.New().String(),
-				"user_id":   uuid.New().String(),
+				"workspace_id": uuid.New().String(),
+				"user_id":      uuid.New().String(),
 			},
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -456,10 +456,10 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 			jsonData, _ := json.Marshal(tt.input)
 			c.Request = httptest.NewRequest("DELETE", "/api/enduser/delete", bytes.NewBuffer(jsonData))
 			c.Request.Header.Set("Content-Type", "application/json")
-			if tenantID, ok := tt.input["tenant_id"]; ok {
+			if tenantID, ok := tt.input["workspace_id"]; ok {
 				// Set token claims for auth middleware simulation
 				setTokenClaimsInContext(c, tenantID, tt.input["user_id"])
-				c.Set("user_info", &middlewares.UserInfo{TenantID: tenantID})
+				c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID})
 			}
 
 			controller.DeleteEndUser(c)
@@ -483,9 +483,9 @@ func TestEndUserController_ActiveOrDeactiveEndUser(t *testing.T) {
 	controller := &EndUserController{}
 
 	payload := map[string]interface{}{
-		"tenant_id": uuid.New().String(),
-		"user_id":   uuid.New().String(),
-		"active":    false,
+		"workspace_id": uuid.New().String(),
+		"user_id":      uuid.New().String(),
+		"active":       false,
 	}
 
 	body, _ := json.Marshal(payload)
@@ -755,7 +755,7 @@ func TestEndUserController_AdminChangeUserPassword(t *testing.T) {
 		{
 			name: "successful password change",
 			input: models.AdminChangePasswordInput{
-				TenantID:    uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
 				Email:       "test@example.com",
 				NewPassword: "newpassword123",
 			},
@@ -770,7 +770,7 @@ func TestEndUserController_AdminChangeUserPassword(t *testing.T) {
 		{
 			name: "weak password",
 			input: models.AdminChangePasswordInput{
-				TenantID:    uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
 				Email:       "test@example.com",
 				NewPassword: "123", // Too short
 			},
@@ -783,7 +783,7 @@ func TestEndUserController_AdminChangeUserPassword(t *testing.T) {
 		{
 			name: "user not found",
 			input: models.AdminChangePasswordInput{
-				TenantID:    uuid.New().String(),
+				WorkspaceID: uuid.New().String(),
 				Email:       "nonexistent@example.com",
 				NewPassword: "newpassword123",
 			},
@@ -836,9 +836,9 @@ func TestEndUserController_AdminResetUserPassword(t *testing.T) {
 		{
 			name: "successful password reset",
 			input: models.AdminResetPasswordInput{
-				TenantID:  uuid.New().String(),
-				Email:     "test@example.com",
-				SendEmail: true,
+				WorkspaceID: uuid.New().String(),
+				Email:       "test@example.com",
+				SendEmail:   true,
 			},
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -851,9 +851,9 @@ func TestEndUserController_AdminResetUserPassword(t *testing.T) {
 		{
 			name: "user not found",
 			input: models.AdminResetPasswordInput{
-				TenantID:  uuid.New().String(),
-				Email:     "nonexistent@example.com",
-				SendEmail: false,
+				WorkspaceID: uuid.New().String(),
+				Email:       "nonexistent@example.com",
+				SendEmail:   false,
 			},
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{

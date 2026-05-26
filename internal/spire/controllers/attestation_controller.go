@@ -34,7 +34,7 @@ func (ctrl *AttestationController) Attest(c *gin.Context) {
 	}
 
 	// Validate request
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -49,7 +49,7 @@ func (ctrl *AttestationController) Attest(c *gin.Context) {
 
 	// Call service
 	serviceReq := &services.AttestRequest{
-		TenantID:        req.TenantID,
+		WorkspaceID:        req.WorkspaceID,
 		CSR:             req.CSR,
 		AttestationType: req.AttestationType,
 		Selectors:       req.Selectors,

@@ -26,7 +26,7 @@ func NewHubSpotController() *HubSpotController {
 type SyncContactRequest struct {
 	Email        string `json:"email" binding:"required,email"`
 	TenantDomain string `json:"tenant_domain" binding:"required"`
-	TenantID     string `json:"tenant_id" binding:"required"`
+	WorkspaceID     string `json:"workspace_id" binding:"required"`
 }
 
 // SyncContact syncs a contact to HubSpot CRM
@@ -50,7 +50,7 @@ func (hc *HubSpotController) SyncContact(c *gin.Context) {
 		return
 	}
 
-	contactID, err := hc.hubspotService.SyncContact(req.Email, req.TenantDomain, req.TenantID)
+	contactID, err := hc.hubspotService.SyncContact(req.Email, req.TenantDomain, req.WorkspaceID)
 	if err != nil {
 		log.Printf("[HubSpot] Failed to sync contact %s: %v", req.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{

@@ -573,7 +573,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details
-	tenant, err := ctrl.tenantRepo.GetTenantByID(user.TenantID.String())
+	tenant, err := ctrl.tenantRepo.GetTenantByID(user.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -659,7 +659,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details (needed for authorize and token generation)
-	tenant, err := ctrl.tenantRepo.GetTenantByID(user.TenantID.String())
+	tenant, err := ctrl.tenantRepo.GetTenantByID(user.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -681,7 +681,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 	}
 
 	// Authorize device with full tenant context and pre-generated token
-	if err := ctrl.deviceRepo.AuthorizeDeviceCode(req.UserCode, user.ID, user.Email, user.TenantID, tenant.TenantDomain, clientID, token, true); err != nil {
+	if err := ctrl.deviceRepo.AuthorizeDeviceCode(req.UserCode, user.ID, user.Email, user.WorkspaceID, tenant.TenantDomain, clientID, token, true); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve device", "details": err.Error()})
 		return
 	}

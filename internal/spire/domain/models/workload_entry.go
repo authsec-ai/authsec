@@ -6,7 +6,7 @@ import "time"
 // It maps workload selectors to SPIFFE identities.
 type WorkloadEntry struct {
 	ID         string            `json:"id"`
-	TenantID   string            `json:"tenant_id"`
+	WorkspaceID   string            `json:"workspace_id"`
 	SpiffeID   string            `json:"spiffe_id"`
 	ParentID   string            `json:"parent_id"` // Agent SPIFFE ID; empty = broadcast to all agents in tenant
 	Selectors  map[string]string `json:"selectors"` // Workload selectors (k8s:ns, unix:uid, etc.)
@@ -19,7 +19,7 @@ type WorkloadEntry struct {
 
 // WorkloadEntryFilter represents filters for querying workload entries
 type WorkloadEntryFilter struct {
-	TenantID        string            `json:"tenant_id"`
+	WorkspaceID        string            `json:"workspace_id"`
 	ParentID        string            `json:"parent_id"`
 	SpiffeID        string            `json:"spiffe_id"`
 	SpiffeIDPartial bool              `json:"spiffe_id_partial"`
@@ -44,7 +44,7 @@ func (we *WorkloadEntry) MatchesSelectors(workloadSelectors map[string]string) b
 
 // Validate performs basic validation on the workload entry
 func (we *WorkloadEntry) Validate() error {
-	if we.TenantID == "" {
+	if we.WorkspaceID == "" {
 		return ErrInvalidInput("tenant_id is required")
 	}
 	if we.SpiffeID == "" {

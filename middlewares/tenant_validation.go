@@ -11,7 +11,7 @@ import (
 func ValidateTenantFromToken() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get tenant_id from URL parameter
-		urlTenantID := c.Param("tenant_id")
+		urlTenantID := c.Param("workspace_id")
 		if urlTenantID == "" {
 			// No tenant_id in URL, skip validation (for non-tenant routes)
 			c.Next()

@@ -383,7 +383,7 @@ func TestTenantMigrations_FullFlow(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, status, "GetMigrationStatus should not return nil")
 		assert.Equal(t, "tenant", status.DBType)
-		assert.Equal(t, &tenantID, status.TenantID)
+		assert.Equal(t, &tenantID, status.WorkspaceID)
 		assert.Greater(t, status.LastMigration, 0, "should have recorded migrations")
 		assert.Greater(t, status.TotalMigrations, 0, "should know total migration count")
 	})

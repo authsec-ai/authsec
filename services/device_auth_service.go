@@ -62,7 +62,7 @@ func (s *DeviceAuthService) InitiateDeviceFlow(req *models.DeviceCodeRequest) (*
 
 	dc := &models.DeviceCode{
 		ID:                      uuid.New(),
-		TenantID:                nil, // filled on /authorize
+		WorkspaceID:                nil, // filled on /authorize
 		ClientID:                nil, // filled on /authorize
 		DeviceCode:              deviceCode,
 		UserCode:                userCode,
@@ -154,7 +154,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 			user = &models.ExtendedUser{}
 			user.ID = userID
 			user.Email = userEmail
-			user.TenantID = tenantID
+			user.WorkspaceID = tenantID
 		}
 
 		accessToken, err = s.generateJWTToken(user, tenant, dc.Scopes, clientID)
@@ -259,8 +259,8 @@ func (s *DeviceAuthService) PollForToken(deviceCode string) (*models.DeviceToken
 			userIDStr = dc.UserID.String()
 		}
 		tenantIDStr := ""
-		if dc.TenantID != nil {
-			tenantIDStr = dc.TenantID.String()
+		if dc.WorkspaceID != nil {
+			tenantIDStr = dc.WorkspaceID.String()
 		}
 
 		// Invalidate device code (one-time use)
@@ -273,7 +273,7 @@ func (s *DeviceAuthService) PollForToken(deviceCode string) (*models.DeviceToken
 			Scope:        strings.Join(dc.Scopes, " "),
 			Email:        dc.UserEmail,
 			UserID:       userIDStr,
-			TenantID:     tenantIDStr,
+			WorkspaceID:     tenantIDStr,
 			TenantDomain: dc.TenantDomain,
 			ClientID:     clientIDStr,
 		}, nil
@@ -307,7 +307,7 @@ func (s *DeviceAuthService) generateJWTToken(
 ) (string, error) {
 	return config.TokenService.GenerateDeviceAuthToken(
 		user.ID,
-		tenant.TenantID,
+		tenant.WorkspaceID,
 		user.Email,
 		scopes,
 		24*time.Hour,

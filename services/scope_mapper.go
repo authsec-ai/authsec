@@ -22,6 +22,8 @@ type ToolScopeMapping struct {
 //  4. "mcp:tools:<tool_name>:*"      → prefixed wildcard
 //  5. "<tool_name>:<action>"         → flat match (e.g. "weather:read")
 //  6. "tools:*"                      → global wildcard → maps to ALL tools
+//  7. "<app>:tools:<action>"         → AuthSec canonical global tool scope
+//  8. "<app>:tool:<tool_name>:<action>" → AuthSec canonical per-tool scope
 //
 // Scope strings that don't match any tool are returned as unmapped.
 func MapToolsToScopes(tools []mcpclient.Tool, scopeStrings []string) ([]ToolScopeMapping, []string) {
@@ -87,6 +89,30 @@ func MapToolsToScopes(tools []mcpclient.Tool, scopeStrings []string) ([]ToolScop
 				})
 			}
 			matched = true
+
+		// "<app>:tools:<action>" or "<app>:tools:*" — AuthSec canonical global
+		// tool scope. Maps to every discovered tool; the app prefix is authoritative.
+		case len(parts) == 3 && parts[1] == "tools":
+			for _, t := range tools {
+				mappings = append(mappings, ToolScopeMapping{
+					ToolName:    t.Name,
+					ScopeString: scope,
+					AutoMatched: true,
+				})
+			}
+			matched = true
+
+		// "<app>:tool:<tool_name>:<action>" — AuthSec canonical per-tool scope.
+		case len(parts) == 4 && parts[1] == "tool":
+			toolName := parts[2]
+			if toolNames[toolName] {
+				mappings = append(mappings, ToolScopeMapping{
+					ToolName:    resolveToolName(toolName, tools),
+					ScopeString: scope,
+					AutoMatched: true,
+				})
+				matched = true
+			}
 		}
 
 		if !matched {

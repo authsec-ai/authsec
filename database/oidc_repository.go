@@ -255,7 +255,7 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 
 	err := r.db.QueryRow(query,
 		state.StateToken,
-		state.TenantID,
+		state.WorkspaceID,
 		state.TenantDomain,
 		requestHostParam,
 		state.ProviderName,
@@ -319,7 +319,7 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 
 	if tenantID.Valid {
 		id, _ := uuid.Parse(tenantID.String)
-		state.TenantID = &id
+		state.WorkspaceID = &id
 	}
 	if requestHost.Valid {
 		state.OriginDomain = requestHost.String
@@ -394,7 +394,7 @@ func (r *OIDCUserIdentityRepository) CreateIdentity(identity *models.OIDCUserIde
 	identity.UpdatedAt = now
 
 	err := r.db.QueryRow(query,
-		identity.TenantID,
+		identity.WorkspaceID,
 		identity.UserID,
 		identity.ProviderName,
 		identity.ProviderUserID,
@@ -425,7 +425,7 @@ func (r *OIDCUserIdentityRepository) GetIdentityByProviderUser(providerName, pro
 
 	err := r.db.QueryRow(query, providerName, providerUserID).Scan(
 		&identity.ID,
-		&identity.TenantID,
+		&identity.WorkspaceID,
 		&identity.UserID,
 		&identity.ProviderName,
 		&identity.ProviderUserID,
@@ -473,7 +473,7 @@ func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID
 
 	err := r.db.QueryRow(query, tenantID, providerName, providerUserID).Scan(
 		&identity.ID,
-		&identity.TenantID,
+		&identity.WorkspaceID,
 		&identity.UserID,
 		&identity.ProviderName,
 		&identity.ProviderUserID,
@@ -528,7 +528,7 @@ func (r *OIDCUserIdentityRepository) GetIdentitiesByUserID(tenantID, userID uuid
 
 		err := rows.Scan(
 			&identity.ID,
-			&identity.TenantID,
+			&identity.WorkspaceID,
 			&identity.UserID,
 			&identity.ProviderName,
 			&identity.ProviderUserID,

@@ -14,7 +14,7 @@ import (
 type DeviceToken struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID    uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID    uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	DeviceToken string    `json:"device_token" gorm:"uniqueIndex;size:500;not null"`
 	Platform    string    `json:"platform" gorm:"size:20;not null"` // ios, android
 
@@ -49,7 +49,7 @@ type CIBAAuthRequest struct {
 
 	// User identification
 	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	UserEmail string    `json:"user_email" gorm:"size:255;not null"`
 
 	// Client information

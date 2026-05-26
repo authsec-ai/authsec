@@ -41,7 +41,7 @@ type ADSyncConfig struct {
 
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
-	TenantID  string        `json:"tenant_id" binding:"required"`
+	WorkspaceID  string        `json:"workspace_id" binding:"required"`
 	ClientID  string        `json:"client_id" binding:"required"`
 	ProjectID string        `json:"project_id" binding:"required"`
 	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
@@ -99,7 +99,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 
 	if input.ConfigID != nil && *input.ConfigID != "" {
 		// Load config from database
-		adConfig, err = asc.loadStoredADConfig(*input.ConfigID, input.TenantID, input.ClientID)
+		adConfig, err = asc.loadStoredADConfig(*input.ConfigID, input.WorkspaceID, input.ClientID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.ErrorResponse{
 				Error:   "Failed to load stored configuration",
@@ -145,7 +145,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 
 	// Sync users to database
 	for _, adUser := range adUsers {
-		if err := asc.syncUserToDatabase(tenantDB, adUser, input.TenantID, input.ClientID, input.ProjectID); err != nil {
+		if err := asc.syncUserToDatabase(tenantDB, adUser, input.WorkspaceID, input.ClientID, input.ProjectID); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("Failed to sync user %s: %v", adUser.Email, err))
 			continue
 		}
@@ -153,12 +153,12 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 	}
 
 	log.Printf("AD sync completed for tenant %s: %d users processed, %d created, %d errors",
-		input.TenantID, result.UsersFound, result.UsersCreated, len(result.Errors))
+		input.WorkspaceID, result.UsersFound, result.UsersCreated, len(result.Errors))
 
 	// Audit log: AD sync completed
-	middlewares.Audit(c, "ad_sync", input.TenantID, "sync_users", &middlewares.AuditChanges{
+	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":     input.TenantID,
+			"tenant_id":     input.WorkspaceID,
 			"client_id":     input.ClientID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
@@ -492,7 +492,7 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 			User: sharedmodels.User{
 				ID:         uuid.New(),
 				ClientID:   clientUUID,
-				TenantID:   tenantUUID,
+				WorkspaceID:   tenantUUID,
 				ProjectID:  projectUUID,
 				Name:       adUser.DisplayName,
 				Username:   stringPtr(adUser.Username),
@@ -584,7 +584,7 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 
 	// Process each user
 	for _, user := range input.Users {
-		if err := asc.syncAgentUserToDatabase(tenantDB, user, input.TenantID, input.ProjectID, input.ClientID); err != nil {
+		if err := asc.syncAgentUserToDatabase(tenantDB, user, input.WorkspaceID, input.ProjectID, input.ClientID); err != nil {
 			result.Errors = append(result.Errors, models.ErrorResponse{
 				Error:   "User sync failed",
 				Details: fmt.Sprintf("Failed to sync user %s: %v", user.Email, err),
@@ -598,12 +598,12 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 	result.Message = fmt.Sprintf("Sync completed: %d users processed, %d created/updated, %d errors",
 		result.UsersProcessed, result.UsersCreated, len(result.Errors))
 
-	log.Printf("Agent sync completed for tenant %s: %s", input.TenantID, result.Message)
+	log.Printf("Agent sync completed for tenant %s: %s", input.WorkspaceID, result.Message)
 
 	// Audit log: Agent sync completed
-	middlewares.Audit(c, "ad_sync", input.TenantID, "agent_sync_users", &middlewares.AuditChanges{
+	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "agent_sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":       input.TenantID,
+			"tenant_id":       input.WorkspaceID,
 			"client_id":       input.ClientID,
 			"users_processed": result.UsersProcessed,
 			"users_created":   result.UsersCreated,
@@ -616,7 +616,7 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 
 // AgentSyncRequest represents the request from AD Agent
 type AgentSyncRequest struct {
-	TenantID  string          `json:"tenant_id" binding:"required"`
+	WorkspaceID  string          `json:"workspace_id" binding:"required"`
 	ProjectID string          `json:"project_id" binding:"required"`
 	ClientID  string          `json:"client_id" binding:"required"`
 	Users     []AgentUserData `json:"users" binding:"required"`
@@ -673,7 +673,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 			User: sharedmodels.User{
 				ID:           uuid.New(),
 				ClientID:     clientUUID,
-				TenantID:     tenantUUID,
+				WorkspaceID:     tenantUUID,
 				ProjectID:    projectUUID,
 				Name:         agentUser.Name,
 				Username:     stringPtr(agentUser.Username),

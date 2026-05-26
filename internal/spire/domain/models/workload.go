@@ -5,7 +5,7 @@ import "time"
 // Workload represents a workload that can request certificates
 type Workload struct {
 	ID              string            `json:"id" db:"id"`
-	TenantID        string            `json:"tenant_id" db:"tenant_id"`
+	WorkspaceID        string            `json:"workspace_id" db:"tenant_id"`
 	SpiffeID        string            `json:"spiffe_id" db:"spiffe_id"`
 	Selectors       map[string]string `json:"selectors" db:"selectors"`
 	VaultRole       string            `json:"vault_role" db:"vault_role"`

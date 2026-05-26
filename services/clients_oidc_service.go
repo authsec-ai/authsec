@@ -23,7 +23,7 @@ type ClientsOIDCClientResponse struct {
 
 // ClientsCreateTenantClientRequest represents the request structure for creating a tenant client
 type ClientsCreateTenantClientRequest struct {
-	TenantID     string   `json:"tenant_id"`
+	WorkspaceID     string   `json:"workspace_id"`
 	TenantName   string   `json:"tenant_name"`
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`

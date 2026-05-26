@@ -132,7 +132,7 @@ func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 		User: sharedmodels.User{
 			ID:           uuid.New(),
 			ClientID:     clientUUID,
-			TenantID:     tenantUUID,
+			WorkspaceID:     tenantUUID,
 			ProjectID:    client.ProjectID,
 			Name:         input.Email, // Use email as name
 			Email:        input.Email,
@@ -447,7 +447,7 @@ func (euac *EndUserAuthController) Login(c *gin.Context) {
 	}
 
 	response := models.LoginResponse{
-		TenantID:    user.TenantID.String(),
+		WorkspaceID:    user.WorkspaceID.String(),
 		Email:       user.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -521,7 +521,7 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 	isFirstLogin := user.LastLogin == nil
 
 	response := models.LoginResponse{
-		TenantID:    user.TenantID.String(),
+		WorkspaceID:    user.WorkspaceID.String(),
 		Email:       user.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -571,13 +571,13 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		return
 	}
 
-	tenant, err := euac.tenantRepo.GetTenantByTenantID(input.TenantID.String())
+	tenant, err := euac.tenantRepo.GetTenantByTenantID(input.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 
-	tenantIDStr := tenant.TenantID.String()
+	tenantIDStr := tenant.WorkspaceID.String()
 	tenantDB := config.DB
 
 	var user models.User
@@ -667,7 +667,7 @@ func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, err := uuid.Parse(input.TenantID)
+	tenantUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -772,13 +772,13 @@ func (euac *EndUserAuthController) WebAuthnRegister(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	tenant, err := euac.tenantRepo.GetTenantByTenantID(input.TenantID.String())
+	tenant, err := euac.tenantRepo.GetTenantByTenantID(input.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 
-	tenantIDStr := tenant.TenantID.String()
+	tenantIDStr := tenant.WorkspaceID.String()
 	tenantDB := config.DB
 
 	var user models.User
@@ -821,7 +821,7 @@ func (euac *EndUserAuthController) WebAuthnRegister(c *gin.Context) {
 
 		clientID := user.ClientID
 		if clientID == uuid.Nil {
-			clientID = tenant.TenantID
+			clientID = tenant.WorkspaceID
 		}
 
 		if _, err := sqlDB.Exec(

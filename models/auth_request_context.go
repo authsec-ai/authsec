@@ -26,7 +26,7 @@ type AuthRequestContext struct {
 	HydraClientID    string     `json:"hydra_client_id" gorm:"type:varchar(255);not null;index"`
 	HydraRequestURI  *string    `json:"hydra_request_uri,omitempty" gorm:"type:varchar(512)"`
 	ResourceServerID string     `json:"resource_server_id" gorm:"type:uuid;not null"`
-	TenantID         string     `json:"tenant_id" gorm:"type:uuid;not null"`
+	WorkspaceID         string     `json:"workspace_id" gorm:"type:uuid;not null"`
 	ResourceURI      string     `json:"resource_uri" gorm:"type:text;not null"`
 	RedirectURI      string     `json:"redirect_uri" gorm:"type:text"`
 	RequestedScopes  string     `json:"requested_scopes" gorm:"type:text"`

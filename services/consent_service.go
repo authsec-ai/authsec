@@ -116,7 +116,7 @@ func (s *ConsentService) UpsertConsent(
 	}
 
 	grant := models.OAuthConsentGrant{
-		TenantID:         tenantID,
+		WorkspaceID:         tenantID,
 		UserID:           userID,
 		ClientID:         clientID,
 		ResourceServerID: resourceServerID,

@@ -157,7 +157,7 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, t
 			return nil, err
 		}
 		existing = models.ResourceServerAccessPolicy{
-			TenantID:          tenantUUID,
+			WorkspaceID:          tenantUUID,
 			ResourceServerID:  rsUUID,
 			Enabled:           req.Enabled,
 			DefaultRoleID:     defaultRoleID,
@@ -315,7 +315,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	}
 
 	binding := models.RoleBinding{
-		TenantID:           &tenantUUID,
+		WorkspaceID:           &tenantUUID,
 		UserID:             &userUUID,
 		Username:           firstNonEmpty(username, emailFallback, userUUID.String()),
 		RoleID:             role.ID,

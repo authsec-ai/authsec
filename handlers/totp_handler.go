@@ -50,10 +50,10 @@ func (h *TOTPHandler) BeginTOTPSetup(c *gin.Context) {
 		return
 	}
 
-	log.Printf("Starting TOTP setup for email: %s, tenant: %s, client: %s", req.Email, req.TenantID, req.ClientID)
+	log.Printf("Starting TOTP setup for email: %s, tenant: %s, client: %s", req.Email, req.WorkspaceID, req.ClientID)
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForMFA(req.Email, req.TenantID, req.ClientID)
+	tenantDB, client, err := fetchClientForMFA(req.Email, req.WorkspaceID, req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -110,10 +110,10 @@ func (h *TOTPHandler) BeginSetup(c *gin.Context) {
 		return
 	}
 
-	log.Printf("Starting TOTP setup for email: %s, tenant: %s, client: %s", req.Email, req.TenantID, req.ClientID)
+	log.Printf("Starting TOTP setup for email: %s, tenant: %s, client: %s", req.Email, req.WorkspaceID, req.ClientID)
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.TenantID)
+	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -192,7 +192,7 @@ func (h *TOTPHandler) ConfirmTOTPSetup(c *gin.Context) {
 	}
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForMFA(req.Email, req.TenantID, req.ClientID)
+	tenantDB, client, err := fetchClientForMFA(req.Email, req.WorkspaceID, req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -295,7 +295,7 @@ func (h *TOTPHandler) ConfirmTOTPSetup(c *gin.Context) {
 
 	// Audit log for successful TOTP setup
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
-		"tenant_id": req.TenantID,
+		"tenant_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -325,7 +325,7 @@ func (h *TOTPHandler) ConfirmSetup(c *gin.Context) {
 	}
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.TenantID)
+	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -428,7 +428,7 @@ func (h *TOTPHandler) ConfirmSetup(c *gin.Context) {
 
 	// Audit log for successful TOTP setup (login flow)
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
-		"tenant_id": req.TenantID,
+		"tenant_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -462,7 +462,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 	log.Printf("Verifying TOTP code for email: %s", req.Email)
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForMFA(req.Email, req.TenantID, req.ClientID)
+	tenantDB, client, err := fetchClientForMFA(req.Email, req.WorkspaceID, req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -515,7 +515,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 					Success:  true,
 					Message:  "Backup code accepted",
 					Method:   "backup_code",
-					TenantID: req.TenantID,
+					WorkspaceID: req.WorkspaceID,
 					Email:    client.Email,
 				}
 				c.JSON(http.StatusOK, response)
@@ -578,7 +578,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 
 	// Audit log for successful TOTP verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "verify", true, map[string]interface{}{
-		"tenant_id": req.TenantID,
+		"tenant_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -586,7 +586,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 		Success:  true,
 		Message:  "TOTP verification successful",
 		Method:   "totp",
-		TenantID: req.TenantID,
+		WorkspaceID: req.WorkspaceID,
 		Email:    client.Email,
 	}
 
@@ -614,7 +614,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 	log.Printf("Verifying TOTP code for email: %s", req.Email)
 
 	// Get client from database
-	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.TenantID)
+	tenantDB, client, err := fetchClientForLoginMFA(req.Email, req.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "client not found"})
 		return
@@ -645,13 +645,13 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 			log.Printf("Backup code verified for: %s", req.Email)
 
 			// Update MFA verified status for backup code
-			h.updateMFAVerifiedStatus(tenantDB, req.TenantID)
+			h.updateMFAVerifiedStatus(tenantDB, req.WorkspaceID)
 
 			response := AuthenticationResponse{
 				Success:  true,
 				Message:  "Backup code accepted",
 				Method:   "backup_code",
-				TenantID: req.TenantID,
+				WorkspaceID: req.WorkspaceID,
 				Email:    client.Email,
 			}
 			c.JSON(http.StatusOK, response)
@@ -690,7 +690,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 		// Audit log for successful TOTP login verification
 		middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", true, map[string]interface{}{
-			"tenant_id": req.TenantID,
+			"tenant_id": req.WorkspaceID,
 			"email":     req.Email,
 		})
 
@@ -698,7 +698,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 			Success:  true,
 			Message:  "TOTP code valid",
 			Method:   "totp",
-			TenantID: req.TenantID,
+			WorkspaceID: req.WorkspaceID,
 			Email:    client.Email,
 		}
 		c.JSON(http.StatusOK, response)
@@ -707,7 +707,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 	// Audit log for failed TOTP login verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", false, map[string]interface{}{
-		"tenant_id": req.TenantID,
+		"tenant_id": req.WorkspaceID,
 		"email":     req.Email,
 		"reason":    "invalid_code",
 	})

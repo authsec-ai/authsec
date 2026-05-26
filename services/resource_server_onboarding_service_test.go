@@ -36,7 +36,7 @@ func TestValidateResourceServerAllowsDCRWithoutPreRegisteredClients(t *testing.T
 
 	rs := models.ResourceServer{
 		ID:                       uuid.New(),
-		TenantID:                 uuid.New(),
+		WorkspaceID:              uuid.New(),
 		Name:                     "demo-server",
 		PublicBaseURL:            server.URL,
 		ProtectedBasePath:        "/mcp",
@@ -87,7 +87,7 @@ func TestValidateResourceServerRequiresClientWhenDCRDisabled(t *testing.T) {
 
 	rs := models.ResourceServer{
 		ID:                       uuid.New(),
-		TenantID:                 uuid.New(),
+		WorkspaceID:              uuid.New(),
 		Name:                     "demo-server",
 		PublicBaseURL:            server.URL,
 		ProtectedBasePath:        "/mcp",
@@ -118,7 +118,10 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.Exec(`
 		CREATE TABLE resource_servers (
 			id TEXT PRIMARY KEY,
-			tenant_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
+			tenant_id TEXT,
+			application_type TEXT NOT NULL DEFAULT 'mcp_server',
+			legacy_client_id TEXT,
 			name TEXT NOT NULL,
 			public_base_url TEXT NOT NULL,
 			protected_base_path TEXT NOT NULL,

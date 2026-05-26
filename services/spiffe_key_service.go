@@ -148,8 +148,8 @@ type DelegateSVIDRequest struct {
 	UserJWT string
 	// UserID extracted from the user JWT (sub / user_id claim).
 	UserID string
-	// TenantID extracted from the user JWT.
-	TenantID string
+	// WorkspaceID extracted from the user JWT.
+	WorkspaceID string
 	// Email extracted from the user JWT.
 	Email string
 	// AgentType is a label for the AI agent kind (e.g. "ai-assistant", "mcp-agent").
@@ -173,7 +173,7 @@ type JWTSVIDClaims struct {
 
 	// AuthSec identity claims (carry user context to the agent)
 	UserID   string `json:"user_id"`
-	TenantID string `json:"tenant_id"`
+	WorkspaceID string `json:"workspace_id"`
 	Email    string `json:"email"`
 
 	// SPIFFE delegation metadata
@@ -216,7 +216,7 @@ func (s *SpiffeKeyService) IssueJWTSVID(req DelegateSVIDRequest) (string, error)
 		Nbf:         now.Unix(),
 		Exp:         now.Add(req.TTL).Unix(),
 		UserID:      req.UserID,
-		TenantID:    req.TenantID,
+		WorkspaceID:    req.WorkspaceID,
 		Email:       req.Email,
 		AgentType:   agentType,
 		SpiffeID:    spiffeID,
@@ -243,7 +243,7 @@ func toMapClaims(c JWTSVIDClaims) jwt.MapClaims {
 		"nbf":          c.Nbf,
 		"exp":          c.Exp,
 		"user_id":      c.UserID,
-		"tenant_id":    c.TenantID,
+		"tenant_id":    c.WorkspaceID,
 		"email":        c.Email,
 		"agent_type":   c.AgentType,
 		"spiffe_id":    c.SpiffeID,

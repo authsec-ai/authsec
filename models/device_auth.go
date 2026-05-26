@@ -13,7 +13,7 @@ import (
 // All timestamps are stored as Unix epoch (seconds)
 type DeviceCode struct {
 	ID       uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid;index"` // nullable until /authorize step
+	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"` // nullable until /authorize step
 	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid;index"`
 
 	// Device code: Long secret code for device polling
@@ -113,7 +113,7 @@ type DeviceTokenResponse struct {
 	// Identity fields returned alongside token
 	Email        string `json:"email,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
-	TenantID     string `json:"tenant_id,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
 	TenantDomain string `json:"tenant_domain,omitempty"`
 	ClientID     string `json:"client_id,omitempty"`
 	// RFC 8628 error fields

@@ -61,7 +61,7 @@ func (r *PostgresWorkloadRepository) Create(ctx context.Context, workload *model
 
 	_, err = r.db.ExecContext(ctx, query,
 		workload.ID,
-		workload.TenantID,
+		workload.WorkspaceID,
 		workload.SpiffeID,
 		selectorsJSON,
 		workload.VaultRole,
@@ -95,7 +95,7 @@ func (r *PostgresWorkloadRepository) Update(ctx context.Context, workload *model
 
 	result, err := r.db.ExecContext(ctx, query,
 		workload.ID,
-		workload.TenantID,
+		workload.WorkspaceID,
 		selectorsJSON,
 		workload.VaultRole,
 		workload.Status,
@@ -185,7 +185,7 @@ func (r *PostgresWorkloadRepository) scanWorkload(ctx context.Context, query str
 
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(
 		&workload.ID,
-		&workload.TenantID,
+		&workload.WorkspaceID,
 		&workload.SpiffeID,
 		&selectorsJSON,
 		&workload.VaultRole,
@@ -224,7 +224,7 @@ func (r *PostgresWorkloadRepository) queryWorkloads(ctx context.Context, query s
 
 		err := rows.Scan(
 			&workload.ID,
-			&workload.TenantID,
+			&workload.WorkspaceID,
 			&workload.SpiffeID,
 			&selectorsJSON,
 			&workload.VaultRole,

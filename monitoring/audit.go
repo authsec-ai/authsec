@@ -12,7 +12,7 @@ import (
 type AuditEvent struct {
 	ID         uint      `json:"id" gorm:"primaryKey"`
 	RequestID  string    `json:"request_id" gorm:"index"`
-	TenantID   string    `json:"tenant_id" gorm:"index"`
+	WorkspaceID   string    `json:"workspace_id" gorm:"index"`
 	UserID     string    `json:"user_id" gorm:"index"`
 	Action     string    `json:"action" gorm:"index"`
 	Resource   string    `json:"resource" gorm:"index"`
@@ -71,7 +71,7 @@ func (al *AuditLogger) LogEvent(event *AuditEvent) {
 	// Log to structured logger
 	al.logger.WithFields(logrus.Fields{
 		"request_id":  event.RequestID,
-		"tenant_id":   event.TenantID,
+		"tenant_id":   event.WorkspaceID,
 		"user_id":     event.UserID,
 		"action":      event.Action,
 		"resource":    event.Resource,
@@ -94,7 +94,7 @@ func (al *AuditLogger) LogAuthentication(requestID, tenantID, userID, action, cl
 
 	event := &AuditEvent{
 		RequestID:  requestID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   "authentication",
@@ -114,7 +114,7 @@ func (al *AuditLogger) LogAuthentication(requestID, tenantID, userID, action, cl
 func (al *AuditLogger) LogAdminAction(requestID, tenantID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, oldValues, newValues interface{}, errorMsg string) {
 	event := &AuditEvent{
 		RequestID:  requestID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   resource,
@@ -156,7 +156,7 @@ func (al *AuditLogger) LogAdminAction(requestID, tenantID, userID, action, resou
 func (al *AuditLogger) LogTenantAction(requestID, tenantID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, errorMsg string) {
 	event := &AuditEvent{
 		RequestID:  requestID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   resource,

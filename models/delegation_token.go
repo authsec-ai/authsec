@@ -13,10 +13,9 @@ import (
 // Upserted by DelegateToken, keyed by (tenant_id, client_id).
 type DelegationToken struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`
-	// WorkspaceID mirrors TenantID during the workspace transition. Backfilled
-	// by migration 122; new code should read this rather than TenantID.
-	WorkspaceID *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition. Backfilled
+	// by migration 122; new code should read this rather than WorkspaceID.
 	// ClientID is the legacy clients.id this token was originally bound to.
 	// New code should prefer ApplicationID; ClientID is kept during the
 	// resource_server / legacy_client_id transition.

@@ -13,7 +13,7 @@ import (
 // JWTClaims represents the JWT claims structure
 type JWTClaims struct {
 	UserID      string   `json:"user_id,omitempty"`
-	TenantID    string   `json:"tenant_id,omitempty"`
+	WorkspaceID    string   `json:"workspace_id,omitempty"`
 	Role        string   `json:"role,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
 	Permissions []string `json:"permissions,omitempty"`

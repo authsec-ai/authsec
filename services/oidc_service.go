@@ -152,7 +152,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	// Store state in database (expires in 30 minutes)
 	state := &models.OIDCState{
 		StateToken:     stateToken,
-		TenantID:       tenantID,
+		WorkspaceID:       tenantID,
 		ApplicationID:  input.ApplicationID,
 		SignedState:    signedState,
 		TenantDomain:   input.TenantDomain,
@@ -213,9 +213,9 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 			log.Printf("ERROR HandleCallback: signed state failed verification: %v", verr)
 			return nil, nil, fmt.Errorf("oidc state signature invalid: %w", verr)
 		}
-		if state.TenantID != nil && claims.WorkspaceID != *state.TenantID {
+		if state.WorkspaceID != nil && claims.WorkspaceID != *state.WorkspaceID {
 			log.Printf("ERROR HandleCallback: signed workspace_id %s != row tenant_id %s",
-				claims.WorkspaceID, state.TenantID)
+				claims.WorkspaceID, state.WorkspaceID)
 			return nil, nil, fmt.Errorf("oidc state workspace mismatch")
 		}
 		if state.ApplicationID != nil && (claims.ApplicationID == nil || *claims.ApplicationID != *state.ApplicationID) {

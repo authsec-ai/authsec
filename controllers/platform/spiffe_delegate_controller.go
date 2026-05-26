@@ -175,7 +175,7 @@ func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 	svid, err := ctrl.keySvc.IssueJWTSVID(services.DelegateSVIDRequest{
 		UserJWT:   rawJWT,
 		UserID:    userID,
-		TenantID:  tenantID,
+		WorkspaceID:  tenantID,
 		Email:     email,
 		AgentType: req.AgentType,
 		TTL:       ttl,

@@ -43,7 +43,7 @@ func NewJWTSVIDService(vaultClient *vault.Client, logger *logrus.Entry) *JWTSVID
 
 // IssueJWTSVIDRequest is the request to issue a JWT-SVID
 type IssueJWTSVIDRequest struct {
-	TenantID     string                 `json:"tenant_id"`
+	WorkspaceID     string                 `json:"workspace_id"`
 	SpiffeID     string                 `json:"spiffe_id"`
 	Audience     []string               `json:"audience"`
 	TTL          int                    `json:"ttl"` // seconds
@@ -59,7 +59,7 @@ type IssueJWTSVIDResponse struct {
 
 // ValidateJWTSVIDRequest is the request to validate a JWT-SVID
 type ValidateJWTSVIDRequest struct {
-	TenantID string `json:"tenant_id"`
+	WorkspaceID string `json:"workspace_id"`
 	Token    string `json:"token"`
 	Audience string `json:"audience"`
 }
@@ -77,7 +77,7 @@ func (s *JWTSVIDService) IssueJWTSVID(
 	req *IssueJWTSVIDRequest,
 ) (*IssueJWTSVIDResponse, error) {
 	// Validate request
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		return nil, fmt.Errorf("tenant_id is required")
 	}
 	if req.SpiffeID == "" {
@@ -97,14 +97,14 @@ func (s *JWTSVIDService) IssueJWTSVID(
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 
-	signingKey, err := s.getOrCreateSigningKey(ctx, req.TenantID)
+	signingKey, err := s.getOrCreateSigningKey(ctx, req.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get signing key: %w", err)
 	}
 
 	// Build claims as MapClaims to support arbitrary custom fields
 	mapClaims := jwt.MapClaims{
-		"iss": fmt.Sprintf("spiffe://%s", req.TenantID),
+		"iss": fmt.Sprintf("spiffe://%s", req.WorkspaceID),
 		"sub": req.SpiffeID,
 		"aud": req.Audience,
 		"exp": jwt.NewNumericDate(expiresAt),
@@ -144,7 +144,7 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 	req *ValidateJWTSVIDRequest,
 ) (*ValidateJWTSVIDResponse, error) {
 	// Get public key for validation
-	publicKey, err := s.getPublicKey(ctx, req.TenantID)
+	publicKey, err := s.getPublicKey(ctx, req.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get public key: %w", err)
 	}

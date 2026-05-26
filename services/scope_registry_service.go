@@ -37,7 +37,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 		}
 
 		scope := models.OAuthScope{
-			TenantID:         tenantID,
+			WorkspaceID:         tenantID,
 			ResourceServerID: &resourceServerID,
 			ScopeString:      scopeStr,
 			DisplayName:      generateDisplayName(scopeStr),
@@ -270,7 +270,7 @@ func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuth
 	if err := s.db.First(&scope, "id = ?", scopeID).Error; err != nil {
 		return nil, err
 	}
-	return s.applyUpdate(&scope, scope.TenantID, req)
+	return s.applyUpdate(&scope, scope.WorkspaceID, req)
 }
 
 // UpdateByTenant updates scope metadata only when the scope belongs to tenantID.

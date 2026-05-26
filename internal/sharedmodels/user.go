@@ -28,7 +28,7 @@ func init() {
 
 type Tenant struct {
 	ID           uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID     uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex"`
+	WorkspaceID     uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
 	TenantDB     string     `json:"tenant_db"`
 	Email        string     `json:"email" gorm:"type:text;uniqueIndex;not null"`
 	Username     *string    `json:"username,omitempty" gorm:"type:text"`
@@ -51,7 +51,7 @@ func (Tenant) TableName() string {
 }
 
 type RegisterResponse struct {
-	TenantID     uuid.UUID `json:"tenant_id"`
+	WorkspaceID     uuid.UUID `json:"workspace_id"`
 	ProjectID    uuid.UUID `json:"project_id"`
 	ClientID     uuid.UUID `json:"client_id"`
 	EmailID      string    `json:"email_id"`
@@ -74,7 +74,7 @@ type PendingRegistration struct {
 	PasswordHash string    `json:"-"`
 	FirstName    string    `json:"first_name"`
 	LastName     string    `json:"last_name"`
-	TenantID     uuid.UUID `json:"tenant_id" gorm:"type:uuid"`
+	WorkspaceID     uuid.UUID `json:"workspace_id" gorm:"type:uuid"`
 	ProjectID    uuid.UUID `json:"project_id" gorm:"type:uuid"`
 	ClientID     uuid.UUID `json:"client_id" gorm:"type:uuid"`
 	ExpiresAt    time.Time `json:"expires_at"`
@@ -162,5 +162,5 @@ func (Credential) TableName() string {
 type WebAuthnCallbackInput struct {
 	Email       string    `json:"email" binding:"required,email"`
 	MFAVerified *bool     `json:"mfa_verified" binding:"required"`
-	TenantID    uuid.UUID `json:"tenant_id" binding:"required"`
+	WorkspaceID    uuid.UUID `json:"workspace_id" binding:"required"`
 }

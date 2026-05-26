@@ -23,7 +23,10 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 	stmts := []string{
 		`CREATE TABLE resource_servers (
 			id                          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-			tenant_id                   TEXT NOT NULL,
+			workspace_id                TEXT NOT NULL,
+			tenant_id                   TEXT,
+			application_type            TEXT NOT NULL DEFAULT 'mcp_server',
+			legacy_client_id            TEXT,
 			name                        TEXT NOT NULL,
 			public_base_url             TEXT NOT NULL,
 			protected_base_path         TEXT NOT NULL,
@@ -53,6 +56,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		)`,
 		`CREATE TABLE roles (
 			id                TEXT PRIMARY KEY,
+			workspace_id      TEXT,
 			tenant_id         TEXT,
 			name              TEXT NOT NULL,
 			description       TEXT,
@@ -63,7 +67,8 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		)`,
 		`CREATE TABLE resource_server_access_policies (
 			id                  TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-			tenant_id           TEXT NOT NULL,
+			workspace_id        TEXT NOT NULL,
+			tenant_id           TEXT,
 			resource_server_id  TEXT NOT NULL,
 			enabled             NUMERIC NOT NULL DEFAULT 0,
 			default_role_id     TEXT,
@@ -74,7 +79,8 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		)`,
 		`CREATE TABLE oauth_scopes (
 			id                  TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-			tenant_id           TEXT NOT NULL,
+			workspace_id        TEXT NOT NULL,
+			tenant_id           TEXT,
 			resource_server_id  TEXT,
 			scope_string        TEXT NOT NULL,
 			display_name        TEXT NOT NULL,
@@ -86,7 +92,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 			source              TEXT NOT NULL DEFAULT 'discovered',
 			created_at          DATETIME,
 			updated_at          DATETIME,
-			UNIQUE (tenant_id, resource_server_id, scope_string)
+			UNIQUE (workspace_id, resource_server_id, scope_string)
 		)`,
 	}
 	for _, s := range stmts {
@@ -105,7 +111,7 @@ func TestCreateResourceServer_DefaultAccessClosed(t *testing.T) {
 	svc := NewResourceServerService(db)
 
 	rs, _, err := svc.Create(CreateResourceServerRequest{
-		TenantID:      uuid.New(),
+		WorkspaceID:   uuid.New(),
 		Name:          "Closed RS",
 		PublicBaseURL: "https://example.com",
 	}, "https://auth.example.com")
@@ -125,7 +131,7 @@ func TestCreateResourceServer_DefaultAccessEnabledExplicit(t *testing.T) {
 	svc := NewResourceServerService(db)
 
 	rs, _, err := svc.Create(CreateResourceServerRequest{
-		TenantID:             uuid.New(),
+		WorkspaceID:          uuid.New(),
 		Name:                 "Open RS",
 		PublicBaseURL:        "https://example.com",
 		DefaultAccessEnabled: ptrBool(true),
@@ -146,7 +152,7 @@ func TestCreateResourceServer_SeedsPresetScopes(t *testing.T) {
 	svc := NewResourceServerService(db)
 
 	rs, _, err := svc.Create(CreateResourceServerRequest{
-		TenantID:      uuid.New(),
+		WorkspaceID:   uuid.New(),
 		Name:          "GitHub MCP",
 		PublicBaseURL: "https://github.example.com",
 		ScopePresetID: ptrString("read_write"),
@@ -156,9 +162,9 @@ func TestCreateResourceServer_SeedsPresetScopes(t *testing.T) {
 
 	var scopes []models.OAuthScope
 	require.NoError(t, db.Where("resource_server_id = ?", rs.ID).Order("scope_string").Find(&scopes).Error)
-	require.Len(t, scopes, 2, "read_write preset must seed exactly 2 scopes")
+	require.Len(t, scopes, 4, "read_write preset must seed the canonical read/write and tools scopes")
 
-	expectedStrings := []string{"github_mcp:read", "github_mcp:write"}
+	expectedStrings := []string{"github_mcp:read", "github_mcp:tools:read", "github_mcp:tools:write", "github_mcp:write"}
 	for i, sc := range scopes {
 		require.Equal(t, expectedStrings[i], sc.ScopeString)
 		require.Equal(t, "preset", sc.Source, "preset-seeded scopes must carry source='preset'")
@@ -173,7 +179,7 @@ func TestCreateResourceServer_BlankPresetSeedsNothing(t *testing.T) {
 	svc := NewResourceServerService(db)
 
 	rs, _, err := svc.Create(CreateResourceServerRequest{
-		TenantID:      uuid.New(),
+		WorkspaceID:   uuid.New(),
 		Name:          "Blank RS",
 		PublicBaseURL: "https://example.com",
 		ScopePresetID: ptrString("blank"),
@@ -192,7 +198,7 @@ func TestCreateResourceServer_UnknownPresetIgnored(t *testing.T) {
 	svc := NewResourceServerService(db)
 
 	rs, _, err := svc.Create(CreateResourceServerRequest{
-		TenantID:      uuid.New(),
+		WorkspaceID:   uuid.New(),
 		Name:          "Mystery RS",
 		PublicBaseURL: "https://example.com",
 		ScopePresetID: ptrString("does_not_exist"),

@@ -68,7 +68,7 @@ func (w *PKIRetryWorker) retryTenantPKI(tenantID, name, domain string) {
 	defer cancel()
 
 	resp, err := w.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		CommonName: name,
 		Domain:     domain,
 		TTL:        "87600h",

@@ -58,7 +58,7 @@ const (
 // One row per (tenant_id, user_id).
 type TenantMembership struct {
 	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID       uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_tm_tenant_user"`
+	WorkspaceID       uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_tm_tenant_user"`
 	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null;uniqueIndex:idx_tm_tenant_user"`
 	Status         string     `json:"status" gorm:"type:text;not null;default:'active'"`
 	MembershipType string     `json:"membership_type" gorm:"type:text;not null;default:'member'"`
@@ -100,7 +100,7 @@ const (
 // (a consumer who has consented to one of the tenant's published Applications).
 // Created lazily on first consent. Primary key is (tenant_id, user_id).
 type TenantEndUserState struct {
-	TenantID          uuid.UUID       `json:"tenant_id" gorm:"type:uuid;primaryKey"`
+	WorkspaceID          uuid.UUID       `json:"workspace_id" gorm:"type:uuid;primaryKey"`
 	UserID            uuid.UUID       `json:"user_id" gorm:"type:uuid;primaryKey"`
 	Status            string          `json:"status" gorm:"type:text;not null;default:'active'"`
 	PlanTier          *string         `json:"plan_tier,omitempty" gorm:"type:text"`

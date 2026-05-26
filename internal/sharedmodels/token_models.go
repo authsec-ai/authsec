@@ -8,7 +8,7 @@ import (
 
 type Role struct {
 	ID          uuid.UUID    `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_roles_tenant_id"`
-	TenantID    uuid.UUID    `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
+	WorkspaceID    uuid.UUID    `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
 	Name        string       `json:"name" gorm:"type:text;not null;uniqueIndex:idx_roles_tenant_name"`
 	Description string       `json:"description" gorm:"type:text"`
 	IsSystem    bool         `json:"is_system" gorm:"default:false"`
@@ -19,7 +19,7 @@ type Role struct {
 
 type Group struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`
+	WorkspaceID    *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`
 	Name        string     `json:"name" gorm:"uniqueIndex;not null"`
 	Description string     `json:"description"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -27,7 +27,7 @@ type Group struct {
 }
 
 type TokenRequest struct {
-	TenantID  string  `json:"tenant_id" binding:"required"`
+	WorkspaceID  string  `json:"workspace_id" binding:"required"`
 	ProjectID string  `json:"project_id" binding:"required"`
 	ClientID  string  `json:"client_id" binding:"required"`
 	SecretID  *string `json:"secret_id,omitempty"`
@@ -45,7 +45,7 @@ type VerifyRequest struct {
 }
 
 type TokenClaims struct {
-	TenantID  string   `json:"tenant_id"`
+	WorkspaceID  string   `json:"workspace_id"`
 	ProjectID string   `json:"project_id"`
 	ClientID  string   `json:"client_id"`
 	EmailID   string   `json:"email_id"`

@@ -1,7 +1,7 @@
 package sharedmodels
 
 type BeginRegistrationRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 }
 
@@ -26,7 +26,7 @@ type WebAuthnOptionsResponse struct {
 }
 
 type FinishRegistrationRequest struct {
-	TenantID string      `json:"tenant_id" binding:"required"`
+	WorkspaceID string      `json:"workspace_id" binding:"required"`
 	Email    string      `json:"email" binding:"required,email"`
 	Response interface{} `json:"response" binding:"required"`
 }

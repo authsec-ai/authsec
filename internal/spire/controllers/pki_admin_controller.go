@@ -28,7 +28,7 @@ func NewPKIAdminController(pkiService *services.PKIProvisioningService, logger *
 // ProvisionPKI handles POST /spire/admin/pki/provision
 func (ctrl *PKIAdminController) ProvisionPKI(c *gin.Context) {
 	var req struct {
-		TenantID       string `json:"tenant_id"`
+		WorkspaceID       string `json:"workspace_id"`
 		CommonName     string `json:"common_name,omitempty"`
 		Domain         string `json:"domain,omitempty"`
 		TTL            string `json:"ttl,omitempty"`
@@ -40,7 +40,7 @@ func (ctrl *PKIAdminController) ProvisionPKI(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" {
+	if req.WorkspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
 		return
 	}
@@ -52,7 +52,7 @@ func (ctrl *PKIAdminController) ProvisionPKI(c *gin.Context) {
 	}
 
 	result, err := ctrl.pkiService.ProvisionPKI(c.Request.Context(), &services.ProvisionPKIRequest{
-		TenantID:       req.TenantID,
+		WorkspaceID:       req.WorkspaceID,
 		CommonName:     req.CommonName,
 		TTL:            req.TTL,
 		MaxTTL:         req.MaxTTL,
@@ -97,7 +97,7 @@ func (ctrl *PKIAdminController) ProvisionPKIForTenant(c *gin.Context) {
 	}
 
 	result, err := ctrl.pkiService.ProvisionPKI(c.Request.Context(), &services.ProvisionPKIRequest{
-		TenantID:       tenantID,
+		WorkspaceID:       tenantID,
 		CommonName:     req.CommonName,
 		TTL:            req.TTL,
 		MaxTTL:         req.MaxTTL,

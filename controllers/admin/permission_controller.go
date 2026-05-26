@@ -144,7 +144,7 @@ func (pc *PermissionController) RegisterAtomicPermissionEndUser(c *gin.Context) 
 
 func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, tenantID uuid.UUID, req PermissionRequest) error {
 	perm := &models.RBACPermission{
-		TenantID:    &tenantID,
+		WorkspaceID:    &tenantID,
 		Resource:    req.Resource,
 		Action:      req.Action,
 		Description: req.Description,
@@ -159,8 +159,8 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 	}
 
 	// Debug: Verify permission was created with correct tenant_id
-	if perm.TenantID != nil {
-		log.Printf("[RegisterPermission] Permission created successfully with ID: %s, tenant_id: %s", perm.ID.String(), perm.TenantID.String())
+	if perm.WorkspaceID != nil {
+		log.Printf("[RegisterPermission] Permission created successfully with ID: %s, tenant_id: %s", perm.ID.String(), perm.WorkspaceID.String())
 	} else {
 		log.Printf("[RegisterPermission] WARNING: Permission created with ID: %s but tenant_id is NULL!", perm.ID.String())
 	}
@@ -721,7 +721,7 @@ func (pc *PermissionController) CheckPermission(c *gin.Context) {
 
 	response := PermissionCheckResponse{
 		UserID:        userID,
-		TenantID:      tenantID,
+		WorkspaceID:      tenantID,
 		Resource:      resource,
 		Scope:         scope,
 		HasPermission: hasPermission,
@@ -739,7 +739,7 @@ type EffectivePermissionsResponse struct {
 
 type PermissionCheckResponse struct {
 	UserID        string `json:"user_id"`
-	TenantID      string `json:"tenant_id"`
+	WorkspaceID      string `json:"workspace_id"`
 	Resource      string `json:"resource"`
 	Scope         string `json:"scope"`
 	HasPermission bool   `json:"has_permission"`
@@ -765,7 +765,7 @@ func GetUserPermissionsInTenant(userID, tenantID string) ([]models.Permission, e
 	var permissions []models.Permission
 	for rows.Next() {
 		var permission models.Permission
-		err := rows.Scan(&permission.ID, &permission.TenantID, &permission.Resource, &permission.Action,
+		err := rows.Scan(&permission.ID, &permission.WorkspaceID, &permission.Resource, &permission.Action,
 			&permission.Description, &permission.CreatedAt, &permission.UpdatedAt)
 		if err != nil {
 			return nil, err
@@ -794,7 +794,7 @@ func GetUserRolePermissionsInTenant(userID, tenantID string) ([]models.Permissio
 	var permissions []models.Permission
 	for rows.Next() {
 		var permission models.Permission
-		err := rows.Scan(&permission.ID, &permission.TenantID, &permission.Resource, &permission.Action,
+		err := rows.Scan(&permission.ID, &permission.WorkspaceID, &permission.Resource, &permission.Action,
 			&permission.Description, &permission.CreatedAt, &permission.UpdatedAt)
 		if err != nil {
 			return nil, err

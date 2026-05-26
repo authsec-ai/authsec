@@ -38,7 +38,7 @@ func (tr *TenantRepository) CreateTenant(tenant *models.Tenant) error {
 
 	_, err := tr.db.Exec(query,
 		tenant.ID,
-		tenant.TenantID,
+		tenant.WorkspaceID,
 		tenant.TenantDB,
 		tenant.Email,
 		tenant.Username,
@@ -74,7 +74,7 @@ func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, erro
 
 	err := tr.db.QueryRow(query, email).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&username,
@@ -131,7 +131,7 @@ func (tr *TenantRepository) GetTenantByTenantID(tenantID string) (*models.Tenant
 
 	err := tr.db.QueryRow(query, tenantID).Scan(
 		&tenant.ID,
-		&tenant.TenantID,
+		&tenant.WorkspaceID,
 		&tenant.TenantDB,
 		&tenant.Email,
 		&username,
@@ -274,7 +274,7 @@ func (tr *TenantRepository) CreateTenantTx(tx *sql.Tx, tenant *models.Tenant) er
 
 	_, err := tx.Exec(query,
 		tenant.ID,
-		tenant.TenantID,
+		tenant.WorkspaceID,
 		tenant.TenantDB,
 		tenant.Email,
 		tenant.Username,
@@ -340,7 +340,7 @@ func (tr *TenantRepository) GetAllTenants() ([]*models.Tenant, error) {
 		tenant := &models.Tenant{}
 		err := rows.Scan(
 			&tenant.ID,
-			&tenant.TenantID,
+			&tenant.WorkspaceID,
 			&tenant.TenantDB,
 			&tenant.Email,
 			&tenant.Username,

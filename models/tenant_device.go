@@ -14,7 +14,7 @@ import (
 type TenantDeviceToken struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID    uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID    uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	DeviceToken string    `json:"device_token" gorm:"uniqueIndex;size:500;not null"`
 	Platform    string    `json:"platform" gorm:"size:20;not null"` // ios, android
 
@@ -49,7 +49,7 @@ type TenantCIBAAuthRequest struct {
 
 	// User identification
 	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	UserEmail string    `json:"user_email" gorm:"size:255;not null"`
 
 	// Client information
@@ -103,7 +103,7 @@ func (c *TenantCIBAAuthRequest) IsApproved() bool {
 type TenantTOTPSecret struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID   uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
 	// TOTP secret (base32 encoded)
 	Secret string `json:"-" gorm:"size:64;not null"` // Never expose this in JSON
@@ -131,7 +131,7 @@ func (TenantTOTPSecret) TableName() string {
 type TenantBackupCode struct {
 	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	TenantID  uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	Code      string    `json:"code" gorm:"size:32;not null;uniqueIndex"` // Hashed code
 	IsUsed    bool      `json:"is_used" gorm:"default:false;index"`
 	CreatedAt int64     `json:"created_at" gorm:"not null"`

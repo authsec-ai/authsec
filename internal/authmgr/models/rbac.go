@@ -13,7 +13,7 @@ import (
 // Role represents a collection of permissions.
 type Role struct {
 	ID          uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID    uuid.UUID `gorm:"type:uuid;not null"`
+	WorkspaceID    uuid.UUID `gorm:"type:uuid;not null"`
 	Name        string    `gorm:"not null"`
 	Description string
 	IsSystem    bool `gorm:"default:false"`
@@ -26,7 +26,7 @@ type Role struct {
 // Permission represents an atomic resource+action pair.
 type Permission struct {
 	ID          uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID    uuid.UUID `gorm:"type:uuid;not null"`
+	WorkspaceID    uuid.UUID `gorm:"type:uuid;not null"`
 	Resource    string    `gorm:"not null"`
 	Action      string    `gorm:"not null"`
 	Description string
@@ -38,7 +38,7 @@ type Permission struct {
 // optionally scoped to a specific resource.
 type RoleBinding struct {
 	ID       uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID uuid.UUID `gorm:"type:uuid;not null"`
+	WorkspaceID uuid.UUID `gorm:"type:uuid;not null"`
 
 	UserID           *uuid.UUID `gorm:"type:uuid"`
 	ServiceAccountID *uuid.UUID `gorm:"type:uuid"`

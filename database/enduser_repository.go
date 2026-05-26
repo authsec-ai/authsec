@@ -83,7 +83,7 @@ func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 	_, err := eur.executeExec(query,
 		user.ID,
 		user.ClientID,
-		user.TenantID,
+		user.WorkspaceID,
 		user.ProjectID,
 		user.Name,
 		user.Username,
@@ -132,7 +132,7 @@ WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND active = true
 	err := row.Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&user.Username,
@@ -184,7 +184,7 @@ WHERE id = $1 AND active = true
 	err := row.Scan(
 		&user.ID,
 		&user.ClientID,
-		&user.TenantID,
+		&user.WorkspaceID,
 		&user.ProjectID,
 		&user.Name,
 		&user.Username,
@@ -284,7 +284,7 @@ LIMIT $2 OFFSET $3
 		err := rows.Scan(
 			&user.ID,
 			&user.ClientID,
-			&user.TenantID,
+			&user.WorkspaceID,
 			&user.ProjectID,
 			&user.Name,
 			&user.Username,

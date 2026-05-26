@@ -82,7 +82,7 @@ type PendingRegistration struct {
 	PasswordHash string    `json:"-"`
 	FirstName    string    `json:"first_name"`
 	LastName     string    `json:"last_name"`
-	TenantID     uuid.UUID `json:"tenant_id" gorm:"type:uuid"`
+	WorkspaceID     uuid.UUID `json:"workspace_id" gorm:"type:uuid"`
 	ProjectID    uuid.UUID `json:"project_id" gorm:"type:uuid"`
 	ClientID     uuid.UUID `json:"client_id" gorm:"type:uuid"`
 	ExpiresAt    time.Time `json:"expires_at"`
@@ -96,14 +96,14 @@ type TenantGroup struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	Name        string    `json:"name" gorm:"not null"`
 	Description *string   `json:"description"`
-	TenantID    uuid.UUID `json:"tenant_id" gorm:"type:uuid"`
+	WorkspaceID    uuid.UUID `json:"workspace_id" gorm:"type:uuid"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Group struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"type:uuid"`
+	WorkspaceID    *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`
 	Name        string     `json:"name" gorm:"uniqueIndex;not null"`
 	Description string     `json:"description"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -115,7 +115,7 @@ func (Group) TableName() string {
 }
 
 type RemoveGroupsRequest struct {
-	TenantID string   `json:"tenant_id" binding:"required"`
+	WorkspaceID string   `json:"workspace_id" binding:"required"`
 	ClientID string   `json:"client_id" binding:"required"`
 	Groups   []string `json:"groups" binding:"required"`
 }
@@ -125,7 +125,7 @@ type RemoveGroupsRequest struct {
 // Primary key is the (tenant_id, user_id, group_id) tuple so all rows are
 // tenant-scoped and the composite FK to users(tenant_id, id) is satisfied.
 type UserGroup struct {
-	TenantID uuid.UUID  `json:"tenant_id" gorm:"type:uuid;primaryKey;not null"`
+	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;primaryKey;not null"`
 	UserID   uuid.UUID  `json:"user_id" gorm:"type:uuid;primaryKey;not null"`
 	GroupID  uuid.UUID  `json:"group_id" gorm:"type:uuid;primaryKey;not null"`
 	AddedAt  time.Time  `json:"added_at" gorm:"autoCreateTime"`
@@ -167,7 +167,7 @@ type InitiateRegistrationInput struct {
 // DeleteRolesRequest with support for both "roles" and "role_ids" field names
 // This overrides sharedmodels.DeleteRolesRequest to handle legacy clients sending "role_ids"
 type DeleteRolesRequest struct {
-	TenantID  string   `json:"tenant_id" binding:"required"`
+	WorkspaceID  string   `json:"workspace_id" binding:"required"`
 	ProjectID string   `json:"project_id" binding:"required"`
 	Roles     []string `json:"roles" binding:"required"`
 	RoleIDs   []string `json:"role_ids"` // Alternative field name for backward compatibility

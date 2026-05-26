@@ -15,7 +15,7 @@ import (
 type UserWithJSONMFAMethods struct {
 	ID               uuid.UUID      `gorm:"column:id"`
 	ClientID         uuid.UUID      `gorm:"column:client_id"`
-	TenantID         uuid.UUID      `gorm:"column:tenant_id"`
+	WorkspaceID         uuid.UUID      `gorm:"column:tenant_id"`
 	ProjectID        uuid.UUID      `gorm:"column:project_id"`
 	Name             string         `gorm:"column:name"`
 	Username         *string        `gorm:"column:username"`
@@ -51,7 +51,7 @@ func (u UserWithJSONMFAMethods) ToShared() sharedmodels.User {
 	user := sharedmodels.User{
 		ID:               u.ID,
 		ClientID:         u.ClientID,
-		TenantID:         u.TenantID,
+		WorkspaceID:         u.WorkspaceID,
 		ProjectID:        u.ProjectID,
 		Name:             u.Name,
 		Username:         u.Username,

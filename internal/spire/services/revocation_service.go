@@ -45,7 +45,7 @@ func NewRevocationService(
 
 // RevokeRequest represents a revocation request
 type RevokeRequest struct {
-	TenantID     string
+	WorkspaceID     string
 	SerialNumber string
 	Reason       string
 	IPAddress    string
@@ -55,12 +55,12 @@ type RevokeRequest struct {
 // Revoke revokes a certificate
 func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) error {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":     req.TenantID,
+		"tenant_id":     req.WorkspaceID,
 		"serial_number": req.SerialNumber,
 	}).Info("Starting certificate revocation")
 
 	// Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		s.auditRevocation(ctx, req, false, err.Error())
 		return err
@@ -72,14 +72,14 @@ func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) erro
 	}
 
 	// Get tenant-specific repositories
-	certRepo, _, err := s.getTenantRepositories(ctx, req.TenantID)
+	certRepo, _, err := s.getTenantRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
 	// Get certificate
-	cert, err := certRepo.GetBySerialNumber(ctx, req.TenantID, req.SerialNumber)
+	cert, err := certRepo.GetBySerialNumber(ctx, req.WorkspaceID, req.SerialNumber)
 	if err != nil {
 		s.auditRevocation(ctx, req, false, "certificate not found")
 		return errors.NewNotFoundError("Certificate not found", err)
@@ -98,7 +98,7 @@ func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) erro
 	}
 
 	// Update certificate status
-	if err := certRepo.Revoke(ctx, req.TenantID, cert.ID); err != nil {
+	if err := certRepo.Revoke(ctx, req.WorkspaceID, cert.ID); err != nil {
 		s.logger.WithField("serial_number", req.SerialNumber).WithError(err).Error("Failed to update certificate status")
 		// Don't fail - certificate is already revoked in Vault
 	}
@@ -133,7 +133,7 @@ func (s *RevocationService) getTenantRepositories(ctx context.Context, tenantID 
 // auditRevocation creates an audit log entry for revocation
 func (s *RevocationService) auditRevocation(ctx context.Context, req *RevokeRequest, success bool, errorMsg string) {
 	audit := &models.AuditLog{
-		TenantID:     req.TenantID,
+		WorkspaceID:     req.WorkspaceID,
 		EventType:    models.EventRevoke,
 		Success:      success,
 		ErrorMessage: errorMsg,

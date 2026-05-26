@@ -19,7 +19,7 @@ import (
 type TenantHydraClient struct {
 	ID                uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	OrgID             string         `json:"org_id" gorm:"not null;index"`
-	TenantID          string         `json:"tenant_id" gorm:"not null;index"`
+	WorkspaceID          string         `json:"workspace_id" gorm:"not null;index"`
 	TenantName        string         `json:"tenant_name" gorm:"not null"`
 	HydraClientID     string         `json:"hydra_client_id" gorm:"not null;unique"`
 	HydraClientSecret string         `json:"hydra_client_secret" gorm:"not null"`
@@ -42,7 +42,7 @@ func (TenantHydraClient) TableName() string {
 // GetTenantHydraClientsRequest is the filter struct for listing hydra clients.
 type GetTenantHydraClientsRequest struct {
 	OrgID      string `json:"org_id,omitempty"`
-	TenantID   string `json:"tenant_id,omitempty"`
+	WorkspaceID   string `json:"workspace_id,omitempty"`
 	ClientType string `json:"client_type,omitempty"`
 	IsActive   *bool  `json:"is_active,omitempty"`
 }
@@ -65,8 +65,8 @@ func (r *hydraClientRepository) ListAll(req *GetTenantHydraClientsRequest) ([]*T
 	if req.OrgID != "" {
 		query = query.Where("org_id = ?", req.OrgID)
 	}
-	if req.TenantID != "" {
-		query = query.Where("tenant_id = ?", req.TenantID)
+	if req.WorkspaceID != "" {
+		query = query.Where("tenant_id = ?", req.WorkspaceID)
 	}
 	if req.ClientType != "" {
 		query = query.Where("client_type = ?", req.ClientType)
@@ -111,7 +111,7 @@ func (s *Service) MethodsForClients(tenantID uuid.UUID, clients []sharedmodels.C
 	tenantKey := tenantID.String()
 	isActive := true
 	orgRecords, err := s.repo.ListAll(&GetTenantHydraClientsRequest{
-		TenantID:   tenantKey,
+		WorkspaceID:   tenantKey,
 		ClientType: "oidc_provider",
 		IsActive:   &isActive,
 	})

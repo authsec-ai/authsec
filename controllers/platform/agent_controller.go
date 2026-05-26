@@ -54,7 +54,7 @@ type DelegateTokenRequest struct {
 type agentClient struct {
 	ID         uuid.UUID `json:"id"`
 	ClientID   uuid.UUID `json:"client_id"`
-	TenantID   uuid.UUID `json:"tenant_id"`
+	WorkspaceID   uuid.UUID `json:"workspace_id"`
 	Name       string    `json:"name"`
 	Email      *string   `json:"email,omitempty"`
 	Status     string    `json:"status"`
@@ -195,7 +195,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		trustDomain, tenantID.String(), *agent.AgentType, clientID)
 
 	spireEntry := &spiremodels.WorkloadEntry{
-		TenantID:  tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		SpiffeID:  spiffeID,
 		ParentID:  req.ParentID,
 		Selectors: map[string]string{"authsec:client_id": clientID, "authsec:agent_type": *agent.AgentType},
@@ -386,7 +386,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		return
 	}
 	jwtResp, err := ac.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
-		TenantID:     tenantID.String(),
+		WorkspaceID:     tenantID.String(),
 		SpiffeID:     *agent.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          finalTTL,
@@ -418,7 +418,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	applicationID := lookupApplicationIDForLegacyClient(clientUUID)
 
 	upsertToken := models.DelegationToken{
-		TenantID:      *tenantID,
+		WorkspaceID:      *tenantID,
 		ClientID:      clientUUID,
 		ApplicationID: applicationID,
 		PolicyID:      policyID,

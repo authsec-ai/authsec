@@ -24,7 +24,7 @@ func NewDeviceAuthRepository(db *DBConnection) *DeviceAuthRepository {
 }
 
 // CreateDeviceCode creates a new device authorization request.
-// TenantID may be nil when the CLI initiates the flow — it is populated during /authorize.
+// WorkspaceID may be nil when the CLI initiates the flow — it is populated during /authorize.
 func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) error {
 	query := `
 		INSERT INTO device_codes (
@@ -50,7 +50,7 @@ func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) e
 
 	_, err = r.db.Exec(query,
 		deviceCode.ID,
-		deviceCode.TenantID, // nullable *uuid.UUID — driver handles nil → NULL
+		deviceCode.WorkspaceID, // nullable *uuid.UUID — driver handles nil → NULL
 		deviceCode.ClientID,
 		deviceCode.DeviceCode,
 		deviceCode.UserCode,
@@ -135,7 +135,7 @@ func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode,
 
 	if tenantID.Valid {
 		id := uuid.MustParse(tenantID.String)
-		dc.TenantID = &id
+		dc.WorkspaceID = &id
 	}
 	if clientID.Valid {
 		id := uuid.MustParse(clientID.String)
@@ -376,7 +376,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 
 		if tID.Valid {
 			id := uuid.MustParse(tID.String)
-			dc.TenantID = &id
+			dc.WorkspaceID = &id
 		}
 		if cID.Valid {
 			id := uuid.MustParse(cID.String)

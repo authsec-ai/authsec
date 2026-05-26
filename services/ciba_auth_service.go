@@ -62,7 +62,7 @@ func (s *CIBAAuthService) InitiateCIBAAuth(req *models.CIBAInitiateRequest) (*mo
 	}
 
 	// Step 2: Get user's registered push devices
-	devices, err := s.cibaRepo.GetDeviceTokensByUserID(user.ID, user.TenantID)
+	devices, err := s.cibaRepo.GetDeviceTokensByUserID(user.ID, user.WorkspaceID)
 	if err != nil || len(devices) == 0 {
 		return &models.CIBAInitiateResponse{
 			Error:            models.CIBAErrorNoDevice,
@@ -99,7 +99,7 @@ func (s *CIBAAuthService) InitiateCIBAAuth(req *models.CIBAInitiateRequest) (*mo
 		ID:             uuid.New(),
 		AuthReqID:      authReqID,
 		UserID:         user.ID,
-		TenantID:       user.TenantID,
+		WorkspaceID:       user.WorkspaceID,
 		UserEmail:      user.Email,
 		ClientID:       clientID,
 		DeviceTokenID:  device.ID,
@@ -232,7 +232,7 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 		}
 
 		// Get tenant info
-		tenant, err := s.tenantRepo.GetTenantByID(authReq.TenantID.String())
+		tenant, err := s.tenantRepo.GetTenantByID(authReq.WorkspaceID.String())
 		if err != nil {
 			return &models.CIBATokenResponse{
 				Error:            "server_error",
@@ -285,7 +285,7 @@ func (s *CIBAAuthService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, r
 	deviceToken := &models.DeviceToken{
 		ID:          uuid.New(),
 		UserID:      userID,
-		TenantID:    tenantID,
+		WorkspaceID:    tenantID,
 		DeviceToken: req.DeviceToken,
 		Platform:    req.Platform,
 		DeviceName:  req.DeviceName,
@@ -395,7 +395,7 @@ func (s *CIBAAuthService) DeleteDevice(deviceID, userID, tenantID uuid.UUID) err
 		return fmt.Errorf("device not found: %w", err)
 	}
 
-	if device.UserID != userID || device.TenantID != tenantID {
+	if device.UserID != userID || device.WorkspaceID != tenantID {
 		return fmt.Errorf("device not found or unauthorized")
 	}
 

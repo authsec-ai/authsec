@@ -16,7 +16,7 @@ import (
 // TenantDomain represents a verified or pending custom domain for a tenant
 type TenantDomain struct {
 	ID                   uuid.UUID  `db:"id"`
-	TenantID             uuid.UUID  `db:"tenant_id"`
+	WorkspaceID             uuid.UUID  `db:"tenant_id"`
 	Domain               string     `db:"domain"`
 	Kind                 string     `db:"kind"` // 'platform_subdomain' or 'custom'
 	IsPrimary            bool       `db:"is_primary"`
@@ -112,7 +112,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 
 	td := &TenantDomain{
 		ID:                   id,
-		TenantID:             tenantID,
+		WorkspaceID:             tenantID,
 		Domain:               domain,
 		Kind:                 kind,
 		IsPrimary:            false,
@@ -128,7 +128,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 
 	err = tdr.db.QueryRow(query, id, tenantID, domain, kind, false, false,
 		"dns_txt", token, txtName, txtValue, now, now, createdBy).Scan(
-		&td.ID, &td.TenantID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
+		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 		&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt,
 		&td.FailureReason, &td.CreatedAt, &td.UpdatedAt, &td.CreatedBy, &td.UpdatedBy,
@@ -153,7 +153,7 @@ func (tdr *TenantDomainsRepository) GetDomainByID(id uuid.UUID) (*TenantDomain, 
 
 	td := &TenantDomain{}
 	err := tdr.db.QueryRow(query, id).Scan(
-		&td.ID, &td.TenantID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
+		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 		&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt, &td.FailureReason,
 		&td.CreatedAt, &td.UpdatedAt, &td.CreatedBy, &td.UpdatedBy,
@@ -184,7 +184,7 @@ func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*Tenan
 
 	td := &TenantDomain{}
 	err := tdr.db.QueryRow(query, hostname).Scan(
-		&td.ID, &td.TenantID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
+		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 		&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt, &td.FailureReason,
 		&td.CreatedAt, &td.UpdatedAt, &td.CreatedBy, &td.UpdatedBy,
@@ -221,7 +221,7 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(tenantID uuid.UUID) ([]Ten
 	for rows.Next() {
 		td := TenantDomain{}
 		err := rows.Scan(
-			&td.ID, &td.TenantID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
+			&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 			&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 			&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt, &td.FailureReason,
 			&td.CreatedAt, &td.UpdatedAt, &td.CreatedBy, &td.UpdatedBy,
@@ -249,7 +249,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(tenantID uuid.UUI
 
 	td := &TenantDomain{}
 	err := tdr.db.QueryRow(query, tenantID).Scan(
-		&td.ID, &td.TenantID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
+		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 		&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt, &td.FailureReason,
 		&td.CreatedAt, &td.UpdatedAt, &td.CreatedBy, &td.UpdatedBy,
@@ -494,7 +494,7 @@ func (tdr *TenantDomainsRepository) NormalizeHostnameAndCheckOwnership(tenantID 
 		return "", err
 	}
 	if !owned {
-		return "", &DomainOwnershipError{Hostname: host, TenantID: tenantID}
+		return "", &DomainOwnershipError{Hostname: host, WorkspaceID: tenantID}
 	}
 
 	return host, nil
@@ -541,11 +541,11 @@ func (e *InvalidRedirectURIError) Error() string {
 
 type DomainOwnershipError struct {
 	Hostname string
-	TenantID uuid.UUID
+	WorkspaceID uuid.UUID
 }
 
 func (e *DomainOwnershipError) Error() string {
-	return fmt.Sprintf("redirect URI host %s is not owned by tenant %s", e.Hostname, e.TenantID)
+	return fmt.Sprintf("redirect URI host %s is not owned by tenant %s", e.Hostname, e.WorkspaceID)
 }
 
 type RedirectURIValidationError struct {

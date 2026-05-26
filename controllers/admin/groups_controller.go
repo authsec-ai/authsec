@@ -22,13 +22,13 @@ type GroupController struct{}
 
 // AdminGroupListRequest represents the payload for admin tenant group listing
 type AdminGroupListRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	UserID   string `json:"user_id"`
 }
 
 // GroupRequest handles both string and object formats for groups
 type GroupRequest struct {
-	TenantID  string          `json:"tenant_id" binding:"required"`
+	WorkspaceID  string          `json:"workspace_id" binding:"required"`
 	ClientID  string          `json:"client_id,omitempty"`
 	ProjectID string          `json:"project_id,omitempty"`
 	Groups    json.RawMessage `json:"groups" binding:"required"`
@@ -59,8 +59,8 @@ func (gc *GroupController) AddUserDefinedGroups(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TenantID is required"})
+	if req.WorkspaceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "WorkspaceID is required"})
 		return
 	}
 
@@ -93,16 +93,16 @@ func (gc *GroupController) AddUserDefinedGroups(c *gin.Context) {
 		return
 	}
 
-	createdGroups, err := AddUserDefinedGroups(req.TenantID, groupNames)
+	createdGroups, err := AddUserDefinedGroups(req.WorkspaceID, groupNames)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add groups: " + err.Error()})
 		return
 	}
 
 	// Audit log: Groups created
-	middlewares.Audit(c, "group", req.TenantID, "create", &middlewares.AuditChanges{
+	middlewares.Audit(c, "group", req.WorkspaceID, "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":    req.TenantID,
+			"tenant_id":    req.WorkspaceID,
 			"groups_count": len(createdGroups),
 			"group_names":  groupNames,
 		},
@@ -134,12 +134,12 @@ func (gc *GroupController) MapGroupsToClient(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" || req.ClientID == "" || len(req.Groups) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TenantID, ClientID and Groups are required"})
+	if req.WorkspaceID == "" || req.ClientID == "" || len(req.Groups) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "WorkspaceID, ClientID and Groups are required"})
 		return
 	}
 
-	if err := MapGroupsToClient(req.TenantID, req.ClientID, req.Groups); err != nil {
+	if err := MapGroupsToClient(req.WorkspaceID, req.ClientID, req.Groups); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to map groups to client: " + err.Error()})
 		return
 	}
@@ -147,7 +147,7 @@ func (gc *GroupController) MapGroupsToClient(c *gin.Context) {
 	// Audit log: Groups mapped to client
 	middlewares.Audit(c, "group", req.ClientID, "map_to_client", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id": req.TenantID,
+			"tenant_id": req.WorkspaceID,
 			"client_id": req.ClientID,
 			"groups":    req.Groups,
 		},
@@ -174,12 +174,12 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" || req.ClientID == "" || len(req.Groups) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TenantID, ClientID and Groups are required"})
+	if req.WorkspaceID == "" || req.ClientID == "" || len(req.Groups) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "WorkspaceID, ClientID and Groups are required"})
 		return
 	}
 
-	if err := RemoveGroupsFromClient(req.TenantID, req.ClientID, req.Groups); err != nil {
+	if err := RemoveGroupsFromClient(req.WorkspaceID, req.ClientID, req.Groups); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove groups from client: " + err.Error()})
 		return
 	}
@@ -187,7 +187,7 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 	// Audit log: Groups removed from client
 	middlewares.Audit(c, "group", req.ClientID, "unmap_from_client", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id": req.TenantID,
+			"tenant_id": req.WorkspaceID,
 			"client_id": req.ClientID,
 			"groups":    req.Groups,
 		},
@@ -533,7 +533,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 	}
 
 	var req struct {
-		TenantID    string `json:"tenant_id" binding:"required"`
+		WorkspaceID    string `json:"workspace_id" binding:"required"`
 		Name        string `json:"name" binding:"required"`
 		Description string `json:"description"`
 	}
@@ -543,7 +543,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 		return
 	}
 
-	if err := UpdateUserDefinedGroup(groupID, req.TenantID, req.Name, req.Description); err != nil {
+	if err := UpdateUserDefinedGroup(groupID, req.WorkspaceID, req.Name, req.Description); err != nil {
 		if err.Error() == "group not found" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Group not found"})
 			return
@@ -555,7 +555,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 	// Audit log: Group updated
 	middlewares.Audit(c, "group", groupID, "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":   req.TenantID,
+			"tenant_id":   req.WorkspaceID,
 			"group_id":    groupID,
 			"name":        req.Name,
 			"description": req.Description,
@@ -578,7 +578,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 // @Router /authsec/uflow/groups/users/add [post]
 func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 	var req struct {
-		TenantID string   `json:"tenant_id" binding:"required"`
+		WorkspaceID string   `json:"workspace_id" binding:"required"`
 		UserID   string   `json:"user_id" binding:"required"`
 		Groups   []string `json:"groups" binding:"required"`
 	}
@@ -588,12 +588,12 @@ func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" || req.UserID == "" || len(req.Groups) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TenantID, UserID and Groups are required"})
+	if req.WorkspaceID == "" || req.UserID == "" || len(req.Groups) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "WorkspaceID, UserID and Groups are required"})
 		return
 	}
 
-	if err := AddUserToGroups(req.TenantID, req.UserID, req.Groups); err != nil {
+	if err := AddUserToGroups(req.WorkspaceID, req.UserID, req.Groups); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add user to groups: " + err.Error()})
 		return
 	}
@@ -601,7 +601,7 @@ func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 	// Audit log: User added to groups
 	middlewares.Audit(c, "group", req.UserID, "add_user_to_groups", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id": req.TenantID,
+			"tenant_id": req.WorkspaceID,
 			"user_id":   req.UserID,
 			"groups":    req.Groups,
 		},
@@ -623,7 +623,7 @@ func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 // @Router /authsec/uflow/groups/users/remove [post]
 func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 	var req struct {
-		TenantID string   `json:"tenant_id" binding:"required"`
+		WorkspaceID string   `json:"workspace_id" binding:"required"`
 		UserID   string   `json:"user_id" binding:"required"`
 		Groups   []string `json:"groups" binding:"required"`
 	}
@@ -633,12 +633,12 @@ func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 		return
 	}
 
-	if req.TenantID == "" || req.UserID == "" || len(req.Groups) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "TenantID, UserID and Groups are required"})
+	if req.WorkspaceID == "" || req.UserID == "" || len(req.Groups) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "WorkspaceID, UserID and Groups are required"})
 		return
 	}
 
-	if err := RemoveUserFromGroups(req.TenantID, req.UserID, req.Groups); err != nil {
+	if err := RemoveUserFromGroups(req.WorkspaceID, req.UserID, req.Groups); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove user from groups: " + err.Error()})
 		return
 	}
@@ -646,7 +646,7 @@ func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 	// Audit log: User removed from groups
 	middlewares.Audit(c, "group", req.UserID, "remove_user_from_groups", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id": req.TenantID,
+			"tenant_id": req.WorkspaceID,
 			"user_id":   req.UserID,
 			"groups":    req.Groups,
 		},
@@ -732,9 +732,9 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 	)
 
 	if strings.TrimSpace(req.UserID) != "" {
-		groups, err = GetUserGroups(req.TenantID, req.UserID)
+		groups, err = GetUserGroups(req.WorkspaceID, req.UserID)
 	} else {
-		groups, err = GetUserDefinedGroups(req.TenantID)
+		groups, err = GetUserDefinedGroups(req.WorkspaceID)
 	}
 
 	if err != nil {
@@ -745,7 +745,7 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 	groupResponses := make([]gin.H, 0, len(groups))
 	for _, group := range groups {
 		groupID := group.ID.String()
-		members, err := GetGroupUsers(req.TenantID, groupID)
+		members, err := GetGroupUsers(req.WorkspaceID, groupID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to fetch users for group %s: %v", groupID, err)})
 			return
@@ -809,7 +809,7 @@ func AddUserDefinedGroups(tenantID string, groups []string) ([]models.TenantGrou
 	for _, groupName := range groups {
 		group := models.TenantGroup{
 			Name:     groupName,
-			TenantID: uuid.MustParse(tenantID),
+			WorkspaceID: uuid.MustParse(tenantID),
 		}
 		if err := tenantDB.Where("name = ? AND tenant_id = ?", groupName, tenantID).FirstOrCreate(&group).Error; err != nil {
 			return nil, err

@@ -5,7 +5,7 @@ type ADSyncController struct{}
 
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
-	TenantID  string       `json:"tenant_id" binding:"required"`
+	WorkspaceID  string       `json:"workspace_id" binding:"required"`
 	ClientID  string       `json:"client_id" binding:"required"`
 	ProjectID string       `json:"project_id" binding:"required"`
 	Config    ADSyncConfig `json:"config" binding:"required"`
@@ -13,7 +13,7 @@ type SyncUsersInput struct {
 }
 
 type AgentSyncRequest struct {
-	TenantID  string          `json:"tenant_id" binding:"required"`
+	WorkspaceID  string          `json:"workspace_id" binding:"required"`
 	ProjectID string          `json:"project_id" binding:"required"`
 	ClientID  string          `json:"client_id" binding:"required"`
 	Users     []AgentUserData `json:"users" binding:"required"`

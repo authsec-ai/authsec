@@ -12,10 +12,9 @@ import (
 // with optional permission scoping and TTL caps.
 type DelegationPolicy struct {
 	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
-	// WorkspaceID mirrors TenantID during the workspace transition. Backfilled
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
+	// WorkspaceID mirrors WorkspaceID during the workspace transition. Backfilled
 	// by migration 122.
-	WorkspaceID        *uuid.UUID      `json:"workspace_id,omitempty" gorm:"type:uuid;index"`
 	RoleName           string          `json:"role_name" gorm:"type:text;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
 	AgentType          string          `json:"agent_type" gorm:"type:text;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
 	AllowedPermissions json.RawMessage `json:"allowed_permissions" gorm:"type:jsonb;default:'[]'"`

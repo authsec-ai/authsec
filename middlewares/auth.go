@@ -414,7 +414,6 @@ func validateAudience(aud interface{}, expected string) bool {
 
 // UserInfo holds extracted user information from JWT claims
 type UserInfo struct {
-	TenantID              string
 	WorkspaceID           string
 	WorkspaceMembershipID string
 	ProjectID             string
@@ -453,7 +452,7 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 	tenantClaim, _ := claimsMap["tenant_id"].(string)
 	workspaceClaim, _ := claimsMap["workspace_id"].(string)
 
-	info.TenantID = tenantClaim
+	info.WorkspaceID = tenantClaim
 	switch {
 	case workspaceClaim != "":
 		info.WorkspaceID = workspaceClaim
@@ -700,8 +699,8 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 	if userInfo.Email == "" {
 		userInfo.Email = user.Email
 	}
-	if user.TenantID != uuid.Nil && userInfo.TenantID == "" {
-		userInfo.TenantID = user.TenantID.String()
+	if user.WorkspaceID != uuid.Nil && userInfo.WorkspaceID == "" {
+		userInfo.WorkspaceID = user.WorkspaceID.String()
 	}
 	if user.ProjectID != uuid.Nil && userInfo.ProjectID == "" {
 		userInfo.ProjectID = user.ProjectID.String()
@@ -886,9 +885,9 @@ func normalizeUserInfoContext(c *gin.Context) {
 		return
 	}
 
-	if userInfo.TenantID == "" {
+	if userInfo.WorkspaceID == "" {
 		if tenantID := getContextString(c, "tenant_id"); tenantID != "" {
-			userInfo.TenantID = tenantID
+			userInfo.WorkspaceID = tenantID
 		}
 	}
 	if userInfo.ClientID == "" {
@@ -936,9 +935,9 @@ func stringFromAny(value interface{}) string {
 // setContextValues sets user information in Gin context
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
 	// Set individual fields for backward compatibility
-	c.Set("tenant_id", userInfo.TenantID)
+	c.Set("tenant_id", userInfo.WorkspaceID)
 	// Phase 3: workspace_id is canonical; always set it. extractUserInfo() guarantees
-	// WorkspaceID is non-empty whenever TenantID is non-empty (mirror fallback).
+	// WorkspaceID is non-empty whenever WorkspaceID is non-empty (mirror fallback).
 	c.Set("workspace_id", userInfo.WorkspaceID)
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
@@ -1059,13 +1058,16 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ExtractTenantFromPath is a middleware that extracts the tenant_id from the URL path
-// and sets it in the Gin context. This is used for routes where tenant_id is part of the URL.
+// ExtractTenantFromPath is a middleware that extracts the workspace_id from the URL path
+// and sets it in the Gin context. Phase 5.1 renamed the URL param from :tenant_id to
+// :workspace_id; the function name is kept (deprecated) to avoid churning route
+// registrations — Phase 10 sweeps it.
 func ExtractTenantFromPath() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tenantID := c.Param("tenant_id")
-		if tenantID != "" {
-			c.Set("tenant_id", tenantID)
+		workspaceID := c.Param("workspace_id")
+		if workspaceID != "" {
+			c.Set("workspace_id", workspaceID)
+			c.Set("tenant_id", workspaceID) // lockstep until Phase 6
 		}
 		c.Next()
 	}

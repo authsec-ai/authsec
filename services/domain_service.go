@@ -112,7 +112,7 @@ func (ds *DomainService) ResolveTenantByHost(hostname string) (uuid.UUID, error)
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return td.TenantID, nil
+	return td.WorkspaceID, nil
 }
 
 // ListTenantDomains lists all domains for a tenant

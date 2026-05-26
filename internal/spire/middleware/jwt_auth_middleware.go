@@ -61,7 +61,7 @@ func (m *JWTAuthMiddleware) Authenticate() gin.HandlerFunc {
 			return
 		}
 
-		if claims.TenantID == "" {
+		if claims.WorkspaceID == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": gin.H{
 					"code":    "UNAUTHORIZED",
@@ -72,14 +72,14 @@ func (m *JWTAuthMiddleware) Authenticate() gin.HandlerFunc {
 		}
 
 		// Set Gin context values
-		c.Set(SpireTenantIDKey, claims.TenantID)
+		c.Set(SpireTenantIDKey, claims.WorkspaceID)
 		c.Set(SpireUserIDKey, claims.UserID)
 		c.Set(SpireClaimsKey, claims)
 		c.Set(SpireIsAgentKey, false)
 
 		m.logger.WithFields(logrus.Fields{
 			"user_id":   claims.UserID,
-			"tenant_id": claims.TenantID,
+			"tenant_id": claims.WorkspaceID,
 		}).Debug("JWT authenticated")
 
 		c.Next()

@@ -244,7 +244,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 	totpSecret := &models.TenantTOTPSecret{
 		ID:         uuid.New(),
 		UserID:     userID,
-		TenantID:   tenantID,
+		WorkspaceID:   tenantID,
 		Secret:     secret,
 		DeviceName: req.DeviceName,
 		DeviceType: req.DeviceType,
@@ -274,7 +274,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 		hashedCodes = append(hashedCodes, models.TenantBackupCode{
 			ID:       uuid.New(),
 			UserID:   userID,
-			TenantID: tenantID,
+			WorkspaceID: tenantID,
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		})

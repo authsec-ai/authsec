@@ -68,7 +68,7 @@ type OAuthOIDCConfiguration struct {
 	ID          uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	Name        string         `json:"name" gorm:"not null;index"`
 	OrgID       string         `json:"org_id" gorm:"not null;index"`
-	TenantID    string         `json:"tenant_id" gorm:"not null;index"`
+	WorkspaceID    string         `json:"workspace_id" gorm:"not null;index"`
 	ConfigType  string         `json:"config_type" gorm:"not null"`
 	ConfigFiles JSONMap        `json:"config_files" gorm:"type:jsonb"`
 	IsActive    bool           `json:"is_active" gorm:"default:true"`
@@ -92,7 +92,7 @@ func (c *OAuthOIDCConfiguration) ToResponse() *ConfigResponse {
 		ID:          c.ID,
 		Name:        c.Name,
 		OrgID:       c.OrgID,
-		TenantID:    c.TenantID,
+		WorkspaceID:    c.WorkspaceID,
 		ConfigType:  c.ConfigType,
 		ConfigFiles: configFiles,
 		IsActive:    c.IsActive,
@@ -108,7 +108,7 @@ func (c *OAuthOIDCConfiguration) ToResponse() *ConfigResponse {
 type CreateConfigRequest struct {
 	Name        string                 `json:"name" validate:"required"`
 	OrgID       string                 `json:"org_id" validate:"required"`
-	TenantID    string                 `json:"tenant_id" validate:"required"`
+	WorkspaceID    string                 `json:"workspace_id" validate:"required"`
 	ConfigType  string                 `json:"config_type" validate:"required,oneof=local_auth oidc oauth_server webauthn_mfa saml2 entra_sync ad_sync"`
 	ConfigFiles map[string]interface{} `json:"config_files" validate:"required"`
 	IsActive    bool                   `json:"is_active"`
@@ -118,7 +118,7 @@ type CreateConfigRequest struct {
 type UpdateConfigRequest struct {
 	ID          uuid.UUID              `json:"id" validate:"required"`
 	OrgID       string                 `json:"org_id" validate:"required"`
-	TenantID    string                 `json:"tenant_id" validate:"required"`
+	WorkspaceID    string                 `json:"workspace_id" validate:"required"`
 	Name        *string                `json:"name,omitempty"`
 	ConfigFiles map[string]interface{} `json:"config_files,omitempty"`
 	IsActive    *bool                  `json:"is_active,omitempty"`
@@ -128,7 +128,7 @@ type UpdateConfigRequest struct {
 type EditConfigRequest struct {
 	ID          uuid.UUID              `json:"id" validate:"required"`
 	OrgID       string                 `json:"org_id" validate:"required"`
-	TenantID    string                 `json:"tenant_id" validate:"required"`
+	WorkspaceID    string                 `json:"workspace_id" validate:"required"`
 	Name        string                 `json:"name" validate:"required"`
 	ConfigType  string                 `json:"config_type" validate:"required"`
 	ConfigFiles map[string]interface{} `json:"config_files" validate:"required"`
@@ -138,7 +138,7 @@ type EditConfigRequest struct {
 
 type GetConfigsRequest struct {
 	OrgID      string `json:"org_id" validate:"required"`
-	TenantID   string `json:"tenant_id" validate:"required"`
+	WorkspaceID   string `json:"workspace_id" validate:"required"`
 	Page       int    `json:"page"`
 	Limit      int    `json:"limit"`
 	ConfigType string `json:"config_type,omitempty"`
@@ -148,24 +148,24 @@ type GetConfigsRequest struct {
 type GetConfigByNameRequest struct {
 	Name     string `json:"name" validate:"required"`
 	OrgID    string `json:"org_id" validate:"required"`
-	TenantID string `json:"tenant_id" validate:"required"`
+	WorkspaceID string `json:"workspace_id" validate:"required"`
 }
 
 type GetConfigByIDRequest struct {
 	ID       uuid.UUID `json:"id" validate:"required"`
 	OrgID    string    `json:"org_id" validate:"required"`
-	TenantID string    `json:"tenant_id" validate:"required"`
+	WorkspaceID string    `json:"workspace_id" validate:"required"`
 }
 
 type DeleteConfigRequest struct {
 	ID       uuid.UUID `json:"id" validate:"required"`
 	OrgID    string    `json:"org_id" validate:"required"`
-	TenantID string    `json:"tenant_id" validate:"required"`
+	WorkspaceID string    `json:"workspace_id" validate:"required"`
 }
 
 type GetTenantConfigsRequest struct {
 	OrgID      uuid.UUID `json:"org_id" validate:"required"`
-	TenantID   uuid.UUID `json:"tenant_id" validate:"required"`
+	WorkspaceID   uuid.UUID `json:"workspace_id" validate:"required"`
 	Page       int       `json:"page"`
 	Limit      int       `json:"limit"`
 	ActiveOnly bool      `json:"active_only"`
@@ -173,27 +173,27 @@ type GetTenantConfigsRequest struct {
 
 type GetConfigsByTypeRequest struct {
 	OrgID      uuid.UUID `json:"org_id" validate:"required"`
-	TenantID   uuid.UUID `json:"tenant_id" validate:"required"`
+	WorkspaceID   uuid.UUID `json:"workspace_id" validate:"required"`
 	ConfigType string    `json:"config_type" validate:"required"`
 	ActiveOnly bool      `json:"active_only"`
 }
 
 type CheckTenantConfigRequest struct {
 	OrgID      uuid.UUID `json:"org_id" validate:"required"`
-	TenantID   uuid.UUID `json:"tenant_id" validate:"required"`
+	WorkspaceID   uuid.UUID `json:"workspace_id" validate:"required"`
 	ConfigType string    `json:"config_type" validate:"required"`
 	ActiveOnly bool      `json:"active_only"`
 }
 
 type GetConfigStatsRequest struct {
 	OrgID    uuid.UUID `json:"org_id" validate:"required"`
-	TenantID uuid.UUID `json:"tenant_id" validate:"required"`
+	WorkspaceID uuid.UUID `json:"workspace_id" validate:"required"`
 }
 
 type ActivateConfigRequest struct {
 	ID        uuid.UUID `json:"id" validate:"required"`
 	OrgID     uuid.UUID `json:"org_id" validate:"required"`
-	TenantID  uuid.UUID `json:"tenant_id" validate:"required"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" validate:"required"`
 	UpdatedBy string    `json:"updated_by"`
 }
 
@@ -208,7 +208,7 @@ type ConfigResponse struct {
 	ID          uuid.UUID              `json:"id"`
 	Name        string                 `json:"name"`
 	OrgID       string                 `json:"org_id"`
-	TenantID    string                 `json:"tenant_id"`
+	WorkspaceID    string                 `json:"workspace_id"`
 	ConfigType  string                 `json:"config_type"`
 	ConfigFiles map[string]interface{} `json:"config_files"`
 	IsActive    bool                   `json:"is_active"`
@@ -228,7 +228,7 @@ type ConfigListResponse struct {
 
 type TenantConfigListResponse struct {
 	Configs    []*ConfigResponse `json:"configs"`
-	TenantID   uuid.UUID         `json:"tenant_id"`
+	WorkspaceID   uuid.UUID         `json:"workspace_id"`
 	OrgID      uuid.UUID         `json:"org_id"`
 	Page       int               `json:"page"`
 	Limit      int               `json:"limit"`
@@ -240,7 +240,7 @@ type TenantConfigListResponse struct {
 type ConfigsByTypeResponse struct {
 	Configs    []*ConfigResponse `json:"configs"`
 	ConfigType string            `json:"config_type"`
-	TenantID   uuid.UUID         `json:"tenant_id"`
+	WorkspaceID   uuid.UUID         `json:"workspace_id"`
 	OrgID      uuid.UUID         `json:"org_id"`
 	Count      int64             `json:"count"`
 	ActiveOnly bool              `json:"active_only"`
@@ -250,13 +250,13 @@ type TenantConfigCheckResponse struct {
 	HasConfig  bool      `json:"has_config"`
 	Count      int64     `json:"count"`
 	ConfigType string    `json:"config_type"`
-	TenantID   uuid.UUID `json:"tenant_id"`
+	WorkspaceID   uuid.UUID `json:"workspace_id"`
 	OrgID      uuid.UUID `json:"org_id"`
 	ActiveOnly bool      `json:"active_only"`
 }
 
 type ConfigStatsResponse struct {
-	TenantID uuid.UUID        `json:"tenant_id"`
+	WorkspaceID uuid.UUID        `json:"workspace_id"`
 	OrgID    uuid.UUID        `json:"org_id"`
 	Total    int64            `json:"total"`
 	Active   int64            `json:"active"`
@@ -281,7 +281,7 @@ type MessageResponse struct {
 // ===== SAML DTOs =====
 
 type AddSAMLProviderRequest struct {
-	TenantID         string                 `json:"tenant_id" binding:"required"`
+	WorkspaceID         string                 `json:"workspace_id" binding:"required"`
 	ClientID         string                 `json:"client_id" binding:"required"`
 	ProviderName     string                 `json:"provider_name" binding:"required"`
 	DisplayName      string                 `json:"display_name" binding:"required"`
@@ -297,7 +297,7 @@ type AddSAMLProviderRequest struct {
 }
 
 type UpdateSAMLProviderRequest struct {
-	TenantID         string                 `json:"tenant_id" binding:"required"`
+	WorkspaceID         string                 `json:"workspace_id" binding:"required"`
 	ProviderID       string                 `json:"provider_id" binding:"required"`
 	ClientID         string                 `json:"client_id"`
 	ProviderName     string                 `json:"provider_name"`
@@ -314,24 +314,24 @@ type UpdateSAMLProviderRequest struct {
 }
 
 type DeleteSAMLProviderRequest struct {
-	TenantID   string `json:"tenant_id" binding:"required"`
+	WorkspaceID   string `json:"workspace_id" binding:"required"`
 	ProviderID string `json:"provider_id" binding:"required"`
 	ClientID   string `json:"client_id"`
 }
 
 type GetSAMLProviderRequest struct {
-	TenantID   string `json:"tenant_id" binding:"required"`
+	WorkspaceID   string `json:"workspace_id" binding:"required"`
 	ProviderID string `json:"provider_id" binding:"required"`
 }
 
 type ListSAMLProvidersRequest struct {
-	TenantID string `json:"tenant_id" binding:"required"`
+	WorkspaceID string `json:"workspace_id" binding:"required"`
 	ClientID string `json:"client_id"`
 }
 
 type SAMLProviderResponse struct {
 	ID               uuid.UUID              `json:"id"`
-	TenantID         uuid.UUID              `json:"tenant_id"`
+	WorkspaceID         uuid.UUID              `json:"workspace_id"`
 	ProviderName     string                 `json:"provider_name"`
 	DisplayName      string                 `json:"display_name"`
 	EntityID         string                 `json:"entity_id"`
@@ -366,7 +366,7 @@ type SAMLTemplateDTO struct {
 type TenantHydraClient struct {
 	ID                uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	OrgID             string         `json:"org_id" gorm:"not null;index"`
-	TenantID          string         `json:"tenant_id" gorm:"not null;index"`
+	WorkspaceID          string         `json:"workspace_id" gorm:"not null;index"`
 	TenantName        string         `json:"tenant_name" gorm:"not null"`
 	HydraClientID     string         `json:"hydra_client_id" gorm:"not null;unique"`
 	HydraClientSecret string         `json:"hydra_client_secret" gorm:"not null"`
@@ -389,7 +389,7 @@ func (TenantHydraClient) TableName() string {
 
 type GetTenantHydraClientsRequest struct {
 	OrgID      string `json:"org_id,omitempty"`
-	TenantID   string `json:"tenant_id,omitempty"`
+	WorkspaceID   string `json:"workspace_id,omitempty"`
 	ClientType string `json:"client_type,omitempty"`
 	IsActive   *bool  `json:"is_active,omitempty"`
 }
@@ -398,7 +398,7 @@ type GetTenantHydraClientsRequest struct {
 type TenantHydraClientResponse struct {
 	ID                uuid.UUID `json:"id"`
 	OrgID             string    `json:"org_id"`
-	TenantID          string    `json:"tenant_id"`
+	WorkspaceID          string    `json:"workspace_id"`
 	TenantName        string    `json:"tenant_name"`
 	HydraClientID     string    `json:"hydra_client_id"`
 	HydraClientSecret string    `json:"hydra_client_secret,omitempty"`
@@ -418,7 +418,7 @@ type TenantHydraClientResponse struct {
 type Client struct {
 	ID        string    `json:"id" gorm:"primaryKey"`
 	ClientID  string    `json:"client_id" gorm:"uniqueIndex;not null"`
-	TenantID  string    `json:"tenant_id" gorm:"not null;index"`
+	WorkspaceID  string    `json:"workspace_id" gorm:"not null;index"`
 	ProjectID string    `json:"project_id" gorm:"not null;index"`
 	Name      string    `json:"name"`
 	Active    bool      `json:"active" gorm:"default:true;index"`
@@ -434,6 +434,6 @@ func (Client) TableName() string {
 // SAMLConfigResponse wraps a list of SAML providers for a tenant.
 type SAMLConfigResponse struct {
 	Success   bool                   `json:"success"`
-	TenantID  string                 `json:"tenant_id"`
+	WorkspaceID  string                 `json:"workspace_id"`
 	Providers []SAMLProviderResponse `json:"providers"`
 }

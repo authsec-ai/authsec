@@ -5,7 +5,7 @@ import "time"
 // Certificate represents an issued certificate
 type Certificate struct {
 	ID                string     `json:"id" db:"id"`
-	TenantID          string     `json:"tenant_id" db:"tenant_id"`
+	WorkspaceID          string     `json:"workspace_id" db:"tenant_id"`
 	WorkloadID        string     `json:"workload_id" db:"workload_id"`
 	SerialNumber      string     `json:"serial_number" db:"serial_number"`
 	SHA256Fingerprint string     `json:"sha256_fingerprint" db:"sha256_fingerprint"`

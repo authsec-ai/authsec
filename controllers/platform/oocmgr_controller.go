@@ -71,7 +71,7 @@ type oocmgrHydraClient struct {
 
 func (ac *OocmgrController) SyncHydraClients(c *gin.Context) {
 	var req struct {
-		TenantID string `json:"tenant_id,omitempty"`
+		WorkspaceID string `json:"workspace_id,omitempty"`
 		OrgID    string `json:"org_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -107,7 +107,7 @@ func (ac *OocmgrController) SyncHydraClients(c *gin.Context) {
 
 func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 	var req struct {
-		TenantID   string `json:"tenant_id"`
+		WorkspaceID   string `json:"workspace_id"`
 		ClientType string `json:"client_type"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -115,7 +115,7 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 		return
 	}
 
-	tenantID := strings.TrimSpace(req.TenantID)
+	tenantID := strings.TrimSpace(req.WorkspaceID)
 	if tenantID == "" {
 		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "tenant_id is required", Message: "Provide a tenant_id to dump Hydra data.", Code: http.StatusBadRequest, Timestamp: time.Now()})
 		return
