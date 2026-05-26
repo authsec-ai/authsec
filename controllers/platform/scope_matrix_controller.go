@@ -1432,6 +1432,25 @@ func appendUniqueScopeRef(scopes []accessScopeRef, scope accessScopeRef) []acces
 	return append(scopes, scope)
 }
 
+func normalizeApplicationRoleSlug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isAlphaNum {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteRune('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 // ListApplicationRoles returns all application-scoped roles across the workspace.
 // GET /authsec/application-roles
 func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
@@ -1519,6 +1538,45 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 			Source:      applicationRoleSource(role.Name),
 			UpdatedAt:   updatedAt.UTC().Format(time.RFC3339),
 		})
+	}
+
+	q := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	appFilter := strings.TrimSpace(c.Query("application_id"))
+	sourceFilter := strings.ToLower(strings.TrimSpace(c.Query("source")))
+	defaultFilter := strings.ToLower(strings.TrimSpace(c.Query("default")))
+	if q != "" || appFilter != "" || sourceFilter != "" || defaultFilter != "" {
+		filtered := make([]applicationRoleResponse, 0, len(out))
+		for _, role := range out {
+			if appFilter != "" && role.Application.ID != appFilter {
+				continue
+			}
+			if sourceFilter != "" && strings.ToLower(role.Source) != sourceFilter {
+				continue
+			}
+			if defaultFilter == "true" && !role.IsDefault {
+				continue
+			}
+			if defaultFilter == "false" && role.IsDefault {
+				continue
+			}
+			if q != "" {
+				haystack := strings.ToLower(strings.Join([]string{
+					role.Label,
+					role.Name,
+					role.Description,
+					role.Application.Name,
+					role.Application.ResourceURI,
+				}, " "))
+				for _, scope := range role.Scopes {
+					haystack += " " + strings.ToLower(scope.ScopeString+" "+scope.DisplayName+" "+scope.RiskLevel)
+				}
+				if !strings.Contains(haystack, q) {
+					continue
+				}
+			}
+			filtered = append(filtered, role)
+		}
+		out = filtered
 	}
 
 	c.JSON(http.StatusOK, gin.H{"roles": out, "count": len(out)})
@@ -1756,6 +1814,232 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	})
 }
 
+// CreateApplicationRole creates an application-scoped role, grants selected
+// application scopes, and optionally assigns it to users.
+// POST /authsec/applications/:id/roles
+func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	var req struct {
+		Name          string   `json:"name" binding:"required"`
+		Description   string   `json:"description"`
+		ScopeIDs      []string `json:"scope_ids"`
+		DefaultRole   bool     `json:"default_role"`
+		AssignUserIDs []string `json:"assign_user_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	slug := normalizeApplicationRoleSlug(req.Name)
+	if slug == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "role name must contain letters or numbers"})
+		return
+	}
+	roleName := fmt.Sprintf("rs-%s:%s", rs.ID.String(), slug)
+
+	scopeIDs := make([]uuid.UUID, 0, len(req.ScopeIDs))
+	seenScopes := map[uuid.UUID]struct{}{}
+	for _, raw := range req.ScopeIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope_id"})
+			return
+		}
+		if _, ok := seenScopes[parsed]; ok {
+			continue
+		}
+		seenScopes[parsed] = struct{}{}
+		scopeIDs = append(scopeIDs, parsed)
+	}
+
+	userIDs := make([]uuid.UUID, 0, len(req.AssignUserIDs))
+	seenUsers := map[uuid.UUID]struct{}{}
+	for _, raw := range req.AssignUserIDs {
+		parsed, err := uuid.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid assign_user_id"})
+			return
+		}
+		if _, ok := seenUsers[parsed]; ok {
+			continue
+		}
+		seenUsers[parsed] = struct{}{}
+		userIDs = append(userIDs, parsed)
+	}
+
+	var selectedScopes []models.OAuthScope
+	if len(scopeIDs) > 0 {
+		if err := config.DB.Where("tenant_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+			Find(&selectedScopes).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if len(selectedScopes) != len(scopeIDs) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "one or more scopes do not belong to this application"})
+			return
+		}
+		for i := range selectedScopes {
+			autoCreateScopePermission(tenantID, &selectedScopes[i])
+		}
+	}
+
+	type userRow struct {
+		ID       uuid.UUID
+		Email    string
+		Name     string
+		Username *string
+	}
+	usersByID := map[uuid.UUID]userRow{}
+	if len(userIDs) > 0 {
+		var rows []userRow
+		if err := config.DB.Table("users").
+			Select("id, email, name, username").
+			Where("tenant_id = ? AND id IN ?", tenantID, userIDs).
+			Find(&rows).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if len(rows) != len(userIDs) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "one or more users do not belong to this tenant"})
+			return
+		}
+		for _, row := range rows {
+			usersByID[row.ID] = row
+		}
+	}
+
+	var permissionIDs []uuid.UUID
+	if len(scopeIDs) > 0 {
+		if err := config.DB.Table("oauth_scope_permissions").
+			Select("DISTINCT permission_id").
+			Where("scope_id IN ?", scopeIDs).
+			Scan(&permissionIDs).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	workspaceID := tenantID
+	role := models.RBACRole{
+		TenantID:    &tenantID,
+		WorkspaceID: &workspaceID,
+		Name:        roleName,
+		Description: strings.TrimSpace(req.Description),
+		IsSystem:    false,
+	}
+	rsScopeType := "resource_server"
+	rsScopeID := rs.ID
+	if err := config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&role).Error; err != nil {
+			return err
+		}
+		for _, permissionID := range permissionIDs {
+			if err := tx.FirstOrCreate(&models.RolePermission{
+				RoleID:       role.ID,
+				PermissionID: permissionID,
+			}).Error; err != nil {
+				return err
+			}
+		}
+		if req.DefaultRole {
+			var policy models.ResourceServerAccessPolicy
+			err := tx.Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).First(&policy).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				policy = models.ResourceServerAccessPolicy{
+					TenantID:          tenantID,
+					ResourceServerID:  rs.ID,
+					Enabled:           true,
+					DefaultRoleID:     &role.ID,
+					AssignmentTrigger: "first_successful_login",
+					AssignmentSource:  "default_policy",
+				}
+				if err := tx.Create(&policy).Error; err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			} else if err := tx.Model(&policy).Updates(map[string]interface{}{
+				"enabled":         true,
+				"default_role_id": role.ID,
+				"updated_at":      time.Now().UTC(),
+			}).Error; err != nil {
+				return err
+			}
+		}
+		for _, userID := range userIDs {
+			row := usersByID[userID]
+			username := ""
+			if row.Username != nil {
+				username = *row.Username
+			}
+			if username == "" {
+				username = row.Email
+			}
+			if username == "" {
+				username = row.ID.String()
+			}
+			binding := models.RoleBinding{
+				TenantID:         &tenantID,
+				WorkspaceID:      &workspaceID,
+				UserID:           &userID,
+				Username:         username,
+				RoleID:           role.ID,
+				RoleName:         role.Name,
+				ScopeType:        &rsScopeType,
+				ScopeID:          &rsScopeID,
+				Conditions:       json.RawMessage([]byte("{}")),
+				AssignmentSource: "manual_admin",
+				CreatedAt:        time.Now().UTC(),
+			}
+			if err := tx.Where(
+				"tenant_id = ? AND user_id = ? AND role_id = ? AND scope_type = ? AND scope_id = ?",
+				tenantID, userID, role.ID, rsScopeType, rsScopeID,
+			).FirstOrCreate(&binding).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+
+	scopes := scopeRefsForRole(config.DB, tenantID, role.ID, rs.ID)
+	var usersCount int64
+	config.DB.Table("role_bindings rb").
+		Where("rb.tenant_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
+		Where("rb.scope_type = 'resource_server' AND rb.scope_id = ?", rs.ID).
+		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
+
+	auditAdminMutation(c, tenantID.String(), "application_role_created", "role",
+		role.ID.String(), http.StatusCreated, nil,
+		map[string]interface{}{"rs_id": rs.ID, "scope_count": len(scopes), "users_count": usersCount})
+	c.JSON(http.StatusCreated, applicationRoleResponse{
+		ID:          role.ID.String(),
+		Name:        role.Name,
+		Label:       applicationRoleLabel(role.Name),
+		Description: role.Description,
+		Application: accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		IsDefault:   req.DefaultRole,
+		UsersCount:  usersCount,
+		ScopesCount: len(scopes),
+		Scopes:      scopes,
+		Source:      applicationRoleSource(role.Name),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // ListScopeCatalog returns reusable catalog entries plus app-owned runtime
 // scopes. Catalog entries do not directly grant runtime access.
 // GET /authsec/scope-catalog
@@ -1851,6 +2135,46 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 		})
 	}
 
+	q := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	kindFilter := strings.ToLower(strings.TrimSpace(c.Query("kind")))
+	riskFilter := strings.ToLower(strings.TrimSpace(c.Query("risk_level")))
+	appFilter := strings.TrimSpace(c.Query("application_id"))
+	if q != "" || kindFilter != "" || riskFilter != "" || appFilter != "" {
+		filtered := make([]scopeCatalogEntryResponse, 0, len(out))
+		for _, item := range out {
+			if kindFilter != "" && strings.ToLower(item.Kind) != kindFilter {
+				continue
+			}
+			if riskFilter != "" && strings.ToLower(item.RiskLevel) != riskFilter {
+				continue
+			}
+			if appFilter != "" {
+				if item.Application == nil || item.Application.ID != appFilter {
+					continue
+				}
+			}
+			if q != "" {
+				haystack := strings.ToLower(strings.Join([]string{
+					item.Key,
+					item.ScopeString,
+					item.DisplayName,
+					item.Description,
+					item.RiskLevel,
+					item.Source,
+					item.Kind,
+				}, " "))
+				if item.Application != nil {
+					haystack += " " + strings.ToLower(item.Application.Name+" "+item.Application.ResourceURI)
+				}
+				if !strings.Contains(haystack, q) {
+					continue
+				}
+			}
+			filtered = append(filtered, item)
+		}
+		out = filtered
+	}
+
 	c.JSON(http.StatusOK, gin.H{"items": out, "count": len(out)})
 }
 
@@ -1902,7 +2226,17 @@ func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusCreated, entry)
+	c.JSON(http.StatusCreated, scopeCatalogEntryResponse{
+		ID:          entry.ID.String(),
+		Kind:        "catalog",
+		Key:         entry.Key,
+		ScopeString: entry.Key,
+		DisplayName: entry.DisplayName,
+		Description: entry.Description,
+		RiskLevel:   entry.RiskLevel,
+		Source:      entry.Source,
+		UpdatedAt:   entry.UpdatedAt.UTC().Format(time.RFC3339),
+	})
 }
 
 // AttachScopeCatalogEntryToApplication copies a catalog template into an
@@ -1925,7 +2259,8 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application_id"})
 		return
 	}
-	if _, err := ctrl.rsService.GetByIDAndTenant(appID.String(), tenantID.String()); err != nil {
+	rs, err := ctrl.rsService.GetByIDAndTenant(appID.String(), tenantID.String())
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
 	}
@@ -1957,7 +2292,18 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 
 	autoCreateScopePermission(tenantID, &scope)
 	syncScopesSupported(appID, tenantID)
-	c.JSON(http.StatusOK, scope)
+	c.JSON(http.StatusOK, scopeCatalogEntryResponse{
+		ID:          scope.ID.String(),
+		Kind:        "application",
+		Key:         scope.ScopeString,
+		ScopeString: scope.ScopeString,
+		DisplayName: scope.DisplayName,
+		Description: scope.Description,
+		RiskLevel:   scope.RiskLevel,
+		Source:      scope.Source,
+		Application: &accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		UpdatedAt:   scope.UpdatedAt.UTC().Format(time.RFC3339),
+	})
 }
 
 // UpdateRSRoleScopeGrants replaces the Application-scope grants on one

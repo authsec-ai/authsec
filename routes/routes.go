@@ -380,6 +380,7 @@ func SetupRoutes(
 
 			// RS-scoped roles + bindings management
 			applications.GET("/:id/roles", scopeMatrixController.ListRSRoles)
+			applications.POST("/:id/roles", scopeMatrixController.CreateApplicationRole)
 			applications.PUT("/:id/roles/:role_id/scope-grants", scopeMatrixController.UpdateRSRoleScopeGrants)
 			applications.GET("/:id/bindings", scopeMatrixController.ListRSBindings)
 			applications.POST("/:id/bindings", scopeMatrixController.CreateRSBinding)

@@ -389,17 +389,19 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		tokenType = "default"
 	}
 
+	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":  req.TenantID,
-		"project_id": req.ProjectID,
-		"client_id":  req.ClientID,
-		"email_id":   req.EmailID,
-		"token_type": tokenType,
-		"aud":        "authsec-api",
-		"iat":        time.Now().Unix(),
-		"nbf":        time.Now().Unix(),
-		"exp":        time.Now().Add(24 * time.Hour).Unix(),
-		"iss":        "authsec-ai/auth-manager",
+		"tenant_id":    req.TenantID,
+		"workspace_id": req.TenantID,
+		"project_id":   req.ProjectID,
+		"client_id":    req.ClientID,
+		"email_id":     req.EmailID,
+		"token_type":   tokenType,
+		"aud":          "authsec-api",
+		"iat":          time.Now().Unix(),
+		"nbf":          time.Now().Unix(),
+		"exp":          time.Now().Add(24 * time.Hour).Unix(),
+		"iss":          "authsec-ai/auth-manager",
 	})
 	token.Header["kid"] = tokenType
 

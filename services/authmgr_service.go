@@ -56,20 +56,22 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		return nil, fmt.Errorf("failed to retrieve tenant information: %w", err)
 	}
 
+	// Phase 3: tenant_id and workspace_id are mirrored — equal UUIDs by construction.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":   tenantID,
-		"project_id":  projectID,
-		"client_id":   clientID,
-		"email_id":    emailID,
-		"provider":    provider,
-		"provider_id": providerID,
-		"user_id":     userID,
-		"token_type":  "oidc",
-		"aud":         "authsec-api",
-		"iat":         time.Now().Unix(),
-		"exp":         time.Now().Add(24 * time.Hour).Unix(),
-		"iss":         "authsec-ai/auth-manager",
-		"jti":         uuid.New().String(),
+		"tenant_id":    tenantID,
+		"workspace_id": tenantID,
+		"project_id":   projectID,
+		"client_id":    clientID,
+		"email_id":     emailID,
+		"provider":     provider,
+		"provider_id":  providerID,
+		"user_id":      userID,
+		"token_type":   "oidc",
+		"aud":          "authsec-api",
+		"iat":          time.Now().Unix(),
+		"exp":          time.Now().Add(24 * time.Hour).Unix(),
+		"iss":          "authsec-ai/auth-manager",
+		"jti":          uuid.New().String(),
 	})
 
 	tokenString, err := token.SignedString([]byte(config.AppConfig.JWTDefSecret))

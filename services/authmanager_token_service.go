@@ -74,7 +74,7 @@ func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, works
 	}
 
 	return s.GenerateToken(TokenClaims{
-		TenantID:              workspaceID.String(), // compatibility during tenant_id -> workspace_id rollout
+		TenantID:              workspaceID.String(), // Phase 3: tenant_id stays dual-emitted until Phase 8
 		WorkspaceID:           workspaceID.String(),
 		WorkspaceMembershipID: membershipID.String(),
 		ProjectID:             projectID.String(),
@@ -93,22 +93,30 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		expiresIn = 24 * time.Hour // Default 24 hours
 	}
 
+	// Phase 3 (tenant → workspace migration): every token now carries workspace_id
+	// unconditionally. tenant_id is still emitted in lockstep for backward compatibility
+	// until Phase 8 drops it. If a caller forgot to set WorkspaceID (legacy code path
+	// still passing only TenantID), mirror tenant_id into workspace_id — by construction
+	// tenants.id == workspaces.id (see admin signup transaction).
+	workspaceID := claims.WorkspaceID
+	if workspaceID == "" {
+		workspaceID = claims.TenantID
+	}
+
 	// Build JWT claims following auth-manager's exact pattern
 	// Reference: github.com/authsec-ai/auth-manager/controllers/token_controller.go
 	jwtClaims := jwt.MapClaims{
-		"tenant_id":  claims.TenantID,
-		"project_id": claims.ProjectID,
-		"client_id":  claims.ClientID,
-		"email_id":   claims.EmailID,
-		"token_type": tokenType,
-		"aud":        "authsec-api",
-		"iat":        now.Unix(),
-		"nbf":        now.Unix(),
-		"exp":        now.Add(expiresIn).Unix(),
-		"iss":        "authsec-ai/auth-manager",
-	}
-	if claims.WorkspaceID != "" {
-		jwtClaims["workspace_id"] = claims.WorkspaceID
+		"tenant_id":    claims.TenantID,
+		"workspace_id": workspaceID,
+		"project_id":   claims.ProjectID,
+		"client_id":    claims.ClientID,
+		"email_id":     claims.EmailID,
+		"token_type":   tokenType,
+		"aud":          "authsec-api",
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          now.Add(expiresIn).Unix(),
+		"iss":          "authsec-ai/auth-manager",
 	}
 	if claims.WorkspaceMembershipID != "" {
 		jwtClaims["workspace_membership_id"] = claims.WorkspaceMembershipID
@@ -163,17 +171,19 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	}
 
 	now := time.Now()
+	// Phase 3: emit workspace_id alongside tenant_id (mirror — they're equal UUIDs by construction).
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":  req.TenantID,
-		"project_id": req.ProjectID,
-		"client_id":  req.ClientID,
-		"email_id":   req.EmailID,
-		"token_type": tokenType,
-		"aud":        "authsec-api",
-		"iat":        now.Unix(),
-		"nbf":        now.Unix(),
-		"exp":        now.Add(24 * time.Hour).Unix(),
-		"iss":        "authsec-ai/auth-manager",
+		"tenant_id":    req.TenantID,
+		"workspace_id": req.TenantID,
+		"project_id":   req.ProjectID,
+		"client_id":    req.ClientID,
+		"email_id":     req.EmailID,
+		"token_type":   tokenType,
+		"aud":          "authsec-api",
+		"iat":          now.Unix(),
+		"nbf":          now.Unix(),
+		"exp":          now.Add(24 * time.Hour).Unix(),
+		"iss":          "authsec-ai/auth-manager",
 	})
 	token.Header["kid"] = tokenType
 

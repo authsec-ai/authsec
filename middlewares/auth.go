@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 )
 
 // AuthConfig holds configuration for authentication
@@ -441,14 +442,32 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 		return nil, fmt.Errorf("invalid claims format")
 	}
 
-	// Extract basic user info
-	if v, ok := claimsMap["tenant_id"].(string); ok {
-		info.TenantID = v
-	}
-	if v, ok := claimsMap["workspace_id"].(string); ok {
-		info.WorkspaceID = v
-	} else {
-		info.WorkspaceID = info.TenantID
+	// Extract basic user info.
+	//
+	// Phase 3 (tenant → workspace migration): workspace_id is the canonical scope claim.
+	// Every token minted after Phase 3 carries both workspace_id and tenant_id with equal
+	// UUIDs. If a token arrives with tenant_id only (legacy issuer that didn't get the
+	// Phase 3 update, or an externally-issued Hydra token from before the rollout) we
+	// mirror tenant_id into workspace_id and log a structured warning so stragglers are
+	// visible in the logs. The fallback will be removed in Phase 8.
+	tenantClaim, _ := claimsMap["tenant_id"].(string)
+	workspaceClaim, _ := claimsMap["workspace_id"].(string)
+
+	info.TenantID = tenantClaim
+	switch {
+	case workspaceClaim != "":
+		info.WorkspaceID = workspaceClaim
+	case tenantClaim != "":
+		info.WorkspaceID = tenantClaim
+		// Identify the issuer to help track down the missing emitter.
+		issuer, _ := claimsMap["iss"].(string)
+		tokenType, _ := claimsMap["token_type"].(string)
+		logrus.WithFields(logrus.Fields{
+			"event":      "workspace_id_fallback",
+			"iss":        issuer,
+			"token_type": tokenType,
+			"path":       c.Request.URL.Path,
+		}).Warn("JWT missing workspace_id claim; falling back to tenant_id (Phase 3 straggler)")
 	}
 	if v, ok := claimsMap["workspace_membership_id"].(string); ok {
 		info.WorkspaceMembershipID = v
@@ -839,15 +858,20 @@ func setTenantContext(c *gin.Context, tenantID string) {
 
 	c.Set("tenant_id", tenantID)
 	c.Set("validated_tenant_id", tenantID)
+	// Phase 3: keep workspace_id in lockstep so downstream readers can switch over
+	// in Phase 4 without caring which path populated the context.
+	c.Set("workspace_id", tenantID)
 
 	if claimsVal, exists := c.Get("claims"); exists {
 		switch claims := claimsVal.(type) {
 		case jwt.MapClaims:
 			claims["tenant_id"] = tenantID
 			claims["validated_tenant_id"] = tenantID
+			claims["workspace_id"] = tenantID
 		case map[string]interface{}:
 			claims["tenant_id"] = tenantID
 			claims["validated_tenant_id"] = tenantID
+			claims["workspace_id"] = tenantID
 			c.Set("claims", claims)
 		}
 	}
@@ -913,9 +937,9 @@ func stringFromAny(value interface{}) string {
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
 	// Set individual fields for backward compatibility
 	c.Set("tenant_id", userInfo.TenantID)
-	if userInfo.WorkspaceID != "" {
-		c.Set("workspace_id", userInfo.WorkspaceID)
-	}
+	// Phase 3: workspace_id is canonical; always set it. extractUserInfo() guarantees
+	// WorkspaceID is non-empty whenever TenantID is non-empty (mirror fallback).
+	c.Set("workspace_id", userInfo.WorkspaceID)
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
 	}

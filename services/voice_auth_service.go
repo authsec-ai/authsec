@@ -459,8 +459,10 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 	}
 
 	now := time.Now().UTC()
+	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
 	claims := jwt.MapClaims{
 		"tenant_id":      tenant.ID.String(),
+		"workspace_id":   tenant.ID.String(),
 		"project_id":     tenant.ID.String(),
 		"client_id":      user.ClientID.String(),
 		"email":          user.Email,
