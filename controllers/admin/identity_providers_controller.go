@@ -245,7 +245,7 @@ func (ctrl *IdentityProvidersController) Delete(c *gin.Context) {
 // Returns uuid.Nil when the claim is missing or unparseable; the handler
 // decides whether to reject the request.
 func extractUserID(c *gin.Context) uuid.UUID {
-	if uid, ok := middlewares.GetTenantIDFromToken(c); ok {
+	if uid, ok := middlewares.GetWorkspaceIDFromToken(c); ok {
 		_ = uid // not used; we want the user_id specifically
 	}
 	if v, exists := c.Get("user_id"); exists {

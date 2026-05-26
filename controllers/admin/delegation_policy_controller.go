@@ -76,7 +76,7 @@ type UpdateDelegationPolicyRequest struct {
 // @Failure     409 {object} map[string]string
 // @Router      /uflow/delegation-policies [post]
 func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -378,7 +378,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 // @Success     200 {array} models.DelegationPolicy
 // @Router      /uflow/delegation-policies [get]
 func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -419,7 +419,7 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 // @Failure     404 {object} map[string]string
 // @Router      /uflow/delegation-policies/{id} [get]
 func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -455,7 +455,7 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 // @Failure     404 {object} map[string]string
 // @Router      /uflow/delegation-policies/{id} [put]
 func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -549,7 +549,7 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 // @Failure     404 {object} map[string]string
 // @Router      /uflow/delegation-policies/{id} [delete]
 func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -585,7 +585,7 @@ func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
 // @Failure     401 {object} map[string]string
 // @Router      /uflow/admin/me/roles-permissions [get]
 func (dc *DelegationPolicyController) GetMyRolesAndPermissions(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return

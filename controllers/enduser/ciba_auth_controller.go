@@ -200,7 +200,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
 		return
@@ -258,7 +258,7 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 	}
 
 	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
 		return
@@ -321,7 +321,7 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
 		return

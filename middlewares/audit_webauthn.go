@@ -11,7 +11,7 @@ import (
 // AuditWithStatus logs an audit event with an explicit status string.
 // Used by WebAuthn and MFA handlers.
 func AuditWithStatus(c *gin.Context, objectType string, objectID string, actionType string, status string, changes *AuditChanges) {
-	tenantID := c.GetString("tenant_id")
+	tenantID := c.GetString("workspace_id")
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.Writer.Header().Get("X-Request-ID")
@@ -56,7 +56,7 @@ func AuditWithStatus(c *gin.Context, objectType string, objectID string, actionT
 // AuditAuthentication logs authentication-specific audit events.
 // Used by WebAuthn, TOTP, and SMS MFA handlers.
 func AuditAuthentication(c *gin.Context, userID string, authMethod string, actionType string, success bool, metadata map[string]interface{}) {
-	tenantID := c.GetString("tenant_id")
+	tenantID := c.GetString("workspace_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.Writer.Header().Get("X-Request-ID")
 

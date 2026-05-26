@@ -484,7 +484,7 @@ func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 }
 
 func extractTenantID(c *gin.Context) (uuid.UUID, error) {
-	tidStr, ok := middlewares.GetTenantIDFromToken(c)
+	tidStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok || tidStr == "" {
 		return uuid.Nil, fmt.Errorf("tenant_id not found in token")
 	}

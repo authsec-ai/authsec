@@ -55,7 +55,7 @@ func scimAdminBaseURL(c *gin.Context) string {
 func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -149,7 +149,7 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 func (sac *SCIMAdminController) GetAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -183,7 +183,7 @@ func (sac *SCIMAdminController) GetAdminUser(c *gin.Context) {
 func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -280,7 +280,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 func (sac *SCIMAdminController) ReplaceAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -357,7 +357,7 @@ func (sac *SCIMAdminController) ReplaceAdminUser(c *gin.Context) {
 func (sac *SCIMAdminController) PatchAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return
@@ -427,7 +427,7 @@ func (sac *SCIMAdminController) PatchAdminUser(c *gin.Context) {
 func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 	shared.SCIMContentType(c)
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", "Tenant not found in token", ""))
 		return

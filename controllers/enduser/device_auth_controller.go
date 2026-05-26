@@ -180,7 +180,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 
 	// tenant_id from token claims (set by AuthMiddleware)
 	tenantIDStr := ""
-	if v, ok := c.Get("tenant_id"); ok && v != nil {
+	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		tenantIDStr, _ = v.(string)
 	}
 	if tenantIDStr == "" {
@@ -274,7 +274,7 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 	}
 
 	tenantIDStr := ""
-	if v, ok := c.Get("tenant_id"); ok && v != nil {
+	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		tenantIDStr, _ = v.(string)
 	}
 	tenantID := uuid.Nil

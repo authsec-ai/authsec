@@ -83,7 +83,7 @@ func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 // the shared config.DB. The name is kept for backward compatibility with
 // callers; the tenant-DB-routing behavior was removed in Step 0.
 func getTenantDB(c *gin.Context) (*gorm.DB, string, error) {
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		return nil, "", fmt.Errorf("tenant not found in token")
 	}
@@ -1184,7 +1184,7 @@ type SCIMTokenResponse struct {
 // POST /uflow/admin/scim/generate-token
 func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 	// Get admin's tenant_id from JWT (set by AuthMiddleware + ValidateTenantFromToken)
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant not found in token"})
 		return

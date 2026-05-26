@@ -210,7 +210,7 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 // @Router /authsec/uflow/groups/{tenant_id} [get]
 func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -240,7 +240,7 @@ func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 // @Router /authsec/uflow/groups/{tenant_id}/users/bulk [post]
 func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -293,7 +293,7 @@ func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 // @Router /authsec/uflow/groups/{tenant_id}/users/bulk [delete]
 func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return
@@ -352,7 +352,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	_, ok := middlewares.GetTenantIDFromToken(c)
+	_, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
@@ -365,7 +365,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	}
 
 	// Override with token tenant_id for security
-	tenantID, _ = middlewares.GetTenantIDFromToken(c)
+	tenantID, _ = middlewares.GetWorkspaceIDFromToken(c)
 
 	queryGroups := []string{}
 	queryGroups = append(queryGroups, c.QueryArray("group_ids")...)
@@ -672,7 +672,7 @@ func (gc *GroupController) GetMyGroups(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := shared.RequireTenantID(c)
+	tenantID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -773,7 +773,7 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 // @Router /authsec/uflow/groups/{tenant_id}/{group_id}/users [get]
 func (gc *GroupController) GetGroupUsers(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantID, ok := middlewares.GetTenantIDFromToken(c)
+	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return

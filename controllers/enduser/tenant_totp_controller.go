@@ -107,7 +107,7 @@ func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -182,7 +182,7 @@ func (ttc *TenantTOTPController) ConfirmTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -233,7 +233,7 @@ func (ttc *TenantTOTPController) GetTenantTOTPDevices(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -294,7 +294,7 @@ func (ttc *TenantTOTPController) DeleteTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -359,7 +359,7 @@ func (ttc *TenantTOTPController) SetTenantPrimaryTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return

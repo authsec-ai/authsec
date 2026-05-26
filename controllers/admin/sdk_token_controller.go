@@ -96,7 +96,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 // RevokeDelegationToken revokes the active delegation token for an AI agent.
 // POST /uflow/admin/agents/:id/revoke-token
 func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return

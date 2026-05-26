@@ -33,12 +33,35 @@ func ContextStringValue(c *gin.Context, key string) string {
 }
 
 // RequireTenantID retrieves tenant_id from context, returning an error when missing.
+//
+// Deprecated: use RequireWorkspaceID. Kept during the Phase 4 read-path migration so
+// stragglers compile until they're swept; will be removed in Phase 8 along with the
+// tenant_id JWT claim.
 func RequireTenantID(c *gin.Context) (string, error) {
 	tenantID := ContextStringValue(c, "tenant_id")
 	if tenantID == "" {
 		return "", fmt.Errorf("tenant not found")
 	}
 	return tenantID, nil
+}
+
+// RequireWorkspaceID retrieves workspace_id from the Gin context, returning an error
+// when missing. Phase 3 guarantees workspace_id is always set in context for any
+// authenticated request, in lockstep with tenant_id. This is the canonical helper
+// to use in handlers post-Phase-4.
+func RequireWorkspaceID(c *gin.Context) (string, error) {
+	workspaceID := ContextStringValue(c, "workspace_id")
+	if workspaceID == "" {
+		// Fall back to tenant_id during the migration window. Auth middleware mirrors
+		// the two values whenever it can; this fallback catches the rare edge case
+		// where a handler runs against a context that only has tenant_id set
+		// (e.g. legacy admin tokens issued before Phase 3).
+		if tenantID := ContextStringValue(c, "tenant_id"); tenantID != "" {
+			return tenantID, nil
+		}
+		return "", fmt.Errorf("workspace not found")
+	}
+	return workspaceID, nil
 }
 
 // StringPtr returns a pointer to the given string value.

@@ -59,32 +59,38 @@ func DerefString(s *string) string {
 	return *s
 }
 
-// ResolveTenantIDFromToken extracts tenant ID from context/token and returns a pointer UUID.
-func ResolveTenantIDFromToken(c *gin.Context) (*uuid.UUID, error) {
-	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
-	if !ok {
-		return nil, fmt.Errorf("Tenant ID not found in context")
-	}
-	tenantID, err := uuid.Parse(tenantIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid tenant ID format")
-	}
-	return &tenantID, nil
-}
-
-// ResolveWorkspaceIDFromToken extracts the active workspace_id from the JWT.
-// Falls back to tenant_id during the tenant_id -> workspace_id rollout so
-// existing tokens continue to authorize correctly.
-func ResolveWorkspaceIDFromToken(c *gin.Context) (uuid.UUID, error) {
+// ResolveWorkspaceIDFromTokenPtr extracts the active workspace_id from the JWT and
+// returns a pointer UUID. This is the canonical helper post-Phase-4 for the call
+// sites that previously used ResolveTenantIDFromToken (pointer signature preserved
+// for caller compatibility — they often dereference via *workspaceID).
+func ResolveWorkspaceIDFromTokenPtr(c *gin.Context) (*uuid.UUID, error) {
 	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
-		return uuid.Nil, fmt.Errorf("Workspace ID not found in context")
+		return nil, fmt.Errorf("Workspace ID not found in context")
 	}
 	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("Invalid workspace ID format")
+		return nil, fmt.Errorf("Invalid workspace ID format")
 	}
-	return workspaceID, nil
+	return &workspaceID, nil
+}
+
+// ResolveTenantIDFromToken is the deprecated alias kept during Phase 4.
+// All new code should call ResolveWorkspaceIDFromTokenPtr. Removed in Phase 10.
+//
+// Deprecated: use ResolveWorkspaceIDFromTokenPtr.
+func ResolveTenantIDFromToken(c *gin.Context) (*uuid.UUID, error) {
+	return ResolveWorkspaceIDFromTokenPtr(c)
+}
+
+// ResolveWorkspaceIDFromToken returns workspace_id as a value UUID (not pointer).
+// Use this for new handler code where pointer semantics aren't needed.
+func ResolveWorkspaceIDFromToken(c *gin.Context) (uuid.UUID, error) {
+	workspaceID, err := ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return *workspaceID, nil
 }
 
 // ParseUUIDs converts a slice of strings to UUIDs with field context for errors.

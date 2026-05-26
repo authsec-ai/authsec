@@ -233,7 +233,7 @@ func (ac *AuthmgrController) HealthCheck(c *gin.Context) {
 // GetProfile returns the authenticated user's profile from JWT claims.
 func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":  c.GetString("tenant_id"),
+		"tenant_id":  c.GetString("workspace_id"),
 		"project_id": c.GetString("project_id"),
 		"client_id":  c.GetString("client_id"),
 		"email_id":   c.GetString("email_id"),
@@ -722,7 +722,7 @@ func (ac *AuthmgrController) ValidateToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":   "Token validation successful",
 		"service":   "auth-manager",
-		"tenant_id": c.GetString("tenant_id"),
+		"tenant_id": c.GetString("workspace_id"),
 		"client_id": c.GetString("client_id"),
 		"scopes":    c.MustGet("scopes"),
 		"roles":     c.MustGet("roles"),

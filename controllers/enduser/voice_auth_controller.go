@@ -181,7 +181,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -242,7 +242,7 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID from JWT token
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -299,7 +299,7 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -337,7 +337,7 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Router /authsec/uflow/auth/voice/device-pending [get]
 func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
@@ -443,7 +443,7 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	// Resolve tenant context from JWT claims (set by AuthMiddleware)
 	tenantID := uuid.Nil
 	tenantDomain := ""
-	if v, ok := c.Get("tenant_id"); ok && v != nil {
+	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		if tidStr, ok := v.(string); ok && tidStr != "" {
 			if parsed, parseErr := uuid.Parse(tidStr); parseErr == nil {
 				tenantID = parsed

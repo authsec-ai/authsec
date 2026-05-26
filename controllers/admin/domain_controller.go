@@ -48,7 +48,7 @@ type DomainResponse struct {
 
 func getTenantIDFromRequest(c *gin.Context) (uuid.UUID, error) {
 	// Get tenant_id from context (set by ValidateTenantFromPath middleware)
-	tenantIDAny, ok := c.Get("tenant_id")
+	tenantIDAny, ok := c.Get("workspace_id")
 	if !ok {
 		return uuid.Nil, fmt.Errorf("tenant_id not found in request context")
 	}
@@ -219,7 +219,7 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 	}
 
 	// Get tenant_id from context (set by ValidateTenantFromPath middleware)
-	tenantIDAny, ok := c.Get("tenant_id")
+	tenantIDAny, ok := c.Get("workspace_id")
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in request"})
 		return

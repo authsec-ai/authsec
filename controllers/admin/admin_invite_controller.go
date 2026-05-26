@@ -108,7 +108,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	// Get tenant_id from token (set by auth middleware)
 	var tenantIDFromToken string
 	var tenantUUID uuid.UUID
-	if tenantVal, exists := c.Get("tenant_id"); exists {
+	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			tenantIDFromToken = tenantStr
 			if parsedUUID, parseErr := uuid.Parse(tenantIDFromToken); parseErr == nil {
@@ -363,7 +363,7 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 
 	// Get tenant_id from token
 	var tenantUUID uuid.UUID
-	if tenantVal, exists := c.Get("tenant_id"); exists {
+	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
 				tenantUUID = parsedUUID
@@ -482,7 +482,7 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 
 	// Get tenant_id from token
 	var tenantUUID uuid.UUID
-	if tenantVal, exists := c.Get("tenant_id"); exists {
+	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
 				tenantUUID = parsedUUID
@@ -619,7 +619,7 @@ type ListPendingInvitesResponse struct {
 func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 	// Get tenant_id from token
 	var tenantUUID uuid.UUID
-	if tenantVal, exists := c.Get("tenant_id"); exists {
+	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
 				tenantUUID = parsedUUID

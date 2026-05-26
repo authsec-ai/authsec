@@ -65,7 +65,7 @@ type agentClient struct {
 // ListAgents lists all AI agent clients for the tenant.
 // GET /uflow/admin/agents
 func (ac *AgentController) ListAgents(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -96,7 +96,7 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 // GetAgent gets a single AI agent client by client_id.
 // GET /uflow/admin/agents/:id
 func (ac *AgentController) GetAgent(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -129,7 +129,7 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 // The SPIFFE ID is then written back to the client record.
 // POST /uflow/admin/agents/:id/provision-identity
 func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -222,7 +222,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 // RevokeIdentity deletes the SPIRE workload entry for an AI agent and clears its SPIFFE ID.
 // DELETE /uflow/admin/agents/:id/revoke-identity
 func (ac *AgentController) RevokeIdentity(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -276,7 +276,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 // DelegateToken resolves delegation permissions and issues a JWT-SVID for the agent.
 // POST /uflow/admin/agents/:id/delegate-token
 func (ac *AgentController) DelegateToken(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveTenantIDFromToken(c)
+	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return

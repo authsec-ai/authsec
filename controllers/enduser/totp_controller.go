@@ -72,7 +72,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -148,7 +148,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -218,7 +218,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -310,7 +310,7 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -369,7 +369,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -441,7 +441,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -505,7 +505,7 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 	}
 
 	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return

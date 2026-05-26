@@ -112,7 +112,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 	}
 
 	// Get tenant_id from validated JWT token
-	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		log.Printf("%s: tenant_id not found in authentication token", logPrefix)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
@@ -957,7 +957,7 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 // UpdateTenant updates an existing tenant
 func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
-	tenantIDStr, ok := middlewares.GetTenantIDFromToken(c)
+	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
 		return

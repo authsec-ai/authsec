@@ -107,7 +107,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		duration := time.Since(start)
 
 		// Extract context values (set by your existing AuthMiddleware)
-		tenantID := c.GetString("tenant_id")
+		tenantID := c.GetString("workspace_id")
 		userID := c.GetString("user_id")
 		userEmail := c.GetString("email_id")
 
@@ -225,7 +225,7 @@ type AuditCorrelation struct {
 //	middlewares.Audit(c, "role", roleID, "update", changes)
 func Audit(c *gin.Context, objectType string, objectID string, actionType string, changes *AuditChanges) {
 	// Extract context values
-	tenantID := c.GetString("tenant_id")
+	tenantID := c.GetString("workspace_id")
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.GetString("request_id") // From RequestIDMiddleware

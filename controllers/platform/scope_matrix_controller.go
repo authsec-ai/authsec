@@ -42,7 +42,7 @@ func NewScopeMatrixController() *ScopeMatrixController {
 func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1820,7 +1820,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
@@ -1910,7 +1910,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 			return
 		}
 		if len(rows) != len(userIDs) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "one or more users do not belong to this tenant"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "one or more users do not belong to this workspace"})
 			return
 		}
 		for _, row := range rows {

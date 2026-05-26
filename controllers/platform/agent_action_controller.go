@@ -64,7 +64,7 @@ func (ctrl *AgentActionController) EvaluateAction(c *gin.Context) {
 		userEmail = email.(string)
 	}
 	tenantIDStr := ""
-	if tid, exists := c.Get("tenant_id"); exists {
+	if tid, exists := c.Get("workspace_id"); exists {
 		tenantIDStr = tid.(string)
 	}
 
@@ -475,7 +475,7 @@ func (ctrl *AgentActionController) GetAuditLog(c *gin.Context) {
 // ========================================
 
 func (ctrl *AgentActionController) getTenantID(c *gin.Context) uuid.UUID {
-	tenantIDStr, exists := c.Get("tenant_id")
+	tenantIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found"})
 		return uuid.Nil
