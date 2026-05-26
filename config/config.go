@@ -55,6 +55,7 @@ type Config struct {
 	CorsAllowOrigin    string
 	RedisURL           string
 	ICPServiceURL      string // ICP service URL for PKI provisioning
+	BillingServiceURL  string // BILLING_SERVICE_URL — empty disables MAU gating (OSS / single-tenant mode)
 	BaseURL            string // Base URL for app/browser callbacks (e.g., https://dev.authsec.dev)
 	OAuthIssuerURL     string // Public OAuth/OIDC issuer base URL (e.g., https://dev.api.authsec.dev)
 
@@ -193,6 +194,9 @@ func LoadConfig() *Config {
 	// Load ICP service configuration
 	icpServiceURL := getEnv("ICP_SERVICE_URL", "http://localhost:7001")
 
+	// Load billing service URL (empty = OSS mode, no MAU gating)
+	billingServiceURL := getEnv("BILLING_SERVICE_URL", "")
+
 	// Load SMTP configuration
 	smtpHost := getEnv("SMTP_HOST", "")
 	smtpPort := getEnv("SMTP_PORT", "")
@@ -322,6 +326,7 @@ func LoadConfig() *Config {
 		CorsAllowOrigin:         corsAllowOrigin,
 		RedisURL:                redisURL,
 		ICPServiceURL:           icpServiceURL,
+		BillingServiceURL:       billingServiceURL,
 		BaseURL:                 baseURL,
 		OAuthIssuerURL:          oauthIssuerURL,
 		Environment:             environment,
