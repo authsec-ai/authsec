@@ -1627,8 +1627,8 @@ CREATE INDEX idx_mfa_methods_user_id ON public.mfa_methods USING btree (user_id)
 
 -- migration_logs indexes — add them defensively in case GORM AutoMigrate didn't
 -- create them (older runner versions only created the table, not the helper indexes).
-CREATE INDEX IF NOT EXISTS idx_migration_logs_tenant_id ON public.migration_logs USING btree (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_migration_logs_version   ON public.migration_logs USING btree (version);
+CREATE INDEX IF NOT EXISTS idx_migration_logs_workspace_id ON public.migration_logs USING btree (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_migration_logs_version      ON public.migration_logs USING btree (version);
 
 CREATE INDEX idx_oauth_scope_perms_permission ON public.oauth_scope_permissions USING btree (permission_id);
 

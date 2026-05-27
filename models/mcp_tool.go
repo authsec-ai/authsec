@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"gorm.io/gorm"
 )
 
 // Inventory source constants for MCPTool.InventorySource.
@@ -24,7 +25,8 @@ const (
 // MCPTool represents a tool discovered from an MCP server via tools/list.
 type MCPTool struct {
 	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID           uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
+	TenantID           uuid.UUID       `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;not null;index"`
+	WorkspaceID        uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null"`
 	ResourceServerID   uuid.UUID       `json:"resource_server_id" gorm:"type:uuid;not null;uniqueIndex:idx_mcp_tools_rs_name"`
 	Name               string          `json:"name" gorm:"type:text;not null;uniqueIndex:idx_mcp_tools_rs_name"`
 	Title              string          `json:"title" gorm:"type:text"`
@@ -53,6 +55,16 @@ type MCPTool struct {
 
 func (MCPTool) TableName() string {
 	return "mcp_tools"
+}
+
+func (t *MCPTool) BeforeCreate(tx *gorm.DB) error {
+	if t.TenantID == uuid.Nil {
+		t.TenantID = t.WorkspaceID
+	}
+	if t.WorkspaceID == uuid.Nil {
+		t.WorkspaceID = t.TenantID
+	}
+	return nil
 }
 
 // MCPToolScopeMap is the join table between tools and scopes.

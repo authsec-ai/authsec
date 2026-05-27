@@ -348,7 +348,7 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 			Success:     success,
 			ErrorMsg:    errorMsg,
 			DBType:      mr.dbType,
-			WorkspaceID:    mr.tenantID,
+			WorkspaceID: mr.tenantID,
 			ExecutionMS: executionMS,
 		})
 		return
@@ -360,15 +360,15 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 		logDB = mr.masterDB
 	}
 
-	tenantIDVal := sql.NullString{}
+	workspaceIDVal := sql.NullString{}
 	if mr.tenantID != nil {
-		tenantIDVal = sql.NullString{String: *mr.tenantID, Valid: true}
+		workspaceIDVal = sql.NullString{String: *mr.tenantID, Valid: true}
 	}
 
 	_, err := logDB.Exec(
-		`INSERT INTO migration_logs (id, version, name, executed_at, success, error_msg, db_type, tenant_id, execution_ms)
+		`INSERT INTO migration_logs (id, version, name, executed_at, success, error_msg, db_type, workspace_id, execution_ms)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		uuid.New().String(), version, name, time.Now().UTC(), success, errorMsg, mr.dbType, tenantIDVal, executionMS,
+		uuid.New().String(), version, name, time.Now().UTC(), success, errorMsg, mr.dbType, workspaceIDVal, executionMS,
 	)
 	if err != nil {
 		log.Printf("[Migration] Warning: failed to log migration v%d: %v", version, err)
@@ -413,7 +413,7 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	return &MigrationStatusResponse{
 		DBType:          mr.dbType,
-		WorkspaceID:        mr.tenantID,
+		WorkspaceID:     mr.tenantID,
 		LastMigration:   lastMigration,
 		TotalMigrations: len(migrations),
 		Status:          status,
