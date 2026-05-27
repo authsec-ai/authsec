@@ -395,6 +395,32 @@ func SetupRoutes(
 			applications.DELETE("/:id/identity-providers/:idp_id", applicationIDPPoliciesController.Remove)
 		}
 
+		// v1 IAM cockpit aggregate/read-model aliases. These routes expose the
+		// product vocabulary used by the AI/MCP access-control UI while reusing
+		// the existing scope matrix, bindings, and runtime resolver backends.
+		v1 := authsec.Group("/v1")
+		v1.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateTenantFromToken(),
+		)
+		{
+			v1.GET("/workspaces/:workspace_id/applications/posture-summary", applicationsController.PostureSummary)
+
+			v1Applications := v1.Group("/applications")
+			{
+				v1Applications.GET("/:id/tool-exposure", scopeMatrixController.GetScopeMatrix)
+				v1Applications.GET("/:id/scopes", scopeMatrixController.ListScopes)
+				v1Applications.GET("/:id/scopes/:scope_id/impact", scopeMatrixController.ScopeImpact)
+				v1Applications.GET("/:id/access-assignments", scopeMatrixController.ListRSBindings)
+				v1Applications.GET("/:id/end-user-access-summary", scopeMatrixController.ListApplicationAccessUsers)
+				v1Applications.GET("/:id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccessQuery)
+				v1Applications.POST("/:id/access-simulations", scopeMatrixController.AccessSimulation)
+				v1Applications.POST("/:id/access-change-previews", scopeMatrixController.AccessChangePreview)
+				v1Applications.POST("/:id/evidence-exports", scopeMatrixController.EvidenceExport)
+			}
+		}
+
 		authsec.GET("/application-roles",
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),

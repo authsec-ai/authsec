@@ -2927,3 +2927,306 @@ func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
 		"diagnostics":        enriched,
 	})
 }
+
+// GetApplicationUserEffectiveAccessQuery is the v1 aggregate alias:
+// GET /authsec/v1/applications/:id/effective-access?user_id=<uuid>
+func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccessQuery(c *gin.Context) {
+	userID := strings.TrimSpace(c.Query("user_id"))
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id query parameter required"})
+		return
+	}
+	c.Params = append(c.Params, gin.Param{Key: "user_id", Value: userID})
+	ctrl.GetApplicationUserEffectiveAccess(c)
+}
+
+// ScopeImpact returns the operator impact preview for deleting or changing one
+// application access label.
+func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+	scopeID, err := uuid.Parse(c.Param("scope_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope_id"})
+		return
+	}
+
+	var scope models.OAuthScope
+	if err := config.DB.Where("id = ? AND tenant_id = ? AND resource_server_id = ?", scopeID, tenantID, rs.ID).Take(&scope).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scope not found"})
+		return
+	}
+
+	var toolsCount, rolesCount, usersCount, grantsCount int64
+	config.DB.Table("mcp_tool_scope_map mtsm").
+		Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
+		Where("mtsm.scope_id = ? AND t.tenant_id = ? AND t.resource_server_id = ?", scope.ID, tenantID, rs.ID).
+		Count(&toolsCount)
+	config.DB.Table("role_permissions rp").
+		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
+		Joins("JOIN roles r ON r.id = rp.role_id").
+		Where("osp.scope_id = ? AND r.tenant_id = ? AND r.name LIKE ?", scope.ID, tenantID, "rs-"+rs.ID.String()+":%").
+		Select("COUNT(DISTINCT rp.role_id)").Scan(&rolesCount)
+	config.DB.Table("role_bindings rb").
+		Joins("JOIN role_permissions rp ON rp.role_id = rb.role_id").
+		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
+		Where("osp.scope_id = ? AND rb.tenant_id = ? AND rb.user_id IS NOT NULL", scope.ID, tenantID).
+		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
+	config.DB.Table("oauth_consent_grants").
+		Where("tenant_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND ? = ANY(granted_scopes)", tenantID, rs.ID, scope.ScopeString).
+		Count(&grantsCount)
+
+	c.JSON(http.StatusOK, gin.H{
+		"application": accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		"scope": gin.H{
+			"id":           scope.ID.String(),
+			"scope_string": scope.ScopeString,
+			"display_name": scope.DisplayName,
+			"risk_level":   scope.RiskLevel,
+		},
+		"impact": gin.H{
+			"tools_unlocked": toolsCount,
+			"roles_using_it": rolesCount,
+			"users_affected": usersCount,
+			"consent_grants": grantsCount,
+		},
+		"safe_to_delete": toolsCount == 0 && rolesCount == 0 && usersCount == 0 && grantsCount == 0,
+	})
+}
+
+// AccessSimulation evaluates one user/application/tool path using the same
+// scope resolver used by runtime policy, with an operator-friendly trace.
+func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	var req struct {
+		UserID   string `json:"user_id"`
+		ClientID string `json:"client_id"`
+		ToolID   string `json:"tool_id"`
+		ToolName string `json:"tool_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.UserID == "" {
+		req.UserID = c.Query("user_id")
+	}
+	if req.ToolID == "" {
+		req.ToolID = c.Query("tool_id")
+	}
+	if req.ToolName == "" {
+		req.ToolName = c.Query("tool_name")
+	}
+	userID, err := uuid.Parse(strings.TrimSpace(req.UserID))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid user_id is required"})
+		return
+	}
+
+	var userStatus string
+	if err := config.DB.Table("users u").
+		Select("COALESCE(teus.status, 'active')").
+		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.tenant_id").
+		Where("u.id = ? AND u.tenant_id = ?", userID, tenantID).
+		Scan(&userStatus).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
+		return
+	}
+	if userStatus == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found for this workspace"})
+		return
+	}
+
+	var tool models.MCPTool
+	toolQuery := config.DB.Preload("Scopes").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID)
+	if req.ToolID != "" {
+		toolUUID, err := uuid.Parse(req.ToolID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tool_id"})
+			return
+		}
+		toolQuery = toolQuery.Where("id = ?", toolUUID)
+	} else if req.ToolName != "" {
+		toolQuery = toolQuery.Where("name = ?", req.ToolName)
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tool_id or tool_name is required"})
+		return
+	}
+	if err := toolQuery.Take(&tool).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "tool not found"})
+		return
+	}
+
+	trace := []gin.H{
+		{"check": "user_active", "state": boolState(userStatus == "active"), "detail": userStatus},
+		{"check": "application_launched", "state": boolState(rs.IsReady()), "detail": rs.State},
+	}
+	if userStatus != "active" {
+		c.JSON(http.StatusOK, simulationDenied(rs, tool, trace, "user_inactive", "Reactivate the user before changing application roles."))
+		return
+	}
+	if !rs.IsReady() {
+		c.JSON(http.StatusOK, simulationDenied(rs, tool, trace, "application_not_launched", "Open Overview and complete launch blockers."))
+		return
+	}
+	if tool.IsPublic {
+		trace = append(trace, gin.H{"check": "tool_public", "state": "ok", "detail": "public tool bypasses role scope mapping"})
+		c.JSON(http.StatusOK, simulationAllowed(rs, tool, trace, "Tool is public for tokens with this audience."))
+		return
+	}
+
+	requestedScopes := make([]string, 0, len(tool.Scopes))
+	for _, scope := range tool.Scopes {
+		var mapping models.MCPToolScopeMap
+		if err := config.DB.Where("tool_id = ? AND scope_id = ?", tool.ID, scope.ID).Take(&mapping).Error; err == nil && mapping.Source == models.ScopeMapSourceAdminOverride {
+			requestedScopes = append(requestedScopes, scope.ScopeString)
+		}
+	}
+	if len(requestedScopes) == 0 {
+		trace = append(trace, gin.H{"check": "tool_mapped", "state": "blocked", "detail": "tool has no operator-approved access label"})
+		c.JSON(http.StatusOK, simulationDenied(rs, tool, trace, "tool_unmapped", "Map the tool to an access label or intentionally mark it public."))
+		return
+	}
+	trace = append(trace, gin.H{"check": "tool_mapped", "state": "ok", "detail": requestedScopes})
+
+	report, err := ctrl.scopeResolver.ResolveWithReport(c.Request.Context(), tenantID.String(), userID.String(), rs.ID.String(), requestedScopes, rs, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "scope resolution failed"})
+		return
+	}
+	trace = append(trace, gin.H{"check": "role_grants_scope", "state": boolState(len(report.Grantable) > 0), "detail": report.Diagnostics})
+	if len(report.Grantable) == 0 {
+		c.JSON(http.StatusOK, simulationDenied(rs, tool, trace, "missing_role_scope", "Assign a role that grants one of the tool's access labels."))
+		return
+	}
+	c.JSON(http.StatusOK, simulationAllowed(rs, tool, trace, "User has a role that grants the tool's access label."))
+}
+
+func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+	var req struct {
+		Action    string `json:"action"`
+		BindingID string `json:"binding_id"`
+		ScopeID   string `json:"scope_id"`
+		RoleID    string `json:"role_id"`
+		UserID    string `json:"user_id"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	var affectedBindings, affectedUsers, affectedTools int64
+	if req.BindingID != "" {
+		if bindingID, err := uuid.Parse(req.BindingID); err == nil {
+			config.DB.Table("role_bindings").Where("tenant_id = ? AND id = ?", tenantID, bindingID).Count(&affectedBindings)
+			config.DB.Table("role_bindings").Where("tenant_id = ? AND id = ? AND user_id IS NOT NULL", tenantID, bindingID).Count(&affectedUsers)
+		}
+	}
+	if req.ScopeID != "" {
+		if scopeID, err := uuid.Parse(req.ScopeID); err == nil {
+			config.DB.Table("mcp_tool_scope_map mtsm").
+				Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
+				Where("mtsm.scope_id = ? AND t.tenant_id = ? AND t.resource_server_id = ?", scopeID, tenantID, rs.ID).
+				Count(&affectedTools)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"application": accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		"action":      req.Action,
+		"impact": gin.H{
+			"bindings": affectedBindings,
+			"users":    affectedUsers,
+			"tools":    affectedTools,
+		},
+		"warnings":      []string{},
+		"safe_to_apply": true,
+	})
+}
+
+func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
+	tenantID, err := extractTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+	var toolsCount, scopesCount, rolesCount, bindingsCount int64
+	config.DB.Table("mcp_tools").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&toolsCount)
+	config.DB.Table("oauth_scopes").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&scopesCount)
+	config.DB.Table("roles").Where("tenant_id = ? AND name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
+	config.DB.Table("role_bindings rb").
+		Joins("JOIN roles r ON r.id = rb.role_id").
+		Where("rb.tenant_id = ? AND r.name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").
+		Count(&bindingsCount)
+	c.JSON(http.StatusAccepted, gin.H{
+		"export_id":    uuid.NewString(),
+		"status":       "ready",
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"application":  accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		"evidence": gin.H{
+			"tools":              toolsCount,
+			"access_labels":      scopesCount,
+			"application_roles":  rolesCount,
+			"access_assignments": bindingsCount,
+		},
+	})
+}
+
+func boolState(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "blocked"
+}
+
+func simulationDenied(rs *models.ResourceServer, tool models.MCPTool, trace []gin.H, condition string, fix string) gin.H {
+	return gin.H{
+		"verdict":          "denied",
+		"application":      accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		"tool":             gin.H{"id": tool.ID.String(), "name": tool.Name, "public": tool.IsPublic},
+		"failed_condition": condition,
+		"safest_fix":       fix,
+		"decision_trace":   trace,
+	}
+}
+
+func simulationAllowed(rs *models.ResourceServer, tool models.MCPTool, trace []gin.H, reason string) gin.H {
+	return gin.H{
+		"verdict":        "allowed",
+		"application":    accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
+		"tool":           gin.H{"id": tool.ID.String(), "name": tool.Name, "public": tool.IsPublic},
+		"reason":         reason,
+		"safest_fix":     "",
+		"decision_trace": trace,
+	}
+}

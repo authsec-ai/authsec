@@ -73,6 +73,19 @@ AuthSec is a unified authentication and identity platform delivered as a single 
 
 A backward-compatibility alias exists at the bare root `/sdkmgr/*` for legacy SDK clients.
 
+### Tenant to Workspace Migration Contract
+
+AuthSec is currently in Phase 5 of the tenant to workspace migration. For
+backend JSON, `workspace_id` is canonical. `tenant_id` is a deprecated
+compatibility mirror and, when present, has the same value as `workspace_id`
+until it is removed in Phase 8.
+
+UI and SDK clients do not need an immediate Phase 5 change, but all clients
+must migrate to `workspace_id` before Phase 8. Existing path names are not all
+renamed during this phase; the legacy MFA URL families
+`/authsec/uflow/auth/tenant/totp/*` and
+`/authsec/uflow/auth/tenant/ciba/*` remain valid exceptions.
+
 ### Single-Tenant vs Multi-Tenant Mode
 
 authsec operates in **single-tenant mode** by default — one admin, one master database. Multi-tenant support is provided by the **mt-plugin** gRPC microservice. When `MT_PLUGIN_GRPC_ADDR` is configured and mt-plugin is reachable, authsec enables multi-tenant admin registration and delegates tenant database management to mt-plugin.
@@ -113,7 +126,8 @@ Authorization: Bearer <jwt>
 
 Some routes also accept a **SPIFFE JWT-SVID** for service-to-service calls (dual-auth routes under `/exsvc/services`).
 
-**Token claims include:** `sub` (user ID), `tenant_id`, `roles`, `permissions`, `scope`.
+**Token claims include:** `sub` (user ID), `workspace_id`, deprecated mirror
+`tenant_id`, `roles`, `permissions`, `scope`.
 
 Routes explicitly marked **[Public]** require no authentication.
 
@@ -230,12 +244,14 @@ Check whether an admin email exists and which next step to take.
   "exists": true,
   "display_name": "Alice Smith",
   "tenant_domain": "example.com",
+  "workspace_id": "uuid",
   "tenant_id": "uuid",
   "next_step": "login",
   "requires_password": true,
   "available_providers": ["google", "github"]
 }
 ```
+`workspace_id` is canonical. `tenant_id` is a deprecated mirror retained until Phase 8.
 `next_step` values: `"login"` | `"bootstrap"` | `"register"`
 
 ---
@@ -260,11 +276,13 @@ Create the first admin user and tenant (initial setup only).
 {
   "message": "Bootstrap successful",
   "status": "pending_verification",
+  "workspace_id": "uuid",
   "tenant_id": "uuid",
   "tenant_domain": "example.com",
   "user_id": "uuid"
 }
 ```
+`workspace_id` is canonical. `tenant_id` is a deprecated mirror retained until Phase 8.
 
 ---
 

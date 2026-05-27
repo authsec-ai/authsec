@@ -702,7 +702,7 @@ CREATE TABLE public.resource_server_manifest_attempts (
 
 CREATE TABLE public.resource_servers (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    tenant_id uuid NOT NULL,
+    tenant_id uuid ,
     name character varying(255) NOT NULL,
     public_base_url text NOT NULL,
     protected_base_path text DEFAULT '/mcp'::text NOT NULL,

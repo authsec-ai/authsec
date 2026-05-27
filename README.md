@@ -67,6 +67,19 @@ All HTTP routes are served from a single `gin.Engine`. Each module's routes live
 
 authsec is a **single-tenant service by default**. All operations use the master PostgreSQL database. Multi-tenant support requires running the **mt-plugin** gRPC microservice and setting `MT_PLUGIN_GRPC_ADDR`.
 
+### Tenant to workspace migration contract
+
+AuthSec is currently in Phase 5 of the tenant to workspace migration. Backend
+JSON uses `workspace_id` as the canonical scope identifier. `tenant_id` may
+still appear in responses as a deprecated compatibility mirror with the same
+value until Phase 8.
+
+New backend integrations should read `workspace_id`. Existing UI and SDK
+clients do not need an immediate Phase 5 change, but must migrate before Phase
+8 removes the `tenant_id` JSON mirror. The legacy MFA URL families
+`/authsec/uflow/auth/tenant/totp/*` and `/authsec/uflow/auth/tenant/ciba/*`
+remain intentionally named with `tenant`.
+
 ---
 
 ## Modules
@@ -797,9 +810,9 @@ All routes with **JWT** authentication use `AuthMiddleware` from `middlewares/au
 1. Extracts the `Authorization: Bearer <token>` header.
 2. Validates the JWT signature against the configured `JWT_DEF_SECRET` / `JWT_SDK_SECRET`.
 3. Accepts tokens with issuer `authsec-ai/auth-manager`.
-4. Sets claims into the gin context (`user_id`, `tenant_id`, `project_id`, `client_id`, `email`, `roles`, `scopes`).
+4. Sets claims into the gin context (`user_id`, `workspace_id`, deprecated mirror `tenant_id`, `project_id`, `client_id`, `email`, `roles`, `scopes`).
 
-Routes marked **JWT+Tenant** additionally pass through `ValidateTenantFromToken()` which ensures the token's `tenant_id` claim matches the tenant being accessed.
+Routes marked **JWT+Tenant** additionally pass through `ValidateTenantFromToken()` for legacy route compatibility. During Phase 5, `workspace_id` is canonical and `tenant_id` is a deprecated mirror kept for existing callers until Phase 8.
 
 Routes marked **JWT+Admin** also enforce `Require("admin", "access")`.
 
