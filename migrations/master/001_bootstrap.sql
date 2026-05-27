@@ -442,6 +442,7 @@ CREATE TABLE public.mcp_tool_scope_map (
 CREATE TABLE public.mcp_tools (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
     resource_server_id uuid NOT NULL,
     name text NOT NULL,
     title text,
@@ -455,7 +456,6 @@ CREATE TABLE public.mcp_tools (
     is_public boolean DEFAULT false NOT NULL,
     is_public_acknowledged_by uuid,
     CONSTRAINT mcp_tools_inventory_source_check CHECK ((inventory_source = ANY (ARRAY['mcp_scan'::text, 'sdk_manifest'::text, 'manual'::text]))),
-    workspace_id uuid,
     CONSTRAINT mcp_tools_pkey PRIMARY KEY (id),
     CONSTRAINT mcp_tools_resource_server_id_name_key UNIQUE (resource_server_id, name)
 );
@@ -511,6 +511,7 @@ CREATE TABLE public.oauth_scope_permissions (
 CREATE TABLE public.oauth_scopes (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
     resource_server_id uuid,
     scope_string text NOT NULL,
     display_name text NOT NULL,
@@ -524,7 +525,6 @@ CREATE TABLE public.oauth_scopes (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT oauth_scopes_risk_level_check CHECK ((risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
     CONSTRAINT oauth_scopes_source_check CHECK ((source = ANY (ARRAY['discovered'::text, 'preset'::text, 'manifest'::text, 'manual'::text]))),
-    workspace_id uuid,
     CONSTRAINT oauth_scopes_pkey PRIMARY KEY (id),
     CONSTRAINT oauth_scopes_tenant_id_resource_server_id_scope_string_key UNIQUE (tenant_id, resource_server_id, scope_string)
 );
@@ -645,6 +645,7 @@ CREATE TABLE public.projects (
 CREATE TABLE public.resource_server_access_policies (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
     resource_server_id uuid NOT NULL,
     enabled boolean DEFAULT false NOT NULL,
     default_role_id uuid,
@@ -702,7 +703,8 @@ CREATE TABLE public.resource_server_manifest_attempts (
 
 CREATE TABLE public.resource_servers (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    tenant_id uuid ,
+    tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
     name character varying(255) NOT NULL,
     public_base_url text NOT NULL,
     protected_base_path text DEFAULT '/mcp'::text NOT NULL,
@@ -732,7 +734,6 @@ CREATE TABLE public.resource_servers (
     CONSTRAINT resource_servers_last_scan_status_check CHECK (((last_scan_status IS NULL) OR (last_scan_status = ANY (ARRAY['success'::text, 'failure'::text, 'partial'::text])))),
     CONSTRAINT resource_servers_state_check CHECK ((state = ANY (ARRAY['pending_scan'::text, 'needs_setup'::text, 'ready'::text, 'scan_failed'::text]))),
     CONSTRAINT resource_servers_status_check CHECK ((status = ANY (ARRAY['pending_scan'::text, 'ready'::text, 'degraded'::text]))),
-    workspace_id uuid,
     application_type text DEFAULT 'mcp_server'::text NOT NULL,
     legacy_client_id uuid,
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
@@ -2447,6 +2448,7 @@ CREATE INDEX idx_saml_providers_tenant_id ON public.saml_providers(tenant_id);
 CREATE INDEX idx_resource_servers_workspace_id          ON public.resource_servers(workspace_id);
 CREATE INDEX idx_resource_servers_application_type      ON public.resource_servers(application_type);
 CREATE INDEX idx_resource_servers_legacy_client_id      ON public.resource_servers(legacy_client_id);
+CREATE INDEX idx_rs_access_policies_workspace_id        ON public.resource_server_access_policies(workspace_id);
 CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clients(sync_status) WHERE sync_status <> 'active';
 CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
 CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
