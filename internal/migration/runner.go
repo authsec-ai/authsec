@@ -323,11 +323,11 @@ func (mr *MigrationRunner) isMigrationExecuted(version int, name string) bool {
 	var queryDB *sql.DB
 	if mr.dbType == "tenant" && mr.masterDB != nil {
 		queryDB = mr.masterDB
-		query += ` AND tenant_id = $4`
+		query += ` AND workspace_id = $4`
 		args = append(args, *mr.tenantID)
 	} else {
 		queryDB = mr.db
-		query += ` AND tenant_id IS NULL`
+		query += ` AND workspace_id IS NULL`
 	}
 
 	var count int64
@@ -390,10 +390,10 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 	baseQuery := `SELECT version, executed_at FROM migration_logs WHERE db_type = $1 AND success = true`
 	args := []interface{}{mr.dbType}
 	if mr.tenantID != nil {
-		baseQuery += ` AND tenant_id = $2`
+		baseQuery += ` AND workspace_id = $2`
 		args = append(args, *mr.tenantID)
 	} else {
-		baseQuery += ` AND tenant_id IS NULL`
+		baseQuery += ` AND workspace_id IS NULL`
 	}
 
 	var lastMigration int
