@@ -66,7 +66,7 @@ func (r *hydraClientRepository) ListAll(req *GetTenantHydraClientsRequest) ([]*T
 		query = query.Where("org_id = ?", req.OrgID)
 	}
 	if req.WorkspaceID != "" {
-		query = query.Where("tenant_id = ?", req.WorkspaceID)
+		query = query.Where("workspace_id = ?", req.WorkspaceID)
 	}
 	if req.ClientType != "" {
 		query = query.Where("client_type = ?", req.ClientType)

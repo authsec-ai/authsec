@@ -60,7 +60,7 @@ func RequireWorkspaceRole(allowedRoles ...string) gin.HandlerFunc {
 		var count int64
 		query := config.DB.Table("role_bindings rb").
 			Joins("JOIN roles r ON r.id = rb.role_id").
-			Where("rb.user_id = ? AND rb.tenant_id = ?", userID, workspaceID).
+			Where("rb.user_id = ? AND rb.workspace_id = ?", userID, workspaceID).
 			Where("rb.expires_at IS NULL OR rb.expires_at > NOW()")
 		if len(allowed) > 0 {
 			names := make([]string, 0, len(allowed))

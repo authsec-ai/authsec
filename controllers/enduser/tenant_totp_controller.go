@@ -32,7 +32,7 @@ func NewTenantTOTPController() *TenantTOTPController {
 // @Success 200 {object} models.TenantTOTPLoginResponse "Login successful"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/login [post]
+// @Router /authsec/uflow/auth/workspace/totp/login [post]
 func (ttc *TenantTOTPController) LoginWithTenantTOTP(c *gin.Context) {
 	var req models.TenantTOTPLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -81,7 +81,7 @@ func (ttc *TenantTOTPController) LoginWithTenantTOTP(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/register [post]
+// @Router /authsec/uflow/auth/workspace/totp/register [post]
 func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 	var req models.TenantTOTPRegistrationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -155,7 +155,7 @@ func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/confirm [post]
+// @Router /authsec/uflow/auth/workspace/totp/confirm [post]
 func (ttc *TenantTOTPController) ConfirmTenantTOTPDevice(c *gin.Context) {
 	var req models.TenantTOTPRegistrationConfirmRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -224,7 +224,7 @@ func (ttc *TenantTOTPController) ConfirmTenantTOTPDevice(c *gin.Context) {
 // @Success 200 {object} models.TenantTOTPDeviceListResponse "Devices retrieved successfully"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/devices [get]
+// @Router /authsec/uflow/auth/workspace/totp/devices [get]
 func (ttc *TenantTOTPController) GetTenantTOTPDevices(c *gin.Context) {
 	// Get user and tenant info from JWT token
 	userIDStr, exists := c.Get("user_id")
@@ -273,7 +273,7 @@ func (ttc *TenantTOTPController) GetTenantTOTPDevices(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/devices/delete [post]
+// @Router /authsec/uflow/auth/workspace/totp/devices/delete [post]
 func (ttc *TenantTOTPController) DeleteTenantTOTPDevice(c *gin.Context) {
 	var req models.TenantTOTPDeviceDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -338,7 +338,7 @@ func (ttc *TenantTOTPController) DeleteTenantTOTPDevice(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/totp/devices/primary [post]
+// @Router /authsec/uflow/auth/workspace/totp/devices/primary [post]
 func (ttc *TenantTOTPController) SetTenantPrimaryTOTPDevice(c *gin.Context) {
 	var req models.TenantTOTPDeviceDeleteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

@@ -223,7 +223,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	middlewares.Audit(c, "ciba_device", resp.DeviceID, "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":     userID.String(),
-			"tenant_id":   tenantID.String(),
+			"workspace_id":   tenantID.String(),
 			"platform":    req.Platform,
 			"device_name": req.DeviceName,
 		},
@@ -344,7 +344,7 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 		Before: map[string]interface{}{
 			"device_id": deviceIDStr,
 			"user_id":   userID.String(),
-			"tenant_id": tenantID.String(),
+			"workspace_id": tenantID.String(),
 		},
 	})
 

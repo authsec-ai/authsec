@@ -57,7 +57,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
 		return
 	}
-	if err := config.DB.Where("tenant_id = ?", input.WorkspaceID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", input.WorkspaceID).First(&tenant).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
@@ -131,7 +131,7 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	middlewares.Audit(c, "client", client.ClientID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"client_id":  client.ClientID.String(),
-			"tenant_id":  client.WorkspaceID.String(),
+			"workspace_id":  client.WorkspaceID.String(),
 			"project_id": client.ProjectID.String(),
 			"name":       client.Name,
 			"email":      *client.Email,
@@ -212,7 +212,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 	var user models.User
 	if lookupByID {
 		if err := tenantDB.Preload("Groups").
-			Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+			Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -222,7 +222,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		}
 	} else {
 		if err := tenantDB.Preload("Groups").
-			Where("tenant_id = ? AND client_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, clientUUID, emailIdentifier).First(&user).Error; err != nil {
+			Where("workspace_id = ? AND client_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, clientUUID, emailIdentifier).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -453,7 +453,7 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Update user status
-	result := tenantDB.Model(&models.User{}).Where("id = ? AND tenant_id = ?", userUUID, tenantID).
+	result := tenantDB.Model(&models.User{}).Where("id = ? AND workspace_id = ?", userUUID, tenantID).
 		Updates(map[string]interface{}{
 			"active":     input.Active,
 			"updated_at": time.Now(),
@@ -473,7 +473,7 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 	middlewares.Audit(c, "enduser", userID, "update_status", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":   userID,
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 			"active":    input.Active,
 		},
 	})
@@ -549,7 +549,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 	}
 
 	// Update user
-	result := tenantDB.Model(&models.User{}).Where("id = ? AND tenant_id = ?", userUUID, tenantID).
+	result := tenantDB.Model(&models.User{}).Where("id = ? AND workspace_id = ?", userUUID, tenantID).
 		Updates(updateData)
 
 	if result.Error != nil {
@@ -564,7 +564,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 	// Fetch updated user
 	var updatedUser models.User
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", userUUID, tenantID).First(&updatedUser).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&updatedUser).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch updated user"})
 		return
 	}
@@ -573,7 +573,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 	middlewares.Audit(c, "enduser", userID, "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":   userID,
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 			"updates":   updateData,
 		},
 	})
@@ -746,7 +746,7 @@ func (euc *EndUserController) DeleteEndUser(c *gin.Context) {
 
 			"user_id": userID,
 
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 
 			"active": true,
 		},
@@ -879,7 +879,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 	var user models.User
 
-	if err := freshDB.Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := freshDB.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 
@@ -925,7 +925,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 1. Delete role_bindings
 
-		result := tx.Where("user_id = ? AND tenant_id = ?", userUUID, tenantUUID).Delete(&models.RoleBinding{})
+		result := tx.Where("user_id = ? AND workspace_id = ?", userUUID, tenantUUID).Delete(&models.RoleBinding{})
 
 		if result.Error != nil {
 
@@ -937,7 +937,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 2. Delete totp_secrets (MFA devices)
 
-		result = tx.Exec("DELETE FROM totp_secrets WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM totp_secrets WHERE user_id = ? AND workspace_id = ?", userUUID, tenantUUID)
 
 		if result.Error != nil {
 
@@ -949,7 +949,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 3. Delete backup_codes
 
-		result = tx.Exec("DELETE FROM backup_codes WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM backup_codes WHERE user_id = ? AND workspace_id = ?", userUUID, tenantUUID)
 
 		if result.Error != nil {
 
@@ -961,7 +961,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 4. Delete webauthn_credentials
 
-		result = tx.Exec("DELETE FROM webauthn_credentials WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM webauthn_credentials WHERE user_id = ? AND workspace_id = ?", userUUID, tenantUUID)
 
 		if result.Error != nil {
 
@@ -973,7 +973,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 5. Delete ciba_push_devices
 
-		result = tx.Exec("DELETE FROM ciba_push_devices WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM ciba_push_devices WHERE user_id = ? AND workspace_id = ?", userUUID, tenantUUID)
 
 		if result.Error != nil {
 
@@ -985,7 +985,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 6. Delete ciba_auth_requests
 
-		result = tx.Exec("DELETE FROM ciba_auth_requests WHERE user_id = ? AND tenant_id = ?", userUUID, tenantUUID)
+		result = tx.Exec("DELETE FROM ciba_auth_requests WHERE user_id = ? AND workspace_id = ?", userUUID, tenantUUID)
 
 		if result.Error != nil {
 
@@ -1045,7 +1045,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		// 11. Finally, delete the user
 
-		result = tx.Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).Delete(&models.User{})
+		result = tx.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).Delete(&models.User{})
 
 		if result.Error != nil {
 
@@ -1079,7 +1079,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 			"user_id": userID,
 
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 
 			"email": user.Email,
 
@@ -1118,7 +1118,7 @@ func countOtherActiveEndUsers(db *gorm.DB, tenantID uuid.UUID, excludeUser uuid.
 
 	var count int64
 	if err := db.Model(&models.User{}).
-		Where("tenant_id = ? AND id <> ? AND active = ?", tenantID, excludeUser, true).
+		Where("workspace_id = ? AND id <> ? AND active = ?", tenantID, excludeUser, true).
 		Count(&count).Error; err != nil {
 		return 0, err
 	}
@@ -1198,7 +1198,7 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 	middlewares.Audit(c, "enduser", userID, action, &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":   userID,
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 			"active":    active,
 		},
 	})
@@ -1214,7 +1214,7 @@ func updateUserActiveStatus(db *gorm.DB, tenantID uuid.UUID, userID uuid.UUID, a
 	}
 
 	result := db.Table("users").
-		Where("id = ? AND tenant_id = ?", userID, tenantID).
+		Where("id = ? AND workspace_id = ?", userID, tenantID).
 		Updates(map[string]interface{}{
 			"active":     active,
 			"updated_at": timeNow(),
@@ -1243,7 +1243,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing extension fields in OIDC token"})
 		return
 	}
-	tenantID, ok := ext["tenant_id"].(string)
+	tenantID, ok := ext["workspace_id"].(string)
 	if !ok || tenantID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or missing tenant_id in OIDC token"})
 		return
@@ -1428,7 +1428,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Find tenant user
 	var user models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -1441,7 +1441,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Check if MFA is enabled
 	var user2 models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND mfa_enabled = ?", tenantUUID, input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND mfa_enabled = ?", tenantUUID, input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
 		// MFA is not enabled
 		var isFirstLogin bool
 		if user.Provider == "ad_sync" || user.Provider == "entra_id" {
@@ -1526,7 +1526,7 @@ func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {
 	// Check if email already exists in main tenant table
 	var existingUser models.User
 	input.Email = strings.ToLower(input.Email)
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "scim", "entra_id"}).First(&existingUser).Error; err == nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "scim", "entra_id"}).First(&existingUser).Error; err == nil {
 		// If user exists, check if it's ad_sync with empty password_hash
 		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
 			c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
@@ -1610,7 +1610,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		log.Printf("Error deleting existing pending registration: %v", err)
 	}
 
-	// Create pending registration record - we'll store client_id and tenant_id
+	// Create pending registration record - we'll store client_id and workspace_id
 	clientIDUUID, _ := uuid.Parse(input.ClientID)
 	tenantIDUUID, _ := uuid.Parse(tenantID)
 	pendingReg := models.PendingRegistration{
@@ -1628,7 +1628,7 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		TenantDomain: config.AppConfig.TenantDomainSuffix, // Use configured domain suffix (authsec.dev)
 	}
 
-	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, tenant_id, project_id, client_id, tenant_domain, expires_at, created_at, updated_at)
+	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, workspace_id, project_id, client_id, tenant_domain, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
 	if _, err := db.Exec(insertQuery, pendingReg.Email, pendingReg.PasswordHash, pendingReg.FirstName, pendingReg.LastName,
 		pendingReg.WorkspaceID, pendingReg.ProjectID, pendingReg.ClientID, pendingReg.TenantDomain, pendingReg.ExpiresAt); err != nil {
@@ -1736,7 +1736,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 
 	// Get pending registration
 	var pendingReg models.PendingRegistration
-	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, tenant_id, project_id, client_id, tenant_domain, expires_at
+	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, workspace_id, project_id, client_id, tenant_domain, expires_at
 		FROM pending_registrations WHERE email = $1`, input.Email).Scan(
 		&pendingReg.Email, &pendingReg.PasswordHash, &pendingReg.FirstName, &pendingReg.LastName,
 		&pendingReg.WorkspaceID, &pendingReg.ProjectID, &pendingReg.ClientID, &pendingReg.TenantDomain, &pendingReg.ExpiresAt)
@@ -1756,7 +1756,7 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 
 	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update
 	var adSyncUser models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.WorkspaceID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.WorkspaceID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
 		// Update the existing synced user's password_hash
 		if err := tenantDB.Model(&adSyncUser).Update("password_hash", pendingReg.PasswordHash).Error; err != nil {
 			log.Printf("Failed to update user password: %v", err)
@@ -1882,7 +1882,7 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 	}
 	// Fetch client details
 	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", input.ClientID, tenantID).First(&client).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", input.ClientID, tenantID).First(&client).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find client: %v", err)})
 		return
 	}
@@ -1982,7 +1982,7 @@ func (tc *EndUserController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error
 
 func (tc *EndUserController) resolveCustomLoginProjectID(tenantDB *gorm.DB, clientID uuid.UUID, tenantID uuid.UUID) (uuid.UUID, error) {
 	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).First(&client).Error; err == nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientID, tenantID).First(&client).Error; err == nil {
 		return client.ProjectID, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) && !strings.Contains(err.Error(), `relation "clients" does not exist`) {
 		return uuid.UUID{}, fmt.Errorf("failed to find client: %v", err)
@@ -1993,7 +1993,7 @@ func (tc *EndUserController) resolveCustomLoginProjectID(tenantDB *gorm.DB, clie
 	}
 
 	var projectIDRaw string
-	if err := tenantDB.Raw("SELECT id::text FROM projects WHERE tenant_id = ? ORDER BY created_at ASC LIMIT 1", tenantID).Scan(&projectIDRaw).Error; err != nil {
+	if err := tenantDB.Raw("SELECT id::text FROM projects WHERE workspace_id = ? ORDER BY created_at ASC LIMIT 1", tenantID).Scan(&projectIDRaw).Error; err != nil {
 		return uuid.UUID{}, fmt.Errorf("failed to find default project: %v", err)
 	}
 	projectID, err := uuid.Parse(projectIDRaw)
@@ -2053,7 +2053,7 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 
 	// Check if user exists with custom provider
 	var user models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Printf("User not found for forgot password request: %s", input.Email)
 		} else {
@@ -2176,7 +2176,7 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 
 	// Find the user in tenant database
 	var user models.User
-	if err := tenantDB.Where("tenant_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
@@ -2329,7 +2329,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 
 	// Find the user in tenant database
 	var user models.User
-	query := tenantDB.Where("tenant_id = ? AND active = ?", tenantID, true)
+	query := tenantDB.Where("workspace_id = ? AND active = ?", tenantID, true)
 
 	// Search by email or user ID based on what's provided
 	if input.Email != "" {
@@ -2384,7 +2384,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_id":   user.ID.String(),
 			"email":     user.Email,
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 		},
 	})
 
@@ -2393,7 +2393,7 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 		"message":   "User password changed successfully",
 		"user_id":   user.ID.String(),
 		"email":     user.Email,
-		"tenant_id": user.WorkspaceID.String(),
+		"workspace_id": user.WorkspaceID.String(),
 	})
 }
 
@@ -2436,7 +2436,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 
 	// Find the user in tenant database
 	var user models.User
-	query := tenantDB.Where("tenant_id = ? AND active = ?", tenantID, true)
+	query := tenantDB.Where("workspace_id = ? AND active = ?", tenantID, true)
 
 	if input.Email != "" {
 		query = query.Where("email = ? AND provider IN (?)", input.Email, []string{"custom", "ad_sync"})
@@ -2510,7 +2510,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_id":    user.ID.String(),
 			"email":      user.Email,
-			"tenant_id":  tenantID,
+			"workspace_id":  tenantID,
 			"email_sent": emailSent,
 		},
 	})
@@ -2520,7 +2520,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 		"message":            "User password reset successfully",
 		"user_id":            user.ID.String(),
 		"email":              user.Email,
-		"tenant_id":          user.WorkspaceID.String(),
+		"workspace_id":          user.WorkspaceID.String(),
 		"temporary_password": tempPassword,
 		"email_sent":         emailSent,
 	})
@@ -2532,7 +2532,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully. Temporary password included in response",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"tenant_id":          user.WorkspaceID.String(),
+			"workspace_id":          user.WorkspaceID.String(),
 			"temporary_password": tempPassword,
 			"email_sent":         emailSent,
 		})
@@ -2543,7 +2543,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"tenant_id":          user.WorkspaceID.String(),
+			"workspace_id":          user.WorkspaceID.String(),
 			"temporary_password": "Sent via email",
 			"email_sent":         emailSent,
 		})
@@ -2618,7 +2618,7 @@ func (euc *EndUserController) GetClients(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", tenantID)
+	query := tenantDB.Model(&models.Client{}).Where("workspace_id = ?", tenantID)
 
 	// Apply filters
 	if activeFilter != nil {
@@ -2730,7 +2730,7 @@ func (euc *EndUserController) GetClientsPost(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("tenant_id = ?", req.WorkspaceID)
+	query := tenantDB.Model(&models.Client{}).Where("workspace_id = ?", req.WorkspaceID)
 
 	// Apply filters
 	if req.Active != nil {
@@ -2852,7 +2852,7 @@ func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 	// Build query with base tenant filter — single-DB collapse means row-level
 	// isolation is the only boundary, so the tenant predicate must be explicit.
 	query := tenantDB.Model(&models.Client{}).
-		Where("tenant_id = ?", tenantID).
+		Where("workspace_id = ?", tenantID).
 		Where("deleted_at IS NULL")
 
 	// Add active filter if provided

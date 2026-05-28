@@ -77,7 +77,7 @@ value until Phase 8.
 New backend integrations should read `workspace_id`. Existing UI and SDK
 clients do not need an immediate Phase 5 change, but must migrate before Phase
 8 removes the `tenant_id` JSON mirror. The legacy MFA URL families
-`/authsec/uflow/auth/tenant/totp/*` and `/authsec/uflow/auth/tenant/ciba/*`
+`/authsec/uflow/auth/workspace/totp/*` and `/authsec/uflow/auth/workspace/ciba/*`
 remain intentionally named with `tenant`.
 
 ---
@@ -367,19 +367,19 @@ This is the canonical MCP protected-resource admin API.
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
-| `POST` | `/authsec/uflow/auth/tenant/totp/login` | Public | Tenant TOTP login |
-| `POST` | `/authsec/uflow/auth/tenant/totp/register` | JWT+Tenant | Register tenant TOTP device |
-| `POST` | `/authsec/uflow/auth/tenant/totp/confirm` | JWT+Tenant | Confirm device |
-| `GET` | `/authsec/uflow/auth/tenant/totp/devices` | JWT+Tenant | List devices |
-| `POST` | `/authsec/uflow/auth/tenant/totp/devices/delete` | JWT+Tenant | Delete device |
-| `POST` | `/authsec/uflow/auth/tenant/totp/devices/primary` | JWT+Tenant | Set primary |
-| `POST` | `/authsec/uflow/auth/tenant/ciba/initiate` | Public | Initiate tenant CIBA |
-| `POST` | `/authsec/uflow/auth/tenant/ciba/token` | Public | Poll tenant CIBA token |
-| `POST` | `/authsec/uflow/auth/tenant/ciba/respond` | JWT+Tenant | Respond |
-| `POST` | `/authsec/uflow/auth/tenant/ciba/register-device` | JWT+Tenant | Register device |
-| `GET` | `/authsec/uflow/auth/tenant/ciba/requests` | JWT+Tenant | List pending requests |
-| `GET` | `/authsec/uflow/auth/tenant/ciba/devices` | JWT+Tenant | List devices |
-| `DELETE` | `/authsec/uflow/auth/tenant/ciba/devices/:device_id` | JWT+Tenant | Delete device |
+| `POST` | `/authsec/uflow/auth/workspace/totp/login` | Public | Tenant TOTP login |
+| `POST` | `/authsec/uflow/auth/workspace/totp/register` | JWT+Tenant | Register tenant TOTP device |
+| `POST` | `/authsec/uflow/auth/workspace/totp/confirm` | JWT+Tenant | Confirm device |
+| `GET` | `/authsec/uflow/auth/workspace/totp/devices` | JWT+Tenant | List devices |
+| `POST` | `/authsec/uflow/auth/workspace/totp/devices/delete` | JWT+Tenant | Delete device |
+| `POST` | `/authsec/uflow/auth/workspace/totp/devices/primary` | JWT+Tenant | Set primary |
+| `POST` | `/authsec/uflow/auth/workspace/ciba/initiate` | Public | Initiate tenant CIBA |
+| `POST` | `/authsec/uflow/auth/workspace/ciba/token` | Public | Poll tenant CIBA token |
+| `POST` | `/authsec/uflow/auth/workspace/ciba/respond` | JWT+Tenant | Respond |
+| `POST` | `/authsec/uflow/auth/workspace/ciba/register-device` | JWT+Tenant | Register device |
+| `GET` | `/authsec/uflow/auth/workspace/ciba/requests` | JWT+Tenant | List pending requests |
+| `GET` | `/authsec/uflow/auth/workspace/ciba/devices` | JWT+Tenant | List devices |
+| `DELETE` | `/authsec/uflow/auth/workspace/ciba/devices/:device_id` | JWT+Tenant | Delete device |
 
 #### OIDC Federation (`/authsec/uflow/oidc`)
 

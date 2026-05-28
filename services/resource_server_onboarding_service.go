@@ -87,7 +87,7 @@ func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, tena
 
 	var policy models.ResourceServerAccessPolicy
 	err = s.db.Preload("DefaultRole").
-		Where("resource_server_id = ? AND tenant_id = ?", rsUUID, tenantUUID).
+		Where("resource_server_id = ? AND workspace_id = ?", rsUUID, tenantUUID).
 		First(&policy).Error
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return nil, err
@@ -151,7 +151,7 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, t
 	}
 
 	var existing models.ResourceServerAccessPolicy
-	err = s.db.Where("resource_server_id = ? AND tenant_id = ?", rsUUID, tenantUUID).First(&existing).Error
+	err = s.db.Where("resource_server_id = ? AND workspace_id = ?", rsUUID, tenantUUID).First(&existing).Error
 	if err != nil {
 		if err != gorm.ErrRecordNotFound {
 			return nil, err
@@ -204,7 +204,7 @@ func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerI
 	err = s.db.Table("resource_server_access_policies p").
 		Select("p.enabled, r.name").
 		Joins("LEFT JOIN roles r ON r.id = p.default_role_id").
-		Where("p.resource_server_id = ? AND p.tenant_id = ?", rsUUID, tenantUUID).
+		Where("p.resource_server_id = ? AND p.workspace_id = ?", rsUUID, tenantUUID).
 		Take(&row).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -231,7 +231,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	}
 
 	var policy models.ResourceServerAccessPolicy
-	err = s.db.Where("resource_server_id = ? AND tenant_id = ? AND enabled = true", rs.ID, tenantUUID).First(&policy).Error
+	err = s.db.Where("resource_server_id = ? AND workspace_id = ? AND enabled = true", rs.ID, tenantUUID).First(&policy).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return false, nil
@@ -273,7 +273,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	emailFallback = user.Email
 
 	var role models.RBACRole
-	if err := s.db.Where("id = ? AND tenant_id = ?", *policy.DefaultRoleID, tenantUUID).First(&role).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", *policy.DefaultRoleID, tenantUUID).First(&role).Error; err != nil {
 		// Stale access policy: pointer-to-deleted-role is a known edge case
 		// for RSes that predate the auto-viewer flow or where the admin
 		// deleted the default role manually. Don't 500 — log and skip.
@@ -293,7 +293,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	// to avoid creating a second row when the user already has the role.
 	var existingCount int64
 	if err := s.db.Model(&models.RoleBinding{}).
-		Where("tenant_id = ? AND user_id = ? AND role_id = ?", tenantUUID, userUUID, role.ID).
+		Where("workspace_id = ? AND user_id = ? AND role_id = ?", tenantUUID, userUUID, role.ID).
 		Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = ? AND scope_id = ?)",
 			rsScopeType, rsScopeID).
 		Count(&existingCount).Error; err != nil {
@@ -473,8 +473,8 @@ func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, tena
 		Joins("LEFT JOIN role_permissions rp ON rp.role_id = r.id").
 		Joins("LEFT JOIN permissions p ON p.id = rp.permission_id").
 		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
-		Joins("LEFT JOIN oauth_scopes os ON os.id = osp.scope_id AND os.tenant_id = ?", tenantID).
-		Where("r.tenant_id = ?", tenantID).
+		Joins("LEFT JOIN oauth_scopes os ON os.id = osp.scope_id AND os.workspace_id = ?", tenantID).
+		Where("r.workspace_id = ?", tenantID).
 		Where("r.name LIKE ? OR r.name IN ('admin','viewer','user')", rsRoleLike).
 		Group("r.id, r.name, r.description, r.is_system").
 		Order("r.name").

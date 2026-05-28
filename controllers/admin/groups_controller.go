@@ -102,7 +102,7 @@ func (gc *GroupController) AddUserDefinedGroups(c *gin.Context) {
 	// Audit log: Groups created
 	middlewares.Audit(c, "group", req.WorkspaceID, "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":    req.WorkspaceID,
+			"workspace_id":    req.WorkspaceID,
 			"groups_count": len(createdGroups),
 			"group_names":  groupNames,
 		},
@@ -147,7 +147,7 @@ func (gc *GroupController) MapGroupsToClient(c *gin.Context) {
 	// Audit log: Groups mapped to client
 	middlewares.Audit(c, "group", req.ClientID, "map_to_client", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"client_id": req.ClientID,
 			"groups":    req.Groups,
 		},
@@ -187,7 +187,7 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 	// Audit log: Groups removed from client
 	middlewares.Audit(c, "group", req.ClientID, "unmap_from_client", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"client_id": req.ClientID,
 			"groups":    req.Groups,
 		},
@@ -265,7 +265,7 @@ func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 	// Audit log: Users added to group
 	middlewares.Audit(c, "group", req.GroupID.String(), "add_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":  tenantID,
+			"workspace_id":  tenantID,
 			"group_id":   req.GroupID.String(),
 			"user_count": len(req.UserIDs),
 		},
@@ -318,7 +318,7 @@ func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
 	// Audit log: Users removed from group
 	middlewares.Audit(c, "group", req.GroupID.String(), "remove_users", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id":  tenantID,
+			"workspace_id":  tenantID,
 			"group_id":   req.GroupID.String(),
 			"user_count": len(req.UserIDs),
 		},
@@ -393,7 +393,7 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 	// Audit log: Groups deleted
 	middlewares.Audit(c, "group", tenantID, "delete", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id":   tenantID,
+			"workspace_id":   tenantID,
 			"group_ids":   groups,
 			"group_count": len(groups),
 		},
@@ -413,7 +413,7 @@ func parseDeleteGroupsPayload(body []byte) (string, []string, error) {
 	}
 
 	var tenantID string
-	if value, ok := raw["tenant_id"].(string); ok {
+	if value, ok := raw["workspace_id"].(string); ok {
 		tenantID = value
 	} else if value, ok := raw["tenantId"].(string); ok {
 		tenantID = value
@@ -555,7 +555,7 @@ func (gc *GroupController) UpdateUserDefinedGroup(c *gin.Context) {
 	// Audit log: Group updated
 	middlewares.Audit(c, "group", groupID, "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":   req.WorkspaceID,
+			"workspace_id":   req.WorkspaceID,
 			"group_id":    groupID,
 			"name":        req.Name,
 			"description": req.Description,
@@ -601,7 +601,7 @@ func (gc *GroupController) AddUserToGroups(c *gin.Context) {
 	// Audit log: User added to groups
 	middlewares.Audit(c, "group", req.UserID, "add_user_to_groups", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"user_id":   req.UserID,
 			"groups":    req.Groups,
 		},
@@ -646,7 +646,7 @@ func (gc *GroupController) RemoveUserFromGroups(c *gin.Context) {
 	// Audit log: User removed from groups
 	middlewares.Audit(c, "group", req.UserID, "remove_user_from_groups", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"user_id":   req.UserID,
 			"groups":    req.Groups,
 		},
@@ -811,7 +811,7 @@ func AddUserDefinedGroups(tenantID string, groups []string) ([]models.TenantGrou
 			Name:     groupName,
 			WorkspaceID: uuid.MustParse(tenantID),
 		}
-		if err := tenantDB.Where("name = ? AND tenant_id = ?", groupName, tenantID).FirstOrCreate(&group).Error; err != nil {
+		if err := tenantDB.Where("name = ? AND workspace_id = ?", groupName, tenantID).FirstOrCreate(&group).Error; err != nil {
 			return nil, err
 		}
 		createdGroups = append(createdGroups, group)
@@ -840,13 +840,13 @@ func MapGroupsToClient(tenantID, clientID string, groups []string) error {
 
 	// Find the user in tenant database
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND tenant_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
@@ -857,7 +857,7 @@ func MapGroupsToClient(tenantID, clientID string, groups []string) error {
 	// Insert into user_groups table
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
 			user.ID, group.ID, tenantUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to map group to user: %w", err)
@@ -885,18 +885,18 @@ func RemoveGroupsFromClient(tenantID, clientID string, groups []string) error {
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND tenant_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
-			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND tenant_id = $3",
+			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
 			user.ID, group.ID, tenantUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to remove group from user: %w", err)
@@ -922,7 +922,7 @@ func GetUserDefinedGroups(tenantID string) ([]models.TenantGroup, error) {
 
 	var groups []models.TenantGroup
 	// Query groups from tenant database
-	if err := tenantDB.Where("tenant_id = ? OR tenant_id IS NULL", tenantUUID).Find(&groups).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? OR workspace_id IS NULL", tenantUUID).Find(&groups).Error; err != nil {
 		return nil, fmt.Errorf("failed to query groups: %w", err)
 	}
 	return groups, nil
@@ -942,7 +942,7 @@ func DeleteUserDefinedGroups(tenantID string, groups []string) error {
 	// Connect to tenant database
 	tenantDB := config.DB
 
-	return tenantDB.Where("id IN ? AND tenant_id = ?", groups, tenantUUID).Delete(&models.TenantGroup{}).Error
+	return tenantDB.Where("id IN ? AND workspace_id = ?", groups, tenantUUID).Delete(&models.TenantGroup{}).Error
 }
 
 func UpdateUserDefinedGroup(groupID, tenantID, name, description string) error {
@@ -970,7 +970,7 @@ func UpdateUserDefinedGroup(groupID, tenantID, name, description string) error {
 		Description: &description,
 	}
 
-	return tenantDB.Model(&models.TenantGroup{}).Where("id = ? AND tenant_id = ?", groupUUID, tenantUUID).Updates(updateData).Error
+	return tenantDB.Model(&models.TenantGroup{}).Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).Updates(updateData).Error
 }
 
 // AddUserToGroups adds a user to specified groups within a tenant
@@ -993,13 +993,13 @@ func AddUserToGroups(tenantID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND tenant_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
@@ -1010,7 +1010,7 @@ func AddUserToGroups(tenantID, userID string, groups []string) error {
 	// Insert into user_groups table
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
 			userUUID, group.ID, tenantUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to add user to group: %w", err)
@@ -1040,20 +1040,20 @@ func RemoveUserFromGroups(tenantID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND tenant_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
 	// Delete from user_groups table
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
-			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND tenant_id = $3",
+			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
 			userUUID, group.ID, tenantUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to remove user from group: %w", err)
@@ -1086,7 +1086,7 @@ func GetUserGroups(tenantID, userID string) ([]models.TenantGroup, error) {
 	query := `
 		SELECT g.* FROM groups g
 		INNER JOIN user_groups ug ON g.id = ug.group_id
-		WHERE ug.user_id = $1 AND g.tenant_id = $2 AND ug.tenant_id = $2
+		WHERE ug.user_id = $1 AND g.workspace_id = $2 AND ug.workspace_id = $2
 	`
 	if err := tenantDB.Raw(query, userUUID, tenantUUID).Scan(&groups).Error; err != nil {
 		return nil, fmt.Errorf("failed to query user groups: %w", err)
@@ -1199,7 +1199,7 @@ func GetGroupUsers(tenantID, groupID string) ([]models.User, error) {
 	query := `
 		SELECT u.* FROM users u
 		INNER JOIN user_groups ug ON u.id = ug.user_id
-		WHERE ug.group_id = $1 AND ug.tenant_id = $2
+		WHERE ug.group_id = $1 AND ug.workspace_id = $2
 	`
 	if err := tenantDB.Raw(query, groupUUID, tenantUUID).Scan(&users).Error; err != nil {
 		return nil, fmt.Errorf("failed to query group users: %w", err)
@@ -1223,7 +1223,7 @@ func AddUsersToGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid.UUID
 
 	// Verify the group exists
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("group not found in tenant")
 		}
@@ -1250,7 +1250,7 @@ func AddUsersToGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid.UUID
 		for _, userID := range batch {
 			// Use raw SQL with ON CONFLICT DO NOTHING to handle duplicates
 			if err := tx.Exec(
-				"INSERT INTO user_groups (user_id, group_id, tenant_id, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) ON CONFLICT (user_id, group_id) DO NOTHING",
+				"INSERT INTO user_groups (user_id, group_id, workspace_id, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) ON CONFLICT (user_id, group_id) DO NOTHING",
 				userID, groupID, tenantUUID,
 			).Error; err != nil {
 				tx.Rollback()
@@ -1281,7 +1281,7 @@ func RemoveUsersFromGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid
 
 	// Verify the group exists
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("group not found in tenant")
 		}
@@ -1297,7 +1297,7 @@ func RemoveUsersFromGroupBulk(tenantID string, groupID uuid.UUID, userIDs []uuid
 		}
 		batch := userIDs[i:end]
 
-		if err := tenantDB.Where("group_id = ? AND tenant_id = ? AND user_id IN ?", groupID, tenantUUID, batch).
+		if err := tenantDB.Where("group_id = ? AND workspace_id = ? AND user_id IN ?", groupID, tenantUUID, batch).
 			Delete(&models.UserGroup{}).Error; err != nil {
 			return fmt.Errorf("failed to remove users from group: %w", err)
 		}

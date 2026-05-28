@@ -403,7 +403,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	// Build response with MFA information
 	response := gin.H{
-		"tenant_id":         adminUser.WorkspaceID,
+		"workspace_id":         adminUser.WorkspaceID,
 		"tenant_domain":     tenantDomainToReturn,
 		"email":             adminUser.Email,
 		"first_login":       adminUser.LastLogin == nil,
@@ -553,7 +553,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 		}
 
 		response := gin.H{
-			"tenant_id":    "admin",
+			"workspace_id":    "admin",
 			"email":        adminUser.Email,
 			"first_login":  adminUser.LastLogin == nil,
 			"otp_required": false,
@@ -601,7 +601,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	db := config.GetDatabase()
 	var tenant models.Tenant
 	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
+		SELECT id, workspace_id, tenant_db, email, username, password_hash,
 			provider, provider_id, avatar, name, source, status, last_login,
 			created_at, updated_at, tenant_domain
 		FROM tenants
@@ -638,7 +638,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 		return
 	}
 
-	fmt.Printf("[AdminLoginHybrid] Tenant FOUND: domain=%s, tenant_id=%s\n", input.TenantDomain, tenant.ID)
+	fmt.Printf("[AdminLoginHybrid] Tenant FOUND: domain=%s, workspace_id=%s\n", input.TenantDomain, tenant.ID)
 
 	tenantGormDB := config.DB
 
@@ -762,7 +762,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"tenant_id":     tenant.ID.String(),
+		"workspace_id":     tenant.ID.String(),
 		"email":         tenantUser.Email,
 		"first_login":   tenantUser.LastLogin == nil,
 		"otp_required":  false,
@@ -1278,32 +1278,27 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		}
 	}
 
-	// Step 1: Create tenant first (required for FK constraints on projects table)
-	tenantRepo := database.NewTenantRepository(db)
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(pendingReg.WorkspaceID.String(), "-", "_"))
-	tenant := models.Tenant{
-		ID:           pendingReg.WorkspaceID,
-		WorkspaceID:     pendingReg.WorkspaceID,
-		Email:        pendingReg.Email,
-		PasswordHash: pendingReg.PasswordHash,
-		Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
-		Provider:     "local",
-		Source:       "admin_registration",
-		Status:       "active",
-		TenantDomain: pendingReg.TenantDomain,
-		TenantDB:     tenantDBName, // Set the tenant database name
+	// Phase 6: tenants table dropped. Workspace creation moved below; project FKs now
+	// reference workspaces(id). We must create the workspace first so projects FK is valid.
+	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
+	workspaceName := strings.TrimSpace(fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName))
+	if workspaceName == "" {
+		workspaceName = pendingReg.Email
 	}
-
-	if err := tenantRepo.CreateTenantTx(tx, &tenant); err != nil {
+	if _, err := tx.Exec(`
+		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, vault_mount, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'admin_registration', 'active', NULL, NOW(), NOW())
+		ON CONFLICT (id) DO NOTHING
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.TenantDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
 		tx.Rollback()
-		log.Printf("Failed to create tenant: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
+		log.Printf("Failed to create workspace: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
 		return
 	}
 
-	// Step 2: Generate project ID and create project (now tenant exists for FK)
+	// Step 2: Generate project ID and create project (workspace exists now for FK)
 	defaultProjectID := uuid.New()
-	projectInsertGlobal := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
+	projectInsertGlobal := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
 	if _, err := tx.Exec(projectInsertGlobal, defaultProjectID, pendingReg.WorkspaceID, "Default Project", "Default project for admin user", pendingReg.WorkspaceID); err != nil {
 		tx.Rollback()
@@ -1340,20 +1335,10 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
-	tenantMappingInsert := `INSERT INTO tenant_mappings (tenant_id, client_id, created_at, updated_at)
-		VALUES ($1, $2, NOW(), NOW())
-		ON CONFLICT (client_id) DO NOTHING`
-	if _, err := tx.Exec(tenantMappingInsert, pendingReg.WorkspaceID, pendingReg.WorkspaceID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create tenant mapping: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant mapping"})
-		return
-	}
+	// Phase 6: tenant_mappings table dropped — workspace_id == client owner relationship
+	// is now resolved directly via clients.workspace_id.
 
-	log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", pendingReg.WorkspaceID.String(), pendingReg.ClientID.String())
-
-	// Assign admin role BEFORE committing transaction (tenant-scoped)
+	// Assign admin role BEFORE committing transaction (workspace-scoped)
 	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, pendingReg.WorkspaceID)
 	if err != nil {
 		tx.Rollback()
@@ -1363,14 +1348,14 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Insert into role_bindings within transaction (user_roles is deprecated)
-	// scope_type and scope_id are NULL for tenant-wide role assignments
+	// scope_type and scope_id are NULL for workspace-wide role assignments
 	bindingID := uuid.New()
 	_, err = tx.Exec(`
-		INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 		SELECT $1, $2, $3, $4, NULL, NULL, $5, $5
 		WHERE NOT EXISTS (
 			SELECT 1 FROM role_bindings
-			WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
+			WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
 		)
 	`, bindingID, pendingReg.WorkspaceID, adminUser.ID, roleID, time.Now())
 	if err != nil {
@@ -1380,30 +1365,15 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Phase 2 (tenant → workspace migration): mirror the tenant row into a
-	// workspace row with the SAME UUID. Future phases will move every reader
-	// from tenant_id → workspace_id and eventually drop the tenants table.
-	// Workspace name = admin's full name; slug = first component of the tenant
-	// domain (e.g. "aditya.dev.authsec.dev" → "aditya"). Slug is allowed to be
-	// NULL — the bootstrap check constraint only rejects reserved values.
-	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
-	workspaceName := strings.TrimSpace(fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName))
-	if workspaceName == "" {
-		workspaceName = pendingReg.Email
-	}
-	if _, err := tx.Exec(`
-		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'personal', NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, adminUser.ID); err != nil {
+	// Patch workspace owner_user_id now that the admin user row exists.
+	if _, err := tx.Exec(`UPDATE workspaces SET owner_user_id = $1 WHERE id = $2`, adminUser.ID, pendingReg.WorkspaceID); err != nil {
 		tx.Rollback()
-		log.Printf("Failed to create workspace: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
+		log.Printf("Failed to update workspace owner: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update workspace owner"})
 		return
 	}
 
-	// Bind the admin user to the workspace with the admin role. This is what
-	// the v4 IDP / MCP / SCIM code reads when it filters by workspace_id.
+	// Bind the admin user to the workspace with the admin role.
 	if _, err := tx.Exec(`
 		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
@@ -1456,10 +1426,10 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	log.Printf("Admin registration completed for email: %s", input.Email)
 
 	c.JSON(http.StatusCreated, gin.H{
-		"message":   "Admin registration completed successfully",
-		"email":     input.Email,
-		"tenant_id": pendingReg.WorkspaceID.String(),
-		"user_id":   adminUser.ID.String(),
+		"message":      "Admin registration completed successfully",
+		"email":        input.Email,
+		"workspace_id": pendingReg.WorkspaceID.String(),
+		"user_id":      adminUser.ID.String(),
 	})
 }
 

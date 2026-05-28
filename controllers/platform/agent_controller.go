@@ -79,7 +79,7 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 
 	var agents []agentClient
 	query := tenantDB.Table("clients").
-		Where("tenant_id = ? AND client_type = 'ai_agent'", tenantID).
+		Where("workspace_id = ? AND client_type = 'ai_agent'", tenantID).
 		Where("deleted = false OR deleted IS NULL")
 
 	if agentType := c.Query("agent_type"); agentType != "" {
@@ -116,7 +116,7 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 
 	var agent agentClient
 	result := tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
 		Where("deleted = false OR deleted IS NULL").
 		First(&agent)
 	if result.Error != nil {
@@ -155,7 +155,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 	// Look up the agent client
 	var agent agentClient
 	result := tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
 		Where("deleted = false OR deleted IS NULL").
 		First(&agent)
 	if result.Error != nil {
@@ -211,7 +211,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 
 	// Write the SPIFFE ID back to the client record
 	updateResult := tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
 		Update("spiffe_id", created.SpiffeID)
 	if updateResult.Error != nil {
 		log.Printf("[AgentController] Failed to update client spiffe_id: %v", updateResult.Error)
@@ -232,7 +232,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		"entry_id":  created.ID,
 		"spiffe_id": created.SpiffeID,
 		"client_id": clientID,
-		"tenant_id": tenantID.String(),
+		"workspace_id": tenantID.String(),
 		"parent_id": created.ParentID,
 		"message":   "SPIRE identity provisioned successfully",
 	})
@@ -258,7 +258,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 	// Look up the agent
 	var agent agentClient
 	result := tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
 		Where("deleted = false OR deleted IS NULL").
 		First(&agent)
 	if result.Error != nil {
@@ -273,7 +273,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 
 	// Clear the SPIFFE ID from the client record
 	tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
 		Update("spiffe_id", nil)
 
 	log.Printf("[AgentController] Agent %s identity revoked (spiffe_id was %s)", clientID, *agent.SpiffeID)
@@ -322,7 +322,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	// Look up the agent client
 	var agent agentClient
 	result := tenantDB.Table("clients").
-		Where("client_id = ? AND tenant_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
 		Where("deleted = false OR deleted IS NULL").
 		First(&agent)
 	if result.Error != nil {
@@ -372,7 +372,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	// Build custom claims for the JWT-SVID
 	customClaims := map[string]interface{}{
 		"user_id":     userID,
-		"tenant_id":   tenantID.String(),
+		"workspace_id":   tenantID.String(),
 		"email":       emailID,
 		"agent_type":  req.AgentType,
 		"permissions": delegatedPerms,
@@ -435,7 +435,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	// Upsert: update if (tenant_id, client_id) exists, else insert
 	var existing models.DelegationToken
 	upsertResult := tenantDB.
-		Where("tenant_id = ? AND client_id = ?", tenantID, clientUUID).
+		Where("workspace_id = ? AND client_id = ?", tenantID, clientUUID).
 		First(&existing)
 	if upsertResult.Error == nil {
 		// Update existing row

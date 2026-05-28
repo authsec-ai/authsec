@@ -62,7 +62,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 	var tools []models.MCPTool
 	config.DB.Preload("Scopes").
 		Where(
-			"tenant_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
+			"workspace_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
 			tenantID,
 			rsUUID,
 			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
@@ -423,7 +423,7 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 
 	// Read scope before deletion to get RS info for drift event and scopes_supported sync.
 	var scope models.OAuthScope
-	config.DB.Where("id = ? AND tenant_id = ?", scopeID, tenantID).First(&scope)
+	config.DB.Where("id = ? AND workspace_id = ?", scopeID, tenantID).First(&scope)
 
 	if err := ctrl.scopeRegistry.DeleteByTenant(scopeID, tenantID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -490,7 +490,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		// Tool must belong to this tenant AND this specific RS.
 		var toolCount int64
 		config.DB.Model(&models.MCPTool{}).
-			Where("id = ? AND tenant_id = ? AND resource_server_id = ?", toolID, tenantID, rsUUID).
+			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", toolID, tenantID, rsUUID).
 			Count(&toolCount)
 		if toolCount == 0 {
 			continue
@@ -499,7 +499,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		// Scope must belong to this tenant AND this specific RS.
 		var scopeCount int64
 		config.DB.Model(&models.OAuthScope{}).
-			Where("id = ? AND tenant_id = ? AND resource_server_id = ?", scopeID, tenantID, rsUUID).
+			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, tenantID, rsUUID).
 			Count(&scopeCount)
 		if scopeCount == 0 {
 			continue
@@ -605,7 +605,7 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 	var allTools []models.MCPTool
 	config.DB.Preload("Scopes").
 		Where(
-			"tenant_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
+			"workspace_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
 			rs.WorkspaceID,
 			rs.ID,
 			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
@@ -781,7 +781,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 			config.DB.Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).First(&tool)
 			for _, scopeStr := range canonicalSuggestedScopes {
 				var scope models.OAuthScope
-				err := config.DB.Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+				err := config.DB.Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND scope_string = ?",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID, scopeStr).First(&scope).Error
 				if err != nil {
 					scope = models.OAuthScope{
@@ -987,7 +987,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	// when paths are mixed.
 	var existing models.MCPTool
 	conflictErr := config.DB.
-		Where("tenant_id = ? AND resource_server_id = ? AND name = ?", tenantID, rsUUID, req.Name).
+		Where("workspace_id = ? AND resource_server_id = ? AND name = ?", tenantID, rsUUID, req.Name).
 		First(&existing).Error
 	if conflictErr == nil {
 		c.JSON(http.StatusConflict, gin.H{
@@ -1047,7 +1047,7 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 
 	// Verify tool belongs to this tenant+RS.
 	var tool models.MCPTool
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND resource_server_id = ?",
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND resource_server_id = ?",
 		toolID, tenantID, rsID).First(&tool).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "tool not found"})
 		return
@@ -1232,12 +1232,12 @@ func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
 
 	var roles []models.RBACRole
-	config.DB.Where("tenant_id = ? AND name LIKE ?", tenantID, prefix+"%").
+	config.DB.Where("workspace_id = ? AND name LIKE ?", tenantID, prefix+"%").
 		Order("name ASC").Find(&roles)
 
 	// Fetch the policy default for the is_default flag.
 	var policy models.ResourceServerAccessPolicy
-	policyErr := config.DB.Where("resource_server_id = ? AND tenant_id = ?", rs.ID, tenantID).
+	policyErr := config.DB.Where("resource_server_id = ? AND workspace_id = ?", rs.ID, tenantID).
 		First(&policy).Error
 	defaultRoleID := uuid.Nil
 	if policyErr == nil && policy.DefaultRoleID != nil {
@@ -1250,7 +1250,7 @@ func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 		config.DB.Model(&models.RolePermission{}).Where("role_id = ?", r.ID).Count(&permCount)
 		var bindingCount int64
 		config.DB.Model(&models.RoleBinding{}).
-			Where("role_id = ? AND tenant_id = ?", r.ID, tenantID).
+			Where("role_id = ? AND workspace_id = ?", r.ID, tenantID).
 			Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = 'resource_server' AND scope_id = ?)", rs.ID).
 			Count(&bindingCount)
 		out = append(out, rsRoleSummary{
@@ -1408,7 +1408,7 @@ func scopeRefsForRole(db *gorm.DB, tenantID, roleID, appID uuid.UUID) []accessSc
 		Select("DISTINCT os.id, os.scope_string, os.display_name, os.risk_level, os.source").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
 		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
-		Where("rp.role_id = ? AND os.tenant_id = ? AND os.resource_server_id = ?", roleID, tenantID, appID).
+		Where("rp.role_id = ? AND os.workspace_id = ? AND os.resource_server_id = ?", roleID, tenantID, appID).
 		Order("os.scope_string ASC").
 		Scan(&rows)
 
@@ -1463,13 +1463,13 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 	}
 
 	var apps []models.ResourceServer
-	if err := config.DB.Where("tenant_id = ?", tenantID).Order("name ASC").Find(&apps).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", tenantID).Order("name ASC").Find(&apps).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	var roles []models.RBACRole
-	if err := config.DB.Where("tenant_id = ? AND name LIKE ?", tenantID, "rs-%:%").
+	if err := config.DB.Where("workspace_id = ? AND name LIKE ?", tenantID, "rs-%:%").
 		Order("name ASC").Find(&roles).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1480,7 +1480,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 		UpdatedAt time.Time
 	}
 	var updatedRows []updatedRow
-	config.DB.Table("roles").Select("id, updated_at").Where("tenant_id = ?", tenantID).Scan(&updatedRows)
+	config.DB.Table("roles").Select("id, updated_at").Where("workspace_id = ?", tenantID).Scan(&updatedRows)
 	updatedByRole := map[uuid.UUID]time.Time{}
 	for _, row := range updatedRows {
 		updatedByRole[row.ID] = row.UpdatedAt
@@ -1493,7 +1493,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 	var policies []policyRow
 	config.DB.Table("resource_server_access_policies").
 		Select("resource_server_id, default_role_id").
-		Where("tenant_id = ? AND default_role_id IS NOT NULL", tenantID).
+		Where("workspace_id = ? AND default_role_id IS NOT NULL", tenantID).
 		Scan(&policies)
 	defaultByApp := map[uuid.UUID]uuid.UUID{}
 	for _, p := range policies {
@@ -1518,7 +1518,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 		scopes := scopeRefsForRole(config.DB, tenantID, role.ID, app.ID)
 		var usersCount int64
 		config.DB.Table("role_bindings rb").
-			Where("rb.tenant_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
+			Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
 			Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
@@ -1628,7 +1628,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
 		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.tenant_id = rb.tenant_id").
 		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = rb.user_id AND teus.tenant_id = rb.tenant_id").
-		Where("rb.tenant_id = ? AND rb.user_id IS NOT NULL", tenantID).
+		Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -1731,7 +1731,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	if err := config.DB.Table("users u").
 		Select("u.id::text AS id, COALESCE(u.email, '') AS email, COALESCE(NULLIF(u.name, ''), u.email, u.username, '') AS name, COALESCE(teus.status, 'active') AS status").
 		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.tenant_id").
-		Where("u.id = ? AND u.tenant_id = ?", userID, tenantID).
+		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Take(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found for this tenant"})
 		return
@@ -1750,7 +1750,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	if err := config.DB.Table("role_bindings rb").
 		Select("rb.id AS binding_id, rb.role_id, COALESCE(rb.role_name, ro.name, '') AS role_name, rb.assignment_source AS source, rb.scope_type, rb.scope_id").
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Where("rb.tenant_id = ? AND rb.user_id = ?", tenantID, userID).
+		Where("rb.workspace_id = ? AND rb.user_id = ?", tenantID, userID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -1881,7 +1881,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 
 	var selectedScopes []models.OAuthScope
 	if len(scopeIDs) > 0 {
-		if err := config.DB.Where("tenant_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+		if err := config.DB.Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
 			Find(&selectedScopes).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1906,7 +1906,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		var rows []userRow
 		if err := config.DB.Table("users").
 			Select("id, email, name, username").
-			Where("tenant_id = ? AND id IN ?", tenantID, userIDs).
+			Where("workspace_id = ? AND id IN ?", tenantID, userIDs).
 			Find(&rows).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1953,7 +1953,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		}
 		if req.DefaultRole {
 			var policy models.ResourceServerAccessPolicy
-			err := tx.Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).First(&policy).Error
+			err := tx.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).First(&policy).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				policy = models.ResourceServerAccessPolicy{
 					WorkspaceID:       tenantID,
@@ -2001,7 +2001,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 				CreatedAt:        time.Now().UTC(),
 			}
 			if err := tx.Where(
-				"tenant_id = ? AND user_id = ? AND role_id = ? AND scope_type = ? AND scope_id = ?",
+				"workspace_id = ? AND user_id = ? AND role_id = ? AND scope_type = ? AND scope_id = ?",
 				tenantID, userID, role.ID, rsScopeType, rsScopeID,
 			).FirstOrCreate(&binding).Error; err != nil {
 				return err
@@ -2016,7 +2016,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 	scopes := scopeRefsForRole(config.DB, tenantID, role.ID, rs.ID)
 	var usersCount int64
 	config.DB.Table("role_bindings rb").
-		Where("rb.tenant_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
+		Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("rb.scope_type = 'resource_server' AND rb.scope_id = ?", rs.ID).
 		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
@@ -2084,7 +2084,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 		Select(`os.id, os.scope_string, os.display_name, os.description, os.risk_level, os.source, os.updated_at,
 			rs.id AS app_id, rs.name AS app_name, rs.resource_uri`).
 		Joins("LEFT JOIN resource_servers rs ON rs.id = os.resource_server_id").
-		Where("os.tenant_id = ?", tenantID).
+		Where("os.workspace_id = ?", tenantID).
 		Order("COALESCE(rs.name, ''), os.scope_string ASC").
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -2101,11 +2101,11 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN role_permissions rp ON rp.role_id = rb.role_id").
 			Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-			Where("rb.tenant_id = ? AND rb.user_id IS NOT NULL AND osp.scope_id = ?", tenantID, row.ID).
+			Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL AND osp.scope_id = ?", tenantID, row.ID).
 			Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
 		config.DB.Table("oauth_consent_grants").
-			Where("tenant_id = ? AND ? = ANY(granted_scopes) AND revoked_at IS NULL", tenantID, row.ScopeString).
+			Where("workspace_id = ? AND ? = ANY(granted_scopes) AND revoked_at IS NULL", tenantID, row.ScopeString).
 			Count(&grantsCount)
 
 		var appRef *accessApplicationRef
@@ -2280,7 +2280,7 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 		Source:           "preset",
 	}
 	result := config.DB.Where(
-		"tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
+		"workspace_id = ? AND resource_server_id = ? AND scope_string = ?",
 		tenantID, appID, entry.Key,
 	).FirstOrCreate(&scope)
 	if result.Error != nil {
@@ -2338,7 +2338,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 	}
 
 	var role models.RBACRole
-	if err := config.DB.Where("id = ? AND tenant_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
 		return
 	}
@@ -2369,7 +2369,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 	var selectedScopes []models.OAuthScope
 	if len(scopeIDs) > 0 {
 		if err := config.DB.
-			Where("tenant_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+			Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
 			Find(&selectedScopes).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -2385,7 +2385,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 		Table("oauth_scope_permissions osp").
 		Select("DISTINCT osp.permission_id").
 		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
-		Where("os.tenant_id = ? AND os.resource_server_id = ?", tenantID, rs.ID).
+		Where("os.workspace_id = ? AND os.resource_server_id = ?", tenantID, rs.ID).
 		Scan(&allAppPermissionIDs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -2482,7 +2482,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 			rb.role_id, rb.role_name, rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
 		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.tenant_id = rb.tenant_id").
-		Where("rb.tenant_id = ?", tenantID).
+		Where("rb.workspace_id = ?", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -2560,7 +2560,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 
 	// Verify the role belongs to this tenant and is RS-scoped (rs-{id}: prefix).
 	var role models.RBACRole
-	if err := config.DB.Where("id = ? AND tenant_id = ?", roleUUID, tenantID).First(&role).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", roleUUID, tenantID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
 		return
 	}
@@ -2581,7 +2581,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	}
 	if err := config.DB.Table("users").
 		Select("id, email, name, username").
-		Where("id = ? AND tenant_id = ?", userUUID, tenantID).
+		Where("id = ? AND workspace_id = ?", userUUID, tenantID).
 		Take(&userRow).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": "user not found for this tenant",
@@ -2595,7 +2595,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	rsScopeID := rs.ID
 	var existingCount int64
 	config.DB.Model(&models.RoleBinding{}).
-		Where("tenant_id = ? AND user_id = ? AND role_id = ?", tenantID, userUUID, roleUUID).
+		Where("workspace_id = ? AND user_id = ? AND role_id = ?", tenantID, userUUID, roleUUID).
 		Where("scope_type = ? AND scope_id = ?", rsScopeType, rsScopeID).
 		Count(&existingCount)
 	if existingCount > 0 {
@@ -2670,7 +2670,7 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 	// against the resolver's accept-globals path being used as a delete vector
 	// for tenant-wide bindings.
 	res := config.DB.
-		Where("id = ? AND tenant_id = ?", bindingID, tenantID).
+		Where("id = ? AND workspace_id = ?", bindingID, tenantID).
 		Where("scope_type = 'resource_server' AND scope_id = ?", rs.ID).
 		Delete(&models.RoleBinding{})
 	if res.Error != nil {
@@ -2725,7 +2725,7 @@ func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 // autoCreateScopePermission creates a matching permission + bridge for a scope (correctness #5).
 func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
 	perm := models.RBACPermission{}
-	if config.DB.Where("tenant_id = ? AND resource = ? AND action = ?",
+	if config.DB.Where("workspace_id = ? AND resource = ? AND action = ?",
 		tenantID, scope.ScopeString, "access").First(&perm).Error != nil {
 		perm = models.RBACPermission{
 			WorkspaceID: &tenantID,
@@ -2744,7 +2744,7 @@ func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
 func syncScopesSupported(rsID uuid.UUID, tenantID uuid.UUID) {
 	var scopeStrings []string
 	config.DB.Model(&models.OAuthScope{}).
-		Where("resource_server_id = ? AND (workspace_id = ? OR tenant_id = ?)", rsID, tenantID, tenantID).
+		Where("resource_server_id = ? AND (workspace_id = ? OR workspace_id = ?)", rsID, tenantID, tenantID).
 		Order("scope_string ASC").
 		Pluck("scope_string", &scopeStrings)
 	if scopeStrings == nil {
@@ -2960,7 +2960,7 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 	}
 
 	var scope models.OAuthScope
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND resource_server_id = ?", scopeID, tenantID, rs.ID).Take(&scope).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, tenantID, rs.ID).Take(&scope).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "scope not found"})
 		return
 	}
@@ -2968,20 +2968,20 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 	var toolsCount, rolesCount, usersCount, grantsCount int64
 	config.DB.Table("mcp_tool_scope_map mtsm").
 		Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
-		Where("mtsm.scope_id = ? AND t.tenant_id = ? AND t.resource_server_id = ?", scope.ID, tenantID, rs.ID).
+		Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scope.ID, tenantID, rs.ID).
 		Count(&toolsCount)
 	config.DB.Table("role_permissions rp").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
 		Joins("JOIN roles r ON r.id = rp.role_id").
-		Where("osp.scope_id = ? AND r.tenant_id = ? AND r.name LIKE ?", scope.ID, tenantID, "rs-"+rs.ID.String()+":%").
+		Where("osp.scope_id = ? AND r.workspace_id = ? AND r.name LIKE ?", scope.ID, tenantID, "rs-"+rs.ID.String()+":%").
 		Select("COUNT(DISTINCT rp.role_id)").Scan(&rolesCount)
 	config.DB.Table("role_bindings rb").
 		Joins("JOIN role_permissions rp ON rp.role_id = rb.role_id").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-		Where("osp.scope_id = ? AND rb.tenant_id = ? AND rb.user_id IS NOT NULL", scope.ID, tenantID).
+		Where("osp.scope_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL", scope.ID, tenantID).
 		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
 	config.DB.Table("oauth_consent_grants").
-		Where("tenant_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND ? = ANY(granted_scopes)", tenantID, rs.ID, scope.ScopeString).
+		Where("workspace_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND ? = ANY(granted_scopes)", tenantID, rs.ID, scope.ScopeString).
 		Count(&grantsCount)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -3045,7 +3045,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	if err := config.DB.Table("users u").
 		Select("COALESCE(teus.status, 'active')").
 		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.tenant_id").
-		Where("u.id = ? AND u.tenant_id = ?", userID, tenantID).
+		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Scan(&userStatus).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
 		return
@@ -3056,7 +3056,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	}
 
 	var tool models.MCPTool
-	toolQuery := config.DB.Preload("Scopes").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID)
+	toolQuery := config.DB.Preload("Scopes").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID)
 	if req.ToolID != "" {
 		toolUUID, err := uuid.Parse(req.ToolID)
 		if err != nil {
@@ -3143,15 +3143,15 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 	var affectedBindings, affectedUsers, affectedTools int64
 	if req.BindingID != "" {
 		if bindingID, err := uuid.Parse(req.BindingID); err == nil {
-			config.DB.Table("role_bindings").Where("tenant_id = ? AND id = ?", tenantID, bindingID).Count(&affectedBindings)
-			config.DB.Table("role_bindings").Where("tenant_id = ? AND id = ? AND user_id IS NOT NULL", tenantID, bindingID).Count(&affectedUsers)
+			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ?", tenantID, bindingID).Count(&affectedBindings)
+			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ? AND user_id IS NOT NULL", tenantID, bindingID).Count(&affectedUsers)
 		}
 	}
 	if req.ScopeID != "" {
 		if scopeID, err := uuid.Parse(req.ScopeID); err == nil {
 			config.DB.Table("mcp_tool_scope_map mtsm").
 				Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
-				Where("mtsm.scope_id = ? AND t.tenant_id = ? AND t.resource_server_id = ?", scopeID, tenantID, rs.ID).
+				Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scopeID, tenantID, rs.ID).
 				Count(&affectedTools)
 		}
 	}
@@ -3181,12 +3181,12 @@ func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
 		return
 	}
 	var toolsCount, scopesCount, rolesCount, bindingsCount int64
-	config.DB.Table("mcp_tools").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&toolsCount)
-	config.DB.Table("oauth_scopes").Where("tenant_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&scopesCount)
-	config.DB.Table("roles").Where("tenant_id = ? AND name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
+	config.DB.Table("mcp_tools").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&toolsCount)
+	config.DB.Table("oauth_scopes").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&scopesCount)
+	config.DB.Table("roles").Where("workspace_id = ? AND name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
 	config.DB.Table("role_bindings rb").
 		Joins("JOIN roles r ON r.id = rb.role_id").
-		Where("rb.tenant_id = ? AND r.name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").
+		Where("rb.workspace_id = ? AND r.name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").
 		Count(&bindingsCount)
 	c.JSON(http.StatusAccepted, gin.H{
 		"export_id":    uuid.NewString(),

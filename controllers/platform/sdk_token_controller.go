@@ -55,7 +55,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 
 	var dt models.DelegationToken
 	result := tenantDB.
-		Where("client_id::text = ? AND tenant_id::text = ? AND status = 'active'", clientID, tenantID).
+		Where("client_id::text = ? AND workspace_id::text = ? AND status = 'active'", clientID, tenantID).
 		First(&dt)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{
@@ -85,7 +85,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		"expires_at":  dt.ExpiresAt,
 		"ttl_seconds": dt.TTLSeconds,
 		"client_id":   dt.ClientID,
-		"tenant_id":   dt.WorkspaceID,
+		"workspace_id":   dt.WorkspaceID,
 		"status":      dt.Status,
 		"issued_at":   dt.CreatedAt,
 		"updated_at":  dt.UpdatedAt,
@@ -110,7 +110,7 @@ func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
 	tenantDB := config.DB
 
 	result := tenantDB.Model(&models.DelegationToken{}).
-		Where("client_id::text = ? AND tenant_id = ? AND status = 'active'", clientID, tenantID).
+		Where("client_id::text = ? AND workspace_id = ? AND status = 'active'", clientID, tenantID).
 		Updates(map[string]interface{}{
 			"status":     "revoked",
 			"updated_at": time.Now(),
@@ -137,7 +137,7 @@ func resolveTenantIDFromClientID(clientID string) (string, error) {
 
 	var tenantID string
 	err := masterDB.DB.QueryRow(
-		`SELECT tenant_id FROM tenant_mappings WHERE client_id = $1 LIMIT 1`,
+		`SELECT workspace_id FROM tenant_mappings WHERE client_id = $1 LIMIT 1`,
 		clientID,
 	).Scan(&tenantID)
 	if err != nil {

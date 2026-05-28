@@ -101,7 +101,7 @@ func CORSMiddleware() gin.HandlerFunc {
 			// Never use "*" with Access-Control-Allow-Credentials: true
 			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD")
-			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Requested-With, X-CSRF-Token, X-Tenant-ID, tenant_id, Client-Id, client-id, X-Client-Id, X-Client-ID")
+			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Requested-With, X-CSRF-Token, workspace_id, Client-Id, client-id, X-Client-Id, X-Client-ID")
 			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 			c.Writer.Header().Set("Access-Control-Max-Age", "86400") // Cache preflight for 24 hours
 			c.Writer.Header().Set("Vary", "Origin")                  // Important for caching

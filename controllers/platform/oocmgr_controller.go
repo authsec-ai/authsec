@@ -149,7 +149,7 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 	c.JSON(http.StatusOK, oocmgrdto.MessageResponse{
 		Message: "Hydra client dump retrieved successfully", Success: true,
 		Data: map[string]interface{}{
-			"tenant_id": tenantID, "client_type": clientTypeFilter,
+			"workspace_id": tenantID, "client_type": clientTypeFilter,
 			"count": len(dump), "clients": dump,
 		},
 		Timestamp: time.Now(),
@@ -196,7 +196,7 @@ func oocmgrBelongsToTenant(metadata map[string]interface{}, tenantID string) boo
 	if metadata == nil || tenantID == "" {
 		return false
 	}
-	if metaTenantID, ok := metadata["tenant_id"].(string); ok && metaTenantID == tenantID {
+	if metaTenantID, ok := metadata["workspace_id"].(string); ok && metaTenantID == tenantID {
 		return true
 	}
 	if cid, ok := metadata["c_id"].(string); ok && cid == tenantID {

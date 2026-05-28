@@ -160,7 +160,7 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 
 	// Debug: Verify permission was created with correct tenant_id
 	if perm.WorkspaceID != nil {
-		log.Printf("[RegisterPermission] Permission created successfully with ID: %s, tenant_id: %s", perm.ID.String(), perm.WorkspaceID.String())
+		log.Printf("[RegisterPermission] Permission created successfully with ID: %s, workspace_id: %s", perm.ID.String(), perm.WorkspaceID.String())
 	} else {
 		log.Printf("[RegisterPermission] WARNING: Permission created with ID: %s but tenant_id is NULL!", perm.ID.String())
 	}
@@ -216,7 +216,7 @@ func (pc *PermissionController) DeletePermission(c *gin.Context) {
 
 	// Verify permission belongs to tenant
 	var perm models.RBACPermission
-	if err := config.DB.Where("id = ? AND tenant_id = ?", permID, tenantID).First(&perm).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", permID, tenantID).First(&perm).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Permission not found"})
 			return
@@ -273,7 +273,7 @@ func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 
 	// Verify permission belongs to tenant and capture for audit log
 	var perm models.RBACPermission
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", permID, tenantID).First(&perm).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", permID, tenantID).First(&perm).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Permission not found"})
 			return
@@ -337,7 +337,7 @@ func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
 
 	// Find permission
 	var perm models.RBACPermission
-	if err := config.DB.Where("tenant_id = ? AND resource = ? AND action = ?", tenantID, req.Resource, req.Action).First(&perm).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ? AND resource = ? AND action = ?", tenantID, req.Resource, req.Action).First(&perm).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Permission not found"})
 			return
@@ -399,7 +399,7 @@ func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 
 	// Find permission
 	var perm models.RBACPermission
-	if err := tenantDB.Where("tenant_id = ? AND resource = ? AND action = ?", tenantID, req.Resource, req.Action).First(&perm).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND resource = ? AND action = ?", tenantID, req.Resource, req.Action).First(&perm).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Permission not found"})
 			return
@@ -488,7 +488,7 @@ func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, ten
 	log.Printf("[ListPermissions] Querying with tenant_id: %s, resource: %s", tenantID.String(), resource)
 
 	var perms []models.RBACPermission
-	query := db.Where("tenant_id = ?", tenantID)
+	query := db.Where("workspace_id = ?", tenantID)
 	if resource != "" {
 		query = query.Where("resource = ?", resource)
 	}
@@ -508,7 +508,7 @@ func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, ten
 	_ = db.Table("role_permissions rp").
 		Select("rp.permission_id, count(*) as count").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("p.tenant_id = ?", tenantID).
+		Where("p.workspace_id = ?", tenantID).
 		Group("rp.permission_id").
 		Scan(&counts)
 
@@ -585,7 +585,7 @@ func (pc *PermissionController) ShowResourcesEndUser(c *gin.Context) {
 
 func (pc *PermissionController) showResources(c *gin.Context, db *gorm.DB, tenantID uuid.UUID, isAdmin bool) {
 	var resources []string
-	if err := db.Table("permissions").Where("tenant_id = ?", tenantID).Distinct().Pluck("resource", &resources).Error; err != nil {
+	if err := db.Table("permissions").Where("workspace_id = ?", tenantID).Distinct().Pluck("resource", &resources).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch resources from permissions: " + err.Error()})
 		return
 	}
@@ -753,7 +753,7 @@ func GetUserPermissionsInTenant(userID, tenantID string) ([]models.Permission, e
 		FROM permissions p
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
-		WHERE rb.user_id = $1 AND rb.tenant_id = $2
+		WHERE rb.user_id = $1 AND rb.workspace_id = $2
 		ORDER BY p.created_at DESC
 	`
 	rows, err := config.Database.DB.Query(query, userID, tenantID)
@@ -782,7 +782,7 @@ func GetUserRolePermissionsInTenant(userID, tenantID string) ([]models.Permissio
 		FROM permissions p
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
-		WHERE rb.user_id = $1 AND rb.tenant_id = $2
+		WHERE rb.user_id = $1 AND rb.workspace_id = $2
 		ORDER BY p.created_at DESC
 	`
 	rows, err := config.Database.DB.Query(query, userID, tenantID)
@@ -813,7 +813,7 @@ func CheckUserPermission(userID, tenantID, resource, scope string) (bool, error)
 			INNER JOIN role_permissions rp ON p.id = rp.permission_id
 			INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
 			WHERE rb.user_id = $1
-			AND rb.tenant_id = $2
+			AND rb.workspace_id = $2
 			AND p.resource = $3
 			AND p.action = $4
 		)

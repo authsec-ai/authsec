@@ -32,7 +32,7 @@ func NewVoiceAuthRepository(db *DBConnection) *VoiceAuthRepository {
 func (r *VoiceAuthRepository) CreateVoiceSession(session *models.VoiceSession) error {
 	query := `
 		INSERT INTO voice_sessions (
-			id, tenant_id, client_id, session_token, voice_otp,
+			id, workspace_id, client_id, session_token, voice_otp,
 			otp_attempts, voice_platform, voice_user_id, device_info,
 			status, scopes, expires_at, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -75,7 +75,7 @@ func (r *VoiceAuthRepository) CreateVoiceSession(session *models.VoiceSession) e
 // FindVoiceSessionByToken retrieves a voice session by session_token
 func (r *VoiceAuthRepository) FindVoiceSessionByToken(sessionToken string) (*models.VoiceSession, error) {
 	query := `
-		SELECT id, tenant_id, client_id, session_token, voice_otp,
+		SELECT id, workspace_id, client_id, session_token, voice_otp,
 		       otp_attempts, voice_platform, voice_user_id, device_info,
 		       user_id, user_email, status, linked_device_code, scopes,
 		       expires_at, verified_at, created_at, updated_at
@@ -257,7 +257,7 @@ func (r *VoiceAuthRepository) DeleteExpiredVoiceSessions(olderThan time.Duration
 func (r *VoiceAuthRepository) CreateVoiceIdentityLink(link *models.VoiceIdentityLink) error {
 	query := `
 		INSERT INTO voice_identity_links (
-			id, tenant_id, voice_platform, voice_user_id, voice_user_name,
+			id, workspace_id, voice_platform, voice_user_id, voice_user_name,
 			user_id, user_email, is_active, link_method, linked_at,
 			created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -289,11 +289,11 @@ func (r *VoiceAuthRepository) CreateVoiceIdentityLink(link *models.VoiceIdentity
 // FindVoiceIdentityLink retrieves a voice identity link
 func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePlatform string, voiceUserID string) (*models.VoiceIdentityLink, error) {
 	query := `
-		SELECT id, tenant_id, voice_platform, voice_user_id, voice_user_name,
+		SELECT id, workspace_id, voice_platform, voice_user_id, voice_user_name,
 		       user_id, user_email, is_active, link_method, last_used_at,
 		       linked_at, created_at, updated_at
 		FROM voice_identity_links
-		WHERE tenant_id = $1 AND voice_platform = $2 AND voice_user_id = $3
+		WHERE workspace_id = $1 AND voice_platform = $2 AND voice_user_id = $3
 	`
 
 	link := &models.VoiceIdentityLink{}
@@ -339,11 +339,11 @@ func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePla
 // ListVoiceIdentityLinks lists all voice identity links for a user
 func (r *VoiceAuthRepository) ListVoiceIdentityLinks(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceIdentityLink, error) {
 	query := `
-		SELECT id, tenant_id, voice_platform, voice_user_id, voice_user_name,
+		SELECT id, workspace_id, voice_platform, voice_user_id, voice_user_name,
 		       user_id, user_email, is_active, link_method, last_used_at,
 		       linked_at, created_at, updated_at
 		FROM voice_identity_links
-		WHERE tenant_id = $1 AND user_id = $2
+		WHERE workspace_id = $1 AND user_id = $2
 		ORDER BY linked_at DESC
 	`
 
@@ -413,7 +413,7 @@ func (r *VoiceAuthRepository) DeactivateVoiceIdentityLink(tenantID uuid.UUID, vo
 	query := `
 		UPDATE voice_identity_links
 		SET is_active = false, updated_at = $1
-		WHERE tenant_id = $2 AND voice_platform = $3 AND voice_user_id = $4
+		WHERE workspace_id = $2 AND voice_platform = $3 AND voice_user_id = $4
 	`
 
 	result, err := r.db.Exec(query, time.Now().Unix(), tenantID, voicePlatform, voiceUserID)
@@ -489,7 +489,7 @@ func GenerateVoiceOTP() (string, error) {
 func (r *VoiceAuthRepository) CreateVoiceActiveSession(session *models.VoiceActiveSession) error {
 	query := `
 		INSERT INTO voice_active_sessions (
-			id, tenant_id, client_id, user_id, user_email, session_id,
+			id, workspace_id, client_id, user_id, user_email, session_id,
 			voice_platform, voice_user_id, device_info, device_name,
 			access_token_hash, refresh_token_hash,
 			login_at, last_activity_at, expires_at,
@@ -539,7 +539,7 @@ func (r *VoiceAuthRepository) CreateVoiceActiveSession(session *models.VoiceActi
 // FindVoiceActiveSessionByID retrieves an active session by ID
 func (r *VoiceAuthRepository) FindVoiceActiveSessionByID(sessionID uuid.UUID) (*models.VoiceActiveSession, error) {
 	query := `
-		SELECT id, tenant_id, client_id, user_id, user_email, session_id,
+		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
 		       access_token_hash, refresh_token_hash,
 		       login_at, last_activity_at, expires_at,
@@ -554,7 +554,7 @@ func (r *VoiceAuthRepository) FindVoiceActiveSessionByID(sessionID uuid.UUID) (*
 // FindVoiceActiveSessionBySessionID retrieves an active session by session_id (jti)
 func (r *VoiceAuthRepository) FindVoiceActiveSessionBySessionID(sessionID string) (*models.VoiceActiveSession, error) {
 	query := `
-		SELECT id, tenant_id, client_id, user_id, user_email, session_id,
+		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
 		       access_token_hash, refresh_token_hash,
 		       login_at, last_activity_at, expires_at,
@@ -569,7 +569,7 @@ func (r *VoiceAuthRepository) FindVoiceActiveSessionBySessionID(sessionID string
 // FindVoiceActiveSessionByTokenHash retrieves an active session by token hash
 func (r *VoiceAuthRepository) FindVoiceActiveSessionByTokenHash(tokenHash string) (*models.VoiceActiveSession, error) {
 	query := `
-		SELECT id, tenant_id, client_id, user_id, user_email, session_id,
+		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
 		       access_token_hash, refresh_token_hash,
 		       login_at, last_activity_at, expires_at,
@@ -584,13 +584,13 @@ func (r *VoiceAuthRepository) FindVoiceActiveSessionByTokenHash(tokenHash string
 // ListVoiceActiveSessions lists all active sessions for a user
 func (r *VoiceAuthRepository) ListVoiceActiveSessions(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
 	query := `
-		SELECT id, tenant_id, client_id, user_id, user_email, session_id,
+		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
 		       access_token_hash, refresh_token_hash,
 		       login_at, last_activity_at, expires_at,
 		       is_active, revoked_at, revoked_reason, created_at, updated_at
 		FROM voice_active_sessions
-		WHERE tenant_id = $1 AND user_id = $2
+		WHERE workspace_id = $1 AND user_id = $2
 		ORDER BY login_at DESC
 	`
 
@@ -616,13 +616,13 @@ func (r *VoiceAuthRepository) ListVoiceActiveSessions(tenantID uuid.UUID, userID
 func (r *VoiceAuthRepository) ListActiveVoiceSessions(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
 	now := time.Now().Unix()
 	query := `
-		SELECT id, tenant_id, client_id, user_id, user_email, session_id,
+		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
 		       access_token_hash, refresh_token_hash,
 		       login_at, last_activity_at, expires_at,
 		       is_active, revoked_at, revoked_reason, created_at, updated_at
 		FROM voice_active_sessions
-		WHERE tenant_id = $1 AND user_id = $2 AND is_active = true AND expires_at > $3
+		WHERE workspace_id = $1 AND user_id = $2 AND is_active = true AND expires_at > $3
 		ORDER BY login_at DESC
 	`
 
@@ -675,7 +675,7 @@ func (r *VoiceAuthRepository) RevokeAllVoiceActiveSessions(tenantID uuid.UUID, u
 	query := `
 		UPDATE voice_active_sessions
 		SET is_active = false, revoked_at = $1, revoked_reason = $2, updated_at = $3
-		WHERE tenant_id = $4 AND user_id = $5 AND is_active = true AND session_id != $6
+		WHERE workspace_id = $4 AND user_id = $5 AND is_active = true AND session_id != $6
 	`
 
 	now := time.Now().Unix()
@@ -725,7 +725,7 @@ func (r *VoiceAuthRepository) CountActiveSessionsForUser(tenantID uuid.UUID, use
 	now := time.Now().Unix()
 	query := `
 		SELECT COUNT(*) FROM voice_active_sessions
-		WHERE tenant_id = $1 AND user_id = $2 AND is_active = true AND expires_at > $3
+		WHERE workspace_id = $1 AND user_id = $2 AND is_active = true AND expires_at > $3
 	`
 
 	var count int
@@ -969,12 +969,12 @@ func (r *VoiceAuthRepository) ApproveVoiceSession(sessionToken string, approve b
 func (r *VoiceAuthRepository) ListPendingVoiceSessions(tenantID uuid.UUID) ([]models.VoiceSession, error) {
 	now := time.Now().Unix()
 	query := `
-		SELECT id, tenant_id, client_id, session_token, voice_otp,
+		SELECT id, workspace_id, client_id, session_token, voice_otp,
 		       otp_attempts, voice_platform, voice_user_id, device_info,
 		       user_id, user_email, status, linked_device_code, scopes,
 		       expires_at, verified_at, created_at, updated_at
 		FROM voice_sessions
-		WHERE tenant_id = $1 AND pending_approval = true AND approval_status = 'pending' AND expires_at > $2
+		WHERE workspace_id = $1 AND pending_approval = true AND approval_status = 'pending' AND expires_at > $2
 		ORDER BY created_at DESC
 	`
 

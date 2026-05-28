@@ -101,7 +101,7 @@ func RequestIDMiddleware() gin.HandlerFunc {
 				"path":        path,
 				"query":       c.Request.URL.RawQuery,
 				"status_code": statusCode,
-				"tenant_id":   c.GetHeader("X-Tenant-ID"),
+				"workspace_id": c.GetHeader("X-Workspace-ID"),
 			}
 
 			// Add error message if available

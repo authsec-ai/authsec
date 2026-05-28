@@ -128,7 +128,7 @@ func validateClientActive(clientID, tenantID string) error {
 	query := `
 		SELECT id FROM clients
 		WHERE client_id::text = $1
-		AND tenant_id = $2
+		AND workspace_id = $2
 		AND (deleted = false OR deleted IS NULL)
 		AND status = 'Active'
 		LIMIT 1
@@ -200,7 +200,7 @@ func getTenantRoleNames(tenantID string) ([]string, error) {
 		return nil, fmt.Errorf("master database not initialized")
 	}
 
-	query := `SELECT DISTINCT name FROM roles WHERE tenant_id::text = $1 ORDER BY name`
+	query := `SELECT DISTINCT name FROM roles WHERE workspace_id::text = $1 ORDER BY name`
 	rows, err := masterDB.DB.Query(query, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("query tenant roles: %w", err)

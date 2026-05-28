@@ -153,7 +153,7 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 		return
 	}
 
-	// Whitelist updatable fields — prevent overwriting id, tenant_id, secrets, deleted_at
+	// Whitelist updatable fields — prevent overwriting id, workspace_id, secrets, deleted_at
 	allowed := map[string]bool{
 		"name": true, "public_base_url": true, "protected_base_path": true,
 		"scopes_supported": true, "registration_modes": true, "active": true,

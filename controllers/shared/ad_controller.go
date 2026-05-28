@@ -158,7 +158,7 @@ func (asc *ADSyncController) SyncADUsers(c *gin.Context) {
 	// Audit log: AD sync completed
 	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":     input.WorkspaceID,
+			"workspace_id":     input.WorkspaceID,
 			"client_id":     input.ClientID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
@@ -603,7 +603,7 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 	// Audit log: Agent sync completed
 	middlewares.Audit(c, "ad_sync", input.WorkspaceID, "agent_sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":       input.WorkspaceID,
+			"workspace_id":       input.WorkspaceID,
 			"client_id":       input.ClientID,
 			"users_processed": result.UsersProcessed,
 			"users_created":   result.UsersCreated,
@@ -752,7 +752,7 @@ func (asc *ADSyncController) loadStoredADConfig(configID, tenantID, clientID str
 		         ON ip.workspace_id = sc.tenant_id
 		        AND ip.provider_type IN ('ad', 'entra')
 		        AND ip.config_ref = sc.id::text`).
-		Where("sc.id = ? AND sc.tenant_id = ? AND sc.client_id = ? AND sc.sync_type = ?",
+		Where("sc.id = ? AND sc.workspace_id = ? AND sc.client_id = ? AND sc.sync_type = ?",
 			configUUID, tenantUUID, clientUUID, "active_directory").
 		Where("(ip.id IS NULL OR ip.status <> 'disabled')").
 		First(&syncConfig).Error; err != nil {

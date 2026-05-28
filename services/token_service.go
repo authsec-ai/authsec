@@ -90,12 +90,11 @@ func (ts *TokenService) GenerateTokenPair(userID, tenantID uuid.UUID, email stri
 }
 
 // generateAccessToken creates a JWT access token
-func (ts *TokenService) generateAccessToken(userID, tenantID uuid.UUID, email string, expiresAt time.Time, additionalClaims map[string]interface{}) (string, error) {
-	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
+func (ts *TokenService) generateAccessToken(userID, workspaceID uuid.UUID, email string, expiresAt time.Time, additionalClaims map[string]interface{}) (string, error) {
+	// Phase 6: workspace_id is the only identity claim.
 	claims := jwt.MapClaims{
 		"user_id":      userID.String(),
-		"tenant_id":    tenantID.String(),
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"email":        email,
 		"exp":          expiresAt.Unix(),
 		"iat":          time.Now().Unix(),

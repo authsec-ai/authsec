@@ -29,7 +29,7 @@ func (r *TOTPRepository) CreateTOTPSecret(secret *models.TOTPSecret) error {
 
 	query := `
 		INSERT INTO totp_secrets (
-			id, user_id, tenant_id, secret, device_name, device_type,
+			id, user_id, workspace_id, secret, device_name, device_type,
 			is_active, is_primary, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
@@ -48,7 +48,7 @@ func (r *TOTPRepository) UpdateTOTPSecret(secret *models.TOTPSecret) error {
 	query := `
 		UPDATE totp_secrets
 		SET device_name = $1, is_active = $2, is_primary = $3, updated_at = $4
-		WHERE id = $5 AND user_id = $6 AND tenant_id = $7`
+		WHERE id = $5 AND user_id = $6 AND workspace_id = $7`
 
 	_, err := r.db.Exec(query,
 		secret.DeviceName, secret.IsActive, secret.IsPrimary,
@@ -67,9 +67,9 @@ func (r *TOTPRepository) UpdateLastUsed(id uuid.UUID) error {
 
 // GetTOTPSecretByID retrieves a TOTP secret by ID
 func (r *TOTPRepository) GetTOTPSecretByID(id uuid.UUID, userID uuid.UUID, tenantID uuid.UUID) (*models.TOTPSecret, error) {
-	query := `SELECT id, user_id, tenant_id, secret, device_name, device_type, last_used,
+	query := `SELECT id, user_id, workspace_id, secret, device_name, device_type, last_used,
 	          is_active, is_primary, created_at, updated_at
-	          FROM totp_secrets WHERE id = $1 AND user_id = $2 AND tenant_id = $3`
+	          FROM totp_secrets WHERE id = $1 AND user_id = $2 AND workspace_id = $3`
 
 	row := r.db.QueryRow(query, id, userID, tenantID)
 	return r.scanTOTPSecret(row)
@@ -77,10 +77,10 @@ func (r *TOTPRepository) GetTOTPSecretByID(id uuid.UUID, userID uuid.UUID, tenan
 
 // GetUserTOTPSecrets retrieves all active TOTP secrets for a user
 func (r *TOTPRepository) GetUserTOTPSecrets(userID uuid.UUID, tenantID uuid.UUID) ([]models.TOTPSecret, error) {
-	query := `SELECT id, user_id, tenant_id, secret, device_name, device_type, last_used,
+	query := `SELECT id, user_id, workspace_id, secret, device_name, device_type, last_used,
 	          is_active, is_primary, created_at, updated_at
 	          FROM totp_secrets
-	          WHERE user_id = $1 AND tenant_id = $2 AND is_active = true
+	          WHERE user_id = $1 AND workspace_id = $2 AND is_active = true
 	          ORDER BY is_primary DESC, created_at DESC`
 
 	rows, err := r.db.Query(query, userID, tenantID)
@@ -102,10 +102,10 @@ func (r *TOTPRepository) GetUserTOTPSecrets(userID uuid.UUID, tenantID uuid.UUID
 
 // GetPrimaryTOTPSecret retrieves the primary TOTP secret for a user
 func (r *TOTPRepository) GetPrimaryTOTPSecret(userID uuid.UUID, tenantID uuid.UUID) (*models.TOTPSecret, error) {
-	query := `SELECT id, user_id, tenant_id, secret, device_name, device_type, last_used,
+	query := `SELECT id, user_id, workspace_id, secret, device_name, device_type, last_used,
 	          is_active, is_primary, created_at, updated_at
 	          FROM totp_secrets
-	          WHERE user_id = $1 AND tenant_id = $2 AND is_active = true AND is_primary = true
+	          WHERE user_id = $1 AND workspace_id = $2 AND is_active = true AND is_primary = true
 	          LIMIT 1`
 
 	row := r.db.QueryRow(query, userID, tenantID)
@@ -118,7 +118,7 @@ func (r *TOTPRepository) GetPrimaryTOTPSecret(userID uuid.UUID, tenantID uuid.UU
 
 // DeleteTOTPSecret deletes a TOTP secret
 func (r *TOTPRepository) DeleteTOTPSecret(id uuid.UUID, userID uuid.UUID, tenantID uuid.UUID) error {
-	query := `DELETE FROM totp_secrets WHERE id = $1 AND user_id = $2 AND tenant_id = $3`
+	query := `DELETE FROM totp_secrets WHERE id = $1 AND user_id = $2 AND workspace_id = $3`
 	result, err := r.db.Exec(query, id, userID, tenantID)
 	if err != nil {
 		return err
@@ -141,14 +141,14 @@ func (r *TOTPRepository) SetPrimaryTOTPSecret(id uuid.UUID, userID uuid.UUID, te
 
 	// Unset all primary flags for user
 	_, err = tx.Exec(`UPDATE totp_secrets SET is_primary = false
-	                  WHERE user_id = $1 AND tenant_id = $2`, userID, tenantID)
+	                  WHERE user_id = $1 AND workspace_id = $2`, userID, tenantID)
 	if err != nil {
 		return err
 	}
 
 	// Set this device as primary
 	_, err = tx.Exec(`UPDATE totp_secrets SET is_primary = true, updated_at = $1
-	                  WHERE id = $2 AND user_id = $3 AND tenant_id = $4`, time.Now().Unix(), id, userID, tenantID)
+	                  WHERE id = $2 AND user_id = $3 AND workspace_id = $4`, time.Now().Unix(), id, userID, tenantID)
 	if err != nil {
 		return err
 	}
@@ -168,7 +168,7 @@ func (r *TOTPRepository) CreateBackupCode(code *models.BackupCode) error {
 	code.CreatedAt = time.Now().Unix()
 
 	query := `
-		INSERT INTO totp_backup_codes (id, user_id, tenant_id, code, is_used, created_at)
+		INSERT INTO totp_backup_codes (id, user_id, workspace_id, code, is_used, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`
 
 	_, err := r.db.Exec(query, code.ID, code.UserID, code.WorkspaceID, code.Code, code.IsUsed, code.CreatedAt)
@@ -177,9 +177,9 @@ func (r *TOTPRepository) CreateBackupCode(code *models.BackupCode) error {
 
 // GetUserBackupCodes retrieves unused backup codes for a user
 func (r *TOTPRepository) GetUserBackupCodes(userID uuid.UUID, tenantID uuid.UUID) ([]models.BackupCode, error) {
-	query := `SELECT id, user_id, tenant_id, code, is_used, created_at, used_at
+	query := `SELECT id, user_id, workspace_id, code, is_used, created_at, used_at
 	          FROM totp_backup_codes
-	          WHERE user_id = $1 AND tenant_id = $2
+	          WHERE user_id = $1 AND workspace_id = $2
 	          ORDER BY created_at DESC`
 
 	rows, err := r.db.Query(query, userID, tenantID)
@@ -210,7 +210,7 @@ func (r *TOTPRepository) UseBackupCode(codeID uuid.UUID) error {
 
 // DeleteBackupCodes deletes all backup codes for a user
 func (r *TOTPRepository) DeleteBackupCodes(userID uuid.UUID, tenantID uuid.UUID) error {
-	query := `DELETE FROM totp_backup_codes WHERE user_id = $1 AND tenant_id = $2`
+	query := `DELETE FROM totp_backup_codes WHERE user_id = $1 AND workspace_id = $2`
 	_, err := r.db.Exec(query, userID, tenantID)
 	return err
 }

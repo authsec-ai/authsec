@@ -725,7 +725,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 	})
 
 	log.Printf("[%s] FinishRegistration: Completed successfully", reqID)
@@ -1032,7 +1032,7 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "authenticate", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 		"email":         user.Email,
 	})
 

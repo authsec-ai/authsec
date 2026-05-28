@@ -109,7 +109,7 @@ func GetTenantDB(tenantID string) (*DBConnection, error) {
 	masterDB := GlobalConnectionManager.masterDB
 
 	var tenantDBName sql.NullString
-	query := "SELECT tenant_db FROM tenants WHERE tenant_id::text = $1 OR id::text = $1"
+	query := "SELECT tenant_db FROM tenants WHERE workspace_id::text = $1 OR id::text = $1"
 	err := masterDB.DB.QueryRow(query, tenantID).Scan(&tenantDBName)
 	if err != nil {
 		if err == sql.ErrNoRows {

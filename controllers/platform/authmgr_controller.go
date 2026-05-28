@@ -115,7 +115,7 @@ func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email s
 
 func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
 	var user sharedmodels.User
-	if err := db.WithContext(ctx).Where("email = ? AND tenant_id = ?", email, tid).First(&user).Error; err != nil {
+	if err := db.WithContext(ctx).Where("email = ? AND workspace_id = ?", email, tid).First(&user).Error; err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
@@ -128,7 +128,7 @@ func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, ten
 		Table("role_bindings").
 		Select("role_bindings.role_id, roles.name as role_name").
 		Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
-		Where("role_bindings.tenant_id = ?", tid).
+		Where("role_bindings.workspace_id = ?", tid).
 		Where("role_bindings.user_id = ?", user.ID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > NOW()").
 		Scan(&roleBindings).Error
@@ -201,7 +201,7 @@ func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (st
 		var user sharedmodels.User
 		if err := config.DB.WithContext(ctx).
 			Select("client_id", "project_id").
-			Where("tenant_id = ? AND email = ?", tid, email).
+			Where("workspace_id = ? AND email = ?", tid, email).
 			First(&user).Error; err == nil {
 			return user.ClientID.String(), user.ProjectID.String(), nil
 		}
@@ -210,7 +210,7 @@ func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (st
 	var user sharedmodels.User
 	if err := config.DB.WithContext(ctx).
 		Select("client_id", "project_id").
-		Where("tenant_id = ? AND email = ?", tid, email).
+		Where("workspace_id = ? AND email = ?", tid, email).
 		First(&user).Error; err != nil {
 		return "", "", fmt.Errorf("client lookup: %w", err)
 	}
@@ -233,10 +233,10 @@ func (ac *AuthmgrController) HealthCheck(c *gin.Context) {
 // GetProfile returns the authenticated user's profile from JWT claims.
 func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":  c.GetString("workspace_id"),
-		"project_id": c.GetString("project_id"),
-		"client_id":  c.GetString("client_id"),
-		"email_id":   c.GetString("email_id"),
+		"workspace_id": c.GetString("workspace_id"),
+		"project_id":   c.GetString("project_id"),
+		"client_id":    c.GetString("client_id"),
+		"email_id":     c.GetString("email_id"),
 		"scopes":     c.MustGet("scopes"),
 		"roles":      c.MustGet("roles"),
 		"groups":     c.MustGet("groups"),
@@ -250,7 +250,7 @@ func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
 	tenantID := c.Query("workspace_id")
 	email := c.Query("email")
 	if tenantID == "" || email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and email are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and email are required"})
 		return
 	}
 
@@ -271,7 +271,7 @@ func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":           tenantID,
+		"workspace_id":        tenantID,
 		"email":               email,
 		"client_id":           clientID,
 		"project_id":          projectID,
@@ -312,7 +312,7 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 		return
 	}
 
-	tenantID, _ := unverifiedClaims["tenant_id"].(string)
+	tenantID, _ := unverifiedClaims["workspace_id"].(string)
 	projectID, _ := unverifiedClaims["project_id"].(string)
 	clientID, _ := unverifiedClaims["client_id"].(string)
 	tokenType, _ := unverifiedClaims["token_type"].(string)
@@ -352,11 +352,11 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"valid":      true,
-		"tenant_id":  claims["tenant_id"],
-		"project_id": claims["project_id"],
-		"client_id":  claims["client_id"],
-		"email_id":   claims["email_id"],
+		"valid":        true,
+		"workspace_id": claims["workspace_id"],
+		"project_id":   claims["project_id"],
+		"client_id":    claims["client_id"],
+		"email_id":     claims["email_id"],
 		"scopes":     authzData.Scopes,
 		"roles":      authzData.Roles,
 		"groups":     authzData.Groups,
@@ -389,9 +389,8 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		tokenType = "default"
 	}
 
-	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
+	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":    req.WorkspaceID,
 		"workspace_id": req.WorkspaceID,
 		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,
@@ -450,7 +449,7 @@ func (ac *AuthmgrController) OIDCToken(c *gin.Context) {
 
 // CheckPermission checks if the authenticated user has a permission for a resource+action.
 func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
 	if tenantIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
@@ -483,7 +482,7 @@ func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":        userIDStr,
-		"tenant_id":      tenantIDStr,
+		"workspace_id":   tenantIDStr,
 		"resource":       resource,
 		"scope":          action,
 		"has_permission": hasPerm,
@@ -492,7 +491,7 @@ func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
 
 // CheckRole checks if the authenticated user has a specific role.
 func (ac *AuthmgrController) CheckRole(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
 	if tenantIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
@@ -531,7 +530,7 @@ func (ac *AuthmgrController) CheckRole(c *gin.Context) {
 
 // CheckRoleResource checks if the user has a role scoped to a specific resource.
 func (ac *AuthmgrController) CheckRoleResource(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
 	if tenantIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
@@ -580,7 +579,7 @@ func (ac *AuthmgrController) CheckRoleResource(c *gin.Context) {
 
 // CheckPermissionScoped checks permission with an optional scope ID.
 func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
 	if tenantIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
@@ -625,7 +624,7 @@ func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
 
 	resp := gin.H{
 		"user_id":        userIDStr,
-		"tenant_id":      tenantIDStr,
+		"workspace_id":   tenantIDStr,
 		"resource":       resource,
 		"scope":          action,
 		"has_permission": hasPerm,
@@ -639,7 +638,7 @@ func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
 
 // CheckOAuthScopePermission checks if an OAuth scope name grants a specific permission.
 func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	if tenantIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
@@ -666,7 +665,7 @@ func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":      tenantIDStr,
+		"workspace_id":   tenantIDStr,
 		"scope_name":     scopeName,
 		"resource":       resource,
 		"action":         action,
@@ -676,7 +675,7 @@ func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
 
 // ListUserPermissions returns all permissions for the authenticated user.
 func (ac *AuthmgrController) ListUserPermissions(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "tenant_id")
+	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
 	if tenantIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
@@ -706,10 +705,10 @@ func (ac *AuthmgrController) ListUserPermissions(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":     userIDStr,
-		"tenant_id":   tenantIDStr,
-		"permissions": permStrings,
-		"count":       len(permStrings),
+		"user_id":      userIDStr,
+		"workspace_id": tenantIDStr,
+		"permissions":  permStrings,
+		"count":        len(permStrings),
 	})
 }
 
@@ -722,7 +721,7 @@ func (ac *AuthmgrController) ValidateToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":   "Token validation successful",
 		"service":   "auth-manager",
-		"tenant_id": c.GetString("workspace_id"),
+		"workspace_id": c.GetString("workspace_id"),
 		"client_id": c.GetString("client_id"),
 		"scopes":    c.MustGet("scopes"),
 		"roles":     c.MustGet("roles"),
@@ -781,7 +780,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 	var created []sharedmodels.Group
 	for _, name := range req.Groups {
 		var existing sharedmodels.Group
-		if db.Where("name = ? AND (tenant_id = ? OR tenant_id IS NULL)", name, tenantID).First(&existing).Error == nil {
+		if db.Where("name = ? AND (workspace_id = ? OR workspace_id IS NULL)", name, tenantID).First(&existing).Error == nil {
 			continue
 		}
 		g := sharedmodels.Group{WorkspaceID: &tenantID, Name: name}
@@ -812,7 +811,7 @@ func (ac *AuthmgrController) ListGroups(c *gin.Context) {
 	db := config.DB
 
 	var groups []sharedmodels.Group
-	if err := db.Where("tenant_id = ? OR tenant_id IS NULL", tid).Find(&groups).Error; err != nil {
+	if err := db.Where("workspace_id = ? OR workspace_id IS NULL", tid).Find(&groups).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -842,7 +841,7 @@ func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
@@ -876,7 +875,7 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
@@ -916,7 +915,7 @@ func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
@@ -953,7 +952,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
@@ -965,7 +964,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 			continue
 		}
 		var user sharedmodels.User
-		if err := db.Where("id = ? AND tenant_id = ?", userID, tid).First(&user).Error; err != nil {
+		if err := db.Where("id = ? AND workspace_id = ?", userID, tid).First(&user).Error; err != nil {
 			continue
 		}
 		if err := db.Model(&user).Association("Groups").Append(&group); err == nil {
@@ -1007,7 +1006,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
@@ -1019,7 +1018,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 			continue
 		}
 		var user sharedmodels.User
-		if err := db.Where("id = ? AND tenant_id = ?", userID, tid).First(&user).Error; err != nil {
+		if err := db.Where("id = ? AND workspace_id = ?", userID, tid).First(&user).Error; err != nil {
 			continue
 		}
 		if err := db.Model(&user).Association("Groups").Delete(&group); err == nil {
@@ -1058,7 +1057,7 @@ func (ac *AuthmgrController) ListGroupUsers(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND tenant_id = ?", uint(groupID), tid).Preload("Users").First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).Preload("Users").First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}

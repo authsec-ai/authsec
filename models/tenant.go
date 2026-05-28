@@ -5,21 +5,21 @@ import (
 	"gorm.io/gorm"
 )
 
-// TenantWithHooks extends the sharedmodels.Tenant with GORM hooks.
+// TenantWithHooks extends sharedmodels.Tenant with GORM hooks.
 //
-// Single-tenant collapse: tenant database provisioning has moved out of the
-// model layer entirely. There is no per-tenant DB to create or drop, so the
-// hooks are no-ops kept only for GORM lifecycle compatibility.
+// Phase 6 collapse: the `tenants` table is gone. Everywhere this type used
+// to back is now the `workspaces` table. The struct stays only so existing
+// GORM-flavoured callers keep compiling; the hooks are no-ops.
 type TenantWithHooks struct {
 	sharedmodels.Tenant
 }
 
-// BeforeDelete is a no-op under the single-DB model.
+// BeforeDelete is a no-op under the single-DB / workspace-only model.
 func (t *TenantWithHooks) BeforeDelete(tx *gorm.DB) error {
 	return nil
 }
 
-// TableName ensures the model uses the correct table name
+// TableName points at the workspaces table (post-Phase-6).
 func (TenantWithHooks) TableName() string {
-	return "tenants"
+	return "workspaces"
 }

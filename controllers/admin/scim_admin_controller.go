@@ -86,7 +86,7 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 	}
 
 	// Build query with filter
-	query := "SELECT COUNT(*) FROM users WHERE tenant_id = $1"
+	query := "SELECT COUNT(*) FROM users WHERE workspace_id = $1"
 	filterClause, filterArgs := buildAdminUserFilterClause(filter)
 	args := []interface{}{tenantUUID}
 	if filterClause != "" {
@@ -104,7 +104,7 @@ func (sac *SCIMAdminController) ListAdminUsers(c *gin.Context) {
 	selectQuery := `SELECT id, email, COALESCE(username, ''), COALESCE(name, ''),
 		active, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 		created_at, updated_at
-		FROM users WHERE tenant_id = $1`
+		FROM users WHERE workspace_id = $1`
 	if filterClause != "" {
 		selectQuery += " AND " + filterClause
 	}
@@ -211,7 +211,7 @@ func (sac *SCIMAdminController) CreateAdminUser(c *gin.Context) {
 
 	// Check if user already exists
 	var existingCount int
-	db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER($1) AND tenant_id = $2", email, tenantUUID).Scan(&existingCount)
+	db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE LOWER(email) = LOWER($1) AND workspace_id = $2", email, tenantUUID).Scan(&existingCount)
 	if existingCount > 0 {
 		c.JSON(http.StatusConflict, models.NewSCIMError("409", "User with this email already exists", "uniqueness"))
 		return
@@ -456,7 +456,7 @@ func (sac *SCIMAdminController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	// Delete the user
-	_, err = db.DB.Exec("DELETE FROM users WHERE id = $1 AND tenant_id = $2", userUUID, tenantUUID)
+	_, err = db.DB.Exec("DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, tenantUUID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
@@ -481,7 +481,7 @@ func (sac *SCIMAdminController) fetchAdminUser(db *database.DBConnection, userID
 		active, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 		COALESCE(provider, ''), COALESCE(provider_id, ''),
 		created_at, updated_at
-		FROM users WHERE id = $1 AND tenant_id = $2`
+		FROM users WHERE id = $1 AND workspace_id = $2`
 
 	var user models.AdminUser
 	var username, name, externalID, syncSource, provider, providerID sql.NullString

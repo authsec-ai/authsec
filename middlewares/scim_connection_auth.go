@@ -64,7 +64,6 @@ func SCIMConnectionAuth() gin.HandlerFunc {
 		// existing handlers don't care which path invoked them.
 		workspaceID := conn.WorkspaceID.String()
 		c.Set("workspace_id", workspaceID)
-		c.Set("tenant_id", workspaceID) // workspaces.id == tenant_id during transition
 		c.Set("scim_connection_id", conn.ID.String())
 
 		if conn.DefaultClientID != nil {

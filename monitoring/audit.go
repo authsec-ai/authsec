@@ -71,7 +71,7 @@ func (al *AuditLogger) LogEvent(event *AuditEvent) {
 	// Log to structured logger
 	al.logger.WithFields(logrus.Fields{
 		"request_id":  event.RequestID,
-		"tenant_id":   event.WorkspaceID,
+		"workspace_id":   event.WorkspaceID,
 		"user_id":     event.UserID,
 		"action":      event.Action,
 		"resource":    event.Resource,
@@ -182,7 +182,7 @@ func (al *AuditLogger) GetAuditEvents(tenantID, userID, action, resource string,
 
 	// Apply filters
 	if tenantID != "" {
-		query = query.Where("tenant_id = ?", tenantID)
+		query = query.Where("workspace_id = ?", tenantID)
 	}
 	if userID != "" {
 		query = query.Where("user_id = ?", userID)

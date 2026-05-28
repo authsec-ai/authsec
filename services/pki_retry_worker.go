@@ -39,7 +39,7 @@ func (w *PKIRetryWorker) Start() {
 
 // retryFailedTenants queries tenants with pki_provisioning_failed status and retries each
 func (w *PKIRetryWorker) retryFailedTenants() {
-	rows, err := w.db.Query("SELECT tenant_id, name, tenant_domain FROM tenants WHERE status = 'pki_provisioning_failed'")
+	rows, err := w.db.Query("SELECT workspace_id, name, tenant_domain FROM tenants WHERE status = 'pki_provisioning_failed'")
 	if err != nil {
 		log.Printf("PKI retry worker: failed to query failed tenants: %v", err)
 		return
@@ -80,7 +80,7 @@ func (w *PKIRetryWorker) retryTenantPKI(tenantID, name, domain string) {
 	}
 
 	_, err = w.db.Exec(
-		"UPDATE tenants SET vault_mount = $1, ca_cert = $2, status = 'active', updated_at = NOW() WHERE tenant_id = $3",
+		"UPDATE tenants SET vault_mount = $1, ca_cert = $2, status = 'active', updated_at = NOW() WHERE workspace_id = $3",
 		resp.PKIMount, resp.CACert, tenantID,
 	)
 	if err != nil {

@@ -60,7 +60,7 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Determine tenant_id from token claims or issuer.
-		tenantID, _ := claims["tenant_id"].(string)
+		tenantID, _ := claims["workspace_id"].(string)
 		if tenantID == "" {
 			iss, _ := claims["iss"].(string)
 			tenantID = strings.TrimPrefix(iss, "spiffe://")

@@ -10,196 +10,108 @@ import (
 	"github.com/google/uuid"
 )
 
-// AdminTenantRepository handles admin tenant database operations on global DB
+// AdminTenantRepository handles workspace identity database operations from
+// admin contexts.
+//
+// Phase 6 collapse: queries now target the `workspaces` table rather than the
+// dropped `tenants` table. Type name preserved for source-compat; rename to
+// AdminWorkspaceRepository is tracked as Phase 9/10 cosmetic.
 type AdminTenantRepository struct {
 	db *DBConnection
 }
 
-// NewAdminTenantRepository creates a new admin tenant repository
+// NewAdminTenantRepository creates a new admin workspace repository.
 func NewAdminTenantRepository(db *DBConnection) *AdminTenantRepository {
 	return &AdminTenantRepository{db: db}
 }
 
-// GetAllTenants retrieves all tenants from global database
+// GetAllTenants retrieves all workspace identity rows.
 func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
-	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		ORDER BY created_at DESC
-	`
-
+	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces ORDER BY created_at DESC`
 	rows, err := atr.db.Query(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query tenants: %w", err)
+		return nil, fmt.Errorf("failed to query workspaces: %w", err)
 	}
 	defer rows.Close()
 
 	var tenants []models.Tenant
 	for rows.Next() {
-		var tenant models.Tenant
-		err := rows.Scan(
-			&tenant.ID,
-			&tenant.WorkspaceID,
-			&tenant.TenantDB,
-			&tenant.Email,
-			&tenant.Username,
-			&tenant.PasswordHash,
-			&tenant.Provider,
-			&tenant.ProviderID,
-			&tenant.Avatar,
-			&tenant.Name,
-			&tenant.Source,
-			&tenant.Status,
-			&tenant.LastLogin,
-			&tenant.CreatedAt,
-			&tenant.UpdatedAt,
-			&tenant.TenantDomain,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan tenant: %w", err)
+		var t models.Tenant
+		if err := scanWorkspaceRow(rows, &t); err != nil {
+			return nil, fmt.Errorf("failed to scan workspace row: %w", err)
 		}
-		tenants = append(tenants, tenant)
+		tenants = append(tenants, t)
 	}
-
 	return tenants, nil
 }
 
-// GetTenantByID retrieves a specific tenant by ID
-func (atr *AdminTenantRepository) GetTenantByID(tenantID string) (*models.Tenant, error) {
-	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		WHERE tenant_id = $1
-	`
-
-	var tenant models.Tenant
-	err := atr.db.QueryRow(query, tenantID).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&tenant.Username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&tenant.ProviderID,
-		&tenant.Avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&tenant.LastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
+// GetTenantByID retrieves a workspace by its ID.
+func (atr *AdminTenantRepository) GetTenantByID(workspaceID string) (*models.Tenant, error) {
+	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE id = $1`
+	var t models.Tenant
+	err := scanWorkspaceRow(atr.db.QueryRow(query, workspaceID), &t)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found")
+			return nil, fmt.Errorf("workspace not found")
 		}
-		return nil, fmt.Errorf("failed to get tenant: %w", err)
+		return nil, fmt.Errorf("failed to get workspace: %w", err)
 	}
-
-	return &tenant, nil
+	return &t, nil
 }
 
-// GetTenantByClientID retrieves a tenant using a client_id via tenant_mappings table
+// GetTenantByClientID retrieves a workspace via a Hydra client_id lookup
+// through tenant_hydra_clients (which still maps client_id -> workspace_id).
 func (atr *AdminTenantRepository) GetTenantByClientID(clientID string) (*models.Tenant, error) {
 	query := `
-		SELECT t.id, t.tenant_id, t.tenant_db, t.email, t.username, t.password_hash,
-			t.provider, t.provider_id, t.avatar, t.name, t.source, t.status, t.last_login,
-			t.created_at, t.updated_at, t.tenant_domain
-		FROM tenants t
-		JOIN tenant_mappings tm ON t.id = tm.tenant_id
-		WHERE tm.client_id = $1
+		SELECT ` + workspaceSelectCols + `
+		FROM workspaces w
+		JOIN tenant_hydra_clients thc ON w.id::text = thc.workspace_id
+		WHERE thc.hydra_client_id = $1
+		LIMIT 1
 	`
-
-	var tenant models.Tenant
-	err := atr.db.QueryRow(query, clientID).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&tenant.Username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&tenant.ProviderID,
-		&tenant.Avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&tenant.LastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
+	var t models.Tenant
+	err := scanWorkspaceRow(atr.db.QueryRow(query, clientID), &t)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found for client_id: %s", clientID)
+			return nil, fmt.Errorf("workspace not found for client_id: %s", clientID)
 		}
-		return nil, fmt.Errorf("failed to get tenant for client_id: %w", err)
+		return nil, fmt.Errorf("failed to get workspace for client_id: %w", err)
 	}
-
-	return &tenant, nil
+	return &t, nil
 }
 
-// CreateTenant creates a new tenant in global database
-func (atr *AdminTenantRepository) CreateTenant(tenant *models.Tenant) error {
+// CreateTenant inserts a new workspace identity row.
+func (atr *AdminTenantRepository) CreateTenant(t *models.Tenant) error {
 	query := `
-		INSERT INTO tenants (id, tenant_id, tenant_db, email, username, password_hash,
-provider, provider_id, avatar, name, source, status, last_login,
-created_at, updated_at, tenant_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
-
 	now := time.Now()
-	if tenant.ID == uuid.Nil {
-		tenant.ID = uuid.New()
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
 	}
-	if tenant.CreatedAt.IsZero() {
-		tenant.CreatedAt = now
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
 	}
-	if tenant.UpdatedAt.IsZero() {
-		tenant.UpdatedAt = now
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = now
 	}
-
 	_, err := atr.db.Exec(query,
-		tenant.ID,
-		tenant.WorkspaceID,
-		tenant.TenantDB,
-		tenant.Email,
-		tenant.Username,
-		tenant.PasswordHash,
-		tenant.Provider,
-		tenant.ProviderID,
-		tenant.Avatar,
-		tenant.Name,
-		tenant.Source,
-		tenant.Status,
-		tenant.LastLogin,
-		tenant.CreatedAt,
-		tenant.UpdatedAt,
-		tenant.TenantDomain,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
 	)
-
 	if err != nil {
-		return fmt.Errorf("failed to create tenant: %w", err)
+		return fmt.Errorf("failed to create workspace: %w", err)
 	}
-
 	return nil
 }
 
-// UpdateTenant updates an existing tenant
-func (atr *AdminTenantRepository) UpdateTenant(tenantID string, updates map[string]interface{}) error {
+// UpdateTenant updates fields on the workspace identity row keyed by id.
+func (atr *AdminTenantRepository) UpdateTenant(workspaceID string, updates map[string]interface{}) error {
 	if len(updates) == 0 {
 		return fmt.Errorf("no updates provided")
 	}
 
-	query := "UPDATE tenants SET "
+	query := "UPDATE workspaces SET "
 	args := []interface{}{}
 	argCount := 1
 
@@ -213,235 +125,134 @@ func (atr *AdminTenantRepository) UpdateTenant(tenantID string, updates map[stri
 	args = append(args, time.Now())
 	argCount++
 
-	query += " WHERE tenant_id = $" + fmt.Sprintf("%d", argCount)
-	args = append(args, tenantID)
+	query += " WHERE id = $" + fmt.Sprintf("%d", argCount)
+	args = append(args, workspaceID)
 
 	_, err := atr.db.Exec(query, args...)
 	if err != nil {
-		return fmt.Errorf("failed to update tenant: %w", err)
+		return fmt.Errorf("failed to update workspace: %w", err)
 	}
-
 	return nil
 }
 
-// GetTenantUsers retrieves all users for a specific tenant
-func (atr *AdminTenantRepository) GetTenantUsers(tenantID string) ([]models.User, error) {
-	// This would typically query the tenant's database, but for admin view
-	// we might want to show summary info from global DB
-	// For now, return empty slice as this would need tenant DB access
+// GetTenantUsers retrieves all users for a specific workspace.
+// Returns empty slice; admin user listing has dedicated repositories now.
+func (atr *AdminTenantRepository) GetTenantUsers(workspaceID string) ([]models.User, error) {
 	return []models.User{}, nil
 }
 
-// GetTenantByDomain retrieves a tenant by its domain
-// Supports custom domains via tenant_domains table lookup
-func (atr *AdminTenantRepository) GetTenantByDomain(tenantDomain string) (*models.Tenant, error) {
-	log.Printf("DEBUG GetTenantByDomain: Looking up domain='%s'", tenantDomain)
+// GetTenantByDomain retrieves a workspace by its domain. Supports
+// custom domains via the tenant_domains join.
+func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*models.Tenant, error) {
+	log.Printf("DEBUG GetTenantByDomain: Looking up domain='%s'", workspaceDomain)
 
-	// First try to find tenant via tenant_domains table (supports custom domains)
+	// First try via tenant_domains (custom-domain mapping).
 	query := `
-		SELECT t.id, t.tenant_id, t.tenant_db, t.email, t.username, t.password_hash,
-			t.provider, t.provider_id, t.avatar, t.name, t.source, t.status, t.last_login,
-			t.created_at, t.updated_at, t.tenant_domain
-		FROM tenants t
-		INNER JOIN tenant_domains td ON t.tenant_id = td.tenant_id
+		SELECT ` + workspaceSelectCols + `
+		FROM workspaces w
+		INNER JOIN tenant_domains td ON w.id = td.workspace_id
 		WHERE LOWER(td.domain) = LOWER($1) AND td.is_verified = true
 		LIMIT 1
 	`
-
-	var tenant models.Tenant
-	err := atr.db.QueryRow(query, tenantDomain).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&tenant.Username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&tenant.ProviderID,
-		&tenant.Avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&tenant.LastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
-	// If found via tenant_domains, return it
+	var t models.Tenant
+	err := scanWorkspaceRow(atr.db.QueryRow(query, workspaceDomain), &t)
 	if err == nil {
-		log.Printf("DEBUG GetTenantByDomain: Found tenant via tenant_domains table: tenant_id=%s, tenant_domain=%s", tenant.WorkspaceID, tenant.TenantDomain)
-		return &tenant, nil
+		log.Printf("DEBUG GetTenantByDomain: Found via tenant_domains: workspace_id=%s, workspace_domain=%s", t.WorkspaceID, t.TenantDomain)
+		return &t, nil
 	}
+	log.Printf("DEBUG GetTenantByDomain: Not found in tenant_domains (error: %v), trying fallback", err)
 
-	log.Printf("DEBUG GetTenantByDomain: Not found in tenant_domains (error: %v), trying fallback lookup", err)
-
-	// Fallback: try direct lookup in tenants.tenant_domain (legacy/backwards compatibility)
-	fallbackQuery := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		WHERE tenant_domain LIKE $1 OR tenant_domain = $2
-	`
-
-	// Support both full domain and subdomain prefix
-	err = atr.db.QueryRow(fallbackQuery, tenantDomain+"%", tenantDomain).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&tenant.Username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&tenant.ProviderID,
-		&tenant.Avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&tenant.LastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
+	// Fallback: direct lookup on workspaces.workspace_domain
+	fallbackQuery := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE workspace_domain LIKE $1 OR workspace_domain = $2`
+	err = scanWorkspaceRow(atr.db.QueryRow(fallbackQuery, workspaceDomain+"%", workspaceDomain), &t)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found")
+			return nil, fmt.Errorf("workspace not found")
 		}
-		return nil, fmt.Errorf("failed to get tenant by domain: %w", err)
+		return nil, fmt.Errorf("failed to get workspace by domain: %w", err)
 	}
-
-	return &tenant, nil
+	return &t, nil
 }
 
-// GetTenantByUUID retrieves a tenant by UUID
-func (atr *AdminTenantRepository) GetTenantByUUID(tenantID uuid.UUID) (*models.Tenant, error) {
-	return atr.GetTenantByID(tenantID.String())
+// GetTenantByUUID retrieves a workspace by UUID.
+func (atr *AdminTenantRepository) GetTenantByUUID(workspaceID uuid.UUID) (*models.Tenant, error) {
+	return atr.GetTenantByID(workspaceID.String())
 }
 
-// CreateTenantTx creates a new tenant within a transaction
-func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, tenant *models.Tenant) error {
+// CreateTenantTx inserts a workspace identity row within a transaction.
+func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
 	query := `
-		INSERT INTO tenants (id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
-
 	now := time.Now()
-	if tenant.ID == uuid.Nil {
-		tenant.ID = uuid.New()
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
 	}
-	if tenant.CreatedAt.IsZero() {
-		tenant.CreatedAt = now
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
 	}
-	if tenant.UpdatedAt.IsZero() {
-		tenant.UpdatedAt = now
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = now
 	}
-
 	_, err := tx.Exec(query,
-		tenant.ID,
-		tenant.WorkspaceID,
-		tenant.TenantDB,
-		tenant.Email,
-		tenant.Username,
-		tenant.PasswordHash,
-		tenant.Provider,
-		tenant.ProviderID,
-		tenant.Avatar,
-		tenant.Name,
-		tenant.Source,
-		tenant.Status,
-		tenant.LastLogin,
-		tenant.CreatedAt,
-		tenant.UpdatedAt,
-		tenant.TenantDomain,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
 	)
-
 	if err != nil {
-		return fmt.Errorf("failed to create tenant: %w", err)
+		return fmt.Errorf("failed to create workspace: %w", err)
 	}
-
 	return nil
 }
 
-// CreateProjectTx creates a new project within a transaction
-func (atr *AdminTenantRepository) CreateProjectTx(tx *sql.Tx, projectID, tenantID, userID uuid.UUID, name string) error {
+// CreateProjectTx creates a new project within a transaction.
+func (atr *AdminTenantRepository) CreateProjectTx(tx *sql.Tx, projectID, workspaceID, userID uuid.UUID, name string) error {
 	query := `
-		INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
+		INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-
 	now := time.Now()
 	_, err := tx.Exec(query,
-		projectID,
-		tenantID,
-		name,
-		"Default project",
-		userID,
-		true,
-		now,
-		now,
+		projectID, workspaceID, name, "Default project", userID, true, now, now,
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create project: %w", err)
 	}
-
 	return nil
 }
 
-// CreateAdminUserTx creates a new admin user within a transaction
+// CreateAdminUserTx creates a new admin user within a transaction.
 func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.AdminUser) error {
 	query := `
-		INSERT INTO users (id, email, username, password_hash, name, tenant_id, project_id,
+		INSERT INTO users (id, email, username, password_hash, name, workspace_id, project_id,
 			client_id, tenant_domain, provider, provider_id, avatar_url, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
-
 	now := time.Now()
 	if user.ID == uuid.Nil {
 		user.ID = uuid.New()
 	}
-
 	_, err := tx.Exec(query,
-		user.ID,
-		user.Email,
-		user.Username,
-		user.PasswordHash,
-		user.Name,
-		user.WorkspaceID,
-		user.ProjectID,
-		user.ClientID,
-		user.TenantDomain,
-		user.Provider,
-		user.ProviderID,
-		user.AvatarURL,
-		user.Active,
-		now,
-		now,
+		user.ID, user.Email, user.Username, user.PasswordHash, user.Name,
+		user.WorkspaceID, user.ProjectID, user.ClientID, user.TenantDomain,
+		user.Provider, user.ProviderID, user.AvatarURL, user.Active, now, now,
 	)
-
 	if err != nil {
 		return fmt.Errorf("failed to create admin user: %w", err)
 	}
-
 	return nil
 }
 
-// GetAdminUserByID retrieves an admin user by ID
+// GetAdminUserByID retrieves an admin user by ID.
 func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.AdminUser, error) {
 	query := `
-		SELECT id, email, username, password_hash, name, tenant_id, project_id,
+		SELECT id, email, username, password_hash, name, workspace_id, project_id,
 			client_id, tenant_domain, provider, provider_id, avatar_url, active,
 			created_at, updated_at
 		FROM users
 		WHERE id = $1
 	`
-
 	var user models.AdminUser
-	var tenantID, projectID, clientID sql.NullString
+	var workspaceID, projectID, clientID sql.NullString
 	var providerID, avatarURL sql.NullString
 
 	err := atr.db.QueryRow(query, userID).Scan(
@@ -450,7 +261,7 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 		&user.Username,
 		&user.PasswordHash,
 		&user.Name,
-		&tenantID,
+		&workspaceID,
 		&projectID,
 		&clientID,
 		&user.TenantDomain,
@@ -461,7 +272,6 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 		&user.CreatedAt,
 		&user.UpdatedAt,
 	)
-
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("admin user not found")
@@ -469,8 +279,8 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 		return nil, fmt.Errorf("failed to get admin user: %w", err)
 	}
 
-	if tenantID.Valid {
-		id, _ := uuid.Parse(tenantID.String)
+	if workspaceID.Valid {
+		id, _ := uuid.Parse(workspaceID.String)
 		user.WorkspaceID = &id
 	}
 	if projectID.Valid {
@@ -487,6 +297,5 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 	if avatarURL.Valid {
 		user.AvatarURL = avatarURL.String
 	}
-
 	return &user, nil
 }

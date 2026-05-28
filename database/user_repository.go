@@ -32,7 +32,7 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 	}
 
 	query := `
-		INSERT INTO users (id, client_id, tenant_id, project_id, name, username, email,
+		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
@@ -88,7 +88,7 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 // GetUserByEmail retrieves a user by email (case-insensitive)
 func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
@@ -163,7 +163,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 // GetUserByEmailAndClient retrieves a user by email scoped to a client
 func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
@@ -236,13 +236,13 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 // GetUserByEmailAndTenant retrieves a user by email scoped to a tenant
 func (ur *UserRepository) GetUserByEmailAndTenant(email string, tenantID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND tenant_id = $2
+		WHERE LOWER(email) = LOWER($1) AND workspace_id = $2
 	`
 
 	user := &models.ExtendedUser{}
@@ -309,7 +309,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, tenantID uuid.UU
 // GetUserByID retrieves a user by ID
 func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
@@ -384,7 +384,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 // GetUserByProvider retrieves a user by OAuth provider and provider ID
 func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
@@ -536,13 +536,13 @@ func (ur *UserRepository) UpdateUserPassword(userID uuid.UUID, passwordHash stri
 // GetUsersByTenantID retrieves users by tenant ID with pagination
 func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
 	query := `
-		SELECT id, client_id, tenant_id, project_id, name, username, email,
+		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3
 	`
@@ -621,7 +621,7 @@ func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset i
 
 // CountUsersByTenantID counts users for a tenant
 func (ur *UserRepository) CountUsersByTenantID(tenantID uuid.UUID) (int, error) {
-	query := `SELECT COUNT(*) FROM users WHERE tenant_id = $1`
+	query := `SELECT COUNT(*) FROM users WHERE workspace_id = $1`
 
 	var count int
 	err := ur.db.QueryRow(query, tenantID).Scan(&count)
@@ -669,7 +669,7 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 	}
 
 	query := `
-		INSERT INTO users (id, client_id, tenant_id, project_id, name, username, email,
+		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,

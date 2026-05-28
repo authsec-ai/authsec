@@ -234,7 +234,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_code": req.UserCode,
 			"user_id":   userID.String(),
-			"tenant_id": tenantID.String(),
+			"workspace_id": tenantID.String(),
 			"approved":  req.Approved,
 		},
 	})
@@ -426,7 +426,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_code":  req.UserCode,
 			"user_email": user.Email,
-			"tenant_id":  tenantID.String(),
+			"workspace_id":  tenantID.String(),
 			"method":     "oidc",
 		},
 	})

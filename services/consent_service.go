@@ -42,7 +42,7 @@ func (s *ConsentService) CheckExistingConsent(
 ) (*models.OAuthConsentGrant, bool, error) {
 	var grant models.OAuthConsentGrant
 	err := s.db.Where(
-		"tenant_id = ? AND user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
+		"workspace_id = ? AND user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
 		tenantID, userID, clientID, resourceServerID, time.Now(),
 	).First(&grant).Error
 
@@ -124,10 +124,10 @@ func (s *ConsentService) UpsertConsent(
 		ExpiresAt:        time.Now().Add(ttl),
 	}
 
-	// Upsert: on conflict (tenant_id, user_id, client_id, resource_server_id) → update
+	// Upsert: on conflict (workspace_id, user_id, client_id, resource_server_id) → update
 	result := s.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
-			{Name: "tenant_id"},
+			{Name: "workspace_id"},
 			{Name: "user_id"},
 			{Name: "client_id"},
 			{Name: "resource_server_id"},
@@ -175,7 +175,7 @@ func (s *ConsentService) RevokeConsentByUser(grantID, userID uuid.UUID) error {
 func (s *ConsentService) RevokeConsentByTenant(grantID, tenantID uuid.UUID) error {
 	now := time.Now()
 	result := s.db.Model(&models.OAuthConsentGrant{}).
-		Where("id = ? AND tenant_id = ? AND revoked_at IS NULL", grantID, tenantID).
+		Where("id = ? AND workspace_id = ? AND revoked_at IS NULL", grantID, tenantID).
 		Update("revoked_at", now)
 	if result.Error != nil {
 		return result.Error
@@ -190,7 +190,7 @@ func (s *ConsentService) RevokeConsentByTenant(grantID, tenantID uuid.UUID) erro
 func (s *ConsentService) ListByUser(tenantID, userID uuid.UUID) ([]models.OAuthConsentGrant, error) {
 	var grants []models.OAuthConsentGrant
 	err := s.db.Where(
-		"tenant_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?",
+		"workspace_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?",
 		tenantID, userID, time.Now(),
 	).Order("created_at DESC").Find(&grants).Error
 	return grants, err
@@ -198,7 +198,7 @@ func (s *ConsentService) ListByUser(tenantID, userID uuid.UUID) ([]models.OAuthC
 
 // ListByTenant returns all consent grants for a tenant (admin view), with optional filters.
 func (s *ConsentService) ListByTenant(tenantID uuid.UUID, userID, clientID, rsID *uuid.UUID) ([]models.OAuthConsentGrant, error) {
-	query := s.db.Where("tenant_id = ?", tenantID)
+	query := s.db.Where("workspace_id = ?", tenantID)
 	if userID != nil {
 		query = query.Where("user_id = ?", *userID)
 	}

@@ -13,7 +13,6 @@ import (
 // It is an OAuth 2.1 Resource Server, NOT an OAuth client.
 type ResourceServer struct {
 	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID                uuid.UUID      `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;not null;index"`
 	WorkspaceID             uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ApplicationType         string         `json:"application_type" gorm:"type:text;not null;default:'mcp_server'"`
 	LegacyClientID          *uuid.UUID     `json:"legacy_client_id,omitempty" gorm:"type:uuid;index"`
@@ -61,16 +60,6 @@ type ResourceServer struct {
 
 func (ResourceServer) TableName() string {
 	return "resource_servers"
-}
-
-func (rs *ResourceServer) BeforeCreate(tx *gorm.DB) error {
-	if rs.TenantID == uuid.Nil {
-		rs.TenantID = rs.WorkspaceID
-	}
-	if rs.WorkspaceID == uuid.Nil {
-		rs.WorkspaceID = rs.TenantID
-	}
-	return nil
 }
 
 // RS state constants.

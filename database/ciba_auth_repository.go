@@ -31,14 +31,14 @@ func (r *CIBAAuthRepository) CreateDeviceToken(token *models.DeviceToken) error 
 
 	query := `
 		INSERT INTO device_tokens (
-			id, user_id, tenant_id, device_token, platform,
+			id, user_id, workspace_id, device_token, platform,
 			device_name, device_model, app_version, os_version,
 			is_active, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (device_token)
 		DO UPDATE SET
 			user_id = EXCLUDED.user_id,
-			tenant_id = EXCLUDED.tenant_id,
+			workspace_id = EXCLUDED.tenant_id,
 			device_name = EXCLUDED.device_name,
 			device_model = EXCLUDED.device_model,
 			app_version = EXCLUDED.app_version,
@@ -72,11 +72,11 @@ func (r *CIBAAuthRepository) CreateDeviceToken(token *models.DeviceToken) error 
 // GetDeviceTokensByUserID retrieves all active device tokens for a user
 func (r *CIBAAuthRepository) GetDeviceTokensByUserID(userID uuid.UUID, tenantID uuid.UUID) ([]models.DeviceToken, error) {
 	query := `
-		SELECT id, user_id, tenant_id, device_token, platform,
+		SELECT id, user_id, workspace_id, device_token, platform,
 		       device_name, device_model, app_version, os_version,
 		       is_active, last_used, created_at, updated_at
 		FROM device_tokens
-		WHERE user_id = $1 AND tenant_id = $2 AND is_active = TRUE
+		WHERE user_id = $1 AND workspace_id = $2 AND is_active = TRUE
 		ORDER BY created_at DESC
 	`
 
@@ -132,7 +132,7 @@ func (r *CIBAAuthRepository) CreateCIBAAuthRequest(req *models.CIBAAuthRequest) 
 
 	query := `
 		INSERT INTO ciba_auth_requests (
-			id, auth_req_id, user_id, tenant_id, user_email,
+			id, auth_req_id, user_id, workspace_id, user_email,
 			client_id, device_token_id, binding_message, scopes,
 			status, biometric_verified, expires_at, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -164,7 +164,7 @@ func (r *CIBAAuthRepository) CreateCIBAAuthRequest(req *models.CIBAAuthRequest) 
 // GetCIBAAuthRequestByID retrieves a CIBA request by auth_req_id
 func (r *CIBAAuthRepository) GetCIBAAuthRequestByID(authReqID string) (*models.CIBAAuthRequest, error) {
 	query := `
-		SELECT id, auth_req_id, user_id, tenant_id, user_email,
+		SELECT id, auth_req_id, user_id, workspace_id, user_email,
 		       client_id, device_token_id, binding_message, scopes,
 		       status, biometric_verified, expires_at, created_at,
 		       responded_at, last_polled_at
@@ -278,7 +278,7 @@ func (r *CIBAAuthRepository) DeactivateDeviceToken(tokenID, userID, tenantID uui
 	query := `
 		UPDATE device_tokens
 		SET is_active = FALSE, updated_at = $1
-		WHERE id = $2 AND user_id = $3 AND tenant_id = $4
+		WHERE id = $2 AND user_id = $3 AND workspace_id = $4
 	`
 
 	result, err := r.db.Exec(query, now, tokenID, userID, tenantID)
@@ -297,7 +297,7 @@ func (r *CIBAAuthRepository) DeactivateDeviceToken(tokenID, userID, tenantID uui
 // GetDeviceTokenByID retrieves a device token by ID
 func (r *CIBAAuthRepository) GetDeviceTokenByID(tokenID uuid.UUID) (*models.DeviceToken, error) {
 	query := `
-		SELECT id, user_id, tenant_id, device_token, platform,
+		SELECT id, user_id, workspace_id, device_token, platform,
 		       device_name, device_model, app_version, os_version,
 		       is_active, last_used, created_at, updated_at
 		FROM device_tokens

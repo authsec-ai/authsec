@@ -103,7 +103,7 @@ func (cl *ClientLibrary) CreateClient(req *ClientCreateRequest) (*sharedmodels.C
 // GetClient retrieves a client by ID with tenant validation
 func (cl *ClientLibrary) GetClient(id uuid.UUID, tenantID uuid.UUID) (*sharedmodels.Client, error) {
 	var client sharedmodels.Client
-	err := cl.db.Where("id = ? AND tenant_id = ?", id, tenantID).First(&client).Error
+	err := cl.db.Where("id = ? AND workspace_id = ?", id, tenantID).First(&client).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("client not found")
@@ -155,7 +155,7 @@ func (cl *ClientLibrary) UpdateClient(id uuid.UUID, tenantID uuid.UUID, req *Cli
 		return client, nil
 	}
 
-	if err := cl.db.Model(&sharedmodels.Client{}).Where("id = ? AND tenant_id = ?", id, tenantID).Updates(updates).Error; err != nil {
+	if err := cl.db.Model(&sharedmodels.Client{}).Where("id = ? AND workspace_id = ?", id, tenantID).Updates(updates).Error; err != nil {
 		return nil, fmt.Errorf("failed to update client: %w", err)
 	}
 
@@ -171,12 +171,12 @@ func (cl *ClientLibrary) DeleteClient(id uuid.UUID, tenantID uuid.UUID) error {
 
 	// Mark status/active first, then let GORM set deleted_at
 	if err := cl.db.Model(&sharedmodels.Client{}).
-		Where("id = ? AND tenant_id = ?", id, tenantID).
+		Where("id = ? AND workspace_id = ?", id, tenantID).
 		Updates(map[string]interface{}{"status": sharedmodels.StatusDeleted, "active": false}).Error; err != nil {
 		return fmt.Errorf("failed to delete client: %w", err)
 	}
 
-	if err := cl.db.Where("id = ? AND tenant_id = ?", id, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
+	if err := cl.db.Where("id = ? AND workspace_id = ?", id, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
 		return fmt.Errorf("failed to soft-delete client: %w", err)
 	}
 
@@ -190,7 +190,7 @@ func (cl *ClientLibrary) ListClients(filters *ClientListFilters) ([]sharedmodels
 		base = base.Unscoped()
 	}
 
-	query := base.Where("tenant_id = ?", filters.WorkspaceID)
+	query := base.Where("workspace_id = ?", filters.WorkspaceID)
 
 	if filters.IncludeDeleted == nil || !*filters.IncludeDeleted {
 		query = query.Where("status != ?", sharedmodels.StatusDeleted)
@@ -252,7 +252,7 @@ func (cl *ClientLibrary) DeactivateClient(id uuid.UUID, tenantID uuid.UUID) (*sh
 // GetClientByClientID retrieves a client by ClientID with tenant validation
 func (cl *ClientLibrary) GetClientByClientID(clientID uuid.UUID, tenantID uuid.UUID) (*sharedmodels.Client, error) {
 	var client sharedmodels.Client
-	err := cl.db.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).First(&client).Error
+	err := cl.db.Where("client_id = ? AND workspace_id = ?", clientID, tenantID).First(&client).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("client not found")
@@ -308,7 +308,7 @@ func (cl *ClientLibrary) UpdateClientByClientID(clientID uuid.UUID, tenantID uui
 		return client, nil
 	}
 
-	if err := cl.db.Model(&sharedmodels.Client{}).Where("client_id = ? AND tenant_id = ?", clientID, tenantID).Updates(updates).Error; err != nil {
+	if err := cl.db.Model(&sharedmodels.Client{}).Where("client_id = ? AND workspace_id = ?", clientID, tenantID).Updates(updates).Error; err != nil {
 		return nil, fmt.Errorf("failed to update client: %w", err)
 	}
 
@@ -327,12 +327,12 @@ func (cl *ClientLibrary) DeleteClientByClientID(clientID uuid.UUID, tenantID uui
 	}
 
 	if err := cl.db.Model(&sharedmodels.Client{}).
-		Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+		Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
 		Updates(map[string]interface{}{"status": sharedmodels.StatusDeleted, "active": false}).Error; err != nil {
 		return fmt.Errorf("failed to delete client: %w", err)
 	}
 
-	if err := cl.db.Where("client_id = ? AND tenant_id = ?", clientID, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
+	if err := cl.db.Where("client_id = ? AND workspace_id = ?", clientID, tenantID).Delete(&sharedmodels.Client{}).Error; err != nil {
 		return fmt.Errorf("failed to soft-delete client: %w", err)
 	}
 

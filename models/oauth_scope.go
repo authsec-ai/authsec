@@ -13,7 +13,6 @@ import (
 // and maps to internal RBAC permissions via oauth_scope_permissions.
 type OAuthScope struct {
 	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID         uuid.UUID  `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;not null;uniqueIndex:idx_oauth_scopes_tenant_unique"`
 	WorkspaceID      uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_oauth_scopes_unique"`
 	ResourceServerID *uuid.UUID `json:"resource_server_id" gorm:"type:uuid;uniqueIndex:idx_oauth_scopes_unique"`
 	ScopeString      string     `json:"scope_string" gorm:"type:text;not null;uniqueIndex:idx_oauth_scopes_unique"`
@@ -40,12 +39,6 @@ func (OAuthScope) TableName() string {
 }
 
 func (s *OAuthScope) BeforeCreate(tx *gorm.DB) error {
-	if s.TenantID == uuid.Nil {
-		s.TenantID = s.WorkspaceID
-	}
-	if s.WorkspaceID == uuid.Nil {
-		s.WorkspaceID = s.TenantID
-	}
 	return nil
 }
 

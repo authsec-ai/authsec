@@ -60,7 +60,7 @@ func (euac *EndUserAuthController) tenantMapping(clientID uuid.UUID) (uuid.UUID,
 	}
 
 	var tenantID uuid.UUID
-	query := `SELECT tenant_id FROM tenant_mappings WHERE client_id = $1`
+	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
 	err := db.QueryRow(query, clientID).Scan(&tenantID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -123,7 +123,7 @@ func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 	}
 
 	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND tenant_id = ?", clientUUID, tenantUUID).First(&client).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, tenantUUID).First(&client).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find client: %v", err)})
 		return
 	}
@@ -154,7 +154,7 @@ func (euac *EndUserAuthController) InitiateRegistration(c *gin.Context) {
 		After: map[string]interface{}{
 			"email":     newUser.Email,
 			"client_id": clientUUID.String(),
-			"tenant_id": tenantUUID.String(),
+			"workspace_id": tenantUUID.String(),
 			"provider":  newUser.Provider,
 		},
 	})
@@ -260,7 +260,7 @@ func (euac *EndUserAuthController) EndUserLoginPrecheck(c *gin.Context) {
 		"mfa_enabled":   user.MFAEnabled,
 		"mfa_method":    user.MFAMethod,
 		"tenant_domain": user.TenantDomain,
-		"tenant_id":     tenantID.String(),
+		"workspace_id":     tenantID.String(),
 	})
 }
 
@@ -459,7 +459,7 @@ func (euac *EndUserAuthController) Login(c *gin.Context) {
 		After: map[string]interface{}{
 			"email":       user.Email,
 			"client_id":   clientUUID.String(),
-			"tenant_id":   tenantUUID.String(),
+			"workspace_id":   tenantUUID.String(),
 			"first_login": isFirstLogin,
 			"provider":    user.Provider,
 		},
@@ -532,7 +532,7 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 		After: map[string]interface{}{
 			"email":       user.Email,
 			"client_id":   clientUUID.String(),
-			"tenant_id":   tenantUUID.String(),
+			"workspace_id":   tenantUUID.String(),
 			"first_login": isFirstLogin,
 			"provider":    user.Provider,
 		},
@@ -617,7 +617,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		"token_type":   "Bearer",
 		"expires_in":   365 * 24 * 60 * 60,
 		"first_login":  isFirstLogin,
-		"tenant_id":    tenantIDStr,
+		"workspace_id":    tenantIDStr,
 		"email":        user.Email,
 	}
 
@@ -625,7 +625,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	middlewares.Audit(c, "enduser", user.ID.String(), "webauthn_login", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"email":       user.Email,
-			"tenant_id":   tenantIDStr,
+			"workspace_id":   tenantIDStr,
 			"first_login": isFirstLogin,
 			"mfa_method":  "webauthn",
 		},
@@ -678,7 +678,7 @@ func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 
 	// Single-DB collapse: scope user lookup by tenant_id explicitly.
 	var user models.User
-	if err := tenantDB.Where("tenant_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, input.Email).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, input.Email).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 			return
@@ -712,7 +712,7 @@ func (euac *EndUserAuthController) VerifyLoginOTP(c *gin.Context) {
 	middlewares.Audit(c, "enduser", user.ID.String(), "otp_verify", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"email":     user.Email,
-			"tenant_id": tenantIDStr,
+			"workspace_id": tenantIDStr,
 		},
 	})
 
@@ -906,7 +906,7 @@ func (euac *EndUserAuthController) WebAuthnRegister(c *gin.Context) {
 	middlewares.Audit(c, "enduser", user.ID.String(), "webauthn_register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"email":       user.Email,
-			"tenant_id":   tenantIDStr,
+			"workspace_id":   tenantIDStr,
 			"mfa_enabled": true,
 			"mfa_methods": []string{"webauthn"},
 		},
@@ -917,7 +917,7 @@ func (euac *EndUserAuthController) WebAuthnRegister(c *gin.Context) {
 		"token_type":   "Bearer",
 		"expires_in":   365 * 24 * 60 * 60,
 		"first_login":  isFirstLogin,
-		"tenant_id":    tenantIDStr,
+		"workspace_id":    tenantIDStr,
 		"email":        user.Email,
 		"mfa_enabled":  true,
 		"mfa_methods":  []string{"webauthn"},
@@ -949,7 +949,7 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("tenant_id = ? AND LOWER(email) = LOWER(?) AND client_id = ?", tenantUUID, input.Email, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND client_id = ?", tenantUUID, input.Email, clientUUID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
@@ -1009,7 +1009,7 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 		log.Printf("DEBUG EndUser: No MFA methods found in mfa_methods table for user %s, checking legacy tables", input.Email)
 
 		// First, check for TOTP secrets (TOTP has priority because it's domain-independent)
-		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2 AND is_verified = true`
+		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND workspace_id = $2 AND is_verified = true`
 		var totpCount int
 		if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
 			log.Printf("DEBUG EndUser: Found %d TOTP secrets for user %s", totpCount, input.Email)
@@ -1061,7 +1061,7 @@ func (euac *EndUserAuthController) WebAuthnMFALoginStatus(c *gin.Context) {
 	// Build response
 	response := gin.H{
 		"email":        input.Email,
-		"tenant_id":    tenantUUID.String(),
+		"workspace_id":    tenantUUID.String(),
 		"client_id":    clientUUID.String(),
 		"first_login":  isFirstLogin,
 		"mfa_required": len(mfaMethods) > 0,

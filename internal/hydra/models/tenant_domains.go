@@ -28,7 +28,7 @@ func (TenantDomain) TableName() string { return "tenant_domains" }
 // GetVerifiedDomainsForTenant returns a list of verified domain hosts for a tenant
 func GetVerifiedDomainsForTenant(db *gorm.DB, tenantID string) ([]string, error) {
 	var domains []TenantDomain
-	if err := db.Where("tenant_id = ? AND is_verified = ?", tenantID, true).Find(&domains).Error; err != nil {
+	if err := db.Where("workspace_id = ? AND is_verified = ?", tenantID, true).Find(&domains).Error; err != nil {
 		return nil, err
 	}
 	var result []string

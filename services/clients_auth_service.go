@@ -10,7 +10,7 @@ import (
 
 // ClientsTokenClaims holds JWT claims used by the clients service.
 type ClientsTokenClaims struct {
-	WorkspaceID  string   `json:"workspace_id" mapstructure:"tenant_id"`
+	WorkspaceID  string   `json:"workspace_id" mapstructure:"workspace_id"`
 	ProjectID string   `json:"project_id" mapstructure:"project_id"`
 	ClientID  string   `json:"client_id" mapstructure:"client_id"`
 	EmailID   string   `json:"email_id" mapstructure:"email_id"`

@@ -171,7 +171,7 @@ func (h *WebAuthnHandler) GetMFAStatus(c *gin.Context) {
 
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := globalDB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).
 		First(&userWithJSONMFA).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -208,7 +208,7 @@ func (h *WebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := globalDB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).
 		First(&userWithJSONMFA).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -242,7 +242,7 @@ func (h *WebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	tenantID := c.Query("workspace_id")
 
 	if email == "" || tenantID == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "email and tenant_id query parameters are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "email and workspace_id query parameters are required"})
 		return
 	}
 
@@ -254,7 +254,7 @@ func (h *WebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := globalDB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", email, tenantID).
+		Where("email = ? AND workspace_id = ?", email, tenantID).
 		First(&userWithJSONMFA).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -496,7 +496,7 @@ func (h *SMSHandler) ConfirmSMSSetup(c *gin.Context) {
 
 	// Audit log for successful SMS setup
 	middleware.AuditAuthentication(c, client.ID.String(), "sms", "setup", true, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -651,7 +651,7 @@ func (h *SMSHandler) VerifySMS(c *gin.Context) {
 	log.Printf("SMS code verified for: %s", req.Email)
 	// Fetch the client for this user's tenant
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	if err := tenantDB.Scopes(util.WithUsersMFAMethodArray).Where("tenant_id = ?", req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
+	if err := tenantDB.Scopes(util.WithUsersMFAMethodArray).Where("workspace_id = ?", req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to find client and project"})
 		return
 	}
@@ -663,7 +663,7 @@ func (h *SMSHandler) VerifySMS(c *gin.Context) {
 
 	// Audit log for successful SMS verification
 	middleware.AuditAuthentication(c, client.ID.String(), "sms", "verify", true, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 

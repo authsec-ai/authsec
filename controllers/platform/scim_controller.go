@@ -226,7 +226,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 	baseURL := scimBaseURL(c)
 
 	// Build query — scoped by tenant_id AND client_id
-	query := tenantDB.Model(&models.ExtendedUser{}).Where("tenant_id = ? AND client_id = ?", tenantID, clientUUID)
+	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ? AND client_id = ?", tenantID, clientUUID)
 
 	// When no filter: return only SCIM-provisioned users
 	// When filter is provided (e.g., Okta searching by userName): search ALL users for duplicate detection
@@ -274,7 +274,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND tenant_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -435,7 +435,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND tenant_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -514,7 +514,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND tenant_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -581,7 +581,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	result := tenantDB.Where("id = ? AND tenant_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).Delete(&models.ExtendedUser{})
+	result := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).Delete(&models.ExtendedUser{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
@@ -626,7 +626,7 @@ func (sc *SCIMController) ListGroups(c *gin.Context) {
 	baseURL := scimBaseURL(c)
 	tenantUUID, _ := uuid.Parse(tenantID)
 
-	query := tenantDB.Model(&models.TenantGroup{}).Where("tenant_id = ?", tenantUUID)
+	query := tenantDB.Model(&models.TenantGroup{}).Where("workspace_id = ?", tenantUUID)
 	query = applyGroupFilter(query, filter)
 
 	var totalResults int64
@@ -663,7 +663,7 @@ func (sc *SCIMController) GetGroup(c *gin.Context) {
 	tenantUUID, _ := uuid.Parse(tenantID)
 
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "Group not found", ""))
 			return
@@ -700,7 +700,7 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 
 	// Check for existing group with same name
 	var existing models.TenantGroup
-	if err := tenantDB.Where("name = ? AND tenant_id = ?", input.DisplayName, tenantUUID).First(&existing).Error; err == nil {
+	if err := tenantDB.Where("name = ? AND workspace_id = ?", input.DisplayName, tenantUUID).First(&existing).Error; err == nil {
 		c.JSON(http.StatusConflict, models.NewSCIMError("409", "Group with this name already exists", "uniqueness"))
 		return
 	}
@@ -726,7 +726,7 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 			continue
 		}
 		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
 			memberUUID, newGroup.ID, tenantUUID,
 		)
 	}
@@ -764,7 +764,7 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	tenantUUID, _ := uuid.Parse(tenantID)
 
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "Group not found", ""))
 			return
@@ -786,14 +786,14 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	})
 
 	// Replace members: remove all, then add new
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND tenant_id = $2", groupUUID, tenantUUID)
+	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupUUID, tenantUUID)
 	for _, member := range input.Members {
 		memberUUID, err := uuid.Parse(member.Value)
 		if err != nil {
 			continue
 		}
 		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
 			memberUUID, groupUUID, tenantUUID,
 		)
 	}
@@ -830,7 +830,7 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 	tenantUUID, _ := uuid.Parse(tenantID)
 
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "Group not found", ""))
 			return
@@ -868,7 +868,7 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 				// Handle format: members[value eq "user-id"]
 				memberID := extractFilterValue(op.Path)
 				if memberUUID, err := uuid.Parse(memberID); err == nil {
-					tenantDB.Exec("DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND tenant_id = $3",
+					tenantDB.Exec("DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
 						memberUUID, groupUUID, tenantUUID)
 				}
 			}
@@ -909,9 +909,9 @@ func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 	tenantUUID, _ := uuid.Parse(tenantID)
 
 	// Remove member associations first
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND tenant_id = $2", groupUUID, tenantUUID)
+	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupUUID, tenantUUID)
 
-	result := tenantDB.Where("id = ? AND tenant_id = ?", groupUUID, tenantUUID).Delete(&models.TenantGroup{})
+	result := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).Delete(&models.TenantGroup{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete group", ""))
 		return
@@ -1063,7 +1063,7 @@ func applyUserPatchReplace(op models.SCIMPatchOp, updates map[string]interface{}
 // getGroupMembers retrieves member references for a group
 func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID) []models.SCIMMemberRef {
 	var userGroups []models.UserGroup
-	tenantDB.Where("group_id = ? AND tenant_id = ?", groupID, tenantID).Find(&userGroups)
+	tenantDB.Where("group_id = ? AND workspace_id = ?", groupID, tenantID).Find(&userGroups)
 
 	members := make([]models.SCIMMemberRef, 0, len(userGroups))
 	for _, ug := range userGroups {
@@ -1084,7 +1084,7 @@ func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, tenantID u
 
 // replaceGroupMembers replaces all members of a group
 func (sc *SCIMController) replaceGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID, value interface{}) {
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND tenant_id = $2", groupID, tenantID)
+	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupID, tenantID)
 	sc.addGroupMembers(tenantDB, groupID, tenantID, value)
 }
 
@@ -1097,7 +1097,7 @@ func (sc *SCIMController) addGroupMembers(tenantDB *gorm.DB, groupID, tenantID u
 			continue
 		}
 		tenantDB.Exec(
-			"INSERT INTO user_groups (user_id, group_id, tenant_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
 			memberUUID, groupID, tenantID,
 		)
 	}
@@ -1112,7 +1112,7 @@ func (sc *SCIMController) removeGroupMembers(tenantDB *gorm.DB, groupID, tenantI
 			continue
 		}
 		tenantDB.Exec(
-			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND tenant_id = $3",
+			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
 			memberUUID, groupID, tenantID,
 		)
 	}

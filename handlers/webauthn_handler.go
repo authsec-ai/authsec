@@ -186,7 +186,7 @@ func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, tenant
 
 			// If tenantID is provided, also check tenant ownership
 			if tenantID != "" {
-				whereClause += " AND tenant_id = ?"
+				whereClause += " AND workspace_id = ?"
 				args = append(args, tenantID)
 			}
 
@@ -281,7 +281,7 @@ func (h *WebAuthnHandler) FinishBiometricVerify(c *gin.Context) {
 	}
 	if req.Email == "" || req.WorkspaceID == "" || req.Credential.RawID == "" {
 		log.Printf("[%s] FinishBiometricVerify: missing required fields", reqID)
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "email, tenant_id and credential required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "email, workspace_id and credential required"})
 		return
 	}
 
@@ -296,7 +296,7 @@ func (h *WebAuthnHandler) FinishBiometricVerify(c *gin.Context) {
 	// Step 3: Load user using UserWithJSONMFAMethods to handle JSONB mfa_method field
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
 		log.Printf("[%s] FinishBiometricVerify: user not found email=%s tenant=%s", reqID, req.Email, req.WorkspaceID)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})
 		return
@@ -397,7 +397,7 @@ func (h *WebAuthnHandler) FinishBiometricVerify(c *gin.Context) {
 	// Audit log for successful biometric verification
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "biometric_verify", true, map[string]interface{}{
 		"credential_id": hex.EncodeToString(credential.ID),
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 	})
 
 	// Step 11: Success response
@@ -632,7 +632,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		}
 	} else {
 		if err := db.Scopes(util.WithUsersMFAMethodArray).
-			Where("email = ? AND tenant_id = ?", email, tenantID).First(&userWithJSONMFA).Error; err != nil {
+			Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error; err != nil {
 			log.Printf("[%s] FinishRegistration: user not found in TenantDB: %v", reqID, err)
 			c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 			return
@@ -810,7 +810,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	// Audit log for successful WebAuthn registration
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": hex.EncodeToString(credential.ID),
-		"tenant_id":     tenantID,
+		"workspace_id":     tenantID,
 	})
 
 	// Success
@@ -866,7 +866,7 @@ func (h *WebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	// Step 3: Lookup user using UserWithJSONMFAMethods to handle JSONB mfa_method field
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userWithJSONMFA).Error; err != nil {
 		log.Printf("[%s] BeginAuthentication: user not found email=%s tenant_id=%s err=%v",
 			reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -1002,7 +1002,7 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	// Load user from DB
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		log.Printf("[%s] FinishAuthentication: user lookup failed for email=%s tenant=%s: %v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not found"})
 		return
@@ -1094,7 +1094,7 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	// Audit log for successful WebAuthn authentication
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "authenticate", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 		"email":         user.Email,
 	})
 
@@ -1129,7 +1129,7 @@ func (h *WebAuthnHandler) BeginBiometricSetup(c *gin.Context) {
 	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
 	if req.Email == "" || req.WorkspaceID == "" {
 		log.Printf("[%s] BeginBiometricSetup: missing required fields email=%q tenant_id=%q", reqID, req.Email, req.WorkspaceID)
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request: email and tenant_id are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request: email and workspace_id are required"})
 		return
 	}
 
@@ -1149,7 +1149,7 @@ func (h *WebAuthnHandler) BeginBiometricSetup(c *gin.Context) {
 	} else {
 		// For tenant DB, query with tenant_id
 		dbErr = db.Scopes(util.WithUsersMFAMethodArray).
-			Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error
+			Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error
 		log.Printf("[%s] BeginBiometricSetup: querying TenantDB for email=%s tenant=%s", reqID, req.Email, req.WorkspaceID)
 	}
 
@@ -1261,7 +1261,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request JSON"})
 		return
 	}
-	tenantID, _ := raw["tenant_id"].(string)
+	tenantID, _ := raw["workspace_id"].(string)
 	email, _ := raw["email"].(string)
 	if tenantID == "" || email == "" {
 		log.Printf("[%s] ConfirmBiometricSetup: missing tenant_id or email", reqID)
@@ -1277,7 +1277,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 		WorkspaceID: strings.TrimSpace(tenantID),
 	}
 	if req.Email == "" || req.WorkspaceID == "" {
-		log.Printf("[%s] ConfirmBiometricSetup: trimmed email or tenant_id empty", reqID)
+		log.Printf("[%s] ConfirmBiometricSetup: trimmed email or workspace_id empty", reqID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and email are required"})
 		return
 	}
@@ -1305,7 +1305,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 	// Load the actual user from database (same as BeginBiometricSetup did)
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		log.Printf("[%s] ConfirmBiometricSetup: user not found email=%s tenant=%s: %v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
@@ -1493,7 +1493,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 	// Audit log for successful biometric setup
 	middleware.AuditAuthentication(c, webauthnUser.ID.String(), "webauthn", "biometric_setup", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 	})
 
 	log.Printf("[%s] ConfirmBiometricSetup: COMPLETED SUCCESSFULLY", reqID)
@@ -1523,7 +1523,7 @@ func (h *WebAuthnHandler) VerifyBiometricFinish(c *gin.Context) {
 
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -1585,7 +1585,7 @@ func (h *WebAuthnHandler) BeginOTPSetup(c *gin.Context) {
 
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -1668,7 +1668,7 @@ func (h *WebAuthnHandler) BeginSMSSetup(c *gin.Context) {
 
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -1748,7 +1748,7 @@ func (h *WebAuthnHandler) GenerateBackupCodes(c *gin.Context) {
 
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -1838,7 +1838,7 @@ func (h *WebAuthnHandler) FinishBiometricLoginVerify(c *gin.Context) {
 	// Lookup user in DB
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		log.Printf("[%s] FinishBiometricLoginVerify: user not found email=%s tenant=%s err=%v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not found"})
 		return
@@ -1911,7 +1911,7 @@ func (h *WebAuthnHandler) BeginBiometricLoginVerify(c *gin.Context) {
 
 	var userRecord appmodels.UserWithJSONMFAMethods
 	if err := db.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
+		Where("email = ? AND workspace_id = ?", req.Email, req.WorkspaceID).First(&userRecord).Error; err != nil {
 		log.Printf("[%s] BeginBiometricLoginVerify: user not found email=%s tenant=%s err=%v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user not found"})
 		return

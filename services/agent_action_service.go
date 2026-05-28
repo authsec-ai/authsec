@@ -592,7 +592,7 @@ func (s *AgentActionService) resolveTenantFromClientID(clientID uuid.UUID) (uuid
 	}
 
 	var tenantID uuid.UUID
-	query := `SELECT tenant_id FROM tenant_mappings WHERE client_id = $1`
+	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
 	err := db.QueryRow(query, clientID).Scan(&tenantID)
 	if err != nil {
 		return uuid.UUID{}, fmt.Errorf("client not found in tenant_mappings: %w", err)

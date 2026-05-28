@@ -72,7 +72,7 @@ func NewGlobalRepository(db *gorm.DB) *GlobalRepository {
 
 func (r *GlobalRepository) GetTenantByID(tenantID string) (*sharedmodels.Tenant, error) {
 	var tenant sharedmodels.Tenant
-	if err := r.DB.Where("tenant_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := r.DB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
 		return nil, err
 	}
 	return &tenant, nil
@@ -83,7 +83,7 @@ func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (st
 	var domain string
 	err := r.DB.Table("tenant_domains").
 		Select("domain").
-		Where("tenant_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
+		Where("workspace_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
 		Order("is_primary DESC, created_at ASC"). // Prefer primary domain, then oldest
 		Limit(1).
 		Pluck("domain", &domain).Error
@@ -102,7 +102,7 @@ func (r *GlobalRepository) GetCustomDomainVerificationTime(tenantID string) (*ti
 	var domain appmodels.TenantDomain
 	err := r.DB.Table("tenant_domains").
 		Select("verified_at").
-		Where("tenant_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
+		Where("workspace_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
 		Order("is_primary DESC, created_at ASC").
 		Limit(1).
 		First(&domain).Error
@@ -254,7 +254,7 @@ func (r *ClientRepository) GetClientByEmailAndTenant(email, tenantID, clientID *
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 
 	query := r.DB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ?", email, tenantID)
+		Where("email = ? AND workspace_id = ?", email, tenantID)
 	if clientID != nil && *clientID != "" {
 		query = query.Where("client_id = ?", *clientID)
 	}
@@ -270,7 +270,7 @@ func (r *ClientRepository) GetClientByEmailAndTenant(email, tenantID, clientID *
 		}
 		// Fallback query without MFA condition
 		err = r.DB.Scopes(util.WithUsersMFAMethodArray).
-			Where("email = ? AND tenant_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+			Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				log.Printf("User not found in fallback query for email: %v", email)
@@ -302,7 +302,7 @@ func valueOrNil(value *string) interface{} {
 func (r *ClientRepository) GetClientByEmailAndTenantForLogin(email, tenantID string) (*sharedmodels.User, error) {
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	err := r.DB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ? AND provider = ?", email, tenantID, "local").First(&userWithJSONMFA).Error
+		Where("email = ? AND workspace_id = ? AND provider = ?", email, tenantID, "local").First(&userWithJSONMFA).Error
 	if err != nil {
 		return nil, err
 	}
@@ -312,12 +312,12 @@ func (r *ClientRepository) GetClientByEmailAndTenantForLogin(email, tenantID str
 	return &user, nil
 }
 
-// GetClientByEmailTenantAndClient retrieves a user by email, tenant_id, and client_id
+// GetClientByEmailTenantAndClient retrieves a user by email, workspace_id, and client_id
 // This method takes values instead of pointers to avoid SQL NULL issues
 func (r *ClientRepository) GetClientByEmailTenantAndClient(email, tenantID, clientID string) (*sharedmodels.User, error) {
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	err := r.DB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ? AND client_id = ?", email, tenantID, clientID).First(&userWithJSONMFA).Error
+		Where("email = ? AND workspace_id = ? AND client_id = ?", email, tenantID, clientID).First(&userWithJSONMFA).Error
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +330,7 @@ func (r *ClientRepository) GetClientByEmailTenantAndClient(email, tenantID, clie
 // GetClientForTOTP fetches client for TOTP operations with proper filters
 func (r *ClientRepository) GetClientForTOTP(email, tenantID, clientID string) (*sharedmodels.User, error) {
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	query := r.DB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND tenant_id = ?", email, tenantID)
+	query := r.DB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID)
 
 	// Add clientID filter if provided
 	if clientID != "" {
@@ -342,7 +342,7 @@ func (r *ClientRepository) GetClientForTOTP(email, tenantID, clientID string) (*
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// Try without TOTP filter for new setup
-			query = r.DB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND tenant_id = ?", email, tenantID)
+			query = r.DB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID)
 			if clientID != "" {
 				query = query.Where("client_id = ?", clientID)
 			}
@@ -365,13 +365,13 @@ func (r *ClientRepository) GetClientForTOTPLogin(email, tenantID string) (*share
 
 	// First try to find user with TOTP enabled using text array contains
 	err := r.DB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND tenant_id = ? AND provider = ? AND mfa_method @> ARRAY[?]::text[]",
+		Where("email = ? AND workspace_id = ? AND provider = ? AND mfa_method @> ARRAY[?]::text[]",
 			email, tenantID, "local", "totp").First(&userWithJSONMFA).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// Fallback to find user without TOTP for setup
 			err = r.DB.Scopes(util.WithUsersMFAMethodArray).
-				Where("email = ? AND tenant_id = ? AND provider = ?",
+				Where("email = ? AND workspace_id = ? AND provider = ?",
 					email, tenantID, "local").First(&userWithJSONMFA).Error
 			if err != nil {
 				return nil, err

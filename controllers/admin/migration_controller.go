@@ -83,7 +83,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	tenantID := c.Param("workspace_id")
 
 	var tenant migration.TenantInfo
-	if err := config.DB.Where("tenant_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 		return
 	}
@@ -100,7 +100,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 
 	if dbName == "" {
 		c.JSON(http.StatusOK, gin.H{
-			"tenant_id":        tenant.WorkspaceID.String(),
+			"workspace_id":        tenant.WorkspaceID.String(),
 			"migration_status": migStatus,
 			"last_migration":   tenant.LastMigration,
 		})
@@ -111,7 +111,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	tenantDBConn, err := migration.ConnectToTenantDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
-			"tenant_id":        tenant.WorkspaceID.String(),
+			"workspace_id":        tenant.WorkspaceID.String(),
 			"database_name":    dbName,
 			"migration_status": migStatus,
 			"last_migration":   tenant.LastMigration,
@@ -130,7 +130,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tenant_id":        tenant.WorkspaceID.String(),
+		"workspace_id":        tenant.WorkspaceID.String(),
 		"database_name":    dbName,
 		"migration_status": migStatus,
 		"status":           status,

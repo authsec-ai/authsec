@@ -74,7 +74,7 @@ func (mc *MembershipController) workspaceRoleID(workspaceID uuid.UUID, roleName 
 	var roleID uuid.UUID
 	err := mc.db.Table("roles").
 		Select("id").
-		Where("tenant_id = ? AND name = ?", workspaceID, roleName).
+		Where("workspace_id = ? AND name = ?", workspaceID, roleName).
 		Take(&roleID).Error
 	return roleID, err
 }
@@ -371,7 +371,7 @@ func (mc *MembershipController) endUserAccessSnapshot(tenantID uuid.UUID, userID
 		Joins("JOIN resource_servers rs ON rs.tenant_id = rb.tenant_id AND ro.name LIKE ('rs-' || rs.id::text || ':%')").
 		Joins("LEFT JOIN role_permissions rp ON rp.role_id = rb.role_id").
 		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-		Where("rb.tenant_id = ? AND rb.user_id = ?", tenantID, userID).
+		Where("rb.workspace_id = ? AND rb.user_id = ?", tenantID, userID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = rs.id)").
 		Group("rs.id, rs.name, rs.resource_uri, rb.role_id, rb.role_name, ro.name, rb.id").
@@ -444,7 +444,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 	q := mc.db.Table("tenant_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
-		Where("s.tenant_id = ?", tenantID)
+		Where("s.workspace_id = ?", tenantID)
 	if v := c.Query("status"); v != "" {
 		q = q.Where("s.status = ?", v)
 	}
@@ -484,7 +484,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 	err := mc.db.Table("tenant_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
-		Where("s.tenant_id = ? AND s.user_id = ?", tenantID, userID).
+		Where("s.workspace_id = ? AND s.user_id = ?", tenantID, userID).
 		Take(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -550,7 +550,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	}
 
 	res := mc.db.Model(&models.TenantEndUserState{}).
-		Where("tenant_id = ? AND user_id = ?", tenantID, userID).
+		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -585,7 +585,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	}
 
 	var s models.TenantEndUserState
-	_ = mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
+	_ = mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
 	c.JSON(http.StatusOK, s)
 }
 
@@ -747,7 +747,7 @@ func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUs
 	}
 
 	res := mc.db.Model(&models.TenantEndUserState{}).
-		Where("tenant_id = ? AND user_id = ?", tenantID, userID).
+		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -758,6 +758,6 @@ func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUs
 		return
 	}
 	var s models.TenantEndUserState
-	_ = mc.db.Where("tenant_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
+	_ = mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
 	c.JSON(http.StatusOK, s)
 }

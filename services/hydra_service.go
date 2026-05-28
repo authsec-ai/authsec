@@ -245,12 +245,12 @@ func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenan
 		Audience:      []string{},
 		SubjectType:   "public",
 		Metadata: map[string]interface{}{
-			"type":        "tenant_main_client",
-			"tenant_id":   clientID,
-			"c_id":        tenantID,
-			"tenant_name": clientName,
-			"created_at":  time.Now().Format(time.RFC3339),
-			"created_by":  "system",
+			"type":         "tenant_main_client",
+			"workspace_id": clientID,
+			"c_id":         tenantID,
+			"tenant_name":  clientName,
+			"created_at":   time.Now().Format(time.RFC3339),
+			"created_by":   "system",
 		},
 	}
 
@@ -285,8 +285,8 @@ func DeleteClientFromHydra(clientID string) error {
 	deleted := 0
 	for _, c := range clients {
 		cID, _ := c.Metadata["c_id"].(string)
-		tID, _ := c.Metadata["tenant_id"].(string)
-		if cID != clientID && tID != clientID {
+		wID, _ := c.Metadata["workspace_id"].(string)
+		if cID != clientID && wID != clientID {
 			continue
 		}
 		if err := hydraAdminDeleteClient(c.ClientID); err != nil {
@@ -335,7 +335,7 @@ func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) erro
 		GrantTypes: []string{"client_credentials"},
 		Metadata: map[string]interface{}{
 			"type":          "oidc_provider",
-			"tenant_id":     baseClientID,
+			"workspace_id":  baseClientID,
 			"c_id":          tenantID,
 			"provider_name": providerName,
 			"display_name":  "AuthSec",

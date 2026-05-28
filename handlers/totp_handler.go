@@ -295,7 +295,7 @@ func (h *TOTPHandler) ConfirmTOTPSetup(c *gin.Context) {
 
 	// Audit log for successful TOTP setup
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -428,7 +428,7 @@ func (h *TOTPHandler) ConfirmSetup(c *gin.Context) {
 
 	// Audit log for successful TOTP setup (login flow)
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -578,7 +578,7 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 
 	// Audit log for successful TOTP verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "verify", true, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 	})
 
@@ -690,7 +690,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 		// Audit log for successful TOTP login verification
 		middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", true, map[string]interface{}{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"email":     req.Email,
 		})
 
@@ -707,7 +707,7 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 	// Audit log for failed TOTP login verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", false, map[string]interface{}{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"email":     req.Email,
 		"reason":    "invalid_code",
 	})
@@ -785,7 +785,7 @@ func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodel
 
 	// First check if user exists in global DB (for admin users)
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND tenant_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error
 	user := userWithJSONMFA.ToShared()
 
 	var tenantDB *gorm.DB
@@ -825,7 +825,7 @@ func fetchClientForLoginMFA(email, tenantID string) (*gorm.DB, *sharedmodels.Use
 
 	// First check if user exists in global DB (for admin users)
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND tenant_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error
 	user := userWithJSONMFA.ToShared()
 
 	if globalErr == nil && user.ID != uuid.Nil {

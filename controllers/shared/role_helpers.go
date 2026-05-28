@@ -13,7 +13,7 @@ import (
 
 // ResolvePermissionUUIDs collects permission IDs from explicit UUIDs and resource:action strings.
 // At least one permission must be provided; duplicates are removed.
-func ResolvePermissionUUIDs(db *gorm.DB, tenantID uuid.UUID, ids []string, permStrings []string) ([]uuid.UUID, error) {
+func ResolvePermissionUUIDs(db *gorm.DB, workspaceID uuid.UUID, ids []string, permStrings []string) ([]uuid.UUID, error) {
 	result := make(map[uuid.UUID]struct{})
 
 	if len(ids) > 0 {
@@ -34,7 +34,7 @@ func ResolvePermissionUUIDs(db *gorm.DB, tenantID uuid.UUID, ids []string, permS
 		resource := ps[:sep]
 		action := ps[sep+1:]
 		var perm models.RBACPermission
-		if err := db.Where("tenant_id = ? AND resource = ? AND action = ?", tenantID, resource, action).First(&perm).Error; err != nil {
+		if err := db.Where("workspace_id = ? AND resource = ? AND action = ?", workspaceID, resource, action).First(&perm).Error; err != nil {
 			return nil, fmt.Errorf("permission not found: %s", ps)
 		}
 		result[perm.ID] = struct{}{}
@@ -73,14 +73,6 @@ func ResolveWorkspaceIDFromTokenPtr(c *gin.Context) (*uuid.UUID, error) {
 		return nil, fmt.Errorf("Invalid workspace ID format")
 	}
 	return &workspaceID, nil
-}
-
-// ResolveTenantIDFromToken is the deprecated alias kept during Phase 4.
-// All new code should call ResolveWorkspaceIDFromTokenPtr. Removed in Phase 10.
-//
-// Deprecated: use ResolveWorkspaceIDFromTokenPtr.
-func ResolveTenantIDFromToken(c *gin.Context) (*uuid.UUID, error) {
-	return ResolveWorkspaceIDFromTokenPtr(c)
 }
 
 // ResolveWorkspaceIDFromToken returns workspace_id as a value UUID (not pointer).

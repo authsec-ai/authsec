@@ -224,7 +224,7 @@ func NewOIDCStateRepository(db *DBConnection) *OIDCStateRepository {
 // pre-v4 callers can leave them empty and they'll be NULL in the DB.
 func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 	query := `
-		INSERT INTO oidc_states (state_token, tenant_id, tenant_domain, request_host, provider_name,
+		INSERT INTO oidc_states (state_token, workspace_id, tenant_domain, request_host, provider_name,
 		                         action, code_verifier, redirect_after, expires_at, created_at,
 		                         application_id, signed_state, login_challenge)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -281,7 +281,7 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 // and the callback branches accordingly.
 func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCState, error) {
 	query := `
-		SELECT id, state_token, tenant_id, tenant_domain, request_host, provider_name,
+		SELECT id, state_token, workspace_id, tenant_domain, request_host, provider_name,
 		       action, code_verifier, redirect_after, expires_at, created_at,
 		       application_id, signed_state, login_challenge
 		FROM oidc_states
@@ -376,7 +376,7 @@ func NewOIDCUserIdentityRepository(db *DBConnection) *OIDCUserIdentityRepository
 // CreateIdentity creates a new OIDC user identity link or updates it if it already exists.
 func (r *OIDCUserIdentityRepository) CreateIdentity(identity *models.OIDCUserIdentity) error {
 	query := `
-		INSERT INTO oidc_user_identities (tenant_id, user_id, provider_name, provider_user_id,
+		INSERT INTO oidc_user_identities (workspace_id, user_id, provider_name, provider_user_id,
 		                                  email, profile_data, created_at, updated_at, last_login_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (provider_name, provider_user_id) DO UPDATE
@@ -412,7 +412,7 @@ func (r *OIDCUserIdentityRepository) CreateIdentity(identity *models.OIDCUserIde
 // This answers: "Does this Google user exist anywhere?"
 func (r *OIDCUserIdentityRepository) GetIdentityByProviderUser(providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
 	query := `
-		SELECT id, tenant_id, user_id, provider_name, provider_user_id,
+		SELECT id, workspace_id, user_id, provider_name, provider_user_id,
 		       email, profile_data, last_login_at, created_at, updated_at
 		FROM oidc_user_identities
 		WHERE provider_name = $1 AND provider_user_id = $2
@@ -460,10 +460,10 @@ func (r *OIDCUserIdentityRepository) GetIdentityByProviderUser(providerName, pro
 // This answers: "Does this Google user exist in THIS tenant?"
 func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
 	query := `
-		SELECT id, tenant_id, user_id, provider_name, provider_user_id,
+		SELECT id, workspace_id, user_id, provider_name, provider_user_id,
 		       email, profile_data, last_login_at, created_at, updated_at
 		FROM oidc_user_identities
-		WHERE tenant_id = $1 AND provider_name = $2 AND provider_user_id = $3
+		WHERE workspace_id = $1 AND provider_name = $2 AND provider_user_id = $3
 	`
 
 	identity := &models.OIDCUserIdentity{}
@@ -507,10 +507,10 @@ func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID
 // GetIdentitiesByUserID retrieves all OIDC identities for a user
 func (r *OIDCUserIdentityRepository) GetIdentitiesByUserID(tenantID, userID uuid.UUID) ([]models.OIDCUserIdentity, error) {
 	query := `
-		SELECT id, tenant_id, user_id, provider_name, provider_user_id,
+		SELECT id, workspace_id, user_id, provider_name, provider_user_id,
 		       email, profile_data, last_login_at, created_at, updated_at
 		FROM oidc_user_identities
-		WHERE tenant_id = $1 AND user_id = $2
+		WHERE workspace_id = $1 AND user_id = $2
 	`
 
 	rows, err := r.db.Query(query, tenantID, userID)
@@ -592,7 +592,7 @@ func (r *OIDCUserIdentityRepository) UpdateProfileData(identityID uuid.UUID, pro
 func (r *OIDCUserIdentityRepository) DeleteIdentity(tenantID, userID uuid.UUID, providerName string) error {
 	query := `
 		DELETE FROM oidc_user_identities
-		WHERE tenant_id = $1 AND user_id = $2 AND provider_name = $3
+		WHERE workspace_id = $1 AND user_id = $2 AND provider_name = $3
 	`
 
 	result, err := r.db.Exec(query, tenantID, userID, providerName)

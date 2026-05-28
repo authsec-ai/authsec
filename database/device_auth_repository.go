@@ -28,7 +28,7 @@ func NewDeviceAuthRepository(db *DBConnection) *DeviceAuthRepository {
 func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) error {
 	query := `
 		INSERT INTO device_codes (
-			id, tenant_id, client_id, device_code, user_code,
+			id, workspace_id, client_id, device_code, user_code,
 			verification_uri, verification_uri_complete,
 			status, scopes, device_info, expires_at, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -70,7 +70,7 @@ func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) e
 // FindByDeviceCode retrieves a device code by device_code
 func (r *DeviceAuthRepository) FindByDeviceCode(deviceCode string) (*models.DeviceCode, error) {
 	query := `
-		SELECT id, tenant_id, client_id, device_code, user_code,
+		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
 		       user_id, user_email, tenant_domain, access_token, status, scopes, device_info,
 		       expires_at, last_polled_at, authorized_at,
@@ -85,7 +85,7 @@ func (r *DeviceAuthRepository) FindByDeviceCode(deviceCode string) (*models.Devi
 // Accepts both "ABCD-1234" (with hyphen) and "ABCD1234" (without) — normalizes via SQL.
 func (r *DeviceAuthRepository) FindByUserCode(userCode string) (*models.DeviceCode, error) {
 	query := `
-		SELECT id, tenant_id, client_id, device_code, user_code,
+		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
 		       user_id, user_email, tenant_domain, access_token, status, scopes, device_info,
 		       expires_at, last_polled_at, authorized_at,
@@ -234,7 +234,7 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 		UPDATE device_codes
 		SET user_id       = $1,
 		    user_email    = $2,
-		    tenant_id     = $3,
+		    workspace_id = $3,
 		    tenant_domain = $4,
 		    client_id     = $5,
 		    access_token  = $6,
@@ -303,7 +303,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 	expireQuery := `
 		UPDATE device_codes
 		SET status = 'expired', updated_at = $1
-		WHERE tenant_id = $2 AND status = 'pending' AND expires_at < $3
+		WHERE workspace_id = $2 AND status = 'pending' AND expires_at < $3
 	`
 	r.db.Exec(expireQuery, now, tenantID, now)
 
@@ -312,25 +312,25 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 
 	if clientID != nil {
 		query = `
-			SELECT id, tenant_id, client_id, device_code, user_code,
+			SELECT id, workspace_id, client_id, device_code, user_code,
 			       verification_uri, verification_uri_complete,
 			       user_id, user_email, tenant_domain, status, scopes, device_info,
 			       expires_at, last_polled_at, authorized_at,
 			       created_at, updated_at
 			FROM device_codes
-			WHERE tenant_id = $1 AND client_id = $2 AND status = 'pending' AND expires_at > $3
+			WHERE workspace_id = $1 AND client_id = $2 AND status = 'pending' AND expires_at > $3
 			ORDER BY created_at DESC
 		`
 		args = []interface{}{tenantID, *clientID, now}
 	} else {
 		query = `
-			SELECT id, tenant_id, client_id, device_code, user_code,
+			SELECT id, workspace_id, client_id, device_code, user_code,
 			       verification_uri, verification_uri_complete,
 			       user_id, user_email, tenant_domain, status, scopes, device_info,
 			       expires_at, last_polled_at, authorized_at,
 			       created_at, updated_at
 			FROM device_codes
-			WHERE tenant_id = $1 AND status = 'pending' AND expires_at > $2
+			WHERE workspace_id = $1 AND status = 'pending' AND expires_at > $2
 			ORDER BY created_at DESC
 		`
 		args = []interface{}{tenantID, now}

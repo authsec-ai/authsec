@@ -256,7 +256,7 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 	keys, err := cm.scanKeys(pattern)
 	if err != nil {
 		cm.logger.WithFields(logrus.Fields{
-			"tenant_id": tenantID,
+			"workspace_id": tenantID,
 			"error":     err.Error(),
 		}).Error("Failed to find tenant cache keys")
 		return err
@@ -266,7 +266,7 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 		err = cm.client.Del(cm.ctx, keys...).Err()
 		if err != nil {
 			cm.logger.WithFields(logrus.Fields{
-				"tenant_id": tenantID,
+				"workspace_id": tenantID,
 				"keys":      keys,
 				"error":     err.Error(),
 			}).Error("Failed to delete tenant cache keys")
@@ -274,7 +274,7 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 		}
 
 		cm.logger.WithFields(logrus.Fields{
-			"tenant_id":    tenantID,
+			"workspace_id":    tenantID,
 			"keys_deleted": len(keys),
 		}).Info("Tenant cache invalidated")
 	}
@@ -301,7 +301,7 @@ func (cm *CacheManager) InvalidateUserCache(tenantID, userID string) error {
 	}
 
 	cm.logger.WithFields(logrus.Fields{
-		"tenant_id": tenantID,
+		"workspace_id": tenantID,
 		"user_id":   userID,
 	}).Info("User cache invalidated")
 

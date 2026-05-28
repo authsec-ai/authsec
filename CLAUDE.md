@@ -36,20 +36,25 @@ starting a phase — don't rely on memory of the plan.
   in commit `50a6157`
 - Phase 3 (JWT carries `workspace_id` always) — done
 - Phase 4 (backend reads prefer workspace identity) — done
-- Phase 5 (dual JSON contract) — **current**
+- Phases 5+6+8 collapsed (drop `tenants` table, drop `tenant_id` columns,
+  drop `tenant_id` from JSON/JWT, rename `/auth/tenant/{ciba,totp}` →
+  `/auth/workspace/{ciba,totp}`, UI + SDK swept in lockstep) — done,
+  awaiting fresh-DB cycle and verification push
+- Phases 9–10 (remaining `tenant_*` table renames + SPIRE-layer sweep +
+  test/doc cleanup) — pending
 
 Until Phase 6 lands, both `tenants` and `workspaces` exist; `workspaces.id ==
 tenants.id` by construction (admin signup writes both rows in one
 transaction). The startup log line `[migration:phase2] tenants=N workspaces=N
 (in lockstep)` confirms the invariant on every boot.
 
-Phase 5 API contract: backend JSON responses must emit `workspace_id` as the
-canonical identifier and may also emit `tenant_id` as a deprecated mirror with
-the same value until Phase 8. New backend docs and examples should lead with
-`workspace_id`; keep `tenant_id` only where documenting compatibility or a
-legacy URL/path parameter. UI and SDK clients do not need an immediate Phase 5
-change, but they must migrate to `workspace_id` before Phase 8 removes the
-mirror field.
+API contract (post-collapse): JSON responses emit `workspace_id` only.
+Requests accept `workspace_id` only. JWTs carry `workspace_id` only (no
+`tenant_id` claim). URL path/query params use `workspace_id`. The two formerly
+legacy MFA routes have been renamed: `/auth/workspace/ciba/*` and
+`/auth/workspace/totp/*`. UI (`Authsec-ui`) and SDKs (`sdk-authsec`
+TypeScript + Python; Go SDK was already clean) shipped in lockstep with the
+backend.
 
 ---
 
@@ -104,12 +109,15 @@ The legacy `tenants` table mixed three concerns: workspace identity
 `workspaces` was introduced as the v4 replacement but never made authoritative
 — the table sat empty in production while `tenants` did all the work. The
 10-day plan walks workspaces forward in additive phases (write workspace rows,
-emit `workspace_id` in JWTs, switch reads, dual-emit JSON), then drops
-`tenants` and most `tenant_id` columns in one big wipe at Phase 6, removes the
-deprecated `tenant_id` JSON mirror by Phase 8, cleans up the remaining
-`tenant_*` table names in Phases 7–9, and final-sweeps the Go code in Phase
-10. The only two surviving "tenant" mentions at end-state are the legacy MFA
-routes `/auth/tenant/totp/*` and `/auth/tenant/ciba/*`.
+emit `workspace_id` in JWTs, switch reads, dual-emit JSON), then collapses
+Phases 5–8 into one big push that drops `tenants`, drops every `tenant_id`
+column, drops the deprecated `tenant_id` JSON mirror, drops the `tenant_id`
+JWT claim, renames `/auth/tenant/{ciba,totp}` → `/auth/workspace/{ciba,totp}`,
+and rebuilds the bootstrap as workspace-only. Phases 9–10 then sweep the
+remaining `tenant_*` table names and the `internal/spire/` SPIRE-side
+references. **End-state: zero "tenant" mentions in URL surface; only the
+legacy `entra_tenant_id` Azure AD concept and a handful of historical
+breadcrumb comments survive.**
 
 If you're touching tenant_id or workspace_id today, **open the plan file** and
 match what you're doing to the current phase. Don't freelance ahead of phase.
@@ -140,8 +148,7 @@ match what you're doing to the current phase. Don't freelance ahead of phase.
 - Reintroducing `tenant_db_service`, `MTPluginClient`, dynamic DB switching
 - Backfilling data from `tenants` into `workspaces` (we just keep them in
   lockstep until Phase 6 drops the old one)
-- Treating `tenant_id` as canonical in new JSON docs or backend response work;
-  in Phase 5 it is only a deprecated mirror of `workspace_id`
-- Renaming routes `/auth/tenant/totp/*` or `/auth/tenant/ciba/*` — these are
-  the documented legacy exception
+- Reintroducing `tenant_id` anywhere in new JSON/JWT/Go code — it's gone
+- Reintroducing `/auth/tenant/*` routes — they were renamed to
+  `/auth/workspace/{ciba,totp}/*` in the Phase 5/6/8 collapse
 - Adding tests the user didn't ask for (memory note `feedback_no_unprompted_tests`)

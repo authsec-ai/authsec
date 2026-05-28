@@ -54,10 +54,10 @@ func (o *ClientsOIDCService) CreateTenantClient(tenantID, clientName string) (*C
 			Audience:      []string{},
 			SubjectType:   "public",
 			Metadata: map[string]interface{}{
-				"type":       "tenant_main_client",
-				"tenant_id":  clientID,
-				"c_id":       tenantID,
-				"created_by": "clients-microservice",
+				"type":         "tenant_main_client",
+				"workspace_id": clientID,
+				"c_id":         tenantID,
+				"created_by":   "clients-microservice",
 			},
 		}
 		if err2 := hydraAdminCreateClient(c); err2 != nil {

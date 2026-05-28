@@ -30,7 +30,7 @@ func (r *TenantHydraClientRepository) Create(client *oocmgrdto.TenantHydraClient
 
 func (r *TenantHydraClientRepository) GetByTenantID(tenantID, orgID string) ([]*oocmgrdto.TenantHydraClient, error) {
 	var clients []*oocmgrdto.TenantHydraClient
-	if err := r.masterDB.Where("tenant_id = ? AND org_id = ?", tenantID, orgID).Find(&clients).Error; err != nil {
+	if err := r.masterDB.Where("workspace_id = ? AND org_id = ?", tenantID, orgID).Find(&clients).Error; err != nil {
 		return nil, fmt.Errorf("failed to get tenant hydra clients: %w", err)
 	}
 	return clients, nil
@@ -49,7 +49,7 @@ func (r *TenantHydraClientRepository) GetByHydraClientID(hydraClientID string) (
 
 func (r *TenantHydraClientRepository) GetByTenantAndProvider(tenantID, providerName string) (*oocmgrdto.TenantHydraClient, error) {
 	var client oocmgrdto.TenantHydraClient
-	if err := r.masterDB.Where("tenant_id = ? AND provider_name = ? AND client_type = ?", tenantID, providerName, "oidc_provider").
+	if err := r.masterDB.Where("workspace_id = ? AND provider_name = ? AND client_type = ?", tenantID, providerName, "oidc_provider").
 		First(&client).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -61,7 +61,7 @@ func (r *TenantHydraClientRepository) GetByTenantAndProvider(tenantID, providerN
 
 func (r *TenantHydraClientRepository) GetMainClient(tenantID, orgID string) (*oocmgrdto.TenantHydraClient, error) {
 	var client oocmgrdto.TenantHydraClient
-	if err := r.masterDB.Where("tenant_id = ? AND org_id = ? AND client_type = ?",
+	if err := r.masterDB.Where("workspace_id = ? AND org_id = ? AND client_type = ?",
 		tenantID, orgID, "main").First(&client).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("main client not found for tenant")
@@ -73,7 +73,7 @@ func (r *TenantHydraClientRepository) GetMainClient(tenantID, orgID string) (*oo
 
 func (r *TenantHydraClientRepository) GetProviderClients(tenantID, orgID string) ([]*oocmgrdto.TenantHydraClient, error) {
 	var clients []*oocmgrdto.TenantHydraClient
-	if err := r.masterDB.Where("tenant_id = ? AND org_id = ? AND client_type = ?",
+	if err := r.masterDB.Where("workspace_id = ? AND org_id = ? AND client_type = ?",
 		tenantID, orgID, "oidc_provider").Find(&clients).Error; err != nil {
 		return nil, fmt.Errorf("failed to get provider clients: %w", err)
 	}
@@ -123,7 +123,7 @@ func (r *TenantHydraClientRepository) ListAll(req *oocmgrdto.GetTenantHydraClien
 		query = query.Where("org_id = ?", req.OrgID)
 	}
 	if req.WorkspaceID != "" {
-		query = query.Where("tenant_id = ?", req.WorkspaceID)
+		query = query.Where("workspace_id = ?", req.WorkspaceID)
 	}
 	if req.ClientType != "" {
 		query = query.Where("client_type = ?", req.ClientType)

@@ -30,7 +30,7 @@ func ConnectGlobalDB() (*gorm.DB, error) {
 // Get tenant's DB name from global DB using tenant_id
 func GetTenantDBName(globalDB *gorm.DB, tenantID string) (string, error) {
 	var tenant sharedmodels.Tenant
-	if err := globalDB.Where("tenant_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := globalDB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
 		return "", err
 	}
 	return tenant.TenantDB, nil

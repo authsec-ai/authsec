@@ -152,7 +152,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		var agentType *string
 		tenantDB.Table("clients").
 			Select("spiffe_id, client_type, agent_type").
-			Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+			Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
 			Row().Scan(&spiffeID, &clientType, &agentType)
 
 		if clientType == "ai_agent" {
@@ -203,7 +203,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 							}
 						} else {
 							tenantDB.Table("clients").
-								Where("client_id = ? AND tenant_id = ?", clientID, tenantID).
+								Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
 								Update("spiffe_id", created.SpiffeID)
 
 							log.Printf("[DelegationPolicy] Auto-provisioned identity for agent %s: spiffe_id=%s", clientID.String(), created.SpiffeID)
@@ -253,7 +253,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 					emailID := delegationContextString(c, "email_id")
 					customClaims := map[string]interface{}{
 						"user_id":     userIDStr,
-						"tenant_id":   tenantID.String(),
+						"workspace_id":   tenantID.String(),
 						"email":       emailID,
 						"agent_type":  req.AgentType,
 						"permissions": delegatedPerms,
@@ -300,7 +300,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 
 						var existing models.DelegationToken
 						upsertResult := tenantDB.
-							Where("tenant_id = ? AND client_id = ?", tenantID, clientID).
+							Where("workspace_id = ? AND client_id = ?", tenantID, clientID).
 							First(&existing)
 						if upsertResult.Error == nil {
 							tenantDB.Model(&existing).Updates(map[string]interface{}{
@@ -363,7 +363,7 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 
 	tenantDB := config.DB
 
-	query := tenantDB.Where("tenant_id = ?", tenantID)
+	query := tenantDB.Where("workspace_id = ?", tenantID)
 
 	if roleName := c.Query("role_name"); roleName != "" {
 		query = query.Where("role_name = ?", roleName)
@@ -403,7 +403,7 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 	}
 
 	var policy models.DelegationPolicy
-	result := tenantDB.Where("id = ? AND tenant_id = ?", policyID, tenantID).First(&policy)
+	result := tenantDB.Where("id = ? AND workspace_id = ?", policyID, tenantID).First(&policy)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
 		return
@@ -429,7 +429,7 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 	}
 
 	var policy models.DelegationPolicy
-	if err := tenantDB.Where("id = ? AND tenant_id = ?", policyID, tenantID).First(&policy).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", policyID, tenantID).First(&policy).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
 		return
 	}
@@ -514,7 +514,7 @@ func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
 		return
 	}
 
-	result := tenantDB.Where("id = ? AND tenant_id = ?", policyID, tenantID).Delete(&models.DelegationPolicy{})
+	result := tenantDB.Where("id = ? AND workspace_id = ?", policyID, tenantID).Delete(&models.DelegationPolicy{})
 	if result.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Delegation policy not found"})
 		return

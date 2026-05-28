@@ -171,7 +171,7 @@ func (asc *AdminSyncController) SyncADAdminUsers(c *gin.Context) {
 	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "ad_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "active_directory",
-			"tenant_id":     input.WorkspaceID,
+			"workspace_id":     input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -296,7 +296,7 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 	middlewares.Audit(c, "admin_sync", input.WorkspaceID, "entra_sync", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"sync_type":     "entra_id",
-			"tenant_id":     input.WorkspaceID,
+			"workspace_id":     input.WorkspaceID,
 			"users_found":   result.UsersFound,
 			"users_created": result.UsersCreated,
 			"users_updated": result.UsersUpdated,
@@ -324,13 +324,13 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 	// Check if user already exists (by email or external ID scoped to tenant)
 	var existingUser models.AdminUser
 	query := `SELECT id, email, COALESCE(username, ''), COALESCE(password_hash, ''), COALESCE(name, ''),
-	          client_id, tenant_id, project_id, COALESCE(tenant_domain, ''), COALESCE(provider, ''),
+	          client_id, workspace_id, project_id, COALESCE(tenant_domain, ''), COALESCE(provider, ''),
 	          COALESCE(provider_id, ''), COALESCE(provider_data::text, '{}'), COALESCE(avatar_url, ''),
 	          active, mfa_enabled, COALESCE(mfa_method, ARRAY[]::text[]), COALESCE(mfa_default_method, ''),
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND tenant_id = $3`
+	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
 
 	var username, passwordHash, name, tenantDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, tenantIDVal, projectIDStr sql.NullString
@@ -518,13 +518,13 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 	// Check if user already exists (by email or external ID scoped to tenant)
 	var existingUser models.AdminUser
 	query := `SELECT id, email, COALESCE(username, ''), COALESCE(password_hash, ''), COALESCE(name, ''),
-	          client_id, tenant_id, project_id, COALESCE(tenant_domain, ''), COALESCE(provider, ''),
+	          client_id, workspace_id, project_id, COALESCE(tenant_domain, ''), COALESCE(provider, ''),
 	          COALESCE(provider_id, ''), COALESCE(provider_data::text, '{}'), COALESCE(avatar_url, ''),
 	          active, mfa_enabled, COALESCE(mfa_method, ARRAY[]::text[]), COALESCE(mfa_default_method, ''),
 	          mfa_enrolled_at, mfa_verified, COALESCE(external_id, ''), COALESCE(sync_source, ''),
 	          last_sync_at, is_synced_user, last_login, created_at, updated_at
 	          FROM users
-	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND tenant_id = $3`
+	          WHERE (LOWER(email) = LOWER($1) OR external_id = $2) AND workspace_id = $3`
 
 	var username, passwordHash, name, tenantDomain, provider, providerID, providerData, avatarURL, mfaDefaultMethod, externalID, syncSource sql.NullString
 	var clientIDStr, tenantIDVal, projectIDStr sql.NullString
@@ -717,7 +717,7 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 		updateQuery := `UPDATE tenants
 			SET username = $1, name = $2, tenant_domain = $3, tenant_db = $4,
 			    source = $5, status = $6, updated_at = $7
-			WHERE email = $8 AND tenant_id = $9`
+			WHERE email = $8 AND workspace_id = $9`
 
 		db := config.GetDatabase()
 		if db == nil {
@@ -793,7 +793,7 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (m
 		         ON ip.workspace_id = sc.tenant_id
 		        AND ip.provider_type IN ('ad', 'entra')
 		        AND ip.config_ref = sc.id::text`).
-		Where("sc.id = ? AND sc.tenant_id = ? AND sc.sync_type = ?",
+		Where("sc.id = ? AND sc.workspace_id = ? AND sc.sync_type = ?",
 			configUUID, tenantUUID, "active_directory").
 		Where("(ip.id IS NULL OR ip.status <> 'disabled')").
 		First(&syncConfig).Error; err != nil {
@@ -840,7 +840,7 @@ func (asc *AdminSyncController) loadStoredEntraConfig(configID, tenantID string)
 	}
 
 	// Fetch configuration from database
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND sync_type = ?",
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND sync_type = ?",
 		configUUID, tenantUUID, "entra_id").First(&syncConfig).Error; err != nil {
 		return shared.EntraIDConfig{}, fmt.Errorf("sync configuration not found or not authorized")
 	}

@@ -45,9 +45,10 @@ type Tenant struct {
 	TenantDomain string     `json:"tenant_domain,omitempty" gorm:"uniqueIndex;not null"`
 }
 
-// TableName returns the table name for the Tenant model
+// TableName returns the table name for the Tenant model.
+// Phase 6 collapse: the `tenants` table was dropped; the struct now maps to `workspaces`.
 func (Tenant) TableName() string {
-	return "tenants"
+	return "workspaces"
 }
 
 type RegisterResponse struct {

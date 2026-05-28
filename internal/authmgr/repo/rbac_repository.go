@@ -82,7 +82,7 @@ func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID u
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -102,7 +102,7 @@ func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID,
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -133,7 +133,7 @@ func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID
 		Table("oauth_scopes").
 		Joins("JOIN oauth_scope_permissions ON oauth_scopes.id = oauth_scope_permissions.scope_id").
 		Joins("JOIN permissions ON oauth_scope_permissions.permission_id = permissions.id").
-		Where("oauth_scopes.tenant_id = ?", tenantID).
+		Where("oauth_scopes.workspace_id = ?", tenantID).
 		Where("oauth_scopes.scope_string = ?", scopeName).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -151,7 +151,7 @@ func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UU
 	err = db.WithContext(ctx).
 		Table("role_bindings").
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
@@ -169,7 +169,7 @@ func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID
 	err = db.WithContext(ctx).
 		Table("role_bindings").
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
 		Where("role_bindings.scope_type = ?", scopeType).
@@ -192,7 +192,7 @@ func (r *rbacRepository) GetUserPermissions(ctx context.Context, tenantID, userI
 		Joins("JOIN role_permissions ON permissions.id = role_permissions.permission_id").
 		Joins("JOIN roles ON role_permissions.role_id = roles.id").
 		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
 		Find(&permissions).Error
@@ -210,7 +210,7 @@ func (r *rbacRepository) GetUserRoles(ctx context.Context, tenantID, userID uuid
 		Table("roles").
 		Distinct("roles.*").
 		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
-		Where("role_bindings.tenant_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
 		Find(&roles).Error

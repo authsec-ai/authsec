@@ -48,7 +48,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 
 		// Upsert: create if not exists, don't overwrite admin-edited fields
 		result := s.db.Where(
-			"tenant_id = ? AND resource_server_id = ? AND scope_string = ?",
+			"workspace_id = ? AND resource_server_id = ? AND scope_string = ?",
 			tenantID, resourceServerID, scopeStr,
 		).FirstOrCreate(&scope)
 
@@ -70,7 +70,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 // e.g., "tools:weather:read" gets parent "tools:weather:*", which gets parent "tools:*".
 func (s *ScopeRegistryService) buildHierarchy(tenantID, rsID uuid.UUID) error {
 	var scopes []models.OAuthScope
-	if err := s.db.Where("tenant_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&scopes).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&scopes).Error; err != nil {
 		return err
 	}
 
@@ -131,7 +131,7 @@ func (s *ScopeRegistryService) ResolveHierarchy(tenantID, rsID uuid.UUID, grante
 
 	// Load all scopes for this RS
 	var allScopes []models.OAuthScope
-	if err := s.db.Where("tenant_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&allScopes).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&allScopes).Error; err != nil {
 		return nil, err
 	}
 
@@ -187,7 +187,7 @@ func (s *ScopeRegistryService) ValidateParentScope(parentScopeIDStr string, tena
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("invalid parent_scope_id: %w", err)
 	}
-	q := s.db.Model(&models.OAuthScope{}).Where("id = ? AND tenant_id = ?", pid, tenantID)
+	q := s.db.Model(&models.OAuthScope{}).Where("id = ? AND workspace_id = ?", pid, tenantID)
 	if rsID != nil {
 		q = q.Where("resource_server_id = ?", *rsID)
 	} else {
@@ -250,7 +250,7 @@ func (s *ScopeRegistryService) applyUpdate(
 			// Never remove this filter — it prevents cross-tenant permission bridges.
 			var count int64
 			s.db.Model(&models.RBACPermission{}).
-				Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", pid, tenantID).
+				Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, tenantID).
 				Count(&count)
 			if count == 0 {
 				log.Printf("[SCOPE_REGISTRY] applyUpdate: skipping permission %s (not owned by tenant %s)", pid, tenantID)
@@ -279,7 +279,7 @@ func (s *ScopeRegistryService) UpdateByTenant(
 	req *models.UpdateOAuthScopeRequest,
 ) (*models.OAuthScope, error) {
 	var scope models.OAuthScope
-	if err := s.db.First(&scope, "id = ? AND tenant_id = ?", scopeID, tenantID).Error; err != nil {
+	if err := s.db.First(&scope, "id = ? AND workspace_id = ?", scopeID, tenantID).Error; err != nil {
 		return nil, fmt.Errorf("scope not found")
 	}
 	return s.applyUpdate(&scope, tenantID, req)
@@ -287,7 +287,7 @@ func (s *ScopeRegistryService) UpdateByTenant(
 
 // DeleteByTenant removes a scope only when it belongs to tenantID.
 func (s *ScopeRegistryService) DeleteByTenant(scopeID, tenantID uuid.UUID) error {
-	result := s.db.Where("id = ? AND tenant_id = ?", scopeID, tenantID).Delete(&models.OAuthScope{})
+	result := s.db.Where("id = ? AND workspace_id = ?", scopeID, tenantID).Delete(&models.OAuthScope{})
 	if result.Error != nil {
 		return result.Error
 	}
@@ -310,7 +310,7 @@ func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, tenantID uui
 		// Never remove this filter — it prevents cross-tenant permission bridges.
 		var count int64
 		s.db.Model(&models.RBACPermission{}).
-			Where("id = ? AND (tenant_id = ? OR tenant_id IS NULL)", pid, tenantID).
+			Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, tenantID).
 			Count(&count)
 		if count == 0 {
 			log.Printf("[SCOPE_REGISTRY] LinkPermissions: skipping permission %s (not owned by tenant %s)", pid, tenantID)
@@ -329,7 +329,7 @@ func (s *ScopeRegistryService) Delete(scopeID uuid.UUID) error {
 func (s *ScopeRegistryService) ListByResourceServer(tenantID, rsID uuid.UUID) ([]models.OAuthScope, error) {
 	var scopes []models.OAuthScope
 	err := s.db.Preload("Permissions").Preload("ChildScopes").
-		Where("tenant_id = ? AND resource_server_id = ?", tenantID, rsID).
+		Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).
 		Order("scope_string").
 		Find(&scopes).Error
 	return scopes, err
@@ -353,7 +353,7 @@ func (s *ScopeRegistryService) GetScopesByPermissions(tenantID, rsID uuid.UUID, 
 	var scopeStrings []string
 	err := s.db.Model(&models.OAuthScope{}).
 		Joins("JOIN oauth_scope_permissions osp ON osp.scope_id = oauth_scopes.id").
-		Where("oauth_scopes.tenant_id = ? AND oauth_scopes.resource_server_id = ?", tenantID, rsID).
+		Where("oauth_scopes.workspace_id = ? AND oauth_scopes.resource_server_id = ?", tenantID, rsID).
 		Where("osp.permission_id IN ?", permissionIDs).
 		Distinct().
 		Pluck("scope_string", &scopeStrings).Error
@@ -364,7 +364,7 @@ func (s *ScopeRegistryService) GetScopesByPermissions(tenantID, rsID uuid.UUID, 
 // UpsertScope upserts a scope, used during PRM sync.
 func (s *ScopeRegistryService) UpsertScope(scope *models.OAuthScope) error {
 	return s.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "resource_server_id"}, {Name: "scope_string"}},
+		Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "resource_server_id"}, {Name: "scope_string"}},
 		DoNothing: true,
 	}).Create(scope).Error
 }

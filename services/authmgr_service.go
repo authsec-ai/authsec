@@ -30,7 +30,7 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		return nil, errors.New("invalid or inactive OIDC token")
 	}
 
-	required := []string{"provider", "provider_id", "user_id", "tenant_id", "email"}
+	required := []string{"provider", "provider_id", "user_id", "workspace_id", "email"}
 	for _, field := range required {
 		if v, _ := introspection.Ext[field]; v == nil || fmt.Sprintf("%v", v) == "" {
 			return nil, fmt.Errorf("missing required field: %s", field)
@@ -48,18 +48,17 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 	provider := safeStr("provider")
 	providerID := safeStr("provider_id")
 	userID := safeStr("user_id")
-	tenantID := safeStr("tenant_id")
+	workspaceID := safeStr("workspace_id")
 	emailID := safeStr("email")
 
-	clientID, projectID, err := authmgrLookupClient(ctx, tenantID, emailID)
+	clientID, projectID, err := authmgrLookupClient(ctx, workspaceID, emailID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve tenant information: %w", err)
+		return nil, fmt.Errorf("failed to retrieve workspace information: %w", err)
 	}
 
-	// Phase 3: tenant_id and workspace_id are mirrored — equal UUIDs by construction.
+	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":    tenantID,
-		"workspace_id": tenantID,
+		"workspace_id": workspaceID,
 		"project_id":   projectID,
 		"client_id":    clientID,
 		"email_id":     emailID,
@@ -115,31 +114,30 @@ func introspectOIDCToken(token string) (*sharedmodels.Introspection, error) {
 	}, nil
 }
 
-// authmgrLookupClient looks up client_id and project_id for an email within a tenant.
-func authmgrLookupClient(ctx context.Context, tenantID, email string) (string, string, error) {
-	if tenantID == "" || email == "" {
-		return "", "", errors.New("tenantID and email required")
+// authmgrLookupClient looks up client_id and project_id for an email within a workspace.
+func authmgrLookupClient(ctx context.Context, workspaceID, email string) (string, string, error) {
+	if workspaceID == "" || email == "" {
+		return "", "", errors.New("workspaceID and email required")
 	}
-	tid, err := uuid.Parse(tenantID)
+	wid, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return "", "", fmt.Errorf("parse tenantID: %w", err)
+		return "", "", fmt.Errorf("parse workspaceID: %w", err)
 	}
 
 	if config.DB != nil {
 		var user sharedmodels.User
 		if err := config.DB.WithContext(ctx).
 			Select("client_id", "project_id").
-			Where("tenant_id = ? AND email = ?", tid, email).
+			Where("workspace_id = ? AND email = ?", wid, email).
 			First(&user).Error; err == nil {
 			return user.ClientID.String(), user.ProjectID.String(), nil
 		}
 	}
 
-	tenantDB := config.DB
 	var user sharedmodels.User
-	if err := tenantDB.WithContext(ctx).
+	if err := config.DB.WithContext(ctx).
 		Select("client_id", "project_id").
-		Where("tenant_id = ? AND email = ?", tid, email).
+		Where("workspace_id = ? AND email = ?", wid, email).
 		First(&user).Error; err != nil {
 		return "", "", fmt.Errorf("client lookup: %w", err)
 	}

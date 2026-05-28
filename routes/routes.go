@@ -708,29 +708,29 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
-		// Tenant auth routes
+		// Workspace auth routes (Phase 5/6: renamed from /auth/tenant)
 		// ────────────────────────────────────────────────────
-		tenantAuth := uflow.Group("/auth/tenant")
+		workspaceAuth := uflow.Group("/auth/workspace")
 		{
-			tenantCIBA := tenantAuth.Group("/ciba")
+			workspaceCIBA := workspaceAuth.Group("/ciba")
 			{
-				tenantCIBA.POST("/initiate", tenantCIBAController.InitiateTenantCIBA)
-				tenantCIBA.POST("/token", tenantCIBAController.PollTenantCIBAToken)
-				tenantCIBA.POST("/respond", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RespondToTenantCIBA)
-				tenantCIBA.POST("/register-device", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RegisterTenantDevice)
-				tenantCIBA.GET("/requests", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.GetTenantCIBARequests)
-				tenantCIBA.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.ListTenantDevices)
-				tenantCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.DeleteTenantDevice)
+				workspaceCIBA.POST("/initiate", tenantCIBAController.InitiateTenantCIBA)
+				workspaceCIBA.POST("/token", tenantCIBAController.PollTenantCIBAToken)
+				workspaceCIBA.POST("/respond", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RespondToTenantCIBA)
+				workspaceCIBA.POST("/register-device", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RegisterTenantDevice)
+				workspaceCIBA.GET("/requests", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.GetTenantCIBARequests)
+				workspaceCIBA.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.ListTenantDevices)
+				workspaceCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.DeleteTenantDevice)
 			}
 
-			tenantTOTP := tenantAuth.Group("/totp")
+			workspaceTOTP := workspaceAuth.Group("/totp")
 			{
-				tenantTOTP.POST("/login", tenantTOTPController.LoginWithTenantTOTP)
-				tenantTOTP.POST("/register", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.RegisterTenantTOTPDevice)
-				tenantTOTP.POST("/confirm", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.ConfirmTenantTOTPDevice)
-				tenantTOTP.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.GetTenantTOTPDevices)
-				tenantTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.DeleteTenantTOTPDevice)
-				tenantTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.SetTenantPrimaryTOTPDevice)
+				workspaceTOTP.POST("/login", tenantTOTPController.LoginWithTenantTOTP)
+				workspaceTOTP.POST("/register", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.RegisterTenantTOTPDevice)
+				workspaceTOTP.POST("/confirm", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.ConfirmTenantTOTPDevice)
+				workspaceTOTP.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.GetTenantTOTPDevices)
+				workspaceTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.DeleteTenantTOTPDevice)
+				workspaceTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.SetTenantPrimaryTOTPDevice)
 			}
 		}
 

@@ -86,7 +86,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		HydraClientID string
 	}
 	var hydraClients []hydraRow
-	db.Raw(`SELECT hydra_client_id FROM tenant_hydra_clients WHERE tenant_id = ?`, tenantID).Scan(&hydraClients)
+	db.Raw(`SELECT hydra_client_id FROM tenant_hydra_clients WHERE workspace_id = ?`, tenantID).Scan(&hydraClients)
 	for _, hc := range hydraClients {
 		url := fmt.Sprintf("%s/admin/clients/%s", cfg.HydraAdminURL, hc.HydraClientID)
 		if err := purgeHTTPDelete(url); err != nil {
@@ -141,13 +141,13 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 			label string
 			query string
 		}{
-			{"tenant_hydra_clients", `DELETE FROM tenant_hydra_clients WHERE tenant_id = $1`},
-			{"tenant_mappings", `DELETE FROM tenant_mappings WHERE tenant_id = $1`},
-			{"clients", `DELETE FROM clients WHERE tenant_id = $1`},
-			{"projects", `DELETE FROM projects WHERE tenant_id = $1`},
-			{"role_bindings", `DELETE FROM role_bindings WHERE tenant_id = $1`},
-			{"users", `DELETE FROM users WHERE tenant_id = $1`},
-			{"tenants", `DELETE FROM tenants WHERE tenant_id = $1`},
+			{"tenant_hydra_clients", `DELETE FROM tenant_hydra_clients WHERE workspace_id = $1`},
+			{"tenant_mappings", `DELETE FROM tenant_mappings WHERE workspace_id = $1`},
+			{"clients", `DELETE FROM clients WHERE workspace_id = $1`},
+			{"projects", `DELETE FROM projects WHERE workspace_id = $1`},
+			{"role_bindings", `DELETE FROM role_bindings WHERE workspace_id = $1`},
+			{"users", `DELETE FROM users WHERE workspace_id = $1`},
+			{"tenants", `DELETE FROM tenants WHERE workspace_id = $1`},
 		}
 		for _, q := range purgeQueries {
 			if _, err := sqlDB.Exec(q.query, tenantID); err != nil {

@@ -122,30 +122,30 @@ func (ctrl *ApplicationsController) List(c *gin.Context) {
 	for i := range apps {
 		app := &apps[i]
 		config.DB.Table("mcp_tools").
-			Where("tenant_id = ? AND resource_server_id = ?", workspaceID, app.ID).
+			Where("workspace_id = ? AND resource_server_id = ?", workspaceID, app.ID).
 			Count(&app.ToolsCount)
 		config.DB.Table("oauth_scopes").
-			Where("tenant_id = ? AND resource_server_id = ?", workspaceID, app.ID).
+			Where("workspace_id = ? AND resource_server_id = ?", workspaceID, app.ID).
 			Count(&app.ScopesCount)
 		config.DB.Table("roles").
-			Where("tenant_id = ? AND name LIKE ?", workspaceID, "rs-"+app.ID.String()+":%").
+			Where("workspace_id = ? AND name LIKE ?", workspaceID, "rs-"+app.ID.String()+":%").
 			Count(&app.RolesCount)
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN roles r ON r.id = rb.role_id").
-			Where("rb.tenant_id = ?", workspaceID).
+			Where("rb.workspace_id = ?", workspaceID).
 			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Count(&app.BindingsCount)
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN roles r ON r.id = rb.role_id").
-			Where("rb.tenant_id = ? AND rb.user_id IS NOT NULL", workspaceID).
+			Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", workspaceID).
 			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&app.EndUsersCount)
 		config.DB.Table("resource_server_access_policies p").
 			Select("COALESCE(r.name, '')").
 			Joins("LEFT JOIN roles r ON r.id = p.default_role_id").
-			Where("p.tenant_id = ? AND p.resource_server_id = ?", workspaceID, app.ID).
+			Where("p.workspace_id = ? AND p.resource_server_id = ?", workspaceID, app.ID).
 			Scan(&app.DefaultRoleName)
 		if app.DefaultRoleName == "" {
 			app.LatestAccessIssue = "No default application role"
@@ -193,30 +193,30 @@ func (ctrl *ApplicationsController) PostureSummary(c *gin.Context) {
 	for _, app := range apps {
 		var appTools, appUnmapped, appPublic, appRisky, appBindings, appUsers int64
 		config.DB.Table("mcp_tools").
-			Where("tenant_id = ? AND resource_server_id = ?", workspaceID, app.ID).
+			Where("workspace_id = ? AND resource_server_id = ?", workspaceID, app.ID).
 			Count(&appTools)
 		config.DB.Table("mcp_tools t").
-			Where("t.tenant_id = ? AND t.resource_server_id = ? AND t.is_public = false", workspaceID, app.ID).
+			Where("t.workspace_id = ? AND t.resource_server_id = ? AND t.is_public = false", workspaceID, app.ID).
 			Where(`NOT EXISTS (
 				SELECT 1 FROM mcp_tool_scope_map mtsm
 				WHERE mtsm.tool_id = t.id AND mtsm.source = 'admin_override'
 			)`).
 			Count(&appUnmapped)
 		config.DB.Table("mcp_tools").
-			Where("tenant_id = ? AND resource_server_id = ? AND is_public = true", workspaceID, app.ID).
+			Where("workspace_id = ? AND resource_server_id = ? AND is_public = true", workspaceID, app.ID).
 			Count(&appPublic)
 		config.DB.Table("oauth_scopes").
-			Where("tenant_id = ? AND resource_server_id = ? AND risk_level IN ?", workspaceID, app.ID, []string{"high", "critical"}).
+			Where("workspace_id = ? AND resource_server_id = ? AND risk_level IN ?", workspaceID, app.ID, []string{"high", "critical"}).
 			Count(&appRisky)
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN roles r ON r.id = rb.role_id").
-			Where("rb.tenant_id = ?", workspaceID).
+			Where("rb.workspace_id = ?", workspaceID).
 			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Count(&appBindings)
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN roles r ON r.id = rb.role_id").
-			Where("rb.tenant_id = ? AND rb.user_id IS NOT NULL", workspaceID).
+			Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", workspaceID).
 			Where("r.name LIKE ?", "rs-"+app.ID.String()+":%").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&appUsers)

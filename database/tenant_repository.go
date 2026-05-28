@@ -9,394 +9,221 @@ import (
 	"github.com/google/uuid"
 )
 
-// TenantRepository handles tenant database operations without GORM
+// TenantRepository handles workspace identity database operations.
+//
+// Phase 6 collapse: the `tenants` table has been dropped. All queries here
+// now target the `workspaces` table (which absorbed the legacy identity
+// columns email/password_hash/provider/workspace_domain/status/source/vault_mount/ca_cert).
+// The repository type name is retained for source-compatibility with existing
+// callers; rename to WorkspaceRepository is tracked as Phase 9/10 cosmetic.
 type TenantRepository struct {
 	db *DBConnection
 }
 
-// NewTenantRepository creates a new tenant repository
+// NewTenantRepository creates a new workspace identity repository.
 func NewTenantRepository(db *DBConnection) *TenantRepository {
 	return &TenantRepository{db: db}
 }
 
-// CreateTenant creates a new tenant record
-func (tr *TenantRepository) CreateTenant(tenant *models.Tenant) error {
-	query := `
-		INSERT INTO tenants (id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-	`
-
-	now := time.Now()
-	if tenant.CreatedAt.IsZero() {
-		tenant.CreatedAt = now
-	}
-	if tenant.UpdatedAt.IsZero() {
-		tenant.UpdatedAt = now
-	}
-
-	_, err := tr.db.Exec(query,
-		tenant.ID,
-		tenant.WorkspaceID,
-		tenant.TenantDB,
-		tenant.Email,
-		tenant.Username,
-		tenant.PasswordHash,
-		tenant.Provider,
-		tenant.ProviderID,
-		tenant.Avatar,
-		tenant.Name,
-		tenant.Source,
-		tenant.Status,
-		tenant.LastLogin,
-		tenant.CreatedAt,
-		tenant.UpdatedAt,
-		tenant.TenantDomain,
+// scanWorkspaceRow scans a workspaces row into a models.Tenant. Columns absent
+// from the workspaces schema (username, provider_id, avatar, last_login, tenant_db)
+// are left as zero-value on the struct.
+func scanWorkspaceRow(row interface {
+	Scan(dest ...interface{}) error
+}, t *models.Tenant) error {
+	var providerHolder sql.NullString
+	var sourceHolder, statusHolder sql.NullString
+	var domainHolder sql.NullString
+	err := row.Scan(
+		&t.ID,
+		&t.Email,
+		&t.PasswordHash,
+		&providerHolder,
+		&t.Name,
+		&sourceHolder,
+		&statusHolder,
+		&t.CreatedAt,
+		&t.UpdatedAt,
+		&domainHolder,
 	)
+	if err != nil {
+		return err
+	}
+	// workspace_id mirrors id (post-collapse, the workspace's own UUID IS the scope ID).
+	t.WorkspaceID = t.ID
+	if providerHolder.Valid {
+		t.Provider = providerHolder.String
+	}
+	if sourceHolder.Valid {
+		t.Source = sourceHolder.String
+	}
+	if statusHolder.Valid {
+		t.Status = statusHolder.String
+	}
+	if domainHolder.Valid {
+		t.TenantDomain = domainHolder.String
+	}
+	return nil
+}
 
+const workspaceSelectCols = `id, COALESCE(email, ''), COALESCE(password_hash, ''), provider, COALESCE(name, ''), source, status, created_at, updated_at, workspace_domain`
+
+// CreateTenant inserts a workspace identity row.
+func (tr *TenantRepository) CreateTenant(t *models.Tenant) error {
+	query := `
+		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`
+	now := time.Now()
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
+	}
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = now
+	}
+	_, err := tr.db.Exec(query,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
+	)
 	return err
 }
 
-// GetTenantByEmail retrieves a tenant by email (case-insensitive)
+// GetTenantByEmail retrieves a workspace identity by email (case-insensitive).
 func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, error) {
-	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		WHERE LOWER(email) = LOWER($1)
-	`
-
-	tenant := &models.Tenant{}
-	var lastLogin sql.NullTime
-	var username, providerID, avatar sql.NullString
-
-	err := tr.db.QueryRow(query, email).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&providerID,
-		&avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&lastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
+	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE LOWER(email) = LOWER($1)`
+	t := &models.Tenant{}
+	err := scanWorkspaceRow(tr.db.QueryRow(query, email), t)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found")
+			return nil, fmt.Errorf("workspace not found")
 		}
 		return nil, err
 	}
-
-	// Handle nullable fields
-	if username.Valid {
-		tenant.Username = &username.String
-	}
-	if providerID.Valid {
-		tenant.ProviderID = &providerID.String
-	}
-	if avatar.Valid {
-		tenant.Avatar = &avatar.String
-	}
-	if lastLogin.Valid {
-		tenant.LastLogin = &lastLogin.Time
-	}
-
-	return tenant, nil
+	return t, nil
 }
 
-// GetTenantByTenantID retrieves a tenant by tenant_id
-func (tr *TenantRepository) GetTenantByTenantID(tenantID string) (*models.Tenant, error) {
-	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		WHERE tenant_id = $1
-	`
-
-	tenant := &models.Tenant{}
-	var lastLogin sql.NullTime
-	var username, providerID, avatar sql.NullString
-
-	err := tr.db.QueryRow(query, tenantID).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&providerID,
-		&avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&lastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
+// GetTenantByTenantID retrieves a workspace by its ID (workspace_id == id).
+func (tr *TenantRepository) GetTenantByTenantID(workspaceID string) (*models.Tenant, error) {
+	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE id = $1`
+	t := &models.Tenant{}
+	err := scanWorkspaceRow(tr.db.QueryRow(query, workspaceID), t)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found")
+			return nil, fmt.Errorf("workspace not found")
 		}
 		return nil, err
 	}
-
-	// Handle nullable fields
-	if username.Valid {
-		tenant.Username = &username.String
-	}
-	if providerID.Valid {
-		tenant.ProviderID = &providerID.String
-	}
-	if avatar.Valid {
-		tenant.Avatar = &avatar.String
-	}
-	if lastLogin.Valid {
-		tenant.LastLogin = &lastLogin.Time
-	}
-
-	return tenant, nil
+	return t, nil
 }
 
-// UpdateTenantDB updates the tenant_db field for a tenant
-func (tr *TenantRepository) UpdateTenantDB(tenantID uuid.UUID, dbName string) error {
-	query := `
-		UPDATE tenants
-		SET tenant_db = $1, updated_at = $2
-		WHERE id = $3
-	`
-
-	result, err := tr.db.Exec(query, dbName, time.Now(), tenantID)
-	if err != nil {
-		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("tenant not found")
-	}
-
+// UpdateTenantDB is a no-op under the single-DB collapse (workspaces has no tenant_db column).
+func (tr *TenantRepository) UpdateTenantDB(workspaceID uuid.UUID, dbName string) error {
 	return nil
 }
 
-// UpdateTenantLogin updates the last_login timestamp for a tenant
-func (tr *TenantRepository) UpdateTenantLogin(tenantID uuid.UUID) error {
-	query := `
-		UPDATE tenants
-		SET last_login = $1, updated_at = $2
-		WHERE id = $3
-	`
-
-	now := time.Now()
-	result, err := tr.db.Exec(query, now, now, tenantID)
-	if err != nil {
-		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("tenant not found")
-	}
-
-	return nil
+// UpdateTenantLogin is a no-op under the workspaces schema (no last_login column on workspaces yet).
+// If last-login tracking is needed it should live on admin_users or a sessions row.
+func (tr *TenantRepository) UpdateTenantLogin(workspaceID uuid.UUID) error {
+	_, err := tr.db.Exec(`UPDATE workspaces SET updated_at = $1 WHERE id = $2`, time.Now(), workspaceID)
+	return err
 }
 
-// TenantExists checks if a tenant exists by email (case-insensitive)
+// TenantExists checks whether a workspace identity exists for the given email.
 func (tr *TenantRepository) TenantExists(email string) (bool, error) {
-	// Validate database connection
 	if tr.db == nil || tr.db.DB == nil {
 		return false, fmt.Errorf("database connection is not initialized")
 	}
-
-	// Ensure connection is valid
 	if err := tr.db.DB.Ping(); err != nil {
 		return false, fmt.Errorf("database connection failed: %w", err)
 	}
-
-	query := `SELECT EXISTS(SELECT 1 FROM tenants WHERE LOWER(email) = LOWER($1))`
+	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE LOWER(email) = LOWER($1))`
 	var exists bool
 	err := tr.db.QueryRow(query, email).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("failed to check tenant existence: %w", err)
+		return false, fmt.Errorf("failed to check workspace existence: %w", err)
 	}
 	return exists, nil
 }
 
-// TenantExistsByTenantID checks if a tenant exists by tenant_id
-func (tr *TenantRepository) TenantExistsByTenantID(tenantID string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM tenants WHERE tenant_id = $1)`
-
+// TenantExistsByTenantID checks whether a workspace exists with the given ID.
+func (tr *TenantRepository) TenantExistsByTenantID(workspaceID string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`
 	var exists bool
-	err := tr.db.QueryRow(query, tenantID).Scan(&exists)
+	err := tr.db.QueryRow(query, workspaceID).Scan(&exists)
 	return exists, err
 }
 
-// Transaction support
-
-// CreateTenantTx creates a tenant within a transaction
-func (tr *TenantRepository) CreateTenantTx(tx *sql.Tx, tenant *models.Tenant) error {
+// CreateTenantTx inserts a workspace identity row within a transaction.
+func (tr *TenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
 	query := `
-		INSERT INTO tenants (id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
-
 	now := time.Now()
-	if tenant.CreatedAt.IsZero() {
-		tenant.CreatedAt = now
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
 	}
-	if tenant.UpdatedAt.IsZero() {
-		tenant.UpdatedAt = now
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
 	}
-
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = now
+	}
 	_, err := tx.Exec(query,
-		tenant.ID,
-		tenant.WorkspaceID,
-		tenant.TenantDB,
-		tenant.Email,
-		tenant.Username,
-		tenant.PasswordHash,
-		tenant.Provider,
-		tenant.ProviderID,
-		tenant.Avatar,
-		tenant.Name,
-		tenant.Source,
-		tenant.Status,
-		tenant.LastLogin,
-		tenant.CreatedAt,
-		tenant.UpdatedAt,
-		tenant.TenantDomain,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
 	)
-
 	return err
 }
 
-// UpdateTenantDBTx updates tenant_db within a transaction
-func (tr *TenantRepository) UpdateTenantDBTx(tx *sql.Tx, tenantID uuid.UUID, dbName string) error {
-	query := `
-		UPDATE tenants
-		SET tenant_db = $1, updated_at = $2
-		WHERE id = $3
-	`
-
-	result, err := tx.Exec(query, dbName, time.Now(), tenantID)
-	if err != nil {
-		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("tenant not found")
-	}
-
+// UpdateTenantDBTx is a no-op under the single-DB collapse.
+func (tr *TenantRepository) UpdateTenantDBTx(tx *sql.Tx, workspaceID uuid.UUID, dbName string) error {
 	return nil
 }
 
-// GetAllTenants retrieves all tenants from the database
+// GetAllTenants retrieves every workspace identity row.
 func (tr *TenantRepository) GetAllTenants() ([]*models.Tenant, error) {
-	query := `
-		SELECT id, tenant_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		ORDER BY created_at DESC
-	`
-
+	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces ORDER BY created_at DESC`
 	rows, err := tr.db.Query(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query tenants: %w", err)
+		return nil, fmt.Errorf("failed to query workspaces: %w", err)
 	}
 	defer rows.Close()
 
-	var tenants []*models.Tenant
+	var out []*models.Tenant
 	for rows.Next() {
-		tenant := &models.Tenant{}
-		err := rows.Scan(
-			&tenant.ID,
-			&tenant.WorkspaceID,
-			&tenant.TenantDB,
-			&tenant.Email,
-			&tenant.Username,
-			&tenant.PasswordHash,
-			&tenant.Provider,
-			&tenant.ProviderID,
-			&tenant.Avatar,
-			&tenant.Name,
-			&tenant.Source,
-			&tenant.Status,
-			&tenant.LastLogin,
-			&tenant.CreatedAt,
-			&tenant.UpdatedAt,
-			&tenant.TenantDomain,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan tenant: %w", err)
+		t := &models.Tenant{}
+		if err := scanWorkspaceRow(rows, t); err != nil {
+			return nil, fmt.Errorf("failed to scan workspace row: %w", err)
 		}
-		tenants = append(tenants, tenant)
+		out = append(out, t)
 	}
-
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		return nil, fmt.Errorf("error iterating workspace rows: %w", err)
 	}
-
-	return tenants, nil
+	return out, nil
 }
 
-// UpdateTenantStatusTx updates tenant status within a transaction
-func (tr *TenantRepository) UpdateTenantStatusTx(tx *sql.Tx, tenantID uuid.UUID, status string) error {
-	query := `
-		UPDATE tenants
-		SET status = $1, updated_at = $2
-		WHERE id = $3
-	`
-
-	result, err := tx.Exec(query, status, time.Now(), tenantID)
+// UpdateTenantStatusTx updates a workspace's status within a transaction.
+func (tr *TenantRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid.UUID, status string) error {
+	query := `UPDATE workspaces SET status = $1, updated_at = $2 WHERE id = $3`
+	result, err := tx.Exec(query, status, time.Now(), workspaceID)
 	if err != nil {
 		return err
 	}
-
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
-
 	if rowsAffected == 0 {
-		return fmt.Errorf("tenant not found")
+		return fmt.Errorf("workspace not found")
 	}
-
 	return nil
 }
 
-// DeleteTenant permanently deletes a tenant and all related data from the master database.
-// Single-tenant collapse: there is no per-tenant database to drop separately.
-func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, error) {
+// DeleteTenant permanently deletes a workspace and all related scoped rows.
+func (tr *TenantRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int64, error) {
 	deletedCounts := make(map[string]int64)
 
 	tx, err := tr.db.Begin()
@@ -405,7 +232,6 @@ func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, 
 	}
 	defer tx.Rollback()
 
-	// Helper function to execute delete and count rows
 	execDelete := func(table, query string, args ...interface{}) error {
 		result, err := tx.Exec(query, args...)
 		if err != nil {
@@ -417,92 +243,42 @@ func (tr *TenantRepository) DeleteTenant(tenantID uuid.UUID) (map[string]int64, 
 		return nil
 	}
 
-	// Delete in order of dependencies (child tables first)
-
-	// 1. Delete role_bindings for users in this tenant
-	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE tenant_id = $1", tenantID); err != nil {
+	if err := execDelete("role_bindings", "DELETE FROM role_bindings WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE workspace_id = $1)", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("roles", "DELETE FROM roles WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("permissions", "DELETE FROM permissions WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("oauth_scopes", "DELETE FROM oauth_scopes WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("projects", "DELETE FROM projects WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("users", "DELETE FROM users WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("workspace_memberships", "DELETE FROM workspace_memberships WHERE workspace_id = $1", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := execDelete("workspaces", "DELETE FROM workspaces WHERE id = $1", workspaceID); err != nil {
 		return nil, err
 	}
 
-	// 2. Delete role_permissions for roles in this tenant
-	if err := execDelete("role_permissions", "DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE tenant_id = $1)", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 3. Delete roles for this tenant
-	if err := execDelete("roles", "DELETE FROM roles WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 4. Delete permissions for this tenant
-	if err := execDelete("permissions", "DELETE FROM permissions WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 5. Delete oauth_scopes for this tenant (cascades to oauth_scope_permissions)
-	if err := execDelete("oauth_scopes", "DELETE FROM oauth_scopes WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 6. Delete totp_secrets for users in this tenant
-	if err := execDelete("totp_secrets", "DELETE FROM totp_secrets WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 7. Delete backup_codes for users in this tenant
-	if err := execDelete("backup_codes", "DELETE FROM backup_codes WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 8. Delete webauthn_credentials for users in this tenant
-	if err := execDelete("webauthn_credentials", "DELETE FROM webauthn_credentials WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 9. Delete sessions for users in this tenant
-	if err := execDelete("sessions", "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE tenant_id = $1)", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 10. Delete refresh_tokens for users in this tenant
-	if err := execDelete("refresh_tokens", "DELETE FROM refresh_tokens WHERE user_id IN (SELECT id FROM users WHERE tenant_id = $1)", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 11. Delete user_groups for users in this tenant
-	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE tenant_id = $1)", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 12. Delete oauth_clients for this tenant
-	if err := execDelete("oauth_clients", "DELETE FROM oauth_clients WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 13. Delete projects for this tenant
-	if err := execDelete("projects", "DELETE FROM projects WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 14. Delete tenant_mappings for this tenant
-	if err := execDelete("tenant_mappings", "DELETE FROM tenant_mappings WHERE tenant_id = $1", tenantID.String()); err != nil {
-		return nil, err
-	}
-
-	// 15. Delete users for this tenant
-	if err := execDelete("users", "DELETE FROM users WHERE tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// 16. Finally, delete the tenant record itself
-	if err := execDelete("tenants", "DELETE FROM tenants WHERE id = $1 OR tenant_id = $1", tenantID); err != nil {
-		return nil, err
-	}
-
-	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
-
 	return deletedCounts, nil
 }

@@ -243,7 +243,7 @@ func toMapClaims(c JWTSVIDClaims) jwt.MapClaims {
 		"nbf":          c.Nbf,
 		"exp":          c.Exp,
 		"user_id":      c.UserID,
-		"tenant_id":    c.WorkspaceID,
+		"workspace_id": c.WorkspaceID,
 		"email":        c.Email,
 		"agent_type":   c.AgentType,
 		"spiffe_id":    c.SpiffeID,

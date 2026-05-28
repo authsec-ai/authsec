@@ -151,7 +151,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	userID := claimString(userClaims, "user_id", claimString(userClaims, "sub", ""))
 	email := claimString(userClaims, "email_id", claimString(userClaims, "email", ""))
-	tenantID := claimString(userClaims, "tenant_id", "")
+	tenantID := claimString(userClaims, "workspace_id", "")
 	projectID := claimString(userClaims, "project_id", "")
 
 	if userID == "" || email == "" || tenantID == "" {
@@ -208,8 +208,8 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 			expectedTenantID = legacyTenantID
 		}
 		if expectedTenantID == "" {
-			if legacyTenantID, _ := clientDetails.Metadata["tenant_id"].(string); legacyTenantID != "" {
-				expectedTenantID = legacyTenantID
+			if wsID, _ := clientDetails.Metadata["workspace_id"].(string); wsID != "" {
+				expectedTenantID = wsID
 			}
 		}
 		if expectedTenantID != "" && !strings.EqualFold(expectedTenantID, tenantID) {
@@ -245,7 +245,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"username":    username,
 		"provider":    user.Provider,
 		"provider_id": user.ProviderID,
-		"tenant_id":   user.WorkspaceID,
+		"workspace_id":   user.WorkspaceID,
 		"project_id":  user.ProjectID,
 		"client_id":   expectedClientID,
 		"avatar_url":  user.AvatarURL,
@@ -282,7 +282,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"login_challenge": req.LoginChallenge,
 		"redirect_to":     acceptResponse.RedirectTo,
 		"client_id":       expectedClientID,
-		"tenant_id":       expectedTenantID,
+		"workspace_id":       expectedTenantID,
 		"email":           user.Email,
 	})
 }
@@ -465,7 +465,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		return
 	}
 
-	tenantIDForOIDC, _ := clientDetails.Metadata["tenant_id"].(string)
+	tenantIDForOIDC, _ := clientDetails.Metadata["workspace_id"].(string)
 	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
 	tenantName, _ := clientDetails.Metadata["tenant_name"].(string)
 
@@ -660,8 +660,8 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 	tenantDB := config.DB
 
 	var client hydramodels.Client
-	tenantIDStr := clientDetails.Metadata["tenant_id"].(string)
-	if err := tenantDB.Where("tenant_id = ? AND active = ? AND client_id = ?", orgID, true, tenantIDStr).First(&client).Error; err != nil {
+	tenantIDStr := clientDetails.Metadata["workspace_id"].(string)
+	if err := tenantDB.Where("workspace_id = ? AND active = ? AND client_id = ?", orgID, true, tenantIDStr).First(&client).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to retrieve client information"})
 		return
 	}
@@ -794,7 +794,7 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 
 	baseURL := strings.TrimSuffix(callbackURL, "/oidc/auth/callback")
 
-	if tenantIDObj, ok := clientDetails.Metadata["tenant_id"].(string); ok && tenantIDObj != "" {
+	if tenantIDObj, ok := clientDetails.Metadata["workspace_id"].(string); ok && tenantIDObj != "" {
 		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, tenantIDObj)
 		if err == nil && len(verifiedDomains) > 0 {
 			if u, err := url.Parse(baseURL); err == nil {
@@ -1103,7 +1103,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	}
 
 	sessionClaims := map[string]interface{}{
-		"tenant_id":          arcCtx.WorkspaceID,
+		"workspace_id":          arcCtx.WorkspaceID,
 		"resource_server_id": arcCtx.ResourceServerID,
 		"context_id":         arcCtx.ContextID,
 		"auth_time":          time.Now().Unix(),
@@ -1151,7 +1151,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 			LastSeenAt:     &now,
 		}
 		if err := config.DB.
-			Where("tenant_id = ? AND user_id = ?", tenantUUID, subjectUUID).
+			Where("workspace_id = ? AND user_id = ?", tenantUUID, subjectUUID).
 			Assign(map[string]interface{}{
 				"status":       models.EndUserStatusActive,
 				"last_seen_at": now,
@@ -1394,7 +1394,7 @@ func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
 
 	var tenantClientID string
 	for _, client := range clients {
-		if tenantID, ok := client.Metadata["tenant_id"].(string); ok && tenantID == req.WorkspaceID {
+		if tenantID, ok := client.Metadata["workspace_id"].(string); ok && tenantID == req.WorkspaceID {
 			if orgID, ok := client.Metadata["org_id"].(string); ok && orgID == req.OrgID {
 				if clientType, ok := client.Metadata["type"].(string); ok && clientType == "tenant_main_client" {
 					tenantClientID = client.ClientID
@@ -1606,7 +1606,7 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 	query.Set("user_name", user.Name)
 	query.Set("provider", user.Provider)
 	query.Set("client_id", user.ClientID.String())
-	query.Set("tenant_id", user.WorkspaceID.String())
+	query.Set("workspace_id", user.WorkspaceID.String())
 	query.Set("project_id", user.ProjectID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
@@ -1676,7 +1676,7 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 	query.Set("user_name", user.Name)
 	query.Set("provider", user.Provider)
 	query.Set("client_id", user.ClientID.String())
-	query.Set("tenant_id", user.WorkspaceID.String())
+	query.Set("workspace_id", user.WorkspaceID.String())
 	query.Set("project_id", user.ProjectID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
@@ -1725,7 +1725,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		return "", nil, fmt.Errorf("failed to get client details: %w", err)
 	}
 
-	clientIDFromMetadata, _ := clientDetails.Metadata["tenant_id"].(string)
+	clientIDFromMetadata, _ := clientDetails.Metadata["workspace_id"].(string)
 	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
 
 	if realTenantID != tenantID {
@@ -1746,7 +1746,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		username = strings.Split(username, "@")[0]
 	}
 
-	parsedTenantID, err := hydrautils.ValidateUUID(realTenantID, "tenant_id")
+	parsedTenantID, err := hydrautils.ValidateUUID(realTenantID, "workspace_id")
 	if err != nil {
 		return "", nil, err
 	}
@@ -1779,7 +1779,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		"username":    user.Username,
 		"provider":    user.Provider,
 		"provider_id": user.ProviderID,
-		"tenant_id":   user.WorkspaceID,
+		"workspace_id":   user.WorkspaceID,
 		"client_id":   user.ClientID,
 	})
 	if err != nil {

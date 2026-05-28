@@ -273,12 +273,12 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	// Validate and parse tenant ID
 	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
 
-	logger = logger.WithField("user_id", userUUID).WithField("tenant_id", tenantUUID).WithField("active", active)
+	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", tenantUUID).WithField("active", active)
 
 	// Fetch admin user
 	adminUser, err := auc.adminUserRepo.GetAdminUserByID(userUUID)
@@ -436,7 +436,7 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 	}
 
 	userTenant := strings.TrimSpace(userInfo.WorkspaceID)
-	logger = logger.WithField("tenant_id", userTenant)
+	logger = logger.WithField("workspace_id", userTenant)
 
 	// Fetch admin user to delete
 	adminUser, err := auc.adminUserRepo.GetAdminUserByID(userUUID)
@@ -570,12 +570,12 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	// Validate and parse tenant ID
 	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
 
-	logger = logger.WithField("user_id", userUUID).WithField("tenant_id", tenantUUID)
+	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", tenantUUID)
 
 	// Validate repository initialization
 	if auc.adminUserRepo == nil {
@@ -735,7 +735,7 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	}
 
 	// 8. Finally, delete the user
-	if err := execDelete("users", "DELETE FROM users WHERE id = $1 AND tenant_id = $2", userUUID, tenantUUID); err != nil {
+	if err := execDelete("users", "DELETE FROM users WHERE id = $1 AND workspace_id = $2", userUUID, tenantUUID); err != nil {
 		logger.WithError(err).Error("Failed to delete user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1016,7 +1016,7 @@ func (auc *AdminUserController) GetTenantUsers(c *gin.Context) {
 	tenantIDStr := c.Param("workspace_id")
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error":     "Per-tenant user listing is managed by mt-plugin",
-		"tenant_id": tenantIDStr,
+		"workspace_id": tenantIDStr,
 		"hint":      "Configure MT_PLUGIN_GRPC_ADDR to enable multi-tenant operations",
 	})
 }
@@ -1208,12 +1208,12 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 	tenantIDStr := strings.TrimSpace(req.WorkspaceID)
 	tenantUUID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		logger.WithError(err).WithField("tenant_id", req.WorkspaceID).Warn("Invalid tenant ID format")
+		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
 		return
 	}
 
-	logger = logger.WithField("user_id", userUUID).WithField("tenant_id", tenantUUID).WithField("active", active)
+	logger = logger.WithField("user_id", userUUID).WithField("workspace_id", tenantUUID).WithField("active", active)
 
 	tenantDB := config.DB
 
@@ -1324,7 +1324,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 		return
 	}
 
-	logger = logger.WithField("tenant_id", tenantUUID.String())
+	logger = logger.WithField("workspace_id", tenantUUID.String())
 	logger.Info("Processing delete_tenant request")
 
 	// Get authenticated user info
@@ -1399,7 +1399,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 	// Audit log: Tenant deleted (stdout)
 	middlewares.Audit(c, "tenant", tenantUUID.String(), "delete_tenant", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id":     tenantUUID.String(),
+			"workspace_id":     tenantUUID.String(),
 			"tenant_email":  tenantEmail,
 			"tenant_domain": tenantDomain,
 			"tenant_db":     tenantDB,
@@ -1415,7 +1415,7 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":          "Tenant and all associated data deleted successfully",
-		"tenant_id":        tenantUUID.String(),
+		"workspace_id":        tenantUUID.String(),
 		"deleted_counts":   deletedCounts,
 		"database_dropped": databaseDropped,
 		"warning":          "This action is irreversible. All tenant data has been permanently deleted.",

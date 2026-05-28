@@ -40,24 +40,28 @@ func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthSer
 	}
 }
 
-// tenantMapping maps client ID to tenant ID using tenant_mappings table
+// tenantMapping maps client ID to workspace ID via the clients table.
+// Phase 6: tenant_mappings was deleted — clients.workspace_id is now authoritative.
 func (s *VoiceAuthService) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return uuid.UUID{}, fmt.Errorf("database not initialized")
 	}
 
-	var tenantID uuid.UUID
-	query := `SELECT tenant_id FROM tenant_mappings WHERE client_id = $1`
-	err := db.QueryRow(query, clientID).Scan(&tenantID)
+	var workspaceIDStr string
+	query := `SELECT workspace_id::text FROM clients WHERE client_id = $1`
+	err := db.QueryRow(query, clientID).Scan(&workspaceIDStr)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return uuid.UUID{}, fmt.Errorf("client not found in tenant_mappings")
+			return uuid.UUID{}, fmt.Errorf("client not found")
 		}
-		return uuid.UUID{}, fmt.Errorf("failed to lookup tenant mapping: %w", err)
+		return uuid.UUID{}, fmt.Errorf("failed to lookup workspace: %w", err)
 	}
-
-	return tenantID, nil
+	workspaceID, err := uuid.Parse(workspaceIDStr)
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("invalid workspace_id stored on client: %w", err)
+	}
+	return workspaceID, nil
 }
 
 // InitiateVoiceAuth creates a new voice authentication session
@@ -459,9 +463,8 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 	}
 
 	now := time.Now().UTC()
-	// Phase 3: emit workspace_id alongside tenant_id (mirror — equal UUIDs by construction).
+	// Phase 6: workspace_id is the only identity claim.
 	claims := jwt.MapClaims{
-		"tenant_id":      tenant.ID.String(),
 		"workspace_id":   tenant.ID.String(),
 		"project_id":     tenant.ID.String(),
 		"client_id":      user.ClientID.String(),

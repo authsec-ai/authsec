@@ -93,23 +93,11 @@ func main() {
 
 	}
 
-	// Phase 2 (tenant → workspace migration): assert tenants and workspaces are
-	// in lockstep on every boot. Admin signup writes both rows in one tx, so
-	// drift is a real bug — surface it loud rather than letting downstream code
-	// silently return empty IDP/SCIM/MCP results because workspace_id is NULL.
-	//
-	// This log is the breadcrumb future phases (4, 6) use to know when every
-	// existing tenant has a matching workspace. Once the audit passes for a
-	// full week, the tenants table can be dropped without backfill.
+	// Phase 6: tenants table dropped — workspace is the only identity table.
 	{
-		var tenants, workspaces int64
-		_ = config.Database.DB.QueryRow("SELECT count(*) FROM tenants").Scan(&tenants)
+		var workspaces int64
 		_ = config.Database.DB.QueryRow("SELECT count(*) FROM workspaces").Scan(&workspaces)
-		if tenants == workspaces {
-			log.Printf("[migration:phase2] tenants=%d workspaces=%d (in lockstep)", tenants, workspaces)
-		} else {
-			log.Printf("[migration:phase2] DRIFT — tenants=%d workspaces=%d. New signups create both rows; pre-existing tenants need a one-time backfill OR a fresh DB wipe.", tenants, workspaces)
-		}
+		log.Printf("[migration:phase6] workspaces=%d", workspaces)
 	}
 
 	// Hydra reconciler: walks mcp_oauth_clients rows whose Hydra sync failed
@@ -226,7 +214,6 @@ func main() {
 	r.Use(middlewares.MennovRateLimitMiddleware())
 	// exclude /authsec/metrics from compression so Prometheus can scrape it
 	r.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/authsec/metrics"})))
-	r.Use(middlewares.WorkspaceContractCompatibility())
 
 	// Prometheus metrics endpoint
 	r.GET("/authsec/metrics", gin.WrapH(promhttp.Handler()))

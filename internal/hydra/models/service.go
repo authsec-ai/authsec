@@ -195,13 +195,13 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	db := config.DB
 
 	var client Client
-	if err := db.Table("clients").Where("client_id = ? and tenant_id = ?", clientIDStr, tenantIDStr).First(&client).Error; err != nil {
+	if err := db.Table("clients").Where("client_id = ? and workspace_id = ?", clientIDStr, tenantIDStr).First(&client).Error; err != nil {
 		return nil, fmt.Errorf("failed to get client details: %w", err)
 	}
 
 	var existingUser User
 	err := db.Table("users").Where(
-		"provider = ? AND provider_id = ? AND tenant_id = ? AND client_id = ?",
+		"provider = ? AND provider_id = ? AND workspace_id = ? AND client_id = ?",
 		users.Provider, users.ProviderID, tenantID, clientID,
 	).First(&existingUser).Error
 
@@ -418,7 +418,7 @@ func (s *OAuthLoginService) AcceptHydraConsentRequest(consentChallenge string, c
 				"name":        userContext["name"],
 				"provider":    userContext["provider"],
 				"provider_id": userContext["provider_id"],
-				"tenant_id":   userContext["tenant_id"],
+				"workspace_id": userContext["workspace_id"],
 				"org_id":      userContext["org_id"],
 			},
 			"id_token": map[string]interface{}{
@@ -427,7 +427,7 @@ func (s *OAuthLoginService) AcceptHydraConsentRequest(consentChallenge string, c
 				"name":        userContext["name"],
 				"provider":    userContext["provider"],
 				"provider_id": userContext["provider_id"],
-				"tenant_id":   userContext["tenant_id"],
+				"workspace_id": userContext["workspace_id"],
 				"org_id":      userContext["org_id"],
 			},
 		},

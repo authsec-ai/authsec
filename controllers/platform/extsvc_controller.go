@@ -120,9 +120,9 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 		return nil, "", "", fmt.Errorf("invalid claims format: %T", claimsInterface)
 	}
 
-	tenantIDStr, ok := claims["tenant_id"].(string)
+	tenantIDStr, ok := claims["workspace_id"].(string)
 	if !ok || tenantIDStr == "" {
-		return nil, "", "", fmt.Errorf("tenant_id not found in claims")
+		return nil, "", "", fmt.Errorf("workspace_id not found in claims")
 	}
 	clientIDStr, ok := claims["client_id"].(string)
 	if !ok || clientIDStr == "" {
@@ -135,7 +135,7 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 	}
 
 	var tenant sharedmodels.Tenant
-	if err := ctl.globalDB.Where("tenant_id = ?", tenantUUID).First(&tenant).Error; err != nil {
+	if err := ctl.globalDB.Where("workspace_id = ?", tenantUUID).First(&tenant).Error; err != nil {
 		return nil, "", "", fmt.Errorf("tenant not found: %w", err)
 	}
 
@@ -469,7 +469,7 @@ func DebugExternalServiceAuth(c *gin.Context) {
 		"extracted_scopes":    scopes,
 		"extracted_resources": resources,
 		"client_id":           claims["client_id"],
-		"tenant_id":           claims["tenant_id"],
+		"workspace_id":           claims["workspace_id"],
 	})
 }
 

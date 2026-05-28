@@ -195,7 +195,6 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 		attrMapping := datatypes.JSON(req.AttributeMapping)
 		samlRow := map[string]interface{}{
 			"id":                samlID,
-			"tenant_id":         req.WorkspaceID,
 			"workspace_id":      req.WorkspaceID,
 			"provider_name":     providerName,
 			"display_name":      coalesceString(req.DisplayName, providerName),
@@ -326,7 +325,7 @@ func (s *IdentityProviderService) PinIDPToApplication(workspaceID, applicationID
 	}
 	var count int64
 	if err := s.db.Table("resource_servers").
-		Where("id = ? AND (workspace_id = ? OR tenant_id = ?)", applicationID, workspaceID, workspaceID).
+		Where("id = ? AND (workspace_id = ? OR workspace_id = ?)", applicationID, workspaceID, workspaceID).
 		Count(&count).Error; err != nil {
 		return nil, fmt.Errorf("verify application: %w", err)
 	}

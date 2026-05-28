@@ -51,7 +51,7 @@ func (s *TenantCIBAAuthService) tenantMapping(clientID uuid.UUID) (uuid.UUID, er
 	}
 
 	var tenantID uuid.UUID
-	query := `SELECT tenant_id FROM tenant_mappings WHERE client_id = $1`
+	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
 	err := db.QueryRow(query, clientID).Scan(&tenantID)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {

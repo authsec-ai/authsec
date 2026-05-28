@@ -130,7 +130,7 @@ func validateClientActive(clientID, tenantID string) error {
 	query := `
 		SELECT id FROM clients
 		WHERE client_id::text = $1
-		AND tenant_id = $2
+		AND workspace_id = $2
 		AND (deleted = false OR deleted IS NULL)
 		AND status = 'Active'
 		LIMIT 1
@@ -245,7 +245,7 @@ func delegationContextString(c *gin.Context, key string) string {
 
 // resolveDelegationTenantID extracts the tenant UUID from the gin context.
 func resolveDelegationTenantID(c *gin.Context) (*uuid.UUID, error) {
-	tenantIDStr := delegationContextString(c, "tenant_id")
+	tenantIDStr := delegationContextString(c, "workspace_id")
 	if tenantIDStr == "" {
 		return nil, fmt.Errorf("tenant_id not found in authentication token")
 	}

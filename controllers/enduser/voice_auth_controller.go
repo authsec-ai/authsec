@@ -212,7 +212,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	middlewares.Audit(c, "voice_auth", userID.String(), "link", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":        userID.String(),
-			"tenant_id":      tenantID.String(),
+			"workspace_id":      tenantID.String(),
 			"voice_platform": req.VoicePlatform,
 			"voice_user_id":  req.VoiceUserID,
 		},
@@ -264,7 +264,7 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	// Audit log: Voice assistant unlinked
 	middlewares.Audit(c, "voice_auth", req.VoiceUserID, "unlink", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"tenant_id":      tenantID.String(),
+			"workspace_id":      tenantID.String(),
 			"voice_platform": req.VoicePlatform,
 			"voice_user_id":  req.VoiceUserID,
 		},

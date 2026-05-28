@@ -37,7 +37,7 @@ func (r *AgentActionRepository) CreateRiskPolicy(policy *models.RiskPolicy) erro
 
 	query := `
 		INSERT INTO risk_policies (
-			id, tenant_id, name, description,
+			id, workspace_id, name, description,
 			action_pattern, resource_pattern, environment_pattern,
 			base_score, scope_bulk_threshold, scope_bulk_modifier,
 			pii_modifier, financial_modifier, off_hours_modifier, first_time_modifier,
@@ -80,14 +80,14 @@ func (r *AgentActionRepository) CreateRiskPolicy(policy *models.RiskPolicy) erro
 // GetRiskPoliciesByTenant retrieves all active risk policies for a tenant, ordered by priority
 func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]models.RiskPolicy, error) {
 	query := `
-		SELECT id, tenant_id, name, description,
+		SELECT id, workspace_id, name, description,
 		       action_pattern, resource_pattern, environment_pattern,
 		       base_score, scope_bulk_threshold, scope_bulk_modifier,
 		       pii_modifier, financial_modifier, off_hours_modifier, first_time_modifier,
 		       auto_approve_below, require_approval_above, require_multi_approval_above,
 		       is_active, priority, created_at, updated_at
 		FROM risk_policies
-		WHERE tenant_id = $1 AND is_active = TRUE
+		WHERE workspace_id = $1 AND is_active = TRUE
 		ORDER BY priority DESC, created_at ASC
 	`
 
@@ -120,14 +120,14 @@ func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]m
 // GetRiskPolicyByID retrieves a single risk policy
 func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, tenantID uuid.UUID) (*models.RiskPolicy, error) {
 	query := `
-		SELECT id, tenant_id, name, description,
+		SELECT id, workspace_id, name, description,
 		       action_pattern, resource_pattern, environment_pattern,
 		       base_score, scope_bulk_threshold, scope_bulk_modifier,
 		       pii_modifier, financial_modifier, off_hours_modifier, first_time_modifier,
 		       auto_approve_below, require_approval_above, require_multi_approval_above,
 		       is_active, priority, created_at, updated_at
 		FROM risk_policies
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
 	var p models.RiskPolicy
@@ -163,7 +163,7 @@ func (r *AgentActionRepository) UpdateRiskPolicy(policy *models.RiskPolicy) erro
 			pii_modifier = $9, financial_modifier = $10, off_hours_modifier = $11, first_time_modifier = $12,
 			auto_approve_below = $13, require_approval_above = $14, require_multi_approval_above = $15,
 			is_active = $16, priority = $17, updated_at = $18
-		WHERE id = $19 AND tenant_id = $20
+		WHERE id = $19 AND workspace_id = $20
 	`
 
 	result, err := r.db.Exec(query,
@@ -193,7 +193,7 @@ func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, tenantID uu
 	now := time.Now().Unix()
 	query := `
 		UPDATE risk_policies SET is_active = FALSE, updated_at = $1
-		WHERE id = $2 AND tenant_id = $3
+		WHERE id = $2 AND workspace_id = $3
 	`
 
 	result, err := r.db.Exec(query, now, policyID, tenantID)
@@ -216,14 +216,14 @@ func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, tenantID uu
 // GetOrCreateSettings retrieves tenant settings, creating defaults if needed
 func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models.AgentGuardSettings, error) {
 	query := `
-		SELECT id, tenant_id,
+		SELECT id, workspace_id,
 		       auto_approve_below, require_approval_above, require_multi_approval_above,
 		       approval_timeout_seconds, polling_interval_seconds,
 		       business_hours_start, business_hours_end, business_hours_timezone,
 		       default_approver_user_id, require_biometric,
 		       created_at, updated_at
 		FROM agent_guard_settings
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 	`
 
 	var s models.AgentGuardSettings
@@ -264,14 +264,14 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 
 	insertQuery := `
 		INSERT INTO agent_guard_settings (
-			id, tenant_id,
+			id, workspace_id,
 			auto_approve_below, require_approval_above, require_multi_approval_above,
 			approval_timeout_seconds, polling_interval_seconds,
 			business_hours_start, business_hours_end, business_hours_timezone,
 			default_approver_user_id, require_biometric,
 			created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		ON CONFLICT (tenant_id) DO NOTHING
+		ON CONFLICT (workspace_id) DO NOTHING
 	`
 
 	_, err = r.db.Exec(insertQuery,
@@ -302,7 +302,7 @@ func (r *AgentActionRepository) UpdateSettings(settings *models.AgentGuardSettin
 			business_hours_start = $6, business_hours_end = $7, business_hours_timezone = $8,
 			default_approver_user_id = $9, require_biometric = $10,
 			updated_at = $11
-		WHERE tenant_id = $12
+		WHERE workspace_id = $12
 	`
 
 	_, err := r.db.Exec(query,
@@ -341,7 +341,7 @@ func (r *AgentActionRepository) CreateActionRequest(req *models.AgentActionReque
 
 	query := `
 		INSERT INTO agent_action_requests (
-			id, action_req_id, tenant_id, user_id, user_email,
+			id, action_req_id, workspace_id, user_id, user_email,
 			agent_id, agent_name, agent_framework, session_id,
 			action, resource, detail, metadata,
 			risk_score, risk_level, risk_factors, matched_policy_id,
@@ -371,7 +371,7 @@ func (r *AgentActionRepository) CreateActionRequest(req *models.AgentActionReque
 // GetActionRequestByID retrieves an agent action request by action_req_id
 func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*models.AgentActionRequest, error) {
 	query := `
-		SELECT id, action_req_id, tenant_id, user_id, user_email,
+		SELECT id, action_req_id, workspace_id, user_id, user_email,
 		       agent_id, agent_name, agent_framework, session_id,
 		       action, resource, detail, metadata,
 		       risk_score, risk_level, risk_factors, matched_policy_id,
@@ -418,7 +418,7 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
 	now := time.Now().Unix()
 	query := `
-		SELECT id, action_req_id, tenant_id, user_id, user_email,
+		SELECT id, action_req_id, workspace_id, user_id, user_email,
 		       agent_id, agent_name, agent_framework, session_id,
 		       action, resource, detail, metadata,
 		       risk_score, risk_level, risk_factors, matched_policy_id,
@@ -426,7 +426,7 @@ func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, user
 		       ciba_auth_req_id, device_token_id,
 		       expires_at, created_at, decided_at, last_polled_at
 		FROM agent_action_requests
-		WHERE tenant_id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > $3
+		WHERE workspace_id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > $3
 		ORDER BY created_at DESC
 	`
 
@@ -549,7 +549,7 @@ func (r *AgentActionRepository) HasPriorAction(agentID string, action string, re
 	query := `
 		SELECT EXISTS(
 			SELECT 1 FROM agent_action_audit_log
-			WHERE agent_id = $1 AND action = $2 AND resource = $3 AND tenant_id = $4
+			WHERE agent_id = $1 AND action = $2 AND resource = $3 AND workspace_id = $4
 			AND final_status IN ('approved', 'auto_approved')
 		)
 	`
@@ -612,7 +612,7 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 
 	query := `
 		INSERT INTO agent_action_audit_log (
-			id, tenant_id, action_request_id,
+			id, workspace_id, action_request_id,
 			agent_id, agent_name, user_id, user_email,
 			action, resource, detail, metadata,
 			risk_score, risk_level, final_status, decided_by,
@@ -638,7 +638,7 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 // GetAuditLog retrieves paginated audit entries for a tenant
 func (r *AgentActionRepository) GetAuditLog(tenantID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
 	// Count total
-	countQuery := `SELECT COUNT(*) FROM agent_action_audit_log WHERE tenant_id = $1`
+	countQuery := `SELECT COUNT(*) FROM agent_action_audit_log WHERE workspace_id = $1`
 	var total int
 	err := r.db.QueryRow(countQuery, tenantID).Scan(&total)
 	if err != nil {
@@ -647,13 +647,13 @@ func (r *AgentActionRepository) GetAuditLog(tenantID uuid.UUID, page, perPage in
 
 	offset := (page - 1) * perPage
 	query := `
-		SELECT id, tenant_id, action_request_id,
+		SELECT id, workspace_id, action_request_id,
 		       agent_id, agent_name, user_id, user_email,
 		       action, resource, detail, metadata,
 		       risk_score, risk_level, final_status, decided_by,
 		       requested_at, decided_at, execution_duration_ms, created_at
 		FROM agent_action_audit_log
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3
 	`

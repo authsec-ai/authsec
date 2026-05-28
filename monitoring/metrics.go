@@ -50,14 +50,14 @@ func InitMetrics() {
 				Help:    "Duration of HTTP requests in seconds",
 				Buckets: prometheus.DefBuckets,
 			},
-			[]string{"method", "endpoint", "status_code", "tenant_id"},
+			[]string{"method", "endpoint", "status_code", "workspace_id"},
 		),
 		HTTPRequestTotal: promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "http_requests_total",
 				Help: "Total number of HTTP requests",
 			},
-			[]string{"method", "endpoint", "status_code", "tenant_id"},
+			[]string{"method", "endpoint", "status_code", "workspace_id"},
 		),
 		HTTPResponseSize: promauto.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -65,7 +65,7 @@ func InitMetrics() {
 				Help:    "Size of HTTP responses in bytes",
 				Buckets: []float64{100, 1000, 10000, 100000, 1000000},
 			},
-			[]string{"method", "endpoint", "tenant_id"},
+			[]string{"method", "endpoint", "workspace_id"},
 		),
 
 		// Database metrics
@@ -75,14 +75,14 @@ func InitMetrics() {
 				Help:    "Duration of database queries in seconds",
 				Buckets: prometheus.DefBuckets,
 			},
-			[]string{"operation", "table", "tenant_id"},
+			[]string{"operation", "table", "workspace_id"},
 		),
 		DBConnectionPoolSize: promauto.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "db_connection_pool_size",
 				Help: "Size of database connection pools",
 			},
-			[]string{"database_type", "tenant_id"},
+			[]string{"database_type", "workspace_id"},
 		),
 
 		// Authentication metrics
@@ -91,14 +91,14 @@ func InitMetrics() {
 				Name: "auth_requests_total",
 				Help: "Total number of authentication requests",
 			},
-			[]string{"auth_type", "result", "tenant_id"},
+			[]string{"auth_type", "result", "workspace_id"},
 		),
 		AuthFailuresTotal: promauto.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "auth_failures_total",
 				Help: "Total number of authentication failures",
 			},
-			[]string{"auth_type", "reason", "tenant_id"},
+			[]string{"auth_type", "reason", "workspace_id"},
 		),
 
 		// Tenant metrics
@@ -153,9 +153,9 @@ func GetLogger() *logrus.Logger {
 func Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		tenantID := c.GetHeader("X-Tenant-ID")
-		if tenantID == "" {
-			tenantID = "unknown"
+		workspaceID := c.GetHeader("X-Workspace-ID")
+		if workspaceID == "" {
+			workspaceID = "unknown"
 		}
 
 		// Extract request ID from context or generate one
@@ -176,9 +176,9 @@ func Middleware() gin.HandlerFunc {
 
 		// Record metrics
 		if metrics != nil {
-			metrics.HTTPRequestDuration.WithLabelValues(method, endpoint, statusCode, tenantID).Observe(duration)
-			metrics.HTTPRequestTotal.WithLabelValues(method, endpoint, statusCode, tenantID).Inc()
-			metrics.HTTPResponseSize.WithLabelValues(method, endpoint, tenantID).Observe(float64(c.Writer.Size()))
+			metrics.HTTPRequestDuration.WithLabelValues(method, endpoint, statusCode, workspaceID).Observe(duration)
+			metrics.HTTPRequestTotal.WithLabelValues(method, endpoint, statusCode, workspaceID).Inc()
+			metrics.HTTPResponseSize.WithLabelValues(method, endpoint, workspaceID).Observe(float64(c.Writer.Size()))
 		}
 
 		// Suppress noisy structured logging; metrics capture visibility for failures

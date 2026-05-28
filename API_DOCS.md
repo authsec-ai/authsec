@@ -83,8 +83,8 @@ until it is removed in Phase 8.
 UI and SDK clients do not need an immediate Phase 5 change, but all clients
 must migrate to `workspace_id` before Phase 8. Existing path names are not all
 renamed during this phase; the legacy MFA URL families
-`/authsec/uflow/auth/tenant/totp/*` and
-`/authsec/uflow/auth/tenant/ciba/*` remain valid exceptions.
+`/authsec/uflow/auth/workspace/totp/*` and
+`/authsec/uflow/auth/workspace/ciba/*` remain valid exceptions.
 
 ### Single-Tenant vs Multi-Tenant Mode
 
@@ -666,7 +666,7 @@ Poll for access token (RFC 8628 §3.4).
 
 ### Tenant TOTP
 
-**Base:** `/authsec/uflow/auth/tenant/totp`
+**Base:** `/authsec/uflow/auth/workspace/totp`
 
 Same flow as Admin TOTP but scoped to a specific tenant via `client_id`. All authenticated routes require JWT + `ValidateTenantFromToken`.
 
@@ -772,7 +772,7 @@ Client-Initiated Backchannel Authentication (CIBA). Mobile push notification-bas
 
 ### Tenant CIBA
 
-**Base:** `/authsec/uflow/auth/tenant/ciba`
+**Base:** `/authsec/uflow/auth/workspace/ciba`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|

@@ -61,7 +61,7 @@ func (eur *EndUserRepository) executeExec(query string, args ...interface{}) (sq
 func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 	// Password should already be hashed in PasswordHash field
 	query := `
-	INSERT INTO users (id, client_id, tenant_id, project_id, name, username, email,
+	INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
 		password_hash, tenant_domain, provider, provider_id, provider_data,
 		avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 		mfa_enrolled_at, mfa_verified, last_login,
@@ -115,7 +115,7 @@ func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 // GetUserByEmail retrieves an end-user by email from tenant database (case-insensitive)
 func (eur *EndUserRepository) GetUserByEmail(email string, clientID string) (*models.User, error) {
 	query := `
-SELECT id, client_id, tenant_id, project_id, name, username, email,
+SELECT id, client_id, workspace_id, project_id, name, username, email,
 password_hash, tenant_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
@@ -167,7 +167,7 @@ WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND active = true
 // GetUserByID retrieves an end-user by ID from tenant database
 func (eur *EndUserRepository) GetUserByID(id uuid.UUID) (*models.User, error) {
 	query := `
-SELECT id, client_id, tenant_id, project_id, name, username, email,
+SELECT id, client_id, workspace_id, project_id, name, username, email,
 password_hash, tenant_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
@@ -262,12 +262,12 @@ func (eur *EndUserRepository) DeleteUser(id uuid.UUID) error {
 // GetUsersByTenant retrieves all users for a tenant from tenant database
 func (eur *EndUserRepository) GetUsersByTenant(tenantID string, limit, offset int) ([]models.User, error) {
 	query := `
-SELECT id, client_id, tenant_id, project_id, name, username, email,
+SELECT id, client_id, workspace_id, project_id, name, username, email,
 password_hash, tenant_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
 FROM users
-WHERE tenant_id = $1 AND active = true
+WHERE workspace_id = $1 AND active = true
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3
 `

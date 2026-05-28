@@ -45,9 +45,9 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 	// Ensure admin role - use index name for ON CONFLICT (different DBs may have different constraint names)
 	roleID := uuid.New()
 	if err := exec.QueryRow(`
-		INSERT INTO roles (id, tenant_id, name, description, created_at, updated_at)
+		INSERT INTO roles (id, workspace_id, name, description, created_at, updated_at)
 		VALUES ($1, $2, 'admin', 'Administrator with full access', $3, $3)
-		ON CONFLICT (tenant_id, name) DO UPDATE SET updated_at = EXCLUDED.updated_at
+		ON CONFLICT (workspace_id, name) DO UPDATE SET updated_at = EXCLUDED.updated_at
 		RETURNING id
 	`, roleID, tenantID, now).Scan(&roleID); err != nil {
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)

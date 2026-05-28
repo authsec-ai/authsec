@@ -57,10 +57,10 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(tenantID uuid.U
 		       u.temporary_password, u.temporary_password_expires_at,
 		       COALESCE(u.is_primary_admin, false) AS is_primary_admin
 		FROM users u
-		JOIN role_bindings rb ON u.id = rb.user_id AND rb.tenant_id = $1
-		JOIN roles r ON rb.role_id = r.id AND r.tenant_id = $1
+		JOIN role_bindings rb ON u.id = rb.user_id AND rb.workspace_id = $1
+		JOIN roles r ON rb.role_id = r.id AND r.workspace_id = $1
 		WHERE u.active = true
-		  AND u.tenant_id = $1
+		  AND u.workspace_id = $1
 		  AND LOWER(r.name) IN ('admin', 'administrator', 'super_admin')`
 
 	// Add provider filter if specified
@@ -137,7 +137,7 @@ func (aur *AdminUserRepository) GetUserRoles(userID, tenantID uuid.UUID) ([]User
 		SELECT DISTINCT r.id, r.name
 		FROM roles r
 		JOIN role_bindings rb ON r.id = rb.role_id
-		WHERE rb.user_id = $1 AND rb.tenant_id = $2
+		WHERE rb.user_id = $1 AND rb.workspace_id = $2
 		ORDER BY r.name
 	`
 
@@ -229,7 +229,7 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UU
 			fallbackQuery := `
 				SELECT id
 				FROM users
-				WHERE tenant_id::text = $1
+				WHERE workspace_id::text = $1
 				  AND active = true
 				ORDER BY created_at ASC
 				LIMIT 1
@@ -268,11 +268,11 @@ func (aur *AdminUserRepository) ensureAdminRoleBinding(userID, tenantID, roleID 
 	}
 
 	insertQuery := `
-		INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at)
+		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at)
 		SELECT $1, $2, $3, $4, NULL, NULL, NOW()
 		WHERE NOT EXISTS (
 			SELECT 1 FROM role_bindings
-			WHERE tenant_id = $2
+			WHERE workspace_id = $2
 			  AND user_id = $3
 			  AND role_id = $4
 			  AND scope_type IS NULL
@@ -377,7 +377,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	query := `
 		INSERT INTO users (id, email, username, password_hash, name,
 			provider, active, temporary_password, temporary_password_expires_at,
-			created_at, updated_at, client_id, tenant_id, project_id, tenant_domain)
+			created_at, updated_at, client_id, workspace_id, project_id, tenant_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
@@ -429,10 +429,10 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	// Use role_bindings (user_roles is deprecated)
 	bindingID := uuid.New()
 	result, err := aur.db.Exec(`
-		INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 		SELECT $1, $2, $3, $4, NULL, NULL, NOW(), NOW()
 		WHERE NOT EXISTS (
-			SELECT 1 FROM role_bindings WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL
+			SELECT 1 FROM role_bindings WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL
 		)
 	`, bindingID, tenantID, user.ID, roleID)
 	if err != nil {
@@ -1055,7 +1055,7 @@ func (aur *AdminUserRepository) VerifyPassword(email, password string) (*models.
 }
 
 // GetAdminUserByEmailAndTenant retrieves an admin user by email and tenant ID (case-insensitive)
-// This method respects the new composite unique constraint (email, tenant_id)
+// This method respects the new composite unique constraint (email, workspace_id)
 // Uses role_bindings for role assignments (user_roles is deprecated)
 func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenantID uuid.UUID) (*models.AdminUser, error) {
 	query := `
@@ -1072,7 +1072,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 		FROM users u
 		JOIN role_bindings rb ON u.id = rb.user_id
 		JOIN roles r ON rb.role_id = r.id
-		WHERE LOWER(u.email) = LOWER($1) AND u.tenant_id = $2 AND u.active = true AND LOWER(r.name) = 'admin'
+		WHERE LOWER(u.email) = LOWER($1) AND u.workspace_id = $2 AND u.active = true AND LOWER(r.name) = 'admin'
 	`
 
 	var (
@@ -1410,7 +1410,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 		providerQuery := `
 			SELECT DISTINCT provider_name
 			FROM oauth_configs
-			WHERE tenant_id = $1 AND enabled = true
+			WHERE workspace_id = $1 AND enabled = true
 		`
 		rows, err := aur.db.Query(providerQuery, user.WorkspaceID)
 		if err == nil {
@@ -1445,7 +1445,7 @@ func (aur *AdminUserRepository) GetAdminRoles(userID uuid.UUID, tenantID uuid.UU
 		FROM role_bindings rb
 		JOIN roles r ON rb.role_id = r.id
 		WHERE rb.user_id = $1 
-		  AND rb.tenant_id = $2
+		  AND rb.workspace_id = $2
 		ORDER BY r.name
 	`
 

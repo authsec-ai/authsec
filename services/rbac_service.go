@@ -194,7 +194,7 @@ func (s *RBACService) Check(ctx context.Context, req PDPRequest) (*PolicyCheckRe
 		Table("user_groups").
 		Select("group_id").
 		Where("user_id = ?", req.PrincipalID).
-		Where("tenant_id = ?", req.WorkspaceID)
+		Where("workspace_id = ?", req.WorkspaceID)
 
 	query := s.db.WithContext(ctx).Table("role_bindings rb").
 		Select(`r.name as role_name, rb.id as binding_id,
@@ -207,9 +207,9 @@ func (s *RBACService) Check(ctx context.Context, req PDPRequest) (*PolicyCheckRe
 		Joins("JOIN roles r ON rb.role_id = r.id").
 		Joins("JOIN role_permissions rp ON r.id = rp.role_id").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("rb.tenant_id = ?", req.WorkspaceID).
-		Where("(r.tenant_id = ? OR r.tenant_id IS NULL)", req.WorkspaceID).
-		Where("(p.tenant_id = ? OR p.tenant_id IS NULL)", req.WorkspaceID).
+		Where("rb.workspace_id = ?", req.WorkspaceID).
+		Where("(r.workspace_id = ? OR r.tenant_id IS NULL)", req.WorkspaceID).
+		Where("(p.workspace_id = ? OR p.tenant_id IS NULL)", req.WorkspaceID).
 		Where("(rb.user_id = ? OR rb.service_account_id = ? OR rb.group_id IN (?))", req.PrincipalID, req.PrincipalID, principalGroups).
 		Where("p.resource = ? AND p.action = ?", req.Resource, req.Action).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())")
@@ -311,7 +311,7 @@ func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID u
 	var membershipStatus string
 	row := s.db.Table("tenant_memberships").
 		Select("status").
-		Where("tenant_id = ? AND user_id = ?", workspaceID, principalID).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, principalID).
 		Limit(1).
 		Row()
 	if err := row.Scan(&membershipStatus); err == nil {
@@ -325,7 +325,7 @@ func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID u
 	var eusStatus string
 	row2 := s.db.Table("tenant_end_user_states").
 		Select("status").
-		Where("tenant_id = ? AND user_id = ?", workspaceID, principalID).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, principalID).
 		Limit(1).
 		Row()
 	if err := row2.Scan(&eusStatus); err == nil {

@@ -51,7 +51,7 @@ func (sv *SchemaValidator) ValidateProduction() error {
 		"id":                    "uuid",
 		"email":                 "character varying",
 		"password_hash":         "character varying",
-		"tenant_id":             "character varying",
+		"workspace_id":          "uuid",
 		"created_at":            "timestamp",
 		"failed_login_attempts": "integer",
 		"is_active":             "boolean",

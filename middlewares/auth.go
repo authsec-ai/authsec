@@ -13,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
 )
 
 // AuthConfig holds configuration for authentication
@@ -112,7 +111,7 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		}
 
 		// Backfill missing identifiers (tenant_id, user_id, etc.) for legacy controllers
-		ensureTenantContext(c)
+		ensureWorkspaceContext(c)
 		ensureUserContextIdentifiers(c)
 
 		// Enrich claims with DB roles when JWT carries none (Hydra tokens don't include RBAC roles)
@@ -443,31 +442,12 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 
 	// Extract basic user info.
 	//
-	// Phase 3 (tenant → workspace migration): workspace_id is the canonical scope claim.
-	// Every token minted after Phase 3 carries both workspace_id and tenant_id with equal
-	// UUIDs. If a token arrives with tenant_id only (legacy issuer that didn't get the
-	// Phase 3 update, or an externally-issued Hydra token from before the rollout) we
-	// mirror tenant_id into workspace_id and log a structured warning so stragglers are
-	// visible in the logs. The fallback will be removed in Phase 8.
-	tenantClaim, _ := claimsMap["tenant_id"].(string)
+	// Phase 6: workspace_id is the only identity claim. tenant_id fallback removed.
 	workspaceClaim, _ := claimsMap["workspace_id"].(string)
-
-	info.WorkspaceID = tenantClaim
-	switch {
-	case workspaceClaim != "":
-		info.WorkspaceID = workspaceClaim
-	case tenantClaim != "":
-		info.WorkspaceID = tenantClaim
-		// Identify the issuer to help track down the missing emitter.
-		issuer, _ := claimsMap["iss"].(string)
-		tokenType, _ := claimsMap["token_type"].(string)
-		logrus.WithFields(logrus.Fields{
-			"event":      "workspace_id_fallback",
-			"iss":        issuer,
-			"token_type": tokenType,
-			"path":       c.Request.URL.Path,
-		}).Warn("JWT missing workspace_id claim; falling back to tenant_id (Phase 3 straggler)")
+	if workspaceClaim == "" {
+		return nil, fmt.Errorf("workspace_id claim missing from token")
 	}
+	info.WorkspaceID = workspaceClaim
 	if v, ok := claimsMap["workspace_membership_id"].(string); ok {
 		info.WorkspaceMembershipID = v
 	}
@@ -744,8 +724,8 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	}
 
 	userIDStr := getContextString(c, "user_id")
-	tenantIDStr := getContextString(c, "tenant_id")
-	if userIDStr == "" || tenantIDStr == "" {
+	workspaceIDStr := getContextString(c, "workspace_id")
+	if userIDStr == "" || workspaceIDStr == "" {
 		return
 	}
 
@@ -753,7 +733,7 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	if err != nil {
 		return
 	}
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		return
 	}
@@ -764,7 +744,7 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	}
 
 	repo := database.NewAdminUserRepository(dbConn)
-	userRoles, err := repo.GetUserRoles(userID, tenantID)
+	userRoles, err := repo.GetUserRoles(userID, workspaceID)
 	if err != nil || len(userRoles) == 0 {
 		return
 	}
@@ -778,10 +758,11 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	c.Set("roles", roleNames)
 }
 
-// ensureTenantContext makes sure tenant_id is available even when omitted from JWTs
-func ensureTenantContext(c *gin.Context) {
-	if tenantID := getContextString(c, "tenant_id"); tenantID != "" {
-		setTenantContext(c, tenantID)
+// ensureWorkspaceContext makes sure workspace_id is available even when omitted from JWTs.
+// Phase 6: tenant_id fallback removed; only workspace_id is consulted.
+func ensureWorkspaceContext(c *gin.Context) {
+	if workspaceID := getContextString(c, "workspace_id"); workspaceID != "" {
+		setWorkspaceContext(c, workspaceID)
 		return
 	}
 
@@ -789,88 +770,34 @@ func ensureTenantContext(c *gin.Context) {
 	if claimsVal, exists := c.Get("claims"); exists {
 		switch claims := claimsVal.(type) {
 		case jwt.MapClaims:
-			if tenantID, ok := claimString(claims["tenant_id"]); ok {
-				setTenantContext(c, tenantID)
-				return
-			}
-			if tenantID, ok := claimString(claims["validated_tenant_id"]); ok {
-				setTenantContext(c, tenantID)
+			if workspaceID, ok := claimString(claims["workspace_id"]); ok {
+				setWorkspaceContext(c, workspaceID)
 				return
 			}
 		case map[string]interface{}:
-			if tenantID := stringFromAny(claims["tenant_id"]); tenantID != "" {
-				setTenantContext(c, tenantID)
-				return
-			}
-			if tenantID := stringFromAny(claims["validated_tenant_id"]); tenantID != "" {
-				setTenantContext(c, tenantID)
+			if workspaceID := stringFromAny(claims["workspace_id"]); workspaceID != "" {
+				setWorkspaceContext(c, workspaceID)
 				return
 			}
 		}
-	}
-
-	// Fall back to tenant lookup using client_id when available
-	clientID := getContextString(c, "client_id")
-	if clientID == "" {
-		// Try extracting from claims if missing in context
-		if claimsVal, exists := c.Get("claims"); exists {
-			switch claims := claimsVal.(type) {
-			case jwt.MapClaims:
-				if cid, ok := claimString(claims["client_id"]); ok {
-					clientID = cid
-				}
-			case map[string]interface{}:
-				clientID = stringFromAny(claims["client_id"])
-			}
-		}
-	}
-
-	if clientID == "" {
-		return
-	}
-
-	if config.Database == nil || config.Database.DB == nil {
-		return
-	}
-
-	clientUUID, err := uuid.Parse(clientID)
-	if err != nil {
-		return
-	}
-
-	var tenantUUID uuid.UUID
-	err = config.Database.DB.QueryRow(
-		"SELECT tenant_id FROM tenant_mappings WHERE client_id = $1",
-		clientUUID,
-	).Scan(&tenantUUID)
-	if err == nil {
-		setTenantContext(c, tenantUUID.String())
 	}
 }
 
-// setTenantContext normalizes tenant identifiers across context helpers
-func setTenantContext(c *gin.Context, tenantID string) {
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
+// setWorkspaceContext normalizes workspace identifiers across context helpers.
+func setWorkspaceContext(c *gin.Context, workspaceID string) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
 		return
 	}
 
-	c.Set("tenant_id", tenantID)
-	c.Set("validated_tenant_id", tenantID)
-	// Phase 3: keep workspace_id in lockstep so downstream readers can switch over
-	// in Phase 4 without caring which path populated the context.
-	c.Set("workspace_id", tenantID)
+	c.Set("workspace_id", workspaceID)
 
 	if claimsVal, exists := c.Get("claims"); exists {
 		switch claims := claimsVal.(type) {
 		case jwt.MapClaims:
-			claims["tenant_id"] = tenantID
-			claims["validated_tenant_id"] = tenantID
-			claims["workspace_id"] = tenantID
+			claims["workspace_id"] = workspaceID
 		case map[string]interface{}:
-			claims["tenant_id"] = tenantID
-			claims["validated_tenant_id"] = tenantID
-			claims["workspace_id"] = tenantID
+			claims["workspace_id"] = workspaceID
 			c.Set("claims", claims)
 		}
 	}
@@ -886,8 +813,8 @@ func normalizeUserInfoContext(c *gin.Context) {
 	}
 
 	if userInfo.WorkspaceID == "" {
-		if tenantID := getContextString(c, "tenant_id"); tenantID != "" {
-			userInfo.WorkspaceID = tenantID
+		if workspaceID := getContextString(c, "workspace_id"); workspaceID != "" {
+			userInfo.WorkspaceID = workspaceID
 		}
 	}
 	if userInfo.ClientID == "" {
@@ -934,10 +861,7 @@ func stringFromAny(value interface{}) string {
 
 // setContextValues sets user information in Gin context
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
-	// Set individual fields for backward compatibility
-	c.Set("tenant_id", userInfo.WorkspaceID)
-	// Phase 3: workspace_id is canonical; always set it. extractUserInfo() guarantees
-	// WorkspaceID is non-empty whenever WorkspaceID is non-empty (mirror fallback).
+	// Phase 6: workspace_id is canonical and the only identity context key.
 	c.Set("workspace_id", userInfo.WorkspaceID)
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
@@ -1029,8 +953,8 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		c.Set("claims", claims)
 
 		// Extract and set individual claims
-		if tenantID, ok := claims["tenant_id"].(string); ok {
-			c.Set("tenant_id", tenantID)
+		if workspaceID, ok := claims["workspace_id"].(string); ok {
+			c.Set("workspace_id", workspaceID)
 		}
 		if projectID, ok := claims["project_id"].(string); ok {
 			c.Set("project_id", projectID)
@@ -1051,7 +975,7 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Backfill context
-		ensureTenantContext(c)
+		ensureWorkspaceContext(c)
 		ensureUserContextIdentifiers(c)
 
 		c.Next()
@@ -1067,7 +991,6 @@ func ExtractTenantFromPath() gin.HandlerFunc {
 		workspaceID := c.Param("workspace_id")
 		if workspaceID != "" {
 			c.Set("workspace_id", workspaceID)
-			c.Set("tenant_id", workspaceID) // lockstep until Phase 6
 		}
 		c.Next()
 	}

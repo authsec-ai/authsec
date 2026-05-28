@@ -658,8 +658,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 
 	// 2. Accept the Hydra login challenge with the local user as subject.
 	hydraCtx := map[string]interface{}{
-		"tenant_id":    workspaceID.String(),
-		"workspace_id": workspaceID.String(),
+		"workspace_id":    workspaceID.String(),
 		"email":        user.Email,
 		"name":         userInfo.Name,
 		"provider":     state.ProviderName,
@@ -933,7 +932,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Create new tenant and user
-	// Note: In admin registration pattern, tenant_id = client_id for the default client
+	// Note: In admin registration pattern, workspace_id = client_id for the default client
 	// tenantID is used for tenant.WorkspaceID (business key)
 	// tenant.ID (primary key) is auto-generated and used for FK references
 	tenantID := uuid.New()
@@ -957,7 +956,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	username := userInfo.Email
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
-		ID:           tenantID, // Use same ID for both id and tenant_id for simplicity
+		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:     tenantID,
 		TenantDB:     tenantDBName,
 		Email:        userInfo.Email,
@@ -1024,11 +1023,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		// Insert into role_bindings (user_roles is deprecated)
 		// scope_type and scope_id are NULL for tenant-wide role assignments
 		if _, err := tx.Exec(`
-			INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+			INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 			SELECT gen_random_uuid(), $1, $2, $3, NULL, NULL, NOW(), NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM role_bindings
-				WHERE tenant_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
+				WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
 			)
 		`, tenantID, userID, roleID); err != nil {
 			log.Printf("WARNING: Failed to assign admin role to OIDC user %s: %v", userID, err)
@@ -1040,18 +1039,18 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create default role bindings in MAIN DB for admin across core services
 	var adminRoleID uuid.UUID
-	if err := tx.QueryRow("SELECT id FROM roles WHERE LOWER(name) = 'admin' AND tenant_id = $1 LIMIT 1", tenantID).Scan(&adminRoleID); err != nil {
+	if err := tx.QueryRow("SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1", tenantID).Scan(&adminRoleID); err != nil {
 		log.Printf("Failed to resolve admin role id for default bindings: %v", err)
 	} else {
 		services := []string{"external-service", "clients", "user-flow", "ooc-manager", "log-service", "hydra-service", "sdk-manager"}
 		usernameVal := userInfo.Email
 		for _, svc := range services {
 			if _, err := tx.Exec(`
-				INSERT INTO role_bindings (id, tenant_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
+				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
 				SELECT $1, $2, $3, $4, 'admin', $5, $6, $7, NOW(), NOW()
 				WHERE NOT EXISTS (
 					SELECT 1 FROM role_bindings
-					WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = $6 AND scope_id = $7
+					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = $6 AND scope_id = $7
 				)
 			`, uuid.New(), tenantID, userID, adminRoleID, usernameVal, svc, tenantID); err != nil {
 				log.Printf("WARNING: Failed to create role binding for service=%s tenant=%s: %v", svc, tenantID, err)
@@ -1060,11 +1059,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		}
 		// Add a wildcard binding to grant full access for the admin user
 		if _, err := tx.Exec(`
-			INSERT INTO role_bindings (id, tenant_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
+			INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, scope_type, scope_id, created_at, updated_at)
 			SELECT $1, $2, $3, $4, 'admin', $5, '*', NULL, NOW(), NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM role_bindings
-				WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = '*' AND scope_id IS NULL
+				WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = '*' AND scope_id IS NULL
 			)
 		`, uuid.New(), tenantID, userID, adminRoleID, usernameVal); err != nil {
 			log.Printf("WARNING: Failed to create wildcard role binding tenant=%s: %v", tenantID, err)
@@ -1100,14 +1099,14 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE tenant_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE tenant_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
@@ -1129,7 +1128,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create default client in tenant DB with Hydra client ID
 	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
-	clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
+	clientInsert := `INSERT INTO clients (id, client_id, workspace_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
@@ -1146,7 +1145,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
+	tenantInsert := `INSERT INTO tenants (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
@@ -1160,7 +1159,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
 
 	// Create default project in tenant database (project was already created in global database)
-	projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
+	projectInsert := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
@@ -1171,7 +1170,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
 	globalDB := config.GetDatabase()
-	tenantMappingInsert := `INSERT INTO tenant_mappings (tenant_id, client_id, created_at, updated_at)
+	tenantMappingInsert := `INSERT INTO tenant_mappings (workspace_id, client_id, created_at, updated_at)
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (client_id) DO NOTHING`
 	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
@@ -1242,7 +1241,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	// Audit log: OIDC registration completed
 	middlewares.Audit(c, "oidc", tenantID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":     tenantID.String(),
+			"workspace_id":     tenantID.String(),
 			"tenant_domain": fullDomain,
 			"user_id":       userID.String(),
 			"email":         userInfo.Email,
@@ -1263,7 +1262,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		"success":       true,
 		"message":       "Registration successful",
 		"tenant_domain": redirectDomain,
-		"tenant_id":     tenantID.String(),
+		"workspace_id":     tenantID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true,
 	})
@@ -1316,7 +1315,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Create new tenant and user (similar to handleRegistrationCallback)
-	// Note: In admin registration pattern, tenant_id = client_id for the default client
+	// Note: In admin registration pattern, workspace_id = client_id for the default client
 	tenantID := uuid.New()
 	projectID := uuid.New()
 	clientID := tenantID // Client ID = Tenant ID for default client (matches admin registration)
@@ -1338,7 +1337,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	username := input.Email
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
-		ID:           tenantID, // Use same ID for both id and tenant_id for simplicity
+		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:     tenantID,
 		TenantDB:     tenantDBName,
 		Email:        input.Email,
@@ -1405,11 +1404,11 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		// Insert into role_bindings (user_roles is deprecated)
 		// scope_type and scope_id are NULL for tenant-wide role assignments
 		if _, err := tx.Exec(`
-			INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+			INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 			SELECT gen_random_uuid(), $1, $2, $3, NULL, NULL, NOW(), NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM role_bindings
-				WHERE tenant_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
+				WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
 			)
 		`, tenantID, userID, roleID); err != nil {
 			log.Printf("WARNING: Failed to assign admin role to OIDC user %s: %v", userID, err)
@@ -1446,14 +1445,14 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE tenant_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE tenant_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
@@ -1476,7 +1475,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	// Create default client in tenant DB with Hydra client ID
 	// Non-fatal: Vault/Hydra registration must proceed even if tenant DB setup fails
 	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
-	clientInsert := `INSERT INTO clients (id, client_id, tenant_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
+	clientInsert := `INSERT INTO clients (id, client_id, workspace_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
@@ -1493,7 +1492,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO tenants (id, tenant_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
+	tenantInsert := `INSERT INTO tenants (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
@@ -1507,7 +1506,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Create default project in tenant database (project was already created in global database)
-	projectInsert := `INSERT INTO projects (id, tenant_id, name, description, user_id, active, created_at, updated_at)
+	projectInsert := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`
 	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
@@ -1518,7 +1517,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 
 	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
 	globalDB := config.GetDatabase()
-	tenantMappingInsert := `INSERT INTO tenant_mappings (tenant_id, client_id, created_at, updated_at)
+	tenantMappingInsert := `INSERT INTO tenant_mappings (workspace_id, client_id, created_at, updated_at)
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (client_id) DO NOTHING`
 	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
@@ -1595,7 +1594,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		"success":       true,
 		"message":       "Registration successful - welcome to your new workspace!",
 		"tenant_domain": fullDomain,
-		"tenant_id":     tenantID.String(),
+		"workspace_id":     tenantID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true, // Always true for new registrations
 	})
@@ -1607,7 +1606,7 @@ func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID, proje
 
 	// Create user in tenant DB
 	query := `
-		INSERT INTO users (id, email, name, tenant_id, client_id, project_id, tenant_domain, provider, provider_id, active, created_at, updated_at)
+		INSERT INTO users (id, email, name, workspace_id, client_id, project_id, tenant_domain, provider, provider_id, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11)
 		ON CONFLICT (id) DO NOTHING
 	`
@@ -2048,7 +2047,7 @@ func (oc *OIDCController) seedDefaultGroupsInTenantDB(tenantDB *sql.DB, tenantID
 		}
 		now := time.Now()
 		if _, err := tenantDB.Exec(
-			"INSERT INTO groups (name, description, tenant_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, tenant_id) DO NOTHING",
+			"INSERT INTO groups (name, description, workspace_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, workspace_id) DO NOTHING",
 			name, description, tenantID, now, now,
 		); err != nil {
 			return fmt.Errorf("failed to insert group %s: %w", name, err)
@@ -2060,7 +2059,7 @@ func (oc *OIDCController) seedDefaultGroupsInTenantDB(tenantDB *sql.DB, tenantID
 // assignDefaultClientAssociations assigns all roles and groups in the tenant DB to the given client
 func (oc *OIDCController) assignDefaultClientAssociations(tenantDB *sql.DB, clientID uuid.UUID, tenantID uuid.UUID) error {
 	// Assign all roles to client
-	roleRows, err := tenantDB.Query("SELECT id FROM roles WHERE tenant_id = $1", tenantID)
+	roleRows, err := tenantDB.Query("SELECT id FROM roles WHERE workspace_id = $1", tenantID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch role IDs: %w", err)
 	}
@@ -2082,7 +2081,7 @@ func (oc *OIDCController) assignDefaultClientAssociations(tenantDB *sql.DB, clie
 	}
 
 	// Assign all groups to client
-	groupRows, err := tenantDB.Query("SELECT id FROM groups WHERE tenant_id = $1", tenantID)
+	groupRows, err := tenantDB.Query("SELECT id FROM groups WHERE workspace_id = $1", tenantID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch group IDs: %w", err)
 	}
@@ -2106,12 +2105,12 @@ func (oc *OIDCController) assignDefaultClientAssociations(tenantDB *sql.DB, clie
 func (oc *OIDCController) assignAdminRoleToUser(tenantDB *sql.DB, userID uuid.UUID, tenantID uuid.UUID) error {
 	// Insert admin role if it doesn't exist (check first to avoid deferrable constraint issues)
 	var adminRoleID uuid.UUID
-	checkRoleExistsQuery := `SELECT id FROM roles WHERE name = 'admin' AND tenant_id = $1`
+	checkRoleExistsQuery := `SELECT id FROM roles WHERE name = 'admin' AND workspace_id = $1`
 	err := tenantDB.QueryRow(checkRoleExistsQuery, tenantID).Scan(&adminRoleID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Role doesn't exist, insert it
-			insertRoleQuery := `INSERT INTO roles (name, description, tenant_id) VALUES ('admin', 'Administrator role with full access', $1) RETURNING id`
+			insertRoleQuery := `INSERT INTO roles (name, description, workspace_id) VALUES ('admin', 'Administrator role with full access', $1) RETURNING id`
 			err = tenantDB.QueryRow(insertRoleQuery, tenantID).Scan(&adminRoleID)
 			if err != nil {
 				return fmt.Errorf("failed to insert admin role: %w", err)
@@ -2122,7 +2121,7 @@ func (oc *OIDCController) assignAdminRoleToUser(tenantDB *sql.DB, userID uuid.UU
 	}
 
 	// Assign admin role via role_bindings (user_roles is deprecated)
-	checkBindingQuery := `SELECT 1 FROM role_bindings WHERE user_id = $1 AND role_id = $2 AND tenant_id = $3 AND scope_type IS NULL`
+	checkBindingQuery := `SELECT 1 FROM role_bindings WHERE user_id = $1 AND role_id = $2 AND workspace_id = $3 AND scope_type IS NULL`
 	var exists int
 	err = tenantDB.QueryRow(checkBindingQuery, userID, adminRoleID, tenantID).Scan(&exists)
 	if err != nil && err != sql.ErrNoRows {
@@ -2131,7 +2130,7 @@ func (oc *OIDCController) assignAdminRoleToUser(tenantDB *sql.DB, userID uuid.UU
 
 	// Only insert if the role binding doesn't already exist
 	if err == sql.ErrNoRows {
-		assignBindingQuery := `INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, NULL, NOW(), NOW())`
+		assignBindingQuery := `INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, NULL, NOW(), NOW())`
 		if _, err := tenantDB.Exec(assignBindingQuery, uuid.New(), tenantID, userID, adminRoleID); err != nil {
 			return fmt.Errorf("failed to create admin role binding: %w", err)
 		}

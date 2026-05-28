@@ -11,9 +11,8 @@ import (
 // RBACRole represents a role in the RBAC system
 type RBACRole struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
-	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;index"`
-	Name        string     `json:"name" gorm:"type:text;not null;uniqueIndex:idx_roles_tenant_name"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_roles_workspace_name;index"`
+	Name        string     `json:"name" gorm:"type:text;not null;uniqueIndex:idx_roles_workspace_name"`
 	Description string     `json:"description" gorm:"type:text"`
 	IsSystem    bool       `json:"is_system" gorm:"default:false"`
 	CreatedAt   time.Time  `json:"created_at"`
@@ -31,22 +30,15 @@ func (r *RBACRole) BeforeCreate(tx *gorm.DB) error {
 	if r.ID == uuid.Nil {
 		r.ID = uuid.New()
 	}
-	if r.TenantID == nil {
-		r.TenantID = r.WorkspaceID
-	}
-	if r.WorkspaceID == nil {
-		r.WorkspaceID = r.TenantID
-	}
 	return nil
 }
 
 // RBACPermission represents an atomic resource-action capability
 type RBACPermission struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey"`
-	TenantID    *uuid.UUID `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;uniqueIndex:idx_permissions_tenant_resource_action"`
-	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;index"`
-	Resource    string     `json:"resource" gorm:"type:text;not null;uniqueIndex:idx_permissions_tenant_resource_action"`
-	Action      string     `json:"action" gorm:"type:text;not null;uniqueIndex:idx_permissions_tenant_resource_action"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_permissions_workspace_resource_action;index"`
+	Resource    string     `json:"resource" gorm:"type:text;not null;uniqueIndex:idx_permissions_workspace_resource_action"`
+	Action      string     `json:"action" gorm:"type:text;not null;uniqueIndex:idx_permissions_workspace_resource_action"`
 	Description string     `json:"description" gorm:"type:text"`
 	CreatedAt   time.Time  `json:"created_at"`
 }
@@ -59,12 +51,6 @@ func (RBACPermission) TableName() string {
 func (p *RBACPermission) BeforeCreate(tx *gorm.DB) error {
 	if p.ID == uuid.Nil {
 		p.ID = uuid.New()
-	}
-	if p.TenantID == nil {
-		p.TenantID = p.WorkspaceID
-	}
-	if p.WorkspaceID == nil {
-		p.WorkspaceID = p.TenantID
 	}
 	return nil
 }
@@ -95,7 +81,6 @@ type ServiceAccount struct {
 // check_principal CHECK constraint on the table.
 type RoleBinding struct {
 	ID                 uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	TenantID           *uuid.UUID      `json:"tenant_id,omitempty" gorm:"column:tenant_id;type:uuid;index"`
 	WorkspaceID        *uuid.UUID      `json:"workspace_id" gorm:"type:uuid;index"`
 	UserID             *uuid.UUID      `json:"user_id" gorm:"type:uuid"`
 	Username           string          `json:"username" gorm:"type:text"`
@@ -153,16 +138,6 @@ func (rb *RoleBinding) SubjectID() *uuid.UUID {
 
 func (RoleBinding) TableName() string {
 	return "role_bindings"
-}
-
-func (rb *RoleBinding) BeforeCreate(tx *gorm.DB) error {
-	if rb.TenantID == nil {
-		rb.TenantID = rb.WorkspaceID
-	}
-	if rb.WorkspaceID == nil {
-		rb.WorkspaceID = rb.TenantID
-	}
-	return nil
 }
 
 // GrantAudit represents the audit log for role assignments

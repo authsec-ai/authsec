@@ -91,20 +91,12 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		expiresIn = 24 * time.Hour // Default 24 hours
 	}
 
-	// Phase 3 (tenant → workspace migration): every token now carries workspace_id
-	// unconditionally. tenant_id is still emitted in lockstep for backward compatibility
-	// until Phase 8 drops it. If a caller forgot to set WorkspaceID (legacy code path
-	// still passing only WorkspaceID), mirror tenant_id into workspace_id — by construction
-	// tenants.id == workspaces.id (see admin signup transaction).
+	// Phase 6: workspace_id is the only identity claim emitted.
 	workspaceID := claims.WorkspaceID
-	if workspaceID == "" {
-		workspaceID = claims.WorkspaceID
-	}
 
 	// Build JWT claims following auth-manager's exact pattern
 	// Reference: github.com/authsec-ai/auth-manager/controllers/token_controller.go
 	jwtClaims := jwt.MapClaims{
-		"tenant_id":    claims.WorkspaceID,
 		"workspace_id": workspaceID,
 		"project_id":   claims.ProjectID,
 		"client_id":    claims.ClientID,
@@ -169,9 +161,8 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	}
 
 	now := time.Now()
-	// Phase 3: emit workspace_id alongside tenant_id (mirror — they're equal UUIDs by construction).
+	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"tenant_id":    req.WorkspaceID,
 		"workspace_id": req.WorkspaceID,
 		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,

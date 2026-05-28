@@ -41,7 +41,7 @@ func NewTenantCIBAController() (*TenantCIBAController, error) {
 // @Success 200 {object} models.TenantCIBAInitiateResponse "CIBA initiation successful"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/initiate [post]
+// @Router /authsec/uflow/auth/workspace/ciba/initiate [post]
 func (tcc *TenantCIBAController) InitiateTenantCIBA(c *gin.Context) {
 	var req models.TenantCIBAInitiateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -85,7 +85,7 @@ func (tcc *TenantCIBAController) InitiateTenantCIBA(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/respond [post]
+// @Router /authsec/uflow/auth/workspace/ciba/respond [post]
 func (tcc *TenantCIBAController) RespondToTenantCIBA(c *gin.Context) {
 	var req models.TenantCIBARespondRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -138,7 +138,7 @@ func (tcc *TenantCIBAController) RespondToTenantCIBA(c *gin.Context) {
 // @Success 200 {object} models.TenantCIBATokenResponse "Token response"
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/token [post]
+// @Router /authsec/uflow/auth/workspace/ciba/token [post]
 func (tcc *TenantCIBAController) PollTenantCIBAToken(c *gin.Context) {
 	var req models.TenantCIBATokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -186,7 +186,7 @@ func (tcc *TenantCIBAController) PollTenantCIBAToken(c *gin.Context) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/register-device [post]
+// @Router /authsec/uflow/auth/workspace/ciba/register-device [post]
 func (tcc *TenantCIBAController) RegisterTenantDevice(c *gin.Context) {
 	var req models.TenantDeviceTokenRegistrationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -251,7 +251,7 @@ func (tcc *TenantCIBAController) RegisterTenantDevice(c *gin.Context) {
 // @Success 200 {object} map[string]interface{} "Pending requests retrieved"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/requests [get]
+// @Router /authsec/uflow/auth/workspace/ciba/requests [get]
 func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 	// Get user and tenant info from JWT token
 	userIDStr, exists := c.Get("user_id")
@@ -304,7 +304,7 @@ func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 // @Success 200 {object} models.TenantDeviceListResponse "Devices retrieved successfully"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/devices [get]
+// @Router /authsec/uflow/auth/workspace/ciba/devices [get]
 func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 	userIDStr, exists := c.Get("user_id")
 	if !exists {
@@ -374,7 +374,7 @@ func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 // @Failure 401 {object} map[string]string "Unauthorized - invalid token"
 // @Failure 404 {object} map[string]string "Device not found"
 // @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/tenant/ciba/devices/{device_id} [delete]
+// @Router /authsec/uflow/auth/workspace/ciba/devices/{device_id} [delete]
 func (tcc *TenantCIBAController) DeleteTenantDevice(c *gin.Context) {
 	deviceIDStr := c.Param("device_id")
 	deviceID, err := uuid.Parse(deviceIDStr)

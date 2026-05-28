@@ -198,7 +198,7 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 	// Audit log: Entra ID sync completed
 	middlewares.Audit(c, "entra_sync", input.WorkspaceID, "sync_users", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"tenant_id":     input.WorkspaceID,
+			"workspace_id":     input.WorkspaceID,
 			"client_id":     input.ClientID,
 			"project_id":    input.ProjectID,
 			"users_found":   result.UsersFound,
@@ -266,7 +266,7 @@ func (eic *EntraIDController) TestEntraIDConnection(c *gin.Context) {
 		"success":      true,
 		"message":      "Successfully connected to Entra ID",
 		"users_found":  len(users),
-		"tenant_id":    config.WorkspaceID,
+		"workspace_id":    config.WorkspaceID,
 		"sample_users": sampleUsers,
 	})
 }
@@ -732,7 +732,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 	}
 
 	// Fetch configuration from database
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND client_id = ? AND sync_type = ?",
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ? AND sync_type = ?",
 		configUUID, tenantUUID, clientUUID, "entra_id").First(&syncConfig).Error; err != nil {
 		return EntraIDConfig{}, fmt.Errorf("sync configuration not found or not authorized")
 	}

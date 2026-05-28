@@ -289,7 +289,7 @@ func NewPendingRegistrationRepository(db *DBConnection) *PendingRegistrationRepo
 func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *models.PendingRegistration) error {
 	query := `
 		INSERT INTO pending_registrations (email, password_hash, first_name, last_name,
-			tenant_id, project_id, client_id, expires_at, created_at, updated_at, tenant_domain)
+			workspace_id, project_id, client_id, expires_at, created_at, updated_at, tenant_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id
 	`
@@ -322,7 +322,7 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 // GetPendingRegistration retrieves a pending registration by email
 func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*models.PendingRegistration, error) {
 	query := `
-		SELECT id, email, password_hash, first_name, last_name, tenant_id,
+		SELECT id, email, password_hash, first_name, last_name, workspace_id,
 			project_id, client_id, expires_at, created_at, updated_at, tenant_domain
 		FROM pending_registrations
 		WHERE email = $1 AND expires_at > $2
@@ -387,7 +387,7 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx 
 func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *models.PendingRegistration) error {
 	query := `
 		UPDATE pending_registrations
-		SET password_hash = $1, tenant_id = $2, project_id = $3, client_id = $4,
+		SET password_hash = $1, workspace_id = $2, project_id = $3, client_id = $4,
 		    tenant_domain = $5, expires_at = $6, updated_at = $7
 		WHERE email = $8
 	`

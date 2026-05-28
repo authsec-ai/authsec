@@ -71,7 +71,7 @@ func (ctrl *SpiffeDelegateController) OIDCDiscovery(c *gin.Context) {
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"scopes_supported":                      []string{"openid"},
-		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "user_id", "tenant_id", "email", "spiffe_id"},
+		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "user_id", "workspace_id", "email", "spiffe_id"},
 	})
 }
 
@@ -163,7 +163,7 @@ func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 
 	// 5. Extract identity from user claims.
 	userID := claimString(userClaims, "user_id", claimString(userClaims, "sub", ""))
-	tenantID := claimString(userClaims, "tenant_id", "")
+	tenantID := claimString(userClaims, "workspace_id", "")
 	email := claimString(userClaims, "email_id", claimString(userClaims, "email", ""))
 
 	if userID == "" {

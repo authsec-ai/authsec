@@ -46,7 +46,7 @@ func (r *TenantDeviceRepository) CreateTenantDeviceToken(token *models.TenantDev
 // GetTenantDeviceTokensByUserID retrieves all active device tokens for a user in tenant DB
 func (r *TenantDeviceRepository) GetTenantDeviceTokensByUserID(userID, tenantID uuid.UUID) ([]models.TenantDeviceToken, error) {
 	var tokens []models.TenantDeviceToken
-	err := r.db.Where("user_id = ? AND tenant_id = ? AND is_active = ?", userID, tenantID, true).
+	err := r.db.Where("user_id = ? AND workspace_id = ? AND is_active = ?", userID, tenantID, true).
 		Order("created_at DESC").
 		Find(&tokens).Error
 	return tokens, err
@@ -55,7 +55,7 @@ func (r *TenantDeviceRepository) GetTenantDeviceTokensByUserID(userID, tenantID 
 // GetTenantDeviceTokenByToken retrieves device token by device token string
 func (r *TenantDeviceRepository) GetTenantDeviceTokenByToken(deviceToken string, tenantID uuid.UUID) (*models.TenantDeviceToken, error) {
 	var token models.TenantDeviceToken
-	err := r.db.Where("device_token = ? AND tenant_id = ?", deviceToken, tenantID).
+	err := r.db.Where("device_token = ? AND workspace_id = ?", deviceToken, tenantID).
 		First(&token).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -69,7 +69,7 @@ func (r *TenantDeviceRepository) GetTenantDeviceTokenByToken(deviceToken string,
 // DeactivateTenantDeviceToken deactivates a device token
 func (r *TenantDeviceRepository) DeactivateTenantDeviceToken(tokenID, userID, tenantID uuid.UUID) error {
 	return r.db.Model(&models.TenantDeviceToken{}).
-		Where("id = ? AND user_id = ? AND tenant_id = ?", tokenID, userID, tenantID).
+		Where("id = ? AND user_id = ? AND workspace_id = ?", tokenID, userID, tenantID).
 		Update("is_active", false).Error
 }
 
@@ -116,7 +116,7 @@ func (r *TenantDeviceRepository) CreateTenantCIBAAuthRequest(request *models.Ten
 // GetTenantCIBAAuthRequestByAuthReqID retrieves CIBA request by auth_req_id
 func (r *TenantDeviceRepository) GetTenantCIBAAuthRequestByAuthReqID(authReqID string, tenantID uuid.UUID) (*models.TenantCIBAAuthRequest, error) {
 	var request models.TenantCIBAAuthRequest
-	err := r.db.Where("auth_req_id = ? AND tenant_id = ?", authReqID, tenantID).
+	err := r.db.Where("auth_req_id = ? AND workspace_id = ?", authReqID, tenantID).
 		First(&request).Error
 	if err != nil {
 		return nil, err
@@ -142,7 +142,7 @@ func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestStatus(authReqID str
 	}
 
 	return r.db.Model(&models.TenantCIBAAuthRequest{}).
-		Where("auth_req_id = ? AND tenant_id = ?", authReqID, tenantID).
+		Where("auth_req_id = ? AND workspace_id = ?", authReqID, tenantID).
 		Updates(updates).Error
 }
 
@@ -150,14 +150,14 @@ func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestStatus(authReqID str
 func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestLastPolled(authReqID string, tenantID uuid.UUID) error {
 	now := time.Now().Unix()
 	return r.db.Model(&models.TenantCIBAAuthRequest{}).
-		Where("auth_req_id = ? AND tenant_id = ?", authReqID, tenantID).
+		Where("auth_req_id = ? AND workspace_id = ?", authReqID, tenantID).
 		Update("last_polled_at", now).Error
 }
 
 // GetPendingTenantCIBAAuthRequests gets all pending CIBA requests for a user
 func (r *TenantDeviceRepository) GetPendingTenantCIBAAuthRequests(userID, tenantID uuid.UUID) ([]models.TenantCIBAAuthRequest, error) {
 	var requests []models.TenantCIBAAuthRequest
-	err := r.db.Where("user_id = ? AND tenant_id = ? AND status = ?", userID, tenantID, "pending").
+	err := r.db.Where("user_id = ? AND workspace_id = ? AND status = ?", userID, tenantID, "pending").
 		Where("expires_at > ?", time.Now().Unix()).
 		Order("created_at DESC").
 		Find(&requests).Error
@@ -190,7 +190,7 @@ func (r *TenantDeviceRepository) CreateTenantTOTPSecret(secret *models.TenantTOT
 // GetTenantTOTPSecretByID retrieves a TOTP secret by ID in tenant DB
 func (r *TenantDeviceRepository) GetTenantTOTPSecretByID(id, userID, tenantID uuid.UUID) (*models.TenantTOTPSecret, error) {
 	var secret models.TenantTOTPSecret
-	err := r.db.Where("id = ? AND user_id = ? AND tenant_id = ? AND is_active = ?", id, userID, tenantID, true).
+	err := r.db.Where("id = ? AND user_id = ? AND workspace_id = ? AND is_active = ?", id, userID, tenantID, true).
 		First(&secret).Error
 	if err != nil {
 		return nil, err
@@ -201,7 +201,7 @@ func (r *TenantDeviceRepository) GetTenantTOTPSecretByID(id, userID, tenantID uu
 // GetTenantUserTOTPSecrets retrieves all active TOTP secrets for a user in tenant DB
 func (r *TenantDeviceRepository) GetTenantUserTOTPSecrets(userID, tenantID uuid.UUID) ([]models.TenantTOTPSecret, error) {
 	var secrets []models.TenantTOTPSecret
-	err := r.db.Where("user_id = ? AND tenant_id = ? AND is_active = ?", userID, tenantID, true).
+	err := r.db.Where("user_id = ? AND workspace_id = ? AND is_active = ?", userID, tenantID, true).
 		Order("is_primary DESC, created_at DESC").
 		Find(&secrets).Error
 	return secrets, err
@@ -216,7 +216,7 @@ func (r *TenantDeviceRepository) UpdateTenantTOTPSecret(secret *models.TenantTOT
 // DeleteTenantTOTPSecret soft deletes a TOTP secret by setting is_active to false
 func (r *TenantDeviceRepository) DeleteTenantTOTPSecret(id, userID, tenantID uuid.UUID) error {
 	return r.db.Model(&models.TenantTOTPSecret{}).
-		Where("id = ? AND user_id = ? AND tenant_id = ?", id, userID, tenantID).
+		Where("id = ? AND user_id = ? AND workspace_id = ?", id, userID, tenantID).
 		Update("is_active", false).Error
 }
 
@@ -235,7 +235,7 @@ func (r *TenantDeviceRepository) SetTenantTOTPSecretAsPrimary(id, userID, tenant
 
 	// Unset all other secrets as primary
 	if err := tx.Model(&models.TenantTOTPSecret{}).
-		Where("user_id = ? AND tenant_id = ? AND id != ?", userID, tenantID, id).
+		Where("user_id = ? AND workspace_id = ? AND id != ?", userID, tenantID, id).
 		Update("is_primary", false).Error; err != nil {
 		tx.Rollback()
 		return err
@@ -243,7 +243,7 @@ func (r *TenantDeviceRepository) SetTenantTOTPSecretAsPrimary(id, userID, tenant
 
 	// Set this secret as primary
 	if err := tx.Model(&models.TenantTOTPSecret{}).
-		Where("id = ? AND user_id = ? AND tenant_id = ?", id, userID, tenantID).
+		Where("id = ? AND user_id = ? AND workspace_id = ?", id, userID, tenantID).
 		Update("is_primary", true).Error; err != nil {
 		tx.Rollback()
 		return err
@@ -278,7 +278,7 @@ func (r *TenantDeviceRepository) CreateTenantBackupCodes(codes []models.TenantBa
 // GetTenantUserBackupCodes retrieves all unused backup codes for a user in tenant DB
 func (r *TenantDeviceRepository) GetTenantUserBackupCodes(userID, tenantID uuid.UUID) ([]models.TenantBackupCode, error) {
 	var codes []models.TenantBackupCode
-	err := r.db.Where("user_id = ? AND tenant_id = ? AND is_used = ?", userID, tenantID, false).
+	err := r.db.Where("user_id = ? AND workspace_id = ? AND is_used = ?", userID, tenantID, false).
 		Order("created_at DESC").
 		Find(&codes).Error
 	return codes, err
@@ -288,7 +288,7 @@ func (r *TenantDeviceRepository) GetTenantUserBackupCodes(userID, tenantID uuid.
 func (r *TenantDeviceRepository) UseTenantBackupCode(code, userID, tenantID uuid.UUID) error {
 	now := time.Now().Unix()
 	return r.db.Model(&models.TenantBackupCode{}).
-		Where("code = ? AND user_id = ? AND tenant_id = ? AND is_used = ?", code, userID, tenantID, false).
+		Where("code = ? AND user_id = ? AND workspace_id = ? AND is_used = ?", code, userID, tenantID, false).
 		Updates(map[string]interface{}{
 			"is_used": true,
 			"used_at": now,
@@ -297,7 +297,7 @@ func (r *TenantDeviceRepository) UseTenantBackupCode(code, userID, tenantID uuid
 
 // DeleteTenantUserBackupCodes deletes all backup codes for a user in tenant DB
 func (r *TenantDeviceRepository) DeleteTenantUserBackupCodes(userID, tenantID uuid.UUID) error {
-	return r.db.Where("user_id = ? AND tenant_id = ?", userID, tenantID).
+	return r.db.Where("user_id = ? AND workspace_id = ?", userID, tenantID).
 		Delete(&models.TenantBackupCode{}).Error
 }
 

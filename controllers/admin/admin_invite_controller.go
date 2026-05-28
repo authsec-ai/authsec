@@ -118,7 +118,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	// Check if user with this email already exists IN THIS TENANT (tenant-scoped check)
-	// This respects the new composite UNIQUE constraint (email, tenant_id)
+	// This respects the new composite UNIQUE constraint (email, workspace_id)
 	if tenantUUID != uuid.Nil {
 		u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, tenantUUID)
 		if err == nil && u != nil {
@@ -146,10 +146,10 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		}
 	}
 
-	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND tenant_id = $2 LIMIT 1", req.Username, tenantUUIDForQuery).Scan(&existingUsername)
+	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND workspace_id = $2 LIMIT 1", req.Username, tenantUUIDForQuery).Scan(&existingUsername)
 	if err == nil {
 		//reactivate the user just in case the user was deleted or deactivated.
-		_, err = db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND tenant_id = $2", req.Username, tenantUUIDForQuery)
+		_, err = db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, tenantUUIDForQuery)
 
 		c.JSON(http.StatusConflict, gin.H{"error": "User with this username already exists in this tenant"})
 		return
@@ -251,11 +251,11 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			// Insert into role_bindings (user_roles is deprecated)
 			// scope_type and scope_id are NULL for tenant-wide role assignments
 			if _, err := config.GetDatabase().Exec(`
-				INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
+				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 				SELECT $1, $2, $3, $4, NULL, NULL, NOW(), NOW()
 				WHERE NOT EXISTS (
 					SELECT 1 FROM role_bindings 
-					WHERE tenant_id = $2 AND user_id = $3 AND role_id = $4 
+					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 
 					AND scope_type IS NULL AND scope_id IS NULL
 				)
 			`, uuid.New(), tenantUUID, adminUser.ID, roleID); err != nil {
@@ -290,7 +290,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			"email":      adminUser.Email,
 			"username":   adminUser.Username,
 			"name":       adminUser.Name,
-			"tenant_id":  tenantIDFromToken,
+			"workspace_id":  tenantIDFromToken,
 			"email_sent": emailSent,
 		},
 	})
@@ -639,7 +639,7 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 		FROM users
 		WHERE temporary_password = true 
 		  AND last_login IS NULL
-		  AND ($1::uuid IS NULL OR tenant_id = $1)
+		  AND ($1::uuid IS NULL OR workspace_id = $1)
 		ORDER BY created_at DESC
 	`
 
@@ -708,7 +708,7 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *models.AdminUser, tenantID uuid.UUID, clientID, projectID *uuid.UUID) error {
 	// Get tenant information
 	var tenant models.Tenant
-	if err := config.DB.Where("tenant_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
 		return fmt.Errorf("failed to get tenant info: %w", err)
 	}
 
@@ -738,7 +738,7 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	} else {
 		// Try to get default project for this tenant
 		var defaultProject models.Project
-		if err := config.DB.Where("tenant_id = ? AND active = true", tenantID).First(&defaultProject).Error; err == nil {
+		if err := config.DB.Where("workspace_id = ? AND active = true", tenantID).First(&defaultProject).Error; err == nil {
 			effectiveProjectID = defaultProject.ID
 		} else {
 			effectiveProjectID = tenantID // Use tenant ID as fallback
@@ -747,7 +747,7 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 
 	// Create end user with same credentials as admin
 	endUserInsert := `
-		INSERT INTO users (id, client_id, tenant_id, project_id, email, name, username, 
+		INSERT INTO users (id, client_id, workspace_id, project_id, email, name, username, 
 			password_hash, tenant_domain, provider, provider_id, active, 
 			created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())

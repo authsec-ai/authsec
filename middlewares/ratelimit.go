@@ -82,18 +82,19 @@ func RateLimitMiddleware() gin.HandlerFunc {
 	}
 }
 
-// TenantRateLimitMiddleware provides per-tenant rate limiting
+// TenantRateLimitMiddleware provides per-workspace rate limiting.
+// Function name preserved to avoid churning route registrations.
 func TenantRateLimitMiddleware() gin.HandlerFunc {
-	// Tenant-specific rate limiter (1000 requests per minute per tenant per IP)
-	tenantLimiter := tollbooth.NewLimiter(16.67, nil) // 1000 requests per minute = 16.67 per second
-	tenantLimiter.SetIPLookups([]string{"X-Real-IP", "X-Forwarded-For", "RemoteAddr"})
-	tenantLimiter.SetMethods([]string{"GET", "POST", "PUT", "DELETE", "PATCH"})
-	tenantLimiter.SetMessage(`{"error": "Tenant rate limit exceeded", "message": "Too many requests for this tenant. Please try again later."}`)
+	// Workspace-specific rate limiter (1000 requests per minute per workspace per IP)
+	workspaceLimiter := tollbooth.NewLimiter(16.67, nil) // 1000 requests per minute = 16.67 per second
+	workspaceLimiter.SetIPLookups([]string{"X-Real-IP", "X-Forwarded-For", "RemoteAddr"})
+	workspaceLimiter.SetMethods([]string{"GET", "POST", "PUT", "DELETE", "PATCH"})
+	workspaceLimiter.SetMessage(`{"error": "Workspace rate limit exceeded", "message": "Too many requests for this workspace. Please try again later."}`)
 
 	return func(c *gin.Context) {
-		tenantID := c.GetHeader("X-Tenant-ID")
-		if tenantID == "" {
-			// No tenant specified, skip tenant-specific rate limiting
+		workspaceID := c.GetHeader("X-Workspace-ID")
+		if workspaceID == "" {
+			// No workspace specified, skip workspace-specific rate limiting
 			c.Next()
 			return
 		}
@@ -102,40 +103,40 @@ func TenantRateLimitMiddleware() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		path := c.Request.URL.Path
 
-		// Create a composite key for tenant + IP rate limiting
-		tenantIPKey := tenantID + ":" + clientIP
+		// Create a composite key for workspace + IP rate limiting
+		workspaceIPKey := workspaceID + ":" + clientIP
 
-		// Check tenant-specific rate limit
-		httpError := tollbooth.LimitByKeys(tenantLimiter, []string{tenantIPKey})
+		// Check workspace-specific rate limit
+		httpError := tollbooth.LimitByKeys(workspaceLimiter, []string{workspaceIPKey})
 		if httpError != nil {
-			// Rate limit exceeded for this tenant
+			// Rate limit exceeded for this workspace
 			logrus.WithFields(logrus.Fields{
-				"request_id": requestID,
-				"client_ip":  clientIP,
-				"tenant_id":  tenantID,
-				"path":       path,
-				"method":     c.Request.Method,
-				"user_agent": c.GetHeader("User-Agent"),
-			}).Warn("Tenant rate limit exceeded")
+				"request_id":   requestID,
+				"client_ip":    clientIP,
+				"workspace_id": workspaceID,
+				"path":         path,
+				"method":       c.Request.Method,
+				"user_agent":   c.GetHeader("User-Agent"),
+			}).Warn("Workspace rate limit exceeded")
 
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":      "Tenant rate limit exceeded",
-				"message":    "Too many requests for this tenant. Please try again later.",
-				"request_id": requestID,
-				"tenant_id":  tenantID,
+				"error":        "Workspace rate limit exceeded",
+				"message":      "Too many requests for this workspace. Please try again later.",
+				"request_id":   requestID,
+				"workspace_id": workspaceID,
 			})
 			return
 		}
 
-		// Log tenant rate limit info
+		// Log workspace rate limit info
 		// Note: tollbooth v7 doesn't expose remaining/reset info directly
 		logrus.WithFields(logrus.Fields{
-			"request_id": requestID,
-			"client_ip":  clientIP,
-			"tenant_id":  tenantID,
-			"path":       path,
-			"method":     c.Request.Method,
-		}).Debug("Tenant rate limit check passed")
+			"request_id":   requestID,
+			"client_ip":    clientIP,
+			"workspace_id": workspaceID,
+			"path":         path,
+			"method":       c.Request.Method,
+		}).Debug("Workspace rate limit check passed")
 
 		c.Next()
 	}

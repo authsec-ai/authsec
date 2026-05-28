@@ -191,7 +191,7 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 						IsAutoDiscovered: false,
 					}
 					if err := tx.Where(
-						"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+						"(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND scope_string = ?",
 						req.WorkspaceID, req.WorkspaceID, rs.ID, ss,
 					).FirstOrCreate(&scope).Error; err != nil {
 						return fmt.Errorf("seed preset scope %s: %w", ss, err)
@@ -210,7 +210,7 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 				IsAutoDiscovered: false,
 			}
 			if err := tx.Where(
-				"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+				"(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND scope_string = ?",
 				req.WorkspaceID, req.WorkspaceID, rs.ID, ss,
 			).FirstOrCreate(&scope).Error; err != nil {
 				return fmt.Errorf("seed canonical scope %s: %w", ss, err)
@@ -282,7 +282,7 @@ func CanonicalAuthSecScopes(scopes []string, appSlug string) []string {
 func syncSupportedScopesFromRegistry(tx *gorm.DB, workspaceID, rsID uuid.UUID) (pq.StringArray, error) {
 	var scopeStrings []string
 	if err := tx.Model(&models.OAuthScope{}).
-		Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
+		Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
 		Order("scope_string ASC").
 		Pluck("scope_string", &scopeStrings).Error; err != nil {
 		return nil, fmt.Errorf("sync supported scopes from registry: %w", err)
@@ -313,7 +313,7 @@ func (s *ResourceServerService) GetByResourceURI(uri string) (*models.ResourceSe
 
 func (s *ResourceServerService) ListByTenant(tenantID string) ([]models.ResourceServer, error) {
 	var servers []models.ResourceServer
-	if err := s.db.Where("tenant_id = ? AND active = true", tenantID).Find(&servers).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND active = true", tenantID).Find(&servers).Error; err != nil {
 		return nil, err
 	}
 	return servers, nil
@@ -321,14 +321,14 @@ func (s *ResourceServerService) ListByTenant(tenantID string) ([]models.Resource
 
 // ListByWorkspace returns Applications in a workspace, optionally filtered by
 // application_type. During the tenant_id -> workspace_id rollout this matches
-// rows where workspace_id = $1 OR (workspace_id IS NULL AND tenant_id = $1) so
+// rows where workspace_id = $1 OR (workspace_id IS NULL AND workspace_id = $1) so
 // unbackfilled rows are still surfaced to their owning workspace.
 //
 // applicationType is matched as a literal string ("" means no filter).
 func (s *ResourceServerService) ListByWorkspace(workspaceID string, applicationType string) ([]models.ResourceServer, error) {
 	var servers []models.ResourceServer
 	q := s.db.Where(
-		"(workspace_id = ? OR (workspace_id IS NULL AND tenant_id = ?)) AND active = true",
+		"(workspace_id = ? OR (workspace_id IS NULL AND workspace_id = ?)) AND active = true",
 		workspaceID, workspaceID,
 	)
 	if applicationType != "" {
@@ -358,7 +358,7 @@ func (s *ResourceServerService) Delete(id string) error {
 // GetByIDAndTenant fetches a resource server by ID with tenant ownership check.
 func (s *ResourceServerService) GetByIDAndTenant(id, tenantID string) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND tenant_id = ? AND active = true", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ? AND active = true", id, tenantID).First(&rs).Error; err != nil {
 		return nil, err
 	}
 	return &rs, nil
@@ -368,7 +368,7 @@ func (s *ResourceServerService) GetByIDAndTenant(id, tenantID string) (*models.R
 // If public_base_url or protected_base_path change, resource_uri is recomputed.
 func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[string]interface{}) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND tenant_id = ?", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).First(&rs).Error; err != nil {
 		return nil, err
 	}
 	if err := s.db.Model(&rs).Updates(updates).Error; err != nil {
@@ -393,7 +393,7 @@ func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[
 
 // DeleteByTenant deletes a resource server with tenant ownership check.
 func (s *ResourceServerService) DeleteByTenant(id, tenantID string) error {
-	result := s.db.Where("id = ? AND tenant_id = ?", id, tenantID).Delete(&models.ResourceServer{})
+	result := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).Delete(&models.ResourceServer{})
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("resource server not found")
 	}
@@ -403,7 +403,7 @@ func (s *ResourceServerService) DeleteByTenant(id, tenantID string) error {
 // RotateIntrospectionSecret generates a new secret, stores its bcrypt hash, returns plaintext once.
 func (s *ResourceServerService) RotateIntrospectionSecret(id, tenantID string) (string, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND tenant_id = ?", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).First(&rs).Error; err != nil {
 		return "", fmt.Errorf("resource server not found")
 	}
 
@@ -554,7 +554,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 			// Count existing auto-discovered scopes before upsert
 			var beforeCount int64
 			tx.Model(&models.OAuthScope{}).
-				Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+				Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID).Count(&beforeCount)
 
 			if len(currentScopeStrings) > 0 {
@@ -565,7 +565,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 
 			var afterCount int64
 			tx.Model(&models.OAuthScope{}).
-				Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+				Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID).Count(&afterCount)
 			syncResult.ScopesAdded = int(afterCount - beforeCount)
 
@@ -573,13 +573,13 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 			var staleAutoScopes []models.OAuthScope
 			if len(currentScopeStrings) > 0 {
 				tx.Where(
-					"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true AND scope_string NOT IN ?",
+					"(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND is_auto_discovered = true AND scope_string NOT IN ?",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID, currentScopeStrings,
 				).Find(&staleAutoScopes)
 			} else {
 				// PRM legitimately returned empty — remove ALL auto-discovered scopes
 				tx.Where(
-					"(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
+					"(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND is_auto_discovered = true",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID,
 				).Find(&staleAutoScopes)
 			}
@@ -728,7 +728,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					continue
 				}
 				var scope models.OAuthScope
-				if tx.Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ? AND scope_string = ?",
+				if tx.Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND scope_string = ?",
 					rs.WorkspaceID, rs.WorkspaceID, rs.ID, m.ScopeString).First(&scope).Error != nil {
 					continue
 				}
@@ -855,7 +855,7 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 func scopesForResourceServer(tx *gorm.DB, workspaceID, rsID uuid.UUID) ([]string, error) {
 	var scopeStrings []string
 	if err := tx.Model(&models.OAuthScope{}).
-		Where("(workspace_id = ? OR tenant_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
+		Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ?", workspaceID, workspaceID, rsID).
 		Order("scope_string ASC").
 		Pluck("scope_string", &scopeStrings).Error; err != nil {
 		return nil, fmt.Errorf("list resource server scopes: %w", err)
@@ -922,9 +922,9 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 	viewerRoleName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 
 	var existingAdmin, existingReadonly, existingViewer models.RBACRole
-	adminExists := db.Where("name = ? AND tenant_id = ?", adminRoleName, rs.WorkspaceID).First(&existingAdmin).Error == nil
-	readonlyExists := db.Where("name = ? AND tenant_id = ?", readonlyRoleName, rs.WorkspaceID).First(&existingReadonly).Error == nil
-	viewerExists := db.Where("name = ? AND tenant_id = ?", viewerRoleName, rs.WorkspaceID).First(&existingViewer).Error == nil
+	adminExists := db.Where("name = ? AND workspace_id = ?", adminRoleName, rs.WorkspaceID).First(&existingAdmin).Error == nil
+	readonlyExists := db.Where("name = ? AND workspace_id = ?", readonlyRoleName, rs.WorkspaceID).First(&existingReadonly).Error == nil
+	viewerExists := db.Where("name = ? AND workspace_id = ?", viewerRoleName, rs.WorkspaceID).First(&existingViewer).Error == nil
 
 	// Removed early-exit: always reconcile permissions even when both roles exist.
 
@@ -944,7 +944,7 @@ func (s *ResourceServerService) reconcileDefaultRoles(rs *models.ResourceServer,
 			Description: fmt.Sprintf("OAuth scope: %s", scope.DisplayName),
 		}
 		existing := models.RBACPermission{}
-		if err := db.Where("tenant_id = ? AND resource = ? AND action = ?",
+		if err := db.Where("workspace_id = ? AND resource = ? AND action = ?",
 			rs.WorkspaceID, perm.Resource, perm.Action).First(&existing).Error; err == nil {
 			perm = existing
 		} else {
@@ -1115,7 +1115,7 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUI
 	// Step 5: Default role — viewer exists and has ≥1 scope
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
-	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
+	viewerExists := s.db.Where("name = ? AND workspace_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
 	var viewerPermCount int64
 	if viewerExists {
 		s.db.Model(&models.RolePermission{}).Where("role_id = ?", viewerRole.ID).Count(&viewerPermCount)
@@ -1197,7 +1197,7 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
 	viewerScopeStrings := make([]string, 0)
-	if s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil {
+	if s.db.Where("name = ? AND workspace_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil {
 		var perms []models.RBACPermission
 		s.db.Joins("JOIN role_permissions rp ON rp.permission_id = permissions.id").
 			Where("rp.role_id = ?", viewerRole.ID).
@@ -1279,7 +1279,7 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, act
 	// Gate 4: viewer role has ≥1 scope
 	viewerName := fmt.Sprintf("rs-%s:viewer", rs.ID.String())
 	var viewerRole models.RBACRole
-	viewerExists := s.db.Where("name = ? AND tenant_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
+	viewerExists := s.db.Where("name = ? AND workspace_id = ?", viewerName, rs.WorkspaceID).First(&viewerRole).Error == nil
 	if !viewerExists {
 		failed = append(failed, "step_5_no_viewer_role")
 	} else {

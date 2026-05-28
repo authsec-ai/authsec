@@ -135,7 +135,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 		After: map[string]interface{}{
 			"config_name": syncConfig.ConfigName,
 			"sync_type":   syncConfig.SyncType,
-			"tenant_id":   syncConfig.WorkspaceID.String(),
+			"workspace_id":   syncConfig.WorkspaceID.String(),
 			"client_id":   syncConfig.ClientID.String(),
 			"is_active":   syncConfig.IsActive,
 		},
@@ -182,7 +182,7 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	}
 
 	// Build query
-	query := config.DB.Where("tenant_id = ? AND client_id = ?", tenantID, clientID)
+	query := config.DB.Where("workspace_id = ? AND client_id = ?", tenantID, clientID)
 
 	// Apply sync type filter if provided
 	if req.SyncType != nil && *req.SyncType != "" {
@@ -247,7 +247,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 
 	// Fetch existing configuration
 	var syncConfig models.SyncConfiguration
-	if err := config.DB.Where("id = ? AND tenant_id = ? AND client_id = ?", configID, tenantID, clientID).First(&syncConfig).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, tenantID, clientID).First(&syncConfig).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Sync configuration not found"})
 		return
 	}
@@ -328,7 +328,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		After: map[string]interface{}{
 			"config_name": syncConfig.ConfigName,
 			"sync_type":   syncConfig.SyncType,
-			"tenant_id":   syncConfig.WorkspaceID.String(),
+			"workspace_id":   syncConfig.WorkspaceID.String(),
 			"client_id":   syncConfig.ClientID.String(),
 			"is_active":   syncConfig.IsActive,
 		},
@@ -381,7 +381,7 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	}
 
 	// Delete configuration
-	result := config.DB.Where("id = ? AND tenant_id = ? AND client_id = ?", configID, tenantID, clientID).Delete(&models.SyncConfiguration{})
+	result := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, tenantID, clientID).Delete(&models.SyncConfiguration{})
 	if result.Error != nil {
 		log.Printf("Failed to delete sync configuration: %v", result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete configuration"})
@@ -397,7 +397,7 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	middlewares.Audit(c, "sync_config", configID.String(), "delete", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
 			"id":        configID.String(),
-			"tenant_id": tenantID.String(),
+			"workspace_id": tenantID.String(),
 			"client_id": clientID.String(),
 		},
 	})

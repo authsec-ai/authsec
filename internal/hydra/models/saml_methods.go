@@ -135,7 +135,7 @@ func (s *OAuthLoginService) GetSAMLProvidersForTenant(workspaceID string, _ ...s
 		         ON ip.workspace_id = sp.tenant_id
 		        AND ip.provider_type = 'saml'
 		        AND ip.config_ref = sp.id::text`).
-		Where("sp.tenant_id = ?", workspaceID).
+		Where("sp.workspace_id = ?", workspaceID).
 		Where("sp.is_active = ?", true).
 		Where("ip.status <> 'disabled'")
 
@@ -208,7 +208,7 @@ func (s *OAuthLoginService) GetSAMLProvider(workspaceID, providerName string, _ 
 
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
 	var provider SAMLProvider
-	if err := db.Where("tenant_id = ? AND provider_name = ?", workspaceID, providerName).
+	if err := db.Where("workspace_id = ? AND provider_name = ?", workspaceID, providerName).
 		First(&provider).Error; err != nil {
 		return nil, fmt.Errorf("SAML provider not found: %w", err)
 	}
@@ -383,7 +383,7 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLS
 	db := config.DB
 
 	var cert SAMLSPCertificate
-	err := db.Where("tenant_id = ?", tenantID).First(&cert).Error
+	err := db.Where("workspace_id = ?", tenantID).First(&cert).Error
 	if err == nil {
 		return &cert, nil
 	}
