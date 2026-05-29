@@ -1396,6 +1396,204 @@ CREATE TABLE public.webauthn_sessions (
     CONSTRAINT webauthn_sessions_pkey PRIMARY KEY (id),
     CONSTRAINT webauthn_sessions_session_key_key UNIQUE (session_key)
 );
+--
+-- =====================================================================
+-- v4 IDP + Workspace plane
+-- =====================================================================
+-- The pg_dump snapshot above was taken before the v4 IDP migrations were
+-- applied to the source database. The tables below ARE part of v4 and the
+-- backend will 500 on any IDP/SAML/SCIM/workspace endpoint without them.
+-- Consolidated from migrations 115, 117, 124, 125, 126, plus the saml_providers
+-- shape used by internal/hydra/models/saml_methods.go.
+--
+
+CREATE TABLE public.workspaces (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    slug text UNIQUE,
+    owner_user_id uuid,
+    workspace_type text NOT NULL DEFAULT 'personal',
+    workspace_domain text,
+    email text,
+    password_hash text,
+    provider text DEFAULT 'local',
+    source text,
+    status text DEFAULT 'active',
+    vault_mount text,
+    ca_cert text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT workspaces_type_chk CHECK (workspace_type IN ('personal', 'team')),
+    CONSTRAINT workspaces_slug_reserved_chk CHECK (
+        slug IS NULL OR lower(slug) NOT IN (
+            'admin', 'api', 'auth', 'oauth', 'scim', 'login', 'support', 'www', 'root', 'system'
+        )
+    )
+);
+
+CREATE INDEX idx_workspaces_owner_user_id ON public.workspaces(owner_user_id);
+
+CREATE TABLE public.workspace_memberships (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL,
+    role_id uuid NOT NULL REFERENCES public.roles(id) ON DELETE RESTRICT,
+    status text NOT NULL DEFAULT 'active',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT workspace_memberships_status_chk CHECK (status IN ('active', 'invited', 'suspended', 'left')),
+    CONSTRAINT workspace_memberships_workspace_user_uq UNIQUE (workspace_id, user_id)
+);
+
+CREATE INDEX idx_workspace_memberships_user_id ON public.workspace_memberships(user_id);
+CREATE INDEX idx_workspace_memberships_role_id ON public.workspace_memberships(role_id);
+
+-- identity_providers — canonical v4 IDP table. Each row is workspace-owned
+-- and points to a concrete config row (oidc_providers, saml_providers, etc.)
+-- via config_ref.
+CREATE TABLE public.identity_providers (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    provider_type text NOT NULL,
+    display_name text NOT NULL,
+    config_ref text NOT NULL,
+    status text NOT NULL DEFAULT 'configured',
+    created_by_user_id uuid NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT identity_providers_type_chk
+        CHECK (provider_type IN ('oidc', 'saml', 'ad', 'entra', 'scim'))
+);
+
+CREATE INDEX idx_identity_providers_workspace ON public.identity_providers(workspace_id);
+CREATE INDEX idx_identity_providers_type      ON public.identity_providers(provider_type);
+
+-- application_identity_provider_policies — opt-in restriction of which IDPs
+-- a given application (resource_servers row) accepts.
+CREATE TABLE public.application_identity_provider_policies (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
+    identity_provider_id uuid NOT NULL REFERENCES public.identity_providers(id) ON DELETE CASCADE,
+    enabled boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT application_identity_provider_policies_uq UNIQUE (application_id, identity_provider_id)
+);
+
+CREATE INDEX idx_app_idp_policies_workspace ON public.application_identity_provider_policies(workspace_id);
+
+-- scim_connections — workspace-scoped SCIM 2.0 connection tokens. Optional
+-- back-reference to identity_providers if the SCIM source is itself an IDP.
+CREATE TABLE public.scim_connections (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    identity_provider_id uuid REFERENCES public.identity_providers(id) ON DELETE SET NULL,
+    token_hash text NOT NULL,
+    status text NOT NULL DEFAULT 'active',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    revoked_at timestamptz,
+    CONSTRAINT scim_connections_status_chk CHECK (status IN ('active', 'revoked', 'disabled')),
+    default_client_id uuid,
+    default_project_id uuid
+);
+
+CREATE INDEX idx_scim_connections_workspace          ON public.scim_connections(workspace_id);
+CREATE INDEX idx_scim_connections_identity_provider  ON public.scim_connections(identity_provider_id);
+
+-- application_spiffe_identities — workspace-scoped SPIFFE ID ↔ Application
+-- binding. Used by the agent-guard plane.
+CREATE TABLE public.application_spiffe_identities (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
+    spiffe_id text NOT NULL UNIQUE,
+    trust_domain text NOT NULL,
+    selectors jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'active',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    revoked_at timestamptz,
+    CONSTRAINT application_spiffe_identities_status_chk CHECK (status IN ('active', 'revoked', 'disabled'))
+);
+
+CREATE INDEX idx_app_spiffe_workspace   ON public.application_spiffe_identities(workspace_id);
+CREATE INDEX idx_app_spiffe_application ON public.application_spiffe_identities(application_id);
+
+-- saml_providers — referenced by identity_providers.config_ref for SAML IDPs.
+-- v4 shape: workspace-scoped via workspace_id (no client_id; per-Application
+-- restriction lives in application_identity_provider_policies).
+CREATE TABLE public.saml_providers (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    provider_name varchar(255) NOT NULL,
+    display_name varchar(255) NOT NULL,
+    entity_id varchar(500) NOT NULL,
+    sso_url varchar(500) NOT NULL,
+    slo_url varchar(500),
+    certificate text NOT NULL,
+    metadata_url varchar(500),
+    name_id_format varchar(255) DEFAULT 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+    attribute_mapping jsonb,
+    is_active boolean DEFAULT true,
+    sort_order int DEFAULT 0,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT idx_saml_provider_unique UNIQUE (workspace_id, provider_name)
+);
+
+CREATE INDEX idx_saml_providers_tenant_id ON public.saml_providers(workspace_id);
+
+-- ---------------------------------------------------------------------------
+-- Indexes for v4 columns that were inlined into their CREATE TABLE statements
+-- above. Placed here (after the v4 IDP block) so that every referenced table
+-- already exists at index-creation time.
+-- ---------------------------------------------------------------------------
+CREATE INDEX idx_resource_servers_workspace_id          ON public.resource_servers(workspace_id);
+CREATE INDEX idx_resource_servers_application_type      ON public.resource_servers(application_type);
+CREATE INDEX idx_resource_servers_legacy_client_id      ON public.resource_servers(legacy_client_id);
+CREATE INDEX idx_rs_access_policies_workspace_id        ON public.resource_server_access_policies(workspace_id);
+CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clients(sync_status) WHERE sync_status <> 'active';
+CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
+CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
+CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name);
+CREATE INDEX idx_delegation_tokens_workspace_id         ON public.delegation_tokens(workspace_id);
+CREATE INDEX idx_delegation_policies_workspace_id       ON public.delegation_policies(workspace_id);
+CREATE INDEX idx_oauth_scopes_workspace_id              ON public.oauth_scopes(workspace_id);
+CREATE INDEX idx_roles_workspace_id                     ON public.roles(workspace_id);
+CREATE INDEX idx_permissions_workspace_id               ON public.permissions(workspace_id);
+CREATE INDEX idx_role_bindings_workspace_id             ON public.role_bindings(workspace_id);
+CREATE INDEX idx_rs_client_reg_workspace_id             ON public.resource_server_client_registrations(workspace_id);
+CREATE INDEX idx_mcp_tools_workspace_id                 ON public.mcp_tools(workspace_id);
+CREATE INDEX idx_auth_request_contexts_workspace_id     ON public.auth_request_contexts(workspace_id);
+
+-- Reusable scope vocabulary templates (workspace-scoped). Catalog entries do
+-- not grant runtime access on their own — they are templates that can be
+-- attached to an application, which materialises an oauth_scopes row.
+--
+
+CREATE TABLE public.scope_catalog_entries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    key text NOT NULL,
+    display_name text NOT NULL,
+    description text,
+    risk_level text DEFAULT 'low'::text NOT NULL,
+    source text DEFAULT 'manual'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT scope_catalog_entries_pkey PRIMARY KEY (id)
+);
+
+-- OWNER intentionally not set here; pg_dump used `OWNER TO -` (anonymous)
+-- everywhere else in this file, so the table inherits the role that ran the
+-- bootstrap (authdev on dev, authsec on prod). Hard-coding either name breaks
+-- the opposite environment.
+
+CREATE UNIQUE INDEX idx_scope_catalog_workspace_key
+    ON public.scope_catalog_entries USING btree (workspace_id, key);
+
+CREATE INDEX idx_scope_catalog_workspace_id
+    ON public.scope_catalog_entries USING btree (workspace_id);
 
 ALTER TABLE ONLY public.audit_events ALTER COLUMN id SET DEFAULT nextval('public.audit_events_id_seq'::regclass);
 
@@ -2251,204 +2449,6 @@ BEGIN
     ON CONFLICT DO NOTHING;
 END $$;
 
---
--- =====================================================================
--- v4 IDP + Workspace plane
--- =====================================================================
--- The pg_dump snapshot above was taken before the v4 IDP migrations were
--- applied to the source database. The tables below ARE part of v4 and the
--- backend will 500 on any IDP/SAML/SCIM/workspace endpoint without them.
--- Consolidated from migrations 115, 117, 124, 125, 126, plus the saml_providers
--- shape used by internal/hydra/models/saml_methods.go.
---
-
-CREATE TABLE public.workspaces (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    name text NOT NULL,
-    slug text UNIQUE,
-    owner_user_id uuid,
-    workspace_type text NOT NULL DEFAULT 'personal',
-    workspace_domain text,
-    email text,
-    password_hash text,
-    provider text DEFAULT 'local',
-    source text,
-    status text DEFAULT 'active',
-    vault_mount text,
-    ca_cert text,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT workspaces_type_chk CHECK (workspace_type IN ('personal', 'team')),
-    CONSTRAINT workspaces_slug_reserved_chk CHECK (
-        slug IS NULL OR lower(slug) NOT IN (
-            'admin', 'api', 'auth', 'oauth', 'scim', 'login', 'support', 'www', 'root', 'system'
-        )
-    )
-);
-
-CREATE INDEX idx_workspaces_owner_user_id ON public.workspaces(owner_user_id);
-
-CREATE TABLE public.workspace_memberships (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    user_id uuid NOT NULL,
-    role_id uuid NOT NULL REFERENCES public.roles(id) ON DELETE RESTRICT,
-    status text NOT NULL DEFAULT 'active',
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT workspace_memberships_status_chk CHECK (status IN ('active', 'invited', 'suspended', 'left')),
-    CONSTRAINT workspace_memberships_workspace_user_uq UNIQUE (workspace_id, user_id)
-);
-
-CREATE INDEX idx_workspace_memberships_user_id ON public.workspace_memberships(user_id);
-CREATE INDEX idx_workspace_memberships_role_id ON public.workspace_memberships(role_id);
-
--- identity_providers — canonical v4 IDP table. Each row is workspace-owned
--- and points to a concrete config row (oidc_providers, saml_providers, etc.)
--- via config_ref.
-CREATE TABLE public.identity_providers (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    provider_type text NOT NULL,
-    display_name text NOT NULL,
-    config_ref text NOT NULL,
-    status text NOT NULL DEFAULT 'configured',
-    created_by_user_id uuid NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT identity_providers_type_chk
-        CHECK (provider_type IN ('oidc', 'saml', 'ad', 'entra', 'scim'))
-);
-
-CREATE INDEX idx_identity_providers_workspace ON public.identity_providers(workspace_id);
-CREATE INDEX idx_identity_providers_type      ON public.identity_providers(provider_type);
-
--- application_identity_provider_policies — opt-in restriction of which IDPs
--- a given application (resource_servers row) accepts.
-CREATE TABLE public.application_identity_provider_policies (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
-    identity_provider_id uuid NOT NULL REFERENCES public.identity_providers(id) ON DELETE CASCADE,
-    enabled boolean NOT NULL DEFAULT true,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT application_identity_provider_policies_uq UNIQUE (application_id, identity_provider_id)
-);
-
-CREATE INDEX idx_app_idp_policies_workspace ON public.application_identity_provider_policies(workspace_id);
-
--- scim_connections — workspace-scoped SCIM 2.0 connection tokens. Optional
--- back-reference to identity_providers if the SCIM source is itself an IDP.
-CREATE TABLE public.scim_connections (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    identity_provider_id uuid REFERENCES public.identity_providers(id) ON DELETE SET NULL,
-    token_hash text NOT NULL,
-    status text NOT NULL DEFAULT 'active',
-    created_at timestamptz NOT NULL DEFAULT now(),
-    revoked_at timestamptz,
-    CONSTRAINT scim_connections_status_chk CHECK (status IN ('active', 'revoked', 'disabled')),
-    default_client_id uuid,
-    default_project_id uuid
-);
-
-CREATE INDEX idx_scim_connections_workspace          ON public.scim_connections(workspace_id);
-CREATE INDEX idx_scim_connections_identity_provider  ON public.scim_connections(identity_provider_id);
-
--- application_spiffe_identities — workspace-scoped SPIFFE ID ↔ Application
--- binding. Used by the agent-guard plane.
-CREATE TABLE public.application_spiffe_identities (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
-    spiffe_id text NOT NULL UNIQUE,
-    trust_domain text NOT NULL,
-    selectors jsonb NOT NULL DEFAULT '{}'::jsonb,
-    status text NOT NULL DEFAULT 'active',
-    created_at timestamptz NOT NULL DEFAULT now(),
-    revoked_at timestamptz,
-    CONSTRAINT application_spiffe_identities_status_chk CHECK (status IN ('active', 'revoked', 'disabled'))
-);
-
-CREATE INDEX idx_app_spiffe_workspace   ON public.application_spiffe_identities(workspace_id);
-CREATE INDEX idx_app_spiffe_application ON public.application_spiffe_identities(application_id);
-
--- saml_providers — referenced by identity_providers.config_ref for SAML IDPs.
--- v4 shape: workspace-scoped via workspace_id (no client_id; per-Application
--- restriction lives in application_identity_provider_policies).
-CREATE TABLE public.saml_providers (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL,
-    provider_name varchar(255) NOT NULL,
-    display_name varchar(255) NOT NULL,
-    entity_id varchar(500) NOT NULL,
-    sso_url varchar(500) NOT NULL,
-    slo_url varchar(500),
-    certificate text NOT NULL,
-    metadata_url varchar(500),
-    name_id_format varchar(255) DEFAULT 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
-    attribute_mapping jsonb,
-    is_active boolean DEFAULT true,
-    sort_order int DEFAULT 0,
-    created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamptz DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT idx_saml_provider_unique UNIQUE (workspace_id, provider_name)
-);
-
-CREATE INDEX idx_saml_providers_tenant_id ON public.saml_providers(workspace_id);
-
--- ---------------------------------------------------------------------------
--- Indexes for v4 columns that were inlined into their CREATE TABLE statements
--- above. Placed here (after the v4 IDP block) so that every referenced table
--- already exists at index-creation time.
--- ---------------------------------------------------------------------------
-CREATE INDEX idx_resource_servers_workspace_id          ON public.resource_servers(workspace_id);
-CREATE INDEX idx_resource_servers_application_type      ON public.resource_servers(application_type);
-CREATE INDEX idx_resource_servers_legacy_client_id      ON public.resource_servers(legacy_client_id);
-CREATE INDEX idx_rs_access_policies_workspace_id        ON public.resource_server_access_policies(workspace_id);
-CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clients(sync_status) WHERE sync_status <> 'active';
-CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
-CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
-CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name);
-CREATE INDEX idx_delegation_tokens_workspace_id         ON public.delegation_tokens(workspace_id);
-CREATE INDEX idx_delegation_policies_workspace_id       ON public.delegation_policies(workspace_id);
-CREATE INDEX idx_oauth_scopes_workspace_id              ON public.oauth_scopes(workspace_id);
-CREATE INDEX idx_roles_workspace_id                     ON public.roles(workspace_id);
-CREATE INDEX idx_permissions_workspace_id               ON public.permissions(workspace_id);
-CREATE INDEX idx_role_bindings_workspace_id             ON public.role_bindings(workspace_id);
-CREATE INDEX idx_rs_client_reg_workspace_id             ON public.resource_server_client_registrations(workspace_id);
-CREATE INDEX idx_mcp_tools_workspace_id                 ON public.mcp_tools(workspace_id);
-CREATE INDEX idx_auth_request_contexts_workspace_id     ON public.auth_request_contexts(workspace_id);
-
--- Reusable scope vocabulary templates (workspace-scoped). Catalog entries do
--- not grant runtime access on their own — they are templates that can be
--- attached to an application, which materialises an oauth_scopes row.
---
-
-CREATE TABLE public.scope_catalog_entries (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    workspace_id uuid NOT NULL,
-    key text NOT NULL,
-    display_name text NOT NULL,
-    description text,
-    risk_level text DEFAULT 'low'::text NOT NULL,
-    source text DEFAULT 'manual'::text NOT NULL,
-    created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT scope_catalog_entries_pkey PRIMARY KEY (id)
-);
-
--- OWNER intentionally not set here; pg_dump used `OWNER TO -` (anonymous)
--- everywhere else in this file, so the table inherits the role that ran the
--- bootstrap (authdev on dev, authsec on prod). Hard-coding either name breaks
--- the opposite environment.
-
-CREATE UNIQUE INDEX idx_scope_catalog_workspace_key
-    ON public.scope_catalog_entries USING btree (workspace_id, key);
-
-CREATE INDEX idx_scope_catalog_workspace_id
-    ON public.scope_catalog_entries USING btree (workspace_id);
 
 -- Phase 2 (tenant → workspace migration): seed the system workspace mirroring
 -- the system tenant. Both rows share UUID 00000000-...000. Future phases drop
