@@ -59,27 +59,6 @@ func (atr *AdminTenantRepository) GetTenantByID(workspaceID string) (*models.Ten
 	return &t, nil
 }
 
-// GetTenantByClientID retrieves a workspace via a Hydra client_id lookup
-// through tenant_hydra_clients (which still maps client_id -> workspace_id).
-func (atr *AdminTenantRepository) GetTenantByClientID(clientID string) (*models.Tenant, error) {
-	query := `
-		SELECT ` + workspaceSelectCols + `
-		FROM workspaces w
-		JOIN tenant_hydra_clients thc ON w.id::text = thc.workspace_id
-		WHERE thc.hydra_client_id = $1
-		LIMIT 1
-	`
-	var t models.Tenant
-	err := scanWorkspaceRow(atr.db.QueryRow(query, clientID), &t)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("workspace not found for client_id: %s", clientID)
-		}
-		return nil, fmt.Errorf("failed to get workspace for client_id: %w", err)
-	}
-	return &t, nil
-}
-
 // CreateTenant inserts a new workspace identity row.
 func (atr *AdminTenantRepository) CreateTenant(t *models.Tenant) error {
 	query := `

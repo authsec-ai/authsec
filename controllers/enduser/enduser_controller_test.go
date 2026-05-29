@@ -932,42 +932,9 @@ func TestEndUserController_validateOIDCToken(t *testing.T) {
 	}
 }
 
-func TestEndUserController_tenantMapping(t *testing.T) {
-	ensureNoDatabase(t)
-	controller := &EndUserController{}
-
-	tests := []struct {
-		name       string
-		clientID   uuid.UUID
-		wantErr    bool
-		expected   uuid.UUID
-		setupMocks func()
-	}{
-		{
-			name:     "database unavailable",
-			clientID: uuid.New(),
-			wantErr:  true, // Database connection not available
-			expected: uuid.UUID{},
-			setupMocks: func() {
-				// Mock database lookup
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tt.setupMocks()
-
-			result, err := controller.tenantMapping(tt.clientID)
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, tt.expected, result)
-			}
-		})
-	}
-}
+// TestEndUserController_tenantMapping deleted in Phase A.
+// tenantMapping(clientID) was the legacy client_id → workspace resolver.
+// Workspace is now resolved via shared.ResolveWorkspace(c, input.WorkspaceID).
 
 func TestEndUserController_generateAndSendCustomPasswordResetOTP(t *testing.T) {
 	ensureNoDatabase(t)

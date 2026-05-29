@@ -137,11 +137,11 @@ func resolveTenantIDFromClientID(clientID string) (string, error) {
 
 	var tenantID string
 	err := masterDB.DB.QueryRow(
-		`SELECT workspace_id FROM tenant_mappings WHERE client_id = $1 LIMIT 1`,
+		`SELECT workspace_id::uuid FROM clients WHERE client_id = $1 LIMIT 1`,
 		clientID,
 	).Scan(&tenantID)
 	if err != nil {
-		return "", fmt.Errorf("client_id %s not found in tenant_mappings", clientID)
+		return "", fmt.Errorf("client_id %s not found in clients", clientID)
 	}
 	return tenantID, nil
 }

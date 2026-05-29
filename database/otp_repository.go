@@ -287,10 +287,11 @@ func NewPendingRegistrationRepository(db *DBConnection) *PendingRegistrationRepo
 
 // CreatePendingRegistration creates a new pending registration
 func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *models.PendingRegistration) error {
+	// Phase A: client_id column removed from pending_registrations.
 	query := `
 		INSERT INTO pending_registrations (email, password_hash, first_name, last_name,
-			workspace_id, project_id, client_id, expires_at, created_at, updated_at, tenant_domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			workspace_id, project_id, expires_at, created_at, updated_at, tenant_domain)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id
 	`
 
@@ -309,7 +310,6 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 		pending.LastName,
 		pending.WorkspaceID,
 		pending.ProjectID,
-		pending.ClientID,
 		pending.ExpiresAt,
 		pending.CreatedAt,
 		pending.UpdatedAt,
@@ -321,9 +321,10 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 
 // GetPendingRegistration retrieves a pending registration by email
 func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*models.PendingRegistration, error) {
+	// Phase A: client_id column removed from pending_registrations.
 	query := `
 		SELECT id, email, password_hash, first_name, last_name, workspace_id,
-			project_id, client_id, expires_at, created_at, updated_at, tenant_domain
+			project_id, expires_at, created_at, updated_at, tenant_domain
 		FROM pending_registrations
 		WHERE email = $1 AND expires_at > $2
 		ORDER BY created_at DESC
@@ -339,7 +340,6 @@ func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*
 		&pending.LastName,
 		&pending.WorkspaceID,
 		&pending.ProjectID,
-		&pending.ClientID,
 		&pending.ExpiresAt,
 		&pending.CreatedAt,
 		&pending.UpdatedAt,
@@ -385,11 +385,12 @@ func (pr *PendingRegistrationRepository) DeletePendingRegistrationsByEmailTx(tx 
 
 // UpdatePendingRegistration updates an existing pending registration
 func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *models.PendingRegistration) error {
+	// Phase A: client_id column removed from pending_registrations.
 	query := `
 		UPDATE pending_registrations
-		SET password_hash = $1, workspace_id = $2, project_id = $3, client_id = $4,
-		    tenant_domain = $5, expires_at = $6, updated_at = $7
-		WHERE email = $8
+		SET password_hash = $1, workspace_id = $2, project_id = $3,
+		    tenant_domain = $4, expires_at = $5, updated_at = $6
+		WHERE email = $7
 	`
 
 	now := time.Now()
@@ -399,7 +400,6 @@ func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *mode
 		pending.PasswordHash,
 		pending.WorkspaceID,
 		pending.ProjectID,
-		pending.ClientID,
 		pending.TenantDomain,
 		pending.ExpiresAt,
 		pending.UpdatedAt,

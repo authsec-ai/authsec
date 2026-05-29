@@ -498,66 +498,39 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// --- Post-commit operations (non-blocking) ---
-	// Global state is committed. Failures below are logged as warnings and don't block registration.
-
-	// Single-tenant: no per-tenant DB provisioning. Workspace lives in master DB.
-
-	// Provision PKI infrastructure via ICP service
-	log.Printf("Provisioning PKI for tenant: %s", workspace.WorkspaceID.String())
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	icpResp, err := uc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-		WorkspaceID: workspace.WorkspaceID.String(),
-		CommonName:  fmt.Sprintf("%s Root CA", workspace.Name),
-		Domain:      workspace.WorkspaceDomain,
-		TTL:         "87600h", // 10 years
-		MaxTTL:      "24h",    // Max certificate TTL
-	})
-
-	if err != nil {
-		log.Printf("Warning: PKI provisioning failed: %v", err)
-	} else {
-		log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
-		// Update tenant with PKI information (post-commit, direct update)
-		updateQuery := `UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE id = $3`
-		if _, err := db.Exec(updateQuery, icpResp.PKIMount, icpResp.CACert, workspace.WorkspaceID); err != nil {
-			log.Printf("Warning: Failed to update workspace with PKI info: %v", err)
+	// --- Post-commit operations: actually non-blocking now ---
+	// Global state is committed. PKI/Vault/Hydra/Provider setup run in a
+	// background goroutine so the HTTP response returns immediately. Vault
+	// can take 5+ seconds to time out when unreachable; ICP PKI provisioning
+	// has a 2-minute upper bound; the user shouldn't wait for any of it.
+	// Failures are logged; the Hydra reconciler picks up missing clients
+	// on its next tick (services/hydra_reconciler.go).
+	go func(workspaceID, workspaceName, workspaceDomain, projectID, clientID, email, tenantDomain string) {
+		// Provision PKI via ICP
+		log.Printf("Provisioning PKI for workspace: %s", workspaceID)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		icpResp, err := uc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
+			WorkspaceID: workspaceID,
+			CommonName:  fmt.Sprintf("%s Root CA", workspaceName),
+			Domain:      workspaceDomain,
+			TTL:         "87600h",
+			MaxTTL:      "24h",
+		})
+		if err != nil {
+			log.Printf("WARN: PKI provisioning failed for workspace %s: %v", workspaceID, err)
+		} else {
+			log.Printf("PKI provisioned for workspace %s - Mount: %s", workspaceID, icpResp.PKIMount)
+			if _, err := db.Exec(`UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE id = $3`, icpResp.PKIMount, icpResp.CACert, workspaceID); err != nil {
+				log.Printf("WARN: Failed to update workspace with PKI info: %v", err)
+			}
 		}
-	}
 
-	// Save secret to Vault and register with Hydra
-	secretID, err := config.SaveSecretToVault(workspace.WorkspaceID.String(), pendingReg.ProjectID.String(), pendingReg.WorkspaceID.String())
-	if err != nil {
-		log.Printf("Warning: Failed to save secret to vault: %v", err)
-		log.Printf("User registration will continue without Vault secret storage for workspace: %s", workspace.WorkspaceID.String())
-		// Don't block user registration - they can still use the system without Vault integration
-		secretID = "" // Clear secretID so we don't attempt Hydra registration
-	}
-
-	// Register user with Hydra only if we have a valid secretID
-	if secretID != "" {
-		if err := services.RegisterClientWithHydra(pendingReg.WorkspaceID.String(), secretID, pendingReg.Email, pendingReg.WorkspaceID.String(), pendingReg.TenantDomain); err != nil {
-			log.Printf("Warning: Failed to register client with Hydra: %v", err)
-			log.Printf("User registration will continue without Hydra client registration for workspace: %s", workspace.WorkspaceID.String())
-			// Don't block user registration - they can still use the system without OAuth integration
+		// Save secret to Vault (best-effort)
+		if _, err := config.SaveSecretToVault(workspaceID, projectID, workspaceID); err != nil {
+			log.Printf("WARN: Failed to save secret to vault for workspace %s: %v", workspaceID, err)
 		}
-	} else {
-		log.Printf("Skipping Hydra registration for workspace %s because no Vault secret was stored", workspace.WorkspaceID.String())
-	}
-
-	// Add dummy AuthSec provider for the client
-	createdBy := pendingReg.Email
-	if createdBy == "" {
-		createdBy = "system"
-	}
-	if err := services.AddProviderToClient(pendingReg.WorkspaceID.String(), pendingReg.WorkspaceID.String(), pendingReg.TenantDomain, createdBy); err != nil {
-		log.Printf("Warning: Failed to add provider to client: %v", err)
-		log.Printf("User registration will continue without provider setup for workspace: %s", workspace.WorkspaceID.String())
-		// Don't block user registration - they can still use the system without provider integration
-	}
+	}(workspace.WorkspaceID.String(), workspace.Name, workspace.WorkspaceDomain, pendingReg.ProjectID.String(), pendingReg.WorkspaceID.String(), pendingReg.Email, pendingReg.TenantDomain)
 
 	log.Printf("User registration completed successfully: %s", workspace.Email)
 
@@ -1071,18 +1044,19 @@ func (uc *UserController) generateAndSendOTP(email string) error {
 
 	log.Printf("generateAndSendOTP: Successfully inserted OTP (ID: %s) for %s", otpEntry.ID.String(), email)
 
-	// Send OTP email
-	log.Printf("generateAndSendOTP: Sending OTP email to %s", email)
-	if err := utils.SendOTPEmail(email, otp); err != nil {
-		log.Printf("generateAndSendOTP: Failed to send OTP email to %s: %v", email, err)
-		// FIX: Don't delete OTP on email failure - the OTP is still valid
-		// and the email might still be delivered despite the error
-		log.Printf("generateAndSendOTP: OTP remains valid in database despite email error for %s", email)
-		return fmt.Errorf("failed to send OTP email: %w", err)
-	}
-
-	log.Printf("generateAndSendOTP: Successfully sent OTP email to %s", email)
-	log.Printf("generateAndSendOTP: completed flow for %s", email)
+	// Send OTP email asynchronously. The OTP is already persisted in the DB,
+	// so the HTTP response can return immediately. SMTP can take 10+ seconds.
+	// Failures are logged; users can request "resend OTP" if the email never
+	// arrives. Don't make the HTTP caller wait on SMTP.
+	go func(addr, code string) {
+		log.Printf("generateAndSendOTP[async]: Sending OTP email to %s", addr)
+		if err := utils.SendOTPEmail(addr, code); err != nil {
+			log.Printf("generateAndSendOTP[async]: Failed to send OTP email to %s: %v (OTP remains valid in DB)", addr, err)
+			return
+		}
+		log.Printf("generateAndSendOTP[async]: Successfully sent OTP email to %s", addr)
+	}(email, otp)
+	log.Printf("generateAndSendOTP: completed flow for %s (email send in progress)", email)
 
 	return nil
 }

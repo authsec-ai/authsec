@@ -51,25 +51,16 @@ func NewEndUserAuthController() (*EndUserAuthController, error) {
 	}, nil
 }
 
-// tenantMapping maps client ID to tenant ID
+// tenantMapping is retired (Phase B). It used to resolve workspace from the
+// legacy `clients` table via client_id — wrong under OAuth 2.1 (no general
+// client_id → workspace mapping) and the table no longer exists. These legacy
+// `/auth/enduser/*` SDK routes must be reworked to resolve workspace from host /
+// JWT / resource indicator (see controllers/shared/workspace_resolver.go).
+// Returns a clean error instead of 500-ing on a missing relation.
+// Tracked in RESIDUAL_AGENTS_WORK.md.
 func (euac *EndUserAuthController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	// Query tenant_mappings table in global database
-	db := config.GetDatabase()
-	if db == nil {
-		return uuid.UUID{}, fmt.Errorf("database not initialized")
-	}
-
-	var tenantID uuid.UUID
-	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
-	err := db.QueryRow(query, clientID).Scan(&tenantID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return uuid.UUID{}, fmt.Errorf("client not found")
-		}
-		return uuid.UUID{}, fmt.Errorf("failed to lookup tenant mapping: %w", err)
-	}
-
-	return tenantID, nil
+	_ = clientID
+	return uuid.UUID{}, fmt.Errorf("legacy client_id→workspace lookup removed (Phase B); pass workspace_id explicitly")
 }
 
 // InitiateRegistration handles end-user registration initiation

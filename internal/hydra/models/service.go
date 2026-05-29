@@ -186,7 +186,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	tenantID := users.WorkspaceID
 	clientID := users.ClientID
 	tenantIDStr := tenantID.String()
-	clientIDStr := strings.TrimSuffix(clientID.String(), "-main-client")
+	clientIDStr := clientID.String()
 
 	if tenantIDStr == "" || clientIDStr == "" {
 		return nil, fmt.Errorf("missing tenant_id or client_id in JWT token")

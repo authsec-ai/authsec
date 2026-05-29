@@ -83,6 +83,10 @@ type OIDCProvider struct {
 }
 
 type LoginPageDataResponse struct {
+	// WorkspaceID is the canonical scope, resolved server-side from the Hydra
+	// login_challenge via auth_request_contexts. The UI carries this forward
+	// into login/status + register calls — it does NOT use client_id for that.
+	WorkspaceID       string         `json:"workspace_id"`
 	ClientID          string         `json:"client_id"`
 	Success           bool           `json:"success"`
 	LoginChallenge    string         `json:"login_challenge"`

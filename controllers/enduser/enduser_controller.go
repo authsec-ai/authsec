@@ -15,7 +15,6 @@ import (
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
-	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -117,14 +116,6 @@ func (euc *EndUserController) RegisterClient(c *gin.Context) {
 	if err != nil {
 		// Log the error but don't fail the registration
 		fmt.Printf("Warning: failed to save secret to vault: %v\n", err)
-	}
-
-	// Register client with Hydra (optional - based on your requirements)
-	if secretID != "" {
-		if err := services.RegisterClientWithHydra(client.ClientID.String(), secretID, *client.Email, client.WorkspaceID.String(), tenant.TenantDomain); err != nil {
-			// Log the error but don't fail the registration
-			fmt.Printf("Warning: failed to register client with Hydra: %v\n", err)
-		}
 	}
 
 	// Audit log: Client registered
@@ -1263,7 +1254,6 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 
 	// Get tenant database connection
 	tenantDB := config.DB
-	clientID = strings.TrimSuffix(clientID, "-main-client")
 	// Find enduser details, prioritizing MFA-enabled check with client_id validation
 	var user models.User
 	err = tenantDB.Where("email = ? AND client_id = ? AND active = ? AND mfa_enabled = ?", emailID, clientID, true, true).First(&user).Error
@@ -1411,24 +1401,20 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
-	clientUUID, err := uuid.Parse(input.ClientID)
+	// Workspace comes from explicit workspace_id (set by UI from page-data),
+	// ?workspace= query param, or Host header — never from client_id.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
-		return
-	}
-
-	tenantUUID, err := euc.tenantMapping(clientUUID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to map tenant: %v", err)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
 		return
 	}
 
 	// Single-DB collapse: tenant isolation must come from explicit predicates.
 	tenantDB := config.DB
 
-	// Find tenant user
+	// Find user by (workspace_id, email) — the canonical identity tuple.
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -1441,7 +1427,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Check if MFA is enabled
 	var user2 models.User
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND mfa_enabled = ?", tenantUUID, input.Email, input.ClientID, "true").First(&user2).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND mfa_enabled = ?", workspaceID, input.Email, "true").First(&user2).Error; err != nil {
 		// MFA is not enabled
 		var isFirstLogin bool
 		if user.Provider == "ad_sync" || user.Provider == "entra_id" {
@@ -1506,39 +1492,41 @@ func (euc *EndUserController) CustomLoginStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	input.Email = strings.ToLower(input.Email)
-
-	clientUUID, err := uuid.Parse(input.ClientID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	if input.Email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
 		return
 	}
 
-	tenantUUID, err := euc.tenantMapping(clientUUID)
+	// Workspace comes from the explicit workspace_id the UI resolved from the
+	// Hydra login_challenge (via page-data), then ?workspace=, then Host header.
+	// NEVER from an OAuth client_id (global per OAuth 2.1) and never from email
+	// (ambiguous across workspaces).
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to map tenant: %v", err)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown workspace: %v", err)})
 		return
 	}
 
-	// Single-DB collapse: scope existence check by tenant_id explicitly.
-	tenantDB := config.DB
-
-	// Check if email already exists in main tenant table
+	// User identity is (workspace_id, email). Period. No client_id in the WHERE.
 	var existingUser models.User
-	input.Email = strings.ToLower(input.Email)
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", tenantUUID, input.Email, input.ClientID, []string{"custom", "ad_sync", "scim", "entra_id"}).First(&existingUser).Error; err == nil {
-		// If user exists, check if it's ad_sync with empty password_hash
-		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
-			c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
-			return
-		}
-
-		// For all other cases (custom users or ad_sync users with password_hash)
-		c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
+	err = config.DB.Where(
+		"workspace_id = ? AND LOWER(email) = ? AND provider IN (?)",
+		workspaceID, input.Email, []string{"custom", "ad_sync", "scim", "entra_id"},
+	).First(&existingUser).Error
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
+	// Synced users (ad_sync / entra_id / scim) without a password_hash need to
+	// finish registration (password setup), so report as "not yet registered".
+	if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
+		c.JSON(http.StatusOK, gin.H{"response": "false", "message": "User does not exist, proceed with registration"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
 }
 
 // InitiateCustomLoginRegister godoc
@@ -1560,36 +1548,25 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
-	clientUUID, err := uuid.Parse(input.ClientID)
+	// Workspace comes from explicit workspace_id (set by UI from page-data),
+	// ?workspace= query param, or Host header — never from client_id.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
 		return
 	}
 
-	tenantUUID, err := euc.tenantMapping(clientUUID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to map tenant: %v", err)})
-		return
-	}
-
-	tenantID := tenantUUID.String()
 	// Get tenant database connection
 	tenantDB := config.DB
 
-	// Check if email already exists
+	// Check if email already exists in this workspace
 	var existingUser models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
 		// If user exists and is not a synced user with empty password, reject registration
 		if !((existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "") {
 			c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
 			return
 		}
-	}
-
-	projectID, err := euc.resolveCustomLoginProjectID(tenantDB, clientUUID, tenantUUID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
 	}
 
 	// Hash the password for storage in pending registration
@@ -1610,28 +1587,19 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 		log.Printf("Error deleting existing pending registration: %v", err)
 	}
 
-	// Create pending registration record - we'll store client_id and workspace_id
-	clientIDUUID, _ := uuid.Parse(input.ClientID)
-	tenantIDUUID, _ := uuid.Parse(tenantID)
-	pendingReg := models.PendingRegistration{
-		Email:        input.Email,
-		PasswordHash: tempUser.PasswordHash,
-		// Custom-login signup form does not collect names. Leave blank rather
-		// than pollute first_name with the email — the OTP-completion flow
-		// derives a sensible Name from the email local-part if these stay empty.
-		FirstName:    "",
-		LastName:     "",
-		WorkspaceID:     tenantIDUUID,
-		ProjectID:    projectID,
-		ClientID:     clientIDUUID,
-		ExpiresAt:    time.Now().Add(30 * time.Minute),    // Expires in 30 minutes to match OTP
-		TenantDomain: config.AppConfig.TenantDomainSuffix, // Use configured domain suffix (authsec.dev)
-	}
-
-	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, workspace_id, project_id, client_id, tenant_domain, expires_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())`
-	if _, err := db.Exec(insertQuery, pendingReg.Email, pendingReg.PasswordHash, pendingReg.FirstName, pendingReg.LastName,
-		pendingReg.WorkspaceID, pendingReg.ProjectID, pendingReg.ClientID, pendingReg.TenantDomain, pendingReg.ExpiresAt); err != nil {
+	// Phase A: client_id and project_id removed from pending_registrations.
+	// workspace_id is the only scope identifier.
+	insertQuery := `INSERT INTO pending_registrations (email, password_hash, first_name, last_name, workspace_id, tenant_domain, expires_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`
+	if _, err := db.Exec(insertQuery,
+		input.Email,
+		tempUser.PasswordHash,
+		"", // first_name: not collected during custom-login signup
+		"", // last_name:  same
+		workspaceID,
+		config.AppConfig.TenantDomainSuffix,
+		time.Now().Add(30*time.Minute),
+	); err != nil {
 		log.Printf("Failed to create pending registration: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
 		return
@@ -1775,11 +1743,6 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	if _, err := euc.resolveCustomLoginProjectID(tenantDB, pendingReg.ClientID, pendingReg.WorkspaceID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
 	// Derive a display name. The custom-login signup form doesn't collect
 	// first/last name, and historically we wrote pendingReg.Email into the
 	// users.name column — which the admin UI then split on whitespace and
@@ -1799,21 +1762,20 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		}
 	}
 
-	// Create new user
+	// Phase A: client_id and project_id removed from PendingRegistration.
+	// User identity is (workspace_id, email); no client_id predicate.
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:           uuid.New(),
-			ClientID:     pendingReg.ClientID,
-			WorkspaceID:     pendingReg.WorkspaceID,
-			ProjectID:    pendingReg.ProjectID,
-			Name:         displayName,
-			Email:        pendingReg.Email,
+			ID:          uuid.New(),
+			WorkspaceID: pendingReg.WorkspaceID,
+			Name:        displayName,
+			Email:       pendingReg.Email,
 			PasswordHash: pendingReg.PasswordHash,
 			TenantDomain: pendingReg.TenantDomain,
-			Provider:     "custom",
-			ProviderID:   pendingReg.Email,
-			Active:       true,
-			MFAEnabled:   false,
+			Provider:    "custom",
+			ProviderID:  pendingReg.Email,
+			Active:      true,
+			MFAEnabled:  false,
 		},
 	}
 
@@ -1835,8 +1797,8 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	})
 }
 
-// CustomLoginRegister - Legacy endpoint (kept for backward compatibility)
-// Deprecated: Use InitiateCustomLoginRegister and CompleteCustomLoginRegister instead
+// CustomLoginRegister - Legacy single-step registration endpoint.
+// Deprecated: Use InitiateCustomLoginRegister + CompleteCustomLoginRegister instead.
 func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 	var input models.CustomLoginRegister
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1845,166 +1807,73 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
-	clientUUID, err := uuid.Parse(input.ClientID)
+	// Workspace comes from explicit workspace_id (set by UI from page-data),
+	// ?workspace= query param, or Host header — never from client_id.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
 		return
 	}
 
-	tenantUUID, err := euc.tenantMapping(clientUUID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to map tenant: %v", err)})
-		return
-	}
-
-	tenantID := tenantUUID.String()
-	// Get tenant database connection
 	tenantDB := config.DB
 
-	// Check if email already exists in main tenant table
+	// Check if email already exists in this workspace
 	var existingUser models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
-		// If user exists, check if it's a synced user with empty password_hash
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&existingUser).Error; err == nil {
 		if (existingUser.Provider == "ad_sync" || existingUser.Provider == "entra_id" || existingUser.Provider == "scim") && existingUser.PasswordHash == "" {
-			// Allow registration to proceed (will be handled below)
-		} else {
-			c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
+			// Synced user without password — update their password_hash instead.
+			tempUser := models.ExtendedUser{User: sharedmodels.User{PasswordHash: input.Password}}
+			if err := tempUser.HashPassword(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
+				return
+			}
+			if err := tenantDB.Model(&existingUser).Update("password_hash", tempUser.PasswordHash).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"message": "Registration completed successfully", "email": input.Email})
 			return
 		}
-	}
-
-	var user models.User
-	if err := tenantDB.Where("client_id = ? AND email = ?", input.ClientID, input.Email).First(&user).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find user: %v", err)})
-			return
-		}
-	}
-	// Fetch client details
-	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", input.ClientID, tenantID).First(&client).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find client: %v", err)})
+		c.JSON(http.StatusOK, gin.H{"response": "true", "message": "User already exists"})
 		return
 	}
 
-	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update
-	var adSyncUser models.User
-	if err := tenantDB.Where("email = ? AND client_id = ? AND provider IN (?)", input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
-		// Hash the new password
-		tempUser := models.ExtendedUser{
-			User: sharedmodels.User{
-				PasswordHash: input.Password,
-			},
-		}
-		if err := tempUser.HashPassword(); err != nil {
-			log.Printf("Failed to hash password: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
-			return
-		}
-
-		// Update the existing ad_sync user's password_hash
-		if err := tenantDB.Model(&adSyncUser).Update("password_hash", tempUser.PasswordHash).Error; err != nil {
-			log.Printf("Failed to update user password: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Registration completed successfully",
-			"email":   input.Email,
-		})
-		return
-	}
-
-	tempUser := models.User{
-		PasswordHash: input.Password,
-	}
+	tempUser := models.ExtendedUser{User: sharedmodels.User{PasswordHash: input.Password}}
 	if err := tempUser.HashPassword(); err != nil {
 		log.Printf("Failed to hash password: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
 		return
 	}
 
-	// Create new user with all required data
-	clientIDUUID, err := uuid.Parse(input.ClientID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID format"})
-		return
-	}
-	tenantIDUUID, err := uuid.Parse(tenantID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
-		return
-	}
-
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
 			ID:           uuid.New(),
-			ClientID:     clientIDUUID,
-			WorkspaceID:     tenantIDUUID,
-			ProjectID:    client.ProjectID, // Already UUID
-			Name:         input.Email,      // Use email as name if Name field doesn't exist
+			WorkspaceID:  workspaceID,
+			Name:         input.Email,
 			Email:        input.Email,
 			PasswordHash: tempUser.PasswordHash,
-			TenantDomain: config.AppConfig.TenantDomainSuffix, // Use configured domain suffix (authsec.dev)
+			TenantDomain: config.AppConfig.TenantDomainSuffix,
 			Provider:     "custom",
-			ProviderID:   input.Email, // Ensure ProviderID is not null
+			ProviderID:   input.Email,
 			Active:       true,
-			MFAEnabled:   false, // Explicitly set MFAEnabled as required by shared-models v0.5.0
+			MFAEnabled:   false,
 		},
 	}
-	// Prepare base response
 	if err := tenantDB.Create(&newUser).Error; err != nil {
 		log.Printf("Failed to create new user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate registration"})
 		return
 	}
 
-	// For returning users, check if they need MFA verification
-	// Since this is not first login, they should go through WebAuthn/MFA flow
-	// Return response without token - client should redirect to WebAuthn verification
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Registration completed successfully",
 		"email":   input.Email,
 	})
 }
 
-func (tc *EndUserController) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	if config.DB == nil {
-		return uuid.UUID{}, fmt.Errorf("database connection not available")
-	}
-	var tenantMapping models.TenantMapping
-	if err := config.DB.Where("client_id = ?", clientID).First(&tenantMapping).Error; err != nil {
-		return uuid.UUID{}, fmt.Errorf("failed to find tenant: %w", err)
-	}
-	return tenantMapping.WorkspaceID, nil
-}
-
-func (tc *EndUserController) resolveCustomLoginProjectID(tenantDB *gorm.DB, clientID uuid.UUID, tenantID uuid.UUID) (uuid.UUID, error) {
-	var client models.Client
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientID, tenantID).First(&client).Error; err == nil {
-		return client.ProjectID, nil
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) && !strings.Contains(err.Error(), `relation "clients" does not exist`) {
-		return uuid.UUID{}, fmt.Errorf("failed to find client: %v", err)
-	}
-
-	if clientID != tenantID {
-		return uuid.UUID{}, fmt.Errorf("failed to find client")
-	}
-
-	var projectIDRaw string
-	if err := tenantDB.Raw("SELECT id::text FROM projects WHERE workspace_id = ? ORDER BY created_at ASC LIMIT 1", tenantID).Scan(&projectIDRaw).Error; err != nil {
-		return uuid.UUID{}, fmt.Errorf("failed to find default project: %v", err)
-	}
-	projectID, err := uuid.Parse(projectIDRaw)
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("failed to parse default project: %v", err)
-	}
-	if projectID == uuid.Nil {
-		return uuid.UUID{}, fmt.Errorf("failed to find default project")
-	}
-	return projectID, nil
-}
+// tenantMapping and resolveCustomLoginProjectID deleted in Phase A.
+// Workspace is resolved via shared.ResolveWorkspace(c, input.WorkspaceID).
+// There is no general client_id → workspace mapping in OAuth 2.1.
 
 // Add these methods to your EndUserController struct in enduser_controller.go
 
@@ -2027,10 +1896,11 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
-	// Get tenant ID from client mapping
-	clientUUID, err := uuid.Parse(input.ClientID)
+	// Workspace comes from explicit workspace_id (set by UI from page-data),
+	// ?workspace= query param, or Host header — never from client_id.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		// For security, don't reveal if client ID is invalid
+		// For security, don't reveal workspace resolution failure
 		c.JSON(http.StatusOK, models.CustomForgotPasswordResponse{
 			Message: "If your email is registered, you will receive a password reset OTP",
 			Email:   input.Email,
@@ -2038,22 +1908,12 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, err := euc.tenantMapping(clientUUID)
-	if err != nil {
-		// For security, don't reveal if client ID is invalid
-		c.JSON(http.StatusOK, models.CustomForgotPasswordResponse{
-			Message: "If your email is registered, you will receive a password reset OTP",
-			Email:   input.Email,
-		})
-		return
-	}
-
-	// Single-DB collapse: scope user lookup by tenant_id explicitly.
+	// Single-DB collapse: scope user lookup by workspace_id explicitly.
 	tenantDB := config.DB
 
-	// Check if user exists with custom provider
+	// Check if user exists with custom provider in this workspace
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ?", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Printf("User not found for forgot password request: %s", input.Email)
 		} else {
@@ -2158,25 +2018,20 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 		return
 	}
 
-	// Get tenant ID from client mapping
-	clientUUID, err := uuid.Parse(input.ClientID)
+	// Workspace comes from explicit workspace_id (set by UI from page-data),
+	// ?workspace= query param, or Host header — never from client_id.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
 		return
 	}
 
-	tenantUUID, err := euc.tenantMapping(clientUUID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client ID"})
-		return
-	}
-
-	// Single-DB collapse: scope password reset lookup by tenant_id explicitly.
+	// Single-DB collapse: scope password reset lookup by workspace_id explicitly.
 	tenantDB := config.DB
 
-	// Find the user in tenant database
+	// Find the user in the workspace database
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND provider IN (?) AND client_id = ? AND active = ?", tenantUUID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, input.ClientID, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ?", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return

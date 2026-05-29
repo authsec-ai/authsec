@@ -4,12 +4,11 @@ package admin
 // registered user and all their associated data from the platform.
 //
 // What gets purged (in order):
-//  1. Hydra OAuth clients linked to the tenant (via tenant_hydra_clients)
-//  2. Vault PKI secrets engine mount for the tenant domain
-//  3. Vault KV secrets under the tenant path
-//  4. Tenant database (DROP DATABASE)
-//  5. Master DB rows: tenant_hydra_clients, tenant_mappings, clients, projects,
-//     role_bindings, users, tenants, pending_registrations
+//  1. Vault PKI secrets engine mount for the tenant domain
+//  2. Vault KV secrets under the tenant path
+//  3. Tenant database (DROP DATABASE)
+//  4. Master DB rows: projects, role_bindings, users, workspaces,
+//     pending_registrations
 //
 // This endpoint is intentionally unauthenticated in routes.go and must be
 // removed or gated behind a proper permission before going to production.
@@ -81,22 +80,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 	}
 	addStep(fmt.Sprintf("found user=%s tenant=%s db=%s", userID, tenantID, tenantDB))
 
-	// ── 2. Delete Hydra clients ───────────────────────────────────────────────
-	type hydraRow struct {
-		HydraClientID string
-	}
-	var hydraClients []hydraRow
-	db.Raw(`SELECT hydra_client_id FROM tenant_hydra_clients WHERE workspace_id = ?`, tenantID).Scan(&hydraClients)
-	for _, hc := range hydraClients {
-		url := fmt.Sprintf("%s/admin/clients/%s", cfg.HydraAdminURL, hc.HydraClientID)
-		if err := purgeHTTPDelete(url); err != nil {
-			addErr(fmt.Sprintf("hydra delete %s: %v", hc.HydraClientID, err))
-		} else {
-			addStep(fmt.Sprintf("deleted hydra client %s", hc.HydraClientID))
-		}
-	}
-
-	// ── 3. Disable Vault PKI mount ────────────────────────────────────────────
+	// ── 2. Disable Vault PKI mount ────────────────────────────────────────────
 	if vaultMount != "" {
 		if err := purgeVaultDisableMount(cfg.VaultAddr, cfg.VaultToken, vaultMount); err != nil {
 			addErr(fmt.Sprintf("vault disable mount %s: %v", vaultMount, err))
@@ -113,7 +97,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		addStep(fmt.Sprintf("deleted vault KV path %s", kvPath))
 	}
 
-	// ── 5. Drop tenant database ───────────────────────────────────────────────
+	// ── 3. Drop tenant database ───────────────────────────────────────────────
 	if tenantDB != "" {
 		adminDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=postgres port=%s sslmode=disable",
 			cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
@@ -132,7 +116,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		}
 	}
 
-	// ── 6. Purge master DB rows ───────────────────────────────────────────────
+	// ── 4. Purge master DB rows ───────────────────────────────────────────────
 	sqlDB, err := db.DB()
 	if err != nil {
 		addErr(fmt.Sprintf("get raw db: %v", err))
@@ -141,13 +125,13 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 			label string
 			query string
 		}{
-			{"tenant_hydra_clients", `DELETE FROM tenant_hydra_clients WHERE workspace_id = $1`},
-			{"tenant_mappings", `DELETE FROM tenant_mappings WHERE workspace_id = $1`},
-			{"clients", `DELETE FROM clients WHERE workspace_id = $1`},
+			// Phase A: tenant_mappings + tenants tables deleted (Phase 6).
+			// Phase B: clients table deleted — no purge entry needed.
+			// Phase C: tenant_hydra_clients table dropped.
 			{"projects", `DELETE FROM projects WHERE workspace_id = $1`},
 			{"role_bindings", `DELETE FROM role_bindings WHERE workspace_id = $1`},
 			{"users", `DELETE FROM users WHERE workspace_id = $1`},
-			{"tenants", `DELETE FROM workspaces WHERE workspace_id = $1`},
+			{"workspaces", `DELETE FROM workspaces WHERE id = $1`},
 		}
 		for _, q := range purgeQueries {
 			if _, err := sqlDB.Exec(q.query, tenantID); err != nil {

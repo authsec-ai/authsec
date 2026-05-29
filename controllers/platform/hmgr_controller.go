@@ -172,54 +172,27 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 	}
 
 	hydraClientID := loginRequest.Client.ClientID
-	expectedClientID := strings.TrimSuffix(hydraClientID, "-main-client")
+	expectedClientID := hydraClientID
 	expectedTenantID := tenantID
 	var mcpAuthCtx *models.AuthRequestContext
 
-	if ctrl.isNewMCPClient(hydraClientID) {
-		arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
-		if arcErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"error":   "failed to resolve MCP auth context",
-			})
-			return
-		}
-		if !strings.EqualFold(arcCtx.WorkspaceID, tenantID) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   "user token tenant does not match login challenge tenant",
-			})
-			return
-		}
-		mcpAuthCtx = arcCtx
-		expectedTenantID = arcCtx.WorkspaceID
-	} else {
-		clientDetails, _, hydraErr := ctrl.service.GetHydraClient(hydraClientID)
-		if hydraErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"error":   "failed to load hydra client",
-			})
-			return
-		}
-
-		if legacyTenantID, _ := clientDetails.Metadata["c_id"].(string); legacyTenantID != "" {
-			expectedTenantID = legacyTenantID
-		}
-		if expectedTenantID == "" {
-			if wsID, _ := clientDetails.Metadata["workspace_id"].(string); wsID != "" {
-				expectedTenantID = wsID
-			}
-		}
-		if expectedTenantID != "" && !strings.EqualFold(expectedTenantID, tenantID) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   "user token tenant does not match login challenge tenant",
-			})
-			return
-		}
+	arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
+	if arcErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "failed to resolve MCP auth context",
+		})
+		return
 	}
+	if !strings.EqualFold(arcCtx.WorkspaceID, tenantID) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"error":   "user token tenant does not match login challenge tenant",
+		})
+		return
+	}
+	mcpAuthCtx = arcCtx
+	expectedTenantID = arcCtx.WorkspaceID
 
 	tenantDB := config.DB
 
@@ -442,10 +415,14 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		}
 
 		c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
-			ClientID:          tenantIDForOIDC,
+			// WorkspaceID is the real workspace resolved from the login_challenge
+			// via the auth_request_context. ClientID is the OAuth client (display
+			// only) — no longer overloaded to carry the workspace.
+			WorkspaceID:       tenantIDForOIDC,
+			ClientID:          hydraClientID,
 			Success:           true,
 			LoginChallenge:    loginChallenge,
-			TenantName:        tenantIDForOIDC,
+			TenantName:        rsName,
 			ClientName:        rsName,
 			ClientType:        "mcp_dynamic_client",
 			Providers:         oidcProviders,
@@ -455,64 +432,9 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 		return
 	}
 
-	// LEGACY PATH: Resolve tenant from Hydra client metadata
-	clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, hydramodels.LoginPageDataResponse{
-			Success: false,
-			Error:   "Client not found",
-		})
-		return
-	}
-
-	tenantIDForOIDC, _ := clientDetails.Metadata["workspace_id"].(string)
-	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
-	tenantName, _ := clientDetails.Metadata["tenant_name"].(string)
-
-	if tenantIDForOIDC == "" {
-		c.JSON(http.StatusBadRequest, hydramodels.LoginPageDataResponse{
-			Success: false,
-			Error:   "Invalid client configuration",
-		})
-		return
-	}
-
-	clientID := hydraClientID
-	allProviders, err := ctrl.service.GetAllProvidersForTenant(tenantIDForOIDC, realTenantID, clientID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
-			Success: false,
-			Error:   "Failed to get authentication providers",
-		})
-		return
-	}
-
-	oidcProviders := make([]hydramodels.OIDCProvider, 0, len(allProviders))
-	for _, p := range allProviders {
-		providerConfig := map[string]interface{}{"type": p.Type}
-		for key, value := range p.Config {
-			providerConfig[key] = value
-		}
-		oidcProviders = append(oidcProviders, hydramodels.OIDCProvider{
-			ProviderName: p.ProviderName,
-			DisplayName:  p.DisplayName,
-			IsActive:     p.IsActive,
-			SortOrder:    p.SortOrder,
-			Config:       providerConfig,
-		})
-	}
-
-	c.JSON(http.StatusOK, hydramodels.LoginPageDataResponse{
-		ClientID:          strings.TrimSuffix(hydraClientID, "-main-client"),
-		Success:           true,
-		LoginChallenge:    loginChallenge,
-		TenantName:        tenantName,
-		ClientName:        clientDetails.ClientName,
-		ClientType:        "tenant_client",
-		RedirectURIs:      clientDetails.RedirectURIs,
-		Providers:         oidcProviders,
-		BaseURL:           config.AppConfig.BaseURL,
-		LocalLoginEnabled: true,
+	c.JSON(http.StatusNotFound, hydramodels.LoginPageDataResponse{
+		Success: false,
+		Error:   "Client not found",
 	})
 }
 

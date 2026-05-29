@@ -32,22 +32,15 @@ func NewTenantTOTPService() *TenantTOTPService {
 
 // tenantMapping maps client ID to tenant ID using tenant_mappings table
 func (s *TenantTOTPService) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	db := config.GetDatabase()
-	if db == nil {
-		return uuid.UUID{}, fmt.Errorf("database not initialized")
-	}
-
-	var tenantID uuid.UUID
-	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
-	err := db.QueryRow(query, clientID).Scan(&tenantID)
-	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
-			return uuid.UUID{}, fmt.Errorf("client not found")
-		}
-		return uuid.UUID{}, fmt.Errorf("failed to lookup tenant mapping: %w", err)
-	}
-
-	return tenantID, nil
+	// Phase A: legacy client_id → workspace lookup removed. There is no
+	// general client_id → workspace mapping in OAuth 2.1; workspace must come
+	// from request context (host header) or the JWT, not from client_id.
+	// Callers of this helper must be refactored to pass workspace_id directly
+	// — tracked in plan Phases A/F. Until then, this returns an error so the
+	// runtime bomb (tenant_mappings table doesn't exist) becomes a clean 400
+	// at the handler boundary instead of a 500.
+	_ = clientID
+	return uuid.Nil, fmt.Errorf("legacy client_id→workspace lookup removed; pass workspace_id explicitly")
 }
 
 // GenerateSecret generates a random 20-byte TOTP secret (160 bits)

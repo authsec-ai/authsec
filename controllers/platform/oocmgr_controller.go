@@ -5,7 +5,6 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -22,9 +21,8 @@ import (
 
 // OocmgrController is the OIDC Configuration Manager controller.
 type OocmgrController struct {
-	authService           *oocmgrsvc.AuthService
-	hydraConfig           oocmgrHydraConfig
-	tenantHydraClientRepo *oocmgrrepo.TenantHydraClientRepository
+	authService *oocmgrsvc.AuthService
+	hydraConfig oocmgrHydraConfig
 }
 
 type oocmgrHydraConfig struct {
@@ -42,7 +40,6 @@ func NewOocmgrController() *OocmgrController {
 			AdminURL:  config.AppConfig.HydraAdminURL,
 			PublicURL: config.AppConfig.HydraPublicURL,
 		},
-		tenantHydraClientRepo: oocmgrrepo.NewTenantHydraClientRepository(),
 	}
 }
 
@@ -70,36 +67,24 @@ type oocmgrHydraClient struct {
 // ===== ADDITIONAL HELPER ENDPOINTS =====
 
 func (ac *OocmgrController) SyncHydraClients(c *gin.Context) {
-	var req struct {
-		WorkspaceID string `json:"workspace_id,omitempty"`
-		OrgID    string `json:"org_id,omitempty"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "Invalid request", Message: err.Error(), Code: http.StatusBadRequest, Timestamp: time.Now()})
-		return
-	}
-
 	hydraClients, err := ac.getAllHydraClients()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, oocmgrdto.ErrorResponse{Error: "Failed to get Hydra clients", Message: err.Error(), Code: http.StatusInternalServerError, Timestamp: time.Now()})
 		return
 	}
 
-	syncedCount, missingCount := 0, 0
-	for _, hClient := range hydraClients {
-		if _, err := ac.tenantHydraClientRepo.GetByHydraClientID(hClient.ClientID); err != nil {
-			log.Printf("[oocmgr] Hydra client %s not found in database mappings", hClient.ClientID)
-			missingCount++
-		} else {
-			syncedCount++
-		}
+	// Count rows in mcp_oauth_clients for comparison
+	var registeredCount int64
+	if err := config.DB.Table("mcp_oauth_clients").Count(&registeredCount).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, oocmgrdto.ErrorResponse{Error: "Failed to query mcp_oauth_clients", Message: err.Error(), Code: http.StatusInternalServerError, Timestamp: time.Now()})
+		return
 	}
 
 	c.JSON(http.StatusOK, oocmgrdto.MessageResponse{
 		Message: "Hydra clients sync completed", Success: true,
 		Data: map[string]interface{}{
-			"total_hydra_clients": len(hydraClients),
-			"synced_clients":      syncedCount, "missing_mappings": missingCount,
+			"total_hydra_clients":    len(hydraClients),
+			"registered_mcp_clients": registeredCount,
 		},
 		Timestamp: time.Now(),
 	})

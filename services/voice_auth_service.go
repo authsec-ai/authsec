@@ -1,14 +1,11 @@
 package services
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/golang-jwt/jwt/v5"
@@ -40,28 +37,15 @@ func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthSer
 	}
 }
 
-// tenantMapping maps client ID to workspace ID via the clients table.
-// Phase 6: tenant_mappings was deleted — clients.workspace_id is now authoritative.
+// tenantMapping is retired (Phase B). It used to resolve workspace from the
+// legacy `clients` table via client_id, which is wrong under OAuth 2.1 (no
+// general client_id → workspace mapping) and the table no longer exists.
+// Voice auth must be reworked to carry workspace_id explicitly (host header /
+// JWT / resource indicator). Until then this returns a clean error instead of
+// a 500 on a missing relation. Tracked in RESIDUAL_AGENTS_WORK.md.
 func (s *VoiceAuthService) tenantMapping(clientID uuid.UUID) (uuid.UUID, error) {
-	db := config.GetDatabase()
-	if db == nil {
-		return uuid.UUID{}, fmt.Errorf("database not initialized")
-	}
-
-	var workspaceIDStr string
-	query := `SELECT workspace_id::text FROM clients WHERE client_id = $1`
-	err := db.QueryRow(query, clientID).Scan(&workspaceIDStr)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return uuid.UUID{}, fmt.Errorf("client not found")
-		}
-		return uuid.UUID{}, fmt.Errorf("failed to lookup workspace: %w", err)
-	}
-	workspaceID, err := uuid.Parse(workspaceIDStr)
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("invalid workspace_id stored on client: %w", err)
-	}
-	return workspaceID, nil
+	_ = clientID
+	return uuid.Nil, fmt.Errorf("legacy client_id→workspace lookup removed (Phase B); voice auth must pass workspace_id explicitly")
 }
 
 // InitiateVoiceAuth creates a new voice authentication session

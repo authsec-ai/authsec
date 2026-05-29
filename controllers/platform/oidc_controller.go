@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -320,8 +319,8 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 		return
 	}
 
-	// Find tenant by client_id using the repository method
-	tenant, err := oc.tenantRepo.GetTenantByClientID(input.ClientID)
+	// Look up workspace by workspace_id (client_id == workspace_id for v4 clients)
+	tenant, err := oc.tenantRepo.GetTenantByID(input.ClientID)
 	if err != nil {
 		log.Printf("Failed to find tenant for client_id %s: %v", input.ClientID, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "Client ID not found or associated with any tenant"})
@@ -337,12 +336,7 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 	baseURL := "https://oauth.prod.authsec.ai/oauth2/auth"
 	redirectURI := fmt.Sprintf("https://%s/oidc/auth/callback", tenant.TenantDomain)
 
-	// Appending -main-client to the client_id for the OAuth provider as requested
-	// Internal DB lookup used the raw UUID, but external provider seems to expect the suffix
 	oauthClientID := input.ClientID
-	if !strings.HasSuffix(oauthClientID, "-main-client") {
-		oauthClientID = oauthClientID + "-main-client"
-	}
 
 	// Generate random state
 	stateBytes := make([]byte, 32)
@@ -1114,78 +1108,12 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", tenantID.String())
 	}
 
-	// Connect to tenant database for additional setup
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		log.Printf("Failed to connect to tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-	defer tenantDB.Close()
-
-	// Create default client in tenant DB with Hydra client ID
-	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
-	clientInsert := `INSERT INTO clients (id, client_id, workspace_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING`
-	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
-		log.Printf("Warning: Failed to create default client in tenant DB: %v", err)
-		// Non-fatal - continue to set up Vault/Hydra
-	}
-	log.Printf("Created default client in tenant DB: %s", clientID)
-	// Seed default groups and assign roles+groups to client (matches custom registration flow)
-	if err := oc.seedDefaultGroupsInTenantDB(tenantDB, tenantID); err != nil {
-		log.Printf("Warning: Failed to seed default groups in tenant DB: %v", err)
-	}
-	if err := oc.assignDefaultClientAssociations(tenantDB, clientID, tenantID); err != nil {
-		log.Printf("Warning: Failed to assign default associations to client: %v", err)
-	}
-
-	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO workspaces (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
-		ON CONFLICT (id) DO UPDATE SET
-			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
-			source = EXCLUDED.source, status = EXCLUDED.status,
-			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
-			updated_at = NOW()`
-	if _, err := tenantDB.Exec(tenantInsert, tenantID, userInfo.Email, "", userInfo.Name, state.ProviderName, fullDomain, tenantDBName); err != nil {
-		log.Printf("Warning: Failed to upsert tenant record in tenant database: %v", err)
-		// Non-fatal - continue to set up Vault/Hydra
-	}
-	log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
-
-	// Create default project in tenant database (project was already created in global database)
-	projectInsert := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING`
-	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
-		log.Printf("Warning: Failed to create default project in tenant database: %v", err)
-		// Non-fatal - continue to set up Vault/Hydra
-	}
-	log.Printf("Created default project in tenant DB: %s", projectID)
-
-	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
-	globalDB := config.GetDatabase()
-	tenantMappingInsert := `INSERT INTO tenant_mappings (workspace_id, client_id, created_at, updated_at)
-		VALUES ($1, $2, NOW(), NOW())
-		ON CONFLICT (client_id) DO NOTHING`
-	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
-		log.Printf("Warning: Failed to create tenant mapping: %v", err)
-		// Non-fatal - continue to set up Vault/Hydra
-	}
-	log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", tenantID.String(), clientID.String())
-
-	// Assign admin role to the created user in the tenant database
-	if err := oc.assignAdminRoleToUser(tenantDB, userID, tenantID); err != nil {
-		log.Printf("Warning: Failed to assign admin role to user %s in tenant DB: %v", userInfo.Email, err)
-		// Non-fatal - continue with registration
-	} else {
-		log.Printf("Successfully assigned admin role to user in tenant DB: %s", userInfo.Email)
-	}
+	// Phase A: legacy tenant_mappings bridge deleted. Per OAuth 2.1 + MCP
+	// authorization spec, OAuth client_id → workspace is not a defined mapping.
+	// The (workspace, user, client, resource_server) relationship lives in
+	// oauth_consent_grants and resource_server_client_registrations.
+	_ = clientID
+	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", tenantID.String(), clientID.String())
 
 	// Create OIDC identity link
 	profileDataJSON, _ := json.Marshal(map[string]interface{}{
@@ -1207,35 +1135,10 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		// Non-fatal, user can still login
 	}
 
-	// Create user in tenant database
-	if err := oc.createUserInTenantDB(tenantID, userID, clientID, projectID, fullDomain, state.ProviderName, userInfo); err != nil {
-		log.Printf("Failed to create user in tenant DB: %v", err)
-		// Non-fatal for registration response
-	}
-
-	// Save secret to Vault and register with Hydra
-	secretID, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String())
-	if err != nil {
+	// Save secret to Vault (best-effort, non-blocking)
+	if _, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
 		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
-		// Don't block OIDC registration - they can still use the system without Vault integration
-		secretID = "" // Clear secretID so we don't attempt Hydra registration
-	}
-
-	// Register client with Hydra only when we have a secret to use
-	if secretID != "" {
-		if err := services.RegisterClientWithHydra(clientID.String(), secretID, userInfo.Email, tenantID.String(), fullDomain); err != nil {
-			log.Printf("Warning: Failed to register client with Hydra: %v", err)
-			log.Printf("OIDC registration will continue without Hydra client registration for tenant: %s", tenantID.String())
-			// Don't block OIDC registration - they can still use the system without OAuth integration
-		} else {
-			// Add default AuthSec OIDC provider so the tenant login page has an auth method
-			if err := services.AddProviderToClient(tenantID.String(), tenantID.String(), fullDomain, userInfo.Email); err != nil {
-				log.Printf("Warning: Failed to add AuthSec provider to client for tenant %s: %v", tenantID.String(), err)
-			}
-		}
-	} else {
-		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
 	}
 
 	// Audit log: OIDC registration completed
@@ -1460,78 +1363,12 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", tenantID.String())
 	}
 
-	// Connect to tenant database for additional setup
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		log.Printf("Failed to connect to tenant database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to connect to tenant database"})
-		return
-	}
-	defer tenantDB.Close()
-
-	// Create default client in tenant DB with Hydra client ID
-	// Non-fatal: Vault/Hydra registration must proceed even if tenant DB setup fails
-	hydraClientID := fmt.Sprintf("%s-main-client", clientID.String())
-	clientInsert := `INSERT INTO clients (id, client_id, workspace_id, project_id, owner_id, org_id, name, description, hydra_client_id, active, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $2, $5, $6, $7, true, NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING`
-	if _, err := tenantDB.Exec(clientInsert, clientID, tenantID, projectID, tenantID, "Default Client", "Default client for OIDC user", hydraClientID); err != nil {
-		log.Printf("Warning: Failed to create default client in tenant DB: %v", err)
-	} else {
-		log.Printf("Created default client in tenant DB: %s", clientID)
-	}
-	// Seed default groups and assign roles+groups to client (matches custom registration flow)
-	if err := oc.seedDefaultGroupsInTenantDB(tenantDB, tenantID); err != nil {
-		log.Printf("Warning: Failed to seed default groups in tenant DB: %v", err)
-	}
-	if err := oc.assignDefaultClientAssociations(tenantDB, clientID, tenantID); err != nil {
-		log.Printf("Warning: Failed to assign default associations to client: %v", err)
-	}
-
-	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO workspaces (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
-		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
-		ON CONFLICT (id) DO UPDATE SET
-			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
-			source = EXCLUDED.source, status = EXCLUDED.status,
-			tenant_domain = EXCLUDED.tenant_domain, tenant_db = EXCLUDED.tenant_db,
-			updated_at = NOW()`
-	if _, err := tenantDB.Exec(tenantInsert, tenantID, input.Email, "", input.Name, input.Provider, fullDomain, tenantDBName); err != nil {
-		log.Printf("Warning: Failed to upsert tenant record in tenant database: %v", err)
-	} else {
-		log.Printf("Created tenant record in tenant DB for tenant: %s", tenantID)
-	}
-
-	// Create default project in tenant database (project was already created in global database)
-	projectInsert := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())
-		ON CONFLICT (id) DO NOTHING`
-	if _, err := tenantDB.Exec(projectInsert, projectID, tenantID, "Default Project", "Default project for OIDC user", tenantID); err != nil {
-		log.Printf("Warning: Failed to create default project in tenant database: %v", err)
-	} else {
-		log.Printf("Created default project in tenant DB: %s", projectID)
-	}
-
-	// Create tenant_mappings entry in global database for client_id to tenant_id mapping
-	globalDB := config.GetDatabase()
-	tenantMappingInsert := `INSERT INTO tenant_mappings (workspace_id, client_id, created_at, updated_at)
-		VALUES ($1, $2, NOW(), NOW())
-		ON CONFLICT (client_id) DO NOTHING`
-	if _, err := globalDB.Exec(tenantMappingInsert, tenantID, clientID); err != nil {
-		log.Printf("Warning: Failed to create tenant mapping: %v", err)
-	} else {
-		log.Printf("Created tenant_mappings entry: tenant_id=%s, client_id=%s", tenantID.String(), clientID.String())
-	}
-
-	// Assign admin role to the created user in the tenant database
-	if err := oc.assignAdminRoleToUser(tenantDB, userID, tenantID); err != nil {
-		log.Printf("Warning: Failed to assign admin role to user %s in tenant DB: %v", input.Email, err)
-	} else {
-		log.Printf("Successfully assigned admin role to user in tenant DB: %s", input.Email)
-	}
+	// Phase A: legacy tenant_mappings bridge deleted. Per OAuth 2.1 + MCP
+	// authorization spec, OAuth client_id → workspace is not a defined mapping.
+	// The (workspace, user, client, resource_server) relationship lives on
+	// oauth_consent_grants and resource_server_client_registrations.
+	_ = clientID
+	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", tenantID.String(), clientID.String())
 
 	// Create OIDC identity link
 	profileDataJSON, _ := json.Marshal(map[string]interface{}{
@@ -1552,41 +1389,10 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		log.Printf("Failed to create OIDC identity: %v", err)
 	}
 
-	// Create user in tenant database
-	userInfo := &models.OIDCUserInfo{
-		Sub:       input.ProviderUserID,
-		Email:     input.Email,
-		Name:      input.Name,
-		GivenName: strings.SplitN(input.Name, " ", 2)[0],
-	}
-	if len(strings.SplitN(input.Name, " ", 2)) > 1 {
-		userInfo.FamilyName = strings.SplitN(input.Name, " ", 2)[1]
-	}
-	if err := oc.createUserInTenantDB(tenantID, userID, clientID, projectID, fullDomain, input.Provider, userInfo); err != nil {
-		log.Printf("Failed to create user in tenant DB: %v", err)
-	}
-
-	// Save secret to Vault and register with Hydra — always runs regardless of tenant DB setup success
-	secretID, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String())
-	if err != nil {
+	// Save secret to Vault (best-effort, non-blocking)
+	if _, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
 		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
-		secretID = ""
-	}
-
-	// Register client with Hydra only when we have a secret to use
-	if secretID != "" {
-		if err := services.RegisterClientWithHydra(clientID.String(), secretID, input.Email, tenantID.String(), fullDomain); err != nil {
-			log.Printf("Warning: Failed to register client with Hydra: %v", err)
-			log.Printf("OIDC registration will continue without Hydra client registration for tenant: %s", tenantID.String())
-		} else {
-			// Add default AuthSec OIDC provider so the tenant login page has an auth method
-			if err := services.AddProviderToClient(tenantID.String(), tenantID.String(), fullDomain, input.Email); err != nil {
-				log.Printf("Warning: Failed to add AuthSec provider to client for tenant %s: %v", tenantID.String(), err)
-			}
-		}
-	} else {
-		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
 	}
 
 	// Return JSON response without token (frontend should login separately)
@@ -1598,31 +1404,6 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		"client_id":     clientID.String(),
 		"first_login":   true, // Always true for new registrations
 	})
-}
-
-// createUserInTenantDB creates the user record in the tenant's database
-func (oc *OIDCController) createUserInTenantDB(tenantID, userID, clientID, projectID uuid.UUID, tenantDomain, provider string, userInfo *models.OIDCUserInfo) error {
-	tenantDB := config.DB
-
-	// Create user in tenant DB
-	query := `
-		INSERT INTO users (id, email, name, workspace_id, client_id, project_id, tenant_domain, provider, provider_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11)
-		ON CONFLICT (id) DO NOTHING
-	`
-
-	// Get full name
-	name := userInfo.Name
-	if name == "" {
-		name = userInfo.GivenName
-		if userInfo.FamilyName != "" {
-			name = name + " " + userInfo.FamilyName
-		}
-	}
-
-	now := time.Now()
-	result := tenantDB.Exec(query, userID, userInfo.Email, name, tenantID, clientID, projectID, tenantDomain, provider, userInfo.Sub, now, now)
-	return result.Error
 }
 
 // LinkIdentity links an OIDC provider to an existing user account
@@ -2029,112 +1810,4 @@ func isValidTenantDomainOrCustomDomain(domain string) bool {
 
 	// If no dot, treat as subdomain prefix - use original validation
 	return isValidTenantDomain(domain)
-}
-
-// seedDefaultGroupsInTenantDB copies default groups from master DB into tenant DB
-func (oc *OIDCController) seedDefaultGroupsInTenantDB(tenantDB *sql.DB, tenantID uuid.UUID) error {
-	masterDB := config.GetDatabase()
-	rows, err := masterDB.Query("SELECT name, description FROM groups")
-	if err != nil {
-		return fmt.Errorf("failed to fetch groups from master DB: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var name, description string
-		if err := rows.Scan(&name, &description); err != nil {
-			return fmt.Errorf("failed to scan group row: %w", err)
-		}
-		now := time.Now()
-		if _, err := tenantDB.Exec(
-			"INSERT INTO groups (name, description, workspace_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, workspace_id) DO NOTHING",
-			name, description, tenantID, now, now,
-		); err != nil {
-			return fmt.Errorf("failed to insert group %s: %w", name, err)
-		}
-	}
-	return rows.Err()
-}
-
-// assignDefaultClientAssociations assigns all roles and groups in the tenant DB to the given client
-func (oc *OIDCController) assignDefaultClientAssociations(tenantDB *sql.DB, clientID uuid.UUID, tenantID uuid.UUID) error {
-	// Assign all roles to client
-	roleRows, err := tenantDB.Query("SELECT id FROM roles WHERE workspace_id = $1", tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to fetch role IDs: %w", err)
-	}
-	defer roleRows.Close()
-	for roleRows.Next() {
-		var roleID uuid.UUID
-		if err := roleRows.Scan(&roleID); err != nil {
-			return fmt.Errorf("failed to scan role ID: %w", err)
-		}
-		if _, err := tenantDB.Exec(
-			"INSERT INTO client_roles (client_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			clientID, roleID,
-		); err != nil {
-			return fmt.Errorf("failed to assign role %s to client: %w", roleID, err)
-		}
-	}
-	if err := roleRows.Err(); err != nil {
-		return err
-	}
-
-	// Assign all groups to client
-	groupRows, err := tenantDB.Query("SELECT id FROM groups WHERE workspace_id = $1", tenantID)
-	if err != nil {
-		return fmt.Errorf("failed to fetch group IDs: %w", err)
-	}
-	defer groupRows.Close()
-	for groupRows.Next() {
-		var groupID uuid.UUID
-		if err := groupRows.Scan(&groupID); err != nil {
-			return fmt.Errorf("failed to scan group ID: %w", err)
-		}
-		if _, err := tenantDB.Exec(
-			"INSERT INTO client_groups (client_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			clientID, groupID,
-		); err != nil {
-			return fmt.Errorf("failed to assign group %s to client: %w", groupID, err)
-		}
-	}
-	return groupRows.Err()
-}
-
-// assignAdminRoleToUser assigns admin role to a user in the tenant database
-func (oc *OIDCController) assignAdminRoleToUser(tenantDB *sql.DB, userID uuid.UUID, tenantID uuid.UUID) error {
-	// Insert admin role if it doesn't exist (check first to avoid deferrable constraint issues)
-	var adminRoleID uuid.UUID
-	checkRoleExistsQuery := `SELECT id FROM roles WHERE name = 'admin' AND workspace_id = $1`
-	err := tenantDB.QueryRow(checkRoleExistsQuery, tenantID).Scan(&adminRoleID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Role doesn't exist, insert it
-			insertRoleQuery := `INSERT INTO roles (name, description, workspace_id) VALUES ('admin', 'Administrator role with full access', $1) RETURNING id`
-			err = tenantDB.QueryRow(insertRoleQuery, tenantID).Scan(&adminRoleID)
-			if err != nil {
-				return fmt.Errorf("failed to insert admin role: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to check existing admin role: %w", err)
-		}
-	}
-
-	// Assign admin role via role_bindings (user_roles is deprecated)
-	checkBindingQuery := `SELECT 1 FROM role_bindings WHERE user_id = $1 AND role_id = $2 AND workspace_id = $3 AND scope_type IS NULL`
-	var exists int
-	err = tenantDB.QueryRow(checkBindingQuery, userID, adminRoleID, tenantID).Scan(&exists)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing role binding: %w", err)
-	}
-
-	// Only insert if the role binding doesn't already exist
-	if err == sql.ErrNoRows {
-		assignBindingQuery := `INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, NULL, NOW(), NOW())`
-		if _, err := tenantDB.Exec(assignBindingQuery, uuid.New(), tenantID, userID, adminRoleID); err != nil {
-			return fmt.Errorf("failed to create admin role binding: %w", err)
-		}
-	}
-
-	return nil
 }

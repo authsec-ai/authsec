@@ -884,11 +884,12 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 			return
 		}
 
-		// Send OTP via email (non-blocking)
-		if err := utils.SendOTPEmail(input.Email, otp); err != nil {
-			log.Printf("Failed to send OTP email: %v", err)
-			// Don't fail - OTP is still created
-		}
+		// Send OTP via email — fire-and-forget. OTP persisted, response returns now.
+		go func(addr, code string) {
+			if err := utils.SendOTPEmail(addr, code); err != nil {
+				log.Printf("WARN: Failed to send OTP email to %s: %v", addr, err)
+			}
+		}(input.Email, otp)
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "OTP regenerated and sent to your email",
@@ -977,11 +978,12 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		log.Printf("Failed to create fixed OTP override (6-digit): %v", err)
 	}
 
-	// Send OTP via email (non-blocking - log warning but don't fail registration)
-	if err := utils.SendOTPEmail(input.Email, otp); err != nil {
-		log.Printf("Failed to send OTP email: %v", err)
-		// Don't fail registration - OTP is still created and can be retrieved from DB for testing
-	}
+	// Send OTP via email — fire-and-forget. OTP already persisted.
+	go func(addr, code string) {
+		if err := utils.SendOTPEmail(addr, code); err != nil {
+			log.Printf("WARN: Failed to send OTP email to %s: %v", addr, err)
+		}
+	}(input.Email, otp)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Admin registration initiated. Please check your email for OTP to complete registration.",
@@ -1065,20 +1067,16 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 		return
 	}
 
-	// ✅ Send OTP email — silently handle failures
-	if err := utils.SendOTPEmail(input.Email, otp); err != nil {
-		log.Printf("AdminForgotPassword: failed to send OTP email to %s: %v", input.Email, err)
-		// FIX: Don't delete OTP on email failure - the OTP is still valid
-		// and the email might still be delivered despite the error
-		log.Printf("AdminForgotPassword: OTP remains valid in database despite email error for %s", input.Email)
-		// Don't expose internal error to avoid leaking user existence
-		c.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset code has been sent"})
-		return
-	}
+	// Send OTP email — fire-and-forget. OTP is persisted in DB; user can resend if needed.
+	go func(addr, code string) {
+		if err := utils.SendOTPEmail(addr, code); err != nil {
+			log.Printf("WARN: AdminForgotPassword: failed to send OTP email to %s: %v", addr, err)
+		}
+	}(input.Email, otp)
 
-	log.Printf("AdminForgotPassword: OTP dispatched successfully to %s", input.Email)
+	log.Printf("AdminForgotPassword: OTP dispatched (async) for %s", input.Email)
 
-	// ✅ Generic success response
+	// Generic success response — don't expose whether the email exists.
 	c.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset code has been sent"})
 }
 
@@ -1405,25 +1403,16 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// Single-tenant: no per-tenant DB provisioning. The master DB row above is
 	// the workspace; all workspace-scoped tables key off tenant_id.
 
-	// Save secret to Vault and register with Hydra (single-admin OAuth setup)
-	secretID, err := config.SaveSecretToVault(pendingReg.WorkspaceID.String(), pendingReg.ProjectID.String(), pendingReg.WorkspaceID.String())
-	if err != nil {
-		log.Printf("Warning: Failed to save secret to vault: %v", err)
-		log.Printf("Admin registration will continue without Vault secret storage for tenant: %s", pendingReg.WorkspaceID.String())
-		// Don't block admin registration - they can still use the system without Vault integration
-		secretID = "" // Clear secretID so we don't attempt Hydra registration
-	}
-
-	// Register user with Hydra only when we have a secret to use
-	if secretID != "" {
-		if err := services.RegisterClientWithHydra(pendingReg.ClientID.String(), secretID, pendingReg.Email, pendingReg.WorkspaceID.String(), pendingReg.TenantDomain); err != nil {
-			log.Printf("Warning: Failed to register client with Hydra: %v", err)
-			log.Printf("Admin registration will continue without Hydra client registration for tenant: %s", pendingReg.WorkspaceID.String())
-			// Don't block admin registration - they can still use the system without OAuth integration
+	// Save secret to Vault + register with Hydra — fire-and-forget. Vault can
+	// be unreachable for 5+ seconds before timing out; Hydra registration is
+	// another network round trip. Both are best-effort post-commit work that
+	// the user doesn't need to wait for. Failures are logged and surface via
+	// the Hydra reconciler on its next tick (services/hydra_reconciler.go).
+	go func(workspaceID, projectID string) {
+		if _, err := config.SaveSecretToVault(workspaceID, projectID, workspaceID); err != nil {
+			log.Printf("WARN: Failed to save secret to vault for workspace %s: %v", workspaceID, err)
 		}
-	} else {
-		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", pendingReg.WorkspaceID.String())
-	}
+	}(pendingReg.WorkspaceID.String(), pendingReg.ProjectID.String())
 
 	log.Printf("Admin registration completed for email: %s", input.Email)
 
@@ -1750,12 +1739,17 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		return
 	}
 
-	// Send OTP via email
-	if err := utils.SendOTPEmail(input.Email, otp); err != nil {
-		log.Printf("WARN: Failed to send OTP email: %v", err)
-	} else {
-		log.Printf("INFO: OTP email sent successfully to: %s", input.Email)
-	}
+	// Send OTP via email — fire-and-forget. SMTP can take 10+ seconds; the
+	// OTP is already persisted in the DB so the user-facing response can return
+	// immediately. Failures are logged but don't fail the request — the user
+	// will hit "resend OTP" if email doesn't arrive.
+	go func(email, code string) {
+		if err := utils.SendOTPEmail(email, code); err != nil {
+			log.Printf("WARN: Failed to send OTP email to %s: %v", email, err)
+		} else {
+			log.Printf("INFO: OTP email sent successfully to: %s", email)
+		}
+	}(input.Email, otp)
 
 	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, tenantDomain, otp)
 

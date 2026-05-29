@@ -9,11 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	oocmgrdto "github.com/authsec-ai/authsec/internal/oocmgr/dto"
-	oocmgrrepo "github.com/authsec-ai/authsec/internal/oocmgr/repository"
 )
 
 // hydraClient mirrors the Hydra admin API client object used for direct calls.
@@ -185,10 +182,6 @@ func RegisterHydraClientWithParams(clientID, clientName string, redirectURIs []s
 	})
 }
 
-func oocmgrNormalizeProviderName(name string) string {
-	return strings.ToLower(strings.ReplaceAll(name, " ", "_"))
-}
-
 // OOCManager represents the request structure for OOC Manager API
 type OOCManager struct {
 	WorkspaceID     string   `json:"workspace_id" validate:"required"`
@@ -222,59 +215,6 @@ type AddProviderRequest struct {
 	CreatedBy   string         `json:"created_by"`
 }
 
-// RegisterClientWithHydra creates the tenant's main OAuth2 client directly in Hydra.
-func RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, tenantDomain string) error {
-	mainClientID := fmt.Sprintf("%s-main-client", clientID)
-
-	// Skip if already exists
-	if existing, _ := hydraAdminGetClient(mainClientID); existing != nil {
-		log.Printf("Hydra client %s already exists, skipping creation", mainClientID)
-		return nil
-	}
-
-	scopes := []string{"openid", "offline_access", "email", "profile"}
-	c := hydraClient{
-		ClientID:      mainClientID,
-		ClientSecret:  clientSecret,
-		ClientName:    fmt.Sprintf("%s Main OAuth Client", clientName),
-		GrantTypes:    []string{"authorization_code", "refresh_token"},
-		RedirectURIs:  []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
-		ResponseTypes: []string{"code"},
-		TokenEndpoint: "client_secret_post",
-		Scope:         strings.Join(scopes, " "),
-		Audience:      []string{},
-		SubjectType:   "public",
-		Metadata: map[string]interface{}{
-			"type":         "tenant_main_client",
-			"workspace_id": clientID,
-			"c_id":         tenantID,
-			"tenant_name":  clientName,
-			"created_at":   time.Now().Format(time.RFC3339),
-			"created_by":   "system",
-		},
-	}
-
-	if err := hydraAdminCreateClient(c); err != nil {
-		return fmt.Errorf("failed to create Hydra client: %w", err)
-	}
-
-	// Best-effort: store mapping in master DB
-	thc := &oocmgrdto.TenantHydraClient{
-		WorkspaceID: tenantID, TenantName: clientName,
-		HydraClientID: mainClientID, HydraClientSecret: clientSecret,
-		ClientName:   fmt.Sprintf("%s Main OAuth Client", clientName),
-		RedirectURIs: []string{fmt.Sprintf("https://%s/oidc/auth/callback", tenantDomain)},
-		Scopes:       scopes, ClientType: "main", IsActive: true,
-		CreatedBy: "system", UpdatedBy: "system",
-	}
-	if err := oocmgrrepo.NewTenantHydraClientRepository().Create(thc); err != nil {
-		log.Printf("Warning: failed to store tenant-client mapping for %s: %v", mainClientID, err)
-	}
-
-	log.Printf("Successfully registered Hydra client %s", mainClientID)
-	return nil
-}
-
 // DeleteClientFromHydra removes all Hydra clients belonging to the tenant directly.
 func DeleteClientFromHydra(clientID string) error {
 	clients, err := hydraAdminGetAllClients()
@@ -300,77 +240,3 @@ func DeleteClientFromHydra(clientID string) error {
 	return nil
 }
 
-// UpdateClientInHydra updates the main Hydra client's secret directly.
-func UpdateClientInHydra(clientID, secret, email, tenantID string) error {
-	mainClientID := fmt.Sprintf("%s-main-client", clientID)
-	existing, err := hydraAdminGetClient(mainClientID)
-	if err != nil {
-		return fmt.Errorf("client %s not found in Hydra: %w", mainClientID, err)
-	}
-	existing.ClientSecret = secret
-	if err := hydraAdminUpdateClient(mainClientID, *existing); err != nil {
-		return fmt.Errorf("failed to update Hydra client %s: %w", mainClientID, err)
-	}
-	log.Printf("Successfully updated Hydra client %s", mainClientID)
-	return nil
-}
-
-// AddProviderToClient adds a dummy AuthSec OIDC provider client directly in Hydra.
-func AddProviderToClient(tenantID, clientID, reactAppURL, createdBy string) error {
-	baseClientID := strings.TrimSuffix(clientID, "-main-client")
-	mainClientID := fmt.Sprintf("%s-main-client", baseClientID)
-
-	tenantClient, err := hydraAdminGetClient(mainClientID)
-	if err != nil {
-		return fmt.Errorf("base client %s not found in Hydra: %w", mainClientID, err)
-	}
-
-	providerName := "authsec"
-	oidcClientID := fmt.Sprintf("%s-%s-oidc", baseClientID, oocmgrNormalizeProviderName(providerName))
-	tenantName, _ := tenantClient.Metadata["tenant_name"].(string)
-
-	oidcClient := hydraClient{
-		ClientID:   oidcClientID,
-		ClientName: fmt.Sprintf("%s AuthSec OIDC Config", tenantName),
-		GrantTypes: []string{"client_credentials"},
-		Metadata: map[string]interface{}{
-			"type":          "oidc_provider",
-			"workspace_id":  baseClientID,
-			"c_id":          tenantID,
-			"provider_name": providerName,
-			"display_name":  "AuthSec",
-			"provider_config": map[string]interface{}{
-				"client_id":     clientID,
-				"client_secret": "dummy-secret-" + clientID,
-				"auth_url":      fmt.Sprintf("https://%s/oauth2/auth", reactAppURL),
-				"token_url":     fmt.Sprintf("https://%s/oauth2/token", reactAppURL),
-				"user_info_url": fmt.Sprintf("https://%s/userinfo", reactAppURL),
-				"scopes":        []string{"openid", "profile", "email"},
-			},
-			"is_active":    true,
-			"callback_url": fmt.Sprintf("%s/oidc/auth/callback/%s", reactAppURL, oocmgrNormalizeProviderName(providerName)),
-			"created_at":   time.Now().Format(time.RFC3339),
-			"created_by":   createdBy,
-		},
-	}
-
-	if err := hydraAdminCreateClient(oidcClient); err != nil {
-		return fmt.Errorf("failed to create OIDC provider client: %w", err)
-	}
-
-	// Best-effort: store mapping in master DB
-	thc := &oocmgrdto.TenantHydraClient{
-		WorkspaceID: tenantID, TenantName: tenantName,
-		HydraClientID:     oidcClientID,
-		HydraClientSecret: "not-used-for-oidc-config",
-		ClientName:        fmt.Sprintf("%s AuthSec OIDC Config", tenantName),
-		ClientType:        "oidc_provider", ProviderName: providerName,
-		IsActive: true, CreatedBy: createdBy, UpdatedBy: createdBy,
-	}
-	if err := oocmgrrepo.NewTenantHydraClientRepository().Create(thc); err != nil {
-		log.Printf("Warning: failed to store OIDC provider mapping for %s: %v", oidcClientID, err)
-	}
-
-	log.Printf("Successfully added AuthSec provider client %s", oidcClientID)
-	return nil
-}

@@ -70,18 +70,19 @@ type OTPEntry struct {
 }
 
 type PendingRegistration struct {
-	ID           uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"`
-	FirstName    string    `json:"first_name"`
-	LastName     string    `json:"last_name"`
-	WorkspaceID     uuid.UUID `json:"workspace_id" gorm:"type:uuid"`
-	ProjectID    uuid.UUID `json:"project_id" gorm:"type:uuid"`
-	ClientID     uuid.UUID `json:"client_id" gorm:"type:uuid"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	TenantDomain string    `json:"tenant_domain"`
+	ID           uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	Email        string     `json:"email"`
+	PasswordHash string     `json:"-"`
+	FirstName    string     `json:"first_name"`
+	LastName     string     `json:"last_name"`
+	WorkspaceID  uuid.UUID  `json:"workspace_id" gorm:"type:uuid"`
+	// ProjectID is nullable (projects table is legacy; Phase E will delete it).
+	ProjectID    *uuid.UUID `json:"project_id,omitempty" gorm:"type:uuid"`
+	// ClientID removed (Phase A): OAuth client is global, not workspace-owned.
+	ExpiresAt    time.Time  `json:"expires_at"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	TenantDomain string     `json:"tenant_domain"`
 }
 
 // Updated Input/Response models using your existing structures

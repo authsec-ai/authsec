@@ -259,34 +259,10 @@ CREATE TABLE public.ciba_auth_requests (
     CONSTRAINT ciba_auth_requests_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.clients (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    client_id uuid NOT NULL,
-    workspace_id text,
-    project_id text,
-    owner_id text,
-    org_id text,
-    name text NOT NULL,
-    email text,
-    status text DEFAULT 'Active'::text,
-    tags text,
-    active boolean DEFAULT true,
-    last_login timestamp without time zone,
-    mfa_enabled boolean DEFAULT false,
-    mfa_method text,
-    mfa_default_method text,
-    mfa_enrolled_at timestamp without time zone,
-    mfa_verified boolean DEFAULT false,
-    hydra_client_id text,
-    oidc_enabled boolean DEFAULT false,
-    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    deleted_at timestamp without time zone,
-    deleted boolean DEFAULT false,
-    CONSTRAINT clients_client_id_key UNIQUE (client_id),
-    CONSTRAINT clients_hydra_client_id_key UNIQUE (hydra_client_id),
-    CONSTRAINT clients_pkey PRIMARY KEY (id)
-);
+-- Phase B: public.clients table removed. Legacy v3 concept that conflated
+-- "MCP server" (now resource_servers) with "OAuth client" (now mcp_oauth_clients).
+-- Agent + delegation + client-management flows that still query it are documented
+-- in RESIDUAL_AGENTS_WORK.md as known-broken pending migration.
 
 CREATE TABLE public.credentials (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -426,6 +402,44 @@ CREATE TABLE public.mcp_oauth_clients (
     CONSTRAINT mcp_oauth_clients_hydra_client_id_key UNIQUE (hydra_client_id),
     CONSTRAINT mcp_oauth_clients_pkey PRIMARY KEY (id)
 );
+
+-- Pre-seeded demo OAuth client (registration_type='prereg') — used by the hosted
+-- login UI to self-initiate OAuth flows in dev/test. NOT used by direct login flows.
+INSERT INTO public.mcp_oauth_clients (
+    id,
+    client_id,
+    hydra_client_id,
+    client_name,
+    redirect_uris,
+    grant_types,
+    response_types,
+    token_endpoint_auth_method,
+    scope,
+    registration_type,
+    sync_status,
+    sync_last_error,
+    created_at,
+    updated_at
+) VALUES (
+    'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+    'authsec-login-ui',
+    'authsec-login-ui',
+    'AuthSec Login UI',
+    ARRAY['http://localhost:3000/oidc/auth/callback', 'https://app.authsec.dev/oidc/auth/callback'],
+    ARRAY['authorization_code', 'refresh_token'],
+    ARRAY['code'],
+    'none',
+    'openid profile email offline_access',
+    'prereg',
+    -- Seed as 'sync_error' (NOT 'active') so the Hydra reconciler picks this row up
+    -- on its next tick and creates the matching Hydra client. tick() only scans
+    -- sync_status IN ('sync_error','pending_delete'); an 'active' seed would be
+    -- skipped forever and the Hydra client would never be created.
+    'sync_error',
+    'awaiting initial hydra client creation by reconciler',
+    NOW(),
+    NOW()
+) ON CONFLICT (client_id) DO NOTHING;
 
 CREATE TABLE public.mcp_tool_scope_map (
     tool_id uuid NOT NULL,
@@ -593,8 +607,10 @@ CREATE TABLE public.pending_registrations (
     first_name character varying(100) DEFAULT ''::character varying,
     last_name character varying(100) DEFAULT ''::character varying,
     workspace_id uuid NOT NULL,
-    project_id uuid NOT NULL,
-    client_id uuid NOT NULL,
+    -- project_id is legacy (projects table is Phase E to delete); nullable so
+    -- registrations without a project still succeed.
+    project_id uuid,
+    -- client_id removed (Phase A): OAuth client is global, not workspace-owned.
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
@@ -1184,27 +1200,7 @@ CREATE TABLE public.tenant_end_user_states (
     CONSTRAINT tenant_end_user_states_pkey PRIMARY KEY (workspace_id, user_id)
 );
 
-CREATE TABLE public.tenant_hydra_clients (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    org_id text NOT NULL,
-    workspace_id text NOT NULL,
-    tenant_name text NOT NULL,
-    hydra_client_id text NOT NULL,
-    hydra_client_secret text NOT NULL,
-    client_name text NOT NULL,
-    scopes text[] DEFAULT ARRAY['openid'::text, 'profile'::text, 'email'::text] NOT NULL,
-    client_type text NOT NULL,
-    provider_name text,
-    is_active boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    created_by text DEFAULT 'system'::text NOT NULL,
-    updated_by text DEFAULT 'system'::text NOT NULL,
-    deleted_at timestamp with time zone,
-    redirect_uris text[] DEFAULT '{}'::text[],
-    CONSTRAINT tenant_hydra_clients_hydra_client_id_key UNIQUE (hydra_client_id),
-    CONSTRAINT tenant_hydra_clients_pkey PRIMARY KEY (id)
-);
+-- Phase C: dropped CREATE TABLE public.tenant_hydra_clients
 
 -- Phase 6: dropped CREATE TABLE public.tenant_mappings
 
@@ -1298,6 +1294,8 @@ CREATE TABLE public.user_groups (
 
 CREATE TABLE public.users (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
+    -- client_id: legacy field, nullable. User identity is (workspace_id, email).
+    -- Full removal tracked in Phase G (final sweep) after all repo references cleared.
     client_id uuid,
     workspace_id uuid,
     project_id uuid,
@@ -1432,6 +1430,10 @@ CREATE TABLE public.workspaces (
 );
 
 CREATE INDEX idx_workspaces_owner_user_id ON public.workspaces(owner_user_id);
+
+-- Phase A: workspace_domain is the canonical Host-header lookup key.
+-- Must be unique so WorkspaceFromHost returns exactly one workspace per hostname.
+CREATE UNIQUE INDEX idx_workspaces_workspace_domain ON public.workspaces (LOWER(workspace_domain)) WHERE workspace_domain IS NOT NULL;
 
 CREATE TABLE public.workspace_memberships (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1691,31 +1693,7 @@ CREATE INDEX idx_ciba_auth_tenant ON public.ciba_auth_requests USING btree (work
 
 CREATE INDEX idx_ciba_auth_user ON public.ciba_auth_requests USING btree (user_id);
 
-CREATE INDEX idx_clients_deleted ON public.clients USING btree (deleted);
-
-CREATE INDEX idx_clients_deleted_at ON public.clients USING btree (deleted_at);
-
-CREATE INDEX idx_clients_hydra_client_id ON public.clients USING btree (hydra_client_id) WHERE ((hydra_client_id IS NOT NULL) AND (hydra_client_id <> ''::text));
-
-CREATE INDEX idx_clients_oidc_enabled ON public.clients USING btree (oidc_enabled);
-
-CREATE INDEX idx_clients_org_id ON public.clients USING btree (org_id);
-
-CREATE INDEX idx_clients_owner ON public.clients USING btree (owner_id);
-
-CREATE INDEX idx_clients_owner_id ON public.clients USING btree (owner_id);
-
-CREATE INDEX idx_clients_project_id ON public.clients USING btree (project_id);
-
-CREATE INDEX idx_clients_status ON public.clients USING btree (status);
-
-CREATE INDEX idx_clients_tags ON public.clients USING btree (tags);
-
-CREATE INDEX idx_clients_tenant_id ON public.clients USING btree (workspace_id);
-
-CREATE INDEX idx_clients_tenant_org ON public.clients USING btree (workspace_id, org_id);
-
-CREATE UNIQUE INDEX idx_clients_tenant_org_email_name ON public.clients USING btree (workspace_id, org_id, email, name) WHERE (deleted_at IS NULL);
+-- Phase B: idx_clients_* indexes removed with the public.clients table.
 
 CREATE INDEX idx_consent_grants_tenant ON public.oauth_consent_grants USING btree (workspace_id) WHERE (revoked_at IS NULL);
 
@@ -1990,11 +1968,7 @@ CREATE INDEX idx_tenant_domains_tenant_id_primary ON public.tenant_domains USING
 
 CREATE INDEX idx_tenant_domains_tenant_id_verified ON public.tenant_domains USING btree (workspace_id, is_verified);
 
-CREATE INDEX idx_tenant_hydra_clients_client_type ON public.tenant_hydra_clients USING btree (client_type);
-
-CREATE UNIQUE INDEX idx_tenant_hydra_clients_hydra_client_id ON public.tenant_hydra_clients USING btree (hydra_client_id);
-
-CREATE INDEX idx_tenant_hydra_clients_org_tenant ON public.tenant_hydra_clients USING btree (org_id, workspace_id);
+-- Phase C: idx_tenant_hydra_clients_* removed (tenant_hydra_clients table dropped).
 
 -- Phase 6: idx_tenant_mappings_* removed (tenant_mappings table dropped).
 
@@ -2102,6 +2076,11 @@ CREATE INDEX idx_users_tenant_id ON public.users USING btree (workspace_id);
 
 CREATE INDEX idx_users_tenant_id_active ON public.users USING btree (workspace_id, active) WHERE (active = true);
 
+-- Phase A: canonical multi-workspace identity constraint.
+-- One user row per (workspace, email). Enforces "same email in two workspaces
+-- = two distinct users" — the Slack/GitHub user model.
+CREATE UNIQUE INDEX idx_users_workspace_email ON public.users (workspace_id, LOWER(email)) WHERE deleted_at IS NULL;
+
 CREATE INDEX idx_users_tenant_project ON public.users USING btree (workspace_id, project_id);
 
 CREATE INDEX idx_users_timestamps ON public.users USING btree (created_at, updated_at);
@@ -2146,7 +2125,7 @@ CREATE TRIGGER trigger_voice_sessions_updated_at BEFORE UPDATE ON public.voice_s
 
 CREATE TRIGGER update_services_updated_at BEFORE UPDATE ON public.services FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
-CREATE TRIGGER update_tenant_hydra_clients_updated_at BEFORE UPDATE ON public.tenant_hydra_clients FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+-- Phase C: update_tenant_hydra_clients_updated_at trigger removed (table dropped).
 
 CREATE TRIGGER users_set_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 

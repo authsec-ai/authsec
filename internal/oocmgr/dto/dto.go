@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
@@ -359,59 +358,6 @@ type SAMLTemplateDTO struct {
 	Instructions     string                 `json:"instructions"`
 	DocumentationURL string                 `json:"documentation_url"`
 	ConfigFields     []string               `json:"config_fields"`
-}
-
-// ===== TENANT HYDRA CLIENT =====
-
-type TenantHydraClient struct {
-	ID                uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	OrgID             string         `json:"org_id" gorm:"not null;index"`
-	WorkspaceID          string         `json:"workspace_id" gorm:"not null;index"`
-	TenantName        string         `json:"tenant_name" gorm:"not null"`
-	HydraClientID     string         `json:"hydra_client_id" gorm:"not null;unique"`
-	HydraClientSecret string         `json:"hydra_client_secret" gorm:"not null"`
-	ClientName        string         `json:"client_name" gorm:"not null"`
-	RedirectURIs      pq.StringArray `json:"redirect_uris" gorm:"type:text[];default:'{}'"`
-	Scopes            pq.StringArray `json:"scopes" gorm:"type:text[];default:'{openid,profile,email}'"`
-	ClientType        string         `json:"client_type" gorm:"not null"`
-	ProviderName      string         `json:"provider_name,omitempty"`
-	IsActive          bool           `json:"is_active" gorm:"default:true"`
-	CreatedAt         time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt         time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	CreatedBy         string         `json:"created_by" gorm:"default:'system'"`
-	UpdatedBy         string         `json:"updated_by" gorm:"default:'system'"`
-	DeletedAt         gorm.DeletedAt `json:"-" gorm:"index"`
-}
-
-func (TenantHydraClient) TableName() string {
-	return "tenant_hydra_clients"
-}
-
-type GetTenantHydraClientsRequest struct {
-	OrgID      string `json:"org_id,omitempty"`
-	WorkspaceID   string `json:"workspace_id,omitempty"`
-	ClientType string `json:"client_type,omitempty"`
-	IsActive   *bool  `json:"is_active,omitempty"`
-}
-
-// TenantHydraClientResponse for API responses
-type TenantHydraClientResponse struct {
-	ID                uuid.UUID `json:"id"`
-	OrgID             string    `json:"org_id"`
-	WorkspaceID          string    `json:"workspace_id"`
-	TenantName        string    `json:"tenant_name"`
-	HydraClientID     string    `json:"hydra_client_id"`
-	HydraClientSecret string    `json:"hydra_client_secret,omitempty"`
-	ClientName        string    `json:"client_name"`
-	RedirectURIs      []string  `json:"redirect_uris"`
-	Scopes            []string  `json:"scopes"`
-	ClientType        string    `json:"client_type"`
-	ProviderName      string    `json:"provider_name,omitempty"`
-	IsActive          bool      `json:"is_active"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	CreatedBy         string    `json:"created_by"`
-	UpdatedBy         string    `json:"updated_by"`
 }
 
 // Client represents a client record in tenant DB (used by GetClientsByTenant)

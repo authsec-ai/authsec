@@ -83,7 +83,7 @@ func (cl *ClientLibrary) CreateClient(req *ClientCreateRequest) (*sharedmodels.C
 		Active:        req.Active,
 		Status:        status,
 		Tags:          pq.StringArray(req.Tags),
-		HydraClientID: fmt.Sprintf("%s-main-client", clientID.String()),
+		HydraClientID: clientID.String(),
 		OIDCEnabled:   req.OIDCEnabled,
 	}
 

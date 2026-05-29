@@ -584,21 +584,12 @@ func (s *AgentActionService) generateActionReqID() (string, error) {
 	return "act_" + base64.URLEncoding.EncodeToString(bytes), nil
 }
 
-// resolveTenantFromClientID maps client_id → tenant_id via tenant_mappings table
+// resolveTenantFromClientID — Phase A stub. Legacy lookup removed. Callers
+// must pass workspaceID explicitly (workspace lives on the request context
+// or JWT, not on client_id).
 func (s *AgentActionService) resolveTenantFromClientID(clientID uuid.UUID) (uuid.UUID, error) {
-	db := s.actionRepo.GetDB()
-	if db == nil {
-		return uuid.UUID{}, fmt.Errorf("database not initialized")
-	}
-
-	var tenantID uuid.UUID
-	query := `SELECT workspace_id FROM tenant_mappings WHERE client_id = $1`
-	err := db.QueryRow(query, clientID).Scan(&tenantID)
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("client not found in tenant_mappings: %w", err)
-	}
-
-	return tenantID, nil
+	_ = clientID
+	return uuid.Nil, fmt.Errorf("legacy client_id→workspace lookup removed; pass workspace_id explicitly")
 }
 
 func (s *AgentActionService) writeAuditLog(req *models.AgentActionRequest, finalStatus string, decidedBy []map[string]interface{}) {

@@ -54,26 +54,40 @@ type OIDCLoginInput struct {
 
 // Custom login models
 type CustomLoginInput struct {
-	ClientID string `json:"client_id" binding:"required"`
+	// WorkspaceID is the canonical scope, resolved by the UI from the Hydra
+	// login_challenge page-data. Accepts UUID, slug, or workspace_domain.
+	WorkspaceID string `json:"workspace_id"`
+	// ClientID is deprecated for user-identity flows; no longer used as the
+	// workspace identifier. Kept optional so older builds don't 400.
+	ClientID string `json:"client_id"`
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
 }
 
 type CustomLoginStatus struct {
-	ClientID string `json:"client_id" binding:"required"`
+	// WorkspaceID is the canonical scope. The UI sets it from the page-data
+	// response that resolved the Hydra login_challenge. Accepts UUID, slug,
+	// or workspace_domain.
+	WorkspaceID string `json:"workspace_id"`
+	// ClientID is deprecated for user-identity flows — it is NOT used to
+	// resolve the workspace anymore (OAuth clients are global per OAuth 2.1).
+	// Kept optional so older UI builds don't 400 during the rollout; ignored.
+	ClientID string `json:"client_id"`
 	Email    string `json:"email" binding:"required"`
 }
 
 type CustomLoginRegister struct {
-	ClientID string `json:"client_id" binding:"required"`
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	WorkspaceID string `json:"workspace_id"`
+	ClientID    string `json:"client_id"` // deprecated, ignored — see CustomLoginStatus
+	Email       string `json:"email" binding:"required"`
+	Password    string `json:"password" binding:"required"`
 }
 
 // Forgot password models
 type CustomForgotPasswordInput struct {
-	ClientID string `json:"client_id" binding:"required"`
-	Email    string `json:"email" binding:"required"`
+	WorkspaceID string `json:"workspace_id"`
+	ClientID    string `json:"client_id"` // deprecated, ignored
+	Email       string `json:"email" binding:"required"`
 }
 
 type CustomForgotPasswordResponse struct {
@@ -92,7 +106,10 @@ type CustomVerifyPasswordResetOTPResponse struct {
 }
 
 type CustomResetPasswordInput struct {
-	ClientID    string `json:"client_id" binding:"required"`
+	// WorkspaceID scopes the password reset user lookup.
+	WorkspaceID string `json:"workspace_id"`
+	// ClientID is deprecated; ignored by the backend.
+	ClientID    string `json:"client_id"`
 	Email       string `json:"email" binding:"required"`
 	NewPassword string `json:"new_password" binding:"required"`
 }

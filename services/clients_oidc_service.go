@@ -40,29 +40,26 @@ func (o *ClientsOIDCService) CreateTenantClient(tenantID, clientName string) (*C
 
 	redirectURIs := []string{"http://localhost:3000/callback"}
 
-	if err := RegisterClientWithHydra(clientID, clientSecret, clientName, tenantID, "localhost:3000"); err != nil {
-		// RegisterClientWithHydra builds a main-client suffix; here we want the raw clientID so create directly
-		c := hydraClient{
-			ClientID:      clientID,
-			ClientSecret:  clientSecret,
-			ClientName:    clientName,
-			GrantTypes:    []string{"authorization_code", "refresh_token"},
-			RedirectURIs:  redirectURIs,
-			ResponseTypes: []string{"code"},
-			TokenEndpoint: "client_secret_post",
-			Scope:         "openid profile email",
-			Audience:      []string{},
-			SubjectType:   "public",
-			Metadata: map[string]interface{}{
-				"type":         "tenant_main_client",
-				"workspace_id": clientID,
-				"c_id":         tenantID,
-				"created_by":   "clients-microservice",
-			},
-		}
-		if err2 := hydraAdminCreateClient(c); err2 != nil {
-			return nil, fmt.Errorf("failed to create Hydra client: %w", err2)
-		}
+	hc := hydraClient{
+		ClientID:      clientID,
+		ClientSecret:  clientSecret,
+		ClientName:    clientName,
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  redirectURIs,
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: "client_secret_post",
+		Scope:         "openid profile email",
+		Audience:      []string{},
+		SubjectType:   "public",
+		Metadata: map[string]interface{}{
+			"type":         "tenant_main_client",
+			"workspace_id": clientID,
+			"c_id":         tenantID,
+			"created_by":   "clients-microservice",
+		},
+	}
+	if err := hydraAdminCreateClient(hc); err != nil {
+		return nil, fmt.Errorf("failed to create Hydra client: %w", err)
 	}
 
 	return &ClientsOIDCClientResponse{

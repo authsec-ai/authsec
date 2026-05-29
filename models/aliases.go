@@ -181,5 +181,3 @@ func (r *DeleteRolesRequest) GetRoles() []string {
 	return r.RoleIDs
 }
 
-// RegisterClientWithHydra is now implemented in hydra.go
-// No need to delegate to sharedmodels
