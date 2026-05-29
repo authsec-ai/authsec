@@ -68,7 +68,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		       COALESCE(t.tenant_domain, ''),
 		       COALESCE(t.vault_mount, '')
 		FROM users u
-		LEFT JOIN tenants t ON t.workspace_id = u.workspace_id
+		LEFT JOIN workspaces t ON t.workspace_id = u.workspace_id
 		WHERE LOWER(u.email) = ?
 		LIMIT 1`, email).Row()
 	if err := row.Scan(&userID, &tenantID, &tenantDB, &tenantDomain, &vaultMount); err != nil {
@@ -147,7 +147,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 			{"projects", `DELETE FROM projects WHERE workspace_id = $1`},
 			{"role_bindings", `DELETE FROM role_bindings WHERE workspace_id = $1`},
 			{"users", `DELETE FROM users WHERE workspace_id = $1`},
-			{"tenants", `DELETE FROM tenants WHERE workspace_id = $1`},
+			{"tenants", `DELETE FROM workspaces WHERE workspace_id = $1`},
 		}
 		for _, q := range purgeQueries {
 			if _, err := sqlDB.Exec(q.query, tenantID); err != nil {

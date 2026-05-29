@@ -260,7 +260,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 
 	if err := tenantRepo.CreateTenantTOTPSecret(totpSecret); err != nil {
 		if err.Error() == "tenant_not_found" {
-			return nil, fmt.Errorf("database integrity error: tenant record missing in tenant database (run: INSERT INTO tenants (id) VALUES ('%s');)", tenantID)
+			return nil, fmt.Errorf("database integrity error: workspace record missing (id=%s)", tenantID)
 		}
 		if err.Error() == "user_not_found" {
 			return nil, fmt.Errorf("user record not found in tenant database")

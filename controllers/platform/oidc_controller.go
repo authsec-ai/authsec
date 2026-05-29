@@ -1099,14 +1099,14 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
@@ -1145,7 +1145,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO tenants (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
+	tenantInsert := `INSERT INTO workspaces (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,
@@ -1445,14 +1445,14 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE tenants SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE tenants SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
@@ -1492,7 +1492,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Upsert tenant record in tenant database (migration may have seeded a minimal stub row)
-	tenantInsert := `INSERT INTO tenants (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
+	tenantInsert := `INSERT INTO workspaces (id, workspace_id, email, password_hash, name, provider, source, status, tenant_domain, tenant_db, created_at, updated_at)
 		VALUES ($1, $1, $2, $3, $4, $5, 'oidc_registration', 'active', $6, $7, NOW(), NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			email = EXCLUDED.email, name = EXCLUDED.name, provider = EXCLUDED.provider,

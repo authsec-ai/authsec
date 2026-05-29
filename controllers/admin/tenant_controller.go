@@ -170,7 +170,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		// Check domain existence using a custom query
 		db := config.GetDatabase()
 		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE tenant_domain = $1", tenantDomain).Scan(&count)
+		err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
 		if err != nil {
 			log.Printf("Error checking tenant domain: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
@@ -186,7 +186,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	{
 		db := config.GetDatabase()
 		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active'").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
@@ -1098,7 +1098,7 @@ func (uc *UserController) AdminForgotPassword(c *gin.Context) {
 	// Check if admin user exists in main Tenant table using native query
 	db := config.GetDatabase()
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE email = $1 AND status = $2 AND provider = $3",
+	err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE email = $1 AND status = $2 AND provider = $3",
 		input.Email, "active", "local").Scan(&count)
 	if err != nil || count == 0 {
 		if err != nil {
@@ -1284,7 +1284,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}()
 
 	// Update admin password in main Tenant table
-	updateQuery := `UPDATE tenants SET password_hash = $1, updated_at = $2 WHERE id = $3`
+	updateQuery := `UPDATE workspaces SET password_hash = $1, updated_at = $2 WHERE id = $3`
 	if _, err := tx.Exec(updateQuery, hashedPassword, time.Now(), tenant.ID); err != nil {
 		tx.Rollback()
 		tenantTx.Rollback()

@@ -217,7 +217,7 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UU
 	query := `
 		SELECT u.id
 		FROM users u
-		JOIN tenants t ON t.workspace_id::text = u.workspace_id::text
+		JOIN workspaces t ON t.workspace_id::text = u.workspace_id::text
 		WHERE u.workspace_id::text = $1
 		  AND LOWER(u.email) = LOWER(t.email)
 		LIMIT 1

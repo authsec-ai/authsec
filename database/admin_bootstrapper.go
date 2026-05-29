@@ -24,7 +24,7 @@ func (b *AdminBootstrapper) SeedAllTenants() error {
 	}
 
 	log.Println("DEBUG: SeedAllTenants - about to query tenants")
-	rows, err := b.db.Query(`SELECT COALESCE(tenant_id, id) AS tenant_id FROM tenants`)
+	rows, err := b.db.Query(`SELECT id FROM workspaces`)
 	if err != nil {
 		return fmt.Errorf("list tenants: %w", err)
 	}

@@ -600,12 +600,14 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	// Get tenant by domain from database
 	db := config.GetDatabase()
 	var tenant models.Tenant
+	// Phase 6: tenants table dropped; workspaces is the new home.
+	// tenant_db column was for the legacy dynamic-DB feature (removed).
 	query := `
-		SELECT id, workspace_id, tenant_db, email, username, password_hash,
-			provider, provider_id, avatar, name, source, status, last_login,
-			created_at, updated_at, tenant_domain
-		FROM tenants
-		WHERE tenant_domain = $1
+		SELECT id, id AS workspace_id, '' AS tenant_db, email, '' AS username, password_hash,
+			provider, '' AS provider_id, '' AS avatar, name, source, status, NULL::timestamptz AS last_login,
+			created_at, updated_at, workspace_domain
+		FROM workspaces
+		WHERE workspace_domain = $1
 	`
 
 	err = db.QueryRow(query, input.TenantDomain).Scan(
@@ -828,7 +830,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	tenantDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.TenantDomain), config.AppConfig.TenantDomainSuffix)
 	db := config.GetDatabase()
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM tenants WHERE tenant_domain = $1", tenantDomain).Scan(&count)
+	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
 	if err != nil {
 		log.Printf("Failed to check tenant domain existence: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant domain"})
@@ -844,7 +846,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	{
 		db := config.GetDatabase()
 		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM tenants WHERE active = true").Scan(&tenantCount); err == nil && tenantCount > 0 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active'").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
@@ -1652,17 +1654,18 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		return
 	}
 
-	// Check if tenant domain already exists
+	// Check if workspace domain already exists.
+	// Phase 6: tenants table deleted, workspaces.workspace_domain is the new home.
 	db := config.GetDatabase()
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM tenants WHERE tenant_domain = $1", tenantDomain).Scan(&count)
+	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
 	if err != nil {
-		log.Printf("ERROR: Failed to check tenant domain: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant domain"})
+		log.Printf("ERROR: Failed to check workspace domain: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check workspace domain"})
 		return
 	}
 	if count > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Tenant domain already exists"})
+		c.JSON(http.StatusConflict, gin.H{"error": "Workspace domain already exists"})
 		return
 	}
 

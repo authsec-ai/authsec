@@ -714,21 +714,24 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 
 		// Update tenant record with latest sync data
 		now := time.Now()
-		updateQuery := `UPDATE tenants
-			SET username = $1, name = $2, tenant_domain = $3, tenant_db = $4,
-			    source = $5, status = $6, updated_at = $7
-			WHERE email = $8 AND workspace_id = $9`
+		// Phase 6: workspaces is the new tenants. workspace_domain replaces tenant_domain.
+		// tenant_db column gone with the dynamic-DB feature. username column is on users
+		// table, not workspaces — dropped here. id is the PK.
+		updateQuery := `UPDATE workspaces
+			SET name = $1, workspace_domain = $2,
+			    source = $3, status = $4, updated_at = $5
+			WHERE email = $6 AND id = $7`
 
 		db := config.GetDatabase()
 		if db == nil {
 			return fmt.Errorf("database not initialized")
 		}
 
+		// Phase 6: dropped Username (lives on users table, not workspaces) and TenantDB
+		// (legacy dynamic-DB column, removed) — query now has 7 placeholders matching 7 args.
 		_, err := db.DB.Exec(updateQuery,
-			adminUser.Username,
 			adminUser.Name,
 			existingTenant.TenantDomain,
-			existingTenant.TenantDB,
 			existingTenant.Source,
 			existingTenant.Status,
 			now,

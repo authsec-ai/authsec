@@ -89,49 +89,17 @@ func GetMasterDB() *DBConnection {
 	return GlobalConnectionManager.masterDB
 }
 
-// GetTenantDB gets or creates a tenant database connection
+// GetTenantDB is a Phase 6 no-op stub. Dynamic tenant-DB routing was removed
+// when the tenants table was deleted; everything now lives in the single shared
+// master DB (config.DB / GetMasterDB). Kept exported in case external code
+// imports the symbol; returns the master connection to preserve "happy path"
+// behavior for any straggler caller. Logs a warning so the call is visible.
 func GetTenantDB(tenantID string) (*DBConnection, error) {
 	if GlobalConnectionManager == nil {
 		return nil, fmt.Errorf("connection manager not initialized")
 	}
-
-	// Check if we already have a connection
-	if conn, exists := GlobalConnectionManager.tenantConnections[tenantID]; exists {
-		// Test if connection is still alive
-		if err := conn.DB.Ping(); err == nil {
-			return conn, nil
-		}
-		// Connection is dead, remove it
-		delete(GlobalConnectionManager.tenantConnections, tenantID)
-	}
-
-	// Get tenant database name from master database
-	masterDB := GlobalConnectionManager.masterDB
-
-	var tenantDBName sql.NullString
-	query := "SELECT tenant_db FROM tenants WHERE workspace_id::text = $1 OR id::text = $1"
-	err := masterDB.DB.QueryRow(query, tenantID).Scan(&tenantDBName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("tenant not found: %s", tenantID)
-		}
-		return nil, fmt.Errorf("failed to query tenant: %w", err)
-	}
-
-	if !tenantDBName.Valid || tenantDBName.String == "" {
-		return nil, fmt.Errorf("tenant database not configured for tenant %s", tenantID)
-	}
-
-	// Create connection to tenant database
-	tenantConn, err := createTenantConnection(tenantDBName.String)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database '%s': %w", tenantDBName.String, err)
-	}
-
-	// Cache the connection
-	GlobalConnectionManager.tenantConnections[tenantID] = tenantConn
-
-	return tenantConn, nil
+	// Phase 6: no dynamic tenant DBs — return the master connection.
+	return GlobalConnectionManager.masterDB, nil
 }
 
 // createTenantConnection creates a connection to a specific tenant database

@@ -125,7 +125,7 @@ func seedTestAdmin(dbName string, cfg *config.Config) error {
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, workspace_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
 
 	// upsert tenant
-	_, _ = db.Exec(`INSERT INTO tenants (workspace_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, tenantID, "admin@test.local", "test.local", dbName)
+	_, _ = db.Exec(`INSERT INTO workspaces (workspace_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, tenantID, "admin@test.local", "test.local", dbName)
 
 	// upsert admin user
 	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, workspace_id, tenant_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
