@@ -749,7 +749,7 @@ type PermissionCheckResponse struct {
 // Uses role_bindings for role assignments (user_roles is deprecated)
 func GetUserPermissionsInTenant(userID, tenantID string) ([]models.Permission, error) {
 	query := `
-		SELECT DISTINCT p.id, p.tenant_id, p.resource, p.action, p.description, p.created_at, p.updated_at
+		SELECT DISTINCT p.id, p.workspace_id, p.resource, p.action, p.description, p.created_at, p.updated_at
 		FROM permissions p
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
@@ -778,7 +778,7 @@ func GetUserPermissionsInTenant(userID, tenantID string) ([]models.Permission, e
 func GetUserRolePermissionsInTenant(userID, tenantID string) ([]models.Permission, error) {
 	// Uses role_bindings for role assignments (user_roles is deprecated)
 	query := `
-		SELECT DISTINCT p.id, p.tenant_id, p.resource, p.action, p.description, p.created_at, p.updated_at
+		SELECT DISTINCT p.id, p.workspace_id, p.resource, p.action, p.description, p.created_at, p.updated_at
 		FROM permissions p
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id

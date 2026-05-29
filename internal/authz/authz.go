@@ -184,7 +184,7 @@ func hasDBPermission(claims jwt.MapClaims, resource, action string) bool {
 		Joins("JOIN role_permissions rp ON rp.role_id = r.id").
 		Joins("JOIN permissions p ON p.id = rp.permission_id").
 		Where("rb.user_id = ? AND rb.workspace_id = ?", userID, workspaceID).
-		Where("p.workspace_id = ? OR p.tenant_id IS NULL", workspaceID).
+		Where("p.workspace_id = ? OR p.workspace_id IS NULL", workspaceID).
 		Where("(p.resource = ? OR p.resource = '*') AND (p.action = ? OR p.action = '*')", resource, action).
 		Where("rb.expires_at IS NULL OR rb.expires_at > NOW()").
 		Count(&count).Error; err != nil {

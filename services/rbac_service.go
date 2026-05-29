@@ -208,8 +208,8 @@ func (s *RBACService) Check(ctx context.Context, req PDPRequest) (*PolicyCheckRe
 		Joins("JOIN role_permissions rp ON r.id = rp.role_id").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
 		Where("rb.workspace_id = ?", req.WorkspaceID).
-		Where("(r.workspace_id = ? OR r.tenant_id IS NULL)", req.WorkspaceID).
-		Where("(p.workspace_id = ? OR p.tenant_id IS NULL)", req.WorkspaceID).
+		Where("(r.workspace_id = ? OR r.workspace_id IS NULL)", req.WorkspaceID).
+		Where("(p.workspace_id = ? OR p.workspace_id IS NULL)", req.WorkspaceID).
 		Where("(rb.user_id = ? OR rb.service_account_id = ? OR rb.group_id IN (?))", req.PrincipalID, req.PrincipalID, principalGroups).
 		Where("p.resource = ? AND p.action = ?", req.Resource, req.Action).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())")

@@ -1626,7 +1626,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 			rb.role_id, COALESCE(rb.role_name, ro.name, '') AS role_name,
 			rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.tenant_id = rb.tenant_id").
+		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.tenant_id").
 		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = rb.user_id AND teus.tenant_id = rb.tenant_id").
 		Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
@@ -1730,7 +1730,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	var user accessUserRef
 	if err := config.DB.Table("users u").
 		Select("u.id::text AS id, COALESCE(u.email, '') AS email, COALESCE(NULLIF(u.name, ''), u.email, u.username, '') AS name, COALESCE(teus.status, 'active') AS status").
-		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.tenant_id").
+		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.workspace_id").
 		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Take(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found for this tenant"})
@@ -2481,7 +2481,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 		Select(`rb.id, rb.user_id, rb.username, COALESCE(u.email, '') AS user_email,
 			rb.role_id, rb.role_name, rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.tenant_id = rb.tenant_id").
+		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.tenant_id").
 		Where("rb.workspace_id = ?", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
@@ -3044,7 +3044,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	var userStatus string
 	if err := config.DB.Table("users u").
 		Select("COALESCE(teus.status, 'active')").
-		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.tenant_id").
+		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.workspace_id").
 		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Scan(&userStatus).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})

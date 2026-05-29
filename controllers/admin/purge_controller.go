@@ -63,12 +63,12 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 	// ── 1. Look up user + tenant ──────────────────────────────────────────────
 	var userID, tenantID, tenantDB, tenantDomain, vaultMount string
 	row := db.Raw(`
-		SELECT u.id, u.tenant_id,
+		SELECT u.id, u.workspace_id,
 		       COALESCE(t.tenant_db, ''),
 		       COALESCE(t.tenant_domain, ''),
 		       COALESCE(t.vault_mount, '')
 		FROM users u
-		LEFT JOIN tenants t ON t.tenant_id = u.tenant_id
+		LEFT JOIN tenants t ON t.workspace_id = u.workspace_id
 		WHERE LOWER(u.email) = ?
 		LIMIT 1`, email).Row()
 	if err := row.Scan(&userID, &tenantID, &tenantDB, &tenantDomain, &vaultMount); err != nil {

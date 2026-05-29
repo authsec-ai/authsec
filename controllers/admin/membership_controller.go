@@ -108,7 +108,7 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 			u.last_login AS user_last_login
 		`).
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
-		Joins("LEFT JOIN users u ON u.tenant_id = wm.workspace_id AND u.id = wm.user_id").
+		Joins("LEFT JOIN users u ON u.workspace_id = wm.workspace_id AND u.id = wm.user_id").
 		Where("wm.workspace_id = ?", tenantID)
 	if s := c.Query("status"); s != "" {
 		q = q.Where("wm.status = ?", s)
@@ -154,7 +154,7 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 			u.last_login AS user_last_login
 		`).
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
-		Joins("LEFT JOIN users u ON u.tenant_id = wm.workspace_id AND u.id = wm.user_id").
+		Joins("LEFT JOIN users u ON u.workspace_id = wm.workspace_id AND u.id = wm.user_id").
 		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
 		Take(&row).Error
 	if err != nil {
@@ -443,7 +443,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 
 	q := mc.db.Table("tenant_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
-		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
+		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
 		Where("s.workspace_id = ?", tenantID)
 	if v := c.Query("status"); v != "" {
 		q = q.Where("s.status = ?", v)
@@ -483,7 +483,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 	var row map[string]interface{}
 	err := mc.db.Table("tenant_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
-		Joins("LEFT JOIN users u ON u.tenant_id = s.tenant_id AND u.id = s.user_id").
+		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
 		Where("s.workspace_id = ? AND s.user_id = ?", tenantID, userID).
 		Take(&row).Error
 	if err != nil {

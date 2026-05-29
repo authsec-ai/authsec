@@ -44,7 +44,7 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(tenantID uuid.U
 	// Build query with optional provider filter
 	queryBase := `
 		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
-		       u.client_id, u.tenant_id, u.project_id, u.tenant_domain, u.provider,
+		       u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
 		       COALESCE(u.provider_id, '') AS provider_id,
 		       COALESCE(u.provider_data, '{}'::jsonb) AS provider_data,
 		       COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
@@ -217,8 +217,8 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UU
 	query := `
 		SELECT u.id
 		FROM users u
-		JOIN tenants t ON t.tenant_id::text = u.tenant_id::text
-		WHERE u.tenant_id::text = $1
+		JOIN tenants t ON t.workspace_id::text = u.workspace_id::text
+		WHERE u.workspace_id::text = $1
 		  AND LOWER(u.email) = LOWER(t.email)
 		LIMIT 1
 	`
@@ -455,7 +455,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.tenant_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -636,7 +636,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 	// First try with role_bindings (user has admin role)
 	queryWithRole := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.tenant_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -663,7 +663,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 	if err == sql.ErrNoRows {
 		queryWithoutRole := `
 			SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-				u.client_id, u.tenant_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+				u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 				u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 				u.avatar_url, u.active, u.mfa_enabled,
 				COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -842,7 +842,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 func (aur *AdminUserRepository) GetAdminUserByID(id uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.tenant_id, u.project_id, u.tenant_domain, u.provider,
+			u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
 			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
@@ -965,7 +965,7 @@ func (aur *AdminUserRepository) UpdateAdminUserActiveStatus(id uuid.UUID, active
 func (aur *AdminUserRepository) GetAllAdminUsers() ([]models.AdminUser, error) {
 	query := `
 		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.tenant_id, u.project_id, u.tenant_domain, u.provider,
+			u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
 			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
@@ -1060,7 +1060,7 @@ func (aur *AdminUserRepository) VerifyPassword(email, password string) (*models.
 func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenantID uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.tenant_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -1234,7 +1234,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	// Query user without requiring admin role (for precheck purposes)
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.tenant_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,

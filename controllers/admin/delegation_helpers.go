@@ -230,7 +230,7 @@ func getTenantPermissionStrings(tenantID string) ([]string, error) {
 		FROM permissions p
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN roles r ON rp.role_id = r.id
-		WHERE r.tenant_id::text = $1
+		WHERE r.workspace_id::text = $1
 		ORDER BY 1
 	`
 	rows, err := masterDB.DB.Query(query, tenantID)

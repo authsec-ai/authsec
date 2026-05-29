@@ -248,7 +248,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Where("(rb.tenant_id IS NULL OR rb.workspace_id = ?)", tenantUUID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(ro.tenant_id IS NULL OR ro.workspace_id = ?)", tenantUUID).
-		Where("(p.tenant_id IS NULL OR p.workspace_id = ?)", tenantUUID).
+		Where("(p.workspace_id IS NULL OR p.workspace_id = ?)", tenantUUID).
 		Where("os.workspace_id = ? AND os.resource_server_id = ?", tenantUUID, rsUUID).
 		Where(`
 			rb.scope_type IS NULL
