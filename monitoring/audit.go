@@ -45,9 +45,12 @@ func NewAuditLogger(db *gorm.DB) *AuditLogger {
 	}
 }
 
-// InitAuditTable creates the audit_events table if it doesn't exist
+// InitAuditTable is a deliberate no-op: the audit_events table is created by
+// migrations/master/001_bootstrap.sql. GORM AutoMigrate is reserved for
+// migration_logs only (see cmd/main.go and CLAUDE.md). Kept as a no-op for
+// API compatibility; any caller that depended on it will continue to compile.
 func (al *AuditLogger) InitAuditTable() error {
-	return al.db.AutoMigrate(&AuditEvent{})
+	return nil
 }
 
 // LogEvent logs an audit event

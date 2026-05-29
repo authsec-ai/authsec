@@ -137,11 +137,10 @@ func main() {
 		}
 	}
 
-	// Audit logger
+	// Audit logger. The audit_events table is owned by 001_bootstrap.sql — do NOT
+	// AutoMigrate it (violates the GORM/SQL ownership rule and races with the
+	// bootstrap CREATE TABLE on first boot, causing "already exists" failures).
 	auditLogger := monitoring.NewAuditLogger(config.DB)
-	if err := auditLogger.InitAuditTable(); err != nil {
-		monitoring.GetLogger().WithError(err).Fatal("Failed to initialize audit table")
-	}
 
 	config.CacheManager = cacheManager
 	config.AuditLogger = auditLogger
