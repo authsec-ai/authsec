@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -577,16 +578,17 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 			reason = "rs_pending_scan"
 		}
 		c.JSON(http.StatusOK, gin.H{
-			"state":           rs.State,
-			"policy_complete": false,
-			"reason":          reason,
-			"rs_id":           rs.ID.String(),
-			"generation":      rs.LastSuccessfulGeneration,
-			"tools":           gin.H{},
-			"tool_policy":     []interface{}{},
-			"tool_metadata":   gin.H{},
-			"fetched_at":      time.Now().UTC().Format(time.RFC3339),
-			"ttl_seconds":     60,
+			"state":            rs.State,
+			"policy_complete":  false,
+			"reason":           reason,
+			"rs_id":            rs.ID.String(),
+			"generation":       rs.LastSuccessfulGeneration,
+			"scopes_supported": []string{},
+			"tools":            gin.H{},
+			"tool_policy":      []interface{}{},
+			"tool_metadata":    gin.H{},
+			"fetched_at":       time.Now().UTC().Format(time.RFC3339),
+			"ttl_seconds":      60,
 		})
 		return
 	}
@@ -663,17 +665,37 @@ func (ctrl *ScopeMatrixController) SDKPolicy(c *gin.Context) {
 		}
 	}
 
+	// scopes_supported: the authoritative list of scopes this RS publishes.
+	// The SDK uses this to build the PRM (.well-known/oauth-protected-resource)
+	// scopes_supported field — making AuthSec the single source of truth.
+	// Admin adds/removes a scope in the AuthSec UI → SDK picks it up on next
+	// matrix refresh (TTL ≤ 5 min) → PRM auto-updates → OAuth client sees it.
+	var scopesSupported []string
+	if err := config.DB.Model(&models.OAuthScope{}).
+		Where("workspace_id = ? AND resource_server_id = ?", rs.WorkspaceID, rs.ID).
+		Order("scope_string ASC").
+		Pluck("scope_string", &scopesSupported).Error; err != nil {
+		// Soft-fail: log and serve an empty list rather than 500. The SDK
+		// caches the previous value and the PRM keeps working.
+		log.Printf("[SDKPolicy] scopes_supported pluck failed rs=%s: %v", rs.ID, err)
+		scopesSupported = []string{}
+	}
+	if scopesSupported == nil {
+		scopesSupported = []string{}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"state":           rs.State,
-		"policy_complete": true,
-		"reason":          "",
-		"rs_id":           rs.ID.String(),
-		"generation":      rs.LastSuccessfulGeneration,
-		"tools":           toolMap,
-		"tool_policy":     toolPolicyArr,
-		"tool_metadata":   toolMeta,
-		"fetched_at":      time.Now().UTC().Format(time.RFC3339),
-		"ttl_seconds":     300,
+		"state":            rs.State,
+		"policy_complete":  true,
+		"reason":           "",
+		"rs_id":            rs.ID.String(),
+		"generation":       rs.LastSuccessfulGeneration,
+		"scopes_supported": scopesSupported,
+		"tools":            toolMap,
+		"tool_policy":      toolPolicyArr,
+		"tool_metadata":    toolMeta,
+		"fetched_at":       time.Now().UTC().Format(time.RFC3339),
+		"ttl_seconds":      300,
 	})
 }
 
