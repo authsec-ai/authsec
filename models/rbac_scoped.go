@@ -68,7 +68,7 @@ func (RolePermission) TableName() string {
 // ServiceAccount represents a non-human identity
 type ServiceAccount struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_sa_tenant_id"`
+	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_sa_workspace_id"`
 	Name        string     `json:"name" gorm:"type:text;not null"`
 	Description string     `json:"description" gorm:"type:text"`
 	CreatedAt   time.Time  `json:"created_at"`

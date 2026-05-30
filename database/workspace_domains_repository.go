@@ -73,7 +73,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 	// Check if domain is already claimed by another tenant
 	var existingTenantID uuid.UUID
 	err := tdr.db.QueryRow(
-		"SELECT workspace_id FROM tenant_domains WHERE domain = $1",
+		"SELECT workspace_id FROM workspace_domains WHERE domain = $1",
 		domain,
 	).Scan(&existingTenantID)
 	if err != nil && err != sql.ErrNoRows {
@@ -98,7 +98,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 	kind := "custom"
 
 	query := `
-		INSERT INTO tenant_domains (
+		INSERT INTO workspace_domains (
 			id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
 			verification_txt_value, created_at, updated_at, created_by
@@ -147,7 +147,7 @@ func (tdr *TenantDomainsRepository) GetDomainByID(id uuid.UUID) (*TenantDomain, 
 			verification_method, verification_token, verification_txt_name,
 			verification_txt_value, verified_at, last_checked_at, failure_reason,
 			created_at, updated_at, created_by, updated_by
-		FROM tenant_domains
+		FROM workspace_domains
 		WHERE id = $1
 	`
 
@@ -177,7 +177,7 @@ func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*Tenan
 			verification_method, verification_token, verification_txt_name,
 			verification_txt_value, verified_at, last_checked_at, failure_reason,
 			created_at, updated_at, created_by, updated_by
-		FROM tenant_domains
+		FROM workspace_domains
 		WHERE domain = $1 AND is_verified = true
 		LIMIT 1
 	`
@@ -206,7 +206,7 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(tenantID uuid.UUID) ([]Ten
 			verification_method, verification_token, verification_txt_name,
 			verification_txt_value, verified_at, last_checked_at, failure_reason,
 			created_at, updated_at, created_by, updated_by
-		FROM tenant_domains
+		FROM workspace_domains
 		WHERE workspace_id = $1
 		ORDER BY is_primary DESC, created_at DESC
 	`
@@ -242,7 +242,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(tenantID uuid.UUI
 			verification_method, verification_token, verification_txt_name,
 			verification_txt_value, verified_at, last_checked_at, failure_reason,
 			created_at, updated_at, created_by, updated_by
-		FROM tenant_domains
+		FROM workspace_domains
 		WHERE workspace_id = $1 AND is_primary = true
 		LIMIT 1
 	`
@@ -269,7 +269,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(tenantID uuid.UUI
 func (tdr *TenantDomainsRepository) VerifyDomain(id uuid.UUID, updatedBy *uuid.UUID) error {
 	now := time.Now()
 	query := `
-		UPDATE tenant_domains
+		UPDATE workspace_domains
 		SET is_verified = true, verified_at = $1, updated_at = $1, updated_by = $2
 		WHERE id = $3
 	`
@@ -296,7 +296,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUI
 
 	// First, unset all other primary domains for this tenant
 	query1 := `
-		UPDATE tenant_domains
+		UPDATE workspace_domains
 		SET is_primary = false, updated_at = $1, updated_by = $2
 		WHERE workspace_id = $3 AND is_primary = true
 	`
@@ -307,7 +307,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUI
 
 	// Then set this one as primary
 	query2 := `
-		UPDATE tenant_domains
+		UPDATE workspace_domains
 		SET is_primary = true, updated_at = $1, updated_by = $2
 		WHERE id = $3 AND workspace_id = $4
 	`
@@ -329,7 +329,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUI
 
 // DeleteDomain soft-deletes (or hard-deletes) a domain
 func (tdr *TenantDomainsRepository) DeleteDomain(id uuid.UUID) error {
-	query := `DELETE FROM tenant_domains WHERE id = $1`
+	query := `DELETE FROM workspace_domains WHERE id = $1`
 	result, err := tdr.db.Exec(query, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete domain: %w", err)
@@ -350,7 +350,7 @@ func (tdr *TenantDomainsRepository) DeleteDomain(id uuid.UUID) error {
 func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(tenantID uuid.UUID) ([]string, error) {
 	query := `
 		SELECT domain
-		FROM tenant_domains
+		FROM workspace_domains
 		WHERE workspace_id = $1 AND is_verified = true
 		ORDER BY is_primary DESC
 	`
@@ -377,7 +377,7 @@ func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(tenantID uuid.UU
 func (tdr *TenantDomainsRepository) UpdateVerificationStatus(id uuid.UUID, isVerified bool, failureReason *string) error {
 	now := time.Now()
 	query := `
-		UPDATE tenant_domains
+		UPDATE workspace_domains
 		SET is_verified = $1, last_checked_at = $2, failure_reason = $3, updated_at = $2
 		WHERE id = $4
 	`
@@ -404,7 +404,7 @@ func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(tenantID uuid.UUID, ho
 
 	var count int
 	err := tdr.db.QueryRow(
-		"SELECT COUNT(*) FROM tenant_domains WHERE workspace_id = $1 AND domain = $2 AND is_verified = true",
+		"SELECT COUNT(*) FROM workspace_domains WHERE workspace_id = $1 AND domain = $2 AND is_verified = true",
 		tenantID, hostname,
 	).Scan(&count)
 	if err != nil {

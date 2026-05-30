@@ -35,7 +35,7 @@ type TenantDeviceToken struct {
 
 // TableName specifies the table name for TenantDeviceToken
 func (TenantDeviceToken) TableName() string {
-	return "tenant_device_tokens"
+	return "workspace_device_tokens"
 }
 
 // ========================================
@@ -77,7 +77,7 @@ type TenantCIBAAuthRequest struct {
 
 // TableName specifies the table name for TenantCIBAAuthRequest
 func (TenantCIBAAuthRequest) TableName() string {
-	return "tenant_ciba_auth_requests"
+	return "workspace_ciba_auth_requests"
 }
 
 // IsExpired checks if the CIBA request has expired
@@ -124,7 +124,7 @@ type TenantTOTPSecret struct {
 
 // TableName specifies the table name for TenantTOTPSecret
 func (TenantTOTPSecret) TableName() string {
-	return "tenant_totp_secrets"
+	return "workspace_totp_secrets"
 }
 
 // TenantBackupCode represents a recovery backup code for TOTP in tenant DB
@@ -140,7 +140,7 @@ type TenantBackupCode struct {
 
 // TableName specifies the table name for TenantBackupCode
 func (TenantBackupCode) TableName() string {
-	return "tenant_totp_backup_codes"
+	return "workspace_totp_backup_codes"
 }
 
 // ========================================
@@ -166,7 +166,7 @@ type TenantDeviceTokenRegistrationResponse struct {
 
 // TenantCIBAInitiateRequest - Initiate CIBA authentication for tenant user
 type TenantCIBAInitiateRequest struct {
-	ClientID       string   `json:"client_id" binding:"required"`   // Maps to tenant
+	ClientID       string   `json:"client_id"` // legacy: workspace now resolved from host/JWT
 	Email          string   `json:"email" binding:"required,email"` // User email
 	TenantDomain   string   `json:"tenant_domain"`                  // Optional: For validation if provided
 	BindingMessage string   `json:"binding_message,omitempty"`      // Message shown to user
@@ -199,7 +199,7 @@ type TenantCIBARespondResponse struct {
 // TenantCIBATokenRequest - Client polls for token
 type TenantCIBATokenRequest struct {
 	AuthReqID string `json:"auth_req_id" binding:"required"`
-	ClientID  string `json:"client_id" binding:"required"`
+	ClientID  string `json:"client_id"`
 }
 
 // TenantCIBATokenResponse - Returns token or status
@@ -215,7 +215,7 @@ type TenantCIBATokenResponse struct {
 
 // TenantTOTPLoginRequest represents a TOTP login for tenant user
 type TenantTOTPLoginRequest struct {
-	ClientID     string `json:"client_id" binding:"required"`       // Maps to tenant
+	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
 	Email        string `json:"email" binding:"required,email"`     // User email
 	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
 	TenantDomain string `json:"tenant_domain"`                      // For validation
@@ -279,7 +279,7 @@ type TenantTOTPDeviceDeleteResponse struct {
 // TenantTOTPDeviceApprovalRequest approves device code using TOTP in tenant context
 type TenantTOTPDeviceApprovalRequest struct {
 	UserCode     string `json:"user_code" binding:"required"`       // Device user code to approve
-	ClientID     string `json:"client_id" binding:"required"`       // Maps to tenant
+	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
 	Email        string `json:"email" binding:"required,email"`     // User email (to find user and validate TOTP)
 	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code from authenticator app
 	TenantDomain string `json:"tenant_domain" binding:"required"`   // For validation

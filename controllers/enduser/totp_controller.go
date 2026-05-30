@@ -553,7 +553,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// Get user by email
+	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
 	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
@@ -620,7 +620,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 		return
 	}
 
-	// Get user by email
+	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
 	user, err := ctrl.userRepo.GetUserByEmail(req.Email)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})

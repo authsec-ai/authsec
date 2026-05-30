@@ -101,7 +101,7 @@ func (VoiceIdentityLink) TableName() string {
 
 // VoiceInitiateRequest represents a request to initiate voice authentication
 type VoiceInitiateRequest struct {
-	ClientID      string                 `json:"client_id" binding:"required"` // Used to lookup tenant via tenant_mappings
+	ClientID      string                 `json:"client_id"` // legacy: workspace now from JWT/host
 	VoicePlatform string                 `json:"voice_platform,omitempty"`     // 'alexa', 'google', 'siri', 'web'
 	VoiceUserID   string                 `json:"voice_user_id,omitempty"`      // Platform-specific user ID
 	DeviceInfo    map[string]interface{} `json:"device_info,omitempty"`        // Optional device metadata
@@ -349,7 +349,7 @@ type VoicePendingRequestsResponse struct {
 
 // VoiceCheckPendingRequest represents request to check for pending voice auths
 type VoiceCheckPendingRequest struct {
-	ClientID string `json:"client_id" binding:"required"` // Client ID to check for pending requests
+	ClientID string `json:"client_id"` // legacy: workspace now from JWT/host
 }
 
 // VoiceApproveRequest represents a request to approve/deny a voice auth

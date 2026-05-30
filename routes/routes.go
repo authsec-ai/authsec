@@ -80,8 +80,6 @@ func SetupRoutes(
 	if err != nil {
 		log.Fatalf("Failed to initialize end-user auth controller: %v", err)
 	}
-	projectController := &adminCtrl.ProjectController{}
-
 	// Scoped RBAC Controllers
 	rolesScopedBindingsController := adminCtrl.NewRolesScopedBindingsController()
 	authController := platformCtrl.NewAuthorizationController()
@@ -174,12 +172,9 @@ func SetupRoutes(
 
 	// ── Inject merged SPIRE services into controllers that need them ──
 	if spireDeps != nil {
-		// Agent controllers (admin + platform)
+		// Agent controller (admin). The platform agent controller was unrouted
+		// dead code (RESIDUAL #40) and has been removed.
 		agentController.SetJWTSVIDService(spireDeps.JWTSVIDSvc)
-
-		platformAgentController := platformCtrl.NewAgentController()
-		platformAgentController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc)
-		_ = platformAgentController // used in platform routes below
 
 		// Delegation policy controllers (admin + platform)
 		delegationPolicyController.SetServices(spireDeps.WorkloadEntrySvc, spireDeps.JWTSVIDSvc, spireDeps.AgentSvc)
@@ -643,10 +638,6 @@ func SetupRoutes(
 			enduserAuth.Use(middlewares.StrictAuthRateLimitMiddleware(10, time.Minute))
 			{
 				enduserAuth.GET("/challenge", endUserAuthController.GetAuthChallenge)
-				enduserAuth.POST("/initiate-registration", endUserAuthController.InitiateRegistration)
-				enduserAuth.POST("/verify-otp", endUserAuthController.VerifyOTPAndCompleteRegistration)
-				enduserAuth.POST("/login/precheck", endUserAuthController.EndUserLoginPrecheck)
-				enduserAuth.POST("/login", endUserAuthController.Login)
 				enduserAuth.POST("/webauthn-callback", endUserAuthController.WebAuthnCallback)
 				enduserAuth.POST("/delegate-svid", spiffeDelegateController.DelegateSVID)
 			}
@@ -781,9 +772,7 @@ func SetupRoutes(
 		{
 			adminPlatform.GET("/oidc/providers", oidcController.GetAllProviders)
 			adminPlatform.PUT("/oidc/providers/:provider", oidcController.UpdateProvider)
-			adminPlatform.POST("/projects", projectController.CreateProject)
-			adminPlatform.GET("/projects", projectController.ListProjects)
-			adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
+adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			adminPlatform.POST("/groups", groupController.AddUserDefinedGroups)
 			adminPlatform.POST("/groups/map", groupController.MapGroupsToClient)
 			adminPlatform.POST("/groups/list", groupController.ListTenantGroupsForAdmin)
@@ -906,9 +895,6 @@ func SetupRoutes(
 
 		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
 		{
-			user.POST("/clients/register", endUserController.RegisterClient)
-			user.GET("/clients", endUserController.GetClients)
-			user.POST("/clients/get", endUserController.GetClientsPost)
 			user.GET("/enduser/:workspace_id/:user_id", endUserController.GetEndUser)
 			user.POST("/enduser/list", endUserController.GetEndUsers)
 			user.GET("/enduser/list", endUserController.GetEndUsers)

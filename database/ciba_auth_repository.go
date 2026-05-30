@@ -38,7 +38,7 @@ func (r *CIBAAuthRepository) CreateDeviceToken(token *models.DeviceToken) error 
 		ON CONFLICT (device_token)
 		DO UPDATE SET
 			user_id = EXCLUDED.user_id,
-			workspace_id = EXCLUDED.tenant_id,
+			workspace_id = EXCLUDED.workspace_id,
 			device_name = EXCLUDED.device_name,
 			device_model = EXCLUDED.device_model,
 			app_version = EXCLUDED.app_version,

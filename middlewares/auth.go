@@ -10,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	authz "github.com/authsec-ai/authsec/internal/authz"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -415,7 +416,6 @@ func validateAudience(aud interface{}, expected string) bool {
 type UserInfo struct {
 	WorkspaceID           string
 	WorkspaceMembershipID string
-	ProjectID             string
 	ClientID              string
 	UserID                string
 	Email                 string
@@ -450,9 +450,6 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 	info.WorkspaceID = workspaceClaim
 	if v, ok := claimsMap["workspace_membership_id"].(string); ok {
 		info.WorkspaceMembershipID = v
-	}
-	if v, ok := claimsMap["project_id"].(string); ok {
-		info.ProjectID = v
 	}
 	if v, ok := claimsMap["client_id"].(string); ok {
 		info.ClientID = v
@@ -646,12 +643,24 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 	}
 
 	userRepo := database.NewUserRepository(dbConn)
-	user, err := userRepo.GetUserByEmail(email)
-	if err != nil || user == nil {
-		if err == nil {
-			err = fmt.Errorf("user not found")
+
+	// Use workspace-scoped lookup when workspace_id is available to avoid
+	// returning the wrong user in multi-workspace deployments.
+	var user *models.ExtendedUser
+	var lookupErr error
+	if wsID := getContextString(c, "workspace_id"); wsID != "" {
+		if wsUUID, parseErr := uuid.Parse(wsID); parseErr == nil {
+			user, lookupErr = userRepo.GetUserByEmailAndTenant(email, wsUUID)
 		}
-		return "", fmt.Errorf("failed to resolve user by email: %w", err)
+	}
+	if user == nil {
+		user, lookupErr = userRepo.GetUserByEmail(email)
+	}
+	if lookupErr != nil || user == nil {
+		if lookupErr == nil {
+			lookupErr = fmt.Errorf("user not found")
+		}
+		return "", fmt.Errorf("failed to resolve user by email: %w", lookupErr)
 	}
 
 	userID := strings.TrimSpace(user.ID.String())
@@ -681,9 +690,6 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 	}
 	if user.WorkspaceID != uuid.Nil && userInfo.WorkspaceID == "" {
 		userInfo.WorkspaceID = user.WorkspaceID.String()
-	}
-	if user.ProjectID != uuid.Nil && userInfo.ProjectID == "" {
-		userInfo.ProjectID = user.ProjectID.String()
 	}
 	if user.ClientID != uuid.Nil && userInfo.ClientID == "" {
 		userInfo.ClientID = user.ClientID.String()
@@ -822,11 +828,6 @@ func normalizeUserInfoContext(c *gin.Context) {
 			userInfo.ClientID = clientID
 		}
 	}
-	if userInfo.ProjectID == "" {
-		if projectID := getContextString(c, "project_id"); projectID != "" {
-			userInfo.ProjectID = projectID
-		}
-	}
 
 	c.Set("user_info", userInfo)
 }
@@ -866,7 +867,6 @@ func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) 
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
 	}
-	c.Set("project_id", userInfo.ProjectID)
 	c.Set("client_id", userInfo.ClientID)
 	c.Set("user_id", userInfo.UserID)
 	c.Set("email", userInfo.Email)
@@ -955,9 +955,6 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		// Extract and set individual claims
 		if workspaceID, ok := claims["workspace_id"].(string); ok {
 			c.Set("workspace_id", workspaceID)
-		}
-		if projectID, ok := claims["project_id"].(string); ok {
-			c.Set("project_id", projectID)
 		}
 		if clientID, ok := claims["client_id"].(string); ok {
 			c.Set("client_id", clientID)

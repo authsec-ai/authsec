@@ -37,33 +37,17 @@ type EndUserWebAuthnHandler struct {
 	RPOrigins      []string
 }
 
-// resolveDB provides database connection for end-user operations (tenant-specific)
+// resolveDB provides the database connection for end-user operations.
+// Single-DB mode: there is no per-tenant database — everything lives in the
+// one global DB (config.DB).
 func (h *EndUserWebAuthnHandler) resolveDB(tenantID string) (*gorm.DB, error) {
 	if tenantID == "" {
-		return nil, fmt.Errorf("tenant id is required")
+		return nil, fmt.Errorf("workspace id is required")
 	}
-
-	// Allow direct DB name usage (e.g., tenant_<uuid>) to support legacy callers
-	if strings.HasPrefix(tenantID, "tenant_") {
-		return config.ConnectTenantDB(tenantID)
+	if config.DB != nil {
+		return config.DB, nil
 	}
-
-	globalDB, err := config.ConnectGlobalDB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to global DB: %w", err)
-	}
-
-	globalRepo := repositories.NewGlobalRepository(globalDB)
-	tenant, err := globalRepo.GetTenantByID(tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve tenant %s: %w", tenantID, err)
-	}
-
-	if tenant.TenantDB == "" {
-		return nil, fmt.Errorf("tenant %s does not have a configured database name", tenantID)
-	}
-
-	return config.ConnectTenantDB(tenant.TenantDB)
+	return config.ConnectGlobalDB()
 }
 
 // getTenantSessionManager creates a tenant-specific session manager
@@ -93,7 +77,7 @@ func (h *EndUserWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context)
 		globalDB, err := config.ConnectGlobalDB()
 		if err == nil {
 			var count int64
-			err := globalDB.Table("tenant_domains").
+			err := globalDB.Table("workspace_domains").
 				Where("domain = ? AND is_verified = true", domain).
 				Count(&count).Error
 
@@ -106,7 +90,7 @@ func (h *EndUserWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context)
 				)
 				return dynamicWebAuthn, nil
 			}
-			log.Printf("EndUserWebAuthn validateOrigin: Domain %s not found in tenant_domains or not verified", domain)
+			log.Printf("EndUserWebAuthn validateOrigin: Domain %s not found in workspace_domains or not verified", domain)
 		} else {
 			log.Printf("EndUserWebAuthn validateOrigin: Failed to connect to global DB: %v", err)
 		}
@@ -133,8 +117,8 @@ func (h *EndUserWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context)
 func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 	var req struct {
 		WorkspaceID string  `json:"workspace_id" binding:"required"`
-		Email    string  `json:"email" binding:"required"`
-		ClientID *string `json:"client_id"` // Optional
+		Email       string  `json:"email" binding:"required"`
+		ClientID    *string `json:"client_id"` // Optional
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -174,7 +158,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	var req struct {
 		WorkspaceID string `json:"workspace_id" binding:"required"`
-		Email    string `json:"email" binding:"required"`
+		Email       string `json:"email" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -375,8 +359,8 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 	var req struct {
 		WorkspaceID string `json:"workspace_id" binding:"required"`
-		Email    string `json:"email" binding:"required"`
-		ClientID string `json:"client_id" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		ClientID    string `json:"client_id" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -415,14 +399,14 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 			// Create new user
 			newUser := &sharedmodels.User{
-				ID:        uuid.New(),
-				ClientID:  clientUUID,
-				WorkspaceID:  tenantUUID,
-				Email:     req.Email,
-				Active:    true,
-				Provider:  "local",
-				CreatedAt: time.Now(),
-				UpdatedAt: time.Now(),
+				ID:          uuid.New(),
+				ClientID:    clientUUID,
+				WorkspaceID: tenantUUID,
+				Email:       req.Email,
+				Active:      true,
+				Provider:    "local",
+				CreatedAt:   time.Now(),
+				UpdatedAt:   time.Now(),
 			}
 
 			if err := tenantDB.Create(newUser).Error; err != nil {
@@ -513,10 +497,10 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 // @Router       /webauthn/enduser/finishRegistration [post]
 func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	var req struct {
-		WorkspaceID   string          `json:"workspace_id" binding:"required"`
-		Email      string          `json:"email" binding:"required"`
-		ClientID   string          `json:"client_id" binding:"required"`
-		Credential json.RawMessage `json:"credential" binding:"required"`
+		WorkspaceID string          `json:"workspace_id" binding:"required"`
+		Email       string          `json:"email" binding:"required"`
+		ClientID    string          `json:"client_id" binding:"required"`
+		Credential  json.RawMessage `json:"credential" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -725,7 +709,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"workspace_id":     req.WorkspaceID,
+		"workspace_id":  req.WorkspaceID,
 	})
 
 	log.Printf("[%s] FinishRegistration: Completed successfully", reqID)
@@ -753,8 +737,8 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 
 	var req struct {
 		WorkspaceID string  `json:"workspace_id" binding:"required"`
-		Email    string  `json:"email" binding:"required"`
-		ClientID *string `json:"client_id"` // Optional
+		Email       string  `json:"email" binding:"required"`
+		ClientID    *string `json:"client_id"` // Optional
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -855,10 +839,10 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 // @Router       /webauthn/enduser/finishAuthentication [post]
 func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	var req struct {
-		WorkspaceID   string          `json:"workspace_id" binding:"required"`
-		Email      string          `json:"email" binding:"required"`
-		ClientID   *string         `json:"client_id"` // Optional
-		Credential json.RawMessage `json:"credential" binding:"required"`
+		WorkspaceID string          `json:"workspace_id" binding:"required"`
+		Email       string          `json:"email" binding:"required"`
+		ClientID    *string         `json:"client_id"` // Optional
+		Credential  json.RawMessage `json:"credential" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1032,7 +1016,7 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "authenticate", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
 		"user_type":     "enduser",
-		"workspace_id":     req.WorkspaceID,
+		"workspace_id":  req.WorkspaceID,
 		"email":         user.Email,
 	})
 

@@ -450,7 +450,6 @@ func (s *VoiceAuthService) generateJWTTokenWithSession(
 	// Phase 6: workspace_id is the only identity claim.
 	claims := jwt.MapClaims{
 		"workspace_id":   tenant.ID.String(),
-		"project_id":     tenant.ID.String(),
 		"client_id":      user.ClientID.String(),
 		"email":          user.Email,
 		"sub":            user.ID.String(),

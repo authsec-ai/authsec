@@ -1485,7 +1485,7 @@ func extractContextIDFromToken(accessToken string) string {
 func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1520,7 +1520,7 @@ func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1587,7 +1587,7 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 func (ctrl *OAuthASController) requireAuthenticatedUserContext(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("tenant_id required in JWT")
+		return uuid.Nil, uuid.Nil, fmt.Errorf("workspace_id required in JWT")
 	}
 
 	userIDStr, err := middlewares.ResolveUserID(c)

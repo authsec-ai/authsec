@@ -79,7 +79,7 @@ func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID u
 	var count int64
 	err = db.WithContext(ctx).
 		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
+		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
 		Where("role_bindings.workspace_id = ?", tenantID).
@@ -99,7 +99,7 @@ func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID,
 
 	query := db.WithContext(ctx).
 		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
+		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
 		Where("role_bindings.workspace_id = ?", tenantID).
@@ -150,7 +150,7 @@ func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UU
 	var count int64
 	err = db.WithContext(ctx).
 		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
+		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
@@ -168,7 +168,7 @@ func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID
 	var count int64
 	err = db.WithContext(ctx).
 		Table("role_bindings").
-		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.tenant_id = roles.tenant_id").
+		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
@@ -191,7 +191,7 @@ func (r *rbacRepository) GetUserPermissions(ctx context.Context, tenantID, userI
 		Distinct("permissions.*").
 		Joins("JOIN role_permissions ON permissions.id = role_permissions.permission_id").
 		Joins("JOIN roles ON role_permissions.role_id = roles.id").
-		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
+		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.workspace_id = role_bindings.workspace_id").
 		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
@@ -209,7 +209,7 @@ func (r *rbacRepository) GetUserRoles(ctx context.Context, tenantID, userID uuid
 	err = db.WithContext(ctx).
 		Table("roles").
 		Distinct("roles.*").
-		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.tenant_id = role_bindings.tenant_id").
+		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.workspace_id = role_bindings.workspace_id").
 		Where("role_bindings.workspace_id = ?", tenantID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).

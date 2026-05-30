@@ -17,8 +17,8 @@ type ADSyncConfig struct {
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
 	WorkspaceID  string        `json:"workspace_id" binding:"required"`
-	ClientID  string        `json:"client_id" binding:"required"`
-	ProjectID string        `json:"project_id" binding:"required"`
+	ClientID  string        `json:"client_id"`
+	ProjectID string        `json:"project_id"`
 	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
 	Config    *ADSyncConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
 	DryRun    bool          `json:"dry_run,omitempty"`   // Preview changes without applying
@@ -51,8 +51,8 @@ type ADUser struct {
 // AgentSyncRequest represents the request from AD Agent
 type AgentSyncRequest struct {
 	WorkspaceID  string          `json:"workspace_id" binding:"required"`
-	ProjectID string          `json:"project_id" binding:"required"`
-	ClientID  string          `json:"client_id" binding:"required"`
+	ProjectID string          `json:"project_id"`
+	ClientID  string          `json:"client_id"`
 	Users     []AgentUserData `json:"users" binding:"required"`
 	DryRun    bool            `json:"dry_run,omitempty"`
 }

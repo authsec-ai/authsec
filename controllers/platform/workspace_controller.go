@@ -40,13 +40,6 @@ func (wc *WorkspaceController) SwitchWorkspace(c *gin.Context) {
 		return
 	}
 
-	projectID := workspaceID
-	if raw, ok := mapClaims["project_id"].(string); ok {
-		if parsed, err := uuid.Parse(raw); err == nil {
-			projectID = parsed
-		}
-	}
-
 	clientID := ""
 	if raw, ok := mapClaims["client_id"].(string); ok {
 		clientID = raw
@@ -62,7 +55,6 @@ func (wc *WorkspaceController) SwitchWorkspace(c *gin.Context) {
 		userID,
 		workspaceID,
 		membership.ID,
-		projectID,
 		clientID,
 		email,
 		24*time.Hour,

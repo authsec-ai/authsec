@@ -81,7 +81,7 @@ func (r *GlobalRepository) GetTenantByID(tenantID string) (*sharedmodels.Tenant,
 // GetVerifiedCustomDomainForTenant returns the verified custom domain for a tenant, if any
 func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (string, error) {
 	var domain string
-	err := r.DB.Table("tenant_domains").
+	err := r.DB.Table("workspace_domains").
 		Select("domain").
 		Where("workspace_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
 		Order("is_primary DESC, created_at ASC"). // Prefer primary domain, then oldest
@@ -100,7 +100,7 @@ func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(tenantID string) (st
 // GetCustomDomainVerificationTime returns when the custom domain was verified
 func (r *GlobalRepository) GetCustomDomainVerificationTime(tenantID string) (*time.Time, error) {
 	var domain appmodels.TenantDomain
-	err := r.DB.Table("tenant_domains").
+	err := r.DB.Table("workspace_domains").
 		Select("verified_at").
 		Where("workspace_id = ? AND is_verified = ? AND kind = ?", tenantID, true, "custom").
 		Order("is_primary DESC, created_at ASC").

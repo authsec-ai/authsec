@@ -37,8 +37,8 @@ type EntraIDConfig struct {
 // EntraSyncInput represents the input for syncing users from Entra ID
 type EntraSyncInput struct {
 	WorkspaceID  string         `json:"workspace_id" binding:"required"`
-	ClientID  string         `json:"client_id" binding:"required"`
-	ProjectID string         `json:"project_id" binding:"required"`
+	ClientID  string         `json:"client_id"`
+	ProjectID string         `json:"project_id"`
 	ConfigID  *string        `json:"config_id,omitempty"` // ID of stored config to use
 	Config    *EntraIDConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
 	DryRun    bool           `json:"dry_run,omitempty"`
@@ -618,9 +618,9 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 		return fmt.Errorf("invalid project ID format: %w", err)
 	}
 
-	// Check if user already exists (by email or external ID scoped to client)
+	// Check if user already exists (by email or external ID scoped to workspace)
 	var existingUser models.User
-	err = tenantDB.Where("(email = ? OR external_id = ?) AND client_id = ?", entraUser.Mail, entraUser.ID, clientUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", entraUser.Mail, entraUser.ID, tenantUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -649,7 +649,7 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 				ProjectID:    projectUUID,
 				Name:         entraUser.DisplayName,
 				Username:     &entraUser.MailNickname,
-				Email:        entraUser.Mail,
+				Email:        strings.ToLower(entraUser.Mail),
 				Provider:     "entra_id",
 				ProviderID:   entraUser.UserPrincipalName,
 				Active:       entraUser.AccountEnabled,

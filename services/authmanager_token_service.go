@@ -40,7 +40,6 @@ type TokenClaims struct {
 	WorkspaceID           string
 	WorkspaceMembershipID string
 	TenantDomain          string // Tenant domain for display/routing
-	ProjectID             string
 	ClientID              string
 	EmailID               string
 	UserID                *uuid.UUID
@@ -64,10 +63,7 @@ func (s *AuthManagerTokenService) GenerateSDKToken(claims TokenClaims) (string, 
 	return s.generateTokenWithType(claims, "sdk-agent", s.jwtSDKSecret)
 }
 
-func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, projectID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error) {
-	if projectID == uuid.Nil {
-		projectID = workspaceID
-	}
+func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error) {
 	if clientID == "" {
 		clientID = userID.String()
 	}
@@ -75,7 +71,6 @@ func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, works
 	return s.GenerateToken(TokenClaims{
 		WorkspaceID:           workspaceID.String(),
 		WorkspaceMembershipID: membershipID.String(),
-		ProjectID:             projectID.String(),
 		ClientID:              clientID,
 		EmailID:               email,
 		UserID:                &userID,
@@ -98,7 +93,6 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 	// Reference: github.com/authsec-ai/auth-manager/controllers/token_controller.go
 	jwtClaims := jwt.MapClaims{
 		"workspace_id": workspaceID,
-		"project_id":   claims.ProjectID,
 		"client_id":    claims.ClientID,
 		"email_id":     claims.EmailID,
 		"token_type":   tokenType,
@@ -164,7 +158,6 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"workspace_id": req.WorkspaceID,
-		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,
 		"token_type":   tokenType,
@@ -185,7 +178,7 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 }
 
 // GenerateAdminToken generates a token for admin users
-func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, projectID uuid.UUID, tenantID *uuid.UUID, tenantDomain string, roles []string) (string, error) {
+func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, tenantID *uuid.UUID, tenantDomain string, roles []string) (string, error) {
 	// Use actual tenant_id if provided, otherwise default to "admin" for super-admins
 	tenantIDStr := "admin"
 	if tenantID != nil && *tenantID != uuid.Nil {
@@ -193,9 +186,8 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 	}
 
 	claims := TokenClaims{
-		WorkspaceID:     tenantIDStr,  // Use actual tenant_id
+		WorkspaceID:  tenantIDStr,  // Use actual tenant_id
 		TenantDomain: tenantDomain, // Include tenant domain
-		ProjectID:    projectID.String(),
 		ClientID:     adminUserID.String(),
 		EmailID:      email,
 		UserID:       &adminUserID,
@@ -209,17 +201,15 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 func (s *AuthManagerTokenService) GenerateTenantUserToken(
 	userID uuid.UUID,
 	tenantID uuid.UUID,
-	projectID uuid.UUID,
 	email string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
-		ProjectID: projectID.String(),
-		ClientID:  userID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		ExpiresIn: expiresIn,
+		WorkspaceID: tenantID.String(),
+		ClientID:    userID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -234,13 +224,12 @@ func (s *AuthManagerTokenService) GenerateEndUserToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID,
-		ProjectID: tenantID, // Default project_id = tenant_id for endusers
-		ClientID:  clientID,
-		EmailID:   email,
-		UserID:    &userID,
-		Scopes:    scopes,
-		ExpiresIn: expiresIn,
+		WorkspaceID: tenantID,
+		ClientID:    clientID,
+		EmailID:     email,
+		UserID:      &userID,
+		Scopes:      scopes,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -254,13 +243,12 @@ func (s *AuthManagerTokenService) GenerateVoiceAuthToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
-		ProjectID: tenantID.String(), // Default project_id = tenant_id for voice auth
-		ClientID:  userID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		Scopes:    scopes,
-		ExpiresIn: expiresIn,
+		WorkspaceID: tenantID.String(),
+		ClientID:    userID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		Scopes:      scopes,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -274,13 +262,12 @@ func (s *AuthManagerTokenService) GenerateDeviceAuthToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
-		ProjectID: tenantID.String(), // Default project_id = tenant_id for device auth
-		ClientID:  userID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		Scopes:    scopes,
-		ExpiresIn: expiresIn,
+		WorkspaceID: tenantID.String(),
+		ClientID:    userID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		Scopes:      scopes,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -295,7 +282,6 @@ func (s *AuthManagerTokenService) GenerateCIBAToken(
 ) (string, error) {
 	claims := TokenClaims{
 		WorkspaceID:  tenantID.String(),
-		ProjectID: tenantID.String(), // Default project_id = tenant_id for CIBA
 		ClientID:  userID.String(),
 		EmailID:   email,
 		UserID:    &userID,
@@ -316,7 +302,6 @@ func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 ) (string, error) {
 	claims := TokenClaims{
 		WorkspaceID:  tenantID.String(),
-		ProjectID: tenantID.String(),
 		ClientID:  clientID.String(),
 		EmailID:   email,
 		UserID:    &userID,
@@ -335,7 +320,6 @@ func (s *AuthManagerTokenService) GenerateTOTPToken(
 ) (string, error) {
 	claims := TokenClaims{
 		WorkspaceID:  tenantID.String(),
-		ProjectID: tenantID.String(),
 		ClientID:  userID.String(),
 		EmailID:   email,
 		UserID:    &userID,

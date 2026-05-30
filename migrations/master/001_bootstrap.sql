@@ -639,19 +639,6 @@ CREATE TABLE public.pkce_verifiers (
     CONSTRAINT pkce_verifiers_pkey PRIMARY KEY (key)
 );
 
-CREATE TABLE public.projects (
-    name character varying(255) NOT NULL,
-    description text,
-    user_id uuid,
-    workspace_id uuid,
-    client_id uuid,
-    active boolean DEFAULT true,
-    created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now(),
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    CONSTRAINT projects_pkey PRIMARY KEY (id)
-);
-
 CREATE TABLE public.resource_server_access_policies (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     workspace_id uuid NOT NULL,
@@ -744,6 +731,10 @@ CREATE TABLE public.resource_servers (
     CONSTRAINT resource_servers_status_check CHECK ((status = ANY (ARRAY['pending_scan'::text, 'ready'::text, 'degraded'::text]))),
     application_type text DEFAULT 'mcp_server'::text NOT NULL,
     legacy_client_id uuid,
+    -- ai_agent state (RESIDUAL #40): an "agent" is a resource_servers row with
+    -- application_type='ai_agent'. These columns hold its SPIRE identity + type.
+    spiffe_id text,
+    agent_type text,
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
     CONSTRAINT resource_servers_resource_uri_key UNIQUE (resource_uri)
@@ -1092,7 +1083,7 @@ CREATE TABLE public.sync_configurations (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     workspace_id uuid NOT NULL,
     client_id uuid NOT NULL,
-    project_id uuid NOT NULL,
+    project_id uuid,
     sync_type character varying(50) NOT NULL,
     config_name character varying(255) NOT NULL,
     description text,
@@ -1121,7 +1112,7 @@ CREATE TABLE public.sync_configurations (
     CONSTRAINT sync_configurations_tenant_id_config_name_key UNIQUE (workspace_id, config_name)
 );
 
-CREATE TABLE public.tenant_ciba_auth_requests (
+CREATE TABLE public.workspace_ciba_auth_requests (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     auth_req_id character varying(255) NOT NULL,
     user_id uuid NOT NULL,
@@ -1137,11 +1128,11 @@ CREATE TABLE public.tenant_ciba_auth_requests (
     created_at bigint NOT NULL,
     responded_at bigint,
     last_polled_at bigint,
-    CONSTRAINT tenant_ciba_auth_requests_auth_req_id_key UNIQUE (auth_req_id),
-    CONSTRAINT tenant_ciba_auth_requests_pkey PRIMARY KEY (id)
+    CONSTRAINT workspace_ciba_auth_requests_auth_req_id_key UNIQUE (auth_req_id),
+    CONSTRAINT workspace_ciba_auth_requests_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.tenant_device_tokens (
+CREATE TABLE public.workspace_device_tokens (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -1156,12 +1147,12 @@ CREATE TABLE public.tenant_device_tokens (
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL,
     CONSTRAINT fk_tenant_device_token UNIQUE (device_token, workspace_id),
-    CONSTRAINT tenant_device_tokens_device_token_key UNIQUE (device_token),
-    CONSTRAINT tenant_device_tokens_pkey PRIMARY KEY (id),
+    CONSTRAINT workspace_device_tokens_device_token_key UNIQUE (device_token),
+    CONSTRAINT workspace_device_tokens_pkey PRIMARY KEY (id),
     CONSTRAINT uq_tenant_device_id_tenant UNIQUE (id, workspace_id)
 );
 
-CREATE TABLE public.tenant_domains (
+CREATE TABLE public.workspace_domains (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     workspace_id uuid NOT NULL,
     domain character varying(255) NOT NULL,
@@ -1180,10 +1171,10 @@ CREATE TABLE public.tenant_domains (
     updated_at timestamp with time zone DEFAULT now(),
     created_by uuid,
     updated_by uuid,
-    CONSTRAINT tenant_domains_pkey PRIMARY KEY (id)
+    CONSTRAINT workspace_domains_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.tenant_end_user_states (
+CREATE TABLE public.workspace_end_user_states (
     workspace_id uuid NOT NULL,
     user_id uuid NOT NULL,
     status text DEFAULT 'active'::text NOT NULL,
@@ -1197,7 +1188,7 @@ CREATE TABLE public.tenant_end_user_states (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT chk_teus_status CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text]))),
-    CONSTRAINT tenant_end_user_states_pkey PRIMARY KEY (workspace_id, user_id)
+    CONSTRAINT workspace_end_user_states_pkey PRIMARY KEY (workspace_id, user_id)
 );
 
 -- Phase C: dropped CREATE TABLE public.tenant_hydra_clients
@@ -1205,7 +1196,7 @@ CREATE TABLE public.tenant_end_user_states (
 -- Phase 6: dropped CREATE TABLE public.tenant_mappings
 
 
-CREATE TABLE public.tenant_memberships (
+CREATE TABLE public.workspace_user_memberships (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     workspace_id uuid NOT NULL,
     user_id uuid NOT NULL,
@@ -1221,11 +1212,11 @@ CREATE TABLE public.tenant_memberships (
     CONSTRAINT chk_tm_source CHECK ((source = ANY (ARRAY['signup'::text, 'invite'::text, 'scim'::text, 'oidc_jit'::text, 'saml_jit'::text, 'api'::text, 'migration'::text]))),
     CONSTRAINT chk_tm_status CHECK ((status = ANY (ARRAY['active'::text, 'invited'::text, 'suspended'::text, 'left'::text]))),
     CONSTRAINT chk_tm_type CHECK ((membership_type = ANY (ARRAY['owner'::text, 'admin'::text, 'member'::text, 'contractor'::text, 'service_operator'::text, 'readonly_auditor'::text]))),
-    CONSTRAINT tenant_memberships_pkey PRIMARY KEY (id),
-    CONSTRAINT tenant_memberships_tenant_id_user_id_key UNIQUE (workspace_id, user_id)
+    CONSTRAINT workspace_user_memberships_pkey PRIMARY KEY (id),
+    CONSTRAINT workspace_user_memberships_tenant_id_user_id_key UNIQUE (workspace_id, user_id)
 );
 
-CREATE TABLE public.tenant_totp_backup_codes (
+CREATE TABLE public.workspace_totp_backup_codes (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -1233,11 +1224,11 @@ CREATE TABLE public.tenant_totp_backup_codes (
     is_used boolean DEFAULT false NOT NULL,
     created_at bigint NOT NULL,
     used_at bigint,
-    CONSTRAINT tenant_totp_backup_codes_code_key UNIQUE (code),
-    CONSTRAINT tenant_totp_backup_codes_pkey PRIMARY KEY (id)
+    CONSTRAINT workspace_totp_backup_codes_code_key UNIQUE (code),
+    CONSTRAINT workspace_totp_backup_codes_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.tenant_totp_secrets (
+CREATE TABLE public.workspace_totp_secrets (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -1249,8 +1240,8 @@ CREATE TABLE public.tenant_totp_secrets (
     is_primary boolean DEFAULT false,
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL,
-    CONSTRAINT tenant_totp_secrets_pkey PRIMARY KEY (id),
-    CONSTRAINT tenant_totp_secrets_user_id_tenant_id_is_primary_key UNIQUE (user_id, workspace_id, is_primary)
+    CONSTRAINT workspace_totp_secrets_pkey PRIMARY KEY (id),
+    CONSTRAINT workspace_totp_secrets_user_id_tenant_id_is_primary_key UNIQUE (user_id, workspace_id, is_primary)
 );
 
 -- Phase 6: dropped CREATE TABLE public.tenants
@@ -1810,20 +1801,6 @@ CREATE UNIQUE INDEX idx_permissions_tenant_resource_action_unique ON public.perm
 
 CREATE INDEX idx_pkce_verifiers_expires_at ON public.pkce_verifiers USING btree (expires_at);
 
-CREATE INDEX idx_projects_active ON public.projects USING btree (active);
-
-CREATE INDEX idx_projects_client_id ON public.projects USING btree (client_id);
-
-CREATE INDEX idx_projects_created_at ON public.projects USING btree (created_at);
-
-CREATE INDEX idx_projects_tenant_id ON public.projects USING btree (workspace_id);
-
-CREATE INDEX idx_projects_timestamps ON public.projects USING btree (created_at, updated_at);
-
-CREATE INDEX idx_projects_updated_at ON public.projects USING btree (updated_at);
-
-CREATE INDEX idx_projects_user_id ON public.projects USING btree (user_id);
-
 CREATE INDEX idx_rb_tenant_group ON public.role_bindings USING btree (workspace_id, group_id) WHERE (group_id IS NOT NULL);
 
 CREATE INDEX idx_resource_servers_resource_uri ON public.resource_servers USING btree (resource_uri);
@@ -1922,87 +1899,87 @@ CREATE INDEX idx_sync_configs_tenant_id ON public.sync_configurations USING btre
 
 CREATE INDEX idx_sync_configs_tenant_type ON public.sync_configurations USING btree (workspace_id, sync_type);
 
-CREATE INDEX idx_tenant_backup_code ON public.tenant_totp_backup_codes USING btree (code);
+CREATE INDEX idx_tenant_backup_code ON public.workspace_totp_backup_codes USING btree (code);
 
-CREATE INDEX idx_tenant_backup_created_at ON public.tenant_totp_backup_codes USING btree (created_at);
+CREATE INDEX idx_tenant_backup_created_at ON public.workspace_totp_backup_codes USING btree (created_at);
 
-CREATE INDEX idx_tenant_backup_tenant ON public.tenant_totp_backup_codes USING btree (workspace_id);
+CREATE INDEX idx_tenant_backup_tenant ON public.workspace_totp_backup_codes USING btree (workspace_id);
 
-CREATE INDEX idx_tenant_backup_used ON public.tenant_totp_backup_codes USING btree (is_used);
+CREATE INDEX idx_tenant_backup_used ON public.workspace_totp_backup_codes USING btree (is_used);
 
-CREATE INDEX idx_tenant_backup_user ON public.tenant_totp_backup_codes USING btree (user_id);
+CREATE INDEX idx_tenant_backup_user ON public.workspace_totp_backup_codes USING btree (user_id);
 
-CREATE INDEX idx_tenant_backup_user_unused ON public.tenant_totp_backup_codes USING btree (user_id, is_used);
+CREATE INDEX idx_tenant_backup_user_unused ON public.workspace_totp_backup_codes USING btree (user_id, is_used);
 
-CREATE INDEX idx_tenant_ciba_auth_req_id ON public.tenant_ciba_auth_requests USING btree (auth_req_id);
+CREATE INDEX idx_tenant_ciba_auth_req_id ON public.workspace_ciba_auth_requests USING btree (auth_req_id);
 
-CREATE INDEX idx_tenant_ciba_created_at ON public.tenant_ciba_auth_requests USING btree (created_at);
+CREATE INDEX idx_tenant_ciba_created_at ON public.workspace_ciba_auth_requests USING btree (created_at);
 
-CREATE INDEX idx_tenant_ciba_expires_at ON public.tenant_ciba_auth_requests USING btree (expires_at);
+CREATE INDEX idx_tenant_ciba_expires_at ON public.workspace_ciba_auth_requests USING btree (expires_at);
 
-CREATE INDEX idx_tenant_ciba_status ON public.tenant_ciba_auth_requests USING btree (status);
+CREATE INDEX idx_tenant_ciba_status ON public.workspace_ciba_auth_requests USING btree (status);
 
-CREATE INDEX idx_tenant_ciba_tenant ON public.tenant_ciba_auth_requests USING btree (workspace_id);
+CREATE INDEX idx_tenant_ciba_tenant ON public.workspace_ciba_auth_requests USING btree (workspace_id);
 
-CREATE INDEX idx_tenant_ciba_user ON public.tenant_ciba_auth_requests USING btree (user_id);
+CREATE INDEX idx_tenant_ciba_user ON public.workspace_ciba_auth_requests USING btree (user_id);
 
-CREATE INDEX idx_tenant_ciba_user_status ON public.tenant_ciba_auth_requests USING btree (user_id, status);
+CREATE INDEX idx_tenant_ciba_user_status ON public.workspace_ciba_auth_requests USING btree (user_id, status);
 
-CREATE INDEX idx_tenant_device_token_active ON public.tenant_device_tokens USING btree (is_active);
+CREATE INDEX idx_tenant_device_token_active ON public.workspace_device_tokens USING btree (is_active);
 
-CREATE INDEX idx_tenant_device_token_device_token ON public.tenant_device_tokens USING btree (device_token);
+CREATE INDEX idx_tenant_device_token_device_token ON public.workspace_device_tokens USING btree (device_token);
 
-CREATE INDEX idx_tenant_device_token_tenant ON public.tenant_device_tokens USING btree (workspace_id);
+CREATE INDEX idx_tenant_device_token_tenant ON public.workspace_device_tokens USING btree (workspace_id);
 
-CREATE INDEX idx_tenant_device_token_user ON public.tenant_device_tokens USING btree (user_id);
+CREATE INDEX idx_tenant_device_token_user ON public.workspace_device_tokens USING btree (user_id);
 
-CREATE UNIQUE INDEX idx_tenant_domains_domain_unique ON public.tenant_domains USING btree (domain);
+CREATE UNIQUE INDEX idx_workspace_domains_domain_unique ON public.workspace_domains USING btree (domain);
 
-CREATE INDEX idx_tenant_domains_domain_verified ON public.tenant_domains USING btree (domain, is_verified);
+CREATE INDEX idx_workspace_domains_domain_verified ON public.workspace_domains USING btree (domain, is_verified);
 
-CREATE UNIQUE INDEX idx_tenant_domains_primary_per_tenant ON public.tenant_domains USING btree (workspace_id) WHERE (is_primary = true);
+CREATE UNIQUE INDEX idx_workspace_domains_primary_per_tenant ON public.workspace_domains USING btree (workspace_id) WHERE (is_primary = true);
 
-CREATE INDEX idx_tenant_domains_status ON public.tenant_domains USING btree (is_verified, kind);
+CREATE INDEX idx_workspace_domains_status ON public.workspace_domains USING btree (is_verified, kind);
 
-CREATE INDEX idx_tenant_domains_tenant_id_primary ON public.tenant_domains USING btree (workspace_id, is_primary);
+CREATE INDEX idx_workspace_domains_tenant_id_primary ON public.workspace_domains USING btree (workspace_id, is_primary);
 
-CREATE INDEX idx_tenant_domains_tenant_id_verified ON public.tenant_domains USING btree (workspace_id, is_verified);
+CREATE INDEX idx_workspace_domains_tenant_id_verified ON public.workspace_domains USING btree (workspace_id, is_verified);
 
 -- Phase C: idx_tenant_hydra_clients_* removed (tenant_hydra_clients table dropped).
 
 -- Phase 6: idx_tenant_mappings_* removed (tenant_mappings table dropped).
 
-CREATE INDEX idx_tenant_totp_active ON public.tenant_totp_secrets USING btree (is_active);
+CREATE INDEX idx_tenant_totp_active ON public.workspace_totp_secrets USING btree (is_active);
 
-CREATE INDEX idx_tenant_totp_created_at ON public.tenant_totp_secrets USING btree (created_at);
+CREATE INDEX idx_tenant_totp_created_at ON public.workspace_totp_secrets USING btree (created_at);
 
-CREATE INDEX idx_tenant_totp_primary ON public.tenant_totp_secrets USING btree (is_primary);
+CREATE INDEX idx_tenant_totp_primary ON public.workspace_totp_secrets USING btree (is_primary);
 
-CREATE INDEX idx_tenant_totp_tenant ON public.tenant_totp_secrets USING btree (workspace_id);
+CREATE INDEX idx_tenant_totp_tenant ON public.workspace_totp_secrets USING btree (workspace_id);
 
-CREATE INDEX idx_tenant_totp_user ON public.tenant_totp_secrets USING btree (user_id);
+CREATE INDEX idx_tenant_totp_user ON public.workspace_totp_secrets USING btree (user_id);
 
-CREATE INDEX idx_tenant_totp_user_active ON public.tenant_totp_secrets USING btree (user_id, is_active);
-
-
+CREATE INDEX idx_tenant_totp_user_active ON public.workspace_totp_secrets USING btree (user_id, is_active);
 
 
 
 
 
-CREATE INDEX idx_teus_last_seen ON public.tenant_end_user_states USING btree (workspace_id, last_seen_at DESC);
 
-CREATE INDEX idx_teus_tenant_plan ON public.tenant_end_user_states USING btree (workspace_id, plan_tier) WHERE (plan_tier IS NOT NULL);
 
-CREATE INDEX idx_teus_tenant_status ON public.tenant_end_user_states USING btree (workspace_id, status);
+CREATE INDEX idx_teus_last_seen ON public.workspace_end_user_states USING btree (workspace_id, last_seen_at DESC);
 
-CREATE INDEX idx_tm_invited_by ON public.tenant_memberships USING btree (invited_by) WHERE (invited_by IS NOT NULL);
+CREATE INDEX idx_teus_tenant_plan ON public.workspace_end_user_states USING btree (workspace_id, plan_tier) WHERE (plan_tier IS NOT NULL);
 
-CREATE INDEX idx_tm_tenant_status ON public.tenant_memberships USING btree (workspace_id, status);
+CREATE INDEX idx_teus_tenant_status ON public.workspace_end_user_states USING btree (workspace_id, status);
 
-CREATE INDEX idx_tm_tenant_type ON public.tenant_memberships USING btree (workspace_id, membership_type);
+CREATE INDEX idx_tm_invited_by ON public.workspace_user_memberships USING btree (invited_by) WHERE (invited_by IS NOT NULL);
 
-CREATE INDEX idx_tm_user ON public.tenant_memberships USING btree (user_id);
+CREATE INDEX idx_tm_tenant_status ON public.workspace_user_memberships USING btree (workspace_id, status);
+
+CREATE INDEX idx_tm_tenant_type ON public.workspace_user_memberships USING btree (workspace_id, membership_type);
+
+CREATE INDEX idx_tm_user ON public.workspace_user_memberships USING btree (user_id);
 
 CREATE INDEX idx_totp_active ON public.totp_secrets USING btree (is_active, is_primary);
 
@@ -2074,7 +2051,7 @@ CREATE INDEX idx_users_tenant_email ON public.users USING btree (workspace_id, e
 
 CREATE INDEX idx_users_tenant_id ON public.users USING btree (workspace_id);
 
-CREATE INDEX idx_users_tenant_id_active ON public.users USING btree (workspace_id, active) WHERE (active = true);
+CREATE INDEX idx_users_workspace_id_active ON public.users USING btree (workspace_id, active) WHERE (active = true);
 
 -- Phase A: canonical multi-workspace identity constraint.
 -- One user row per (workspace, email). Enforces "same email in two workspaces
@@ -2198,46 +2175,46 @@ ALTER TABLE ONLY public.spire_policy_resources
 ALTER TABLE ONLY public.spire_policy_subjects
     ADD CONSTRAINT fk_spire_policy_rules_subjects FOREIGN KEY (rule_id) REFERENCES public.spire_policy_rules(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_totp_backup_codes
+ALTER TABLE ONLY public.workspace_totp_backup_codes
     ADD CONSTRAINT fk_tenant_backup_tenant FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_totp_backup_codes
+ALTER TABLE ONLY public.workspace_totp_backup_codes
     ADD CONSTRAINT fk_tenant_backup_user FOREIGN KEY (user_id, workspace_id) REFERENCES public.users(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_ciba_auth_requests
-    ADD CONSTRAINT fk_tenant_ciba_device FOREIGN KEY (device_token_id, workspace_id) REFERENCES public.tenant_device_tokens(id, workspace_id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.workspace_ciba_auth_requests
+    ADD CONSTRAINT fk_tenant_ciba_device FOREIGN KEY (device_token_id, workspace_id) REFERENCES public.workspace_device_tokens(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_ciba_auth_requests
+ALTER TABLE ONLY public.workspace_ciba_auth_requests
     ADD CONSTRAINT fk_tenant_ciba_tenant FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_ciba_auth_requests
+ALTER TABLE ONLY public.workspace_ciba_auth_requests
     ADD CONSTRAINT fk_tenant_ciba_user FOREIGN KEY (user_id, workspace_id) REFERENCES public.users(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_device_tokens
+ALTER TABLE ONLY public.workspace_device_tokens
     ADD CONSTRAINT fk_tenant_device_tenant FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_device_tokens
+ALTER TABLE ONLY public.workspace_device_tokens
     ADD CONSTRAINT fk_tenant_device_user FOREIGN KEY (user_id, workspace_id) REFERENCES public.users(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_domains
-    ADD CONSTRAINT fk_tenant_domains_tenant_id FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.workspace_domains
+    ADD CONSTRAINT fk_workspace_domains_workspace_id FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_totp_secrets
+ALTER TABLE ONLY public.workspace_totp_secrets
     ADD CONSTRAINT fk_tenant_totp_tenant FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_totp_secrets
+ALTER TABLE ONLY public.workspace_totp_secrets
     ADD CONSTRAINT fk_tenant_totp_user FOREIGN KEY (user_id, workspace_id) REFERENCES public.users(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_end_user_states
+ALTER TABLE ONLY public.workspace_end_user_states
     ADD CONSTRAINT fk_teus_suspended_by FOREIGN KEY (suspended_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
-ALTER TABLE ONLY public.tenant_end_user_states
+ALTER TABLE ONLY public.workspace_end_user_states
     ADD CONSTRAINT fk_teus_user FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_memberships
+ALTER TABLE ONLY public.workspace_user_memberships
     ADD CONSTRAINT fk_tm_invited_by FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
-ALTER TABLE ONLY public.tenant_memberships
+ALTER TABLE ONLY public.workspace_user_memberships
     ADD CONSTRAINT fk_tm_user FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.totp_secrets
@@ -2348,11 +2325,11 @@ ALTER TABLE ONLY public.role_bindings
 ALTER TABLE ONLY public.role_permissions
     ADD CONSTRAINT role_permissions_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_end_user_states
-    ADD CONSTRAINT tenant_end_user_states_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.workspace_end_user_states
+    ADD CONSTRAINT workspace_end_user_states_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.tenant_memberships
-    ADD CONSTRAINT tenant_memberships_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.workspace_user_memberships
+    ADD CONSTRAINT workspace_user_memberships_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT user_groups_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;

@@ -116,7 +116,7 @@ func (Group) TableName() string {
 
 type RemoveGroupsRequest struct {
 	WorkspaceID string   `json:"workspace_id" binding:"required"`
-	ClientID string   `json:"client_id" binding:"required"`
+	ClientID string   `json:"client_id"`
 	Groups   []string `json:"groups" binding:"required"`
 }
 
@@ -168,7 +168,7 @@ type InitiateRegistrationInput struct {
 // This overrides sharedmodels.DeleteRolesRequest to handle legacy clients sending "role_ids"
 type DeleteRolesRequest struct {
 	WorkspaceID  string   `json:"workspace_id" binding:"required"`
-	ProjectID string   `json:"project_id" binding:"required"`
+	ProjectID string   `json:"project_id"`
 	Roles     []string `json:"roles" binding:"required"`
 	RoleIDs   []string `json:"role_ids"` // Alternative field name for backward compatibility
 }

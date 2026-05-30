@@ -147,12 +147,16 @@ func HealthCheck() error {
 }
 
 // SecretInVault retrieves a secret from Vault for the specified tenant, project, and client
-func SecretInVault(tenantID, projectID, clientID string) (string, error) {
+// SecretInVault reads the workspace OAuth client secret. Phase E/P2-10: the
+// legacy {workspace}/{project}/{client} path was collapsed to
+// {workspace}/{client} — project_id is retired and was always equal to the
+// workspace UUID at both ends anyway.
+func SecretInVault(workspaceID, clientID string) (string, error) {
 	if VaultClient == nil {
 		return "", fmt.Errorf("vault client not initialized")
 	}
 
-	secretPath := fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
+	secretPath := fmt.Sprintf("kv/data/secret/%s/%s", workspaceID, clientID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -175,8 +179,9 @@ func SecretInVault(tenantID, projectID, clientID string) (string, error) {
 	return secretID, nil
 }
 
-// SaveSecretToVault saves a secret to Vault under the specified tenant and project
-func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
+// SaveSecretToVault saves a secret to Vault under the workspace-scoped path
+// kv/data/secret/{workspaceID}/{clientID} (project_id segment retired, P2-10).
+func SaveSecretToVault(workspaceID, clientID string) (string, error) {
 	if VaultClient == nil {
 		log.Println("ERROR: Vault client not initialized - VaultClient is nil")
 		return "", fmt.Errorf("vault client not initialized")
@@ -242,8 +247,8 @@ func SaveSecretToVault(tenantID, projectID, clientID string) (string, error) {
 
 	// Use KV v2 secret engine which is mounted at "kv/" in this Vault instance
 	// Path format: kv/data/<path> where "data" is required for KV v2 API
-	// Full path: kv/data/secret/{tenant_id}/{project_id}/{client_id}
-	secretPath := fmt.Sprintf("kv/data/secret/%s/%s/%s", tenantID, projectID, clientID)
+	// Full path: kv/data/secret/{workspace_id}/{client_id}
+	secretPath := fmt.Sprintf("kv/data/secret/%s/%s", workspaceID, clientID)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel2()

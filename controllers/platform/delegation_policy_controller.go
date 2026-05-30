@@ -100,7 +100,8 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		createdBy = &uid
 	}
 
-	// Validate and parse client_id if provided
+	// Validate and parse client_id if provided. client_id references the
+	// ai_agent resource_servers.id this policy is scoped to (Phase B).
 	var clientID *uuid.UUID
 	if req.ClientID != "" {
 		cid, err := uuid.Parse(req.ClientID)
@@ -109,26 +110,20 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 			return
 		}
 		if err := validateClientActive(req.ClientID, tenantID.String()); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Client not found or not active", "details": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Agent not found or not active", "details": err.Error()})
 			return
 		}
 		clientID = &cid
 	}
 
-	var applicationID *uuid.UUID
-	if clientID != nil {
-		applicationID = lookupApplicationIDForLegacyClient(*clientID)
-	}
-
 	policy := models.DelegationPolicy{
-		WorkspaceID:           *tenantID,
+		WorkspaceID:        *tenantID,
 		RoleName:           req.RoleName,
 		AgentType:          req.AgentType,
 		AllowedPermissions: permsJSON,
 		MaxTTLSeconds:      req.MaxTTLSeconds,
 		Enabled:            enabled,
 		ClientID:           clientID,
-		ApplicationID:      applicationID,
 		CreatedBy:          createdBy,
 	}
 
@@ -150,9 +145,9 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 		var spiffeID *string
 		var clientType string
 		var agentType *string
-		tenantDB.Table("clients").
-			Select("spiffe_id, client_type, agent_type").
-			Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
+		tenantDB.Table("resource_servers").
+			Select("spiffe_id, application_type, agent_type").
+			Where("id = ? AND workspace_id = ?", clientID, tenantID).
 			Row().Scan(&spiffeID, &clientType, &agentType)
 
 		if clientType == "ai_agent" {
@@ -188,10 +183,10 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 							trustDomain, tenantID.String(), agentTypeStr, clientID.String())
 
 						entry := &spiremodels.WorkloadEntry{
-							WorkspaceID:  tenantID.String(),
-							SpiffeID:  newSpiffeID,
-							ParentID:  parentID,
-							Selectors: map[string]string{"authsec:client_id": clientID.String(), "authsec:agent_type": agentTypeStr},
+							WorkspaceID: tenantID.String(),
+							SpiffeID:    newSpiffeID,
+							ParentID:    parentID,
+							Selectors:   map[string]string{"authsec:client_id": clientID.String(), "authsec:agent_type": agentTypeStr},
 						}
 
 						created, err := dc.workloadEntrySvc.CreateEntry(c.Request.Context(), entry)
@@ -202,8 +197,8 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 								"reason": err.Error(),
 							}
 						} else {
-							tenantDB.Table("clients").
-								Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
+							tenantDB.Table("resource_servers").
+								Where("id = ? AND workspace_id = ?", clientID, tenantID).
 								Update("spiffe_id", created.SpiffeID)
 
 							log.Printf("[DelegationPolicy] Auto-provisioned identity for agent %s: spiffe_id=%s", clientID.String(), created.SpiffeID)
@@ -252,17 +247,17 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 				} else {
 					emailID := delegationContextString(c, "email_id")
 					customClaims := map[string]interface{}{
-						"user_id":     userIDStr,
-						"workspace_id":   tenantID.String(),
-						"email":       emailID,
-						"agent_type":  req.AgentType,
-						"permissions": delegatedPerms,
-						"client_id":   clientID.String(),
+						"user_id":      userIDStr,
+						"workspace_id": tenantID.String(),
+						"email":        emailID,
+						"agent_type":   req.AgentType,
+						"permissions":  delegatedPerms,
+						"client_id":    clientID.String(),
 					}
 
 					finalTTL := int(ttlDuration.Seconds())
 					jwtResp, jwtErr := dc.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
-						WorkspaceID:     tenantID.String(),
+						WorkspaceID:  tenantID.String(),
 						SpiffeID:     resolvedSpiffeID,
 						Audience:     audience,
 						TTL:          finalTTL,
@@ -281,21 +276,18 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 						userUUID, _ := uuid.Parse(userIDStr)
 						expiresAt := time.Now().Add(time.Duration(finalTTL) * time.Second)
 
-						applicationID := lookupApplicationIDForLegacyClient(*clientID)
-
 						upsertToken := models.DelegationToken{
-							WorkspaceID:      *tenantID,
-							ClientID:      *clientID,
-							ApplicationID: applicationID,
-							PolicyID:      &policy.ID,
-							Token:         jwtResp.Token,
-							SpiffeID:      jwtResp.SpiffeID,
-							Permissions:   dPermsJSON,
-							Audience:      audJSON,
-							ExpiresAt:     expiresAt,
-							DelegatedBy:   userUUID,
-							TTLSeconds:    finalTTL,
-							Status:        "active",
+							WorkspaceID: *tenantID,
+							ClientID:    *clientID,
+							PolicyID:    &policy.ID,
+							Token:       jwtResp.Token,
+							SpiffeID:    jwtResp.SpiffeID,
+							Permissions: dPermsJSON,
+							Audience:    audJSON,
+							ExpiresAt:   expiresAt,
+							DelegatedBy: userUUID,
+							TTLSeconds:  finalTTL,
+							Status:      "active",
 						}
 
 						var existing models.DelegationToken
@@ -304,17 +296,16 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 							First(&existing)
 						if upsertResult.Error == nil {
 							tenantDB.Model(&existing).Updates(map[string]interface{}{
-								"policy_id":      &policy.ID,
-								"application_id": applicationID,
-								"token":          jwtResp.Token,
-								"spiffe_id":      jwtResp.SpiffeID,
-								"permissions":    dPermsJSON,
-								"audience":       audJSON,
-								"expires_at":     expiresAt,
-								"delegated_by":   userUUID,
-								"ttl_seconds":    finalTTL,
-								"status":         "active",
-								"updated_at":     time.Now(),
+								"policy_id":    &policy.ID,
+								"token":        jwtResp.Token,
+								"spiffe_id":    jwtResp.SpiffeID,
+								"permissions":  dPermsJSON,
+								"audience":     audJSON,
+								"expires_at":   expiresAt,
+								"delegated_by": userUUID,
+								"ttl_seconds":  finalTTL,
+								"status":       "active",
+								"updated_at":   time.Now(),
 							})
 						} else {
 							if err := tenantDB.Create(&upsertToken).Error; err != nil {

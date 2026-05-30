@@ -73,7 +73,7 @@ type TenantMembership struct {
 
 // TableName overrides the default GORM table name (would otherwise pluralize to "tenant_memberships" anyway).
 func (TenantMembership) TableName() string {
-	return "tenant_memberships"
+	return "workspace_user_memberships"
 }
 
 // IsActive returns true when the membership is in a state that should pass
@@ -115,7 +115,7 @@ type TenantEndUserState struct {
 }
 
 func (TenantEndUserState) TableName() string {
-	return "tenant_end_user_states"
+	return "workspace_end_user_states"
 }
 
 // IsActive returns true when the end user is not suspended for this tenant.

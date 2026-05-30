@@ -949,7 +949,7 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 		`).
 		Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
 		Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
-		Joins(`LEFT JOIN resource_servers rs ON rs.tenant_id = role_bindings.tenant_id AND (
+		Joins(`LEFT JOIN resource_servers rs ON rs.workspace_id = role_bindings.workspace_id AND (
 			(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
 			OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
 		)`).
@@ -1015,7 +1015,7 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 				`).
 				Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
 				Joins("LEFT JOIN roles ON role_bindings.role_id = roles.id").
-				Joins(`LEFT JOIN resource_servers rs ON rs.tenant_id = role_bindings.tenant_id AND (
+				Joins(`LEFT JOIN resource_servers rs ON rs.workspace_id = role_bindings.workspace_id AND (
 					(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
 					OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
 				)`).

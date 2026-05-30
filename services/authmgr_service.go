@@ -51,7 +51,7 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 	workspaceID := safeStr("workspace_id")
 	emailID := safeStr("email")
 
-	clientID, projectID, err := authmgrLookupClient(ctx, workspaceID, emailID)
+	clientID, err := authmgrLookupClient(ctx, workspaceID, emailID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve workspace information: %w", err)
 	}
@@ -59,7 +59,6 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"workspace_id": workspaceID,
-		"project_id":   projectID,
 		"client_id":    clientID,
 		"email_id":     emailID,
 		"provider":     provider,
@@ -114,32 +113,22 @@ func introspectOIDCToken(token string) (*sharedmodels.Introspection, error) {
 	}, nil
 }
 
-// authmgrLookupClient looks up client_id and project_id for an email within a workspace.
-func authmgrLookupClient(ctx context.Context, workspaceID, email string) (string, string, error) {
+// authmgrLookupClient looks up client_id for an email within a workspace.
+func authmgrLookupClient(ctx context.Context, workspaceID, email string) (string, error) {
 	if workspaceID == "" || email == "" {
-		return "", "", errors.New("workspaceID and email required")
+		return "", errors.New("workspaceID and email required")
 	}
 	wid, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return "", "", fmt.Errorf("parse workspaceID: %w", err)
-	}
-
-	if config.DB != nil {
-		var user sharedmodels.User
-		if err := config.DB.WithContext(ctx).
-			Select("client_id", "project_id").
-			Where("workspace_id = ? AND email = ?", wid, email).
-			First(&user).Error; err == nil {
-			return user.ClientID.String(), user.ProjectID.String(), nil
-		}
+		return "", fmt.Errorf("parse workspaceID: %w", err)
 	}
 
 	var user sharedmodels.User
 	if err := config.DB.WithContext(ctx).
-		Select("client_id", "project_id").
+		Select("client_id").
 		Where("workspace_id = ? AND email = ?", wid, email).
 		First(&user).Error; err != nil {
-		return "", "", fmt.Errorf("client lookup: %w", err)
+		return "", fmt.Errorf("client lookup: %w", err)
 	}
-	return user.ClientID.String(), user.ProjectID.String(), nil
+	return user.ClientID.String(), nil
 }

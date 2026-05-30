@@ -47,19 +47,18 @@ type DelegateTokenRequest struct {
 
 // --- Agent client query helpers ---
 
+// agentClient is an ai_agent view over resource_servers (Phase B / RESIDUAL #40:
+// an agent is a resource_servers row with application_type='ai_agent'). The
+// agent's identifier is resource_servers.id.
 type agentClient struct {
-	ID         uuid.UUID `json:"id"`
-	ClientID   uuid.UUID `json:"client_id"`
-	WorkspaceID   uuid.UUID `json:"workspace_id"`
-	Name       string    `json:"name"`
-	Email      *string   `json:"email,omitempty"`
-	Status     string    `json:"status"`
-	Active     bool      `json:"active"`
-	ClientType string    `json:"client_type"`
-	AgentType  *string   `json:"agent_type,omitempty"`
-	SpiffeID   *string   `json:"spiffe_id,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID          uuid.UUID `gorm:"column:id" json:"id"`
+	WorkspaceID uuid.UUID `gorm:"column:workspace_id" json:"workspace_id"`
+	Name        string    `gorm:"column:name" json:"name"`
+	Active      bool      `gorm:"column:active" json:"active"`
+	AgentType   *string   `gorm:"column:agent_type" json:"agent_type,omitempty"`
+	SpiffeID    *string   `gorm:"column:spiffe_id" json:"spiffe_id,omitempty"`
+	CreatedAt   time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 // ListAgents lists all AI agent clients for the tenant.
@@ -74,15 +73,15 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 	tenantDB := config.DB
 
 	var agents []agentClient
-	query := tenantDB.Table("clients").
-		Where("workspace_id = ? AND client_type = 'ai_agent'", tenantID).
-		Where("deleted = false OR deleted IS NULL")
+	query := tenantDB.Table("resource_servers").
+		Where("workspace_id = ? AND application_type = 'ai_agent'", tenantID).
+		Where("deleted_at IS NULL")
 
 	if agentType := c.Query("agent_type"); agentType != "" {
 		query = query.Where("agent_type = ?", agentType)
 	}
 	if status := c.Query("status"); status != "" {
-		query = query.Where("status = ?", status)
+		query = query.Where("active = ?", status == "Active")
 	}
 
 	if err := query.Order("created_at DESC").Find(&agents).Error; err != nil {
@@ -111,9 +110,9 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 	tenantDB := config.DB
 
 	var agent agentClient
-	result := tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
-		Where("deleted = false OR deleted IS NULL").
+	result := tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, tenantID).
+		Where("deleted_at IS NULL").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
@@ -151,16 +150,16 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 
 	// Look up the agent client
 	var agent agentClient
-	result := tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
-		Where("deleted = false OR deleted IS NULL").
+	result := tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, tenantID).
+		Where("deleted_at IS NULL").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
 		return
 	}
 
-	if !agent.Active || agent.Status != "Active" {
+	if !agent.Active {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Agent is not active"})
 		return
 	}
@@ -194,12 +193,12 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 		return
 	}
 
-	// Write the SPIFFE ID back to the client record
-	updateResult := tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
+	// Write the SPIFFE ID back to the agent's resource_servers row
+	updateResult := tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ?", clientID, tenantID).
 		Update("spiffe_id", spiffeID)
 	if updateResult.Error != nil {
-		log.Printf("[AgentController] Failed to update client spiffe_id: %v", updateResult.Error)
+		log.Printf("[AgentController] Failed to update agent spiffe_id: %v", updateResult.Error)
 	}
 
 	log.Printf("[AgentController] Agent %s provisioned: spiffe_id=%s", clientID, spiffeID)
@@ -212,10 +211,10 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusCreated, gin.H{
-		"spiffe_id": spiffeID,
-		"client_id": clientID,
+		"spiffe_id":    spiffeID,
+		"client_id":    clientID,
 		"workspace_id": tenantID.String(),
-		"message":   "SPIRE identity provisioned successfully",
+		"message":      "SPIRE identity provisioned successfully",
 	})
 }
 
@@ -238,9 +237,9 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 
 	// Look up the agent
 	var agent agentClient
-	result := tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
-		Where("deleted = false OR deleted IS NULL").
+	result := tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, tenantID).
+		Where("deleted_at IS NULL").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
@@ -252,9 +251,9 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 		return
 	}
 
-	// Clear the SPIFFE ID from the client record
-	tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ?", clientID, tenantID).
+	// Clear the SPIFFE ID from the agent's resource_servers row
+	tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ?", clientID, tenantID).
 		Update("spiffe_id", nil)
 
 	log.Printf("[AgentController] Agent %s identity revoked (spiffe_id was %s)", clientID, *agent.SpiffeID)
@@ -302,16 +301,16 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 
 	// Look up the agent client
 	var agent agentClient
-	result := tenantDB.Table("clients").
-		Where("client_id = ? AND workspace_id = ? AND client_type = 'ai_agent'", clientID, tenantID).
-		Where("deleted = false OR deleted IS NULL").
+	result := tenantDB.Table("resource_servers").
+		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, tenantID).
+		Where("deleted_at IS NULL").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
 		return
 	}
 
-	if !agent.Active || agent.Status != "Active" {
+	if !agent.Active {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Agent is not active"})
 		return
 	}
@@ -352,12 +351,12 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 
 	// Build custom claims for the JWT-SVID
 	customClaims := map[string]interface{}{
-		"user_id":     userID,
-		"workspace_id":   tenantID.String(),
-		"email":       emailID,
-		"agent_type":  req.AgentType,
-		"permissions": delegatedPerms,
-		"client_id":   clientID,
+		"user_id":      userID,
+		"workspace_id": tenantID.String(),
+		"email":        emailID,
+		"agent_type":   req.AgentType,
+		"permissions":  delegatedPerms,
+		"client_id":    clientID,
 	}
 
 	// Issue JWT-SVID directly via merged service
@@ -367,7 +366,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		return
 	}
 	jwtResp, err := ac.jwtSvidSvc.IssueJWTSVID(c.Request.Context(), &spireservices.IssueJWTSVIDRequest{
-		WorkspaceID:     tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		SpiffeID:     *agent.SpiffeID,
 		Audience:     req.Audience,
 		TTL:          finalTTL,
@@ -396,21 +395,18 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		policyID = &policy.ID
 	}
 
-	applicationID := lookupApplicationIDForLegacyClient(clientUUID)
-
 	upsertToken := models.DelegationToken{
-		WorkspaceID:      *tenantID,
-		ClientID:      clientUUID,
-		ApplicationID: applicationID,
-		PolicyID:      policyID,
-		Token:         jwtResp.Token,
-		SpiffeID:      jwtResp.SpiffeID,
-		Permissions:   permsJSON,
-		Audience:      audJSON,
-		ExpiresAt:     expiresAt,
-		DelegatedBy:   userUUID,
-		TTLSeconds:    finalTTL,
-		Status:        "active",
+		WorkspaceID: *tenantID,
+		ClientID:    clientUUID,
+		PolicyID:    policyID,
+		Token:       jwtResp.Token,
+		SpiffeID:    jwtResp.SpiffeID,
+		Permissions: permsJSON,
+		Audience:    audJSON,
+		ExpiresAt:   expiresAt,
+		DelegatedBy: userUUID,
+		TTLSeconds:  finalTTL,
+		Status:      "active",
 	}
 
 	// Upsert: update if (tenant_id, client_id) exists, else insert
@@ -421,17 +417,16 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	if upsertResult.Error == nil {
 		// Update existing row
 		tenantDB.Model(&existing).Updates(map[string]interface{}{
-			"policy_id":      policyID,
-			"application_id": applicationID,
-			"token":          jwtResp.Token,
-			"spiffe_id":      jwtResp.SpiffeID,
-			"permissions":    permsJSON,
-			"audience":       audJSON,
-			"expires_at":     expiresAt,
-			"delegated_by":   userUUID,
-			"ttl_seconds":    finalTTL,
-			"status":         "active",
-			"updated_at":     time.Now(),
+			"policy_id":    policyID,
+			"token":        jwtResp.Token,
+			"spiffe_id":    jwtResp.SpiffeID,
+			"permissions":  permsJSON,
+			"audience":     audJSON,
+			"expires_at":   expiresAt,
+			"delegated_by": userUUID,
+			"ttl_seconds":  finalTTL,
+			"status":       "active",
+			"updated_at":   time.Now(),
 		})
 		log.Printf("[AgentController] Delegation token updated for agent %s", clientID)
 	} else {

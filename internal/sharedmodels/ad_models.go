@@ -6,16 +6,16 @@ type ADSyncController struct{}
 // SyncUsersInput represents the input for syncing users from AD
 type SyncUsersInput struct {
 	WorkspaceID  string       `json:"workspace_id" binding:"required"`
-	ClientID  string       `json:"client_id" binding:"required"`
-	ProjectID string       `json:"project_id" binding:"required"`
+	ClientID  string       `json:"client_id"`
+	ProjectID string       `json:"project_id"`
 	Config    ADSyncConfig `json:"config" binding:"required"`
 	DryRun    bool         `json:"dry_run,omitempty"` // Preview changes without applying
 }
 
 type AgentSyncRequest struct {
 	WorkspaceID  string          `json:"workspace_id" binding:"required"`
-	ProjectID string          `json:"project_id" binding:"required"`
-	ClientID  string          `json:"client_id" binding:"required"`
+	ProjectID string          `json:"project_id"`
+	ClientID  string          `json:"client_id"`
 	Users     []AgentUserData `json:"users" binding:"required"`
 	DryRun    bool            `json:"dry_run,omitempty"`
 }

@@ -41,7 +41,7 @@ type ErrorResponse struct {
 // SMS Request/Response structs
 type SMSSetupRequest struct {
 	WorkspaceID    string `json:"workspace_id" binding:"required"`
-	ClientID    string `json:"client_id" binding:"required"`
+	ClientID    string `json:"client_id"`
 	Email       string `json:"email" binding:"required,email"`
 	PhoneNumber string `json:"phone_number" binding:"required"`
 }
@@ -56,7 +56,7 @@ type SMSSetupResponse struct {
 
 type SMSConfirmRequest struct {
 	WorkspaceID    string `json:"workspace_id" binding:"required"`
-	ClientID    string `json:"client_id" binding:"required"`
+	ClientID    string `json:"client_id"`
 	Email       string `json:"email" binding:"required,email"`
 	PhoneNumber string `json:"phone_number" binding:"required"`
 	Code        string `json:"code" binding:"required"`
@@ -70,7 +70,7 @@ type SMSConfirmResponse struct {
 
 type RequestSMSCodeRequest struct {
 	WorkspaceID string `json:"workspace_id" binding:"required"`
-	ClientID string `json:"client_id" binding:"required"`
+	ClientID string `json:"client_id"`
 	Email    string `json:"email" binding:"required,email"`
 }
 
@@ -84,7 +84,7 @@ type SMSCodeResponse struct {
 
 type VerifySMSRequest struct {
 	WorkspaceID string `json:"workspace_id" binding:"required"`
-	ClientID string `json:"client_id" binding:"required"`
+	ClientID string `json:"client_id"`
 	Email    string `json:"email" binding:"required,email"`
 	Code     string `json:"code" binding:"required"`
 }

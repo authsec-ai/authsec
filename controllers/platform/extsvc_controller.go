@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/authsec-ai/authsec/internal/vault"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -134,15 +133,14 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 		return nil, "", "", fmt.Errorf("invalid tenant ID: %w", err)
 	}
 
-	var tenant sharedmodels.Tenant
-	if err := ctl.globalDB.Where("workspace_id = ?", tenantUUID).First(&tenant).Error; err != nil {
-		return nil, "", "", fmt.Errorf("tenant not found: %w", err)
+	// Single-DB mode: no per-tenant database. Validate the workspace exists,
+	// then operate on the single global connection.
+	var ws struct{ ID uuid.UUID }
+	if err := ctl.globalDB.Table("workspaces").Select("id").Where("id = ?", tenantUUID).First(&ws).Error; err != nil {
+		return nil, "", "", fmt.Errorf("workspace not found: %w", err)
 	}
 
-	tenantDB, err := config.ConnectTenantDB(tenant.TenantDB)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to connect to tenant DB: %w", err)
-	}
+	tenantDB := config.DB
 
 	if err := ctl.ensureTenantSchema(tenantIDStr, tenantDB); err != nil {
 		return nil, "", "", fmt.Errorf("failed to prepare tenant schema: %w", err)
@@ -469,7 +467,7 @@ func DebugExternalServiceAuth(c *gin.Context) {
 		"extracted_scopes":    scopes,
 		"extracted_resources": resources,
 		"client_id":           claims["client_id"],
-		"workspace_id":           claims["workspace_id"],
+		"workspace_id":        claims["workspace_id"],
 	})
 }
 

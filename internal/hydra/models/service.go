@@ -43,13 +43,13 @@ type JWTClaims struct {
 	ClientID  string   `json:"client_id"`
 	ExpiresAt int64    `json:"exp"`
 	Ext       struct {
-		Email      string `json:"email"`
-		Name       string `json:"name"`
-		OrgID      string `json:"org_id"`
-		Provider   string `json:"provider"`
-		ProviderID string `json:"provider_id"`
-		WorkspaceID   string `json:"workspace_id"`
-		UserID     string `json:"user_id"`
+		Email       string `json:"email"`
+		Name        string `json:"name"`
+		OrgID       string `json:"org_id"`
+		Provider    string `json:"provider"`
+		ProviderID  string `json:"provider_id"`
+		WorkspaceID string `json:"workspace_id"`
+		UserID      string `json:"user_id"`
 	} `json:"ext"`
 	IssuedAt  int64    `json:"iat"`
 	Issuer    string   `json:"iss"`
@@ -186,28 +186,24 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	tenantID := users.WorkspaceID
 	clientID := users.ClientID
 	tenantIDStr := tenantID.String()
-	clientIDStr := clientID.String()
 
-	if tenantIDStr == "" || clientIDStr == "" {
-		return nil, fmt.Errorf("missing tenant_id or client_id in JWT token")
+	if tenantIDStr == "" {
+		return nil, fmt.Errorf("missing workspace_id in JWT token")
 	}
 
 	db := config.DB
 
-	var client Client
-	if err := db.Table("clients").Where("client_id = ? and workspace_id = ?", clientIDStr, tenantIDStr).First(&client).Error; err != nil {
-		return nil, fmt.Errorf("failed to get client details: %w", err)
-	}
-
+	// Federated identity is keyed by (workspace_id, provider, provider_id).
+	// Phase B: the legacy `clients` table was dropped; we no longer scope the
+	// user by client_id, and ProjectID (Phase E retirement) is no longer set.
 	var existingUser User
 	err := db.Table("users").Where(
-		"provider = ? AND provider_id = ? AND workspace_id = ? AND client_id = ?",
-		users.Provider, users.ProviderID, tenantID, clientID,
+		"provider = ? AND provider_id = ? AND workspace_id = ?",
+		users.Provider, users.ProviderID, tenantID,
 	).First(&existingUser).Error
 
 	now := time.Now()
 	if err == nil {
-		existingUser.ProjectID = client.ProjectID
 		existingUser.Name = *users.Username
 		existingUser.Email = users.Email
 		existingUser.ProviderData = datatypes.JSON(users.ProviderData)
@@ -223,8 +219,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	user := &User{
 		ID:           uuid.New(),
 		ClientID:     clientID,
-		WorkspaceID:     tenantID,
-		ProjectID:    client.ProjectID,
+		WorkspaceID:  tenantID,
 		Name:         *users.Username,
 		Username:     nil,
 		Email:        users.Email,
@@ -413,22 +408,22 @@ func (s *OAuthLoginService) AcceptHydraConsentRequest(consentChallenge string, c
 		RememberFor:              3600,
 		Session: map[string]interface{}{
 			"access_token": map[string]interface{}{
-				"user_id":     consentRequest.Subject,
-				"email":       userContext["email"],
-				"name":        userContext["name"],
-				"provider":    userContext["provider"],
-				"provider_id": userContext["provider_id"],
+				"user_id":      consentRequest.Subject,
+				"email":        userContext["email"],
+				"name":         userContext["name"],
+				"provider":     userContext["provider"],
+				"provider_id":  userContext["provider_id"],
 				"workspace_id": userContext["workspace_id"],
-				"org_id":      userContext["org_id"],
+				"org_id":       userContext["org_id"],
 			},
 			"id_token": map[string]interface{}{
-				"user_id":     consentRequest.Subject,
-				"email":       userContext["email"],
-				"name":        userContext["name"],
-				"provider":    userContext["provider"],
-				"provider_id": userContext["provider_id"],
+				"user_id":      consentRequest.Subject,
+				"email":        userContext["email"],
+				"name":         userContext["name"],
+				"provider":     userContext["provider"],
+				"provider_id":  userContext["provider_id"],
 				"workspace_id": userContext["workspace_id"],
-				"org_id":      userContext["org_id"],
+				"org_id":       userContext["org_id"],
 			},
 		},
 	}

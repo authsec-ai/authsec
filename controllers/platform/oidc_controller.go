@@ -50,14 +50,6 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 		return "", errors.New("admin user is required")
 	}
 
-	// Determine project_id for token
-	var projectID uuid.UUID
-	if adminUser.ProjectID != nil && *adminUser.ProjectID != uuid.Nil {
-		projectID = *adminUser.ProjectID
-	} else {
-		projectID = uuid.Nil
-	}
-
 	// Fetch admin roles from database
 	var roles []string
 	if adminUser.WorkspaceID != nil && *adminUser.WorkspaceID != uuid.Nil {
@@ -77,7 +69,6 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 	token, err := config.TokenService.GenerateAdminToken(
 		adminUser.ID,
 		adminUser.Email,
-		projectID,
 		adminUser.WorkspaceID,
 		adminUser.TenantDomain,
 		roles,
@@ -631,7 +622,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		// bookkeeping.
 		profileJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 		if err := oc.oidcService.CreateIdentity(&models.OIDCUserIdentity{
-			WorkspaceID:       workspaceID,
+			WorkspaceID:    workspaceID,
 			UserID:         user.ID,
 			ProviderName:   state.ProviderName,
 			ProviderUserID: userInfo.Sub,
@@ -652,7 +643,7 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 
 	// 2. Accept the Hydra login challenge with the local user as subject.
 	hydraCtx := map[string]interface{}{
-		"workspace_id":    workspaceID.String(),
+		"workspace_id": workspaceID.String(),
 		"email":        user.Email,
 		"name":         userInfo.Name,
 		"provider":     state.ProviderName,
@@ -805,7 +796,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 		// User exists by email but no OIDC identity - link the OIDC provider
 		profileDataJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 		newIdentity := &models.OIDCUserIdentity{
-			WorkspaceID:       *state.WorkspaceID,
+			WorkspaceID:    *state.WorkspaceID,
 			UserID:         user.ID,
 			ProviderName:   state.ProviderName,
 			ProviderUserID: userInfo.Sub,
@@ -824,6 +815,7 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 
 // handleDiscoverAndGenerateToken is a modified version of handleDiscoverCallback for the SPA flow
 func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
+	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
 	existingUser, err := oc.userRepo.GetUserByEmail(userInfo.Email)
 
 	if err == nil && existingUser != nil {
@@ -833,7 +825,7 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 		if existingIdentity == nil {
 			profileDataJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 			identity := &models.OIDCUserIdentity{
-				WorkspaceID:       existingUser.WorkspaceID,
+				WorkspaceID:    existingUser.WorkspaceID,
 				UserID:         existingUser.ID,
 				ProviderName:   state.ProviderName,
 				ProviderUserID: userInfo.Sub,
@@ -900,7 +892,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 	}
 
 	c.JSON(http.StatusOK, models.LoginResponse{
-		WorkspaceID:     user.WorkspaceID.String(),
+		WorkspaceID:  user.WorkspaceID.String(),
 		TenantDomain: tenantDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
@@ -951,7 +943,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
 		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
-		WorkspaceID:     tenantID,
+		WorkspaceID:  tenantID,
 		TenantDB:     tenantDBName,
 		Email:        userInfo.Email,
 		Username:     &username,
@@ -971,14 +963,9 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		return
 	}
 
-	// Create project - use tenant.ID for FK reference (projects.tenant_id -> tenants.id)
-	if err := oc.tenantRepo.CreateProjectTx(tx, projectID, tenant.ID, userID, "Default Project"); err != nil {
-		log.Printf("Failed to create project: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
-		return
-	}
+	// Phase E: `projects` table dropped — no project row created.
 
-	// Create admin user in main DB (users table)
+	// Createadmin user in main DB (users table)
 	usernameStr := userInfo.Email
 	adminUser := &models.ExtendedUser{
 		User: sharedmodels.User{
@@ -987,7 +974,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			Name:         userInfo.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			WorkspaceID:     tenantID,
+			WorkspaceID:  tenantID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     state.ProviderName,
@@ -1084,11 +1071,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			WorkspaceID:   tenantID.String(),
-			CommonName: fmt.Sprintf("%s Root CA", userInfo.Name),
-			Domain:     fullDomain,
-			TTL:        "87600h", // 10 years
-			MaxTTL:     "24h",    // Max certificate TTL
+			WorkspaceID: tenantID.String(),
+			CommonName:  fmt.Sprintf("%s Root CA", userInfo.Name),
+			Domain:      fullDomain,
+			TTL:         "87600h", // 10 years
+			MaxTTL:      "24h",    // Max certificate TTL
 		})
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
@@ -1122,7 +1109,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	})
 
 	identity := &models.OIDCUserIdentity{
-		WorkspaceID:       tenantID,
+		WorkspaceID:    tenantID,
 		UserID:         userID,
 		ProviderName:   state.ProviderName,
 		ProviderUserID: userInfo.Sub,
@@ -1136,7 +1123,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Save secret to Vault (best-effort, non-blocking)
-	if _, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String()); err != nil {
+	if _, err := config.SaveSecretToVault(tenantID.String(), tenantID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
 		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
 	}
@@ -1144,7 +1131,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	// Audit log: OIDC registration completed
 	middlewares.Audit(c, "oidc", tenantID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"workspace_id":     tenantID.String(),
+			"workspace_id":  tenantID.String(),
 			"tenant_domain": fullDomain,
 			"user_id":       userID.String(),
 			"email":         userInfo.Email,
@@ -1165,7 +1152,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		"success":       true,
 		"message":       "Registration successful",
 		"tenant_domain": redirectDomain,
-		"workspace_id":     tenantID.String(),
+		"workspace_id":  tenantID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true,
 	})
@@ -1241,7 +1228,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
 		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
-		WorkspaceID:     tenantID,
+		WorkspaceID:  tenantID,
 		TenantDB:     tenantDBName,
 		Email:        input.Email,
 		Username:     &username,
@@ -1261,14 +1248,9 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Create project - use tenant.ID for FK reference (projects.tenant_id -> tenants.id)
-	if err := oc.tenantRepo.CreateProjectTx(tx, projectID, tenant.ID, userID, "Default Project"); err != nil {
-		log.Printf("Failed to create project: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
-		return
-	}
+	// Phase E: `projects` table dropped — no project row created.
 
-	// Create user in main DB (users table)
+	// Createuser in main DB (users table)
 	usernameStr := input.Email
 	adminUser := &models.ExtendedUser{
 		User: sharedmodels.User{
@@ -1277,7 +1259,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			Name:         input.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			WorkspaceID:     tenantID,
+			WorkspaceID:  tenantID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     input.Provider,
@@ -1338,11 +1320,11 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			WorkspaceID:   tenantID.String(),
-			CommonName: fmt.Sprintf("%s Root CA", input.Name),
-			Domain:     fullDomain,
-			TTL:        "87600h", // 10 years
-			MaxTTL:     "24h",    // Max certificate TTL
+			WorkspaceID: tenantID.String(),
+			CommonName:  fmt.Sprintf("%s Root CA", input.Name),
+			Domain:      fullDomain,
+			TTL:         "87600h", // 10 years
+			MaxTTL:      "24h",    // Max certificate TTL
 		})
 
 		if err != nil {
@@ -1377,7 +1359,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	})
 
 	identity := &models.OIDCUserIdentity{
-		WorkspaceID:       tenantID,
+		WorkspaceID:    tenantID,
 		UserID:         userID,
 		ProviderName:   input.Provider,
 		ProviderUserID: input.ProviderUserID,
@@ -1390,7 +1372,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Save secret to Vault (best-effort, non-blocking)
-	if _, err := config.SaveSecretToVault(tenantID.String(), projectID.String(), tenantID.String()); err != nil {
+	if _, err := config.SaveSecretToVault(tenantID.String(), tenantID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
 		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
 	}
@@ -1400,7 +1382,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		"success":       true,
 		"message":       "Registration successful - welcome to your new workspace!",
 		"tenant_domain": fullDomain,
-		"workspace_id":     tenantID.String(),
+		"workspace_id":  tenantID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true, // Always true for new registrations
 	})
@@ -1629,7 +1611,7 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 		frontendHost := convertAPIToFrontendDomain(host)
 
 		// For platform domains, validate against allowlist
-		// For custom domains, trust them (they came from tenant_domains table via state)
+		// For custom domains, trust them (they came from workspace_domains table via state)
 		if isAllowedFrontendDomain(frontendHost) || (!strings.HasSuffix(frontendHost, ".authsec.dev") && !strings.HasSuffix(frontendHost, ".authsec.ai")) {
 			redirectURL = "https://" + frontendHost + "/authsec/uflow/oidc/callback"
 		}

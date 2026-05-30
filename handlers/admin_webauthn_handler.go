@@ -55,7 +55,7 @@ func (h *AdminWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context) (
 		globalDB, err := h.resolveDB()
 		if err == nil {
 			var count int64
-			err := globalDB.Table("tenant_domains").
+			err := globalDB.Table("workspace_domains").
 				Where("domain = ? AND is_verified = true", domain).
 				Count(&count).Error
 
@@ -68,7 +68,7 @@ func (h *AdminWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context) (
 				)
 				return dynamicWebAuthn, nil
 			}
-			log.Printf("AdminWebAuthn validateOrigin: Domain %s not found in tenant_domains or not verified", domain)
+			log.Printf("AdminWebAuthn validateOrigin: Domain %s not found in workspace_domains or not verified", domain)
 		} else {
 			log.Printf("AdminWebAuthn validateOrigin: Failed to resolve DB: %v", err)
 		}

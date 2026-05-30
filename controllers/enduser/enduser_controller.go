@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -32,143 +31,29 @@ var (
 
 type EndUserController struct{}
 
-// RegisterEndUser godoc
-// @Summary Register a new end user in tenant database
-// @Description Registers a new end user in the specified tenant database with all default associations
-// @Tags EndUser
-// @Accept json
-// @Produce json
-// @Param register body object true "End user registration data"
-// @Success 201 {object} object
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 409 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/clients/register [post]
-func (euc *EndUserController) RegisterClient(c *gin.Context) {
-	var input models.RegisterClientsRequest
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	var tenant models.Tenant
-	if config.DB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-		return
-	}
-	if err := config.DB.Where("workspace_id = ?", input.WorkspaceID).First(&tenant).Error; err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
-		return
-	}
-	// Parse UUIDs
-	tenantID := input.WorkspaceID
-	projectID := input.ProjectID
-	// Connect to tenant database
-	tenantDB := config.DB
-	// Check if user with email already exists
-	// var existingClient models.Client
-	// if err := tenantDB.Where("email = ?", input.Email).First(&existingClient).Error; err == nil {
-	// 	c.JSON(http.StatusConflict, gin.H{"error": "user with this email already exists"})
-	// 	return
-	// }
-
-	// Generate unique IDs
-	clientID := uuid.New()
-
-	// Create new user with all required data
-	client := models.Client{
-		ID:        clientID,
-		ClientID:  clientID,
-		WorkspaceID:  uuid.MustParse(tenantID),
-		ProjectID: uuid.MustParse(projectID),
-		Name:      input.Name,
-		Email:     shared.StringPtr(input.Email),
-		Active:    true,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-
-	// Start transaction for client creation and associations
-	tx := tenantDB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	// Create the user record
-	if err := tx.Create(&client).Error; err != nil {
-		tx.Rollback()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
-		return
-	}
-
-	// Assign default associations (scopes, roles, groups, resources)
-
-	// Commit the transaction
-	if err := tx.Commit().Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit transaction"})
-		return
-	}
-
-	// Save secret to vault (optional - based on your requirements)
-	secretID, err := config.SaveSecretToVault(client.WorkspaceID.String(), client.ProjectID.String(), client.ClientID.String())
-	if err != nil {
-		// Log the error but don't fail the registration
-		fmt.Printf("Warning: failed to save secret to vault: %v\n", err)
-	}
-
-	// Audit log: Client registered
-	middlewares.Audit(c, "client", client.ClientID.String(), "register", &middlewares.AuditChanges{
-		After: map[string]interface{}{
-			"client_id":  client.ClientID.String(),
-			"workspace_id":  client.WorkspaceID.String(),
-			"project_id": client.ProjectID.String(),
-			"name":       client.Name,
-			"email":      *client.Email,
-		},
-	})
-
-	// Return success response
-	response := models.RegisterClientsResponse{
-		ID:        client.ID.String(),
-		ClientID:  client.ClientID.String(),
-		WorkspaceID:  client.WorkspaceID.String(),
-		ProjectID: client.ProjectID.String(),
-		Name:      client.Name,
-		SecretID:  secretID,
-		Email:     *client.Email, // Dereference pointer
-		Active:    client.Active,
-		CreatedAt: client.CreatedAt,
-		Message:   "Client registered successfully",
-	}
-
-	c.JSON(http.StatusCreated, response)
-}
-
 // GetEndUser godoc
 // @Summary Get end user
 // @Description Retrieves an end user by ID or by email (requires client_id) with all associations
 // @Tags EndUser
 // @Accept json
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Workspace ID"
 // @Param user_id path string true "User ID"
 // @Param client_id query string false "Client ID (required when using email identifier)"
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [get]
+// @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id} [get]
 type GetEndUsersFilter struct {
 	WorkspaceID string `json:"workspace_id" binding:"required" validate:"required"`
-	Page     int    `json:"page,omitempty"`
-	Limit    int    `json:"limit,omitempty"`
-	Active   *bool  `json:"active,omitempty"`
-	ClientID string `json:"client_id,omitempty"`
-	Email    string `json:"email,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Provider string `json:"provider,omitempty"`
+	Page        int    `json:"page,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
+	Active      *bool  `json:"active,omitempty"`
+	ClientID    string `json:"client_id,omitempty"`
+	Email       string `json:"email,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Provider    string `json:"provider,omitempty"`
 }
 
 func (euc *EndUserController) GetEndUser(c *gin.Context) {
@@ -179,7 +64,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 	}
 	userIdentifier := c.Param("user_id")
 
-	lookupByID, userUUID, clientUUID, emailIdentifier, parseErr := resolveEndUserLookup(userIdentifier, c.Query("client_id"))
+	lookupByID, userUUID, _, emailIdentifier, parseErr := resolveEndUserLookup(userIdentifier, c.Query("client_id"))
 	if parseErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": parseErr.Error()})
 		return
@@ -213,7 +98,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		}
 	} else {
 		if err := tenantDB.Preload("Groups").
-			Where("workspace_id = ? AND client_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, clientUUID, emailIdentifier).First(&user).Error; err != nil {
+			Where("workspace_id = ? AND LOWER(email) = LOWER(?)", tenantUUID, emailIdentifier).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -267,7 +152,7 @@ func resolveEndUserLookup(identifier, clientIDParam string) (byID bool, userID u
 // @Tags EndUser
 // @Accept json
 // @Produce json
-// @Param tenant_id query string true "Tenant ID (GET) or in body (POST)"
+// @Param workspace_id query string true "Workspace ID (GET) or in body (POST)"
 // @Param page query int false "Page number (default: 1) - GET method"
 // @Param limit query int false "Items per page (default: 10, max: 100) - GET method"
 // @Param active query bool false "Filter by active status - GET method"
@@ -353,10 +238,6 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 		query = query.Where("active = ?", true)
 	}
 
-	if filter.ClientID != "" {
-		query = query.Where("client_id = ?", filter.ClientID)
-	}
-
 	if filter.Email != "" {
 		// Use ILIKE for case-insensitive partial matching (PostgreSQL)
 		// Use LIKE for case-sensitive partial matching (other databases)
@@ -408,14 +289,14 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 // @Tags EndUser
 // @Accept json
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Workspace ID"
 // @Param user_id path string true "User ID"
 // @Param input body object true "Status update data"
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id}/status [put]
+// @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id}/status [put]
 func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
@@ -463,9 +344,9 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 	// Audit log: End user status updated
 	middlewares.Audit(c, "enduser", userID, "update_status", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":   userID,
+			"user_id":      userID,
 			"workspace_id": tenantID,
-			"active":    input.Active,
+			"active":       input.Active,
 		},
 	})
 
@@ -484,14 +365,14 @@ func (euc *EndUserController) UpdateEndUserStatus(c *gin.Context) {
 // @Tags EndUser
 // @Accept json
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Workspace ID"
 // @Param user_id path string true "User ID"
 // @Param input body object true "User update data"
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [put]
+// @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id} [put]
 func (euc *EndUserController) UpdateUser(c *gin.Context) {
 	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
@@ -563,9 +444,9 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 	// Audit log: End user profile updated
 	middlewares.Audit(c, "enduser", userID, "update", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":   userID,
+			"user_id":      userID,
 			"workspace_id": tenantID,
-			"updates":   updateData,
+			"updates":      updateData,
 		},
 	})
 
@@ -589,7 +470,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 // @Produce json
 
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Workspace ID"
 
 // @Param user_id path string true "User ID"
 
@@ -601,7 +482,7 @@ func (euc *EndUserController) UpdateUser(c *gin.Context) {
 
 // @Failure 500 {object} map[string]string
 
-// @Router /authsec/uflow/user/enduser/{tenant_id}/{user_id} [delete]
+// @Router /authsec/uflow/user/enduser/{workspace_id}/{user_id} [delete]
 
 // @Router /authsec/uflow/user/enduser/delete [post]
 
@@ -1098,8 +979,8 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 type toggleEndUserActiveRequest struct {
 	WorkspaceID string               `json:"workspace_id" binding:"required"`
-	UserID   string               `json:"user_id" binding:"required"`
-	Active   *shared.FlexibleBool `json:"active" binding:"required"`
+	UserID      string               `json:"user_id" binding:"required"`
+	Active      *shared.FlexibleBool `json:"active" binding:"required"`
 }
 
 func countOtherActiveEndUsers(db *gorm.DB, tenantID uuid.UUID, excludeUser uuid.UUID) (int64, error) {
@@ -1188,9 +1069,9 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 	}
 	middlewares.Audit(c, "enduser", userID, action, &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":   userID,
+			"user_id":      userID,
 			"workspace_id": tenantID,
-			"active":    active,
+			"active":       active,
 		},
 	})
 
@@ -1245,55 +1126,54 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		return
 	}
 
-	// Extract client_id from the token introspection response
+	// clientID is the OAuth client that issued the token (Category A — for logging only).
+	// It is NOT a user-identity predicate; user identity is (workspace_id, LOWER(email)).
 	clientID := introspection.ClientID
-	if clientID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or missing client_id in OIDC token"})
+
+	// Parse workspace UUID before user lookup so it can be used as a WHERE predicate.
+	tenantIDUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace ID format"})
 		return
 	}
 
-	// Get tenant database connection
+	// Find user by (workspace_id, email) — the canonical v4 identity predicate.
+	// Category-C fix: client_id is NOT a user-identity predicate; it was the OAuth client
+	// that issued the token. MFA check is attempted first, then falls back to active check.
 	tenantDB := config.DB
-	// Find enduser details, prioritizing MFA-enabled check with client_id validation
 	var user models.User
-	err = tenantDB.Where("email = ? AND client_id = ? AND active = ? AND mfa_enabled = ?", emailID, clientID, true, true).First(&user).Error
+	err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ? AND mfa_enabled = ?",
+		tenantIDUUID, emailID, true, true).First(&user).Error
 	if err != nil {
-		// MFA check failed: log and fallback to query without MFA condition
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("MFA not enabled or user not found for email: %s, client_id: %s", emailID, clientID)
+			log.Printf("MFA not enabled or user not found for workspace: %s, email: %s, oauth_client: %s", tenantID, emailID, clientID)
 		} else {
-			log.Printf("Database error during MFA-enabled user query for email: %s, client_id: %s, error: %v", emailID, clientID, err)
+			log.Printf("Database error during MFA-enabled user query for workspace: %s, email: %s, error: %v", tenantID, emailID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 			return
 		}
 
-		// Fallback query without MFA condition but still include client_id
-		err = tenantDB.Where("email = ? AND client_id = ? AND active = ?", emailID, clientID, true).First(&user).Error
+		// Fallback: user exists but MFA is not enabled
+		err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ?",
+			tenantIDUUID, emailID, true).First(&user).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("User not found in fallback query for email: %s, client_id: %s", emailID, clientID)
+				log.Printf("User not found in fallback query for workspace: %s, email: %s", tenantID, emailID)
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			} else {
-				log.Printf("Database error in fallback user query for email: %s, client_id: %s, error: %v", emailID, clientID, err)
+				log.Printf("Database error in fallback user query for workspace: %s, email: %s, error: %v", tenantID, emailID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 			}
 			return
 		}
-		// At this point, user exists but MFA is not enabled
-		log.Printf("Fallback successful: User found with MFA disabled for email: %s, client_id: %s", user.Email, clientID)
+		log.Printf("Fallback successful: User found with MFA disabled for workspace: %s, email: %s", tenantID, user.Email)
 	} else {
-		// MFA-enabled user found
-		log.Printf("MFA-enabled user found for email: %s, client_id: %s", user.Email, clientID)
+		log.Printf("MFA-enabled user found for workspace: %s, email: %s", tenantID, user.Email)
 	}
 
-	// Cross-verify tenant ID from token matches user's tenant
-	tenantIDUUID, err := uuid.Parse(tenantID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
-		return
-	}
+	// Cross-verify workspace ID from token matches user's workspace
 	if user.WorkspaceID != tenantIDUUID {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant mismatch in credentials"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Workspace mismatch in credentials"})
 		return
 	}
 
@@ -1302,7 +1182,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 
 	// Prepare base response
 	response := models.LoginResponse{
-		WorkspaceID:    user.WorkspaceID.String(),
+		WorkspaceID: user.WorkspaceID.String(),
 		Email:       user.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -1437,7 +1317,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 		}
 
 		response := models.LoginResponse{
-			WorkspaceID:    user.WorkspaceID.String(),
+			WorkspaceID: user.WorkspaceID.String(),
 			Email:       user.Email,
 			FirstLogin:  isFirstLogin,
 			OTPRequired: false,
@@ -1475,7 +1355,7 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 
 	// Prepare base response
 	response := models.LoginResponse{
-		WorkspaceID:    user2.WorkspaceID.String(),
+		WorkspaceID: user2.WorkspaceID.String(),
 		Email:       user2.Email,
 		FirstLogin:  isFirstLogin,
 		OTPRequired: false,
@@ -1669,9 +1549,9 @@ func (euc *EndUserController) InitiateCustomLoginRegister(c *gin.Context) {
 // @Router /authsec/uflow/user/register/complete [post]
 func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	var input struct {
-		Email    string `json:"email" binding:"required,email"`
-		OTP      string `json:"otp" binding:"required"`
-		ClientID string `json:"client_id" binding:"required"`
+		Email       string `json:"email" binding:"required,email"`
+		OTP         string `json:"otp" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1679,12 +1559,21 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	}
 	input.Email = strings.ToLower(input.Email)
 
+	// Workspace comes from explicit workspace_id (set by the UI from page-data),
+	// ?workspace=, or Host — never from client_id. Scopes the pending lookup so
+	// the same email registering across multiple workspaces resolves correctly.
+	workspaceID, err := shared.ResolveWorkspace(c, input.WorkspaceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workspace resolution failed: %v", err)})
+		return
+	}
+
 	db := config.GetDatabase()
 
 	// Verify OTP
 	var otpVerified bool
 	var otpExpiry time.Time
-	err := db.QueryRow("SELECT verified, expires_at FROM otp_entries WHERE email = $1 AND otp = $2", input.Email, input.OTP).Scan(&otpVerified, &otpExpiry)
+	err = db.QueryRow("SELECT verified, expires_at FROM otp_entries WHERE email = $1 AND otp = $2", input.Email, input.OTP).Scan(&otpVerified, &otpExpiry)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -1702,29 +1591,26 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 		return
 	}
 
-	// Get pending registration
+	// Get pending registration, scoped by (workspace_id, email). The legacy
+	// client_id and project_id columns are no longer selected — client_id was
+	// dropped in Phase A and project_id is unused by the user creation below.
 	var pendingReg models.PendingRegistration
-	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, workspace_id, project_id, client_id, tenant_domain, expires_at
-		FROM pending_registrations WHERE email = $1`, input.Email).Scan(
+	err = db.QueryRow(`SELECT email, password_hash, first_name, last_name, workspace_id, tenant_domain, expires_at
+		FROM pending_registrations WHERE email = $1 AND workspace_id = $2`, input.Email, workspaceID).Scan(
 		&pendingReg.Email, &pendingReg.PasswordHash, &pendingReg.FirstName, &pendingReg.LastName,
-		&pendingReg.WorkspaceID, &pendingReg.ProjectID, &pendingReg.ClientID, &pendingReg.TenantDomain, &pendingReg.ExpiresAt)
+		&pendingReg.WorkspaceID, &pendingReg.TenantDomain, &pendingReg.ExpiresAt)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Registration session expired. Please initiate registration again"})
-		return
-	}
-
-	// Verify client_id matches
-	if pendingReg.ClientID.String() != input.ClientID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Client ID mismatch"})
 		return
 	}
 
 	// Single-DB collapse: scope by pendingReg.WorkspaceID explicitly.
 	tenantDB := config.DB
 
-	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update
+	// Check if there's an existing synced user (AD/Entra/SCIM) that needs password update.
+	// Identity is (workspace_id, email) — no client_id predicate.
 	var adSyncUser models.User
-	if err := tenantDB.Where("workspace_id = ? AND email = ? AND client_id = ? AND provider IN (?)", pendingReg.WorkspaceID, input.Email, input.ClientID, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", pendingReg.WorkspaceID, input.Email, []string{"ad_sync", "entra_id", "scim"}).First(&adSyncUser).Error; err == nil {
 		// Update the existing synced user's password_hash
 		if err := tenantDB.Model(&adSyncUser).Update("password_hash", pendingReg.PasswordHash).Error; err != nil {
 			log.Printf("Failed to update user password: %v", err)
@@ -1766,16 +1652,16 @@ func (euc *EndUserController) CompleteCustomLoginRegister(c *gin.Context) {
 	// User identity is (workspace_id, email); no client_id predicate.
 	newUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:          uuid.New(),
-			WorkspaceID: pendingReg.WorkspaceID,
-			Name:        displayName,
-			Email:       pendingReg.Email,
+			ID:           uuid.New(),
+			WorkspaceID:  pendingReg.WorkspaceID,
+			Name:         displayName,
+			Email:        pendingReg.Email,
 			PasswordHash: pendingReg.PasswordHash,
 			TenantDomain: pendingReg.TenantDomain,
-			Provider:    "custom",
-			ProviderID:  pendingReg.Email,
-			Active:      true,
-			MFAEnabled:  false,
+			Provider:     "custom",
+			ProviderID:   pendingReg.Email,
+			Active:       true,
+			MFAEnabled:   false,
 		},
 	}
 
@@ -2237,17 +2123,17 @@ func (euc *EndUserController) AdminChangeUserPassword(c *gin.Context) {
 	// Audit log: Admin changed user password
 	middlewares.Audit(c, "enduser", user.ID.String(), "admin_change_password", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":   user.ID.String(),
-			"email":     user.Email,
+			"user_id":      user.ID.String(),
+			"email":        user.Email,
 			"workspace_id": tenantID,
 		},
 	})
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":   true,
-		"message":   "User password changed successfully",
-		"user_id":   user.ID.String(),
-		"email":     user.Email,
+		"success":      true,
+		"message":      "User password changed successfully",
+		"user_id":      user.ID.String(),
+		"email":        user.Email,
 		"workspace_id": user.WorkspaceID.String(),
 	})
 }
@@ -2363,10 +2249,10 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 	// Audit log: Admin reset user password
 	middlewares.Audit(c, "enduser", user.ID.String(), "admin_reset_password", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":    user.ID.String(),
-			"email":      user.Email,
-			"workspace_id":  tenantID,
-			"email_sent": emailSent,
+			"user_id":      user.ID.String(),
+			"email":        user.Email,
+			"workspace_id": tenantID,
+			"email_sent":   emailSent,
 		},
 	})
 
@@ -2375,7 +2261,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 		"message":            "User password reset successfully",
 		"user_id":            user.ID.String(),
 		"email":              user.Email,
-		"workspace_id":          user.WorkspaceID.String(),
+		"workspace_id":       user.WorkspaceID.String(),
 		"temporary_password": tempPassword,
 		"email_sent":         emailSent,
 	})
@@ -2387,7 +2273,7 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully. Temporary password included in response",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"workspace_id":          user.WorkspaceID.String(),
+			"workspace_id":       user.WorkspaceID.String(),
 			"temporary_password": tempPassword,
 			"email_sent":         emailSent,
 		})
@@ -2398,357 +2284,11 @@ func (euc *EndUserController) AdminResetUserPassword(c *gin.Context) {
 			"message":            "User password reset successfully",
 			"user_id":            user.ID.String(),
 			"email":              user.Email,
-			"workspace_id":          user.WorkspaceID.String(),
+			"workspace_id":       user.WorkspaceID.String(),
 			"temporary_password": "Sent via email",
 			"email_sent":         emailSent,
 		})
 	}
-}
-
-// GetClients godoc
-// @Summary Get all clients for a tenant
-// @Description Retrieves all clients for a specific tenant with pagination and filtering
-// @Tags Clients
-// @Accept json
-// @Produce json
-// @Param tenant_id query string true "Tenant ID"
-// @Param page query int false "Page number (default: 1)"
-// @Param limit query int false "Items per page (default: 10, max: 100)"
-// @Param active query bool false "Filter by active status"
-// @Param client_id query string false "Filter by specific client ID"
-// @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/clients [get]
-func (euc *EndUserController) GetClients(c *gin.Context) {
-	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
-		return
-	}
-
-	// Parse pagination parameters
-	pageStr := c.DefaultQuery("page", "1")
-	limitStr := c.DefaultQuery("limit", "10")
-	activeStr := c.Query("active")
-	clientIDFilter := c.Query("client_id")
-
-	page, err := strconv.Atoi(pageStr)
-	if err != nil || page <= 0 {
-		page = 1
-	}
-
-	limit, err := strconv.Atoi(limitStr)
-	if err != nil || limit <= 0 {
-		limit = 10
-	}
-	if limit > 100 {
-		limit = 100
-	}
-
-	offset := (page - 1) * limit
-
-	// Parse active filter
-	var activeFilter *bool
-	if activeStr != "" {
-		active, err := strconv.ParseBool(activeStr)
-		if err == nil {
-			activeFilter = &active
-		}
-	}
-
-	// Validate client ID format if provided
-	if clientIDFilter != "" {
-		if _, err := uuid.Parse(clientIDFilter); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid client_id format"})
-			return
-		}
-	}
-
-	// Connect to tenant database
-	if config.DB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-		return
-	}
-	tenantDB := config.DB
-
-	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("workspace_id = ?", tenantID)
-
-	// Apply filters
-	if activeFilter != nil {
-		query = query.Where("active = ?", *activeFilter)
-	}
-	if clientIDFilter != "" {
-		query = query.Where("client_id = ?", clientIDFilter)
-	}
-
-	// Get total count
-	var totalCount int64
-	if err := query.Count(&totalCount).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count clients"})
-		return
-	}
-
-	// Get paginated results
-	var clients []models.Client
-	if err := query.Offset(offset).Limit(limit).Find(&clients).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve clients"})
-		return
-	}
-
-	// Convert to response format
-	var clientResponses []models.RegisterClientsResponse
-	for _, client := range clients {
-		email := ""
-		if client.Email != nil {
-			email = *client.Email
-		}
-		response := models.RegisterClientsResponse{
-			ID:        client.ID.String(),
-			ClientID:  client.ClientID.String(),
-			WorkspaceID:  client.WorkspaceID.String(),
-			ProjectID: client.ProjectID.String(),
-			Name:      client.Name,
-			Email:     email,
-			Active:    client.Active,
-			CreatedAt: client.CreatedAt,
-		}
-		clientResponses = append(clientResponses, response)
-	}
-
-	// Calculate pagination info
-	totalPages := (int(totalCount) + limit - 1) / limit
-
-	response := gin.H{
-		"clients":    clientResponses,
-		"total":      int(totalCount),
-		"page":       page,
-		"limit":      limit,
-		"totalPages": totalPages,
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-// GetClientsPost godoc
-// @Summary Get all clients for a tenant (POST version)
-// @Description Retrieves all clients for a specific tenant with pagination and filtering via POST request
-// @Tags Clients
-// @Accept json
-// @Produce json
-// @Param input body object true "Client list request payload"
-// @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/user/clients/get [post]
-func (euc *EndUserController) GetClientsPost(c *gin.Context) {
-	var req struct {
-		WorkspaceID string `json:"workspace_id" binding:"required"`
-		Page     int    `json:"page,omitempty"`
-		Limit    int    `json:"limit,omitempty"`
-		Active   *bool  `json:"active,omitempty"`
-		ClientID string `json:"client_id,omitempty"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
-		return
-	}
-
-	// Set default values
-	if req.Page <= 0 {
-		req.Page = 1
-	}
-	if req.Limit <= 0 {
-		req.Limit = 10
-	}
-	if req.Limit > 100 {
-		req.Limit = 100
-	}
-
-	offset := (req.Page - 1) * req.Limit
-
-	// Validate client ID format if provided
-	if req.ClientID != "" {
-		if _, err := uuid.Parse(req.ClientID); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid client_id format"})
-			return
-		}
-	}
-
-	// Connect to tenant database
-	if config.DB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-		return
-	}
-	tenantDB := config.DB
-
-	// Build query with base tenant filter
-	query := tenantDB.Model(&models.Client{}).Where("workspace_id = ?", req.WorkspaceID)
-
-	// Apply filters
-	if req.Active != nil {
-		query = query.Where("active = ?", *req.Active)
-	}
-	if req.ClientID != "" {
-		query = query.Where("client_id = ?", req.ClientID)
-	}
-
-	// Get total count
-	var totalCount int64
-	if err := query.Count(&totalCount).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count clients"})
-		return
-	}
-
-	// Get paginated results
-	var clients []models.Client
-	if err := query.Offset(offset).Limit(req.Limit).Find(&clients).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve clients"})
-		return
-	}
-
-	// Convert to response format
-	var clientResponses []models.RegisterClientsResponse
-	for _, client := range clients {
-		email := ""
-		if client.Email != nil {
-			email = *client.Email
-		}
-		response := models.RegisterClientsResponse{
-			ID:        client.ID.String(),
-			ClientID:  client.ClientID.String(),
-			WorkspaceID:  client.WorkspaceID.String(),
-			ProjectID: client.ProjectID.String(),
-			Name:      client.Name,
-			Email:     email,
-			Active:    client.Active,
-			CreatedAt: client.CreatedAt,
-		}
-		clientResponses = append(clientResponses, response)
-	}
-
-	// Calculate pagination info
-	totalPages := (int(totalCount) + req.Limit - 1) / req.Limit
-
-	response := gin.H{
-		"clients":    clientResponses,
-		"total":      int(totalCount),
-		"page":       req.Page,
-		"limit":      req.Limit,
-		"totalPages": totalPages,
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-// GetClientsByTenantID godoc
-// @Summary Get clients for a specific tenant (URL path version)
-// @Description Retrieves clients for a tenant specified in URL path with filtering via request body
-// @Tags Clients
-// @Accept json
-// @Produce json
-// @Param tenant_id path string true "Tenant ID"
-// @Param input body object true "Client filter options"
-// @Success 200 {object} sharedmodels.PaginatedEndUsersResponse
-// @Failure 400 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/clientms/tenants/{tenant_id}/clients/getClients [post]
-func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
-	// Get tenant_id from token
-	tenantID, ok := middlewares.GetWorkspaceIDFromToken(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
-		return
-	}
-
-	// Parse request body for filters
-	var req struct {
-		Page     int    `json:"page,omitempty"`
-		Limit    int    `json:"limit,omitempty"`
-		Active   *bool  `json:"active_only,omitempty"` // Map active_only to active
-		ClientID string `json:"client_id,omitempty"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
-		return
-	}
-
-	// Set default values
-	if req.Page <= 0 {
-		req.Page = 1
-	}
-	if req.Limit <= 0 {
-		req.Limit = 10
-	}
-	if req.Limit > 100 {
-		req.Limit = 100
-	}
-
-	offset := (req.Page - 1) * req.Limit
-
-	// Validate client ID format if provided
-	if req.ClientID != "" {
-		if _, err := uuid.Parse(req.ClientID); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid client_id format"})
-			return
-		}
-	}
-
-	// Connect to tenant database
-	if config.DB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection not available"})
-		return
-	}
-	tenantDB := config.DB
-
-	// Build query with base tenant filter — single-DB collapse means row-level
-	// isolation is the only boundary, so the tenant predicate must be explicit.
-	query := tenantDB.Model(&models.Client{}).
-		Where("workspace_id = ?", tenantID).
-		Where("deleted_at IS NULL")
-
-	// Add active filter if provided
-	if req.Active != nil {
-		query = query.Where("active = ?", *req.Active)
-	}
-
-	// Add client ID filter if provided
-	if req.ClientID != "" {
-		query = query.Where("id = ?", req.ClientID)
-	}
-
-	// Get total count
-	var totalCount int64
-	if err := query.Count(&totalCount).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count clients"})
-		return
-	}
-
-	// Calculate total pages
-	totalPages := int((totalCount + int64(req.Limit) - 1) / int64(req.Limit))
-
-	// Get paginated results
-	var clients []models.Client
-	if err := query.Order("created_at DESC").Offset(offset).Limit(req.Limit).Find(&clients).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch clients"})
-		return
-	}
-
-	// Build response
-	response := gin.H{
-		"clients": clients,
-		"pagination": gin.H{
-			"total":      int(totalCount),
-			"page":       req.Page,
-			"limit":      req.Limit,
-			"totalPages": totalPages,
-		},
-	}
-
-	c.JSON(http.StatusOK, response)
 }
 
 // NotifyOwnerNewRegistration godoc

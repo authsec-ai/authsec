@@ -23,5 +23,5 @@ type TenantDomain struct {
 }
 
 func (TenantDomain) TableName() string {
-	return "tenant_domains"
+	return "workspace_domains"
 }

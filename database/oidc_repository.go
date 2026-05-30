@@ -616,7 +616,7 @@ func (r *OIDCUserIdentityRepository) DeleteIdentity(tenantID, userID uuid.UUID, 
 // Useful for "find my workspace" feature
 func (r *OIDCUserIdentityRepository) GetTenantsByProviderEmail(email string) ([]uuid.UUID, error) {
 	query := `
-		SELECT DISTINCT tenant_id
+		SELECT DISTINCT workspace_id
 		FROM oidc_user_identities
 		WHERE email = $1
 	`

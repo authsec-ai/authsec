@@ -23,7 +23,7 @@ type TenantDomain struct {
 	UpdatedAt            time.Time  `gorm:"type:timestamp;default:now()"`
 }
 
-func (TenantDomain) TableName() string { return "tenant_domains" }
+func (TenantDomain) TableName() string { return "workspace_domains" }
 
 // GetVerifiedDomainsForTenant returns a list of verified domain hosts for a tenant
 func GetVerifiedDomainsForTenant(db *gorm.DB, tenantID string) ([]string, error) {

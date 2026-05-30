@@ -121,25 +121,25 @@ func (atr *AdminTenantRepository) GetTenantUsers(workspaceID string) ([]models.U
 }
 
 // GetTenantByDomain retrieves a workspace by its domain. Supports
-// custom domains via the tenant_domains join.
+// custom domains via the workspace_domains join.
 func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*models.Tenant, error) {
 	log.Printf("DEBUG GetTenantByDomain: Looking up domain='%s'", workspaceDomain)
 
-	// First try via tenant_domains (custom-domain mapping).
+	// First try via workspace_domains (custom-domain mapping).
 	query := `
 		SELECT ` + workspaceSelectCols + `
 		FROM workspaces w
-		INNER JOIN tenant_domains td ON w.id = td.workspace_id
+		INNER JOIN workspace_domains td ON w.id = td.workspace_id
 		WHERE LOWER(td.domain) = LOWER($1) AND td.is_verified = true
 		LIMIT 1
 	`
 	var t models.Tenant
 	err := scanWorkspaceRow(atr.db.QueryRow(query, workspaceDomain), &t)
 	if err == nil {
-		log.Printf("DEBUG GetTenantByDomain: Found via tenant_domains: workspace_id=%s, workspace_domain=%s", t.WorkspaceID, t.TenantDomain)
+		log.Printf("DEBUG GetTenantByDomain: Found via workspace_domains: workspace_id=%s, workspace_domain=%s", t.WorkspaceID, t.TenantDomain)
 		return &t, nil
 	}
-	log.Printf("DEBUG GetTenantByDomain: Not found in tenant_domains (error: %v), trying fallback", err)
+	log.Printf("DEBUG GetTenantByDomain: Not found in workspace_domains (error: %v), trying fallback", err)
 
 	// Fallback: direct lookup on workspaces.workspace_domain
 	fallbackQuery := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE workspace_domain LIKE $1 OR workspace_domain = $2`
@@ -179,22 +179,6 @@ func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) e
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create workspace: %w", err)
-	}
-	return nil
-}
-
-// CreateProjectTx creates a new project within a transaction.
-func (atr *AdminTenantRepository) CreateProjectTx(tx *sql.Tx, projectID, workspaceID, userID uuid.UUID, name string) error {
-	query := `
-		INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
-	now := time.Now()
-	_, err := tx.Exec(query,
-		projectID, workspaceID, name, "Default project", userID, true, now, now,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create project: %w", err)
 	}
 	return nil
 }

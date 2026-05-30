@@ -59,15 +59,17 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 	addStep := func(s string) { steps = append(steps, s); log.Printf("[purge] %s", s) }
 	addErr := func(s string) { errs = append(errs, s); log.Printf("[purge] ERROR: %s", s) }
 
-	// ── 1. Look up user + tenant ──────────────────────────────────────────────
+	// ── 1. Look up user + workspace ───────────────────────────────────────────
+	// Single-DB mode: there is no per-tenant database, so tenantDB is always "".
+	// workspaces has columns id / workspace_domain / vault_mount (no tenant_db).
 	var userID, tenantID, tenantDB, tenantDomain, vaultMount string
 	row := db.Raw(`
 		SELECT u.id, u.workspace_id,
-		       COALESCE(t.tenant_db, ''),
-		       COALESCE(t.tenant_domain, ''),
+		       '' AS tenant_db,
+		       COALESCE(t.workspace_domain, ''),
 		       COALESCE(t.vault_mount, '')
 		FROM users u
-		LEFT JOIN workspaces t ON t.workspace_id = u.workspace_id
+		LEFT JOIN workspaces t ON t.id = u.workspace_id
 		WHERE LOWER(u.email) = ?
 		LIMIT 1`, email).Row()
 	if err := row.Scan(&userID, &tenantID, &tenantDB, &tenantDomain, &vaultMount); err != nil {
@@ -128,7 +130,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 			// Phase A: tenant_mappings + tenants tables deleted (Phase 6).
 			// Phase B: clients table deleted — no purge entry needed.
 			// Phase C: tenant_hydra_clients table dropped.
-			{"projects", `DELETE FROM projects WHERE workspace_id = $1`},
+			// Phase E: projects table dropped — no purge entry needed.
 			{"role_bindings", `DELETE FROM role_bindings WHERE workspace_id = $1`},
 			{"users", `DELETE FROM users WHERE workspace_id = $1`},
 			{"workspaces", `DELETE FROM workspaces WHERE id = $1`},
@@ -161,23 +163,6 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		status = http.StatusPartialContent
 	}
 	c.JSON(status, report)
-}
-
-func purgeHTTPDelete(url string) error {
-	req, err := http.NewRequest(http.MethodDelete, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-		return nil
-	}
-	body, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 }
 
 func purgeVaultDisableMount(vaultAddr, vaultToken, mount string) error {

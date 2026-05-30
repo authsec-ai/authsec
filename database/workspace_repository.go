@@ -264,9 +264,6 @@ func (tr *TenantRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int6
 	if err := execDelete("user_groups", "DELETE FROM user_groups WHERE user_id IN (SELECT id FROM users WHERE workspace_id = $1)", workspaceID); err != nil {
 		return nil, err
 	}
-	if err := execDelete("projects", "DELETE FROM projects WHERE workspace_id = $1", workspaceID); err != nil {
-		return nil, err
-	}
 	if err := execDelete("users", "DELETE FROM users WHERE workspace_id = $1", workspaceID); err != nil {
 		return nil, err
 	}

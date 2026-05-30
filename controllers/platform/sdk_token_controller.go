@@ -1,7 +1,6 @@
 package platform
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
@@ -19,17 +18,19 @@ func NewSDKTokenController() *SDKTokenController {
 	return &SDKTokenController{}
 }
 
-// GetDelegationToken returns the active delegation token for an AI agent client.
-// The SDK authenticates with its client_id (passed as query param or header).
+// GetDelegationToken returns the active delegation token for an AI agent.
+// Workspace is resolved from the caller's JWT workspace_id claim.
+// client_id identifies the agent (resource_servers.id).
 //
 // GET /uflow/sdk/delegation-token?client_id=<uuid>
-//
-// Flow:
-//  1. SDK sends client_id
-//  2. Look up tenant_id via tenant_mappings table (client_id → tenant_id)
-//  3. Query delegation_tokens in tenant DB
-//  4. Return token + permissions if active and not expired
 func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
+	// Workspace from the caller's JWT (same pattern as RevokeDelegationToken).
+	workspaceID, err := resolveDelegationTenantID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+
 	clientID := c.Query("client_id")
 	if clientID == "" {
 		clientID = c.GetHeader("X-Client-ID")
@@ -38,16 +39,8 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "client_id is required (query param or X-Client-ID header)"})
 		return
 	}
-
 	if _, err := uuid.Parse(clientID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
-		return
-	}
-
-	// Resolve tenant_id from client_id via tenant_mappings in master DB
-	tenantID, err := resolveTenantIDFromClientID(clientID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Client not found", "details": err.Error()})
 		return
 	}
 
@@ -55,7 +48,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 
 	var dt models.DelegationToken
 	result := tenantDB.
-		Where("client_id::text = ? AND workspace_id::text = ? AND status = 'active'", clientID, tenantID).
+		Where("client_id::text = ? AND workspace_id = ? AND status = 'active'", clientID, workspaceID).
 		First(&dt)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{
@@ -78,17 +71,17 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"token":       dt.Token,
-		"spiffe_id":   dt.SpiffeID,
-		"permissions": dt.GetPermissions(),
-		"audience":    dt.GetAudience(),
-		"expires_at":  dt.ExpiresAt,
-		"ttl_seconds": dt.TTLSeconds,
-		"client_id":   dt.ClientID,
-		"workspace_id":   dt.WorkspaceID,
-		"status":      dt.Status,
-		"issued_at":   dt.CreatedAt,
-		"updated_at":  dt.UpdatedAt,
+		"token":        dt.Token,
+		"spiffe_id":    dt.SpiffeID,
+		"permissions":  dt.GetPermissions(),
+		"audience":     dt.GetAudience(),
+		"expires_at":   dt.ExpiresAt,
+		"ttl_seconds":  dt.TTLSeconds,
+		"client_id":    dt.ClientID,
+		"workspace_id": dt.WorkspaceID,
+		"status":       dt.Status,
+		"issued_at":    dt.CreatedAt,
+		"updated_at":   dt.UpdatedAt,
 	})
 }
 
@@ -127,21 +120,3 @@ func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
 	})
 }
 
-// resolveTenantIDFromClientID looks up the tenant_id for a client_id
-// via the tenant_mappings table in the master database.
-func resolveTenantIDFromClientID(clientID string) (string, error) {
-	masterDB := config.GetDatabase()
-	if masterDB == nil {
-		return "", fmt.Errorf("master database not initialized")
-	}
-
-	var tenantID string
-	err := masterDB.DB.QueryRow(
-		`SELECT workspace_id::uuid FROM clients WHERE client_id = $1 LIMIT 1`,
-		clientID,
-	).Scan(&tenantID)
-	if err != nil {
-		return "", fmt.Errorf("client_id %s not found in clients", clientID)
-	}
-	return tenantID, nil
-}

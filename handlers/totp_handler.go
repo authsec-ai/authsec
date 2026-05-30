@@ -296,7 +296,7 @@ func (h *TOTPHandler) ConfirmTOTPSetup(c *gin.Context) {
 	// Audit log for successful TOTP setup
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
 		"workspace_id": req.WorkspaceID,
-		"email":     req.Email,
+		"email":        req.Email,
 	})
 
 	response := TOTPConfirmResponse{
@@ -429,7 +429,7 @@ func (h *TOTPHandler) ConfirmSetup(c *gin.Context) {
 	// Audit log for successful TOTP setup (login flow)
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "setup", true, map[string]interface{}{
 		"workspace_id": req.WorkspaceID,
-		"email":     req.Email,
+		"email":        req.Email,
 	})
 
 	response := TOTPConfirmResponse{
@@ -512,11 +512,11 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 				}
 
 				response := AuthenticationResponse{
-					Success:  true,
-					Message:  "Backup code accepted",
-					Method:   "backup_code",
+					Success:     true,
+					Message:     "Backup code accepted",
+					Method:      "backup_code",
 					WorkspaceID: req.WorkspaceID,
-					Email:    client.Email,
+					Email:       client.Email,
 				}
 				c.JSON(http.StatusOK, response)
 				return
@@ -579,15 +579,15 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 	// Audit log for successful TOTP verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "verify", true, map[string]interface{}{
 		"workspace_id": req.WorkspaceID,
-		"email":     req.Email,
+		"email":        req.Email,
 	})
 
 	response := AuthenticationResponse{
-		Success:  true,
-		Message:  "TOTP verification successful",
-		Method:   "totp",
+		Success:     true,
+		Message:     "TOTP verification successful",
+		Method:      "totp",
 		WorkspaceID: req.WorkspaceID,
-		Email:    client.Email,
+		Email:       client.Email,
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -648,11 +648,11 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 			h.updateMFAVerifiedStatus(tenantDB, req.WorkspaceID)
 
 			response := AuthenticationResponse{
-				Success:  true,
-				Message:  "Backup code accepted",
-				Method:   "backup_code",
+				Success:     true,
+				Message:     "Backup code accepted",
+				Method:      "backup_code",
 				WorkspaceID: req.WorkspaceID,
-				Email:    client.Email,
+				Email:       client.Email,
 			}
 			c.JSON(http.StatusOK, response)
 			return
@@ -691,15 +691,15 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 		// Audit log for successful TOTP login verification
 		middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", true, map[string]interface{}{
 			"workspace_id": req.WorkspaceID,
-			"email":     req.Email,
+			"email":        req.Email,
 		})
 
 		response := AuthenticationResponse{
-			Success:  true,
-			Message:  "TOTP code valid",
-			Method:   "totp",
+			Success:     true,
+			Message:     "TOTP code valid",
+			Method:      "totp",
 			WorkspaceID: req.WorkspaceID,
-			Email:    client.Email,
+			Email:       client.Email,
 		}
 		c.JSON(http.StatusOK, response)
 		return
@@ -708,8 +708,8 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 	// Audit log for failed TOTP login verification
 	middleware.AuditAuthentication(c, client.ID.String(), "totp", "login_verify", false, map[string]interface{}{
 		"workspace_id": req.WorkspaceID,
-		"email":     req.Email,
-		"reason":    "invalid_code",
+		"email":        req.Email,
+		"reason":       "invalid_code",
 	})
 
 	log.Printf("Invalid TOTP code for: %s", req.Email)
@@ -795,17 +795,9 @@ func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodel
 		log.Printf("fetchClientForMFA: Found admin user in global DB: %s", user.Email)
 		return globalDB, &user, nil
 	} else {
-		// Not an admin user - proceed with tenant DB lookup
-		tenantDBName, err := config.GetTenantDBName(globalDB, tenantID)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		tenantDB, err = config.ConnectTenantDB(tenantDBName)
-		if err != nil {
-			return nil, nil, err
-		}
-
+		// Single-DB mode: there is no per-tenant DB. The end-user lives in the
+		// same global `users` table; query it directly.
+		tenantDB = globalDB
 		clientRepo := repositories.NewClientRepository(tenantDB)
 		// Use the new TOTP-specific function
 		client, err := clientRepo.GetClientForTOTP(email, tenantID, clientID)
@@ -833,17 +825,9 @@ func fetchClientForLoginMFA(email, tenantID string) (*gorm.DB, *sharedmodels.Use
 		log.Printf("fetchClientForLoginMFA: Found admin user in global DB: %s", user.Email)
 		return globalDB, &user, nil
 	} else {
-		// Not an admin user - proceed with tenant DB lookup
-		tenantDBName, err := config.GetTenantDBName(globalDB, tenantID)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		tenantDB, err := config.ConnectTenantDB(tenantDBName)
-		if err != nil {
-			return nil, nil, err
-		}
-
+		// Single-DB mode: there is no per-tenant DB. The end-user lives in the
+		// same global `users` table; query it directly.
+		tenantDB := globalDB
 		clientRepo := repositories.NewClientRepository(tenantDB)
 		// Use the new TOTP-specific login function
 		client, err := clientRepo.GetClientForTOTPLogin(email, tenantID)

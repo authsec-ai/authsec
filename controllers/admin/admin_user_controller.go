@@ -295,7 +295,7 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 
 	// Validate tenant ownership
 	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), tenantUUID.String()) {
-		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
+		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}
@@ -453,7 +453,7 @@ func (auc *AdminUserController) DeleteAdminUser(c *gin.Context) {
 
 	// Validate tenant ownership
 	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), userTenant) {
-		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
+		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}
@@ -613,7 +613,7 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 
 	// Validate tenant ownership
 	if adminUser.WorkspaceID == nil || !strings.EqualFold(adminUser.WorkspaceID.String(), tenantUUID.String()) {
-		logger.WithField("admin_tenant_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
+		logger.WithField("admin_workspace_id", adminUser.WorkspaceID).Warn("Admin user belongs to different tenant")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin user belongs to a different tenant"})
 		return
 	}

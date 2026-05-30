@@ -53,7 +53,7 @@ func (ctrl *ResourceServerController) ScopePresets(c *gin.Context) {
 func (ctrl *ResourceServerController) Create(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -91,7 +91,7 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 func (ctrl *ResourceServerController) List(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -119,7 +119,7 @@ func (ctrl *ResourceServerController) List(c *gin.Context) {
 func (ctrl *ResourceServerController) Get(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -142,7 +142,7 @@ func (ctrl *ResourceServerController) Get(c *gin.Context) {
 func (ctrl *ResourceServerController) Update(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -185,7 +185,7 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 func (ctrl *ResourceServerController) Delete(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -204,7 +204,7 @@ func (ctrl *ResourceServerController) Delete(c *gin.Context) {
 func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -237,7 +237,7 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -279,7 +279,7 @@ func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -304,7 +304,7 @@ func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
 func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -328,7 +328,7 @@ func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
 func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -377,7 +377,7 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 func (ctrl *ResourceServerController) Validate(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -434,7 +434,7 @@ func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, te
 func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -461,7 +461,7 @@ func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 

@@ -184,6 +184,8 @@ func spiffeGetPublicKey(tenantID string) (*rsa.PublicKey, error) {
 		spireURL = "http://localhost:7001"
 	}
 
+	// TODO(phase9): ICP service still expects ?tenant_id= here; update to
+	// ?workspace_id= once the SPIRE-layer has been swept in Phase 9.
 	url := fmt.Sprintf("%s/v1/jwt/bundle?tenant_id=%s", spireURL, tenantID)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)

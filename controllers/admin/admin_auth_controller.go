@@ -370,7 +370,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		currentDomain == "api.authsec.dev" ||
 		strings.HasPrefix(currentDomain, "dev") && strings.Contains(currentDomain, ".authsec.dev")
 
-	// Check tenant_domains table for primary domain
+	// Check workspace_domains table for primary domain
 	var tenantDomainToReturn string
 	if adminUser.WorkspaceID != nil {
 		tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
@@ -381,7 +381,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 			log.Printf("DEBUG AdminLogin: Using stored tenant_domain=%s", tenantDomainToReturn)
 		} else if primaryDomain != nil {
 			tenantDomainToReturn = primaryDomain.Domain
-			log.Printf("DEBUG AdminLogin: primaryTenantDomain=%s from tenant_domains table", tenantDomainToReturn)
+			log.Printf("DEBUG AdminLogin: primaryTenantDomain=%s from workspace_domains table", tenantDomainToReturn)
 
 			// Check if current domain is a verified custom domain for this tenant
 			// Skip this check if the current domain is an API backend domain
@@ -403,7 +403,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	// Build response with MFA information
 	response := gin.H{
-		"workspace_id":         adminUser.WorkspaceID,
+		"workspace_id":      adminUser.WorkspaceID,
 		"tenant_domain":     tenantDomainToReturn,
 		"email":             adminUser.Email,
 		"first_login":       adminUser.LastLogin == nil,
@@ -553,7 +553,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 		}
 
 		response := gin.H{
-			"workspace_id":    "admin",
+			"workspace_id": "admin",
 			"email":        adminUser.Email,
 			"first_login":  adminUser.LastLogin == nil,
 			"otp_required": false,
@@ -658,9 +658,9 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	// Create user repository for tenant database
 	userRepo := database.NewUserRepository(tenantDB)
 
-	// Search for user in tenant database
+	// Search for user in tenant database, scoped to the workspace
 	fmt.Printf("[AdminLoginHybrid] Searching for user in tenant database: email=%s\n", input.Email)
-	tenantUser, err := userRepo.GetUserByEmail(input.Email)
+	tenantUser, err := userRepo.GetUserByEmailAndTenant(input.Email, tenant.ID)
 	if err != nil {
 		fmt.Printf("[AdminLoginHybrid] User NOT FOUND in tenant database: email=%s, error=%v\n", input.Email, err)
 		if config.AuditLogger != nil {
@@ -708,7 +708,6 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	token, err := config.TokenService.GenerateTenantUserToken(
 		tenantUser.ID,
 		tenant.ID,
-		tenantUser.ProjectID,
 		tenantUser.Email,
 		24*time.Hour,
 	)
@@ -764,7 +763,7 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"workspace_id":     tenant.ID.String(),
+		"workspace_id":  tenant.ID.String(),
 		"email":         tenantUser.Email,
 		"first_login":   tenantUser.LastLogin == nil,
 		"otp_required":  false,
@@ -920,7 +919,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	pendingReg := &models.PendingRegistration{
 		Email:        input.Email,
 		PasswordHash: hashedPassword,
-		WorkspaceID:     adminUUID,
+		WorkspaceID:  adminUUID,
 		ProjectID:    uuid.New(),
 		ClientID:     adminUUID, // Same as tenant for admin
 		TenantDomain: tenantDomain,
@@ -1296,18 +1295,10 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
-	// Step 2: Generate project ID and create project (workspace exists now for FK)
-	defaultProjectID := uuid.New()
-	projectInsertGlobal := `INSERT INTO projects (id, workspace_id, name, description, user_id, active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, true, NOW(), NOW())`
-	if _, err := tx.Exec(projectInsertGlobal, defaultProjectID, pendingReg.WorkspaceID, "Default Project", "Default project for admin user", pendingReg.WorkspaceID); err != nil {
-		tx.Rollback()
-		log.Printf("Failed to create project in global database: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create project"})
-		return
-	}
+	// Phase E: the `projects` table was dropped. Admin signup no longer creates a
+	// project row; user identity is (workspace_id, email). project_id is left unset.
 
-	// Step 3: Create admin user (stored in regular users table)
+	// Step 2: Create admin user (stored in regular users table)
 	userRepo := database.NewUserRepository(db)
 	username := pendingReg.Email
 	adminUser := models.ExtendedUser{
@@ -1317,8 +1308,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 			Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 			PasswordHash: pendingReg.PasswordHash,
 			ClientID:     pendingReg.ClientID,
-			WorkspaceID:     pendingReg.WorkspaceID,
-			ProjectID:    defaultProjectID, // Use the newly created project ID
+			WorkspaceID:  pendingReg.WorkspaceID,
 			TenantDomain: pendingReg.TenantDomain,
 			Provider:     "local",
 			ProviderID:   pendingReg.Email,
@@ -1408,11 +1398,11 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// another network round trip. Both are best-effort post-commit work that
 	// the user doesn't need to wait for. Failures are logged and surface via
 	// the Hydra reconciler on its next tick (services/hydra_reconciler.go).
-	go func(workspaceID, projectID string) {
-		if _, err := config.SaveSecretToVault(workspaceID, projectID, workspaceID); err != nil {
+	go func(workspaceID string) {
+		if _, err := config.SaveSecretToVault(workspaceID, workspaceID); err != nil {
 			log.Printf("WARN: Failed to save secret to vault for workspace %s: %v", workspaceID, err)
 		}
-	}(pendingReg.WorkspaceID.String(), pendingReg.ProjectID.String())
+	}(pendingReg.WorkspaceID.String())
 
 	log.Printf("Admin registration completed for email: %s", input.Email)
 
@@ -1428,15 +1418,6 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUser) (string, error) {
 	if adminUser == nil {
 		return "", errors.New("admin user is required")
-	}
-
-	// Determine project_id for token
-	var projectID uuid.UUID
-	if adminUser.ProjectID != nil && *adminUser.ProjectID != uuid.Nil {
-		projectID = *adminUser.ProjectID
-	} else {
-		// Default to a zero UUID for admin users without project
-		projectID = uuid.Nil
 	}
 
 	// Fetch admin roles from database
@@ -1461,8 +1442,7 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	token, err := config.TokenService.GenerateAdminToken(
 		adminUser.ID,
 		adminUser.Email,
-		projectID,
-		adminUser.WorkspaceID,     // Pass actual tenant_id
+		adminUser.WorkspaceID,  // Pass actual tenant_id
 		adminUser.TenantDomain, // Pass tenant_domain
 		roles,                  // Pass admin roles
 	)
@@ -1529,14 +1509,14 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 	}
 	log.Printf("DEBUG AdminLoginPrecheck: currentDomain=%s (from Origin or Host), email=%s", currentDomain, input.Email)
 
-	// Get tenant's primary domain from tenant_domains table (source of truth)
+	// Get tenant's primary domain from workspace_domains table (source of truth)
 	// If not found, fall back to tenants.tenant_domain for backward compatibility
 	var primaryTenantDomain string
 	if user.WorkspaceID != nil {
 		tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
 		primaryDomain, err := tenantDomainRepo.GetPrimaryDomainByTenantID(*user.WorkspaceID)
 		if err != nil {
-			log.Printf("WARN: No primary domain in tenant_domains table, falling back to tenants.tenant_domain: %v", err)
+			log.Printf("WARN: No primary domain in workspace_domains table, falling back to tenants.tenant_domain: %v", err)
 			// Fall back to querying tenants table
 			tenantRepo := database.NewTenantRepository(config.GetDatabase())
 			tenant, tenantErr := tenantRepo.GetTenantByTenantID(user.WorkspaceID.String())
@@ -1549,7 +1529,7 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 			log.Printf("DEBUG AdminLoginPrecheck: Using fallback tenant_domain=%s", primaryTenantDomain)
 		} else if primaryDomain != nil {
 			primaryTenantDomain = primaryDomain.Domain
-			log.Printf("DEBUG AdminLoginPrecheck: primaryTenantDomain=%s from tenant_domains table", primaryTenantDomain)
+			log.Printf("DEBUG AdminLoginPrecheck: primaryTenantDomain=%s from workspace_domains table", primaryTenantDomain)
 		}
 	}
 
@@ -1698,7 +1678,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		pendingReg := &models.PendingRegistration{
 			Email:        input.Email,
 			PasswordHash: hashedPassword,
-			WorkspaceID:     tenantID,
+			WorkspaceID:  tenantID,
 			ProjectID:    uuid.New(),
 			ClientID:     clientID,
 			TenantDomain: tenantDomain,
@@ -1756,7 +1736,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
 		Message:      "Bootstrap initiated. Please check your email for OTP to complete registration.",
 		Status:       "pending_verification",
-		WorkspaceID:     tenantID.String(),
+		WorkspaceID:  tenantID.String(),
 		TenantDomain: tenantDomain,
 	})
 }

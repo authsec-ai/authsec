@@ -7,7 +7,6 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
-	"github.com/google/uuid"
 )
 
 // getUserRoleNames queries role_bindings to get all distinct role names for a user in a tenant.
@@ -22,7 +21,7 @@ func getUserRoleNames(userID, tenantID string) ([]string, error) {
 		SELECT DISTINCT rb.role_name
 		FROM role_bindings rb
 		WHERE rb.user_id::text = $1
-		AND rb.tenant_id::text = $2
+		AND rb.workspace_id::text = $2
 		AND rb.role_name IS NOT NULL
 		AND rb.role_name != ''
 	`
@@ -53,7 +52,7 @@ func findDelegationPolicy(tenantID string, roleNames []string, agentType string)
 
 	var policy models.DelegationPolicy
 	result := config.DB.
-		Where("tenant_id::text = ? AND role_name IN ? AND agent_type = ? AND enabled = true",
+		Where("workspace_id::text = ? AND role_name IN ? AND agent_type = ? AND enabled = true",
 			tenantID, roleNames, agentType).
 		First(&policy)
 
@@ -77,7 +76,7 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 		INNER JOIN role_permissions rp ON p.id = rp.permission_id
 		INNER JOIN role_bindings rb ON rp.role_id = rb.role_id
 		WHERE rb.user_id::text = $1
-		AND rb.tenant_id::text = $2
+		AND rb.workspace_id::text = $2
 	`
 	rows, err := masterDB.DB.Query(query, userID, tenantID)
 	if err != nil {
@@ -96,29 +95,10 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 	return perms, nil
 }
 
-// lookupApplicationIDForLegacyClient resolves a legacy clients.id to its
-// matching resource_servers.id via the legacy_client_id mapping populated by
-// migration 118. Returns nil when no Application has been backfilled for the
-// given clients row — callers should fall back to ClientID during transition.
-func lookupApplicationIDForLegacyClient(clientID uuid.UUID) *uuid.UUID {
-	if clientID == uuid.Nil {
-		return nil
-	}
-	var appID uuid.UUID
-	row := config.DB.Table("resource_servers").
-		Select("id").
-		Where("legacy_client_id = ?", clientID).
-		Limit(1).
-		Row()
-	if err := row.Scan(&appID); err != nil {
-		return nil
-	}
-	return &appID
-}
-
-// validateClientActive checks that a client_id exists and is active in the
-// clients table for the given tenant/workspace. Single-DB collapse: queries
-// run against the shared config.DB connection.
+// validateClientActive checks that a delegation policy's client_id references an
+// active ai_agent resource server in the given workspace. Phase B: the legacy
+// `clients` table was dropped; an "agent" is now a resource_servers row with
+// application_type='ai_agent'. The policy's client_id holds that resource_servers.id.
 func validateClientActive(clientID, tenantID string) error {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
@@ -126,16 +106,17 @@ func validateClientActive(clientID, tenantID string) error {
 	}
 
 	query := `
-		SELECT id FROM clients
-		WHERE client_id::text = $1
-		AND workspace_id = $2
-		AND (deleted = false OR deleted IS NULL)
-		AND status = 'Active'
+		SELECT id FROM resource_servers
+		WHERE id::text = $1
+		AND workspace_id::text = $2
+		AND application_type = 'ai_agent'
+		AND active = true
+		AND deleted_at IS NULL
 		LIMIT 1
 	`
 	var id string
 	if err := masterDB.DB.QueryRow(query, clientID, tenantID).Scan(&id); err != nil {
-		return fmt.Errorf("client %s not found or not active in tenant %s", clientID, tenantID)
+		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, tenantID)
 	}
 	return nil
 }

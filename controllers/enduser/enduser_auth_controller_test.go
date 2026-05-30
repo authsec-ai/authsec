@@ -47,14 +47,12 @@ func TestEndUserAuthController_MethodsExist(t *testing.T) {
 		t.Skip("database not initialized for controller methods test")
 	}
 
-	assert.NotNil(t, controller.InitiateRegistration)
-	assert.NotNil(t, controller.Login)
-	assert.NotNil(t, controller.VerifyOTPAndCompleteRegistration)
+	// Legacy client_id-first handlers (InitiateRegistration, Login,
+	// VerifyOTPAndCompleteRegistration, VerifyLoginOTP, ResendOTP, WebAuthnRegister,
+	// WebAuthnMFALoginStatus) were removed; the v4 flow lives in EndUserController.
+	assert.NotNil(t, controller.SAMLLogin)
 	assert.NotNil(t, controller.WebAuthnCallback)
-	assert.NotNil(t, controller.VerifyLoginOTP)
-	assert.NotNil(t, controller.ResendOTP)
-	assert.NotNil(t, controller.WebAuthnRegister)
-	assert.NotNil(t, controller.WebAuthnMFALoginStatus)
+	assert.NotNil(t, controller.GetAuthChallenge)
 }
 
 func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {

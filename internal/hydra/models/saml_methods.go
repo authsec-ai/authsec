@@ -132,7 +132,7 @@ func (s *OAuthLoginService) GetSAMLProvidersForTenant(workspaceID string, _ ...s
 		Table("saml_providers sp").
 		Select("sp.*").
 		Joins(`JOIN identity_providers ip
-		         ON ip.workspace_id = sp.tenant_id
+		         ON ip.workspace_id = sp.workspace_id
 		        AND ip.provider_type = 'saml'
 		        AND ip.config_ref = sp.id::text`).
 		Where("sp.workspace_id = ?", workspaceID).

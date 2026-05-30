@@ -39,8 +39,8 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 		return "", "", fmt.Errorf("tenant not found: %w", err)
 	}
 
-	// Look up user by email in global database
-	user, err := uc.userRepo.GetUserByEmail(email)
+	// Look up user by email, scoped to the workspace
+	user, err := uc.userRepo.GetUserByEmailAndTenant(email, tenant.WorkspaceID)
 	if err != nil {
 		log.Printf("[WebAuthnBridge] User not found for email=%s: %v", email, err)
 		return "", "", fmt.Errorf("user not found: %w", err)
@@ -67,13 +67,10 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 		return "", "", fmt.Errorf("invalid tenant_id: %w", err)
 	}
 
-	projectUUID := user.ProjectID
-
 	// Generate access token using the centralized auth-manager token service
 	token, err := config.TokenService.GenerateTenantUserToken(
 		user.ID,
 		tenantUUID,
-		projectUUID,
 		email,
 		24*time.Hour,
 	)

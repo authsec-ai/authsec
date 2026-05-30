@@ -360,23 +360,6 @@ type SAMLTemplateDTO struct {
 	ConfigFields     []string               `json:"config_fields"`
 }
 
-// Client represents a client record in tenant DB (used by GetClientsByTenant)
-type Client struct {
-	ID        string    `json:"id" gorm:"primaryKey"`
-	ClientID  string    `json:"client_id" gorm:"uniqueIndex;not null"`
-	WorkspaceID  string    `json:"workspace_id" gorm:"not null;index"`
-	ProjectID string    `json:"project_id" gorm:"not null;index"`
-	Name      string    `json:"name"`
-	Active    bool      `json:"active" gorm:"default:true;index"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-}
-
-func (Client) TableName() string {
-	return "clients"
-}
-
 // SAMLConfigResponse wraps a list of SAML providers for a tenant.
 type SAMLConfigResponse struct {
 	Success   bool                   `json:"success"`

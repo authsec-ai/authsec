@@ -35,8 +35,8 @@ func (ps *PermissionService) GetUserPermissions(userID, tenantID string) []Permi
 		JOIN role_permissions rp ON ro.id = rp.role_id
 		JOIN permissions p ON rp.permission_id = p.id
 		WHERE rb.user_id::text = $1
-		  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $2)
+		  AND (rb.workspace_id IS NULL OR rb.workspace_id::text = $2)
+		  AND (ro.workspace_id IS NULL OR ro.workspace_id::text = $2)
 		  AND (p.workspace_id IS NULL OR p.workspace_id::text = $2)
 		ORDER BY p.resource, p.action
 	`
@@ -82,8 +82,8 @@ func (ps *PermissionService) GetUserScopes(userID, tenantID string) []string {
 		JOIN role_permissions rp ON ro.id = rp.role_id
 		JOIN permissions p ON rp.permission_id = p.id
 		WHERE rb.user_id::text = $1
-		  AND (rb.tenant_id IS NULL OR rb.tenant_id::text = $2)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $2)
+		  AND (rb.workspace_id IS NULL OR rb.workspace_id::text = $2)
+		  AND (ro.workspace_id IS NULL OR ro.workspace_id::text = $2)
 		  AND (p.workspace_id IS NULL OR p.workspace_id::text = $2)
 		ORDER BY scope_string
 	`
@@ -134,7 +134,7 @@ func (ps *PermissionService) ResolvePermissionsFromRoles(roleNames []string, ten
 		JOIN role_permissions rp ON ro.id = rp.role_id
 		JOIN permissions p ON rp.permission_id = p.id
 		WHERE ro.name IN (%s)
-		  AND (ro.tenant_id IS NULL OR ro.tenant_id::text = $1)
+		  AND (ro.workspace_id IS NULL OR ro.workspace_id::text = $1)
 		  AND (p.workspace_id IS NULL OR p.workspace_id::text = $1)
 		ORDER BY p.resource, p.action
 	`, strings.Join(placeholders, ","))

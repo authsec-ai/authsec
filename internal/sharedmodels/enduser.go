@@ -73,9 +73,9 @@ type Client struct {
 }
 */
 type User struct {
-	ID               uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_users_tenant_id_id"`
+	ID               uuid.UUID      `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_users_workspace_id_id"`
 	ClientID         uuid.UUID      `json:"client_id" gorm:"type:uuid;not null;index"`
-	WorkspaceID         uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index:idx_users_tenant_id;uniqueIndex:idx_users_tenant_id_id;uniqueIndex:idx_users_email_tenant"`
+	WorkspaceID         uuid.UUID      `json:"workspace_id" gorm:"type:uuid;not null;index:idx_users_workspace_id;uniqueIndex:idx_users_workspace_id_id;uniqueIndex:idx_users_email_tenant"`
 	ProjectID        uuid.UUID      `json:"project_id" gorm:"type:uuid;not null;index"`
 	Name             string         `json:"name"`
 	Username         *string        `json:"username,omitempty" gorm:"type:text"`

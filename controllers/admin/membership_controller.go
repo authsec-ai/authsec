@@ -94,7 +94,7 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 	q := mc.db.Table("workspace_memberships AS wm").
 		Select(`
 			wm.id,
-			wm.workspace_id AS tenant_id,
+			wm.workspace_id AS workspace_id,
 			wm.user_id,
 			wm.status,
 			r.name AS membership_type,
@@ -140,7 +140,7 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 	err := mc.db.Table("workspace_memberships AS wm").
 		Select(`
 			wm.id,
-			wm.workspace_id AS tenant_id,
+			wm.workspace_id AS workspace_id,
 			wm.user_id,
 			wm.status,
 			r.name AS membership_type,
@@ -285,7 +285,7 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 
 	var row map[string]interface{}
 	_ = mc.db.Table("workspace_memberships AS wm").
-		Select("wm.id, wm.workspace_id AS tenant_id, wm.user_id, wm.status, r.name AS membership_type, 'workspace' AS source, wm.created_at AS joined_at, wm.created_at, wm.updated_at").
+		Select("wm.id, wm.workspace_id AS workspace_id, wm.user_id, wm.status, r.name AS membership_type, 'workspace' AS source, wm.created_at AS joined_at, wm.created_at, wm.updated_at").
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
 		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
 		Take(&row).Error
@@ -368,7 +368,7 @@ func (mc *MembershipController) endUserAccessSnapshot(tenantID uuid.UUID, userID
 			COALESCE(rb.role_name, ro.name, '') AS role_name, rb.id::text AS binding_id,
 			COUNT(DISTINCT osp.scope_id) AS scopes_count`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Joins("JOIN resource_servers rs ON rs.tenant_id = rb.tenant_id AND ro.name LIKE ('rs-' || rs.id::text || ':%')").
+		Joins("JOIN resource_servers rs ON rs.workspace_id = rb.workspace_id AND ro.name LIKE ('rs-' || rs.id::text || ':%')").
 		Joins("LEFT JOIN role_permissions rp ON rp.role_id = rb.role_id").
 		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
 		Where("rb.workspace_id = ? AND rb.user_id = ?", tenantID, userID).
@@ -441,7 +441,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 		return
 	}
 
-	q := mc.db.Table("tenant_end_user_states AS s").
+	q := mc.db.Table("workspace_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
 		Where("s.workspace_id = ?", tenantID)
@@ -481,7 +481,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 	}
 
 	var row map[string]interface{}
-	err := mc.db.Table("tenant_end_user_states AS s").
+	err := mc.db.Table("workspace_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
 		Where("s.workspace_id = ? AND s.user_id = ?", tenantID, userID).

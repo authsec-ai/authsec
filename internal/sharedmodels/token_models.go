@@ -7,8 +7,8 @@ import (
 )
 
 type Role struct {
-	ID          uuid.UUID    `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_roles_tenant_id"`
-	WorkspaceID    uuid.UUID    `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_tenant_id"`
+	ID          uuid.UUID    `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_roles_workspace_id"`
+	WorkspaceID    uuid.UUID    `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_roles_tenant_name;uniqueIndex:idx_roles_workspace_id"`
 	Name        string       `json:"name" gorm:"type:text;not null;uniqueIndex:idx_roles_tenant_name"`
 	Description string       `json:"description" gorm:"type:text"`
 	IsSystem    bool         `json:"is_system" gorm:"default:false"`
@@ -28,8 +28,8 @@ type Group struct {
 
 type TokenRequest struct {
 	WorkspaceID  string  `json:"workspace_id" binding:"required"`
-	ProjectID string  `json:"project_id" binding:"required"`
-	ClientID  string  `json:"client_id" binding:"required"`
+	ProjectID string  `json:"project_id"`
+	ClientID  string  `json:"client_id"`
 	SecretID  *string `json:"secret_id,omitempty"`
 	EmailID   string  `json:"email_id" binding:"required"`
 }

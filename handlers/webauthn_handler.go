@@ -43,9 +43,9 @@ type AttestationObject struct {
 }
 
 type FinishRegistrationRequest struct {
-	WorkspaceID   string              `json:"workspace_id" binding:"required"`
-	Email      string              `json:"email" binding:"required,email"`
-	Credential CredentialContainer `json:"credential"`
+	WorkspaceID string              `json:"workspace_id" binding:"required"`
+	Email       string              `json:"email" binding:"required,email"`
+	Credential  CredentialContainer `json:"credential"`
 }
 
 // AttestationObject matches the WebAuthn CBOR structure
@@ -176,7 +176,7 @@ func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, tenant
 			host = host[:idx]
 		}
 
-		// Connect to global DB to check tenant_domains table
+		// Connect to global DB to check workspace_domains table
 		db, err := config.ConnectGlobalDB()
 		if err == nil {
 			var count int64
@@ -190,13 +190,13 @@ func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, tenant
 				args = append(args, tenantID)
 			}
 
-			if err := db.Table("tenant_domains").Where(whereClause, args...).Count(&count).Error; err == nil && count > 0 {
+			if err := db.Table("workspace_domains").Where(whereClause, args...).Count(&count).Error; err == nil && count > 0 {
 				log.Printf("validateOriginAndCreateWebAuthn: Valid custom domain %s (tenant: %s)", host, tenantID)
 				return config.SetupWebAuthn("AuthSec MFA Service", host, requestOrigin), nil
 			} else if err != nil {
 				log.Printf("validateOriginAndCreateWebAuthn: Custom domain lookup failed for host=%s tenant=%s: %v", host, tenantID, err)
 			} else {
-				log.Printf("validateOriginAndCreateWebAuthn: Domain %s not found in tenant_domains or not verified", host)
+				log.Printf("validateOriginAndCreateWebAuthn: Domain %s not found in workspace_domains or not verified", host)
 			}
 		} else {
 			log.Printf("validateOriginAndCreateWebAuthn: Failed to connect to global DB: %v", err)
@@ -270,9 +270,9 @@ func (h *WebAuthnHandler) FinishBiometricVerify(c *gin.Context) {
 
 	// Step 1: Parse request
 	var req struct {
-		Email      string              `json:"email"`
-		WorkspaceID   string              `json:"workspace_id"`
-		Credential CredentialContainer `json:"credential"`
+		Email       string              `json:"email"`
+		WorkspaceID string              `json:"workspace_id"`
+		Credential  CredentialContainer `json:"credential"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		log.Printf("[%s] FinishBiometricVerify: invalid request: %v", reqID, err)
@@ -397,7 +397,7 @@ func (h *WebAuthnHandler) FinishBiometricVerify(c *gin.Context) {
 	// Audit log for successful biometric verification
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "biometric_verify", true, map[string]interface{}{
 		"credential_id": hex.EncodeToString(credential.ID),
-		"workspace_id":     req.WorkspaceID,
+		"workspace_id":  req.WorkspaceID,
 	})
 
 	// Step 11: Success response
@@ -440,46 +440,17 @@ func (h *WebAuthnHandler) BeginRegistration(c *gin.Context) {
 	clientRepo := repositories.NewClientRepository(globalDB)
 	client, err := clientRepo.GetClientByEmailAndTenantForLogin(req.Email, req.WorkspaceID)
 
-	// If not found in GlobalDB, try TenantDB
+	// Single-DB mode: the user lives in the one global `users` table. If not
+	// found there, they don't exist (the legacy per-tenant DB fallback is gone).
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("BeginRegistration: User not found in GlobalDB, trying TenantDB")
-
-			// Get tenant DB name from GlobalDB
-			globalRepo := repositories.NewGlobalRepository(globalDB)
-			tenant, err := globalRepo.GetTenantByID(req.WorkspaceID)
-			if err != nil {
-				log.Printf("BeginRegistration: Tenant not found - %v", err)
-				c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
-				return
-			}
-
-			// Connect to tenant DB
-			tenantDB, err := config.ConnectTenantDB(tenant.TenantDB)
-			if err != nil {
-				log.Printf("BeginRegistration: Failed to connect to tenant DB - %v", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection failed"})
-				return
-			}
-
-			// Try again with tenant DB
-			clientRepo = repositories.NewClientRepository(tenantDB)
-			client, err = clientRepo.GetClientByEmailAndTenantForLogin(req.Email, req.WorkspaceID)
-			if err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					log.Printf("BeginRegistration: User not found in TenantDB either")
-					c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-				} else {
-					log.Printf("BeginRegistration: Database error - %v", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-				}
-				return
-			}
+			log.Printf("BeginRegistration: User not found")
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		} else {
 			log.Printf("BeginRegistration: Database error - %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-			return
 		}
+		return
 	}
 
 	log.Printf("BeginRegistration: Found client - ID=%s, Email=%s", client.ID, client.Email)
@@ -810,7 +781,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	// Audit log for successful WebAuthn registration
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": hex.EncodeToString(credential.ID),
-		"workspace_id":     tenantID,
+		"workspace_id":  tenantID,
 	})
 
 	// Success
@@ -851,7 +822,7 @@ func (h *WebAuthnHandler) BeginAuthentication(c *gin.Context) {
 
 	// Step 1: Bind request JSON directly
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -977,9 +948,9 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 
 	// Parse request
 	var req struct {
-		Email    string                               `json:"email"`
+		Email       string                               `json:"email"`
 		WorkspaceID string                               `json:"workspace_id"`
-		Response protocol.CredentialAssertionResponse `json:"response"`
+		Response    protocol.CredentialAssertionResponse `json:"response"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		log.Printf("[%s] FinishAuthentication: invalid request: %v", reqID, err)
@@ -1094,7 +1065,7 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	// Audit log for successful WebAuthn authentication
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "authenticate", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
-		"workspace_id":     req.WorkspaceID,
+		"workspace_id":  req.WorkspaceID,
 		"email":         user.Email,
 	})
 
@@ -1117,7 +1088,7 @@ func (h *WebAuthnHandler) BeginBiometricSetup(c *gin.Context) {
 	log.Printf("[%s] BeginBiometricSetup: START", reqID)
 
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1163,13 +1134,13 @@ func (h *WebAuthnHandler) BeginBiometricSetup(c *gin.Context) {
 				return
 			}
 			user = sharedmodels.User{
-				ID:        uuid.New(),
-				ClientID:  uuid.New(),
-				Email:     req.Email,
-				WorkspaceID:  tenantUUID,
-				Provider:  "local",
-				CreatedAt: time.Now().UTC(),
-				UpdatedAt: time.Now().UTC(),
+				ID:          uuid.New(),
+				ClientID:    uuid.New(),
+				Email:       req.Email,
+				WorkspaceID: tenantUUID,
+				Provider:    "local",
+				CreatedAt:   time.Now().UTC(),
+				UpdatedAt:   time.Now().UTC(),
 			}
 			if err := db.Create(&user).Error; err != nil {
 				log.Printf("[%s] BeginBiometricSetup: failed to create user: %v", reqID, err)
@@ -1270,10 +1241,10 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 	}
 
 	req := struct {
-		Email    string
+		Email       string
 		WorkspaceID string
 	}{
-		Email:    strings.TrimSpace(email),
+		Email:       strings.TrimSpace(email),
 		WorkspaceID: strings.TrimSpace(tenantID),
 	}
 	if req.Email == "" || req.WorkspaceID == "" {
@@ -1493,7 +1464,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 	// Audit log for successful biometric setup
 	middleware.AuditAuthentication(c, webauthnUser.ID.String(), "webauthn", "biometric_setup", true, map[string]interface{}{
 		"credential_id": fmt.Sprintf("%x", credential.ID),
-		"workspace_id":     req.WorkspaceID,
+		"workspace_id":  req.WorkspaceID,
 	})
 
 	log.Printf("[%s] ConfirmBiometricSetup: COMPLETED SUCCESSFULLY", reqID)
@@ -1509,9 +1480,9 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 
 func (h *WebAuthnHandler) VerifyBiometricFinish(c *gin.Context) {
 	var req struct {
-		Email      string          `json:"email"`
-		WorkspaceID   string          `json:"workspace_id"`
-		Credential json.RawMessage `json:"credential"`
+		Email       string          `json:"email"`
+		WorkspaceID string          `json:"workspace_id"`
+		Credential  json.RawMessage `json:"credential"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
@@ -1572,7 +1543,7 @@ func (h *WebAuthnHandler) VerifyBiometricFinish(c *gin.Context) {
 
 func (h *WebAuthnHandler) BeginOTPSetup(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1616,9 +1587,9 @@ func (h *WebAuthnHandler) BeginOTPSetup(c *gin.Context) {
 
 func (h *WebAuthnHandler) VerifyOTP(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
-		Code     string `json:"code"`
+		Code        string `json:"code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
@@ -1654,9 +1625,9 @@ func (h *WebAuthnHandler) VerifyOTP(c *gin.Context) {
 
 func (h *WebAuthnHandler) BeginSMSSetup(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
-		Phone    string `json:"phone"`
+		Phone       string `json:"phone"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
@@ -1697,9 +1668,9 @@ func (h *WebAuthnHandler) BeginSMSSetup(c *gin.Context) {
 
 func (h *WebAuthnHandler) VerifySMS(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
-		Code     string `json:"code"`
+		Code        string `json:"code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})
@@ -1735,7 +1706,7 @@ func (h *WebAuthnHandler) VerifySMS(c *gin.Context) {
 
 func (h *WebAuthnHandler) GenerateBackupCodes(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1805,9 +1776,9 @@ func (h *WebAuthnHandler) FinishBiometricLoginVerify(c *gin.Context) {
 
 	// Parse request
 	var req struct {
-		Email      string                               `json:"email"`
-		WorkspaceID   string                               `json:"workspace_id"`
-		Credential protocol.CredentialAssertionResponse `json:"credential"`
+		Email       string                               `json:"email"`
+		WorkspaceID string                               `json:"workspace_id"`
+		Credential  protocol.CredentialAssertionResponse `json:"credential"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		log.Printf("[%s] FinishBiometricLoginVerify: invalid request: %v", reqID, err)
@@ -1898,7 +1869,7 @@ func (h *WebAuthnHandler) BeginBiometricLoginVerify(c *gin.Context) {
 	log.Printf("[%s] BeginBiometricLoginVerify: START", reqID)
 
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1940,9 +1911,9 @@ func (h *WebAuthnHandler) BeginBiometricLoginVerify(c *gin.Context) {
 
 func (h *WebAuthnHandler) VerifyBackupCode(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
+		Email       string `json:"email"`
 		WorkspaceID string `json:"workspace_id"`
-		Code     string `json:"code"`
+		Code        string `json:"code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid request"})

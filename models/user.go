@@ -12,16 +12,16 @@ import (
 
 // TenantMapping represents the mapping between tenants and clients
 type TenantMapping struct {
-	ID        uuid.UUID `json:"id" gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
-	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	ClientID  uuid.UUID `json:"client_id" gorm:"type:uuid;uniqueIndex;not null"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uuid.UUID `json:"id" gorm:"primaryKey;type:uuid;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ClientID    uuid.UUID `json:"client_id" gorm:"type:uuid;uniqueIndex;not null"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // LoginResponse represents the response for login operations
 type LoginResponse struct {
-	WorkspaceID         string   `json:"workspace_id"`
+	WorkspaceID      string   `json:"workspace_id"`
 	TenantDomain     string   `json:"tenant_domain,omitempty"`
 	Email            string   `json:"email"`
 	FirstLogin       bool     `json:"first_login"`
@@ -35,8 +35,8 @@ type LoginResponse struct {
 
 // LoginVerifyOTPInput represents the input for login OTP verification
 type LoginVerifyOTPInput struct {
-	Email    string `json:"email" binding:"required,email"`
-	OTP      string `json:"otp" binding:"required,len=6"`
+	Email       string `json:"email" binding:"required,email"`
+	OTP         string `json:"otp" binding:"required,len=6"`
 	WorkspaceID string `json:"workspace_id" binding:"required"`
 }
 
@@ -95,7 +95,7 @@ type AdminUser struct {
 	PasswordHash               string          `json:"-" gorm:"column:password_hash;not null"`
 	Name                       string          `json:"name"`
 	ClientID                   *uuid.UUID      `json:"client_id,omitempty" gorm:"column:client_id"`
-	WorkspaceID                   *uuid.UUID      `json:"workspace_id,omitempty" gorm:"column:tenant_id"`
+	WorkspaceID                *uuid.UUID      `json:"workspace_id,omitempty" gorm:"column:workspace_id"`
 	ProjectID                  *uuid.UUID      `json:"project_id,omitempty" gorm:"column:project_id"`
 	TenantDomain               string          `json:"tenant_domain,omitempty" gorm:"column:tenant_domain"`
 	Provider                   string          `json:"provider,omitempty" gorm:"column:provider;default:'local'"`
@@ -150,14 +150,14 @@ func (u *AdminUser) CheckPassword(password string) bool {
 
 // RoleAssignmentRequest represents a request for role assignment
 type RoleAssignmentRequest struct {
-	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null"`
-	WorkspaceID  string    `json:"workspace_id" gorm:"type:varchar(255);not null"`
-	RoleID    uuid.UUID `json:"role_id" gorm:"type:uuid;not null"`
-	Reason    string    `json:"reason" gorm:"type:text"`
-	Status    string    `json:"status" gorm:"type:varchar(50);default:'pending'"` // pending, approved, rejected
-	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null"`
+	WorkspaceID string    `json:"workspace_id" gorm:"type:varchar(255);not null"`
+	RoleID      uuid.UUID `json:"role_id" gorm:"type:uuid;not null"`
+	Reason      string    `json:"reason" gorm:"type:text"`
+	Status      string    `json:"status" gorm:"type:varchar(50);default:'pending'"` // pending, approved, rejected
+	CreatedAt   time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt   time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 }
 
 // TableName specifies the table name for RoleAssignmentRequest
@@ -165,11 +165,12 @@ func (RoleAssignmentRequest) TableName() string {
 	return "role_assignment_requests"
 }
 
-// SAMLLoginInput represents the input for SAML login (no password required)
+// SAMLLoginInput represents the input for SAML login (no password required).
+// Workspace is resolved from the Host header; WorkspaceID is an optional fallback
+// for SDK callers that cannot set a workspace-specific Host header.
 type SAMLLoginInput struct {
-	ClientID string `json:"client_id" binding:"required"`
-	Email    string `json:"email" binding:"required,email"`
-	// Provider is validated in the database to ensure it ends with "-saml"
+	Email       string `json:"email" binding:"required,email"`
+	WorkspaceID string `json:"workspace_id"` // optional fallback; prefer Host header
 }
 
 // UpdateUserRequest represents the request payload for updating user profile

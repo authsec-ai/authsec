@@ -92,7 +92,7 @@ type authmgrAuthz struct {
 
 // authmgrGetAuthz loads roles/scopes/groups for a user from the shared
 // config.DB, scoping by tenant_id at the row level.
-func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
+func authmgrGetAuthz(ctx context.Context, tenantID, clientID, email string) (*authmgrAuthz, error) {
 	if tenantID == "" || email == "" {
 		return nil, errors.New("tenantID and email are required")
 	}
@@ -103,17 +103,17 @@ func authmgrGetAuthz(ctx context.Context, tenantID, projectID, clientID, email s
 
 	// Try primary DB first
 	if config.DB != nil {
-		authz, err := authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, projectID, clientID, email)
+		authz, err := authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, clientID, email)
 		if err == nil && authz != nil && (len(authz.Roles) > 0 || len(authz.Scopes) > 0) {
 			return authz, nil
 		}
 		log.Printf("[authmgr GetAuthz] primary DB miss for %s/%s, trying tenant DB: %v", tenantID, email, err)
 	}
 
-	return authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, projectID, clientID, email)
+	return authmgrLoadAuthzFromDB(ctx, config.DB, tid, tenantID, clientID, email)
 }
 
-func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, tenantID, projectID, clientID, email string) (*authmgrAuthz, error) {
+func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, tenantID, clientID, email string) (*authmgrAuthz, error) {
 	var user sharedmodels.User
 	if err := db.WithContext(ctx).Where("email = ? AND workspace_id = ?", email, tid).First(&user).Error; err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
@@ -186,35 +186,24 @@ func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, ten
 	}, nil
 }
 
-// authmgrLookupClientByEmail returns clientID and projectID for the given tenant+email.
-func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (string, string, error) {
+// authmgrLookupClientByEmail returns clientID for the given tenant+email.
+func authmgrLookupClientByEmail(ctx context.Context, tenantID, email string) (string, error) {
 	if tenantID == "" || email == "" {
-		return "", "", errors.New("tenantID and email required")
+		return "", errors.New("tenantID and email required")
 	}
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
-		return "", "", fmt.Errorf("parse tenantID: %w", err)
-	}
-
-	// Try primary DB
-	if config.DB != nil {
-		var user sharedmodels.User
-		if err := config.DB.WithContext(ctx).
-			Select("client_id", "project_id").
-			Where("workspace_id = ? AND email = ?", tid, email).
-			First(&user).Error; err == nil {
-			return user.ClientID.String(), user.ProjectID.String(), nil
-		}
+		return "", fmt.Errorf("parse tenantID: %w", err)
 	}
 
 	var user sharedmodels.User
 	if err := config.DB.WithContext(ctx).
-		Select("client_id", "project_id").
+		Select("client_id").
 		Where("workspace_id = ? AND email = ?", tid, email).
 		First(&user).Error; err != nil {
-		return "", "", fmt.Errorf("client lookup: %w", err)
+		return "", fmt.Errorf("client lookup: %w", err)
 	}
-	return user.ClientID.String(), user.ProjectID.String(), nil
+	return user.ClientID.String(), nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -234,7 +223,6 @@ func (ac *AuthmgrController) HealthCheck(c *gin.Context) {
 func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"workspace_id": c.GetString("workspace_id"),
-		"project_id":   c.GetString("project_id"),
 		"client_id":    c.GetString("client_id"),
 		"email_id":     c.GetString("email_id"),
 		"scopes":     c.MustGet("scopes"),
@@ -257,14 +245,14 @@ func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	clientID, projectID, err := authmgrLookupClientByEmail(ctx, tenantID, email)
+	clientID, err := authmgrLookupClientByEmail(ctx, tenantID, email)
 	if err != nil {
 		log.Printf("[authmgr GetAuthStatus] LookupClientByEmail: %v", err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found", "details": err.Error()})
 		return
 	}
 
-	authzData, err := authmgrGetAuthz(ctx, tenantID, projectID, clientID, email)
+	authzData, err := authmgrGetAuthz(ctx, tenantID, clientID, email)
 	if err != nil {
 		log.Printf("[authmgr GetAuthStatus] GetAuthz: %v", err)
 		authzData = &authmgrAuthz{}
@@ -274,7 +262,6 @@ func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
 		"workspace_id":        tenantID,
 		"email":               email,
 		"client_id":           clientID,
-		"project_id":          projectID,
 		"roles":               authzData.Roles,
 		"scopes":              authzData.Scopes,
 		"groups":              authzData.Groups,
@@ -313,7 +300,6 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	}
 
 	tenantID, _ := unverifiedClaims["workspace_id"].(string)
-	projectID, _ := unverifiedClaims["project_id"].(string)
 	clientID, _ := unverifiedClaims["client_id"].(string)
 	tokenType, _ := unverifiedClaims["token_type"].(string)
 
@@ -345,7 +331,7 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	authzData, err := authmgrGetAuthz(ctx, tenantID, projectID, clientID, emailID)
+	authzData, err := authmgrGetAuthz(ctx, tenantID, clientID, emailID)
 	if err != nil {
 		log.Printf("[authmgr VerifyToken] authz fetch failed: %v", err)
 		authzData = &authmgrAuthz{}
@@ -354,7 +340,6 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"valid":        true,
 		"workspace_id": claims["workspace_id"],
-		"project_id":   claims["project_id"],
 		"client_id":    claims["client_id"],
 		"email_id":     claims["email_id"],
 		"scopes":     authzData.Scopes,
@@ -392,7 +377,6 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"workspace_id": req.WorkspaceID,
-		"project_id":   req.ProjectID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,
 		"token_type":   tokenType,

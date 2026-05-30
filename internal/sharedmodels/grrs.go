@@ -9,7 +9,7 @@ type UserDefinedGroupsRequest struct {
 // Request struct for mapping groups
 type MapGroupsRequest struct {
 	WorkspaceID string   `json:"workspace_id" binding:"required"`
-	ClientID string   `json:"client_id" binding:"required"`
+	ClientID string   `json:"client_id"`
 	Groups   []string `json:"groups" binding:"required"`
 }
 

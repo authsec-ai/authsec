@@ -793,7 +793,7 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (m
 		Table("sync_configurations sc").
 		Select("sc.*").
 		Joins(`LEFT JOIN identity_providers ip
-		         ON ip.workspace_id = sc.tenant_id
+		         ON ip.workspace_id = sc.workspace_id
 		        AND ip.provider_type IN ('ad', 'entra')
 		        AND ip.config_ref = sc.id::text`).
 		Where("sc.id = ? AND sc.workspace_id = ? AND sc.sync_type = ?",

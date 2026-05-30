@@ -188,7 +188,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -246,7 +246,7 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -297,7 +297,7 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -373,7 +373,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -411,7 +411,7 @@ func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -454,7 +454,7 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -838,7 +838,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -877,7 +877,7 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -913,7 +913,7 @@ func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -940,7 +940,7 @@ func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1025,7 +1025,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1102,7 +1102,7 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1138,7 +1138,7 @@ func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
 func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1169,7 +1169,7 @@ func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
 func (ctrl *ScopeMatrixController) DismissDriftEvent(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1218,7 +1218,7 @@ type rsRoleSummary struct {
 func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1458,7 +1458,7 @@ func normalizeApplicationRoleSlug(value string) string {
 func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -1590,7 +1590,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
@@ -1626,8 +1626,8 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 			rb.role_id, COALESCE(rb.role_name, ro.name, '') AS role_name,
 			rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.tenant_id").
-		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = rb.user_id AND teus.tenant_id = rb.tenant_id").
+		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.workspace_id").
+		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = rb.user_id AND teus.workspace_id = rb.workspace_id").
 		Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
@@ -1713,7 +1713,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
@@ -1730,7 +1730,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	var user accessUserRef
 	if err := config.DB.Table("users u").
 		Select("u.id::text AS id, COALESCE(u.email, '') AS email, COALESCE(NULLIF(u.name, ''), u.email, u.username, '') AS name, COALESCE(teus.status, 'active') AS status").
-		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.workspace_id").
+		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = u.id AND teus.workspace_id = u.workspace_id").
 		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Take(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found for this tenant"})
@@ -2045,7 +2045,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2183,7 +2183,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2245,7 +2245,7 @@ func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 	catalogID, err := uuid.Parse(c.Param("catalog_id"))
@@ -2312,7 +2312,7 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2450,7 +2450,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2481,7 +2481,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 		Select(`rb.id, rb.user_id, rb.username, COALESCE(u.email, '') AS user_email,
 			rb.role_id, rb.role_name, rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.tenant_id").
+		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.workspace_id").
 		Where("rb.workspace_id = ?", tenantID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
@@ -2528,7 +2528,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2649,7 +2649,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -2694,7 +2694,7 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 	if _, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String()); err != nil {
@@ -2851,7 +2851,7 @@ func maybeAttempt(exists bool, a models.ResourceServerManifestAttempt) interface
 func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
 	tenantID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
@@ -3044,7 +3044,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	var userStatus string
 	if err := config.DB.Table("users u").
 		Select("COALESCE(teus.status, 'active')").
-		Joins("LEFT JOIN tenant_end_user_states teus ON teus.user_id = u.id AND teus.tenant_id = u.workspace_id").
+		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = u.id AND teus.workspace_id = u.workspace_id").
 		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
 		Scan(&userStatus).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})

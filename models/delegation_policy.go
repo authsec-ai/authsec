@@ -11,7 +11,7 @@ import (
 // DelegationPolicy defines which roles can delegate trust to which AI agent types,
 // with optional permission scoping and TTL caps.
 type DelegationPolicy struct {
-	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_deleg_tenant_role_agent"`
 	// WorkspaceID mirrors WorkspaceID during the workspace transition. Backfilled
 	// by migration 122.
@@ -20,16 +20,13 @@ type DelegationPolicy struct {
 	AllowedPermissions json.RawMessage `json:"allowed_permissions" gorm:"type:jsonb;default:'[]'"`
 	MaxTTLSeconds      int             `json:"max_ttl_seconds" gorm:"default:3600"`
 	Enabled            bool            `json:"enabled" gorm:"default:true"`
-	// ClientID is the legacy clients.id this policy was originally scoped to.
-	// New writes should prefer ApplicationID; ClientID is kept during the
-	// transition so existing rows continue to resolve.
-	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
-	// ApplicationID is the resource_servers.id that supersedes ClientID, populated
-	// by migration 118 via clients.id → resource_servers.legacy_client_id.
-	ApplicationID *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
-	CreatedBy     *uuid.UUID `json:"created_by" gorm:"type:uuid"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// ClientID references the ai_agent resource_servers.id this policy is scoped to.
+	// (Phase B: the legacy `clients` table was dropped; an agent is a resource_servers
+	// row with application_type='ai_agent'. The column name stays client_id.)
+	ClientID  *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
+	CreatedBy *uuid.UUID `json:"created_by" gorm:"type:uuid"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 func (DelegationPolicy) TableName() string {

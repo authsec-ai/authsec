@@ -213,15 +213,15 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 	}
 
 	loginContext := map[string]interface{}{
-		"email":       user.Email,
-		"name":        user.Name,
-		"username":    username,
-		"provider":    user.Provider,
-		"provider_id": user.ProviderID,
-		"workspace_id":   user.WorkspaceID,
-		"project_id":  user.ProjectID,
-		"client_id":   expectedClientID,
-		"avatar_url":  user.AvatarURL,
+		"email":        user.Email,
+		"name":         user.Name,
+		"username":     username,
+		"provider":     user.Provider,
+		"provider_id":  user.ProviderID,
+		"workspace_id": user.WorkspaceID,
+		"project_id":   user.ProjectID,
+		"client_id":    expectedClientID,
+		"avatar_url":   user.AvatarURL,
 	}
 	if projectID != "" {
 		loginContext["project_id"] = projectID
@@ -255,7 +255,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"login_challenge": req.LoginChallenge,
 		"redirect_to":     acceptResponse.RedirectTo,
 		"client_id":       expectedClientID,
-		"workspace_id":       expectedTenantID,
+		"workspace_id":    expectedTenantID,
 		"email":           user.Email,
 	})
 }
@@ -579,16 +579,10 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 
 	orgID := clientDetails.Metadata["c_id"].(string)
 
-	tenantDB := config.DB
-
-	var client hydramodels.Client
-	tenantIDStr := clientDetails.Metadata["workspace_id"].(string)
-	if err := tenantDB.Where("workspace_id = ? AND active = ? AND client_id = ?", orgID, true, tenantIDStr).First(&client).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to retrieve client information"})
-		return
-	}
-
-	clientSecret, err := config.SecretInVault(orgID, client.ProjectID.String(), client.ClientID.String())
+	// Phase B/E: the legacy `clients` table lookup (for project_id) was removed.
+	// The OAuth client secret lives in Vault at kv/data/secret/{workspace}/{workspace};
+	// orgID (Hydra client metadata c_id) is the workspace UUID.
+	clientSecret, err := config.SecretInVault(orgID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to retrieve client secret"})
 		return
@@ -1025,7 +1019,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	}
 
 	sessionClaims := map[string]interface{}{
-		"workspace_id":          arcCtx.WorkspaceID,
+		"workspace_id":       arcCtx.WorkspaceID,
 		"resource_server_id": arcCtx.ResourceServerID,
 		"context_id":         arcCtx.ContextID,
 		"auth_time":          time.Now().Unix(),
@@ -1066,7 +1060,7 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
 		now := time.Now().UTC()
 		state := models.TenantEndUserState{
-			WorkspaceID:       tenantUUID,
+			WorkspaceID:    tenantUUID,
 			UserID:         subjectUUID,
 			Status:         models.EndUserStatusActive,
 			FirstConsentAt: now,
@@ -1294,73 +1288,6 @@ func (ctrl *HmgrController) LoginChallengeHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, loginRequest.Client)
 }
 
-// GenerateLoginURLHandler generates a login URL for testing
-func (ctrl *HmgrController) GenerateLoginURLHandler(c *gin.Context) {
-	var req struct {
-		WorkspaceID    string `json:"workspace_id"`
-		OrgID       string `json:"org_id"`
-		RedirectURI string `json:"redirect_uri"`
-		State       string `json:"state"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.String(http.StatusBadRequest, "Invalid JSON")
-		return
-	}
-
-	clients, err := ctrl.service.GetAllHydraClients()
-	if err != nil {
-		c.String(http.StatusInternalServerError, "Failed to get clients")
-		return
-	}
-
-	var tenantClientID string
-	for _, client := range clients {
-		if tenantID, ok := client.Metadata["workspace_id"].(string); ok && tenantID == req.WorkspaceID {
-			if orgID, ok := client.Metadata["org_id"].(string); ok && orgID == req.OrgID {
-				if clientType, ok := client.Metadata["type"].(string); ok && clientType == "tenant_main_client" {
-					tenantClientID = client.ClientID
-					break
-				}
-			}
-		}
-	}
-
-	if tenantClientID == "" {
-		c.String(http.StatusNotFound, "Tenant client not found")
-		return
-	}
-
-	codeVerifier := hydrautils.GenerateCodeVerifier()
-	codeChallenge := hydrautils.GenerateCodeChallenge(codeVerifier)
-
-	// Store code_verifier server-side, keyed by state.
-	// The state value will be echoed back in the exchange-token request, allowing
-	// retrieval at token exchange time without ever exposing the verifier to the client.
-	if req.State != "" {
-		StorePKCEVerifier(req.State, codeVerifier)
-	}
-
-	hydraAuthURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/") + "/oauth2/auth"
-	if config.AppConfig.OAuthAuthURL != "" {
-		hydraAuthURL = config.AppConfig.OAuthAuthURL
-	}
-	oauthURL := fmt.Sprintf("%s?client_id=%s&response_type=code&scope=openid+profile+email&redirect_uri=%s&state=%s&code_challenge=%s&code_challenge_method=S256",
-		hydraAuthURL,
-		tenantClientID,
-		url.QueryEscape(req.RedirectURI),
-		req.State,
-		codeChallenge,
-	)
-
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"success":          true,
-		"tenant_client_id": tenantClientID,
-		"oauth_url":        oauthURL,
-		"login_endpoint":   fmt.Sprintf("%s/login", config.AppConfig.BaseURL),
-		"react_login_url":  config.AppConfig.BuildUIRouteURL("/oidc/login", nil),
-	})
-}
 
 // --- SAML Handlers ---
 
@@ -1679,14 +1606,14 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	}
 
 	user := &hydramodels.User{
-		Email:      assertion.Email,
-		Username:   &username,
-		Name:       name,
-		Provider:   "saml-" + providerName,
-		ProviderID: nameID,
-		ClientID:   parsedClientID,
-		WorkspaceID:   parsedTenantID,
-		Active:     true,
+		Email:       assertion.Email,
+		Username:    &username,
+		Name:        name,
+		Provider:    "saml-" + providerName,
+		ProviderID:  nameID,
+		ClientID:    parsedClientID,
+		WorkspaceID: parsedTenantID,
+		Active:      true,
 	}
 
 	user, err = ctrl.service.CreateOrUpdateUser("", user)
@@ -1696,13 +1623,13 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 
 	userID := fmt.Sprintf("saml-%s-%s", providerName, nameID)
 	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, map[string]interface{}{
-		"email":       user.Email,
-		"name":        user.Name,
-		"username":    user.Username,
-		"provider":    user.Provider,
-		"provider_id": user.ProviderID,
-		"workspace_id":   user.WorkspaceID,
-		"client_id":   user.ClientID,
+		"email":        user.Email,
+		"name":         user.Name,
+		"username":     user.Username,
+		"provider":     user.Provider,
+		"provider_id":  user.ProviderID,
+		"workspace_id": user.WorkspaceID,
+		"client_id":    user.ClientID,
 	})
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to accept login request: %w", err)

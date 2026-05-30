@@ -12,28 +12,24 @@ import (
 // The SDK/agent pulls this row to get its current token and permissions.
 // Upserted by DelegateToken, keyed by (tenant_id, client_id).
 type DelegationToken struct {
-	ID       uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`
 	// WorkspaceID mirrors WorkspaceID during the workspace transition. Backfilled
 	// by migration 122; new code should read this rather than WorkspaceID.
-	// ClientID is the legacy clients.id this token was originally bound to.
-	// New code should prefer ApplicationID; ClientID is kept during the
-	// resource_server / legacy_client_id transition.
-	ClientID uuid.UUID `json:"client_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`
-	// ApplicationID points at resource_servers.id and is populated by
-	// migration 118 via clients.id → resource_servers.legacy_client_id.
-	ApplicationID *uuid.UUID      `json:"application_id,omitempty" gorm:"type:uuid"`
-	PolicyID      *uuid.UUID      `json:"policy_id,omitempty" gorm:"type:uuid"`
-	Token         string          `json:"token" gorm:"type:text;not null"`
-	SpiffeID      string          `json:"spiffe_id" gorm:"type:text;not null"`
-	Permissions   json.RawMessage `json:"permissions" gorm:"type:jsonb;default:'[]'"`
-	Audience      json.RawMessage `json:"audience" gorm:"type:jsonb;default:'[]'"`
-	ExpiresAt     time.Time       `json:"expires_at" gorm:"type:timestamptz;not null"`
-	DelegatedBy   uuid.UUID       `json:"delegated_by" gorm:"type:uuid;not null"`
-	TTLSeconds    int             `json:"ttl_seconds" gorm:"not null"`
-	Status        string          `json:"status" gorm:"type:text;not null;default:'active'"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	// ClientID references the ai_agent resource_servers.id this token is bound to.
+	// (Phase B: the legacy `clients` table was dropped; the column name stays client_id.)
+	ClientID    uuid.UUID       `json:"client_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`
+	PolicyID    *uuid.UUID      `json:"policy_id,omitempty" gorm:"type:uuid"`
+	Token       string          `json:"token" gorm:"type:text;not null"`
+	SpiffeID    string          `json:"spiffe_id" gorm:"type:text;not null"`
+	Permissions json.RawMessage `json:"permissions" gorm:"type:jsonb;default:'[]'"`
+	Audience    json.RawMessage `json:"audience" gorm:"type:jsonb;default:'[]'"`
+	ExpiresAt   time.Time       `json:"expires_at" gorm:"type:timestamptz;not null"`
+	DelegatedBy uuid.UUID       `json:"delegated_by" gorm:"type:uuid;not null"`
+	TTLSeconds  int             `json:"ttl_seconds" gorm:"not null"`
+	Status      string          `json:"status" gorm:"type:text;not null;default:'active'"`
+	CreatedAt   time.Time       `json:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
 func (DelegationToken) TableName() string {

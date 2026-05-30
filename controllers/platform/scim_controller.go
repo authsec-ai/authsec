@@ -206,8 +206,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
-	if err != nil {
+	if _, _, err := getClientAndProjectID(c); err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
@@ -225,8 +224,8 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 	filter := c.Query("filter")
 	baseURL := scimBaseURL(c)
 
-	// Build query — scoped by tenant_id AND client_id
-	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ? AND client_id = ?", tenantID, clientUUID)
+	// Build query — scoped by workspace_id
+	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ?", tenantID)
 
 	// When no filter: return only SCIM-provisioned users
 	// When filter is provided (e.g., Okta searching by userName): search ALL users for duplicate detection
@@ -260,8 +259,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
-	if err != nil {
+	if _, _, err := getClientAndProjectID(c); err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
@@ -274,7 +272,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -315,9 +313,9 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 	email := input.GetPrimaryEmail()
 	tenantUUID, _ := uuid.Parse(tenantID)
 
-	// Check if user already exists — scoped by client_id (matching AD/Entra pattern)
+	// Check if user already exists — scoped by workspace_id
 	var existing models.ExtendedUser
-	if err := tenantDB.Where("(email = ? OR external_id = ?) AND client_id = ?", strings.ToLower(email), input.ExternalID, clientUUID).First(&existing).Error; err == nil {
+	if err := tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", email, input.ExternalID, tenantUUID).First(&existing).Error; err == nil {
 		c.JSON(http.StatusConflict, models.NewSCIMError("409", "User with this email already exists", "uniqueness"))
 		return
 	}
@@ -415,8 +413,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
-	if err != nil {
+	if _, _, err := getClientAndProjectID(c); err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
@@ -435,7 +432,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -494,8 +491,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
-	if err != nil {
+	if _, _, err := getClientAndProjectID(c); err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
@@ -514,7 +510,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -568,8 +564,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	clientUUID, _, err := getClientAndProjectID(c)
-	if err != nil {
+	if _, _, err := getClientAndProjectID(c); err != nil {
 		c.JSON(http.StatusBadRequest, models.NewSCIMError("400", err.Error(), "invalidValue"))
 		return
 	}
@@ -581,7 +576,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	result := tenantDB.Where("id = ? AND workspace_id = ? AND client_id = ?", userUUID, tenantID, clientUUID).Delete(&models.ExtendedUser{})
+	result := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).Delete(&models.ExtendedUser{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
@@ -1168,8 +1163,8 @@ func extractFilterValue(path string) string {
 
 // SCIMTokenRequest is the input for generating a SCIM Bearer token
 type SCIMTokenRequest struct {
-	ClientID  string `json:"client_id" binding:"required"`
-	ProjectID string `json:"project_id" binding:"required"`
+	ClientID  string `json:"client_id"`
+	ProjectID string `json:"project_id"`
 }
 
 // SCIMTokenResponse is the response containing the SCIM Bearer token and base URL

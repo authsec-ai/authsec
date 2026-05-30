@@ -39,16 +39,6 @@ type ADSyncConfig struct {
 	SkipVerify bool   `json:"skip_verify"` // Skip SSL certificate verification (for testing)
 }
 
-// SyncUsersInput represents the input for syncing users from AD
-type SyncUsersInput struct {
-	WorkspaceID  string        `json:"workspace_id" binding:"required"`
-	ClientID  string        `json:"client_id" binding:"required"`
-	ProjectID string        `json:"project_id" binding:"required"`
-	ConfigID  *string       `json:"config_id,omitempty"` // ID of stored config to use
-	Config    *ADSyncConfig `json:"config,omitempty"`    // Or provide config directly (for backward compatibility)
-	DryRun    bool          `json:"dry_run,omitempty"`   // Preview changes without applying
-}
-
 // SyncResult represents the result of a sync operation
 type SyncResult struct {
 	UsersFound   int      `json:"users_found"`
@@ -483,7 +473,7 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(email = ? OR external_id = ?) AND client_id = ?", adUser.Email, adUser.ObjectGUID, clientUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", adUser.Email, adUser.ObjectGUID, tenantUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -614,34 +604,6 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// AgentSyncRequest represents the request from AD Agent
-type AgentSyncRequest struct {
-	WorkspaceID  string          `json:"workspace_id" binding:"required"`
-	ProjectID string          `json:"project_id" binding:"required"`
-	ClientID  string          `json:"client_id" binding:"required"`
-	Users     []AgentUserData `json:"users" binding:"required"`
-	DryRun    bool            `json:"dry_run,omitempty"`
-}
-
-type AgentUserData struct {
-	ExternalID   string                 `json:"external_id"`
-	Email        string                 `json:"email"`
-	Username     string                 `json:"username"`
-	Provider     string                 `json:"provider"`
-	ProviderID   string                 `json:"provider_id"`
-	ProviderData map[string]interface{} `json:"provider_data"`
-	IsActive     bool                   `json:"is_active"`
-	IsSyncedUser bool                   `json:"is_synced_user"`
-	SyncSource   string                 `json:"sync_source"`
-}
-
-type AgentSyncResponse struct {
-	Message        string   `json:"message"`
-	UsersProcessed int      `json:"users_processed"`
-	UsersCreated   int      `json:"users_created"`
-	Errors         []string `json:"errors,omitempty"`
-}
-
 func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUser models.AgentUserData, tenantID, projectID string, clientID string) error {
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {
@@ -662,7 +624,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(email = ? OR external_id = ?) AND client_id = ?", agentUser.Email, agentUser.ExternalID, clientUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", agentUser.Email, agentUser.ExternalID, tenantUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -749,7 +711,7 @@ func (asc *ADSyncController) loadStoredADConfig(configID, tenantID, clientID str
 		Table("sync_configurations sc").
 		Select("sc.*").
 		Joins(`LEFT JOIN identity_providers ip
-		         ON ip.workspace_id = sc.tenant_id
+		         ON ip.workspace_id = sc.workspace_id
 		        AND ip.provider_type IN ('ad', 'entra')
 		        AND ip.config_ref = sc.id::text`).
 		Where("sc.id = ? AND sc.workspace_id = ? AND sc.client_id = ? AND sc.sync_type = ?",

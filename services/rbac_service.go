@@ -273,7 +273,7 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 	// may belong to multiple tenants in future. For Phase A we treat a single
 	// suspended row anywhere as a hard fail.
 	var membershipStatus string
-	row := s.db.Table("tenant_memberships").
+	row := s.db.Table("workspace_user_memberships").
 		Select("status").
 		Where("user_id = ?", principalID).
 		Limit(1).
@@ -288,7 +288,7 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 
 	// Check tenant_end_user_states — same approach, fail closed on suspended.
 	var eusStatus string
-	row2 := s.db.Table("tenant_end_user_states").
+	row2 := s.db.Table("workspace_end_user_states").
 		Select("status").
 		Where("user_id = ?", principalID).
 		Limit(1).
@@ -309,7 +309,7 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 // existing tenant_id storage column.
 func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID uuid.UUID) error {
 	var membershipStatus string
-	row := s.db.Table("tenant_memberships").
+	row := s.db.Table("workspace_user_memberships").
 		Select("status").
 		Where("workspace_id = ? AND user_id = ?", workspaceID, principalID).
 		Limit(1).
@@ -323,7 +323,7 @@ func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID u
 	}
 
 	var eusStatus string
-	row2 := s.db.Table("tenant_end_user_states").
+	row2 := s.db.Table("workspace_end_user_states").
 		Select("status").
 		Where("workspace_id = ? AND user_id = ?", workspaceID, principalID).
 		Limit(1).
