@@ -192,6 +192,22 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 	rs := policy.RS
 	redirectURIToUse := policy.RedirectURI
 
+	// JIT scope binding for DCR clients. RFC 7591 lets clients register with
+	// an empty `scope`; spec-compliant MCP clients (Claude Code, etc.) do
+	// exactly that, expecting resource-bound scopes to be granted at
+	// /authorize. Without this step, Hydra would reject with
+	//   "OAuth 2.0 Client is not allowed to request scope '<rs-scope>'"
+	// because the Hydra client was registered with an empty scope set.
+	// See EnsureHydraClientHasRSScopes for the full rationale + safety
+	// argument (this only widens what the client may REQUEST; consent + RBAC
+	// still gate what's actually granted).
+	if err := ctrl.service.EnsureHydraClientHasRSScopes(oauthClient, rs); err != nil {
+		log.Printf("[MCP_AUTH] Authorize: scope-binding update failed client=%s rs=%s: %v",
+			oauthClient.ClientID, rs.ResourceURI, err)
+		// Don't fail the request — Hydra will still reject any requested
+		// scope not in the registered set, which is the correct fallback.
+	}
+
 	// 4. Generate server-side context_id for deterministic binding.
 	// This is NOT the client's state — it's an AuthSec-internal ID.
 	contextID := uuid.New().String()
