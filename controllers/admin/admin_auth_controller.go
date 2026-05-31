@@ -1741,6 +1741,97 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	})
 }
 
+// AdminResendOTP regenerates and emails a fresh OTP for an in-flight admin
+// signup (i.e. there's a pending_registrations row for this email). This
+// powers the "Resend code" button on the OTP verification screen.
+//
+// Why this exists separately from AdminBootstrap:
+//   - AdminBootstrap binds required password + tenant_domain (it's the
+//     ground-truth signup path). The UI on the verify screen no longer has
+//     those — it just has the email — so reusing bootstrap there would 400.
+//   - Resend is intentionally narrower: it does NOT create/update pending
+//     state, only generates a new OTP row and emails it. Anti-abuse via the
+//     existing strict-auth rate-limit middleware in routes.
+//
+// @Summary Resend admin signup OTP
+// @Description Regenerates and emails a fresh OTP for an in-flight admin signup. Returns 404 if there's no pending registration for this email.
+// @Tags Admin Authentication
+// @Accept json
+// @Produce json
+// @Param input body object true "{ email: string }"
+// @Success 200 {object} map[string]string "OTP regenerated and emailed"
+// @Failure 400 {object} map[string]string "Bad request"
+// @Failure 404 {object} map[string]string "No pending registration for this email"
+// @Failure 500 {object} map[string]string "Internal server error"
+// @Router /authsec/uflow/auth/admin/login/resend-otp [post]
+func (aac *AdminAuthController) AdminResendOTP(c *gin.Context) {
+	var input struct {
+		Email string `json:"email" binding:"required,email"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(input.Email))
+
+	// Must have a pending_registrations row for this email. If the admin has
+	// already completed signup (admin_users row exists, pending row is gone),
+	// the resend has no signup to resend FOR — surface as 404 so the UI can
+	// route them back to login.
+	pending, err := aac.pendingRepo.GetPendingRegistration(email)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("ERROR: AdminResendOTP pending lookup failed for %s: %v", email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up pending registration"})
+		return
+	}
+	if pending == nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "no_pending_registration",
+			"message": "No in-flight signup for this email. Start a new bootstrap.",
+		})
+		return
+	}
+
+	otp, err := utils.GenerateOTP()
+	if err != nil {
+		log.Printf("ERROR: AdminResendOTP generate OTP failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate OTP"})
+		return
+	}
+
+	// Replace any prior OTP for this email — only the latest is valid.
+	if delErr := aac.otpRepo.DeleteOTPsByEmail(email); delErr != nil {
+		log.Printf("WARN: AdminResendOTP failed to delete old OTPs for %s: %v", email, delErr)
+	}
+
+	otpEntry := models.OTPEntry{
+		Email:     email,
+		OTP:       otp,
+		ExpiresAt: time.Now().Add(30 * time.Minute),
+		Verified:  false,
+	}
+	if err := aac.otpRepo.CreateOTP(&otpEntry); err != nil {
+		log.Printf("ERROR: AdminResendOTP failed to create OTP for %s: %v", email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create OTP"})
+		return
+	}
+
+	// Fire-and-forget mail send — same pattern as AdminBootstrap.
+	go func(em, code string) {
+		if err := utils.SendOTPEmail(em, code); err != nil {
+			log.Printf("WARN: AdminResendOTP email send failed for %s: %v", em, err)
+		} else {
+			log.Printf("INFO: AdminResendOTP email sent successfully to: %s", em)
+		}
+	}(email, otp)
+
+	log.Printf("INFO: AdminResendOTP OTP regenerated for: %s", email)
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"message": "A new OTP has been sent. Please check your email.",
+	})
+}
+
 // GetAuthChallenge generates a challenge for anti-replay protection
 // @Summary Get authentication challenge
 // @Description Generates a server-issued challenge for use in login requests to prevent replay attacks

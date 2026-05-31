@@ -50,6 +50,7 @@ type Config struct {
 	SMTPPort           string
 	SMTPUser           string
 	SMTPPassword       string
+	SMTPFromName       string // Display name for the From: header (e.g. "AuthSec"). Optional; defaults to just the email.
 	TenantDomainSuffix string
 	CorsAllowOrigin    string
 	RedisURL           string
@@ -197,6 +198,7 @@ func LoadConfig() *Config {
 	smtpPort := getEnv("SMTP_PORT", "")
 	smtpUser := getEnv("SMTP_USER", "")
 	smtpPassword := getEnv("SMTP_PASSWORD", "")
+	smtpFromName := getEnv("SMTP_FROM_NAME", "AuthSec") // Display name shown in mail clients; doesn't affect deliverability
 
 	// Load Base URL for OIDC callbacks
 	baseURL := getEnv("BASE_URL", "https://app.authsec.dev")
@@ -315,6 +317,7 @@ func LoadConfig() *Config {
 		SMTPPort:                smtpPort,
 		SMTPUser:                smtpUser,
 		SMTPPassword:            smtpPassword,
+		SMTPFromName:            smtpFromName,
 		TenantDomainSuffix:      tenantDomainSuffix,
 		CorsAllowOrigin:         corsAllowOrigin,
 		RedisURL:                redisURL,

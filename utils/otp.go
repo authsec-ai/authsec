@@ -10,7 +10,41 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/google/uuid"
 )
+
+// buildEmailMessage assembles an RFC 5322–compliant message suitable for
+// hand-off to smtp.SendMail. Historical bug: every call site in this file
+// previously emitted only "To:" + "Subject:" — no From, no Date, no
+// Message-ID, no MIME-Version, no Content-Type. ElasticEmail (port 2525)
+// accepts such messages with a 250 OK, but Gmail/Outlook spam-filter or
+// silently drop them because they violate RFC 5322 §3.6 (Date and From are
+// REQUIRED). Symptom: "successfully sent" in logs, nothing in user's inbox.
+//
+// Sender-domain note: the From: header MUST use the same domain whose SPF/DKIM
+// is configured at the relay (here: authsec.ai via ElasticEmail). Mismatch =
+// DMARC fail = silent drop on Gmail.
+func buildEmailMessage(toEmail, subject, body string) []byte {
+	fromAddr := config.AppConfig.SMTPUser
+	if fromName := strings.TrimSpace(config.AppConfig.SMTPFromName); fromName != "" {
+		fromAddr = fmt.Sprintf("%s <%s>", fromName, config.AppConfig.SMTPUser)
+	}
+	messageID := fmt.Sprintf("<%s@authsec.ai>", uuid.NewString())
+	date := time.Now().UTC().Format(time.RFC1123Z)
+
+	var sb strings.Builder
+	sb.WriteString("From: " + fromAddr + "\r\n")
+	sb.WriteString("To: " + toEmail + "\r\n")
+	sb.WriteString("Subject: " + subject + "\r\n")
+	sb.WriteString("Date: " + date + "\r\n")
+	sb.WriteString("Message-ID: " + messageID + "\r\n")
+	sb.WriteString("MIME-Version: 1.0\r\n")
+	sb.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+	sb.WriteString("\r\n")
+	sb.WriteString(body)
+	return []byte(sb.String())
+}
 
 // GenerateOTPFunc is the function variable for generating OTPs, allowing for mocking in tests
 var GenerateOTPFunc = func() (string, error) {
@@ -62,7 +96,6 @@ Best regards,
 Your App Team
     `, otp)
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -74,7 +107,7 @@ Your App Team
 		auth,
 		smtpUser,
 		[]string{email},
-		[]byte(message),
+		buildEmailMessage(email, subject, body),
 	)
 
 	if err != nil {
@@ -124,7 +157,6 @@ Best regards,
 Your App Team
     `, otp)
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
 	// SMTP authentication (same as existing function)
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -136,7 +168,7 @@ Your App Team
 		auth,
 		smtpUser,
 		[]string{email},
-		[]byte(message),
+		buildEmailMessage(email, subject, body),
 	)
 
 	if err != nil {
@@ -203,7 +235,6 @@ Best regards,
 Your Security Team
     `, tempPassword)
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
 	// SMTP authentication (same as existing function)
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -214,7 +245,7 @@ Your Security Team
 		auth,
 		smtpUser,
 		[]string{email},
-		[]byte(message),
+		buildEmailMessage(email, subject, body),
 	)
 
 	return err
@@ -263,7 +294,6 @@ Regards,
 AuthSec Team
 `, username, tempPassword, loginURL)
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -275,7 +305,7 @@ AuthSec Team
 		auth,
 		smtpUser,
 		[]string{email},
-		[]byte(message),
+		buildEmailMessage(email, subject, body),
 	)
 
 	if err != nil {
@@ -318,7 +348,6 @@ Best regards,
 Your Security Team
     `
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -330,7 +359,7 @@ Your Security Team
 		auth,
 		smtpUser,
 		[]string{email},
-		[]byte(message),
+		buildEmailMessage(email, subject, body),
 	)
 
 	if err != nil {
@@ -375,7 +404,6 @@ Regards,
 AuthSec Team
 `, userName, userEmail, tenantDomain, time.Now().UTC().Format(time.RFC1123))
 
-	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", ownerEmail, subject, body)
 
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
@@ -385,7 +413,7 @@ AuthSec Team
 		auth,
 		smtpUser,
 		[]string{ownerEmail},
-		[]byte(message),
+		buildEmailMessage(ownerEmail, subject, body),
 	)
 
 	if err != nil {

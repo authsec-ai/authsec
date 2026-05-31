@@ -624,6 +624,7 @@ func SetupRoutes(
 				adminAuth.GET("/challenge", adminAuthController.GetAuthChallenge)
 				adminAuth.POST("/login/precheck", adminAuthController.AdminLoginPrecheck)
 				adminAuth.POST("/login/bootstrap", adminAuthController.AdminBootstrap)
+				adminAuth.POST("/login/resend-otp", adminAuthController.AdminResendOTP)
 				adminAuth.POST("/login", adminAuthController.AdminLogin)
 				adminAuth.POST("/login-hybrid", adminAuthController.AdminLoginHybrid)
 				adminAuth.POST("/register", adminAuthController.AdminRegister)
