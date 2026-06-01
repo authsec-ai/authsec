@@ -221,6 +221,25 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		return result, nil
 	}
 
+	// Suspension gate: if an end-user-state row exists for (workspace, user) and
+	// it's not 'active', the user is suspended/disabled — return zero scopes so
+	// token issuance (oauth_as_controller.tokenAuthCodeGrant) fails with
+	// insufficient_scope and introspection flips active=false on the very next
+	// request. Operators/members don't have a row in tenant_end_user_states,
+	// so they're unaffected by this check.
+	//
+	// Done as a separate cheap query (PK lookup) rather than a JOIN so the
+	// fail-closed signal is unambiguous in logs — and so a missing row for an
+	// end-user that somehow slipped past Phase A admin tooling doesn't silently
+	// look like "allowed".
+	var endUserStatus string
+	row := r.db.WithContext(ctx).
+		Raw(`SELECT status FROM tenant_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, tenantUUID, userID).
+		Row()
+	if scanErr := row.Scan(&endUserStatus); scanErr == nil && endUserStatus != "" && endUserStatus != "active" {
+		return result, nil
+	}
+
 	// Single query: user → role_bindings → roles → role_permissions → permissions → oauth_scope_permissions → oauth_scopes
 	// This resolves the full RBAC chain to OAuth scope strings.
 	//

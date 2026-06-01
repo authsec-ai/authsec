@@ -20,10 +20,24 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// revokeTokensOnSuspend is the fan-out the admin paths run after flipping an
+// end-user's status to 'suspended'. Without this, the new status row is
+// visible to the scope resolver (which fail-closes on the next /authorize and
+// next introspect), but any token already issued keeps working until its TTL.
+// The Hydra consent revoke + oauth_consent_grants.revoked_at update kills
+// in-flight sessions within one introspect cycle.
+//
+// Fire-and-forget — matches the call shape used by roles_scoped_bindings_controller.
+func revokeTokensOnSuspend(workspaceID, userID uuid.UUID) {
+	oauthAS := services.NewOAuthASService(config.DB)
+	go oauthAS.RevokeUserTokensForWorkspace(userID, workspaceID)
+}
 
 // actorUserID returns the calling user's UUID from the auth-middleware context,
 // or nil if not present (e.g. during integration tests that bypass auth).
@@ -580,8 +594,15 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "upsert failed", "detail": err.Error()})
 			return
 		}
+		if s.Status == models.EndUserStatusSuspended {
+			revokeTokensOnSuspend(tenantID, userID)
+		}
 		c.JSON(http.StatusOK, s)
 		return
+	}
+
+	if req.Status != nil && *req.Status == models.EndUserStatusSuspended {
+		revokeTokensOnSuspend(tenantID, userID)
 	}
 
 	var s models.TenantEndUserState
@@ -756,6 +777,9 @@ func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUs
 	if res.RowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "end-user state not found"})
 		return
+	}
+	if req.Status != nil && *req.Status == models.EndUserStatusSuspended {
+		revokeTokensOnSuspend(tenantID, userID)
 	}
 	var s models.TenantEndUserState
 	_ = mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
