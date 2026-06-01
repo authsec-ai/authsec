@@ -736,8 +736,12 @@ CREATE TABLE public.resource_servers (
     spiffe_id text,
     agent_type text,
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
-    CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
-    CONSTRAINT resource_servers_resource_uri_key UNIQUE (resource_uri)
+    CONSTRAINT resource_servers_pkey PRIMARY KEY (id)
+    -- resource_uri uniqueness is enforced by the partial index below so that
+    -- soft-deleted rows (deleted_at IS NOT NULL) do not block re-registration
+    -- of the same URL. The old unconditional UNIQUE constraint caused
+    -- "duplicate key" errors whenever an operator deleted an application and
+    -- tried to recreate it with the same base URL.
 );
 
 CREATE TABLE public.risk_policies (
@@ -1804,6 +1808,13 @@ CREATE INDEX idx_pkce_verifiers_expires_at ON public.pkce_verifiers USING btree 
 CREATE INDEX idx_rb_tenant_group ON public.role_bindings USING btree (workspace_id, group_id) WHERE (group_id IS NOT NULL);
 
 CREATE INDEX idx_resource_servers_resource_uri ON public.resource_servers USING btree (resource_uri);
+
+-- Partial unique index: only active (non-soft-deleted) rows must have a unique
+-- resource_uri. Replaces the unconditional UNIQUE constraint that was on the
+-- CREATE TABLE, which blocked re-registration after soft-delete.
+CREATE UNIQUE INDEX idx_resource_servers_resource_uri_active
+    ON public.resource_servers (resource_uri)
+    WHERE deleted_at IS NULL;
 
 CREATE INDEX idx_resource_servers_state ON public.resource_servers USING btree (state);
 

@@ -3,6 +3,7 @@ package platform
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -76,7 +77,13 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 	baseURL := config.AppConfig.OAuthBaseURL()
 	_, resp, err := ctrl.service.Create(req, baseURL)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		// Return 409 for duplicate-URI conflicts so the UI can show
+		// "already exists" instead of a generic "Bad Request".
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "already exists") {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 

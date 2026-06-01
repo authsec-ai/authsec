@@ -103,6 +103,25 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	}
 	resourceURI := publicURL + basePath
 
+	// Pre-check: detect duplicate resource_uri before the INSERT so we can
+	// return a clean 409-friendly error instead of leaking the raw constraint
+	// name ("resource_servers_resource_uri_key") to the operator. This is
+	// purely a UX improvement — the DB unique index is still the source of
+	// truth; we just surface a readable message before it fires.
+	var existingCount int64
+	// Mirrors the partial unique index: only non-deleted rows count as conflicts.
+	if err := s.db.Model(&models.ResourceServer{}).
+		Where("resource_uri = ?", resourceURI).
+		Count(&existingCount).Error; err != nil {
+		return nil, nil, fmt.Errorf("check existing resource server: %w", err)
+	}
+	if existingCount > 0 {
+		return nil, nil, fmt.Errorf(
+			"a resource server with this URL already exists (resource_uri=%s) — use a different Public Base URL or Protected Base Path",
+			resourceURI,
+		)
+	}
+
 	secret, err := generateIntrospectionSecret()
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate introspection secret: %w", err)
