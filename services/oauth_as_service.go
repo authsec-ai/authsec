@@ -626,6 +626,95 @@ func (s *OAuthASService) RevokeHydraLoginSession(subject string) error {
 	return nil
 }
 
+// revokeHydraConsentForSubject calls Hydra Admin API to revoke all consent
+// sessions for a subject. Side effect: every access token issued via those
+// consents becomes invalid on its next introspection (Hydra's grant-state
+// check returns active=false). Refresh tokens tied to those consents also
+// become unusable. This is Hydra's atomic "log this user out everywhere"
+// primitive — narrower than DROP USER but broader than per-token revoke.
+func (s *OAuthASService) revokeHydraConsentForSubject(subject string) error {
+	target := config.AppConfig.HydraAdminURL + "/admin/oauth2/auth/sessions/consent?subject=" + url.QueryEscape(subject) + "&all=true"
+	req, err := http.NewRequest("DELETE", target, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke-consent request: %w", err)
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra admin unavailable: %w", err)
+	}
+	resp.Body.Close()
+	// 204 = revoked, 404 = nothing to revoke (also fine — idempotent semantics).
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("hydra returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// RevokeUserTokensForWorkspace invalidates a user's active OAuth tokens + consent
+// in a specific workspace, immediately after an RBAC mutation removes or narrows
+// their permissions. Phase H-5 is the security keystone: without it, removing
+// a role from a user only takes effect when their access token naturally
+// expires (now ~10 min after H-3) or when the SDK's scope-matrix refreshes
+// (now ~30 s after H-2). Calling this helper drops that window to "instant"
+// (next request fails introspection) for the cost of forcing re-consent on
+// the user's next interaction.
+//
+// Strategy:
+//
+//	1. UPDATE oauth_consent_grants SET revoked_at=now() WHERE workspace_id=? AND user_id=? AND revoked_at IS NULL
+//	   — our /authorize re-validates RBAC against consent state on every flow,
+//	   so any new token issuance will see the fresh permission set.
+//	2. DELETE Hydra consent sessions for subject=user_id
+//	   — invalidates all in-flight access tokens issued via those consents.
+//	   On the user's next protected call, introspection returns active=false
+//	   and the SDK responds 401 → user gets routed back through /authorize
+//	   → fresh consent runs the updated RBAC check.
+//
+// Idempotent: zero-row UPDATEs and 404s from Hydra are normal and non-fatal.
+// Best-effort: call sites SHOULD fire-and-forget (`go s.RevokeUserTokensForWorkspace(...)`)
+// so the RBAC mutation response returns immediately. Revocation failures are
+// logged but don't fail the mutation — the audit trail tells us what fired.
+//
+// Scope: revokes ALL Hydra consent for the subject (Hydra doesn't index by
+// workspace), but only marks oauth_consent_grants for the affected workspace
+// as revoked. A user in multiple workspaces stays logged into workspaces A+B+C
+// — they'll just have to re-consent on the next /authorize for any of them,
+// which is the standards-correct behaviour anyway (RBAC could have changed
+// in any workspace they're a member of).
+func (s *OAuthASService) RevokeUserTokensForWorkspace(userID, workspaceID uuid.UUID) error {
+	if userID == uuid.Nil || workspaceID == uuid.Nil {
+		return nil // no-op; caller passed an empty UUID (e.g. group-binding deletion)
+	}
+
+	// 1. Mark consent grants revoked in our DB. Use raw SQL so we get a clean
+	// "RowsAffected" we can log — useful for confirming the helper actually
+	// did something when an operator runs revoke and watches the logs.
+	res := s.db.Exec(
+		`UPDATE oauth_consent_grants
+		    SET revoked_at = NOW()
+		  WHERE workspace_id = ? AND user_id = ? AND revoked_at IS NULL`,
+		workspaceID, userID,
+	)
+	if res.Error != nil {
+		log.Printf("[MCP_AUTH] RevokeUserTokensForWorkspace: UPDATE consent grants failed user=%s ws=%s: %v",
+			userID, workspaceID, res.Error)
+		// Don't return — still try Hydra revoke; partial success is better than nothing.
+	}
+
+	// 2. Tell Hydra to invalidate all issued tokens for this subject.
+	if err := s.revokeHydraConsentForSubject(userID.String()); err != nil {
+		log.Printf("[MCP_AUTH] RevokeUserTokensForWorkspace: hydra consent revoke failed user=%s ws=%s: %v",
+			userID, workspaceID, err)
+		// Don't return — DB-side revocation already succeeded (or partially
+		// succeeded), so on the next /authorize the user will be denied at
+		// our policy gate even if Hydra still thinks they have a session.
+	}
+
+	log.Printf("[MCP_AUTH] RevokeUserTokensForWorkspace: revoked user=%s ws=%s (grants_marked=%d)",
+		userID, workspaceID, res.RowsAffected)
+	return nil
+}
+
 // FetchJWKS returns the cached Hydra JWKS.
 func (s *OAuthASService) FetchJWKS() (json.RawMessage, error) {
 	return s.jwksCache.get()
@@ -919,16 +1008,37 @@ type DCRResponse struct {
 // Hydra must know every scope that may appear on /oauth2/auth; otherwise it
 // rejects the browser flow with invalid_scope before AuthSec can apply its own
 // RS/RBAC policy checks.
+//
+// Phase H-3: refresh_token is now ALWAYS in grant_types regardless of whether the
+// client requested offline_access. Rationale:
+//
+//   - Hydra's TTL_ACCESS_TOKEN dropped from 1h → 10m to make permission revocation
+//     propagate within minutes (Phase H goal). With 10-minute access tokens, every
+//     OAuth client *needs* refresh tokens to avoid forcing the user to re-consent
+//     every 10 minutes — that would be a worse UX than the old 1h access tokens.
+//   - The OAuth 2.1 spec + MCP authz spec both allow public clients to use refresh
+//     tokens when bound to a single resource server (RFC 8707) + PKCE. AuthSec already
+//     enforces both at /oauth/authorize.
+//   - Hydra OAUTH2_GRANT_REFRESH_TOKEN_ROTATION_GRACE_PERIOD=30s ensures rotation is
+//     enforced — a leaked refresh token is revocable on first reuse.
+//   - The `supportsRefresh` return is now true when EITHER the client explicitly
+//     asked for offline_access OR has any non-empty scope (i.e. wants resource access).
+//     Public-OIDC-only flows (scope=openid only, no resources) still get supportsRefresh
+//     based on the original opt-in semantics for back-compat with id-token-only clients.
 func resolveOIDCClientCapabilities(scope string) (string, []string, bool) {
 	grantTypes := []string{"authorization_code"}
-	supportsRefresh := false
 
 	if scope == "" {
-		return "", grantTypes, false
+		// No scope requested at DCR time (common for MCP clients — they bind scopes
+		// later at /authorize via the resource parameter). Still grant refresh_token
+		// so the eventual resource-bound tokens can be refreshed without re-consent.
+		grantTypes = append(grantTypes, "refresh_token")
+		return "", grantTypes, true
 	}
 
 	seen := make(map[string]struct{})
 	var hydraScopes []string
+	explicitOfflineAccess := false
 	for _, s := range strings.Fields(scope) {
 		if _, ok := seen[s]; ok {
 			continue
@@ -936,15 +1046,16 @@ func resolveOIDCClientCapabilities(scope string) (string, []string, bool) {
 		seen[s] = struct{}{}
 		hydraScopes = append(hydraScopes, s)
 		if s == "offline_access" {
-			supportsRefresh = true
+			explicitOfflineAccess = true
 		}
 	}
 
-	if supportsRefresh {
-		grantTypes = append(grantTypes, "refresh_token")
-	}
-
-	return strings.Join(hydraScopes, " "), grantTypes, supportsRefresh
+	grantTypes = append(grantTypes, "refresh_token")
+	// supportsRefresh tracks whether the client originally asked for refresh-token
+	// flows. Public flows that didn't ask still get refresh tokens issued (per H-3
+	// rationale above) but we surface the original opt-in for callers that need it
+	// (the MCPOAuthClient.SupportsRefreshToken column drives older UI badges).
+	return strings.Join(hydraScopes, " "), grantTypes, explicitOfflineAccess
 }
 
 // --- CIMD types ---

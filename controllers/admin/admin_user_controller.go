@@ -16,6 +16,7 @@ import (
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
+	"github.com/authsec-ai/authsec/services"
 	"github.com/authsec-ai/authsec/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -749,6 +750,17 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	}
 
 	logger.WithField("deleted_counts", deletedCounts).Info("Successfully hard deleted admin user")
+
+	// Phase H-5: even though FK cascades cleared role_bindings + the user row, any
+	// access tokens issued before the delete are still cryptographically valid
+	// until Hydra introspection rejects them. Explicit consent-session revoke
+	// closes the seconds-wide window between "user deleted from DB" and
+	// "introspection sees the user is gone". Fire-and-forget; the response
+	// returns to the operator immediately.
+	if adminUser.WorkspaceID != nil {
+		oauthAS := services.NewOAuthASService(config.DB)
+		go oauthAS.RevokeUserTokensForWorkspace(adminUser.ID, *adminUser.WorkspaceID)
+	}
 
 	// Audit log the successful deletion
 	if config.AuditLogger != nil {

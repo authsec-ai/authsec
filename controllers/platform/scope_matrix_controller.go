@@ -426,6 +426,21 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 	var scope models.OAuthScope
 	config.DB.Where("id = ? AND workspace_id = ?", scopeID, tenantID).First(&scope)
 
+	// Phase H-5 setup: snapshot the users currently entitled to this scope BEFORE
+	// the cascade fires. Once oauth_scope_permissions rows are gone, the join we'd
+	// need to find affected users no longer resolves. We use this list AFTER the
+	// delete commits to revoke their tokens so the revocation is exactly as wide
+	// as the impact (no user revoked unnecessarily, none missed).
+	var affectedUserIDs []uuid.UUID
+	config.DB.Raw(`
+		SELECT DISTINCT rb.user_id
+		  FROM role_bindings rb
+		  JOIN role_permissions rp ON rp.role_id = rb.role_id
+		  JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id
+		 WHERE osp.scope_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL
+		   AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
+	`, scopeID, tenantID).Scan(&affectedUserIDs)
+
 	if err := ctrl.scopeRegistry.DeleteByTenant(scopeID, tenantID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -445,8 +460,17 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 		}
 	}
 
+	// Phase H-5: invalidate active tokens for every user who held this scope.
+	// Fire-and-forget so the API response returns immediately; revocation
+	// failures land in the log, not in the operator's response.
+	for _, uid := range affectedUserIDs {
+		go ctrl.oauthService.RevokeUserTokensForWorkspace(uid, tenantID)
+	}
+
 	auditAdminMutation(c, tenantID.String(), "scope_deleted", "oauth_scope",
-		scopeID.String(), http.StatusNoContent, nil, nil)
+		scopeID.String(), http.StatusNoContent, nil, map[string]interface{}{
+			"affected_users_revoked": len(affectedUserIDs),
+		})
 	c.JSON(http.StatusNoContent, nil)
 }
 

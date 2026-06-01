@@ -326,6 +326,122 @@ func (rc *RolesScopedBindingsController) DeleteRoleAdmin(c *gin.Context) {
 	rc.deleteRole(c, config.DB, *tenantID)
 }
 
+// DeleteRoleBindingAdmin removes a single role binding by id. Phase H-6: this is
+// the previously-missing handler that the UI's "Revoke" button on the Effective
+// Access drawer was calling and 404-ing on. After the binding is gone, Phase H-5
+// kicks in to invalidate any access tokens the affected user still holds.
+//
+// Self-lockout guard: refuses to delete a binding if (a) the binding belongs to
+// the requesting operator AND (b) the binding's role is the admin role for this
+// workspace. Without the guard, an operator can demote themselves into a state
+// where no one (including them) can re-promote. The handler returns 409 with a
+// clear message instructing them to transfer ownership first.
+//
+// @Summary Delete a role binding
+// @Description Removes a single role binding by id. Refuses to remove the requester's own admin binding (self-lockout protection). Triggers token revocation for the affected user via Phase H-5.
+// @Tags RBAC: Roles & Bindings
+// @Produce json
+// @Security BearerAuth
+// @Param binding_id path string true "Role binding UUID"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Failure 409 {object} map[string]string "Refuses self-lockout"
+// @Failure 500 {object} map[string]string
+// @Router /uflow/admin/bindings/{binding_id} [delete]
+func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) {
+	tenantIDPtr, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	tenantID := *tenantIDPtr
+
+	bindingID, err := uuid.Parse(c.Param("binding_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid binding_id"})
+		return
+	}
+
+	// Read the binding before deletion: we need the user_id for revocation,
+	// and we need (user_id, role.name, workspace_id) for the self-lockout check.
+	type bindingRow struct {
+		UserID      *uuid.UUID
+		RoleID      uuid.UUID
+		RoleName    string
+		WorkspaceID uuid.UUID
+	}
+	var row bindingRow
+	err = config.DB.Raw(`
+		SELECT rb.user_id, rb.role_id, COALESCE(r.name, '') AS role_name, rb.workspace_id
+		  FROM role_bindings rb
+		  LEFT JOIN roles r ON r.id = rb.role_id
+		 WHERE rb.id = ? AND rb.workspace_id = ?`,
+		bindingID, tenantID).Scan(&row).Error
+	if err != nil || row.RoleID == uuid.Nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "binding not found"})
+		return
+	}
+
+	// Self-lockout guard. The operator's user_id comes from the same auth
+	// middleware that resolved the workspace; we use the existing helper.
+	requesterID := getUserIDFromRequest(c)
+	if requesterID != nil && row.UserID != nil && *requesterID == *row.UserID {
+		// Operator is removing their own binding. Only blocked if it's the
+		// admin role — losing a non-admin binding is harmless. Match by
+		// lowercased name to tolerate "admin" / "Admin" / "ADMIN" variants.
+		if strings.EqualFold(row.RoleName, "admin") {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "self_lockout_refused",
+				"message": "you cannot remove your own admin binding — transfer ownership to another operator first",
+			})
+			return
+		}
+	}
+
+	// Delete. We don't wrap in a transaction since this is a single-row delete;
+	// if it 0-affects, the binding was already gone (likely a double-click in the UI).
+	res := config.DB.Where("id = ? AND workspace_id = ?", bindingID, tenantID).Delete(&models.RoleBinding{})
+	if res.Error != nil {
+		log.Printf("ERROR: DeleteRoleBindingAdmin: delete failed binding=%s ws=%s: %v", bindingID, tenantID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete binding"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		// Lost-race: someone else deleted it between our SELECT and DELETE.
+		// Treat as success — the desired end state (binding gone) is reached.
+		c.JSON(http.StatusOK, gin.H{
+			"message": "binding already removed",
+			"id":      bindingID.String(),
+		})
+		return
+	}
+
+	// Phase H-5: invalidate the affected user's active tokens so the revocation
+	// takes effect immediately on their next request (without waiting for the
+	// access-token TTL to expire).
+	if row.UserID != nil {
+		oauthAS := services.NewOAuthASService(config.DB)
+		go oauthAS.RevokeUserTokensForWorkspace(*row.UserID, tenantID)
+	}
+
+	middlewares.Audit(c, "role_binding", bindingID.String(), "delete", &middlewares.AuditChanges{
+		Before: map[string]interface{}{
+			"user_id":      row.UserID,
+			"role_id":      row.RoleID.String(),
+			"role_name":    row.RoleName,
+			"workspace_id": row.WorkspaceID.String(),
+		},
+		After: nil,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "binding deleted",
+		"id":      bindingID.String(),
+	})
+}
+
 // AssignRoleScopedAdmin godoc
 // @Summary Assign Role (Admin)
 // @Description Uses the primary admin database. Inserts into role_bindings; scope can be tenant-wide (null) or scoped (type/id). Conditions JSON stored on binding.
@@ -1128,6 +1244,17 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 
 	log.Printf("INFO: Found role %s (name: %s), proceeding to delete with role_permissions and role_bindings", roleID, role.Name)
 
+	// Phase H-5 setup: snapshot the users currently bound to this role BEFORE
+	// the cascade. After tx commit, we revoke each user's active OAuth tokens
+	// so the role removal takes effect on the next request — not at access-token
+	// expiry. Snapshot has to be pre-delete because role_bindings is one of the
+	// things the transaction drops.
+	var affectedUserIDs []uuid.UUID
+	freshDB.Model(&models.RoleBinding{}).
+		Where("role_id = ? AND workspace_id = ? AND user_id IS NOT NULL", roleID, tenantID).
+		Distinct().
+		Pluck("user_id", &affectedUserIDs)
+
 	// Delete role (cascades to role_permissions due to FK constraint)
 	if err := freshDB.Transaction(func(tx *gorm.DB) error {
 		// Delete role permissions first (in case cascade doesn't work)
@@ -1157,6 +1284,17 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		log.Printf("ERROR: Transaction failed for deleting role %s: %v", roleID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete role: " + err.Error()})
 		return
+	}
+
+	// Phase H-5: invalidate active OAuth tokens for every user who had this
+	// role. Fire-and-forget — the API response returns immediately; revocation
+	// failures land in the log, not in the operator's response.
+	if len(affectedUserIDs) > 0 {
+		oauthAS := services.NewOAuthASService(config.DB)
+		for _, uid := range affectedUserIDs {
+			go oauthAS.RevokeUserTokensForWorkspace(uid, tenantID)
+		}
+		log.Printf("INFO: H-5 revoke queued for %d users after role %s deletion", len(affectedUserIDs), roleID)
 	}
 
 	// Audit log: Role deleted

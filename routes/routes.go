@@ -562,6 +562,7 @@ func SetupRoutes(
 			adminRBAC.DELETE("/roles/:role_id", rolesScopedBindingsController.DeleteRoleAdmin)
 			adminRBAC.POST("/bindings", rolesScopedBindingsController.AssignRoleScopedAdmin)
 			adminRBAC.GET("/bindings", rolesScopedBindingsController.ListRoleBindingsAdmin)
+			adminRBAC.DELETE("/bindings/:binding_id", rolesScopedBindingsController.DeleteRoleBindingAdmin)
 			adminRBAC.POST("/permissions", permissionController.RegisterAtomicPermission)
 			adminRBAC.GET("/permissions", permissionController.ListPermissions)
 			adminRBAC.DELETE("/permissions/:id", permissionController.DeletePermission)
