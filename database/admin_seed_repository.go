@@ -23,16 +23,16 @@ func NewAdminSeedRepository(db *DBConnection) *AdminSeedRepository {
 }
 
 // EnsureAdminRoleAndPermissions creates admin role, default scopes, and permissions for a tenant and returns the role ID.
-func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissions(tenantID uuid.UUID) (uuid.UUID, error) {
-	return asr.ensureAdminRoleAndPermissions(asr.db.DB, tenantID)
+func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissions(workspaceID uuid.UUID) (uuid.UUID, error) {
+	return asr.ensureAdminRoleAndPermissions(asr.db.DB, workspaceID)
 }
 
 // EnsureAdminRoleAndPermissionsTx performs the same operation using an existing transaction.
-func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissionsTx(tx *sql.Tx, tenantID uuid.UUID) (uuid.UUID, error) {
-	return asr.ensureAdminRoleAndPermissions(tx, tenantID)
+func (asr *AdminSeedRepository) EnsureAdminRoleAndPermissionsTx(tx *sql.Tx, workspaceID uuid.UUID) (uuid.UUID, error) {
+	return asr.ensureAdminRoleAndPermissions(tx, workspaceID)
 }
 
-func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, tenantID uuid.UUID) (uuid.UUID, error) {
+func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, workspaceID uuid.UUID) (uuid.UUID, error) {
 	if asr == nil || asr.db == nil {
 		return uuid.Nil, fmt.Errorf("admin seed repository not initialized")
 	}
@@ -49,7 +49,7 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 		VALUES ($1, $2, 'admin', 'Administrator with full access', $3, $3)
 		ON CONFLICT (workspace_id, name) DO UPDATE SET updated_at = EXCLUDED.updated_at
 		RETURNING id
-	`, roleID, tenantID, now).Scan(&roleID); err != nil {
+	`, roleID, workspaceID, now).Scan(&roleID); err != nil {
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)
 	}
 

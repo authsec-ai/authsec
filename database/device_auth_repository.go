@@ -100,14 +100,14 @@ func (r *DeviceAuthRepository) FindByUserCode(userCode string) (*models.DeviceCo
 // Handles all nullable columns (tenant_id, client_id, user_id, tenant_domain, access_token, etc.).
 func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode, error) {
 	dc := &models.DeviceCode{}
-	var tenantID, clientID, userID sql.NullString
+	var workspaceID, clientID, userID sql.NullString
 	var verificationURIComplete, userEmail, tenantDomain, accessToken sql.NullString
 	var scopesJSON, deviceInfoJSON []byte
 	var lastPolledAt, authorizedAt sql.NullInt64
 
 	err := row.Scan(
 		&dc.ID,
-		&tenantID,
+		&workspaceID,
 		&clientID,
 		&dc.DeviceCode,
 		&dc.UserCode,
@@ -133,8 +133,8 @@ func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode,
 		return nil, err
 	}
 
-	if tenantID.Valid {
-		id := uuid.MustParse(tenantID.String)
+	if workspaceID.Valid {
+		id := uuid.MustParse(workspaceID.String)
 		dc.WorkspaceID = &id
 	}
 	if clientID.Valid {
@@ -214,12 +214,12 @@ func (r *DeviceAuthRepository) UpdateLastPolled(deviceCode string, minIntervalSe
 
 // AuthorizeDeviceCode authorizes or denies a device code with full user + tenant context.
 // accessToken is the pre-generated JWT; stored here so /token poll can return it directly.
-// tenantID, tenantDomain, and clientID come from the authenticated browser session.
+// workspaceID, tenantDomain, and clientID come from the authenticated browser session.
 func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 	userCode string,
 	userID uuid.UUID,
 	userEmail string,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	tenantDomain string,
 	clientID *uuid.UUID,
 	accessToken string,
@@ -245,7 +245,7 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 	`
 
 	now := time.Now().Unix()
-	result, err := r.db.Exec(query, userID, userEmail, tenantID, tenantDomain, clientID, accessToken, status, now, now, userCode)
+	result, err := r.db.Exec(query, userID, userEmail, workspaceID, tenantDomain, clientID, accessToken, status, now, now, userCode)
 	if err != nil {
 		return err
 	}
@@ -297,7 +297,7 @@ func (r *DeviceAuthRepository) DeleteExpiredDeviceCodes(olderThan time.Duration)
 
 // ListPendingDeviceCodes returns all pending device codes for a tenant (optionally filtered by client_id).
 // Also auto-expires stale pending codes before returning.
-func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, clientID *uuid.UUID) ([]models.DeviceCode, error) {
+func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, clientID *uuid.UUID) ([]models.DeviceCode, error) {
 	now := time.Now().Unix()
 
 	expireQuery := `
@@ -305,7 +305,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 		SET status = 'expired', updated_at = $1
 		WHERE workspace_id = $2 AND status = 'pending' AND expires_at < $3
 	`
-	r.db.Exec(expireQuery, now, tenantID, now)
+	r.db.Exec(expireQuery, now, workspaceID, now)
 
 	var query string
 	var args []interface{}
@@ -321,7 +321,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 			WHERE workspace_id = $1 AND client_id = $2 AND status = 'pending' AND expires_at > $3
 			ORDER BY created_at DESC
 		`
-		args = []interface{}{tenantID, *clientID, now}
+		args = []interface{}{workspaceID, *clientID, now}
 	} else {
 		query = `
 			SELECT id, workspace_id, client_id, device_code, user_code,
@@ -333,7 +333,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(tenantID uuid.UUID, client
 			WHERE workspace_id = $1 AND status = 'pending' AND expires_at > $2
 			ORDER BY created_at DESC
 		`
-		args = []interface{}{tenantID, now}
+		args = []interface{}{workspaceID, now}
 	}
 
 	rows, err := r.db.Query(query, args...)

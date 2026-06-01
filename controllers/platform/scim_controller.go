@@ -25,8 +25,9 @@ import (
 type SCIMController struct{}
 
 func countSCIMTenantUsers(workspaceID uuid.UUID) (int64, error) {
+func countSCIMTenantUsers(workspaceID uuid.UUID) (int64, error) {
 	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ?", workspaceID).Scan(&count).Error
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", workspaceID).Scan(&count).Error
 	return count, err
 }
 
@@ -89,11 +90,11 @@ func getClientAndProjectID(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
 // the shared config.DB. The name is kept for backward compatibility with
 // callers; the tenant-DB-routing behavior was removed in Step 0.
 func getTenantDB(c *gin.Context) (*gorm.DB, string, error) {
-	tenantID, err := shared.RequireWorkspaceID(c)
+	workspaceID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		return nil, "", fmt.Errorf("tenant not found in token")
 	}
-	return config.DB, tenantID, nil
+	return config.DB, workspaceID, nil
 }
 
 // ──────────────────────────────────────────────
@@ -206,7 +207,7 @@ func (sc *SCIMController) GetResourceTypes(c *gin.Context) {
 // ListUsers handles GET /scim/v2/:client_id/:project_id/Users
 func (sc *SCIMController) ListUsers(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -231,7 +232,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 	baseURL := scimBaseURL(c)
 
 	// Build query — scoped by workspace_id
-	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ?", tenantID)
+	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ?", workspaceID)
 
 	// When no filter: return only SCIM-provisioned users
 	// When filter is provided (e.g., Okta searching by userName): search ALL users for duplicate detection
@@ -259,7 +260,7 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 // GetUser handles GET /scim/v2/:client_id/:project_id/Users/:id
 func (sc *SCIMController) GetUser(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -278,7 +279,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -293,7 +294,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 // CreateUser handles POST /scim/v2/:client_id/:project_id/Users
 func (sc *SCIMController) CreateUser(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -317,12 +318,12 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 	}
 
 	email := input.GetPrimaryEmail()
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	// Gate: check total-user limit before provisioning.
 	if currentCount, countErr := countSCIMTenantUsers(tenantUUID); countErr == nil {
-		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), tenantID, int(currentCount)); billErr != nil {
-			log.Printf("[SCIM] billing check failed (fail-open) tenant=%s: %v", tenantID, billErr)
+		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), workspaceID, int(currentCount)); billErr != nil {
+			log.Printf("[SCIM] billing check failed (fail-open) tenant=%s: %v", workspaceID, billErr)
 		} else if !resp.Allowed {
 			c.JSON(http.StatusPaymentRequired, models.NewSCIMError("402",
 				fmt.Sprintf("user limit reached (%d/%d on %s plan). %s", resp.Current, resp.Limit, resp.PlanID, resp.UpgradeHint), ""))
@@ -399,7 +400,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		return
 	}
 
-	log.Printf("SCIM: Created user %s (tenant: %s)", email, tenantID)
+	log.Printf("SCIM: Created user %s (tenant: %s)", email, workspaceID)
 
 	// Send temporary password email to the user (async — don't block SCIM response)
 	go func() {
@@ -410,7 +411,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 		}
 	}()
 
-	middlewares.Audit(c, "scim", tenantID, "create_user", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "create_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":     newUser.ID.String(),
 			"email":       email,
@@ -424,7 +425,7 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 // ReplaceUser handles PUT /scim/v2/:client_id/:project_id/Users/:id
 func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -449,7 +450,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -489,7 +490,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	// Re-fetch updated user
 	tenantDB.Where("id = ?", userUUID).First(&user)
 
-	middlewares.Audit(c, "scim", tenantID, "replace_user", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "replace_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id": userID,
 			"email":   email,
@@ -502,7 +503,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 // PatchUser handles PATCH /scim/v2/:client_id/:project_id/Users/:id
 func (sc *SCIMController) PatchUser(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -527,7 +528,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -562,7 +563,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	// Re-fetch
 	tenantDB.Where("id = ?", userUUID).First(&user)
 
-	middlewares.Audit(c, "scim", tenantID, "patch_user", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "patch_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":    userID,
 			"operations": len(patchReq.Operations),
@@ -575,7 +576,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 // DeleteUser handles DELETE /scim/v2/:client_id/:project_id/Users/:id
 func (sc *SCIMController) DeleteUser(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -593,7 +594,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	result := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantID).Delete(&models.ExtendedUser{})
+	result := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).Delete(&models.ExtendedUser{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, models.NewSCIMError("500", "Failed to delete user", ""))
 		return
@@ -603,9 +604,9 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	log.Printf("SCIM: Deleted user %s (tenant: %s)", userID, tenantID)
+	log.Printf("SCIM: Deleted user %s (tenant: %s)", userID, workspaceID)
 
-	middlewares.Audit(c, "scim", tenantID, "delete_user", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "delete_user", &middlewares.AuditChanges{
 		Before: map[string]interface{}{"user_id": userID},
 	})
 
@@ -619,7 +620,7 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 // ListGroups handles GET /scim/v2/:client_id/:project_id/Groups
 func (sc *SCIMController) ListGroups(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -636,7 +637,7 @@ func (sc *SCIMController) ListGroups(c *gin.Context) {
 
 	filter := c.Query("filter")
 	baseURL := scimBaseURL(c)
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	query := tenantDB.Model(&models.TenantGroup{}).Where("workspace_id = ?", tenantUUID)
 	query = applyGroupFilter(query, filter)
@@ -659,7 +660,7 @@ func (sc *SCIMController) ListGroups(c *gin.Context) {
 // GetGroup handles GET /scim/v2/:client_id/:project_id/Groups/:id
 func (sc *SCIMController) GetGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -672,7 +673,7 @@ func (sc *SCIMController) GetGroup(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	var group models.TenantGroup
 	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
@@ -691,7 +692,7 @@ func (sc *SCIMController) GetGroup(c *gin.Context) {
 // CreateGroup handles POST /scim/v2/:client_id/:project_id/Groups
 func (sc *SCIMController) CreateGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -708,7 +709,7 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	// Check for existing group with same name
 	var existing models.TenantGroup
@@ -743,9 +744,9 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 		)
 	}
 
-	log.Printf("SCIM: Created group %s (tenant: %s)", input.DisplayName, tenantID)
+	log.Printf("SCIM: Created group %s (tenant: %s)", input.DisplayName, workspaceID)
 
-	middlewares.Audit(c, "scim", tenantID, "create_group", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "create_group", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"group_id":     newGroup.ID.String(),
 			"display_name": input.DisplayName,
@@ -760,7 +761,7 @@ func (sc *SCIMController) CreateGroup(c *gin.Context) {
 // ReplaceGroup handles PUT /scim/v2/:client_id/:project_id/Groups/:id
 func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -773,7 +774,7 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	var group models.TenantGroup
 	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
@@ -810,7 +811,7 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 		)
 	}
 
-	middlewares.Audit(c, "scim", tenantID, "replace_group", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "replace_group", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"group_id":     groupID,
 			"display_name": input.DisplayName,
@@ -826,7 +827,7 @@ func (sc *SCIMController) ReplaceGroup(c *gin.Context) {
 // PatchGroup handles PATCH /scim/v2/:client_id/:project_id/Groups/:id
 func (sc *SCIMController) PatchGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -839,7 +840,7 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	var group models.TenantGroup
 	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).First(&group).Error; err != nil {
@@ -889,7 +890,7 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 
 	tenantDB.Model(&group).Update("updated_at", time.Now())
 
-	middlewares.Audit(c, "scim", tenantID, "patch_group", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "patch_group", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"group_id":   groupID,
 			"operations": len(patchReq.Operations),
@@ -905,7 +906,7 @@ func (sc *SCIMController) PatchGroup(c *gin.Context) {
 // DeleteGroup handles DELETE /scim/v2/:client_id/:project_id/Groups/:id
 func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 	shared.SCIMContentType(c)
-	tenantDB, tenantID, err := getTenantDB(c)
+	tenantDB, workspaceID, err := getTenantDB(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, models.NewSCIMError("401", err.Error(), ""))
 		return
@@ -918,7 +919,7 @@ func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	tenantUUID, _ := uuid.Parse(tenantID)
+	tenantUUID, _ := uuid.Parse(workspaceID)
 
 	// Remove member associations first
 	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupUUID, tenantUUID)
@@ -933,9 +934,9 @@ func (sc *SCIMController) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	log.Printf("SCIM: Deleted group %s (tenant: %s)", groupID, tenantID)
+	log.Printf("SCIM: Deleted group %s (tenant: %s)", groupID, workspaceID)
 
-	middlewares.Audit(c, "scim", tenantID, "delete_group", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "delete_group", &middlewares.AuditChanges{
 		Before: map[string]interface{}{"group_id": groupID},
 	})
 
@@ -1073,9 +1074,9 @@ func applyUserPatchReplace(op models.SCIMPatchOp, updates map[string]interface{}
 }
 
 // getGroupMembers retrieves member references for a group
-func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID) []models.SCIMMemberRef {
+func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID) []models.SCIMMemberRef {
 	var userGroups []models.UserGroup
-	tenantDB.Where("group_id = ? AND workspace_id = ?", groupID, tenantID).Find(&userGroups)
+	tenantDB.Where("group_id = ? AND workspace_id = ?", groupID, workspaceID).Find(&userGroups)
 
 	members := make([]models.SCIMMemberRef, 0, len(userGroups))
 	for _, ug := range userGroups {
@@ -1095,13 +1096,13 @@ func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, tenantID u
 }
 
 // replaceGroupMembers replaces all members of a group
-func (sc *SCIMController) replaceGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID, value interface{}) {
-	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupID, tenantID)
-	sc.addGroupMembers(tenantDB, groupID, tenantID, value)
+func (sc *SCIMController) replaceGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
+	tenantDB.Exec("DELETE FROM user_groups WHERE group_id = $1 AND workspace_id = $2", groupID, workspaceID)
+	sc.addGroupMembers(tenantDB, groupID, workspaceID, value)
 }
 
 // addGroupMembers adds members to a group from a SCIM PATCH value
-func (sc *SCIMController) addGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID, value interface{}) {
+func (sc *SCIMController) addGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
 	members := parseMemberRefs(value)
 	for _, member := range members {
 		memberUUID, err := uuid.Parse(member.Value)
@@ -1110,13 +1111,13 @@ func (sc *SCIMController) addGroupMembers(tenantDB *gorm.DB, groupID, tenantID u
 		}
 		tenantDB.Exec(
 			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			memberUUID, groupID, tenantID,
+			memberUUID, groupID, workspaceID,
 		)
 	}
 }
 
 // removeGroupMembers removes members from a group
-func (sc *SCIMController) removeGroupMembers(tenantDB *gorm.DB, groupID, tenantID uuid.UUID, value interface{}) {
+func (sc *SCIMController) removeGroupMembers(tenantDB *gorm.DB, groupID, workspaceID uuid.UUID, value interface{}) {
 	members := parseMemberRefs(value)
 	for _, member := range members {
 		memberUUID, err := uuid.Parse(member.Value)
@@ -1125,7 +1126,7 @@ func (sc *SCIMController) removeGroupMembers(tenantDB *gorm.DB, groupID, tenantI
 		}
 		tenantDB.Exec(
 			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
-			memberUUID, groupID, tenantID,
+			memberUUID, groupID, workspaceID,
 		)
 	}
 }
@@ -1196,7 +1197,7 @@ type SCIMTokenResponse struct {
 // POST /uflow/admin/scim/generate-token
 func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 	// Get admin's tenant_id from JWT (set by AuthMiddleware + ValidateTenantFromToken)
-	tenantID, err := shared.RequireWorkspaceID(c)
+	workspaceID, err := shared.RequireWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant not found in token"})
 		return
@@ -1239,7 +1240,7 @@ func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 	// Generate 365-day token using the same token service (passes AuthMiddleware validation)
 	scimToken, err := config.TokenService.GenerateEndUserToken(
 		userID,
-		tenantID,
+		workspaceID,
 		clientUUID.String(),
 		emailID,
 		[]string{"scim:read", "scim:write"},
@@ -1259,9 +1260,9 @@ func (sc *SCIMController) GenerateSCIMToken(c *gin.Context) {
 	baseURL := fmt.Sprintf("%s://%s/uflow/scim/v2/%s/%s", scheme, c.Request.Host, input.ClientID, input.ProjectID)
 	expireAt := time.Now().Add(365 * 24 * time.Hour).Format(time.RFC3339)
 
-	log.Printf("SCIM: Generated SCIM token for tenant %s, client %s", tenantID, input.ClientID)
+	log.Printf("SCIM: Generated SCIM token for tenant %s, client %s", workspaceID, input.ClientID)
 
-	middlewares.Audit(c, "scim", tenantID, "generate_scim_token", &middlewares.AuditChanges{
+	middlewares.Audit(c, "scim", workspaceID, "generate_scim_token", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"client_id":  input.ClientID,
 			"project_id": input.ProjectID,

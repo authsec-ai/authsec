@@ -60,19 +60,19 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Determine tenant_id from token claims or issuer.
-		tenantID, _ := claims["workspace_id"].(string)
-		if tenantID == "" {
+		workspaceID, _ := claims["workspace_id"].(string)
+		if workspaceID == "" {
 			iss, _ := claims["iss"].(string)
-			tenantID = strings.TrimPrefix(iss, "spiffe://")
+			workspaceID = strings.TrimPrefix(iss, "spiffe://")
 		}
-		if tenantID == "" {
+		if workspaceID == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Cannot determine tenant_id from SPIFFE JWT-SVID"})
 			return
 		}
 
-		pubKey, err := spiffeGetPublicKey(tenantID)
+		pubKey, err := spiffeGetPublicKey(workspaceID)
 		if err != nil {
-			log.Printf("[SpiffeAuth] Failed to fetch JWKS for tenant %s: %v", tenantID, err)
+			log.Printf("[SpiffeAuth] Failed to fetch JWKS for tenant %s: %v", workspaceID, err)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Failed to verify SPIFFE token"})
 			return
 		}
@@ -171,9 +171,9 @@ type spiffeJWKSCacheEntry struct {
 
 const spiffeJWKSCacheTTL = 5 * time.Minute
 
-func spiffeGetPublicKey(tenantID string) (*rsa.PublicKey, error) {
+func spiffeGetPublicKey(workspaceID string) (*rsa.PublicKey, error) {
 	spiffeJWKSCacheMu.RLock()
-	if entry, ok := spiffeJWKSCache[tenantID]; ok && time.Since(entry.fetchedAt) < spiffeJWKSCacheTTL {
+	if entry, ok := spiffeJWKSCache[workspaceID]; ok && time.Since(entry.fetchedAt) < spiffeJWKSCacheTTL {
 		spiffeJWKSCacheMu.RUnlock()
 		return entry.key, nil
 	}
@@ -186,7 +186,7 @@ func spiffeGetPublicKey(tenantID string) (*rsa.PublicKey, error) {
 
 	// TODO(phase9): ICP service still expects ?tenant_id= here; update to
 	// ?workspace_id= once the SPIRE-layer has been swept in Phase 9.
-	url := fmt.Sprintf("%s/v1/jwt/bundle?tenant_id=%s", spireURL, tenantID)
+	url := fmt.Sprintf("%s/v1/jwt/bundle?tenant_id=%s", spireURL, workspaceID)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -211,7 +211,7 @@ func spiffeGetPublicKey(tenantID string) (*rsa.PublicKey, error) {
 		return nil, fmt.Errorf("decode JWKS: %w", err)
 	}
 	if len(jwks.Keys) == 0 {
-		return nil, fmt.Errorf("no keys in JWKS response for tenant %s", tenantID)
+		return nil, fmt.Errorf("no keys in JWKS response for tenant %s", workspaceID)
 	}
 
 	k := jwks.Keys[0]
@@ -225,10 +225,10 @@ func spiffeGetPublicKey(tenantID string) (*rsa.PublicKey, error) {
 	}
 
 	spiffeJWKSCacheMu.Lock()
-	spiffeJWKSCache[tenantID] = &spiffeJWKSCacheEntry{key: pubKey, fetchedAt: time.Now()}
+	spiffeJWKSCache[workspaceID] = &spiffeJWKSCacheEntry{key: pubKey, fetchedAt: time.Now()}
 	spiffeJWKSCacheMu.Unlock()
 
-	log.Printf("[SpiffeAuth] Cached JWKS for tenant %s (kid=%s)", tenantID, k.Kid)
+	log.Printf("[SpiffeAuth] Cached JWKS for tenant %s (kid=%s)", workspaceID, k.Kid)
 	return pubKey, nil
 }
 

@@ -191,8 +191,8 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 // GetPendingActions returns pending (non-expired) action requests for the authenticated user.
 // Filters by both tenant_id and user_id — only the user whose account triggered the action sees it.
 func (ctrl *AgentActionController) GetPendingActions(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == (uuid.UUID{}) {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == (uuid.UUID{}) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
 	}
@@ -208,7 +208,7 @@ func (ctrl *AgentActionController) GetPendingActions(c *gin.Context) {
 		return
 	}
 
-	actions, err := ctrl.actionService.GetPendingActions(tenantID, userID)
+	actions, err := ctrl.actionService.GetPendingActions(workspaceID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch pending actions"})
 		return
@@ -238,12 +238,12 @@ func (ctrl *AgentActionController) GetPendingActions(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/admin/risk-policies [get]
 func (ctrl *AgentActionController) ListRiskPolicies(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
-	policies, err := ctrl.actionService.GetRiskPolicies(tenantID)
+	policies, err := ctrl.actionService.GetRiskPolicies(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list risk policies", "details": err.Error()})
 		return
@@ -269,8 +269,8 @@ func (ctrl *AgentActionController) ListRiskPolicies(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/admin/risk-policies [post]
 func (ctrl *AgentActionController) CreateRiskPolicy(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
@@ -280,7 +280,7 @@ func (ctrl *AgentActionController) CreateRiskPolicy(c *gin.Context) {
 		return
 	}
 
-	policy, err := ctrl.actionService.CreateRiskPolicy(tenantID, &req)
+	policy, err := ctrl.actionService.CreateRiskPolicy(workspaceID, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create risk policy", "details": err.Error()})
 		return
@@ -315,8 +315,8 @@ func (ctrl *AgentActionController) CreateRiskPolicy(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/admin/risk-policies/{id} [put]
 func (ctrl *AgentActionController) UpdateRiskPolicy(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
@@ -332,7 +332,7 @@ func (ctrl *AgentActionController) UpdateRiskPolicy(c *gin.Context) {
 		return
 	}
 
-	policy, err := ctrl.actionService.UpdateRiskPolicy(policyID, tenantID, &req)
+	policy, err := ctrl.actionService.UpdateRiskPolicy(policyID, workspaceID, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update risk policy", "details": err.Error()})
 		return
@@ -358,8 +358,8 @@ func (ctrl *AgentActionController) UpdateRiskPolicy(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/admin/risk-policies/{id} [delete]
 func (ctrl *AgentActionController) DeleteRiskPolicy(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
@@ -369,7 +369,7 @@ func (ctrl *AgentActionController) DeleteRiskPolicy(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.actionService.DeleteRiskPolicy(policyID, tenantID); err != nil {
+	if err := ctrl.actionService.DeleteRiskPolicy(policyID, workspaceID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete risk policy", "details": err.Error()})
 		return
 	}
@@ -386,12 +386,12 @@ func (ctrl *AgentActionController) DeleteRiskPolicy(c *gin.Context) {
 // @Success 200 {object} models.AgentGuardSettingsResponse "Settings"
 // @Router /uflow/admin/agent-guard/settings [get]
 func (ctrl *AgentActionController) GetSettings(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
-	settings, err := ctrl.actionService.GetSettings(tenantID)
+	settings, err := ctrl.actionService.GetSettings(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get settings", "details": err.Error()})
 		return
@@ -412,8 +412,8 @@ func (ctrl *AgentActionController) GetSettings(c *gin.Context) {
 // @Success 200 {object} models.AgentGuardSettingsResponse "Updated settings"
 // @Router /uflow/admin/agent-guard/settings [put]
 func (ctrl *AgentActionController) UpdateSettings(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
@@ -423,13 +423,13 @@ func (ctrl *AgentActionController) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	settings, err := ctrl.actionService.UpdateSettings(tenantID, &req)
+	settings, err := ctrl.actionService.UpdateSettings(workspaceID, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update settings", "details": err.Error()})
 		return
 	}
 
-	middlewares.Audit(c, "agent_guard_settings", tenantID.String(), "update", nil)
+	middlewares.Audit(c, "agent_guard_settings", workspaceID.String(), "update", nil)
 
 	c.JSON(http.StatusOK, models.AgentGuardSettingsResponse{
 		Success:  true,
@@ -447,15 +447,15 @@ func (ctrl *AgentActionController) UpdateSettings(c *gin.Context) {
 // @Success 200 {object} models.AgentAuditListResponse "Audit log"
 // @Router /uflow/admin/agent-audit [get]
 func (ctrl *AgentActionController) GetAuditLog(c *gin.Context) {
-	tenantID := ctrl.getTenantID(c)
-	if tenantID == uuid.Nil {
+	workspaceID := ctrl.getTenantID(c)
+	if workspaceID == uuid.Nil {
 		return
 	}
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "20"))
 
-	entries, total, err := ctrl.actionService.GetAuditLog(tenantID, page, perPage)
+	entries, total, err := ctrl.actionService.GetAuditLog(workspaceID, page, perPage)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get audit log", "details": err.Error()})
 		return
@@ -480,10 +480,10 @@ func (ctrl *AgentActionController) getTenantID(c *gin.Context) uuid.UUID {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found"})
 		return uuid.Nil
 	}
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id"})
 		return uuid.Nil
 	}
-	return tenantID
+	return workspaceID
 }

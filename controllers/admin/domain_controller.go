@@ -58,12 +58,12 @@ func getTenantIDFromRequest(c *gin.Context) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("tenant_id not found in request context")
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid tenant_id format: %w", err)
+		return uuid.Nil, fmt.Errorf("invalid workspace_id format: %w", err)
 	}
 
-	return tenantID, nil
+	return workspaceID, nil
 }
 
 func getUserIDFromRequest(c *gin.Context) *uuid.UUID {
@@ -108,13 +108,13 @@ func domainToResponse(td *database.TenantDomain) DomainResponse {
 
 // ListDomains retrieves all domains for the authenticated tenant
 func (dc *DomainController) ListDomains(c *gin.Context) {
-	tenantID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getTenantIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	domains, err := dc.service.ListTenantDomains(tenantID)
+	domains, err := dc.service.ListTenantDomains(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list domains", "details": err.Error()})
 		return
@@ -146,7 +146,7 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getTenantIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -159,7 +159,7 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 		return
 	}
 
-	if td.WorkspaceID != tenantID {
+	if td.WorkspaceID != workspaceID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to access this domain"})
 		return
 	}
@@ -172,7 +172,7 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 
 // CreateDomain registers a new custom domain (pending verification)
 func (dc *DomainController) CreateDomain(c *gin.Context) {
-	tenantID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getTenantIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -186,7 +186,7 @@ func (dc *DomainController) CreateDomain(c *gin.Context) {
 
 	createdBy := getUserIDFromRequest(c)
 
-	td, err := dc.service.RegisterDomain(tenantID, req.Domain, createdBy)
+	td, err := dc.service.RegisterDomain(workspaceID, req.Domain, createdBy)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -231,9 +231,9 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
 		return
 	}
 
@@ -243,7 +243,7 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.WorkspaceID != tenantID {
+	if td.WorkspaceID != workspaceID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to verify this domain"})
 		return
 	}
@@ -277,7 +277,7 @@ func (dc *DomainController) SetPrimaryDomain(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getTenantIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -289,7 +289,7 @@ func (dc *DomainController) SetPrimaryDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.WorkspaceID != tenantID {
+	if td.WorkspaceID != workspaceID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to modify this domain"})
 		return
 	}
@@ -300,7 +300,7 @@ func (dc *DomainController) SetPrimaryDomain(c *gin.Context) {
 
 	updatedBy := getUserIDFromRequest(c)
 
-	err = dc.service.SetPrimaryDomain(tenantID, domainID, updatedBy)
+	err = dc.service.SetPrimaryDomain(workspaceID, domainID, updatedBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to set primary domain", "details": err.Error()})
 		return
@@ -329,7 +329,7 @@ func (dc *DomainController) DeleteDomain(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getTenantIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -341,7 +341,7 @@ func (dc *DomainController) DeleteDomain(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
 	}
-	if td.WorkspaceID != tenantID {
+	if td.WorkspaceID != workspaceID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized to delete this domain"})
 		return
 	}

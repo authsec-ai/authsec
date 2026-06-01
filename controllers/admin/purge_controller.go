@@ -62,7 +62,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 	// ── 1. Look up user + workspace ───────────────────────────────────────────
 	// Single-DB mode: there is no per-tenant database, so tenantDB is always "".
 	// workspaces has columns id / workspace_domain / vault_mount (no tenant_db).
-	var userID, tenantID, tenantDB, tenantDomain, vaultMount string
+	var userID, workspaceID, tenantDB, tenantDomain, vaultMount string
 	row := db.Raw(`
 		SELECT u.id, u.workspace_id,
 		       '' AS tenant_db,
@@ -72,7 +72,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		LEFT JOIN workspaces t ON t.id = u.workspace_id
 		WHERE LOWER(u.email) = ?
 		LIMIT 1`, email).Row()
-	if err := row.Scan(&userID, &tenantID, &tenantDB, &tenantDomain, &vaultMount); err != nil {
+	if err := row.Scan(&userID, &workspaceID, &tenantDB, &tenantDomain, &vaultMount); err != nil {
 		if err == sql.ErrNoRows {
 			c.JSON(http.StatusNotFound, gin.H{"error": "no user found with that email"})
 			return
@@ -80,7 +80,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("lookup failed: %v", err)})
 		return
 	}
-	addStep(fmt.Sprintf("found user=%s tenant=%s db=%s", userID, tenantID, tenantDB))
+	addStep(fmt.Sprintf("found user=%s tenant=%s db=%s", userID, workspaceID, tenantDB))
 
 	// ── 2. Disable Vault PKI mount ────────────────────────────────────────────
 	if vaultMount != "" {
@@ -92,7 +92,7 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 	}
 
 	// ── 4. Delete Vault KV secrets for tenant ────────────────────────────────
-	kvPath := fmt.Sprintf("kv/metadata/secret/%s", tenantID)
+	kvPath := fmt.Sprintf("kv/metadata/secret/%s", workspaceID)
 	if err := purgeVaultDeleteKV(cfg.VaultAddr, cfg.VaultToken, kvPath); err != nil {
 		addErr(fmt.Sprintf("vault kv delete %s: %v", kvPath, err))
 	} else {
@@ -136,10 +136,10 @@ func (pc *PurgeController) PurgeUserByEmail(c *gin.Context) {
 			{"workspaces", `DELETE FROM workspaces WHERE id = $1`},
 		}
 		for _, q := range purgeQueries {
-			if _, err := sqlDB.Exec(q.query, tenantID); err != nil {
+			if _, err := sqlDB.Exec(q.query, workspaceID); err != nil {
 				addErr(fmt.Sprintf("delete %s: %v", q.label, err))
 			} else {
-				addStep(fmt.Sprintf("deleted %s rows for tenant %s", q.label, tenantID))
+				addStep(fmt.Sprintf("deleted %s rows for tenant %s", q.label, workspaceID))
 			}
 		}
 

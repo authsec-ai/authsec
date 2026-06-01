@@ -47,9 +47,9 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	}
 
 	// Resolve tenant: prefer JWT tenant, fallback to client_id lookup
-	var tenantID uuid.UUID
+	var workspaceID uuid.UUID
 	if jwtTenantID != "" {
-		tenantID, err = uuid.Parse(jwtTenantID)
+		workspaceID, err = uuid.Parse(jwtTenantID)
 		if err != nil {
 			return &models.AgentActionEvaluateResponse{
 				Error:            models.AgentErrorInvalidAction,
@@ -64,7 +64,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 				ErrorDescription: "Invalid client_id format",
 			}, nil
 		}
-		tenantID, err = s.resolveTenantFromClientID(clientID)
+		workspaceID, err = s.resolveTenantFromClientID(clientID)
 		if err != nil {
 			return &models.AgentActionEvaluateResponse{
 				Error:            models.AgentErrorInvalidAction,
@@ -84,14 +84,14 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	}
 
 	// Step 2: Get tenant settings (or create defaults)
-	settings, err := s.actionRepo.GetOrCreateSettings(tenantID)
+	settings, err := s.actionRepo.GetOrCreateSettings(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get agent guard settings: %w", err)
 	}
 
 	// Step 3: Evaluate risk
 	evaluation, err := s.riskEngine.Evaluate(
-		tenantID, req.AgentID,
+		workspaceID, req.AgentID,
 		req.Action, req.Resource,
 		req.Metadata, settings,
 	)
@@ -121,7 +121,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	actionRequest := &models.AgentActionRequest{
 		ID:          uuid.New(),
 		ActionReqID: actionReqID,
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		UserID:      userID,
 		UserEmail:   userEmail,
 
@@ -178,7 +178,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	var deviceTokenID *uuid.UUID
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	if devices, devErr := tenantRepo.GetTenantDeviceTokensByUserID(userID, tenantID); devErr == nil && len(devices) > 0 {
+	if devices, devErr := tenantRepo.GetTenantDeviceTokensByUserID(userID, workspaceID); devErr == nil && len(devices) > 0 {
 		deviceToken = devices[0].DeviceToken
 		deviceTokenID = &devices[0].ID
 	}
@@ -390,20 +390,20 @@ func (s *AgentActionService) RespondToAction(
 }
 
 // GetPendingActions returns all pending (non-expired) action requests for a specific user in a tenant.
-func (s *AgentActionService) GetPendingActions(tenantID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
-	return s.actionRepo.GetPendingActionsByUser(tenantID, userID)
+func (s *AgentActionService) GetPendingActions(workspaceID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
+	return s.actionRepo.GetPendingActionsByUser(workspaceID, userID)
 }
 
 // GetRiskPolicies retrieves all risk policies for a tenant
-func (s *AgentActionService) GetRiskPolicies(tenantID uuid.UUID) ([]models.RiskPolicy, error) {
-	return s.actionRepo.GetRiskPoliciesByTenant(tenantID)
+func (s *AgentActionService) GetRiskPolicies(workspaceID uuid.UUID) ([]models.RiskPolicy, error) {
+	return s.actionRepo.GetRiskPoliciesByTenant(workspaceID)
 }
 
 // CreateRiskPolicy creates a new risk policy
-func (s *AgentActionService) CreateRiskPolicy(tenantID uuid.UUID, req *models.RiskPolicyCreateRequest) (*models.RiskPolicy, error) {
+func (s *AgentActionService) CreateRiskPolicy(workspaceID uuid.UUID, req *models.RiskPolicyCreateRequest) (*models.RiskPolicy, error) {
 	policy := &models.RiskPolicy{
 		ID:                        uuid.New(),
-		WorkspaceID:                  tenantID,
+		WorkspaceID:                  workspaceID,
 		Name:                      req.Name,
 		Description:               req.Description,
 		ActionPattern:             req.ActionPattern,
@@ -438,8 +438,8 @@ func (s *AgentActionService) CreateRiskPolicy(tenantID uuid.UUID, req *models.Ri
 }
 
 // UpdateRiskPolicy updates an existing risk policy
-func (s *AgentActionService) UpdateRiskPolicy(policyID uuid.UUID, tenantID uuid.UUID, req *models.RiskPolicyUpdateRequest) (*models.RiskPolicy, error) {
-	policy, err := s.actionRepo.GetRiskPolicyByID(policyID, tenantID)
+func (s *AgentActionService) UpdateRiskPolicy(policyID uuid.UUID, workspaceID uuid.UUID, req *models.RiskPolicyUpdateRequest) (*models.RiskPolicy, error) {
+	policy, err := s.actionRepo.GetRiskPolicyByID(policyID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -504,18 +504,18 @@ func (s *AgentActionService) UpdateRiskPolicy(policyID uuid.UUID, tenantID uuid.
 }
 
 // DeleteRiskPolicy soft-deletes a risk policy
-func (s *AgentActionService) DeleteRiskPolicy(policyID uuid.UUID, tenantID uuid.UUID) error {
-	return s.actionRepo.DeleteRiskPolicy(policyID, tenantID)
+func (s *AgentActionService) DeleteRiskPolicy(policyID uuid.UUID, workspaceID uuid.UUID) error {
+	return s.actionRepo.DeleteRiskPolicy(policyID, workspaceID)
 }
 
 // GetSettings retrieves tenant guard settings
-func (s *AgentActionService) GetSettings(tenantID uuid.UUID) (*models.AgentGuardSettings, error) {
-	return s.actionRepo.GetOrCreateSettings(tenantID)
+func (s *AgentActionService) GetSettings(workspaceID uuid.UUID) (*models.AgentGuardSettings, error) {
+	return s.actionRepo.GetOrCreateSettings(workspaceID)
 }
 
 // UpdateSettings updates tenant guard settings
-func (s *AgentActionService) UpdateSettings(tenantID uuid.UUID, req *models.AgentGuardSettingsRequest) (*models.AgentGuardSettings, error) {
-	settings, err := s.actionRepo.GetOrCreateSettings(tenantID)
+func (s *AgentActionService) UpdateSettings(workspaceID uuid.UUID, req *models.AgentGuardSettingsRequest) (*models.AgentGuardSettings, error) {
+	settings, err := s.actionRepo.GetOrCreateSettings(workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -556,14 +556,14 @@ func (s *AgentActionService) UpdateSettings(tenantID uuid.UUID, req *models.Agen
 }
 
 // GetAuditLog retrieves the audit log for a tenant
-func (s *AgentActionService) GetAuditLog(tenantID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
+func (s *AgentActionService) GetAuditLog(workspaceID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
 	if page < 1 {
 		page = 1
 	}
 	if perPage < 1 || perPage > 100 {
 		perPage = 20
 	}
-	return s.actionRepo.GetAuditLog(tenantID, page, perPage)
+	return s.actionRepo.GetAuditLog(workspaceID, page, perPage)
 }
 
 // CleanupExpiredRequests expires and cleans up old requests

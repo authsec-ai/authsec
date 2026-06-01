@@ -28,8 +28,8 @@ func (ds *DomainService) skipRealDNSLookup() bool {
 }
 
 // RegisterDomain registers a new domain for a tenant
-func (ds *DomainService) RegisterDomain(tenantID uuid.UUID, domain string, createdBy *uuid.UUID) (*database.TenantDomain, error) {
-	return ds.repo.CreateDomain(tenantID, domain, createdBy)
+func (ds *DomainService) RegisterDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*database.TenantDomain, error) {
+	return ds.repo.CreateDomain(workspaceID, domain, createdBy)
 }
 
 // VerifyDomainOwnership performs DNS TXT verification
@@ -102,8 +102,8 @@ func (ds *DomainService) verifyDNSTXT(txtName, expectedValue string) (bool, stri
 }
 
 // GetVerifiedDomainsForTenant returns list of verified domains (for use in redirect URI validation)
-func (ds *DomainService) GetVerifiedDomainsForTenant(tenantID uuid.UUID) ([]string, error) {
-	return ds.repo.GetVerifiedDomainsForTenant(tenantID)
+func (ds *DomainService) GetVerifiedDomainsForTenant(workspaceID uuid.UUID) ([]string, error) {
+	return ds.repo.GetVerifiedDomainsForTenant(workspaceID)
 }
 
 // ResolveTenantByHost resolves tenant from Host header (for Host-based tenant resolution)
@@ -116,13 +116,13 @@ func (ds *DomainService) ResolveTenantByHost(hostname string) (uuid.UUID, error)
 }
 
 // ListTenantDomains lists all domains for a tenant
-func (ds *DomainService) ListTenantDomains(tenantID uuid.UUID) ([]database.TenantDomain, error) {
-	return ds.repo.ListTenantDomains(tenantID)
+func (ds *DomainService) ListTenantDomains(workspaceID uuid.UUID) ([]database.TenantDomain, error) {
+	return ds.repo.ListTenantDomains(workspaceID)
 }
 
 // SetPrimaryDomain sets a domain as the primary for a tenant
-func (ds *DomainService) SetPrimaryDomain(tenantID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
-	return ds.repo.SetPrimaryDomain(tenantID, domainID, updatedBy)
+func (ds *DomainService) SetPrimaryDomain(workspaceID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
+	return ds.repo.SetPrimaryDomain(workspaceID, domainID, updatedBy)
 }
 
 // DeleteDomain deletes a domain
@@ -131,7 +131,7 @@ func (ds *DomainService) DeleteDomain(domainID uuid.UUID) error {
 }
 
 // ValidateRedirectURIHost checks if a redirect URI's host is owned by tenant
-func (ds *DomainService) ValidateRedirectURIHost(tenantID uuid.UUID, redirectURI string) (bool, error) {
+func (ds *DomainService) ValidateRedirectURIHost(workspaceID uuid.UUID, redirectURI string) (bool, error) {
 	// Parse redirect URI to extract host
 	if !strings.HasPrefix(redirectURI, "http://") && !strings.HasPrefix(redirectURI, "https://") {
 		return false, fmt.Errorf("invalid redirect URI: must start with http:// or https://")
@@ -163,7 +163,7 @@ func (ds *DomainService) ValidateRedirectURIHost(tenantID uuid.UUID, redirectURI
 	}
 
 	// Get verified domains for tenant
-	verifiedDomains, err := ds.repo.GetVerifiedDomainsForTenant(tenantID)
+	verifiedDomains, err := ds.repo.GetVerifiedDomainsForTenant(workspaceID)
 	if err != nil {
 		return false, err
 	}

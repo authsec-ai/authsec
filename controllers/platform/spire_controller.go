@@ -314,7 +314,7 @@ func SetSharedSpireController(sc *SpireController) { sharedSpireController = sc 
 // It writes to both the master DB (spire_workloads) and the tenant DB (workload_entries),
 // and optionally creates a SPIRE entry via gRPC if the server is connected.
 // Returns the generated full SPIFFE ID.
-func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selectors map[string]string) (string, error) {
+func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, selectors map[string]string) (string, error) {
 	sc := sharedSpireController
 	if sc == nil {
 		return "", fmt.Errorf("SPIRE controller not initialized")
@@ -328,7 +328,7 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	// transition. workspace_id == tenant_id from migration 115's backfill.
 	var (
 		applicationID    *uuid.UUID
-		workspaceUUIDStr = tenantID
+		workspaceUUIDStr = workspaceID
 	)
 	if clientUUID, parseErr := uuid.Parse(clientID); parseErr == nil {
 		var rs models.ResourceServer
@@ -348,8 +348,8 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 		spiffeID = fmt.Sprintf("/workspaces/%s/applications/%s", workspaceUUIDStr, applicationID.String())
 		parentID = fmt.Sprintf("spiffe://%s/workspaces/%s", sc.trustDomain, workspaceUUIDStr)
 	} else {
-		spiffeID = fmt.Sprintf("/tenants/%s/agents/%s/%s", tenantID, agentType, clientID)
-		parentID = fmt.Sprintf("spiffe://%s/tenants/%s/agent", sc.trustDomain, tenantID)
+		spiffeID = fmt.Sprintf("/tenants/%s/agents/%s/%s", workspaceID, agentType, clientID)
+		parentID = fmt.Sprintf("spiffe://%s/tenants/%s/agent", sc.trustDomain, workspaceID)
 	}
 	fullSpiffeID := fmt.Sprintf("spiffe://%s%s", sc.trustDomain, spiffeID)
 
@@ -381,7 +381,7 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	selectorMap := map[string]string{
 		"authsec:client_id":  clientID,
 		"authsec:agent_type": agentType,
-		"authsec:tenant_id":  tenantID,
+		"authsec:tenant_id":  workspaceID,
 	}
 	for k, v := range selectors {
 		selectorMap[k] = v
@@ -401,9 +401,9 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	}
 
 	// Save workload entry to tenant DB (workload_entries)
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return "", fmt.Errorf("invalid tenant_id: %w", err)
+		return "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
 
 	tenantDB := config.DB
@@ -427,7 +427,7 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	// Create SPIRE entry via gRPC (if server is connected). ParentId mirrors
 	// the chosen path family — workspace/application for backfilled apps,
 	// legacy tenants/agent for unbackfilled rows.
-	parentPath := fmt.Sprintf("/tenants/%s/agent", tenantID)
+	parentPath := fmt.Sprintf("/tenants/%s/agent", workspaceID)
 	if applicationID != nil {
 		parentPath = fmt.Sprintf("/workspaces/%s", workspaceUUIDStr)
 	}
@@ -481,7 +481,7 @@ func RegisterAgentWorkload(tenantID, clientID, agentType, platform string, selec
 	}
 
 	log.Printf("[SPIRE] Agent workload registered: spiffe_id=%s tenant=%s client=%s application=%v",
-		fullSpiffeID, tenantID, clientID, applicationID)
+		fullSpiffeID, workspaceID, clientID, applicationID)
 	return fullSpiffeID, nil
 }
 

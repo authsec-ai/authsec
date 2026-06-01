@@ -47,18 +47,18 @@ func FromScopes(scopeNames []string) []Perm {
 	return out
 }
 
-// DBProvider is a function that returns a GORM DB for a given tenantID.
-type DBProvider func(tenantID string) (*gorm.DB, error)
+// DBProvider is a function that returns a GORM DB for a given workspaceID.
+type DBProvider func(workspaceID string) (*gorm.DB, error)
 
 // RBACRepository defines runtime permission/role check operations.
 type RBACRepository interface {
-	CheckPermission(ctx context.Context, tenantID, userID uuid.UUID, resource, action string) (bool, error)
-	CheckPermissionWithScope(ctx context.Context, tenantID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error)
-	CheckOAuthScope(ctx context.Context, tenantID uuid.UUID, scopeName, resource, action string) (bool, error)
-	CheckRole(ctx context.Context, tenantID, userID uuid.UUID, roleName string) (bool, error)
-	CheckRoleResource(ctx context.Context, tenantID, userID uuid.UUID, roleName, scopeType string, scopeID uuid.UUID) (bool, error)
-	GetUserPermissions(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Permission, error)
-	GetUserRoles(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Role, error)
+	CheckPermission(ctx context.Context, workspaceID, userID uuid.UUID, resource, action string) (bool, error)
+	CheckPermissionWithScope(ctx context.Context, workspaceID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error)
+	CheckOAuthScope(ctx context.Context, workspaceID uuid.UUID, scopeName, resource, action string) (bool, error)
+	CheckRole(ctx context.Context, workspaceID, userID uuid.UUID, roleName string) (bool, error)
+	CheckRoleResource(ctx context.Context, workspaceID, userID uuid.UUID, roleName, scopeType string, scopeID uuid.UUID) (bool, error)
+	GetUserPermissions(ctx context.Context, workspaceID, userID uuid.UUID) ([]authmgrmodels.Permission, error)
+	GetUserRoles(ctx context.Context, workspaceID, userID uuid.UUID) ([]authmgrmodels.Role, error)
 }
 
 type rbacRepository struct {
@@ -70,8 +70,8 @@ func NewRBACRepository(dbProvider DBProvider) RBACRepository {
 	return &rbacRepository{dbProvider: dbProvider}
 }
 
-func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID uuid.UUID, resource, action string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) CheckPermission(ctx context.Context, workspaceID, userID uuid.UUID, resource, action string) (bool, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return false, err
 	}
@@ -82,7 +82,7 @@ func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID u
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -91,8 +91,8 @@ func (r *rbacRepository) CheckPermission(ctx context.Context, tenantID, userID u
 	return count > 0, err
 }
 
-func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, workspaceID, userID uuid.UUID, resource, action string, scopeType string, scopeID *uuid.UUID) (bool, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return false, err
 	}
@@ -102,7 +102,7 @@ func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID,
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
 		Joins("JOIN role_permissions ON roles.id = role_permissions.role_id").
 		Joins("JOIN permissions ON role_permissions.permission_id = permissions.id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -119,8 +119,8 @@ func (r *rbacRepository) CheckPermissionWithScope(ctx context.Context, tenantID,
 	return count > 0, err
 }
 
-func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID, scopeName, resource, action string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) CheckOAuthScope(ctx context.Context, workspaceID uuid.UUID, scopeName, resource, action string) (bool, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return false, err
 	}
@@ -133,7 +133,7 @@ func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID
 		Table("oauth_scopes").
 		Joins("JOIN oauth_scope_permissions ON oauth_scopes.id = oauth_scope_permissions.scope_id").
 		Joins("JOIN permissions ON oauth_scope_permissions.permission_id = permissions.id").
-		Where("oauth_scopes.workspace_id = ?", tenantID).
+		Where("oauth_scopes.workspace_id = ?", workspaceID).
 		Where("oauth_scopes.scope_string = ?", scopeName).
 		Where("permissions.resource = ?", resource).
 		Where("permissions.action = ?", action).
@@ -141,8 +141,8 @@ func (r *rbacRepository) CheckOAuthScope(ctx context.Context, tenantID uuid.UUID
 	return count > 0, err
 }
 
-func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UUID, roleName string) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) CheckRole(ctx context.Context, workspaceID, userID uuid.UUID, roleName string) (bool, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return false, err
 	}
@@ -151,7 +151,7 @@ func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UU
 	err = db.WithContext(ctx).
 		Table("role_bindings").
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
@@ -159,8 +159,8 @@ func (r *rbacRepository) CheckRole(ctx context.Context, tenantID, userID uuid.UU
 	return count > 0, err
 }
 
-func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID uuid.UUID, roleName, scopeType string, scopeID uuid.UUID) (bool, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) CheckRoleResource(ctx context.Context, workspaceID, userID uuid.UUID, roleName, scopeType string, scopeID uuid.UUID) (bool, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return false, err
 	}
@@ -169,7 +169,7 @@ func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID
 	err = db.WithContext(ctx).
 		Table("role_bindings").
 		Joins("JOIN roles ON role_bindings.role_id = roles.id AND role_bindings.workspace_id = roles.workspace_id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("roles.name = ?", roleName).
 		Where("role_bindings.scope_type = ?", scopeType).
@@ -179,8 +179,8 @@ func (r *rbacRepository) CheckRoleResource(ctx context.Context, tenantID, userID
 	return count > 0, err
 }
 
-func (r *rbacRepository) GetUserPermissions(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Permission, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) GetUserPermissions(ctx context.Context, workspaceID, userID uuid.UUID) ([]authmgrmodels.Permission, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return nil, err
 	}
@@ -192,15 +192,15 @@ func (r *rbacRepository) GetUserPermissions(ctx context.Context, tenantID, userI
 		Joins("JOIN role_permissions ON permissions.id = role_permissions.permission_id").
 		Joins("JOIN roles ON role_permissions.role_id = roles.id").
 		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.workspace_id = role_bindings.workspace_id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
 		Find(&permissions).Error
 	return permissions, err
 }
 
-func (r *rbacRepository) GetUserRoles(ctx context.Context, tenantID, userID uuid.UUID) ([]authmgrmodels.Role, error) {
-	db, err := r.dbProvider(tenantID.String())
+func (r *rbacRepository) GetUserRoles(ctx context.Context, workspaceID, userID uuid.UUID) ([]authmgrmodels.Role, error) {
+	db, err := r.dbProvider(workspaceID.String())
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +210,7 @@ func (r *rbacRepository) GetUserRoles(ctx context.Context, tenantID, userID uuid
 		Table("roles").
 		Distinct("roles.*").
 		Joins("JOIN role_bindings ON roles.id = role_bindings.role_id AND roles.workspace_id = role_bindings.workspace_id").
-		Where("role_bindings.workspace_id = ?", tenantID).
+		Where("role_bindings.workspace_id = ?", workspaceID).
 		Where("role_bindings.user_id = ?", userID).
 		Where("role_bindings.expires_at IS NULL OR role_bindings.expires_at > ?", time.Now()).
 		Find(&roles).Error

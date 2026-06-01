@@ -62,17 +62,17 @@ func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) 
 
 // InitiateOIDCFlow starts the OIDC authentication flow.
 //
-// Workspace gate (v4): when tenantID is set, the workspace must have an
+// Workspace gate (v4): when workspaceID is set, the workspace must have an
 // identity_providers row with provider_type='oidc', status != 'disabled',
 // referencing an oidc_providers row with the requested provider_name. When
 // input.ApplicationID is set AND the Application has any
 // application_identity_provider_policies rows, the IDP must be in the enabled
 // set (default-allow when no policies exist).
-func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action string, tenantID *uuid.UUID) (*models.OIDCInitiateResponse, error) {
-	if tenantID == nil {
-		return nil, fmt.Errorf("workspace_id (tenant_id) is required for OIDC initiate")
+func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action string, workspaceIDPtr *uuid.UUID) (*models.OIDCInitiateResponse, error) {
+	if workspaceIDPtr == nil {
+		return nil, fmt.Errorf("workspace_id is required for OIDC initiate")
 	}
-	workspaceID := *tenantID
+	workspaceID := *workspaceIDPtr
 
 	// Resolve provider through the workspace IDP gate. Find an identity_providers
 	// row for this workspace + the requested provider_name. Reject when the IDP
@@ -152,7 +152,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	// Store state in database (expires in 30 minutes)
 	state := &models.OIDCState{
 		StateToken:     stateToken,
-		WorkspaceID:       tenantID,
+		WorkspaceID:    workspaceIDPtr,
 		ApplicationID:  input.ApplicationID,
 		SignedState:    signedState,
 		TenantDomain:   input.TenantDomain,
@@ -262,8 +262,8 @@ func (s *OIDCService) GetIdentityByProviderUser(providerName, providerUserID str
 }
 
 // GetIdentityByTenantAndProviderUser looks up if a provider user exists in a specific tenant
-func (s *OIDCService) GetIdentityByTenantAndProviderUser(tenantID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
-	return s.identityRepo.GetIdentityByTenantAndProviderUser(tenantID, providerName, providerUserID)
+func (s *OIDCService) GetIdentityByTenantAndProviderUser(workspaceID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
+	return s.identityRepo.GetIdentityByTenantAndProviderUser(workspaceID, providerName, providerUserID)
 }
 
 // CreateIdentity creates a new OIDC user identity link
@@ -277,13 +277,13 @@ func (s *OIDCService) UpdateLastLogin(identityID uuid.UUID) error {
 }
 
 // GetIdentitiesByUser retrieves all OIDC identities for a user
-func (s *OIDCService) GetIdentitiesByUser(tenantID, userID uuid.UUID) ([]models.OIDCUserIdentity, error) {
-	return s.identityRepo.GetIdentitiesByUserID(tenantID, userID)
+func (s *OIDCService) GetIdentitiesByUser(workspaceID, userID uuid.UUID) ([]models.OIDCUserIdentity, error) {
+	return s.identityRepo.GetIdentitiesByUserID(workspaceID, userID)
 }
 
 // UnlinkIdentity removes an OIDC identity from a user
-func (s *OIDCService) UnlinkIdentity(tenantID, userID uuid.UUID, providerName string) error {
-	return s.identityRepo.DeleteIdentity(tenantID, userID, providerName)
+func (s *OIDCService) UnlinkIdentity(workspaceID, userID uuid.UUID, providerName string) error {
+	return s.identityRepo.DeleteIdentity(workspaceID, userID, providerName)
 }
 
 // GetTenantsByEmail finds all tenants where a user with this email has OIDC identity

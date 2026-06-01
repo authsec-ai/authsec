@@ -20,14 +20,14 @@ import (
 // This avoids import cycles while providing type-safe token generation
 type AuthManagerTokenService interface {
 	GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error)
-	GenerateAdminToken(adminUserID uuid.UUID, email string, tenantID *uuid.UUID, tenantDomain string, roles []string) (string, error)
-	GenerateTenantUserToken(userID uuid.UUID, tenantID uuid.UUID, email string, expiresIn time.Duration) (string, error)
-	GenerateEndUserToken(userID uuid.UUID, tenantID string, clientID string, email string, scopes []string, expiresIn time.Duration) (string, error)
-	GenerateVoiceAuthToken(userID uuid.UUID, tenantID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
-	GenerateDeviceAuthToken(userID uuid.UUID, tenantID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
-	GenerateCIBAToken(userID uuid.UUID, tenantID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
-	GenerateTenantCIBAToken(userID uuid.UUID, tenantID uuid.UUID, clientID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
-	GenerateTOTPToken(userID uuid.UUID, tenantID uuid.UUID, email string, expiresIn time.Duration) (string, error)
+	GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, tenantDomain string, roles []string) (string, error)
+	GenerateTenantUserToken(userID uuid.UUID, workspaceID uuid.UUID, email string, expiresIn time.Duration) (string, error)
+	GenerateEndUserToken(userID uuid.UUID, workspaceID string, clientID string, email string, scopes []string, expiresIn time.Duration) (string, error)
+	GenerateVoiceAuthToken(userID uuid.UUID, workspaceID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
+	GenerateDeviceAuthToken(userID uuid.UUID, workspaceID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
+	GenerateCIBAToken(userID uuid.UUID, workspaceID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
+	GenerateTenantCIBAToken(userID uuid.UUID, workspaceID uuid.UUID, clientID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
+	GenerateTOTPToken(userID uuid.UUID, workspaceID uuid.UUID, email string, expiresIn time.Duration) (string, error)
 }
 
 type Config struct {

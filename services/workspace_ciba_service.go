@@ -165,13 +165,13 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 }
 
 // RespondToTenantCIBA handles user response to CIBA authentication request
-func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved bool, biometricVerified bool, userID, tenantID uuid.UUID) (*models.TenantCIBARespondResponse, error) {
+func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved bool, biometricVerified bool, userID, workspaceID uuid.UUID) (*models.TenantCIBARespondResponse, error) {
 	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Step 1: Retrieve and validate the CIBA request
-	request, err := tenantRepo.GetTenantCIBAAuthRequestByAuthReqID(authReqID, tenantID)
+	request, err := tenantRepo.GetTenantCIBAAuthRequestByAuthReqID(authReqID, workspaceID)
 	if err != nil {
 		return &models.TenantCIBARespondResponse{
 			Success: false,
@@ -203,7 +203,7 @@ func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved b
 
 	err = tenantRepo.UpdateTenantCIBAAuthRequestStatus(
 		authReqID,
-		tenantID,
+		workspaceID,
 		status,
 		approved,
 		biometricVerified,
@@ -317,11 +317,11 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 }
 
 // generateJWTToken generates a JWT token for authenticated user
-func (s *TenantCIBAAuthService) generateJWTToken(userID, tenantID, clientID uuid.UUID, email string, scopes []string) (string, error) {
+func (s *TenantCIBAAuthService) generateJWTToken(userID, workspaceID, clientID uuid.UUID, email string, scopes []string) (string, error) {
 	// Use centralized auth-manager token service with correct client_id
 	return config.TokenService.GenerateTenantCIBAToken(
 		userID,
-		tenantID,
+		workspaceID,
 		clientID,
 		email,
 		scopes,
@@ -330,13 +330,13 @@ func (s *TenantCIBAAuthService) generateJWTToken(userID, tenantID, clientID uuid
 }
 
 // RegisterTenantDevice registers a device for push notifications in tenant context
-func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTokenRegistrationRequest, userID, tenantID uuid.UUID) (*models.TenantDeviceTokenRegistrationResponse, error) {
+func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTokenRegistrationRequest, userID, workspaceID uuid.UUID) (*models.TenantDeviceTokenRegistrationResponse, error) {
 	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Check if device token already exists
-	existingDevice, err := tenantRepo.GetTenantDeviceTokenByToken(req.DeviceToken, tenantID)
+	existingDevice, err := tenantRepo.GetTenantDeviceTokenByToken(req.DeviceToken, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check device token: %w", err)
 	}
@@ -364,7 +364,7 @@ func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTok
 	deviceToken := &models.TenantDeviceToken{
 		ID:          uuid.New(),
 		UserID:      userID,
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		DeviceToken: req.DeviceToken,
 		Platform:    req.Platform,
 		DeviceName:  req.DeviceName,

@@ -269,14 +269,14 @@ func (ar *AuthRepository) CheckTenantHasConfig(c *gin.Context, req *oocmgrdto.Ch
 }
 
 // GetActiveConfigByType retrieves the active configuration by type for a tenant.
-func (ar *AuthRepository) GetActiveConfigByType(c *gin.Context, tenantID, orgID uuid.UUID, configType string) (*oocmgrdto.OAuthOIDCConfiguration, error) {
+func (ar *AuthRepository) GetActiveConfigByType(c *gin.Context, workspaceID, orgID uuid.UUID, configType string) (*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var cfg oocmgrdto.OAuthOIDCConfiguration
 	tenantDB, err := ar.getTenantDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
 	if err := tenantDB.Where("workspace_id = ? AND org_id = ? AND config_type = ? AND is_active = ?",
-		tenantID, orgID, configType, true).First(&cfg).Error; err != nil {
+		workspaceID, orgID, configType, true).First(&cfg).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("no active %s configuration found for tenant", configType)
 		}
@@ -286,14 +286,14 @@ func (ar *AuthRepository) GetActiveConfigByType(c *gin.Context, tenantID, orgID 
 }
 
 // DeactivateOtherConfigs deactivates other configurations of the same type.
-func (ar *AuthRepository) DeactivateOtherConfigs(c *gin.Context, tenantID, orgID uuid.UUID, configType string, excludeID uuid.UUID) error {
+func (ar *AuthRepository) DeactivateOtherConfigs(c *gin.Context, workspaceID, orgID uuid.UUID, configType string, excludeID uuid.UUID) error {
 	tenantDB, err := ar.getTenantDB(c)
 	if err != nil {
 		return fmt.Errorf("failed to get tenant database: %w", err)
 	}
 	result := tenantDB.Model(&oocmgrdto.OAuthOIDCConfiguration{}).
 		Where("workspace_id = ? AND org_id = ? AND config_type = ? AND id != ? AND is_active = ?",
-			tenantID, orgID, configType, excludeID, true).
+			workspaceID, orgID, configType, excludeID, true).
 		Update("is_active", false)
 	if result.Error != nil {
 		return fmt.Errorf("failed to deactivate other %s configurations: %w", configType, result.Error)

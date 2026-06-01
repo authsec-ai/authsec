@@ -25,7 +25,7 @@ func NewRiskEngineService(actionRepo *database.AgentActionRepository) *RiskEngin
 
 // Evaluate scores an agent action against tenant risk policies and settings
 func (s *RiskEngineService) Evaluate(
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	agentID string,
 	action string,
 	resource string,
@@ -34,7 +34,7 @@ func (s *RiskEngineService) Evaluate(
 ) (*models.RiskEvaluation, error) {
 
 	// Load tenant policies
-	policies, err := s.actionRepo.GetRiskPoliciesByTenant(tenantID)
+	policies, err := s.actionRepo.GetRiskPoliciesByTenant(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load risk policies: %w", err)
 	}
@@ -97,7 +97,7 @@ func (s *RiskEngineService) Evaluate(
 		}
 
 		// First-time modifier
-		hasPrior, err := s.actionRepo.HasPriorAction(agentID, action, resource, tenantID)
+		hasPrior, err := s.actionRepo.HasPriorAction(agentID, action, resource, workspaceID)
 		if err == nil && !hasPrior {
 			totalScore += matchedPolicy.FirstTimeModifier
 			factors = append(factors, models.RiskFactor{

@@ -11,19 +11,19 @@ import (
 // AuditWithStatus logs an audit event with an explicit status string.
 // Used by WebAuthn and MFA handlers.
 func AuditWithStatus(c *gin.Context, objectType string, objectID string, actionType string, status string, changes *AuditChanges) {
-	tenantID := c.GetString("workspace_id")
+	workspaceID := c.GetString("workspace_id")
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.Writer.Header().Get("X-Request-ID")
 
-	if tenantID == "" {
-		tenantID = "unknown_tenant"
+	if workspaceID == "" {
+		workspaceID = "unknown_tenant"
 	}
 
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: tenantID},
+		Tenant:  Tenant{ID: workspaceID},
 		Event: AuditEvent{
 			ID:       uuid.New().String(),
 			Type:     fmt.Sprintf("%s.%s", objectType, actionType),
@@ -56,12 +56,12 @@ func AuditWithStatus(c *gin.Context, objectType string, objectID string, actionT
 // AuditAuthentication logs authentication-specific audit events.
 // Used by WebAuthn, TOTP, and SMS MFA handlers.
 func AuditAuthentication(c *gin.Context, userID string, authMethod string, actionType string, success bool, metadata map[string]interface{}) {
-	tenantID := c.GetString("workspace_id")
+	workspaceID := c.GetString("workspace_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.Writer.Header().Get("X-Request-ID")
 
-	if tenantID == "" {
-		tenantID = "unknown_tenant"
+	if workspaceID == "" {
+		workspaceID = "unknown_tenant"
 	}
 
 	status := "SUCCESS"
@@ -77,7 +77,7 @@ func AuditAuthentication(c *gin.Context, userID string, authMethod string, actio
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: tenantID},
+		Tenant:  Tenant{ID: workspaceID},
 		Event: AuditEvent{
 			ID:       uuid.New().String(),
 			Type:     fmt.Sprintf("%s.%s", authMethod, actionType),

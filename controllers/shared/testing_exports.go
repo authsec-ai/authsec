@@ -21,13 +21,13 @@ func (asc *ADSyncController) FetchADUsersForTest(config models.ADSyncConfig) ([]
 }
 
 // SyncUserToDatabaseForTest exposes syncUserToDatabase for external tests.
-func (asc *ADSyncController) SyncUserToDatabaseForTest(tenantDB *gorm.DB, adUser models.ADUser, tenantID, clientID, projectID string) error {
-	return asc.syncUserToDatabase(tenantDB, adUser, tenantID, clientID, projectID)
+func (asc *ADSyncController) SyncUserToDatabaseForTest(tenantDB *gorm.DB, adUser models.ADUser, workspaceID, clientID, projectID string) error {
+	return asc.syncUserToDatabase(tenantDB, adUser, workspaceID, clientID, projectID)
 }
 
 // SyncAgentUserToDatabaseForTest exposes syncAgentUserToDatabase for external tests.
-func (asc *ADSyncController) SyncAgentUserToDatabaseForTest(tenantDB *gorm.DB, agentUser models.AgentUserData, tenantID, projectID, clientID string) error {
-	return asc.syncAgentUserToDatabase(tenantDB, agentUser, tenantID, projectID, clientID)
+func (asc *ADSyncController) SyncAgentUserToDatabaseForTest(tenantDB *gorm.DB, agentUser models.AgentUserData, workspaceID, projectID, clientID string) error {
+	return asc.syncAgentUserToDatabase(tenantDB, agentUser, workspaceID, projectID, clientID)
 }
 
 // MapLDAPEntryToUserForTest exposes mapLDAPEntryToUser for external tests.

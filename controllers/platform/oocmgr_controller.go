@@ -100,8 +100,8 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 		return
 	}
 
-	tenantID := strings.TrimSpace(req.WorkspaceID)
-	if tenantID == "" {
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if workspaceID == "" {
 		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "tenant_id is required", Message: "Provide a tenant_id to dump Hydra data.", Code: http.StatusBadRequest, Timestamp: time.Now()})
 		return
 	}
@@ -116,8 +116,8 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 	var dump []map[string]interface{}
 
 	for _, client := range clients {
-		matchesTenant := oocmgrBelongsToTenant(client.Metadata, tenantID)
-		if !matchesTenant && strings.HasPrefix(strings.ToLower(client.ClientID), strings.ToLower(tenantID)) {
+		matchesTenant := oocmgrBelongsToTenant(client.Metadata, workspaceID)
+		if !matchesTenant && strings.HasPrefix(strings.ToLower(client.ClientID), strings.ToLower(workspaceID)) {
 			matchesTenant = true
 		}
 		if !matchesTenant {
@@ -134,7 +134,7 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 	c.JSON(http.StatusOK, oocmgrdto.MessageResponse{
 		Message: "Hydra client dump retrieved successfully", Success: true,
 		Data: map[string]interface{}{
-			"workspace_id": tenantID, "client_type": clientTypeFilter,
+			"workspace_id": workspaceID, "client_type": clientTypeFilter,
 			"count": len(dump), "clients": dump,
 		},
 		Timestamp: time.Now(),
@@ -177,14 +177,14 @@ func (ac *OocmgrController) getAllHydraClients() ([]oocmgrHydraClient, error) {
 // based on the "authority_type" field in additional_params.
 // Supported values: "common" (default), "organizations", "consumers", or a specific tenant ID.
 
-func oocmgrBelongsToTenant(metadata map[string]interface{}, tenantID string) bool {
-	if metadata == nil || tenantID == "" {
+func oocmgrBelongsToTenant(metadata map[string]interface{}, workspaceID string) bool {
+	if metadata == nil || workspaceID == "" {
 		return false
 	}
-	if metaTenantID, ok := metadata["workspace_id"].(string); ok && metaTenantID == tenantID {
+	if metaTenantID, ok := metadata["workspace_id"].(string); ok && metaTenantID == workspaceID {
 		return true
 	}
-	if cid, ok := metadata["c_id"].(string); ok && cid == tenantID {
+	if cid, ok := metadata["c_id"].(string); ok && cid == workspaceID {
 		return true
 	}
 	return false

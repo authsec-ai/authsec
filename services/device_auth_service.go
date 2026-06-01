@@ -120,7 +120,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 	userCode string,
 	userID uuid.UUID,
 	userEmail string,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	tenantDomain string,
 	clientID *uuid.UUID,
 	approve bool,
@@ -140,7 +140,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 	// Generate token at authorize time (empty string when denied)
 	accessToken := ""
 	if approve {
-		tenant, tErr := s.tenantRepo.GetTenantByID(tenantID.String())
+		tenant, tErr := s.tenantRepo.GetTenantByID(workspaceID.String())
 		if tErr != nil {
 			return fmt.Errorf("tenant not found")
 		}
@@ -154,7 +154,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 			user = &models.ExtendedUser{}
 			user.ID = userID
 			user.Email = userEmail
-			user.WorkspaceID = tenantID
+			user.WorkspaceID = workspaceID
 		}
 
 		accessToken, err = s.generateJWTToken(user, tenant, dc.Scopes, clientID)
@@ -163,7 +163,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 		}
 	}
 
-	return s.deviceRepo.AuthorizeDeviceCode(userCode, userID, userEmail, tenantID, tenantDomain, clientID, accessToken, approve)
+	return s.deviceRepo.AuthorizeDeviceCode(userCode, userID, userEmail, workspaceID, tenantDomain, clientID, accessToken, approve)
 }
 
 // VerifyDeviceCode is the legacy alias for AuthorizeDevice (used by legacy /verify endpoint).
@@ -171,12 +171,12 @@ func (s *DeviceAuthService) VerifyDeviceCode(
 	userCode string,
 	userID uuid.UUID,
 	userEmail string,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	tenantDomain string,
 	clientID *uuid.UUID,
 	approve bool,
 ) error {
-	return s.AuthorizeDevice(userCode, userID, userEmail, tenantID, tenantDomain, clientID, approve)
+	return s.AuthorizeDevice(userCode, userID, userEmail, workspaceID, tenantDomain, clientID, approve)
 }
 
 // ValidateUserCode looks up a user_code and returns its record ID and remaining TTL.

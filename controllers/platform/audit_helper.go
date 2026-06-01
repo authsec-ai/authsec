@@ -12,7 +12,7 @@ import (
 // statusCode must be the actual HTTP status that will be returned (201, 200, 204, etc.).
 func auditAdminMutation(
 	c *gin.Context,
-	tenantID, action, resource, resourceID string,
+	workspaceID, action, resource, resourceID string,
 	statusCode int,
 	oldValues, newValues interface{},
 ) {
@@ -22,7 +22,7 @@ func auditAdminMutation(
 	userID, _ := middlewares.ResolveUserID(c)
 	config.AuditLogger.LogAdminAction(
 		c.GetString("request_id"),
-		tenantID,
+		workspaceID,
 		userID,
 		action,
 		resource,

@@ -89,7 +89,7 @@ func (al *AuditLogger) LogEvent(event *AuditEvent) {
 }
 
 // LogAuthentication logs authentication events
-func (al *AuditLogger) LogAuthentication(requestID, tenantID, userID, action, clientIP, userAgent string, success bool, errorMsg string) {
+func (al *AuditLogger) LogAuthentication(requestID, workspaceID, userID, action, clientIP, userAgent string, success bool, errorMsg string) {
 	status := "success"
 	if !success {
 		status = "failure"
@@ -97,7 +97,7 @@ func (al *AuditLogger) LogAuthentication(requestID, tenantID, userID, action, cl
 
 	event := &AuditEvent{
 		RequestID:  requestID,
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   "authentication",
@@ -114,10 +114,10 @@ func (al *AuditLogger) LogAuthentication(requestID, tenantID, userID, action, cl
 }
 
 // LogAdminAction logs administrative actions
-func (al *AuditLogger) LogAdminAction(requestID, tenantID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, oldValues, newValues interface{}, errorMsg string) {
+func (al *AuditLogger) LogAdminAction(requestID, workspaceID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, oldValues, newValues interface{}, errorMsg string) {
 	event := &AuditEvent{
 		RequestID:  requestID,
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   resource,
@@ -156,10 +156,10 @@ func (al *AuditLogger) LogAdminAction(requestID, tenantID, userID, action, resou
 }
 
 // LogTenantAction logs tenant-specific actions
-func (al *AuditLogger) LogTenantAction(requestID, tenantID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, errorMsg string) {
+func (al *AuditLogger) LogTenantAction(requestID, workspaceID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, errorMsg string) {
 	event := &AuditEvent{
 		RequestID:  requestID,
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		UserID:     userID,
 		Action:     action,
 		Resource:   resource,
@@ -177,15 +177,15 @@ func (al *AuditLogger) LogTenantAction(requestID, tenantID, userID, action, reso
 }
 
 // GetAuditEvents retrieves audit events with filtering
-func (al *AuditLogger) GetAuditEvents(tenantID, userID, action, resource string, limit, offset int) ([]AuditEvent, int64, error) {
+func (al *AuditLogger) GetAuditEvents(workspaceID, userID, action, resource string, limit, offset int) ([]AuditEvent, int64, error) {
 	var events []AuditEvent
 	var total int64
 
 	query := al.db.Model(&AuditEvent{})
 
 	// Apply filters
-	if tenantID != "" {
-		query = query.Where("workspace_id = ?", tenantID)
+	if workspaceID != "" {
+		query = query.Where("workspace_id = ?", workspaceID)
 	}
 	if userID != "" {
 		query = query.Where("user_id = ?", userID)

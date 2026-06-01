@@ -78,7 +78,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -97,7 +97,7 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 	}
 
 	// Register device
-	resp, err := ctrl.totpService.RegisterDevice(userID, tenantID, email, req.DeviceName, deviceType)
+	resp, err := ctrl.totpService.RegisterDevice(userID, workspaceID, email, req.DeviceName, deviceType)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register device", "details": err.Error()})
 		return
@@ -154,7 +154,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -168,7 +168,7 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 	}
 
 	// Confirm registration
-	resp, err := ctrl.totpService.ConfirmRegistration(deviceID, userID, tenantID, req.TOTPCode)
+	resp, err := ctrl.totpService.ConfirmRegistration(deviceID, userID, workspaceID, req.TOTPCode)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to confirm registration", "details": err.Error()})
 		return
@@ -224,14 +224,14 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
 	}
 
 	// Verify TOTP code
-	valid, err := ctrl.totpService.VerifyTOTP(userID, tenantID, req.TOTPCode)
+	valid, err := ctrl.totpService.VerifyTOTP(userID, workspaceID, req.TOTPCode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify TOTP", "details": err.Error()})
 		return
@@ -257,7 +257,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details
-	tenant, err := ctrl.tenantRepo.GetTenantByID(tenantID.String())
+	tenant, err := ctrl.tenantRepo.GetTenantByID(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -316,14 +316,14 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
 	}
 
 	// Get devices
-	devices, err := ctrl.totpService.GetUserDevices(userID, tenantID)
+	devices, err := ctrl.totpService.GetUserDevices(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve devices", "details": err.Error()})
 		return
@@ -375,7 +375,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -389,7 +389,7 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 	}
 
 	// Delete device
-	if err := ctrl.totpService.DeleteDevice(deviceID, userID, tenantID); err != nil {
+	if err := ctrl.totpService.DeleteDevice(deviceID, userID, workspaceID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to delete device", "details": err.Error()})
 		return
 	}
@@ -447,7 +447,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -461,7 +461,7 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 	}
 
 	// Set as primary
-	if err := ctrl.totpService.SetPrimaryDevice(deviceID, userID, tenantID); err != nil {
+	if err := ctrl.totpService.SetPrimaryDevice(deviceID, userID, workspaceID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set primary device", "details": err.Error()})
 		return
 	}
@@ -511,14 +511,14 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
 	}
 
 	// Regenerate backup codes
-	backupCodes, err := ctrl.totpService.RegenerateBackupCodes(userID, tenantID)
+	backupCodes, err := ctrl.totpService.RegenerateBackupCodes(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to regenerate backup codes", "details": err.Error()})
 		return

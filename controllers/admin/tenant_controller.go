@@ -77,7 +77,7 @@ func (uc *UserController) SetPKIService(pkiSvc *spireservices.PKIProvisioningSer
 // 1. The original tenant domain (tenants.tenant_domain) - immutable, used for WebAuthn RP ID
 // 2. Any verified custom domain in workspace_domains table
 // This allows users to login with custom domains while preserving the original domain for WebAuthn.
-func validateTenantDomain(db *gorm.DB, tenantID uuid.UUID, providedDomain, originalDomain string) bool {
+func validateTenantDomain(db *gorm.DB, workspaceID uuid.UUID, providedDomain, originalDomain string) bool {
 	// Normalize domains for comparison
 	providedDomain = strings.ToLower(strings.TrimSpace(providedDomain))
 	originalDomain = strings.ToLower(strings.TrimSpace(originalDomain))
@@ -103,7 +103,7 @@ func validateTenantDomain(db *gorm.DB, tenantID uuid.UUID, providedDomain, origi
 		return false
 	}
 
-	err = sqlDB.QueryRow(query, tenantID, providedDomain).Scan(&count)
+	err = sqlDB.QueryRow(query, workspaceID, providedDomain).Scan(&count)
 	if err != nil {
 		log.Printf("Error checking tenant domain: %v", err)
 		return false
@@ -207,7 +207,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// Generate UUIDs for the registration
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	projectID := uuid.New()
 	clientID := uuid.New()
 
@@ -222,7 +222,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		PasswordHash: tempUser.PasswordHash, // Use the hashed password
 		FirstName:    input.FirstName,
 		LastName:     input.LastName,
-		WorkspaceID:  tenantID,
+		WorkspaceID:  workspaceID,
 		ProjectID:    projectID,
 		ClientID:     clientID,
 		ExpiresAt:    time.Now().Add(30 * time.Minute), // Expires in 30 minutes to match OTP
@@ -1298,11 +1298,11 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 
 // generateJWTToken generates a JWT token for authenticated users
 // Ultra-minimal token: identity only - auth-manager fetches roles/permissions from DB via GetAuthz() on every request
-func (uc *UserController) generateJWTToken(tenantID, clientID, emailID string, roles []string, userID *uuid.UUID, tenantDB ...*sql.DB) (string, error) {
+func (uc *UserController) generateJWTToken(workspaceID, clientID, emailID string, roles []string, userID *uuid.UUID, tenantDB ...*sql.DB) (string, error) {
 	// Use centralized auth-manager token service
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return "", fmt.Errorf("invalid tenant_id: %w", err)
+		return "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
 
 	// Use userID if available, otherwise create temporary one

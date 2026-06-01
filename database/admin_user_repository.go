@@ -28,19 +28,19 @@ func NewAdminUserRepository(db *DBConnection) *AdminUserRepository {
 
 // EnsureAdminRole returns the admin role id for the given tenant, creating it if needed.
 // This now uses the full seeding function to ensure permissions are also created.
-func (aur *AdminUserRepository) EnsureAdminRole(tenantID uuid.UUID) (uuid.UUID, error) {
-	return NewAdminSeedRepository(aur.db).EnsureAdminRoleAndPermissions(tenantID)
+func (aur *AdminUserRepository) EnsureAdminRole(workspaceID uuid.UUID) (uuid.UUID, error) {
+	return NewAdminSeedRepository(aur.db).EnsureAdminRoleAndPermissions(workspaceID)
 }
 
 // ListAdminUsersByTenant returns active admin users scoped to a tenant
 // Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) ListAdminUsersByTenant(tenantID uuid.UUID) ([]models.AdminUser, error) {
-	return aur.ListAdminUsersByTenantWithFilter(tenantID, "")
+func (aur *AdminUserRepository) ListAdminUsersByTenant(workspaceID uuid.UUID) ([]models.AdminUser, error) {
+	return aur.ListAdminUsersByTenantWithFilter(workspaceID, "")
 }
 
 // ListAdminUsersByTenantWithFilter returns active admin users scoped to a tenant with optional provider filter
 // Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(tenantID uuid.UUID, provider string) ([]models.AdminUser, error) {
+func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uuid.UUID, provider string) ([]models.AdminUser, error) {
 	// Build query with optional provider filter
 	queryBase := `
 		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
@@ -69,10 +69,10 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(tenantID uuid.U
 
 	if provider != "" {
 		query := queryBase + ` AND u.provider = $2 ORDER BY u.created_at DESC`
-		rows, err = aur.db.Query(query, tenantID, provider)
+		rows, err = aur.db.Query(query, workspaceID, provider)
 	} else {
 		query := queryBase + ` ORDER BY u.created_at DESC`
-		rows, err = aur.db.Query(query, tenantID)
+		rows, err = aur.db.Query(query, workspaceID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query admin users: %w", err)
@@ -132,7 +132,7 @@ type UserRole struct {
 }
 
 // GetUserRoles returns all roles assigned to a user for a specific tenant
-func (aur *AdminUserRepository) GetUserRoles(userID, tenantID uuid.UUID) ([]UserRole, error) {
+func (aur *AdminUserRepository) GetUserRoles(userID, workspaceID uuid.UUID) ([]UserRole, error) {
 	query := `
 		SELECT DISTINCT r.id, r.name
 		FROM roles r
@@ -141,7 +141,7 @@ func (aur *AdminUserRepository) GetUserRoles(userID, tenantID uuid.UUID) ([]User
 		ORDER BY r.name
 	`
 
-	rows, err := aur.db.Query(query, userID, tenantID)
+	rows, err := aur.db.Query(query, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user roles: %w", err)
 	}
@@ -202,11 +202,11 @@ func (aur *AdminUserRepository) UpdateAdminUserActive(userID uuid.UUID, active b
 }
 
 // EnsureTenantAdminRoleAssignment makes sure the tenant's primary admin user is mapped to the admin role.
-func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UUID) error {
+func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(workspaceID uuid.UUID) error {
 	// Seed admin role, scopes, and permissions per tenant
-	adminRoleID, err := NewAdminSeedRepository(aur.db).EnsureAdminRoleAndPermissions(tenantID)
+	adminRoleID, err := NewAdminSeedRepository(aur.db).EnsureAdminRoleAndPermissions(workspaceID)
 	if err != nil {
-		log.Printf("Warning: Could not ensure admin role/permissions for tenant %s: %v", tenantID, err)
+		log.Printf("Warning: Could not ensure admin role/permissions for tenant %s: %v", workspaceID, err)
 		return nil
 	}
 
@@ -222,7 +222,7 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UU
 		  AND LOWER(u.email) = LOWER(t.email)
 		LIMIT 1
 	`
-	err = aur.db.QueryRow(query, tenantID.String()).Scan(&adminUserID)
+	err = aur.db.QueryRow(query, workspaceID.String()).Scan(&adminUserID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Fallback: try to find any user with this tenant_id (for OIDC registered users)
@@ -234,35 +234,35 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(tenantID uuid.UU
 				ORDER BY created_at ASC
 				LIMIT 1
 			`
-			if err := aur.db.QueryRow(fallbackQuery, tenantID.String()).Scan(&adminUserID); err != nil {
+			if err := aur.db.QueryRow(fallbackQuery, workspaceID.String()).Scan(&adminUserID); err != nil {
 				if err == sql.ErrNoRows {
 					// No users found for this tenant yet, that's okay
 					// This is normal for new tenants
 					return nil
 				}
 				// Log error but don't fail - role assignment might have been done during registration
-				log.Printf("Warning: Could not locate tenant admin user for tenant %s: %v", tenantID, err)
+				log.Printf("Warning: Could not locate tenant admin user for tenant %s: %v", workspaceID, err)
 				return nil
 			}
 		} else {
 			// Log error but don't fail - role assignment might have been done during registration
-			log.Printf("Warning: Error finding tenant admin user for tenant %s: %v", tenantID, err)
+			log.Printf("Warning: Error finding tenant admin user for tenant %s: %v", workspaceID, err)
 			return nil
 		}
 	}
 
 	// Assign admin role via role_bindings (user_roles is deprecated)
 	// This is now the primary mechanism for role assignment
-	if err := aur.ensureAdminRoleBinding(adminUserID, tenantID, adminRoleID); err != nil {
+	if err := aur.ensureAdminRoleBinding(adminUserID, workspaceID, adminRoleID); err != nil {
 		// Log warning but don't fail the reconciliation
-		log.Printf("Warning: Could not ensure admin role binding for user %s tenant %s: %v", adminUserID, tenantID, err)
+		log.Printf("Warning: Could not ensure admin role binding for user %s tenant %s: %v", adminUserID, workspaceID, err)
 	}
 
 	return nil
 }
 
 // ensureAdminRoleBinding creates a tenant-wide role binding for the admin user if missing.
-func (aur *AdminUserRepository) ensureAdminRoleBinding(userID, tenantID, roleID uuid.UUID) error {
+func (aur *AdminUserRepository) ensureAdminRoleBinding(userID, workspaceID, roleID uuid.UUID) error {
 	if aur == nil || aur.db == nil {
 		return fmt.Errorf("admin user repository not initialized")
 	}
@@ -280,7 +280,7 @@ func (aur *AdminUserRepository) ensureAdminRoleBinding(userID, tenantID, roleID 
 		)
 	`
 
-	_, err := aur.db.Exec(insertQuery, uuid.New(), tenantID, userID, roleID)
+	_, err := aur.db.Exec(insertQuery, uuid.New(), workspaceID, userID, roleID)
 	if err != nil {
 		return fmt.Errorf("create admin role binding: %w", err)
 	}
@@ -414,14 +414,14 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 		return fmt.Errorf("failed to create admin user: %w", err)
 	}
 
-	tenantID := uuid.Nil
+	workspaceID := uuid.Nil
 	if user.WorkspaceID != nil {
-		tenantID = *user.WorkspaceID
+		workspaceID = *user.WorkspaceID
 	}
 
-	roleID, err := aur.EnsureAdminRole(tenantID)
+	roleID, err := aur.EnsureAdminRole(workspaceID)
 	if err != nil {
-		fmt.Printf("WARNING: Failed to ensure admin role for tenant %s: %v\n", tenantID, err)
+		fmt.Printf("WARNING: Failed to ensure admin role for tenant %s: %v\n", workspaceID, err)
 		fmt.Printf("WARNING: User created but without admin role - they will not be able to login via /admin/login\n")
 		return nil
 	}
@@ -434,7 +434,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 		WHERE NOT EXISTS (
 			SELECT 1 FROM role_bindings WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL
 		)
-	`, bindingID, tenantID, user.ID, roleID)
+	`, bindingID, workspaceID, user.ID, roleID)
 	if err != nil {
 		fmt.Printf("WARNING: Failed to assign admin role to user %s: %v\n", user.ID, err)
 		fmt.Printf("WARNING: User created but without admin role - they will not be able to login via /admin/login\n")
@@ -493,7 +493,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	)
 	var (
 		clientID  *uuid.UUID
-		tenantID  *uuid.UUID
+		workspaceID  *uuid.UUID
 		projectID *uuid.UUID
 	)
 	var user models.AdminUser
@@ -611,7 +611,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	}
 	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
 		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
-			tenantID = &parsed
+			workspaceID = &parsed
 		}
 	}
 	if projectIDStr.Valid && strings.TrimSpace(projectIDStr.String) != "" {
@@ -621,7 +621,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	}
 
 	user.ClientID = clientID
-	user.WorkspaceID = tenantID
+	user.WorkspaceID = workspaceID
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -709,7 +709,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	)
 	var (
 		clientID  *uuid.UUID
-		tenantID  *uuid.UUID
+		workspaceID  *uuid.UUID
 		projectID *uuid.UUID
 	)
 	var user models.AdminUser
@@ -821,7 +821,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	}
 	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
 		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
-			tenantID = &parsed
+			workspaceID = &parsed
 		}
 	}
 	if projectIDStr.Valid && strings.TrimSpace(projectIDStr.String) != "" {
@@ -831,7 +831,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	}
 
 	user.ClientID = clientID
-	user.WorkspaceID = tenantID
+	user.WorkspaceID = workspaceID
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -1057,7 +1057,7 @@ func (aur *AdminUserRepository) VerifyPassword(email, password string) (*models.
 // GetAdminUserByEmailAndTenant retrieves an admin user by email and tenant ID (case-insensitive)
 // This method respects the new composite unique constraint (email, workspace_id)
 // Uses role_bindings for role assignments (user_roles is deprecated)
-func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenantID uuid.UUID) (*models.AdminUser, error) {
+func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
 			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
@@ -1102,7 +1102,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, tenan
 	)
 	var user models.AdminUser
 
-	err := aur.db.QueryRow(query, email, tenantID).Scan(
+	err := aur.db.QueryRow(query, email, workspaceID).Scan(
 		&user.ID,
 		&user.Email,
 		&username,
@@ -1269,7 +1269,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	)
 	var (
 		clientID  *uuid.UUID
-		tenantID  *uuid.UUID
+		workspaceID  *uuid.UUID
 		projectID *uuid.UUID
 	)
 	var user models.AdminUser
@@ -1384,7 +1384,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	}
 	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
 		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
-			tenantID = &parsed
+			workspaceID = &parsed
 		}
 	}
 	if projectIDStr.Valid && strings.TrimSpace(projectIDStr.String) != "" {
@@ -1394,7 +1394,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	}
 
 	user.ClientID = clientID
-	user.WorkspaceID = tenantID
+	user.WorkspaceID = workspaceID
 	user.ProjectID = projectID
 
 	// Get configured providers for this tenant/client
@@ -1439,7 +1439,7 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 
 // GetAdminRoles fetches the role names for an admin user in a specific tenant
 // Queries role_bindings -> roles to get role names
-func (aur *AdminUserRepository) GetAdminRoles(userID uuid.UUID, tenantID uuid.UUID) ([]string, error) {
+func (aur *AdminUserRepository) GetAdminRoles(userID uuid.UUID, workspaceID uuid.UUID) ([]string, error) {
 	query := `
 		SELECT DISTINCT r.name
 		FROM role_bindings rb
@@ -1449,7 +1449,7 @@ func (aur *AdminUserRepository) GetAdminRoles(userID uuid.UUID, tenantID uuid.UU
 		ORDER BY r.name
 	`
 
-	rows, err := aur.db.Query(query, userID, tenantID)
+	rows, err := aur.db.Query(query, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query admin roles: %w", err)
 	}

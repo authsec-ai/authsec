@@ -52,9 +52,9 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	}
 
 	// Parse UUIDs
-	tenantID, err := uuid.Parse(req.WorkspaceID)
+	workspaceID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -71,7 +71,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	// Create sync configuration
 	syncConfig := models.SyncConfiguration{
 		ID:          uuid.New(),
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		ClientID:    clientID,
 		ProjectID:   projectID,
 		SyncType:    req.SyncType,
@@ -170,9 +170,9 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	}
 
 	// Parse UUIDs
-	tenantID, err := uuid.Parse(req.WorkspaceID)
+	workspaceID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -182,7 +182,7 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	}
 
 	// Build query
-	query := config.DB.Where("workspace_id = ? AND client_id = ?", tenantID, clientID)
+	query := config.DB.Where("workspace_id = ? AND client_id = ?", workspaceID, clientID)
 
 	// Apply sync type filter if provided
 	if req.SyncType != nil && *req.SyncType != "" {
@@ -234,9 +234,9 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	tenantID, err := uuid.Parse(req.WorkspaceID)
+	workspaceID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -247,7 +247,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 
 	// Fetch existing configuration
 	var syncConfig models.SyncConfiguration
-	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, tenantID, clientID).First(&syncConfig).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, workspaceID, clientID).First(&syncConfig).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Sync configuration not found"})
 		return
 	}
@@ -369,9 +369,9 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	tenantID, err := uuid.Parse(req.WorkspaceID)
+	workspaceID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -381,7 +381,7 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	}
 
 	// Delete configuration
-	result := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, tenantID, clientID).Delete(&models.SyncConfiguration{})
+	result := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, workspaceID, clientID).Delete(&models.SyncConfiguration{})
 	if result.Error != nil {
 		log.Printf("Failed to delete sync configuration: %v", result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete configuration"})
@@ -397,7 +397,7 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	middlewares.Audit(c, "sync_config", configID.String(), "delete", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
 			"id":        configID.String(),
-			"workspace_id": tenantID.String(),
+			"workspace_id": workspaceID.String(),
 			"client_id": clientID.String(),
 		},
 	})

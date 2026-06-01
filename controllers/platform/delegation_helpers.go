@@ -13,7 +13,7 @@ import (
 // active ai_agent resource server in the given workspace. Phase B: the legacy
 // `clients` table was dropped; an "agent" is now a resource_servers row with
 // application_type='ai_agent'. The policy's client_id holds that resource_servers.id.
-func validateClientActive(clientID, tenantID string) error {
+func validateClientActive(clientID, workspaceID string) error {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return fmt.Errorf("master database not initialized")
@@ -29,8 +29,8 @@ func validateClientActive(clientID, tenantID string) error {
 		LIMIT 1
 	`
 	var id string
-	if err := masterDB.DB.QueryRow(query, clientID, tenantID).Scan(&id); err != nil {
-		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, tenantID)
+	if err := masterDB.DB.QueryRow(query, clientID, workspaceID).Scan(&id); err != nil {
+		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
 	}
 	return nil
 }
@@ -71,7 +71,7 @@ func resolveDelegationTenantID(c *gin.Context) (*uuid.UUID, error) {
 	}
 	tid, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid tenant_id in token: %w", err)
+		return nil, fmt.Errorf("invalid workspace_id in token: %w", err)
 	}
 	return &tid, nil
 }

@@ -60,7 +60,7 @@ func normalizeDomain(domain string) string {
 }
 
 // CreateDomain registers a new domain for a tenant (pending verification)
-func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain string, createdBy *uuid.UUID) (*TenantDomain, error) {
+func (tdr *TenantDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*TenantDomain, error) {
 	// Validate and normalize domain
 	domain = normalizeDomain(domain)
 	if domain == "" {
@@ -79,7 +79,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to check domain uniqueness: %w", err)
 	}
-	if err == nil && existingTenantID != tenantID {
+	if err == nil && existingTenantID != workspaceID {
 		return nil, fmt.Errorf("domain already claimed by another tenant")
 	}
 
@@ -112,7 +112,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 
 	td := &TenantDomain{
 		ID:                   id,
-		WorkspaceID:             tenantID,
+		WorkspaceID:             workspaceID,
 		Domain:               domain,
 		Kind:                 kind,
 		IsPrimary:            false,
@@ -126,7 +126,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(tenantID uuid.UUID, domain stri
 		CreatedBy:            createdBy,
 	}
 
-	err = tdr.db.QueryRow(query, id, tenantID, domain, kind, false, false,
+	err = tdr.db.QueryRow(query, id, workspaceID, domain, kind, false, false,
 		"dns_txt", token, txtName, txtValue, now, now, createdBy).Scan(
 		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
@@ -200,7 +200,7 @@ func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*Tenan
 }
 
 // ListTenantDomains retrieves all domains for a tenant
-func (tdr *TenantDomainsRepository) ListTenantDomains(tenantID uuid.UUID) ([]TenantDomain, error) {
+func (tdr *TenantDomainsRepository) ListTenantDomains(workspaceID uuid.UUID) ([]TenantDomain, error) {
 	query := `
 		SELECT id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
@@ -211,7 +211,7 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(tenantID uuid.UUID) ([]Ten
 		ORDER BY is_primary DESC, created_at DESC
 	`
 
-	rows, err := tdr.db.Query(query, tenantID)
+	rows, err := tdr.db.Query(query, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query domains: %w", err)
 	}
@@ -236,7 +236,7 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(tenantID uuid.UUID) ([]Ten
 }
 
 // GetPrimaryDomainByTenantID retrieves the primary domain for a tenant
-func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(tenantID uuid.UUID) (*TenantDomain, error) {
+func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(workspaceID uuid.UUID) (*TenantDomain, error) {
 	query := `
 		SELECT id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
@@ -248,7 +248,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(tenantID uuid.UUI
 	`
 
 	td := &TenantDomain{}
-	err := tdr.db.QueryRow(query, tenantID).Scan(
+	err := tdr.db.QueryRow(query, workspaceID).Scan(
 		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
 		&td.VerificationTXTValue, &td.VerifiedAt, &td.LastCheckedAt, &td.FailureReason,
@@ -291,7 +291,7 @@ func (tdr *TenantDomainsRepository) VerifyDomain(id uuid.UUID, updatedBy *uuid.U
 }
 
 // SetPrimaryDomain sets a domain as primary for a tenant (and unsets others)
-func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
+func (tdr *TenantDomainsRepository) SetPrimaryDomain(workspaceID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
 	now := time.Now()
 
 	// First, unset all other primary domains for this tenant
@@ -300,7 +300,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUI
 		SET is_primary = false, updated_at = $1, updated_by = $2
 		WHERE workspace_id = $3 AND is_primary = true
 	`
-	_, err := tdr.db.Exec(query1, now, updatedBy, tenantID)
+	_, err := tdr.db.Exec(query1, now, updatedBy, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to unset other primary domains: %w", err)
 	}
@@ -311,7 +311,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(tenantID, domainID uuid.UUI
 		SET is_primary = true, updated_at = $1, updated_by = $2
 		WHERE id = $3 AND workspace_id = $4
 	`
-	result, err := tdr.db.Exec(query2, now, updatedBy, domainID, tenantID)
+	result, err := tdr.db.Exec(query2, now, updatedBy, domainID, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to set primary domain: %w", err)
 	}
@@ -347,7 +347,7 @@ func (tdr *TenantDomainsRepository) DeleteDomain(id uuid.UUID) error {
 }
 
 // GetVerifiedDomainsForTenant returns only verified domains for a tenant
-func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(tenantID uuid.UUID) ([]string, error) {
+func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(workspaceID uuid.UUID) ([]string, error) {
 	query := `
 		SELECT domain
 		FROM workspace_domains
@@ -355,7 +355,7 @@ func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(tenantID uuid.UU
 		ORDER BY is_primary DESC
 	`
 
-	rows, err := tdr.db.Query(query, tenantID)
+	rows, err := tdr.db.Query(query, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query verified domains: %w", err)
 	}
@@ -399,13 +399,13 @@ func (tdr *TenantDomainsRepository) UpdateVerificationStatus(id uuid.UUID, isVer
 }
 
 // IsDomainOwnedByTenant checks if a hostname is owned by the tenant and is verified
-func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(tenantID uuid.UUID, hostname string) (bool, error) {
+func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(workspaceID uuid.UUID, hostname string) (bool, error) {
 	hostname = normalizeDomain(hostname)
 
 	var count int
 	err := tdr.db.QueryRow(
 		"SELECT COUNT(*) FROM workspace_domains WHERE workspace_id = $1 AND domain = $2 AND is_verified = true",
-		tenantID, hostname,
+		workspaceID, hostname,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check domain ownership: %w", err)
@@ -415,7 +415,7 @@ func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(tenantID uuid.UUID, ho
 }
 
 // ValidateRedirectURIs validates all redirect URIs for a tenant
-func (tdr *TenantDomainsRepository) ValidateRedirectURIs(tenantID uuid.UUID, redirectURIs []string) ([]string, error) {
+func (tdr *TenantDomainsRepository) ValidateRedirectURIs(workspaceID uuid.UUID, redirectURIs []string) ([]string, error) {
 	// Special case: allow localhost in development (can be made configurable via env)
 	isDev := os.Getenv("ENVIRONMENT") == "development" || os.Getenv("ENVIRONMENT") == ""
 
@@ -436,7 +436,7 @@ func (tdr *TenantDomainsRepository) ValidateRedirectURIs(tenantID uuid.UUID, red
 		}
 
 		// Validate and normalize
-		host, err := tdr.NormalizeHostnameAndCheckOwnership(tenantID, uri)
+		host, err := tdr.NormalizeHostnameAndCheckOwnership(workspaceID, uri)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -452,7 +452,7 @@ func (tdr *TenantDomainsRepository) ValidateRedirectURIs(tenantID uuid.UUID, red
 }
 
 // NormalizeHostnameAndCheckOwnership validates a redirect URI hostname and checks tenant ownership
-func (tdr *TenantDomainsRepository) NormalizeHostnameAndCheckOwnership(tenantID uuid.UUID, redirectURI string) (string, error) {
+func (tdr *TenantDomainsRepository) NormalizeHostnameAndCheckOwnership(workspaceID uuid.UUID, redirectURI string) (string, error) {
 	// Parse redirect URI to extract host
 	if !strings.HasPrefix(redirectURI, "http://") && !strings.HasPrefix(redirectURI, "https://") {
 		return "", &InvalidRedirectURIError{Message: "invalid redirect URI: must start with http:// or https://"}
@@ -489,12 +489,12 @@ func (tdr *TenantDomainsRepository) NormalizeHostnameAndCheckOwnership(tenantID 
 	}
 
 	// Check if domain is owned by tenant and is verified
-	owned, err := tdr.IsDomainOwnedByTenant(tenantID, host)
+	owned, err := tdr.IsDomainOwnedByTenant(workspaceID, host)
 	if err != nil {
 		return "", err
 	}
 	if !owned {
-		return "", &DomainOwnershipError{Hostname: host, WorkspaceID: tenantID}
+		return "", &DomainOwnershipError{Hostname: host, WorkspaceID: workspaceID}
 	}
 
 	return host, nil

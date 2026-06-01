@@ -74,8 +74,8 @@ func NewResourceServerOnboardingService(db *gorm.DB) *ResourceServerOnboardingSe
 	}
 }
 
-func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, tenantID string) (*ResourceServerAccessPolicyResponse, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, tenantID)
+func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, workspaceID string) (*ResourceServerAccessPolicyResponse, error) {
+	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -116,8 +116,8 @@ func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, tena
 	return resp, nil
 }
 
-func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, tenantID string, req UpdateResourceServerAccessPolicyRequest) (*ResourceServerAccessPolicyResponse, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, tenantID)
+func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, workspaceID string, req UpdateResourceServerAccessPolicyRequest) (*ResourceServerAccessPolicyResponse, error) {
+	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -189,8 +189,8 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, t
 	}, nil
 }
 
-func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerID, tenantID string) (bool, *string, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, tenantID)
+func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerID, workspaceID string) (bool, *string, error) {
+	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return false, nil, err
 	}
@@ -216,7 +216,7 @@ func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerI
 	return row.Enabled, row.Name, nil
 }
 
-func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context.Context, userID, tenantID string, rs *models.ResourceServer) (bool, error) {
+func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context.Context, userID, workspaceID string, rs *models.ResourceServer) (bool, error) {
 	if rs == nil {
 		return false, fmt.Errorf("resource server is required")
 	}
@@ -225,7 +225,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	if err != nil {
 		return false, nil
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return false, nil
 	}
@@ -242,7 +242,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 		return false, nil
 	}
 
-	hasAccess, err := s.scopeResolver.HasEffectiveScopes(ctx, tenantID, userID, rs.ID.String())
+	hasAccess, err := s.scopeResolver.HasEffectiveScopes(ctx, workspaceID, userID, rs.ID.String())
 	if err != nil {
 		// Soft-fail: scope resolution is what the consent handler does next
 		// anyway. If scope resolver is broken here it'll be broken there too,
@@ -264,7 +264,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	emailFallback := ""
 	if err := s.db.Select("id", "email", "username").Where("id = ?", userUUID).First(&user).Error; err != nil {
 		log.Printf("[ONBOARDING] EnsureDefaultAccessBinding: user lookup miss user=%s tenant=%s: %v — skipping auto-bind",
-			userID, tenantID, err)
+			userID, workspaceID, err)
 		return false, nil
 	}
 	if user.Username != nil {
@@ -450,7 +450,7 @@ func (s *ResourceServerOnboardingService) CountRegisteredClients(resourceServerI
 	return count, err
 }
 
-func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, tenantID uuid.UUID) ([]ResourceServerRoleOption, error) {
+func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, workspaceID uuid.UUID) ([]ResourceServerRoleOption, error) {
 	type roleRow struct {
 		ID          uuid.UUID
 		Name        string
@@ -473,8 +473,8 @@ func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, tena
 		Joins("LEFT JOIN role_permissions rp ON rp.role_id = r.id").
 		Joins("LEFT JOIN permissions p ON p.id = rp.permission_id").
 		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
-		Joins("LEFT JOIN oauth_scopes os ON os.id = osp.scope_id AND os.workspace_id = ?", tenantID).
-		Where("r.workspace_id = ?", tenantID).
+		Joins("LEFT JOIN oauth_scopes os ON os.id = osp.scope_id AND os.workspace_id = ?", workspaceID).
+		Where("r.workspace_id = ?", workspaceID).
 		Where("r.name LIKE ? OR r.name IN ('admin','viewer','user')", rsRoleLike).
 		Group("r.id, r.name, r.description, r.is_system").
 		Order("r.name").
@@ -570,12 +570,12 @@ func buildMetadataURL(resourceURI string) string {
 	return origin + "/.well-known/oauth-protected-resource" + path
 }
 
-func parseTenantScopedIDs(resourceServerID, tenantID string) (uuid.UUID, uuid.UUID, error) {
+func parseTenantScopedIDs(resourceServerID, workspaceID string) (uuid.UUID, uuid.UUID, error) {
 	rsUUID, err := uuid.Parse(resourceServerID)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid resource server ID")
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid tenant ID")
 	}

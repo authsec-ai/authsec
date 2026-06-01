@@ -14,9 +14,9 @@ type roleExecutor interface {
 }
 
 // EnsureAdminRoleWithExecutor ensures an admin role exists for the given tenant_id and returns its id.
-func EnsureAdminRoleWithExecutor(exec roleExecutor, tenantID uuid.UUID) (uuid.UUID, error) {
+func EnsureAdminRoleWithExecutor(exec roleExecutor, workspaceID uuid.UUID) (uuid.UUID, error) {
 	var roleID uuid.UUID
-	err := exec.QueryRow(`SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1`, tenantID).Scan(&roleID)
+	err := exec.QueryRow(`SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1`, workspaceID).Scan(&roleID)
 	if err == nil {
 		return roleID, nil
 	}
@@ -29,12 +29,12 @@ func EnsureAdminRoleWithExecutor(exec roleExecutor, tenantID uuid.UUID) (uuid.UU
 		INSERT INTO roles (id, workspace_id, name, description, created_at, updated_at)
 		VALUES ($1, $2, 'admin', 'Administrator with full access', NOW(), NOW())
 		ON CONFLICT ON CONSTRAINT roles_tenant_name_key DO NOTHING
-	`, roleID, tenantID)
+	`, roleID, workspaceID)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to insert admin role: %w", err)
 	}
 
-	if err := exec.QueryRow(`SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1`, tenantID).Scan(&roleID); err != nil {
+	if err := exec.QueryRow(`SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1`, workspaceID).Scan(&roleID); err != nil {
 		return uuid.Nil, fmt.Errorf("failed to fetch admin role after insert: %w", err)
 	}
 	return roleID, nil

@@ -190,8 +190,8 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	if strings.TrimSpace(req.WorkspaceID) != "" {
 		tenantUUID, parseErr := uuid.Parse(req.WorkspaceID)
 		if parseErr != nil {
-			log.Printf("User-flow: invalid tenant_id format: %v", parseErr)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+			log.Printf("User-flow: invalid workspace_id format: %v", parseErr)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 			return
 		}
 		tenantIDPtr = &tenantUUID
@@ -705,15 +705,15 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 
 // createEndUserInTenantDBForInvite creates a corresponding end user account in the tenant database
 // This allows invited admins to also authenticate as end users within their tenant
-func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *models.AdminUser, tenantID uuid.UUID, clientID, projectID *uuid.UUID) error {
+func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *models.AdminUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) error {
 	// Get tenant information
 	var tenant models.Tenant
-	if err := config.DB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
 		return fmt.Errorf("failed to get tenant info: %w", err)
 	}
 
 	// Generate tenant database name
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(tenantID.String(), "-", "_"))
+	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 
 	// Connect to tenant database
 	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
@@ -730,7 +730,7 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	if clientID != nil {
 		effectiveClientID = *clientID
 	} else {
-		effectiveClientID = tenantID // Use tenant ID as default
+		effectiveClientID = workspaceID // Use tenant ID as default
 	}
 
 	if projectID != nil {
@@ -738,10 +738,10 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	} else {
 		// Try to get default project for this tenant
 		var defaultProject models.Project
-		if err := config.DB.Where("workspace_id = ? AND active = true", tenantID).First(&defaultProject).Error; err == nil {
+		if err := config.DB.Where("workspace_id = ? AND active = true", workspaceID).First(&defaultProject).Error; err == nil {
 			effectiveProjectID = defaultProject.ID
 		} else {
-			effectiveProjectID = tenantID // Use tenant ID as fallback
+			effectiveProjectID = workspaceID // Use tenant ID as fallback
 		}
 	}
 
@@ -757,7 +757,7 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	_, err = tenantDB.Exec(endUserInsert,
 		adminUser.ID,           // Use same ID as admin user for consistency
 		effectiveClientID,      // client_id
-		tenantID,               // tenant_id
+		workspaceID,               // tenant_id
 		effectiveProjectID,     // project_id
 		adminUser.Email,        // email
 		adminUser.Name,         // name

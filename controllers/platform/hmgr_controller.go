@@ -154,10 +154,10 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	userID := claimString(userClaims, "user_id", claimString(userClaims, "sub", ""))
 	email := claimString(userClaims, "email_id", claimString(userClaims, "email", ""))
-	tenantID := claimString(userClaims, "workspace_id", "")
+	workspaceID := claimString(userClaims, "workspace_id", "")
 	projectID := claimString(userClaims, "project_id", "")
 
-	if userID == "" || email == "" || tenantID == "" {
+	if userID == "" || email == "" || workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
 			"error":   "user token missing required claims",
@@ -176,7 +176,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	hydraClientID := loginRequest.Client.ClientID
 	expectedClientID := hydraClientID
-	expectedTenantID := tenantID
+	expectedTenantID := workspaceID
 	var mcpAuthCtx *models.AuthRequestContext
 
 	arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
@@ -187,7 +187,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		})
 		return
 	}
-	if !strings.EqualFold(arcCtx.WorkspaceID, tenantID) {
+	if !strings.EqualFold(arcCtx.WorkspaceID, workspaceID) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"error":   "user token tenant does not match login challenge tenant",
@@ -1544,7 +1544,7 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 }
 
 // ProcessSAMLAssertion processes a SAML assertion and creates/updates user
-func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAssertion, loginChallenge, providerName, tenantID string) (string, *hydramodels.User, error) {
+func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAssertion, loginChallenge, providerName, workspaceID string) (string, *hydramodels.User, error) {
 	if err := hydrautils.ValidateEmail(assertion.Email); err != nil {
 		return "", nil, fmt.Errorf("invalid SAML email: %w", err)
 	}
@@ -1580,8 +1580,8 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	clientIDFromMetadata, _ := clientDetails.Metadata["workspace_id"].(string)
 	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
 
-	if realTenantID != tenantID {
-		return "", nil, fmt.Errorf("tenant ID mismatch: expected %s, got %s", realTenantID, tenantID)
+	if realTenantID != workspaceID {
+		return "", nil, fmt.Errorf("tenant ID mismatch: expected %s, got %s", realTenantID, workspaceID)
 	}
 
 	name := fmt.Sprintf("%s %s", firstName, lastName)

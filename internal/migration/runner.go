@@ -29,7 +29,7 @@ type MigrationRunner struct {
 	gormDB        *gorm.DB // used only for master DB migration_logs writes
 	migrationsDir string
 	dbType        string  // "master" or "tenant"
-	tenantID      *string // non-nil for tenant runners
+	workspaceID      *string // non-nil for tenant runners
 	masterDB      *sql.DB // used by tenant runners to write migration_logs
 }
 
@@ -45,13 +45,13 @@ func NewMasterMigrationRunner(migrationsDir string, rawDB *sql.DB, gormDB *gorm.
 
 // NewTenantMigrationRunner creates a runner for a tenant database.
 // masterDB is used solely for writing migration_logs (which live in the master DB).
-func NewTenantMigrationRunner(tenantID string, tenantDBConn *sql.DB, migrationsDir string, masterDB *sql.DB) *MigrationRunner {
+func NewTenantMigrationRunner(workspaceID string, tenantDBConn *sql.DB, migrationsDir string, masterDB *sql.DB) *MigrationRunner {
 	return &MigrationRunner{
 		db:            tenantDBConn,
 		gormDB:        nil,
 		migrationsDir: migrationsDir,
 		dbType:        "tenant",
-		tenantID:      &tenantID,
+		workspaceID:      &workspaceID,
 		masterDB:      masterDB,
 	}
 }
@@ -177,14 +177,14 @@ func (mr *MigrationRunner) RunMigrations() error {
 	}
 
 	// Seed tenant self-reference row so DML migrations can resolve tenant_id.
-	if mr.dbType == "tenant" && mr.tenantID != nil {
+	if mr.dbType == "tenant" && mr.workspaceID != nil {
 		seedSQL := `INSERT INTO workspaces (id, workspace_id, status, created_at, updated_at)
 		            VALUES ($1::uuid, $1::uuid, 'active', NOW(), NOW())
 		            ON CONFLICT (id) DO NOTHING`
-		if _, err := mr.db.Exec(seedSQL, *mr.tenantID); err != nil {
+		if _, err := mr.db.Exec(seedSQL, *mr.workspaceID); err != nil {
 			log.Printf("[Migration] Warning: failed to seed tenant self-reference row (non-fatal): %v", err)
 		} else {
-			log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.tenantID)
+			log.Printf("[Migration] Seeded tenant self-reference row for tenant %s", *mr.workspaceID)
 		}
 	}
 
@@ -324,7 +324,7 @@ func (mr *MigrationRunner) isMigrationExecuted(version int, name string) bool {
 	if mr.dbType == "tenant" && mr.masterDB != nil {
 		queryDB = mr.masterDB
 		query += ` AND workspace_id = $4`
-		args = append(args, *mr.tenantID)
+		args = append(args, *mr.workspaceID)
 	} else {
 		queryDB = mr.db
 		query += ` AND workspace_id IS NULL`
@@ -348,7 +348,7 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 			Success:     success,
 			ErrorMsg:    errorMsg,
 			DBType:      mr.dbType,
-			WorkspaceID: mr.tenantID,
+			WorkspaceID: mr.workspaceID,
 			ExecutionMS: executionMS,
 		})
 		return
@@ -361,8 +361,8 @@ func (mr *MigrationRunner) logMigration(version int, name string, success bool, 
 	}
 
 	workspaceIDVal := sql.NullString{}
-	if mr.tenantID != nil {
-		workspaceIDVal = sql.NullString{String: *mr.tenantID, Valid: true}
+	if mr.workspaceID != nil {
+		workspaceIDVal = sql.NullString{String: *mr.workspaceID, Valid: true}
 	}
 
 	_, err := logDB.Exec(
@@ -389,9 +389,9 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	baseQuery := `SELECT version, executed_at FROM migration_logs WHERE db_type = $1 AND success = true`
 	args := []interface{}{mr.dbType}
-	if mr.tenantID != nil {
+	if mr.workspaceID != nil {
 		baseQuery += ` AND workspace_id = $2`
-		args = append(args, *mr.tenantID)
+		args = append(args, *mr.workspaceID)
 	} else {
 		baseQuery += ` AND workspace_id IS NULL`
 	}
@@ -413,7 +413,7 @@ func (mr *MigrationRunner) GetMigrationStatus() (*MigrationStatusResponse, error
 
 	return &MigrationStatusResponse{
 		DBType:          mr.dbType,
-		WorkspaceID:     mr.tenantID,
+		WorkspaceID:     mr.workspaceID,
 		LastMigration:   lastMigration,
 		TotalMigrations: len(migrations),
 		Status:          status,

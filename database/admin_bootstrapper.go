@@ -35,20 +35,20 @@ func (b *AdminBootstrapper) SeedAllTenants() error {
 	count := 0
 
 	for rows.Next() {
-		var tenantID uuid.UUID
-		if err := rows.Scan(&tenantID); err != nil {
+		var workspaceID uuid.UUID
+		if err := rows.Scan(&workspaceID); err != nil {
 			log.Printf("Skipping tenant scan error: %v", err)
 			continue
 		}
 
-		if tenantID == uuid.Nil {
+		if workspaceID == uuid.Nil {
 			continue
 		}
 		count++
-		log.Printf("DEBUG: SeedAllTenants - processing tenant %d: %s", count, tenantID)
+		log.Printf("DEBUG: SeedAllTenants - processing tenant %d: %s", count, workspaceID)
 
-		if err := aur.EnsureTenantAdminRoleAssignment(tenantID); err != nil {
-			log.Printf("Warning: failed to seed admin artifacts for tenant %s: %v", tenantID, err)
+		if err := aur.EnsureTenantAdminRoleAssignment(workspaceID); err != nil {
+			log.Printf("Warning: failed to seed admin artifacts for tenant %s: %v", workspaceID, err)
 		}
 	}
 

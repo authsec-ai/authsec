@@ -12,12 +12,12 @@ import (
 // WebAuthnRegisterInternal is called by the webauthn handler after a successful
 // WebAuthn registration or authentication to obtain JWT tokens.
 // It replaces the HTTP POST to /uflow/webauthn/register from the old microservice setup.
-func WebAuthnRegisterInternal(clientID, email, tenantID string) (accessToken, refreshToken string, err error) {
+func WebAuthnRegisterInternal(clientID, email, workspaceID string) (accessToken, refreshToken string, err error) {
 	uc, err := NewUserController()
 	if err != nil {
 		return "", "", err
 	}
-	return uc.generateWebAuthnTokens(clientID, email, tenantID)
+	return uc.generateWebAuthnTokens(clientID, email, workspaceID)
 }
 
 // generateWebAuthnTokens is the internal implementation used by WebAuthnRegisterInternal.
@@ -25,17 +25,17 @@ func WebAuthnRegisterInternal(clientID, email, tenantID string) (accessToken, re
 // directly instead of writing an HTTP response.
 //
 // Flow:
-//  1. Look up tenant by tenantID
+//  1. Look up tenant by workspaceID
 //  2. Look up user by email in the global database
 //  3. Verify the user is active and MFA-verified
 //  4. Generate and return JWT tokens using the centralized token service
-func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID string) (accessToken, refreshToken string, err error) {
-	log.Printf("[WebAuthnBridge] Generating tokens for email=%s, tenantID=%s, clientID=%s", email, tenantID, clientID)
+func (uc *UserController) generateWebAuthnTokens(clientID, email, workspaceID string) (accessToken, refreshToken string, err error) {
+	log.Printf("[WebAuthnBridge] Generating tokens for email=%s, workspaceID=%s, clientID=%s", email, workspaceID, clientID)
 
-	// Look up tenant by tenantID
-	tenant, err := uc.tenantRepo.GetTenantByTenantID(tenantID)
+	// Look up tenant by workspaceID
+	tenant, err := uc.tenantRepo.GetTenantByTenantID(workspaceID)
 	if err != nil {
-		log.Printf("[WebAuthnBridge] Tenant not found for tenantID=%s: %v", tenantID, err)
+		log.Printf("[WebAuthnBridge] Tenant not found for workspaceID=%s: %v", workspaceID, err)
 		return "", "", fmt.Errorf("tenant not found: %w", err)
 	}
 
@@ -59,12 +59,12 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 		return "", "", fmt.Errorf("MFA verification required: webauthn credentials must be verified first")
 	}
 
-	log.Printf("[WebAuthnBridge] MFA verification confirmed for email=%s, tenantID=%s", email, tenantID)
+	log.Printf("[WebAuthnBridge] MFA verification confirmed for email=%s, workspaceID=%s", email, workspaceID)
 
 	// Parse UUIDs
 	tenantUUID, err := uuid.Parse(tenant.WorkspaceID.String())
 	if err != nil {
-		return "", "", fmt.Errorf("invalid tenant_id: %w", err)
+		return "", "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
 
 	// Generate access token using the centralized auth-manager token service
@@ -86,6 +86,6 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, tenantID strin
 }
 
 // WebAuthnRegisterInternalForTest calls WebAuthnRegisterInternal for test access.
-func WebAuthnRegisterInternalForTest(clientID, email, tenantID string) (string, string, error) {
-	return WebAuthnRegisterInternal(clientID, email, tenantID)
+func WebAuthnRegisterInternalForTest(clientID, email, workspaceID string) (string, string, error) {
+	return WebAuthnRegisterInternal(clientID, email, workspaceID)
 }

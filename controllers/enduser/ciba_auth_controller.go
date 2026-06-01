@@ -206,14 +206,14 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant_id in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return
 	}
 
 	// Register device
-	resp, err := ctrl.cibaService.RegisterDevice(userID, tenantID, &req)
+	resp, err := ctrl.cibaService.RegisterDevice(userID, workspaceID, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register device", "details": err.Error()})
 		return
@@ -223,7 +223,7 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	middlewares.Audit(c, "ciba_device", resp.DeviceID, "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":     userID.String(),
-			"workspace_id":   tenantID.String(),
+			"workspace_id":   workspaceID.String(),
 			"platform":    req.Platform,
 			"device_name": req.DeviceName,
 		},
@@ -264,14 +264,14 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant_id in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return
 	}
 
 	// Get devices
-	devices, err := ctrl.cibaService.GetUserDevices(userID, tenantID)
+	devices, err := ctrl.cibaService.GetUserDevices(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve devices", "details": err.Error()})
 		return
@@ -327,14 +327,14 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant_id in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return
 	}
 
 	// Delete device
-	if err := ctrl.cibaService.DeleteDevice(deviceID, userID, tenantID); err != nil {
+	if err := ctrl.cibaService.DeleteDevice(deviceID, userID, workspaceID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to delete device", "details": err.Error()})
 		return
 	}
@@ -344,7 +344,7 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 		Before: map[string]interface{}{
 			"device_id": deviceIDStr,
 			"user_id":   userID.String(),
-			"workspace_id": tenantID.String(),
+			"workspace_id": workspaceID.String(),
 		},
 	})
 

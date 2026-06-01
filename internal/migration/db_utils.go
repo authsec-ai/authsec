@@ -229,9 +229,9 @@ func IsValidDatabaseName(name string) bool {
 }
 
 // GenerateTenantDBName produces a deterministic database name from a tenant UUID string.
-func GenerateTenantDBName(tenantID string) string {
+func GenerateTenantDBName(workspaceID string) string {
 	clean := ""
-	for _, c := range tenantID {
+	for _, c := range workspaceID {
 		if c == '-' {
 			clean += "_"
 		} else {
@@ -252,7 +252,7 @@ func AutoMigrateMigrationLogs(gormDB *gorm.DB) error {
 // RunTenantMigrationsInProcess runs tenant migrations directly in-process without an HTTP round-trip.
 // masterDB is the raw master *sql.DB used for migration_logs tracking.
 // migrationsDir is the path to the tenant SQL migration files; pass "" to use the default resolved path.
-func RunTenantMigrationsInProcess(tenantID, host, port, user, password, dbName string, masterDB *sql.DB, migrationsDir string) error {
+func RunTenantMigrationsInProcess(workspaceID, host, port, user, password, dbName string, masterDB *sql.DB, migrationsDir string) error {
 	if migrationsDir == "" {
 		migrationsDir = MigrationsDir("tenant")
 	}
@@ -263,6 +263,6 @@ func RunTenantMigrationsInProcess(tenantID, host, port, user, password, dbName s
 	}
 	defer tenantDBConn.Close()
 
-	runner := NewTenantMigrationRunner(tenantID, tenantDBConn, migrationsDir, masterDB)
+	runner := NewTenantMigrationRunner(workspaceID, tenantDBConn, migrationsDir, masterDB)
 	return runner.RunMigrations()
 }

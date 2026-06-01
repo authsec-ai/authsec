@@ -41,14 +41,14 @@ func NewScopeMatrixController() *ScopeMatrixController {
 // GetScopeMatrix returns the full tool × scope × role matrix for a resource server.
 // GET /authsec/resource-servers/:id/scope-matrix
 func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -64,7 +64,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 	config.DB.Preload("Scopes").
 		Where(
 			"workspace_id = ? AND resource_server_id = ? AND (inventory_source IN ? OR last_scan_generation = ?)",
-			tenantID,
+			workspaceID,
 			rsUUID,
 			[]string{models.InventorySourceSDKManifest, models.InventorySourceManual},
 			rs.LastSuccessfulGeneration,
@@ -73,7 +73,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 		Find(&tools)
 
 	// Get all scopes for this RS
-	scopes, _ := ctrl.scopeRegistry.ListByResourceServer(tenantID, rsUUID)
+	scopes, _ := ctrl.scopeRegistry.ListByResourceServer(workspaceID, rsUUID)
 
 	// Build tool responses (initialize as empty slice so JSON marshals as [] not null)
 	toolResponses := make([]models.MCPToolResponse, 0, len(tools))
@@ -187,14 +187,14 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 // This is the "authenticated scan" path the wizard exposes for MCP servers
 // that require auth on tools/list.
 func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -229,7 +229,7 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 	}
 
 	// Re-fetch the RS to surface the updated lifecycle fields in the response.
-	updatedRS, _ := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	updatedRS, _ := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	resp := gin.H{"result": result}
 	if updatedRS != nil {
 		resp["status"] = updatedRS.Status
@@ -237,7 +237,7 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 		resp["scan_generation"] = updatedRS.ScanGeneration
 		resp["last_successful_generation"] = updatedRS.LastSuccessfulGeneration
 	}
-	auditAdminMutation(c, tenantID.String(), "rs_rescanned", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_rescanned", "resource_server",
 		rsID, http.StatusOK, nil, result)
 	c.JSON(http.StatusOK, resp)
 }
@@ -245,7 +245,7 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 // ListScopes returns all scopes for a resource server.
 // GET /authsec/resource-servers/:id/scopes
 func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -258,7 +258,7 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 		return
 	}
 
-	scopes, err := ctrl.scopeRegistry.ListByResourceServer(tenantID, rsUUID)
+	scopes, err := ctrl.scopeRegistry.ListByResourceServer(workspaceID, rsUUID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -270,12 +270,12 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 	needsRefetch := false
 	for i := range scopes {
 		if len(scopes[i].Permissions) == 0 {
-			autoCreateScopePermission(tenantID, &scopes[i])
+			autoCreateScopePermission(workspaceID, &scopes[i])
 			needsRefetch = true
 		}
 	}
 	if needsRefetch {
-		scopes, err = ctrl.scopeRegistry.ListByResourceServer(tenantID, rsUUID)
+		scopes, err = ctrl.scopeRegistry.ListByResourceServer(workspaceID, rsUUID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -296,7 +296,7 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 // CreateScope creates a new scope in the registry.
 // POST /authsec/resource-servers/:id/scopes
 func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -310,7 +310,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 	}
 
 	// Ownership gate: RS must belong to the requesting tenant.
-	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
@@ -322,7 +322,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 	}
 
 	scope := &models.OAuthScope{
-		WorkspaceID:      tenantID,
+		WorkspaceID:      workspaceID,
 		ResourceServerID: &rsUUID,
 		ScopeString:      req.ScopeString,
 		DisplayName:      req.DisplayName,
@@ -338,7 +338,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 	// Validate parent_scope_id through the service so the domain isolation rule
 	// lives in exactly one place (ScopeRegistryService.ValidateParentScope).
 	if req.ParentScopeID != "" {
-		pid, err := ctrl.scopeRegistry.ValidateParentScope(req.ParentScopeID, tenantID, &rsUUID)
+		pid, err := ctrl.scopeRegistry.ValidateParentScope(req.ParentScopeID, workspaceID, &rsUUID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -353,17 +353,17 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 
 	// Correctness fix #5: auto-create matching permission + bridge in same transaction.
 	// This ensures default roles can grant the scope at OAuth time without manual wiring.
-	autoCreateScopePermission(tenantID, scope)
+	autoCreateScopePermission(workspaceID, scope)
 
 	// Correctness fix #4: keep scopes_supported in sync with oauth_scopes.
-	syncScopesSupported(rsUUID, tenantID)
+	syncScopesSupported(rsUUID, workspaceID)
 
 	// Link permissions with tenant ownership enforcement (skips foreign IDs silently).
 	if len(req.PermissionIDs) > 0 {
-		ctrl.scopeRegistry.LinkPermissionsTenantScoped(scope.ID, tenantID, req.PermissionIDs)
+		ctrl.scopeRegistry.LinkPermissionsTenantScoped(scope.ID, workspaceID, req.PermissionIDs)
 	}
 
-	auditAdminMutation(c, tenantID.String(), "scope_created", "oauth_scope",
+	auditAdminMutation(c, workspaceID.String(), "scope_created", "oauth_scope",
 		scope.ID.String(), http.StatusCreated, nil,
 		map[string]interface{}{"scope_string": scope.ScopeString, "rs_id": rsID})
 	c.JSON(http.StatusCreated, scope)
@@ -372,7 +372,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 // UpdateScope updates scope metadata.
 // PUT /authsec/scopes/:scope_id
 func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -392,7 +392,7 @@ func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 
 	// UpdateByTenant → applyUpdate enforces tenant ownership, parent domain isolation,
 	// and permission tenant filtering.
-	scope, err := ctrl.scopeRegistry.UpdateByTenant(scopeID, tenantID, &req)
+	scope, err := ctrl.scopeRegistry.UpdateByTenant(scopeID, workspaceID, &req)
 	if err != nil {
 		status := http.StatusNotFound
 		if errors.Is(err, services.ErrInvalidParentScope) {
@@ -402,7 +402,7 @@ func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "scope_updated", "oauth_scope",
+	auditAdminMutation(c, workspaceID.String(), "scope_updated", "oauth_scope",
 		scopeID.String(), http.StatusOK, nil, &req)
 	c.JSON(http.StatusOK, scope)
 }
@@ -410,7 +410,7 @@ func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 // DeleteScope removes a scope.
 // DELETE /authsec/scopes/:scope_id
 func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -424,7 +424,7 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 
 	// Read scope before deletion to get RS info for drift event and scopes_supported sync.
 	var scope models.OAuthScope
-	config.DB.Where("id = ? AND workspace_id = ?", scopeID, tenantID).First(&scope)
+	config.DB.Where("id = ? AND workspace_id = ?", scopeID, workspaceID).First(&scope)
 
 	// Phase H-5 setup: snapshot the users currently entitled to this scope BEFORE
 	// the cascade fires. Once oauth_scope_permissions rows are gone, the join we'd
@@ -439,16 +439,16 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 		  JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id
 		 WHERE osp.scope_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL
 		   AND (rb.expires_at IS NULL OR rb.expires_at > NOW())
-	`, scopeID, tenantID).Scan(&affectedUserIDs)
+	`, scopeID, workspaceID).Scan(&affectedUserIDs)
 
-	if err := ctrl.scopeRegistry.DeleteByTenant(scopeID, tenantID); err != nil {
+	if err := ctrl.scopeRegistry.DeleteByTenant(scopeID, workspaceID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 
 	// Sync scopes_supported after deletion.
 	if scope.ResourceServerID != nil {
-		syncScopesSupported(*scope.ResourceServerID, tenantID)
+		syncScopesSupported(*scope.ResourceServerID, workspaceID)
 
 		// Emit drift event if RS is ready (post-activation destructive edit).
 		var rs models.ResourceServer
@@ -464,10 +464,10 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 	// Fire-and-forget so the API response returns immediately; revocation
 	// failures land in the log, not in the operator's response.
 	for _, uid := range affectedUserIDs {
-		go ctrl.oauthService.RevokeUserTokensForWorkspace(uid, tenantID)
+		go ctrl.oauthService.RevokeUserTokensForWorkspace(uid, workspaceID)
 	}
 
-	auditAdminMutation(c, tenantID.String(), "scope_deleted", "oauth_scope",
+	auditAdminMutation(c, workspaceID.String(), "scope_deleted", "oauth_scope",
 		scopeID.String(), http.StatusNoContent, nil, map[string]interface{}{
 			"affected_users_revoked": len(affectedUserIDs),
 		})
@@ -477,7 +477,7 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 // UpdateToolScopeMap manually maps/unmaps tools to scopes.
 // PUT /authsec/resource-servers/:id/tool-scope-map
 func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -485,7 +485,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 
 	rsID := c.Param("id")
 	// Ownership gate: RS must belong to the requesting tenant.
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -515,7 +515,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		// Tool must belong to this tenant AND this specific RS.
 		var toolCount int64
 		config.DB.Model(&models.MCPTool{}).
-			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", toolID, tenantID, rsUUID).
+			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", toolID, workspaceID, rsUUID).
 			Count(&toolCount)
 		if toolCount == 0 {
 			continue
@@ -524,7 +524,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		// Scope must belong to this tenant AND this specific RS.
 		var scopeCount int64
 		config.DB.Model(&models.OAuthScope{}).
-			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, tenantID, rsUUID).
+			Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, workspaceID, rsUUID).
 			Count(&scopeCount)
 		if scopeCount == 0 {
 			continue
@@ -559,7 +559,7 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		applied++
 	}
 
-	auditAdminMutation(c, tenantID.String(), "tool_scope_map_updated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "tool_scope_map_updated", "resource_server",
 		rsUUID.String(), http.StatusOK, nil,
 		map[string]interface{}{"requested": len(req.Mappings), "applied": applied})
 	c.JSON(http.StatusOK, gin.H{"status": "updated", "applied": applied, "requested": len(req.Mappings)})
@@ -882,7 +882,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 // Activate completes RS setup and flips state to 'ready'.
 // POST /authsec/resource-servers/:id/activate
 func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -900,7 +900,7 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 		return
 	}
 
-	if err := ctrl.rsService.Activate(rsID, tenantID, *userID); err != nil {
+	if err := ctrl.rsService.Activate(rsID, workspaceID, *userID); err != nil {
 		var gateErr services.ActivationGateError
 		if errors.As(err, &gateErr) {
 			c.JSON(http.StatusConflict, gin.H{
@@ -913,7 +913,7 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_activated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_activated", "resource_server",
 		rsID.String(), http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
@@ -921,7 +921,7 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 // SetupChecklist returns wizard step completion status.
 // GET /authsec/resource-servers/:id/setup
 func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -933,7 +933,7 @@ func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
 		return
 	}
 
-	steps, err := ctrl.rsService.SetupChecklist(rsID, tenantID)
+	steps, err := ctrl.rsService.SetupChecklist(rsID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -957,7 +957,7 @@ func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
 // ActivationPreview returns the activation review summary card.
 // GET /authsec/resource-servers/:id/activation-preview
 func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -969,7 +969,7 @@ func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 		return
 	}
 
-	preview, err := ctrl.rsService.ActivationPreview(rsID, tenantID)
+	preview, err := ctrl.rsService.ActivationPreview(rsID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -984,7 +984,7 @@ func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 // authenticated scan working).
 // POST /authsec/resource-servers/:id/tools
 func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -998,7 +998,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	}
 
 	// Verify the RS exists for this tenant.
-	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
@@ -1033,7 +1033,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	// when paths are mixed.
 	var existing models.MCPTool
 	conflictErr := config.DB.
-		Where("workspace_id = ? AND resource_server_id = ? AND name = ?", tenantID, rsUUID, req.Name).
+		Where("workspace_id = ? AND resource_server_id = ? AND name = ?", workspaceID, rsUUID, req.Name).
 		First(&existing).Error
 	if conflictErr == nil {
 		c.JSON(http.StatusConflict, gin.H{
@@ -1045,7 +1045,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 	}
 
 	tool := models.MCPTool{
-		WorkspaceID:      tenantID,
+		WorkspaceID:      workspaceID,
 		ResourceServerID: rsUUID,
 		Name:             req.Name,
 		Description:      req.Description,
@@ -1056,7 +1056,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "tool_added_manual", "mcp_tool",
+	auditAdminMutation(c, workspaceID.String(), "tool_added_manual", "mcp_tool",
 		tool.ID.String(), http.StatusCreated, nil,
 		map[string]interface{}{"tool_name": tool.Name})
 	c.JSON(http.StatusCreated, gin.H{
@@ -1069,7 +1069,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 // MarkToolPublic sets is_public=true on a tool with admin acknowledgement.
 // POST /authsec/resource-servers/:id/tools/:tool_id/public
 func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1094,7 +1094,7 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 	// Verify tool belongs to this tenant+RS.
 	var tool models.MCPTool
 	if err := config.DB.Where("id = ? AND workspace_id = ? AND resource_server_id = ?",
-		toolID, tenantID, rsID).First(&tool).Error; err != nil {
+		toolID, workspaceID, rsID).First(&tool).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "tool not found"})
 		return
 	}
@@ -1137,7 +1137,7 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "tool_public_flag_set", "mcp_tool",
+	auditAdminMutation(c, workspaceID.String(), "tool_public_flag_set", "mcp_tool",
 		toolID.String(), http.StatusOK, nil,
 		map[string]interface{}{"is_public": req.IsPublic, "tool_name": tool.Name})
 	c.JSON(http.StatusOK, gin.H{"tool_id": toolID, "is_public": req.IsPublic})
@@ -1146,14 +1146,14 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 // SDKManifestStatus returns the most-recent and most-recent-successful manifest attempt.
 // GET /authsec/resource-servers/:id/sdk-manifest-status
 func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
@@ -1182,14 +1182,14 @@ func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
 // DriftEvents returns undismissed drift events for an RS.
 // GET /authsec/resource-servers/:id/drift-events
 func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -1213,14 +1213,14 @@ func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
 // DismissDriftEvent records a dismissal of a single drift event.
 // POST /authsec/resource-servers/:id/drift-events/:event_id/dismiss
 func (ctrl *ScopeMatrixController) DismissDriftEvent(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
@@ -1262,14 +1262,14 @@ type rsRoleSummary struct {
 // ListRSRoles returns all roles associated with this RS (rs-{id}:* names).
 // GET /authsec/resource-servers/:id/roles
 func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -1278,12 +1278,12 @@ func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 	prefix := fmt.Sprintf("rs-%s:", rs.ID.String())
 
 	var roles []models.RBACRole
-	config.DB.Where("workspace_id = ? AND name LIKE ?", tenantID, prefix+"%").
+	config.DB.Where("workspace_id = ? AND name LIKE ?", workspaceID, prefix+"%").
 		Order("name ASC").Find(&roles)
 
 	// Fetch the policy default for the is_default flag.
 	var policy models.ResourceServerAccessPolicy
-	policyErr := config.DB.Where("resource_server_id = ? AND workspace_id = ?", rs.ID, tenantID).
+	policyErr := config.DB.Where("resource_server_id = ? AND workspace_id = ?", rs.ID, workspaceID).
 		First(&policy).Error
 	defaultRoleID := uuid.Nil
 	if policyErr == nil && policy.DefaultRoleID != nil {
@@ -1296,7 +1296,7 @@ func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
 		config.DB.Model(&models.RolePermission{}).Where("role_id = ?", r.ID).Count(&permCount)
 		var bindingCount int64
 		config.DB.Model(&models.RoleBinding{}).
-			Where("role_id = ? AND workspace_id = ?", r.ID, tenantID).
+			Where("role_id = ? AND workspace_id = ?", r.ID, workspaceID).
 			Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = 'resource_server' AND scope_id = ?)", rs.ID).
 			Count(&bindingCount)
 		out = append(out, rsRoleSummary{
@@ -1441,7 +1441,7 @@ func applicationRoleSource(roleName string) string {
 	}
 }
 
-func scopeRefsForRole(db *gorm.DB, tenantID, roleID, appID uuid.UUID) []accessScopeRef {
+func scopeRefsForRole(db *gorm.DB, workspaceID, roleID, appID uuid.UUID) []accessScopeRef {
 	type scopeRow struct {
 		ID          uuid.UUID
 		ScopeString string
@@ -1454,7 +1454,7 @@ func scopeRefsForRole(db *gorm.DB, tenantID, roleID, appID uuid.UUID) []accessSc
 		Select("DISTINCT os.id, os.scope_string, os.display_name, os.risk_level, os.source").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
 		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
-		Where("rp.role_id = ? AND os.workspace_id = ? AND os.resource_server_id = ?", roleID, tenantID, appID).
+		Where("rp.role_id = ? AND os.workspace_id = ? AND os.resource_server_id = ?", roleID, workspaceID, appID).
 		Order("os.scope_string ASC").
 		Scan(&rows)
 
@@ -1502,20 +1502,20 @@ func normalizeApplicationRoleSlug(value string) string {
 // ListApplicationRoles returns all application-scoped roles across the workspace.
 // GET /authsec/application-roles
 func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	var apps []models.ResourceServer
-	if err := config.DB.Where("workspace_id = ?", tenantID).Order("name ASC").Find(&apps).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", workspaceID).Order("name ASC").Find(&apps).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	var roles []models.RBACRole
-	if err := config.DB.Where("workspace_id = ? AND name LIKE ?", tenantID, "rs-%:%").
+	if err := config.DB.Where("workspace_id = ? AND name LIKE ?", workspaceID, "rs-%:%").
 		Order("name ASC").Find(&roles).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1526,7 +1526,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 		UpdatedAt time.Time
 	}
 	var updatedRows []updatedRow
-	config.DB.Table("roles").Select("id, updated_at").Where("workspace_id = ?", tenantID).Scan(&updatedRows)
+	config.DB.Table("roles").Select("id, updated_at").Where("workspace_id = ?", workspaceID).Scan(&updatedRows)
 	updatedByRole := map[uuid.UUID]time.Time{}
 	for _, row := range updatedRows {
 		updatedByRole[row.ID] = row.UpdatedAt
@@ -1539,7 +1539,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 	var policies []policyRow
 	config.DB.Table("resource_server_access_policies").
 		Select("resource_server_id, default_role_id").
-		Where("workspace_id = ? AND default_role_id IS NOT NULL", tenantID).
+		Where("workspace_id = ? AND default_role_id IS NOT NULL", workspaceID).
 		Scan(&policies)
 	defaultByApp := map[uuid.UUID]uuid.UUID{}
 	for _, p := range policies {
@@ -1561,10 +1561,10 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 			continue
 		}
 
-		scopes := scopeRefsForRole(config.DB, tenantID, role.ID, app.ID)
+		scopes := scopeRefsForRole(config.DB, workspaceID, role.ID, app.ID)
 		var usersCount int64
 		config.DB.Table("role_bindings rb").
-			Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
+			Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", workspaceID, role.ID).
 			Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 			Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", app.ID).
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
@@ -1634,12 +1634,12 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 // app scopes for one application.
 // GET /authsec/applications/:id/access/users
 func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -1674,7 +1674,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
 		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.workspace_id").
 		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = rb.user_id AND teus.workspace_id = rb.workspace_id").
-		Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", tenantID).
+		Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL", workspaceID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -1725,7 +1725,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 				BindingID: r.BindingID.String(),
 			})
 		}
-		for _, scope := range scopeRefsForRole(config.DB, tenantID, r.RoleID, rs.ID) {
+		for _, scope := range scopeRefsForRole(config.DB, workspaceID, r.RoleID, rs.ID) {
 			item.Scopes = appendUniqueScopeRef(item.Scopes, scope)
 		}
 		var scopeIDStr *string
@@ -1757,12 +1757,12 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 // GetApplicationUserEffectiveAccess computes one user's effective app scopes.
 // GET /authsec/applications/:id/users/:user_id/effective-access
 func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -1777,7 +1777,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	if err := config.DB.Table("users u").
 		Select("u.id::text AS id, COALESCE(u.email, '') AS email, COALESCE(NULLIF(u.name, ''), u.email, u.username, '') AS name, COALESCE(teus.status, 'active') AS status").
 		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = u.id AND teus.workspace_id = u.workspace_id").
-		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
+		Where("u.id = ? AND u.workspace_id = ?", userID, workspaceID).
 		Take(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found for this tenant"})
 		return
@@ -1796,7 +1796,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 	if err := config.DB.Table("role_bindings rb").
 		Select("rb.id AS binding_id, rb.role_id, COALESCE(rb.role_name, ro.name, '') AS role_name, rb.assignment_source AS source, rb.scope_type, rb.scope_id").
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
-		Where("rb.workspace_id = ? AND rb.user_id = ?", tenantID, userID).
+		Where("rb.workspace_id = ? AND rb.user_id = ?", workspaceID, userID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -1817,7 +1817,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 			Source:    row.Source,
 			BindingID: row.BindingID.String(),
 		})
-		for _, scope := range scopeRefsForRole(config.DB, tenantID, row.RoleID, rs.ID) {
+		for _, scope := range scopeRefsForRole(config.DB, workspaceID, row.RoleID, rs.ID) {
 			grantsByScope[scope.ID] = append(grantsByScope[scope.ID], scopeGrantSource{
 				RoleID:    row.RoleID.String(),
 				RoleName:  row.RoleName,
@@ -1830,7 +1830,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 		}
 	}
 
-	allScopes, err := ctrl.scopeRegistry.ListByResourceServer(tenantID, rs.ID)
+	allScopes, err := ctrl.scopeRegistry.ListByResourceServer(workspaceID, rs.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1866,12 +1866,12 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 // application scopes, and optionally assigns it to users.
 // POST /authsec/applications/:id/roles
 func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -1927,7 +1927,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 
 	var selectedScopes []models.OAuthScope
 	if len(scopeIDs) > 0 {
-		if err := config.DB.Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+		if err := config.DB.Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", workspaceID, rs.ID, scopeIDs).
 			Find(&selectedScopes).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1937,7 +1937,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 			return
 		}
 		for i := range selectedScopes {
-			autoCreateScopePermission(tenantID, &selectedScopes[i])
+			autoCreateScopePermission(workspaceID, &selectedScopes[i])
 		}
 	}
 
@@ -1952,7 +1952,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		var rows []userRow
 		if err := config.DB.Table("users").
 			Select("id, email, name, username").
-			Where("workspace_id = ? AND id IN ?", tenantID, userIDs).
+			Where("workspace_id = ? AND id IN ?", workspaceID, userIDs).
 			Find(&rows).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1978,7 +1978,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 	}
 
 	role := models.RBACRole{
-		WorkspaceID: &tenantID,
+		WorkspaceID: &workspaceID,
 		Name:        roleName,
 		Description: strings.TrimSpace(req.Description),
 		IsSystem:    false,
@@ -1999,10 +1999,10 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		}
 		if req.DefaultRole {
 			var policy models.ResourceServerAccessPolicy
-			err := tx.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).First(&policy).Error
+			err := tx.Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).First(&policy).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				policy = models.ResourceServerAccessPolicy{
-					WorkspaceID:       tenantID,
+					WorkspaceID:       workspaceID,
 					ResourceServerID:  rs.ID,
 					Enabled:           true,
 					DefaultRoleID:     &role.ID,
@@ -2035,7 +2035,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 				username = row.ID.String()
 			}
 			binding := models.RoleBinding{
-				WorkspaceID:      &tenantID,
+				WorkspaceID:      &workspaceID,
 				UserID:           &userID,
 				Username:         username,
 				RoleID:           role.ID,
@@ -2048,7 +2048,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 			}
 			if err := tx.Where(
 				"workspace_id = ? AND user_id = ? AND role_id = ? AND scope_type = ? AND scope_id = ?",
-				tenantID, userID, role.ID, rsScopeType, rsScopeID,
+				workspaceID, userID, role.ID, rsScopeType, rsScopeID,
 			).FirstOrCreate(&binding).Error; err != nil {
 				return err
 			}
@@ -2059,15 +2059,15 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 		return
 	}
 
-	scopes := scopeRefsForRole(config.DB, tenantID, role.ID, rs.ID)
+	scopes := scopeRefsForRole(config.DB, workspaceID, role.ID, rs.ID)
 	var usersCount int64
 	config.DB.Table("role_bindings rb").
-		Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", tenantID, role.ID).
+		Where("rb.workspace_id = ? AND rb.role_id = ? AND rb.user_id IS NOT NULL", workspaceID, role.ID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("rb.scope_type = 'resource_server' AND rb.scope_id = ?", rs.ID).
 		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
 
-	auditAdminMutation(c, tenantID.String(), "application_role_created", "role",
+	auditAdminMutation(c, workspaceID.String(), "application_role_created", "role",
 		role.ID.String(), http.StatusCreated, nil,
 		map[string]interface{}{"rs_id": rs.ID, "scope_count": len(scopes), "users_count": usersCount})
 	c.JSON(http.StatusCreated, applicationRoleResponse{
@@ -2089,7 +2089,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 // scopes. Catalog entries do not directly grant runtime access.
 // GET /authsec/scope-catalog
 func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2097,7 +2097,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 
 	out := []scopeCatalogEntryResponse{}
 	var catalog []models.ScopeCatalogEntry
-	if err := config.DB.Where("workspace_id = ?", tenantID).Order("key ASC").Find(&catalog).Error; err == nil {
+	if err := config.DB.Where("workspace_id = ?", workspaceID).Order("key ASC").Find(&catalog).Error; err == nil {
 		for _, entry := range catalog {
 			out = append(out, scopeCatalogEntryResponse{
 				ID:          entry.ID.String(),
@@ -2130,7 +2130,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 		Select(`os.id, os.scope_string, os.display_name, os.description, os.risk_level, os.source, os.updated_at,
 			rs.id AS app_id, rs.name AS app_name, rs.resource_uri`).
 		Joins("LEFT JOIN resource_servers rs ON rs.id = os.resource_server_id").
-		Where("os.workspace_id = ?", tenantID).
+		Where("os.workspace_id = ?", workspaceID).
 		Order("COALESCE(rs.name, ''), os.scope_string ASC").
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -2147,11 +2147,11 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 		config.DB.Table("role_bindings rb").
 			Joins("JOIN role_permissions rp ON rp.role_id = rb.role_id").
 			Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-			Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL AND osp.scope_id = ?", tenantID, row.ID).
+			Where("rb.workspace_id = ? AND rb.user_id IS NOT NULL AND osp.scope_id = ?", workspaceID, row.ID).
 			Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 			Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
 		config.DB.Table("oauth_consent_grants").
-			Where("workspace_id = ? AND ? = ANY(granted_scopes) AND revoked_at IS NULL", tenantID, row.ScopeString).
+			Where("workspace_id = ? AND ? = ANY(granted_scopes) AND revoked_at IS NULL", workspaceID, row.ScopeString).
 			Count(&grantsCount)
 
 		var appRef *accessApplicationRef
@@ -2227,7 +2227,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 // do not grant access directly; they are copied into application-owned scopes.
 // POST /authsec/scope-catalog
 func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2260,7 +2260,7 @@ func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 	}
 
 	entry := models.ScopeCatalogEntry{
-		WorkspaceID: tenantID,
+		WorkspaceID: workspaceID,
 		Key:         req.Key,
 		DisplayName: req.DisplayName,
 		Description: req.Description,
@@ -2289,7 +2289,7 @@ func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 // application scope.
 // POST /authsec/scope-catalog/:catalog_id/applications/:application_id
 func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2304,20 +2304,20 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application_id"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(appID.String(), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(appID.String(), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
 	}
 
 	var entry models.ScopeCatalogEntry
-	if err := config.DB.Where("id = ? AND workspace_id = ?", catalogID, tenantID).Take(&entry).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", catalogID, workspaceID).Take(&entry).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "catalog entry not found"})
 		return
 	}
 
 	scope := models.OAuthScope{
-		WorkspaceID:      tenantID,
+		WorkspaceID:      workspaceID,
 		ResourceServerID: &appID,
 		ScopeString:      entry.Key,
 		DisplayName:      entry.DisplayName,
@@ -2327,15 +2327,15 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 	}
 	result := config.DB.Where(
 		"workspace_id = ? AND resource_server_id = ? AND scope_string = ?",
-		tenantID, appID, entry.Key,
+		workspaceID, appID, entry.Key,
 	).FirstOrCreate(&scope)
 	if result.Error != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": result.Error.Error()})
 		return
 	}
 
-	autoCreateScopePermission(tenantID, &scope)
-	syncScopesSupported(appID, tenantID)
+	autoCreateScopePermission(workspaceID, &scope)
+	syncScopesSupported(appID, workspaceID)
 	c.JSON(http.StatusOK, scopeCatalogEntryResponse{
 		ID:          scope.ID.String(),
 		Kind:        "application",
@@ -2356,14 +2356,14 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 // oauth_scope_permissions.
 // PUT /authsec/applications/:id/roles/:role_id/scope-grants
 func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -2384,7 +2384,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 	}
 
 	var role models.RBACRole
-	if err := config.DB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
 		return
 	}
@@ -2415,7 +2415,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 	var selectedScopes []models.OAuthScope
 	if len(scopeIDs) > 0 {
 		if err := config.DB.
-			Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", tenantID, rs.ID, scopeIDs).
+			Where("workspace_id = ? AND resource_server_id = ? AND id IN ?", workspaceID, rs.ID, scopeIDs).
 			Find(&selectedScopes).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -2431,7 +2431,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 		Table("oauth_scope_permissions osp").
 		Select("DISTINCT osp.permission_id").
 		Joins("JOIN oauth_scopes os ON os.id = osp.scope_id").
-		Where("os.workspace_id = ? AND os.resource_server_id = ?", tenantID, rs.ID).
+		Where("os.workspace_id = ? AND os.resource_server_id = ?", workspaceID, rs.ID).
 		Scan(&allAppPermissionIDs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -2477,7 +2477,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 		grantedScopeStrings = append(grantedScopeStrings, scope.ScopeString)
 	}
 
-	auditAdminMutation(c, tenantID.String(), "application_role_scope_grants_updated", "role",
+	auditAdminMutation(c, workspaceID.String(), "application_role_scope_grants_updated", "role",
 		roleID.String(), http.StatusOK, nil,
 		map[string]interface{}{"application_id": rs.ID, "scope_count": len(scopeIDs)})
 	c.JSON(http.StatusOK, gin.H{
@@ -2494,14 +2494,14 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 // for any role whose name starts with rs-{id}: (i.e. RS-scoped roles only).
 // GET /authsec/resource-servers/:id/bindings
 func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -2528,7 +2528,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 			rb.role_id, rb.role_name, rb.scope_type, rb.scope_id, rb.created_at, rb.assignment_source AS source`).
 		Joins("JOIN roles ro ON ro.id = rb.role_id").
 		Joins("LEFT JOIN users u ON u.id = rb.user_id AND u.workspace_id = rb.workspace_id").
-		Where("rb.workspace_id = ?", tenantID).
+		Where("rb.workspace_id = ?", workspaceID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("ro.name LIKE ?", prefix+"%").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = ?)", rs.ID).
@@ -2572,14 +2572,14 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 // consent flow via EnsureDefaultAccessBinding).
 // POST /authsec/resource-servers/:id/bindings
 func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -2606,7 +2606,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 
 	// Verify the role belongs to this tenant and is RS-scoped (rs-{id}: prefix).
 	var role models.RBACRole
-	if err := config.DB.Where("id = ? AND workspace_id = ?", roleUUID, tenantID).First(&role).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ?", roleUUID, workspaceID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
 		return
 	}
@@ -2627,7 +2627,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	}
 	if err := config.DB.Table("users").
 		Select("id, email, name, username").
-		Where("id = ? AND workspace_id = ?", userUUID, tenantID).
+		Where("id = ? AND workspace_id = ?", userUUID, workspaceID).
 		Take(&userRow).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": "user not found for this tenant",
@@ -2641,7 +2641,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	rsScopeID := rs.ID
 	var existingCount int64
 	config.DB.Model(&models.RoleBinding{}).
-		Where("workspace_id = ? AND user_id = ? AND role_id = ?", tenantID, userUUID, roleUUID).
+		Where("workspace_id = ? AND user_id = ? AND role_id = ?", workspaceID, userUUID, roleUUID).
 		Where("scope_type = ? AND scope_id = ?", rsScopeType, rsScopeID).
 		Count(&existingCount)
 	if existingCount > 0 {
@@ -2659,7 +2659,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	if username == "" {
 		username = userRow.ID.String()
 	}
-	tenantUUID := tenantID
+	tenantUUID := workspaceID
 	binding := models.RoleBinding{
 		WorkspaceID:      &tenantUUID,
 		UserID:           &userUUID,
@@ -2677,7 +2677,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_binding_created", "role_binding",
+	auditAdminMutation(c, workspaceID.String(), "rs_binding_created", "role_binding",
 		binding.ID.String(), http.StatusCreated, nil,
 		map[string]interface{}{"user_id": userUUID, "role_id": roleUUID, "rs_id": rs.ID})
 	c.JSON(http.StatusCreated, gin.H{
@@ -2693,14 +2693,14 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 // DeleteRSBinding removes a role binding for this RS.
 // DELETE /authsec/resource-servers/:id/bindings/:binding_id
 func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -2716,7 +2716,7 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 	// against the resolver's accept-globals path being used as a delete vector
 	// for tenant-wide bindings.
 	res := config.DB.
-		Where("id = ? AND workspace_id = ?", bindingID, tenantID).
+		Where("id = ? AND workspace_id = ?", bindingID, workspaceID).
 		Where("scope_type = 'resource_server' AND scope_id = ?", rs.ID).
 		Delete(&models.RoleBinding{})
 	if res.Error != nil {
@@ -2728,7 +2728,7 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_binding_deleted", "role_binding",
+	auditAdminMutation(c, workspaceID.String(), "rs_binding_deleted", "role_binding",
 		bindingID.String(), http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
@@ -2738,12 +2738,12 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 // GetConnectionDynamically, with a small projection (no password hashes).
 // GET /authsec/resource-servers/:id/eligible-users
 func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	if _, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String()); err != nil {
+	if _, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
@@ -2769,12 +2769,12 @@ func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 // ── Helper functions ──────────────────────────────────────────────────────────────────────────────
 
 // autoCreateScopePermission creates a matching permission + bridge for a scope (correctness #5).
-func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
+func autoCreateScopePermission(workspaceID uuid.UUID, scope *models.OAuthScope) {
 	perm := models.RBACPermission{}
 	if config.DB.Where("workspace_id = ? AND resource = ? AND action = ?",
-		tenantID, scope.ScopeString, "access").First(&perm).Error != nil {
+		workspaceID, scope.ScopeString, "access").First(&perm).Error != nil {
 		perm = models.RBACPermission{
-			WorkspaceID: &tenantID,
+			WorkspaceID: &workspaceID,
 			Resource:    scope.ScopeString,
 			Action:      "access",
 			Description: fmt.Sprintf("OAuth scope: %s", scope.DisplayName),
@@ -2787,10 +2787,10 @@ func autoCreateScopePermission(tenantID uuid.UUID, scope *models.OAuthScope) {
 }
 
 // syncScopesSupported keeps resource_servers.scopes_supported in sync with oauth_scopes (correctness #4).
-func syncScopesSupported(rsID uuid.UUID, tenantID uuid.UUID) {
+func syncScopesSupported(rsID uuid.UUID, workspaceID uuid.UUID) {
 	var scopeStrings []string
 	config.DB.Model(&models.OAuthScope{}).
-		Where("resource_server_id = ? AND (workspace_id = ? OR workspace_id = ?)", rsID, tenantID, tenantID).
+		Where("resource_server_id = ? AND (workspace_id = ? OR workspace_id = ?)", rsID, workspaceID, workspaceID).
 		Order("scope_string ASC").
 		Pluck("scope_string", &scopeStrings)
 	if scopeStrings == nil {
@@ -2895,14 +2895,14 @@ func maybeAttempt(exists bool, a models.ResourceServerManifestAttempt) interface
 //
 // GET /authsec/resource-servers/:id/scope-resolution-preview?user_id=<uuid>&scope=<s1>&scope=<s2>
 func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -2930,7 +2930,7 @@ func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
 
 	report, err := ctrl.scopeResolver.ResolveWithReport(
 		c.Request.Context(),
-		tenantID.String(), userID, rs.ID.String(),
+		workspaceID.String(), userID, rs.ID.String(),
 		rsScopes, rs, nil, // client=nil: admin view, OIDC scopes already filtered above
 	)
 	if err != nil {
@@ -2939,7 +2939,7 @@ func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
 	}
 
 	// Enrich diagnostics with scope metadata
-	allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(tenantID, rs.ID)
+	allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(workspaceID, rs.ID)
 	scopeMeta := make(map[string]*models.OAuthScope, len(allScopes))
 	for i := range allScopes {
 		scopeMeta[allScopes[i].ScopeString] = &allScopes[i]
@@ -2989,12 +2989,12 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccessQuery(c *gin
 // ScopeImpact returns the operator impact preview for deleting or changing one
 // application access label.
 func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -3006,7 +3006,7 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 	}
 
 	var scope models.OAuthScope
-	if err := config.DB.Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, tenantID, rs.ID).Take(&scope).Error; err != nil {
+	if err := config.DB.Where("id = ? AND workspace_id = ? AND resource_server_id = ?", scopeID, workspaceID, rs.ID).Take(&scope).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "scope not found"})
 		return
 	}
@@ -3014,20 +3014,20 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 	var toolsCount, rolesCount, usersCount, grantsCount int64
 	config.DB.Table("mcp_tool_scope_map mtsm").
 		Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
-		Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scope.ID, tenantID, rs.ID).
+		Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scope.ID, workspaceID, rs.ID).
 		Count(&toolsCount)
 	config.DB.Table("role_permissions rp").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
 		Joins("JOIN roles r ON r.id = rp.role_id").
-		Where("osp.scope_id = ? AND r.workspace_id = ? AND r.name LIKE ?", scope.ID, tenantID, "rs-"+rs.ID.String()+":%").
+		Where("osp.scope_id = ? AND r.workspace_id = ? AND r.name LIKE ?", scope.ID, workspaceID, "rs-"+rs.ID.String()+":%").
 		Select("COUNT(DISTINCT rp.role_id)").Scan(&rolesCount)
 	config.DB.Table("role_bindings rb").
 		Joins("JOIN role_permissions rp ON rp.role_id = rb.role_id").
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-		Where("osp.scope_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL", scope.ID, tenantID).
+		Where("osp.scope_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL", scope.ID, workspaceID).
 		Select("COUNT(DISTINCT rb.user_id)").Scan(&usersCount)
 	config.DB.Table("oauth_consent_grants").
-		Where("workspace_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND ? = ANY(granted_scopes)", tenantID, rs.ID, scope.ScopeString).
+		Where("workspace_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND ? = ANY(granted_scopes)", workspaceID, rs.ID, scope.ScopeString).
 		Count(&grantsCount)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -3051,12 +3051,12 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 // AccessSimulation evaluates one user/application/tool path using the same
 // scope resolver used by runtime policy, with an operator-friendly trace.
 func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -3091,7 +3091,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	if err := config.DB.Table("users u").
 		Select("COALESCE(teus.status, 'active')").
 		Joins("LEFT JOIN workspace_end_user_states teus ON teus.user_id = u.id AND teus.workspace_id = u.workspace_id").
-		Where("u.id = ? AND u.workspace_id = ?", userID, tenantID).
+		Where("u.id = ? AND u.workspace_id = ?", userID, workspaceID).
 		Scan(&userStatus).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
 		return
@@ -3102,7 +3102,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	}
 
 	var tool models.MCPTool
-	toolQuery := config.DB.Preload("Scopes").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID)
+	toolQuery := config.DB.Preload("Scopes").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID)
 	if req.ToolID != "" {
 		toolUUID, err := uuid.Parse(req.ToolID)
 		if err != nil {
@@ -3153,7 +3153,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 	}
 	trace = append(trace, gin.H{"check": "tool_mapped", "state": "ok", "detail": requestedScopes})
 
-	report, err := ctrl.scopeResolver.ResolveWithReport(c.Request.Context(), tenantID.String(), userID.String(), rs.ID.String(), requestedScopes, rs, nil)
+	report, err := ctrl.scopeResolver.ResolveWithReport(c.Request.Context(), workspaceID.String(), userID.String(), rs.ID.String(), requestedScopes, rs, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "scope resolution failed"})
 		return
@@ -3167,12 +3167,12 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 }
 
 func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
@@ -3189,15 +3189,15 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 	var affectedBindings, affectedUsers, affectedTools int64
 	if req.BindingID != "" {
 		if bindingID, err := uuid.Parse(req.BindingID); err == nil {
-			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ?", tenantID, bindingID).Count(&affectedBindings)
-			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ? AND user_id IS NOT NULL", tenantID, bindingID).Count(&affectedUsers)
+			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ?", workspaceID, bindingID).Count(&affectedBindings)
+			config.DB.Table("role_bindings").Where("workspace_id = ? AND id = ? AND user_id IS NOT NULL", workspaceID, bindingID).Count(&affectedUsers)
 		}
 	}
 	if req.ScopeID != "" {
 		if scopeID, err := uuid.Parse(req.ScopeID); err == nil {
 			config.DB.Table("mcp_tool_scope_map mtsm").
 				Joins("JOIN mcp_tools t ON t.id = mtsm.tool_id").
-				Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scopeID, tenantID, rs.ID).
+				Where("mtsm.scope_id = ? AND t.workspace_id = ? AND t.resource_server_id = ?", scopeID, workspaceID, rs.ID).
 				Count(&affectedTools)
 		}
 	}
@@ -3216,23 +3216,23 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 }
 
 func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), tenantID.String())
+	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
 	}
 	var toolsCount, scopesCount, rolesCount, bindingsCount int64
-	config.DB.Table("mcp_tools").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&toolsCount)
-	config.DB.Table("oauth_scopes").Where("workspace_id = ? AND resource_server_id = ?", tenantID, rs.ID).Count(&scopesCount)
-	config.DB.Table("roles").Where("workspace_id = ? AND name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
+	config.DB.Table("mcp_tools").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&toolsCount)
+	config.DB.Table("oauth_scopes").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&scopesCount)
+	config.DB.Table("roles").Where("workspace_id = ? AND name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
 	config.DB.Table("role_bindings rb").
 		Joins("JOIN roles r ON r.id = rb.role_id").
-		Where("rb.workspace_id = ? AND r.name LIKE ?", tenantID, "rs-"+rs.ID.String()+":%").
+		Where("rb.workspace_id = ? AND r.name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").
 		Count(&bindingsCount)
 	c.JSON(http.StatusAccepted, gin.H{
 		"export_id":    uuid.NewString(),

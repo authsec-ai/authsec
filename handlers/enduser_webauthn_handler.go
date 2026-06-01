@@ -40,8 +40,8 @@ type EndUserWebAuthnHandler struct {
 // resolveDB provides the database connection for end-user operations.
 // Single-DB mode: there is no per-tenant database — everything lives in the
 // one global DB (config.DB).
-func (h *EndUserWebAuthnHandler) resolveDB(tenantID string) (*gorm.DB, error) {
-	if tenantID == "" {
+func (h *EndUserWebAuthnHandler) resolveDB(workspaceID string) (*gorm.DB, error) {
+	if workspaceID == "" {
 		return nil, fmt.Errorf("workspace id is required")
 	}
 	if config.DB != nil {
@@ -51,8 +51,8 @@ func (h *EndUserWebAuthnHandler) resolveDB(tenantID string) (*gorm.DB, error) {
 }
 
 // getTenantSessionManager creates a tenant-specific session manager
-func (h *EndUserWebAuthnHandler) getTenantSessionManager(tenantID string) (SessionManagerInterface, error) {
-	tenantDB, err := h.resolveDB(tenantID)
+func (h *EndUserWebAuthnHandler) getTenantSessionManager(workspaceID string) (SessionManagerInterface, error) {
+	tenantDB, err := h.resolveDB(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to tenant DB: %w", err)
 	}
@@ -252,15 +252,15 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 
 // GetMFAStatusForLoginGET returns MFA status for end-user login via GET
 func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
-	tenantID := c.Query("workspace_id")
+	workspaceID := c.Query("workspace_id")
 	email := c.Query("email")
 
-	if tenantID == "" || email == "" {
+	if workspaceID == "" || email == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email query parameters are required"})
 		return
 	}
 
-	tenantDB, err := h.resolveDB(tenantID)
+	tenantDB, err := h.resolveDB(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "db connect failed"})
 		return
@@ -268,7 +268,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 	// Get end user by email and tenant
 	clientRepo := repositories.NewClientRepository(tenantDB)
-	user, err := clientRepo.GetClientByEmailAndTenant(&email, &tenantID, nil)
+	user, err := clientRepo.GetClientByEmailAndTenant(&email, &workspaceID, nil)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -295,7 +295,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	}
 
 	globalRepo := repositories.NewGlobalRepository(globalDB)
-	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(tenantID)
+	customDomain, err := globalRepo.GetVerifiedCustomDomainForTenant(workspaceID)
 	if err != nil {
 		log.Printf("GetMFAStatusForLoginGET: Error checking custom domain: %v", err)
 	}
@@ -385,8 +385,8 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 			// Parse tenant_id and client_id as UUIDs
 			tenantUUID, err := uuid.Parse(req.WorkspaceID)
 			if err != nil {
-				log.Printf("BeginRegistration: Invalid tenant_id format: %v", err)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid tenant_id format"})
+				log.Printf("BeginRegistration: Invalid workspace_id format: %v", err)
+				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid workspace_id format"})
 				return
 			}
 

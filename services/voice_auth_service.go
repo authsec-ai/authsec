@@ -57,7 +57,7 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 	}
 
 	// Look up tenant_id from tenant_mappings table using client_id
-	tenantID, err := s.tenantMapping(clientID)
+	workspaceID, err := s.tenantMapping(clientID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve tenant from client_id: %w", err)
 	}
@@ -86,7 +86,7 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 	// Create voice session
 	session := &models.VoiceSession{
 		ID:            uuid.New(),
-		WorkspaceID:      tenantID,
+		WorkspaceID:      workspaceID,
 		ClientID:      &clientID, // Store client_id from request
 		SessionToken:  sessionToken,
 		VoiceOTP:      voiceOTP,
@@ -348,7 +348,7 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 }
 
 // LinkVoiceIdentity links a voice assistant to a user account
-func (s *VoiceAuthService) LinkVoiceIdentity(tenantID uuid.UUID, userID uuid.UUID, userEmail string, req *models.VoiceLinkRequest) (*models.VoiceLinkResponse, error) {
+func (s *VoiceAuthService) LinkVoiceIdentity(workspaceID uuid.UUID, userID uuid.UUID, userEmail string, req *models.VoiceLinkRequest) (*models.VoiceLinkResponse, error) {
 	// Voice platform accepts any string for flexibility (alexa, google, siri, web, custom, etc.)
 	if req.VoicePlatform == "" {
 		return &models.VoiceLinkResponse{
@@ -358,7 +358,7 @@ func (s *VoiceAuthService) LinkVoiceIdentity(tenantID uuid.UUID, userID uuid.UUI
 	}
 
 	// Check if already linked
-	existing, err := s.voiceRepo.FindVoiceIdentityLink(tenantID, req.VoicePlatform, req.VoiceUserID)
+	existing, err := s.voiceRepo.FindVoiceIdentityLink(workspaceID, req.VoicePlatform, req.VoiceUserID)
 	if err == nil && existing.IsActive {
 		return &models.VoiceLinkResponse{
 			Success: false,
@@ -370,7 +370,7 @@ func (s *VoiceAuthService) LinkVoiceIdentity(tenantID uuid.UUID, userID uuid.UUI
 	// Create link
 	link := &models.VoiceIdentityLink{
 		ID:            uuid.New(),
-		WorkspaceID:      tenantID,
+		WorkspaceID:      workspaceID,
 		VoicePlatform: req.VoicePlatform,
 		VoiceUserID:   req.VoiceUserID,
 		VoiceUserName: req.VoiceUserName,
@@ -395,8 +395,8 @@ func (s *VoiceAuthService) LinkVoiceIdentity(tenantID uuid.UUID, userID uuid.UUI
 }
 
 // UnlinkVoiceIdentity removes a voice assistant link
-func (s *VoiceAuthService) UnlinkVoiceIdentity(tenantID uuid.UUID, req *models.VoiceUnlinkRequest) (*models.VoiceUnlinkResponse, error) {
-	err := s.voiceRepo.DeactivateVoiceIdentityLink(tenantID, req.VoicePlatform, req.VoiceUserID)
+func (s *VoiceAuthService) UnlinkVoiceIdentity(workspaceID uuid.UUID, req *models.VoiceUnlinkRequest) (*models.VoiceUnlinkResponse, error) {
+	err := s.voiceRepo.DeactivateVoiceIdentityLink(workspaceID, req.VoicePlatform, req.VoiceUserID)
 	if err != nil {
 		return &models.VoiceUnlinkResponse{
 			Success: false,
@@ -411,8 +411,8 @@ func (s *VoiceAuthService) UnlinkVoiceIdentity(tenantID uuid.UUID, req *models.V
 }
 
 // ListVoiceLinks lists all voice assistant links for a user
-func (s *VoiceAuthService) ListVoiceLinks(tenantID uuid.UUID, userID uuid.UUID) (*models.VoiceLinksListResponse, error) {
-	links, err := s.voiceRepo.ListVoiceIdentityLinks(tenantID, userID)
+func (s *VoiceAuthService) ListVoiceLinks(workspaceID uuid.UUID, userID uuid.UUID) (*models.VoiceLinksListResponse, error) {
+	links, err := s.voiceRepo.ListVoiceIdentityLinks(workspaceID, userID)
 	if err != nil {
 		return &models.VoiceLinksListResponse{Links: []models.VoiceIdentityLinkPublic{}}, nil
 	}

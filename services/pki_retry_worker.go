@@ -47,12 +47,12 @@ func (w *PKIRetryWorker) retryFailedTenants() {
 	defer rows.Close()
 
 	for rows.Next() {
-		var tenantID, name, domain string
-		if err := rows.Scan(&tenantID, &name, &domain); err != nil {
+		var workspaceID, name, domain string
+		if err := rows.Scan(&workspaceID, &name, &domain); err != nil {
 			log.Printf("PKI retry worker: failed to scan tenant row: %v", err)
 			continue
 		}
-		w.retryTenantPKI(tenantID, name, domain)
+		w.retryTenantPKI(workspaceID, name, domain)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -61,32 +61,32 @@ func (w *PKIRetryWorker) retryFailedTenants() {
 }
 
 // retryTenantPKI retries PKI provisioning for a single tenant
-func (w *PKIRetryWorker) retryTenantPKI(tenantID, name, domain string) {
-	log.Printf("PKI retry worker: retrying PKI provisioning for tenant %s (%s)", tenantID, name)
+func (w *PKIRetryWorker) retryTenantPKI(workspaceID, name, domain string) {
+	log.Printf("PKI retry worker: retrying PKI provisioning for tenant %s (%s)", workspaceID, name)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	resp, err := w.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		CommonName: name,
 		Domain:     domain,
 		TTL:        "87600h",
 		MaxTTL:     "24h",
 	})
 	if err != nil {
-		log.Printf("PKI retry worker: failed to provision PKI for tenant %s: %v", tenantID, err)
+		log.Printf("PKI retry worker: failed to provision PKI for tenant %s: %v", workspaceID, err)
 		return
 	}
 
 	_, err = w.db.Exec(
 		"UPDATE workspaces SET vault_mount = $1, ca_cert = $2, status = 'active', updated_at = NOW() WHERE workspace_id = $3",
-		resp.PKIMount, resp.CACert, tenantID,
+		resp.PKIMount, resp.CACert, workspaceID,
 	)
 	if err != nil {
-		log.Printf("PKI retry worker: failed to update tenant %s after successful provisioning: %v", tenantID, err)
+		log.Printf("PKI retry worker: failed to update tenant %s after successful provisioning: %v", workspaceID, err)
 		return
 	}
 
-	log.Printf("PKI retry worker: successfully provisioned PKI for tenant %s", tenantID)
+	log.Printf("PKI retry worker: successfully provisioned PKI for tenant %s", workspaceID)
 }

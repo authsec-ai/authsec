@@ -303,20 +303,20 @@ func ValidateClientID(clientID string) error {
 }
 
 // ValidateTenantID validates tenant ID (typically UUID or alphanumeric)
-func ValidateTenantID(tenantID string) error {
-	if tenantID == "" {
+func ValidateTenantID(workspaceID string) error {
+	if workspaceID == "" {
 		return fmt.Errorf("tenant ID is required")
 	}
 
-	tenantID = strings.TrimSpace(tenantID)
+	workspaceID = strings.TrimSpace(workspaceID)
 
 	// Try UUID format first
-	if uuidRegex.MatchString(tenantID) {
+	if uuidRegex.MatchString(workspaceID) {
 		return nil
 	}
 
 	// Otherwise allow alphanumeric with hyphens/underscores
-	if !tenantIDRegex.MatchString(tenantID) {
+	if !tenantIDRegex.MatchString(workspaceID) {
 		return fmt.Errorf("tenant ID must be a valid UUID or alphanumeric identifier (3-50 characters)")
 	}
 

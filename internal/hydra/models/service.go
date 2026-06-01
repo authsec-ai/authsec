@@ -183,9 +183,9 @@ func DecodeJWTToken(tokenString string) (*JWTClaims, error) {
 }
 
 func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) (*User, error) {
-	tenantID := users.WorkspaceID
+	workspaceID := users.WorkspaceID
 	clientID := users.ClientID
-	tenantIDStr := tenantID.String()
+	tenantIDStr := workspaceID.String()
 
 	if tenantIDStr == "" {
 		return nil, fmt.Errorf("missing workspace_id in JWT token")
@@ -199,7 +199,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	var existingUser User
 	err := db.Table("users").Where(
 		"provider = ? AND provider_id = ? AND workspace_id = ?",
-		users.Provider, users.ProviderID, tenantID,
+		users.Provider, users.ProviderID, workspaceID,
 	).First(&existingUser).Error
 
 	now := time.Now()
@@ -219,7 +219,7 @@ func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) 
 	user := &User{
 		ID:           uuid.New(),
 		ClientID:     clientID,
-		WorkspaceID:  tenantID,
+		WorkspaceID:  workspaceID,
 		Name:         *users.Username,
 		Username:     nil,
 		Email:        users.Email,

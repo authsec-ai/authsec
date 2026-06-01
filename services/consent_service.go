@@ -35,7 +35,7 @@ func NewConsentService(db *gorm.DB) *ConsentService {
 //   - stale true: a grant existed but was revoked (RBAC or RS withdrawal detected)
 //   - err non-nil: unexpected DB error (ErrRecordNotFound is normalized to nil, false, nil)
 func (s *ConsentService) CheckExistingConsent(
-	tenantID, userID, clientID, resourceServerID uuid.UUID,
+	workspaceID, userID, clientID, resourceServerID uuid.UUID,
 	requestedScopes []string,
 	userEffectiveScopes []string,
 	rsSupportedScopes []string,
@@ -43,7 +43,7 @@ func (s *ConsentService) CheckExistingConsent(
 	var grant models.OAuthConsentGrant
 	err := s.db.Where(
 		"workspace_id = ? AND user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
-		tenantID, userID, clientID, resourceServerID, time.Now(),
+		workspaceID, userID, clientID, resourceServerID, time.Now(),
 	).First(&grant).Error
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -107,7 +107,7 @@ func (s *ConsentService) CheckExistingConsent(
 // UpsertConsent creates or updates a consent grant for the given (user x client x RS).
 // If a grant already exists, it's updated with the new scopes and TTL.
 func (s *ConsentService) UpsertConsent(
-	tenantID, userID, clientID, resourceServerID uuid.UUID,
+	workspaceID, userID, clientID, resourceServerID uuid.UUID,
 	grantedScopes []string,
 	ttl time.Duration,
 ) (*models.OAuthConsentGrant, error) {
@@ -116,7 +116,7 @@ func (s *ConsentService) UpsertConsent(
 	}
 
 	grant := models.OAuthConsentGrant{
-		WorkspaceID:         tenantID,
+		WorkspaceID:         workspaceID,
 		UserID:           userID,
 		ClientID:         clientID,
 		ResourceServerID: resourceServerID,
@@ -171,11 +171,11 @@ func (s *ConsentService) RevokeConsentByUser(grantID, userID uuid.UUID) error {
 	return result.Error
 }
 
-// RevokeConsentByTenant revokes a consent grant only when it belongs to tenantID (admin path).
-func (s *ConsentService) RevokeConsentByTenant(grantID, tenantID uuid.UUID) error {
+// RevokeConsentByTenant revokes a consent grant only when it belongs to workspaceID (admin path).
+func (s *ConsentService) RevokeConsentByTenant(grantID, workspaceID uuid.UUID) error {
 	now := time.Now()
 	result := s.db.Model(&models.OAuthConsentGrant{}).
-		Where("id = ? AND workspace_id = ? AND revoked_at IS NULL", grantID, tenantID).
+		Where("id = ? AND workspace_id = ? AND revoked_at IS NULL", grantID, workspaceID).
 		Update("revoked_at", now)
 	if result.Error != nil {
 		return result.Error
@@ -187,18 +187,18 @@ func (s *ConsentService) RevokeConsentByTenant(grantID, tenantID uuid.UUID) erro
 }
 
 // ListByUser returns all active (non-revoked) consent grants for a user.
-func (s *ConsentService) ListByUser(tenantID, userID uuid.UUID) ([]models.OAuthConsentGrant, error) {
+func (s *ConsentService) ListByUser(workspaceID, userID uuid.UUID) ([]models.OAuthConsentGrant, error) {
 	var grants []models.OAuthConsentGrant
 	err := s.db.Where(
 		"workspace_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?",
-		tenantID, userID, time.Now(),
+		workspaceID, userID, time.Now(),
 	).Order("created_at DESC").Find(&grants).Error
 	return grants, err
 }
 
 // ListByTenant returns all consent grants for a tenant (admin view), with optional filters.
-func (s *ConsentService) ListByTenant(tenantID uuid.UUID, userID, clientID, rsID *uuid.UUID) ([]models.OAuthConsentGrant, error) {
-	query := s.db.Where("workspace_id = ?", tenantID)
+func (s *ConsentService) ListByTenant(workspaceID uuid.UUID, userID, clientID, rsID *uuid.UUID) ([]models.OAuthConsentGrant, error) {
+	query := s.db.Where("workspace_id = ?", workspaceID)
 	if userID != nil {
 		query = query.Where("user_id = ?", *userID)
 	}

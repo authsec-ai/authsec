@@ -143,12 +143,12 @@ func applicationRoleLabelForAdmin(roleName string) string {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.createRole(c, config.DB, services.NewRBACService(config.DB), *tenantID, true)
+	rc.createRole(c, config.DB, services.NewRBACService(config.DB), *workspaceID, true)
 }
 
 // ListRolesAdmin godoc
@@ -166,12 +166,12 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeAdmin(c *gin.Context
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.listRoles(c, config.DB, *tenantID)
+	rc.listRoles(c, config.DB, *workspaceID)
 }
 
 // GetRoleAdmin godoc
@@ -188,15 +188,15 @@ func (rc *RolesScopedBindingsController) ListRolesAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/roles/{role_id} [get]
 func (rc *RolesScopedBindingsController) GetRoleAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.getRole(c, config.DB, *tenantID)
+	rc.getRole(c, config.DB, *workspaceID)
 }
 
-func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID) {
 	roleIDStr := c.Param("role_id")
 	roleID, err := uuid.Parse(roleIDStr)
 	if err != nil {
@@ -205,15 +205,15 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 	}
 
 	// Frontend may pass the tenant ID as the path param expecting a list of roles for that tenant.
-	if roleID == tenantID {
-		rc.listRoles(c, db, tenantID)
+	if roleID == workspaceID {
+		rc.listRoles(c, db, workspaceID)
 		return
 	}
 
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 
 	var role models.RBACRole
-	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found"})
 		return
 	}
@@ -226,7 +226,7 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 	freshDB.Table("role_permissions rp").
 		Select("p.resource, p.action").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("rp.role_id = ? AND p.workspace_id = ?", roleID, tenantID).
+		Where("rp.role_id = ? AND p.workspace_id = ?", roleID, workspaceID).
 		Find(&permRows)
 
 	permissions := make([]string, 0, len(permRows))
@@ -242,7 +242,7 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 		Select("DISTINCT os.scope_string").
 		Joins("JOIN oauth_scope_permissions osp ON rp.permission_id = osp.permission_id").
 		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
-		Where("rp.role_id = ? AND os.workspace_id = ?", roleID, tenantID).
+		Where("rp.role_id = ? AND os.workspace_id = ?", roleID, workspaceID).
 		Order("os.scope_string ASC").
 		Find(&scopeRows)
 
@@ -259,7 +259,7 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 	freshDB.Table("role_bindings rb").
 		Select("DISTINCT rb.user_id, COALESCE(u.username, '') AS username").
 		Joins("LEFT JOIN users u ON rb.user_id = u.id").
-		Where("rb.role_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL", roleID, tenantID).
+		Where("rb.role_id = ? AND rb.workspace_id = ? AND rb.user_id IS NOT NULL", roleID, workspaceID).
 		Scan(&userRows)
 
 	userIDs := make([]string, 0, len(userRows))
@@ -297,12 +297,12 @@ func (rc *RolesScopedBindingsController) getRole(c *gin.Context, db *gorm.DB, te
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.updateRole(c, config.DB, *tenantID)
+	rc.updateRole(c, config.DB, *workspaceID)
 }
 
 // DeleteRoleAdmin godoc
@@ -318,12 +318,12 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeAdmin(c *gin.Context
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/admin/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.deleteRole(c, config.DB, *tenantID)
+	rc.deleteRole(c, config.DB, *workspaceID)
 }
 
 // DeleteRoleBindingAdmin removes a single role binding by id. Phase H-6: this is
@@ -356,7 +356,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) 
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	tenantID := *tenantIDPtr
+	workspaceID := *tenantIDPtr
 
 	bindingID, err := uuid.Parse(c.Param("binding_id"))
 	if err != nil {
@@ -378,7 +378,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) 
 		  FROM role_bindings rb
 		  LEFT JOIN roles r ON r.id = rb.role_id
 		 WHERE rb.id = ? AND rb.workspace_id = ?`,
-		bindingID, tenantID).Scan(&row).Error
+		bindingID, workspaceID).Scan(&row).Error
 	if err != nil || row.RoleID == uuid.Nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "binding not found"})
 		return
@@ -402,9 +402,9 @@ func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) 
 
 	// Delete. We don't wrap in a transaction since this is a single-row delete;
 	// if it 0-affects, the binding was already gone (likely a double-click in the UI).
-	res := config.DB.Where("id = ? AND workspace_id = ?", bindingID, tenantID).Delete(&models.RoleBinding{})
+	res := config.DB.Where("id = ? AND workspace_id = ?", bindingID, workspaceID).Delete(&models.RoleBinding{})
 	if res.Error != nil {
-		log.Printf("ERROR: DeleteRoleBindingAdmin: delete failed binding=%s ws=%s: %v", bindingID, tenantID, res.Error)
+		log.Printf("ERROR: DeleteRoleBindingAdmin: delete failed binding=%s ws=%s: %v", bindingID, workspaceID, res.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete binding"})
 		return
 	}
@@ -423,7 +423,7 @@ func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) 
 	// access-token TTL to expire).
 	if row.UserID != nil {
 		oauthAS := services.NewOAuthASService(config.DB)
-		go oauthAS.RevokeUserTokensForWorkspace(*row.UserID, tenantID)
+		go oauthAS.RevokeUserTokensForWorkspace(*row.UserID, workspaceID)
 	}
 
 	middlewares.Audit(c, "role_binding", bindingID.String(), "delete", &middlewares.AuditChanges{
@@ -455,12 +455,12 @@ func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) 
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.assignRoleScoped(c, config.DB, services.NewRBACService(config.DB), *tenantID)
+	rc.assignRoleScoped(c, config.DB, services.NewRBACService(config.DB), *workspaceID)
 }
 
 // ListRoleBindingsAdmin godoc
@@ -477,12 +477,12 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
-	tenantID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	rc.listRoleBindings(c, config.DB, *tenantID)
+	rc.listRoleBindings(c, config.DB, *workspaceID)
 }
 
 // --- End-user endpoints (tenant DB) ---
@@ -501,14 +501,14 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles [post]
 func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -526,14 +526,14 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/roles [get]
 func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -557,14 +557,14 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/roles/{role_id} [put]
 func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -586,14 +586,14 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /uflow/user/rbac/roles/{role_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -614,14 +614,14 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 // @Failure 401 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [post]
 func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -643,14 +643,14 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 // @Failure 500 {object} map[string]string
 // @Router /uflow/user/rbac/bindings [get]
 func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context) {
-	tenantID := c.GetString("workspace_id")
-	if tenantID == "" {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -660,7 +660,7 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context)
 
 // --- Shared helpers ---
 
-func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB, rbac *services.RBACService, tenantID uuid.UUID, isAdmin bool) {
+func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB, rbac *services.RBACService, workspaceID uuid.UUID, isAdmin bool) {
 	var req CreateRoleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
@@ -674,7 +674,7 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 
 	permUUIDs := make([]uuid.UUID, 0)
 	if len(req.PermissionIDs) > 0 || len(req.PermissionStrings) > 0 {
-		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
+		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, workspaceID, req.PermissionIDs, req.PermissionStrings)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -684,13 +684,13 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 
 	role := &models.RBACRole{
 		ID:          uuid.New(), // Explicitly generate UUID to ensure it's available in response
-		WorkspaceID:    &tenantID,
+		WorkspaceID:    &workspaceID,
 		Name:        req.Name,
 		Description: req.Description,
 	}
 
 	// Debug: Log role creation details
-	log.Printf("[CreateRole] Creating role '%s' with ID: %s, workspace_id: %s", req.Name, role.ID.String(), tenantID.String())
+	log.Printf("[CreateRole] Creating role '%s' with ID: %s, workspace_id: %s", req.Name, role.ID.String(), workspaceID.String())
 
 	if err := freshRBAC.CreateRoleComposite(role, permUUIDs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create role: " + err.Error()})
@@ -722,7 +722,7 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 	_ = isAdmin
 }
 
-func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID) {
 	resourceFilter := c.Query("resource")
 	roleFilter := c.Query("role_id")
 	userFilter := c.Query("user_id")
@@ -733,9 +733,9 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 
 	var roles []models.RBACRole
 	// Debug: Log the query parameters
-	log.Printf("[ListRoles] Querying with tenant_id: %s", tenantID.String())
+	log.Printf("[ListRoles] Querying with tenant_id: %s", workspaceID.String())
 
-	roleQuery := freshDB.Where("workspace_id = ?", tenantID)
+	roleQuery := freshDB.Where("workspace_id = ?", workspaceID)
 	if roleFilter != "" {
 		if _, err := uuid.Parse(roleFilter); err == nil {
 			roleQuery = roleQuery.Where("id = ?", roleFilter)
@@ -747,7 +747,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 	}
 
 	// Debug: Log the number of roles found
-	log.Printf("[ListRoles] Found %d roles for tenant_id: %s", len(roles), tenantID.String())
+	log.Printf("[ListRoles] Found %d roles for tenant_id: %s", len(roles), workspaceID.String())
 
 	type permRow struct {
 		RoleID     uuid.UUID
@@ -759,7 +759,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 	permQuery := freshDB.Table("role_permissions rp").
 		Select("rp.role_id, p.resource, p.action, concat(p.resource, ':', p.action) as permission").
 		Joins("JOIN permissions p ON rp.permission_id = p.id").
-		Where("p.workspace_id = ?", tenantID)
+		Where("p.workspace_id = ?", workspaceID)
 	if resourceFilter != "" {
 		permQuery = permQuery.Where("p.resource = ?", resourceFilter)
 	}
@@ -782,7 +782,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 	bindingQuery := freshDB.Table("role_bindings").
 		Select("role_bindings.role_id, COUNT(DISTINCT role_bindings.user_id) AS count, role_bindings.user_id, COALESCE(users.username, '') AS username").
 		Joins("LEFT JOIN users ON role_bindings.user_id = users.id").
-		Where("role_bindings.workspace_id = ? AND role_bindings.user_id IS NOT NULL", tenantID)
+		Where("role_bindings.workspace_id = ? AND role_bindings.user_id IS NOT NULL", workspaceID)
 	if roleFilter != "" {
 		if _, err := uuid.Parse(roleFilter); err == nil {
 			bindingQuery = bindingQuery.Where("role_bindings.role_id = ?", roleFilter)
@@ -835,7 +835,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 	c.JSON(http.StatusOK, resp)
 }
 
-func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID) {
 	roleIDStr := c.Param("role_id")
 	roleID, err := uuid.Parse(roleIDStr)
 	if err != nil {
@@ -855,12 +855,12 @@ func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB,
 	// Capture old values for audit log
 	var oldRole models.RBACRole
 	var oldPermCount int64
-	freshDB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&oldRole)
+	freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&oldRole)
 	freshDB.Model(&models.RolePermission{}).Where("role_id = ?", roleID).Count(&oldPermCount)
 
 	permUUIDs := make([]uuid.UUID, 0)
 	if len(req.PermissionIDs) > 0 || len(req.PermissionStrings) > 0 {
-		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, tenantID, req.PermissionIDs, req.PermissionStrings)
+		resolvedPermUUIDs, err := shared.ResolvePermissionUUIDs(freshDB, workspaceID, req.PermissionIDs, req.PermissionStrings)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -870,7 +870,7 @@ func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB,
 
 	if err := freshDB.Transaction(func(tx *gorm.DB) error {
 		// Ensure role belongs to tenant
-		res := tx.Where("id = ? AND workspace_id = ?", roleID, tenantID).Model(&models.RBACRole{}).
+		res := tx.Where("id = ? AND workspace_id = ?", roleID, workspaceID).Model(&models.RBACRole{}).
 			Updates(map[string]interface{}{
 				"name":        req.Name,
 				"description": req.Description,
@@ -930,7 +930,7 @@ func (rc *RolesScopedBindingsController) updateRole(c *gin.Context, db *gorm.DB,
 	c.JSON(http.StatusOK, resp)
 }
 
-func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *gorm.DB, rbac *services.RBACService, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *gorm.DB, rbac *services.RBACService, workspaceID uuid.UUID) {
 	var req BindingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
@@ -958,7 +958,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 
 	// Validate role exists for tenant and capture role name
 	var role models.RBACRole
-	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found for tenant"})
 		return
 	}
@@ -996,7 +996,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 
 	binding := &models.RoleBinding{
 		ID:         uuid.New(), // Generate UUID in Go, don't rely on DB default
-		WorkspaceID:   &tenantID,
+		WorkspaceID:   &workspaceID,
 		UserID:     &userID,
 		Username:   shared.DerefString(user.Username),
 		RoleID:     roleID,
@@ -1035,7 +1035,7 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 }
 
 // listRoleBindings retrieves role bindings with optional filters
-func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID) {
 	userIDFilter := c.Query("user_id")
 	roleIDFilter := c.Query("role_id")
 	scopeTypeFilter := c.Query("scope_type")
@@ -1069,7 +1069,7 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 			(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
 			OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
 		)`).
-		Where("role_bindings.workspace_id = ?", tenantID)
+		Where("role_bindings.workspace_id = ?", workspaceID)
 
 	if userIDFilter != "" {
 		if uid, err := uuid.Parse(userIDFilter); err == nil {
@@ -1135,7 +1135,7 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 					(role_bindings.scope_type = 'resource_server' AND role_bindings.scope_id = rs.id)
 					OR COALESCE(roles.name, role_bindings.role_name, '') LIKE ('rs-' || rs.id::text || ':%')
 				)`).
-				Where("role_bindings.workspace_id = ?", tenantID)
+				Where("role_bindings.workspace_id = ?", workspaceID)
 
 			if userIDFilter != "" {
 				if uid, parseErr := uuid.Parse(userIDFilter); parseErr == nil {
@@ -1215,7 +1215,7 @@ func (rc *RolesScopedBindingsController) listRoleBindings(c *gin.Context, db *go
 
 	c.JSON(http.StatusOK, result)
 }
-func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB, tenantID uuid.UUID) {
+func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID) {
 	roleIDStr := c.Param("role_id")
 	roleID, err := uuid.Parse(roleIDStr)
 	if err != nil {
@@ -1224,16 +1224,16 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 		return
 	}
 
-	log.Printf("INFO: Deleting role %s for tenant %s", roleID, tenantID)
+	log.Printf("INFO: Deleting role %s for tenant %s", roleID, workspaceID)
 
 	// Use a fresh session to avoid stale transaction states from connection pooling
 	freshDB := db.Session(&gorm.Session{NewDB: true})
 
 	// Verify role exists and belongs to tenant
 	var role models.RBACRole
-	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, tenantID).First(&role).Error; err != nil {
+	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
-			log.Printf("WARN: Role %s not found for tenant %s", roleID, tenantID)
+			log.Printf("WARN: Role %s not found for tenant %s", roleID, workspaceID)
 			c.JSON(http.StatusNotFound, gin.H{"error": "Role not found"})
 			return
 		}
@@ -1251,7 +1251,7 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 	// things the transaction drops.
 	var affectedUserIDs []uuid.UUID
 	freshDB.Model(&models.RoleBinding{}).
-		Where("role_id = ? AND workspace_id = ? AND user_id IS NOT NULL", roleID, tenantID).
+		Where("role_id = ? AND workspace_id = ? AND user_id IS NOT NULL", roleID, workspaceID).
 		Distinct().
 		Pluck("user_id", &affectedUserIDs)
 
@@ -1292,7 +1292,7 @@ func (rc *RolesScopedBindingsController) deleteRole(c *gin.Context, db *gorm.DB,
 	if len(affectedUserIDs) > 0 {
 		oauthAS := services.NewOAuthASService(config.DB)
 		for _, uid := range affectedUserIDs {
-			go oauthAS.RevokeUserTokensForWorkspace(uid, tenantID)
+			go oauthAS.RevokeUserTokensForWorkspace(uid, workspaceID)
 		}
 		log.Printf("INFO: H-5 revoke queued for %d users after role %s deletion", len(affectedUserIDs), roleID)
 	}

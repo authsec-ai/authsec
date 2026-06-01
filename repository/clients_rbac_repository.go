@@ -11,7 +11,7 @@ import (
 
 // ClientsRBACRepository defines the interface for clients RBAC-related operations
 type ClientsRBACRepository interface {
-	GrantUserClientsAccess(ctx context.Context, userID, tenantID uuid.UUID) error
+	GrantUserClientsAccess(ctx context.Context, userID, workspaceID uuid.UUID) error
 }
 
 // clientsRbacRepository implements ClientsRBACRepository
@@ -26,7 +26,7 @@ func NewClientsRBACRepository(db *gorm.DB) ClientsRBACRepository {
 
 // GrantUserClientsAccess ensures the tenant has the necessary 'clients' permissions,
 // an admin role exists, and the user is bound to that role.
-func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, userID, tenantID uuid.UUID) error {
+func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, userID, workspaceID uuid.UUID) error {
 	if r.db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
@@ -48,7 +48,7 @@ func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, user
 
 		for _, p := range permissions {
 			var permID uuid.UUID
-			err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, tenantID).Scan(&permID).Error
+			err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, workspaceID).Scan(&permID).Error
 			if err != nil {
 				return err
 			}
@@ -57,17 +57,17 @@ func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, user
 					INSERT INTO permissions (id, workspace_id, resource, action, description, created_at, updated_at)
 					VALUES (gen_random_uuid(), ?, 'clients', ?, ?, NOW(), NOW())
 					ON CONFLICT (workspace_id, resource, action) DO NOTHING
-				`, tenantID, p.Action, p.Description).Error; err != nil {
+				`, workspaceID, p.Action, p.Description).Error; err != nil {
 					return fmt.Errorf("insert permission (clients:%s): %w", p.Action, err)
 				}
-				if err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, tenantID).Scan(&permID).Error; err != nil {
+				if err := tx.Table("permissions").Select("id").Where("resource = 'clients' AND action = ? AND workspace_id = ?", p.Action, workspaceID).Scan(&permID).Error; err != nil {
 					return err
 				}
 			}
 		}
 
 		var adminRoleID uuid.UUID
-		if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, tenantID).
+		if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, workspaceID).
 			Scan(&adminRoleID).Error; err != nil {
 			return fmt.Errorf("fetch admin role: %w", err)
 		}
@@ -77,17 +77,17 @@ func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, user
 				INSERT INTO roles (id, workspace_id, name, description, is_system, created_at, updated_at)
 				VALUES (?, ?, 'admin', 'Tenant admin', true, NOW(), NOW())
 				ON CONFLICT (workspace_id, name) DO NOTHING
-			`, adminRoleID, tenantID).Error; err != nil {
+			`, adminRoleID, workspaceID).Error; err != nil {
 				return fmt.Errorf("create admin role: %w", err)
 			}
-			if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, tenantID).
+			if err := tx.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND name = 'admin' LIMIT 1`, workspaceID).
 				Scan(&adminRoleID).Error; err != nil {
 				return fmt.Errorf("re-fetch admin role: %w", err)
 			}
 		}
 
 		var permIDs []uuid.UUID
-		if err := tx.Raw(`SELECT id FROM permissions WHERE workspace_id = ? AND resource = 'clients'`, tenantID).
+		if err := tx.Raw(`SELECT id FROM permissions WHERE workspace_id = ? AND resource = 'clients'`, workspaceID).
 			Scan(&permIDs).Error; err != nil {
 			return fmt.Errorf("fetch clients permissions: %w", err)
 		}
@@ -101,11 +101,11 @@ func (r *clientsRbacRepository) GrantUserClientsAccess(ctx context.Context, user
 			INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, conditions, created_at, updated_at)
 			VALUES (gen_random_uuid(), ?, ?, ?, NULL, NULL, '{}'::jsonb, NOW(), NOW())
 			ON CONFLICT DO NOTHING
-		`, tenantID, userID, adminRoleID).Error; err != nil {
+		`, workspaceID, userID, adminRoleID).Error; err != nil {
 			return fmt.Errorf("bind user to admin role: %w", err)
 		}
 
-		log.Printf("[ClientsRBAC] Granted clients access to user %s in tenant %s", userID, tenantID)
+		log.Printf("[ClientsRBAC] Granted clients access to user %s in tenant %s", userID, workspaceID)
 		return nil
 	})
 }

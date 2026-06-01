@@ -69,7 +69,7 @@ type hubSpotSearchResponse struct {
 
 // SyncContact creates or updates a contact in HubSpot.
 // Returns the HubSpot contact ID on success.
-func (s *HubSpotService) SyncContact(email, tenantDomain, tenantID string) (string, error) {
+func (s *HubSpotService) SyncContact(email, tenantDomain, workspaceID string) (string, error) {
 	today := time.Now().Format("2006-01-02")
 
 	// Step 1: Try to create the contact
@@ -77,7 +77,7 @@ func (s *HubSpotService) SyncContact(email, tenantDomain, tenantID string) (stri
 		Properties: hubSpotContactProperties{
 			Email:            email,
 			TenantDomain:     tenantDomain,
-			WorkspaceID:         tenantID,
+			WorkspaceID:         workspaceID,
 			RegistrationDate: today,
 			LifecycleStage:   "lead",
 		},
@@ -100,7 +100,7 @@ func (s *HubSpotService) SyncContact(email, tenantDomain, tenantID string) (stri
 
 		err = s.updateContact(contactID, hubSpotContactProperties{
 			TenantDomain:     tenantDomain,
-			WorkspaceID:         tenantID,
+			WorkspaceID:         workspaceID,
 			RegistrationDate: today,
 		})
 		if err != nil {

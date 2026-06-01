@@ -25,7 +25,7 @@ type Permission struct {
 
 // GetUserPermissions returns structured permissions for a user in JWT-compatible format
 // Uses role_bindings for role assignments (user_roles is deprecated)
-func (ps *PermissionService) GetUserPermissions(userID, tenantID string) []Permission {
+func (ps *PermissionService) GetUserPermissions(userID, workspaceID string) []Permission {
 	query := `
 		SELECT DISTINCT
 			p.resource,
@@ -41,7 +41,7 @@ func (ps *PermissionService) GetUserPermissions(userID, tenantID string) []Permi
 		ORDER BY p.resource, p.action
 	`
 
-	rows, err := ps.db.Query(query, userID, tenantID)
+	rows, err := ps.db.Query(query, userID, workspaceID)
 	if err != nil {
 		log.Printf("Error querying user permissions: %v", err)
 		return []Permission{}
@@ -73,7 +73,7 @@ func (ps *PermissionService) GetUserPermissions(userID, tenantID string) []Permi
 
 // GetUserScopes returns scopes in string format for JWT claims (resource:action format)
 // Uses role_bindings for role assignments (user_roles is deprecated)
-func (ps *PermissionService) GetUserScopes(userID, tenantID string) []string {
+func (ps *PermissionService) GetUserScopes(userID, workspaceID string) []string {
 	query := `
 		SELECT DISTINCT
 			CONCAT(p.resource, ':', p.action) as scope_string
@@ -88,7 +88,7 @@ func (ps *PermissionService) GetUserScopes(userID, tenantID string) []string {
 		ORDER BY scope_string
 	`
 
-	rows, err := ps.db.Query(query, userID, tenantID)
+	rows, err := ps.db.Query(query, userID, workspaceID)
 	if err != nil {
 		log.Printf("Error querying user scopes: %v", err)
 		return []string{}
@@ -110,7 +110,7 @@ func (ps *PermissionService) GetUserScopes(userID, tenantID string) []string {
 
 // ResolvePermissionsFromRoles returns permissions for given role names
 // Uses the main database schema: roles -> role_permissions -> permissions
-func (ps *PermissionService) ResolvePermissionsFromRoles(roleNames []string, tenantID string) ([]Permission, []string) {
+func (ps *PermissionService) ResolvePermissionsFromRoles(roleNames []string, workspaceID string) ([]Permission, []string) {
 	if len(roleNames) == 0 {
 		return []Permission{}, []string{}
 	}
@@ -118,7 +118,7 @@ func (ps *PermissionService) ResolvePermissionsFromRoles(roleNames []string, ten
 	// Create placeholders for IN clause
 	placeholders := make([]string, len(roleNames))
 	args := make([]interface{}, len(roleNames)+1)
-	args[0] = tenantID
+	args[0] = workspaceID
 
 	for i, role := range roleNames {
 		placeholders[i] = fmt.Sprintf("$%d", i+2)

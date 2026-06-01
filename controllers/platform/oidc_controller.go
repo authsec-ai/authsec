@@ -157,12 +157,12 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 	input.TenantDomain = strings.ToLower(strings.TrimSpace(input.TenantDomain))
 
 	var action string
-	var tenantID *uuid.UUID
+	var workspaceID *uuid.UUID
 
 	// Case 1: No tenant domain provided (from app.authsec.dev) - DISCOVER mode
 	if input.TenantDomain == "" {
 		action = "discover"
-		tenantID = nil
+		workspaceID = nil
 		log.Printf("OIDC: No tenant domain, initiating DISCOVER flow for provider '%s'", input.Provider)
 	} else {
 		// Validate tenant domain format when provided
@@ -179,12 +179,12 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 		if err == nil && existingTenant != nil {
 			// Tenant exists → LOGIN flow (user must exist in this tenant)
 			action = "login"
-			tenantID = &existingTenant.WorkspaceID
+			workspaceID = &existingTenant.WorkspaceID
 			log.Printf("OIDC: Tenant '%s' found (tenant_id=%s), initiating LOGIN flow", input.TenantDomain, existingTenant.WorkspaceID)
 		} else {
 			// Tenant doesn't exist → REGISTER flow (create new tenant)
 			action = "register"
-			tenantID = nil
+			workspaceID = nil
 			log.Printf("OIDC: Tenant '%s' not found (error: %v), initiating REGISTER flow", input.TenantDomain, err)
 		}
 	}
@@ -218,7 +218,7 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 	// signup-via-email path; once the workspace exists, the owner configures
 	// OIDC via POST /authsec/identity-providers and subsequent users can log
 	// in via Google/etc.
-	if tenantID == nil {
+	if workspaceID == nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":  "OIDC login requires an existing workspace; specify tenant_domain for a known workspace, or sign up via email first.",
 			"action": action,
@@ -227,7 +227,7 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 	}
 
 	// Initiate OIDC flow
-	response, err := oc.oidcService.InitiateOIDCFlow(&input, action, tenantID)
+	response, err := oc.oidcService.InitiateOIDCFlow(&input, action, workspaceID)
 	if err != nil {
 		log.Printf("Failed to initiate OIDC flow: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -919,11 +919,11 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create new tenant and user
 	// Note: In admin registration pattern, workspace_id = client_id for the default client
-	// tenantID is used for tenant.WorkspaceID (business key)
+	// workspaceID is used for tenant.WorkspaceID (business key)
 	// tenant.ID (primary key) is auto-generated and used for FK references
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	projectID := uuid.New()
-	clientID := tenantID // Client ID = Tenant ID for default client (matches admin registration)
+	clientID := workspaceID // Client ID = Tenant ID for default client (matches admin registration)
 	userID := uuid.New()
 
 	// Start transaction
@@ -938,12 +938,12 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create tenant
 	fullDomain := fmt.Sprintf("%s.%s", state.TenantDomain, config.AppConfig.TenantDomainSuffix)
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(tenantID.String(), "-", "_"))
+	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := userInfo.Email
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
-		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
-		WorkspaceID:  tenantID,
+		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
+		WorkspaceID:  workspaceID,
 		TenantDB:     tenantDBName,
 		Email:        userInfo.Email,
 		Username:     &username,
@@ -974,7 +974,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			Name:         userInfo.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			WorkspaceID:  tenantID,
+			WorkspaceID:  workspaceID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     state.ProviderName,
@@ -997,9 +997,9 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Use EnsureAdminRoleAndPermissionsTx to seed both role AND permissions (fix for OIDC registration bug)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, tenantID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, workspaceID)
 	if err != nil {
-		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", tenantID, err)
+		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", workspaceID, err)
 	} else {
 		// Insert into role_bindings (user_roles is deprecated)
 		// scope_type and scope_id are NULL for tenant-wide role assignments
@@ -1010,7 +1010,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 				SELECT 1 FROM role_bindings
 				WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
 			)
-		`, tenantID, userID, roleID); err != nil {
+		`, workspaceID, userID, roleID); err != nil {
 			log.Printf("WARNING: Failed to assign admin role to OIDC user %s: %v", userID, err)
 			// Non-fatal - user can still login via OIDC, just not via admin password login
 		} else {
@@ -1020,7 +1020,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Create default role bindings in MAIN DB for admin across core services
 	var adminRoleID uuid.UUID
-	if err := tx.QueryRow("SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1", tenantID).Scan(&adminRoleID); err != nil {
+	if err := tx.QueryRow("SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1", workspaceID).Scan(&adminRoleID); err != nil {
 		log.Printf("Failed to resolve admin role id for default bindings: %v", err)
 	} else {
 		services := []string{"external-service", "clients", "user-flow", "ooc-manager", "log-service", "hydra-service", "sdk-manager"}
@@ -1033,8 +1033,8 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 					SELECT 1 FROM role_bindings
 					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = $6 AND scope_id = $7
 				)
-			`, uuid.New(), tenantID, userID, adminRoleID, usernameVal, svc, tenantID); err != nil {
-				log.Printf("WARNING: Failed to create role binding for service=%s tenant=%s: %v", svc, tenantID, err)
+			`, uuid.New(), workspaceID, userID, adminRoleID, usernameVal, svc, workspaceID); err != nil {
+				log.Printf("WARNING: Failed to create role binding for service=%s tenant=%s: %v", svc, workspaceID, err)
 				// Non-fatal - continue with other bindings
 			}
 		}
@@ -1046,8 +1046,8 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 				SELECT 1 FROM role_bindings
 				WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type = '*' AND scope_id IS NULL
 			)
-		`, uuid.New(), tenantID, userID, adminRoleID, usernameVal); err != nil {
-			log.Printf("WARNING: Failed to create wildcard role binding tenant=%s: %v", tenantID, err)
+		`, uuid.New(), workspaceID, userID, adminRoleID, usernameVal); err != nil {
+			log.Printf("WARNING: Failed to create wildcard role binding tenant=%s: %v", workspaceID, err)
 		} else {
 			log.Printf("INFO: Created role bindings for OIDC user %s across all services", userID)
 		}
@@ -1065,13 +1065,13 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 
 	// Provision PKI infrastructure via ICP service
 	if oc.icpProvisioningService != nil {
-		log.Printf("Provisioning PKI for tenant: %s", tenantID.String())
+		log.Printf("Provisioning PKI for tenant: %s", workspaceID.String())
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			WorkspaceID: tenantID.String(),
+			WorkspaceID: workspaceID.String(),
 			CommonName:  fmt.Sprintf("%s Root CA", userInfo.Name),
 			Domain:      fullDomain,
 			TTL:         "87600h", // 10 years
@@ -1080,19 +1080,19 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", workspaceID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, workspaceID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
 	} else {
-		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", tenantID.String())
+		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", workspaceID.String())
 	}
 
 	// Phase A: legacy tenant_mappings bridge deleted. Per OAuth 2.1 + MCP
@@ -1100,7 +1100,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	// The (workspace, user, client, resource_server) relationship lives in
 	// oauth_consent_grants and resource_server_client_registrations.
 	_ = clientID
-	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", tenantID.String(), clientID.String())
+	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", workspaceID.String(), clientID.String())
 
 	// Create OIDC identity link
 	profileDataJSON, _ := json.Marshal(map[string]interface{}{
@@ -1109,7 +1109,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	})
 
 	identity := &models.OIDCUserIdentity{
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		UserID:         userID,
 		ProviderName:   state.ProviderName,
 		ProviderUserID: userInfo.Sub,
@@ -1123,15 +1123,15 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 
 	// Save secret to Vault (best-effort, non-blocking)
-	if _, err := config.SaveSecretToVault(tenantID.String(), tenantID.String()); err != nil {
+	if _, err := config.SaveSecretToVault(workspaceID.String(), workspaceID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
-		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
+		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", workspaceID.String())
 	}
 
 	// Audit log: OIDC registration completed
-	middlewares.Audit(c, "oidc", tenantID.String(), "register", &middlewares.AuditChanges{
+	middlewares.Audit(c, "oidc", workspaceID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"workspace_id":  tenantID.String(),
+			"workspace_id":  workspaceID.String(),
 			"tenant_domain": fullDomain,
 			"user_id":       userID.String(),
 			"email":         userInfo.Email,
@@ -1152,7 +1152,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		"success":       true,
 		"message":       "Registration successful",
 		"tenant_domain": redirectDomain,
-		"workspace_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true,
 	})
@@ -1206,9 +1206,9 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 
 	// Create new tenant and user (similar to handleRegistrationCallback)
 	// Note: In admin registration pattern, workspace_id = client_id for the default client
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	projectID := uuid.New()
-	clientID := tenantID // Client ID = Tenant ID for default client (matches admin registration)
+	clientID := workspaceID // Client ID = Tenant ID for default client (matches admin registration)
 	userID := uuid.New()
 
 	// Start transaction
@@ -1223,12 +1223,12 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 
 	// Create tenant
 	fullDomain := fmt.Sprintf("%s.%s", tenantDomain, config.AppConfig.TenantDomainSuffix)
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(tenantID.String(), "-", "_"))
+	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := input.Email
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
-		ID:           tenantID, // Use same ID for both id and workspace_id for simplicity
-		WorkspaceID:  tenantID,
+		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
+		WorkspaceID:  workspaceID,
 		TenantDB:     tenantDBName,
 		Email:        input.Email,
 		Username:     &username,
@@ -1259,7 +1259,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			Name:         input.Name,
 			PasswordHash: "", // No password for OIDC users
 			ClientID:     clientID,
-			WorkspaceID:  tenantID,
+			WorkspaceID:  workspaceID,
 			ProjectID:    projectID,
 			TenantDomain: fullDomain,
 			Provider:     input.Provider,
@@ -1282,9 +1282,9 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Use EnsureAdminRoleAndPermissionsTx to seed both role AND permissions (fix for OIDC registration bug)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, tenantID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, workspaceID)
 	if err != nil {
-		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", tenantID, err)
+		log.Printf("WARNING: Failed to ensure admin role and permissions for tenant %s: %v", workspaceID, err)
 	} else {
 		// Insert into role_bindings (user_roles is deprecated)
 		// scope_type and scope_id are NULL for tenant-wide role assignments
@@ -1295,7 +1295,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 				SELECT 1 FROM role_bindings
 				WHERE workspace_id = $1 AND user_id = $2 AND role_id = $3 AND scope_type IS NULL AND scope_id IS NULL
 			)
-		`, tenantID, userID, roleID); err != nil {
+		`, workspaceID, userID, roleID); err != nil {
 			log.Printf("WARNING: Failed to assign admin role to OIDC user %s: %v", userID, err)
 		} else {
 			log.Printf("INFO: Admin role assigned to OIDC user %s", userID)
@@ -1314,13 +1314,13 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	// Provision PKI infrastructure via ICP service
 	mainDB := config.GetDatabase()
 	if oc.icpProvisioningService != nil {
-		log.Printf("Provisioning PKI for tenant: %s", tenantID.String())
+		log.Printf("Provisioning PKI for tenant: %s", workspaceID.String())
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
 		icpResp, err := oc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
-			WorkspaceID: tenantID.String(),
+			WorkspaceID: workspaceID.String(),
 			CommonName:  fmt.Sprintf("%s Root CA", input.Name),
 			Domain:      fullDomain,
 			TTL:         "87600h", // 10 years
@@ -1330,19 +1330,19 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		if err != nil {
 			log.Printf("Warning: PKI provisioning failed: %v", err)
 			// Update tenant status to indicate PKI provisioning failure
-			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", tenantID); updateErr != nil {
+			if _, updateErr := mainDB.Exec("UPDATE workspaces SET status = 'pki_provisioning_failed' WHERE workspace_id = $1", workspaceID); updateErr != nil {
 				log.Printf("Failed to update tenant status: %v", updateErr)
 			}
 			// Continue - admin can retry PKI provisioning later
 		} else {
 			log.Printf("Successfully provisioned PKI - Mount: %s", icpResp.PKIMount)
 			// Update tenant with PKI information (vault_mount and ca_cert only)
-			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, tenantID); err != nil {
+			if _, err := mainDB.Exec("UPDATE workspaces SET vault_mount = $1, ca_cert = $2 WHERE workspace_id = $3", icpResp.PKIMount, icpResp.CACert, workspaceID); err != nil {
 				log.Printf("Warning: Failed to update tenant with PKI info: %v", err)
 			}
 		}
 	} else {
-		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", tenantID.String())
+		log.Printf("INFO: ICP provisioning service not configured, skipping PKI setup for tenant %s", workspaceID.String())
 	}
 
 	// Phase A: legacy tenant_mappings bridge deleted. Per OAuth 2.1 + MCP
@@ -1350,7 +1350,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	// The (workspace, user, client, resource_server) relationship lives on
 	// oauth_consent_grants and resource_server_client_registrations.
 	_ = clientID
-	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", tenantID.String(), clientID.String())
+	log.Printf("[oidc] workspace=%s client=%s (no tenant_mappings insert; relationship lives on consent grants)", workspaceID.String(), clientID.String())
 
 	// Create OIDC identity link
 	profileDataJSON, _ := json.Marshal(map[string]interface{}{
@@ -1359,7 +1359,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	})
 
 	identity := &models.OIDCUserIdentity{
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		UserID:         userID,
 		ProviderName:   input.Provider,
 		ProviderUserID: input.ProviderUserID,
@@ -1372,9 +1372,9 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Save secret to Vault (best-effort, non-blocking)
-	if _, err := config.SaveSecretToVault(tenantID.String(), tenantID.String()); err != nil {
+	if _, err := config.SaveSecretToVault(workspaceID.String(), workspaceID.String()); err != nil {
 		log.Printf("Warning: Failed to save secret to vault: %v", err)
-		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", tenantID.String())
+		log.Printf("OIDC registration will continue without Vault secret storage for tenant: %s", workspaceID.String())
 	}
 
 	// Return JSON response without token (frontend should login separately)
@@ -1382,7 +1382,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		"success":       true,
 		"message":       "Registration successful - welcome to your new workspace!",
 		"tenant_domain": fullDomain,
-		"workspace_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true, // Always true for new registrations
 	})
@@ -1407,7 +1407,7 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantID, exists := c.Get("workspace_id")
+	workspaceID, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
@@ -1421,7 +1421,7 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 
 	// Safely extract tenant ID string
 	var tenantIDStr string
-	switch v := tenantID.(type) {
+	switch v := workspaceID.(type) {
 	case uuid.UUID:
 		tenantIDStr = v.String()
 	case string:
@@ -1480,13 +1480,13 @@ func (oc *OIDCController) GetLinkedIdentities(c *gin.Context) {
 		return
 	}
 
-	tenantID, exists := c.Get("workspace_id")
+	workspaceID, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
 	}
 
-	identities, err := oc.oidcService.GetIdentitiesByUser(safeUUID(tenantID), safeUUID(userID))
+	identities, err := oc.oidcService.GetIdentitiesByUser(safeUUID(workspaceID), safeUUID(userID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get identities"})
 		return
@@ -1517,13 +1517,13 @@ func (oc *OIDCController) UnlinkIdentity(c *gin.Context) {
 		return
 	}
 
-	tenantID, exists := c.Get("workspace_id")
+	workspaceID, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
 	}
 
-	if err := oc.oidcService.UnlinkIdentity(safeUUID(tenantID), safeUUID(userID), provider); err != nil {
+	if err := oc.oidcService.UnlinkIdentity(safeUUID(workspaceID), safeUUID(userID), provider); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

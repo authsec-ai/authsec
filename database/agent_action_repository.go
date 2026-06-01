@@ -78,7 +78,7 @@ func (r *AgentActionRepository) CreateRiskPolicy(policy *models.RiskPolicy) erro
 }
 
 // GetRiskPoliciesByTenant retrieves all active risk policies for a tenant, ordered by priority
-func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]models.RiskPolicy, error) {
+func (r *AgentActionRepository) GetRiskPoliciesByTenant(workspaceID uuid.UUID) ([]models.RiskPolicy, error) {
 	query := `
 		SELECT id, workspace_id, name, description,
 		       action_pattern, resource_pattern, environment_pattern,
@@ -91,7 +91,7 @@ func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]m
 		ORDER BY priority DESC, created_at ASC
 	`
 
-	rows, err := r.db.Query(query, tenantID)
+	rows, err := r.db.Query(query, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query risk policies: %w", err)
 	}
@@ -118,7 +118,7 @@ func (r *AgentActionRepository) GetRiskPoliciesByTenant(tenantID uuid.UUID) ([]m
 }
 
 // GetRiskPolicyByID retrieves a single risk policy
-func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, tenantID uuid.UUID) (*models.RiskPolicy, error) {
+func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, workspaceID uuid.UUID) (*models.RiskPolicy, error) {
 	query := `
 		SELECT id, workspace_id, name, description,
 		       action_pattern, resource_pattern, environment_pattern,
@@ -131,7 +131,7 @@ func (r *AgentActionRepository) GetRiskPolicyByID(policyID uuid.UUID, tenantID u
 	`
 
 	var p models.RiskPolicy
-	err := r.db.QueryRow(query, policyID, tenantID).Scan(
+	err := r.db.QueryRow(query, policyID, workspaceID).Scan(
 		&p.ID, &p.WorkspaceID, &p.Name, &p.Description,
 		&p.ActionPattern, &p.ResourcePattern, &p.EnvironmentPattern,
 		&p.BaseScore, &p.ScopeBulkThreshold, &p.ScopeBulkModifier,
@@ -189,14 +189,14 @@ func (r *AgentActionRepository) UpdateRiskPolicy(policy *models.RiskPolicy) erro
 }
 
 // DeleteRiskPolicy soft-deletes a risk policy
-func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, tenantID uuid.UUID) error {
+func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, workspaceID uuid.UUID) error {
 	now := time.Now().Unix()
 	query := `
 		UPDATE risk_policies SET is_active = FALSE, updated_at = $1
 		WHERE id = $2 AND workspace_id = $3
 	`
 
-	result, err := r.db.Exec(query, now, policyID, tenantID)
+	result, err := r.db.Exec(query, now, policyID, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to delete risk policy: %w", err)
 	}
@@ -214,7 +214,7 @@ func (r *AgentActionRepository) DeleteRiskPolicy(policyID uuid.UUID, tenantID uu
 // ========================================
 
 // GetOrCreateSettings retrieves tenant settings, creating defaults if needed
-func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models.AgentGuardSettings, error) {
+func (r *AgentActionRepository) GetOrCreateSettings(workspaceID uuid.UUID) (*models.AgentGuardSettings, error) {
 	query := `
 		SELECT id, workspace_id,
 		       auto_approve_below, require_approval_above, require_multi_approval_above,
@@ -227,7 +227,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 	`
 
 	var s models.AgentGuardSettings
-	err := r.db.QueryRow(query, tenantID).Scan(
+	err := r.db.QueryRow(query, workspaceID).Scan(
 		&s.ID, &s.WorkspaceID,
 		&s.AutoApproveBelow, &s.RequireApprovalAbove, &s.RequireMultiApprovalAbove,
 		&s.ApprovalTimeoutSeconds, &s.PollingIntervalSeconds,
@@ -248,7 +248,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(tenantID uuid.UUID) (*models
 	now := time.Now().Unix()
 	s = models.AgentGuardSettings{
 		ID:                        uuid.New(),
-		WorkspaceID:                  tenantID,
+		WorkspaceID:                  workspaceID,
 		AutoApproveBelow:          30,
 		RequireApprovalAbove:      31,
 		RequireMultiApprovalAbove: 81,
@@ -415,7 +415,7 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 
 // GetPendingActionsByUser returns all non-expired pending action requests for a specific user in a tenant.
 // Filters by both tenant_id and user_id so only the affected user sees their notifications.
-func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
+func (r *AgentActionRepository) GetPendingActionsByUser(workspaceID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
 	now := time.Now().Unix()
 	query := `
 		SELECT id, action_req_id, workspace_id, user_id, user_email,
@@ -430,7 +430,7 @@ func (r *AgentActionRepository) GetPendingActionsByUser(tenantID uuid.UUID, user
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.Query(query, tenantID, userID, now)
+	rows, err := r.db.Query(query, workspaceID, userID, now)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending actions: %w", err)
 	}
@@ -545,7 +545,7 @@ func (r *AgentActionRepository) ExpireOldActionRequests() (int64, error) {
 }
 
 // HasPriorAction checks if an agent has previously executed this action+resource combo
-func (r *AgentActionRepository) HasPriorAction(agentID string, action string, resource string, tenantID uuid.UUID) (bool, error) {
+func (r *AgentActionRepository) HasPriorAction(agentID string, action string, resource string, workspaceID uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS(
 			SELECT 1 FROM agent_action_audit_log
@@ -555,7 +555,7 @@ func (r *AgentActionRepository) HasPriorAction(agentID string, action string, re
 	`
 
 	var exists bool
-	err := r.db.QueryRow(query, agentID, action, resource, tenantID).Scan(&exists)
+	err := r.db.QueryRow(query, agentID, action, resource, workspaceID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("failed to check prior action: %w", err)
 	}
@@ -636,11 +636,11 @@ func (r *AgentActionRepository) CreateAuditEntry(entry *models.AgentActionAuditL
 }
 
 // GetAuditLog retrieves paginated audit entries for a tenant
-func (r *AgentActionRepository) GetAuditLog(tenantID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
+func (r *AgentActionRepository) GetAuditLog(workspaceID uuid.UUID, page, perPage int) ([]models.AgentActionAuditLog, int, error) {
 	// Count total
 	countQuery := `SELECT COUNT(*) FROM agent_action_audit_log WHERE workspace_id = $1`
 	var total int
-	err := r.db.QueryRow(countQuery, tenantID).Scan(&total)
+	err := r.db.QueryRow(countQuery, workspaceID).Scan(&total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count audit entries: %w", err)
 	}
@@ -658,7 +658,7 @@ func (r *AgentActionRepository) GetAuditLog(tenantID uuid.UUID, page, perPage in
 		LIMIT $2 OFFSET $3
 	`
 
-	rows, err := r.db.Query(query, tenantID, perPage, offset)
+	rows, err := r.db.Query(query, workspaceID, perPage, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to query audit log: %w", err)
 	}

@@ -260,7 +260,7 @@ func (eur *EndUserRepository) DeleteUser(id uuid.UUID) error {
 }
 
 // GetUsersByTenant retrieves all users for a tenant from tenant database
-func (eur *EndUserRepository) GetUsersByTenant(tenantID string, limit, offset int) ([]models.User, error) {
+func (eur *EndUserRepository) GetUsersByTenant(workspaceID string, limit, offset int) ([]models.User, error) {
 	query := `
 SELECT id, client_id, workspace_id, project_id, name, username, email,
 password_hash, tenant_domain, provider, provider_id, provider_data,
@@ -272,7 +272,7 @@ ORDER BY created_at DESC
 LIMIT $2 OFFSET $3
 `
 
-	rows, err := eur.executeQuery(query, tenantID, limit, offset)
+	rows, err := eur.executeQuery(query, workspaceID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query users: %w", err)
 	}

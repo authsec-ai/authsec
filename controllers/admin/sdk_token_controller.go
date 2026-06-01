@@ -22,7 +22,7 @@ func NewSDKTokenController() *SDKTokenController {
 // RevokeDelegationToken revokes the active delegation token for an AI agent.
 // POST /uflow/admin/agents/:id/revoke-token
 func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
-	tenantID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -37,7 +37,7 @@ func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
 	tenantDB := config.DB
 
 	result := tenantDB.Model(&models.DelegationToken{}).
-		Where("client_id::text = ? AND workspace_id = ? AND status = 'active'", clientID, tenantID).
+		Where("client_id::text = ? AND workspace_id = ? AND status = 'active'", clientID, workspaceID).
 		Updates(map[string]interface{}{
 			"status":     "revoked",
 			"updated_at": time.Now(),

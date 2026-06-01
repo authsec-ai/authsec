@@ -90,12 +90,12 @@ func NewScopeResolver(db *gorm.DB) *ScopeResolver {
 // Backward-compatible wrapper around ResolveWithReport.
 func (r *ScopeResolver) ResolveGrantableScopes(
 	ctx context.Context,
-	tenantID, userID, resourceServerID string,
+	workspaceID, userID, resourceServerID string,
 	requestedScopes []string,
 	rs *models.ResourceServer,
 	client *models.MCPOAuthClient,
 ) ([]string, error) {
-	report, err := r.ResolveWithReport(ctx, tenantID, userID, resourceServerID, requestedScopes, rs, client)
+	report, err := r.ResolveWithReport(ctx, workspaceID, userID, resourceServerID, requestedScopes, rs, client)
 	if err != nil {
 		return nil, err
 	}
@@ -105,9 +105,9 @@ func (r *ScopeResolver) ResolveGrantableScopes(
 // HasEffectiveScopes reports whether the user currently has any RBAC-derived scopes for the resource server.
 func (r *ScopeResolver) HasEffectiveScopes(
 	ctx context.Context,
-	tenantID, userID, resourceServerID string,
+	workspaceID, userID, resourceServerID string,
 ) (bool, error) {
-	userEffective, err := r.resolveUserEffectiveScopes(ctx, tenantID, userID, resourceServerID)
+	userEffective, err := r.resolveUserEffectiveScopes(ctx, workspaceID, userID, resourceServerID)
 	if err != nil {
 		return false, err
 	}
@@ -118,7 +118,7 @@ func (r *ScopeResolver) HasEffectiveScopes(
 // All controller call sites must pass string-form UUIDs (.String()) to match this API.
 func (r *ScopeResolver) ResolveWithReport(
 	ctx context.Context,
-	tenantID, userID, resourceServerID string,
+	workspaceID, userID, resourceServerID string,
 	requestedScopes []string,
 	rs *models.ResourceServer,
 	client *models.MCPOAuthClient,
@@ -138,10 +138,10 @@ func (r *ScopeResolver) ResolveWithReport(
 	// Resolve user's effective OAuth scopes from RBAC.
 	// Propagate DB/query errors to callers — transient failures must not be silently
 	// converted into empty RBAC sets and misreported as no_rbac_binding diagnostics.
-	userEffective, err := r.resolveUserEffectiveScopes(ctx, tenantID, userID, resourceServerID)
+	userEffective, err := r.resolveUserEffectiveScopes(ctx, workspaceID, userID, resourceServerID)
 	if err != nil {
 		log.Printf("[SCOPE_RESOLVER] RBAC scope resolution failed user=%s tenant=%s rs=%s: %v",
-			userID, tenantID, resourceServerID, err)
+			userID, workspaceID, resourceServerID, err)
 		return nil, fmt.Errorf("resolving user RBAC scopes: %w", err)
 	}
 
@@ -208,11 +208,11 @@ func (r *ScopeResolver) ResolveWithReport(
 // all child scopes like "tools:weather:read" are included.
 func (r *ScopeResolver) resolveUserEffectiveScopes(
 	ctx context.Context,
-	tenantID, userID, resourceServerID string,
+	workspaceID, userID, resourceServerID string,
 ) (map[string]struct{}, error) {
 	result := make(map[string]struct{})
 
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return result, nil // invalid UUID = no scopes (fail-closed)
 	}
@@ -294,7 +294,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 
 // expandWildcards checks if any granted scope is a wildcard (ends with ":*") and expands
 // it to include all child scopes from the oauth_scopes table.
-func (r *ScopeResolver) expandWildcards(ctx context.Context, tenantID, rsID uuid.UUID, effectiveSet map[string]struct{}) {
+func (r *ScopeResolver) expandWildcards(ctx context.Context, workspaceID, rsID uuid.UUID, effectiveSet map[string]struct{}) {
 	var wildcards []string
 	for s := range effectiveSet {
 		if strings.HasSuffix(s, ":*") {
@@ -309,7 +309,7 @@ func (r *ScopeResolver) expandWildcards(ctx context.Context, tenantID, rsID uuid
 	var allScopes []string
 	r.db.WithContext(ctx).
 		Model(&models.OAuthScope{}).
-		Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).
+		Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rsID).
 		Pluck("scope_string", &allScopes)
 
 	for _, scope := range allScopes {

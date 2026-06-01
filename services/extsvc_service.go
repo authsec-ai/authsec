@@ -14,7 +14,7 @@ import (
 
 // ExternalServiceManager handles business logic for external services.
 type ExternalServiceManager interface {
-	Create(input *repositories.ExternalService, clientID, tenantID string, secretData map[string]interface{}) (*repositories.ExternalService, error)
+	Create(input *repositories.ExternalService, clientID, workspaceID string, secretData map[string]interface{}) (*repositories.ExternalService, error)
 	Get(id, clientID string) (*repositories.ExternalService, error)
 	List(clientID string) ([]repositories.ExternalService, error)
 	Update(id, clientID string, in ExternalServiceUpdateInput) (*repositories.ExternalService, error)
@@ -44,7 +44,7 @@ func NewExternalServiceManager(repo repositories.ExternalServiceRepository, vaul
 	return &externalServiceManager{repo: repo, vault: vaultClient}
 }
 
-func (m *externalServiceManager) Create(in *repositories.ExternalService, clientID, tenantID string, secretData map[string]interface{}) (*repositories.ExternalService, error) {
+func (m *externalServiceManager) Create(in *repositories.ExternalService, clientID, workspaceID string, secretData map[string]interface{}) (*repositories.ExternalService, error) {
 	if in.Name == "" || in.AuthType == "" {
 		return nil, errors.New("name and auth_type are required")
 	}
@@ -53,7 +53,7 @@ func (m *externalServiceManager) Create(in *repositories.ExternalService, client
 	}
 
 	serviceID := uuid.NewString()
-	vaultPath := fmt.Sprintf("kv/data/secret/tenants/%s/services/%s", tenantID, serviceID)
+	vaultPath := fmt.Sprintf("kv/data/secret/tenants/%s/services/%s", workspaceID, serviceID)
 
 	in.ID = serviceID
 	in.CreatedBy = clientID

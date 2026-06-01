@@ -187,7 +187,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -202,7 +202,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Link voice assistant
-	resp, err := ctrl.voiceService.LinkVoiceIdentity(tenantID, userID, email, &req)
+	resp, err := ctrl.voiceService.LinkVoiceIdentity(workspaceID, userID, email, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link voice assistant", "details": err.Error()})
 		return
@@ -212,7 +212,7 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	middlewares.Audit(c, "voice_auth", userID.String(), "link", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":        userID.String(),
-			"workspace_id":      tenantID.String(),
+			"workspace_id":      workspaceID.String(),
 			"voice_platform": req.VoicePlatform,
 			"voice_user_id":  req.VoiceUserID,
 		},
@@ -248,14 +248,14 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Unlink voice assistant
-	resp, err := ctrl.voiceService.UnlinkVoiceIdentity(tenantID, &req)
+	resp, err := ctrl.voiceService.UnlinkVoiceIdentity(workspaceID, &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unlink voice assistant", "details": err.Error()})
 		return
@@ -264,7 +264,7 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	// Audit log: Voice assistant unlinked
 	middlewares.Audit(c, "voice_auth", req.VoiceUserID, "unlink", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"workspace_id":      tenantID.String(),
+			"workspace_id":      workspaceID.String(),
 			"voice_platform": req.VoicePlatform,
 			"voice_user_id":  req.VoiceUserID,
 		},
@@ -305,14 +305,14 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// List voice links
-	resp, err := ctrl.voiceService.ListVoiceLinks(tenantID, userID)
+	resp, err := ctrl.voiceService.ListVoiceLinks(workspaceID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list voice links", "details": err.Error()})
 		return
@@ -343,7 +343,7 @@ func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -363,7 +363,7 @@ func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
 	}
 
 	// Get pending device codes from device_codes table
-	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(tenantID, clientID)
+	codes, err := ctrl.deviceRepo.ListPendingDeviceCodes(workspaceID, clientID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get pending codes", "details": err.Error()})
 		return
@@ -441,17 +441,17 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	}
 
 	// Resolve tenant context from JWT claims (set by AuthMiddleware)
-	tenantID := uuid.Nil
+	workspaceID := uuid.Nil
 	tenantDomain := ""
 	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		if tidStr, ok := v.(string); ok && tidStr != "" {
 			if parsed, parseErr := uuid.Parse(tidStr); parseErr == nil {
-				tenantID = parsed
+				workspaceID = parsed
 			}
 		}
 	}
-	if tenantID != uuid.Nil {
-		if t, tErr := ctrl.tenantRepo.GetTenantByID(tenantID.String()); tErr == nil {
+	if workspaceID != uuid.Nil {
+		if t, tErr := ctrl.tenantRepo.GetTenantByID(workspaceID.String()); tErr == nil {
 			tenantDomain = t.TenantDomain
 		}
 	}
@@ -465,7 +465,7 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	}
 
 	// Use existing device service to verify (approve/deny)
-	err = ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, tenantID, tenantDomain, clientID, req.Approve)
+	err = ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approve)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,

@@ -379,11 +379,11 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 }
 
 // GetOrCreateSPCertificate gets or creates SP certificate for tenant
-func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLSPCertificate, error) {
+func (s *OAuthLoginService) GetOrCreateSPCertificate(workspaceID uuid.UUID) (*SAMLSPCertificate, error) {
 	db := config.DB
 
 	var cert SAMLSPCertificate
-	err := db.Where("workspace_id = ?", tenantID).First(&cert).Error
+	err := db.Where("workspace_id = ?", workspaceID).First(&cert).Error
 	if err == nil {
 		return &cert, nil
 	}
@@ -420,7 +420,7 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLS
 
 	encryptedPrivateKey := string(privateKeyPEM)
 	if config.VaultClient != nil {
-		encrypted, err := encryptPrivateKeyWithVault(tenantID.String(), string(privateKeyPEM))
+		encrypted, err := encryptPrivateKeyWithVault(workspaceID.String(), string(privateKeyPEM))
 		if err != nil {
 			log.Printf("WARNING: Failed to encrypt private key with Vault: %v. Storing plaintext.", err)
 		} else {
@@ -431,7 +431,7 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(tenantID uuid.UUID) (*SAMLS
 	}
 
 	newCert := SAMLSPCertificate{
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		Certificate: string(certPEM),
 		PrivateKey:  encryptedPrivateKey,
 		ExpiresAt:   time.Now().AddDate(1, 0, 0),

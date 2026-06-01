@@ -187,7 +187,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant context missing from session"})
 		return
 	}
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -212,7 +212,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 	}
 
 	if err := ctrl.deviceService.AuthorizeDevice(
-		req.UserCode, userID, email, tenantID, tenantDomain, clientID, req.Approved,
+		req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approved,
 	); err != nil {
 		statusCode := http.StatusBadRequest
 		// 404 if code not found / expired
@@ -234,7 +234,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_code": req.UserCode,
 			"user_id":   userID.String(),
-			"workspace_id": tenantID.String(),
+			"workspace_id": workspaceID.String(),
 			"approved":  req.Approved,
 		},
 	})
@@ -277,15 +277,15 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		tenantIDStr, _ = v.(string)
 	}
-	tenantID := uuid.Nil
+	workspaceID := uuid.Nil
 	if tenantIDStr != "" {
 		if parsed, parseErr := uuid.Parse(tenantIDStr); parseErr == nil {
-			tenantID = parsed
+			workspaceID = parsed
 		}
 	}
 
 	tenantDomain := ""
-	if tenantID != uuid.Nil {
+	if workspaceID != uuid.Nil {
 		if t, tErr := ctrl.tenantRepo.GetTenantByID(tenantIDStr); tErr == nil {
 			tenantDomain = t.TenantDomain
 		}
@@ -300,7 +300,7 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 		}
 	}
 
-	if err := ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, tenantID, tenantDomain, clientID, req.Approve); err != nil {
+	if err := ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approve); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to verify device code", "details": err.Error()})
 		return
 	}
@@ -383,22 +383,22 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 	}
 
 	// Step 3: Resolve user in the tenant
-	var tenantID uuid.UUID
+	var workspaceID uuid.UUID
 	if state.WorkspaceID != nil {
-		tenantID = *state.WorkspaceID
+		workspaceID = *state.WorkspaceID
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Could not determine tenant from OIDC state"})
 		return
 	}
 
-	user, err := ctrl.userRepo.GetUserByEmailAndTenant(userInfo.Email, tenantID)
+	user, err := ctrl.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace", "details": err.Error()})
 		return
 	}
 
 	// Step 4: Get tenant info
-	tenant, err := ctrl.tenantRepo.GetTenantByID(tenantID.String())
+	tenant, err := ctrl.tenantRepo.GetTenantByID(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -413,7 +413,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		req.UserCode,
 		user.ID,
 		user.Email,
-		tenantID,
+		workspaceID,
 		tenant.TenantDomain,
 		clientID,
 		true, // approved
@@ -426,7 +426,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		After: map[string]interface{}{
 			"user_code":  req.UserCode,
 			"user_email": user.Email,
-			"workspace_id":  tenantID.String(),
+			"workspace_id":  workspaceID.String(),
 			"method":     "oidc",
 		},
 	})

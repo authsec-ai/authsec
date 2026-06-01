@@ -8,7 +8,7 @@ import (
 )
 
 // encryptPrivateKeyWithVault encrypts a private key using Vault transit engine
-func encryptPrivateKeyWithVault(tenantID, privateKeyPEM string) (string, error) {
+func encryptPrivateKeyWithVault(workspaceID, privateKeyPEM string) (string, error) {
 	if config.VaultClient == nil {
 		return "", fmt.Errorf("Vault client not initialized")
 	}
@@ -17,7 +17,7 @@ func encryptPrivateKeyWithVault(tenantID, privateKeyPEM string) (string, error) 
 
 	data := map[string]interface{}{
 		"plaintext": encodedKey,
-		"context":   base64.StdEncoding.EncodeToString([]byte(tenantID)),
+		"context":   base64.StdEncoding.EncodeToString([]byte(workspaceID)),
 	}
 
 	secret, err := config.VaultClient.Logical().Write("transit/encrypt/saml-sp-keys", data)

@@ -239,9 +239,9 @@ func (h *WebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 // GetMFAStatusForLoginGET returns MFA status for login flow via GET request with query parameters
 func (h *WebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	email := c.Query("email")
-	tenantID := c.Query("workspace_id")
+	workspaceID := c.Query("workspace_id")
 
-	if email == "" || tenantID == "" {
+	if email == "" || workspaceID == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "email and workspace_id query parameters are required"})
 		return
 	}
@@ -254,7 +254,7 @@ func (h *WebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
 	if err := globalDB.Scopes(util.WithUsersMFAMethodArray).
-		Where("email = ? AND workspace_id = ?", email, tenantID).
+		Where("email = ? AND workspace_id = ?", email, workspaceID).
 		First(&userWithJSONMFA).Error; err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return

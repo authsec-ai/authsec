@@ -236,11 +236,11 @@ func (s *ICPProvisioningService) ProvisionPKI(ctx context.Context, req *icp.Prov
 }
 
 // RetryPKIProvisioning retries PKI provisioning for a failed tenant
-func (s *ICPProvisioningService) RetryPKIProvisioning(ctx context.Context, tenantID, commonName, domain string) (*icp.ProvisionPKIResponse, error) {
-	log.Printf("Retrying PKI provisioning for tenant: %s", tenantID)
+func (s *ICPProvisioningService) RetryPKIProvisioning(ctx context.Context, workspaceID, commonName, domain string) (*icp.ProvisionPKIResponse, error) {
+	log.Printf("Retrying PKI provisioning for tenant: %s", workspaceID)
 
 	req := &icp.ProvisionPKIRequest{
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		CommonName: commonName,
 		Domain:     domain,
 		TTL:        "87600h", // 10 years
@@ -252,7 +252,7 @@ func (s *ICPProvisioningService) RetryPKIProvisioning(ctx context.Context, tenan
 
 // UpdateTenantStatusInICP updates tenant status in ICP service.
 // No-op when using in-process service (tenant status is managed directly).
-func (s *ICPProvisioningService) UpdateTenantStatusInICP(ctx context.Context, tenantID, status string) error {
+func (s *ICPProvisioningService) UpdateTenantStatusInICP(ctx context.Context, workspaceID, status string) error {
 	if s.pkiService != nil {
 		// In-process mode: tenant status is updated directly by PKIProvisioningService
 		return nil
@@ -261,8 +261,8 @@ func (s *ICPProvisioningService) UpdateTenantStatusInICP(ctx context.Context, te
 		return nil
 	}
 
-	log.Printf("Updating tenant status in ICP: %s -> %s", tenantID, status)
-	if err := s.icpClient.UpdateTenantStatus(ctx, tenantID, status); err != nil {
+	log.Printf("Updating tenant status in ICP: %s -> %s", workspaceID, status)
+	if err := s.icpClient.UpdateTenantStatus(ctx, workspaceID, status); err != nil {
 		log.Printf("Warning: Failed to update tenant status in ICP: %v", err)
 		return nil
 	}

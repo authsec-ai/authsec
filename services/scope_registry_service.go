@@ -27,7 +27,7 @@ func NewScopeRegistryService(db *gorm.DB) *ScopeRegistryService {
 
 // SyncFromPRM upserts scopes from a PRM scopes_supported list.
 // Auto-discovered scopes get is_auto_discovered=true. Existing admin-created scopes are untouched.
-func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID, scopesSupported []string) ([]models.OAuthScope, error) {
+func (s *ScopeRegistryService) SyncFromPRM(workspaceID, resourceServerID uuid.UUID, scopesSupported []string) ([]models.OAuthScope, error) {
 	var upserted []models.OAuthScope
 
 	for _, scopeStr := range scopesSupported {
@@ -37,7 +37,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 		}
 
 		scope := models.OAuthScope{
-			WorkspaceID:         tenantID,
+			WorkspaceID:         workspaceID,
 			ResourceServerID: &resourceServerID,
 			ScopeString:      scopeStr,
 			DisplayName:      generateDisplayName(scopeStr),
@@ -49,7 +49,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 		// Upsert: create if not exists, don't overwrite admin-edited fields
 		result := s.db.Where(
 			"workspace_id = ? AND resource_server_id = ? AND scope_string = ?",
-			tenantID, resourceServerID, scopeStr,
+			workspaceID, resourceServerID, scopeStr,
 		).FirstOrCreate(&scope)
 
 		if result.Error != nil {
@@ -59,7 +59,7 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 	}
 
 	// Build hierarchy for wildcard scopes
-	if err := s.buildHierarchy(tenantID, resourceServerID); err != nil {
+	if err := s.buildHierarchy(workspaceID, resourceServerID); err != nil {
 		return upserted, fmt.Errorf("build hierarchy: %w", err)
 	}
 
@@ -68,9 +68,9 @@ func (s *ScopeRegistryService) SyncFromPRM(tenantID, resourceServerID uuid.UUID,
 
 // buildHierarchy sets parent_scope_id for scopes that follow the colon-delimited convention.
 // e.g., "tools:weather:read" gets parent "tools:weather:*", which gets parent "tools:*".
-func (s *ScopeRegistryService) buildHierarchy(tenantID, rsID uuid.UUID) error {
+func (s *ScopeRegistryService) buildHierarchy(workspaceID, rsID uuid.UUID) error {
 	var scopes []models.OAuthScope
-	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&scopes).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rsID).Find(&scopes).Error; err != nil {
 		return err
 	}
 
@@ -124,14 +124,14 @@ func findParentScope(scope string) string {
 
 // ResolveHierarchy returns all scope strings that are implied by the given scopes.
 // If granted contains "tools:*", it expands to include "tools:weather:read", "tools:weather:write", etc.
-func (s *ScopeRegistryService) ResolveHierarchy(tenantID, rsID uuid.UUID, grantedScopeStrings []string) ([]string, error) {
+func (s *ScopeRegistryService) ResolveHierarchy(workspaceID, rsID uuid.UUID, grantedScopeStrings []string) ([]string, error) {
 	if len(grantedScopeStrings) == 0 {
 		return nil, nil
 	}
 
 	// Load all scopes for this RS
 	var allScopes []models.OAuthScope
-	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).Find(&allScopes).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rsID).Find(&allScopes).Error; err != nil {
 		return nil, err
 	}
 
@@ -182,12 +182,12 @@ func (s *ScopeRegistryService) Create(scope *models.OAuthScope) error {
 // Returns the parsed UUID on success; returns ErrInvalidParentScope when the parent row
 // is not found (wrong tenant, wrong RS, or simply absent), and a wrapped parse error when
 // the string is not a valid UUID.
-func (s *ScopeRegistryService) ValidateParentScope(parentScopeIDStr string, tenantID uuid.UUID, rsID *uuid.UUID) (uuid.UUID, error) {
+func (s *ScopeRegistryService) ValidateParentScope(parentScopeIDStr string, workspaceID uuid.UUID, rsID *uuid.UUID) (uuid.UUID, error) {
 	pid, err := uuid.Parse(parentScopeIDStr)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("invalid parent_scope_id: %w", err)
 	}
-	q := s.db.Model(&models.OAuthScope{}).Where("id = ? AND workspace_id = ?", pid, tenantID)
+	q := s.db.Model(&models.OAuthScope{}).Where("id = ? AND workspace_id = ?", pid, workspaceID)
 	if rsID != nil {
 		q = q.Where("resource_server_id = ?", *rsID)
 	} else {
@@ -202,11 +202,11 @@ func (s *ScopeRegistryService) ValidateParentScope(parentScopeIDStr string, tena
 }
 
 // applyUpdate applies field updates and ownership-verified permission + parent sync.
-// tenantID is enforced on both parent_scope_id (same tenant+RS domain) and
+// workspaceID is enforced on both parent_scope_id (same tenant+RS domain) and
 // permission_ids (tenant-owned or global). Callers must pass the already-fetched scope.
 func (s *ScopeRegistryService) applyUpdate(
 	scope *models.OAuthScope,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	req *models.UpdateOAuthScopeRequest,
 ) (*models.OAuthScope, error) {
 	updates := map[string]interface{}{}
@@ -223,7 +223,7 @@ func (s *ScopeRegistryService) applyUpdate(
 		updates["risk_level"] = req.RiskLevel
 	}
 	if req.ParentScopeID != "" {
-		pid, err := s.ValidateParentScope(req.ParentScopeID, tenantID, scope.ResourceServerID)
+		pid, err := s.ValidateParentScope(req.ParentScopeID, workspaceID, scope.ResourceServerID)
 		if err != nil {
 			return nil, err
 		}
@@ -250,10 +250,10 @@ func (s *ScopeRegistryService) applyUpdate(
 			// Never remove this filter — it prevents cross-tenant permission bridges.
 			var count int64
 			s.db.Model(&models.RBACPermission{}).
-				Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, tenantID).
+				Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, workspaceID).
 				Count(&count)
 			if count == 0 {
-				log.Printf("[SCOPE_REGISTRY] applyUpdate: skipping permission %s (not owned by tenant %s)", pid, tenantID)
+				log.Printf("[SCOPE_REGISTRY] applyUpdate: skipping permission %s (not owned by tenant %s)", pid, workspaceID)
 				continue
 			}
 			s.db.Create(&models.OAuthScopePermission{ScopeID: scope.ID, PermissionID: pid})
@@ -273,21 +273,21 @@ func (s *ScopeRegistryService) Update(scopeID uuid.UUID, req *models.UpdateOAuth
 	return s.applyUpdate(&scope, scope.WorkspaceID, req)
 }
 
-// UpdateByTenant updates scope metadata only when the scope belongs to tenantID.
+// UpdateByTenant updates scope metadata only when the scope belongs to workspaceID.
 func (s *ScopeRegistryService) UpdateByTenant(
-	scopeID, tenantID uuid.UUID,
+	scopeID, workspaceID uuid.UUID,
 	req *models.UpdateOAuthScopeRequest,
 ) (*models.OAuthScope, error) {
 	var scope models.OAuthScope
-	if err := s.db.First(&scope, "id = ? AND workspace_id = ?", scopeID, tenantID).Error; err != nil {
+	if err := s.db.First(&scope, "id = ? AND workspace_id = ?", scopeID, workspaceID).Error; err != nil {
 		return nil, fmt.Errorf("scope not found")
 	}
-	return s.applyUpdate(&scope, tenantID, req)
+	return s.applyUpdate(&scope, workspaceID, req)
 }
 
-// DeleteByTenant removes a scope only when it belongs to tenantID.
-func (s *ScopeRegistryService) DeleteByTenant(scopeID, tenantID uuid.UUID) error {
-	result := s.db.Where("id = ? AND workspace_id = ?", scopeID, tenantID).Delete(&models.OAuthScope{})
+// DeleteByTenant removes a scope only when it belongs to workspaceID.
+func (s *ScopeRegistryService) DeleteByTenant(scopeID, workspaceID uuid.UUID) error {
+	result := s.db.Where("id = ? AND workspace_id = ?", scopeID, workspaceID).Delete(&models.OAuthScope{})
 	if result.Error != nil {
 		return result.Error
 	}
@@ -298,9 +298,9 @@ func (s *ScopeRegistryService) DeleteByTenant(scopeID, tenantID uuid.UUID) error
 }
 
 // LinkPermissionsTenantScoped writes oauth_scope_permissions rows for a newly created scope,
-// skipping any permission ID that doesn't belong to tenantID and isn't a global permission.
+// skipping any permission ID that doesn't belong to workspaceID and isn't a global permission.
 // This is the only sanctioned write path to oauth_scope_permissions from external caller input.
-func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, tenantID uuid.UUID, permIDs []string) {
+func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, workspaceID uuid.UUID, permIDs []string) {
 	for _, pidStr := range permIDs {
 		pid, err := uuid.Parse(pidStr)
 		if err != nil {
@@ -310,10 +310,10 @@ func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, tenantID uui
 		// Never remove this filter — it prevents cross-tenant permission bridges.
 		var count int64
 		s.db.Model(&models.RBACPermission{}).
-			Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, tenantID).
+			Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", pid, workspaceID).
 			Count(&count)
 		if count == 0 {
-			log.Printf("[SCOPE_REGISTRY] LinkPermissions: skipping permission %s (not owned by tenant %s)", pid, tenantID)
+			log.Printf("[SCOPE_REGISTRY] LinkPermissions: skipping permission %s (not owned by tenant %s)", pid, workspaceID)
 			continue
 		}
 		s.db.Create(&models.OAuthScopePermission{ScopeID: scopeID, PermissionID: pid})
@@ -326,10 +326,10 @@ func (s *ScopeRegistryService) Delete(scopeID uuid.UUID) error {
 }
 
 // ListByResourceServer returns all scopes for an RS.
-func (s *ScopeRegistryService) ListByResourceServer(tenantID, rsID uuid.UUID) ([]models.OAuthScope, error) {
+func (s *ScopeRegistryService) ListByResourceServer(workspaceID, rsID uuid.UUID) ([]models.OAuthScope, error) {
 	var scopes []models.OAuthScope
 	err := s.db.Preload("Permissions").Preload("ChildScopes").
-		Where("workspace_id = ? AND resource_server_id = ?", tenantID, rsID).
+		Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rsID).
 		Order("scope_string").
 		Find(&scopes).Error
 	return scopes, err
@@ -345,7 +345,7 @@ func (s *ScopeRegistryService) GetByID(scopeID uuid.UUID) (*models.OAuthScope, e
 
 // GetScopesByPermissions returns OAuth scopes that map to the given permission IDs.
 // This is the reverse lookup: permission → scope (used during token resolution).
-func (s *ScopeRegistryService) GetScopesByPermissions(tenantID, rsID uuid.UUID, permissionIDs []uuid.UUID) ([]string, error) {
+func (s *ScopeRegistryService) GetScopesByPermissions(workspaceID, rsID uuid.UUID, permissionIDs []uuid.UUID) ([]string, error) {
 	if len(permissionIDs) == 0 {
 		return nil, nil
 	}
@@ -353,7 +353,7 @@ func (s *ScopeRegistryService) GetScopesByPermissions(tenantID, rsID uuid.UUID, 
 	var scopeStrings []string
 	err := s.db.Model(&models.OAuthScope{}).
 		Joins("JOIN oauth_scope_permissions osp ON osp.scope_id = oauth_scopes.id").
-		Where("oauth_scopes.workspace_id = ? AND oauth_scopes.resource_server_id = ?", tenantID, rsID).
+		Where("oauth_scopes.workspace_id = ? AND oauth_scopes.resource_server_id = ?", workspaceID, rsID).
 		Where("osp.permission_id IN ?", permissionIDs).
 		Distinct().
 		Pluck("scope_string", &scopeStrings).Error

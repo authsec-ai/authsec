@@ -117,7 +117,7 @@ func (s *TOTPService) generateTOTP(secret string, t int64) string {
 // ============================
 
 // RegisterDevice initiates TOTP device registration
-func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email string, deviceName string, deviceType string) (*models.TOTPRegistrationResponse, error) {
+func (s *TOTPService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID, email string, deviceName string, deviceType string) (*models.TOTPRegistrationResponse, error) {
 	// Generate TOTP secret
 	secret, err := s.GenerateSecret()
 	if err != nil {
@@ -137,7 +137,7 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 	device := &models.TOTPSecret{
 		ID:         uuid.New(),
 		UserID:     userID,
-		WorkspaceID:   tenantID,
+		WorkspaceID:   workspaceID,
 		Secret:     secret,
 		DeviceName: deviceName,
 		DeviceType: deviceType,
@@ -154,7 +154,7 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 	for _, code := range backupCodes {
 		backupCode := &models.BackupCode{
 			UserID:   userID,
-			WorkspaceID: tenantID,
+			WorkspaceID: workspaceID,
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
@@ -174,9 +174,9 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 }
 
 // ConfirmRegistration confirms TOTP device registration after QR code scan
-func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, tenantID uuid.UUID, totpCode string) (*models.TOTPRegistrationConfirmResponse, error) {
+func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID, totpCode string) (*models.TOTPRegistrationConfirmResponse, error) {
 	// Get device
-	device, err := s.totpRepo.GetTOTPSecretByID(deviceID, userID, tenantID)
+	device, err := s.totpRepo.GetTOTPSecretByID(deviceID, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("device not found")
 	}
@@ -190,7 +190,7 @@ func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, 
 	device.IsActive = true
 
 	// If user has no other active devices, make this primary
-	existingDevices, err := s.totpRepo.GetUserTOTPSecrets(userID, tenantID)
+	existingDevices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
 	if err == nil && len(existingDevices) == 0 {
 		device.IsPrimary = true
 	}
@@ -209,9 +209,9 @@ func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, 
 }
 
 // VerifyTOTP validates a TOTP code for authentication
-func (s *TOTPService) VerifyTOTP(userID uuid.UUID, tenantID uuid.UUID, totpCode string) (bool, error) {
+func (s *TOTPService) VerifyTOTP(userID uuid.UUID, workspaceID uuid.UUID, totpCode string) (bool, error) {
 	// Get user's TOTP devices
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, tenantID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
 	if err != nil {
 		return false, err
 	}
@@ -229,9 +229,9 @@ func (s *TOTPService) VerifyTOTP(userID uuid.UUID, tenantID uuid.UUID, totpCode 
 }
 
 // VerifyBackupCode validates a backup code for authentication
-func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, tenantID uuid.UUID, code string) (bool, error) {
+func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, workspaceID uuid.UUID, code string) (bool, error) {
 	// Get user's backup codes
-	codes, err := s.totpRepo.GetUserBackupCodes(userID, tenantID)
+	codes, err := s.totpRepo.GetUserBackupCodes(userID, workspaceID)
 	if err != nil {
 		return false, err
 	}
@@ -252,30 +252,30 @@ func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, tenantID uuid.UUID, cod
 }
 
 // GetUserDevices retrieves user's registered TOTP devices
-func (s *TOTPService) GetUserDevices(userID uuid.UUID, tenantID uuid.UUID) ([]models.TOTPSecret, error) {
-	return s.totpRepo.GetUserTOTPSecrets(userID, tenantID)
+func (s *TOTPService) GetUserDevices(userID uuid.UUID, workspaceID uuid.UUID) ([]models.TOTPSecret, error) {
+	return s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
 }
 
 // DeleteDevice deletes a TOTP device
-func (s *TOTPService) DeleteDevice(deviceID uuid.UUID, userID uuid.UUID, tenantID uuid.UUID) error {
+func (s *TOTPService) DeleteDevice(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID) error {
 	// Check if this is the only device
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, tenantID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
 	if err == nil && len(devices) == 1 {
 		return fmt.Errorf("cannot delete the last device. Disable 2FA instead")
 	}
 
-	return s.totpRepo.DeleteTOTPSecret(deviceID, userID, tenantID)
+	return s.totpRepo.DeleteTOTPSecret(deviceID, userID, workspaceID)
 }
 
 // SetPrimaryDevice sets a device as primary
-func (s *TOTPService) SetPrimaryDevice(deviceID uuid.UUID, userID uuid.UUID, tenantID uuid.UUID) error {
-	return s.totpRepo.SetPrimaryTOTPSecret(deviceID, userID, tenantID)
+func (s *TOTPService) SetPrimaryDevice(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID) error {
+	return s.totpRepo.SetPrimaryTOTPSecret(deviceID, userID, workspaceID)
 }
 
 // RegenerateBackupCodes regenerates backup codes for a user
-func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, tenantID uuid.UUID) ([]string, error) {
+func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, workspaceID uuid.UUID) ([]string, error) {
 	// Delete existing codes
-	if err := s.totpRepo.DeleteBackupCodes(userID, tenantID); err != nil {
+	if err := s.totpRepo.DeleteBackupCodes(userID, workspaceID); err != nil {
 		return nil, err
 	}
 
@@ -289,7 +289,7 @@ func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, tenantID uuid.UUID
 	for _, code := range backupCodes {
 		backupCode := &models.BackupCode{
 			UserID:   userID,
-			WorkspaceID: tenantID,
+			WorkspaceID: workspaceID,
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
@@ -337,8 +337,8 @@ func (s *TOTPService) LoginWithTOTPWithUser(user *models.ExtendedUser, totpCode 
 }
 
 // HasTOTPEnabled checks if user has TOTP enabled
-func (s *TOTPService) HasTOTPEnabled(userID uuid.UUID, tenantID uuid.UUID) (bool, error) {
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, tenantID)
+func (s *TOTPService) HasTOTPEnabled(userID uuid.UUID, workspaceID uuid.UUID) (bool, error) {
+	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
 	if err != nil {
 		return false, err
 	}

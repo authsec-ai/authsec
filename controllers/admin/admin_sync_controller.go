@@ -309,14 +309,14 @@ func (asc *AdminSyncController) SyncEntraAdminUsers(c *gin.Context) {
 
 // syncADUserToMainDB syncs an AD user to the main database as an admin user and creates/updates tenant record
 // Returns (created bool, error) where created=true means new user, created=false means updated existing user
-func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
+func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return false, fmt.Errorf("database not initialized")
 	}
 
 	// Get the existing tenant to copy its configuration
-	existingTenant, err := asc.tenantRepo.GetTenantByTenantID(tenantID.String())
+	existingTenant, err := asc.tenantRepo.GetTenantByTenantID(workspaceID.String())
 	if err != nil {
 		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
@@ -337,7 +337,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, adUser.Email, adUser.ObjectGUID, tenantID).Scan(
+	err = db.DB.QueryRow(query, adUser.Email, adUser.ObjectGUID, workspaceID).Scan(
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &tenantIDVal, &projectIDStr,
 		&tenantDomain, &provider, &providerID, &providerData,
@@ -434,7 +434,7 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 			Username:     adUser.Username,
 			Name:         adUser.DisplayName,
 			ClientID:     clientID,
-			WorkspaceID:     &tenantID,
+			WorkspaceID:     &workspaceID,
 			ProjectID:    projectID,
 			Provider:     "ad_sync",
 			ProviderID:   adUser.UserPrincipalName,
@@ -503,14 +503,14 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, tenantI
 
 // syncEntraUserToMainDB syncs an Entra ID user to the main database as an admin user and creates/updates tenant record
 // Returns (created bool, error) where created=true means new user, created=false means updated existing user
-func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUser, tenantID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
+func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) (bool, error) {
 	db := config.GetDatabase()
 	if db == nil {
 		return false, fmt.Errorf("database not initialized")
 	}
 
 	// Get the existing tenant to copy its configuration
-	existingTenant, err := asc.tenantRepo.GetTenantByTenantID(tenantID.String())
+	existingTenant, err := asc.tenantRepo.GetTenantByTenantID(workspaceID.String())
 	if err != nil {
 		return false, fmt.Errorf("failed to get tenant configuration: %w", err)
 	}
@@ -531,7 +531,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 	var mfaEnrolledAt, lastSyncAt, lastLogin sql.NullTime
 	var mfaMethodBytes []byte
 
-	err = db.DB.QueryRow(query, entraUser.Mail, entraUser.ID, tenantID).Scan(
+	err = db.DB.QueryRow(query, entraUser.Mail, entraUser.ID, workspaceID).Scan(
 		&existingUser.ID, &existingUser.Email, &username, &passwordHash,
 		&name, &clientIDStr, &tenantIDVal, &projectIDStr,
 		&tenantDomain, &provider, &providerID, &providerData,
@@ -632,7 +632,7 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 			Username:     entraUser.MailNickname,
 			Name:         entraUser.DisplayName,
 			ClientID:     clientID,
-			WorkspaceID:     &tenantID,
+			WorkspaceID:     &workspaceID,
 			ProjectID:    projectID,
 			Provider:     "entra_id",
 			ProviderID:   entraUser.UserPrincipalName,
@@ -774,7 +774,7 @@ func (asc *AdminSyncController) createTenantForAdminUser(adminUser *models.Admin
 }
 
 // loadStoredADConfig loads AD configuration from database and decrypts credentials
-func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (models.ADSyncConfig, error) {
+func (asc *AdminSyncController) loadStoredADConfig(configID, workspaceID string) (models.ADSyncConfig, error) {
 	var syncConfig models.SyncConfiguration
 
 	// Parse UUIDs
@@ -782,9 +782,9 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (m
 	if err != nil {
 		return models.ADSyncConfig{}, fmt.Errorf("invalid config_id format")
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return models.ADSyncConfig{}, fmt.Errorf("invalid tenant_id format")
+		return models.ADSyncConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
 
 	// Fetch configuration from database, gated on identity_providers status
@@ -829,7 +829,7 @@ func (asc *AdminSyncController) loadStoredADConfig(configID, tenantID string) (m
 }
 
 // loadStoredEntraConfig loads Entra ID configuration from database and decrypts credentials
-func (asc *AdminSyncController) loadStoredEntraConfig(configID, tenantID string) (shared.EntraIDConfig, error) {
+func (asc *AdminSyncController) loadStoredEntraConfig(configID, workspaceID string) (shared.EntraIDConfig, error) {
 	var syncConfig models.SyncConfiguration
 
 	// Parse UUIDs
@@ -837,9 +837,9 @@ func (asc *AdminSyncController) loadStoredEntraConfig(configID, tenantID string)
 	if err != nil {
 		return shared.EntraIDConfig{}, fmt.Errorf("invalid config_id format")
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return shared.EntraIDConfig{}, fmt.Errorf("invalid tenant_id format")
+		return shared.EntraIDConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
 
 	// Fetch configuration from database

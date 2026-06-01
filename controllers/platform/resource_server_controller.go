@@ -52,7 +52,7 @@ func (ctrl *ResourceServerController) ScopePresets(c *gin.Context) {
 // Create registers a new resource server.
 // POST /authsec/resource-servers
 func (ctrl *ResourceServerController) Create(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -63,7 +63,7 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	req.WorkspaceID = tenantID
+	req.WorkspaceID = workspaceID
 
 	if req.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
@@ -87,7 +87,7 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_created", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_created", "resource_server",
 		resp.ID, http.StatusCreated, nil,
 		map[string]interface{}{"name": req.Name, "url": req.PublicBaseURL})
 	c.JSON(http.StatusCreated, resp)
@@ -96,13 +96,13 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 // List returns all resource servers for the tenant.
 // GET /authsec/resource-servers
 func (ctrl *ResourceServerController) List(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
-	servers, err := ctrl.service.ListByTenant(tenantID.String())
+	servers, err := ctrl.service.ListByTenant(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -110,7 +110,7 @@ func (ctrl *ResourceServerController) List(c *gin.Context) {
 
 	summaries := make([]resourceServerSummaryResponse, 0, len(servers))
 	for i := range servers {
-		summary, buildErr := ctrl.buildSummary(&servers[i], tenantID.String())
+		summary, buildErr := ctrl.buildSummary(&servers[i], workspaceID.String())
 		if buildErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": buildErr.Error()})
 			return
@@ -124,19 +124,19 @@ func (ctrl *ResourceServerController) List(c *gin.Context) {
 // Get returns a single resource server by ID (tenant-scoped).
 // GET /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Get(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	id := c.Param("id")
-	rs, err := ctrl.service.GetByIDAndTenant(id, tenantID.String())
+	rs, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
-	summary, err := ctrl.buildSummary(rs, tenantID.String())
+	summary, err := ctrl.buildSummary(rs, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -147,7 +147,7 @@ func (ctrl *ResourceServerController) Get(c *gin.Context) {
 // Update modifies a resource server (tenant-scoped).
 // PUT /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Update(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -176,13 +176,13 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 		return
 	}
 
-	rs, err := ctrl.service.UpdateByTenant(id, tenantID.String(), updates)
+	rs, err := ctrl.service.UpdateByTenant(id, workspaceID.String(), updates)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_updated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_updated", "resource_server",
 		id, http.StatusOK, nil, updates)
 	c.JSON(http.StatusOK, rs)
 }
@@ -190,18 +190,18 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 // Delete removes a resource server (tenant-scoped).
 // DELETE /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Delete(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	id := c.Param("id")
-	if err := ctrl.service.DeleteByTenant(id, tenantID.String()); err != nil {
+	if err := ctrl.service.DeleteByTenant(id, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
-	auditAdminMutation(c, tenantID.String(), "rs_deleted", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_deleted", "resource_server",
 		id, http.StatusNoContent, nil, nil)
 	c.JSON(http.StatusNoContent, nil)
 }
@@ -209,14 +209,14 @@ func (ctrl *ResourceServerController) Delete(c *gin.Context) {
 // RotateIntrospectionSecret generates a new introspection secret for an RS.
 // POST /authsec/resource-servers/:id/rotate-introspection-secret
 func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	id := c.Param("id")
-	secret, err := ctrl.service.RotateIntrospectionSecret(id, tenantID.String())
+	secret, err := ctrl.service.RotateIntrospectionSecret(id, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -225,7 +225,7 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 	// Drift event: every SDK runtime that holds the OLD introspection secret
 	// will start failing token validation against AuthSec until it picks up
 	// the rotated value. Surface this in the workspace banner for ready RSes.
-	if rs, getErr := ctrl.service.GetByIDAndTenant(id, tenantID.String()); getErr == nil &&
+	if rs, getErr := ctrl.service.GetByIDAndTenant(id, workspaceID.String()); getErr == nil &&
 		rs != nil && rs.State == models.RSStateReady {
 		_ = ctrl.driftService.EmitEvent(
 			config.DB, rs.ID, models.DriftEventSecretRotated,
@@ -234,7 +234,7 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 		)
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_introspection_secret_rotated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_introspection_secret_rotated", "resource_server",
 		id, http.StatusOK, nil, nil) // never log the secret value
 	c.JSON(http.StatusOK, gin.H{"introspection_secret": secret})
 }
@@ -242,14 +242,14 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 // PreRegisterClient pre-registers an OAuth client for a resource server.
 // POST /authsec/resource-servers/:id/clients
 func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -272,7 +272,7 @@ func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_client_preregistered", "oauth_client",
+	auditAdminMutation(c, workspaceID.String(), "rs_client_preregistered", "oauth_client",
 		client.ClientID, http.StatusCreated, nil,
 		map[string]interface{}{"rs_id": rsID, "client_name": client.ClientName})
 	c.JSON(http.StatusCreated, gin.H{
@@ -284,14 +284,14 @@ func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 // ListClients lists all registered OAuth clients for a resource server.
 // GET /authsec/resource-servers/:id/clients
 func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	_, err = ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	_, err = ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -309,19 +309,19 @@ func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
 // GetAccessPolicy returns the default access policy and role options for a resource server.
 // GET /authsec/resource-servers/:id/access-policy
 func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	if _, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String()); err != nil {
+	if _, err := ctrl.service.GetByIDAndTenant(rsID, workspaceID.String()); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
-	policy, err := ctrl.onboardingService.GetAccessPolicy(rsID, tenantID.String())
+	policy, err := ctrl.onboardingService.GetAccessPolicy(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -333,21 +333,21 @@ func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
 // UpdateAccessPolicy persists the backend-owned default access policy for a resource server.
 // PUT /authsec/resource-servers/:id/access-policy
 func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
 	// Capture the prior enabled state so we can detect a transition to disabled.
-	priorPolicy, _ := ctrl.onboardingService.GetAccessPolicy(rsID, tenantID.String())
+	priorPolicy, _ := ctrl.onboardingService.GetAccessPolicy(rsID, workspaceID.String())
 	priorEnabled := priorPolicy != nil && priorPolicy.Enabled
 
 	var req services.UpdateResourceServerAccessPolicyRequest
@@ -356,7 +356,7 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 		return
 	}
 
-	policy, err := ctrl.onboardingService.UpdateAccessPolicy(rsID, tenantID.String(), req)
+	policy, err := ctrl.onboardingService.UpdateAccessPolicy(rsID, workspaceID.String(), req)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -374,7 +374,7 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 		)
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_access_policy_updated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_access_policy_updated", "resource_server",
 		rsID, http.StatusOK, nil, policy)
 	c.JSON(http.StatusOK, policy)
 }
@@ -382,14 +382,14 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 // Validate runs live onboarding checks and persists the most recent validation state.
 // POST /authsec/resource-servers/:id/validate
 func (ctrl *ResourceServerController) Validate(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -401,7 +401,7 @@ func (ctrl *ResourceServerController) Validate(c *gin.Context) {
 		return
 	}
 
-	accessPolicyEnabled, _, err := ctrl.onboardingService.GetAccessPolicySummary(rsID, tenantID.String())
+	accessPolicyEnabled, _, err := ctrl.onboardingService.GetAccessPolicySummary(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -413,17 +413,17 @@ func (ctrl *ResourceServerController) Validate(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_validated", "resource_server",
+	auditAdminMutation(c, workspaceID.String(), "rs_validated", "resource_server",
 		rsID, http.StatusOK, nil, result)
 	c.JSON(http.StatusOK, result)
 }
 
-func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, tenantID string) (*resourceServerSummaryResponse, error) {
+func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, workspaceID string) (*resourceServerSummaryResponse, error) {
 	clientCount, err := ctrl.onboardingService.CountRegisteredClients(rs.ID)
 	if err != nil {
 		return nil, err
 	}
-	accessPolicyEnabled, accessPolicyRoleName, err := ctrl.onboardingService.GetAccessPolicySummary(rs.ID.String(), tenantID)
+	accessPolicyEnabled, accessPolicyRoleName, err := ctrl.onboardingService.GetAccessPolicySummary(rs.ID.String(), workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -439,14 +439,14 @@ func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, te
 // RevokeClient revokes a client's registration for a resource server.
 // DELETE /authsec/resource-servers/:id/clients/:client_id
 func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	_, err = ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	_, err = ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -458,7 +458,7 @@ func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_client_revoked", "oauth_client",
+	auditAdminMutation(c, workspaceID.String(), "rs_client_revoked", "oauth_client",
 		clientID, http.StatusOK, nil, map[string]interface{}{"rs_id": rsID})
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
@@ -466,14 +466,14 @@ func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 // ApproveRedirects approves pending CIMD redirect URI changes for a client.
 // PUT /authsec/resource-servers/:rs_id/clients/:client_id/approve-redirects
 func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
 	}
 
 	rsID := c.Param("id")
-	_, err = ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	_, err = ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
@@ -485,7 +485,7 @@ func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "rs_client_redirects_approved", "oauth_client",
+	auditAdminMutation(c, workspaceID.String(), "rs_client_redirects_approved", "oauth_client",
 		clientID, http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "redirects approved"})
 }
@@ -501,14 +501,14 @@ func extractTenantID(c *gin.Context) (uuid.UUID, error) {
 // TestLogin runs both OAuth and SDK diagnostic surfaces for an RS.
 // POST /authsec/resource-servers/:id/test-login
 func (ctrl *ResourceServerController) TestLogin(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required"})
 		return
 	}
 
 	rsID := c.Param("id")
-	rs, err := ctrl.service.GetByIDAndTenant(rsID, tenantID.String())
+	rs, err := ctrl.service.GetByIDAndTenant(rsID, workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return

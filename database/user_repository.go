@@ -234,7 +234,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 }
 
 // GetUserByEmailAndTenant retrieves a user by email scoped to a tenant
-func (ur *UserRepository) GetUserByEmailAndTenant(email string, tenantID uuid.UUID) (*models.ExtendedUser, error) {
+func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
@@ -250,7 +250,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, tenantID uuid.UU
 	var mfaEnrolledAt, lastLoginAt sql.NullTime
 	var mfaMethod pq.StringArray
 
-	err := ur.db.QueryRow(query, email, tenantID).Scan(
+	err := ur.db.QueryRow(query, email, workspaceID).Scan(
 		&user.ID,
 		&user.ClientID,
 		&user.WorkspaceID,
@@ -534,7 +534,7 @@ func (ur *UserRepository) UpdateUserPassword(userID uuid.UUID, passwordHash stri
 }
 
 // GetUsersByTenantID retrieves users by tenant ID with pagination
-func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
+func (ur *UserRepository) GetUsersByTenantID(workspaceID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
@@ -547,7 +547,7 @@ func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset i
 		LIMIT $2 OFFSET $3
 	`
 
-	rows, err := ur.db.Query(query, tenantID, limit, offset)
+	rows, err := ur.db.Query(query, workspaceID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -620,11 +620,11 @@ func (ur *UserRepository) GetUsersByTenantID(tenantID uuid.UUID, limit, offset i
 }
 
 // CountUsersByTenantID counts users for a tenant
-func (ur *UserRepository) CountUsersByTenantID(tenantID uuid.UUID) (int, error) {
+func (ur *UserRepository) CountUsersByTenantID(workspaceID uuid.UUID) (int, error) {
 	query := `SELECT COUNT(*) FROM users WHERE workspace_id = $1`
 
 	var count int
-	err := ur.db.QueryRow(query, tenantID).Scan(&count)
+	err := ur.db.QueryRow(query, workspaceID).Scan(&count)
 	return count, err
 }
 

@@ -41,6 +41,7 @@ func NewBillingClient(baseURL, sdkSecret string) *BillingClient {
 // Returns allowed=true, limit=-1 when billing service is not configured (OSS mode).
 // Fails open on network errors so a billing outage never blocks user registration.
 func (c *BillingClient) CheckTotalUsers(ctx context.Context, workspaceID string, currentCount int) (*MAUEntitlementResponse, error) {
+func (c *BillingClient) CheckTotalUsers(ctx context.Context, workspaceID string, currentCount int) (*MAUEntitlementResponse, error) {
 	if c.baseURL == "" {
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, nil
 	}
@@ -50,7 +51,7 @@ func (c *BillingClient) CheckTotalUsers(ctx context.Context, workspaceID string,
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, fmt.Errorf("billing: generate service token: %w", err)
 	}
 
-	body, _ := json.Marshal(map[string]any{"workspace_id": workspaceID, "current_count": currentCount})
+	body, _ := json.Marshal(map[string]any{"tenant_id": workspaceID, "current_count": currentCount})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/api/v1/billing/entitlement/total-users", bytes.NewReader(body))
 	if err != nil {

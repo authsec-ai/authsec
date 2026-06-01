@@ -453,12 +453,12 @@ func (asc *ADSyncController) mapLDAPEntryToUser(entry *ldap.Entry) models.ADUser
 	}
 }
 
-func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models.ADUser, tenantID string, clientID string, projectID string) error {
+func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models.ADUser, workspaceID string, clientID string, projectID string) error {
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -604,12 +604,12 @@ func (asc *ADSyncController) AgentSyncUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUser models.AgentUserData, tenantID, projectID string, clientID string) error {
+func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUser models.AgentUserData, workspaceID, projectID string, clientID string) error {
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -684,7 +684,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 }
 
 // loadStoredADConfig loads AD configuration from database and decrypts credentials
-func (asc *ADSyncController) loadStoredADConfig(configID, tenantID, clientID string) (models.ADSyncConfig, error) {
+func (asc *ADSyncController) loadStoredADConfig(configID, workspaceID, clientID string) (models.ADSyncConfig, error) {
 	// Import utils package for decryption
 	var syncConfig models.SyncConfiguration
 
@@ -693,9 +693,9 @@ func (asc *ADSyncController) loadStoredADConfig(configID, tenantID, clientID str
 	if err != nil {
 		return models.ADSyncConfig{}, fmt.Errorf("invalid config_id format")
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
-		return models.ADSyncConfig{}, fmt.Errorf("invalid tenant_id format")
+		return models.ADSyncConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {

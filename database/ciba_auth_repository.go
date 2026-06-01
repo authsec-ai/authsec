@@ -70,7 +70,7 @@ func (r *CIBAAuthRepository) CreateDeviceToken(token *models.DeviceToken) error 
 }
 
 // GetDeviceTokensByUserID retrieves all active device tokens for a user
-func (r *CIBAAuthRepository) GetDeviceTokensByUserID(userID uuid.UUID, tenantID uuid.UUID) ([]models.DeviceToken, error) {
+func (r *CIBAAuthRepository) GetDeviceTokensByUserID(userID uuid.UUID, workspaceID uuid.UUID) ([]models.DeviceToken, error) {
 	query := `
 		SELECT id, user_id, workspace_id, device_token, platform,
 		       device_name, device_model, app_version, os_version,
@@ -80,7 +80,7 @@ func (r *CIBAAuthRepository) GetDeviceTokensByUserID(userID uuid.UUID, tenantID 
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.Query(query, userID, tenantID)
+	rows, err := r.db.Query(query, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query device tokens: %w", err)
 	}
@@ -273,7 +273,7 @@ func (r *CIBAAuthRepository) DeleteExpiredRequests(olderThan time.Duration) (int
 // ========================================
 
 // DeactivateDeviceToken deactivates a device token (soft delete)
-func (r *CIBAAuthRepository) DeactivateDeviceToken(tokenID, userID, tenantID uuid.UUID) error {
+func (r *CIBAAuthRepository) DeactivateDeviceToken(tokenID, userID, workspaceID uuid.UUID) error {
 	now := time.Now().Unix()
 	query := `
 		UPDATE device_tokens
@@ -281,7 +281,7 @@ func (r *CIBAAuthRepository) DeactivateDeviceToken(tokenID, userID, tenantID uui
 		WHERE id = $2 AND user_id = $3 AND workspace_id = $4
 	`
 
-	result, err := r.db.Exec(query, now, tokenID, userID, tenantID)
+	result, err := r.db.Exec(query, now, tokenID, userID, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to deactivate device token: %w", err)
 	}

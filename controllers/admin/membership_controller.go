@@ -68,7 +68,7 @@ func parseTenantID(c *gin.Context) (uuid.UUID, bool) {
 	raw := c.Param("workspace_id")
 	id, err := uuid.Parse(raw)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id", "detail": err.Error()})
 		return uuid.Nil, false
 	}
 	return id, true
@@ -100,7 +100,7 @@ func (mc *MembershipController) workspaceRoleID(workspaceID uuid.UUID, roleName 
 // ListMembers GET /v2/tenants/:tenant_id/memberships
 // Optional ?status=active|suspended|invited|left and ?type=owner|admin|...
 func (mc *MembershipController) ListMembers(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -123,7 +123,7 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 		`).
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
 		Joins("LEFT JOIN users u ON u.workspace_id = wm.workspace_id AND u.id = wm.user_id").
-		Where("wm.workspace_id = ?", tenantID)
+		Where("wm.workspace_id = ?", workspaceID)
 	if s := c.Query("status"); s != "" {
 		q = q.Where("wm.status = ?", s)
 	}
@@ -141,7 +141,7 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 
 // GetMembership GET /v2/tenants/:tenant_id/memberships/:user_id
 func (mc *MembershipController) GetMembership(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -169,7 +169,7 @@ func (mc *MembershipController) GetMembership(c *gin.Context) {
 		`).
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
 		Joins("LEFT JOIN users u ON u.workspace_id = wm.workspace_id AND u.id = wm.user_id").
-		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
+		Where("wm.workspace_id = ? AND wm.user_id = ?", workspaceID, userID).
 		Take(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -194,7 +194,7 @@ type createMembershipRequest struct {
 // CreateMembership POST /v2/tenants/:tenant_id/memberships
 // Records that a user is a tenant operator. Idempotent on (tenant_id, user_id).
 func (mc *MembershipController) CreateMembership(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -219,19 +219,19 @@ func (mc *MembershipController) CreateMembership(c *gin.Context) {
 	if status == "" {
 		status = models.MembershipStatusActive
 	}
-	roleID, err := mc.workspaceRoleID(tenantID, mtype)
+	roleID, err := mc.workspaceRoleID(workspaceID, mtype)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace role not found", "detail": err.Error()})
 		return
 	}
 
 	m := models.WorkspaceMembership{
-		WorkspaceID: tenantID,
+		WorkspaceID: workspaceID,
 		UserID:      userID,
 		RoleID:      roleID,
 		Status:      status,
 	}
-	result := mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).FirstOrCreate(&m)
+	result := mc.db.Where("workspace_id = ? AND user_id = ?", workspaceID, userID).FirstOrCreate(&m)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create membership", "detail": result.Error.Error()})
 		return
@@ -252,7 +252,7 @@ type updateMembershipRequest struct {
 
 // UpdateMembership PATCH /v2/tenants/:tenant_id/memberships/:user_id
 func (mc *MembershipController) UpdateMembership(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -273,7 +273,7 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 	}
 	if req.MembershipType != nil {
 		mtype := strings.ToLower(strings.TrimSpace(*req.MembershipType))
-		roleID, err := mc.workspaceRoleID(tenantID, mtype)
+		roleID, err := mc.workspaceRoleID(workspaceID, mtype)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "workspace role not found", "detail": err.Error()})
 			return
@@ -286,7 +286,7 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 	}
 
 	res := mc.db.Model(&models.WorkspaceMembership{}).
-		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -301,7 +301,7 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 	_ = mc.db.Table("workspace_memberships AS wm").
 		Select("wm.id, wm.workspace_id AS workspace_id, wm.user_id, wm.status, r.name AS membership_type, 'workspace' AS source, wm.created_at AS joined_at, wm.created_at, wm.updated_at").
 		Joins("LEFT JOIN roles r ON r.id = wm.role_id").
-		Where("wm.workspace_id = ? AND wm.user_id = ?", tenantID, userID).
+		Where("wm.workspace_id = ? AND wm.user_id = ?", workspaceID, userID).
 		Take(&row).Error
 	c.JSON(http.StatusOK, row)
 }
@@ -309,7 +309,7 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 // DeleteMembership DELETE /v2/tenants/:tenant_id/memberships/:user_id
 // Hard-deletes the membership row. Use UpdateMembership(status=suspended) for a soft state change.
 func (mc *MembershipController) DeleteMembership(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -318,7 +318,7 @@ func (mc *MembershipController) DeleteMembership(c *gin.Context) {
 		return
 	}
 
-	res := mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).
+	res := mc.db.Where("workspace_id = ? AND user_id = ?", workspaceID, userID).
 		Delete(&models.WorkspaceMembership{})
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed", "detail": res.Error.Error()})
@@ -365,7 +365,7 @@ func applicationRoleLabel(roleName string) string {
 	return strings.Join(parts, " ")
 }
 
-func (mc *MembershipController) endUserAccessSnapshot(tenantID uuid.UUID, userID uuid.UUID) ([]endUserAccessApplication, string, int64) {
+func (mc *MembershipController) endUserAccessSnapshot(workspaceID uuid.UUID, userID uuid.UUID) ([]endUserAccessApplication, string, int64) {
 	type row struct {
 		ApplicationID string
 		Name          string
@@ -385,7 +385,7 @@ func (mc *MembershipController) endUserAccessSnapshot(tenantID uuid.UUID, userID
 		Joins("JOIN resource_servers rs ON rs.workspace_id = rb.workspace_id AND ro.name LIKE ('rs-' || rs.id::text || ':%')").
 		Joins("LEFT JOIN role_permissions rp ON rp.role_id = rb.role_id").
 		Joins("LEFT JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id").
-		Where("rb.workspace_id = ? AND rb.user_id = ?", tenantID, userID).
+		Where("rb.workspace_id = ? AND rb.user_id = ?", workspaceID, userID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
 		Where("(rb.scope_type IS NULL AND rb.scope_id IS NULL) OR (rb.scope_type = 'resource_server' AND rb.scope_id = rs.id)").
 		Group("rs.id, rs.name, rs.resource_uri, rb.role_id, rb.role_name, ro.name, rb.id").
@@ -439,8 +439,8 @@ func uuidFromMapValue(v interface{}) (uuid.UUID, bool) {
 	}
 }
 
-func (mc *MembershipController) decorateEndUserAccess(row map[string]interface{}, tenantID uuid.UUID, userID uuid.UUID) {
-	apps, summary, scopesCount := mc.endUserAccessSnapshot(tenantID, userID)
+func (mc *MembershipController) decorateEndUserAccess(row map[string]interface{}, workspaceID uuid.UUID, userID uuid.UUID) {
+	apps, summary, scopesCount := mc.endUserAccessSnapshot(workspaceID, userID)
 	row["access_summary"] = summary
 	row["applications"] = apps
 	row["applications_count"] = len(apps)
@@ -450,7 +450,7 @@ func (mc *MembershipController) decorateEndUserAccess(row map[string]interface{}
 // ListEndUsers GET /v2/tenants/:tenant_id/end-users
 // Optional ?status=, ?plan_tier=, ?q=<email substring>.
 func (mc *MembershipController) ListEndUsers(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -458,7 +458,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 	q := mc.db.Table("workspace_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
-		Where("s.workspace_id = ?", tenantID)
+		Where("s.workspace_id = ?", workspaceID)
 	if v := c.Query("status"); v != "" {
 		q = q.Where("s.status = ?", v)
 	}
@@ -477,7 +477,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 	}
 	for _, row := range rows {
 		if userID, ok := uuidFromMapValue(row["user_id"]); ok {
-			mc.decorateEndUserAccess(row, tenantID, userID)
+			mc.decorateEndUserAccess(row, workspaceID, userID)
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"items": rows, "count": len(rows)})
@@ -485,7 +485,7 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 
 // GetEndUser GET /v2/tenants/:tenant_id/end-users/:user_id
 func (mc *MembershipController) GetEndUser(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -498,7 +498,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 	err := mc.db.Table("workspace_end_user_states AS s").
 		Select("s.*, u.email AS user_email, u.name AS user_name, u.username AS user_username, u.last_login AS user_last_login").
 		Joins("LEFT JOIN users u ON u.workspace_id = s.workspace_id AND u.id = s.user_id").
-		Where("s.workspace_id = ? AND s.user_id = ?", tenantID, userID).
+		Where("s.workspace_id = ? AND s.user_id = ?", workspaceID, userID).
 		Take(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -508,7 +508,7 @@ func (mc *MembershipController) GetEndUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	mc.decorateEndUserAccess(row, tenantID, userID)
+	mc.decorateEndUserAccess(row, workspaceID, userID)
 	c.JSON(http.StatusOK, row)
 }
 
@@ -522,7 +522,7 @@ type updateEndUserRequest struct {
 
 // UpdateEndUser PATCH /v2/tenants/:tenant_id/end-users/:user_id
 func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -564,7 +564,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	}
 
 	res := mc.db.Model(&models.TenantEndUserState{}).
-		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -573,7 +573,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	if res.RowsAffected == 0 {
 		// Upsert if it doesn't exist (an end user can be edited before their first consent in Phase A admin tooling).
 		s := models.TenantEndUserState{
-			WorkspaceID: tenantID,
+			WorkspaceID: workspaceID,
 			UserID:   userID,
 			Status:   models.EndUserStatusActive,
 		}
@@ -595,18 +595,18 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 			return
 		}
 		if s.Status == models.EndUserStatusSuspended {
-			revokeTokensOnSuspend(tenantID, userID)
+			revokeTokensOnSuspend(workspaceID, userID)
 		}
 		c.JSON(http.StatusOK, s)
 		return
 	}
 
 	if req.Status != nil && *req.Status == models.EndUserStatusSuspended {
-		revokeTokensOnSuspend(tenantID, userID)
+		revokeTokensOnSuspend(workspaceID, userID)
 	}
 
 	var s models.TenantEndUserState
-	_ = mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
+	_ = mc.db.Where("workspace_id = ? AND user_id = ?", workspaceID, userID).First(&s).Error
 	c.JSON(http.StatusOK, s)
 }
 
@@ -663,9 +663,9 @@ func (mc *MembershipController) BindGroupToRole(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body", "detail": err.Error()})
 		return
 	}
-	tenantID, err := uuid.Parse(req.WorkspaceID)
+	workspaceID, err := uuid.Parse(req.WorkspaceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id", "detail": err.Error()})
 		return
 	}
 	roleID, err := uuid.Parse(req.RoleID)
@@ -676,7 +676,7 @@ func (mc *MembershipController) BindGroupToRole(c *gin.Context) {
 
 	binding := models.RoleBinding{
 		ID:        uuid.New(),
-		WorkspaceID:  &tenantID,
+		WorkspaceID:  &workspaceID,
 		GroupID:   &groupID,
 		RoleID:    roleID,
 		ScopeType: req.ScopeType,
@@ -746,7 +746,7 @@ func (mc *MembershipController) EffectiveAccess(c *gin.Context) {
 
 // runEndUserUpdate is the shared core used by the convenience handlers above.
 func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUserRequest) {
-	tenantID, ok := parseTenantID(c)
+	workspaceID, ok := parseTenantID(c)
 	if !ok {
 		return
 	}
@@ -768,7 +768,7 @@ func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUs
 	}
 
 	res := mc.db.Model(&models.TenantEndUserState{}).
-		Where("workspace_id = ? AND user_id = ?", tenantID, userID).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, userID).
 		Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed", "detail": res.Error.Error()})
@@ -779,9 +779,9 @@ func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUs
 		return
 	}
 	if req.Status != nil && *req.Status == models.EndUserStatusSuspended {
-		revokeTokensOnSuspend(tenantID, userID)
+		revokeTokensOnSuspend(workspaceID, userID)
 	}
 	var s models.TenantEndUserState
-	_ = mc.db.Where("workspace_id = ? AND user_id = ?", tenantID, userID).First(&s).Error
+	_ = mc.db.Where("workspace_id = ? AND user_id = ?", workspaceID, userID).First(&s).Error
 	c.JSON(http.StatusOK, s)
 }

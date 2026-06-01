@@ -80,10 +80,10 @@ func (mc *MigrationController) RunTenantMigrations(c *gin.Context) {
 
 // GetTenantMigrationStatus GET /authsec-migration/tenants/:tenant_id/migrations/status
 func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
-	tenantID := c.Param("workspace_id")
+	workspaceID := c.Param("workspace_id")
 
 	var tenant migration.TenantInfo
-	if err := config.DB.Where("workspace_id = ?", tenantID).First(&tenant).Error; err != nil {
+	if err := config.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 		return
 	}
@@ -122,7 +122,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	defer tenantDBConn.Close()
 
 	masterRaw := config.Database.DB
-	runner := migration.NewTenantMigrationRunner(tenantID, tenantDBConn, mc.tenantMigrationsDir, masterRaw)
+	runner := migration.NewTenantMigrationRunner(workspaceID, tenantDBConn, mc.tenantMigrationsDir, masterRaw)
 	status, err := runner.GetMigrationStatus()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get migration status"})

@@ -12,8 +12,8 @@ import (
 type TenantDatabaseUtils struct{}
 
 // GenerateTenantDBName generates a tenant database name from tenant ID
-func (TenantDatabaseUtils) GenerateTenantDBName(tenantID uuid.UUID) string {
-	return fmt.Sprintf("tenant_%s", strings.ReplaceAll(tenantID.String(), "-", "_"))
+func (TenantDatabaseUtils) GenerateTenantDBName(workspaceID uuid.UUID) string {
+	return fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 }
 
 // ValidateTenantDBName validates a tenant database name format

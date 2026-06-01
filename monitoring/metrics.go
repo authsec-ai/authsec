@@ -186,23 +186,23 @@ func Middleware() gin.HandlerFunc {
 }
 
 // RecordDBQuery records database query metrics
-func RecordDBQuery(operation, table, tenantID string, duration time.Duration) {
+func RecordDBQuery(operation, table, workspaceID string, duration time.Duration) {
 	if metrics != nil {
-		metrics.DBQueryDuration.WithLabelValues(operation, table, tenantID).Observe(duration.Seconds())
+		metrics.DBQueryDuration.WithLabelValues(operation, table, workspaceID).Observe(duration.Seconds())
 	}
 }
 
 // RecordAuthRequest records authentication request metrics
-func RecordAuthRequest(authType, result, tenantID string) {
+func RecordAuthRequest(authType, result, workspaceID string) {
 	if metrics != nil {
-		metrics.AuthRequestsTotal.WithLabelValues(authType, result, tenantID).Inc()
+		metrics.AuthRequestsTotal.WithLabelValues(authType, result, workspaceID).Inc()
 	}
 }
 
 // RecordAuthFailure records authentication failure metrics
-func RecordAuthFailure(authType, reason, tenantID string) {
+func RecordAuthFailure(authType, reason, workspaceID string) {
 	if metrics != nil {
-		metrics.AuthFailuresTotal.WithLabelValues(authType, reason, tenantID).Inc()
+		metrics.AuthFailuresTotal.WithLabelValues(authType, reason, workspaceID).Inc()
 	}
 }
 

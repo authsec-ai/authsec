@@ -100,10 +100,10 @@ func seedTestAdmin(dbName string, cfg *config.Config) error {
 	}
 	defer db.Close()
 
-	tenantID := uuid.New()
-	seededTenantID = tenantID
-	userID := tenantID
-	clientID := tenantID
+	workspaceID := uuid.New()
+	seededTenantID = workspaceID
+	userID := workspaceID
+	clientID := workspaceID
 
 	// ensure tenants table
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (tenant_id uuid PRIMARY KEY, email text, tenant_domain text, tenant_db text);`); err != nil {
@@ -125,21 +125,21 @@ func seedTestAdmin(dbName string, cfg *config.Config) error {
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, workspace_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
 
 	// upsert tenant
-	_, _ = db.Exec(`INSERT INTO workspaces (workspace_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, tenantID, "admin@test.local", "test.local", dbName)
+	_, _ = db.Exec(`INSERT INTO workspaces (workspace_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, workspaceID, "admin@test.local", "test.local", dbName)
 
 	// upsert admin user
 	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, workspace_id, tenant_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
-		userID, "admin@test.local", clientID, tenantID, "test.local")
+		userID, "admin@test.local", clientID, workspaceID, "test.local")
 
 	// upsert admin role - use constraint name to avoid ambiguity with multiple unique indexes
 	var roleID uuid.UUID
 	if err := db.QueryRow(`INSERT INTO roles (id, workspace_id, name, description) VALUES ($1, $2, 'admin', 'admin role') ON CONFLICT ON CONSTRAINT roles_tenant_name_key DO UPDATE SET name=EXCLUDED.name RETURNING id`,
-		uuid.New(), tenantID).Scan(&roleID); err != nil {
+		uuid.New(), workspaceID).Scan(&roleID); err != nil {
 		return err
 	}
 	// assign role via role_bindings (user_roles is deprecated)
 	bindingID := uuid.New()
-	_, _ = db.Exec(`INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) SELECT $1,$2,$3,$4,NULL,NULL,now(),now() WHERE NOT EXISTS (SELECT 1 FROM role_bindings WHERE workspace_id = $2 AND user_id=$3 AND role_id=$4)`, bindingID, tenantID, userID, roleID)
+	_, _ = db.Exec(`INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) SELECT $1,$2,$3,$4,NULL,NULL,now(),now() WHERE NOT EXISTS (SELECT 1 FROM role_bindings WHERE workspace_id = $2 AND user_id=$3 AND role_id=$4)`, bindingID, workspaceID, userID, roleID)
 
 	return nil
 }

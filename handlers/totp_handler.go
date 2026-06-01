@@ -777,7 +777,7 @@ func (h *TOTPHandler) verifyBackupCode(mfaRepo *repositories.MFARepository, clie
 }
 
 // Helper function to fetch client (shared across TOTP handlers)
-func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodels.User, error) {
+func fetchClientForMFA(email, workspaceID, clientID string) (*gorm.DB, *sharedmodels.User, error) {
 	globalDB, err := config.ConnectGlobalDB()
 	if err != nil {
 		return nil, nil, err
@@ -785,7 +785,7 @@ func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodel
 
 	// First check if user exists in global DB (for admin users)
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, workspaceID).First(&userWithJSONMFA).Error
 	user := userWithJSONMFA.ToShared()
 
 	var tenantDB *gorm.DB
@@ -800,7 +800,7 @@ func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodel
 		tenantDB = globalDB
 		clientRepo := repositories.NewClientRepository(tenantDB)
 		// Use the new TOTP-specific function
-		client, err := clientRepo.GetClientForTOTP(email, tenantID, clientID)
+		client, err := clientRepo.GetClientForTOTP(email, workspaceID, clientID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -809,7 +809,7 @@ func fetchClientForMFA(email, tenantID, clientID string) (*gorm.DB, *sharedmodel
 	}
 }
 
-func fetchClientForLoginMFA(email, tenantID string) (*gorm.DB, *sharedmodels.User, error) {
+func fetchClientForLoginMFA(email, workspaceID string) (*gorm.DB, *sharedmodels.User, error) {
 	globalDB, err := config.ConnectGlobalDB()
 	if err != nil {
 		return nil, nil, err
@@ -817,7 +817,7 @@ func fetchClientForLoginMFA(email, tenantID string) (*gorm.DB, *sharedmodels.Use
 
 	// First check if user exists in global DB (for admin users)
 	var userWithJSONMFA appmodels.UserWithJSONMFAMethods
-	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error
+	globalErr := globalDB.Scopes(util.WithUsersMFAMethodArray).Where("email = ? AND workspace_id = ?", email, workspaceID).First(&userWithJSONMFA).Error
 	user := userWithJSONMFA.ToShared()
 
 	if globalErr == nil && user.ID != uuid.Nil {
@@ -830,7 +830,7 @@ func fetchClientForLoginMFA(email, tenantID string) (*gorm.DB, *sharedmodels.Use
 		tenantDB := globalDB
 		clientRepo := repositories.NewClientRepository(tenantDB)
 		// Use the new TOTP-specific login function
-		client, err := clientRepo.GetClientForTOTPLogin(email, tenantID)
+		client, err := clientRepo.GetClientForTOTPLogin(email, workspaceID)
 		if err != nil {
 			return nil, nil, err
 		}

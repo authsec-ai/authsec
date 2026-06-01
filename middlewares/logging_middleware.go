@@ -107,13 +107,13 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		duration := time.Since(start)
 
 		// Extract context values (set by your existing AuthMiddleware)
-		tenantID := c.GetString("workspace_id")
+		workspaceID := c.GetString("workspace_id")
 		userID := c.GetString("user_id")
 		userEmail := c.GetString("email_id")
 
 		// Fallback for public endpoints
-		if tenantID == "" {
-			tenantID = "unknown_tenant"
+		if workspaceID == "" {
+			workspaceID = "unknown_tenant"
 		}
 
 		status := "SUCCESS"
@@ -124,7 +124,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		logEntry := AuthLogSchema{
 			TS:       start.UTC().Format(time.RFC3339),
 			LogType:  LogTypeAuth,
-			Tenant:   Tenant{ID: tenantID},
+			Tenant:   Tenant{ID: workspaceID},
 			LogLevel: "INFO",
 			Message:  fmt.Sprintf("%s %s request processed by %s", c.Request.Method, c.Request.URL.Path, serviceName),
 
@@ -225,13 +225,13 @@ type AuditCorrelation struct {
 //	middlewares.Audit(c, "role", roleID, "update", changes)
 func Audit(c *gin.Context, objectType string, objectID string, actionType string, changes *AuditChanges) {
 	// Extract context values
-	tenantID := c.GetString("workspace_id")
+	workspaceID := c.GetString("workspace_id")
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.GetString("request_id") // From RequestIDMiddleware
 
-	if tenantID == "" {
-		tenantID = "unknown_tenant"
+	if workspaceID == "" {
+		workspaceID = "unknown_tenant"
 	}
 
 	// Determine actor type based on context
@@ -246,7 +246,7 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: tenantID},
+		Tenant:  Tenant{ID: workspaceID},
 
 		Event: AuditEvent{
 			Type:     fmt.Sprintf("%s.%s", objectType, actionType),

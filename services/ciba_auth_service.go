@@ -281,11 +281,11 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 }
 
 // RegisterDevice registers a new device for push notifications
-func (s *CIBAAuthService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, req *models.DeviceTokenRegistrationRequest) (*models.DeviceTokenRegistrationResponse, error) {
+func (s *CIBAAuthService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID, req *models.DeviceTokenRegistrationRequest) (*models.DeviceTokenRegistrationResponse, error) {
 	deviceToken := &models.DeviceToken{
 		ID:          uuid.New(),
 		UserID:      userID,
-		WorkspaceID:    tenantID,
+		WorkspaceID:    workspaceID,
 		DeviceToken: req.DeviceToken,
 		Platform:    req.Platform,
 		DeviceName:  req.DeviceName,
@@ -362,8 +362,8 @@ func (s *CIBAAuthService) CleanupExpiredRequests() (int64, error) {
 // ========================================
 
 // GetUserDevices retrieves all registered push devices for a user
-func (s *CIBAAuthService) GetUserDevices(userID, tenantID uuid.UUID) ([]models.DeviceSummary, error) {
-	devices, err := s.cibaRepo.GetDeviceTokensByUserID(userID, tenantID)
+func (s *CIBAAuthService) GetUserDevices(userID, workspaceID uuid.UUID) ([]models.DeviceSummary, error) {
+	devices, err := s.cibaRepo.GetDeviceTokensByUserID(userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve devices: %w", err)
 	}
@@ -388,19 +388,19 @@ func (s *CIBAAuthService) GetUserDevices(userID, tenantID uuid.UUID) ([]models.D
 }
 
 // DeleteDevice deactivates a user's push notification device
-func (s *CIBAAuthService) DeleteDevice(deviceID, userID, tenantID uuid.UUID) error {
+func (s *CIBAAuthService) DeleteDevice(deviceID, userID, workspaceID uuid.UUID) error {
 	// Verify device belongs to user and tenant
 	device, err := s.cibaRepo.GetDeviceTokenByID(deviceID)
 	if err != nil {
 		return fmt.Errorf("device not found: %w", err)
 	}
 
-	if device.UserID != userID || device.WorkspaceID != tenantID {
+	if device.UserID != userID || device.WorkspaceID != workspaceID {
 		return fmt.Errorf("device not found or unauthorized")
 	}
 
 	// Deactivate device
-	if err := s.cibaRepo.DeactivateDeviceToken(deviceID, userID, tenantID); err != nil {
+	if err := s.cibaRepo.DeactivateDeviceToken(deviceID, userID, workspaceID); err != nil {
 		return fmt.Errorf("failed to deactivate device: %w", err)
 	}
 

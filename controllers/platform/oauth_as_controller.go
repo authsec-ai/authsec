@@ -1499,7 +1499,7 @@ func extractContextIDFromToken(accessToken string) string {
 // ListConsentGrants lists consent grants for the admin (filterable by user, client, RS).
 // GET /platform/consent-grants?tenant_id=...&user_id=...&client_id=...&rs_id=...
 func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1522,7 +1522,7 @@ func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 		}
 	}
 
-	grants, err := ctrl.consentService.ListByTenant(tenantID, userID, clientID, rsID)
+	grants, err := ctrl.consentService.ListByTenant(workspaceID, userID, clientID, rsID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list consent grants"})
 		return
@@ -1534,7 +1534,7 @@ func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 // RevokeConsentGrant revokes a consent grant (admin).
 // DELETE /authsec/consent-grants/:id
 func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1548,12 +1548,12 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 	}
 
 	// RevokeConsentByTenant enforces tenant ownership — cross-tenant revocations are rejected.
-	if err := ctrl.consentService.RevokeConsentByTenant(grantID, tenantID); err != nil {
+	if err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
 	}
 
-	auditAdminMutation(c, tenantID.String(), "consent_grant_revoked", "oauth_consent_grant",
+	auditAdminMutation(c, workspaceID.String(), "consent_grant_revoked", "oauth_consent_grant",
 		grantIDStr, http.StatusOK, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
@@ -1561,13 +1561,13 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 // ListUserConsentGrants lists consent grants for the authenticated user.
 // GET /oauth/consent-grants (user self-service)
 func (ctrl *OAuthASController) ListUserConsentGrants(c *gin.Context) {
-	tenantID, userID, err := ctrl.requireAuthenticatedUserContext(c)
+	workspaceID, userID, err := ctrl.requireAuthenticatedUserContext(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	grants, err := ctrl.consentService.ListByUser(tenantID, userID)
+	grants, err := ctrl.consentService.ListByUser(workspaceID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list consent grants"})
 		return
@@ -1601,7 +1601,7 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 }
 
 func (ctrl *OAuthASController) requireAuthenticatedUserContext(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
-	tenantID, err := extractTenantID(c)
+	workspaceID, err := extractTenantID(c)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("workspace_id required in JWT")
 	}
@@ -1616,5 +1616,5 @@ func (ctrl *OAuthASController) requireAuthenticatedUserContext(c *gin.Context) (
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid user_id in JWT")
 	}
 
-	return tenantID, userID, nil
+	return workspaceID, userID, nil
 }

@@ -287,7 +287,7 @@ func (r *VoiceAuthRepository) CreateVoiceIdentityLink(link *models.VoiceIdentity
 }
 
 // FindVoiceIdentityLink retrieves a voice identity link
-func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePlatform string, voiceUserID string) (*models.VoiceIdentityLink, error) {
+func (r *VoiceAuthRepository) FindVoiceIdentityLink(workspaceID uuid.UUID, voicePlatform string, voiceUserID string) (*models.VoiceIdentityLink, error) {
 	query := `
 		SELECT id, workspace_id, voice_platform, voice_user_id, voice_user_name,
 		       user_id, user_email, is_active, link_method, last_used_at,
@@ -300,7 +300,7 @@ func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePla
 	var voiceUserName, linkMethod sql.NullString
 	var lastUsedAt sql.NullInt64
 
-	err := r.db.QueryRow(query, tenantID, voicePlatform, voiceUserID).Scan(
+	err := r.db.QueryRow(query, workspaceID, voicePlatform, voiceUserID).Scan(
 		&link.ID,
 		&link.WorkspaceID,
 		&link.VoicePlatform,
@@ -337,7 +337,7 @@ func (r *VoiceAuthRepository) FindVoiceIdentityLink(tenantID uuid.UUID, voicePla
 }
 
 // ListVoiceIdentityLinks lists all voice identity links for a user
-func (r *VoiceAuthRepository) ListVoiceIdentityLinks(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceIdentityLink, error) {
+func (r *VoiceAuthRepository) ListVoiceIdentityLinks(workspaceID uuid.UUID, userID uuid.UUID) ([]models.VoiceIdentityLink, error) {
 	query := `
 		SELECT id, workspace_id, voice_platform, voice_user_id, voice_user_name,
 		       user_id, user_email, is_active, link_method, last_used_at,
@@ -347,7 +347,7 @@ func (r *VoiceAuthRepository) ListVoiceIdentityLinks(tenantID uuid.UUID, userID 
 		ORDER BY linked_at DESC
 	`
 
-	rows, err := r.db.Query(query, tenantID, userID)
+	rows, err := r.db.Query(query, workspaceID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -409,14 +409,14 @@ func (r *VoiceAuthRepository) UpdateVoiceIdentityLinkLastUsed(linkID uuid.UUID) 
 }
 
 // DeactivateVoiceIdentityLink deactivates a voice identity link
-func (r *VoiceAuthRepository) DeactivateVoiceIdentityLink(tenantID uuid.UUID, voicePlatform string, voiceUserID string) error {
+func (r *VoiceAuthRepository) DeactivateVoiceIdentityLink(workspaceID uuid.UUID, voicePlatform string, voiceUserID string) error {
 	query := `
 		UPDATE voice_identity_links
 		SET is_active = false, updated_at = $1
 		WHERE workspace_id = $2 AND voice_platform = $3 AND voice_user_id = $4
 	`
 
-	result, err := r.db.Exec(query, time.Now().Unix(), tenantID, voicePlatform, voiceUserID)
+	result, err := r.db.Exec(query, time.Now().Unix(), workspaceID, voicePlatform, voiceUserID)
 	if err != nil {
 		return err
 	}
@@ -582,7 +582,7 @@ func (r *VoiceAuthRepository) FindVoiceActiveSessionByTokenHash(tokenHash string
 }
 
 // ListVoiceActiveSessions lists all active sessions for a user
-func (r *VoiceAuthRepository) ListVoiceActiveSessions(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
+func (r *VoiceAuthRepository) ListVoiceActiveSessions(workspaceID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
 	query := `
 		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
 		       voice_platform, voice_user_id, device_info, device_name,
@@ -594,7 +594,7 @@ func (r *VoiceAuthRepository) ListVoiceActiveSessions(tenantID uuid.UUID, userID
 		ORDER BY login_at DESC
 	`
 
-	rows, err := r.db.Query(query, tenantID, userID)
+	rows, err := r.db.Query(query, workspaceID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +613,7 @@ func (r *VoiceAuthRepository) ListVoiceActiveSessions(tenantID uuid.UUID, userID
 }
 
 // ListActiveVoiceSessions lists only active (non-revoked, non-expired) sessions
-func (r *VoiceAuthRepository) ListActiveVoiceSessions(tenantID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
+func (r *VoiceAuthRepository) ListActiveVoiceSessions(workspaceID uuid.UUID, userID uuid.UUID) ([]models.VoiceActiveSession, error) {
 	now := time.Now().Unix()
 	query := `
 		SELECT id, workspace_id, client_id, user_id, user_email, session_id,
@@ -626,7 +626,7 @@ func (r *VoiceAuthRepository) ListActiveVoiceSessions(tenantID uuid.UUID, userID
 		ORDER BY login_at DESC
 	`
 
-	rows, err := r.db.Query(query, tenantID, userID, now)
+	rows, err := r.db.Query(query, workspaceID, userID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +671,7 @@ func (r *VoiceAuthRepository) RevokeVoiceActiveSession(sessionID string, reason 
 }
 
 // RevokeAllVoiceActiveSessions revokes all active sessions for a user
-func (r *VoiceAuthRepository) RevokeAllVoiceActiveSessions(tenantID uuid.UUID, userID uuid.UUID, reason string, exceptSessionID string) (int64, error) {
+func (r *VoiceAuthRepository) RevokeAllVoiceActiveSessions(workspaceID uuid.UUID, userID uuid.UUID, reason string, exceptSessionID string) (int64, error) {
 	query := `
 		UPDATE voice_active_sessions
 		SET is_active = false, revoked_at = $1, revoked_reason = $2, updated_at = $3
@@ -679,7 +679,7 @@ func (r *VoiceAuthRepository) RevokeAllVoiceActiveSessions(tenantID uuid.UUID, u
 	`
 
 	now := time.Now().Unix()
-	result, err := r.db.Exec(query, now, reason, now, tenantID, userID, exceptSessionID)
+	result, err := r.db.Exec(query, now, reason, now, workspaceID, userID, exceptSessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -721,7 +721,7 @@ func (r *VoiceAuthRepository) IsSessionRevoked(sessionID string) (bool, error) {
 }
 
 // CountActiveSessionsForUser counts active sessions for a user
-func (r *VoiceAuthRepository) CountActiveSessionsForUser(tenantID uuid.UUID, userID uuid.UUID) (int, error) {
+func (r *VoiceAuthRepository) CountActiveSessionsForUser(workspaceID uuid.UUID, userID uuid.UUID) (int, error) {
 	now := time.Now().Unix()
 	query := `
 		SELECT COUNT(*) FROM voice_active_sessions
@@ -729,7 +729,7 @@ func (r *VoiceAuthRepository) CountActiveSessionsForUser(tenantID uuid.UUID, use
 	`
 
 	var count int
-	err := r.db.QueryRow(query, tenantID, userID, now).Scan(&count)
+	err := r.db.QueryRow(query, workspaceID, userID, now).Scan(&count)
 	return count, err
 }
 
@@ -966,7 +966,7 @@ func (r *VoiceAuthRepository) ApproveVoiceSession(sessionToken string, approve b
 }
 
 // ListPendingVoiceSessions lists pending voice auth requests for a tenant
-func (r *VoiceAuthRepository) ListPendingVoiceSessions(tenantID uuid.UUID) ([]models.VoiceSession, error) {
+func (r *VoiceAuthRepository) ListPendingVoiceSessions(workspaceID uuid.UUID) ([]models.VoiceSession, error) {
 	now := time.Now().Unix()
 	query := `
 		SELECT id, workspace_id, client_id, session_token, voice_otp,
@@ -978,7 +978,7 @@ func (r *VoiceAuthRepository) ListPendingVoiceSessions(tenantID uuid.UUID) ([]mo
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.Query(query, tenantID, now)
+	rows, err := r.db.Query(query, workspaceID, now)
 	if err != nil {
 		return nil, err
 	}

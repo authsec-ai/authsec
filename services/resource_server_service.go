@@ -330,9 +330,9 @@ func (s *ResourceServerService) GetByResourceURI(uri string) (*models.ResourceSe
 	return &rs, nil
 }
 
-func (s *ResourceServerService) ListByTenant(tenantID string) ([]models.ResourceServer, error) {
+func (s *ResourceServerService) ListByTenant(workspaceID string) ([]models.ResourceServer, error) {
 	var servers []models.ResourceServer
-	if err := s.db.Where("workspace_id = ? AND active = true", tenantID).Find(&servers).Error; err != nil {
+	if err := s.db.Where("workspace_id = ? AND active = true", workspaceID).Find(&servers).Error; err != nil {
 		return nil, err
 	}
 	return servers, nil
@@ -375,9 +375,9 @@ func (s *ResourceServerService) Delete(id string) error {
 }
 
 // GetByIDAndTenant fetches a resource server by ID with tenant ownership check.
-func (s *ResourceServerService) GetByIDAndTenant(id, tenantID string) (*models.ResourceServer, error) {
+func (s *ResourceServerService) GetByIDAndTenant(id, workspaceID string) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND workspace_id = ? AND active = true", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ? AND active = true", id, workspaceID).First(&rs).Error; err != nil {
 		return nil, err
 	}
 	return &rs, nil
@@ -385,9 +385,9 @@ func (s *ResourceServerService) GetByIDAndTenant(id, tenantID string) (*models.R
 
 // UpdateByTenant updates a resource server with tenant ownership check.
 // If public_base_url or protected_base_path change, resource_uri is recomputed.
-func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[string]interface{}) (*models.ResourceServer, error) {
+func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates map[string]interface{}) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
 		return nil, err
 	}
 	if err := s.db.Model(&rs).Updates(updates).Error; err != nil {
@@ -411,8 +411,8 @@ func (s *ResourceServerService) UpdateByTenant(id, tenantID string, updates map[
 }
 
 // DeleteByTenant deletes a resource server with tenant ownership check.
-func (s *ResourceServerService) DeleteByTenant(id, tenantID string) error {
-	result := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).Delete(&models.ResourceServer{})
+func (s *ResourceServerService) DeleteByTenant(id, workspaceID string) error {
+	result := s.db.Where("id = ? AND workspace_id = ?", id, workspaceID).Delete(&models.ResourceServer{})
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("resource server not found")
 	}
@@ -420,9 +420,9 @@ func (s *ResourceServerService) DeleteByTenant(id, tenantID string) error {
 }
 
 // RotateIntrospectionSecret generates a new secret, stores its bcrypt hash, returns plaintext once.
-func (s *ResourceServerService) RotateIntrospectionSecret(id, tenantID string) (string, error) {
+func (s *ResourceServerService) RotateIntrospectionSecret(id, workspaceID string) (string, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND workspace_id = ?", id, tenantID).First(&rs).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
 		return "", fmt.Errorf("resource server not found")
 	}
 
@@ -1079,8 +1079,8 @@ type ChecklistStep struct {
 }
 
 // SetupChecklist returns the step-by-step status for the wizard rail.
-func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUID) ([]ChecklistStep, error) {
-	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, workspaceID uuid.UUID) ([]ChecklistStep, error) {
+	rs, err := s.GetByIDAndTenant(rsID.String(), workspaceID.String())
 	if err != nil {
 		return nil, err
 	}
@@ -1159,8 +1159,8 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, tenantID uuid.UUI
 }
 
 // ActivationPreview returns the summary card shown before activation (§4.1 step 6).
-func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.UUID) (map[string]interface{}, error) {
-	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, workspaceID uuid.UUID) (map[string]interface{}, error) {
+	rs, err := s.GetByIDAndTenant(rsID.String(), workspaceID.String())
 	if err != nil {
 		return nil, err
 	}
@@ -1246,8 +1246,8 @@ func (s *ResourceServerService) ActivationPreview(rsID uuid.UUID, tenantID uuid.
 
 // Activate flips state to 'ready' after verifying all gates. Returns
 // ActivationGateError if any gate fails.
-func (s *ResourceServerService) Activate(rsID uuid.UUID, tenantID uuid.UUID, activatedByUserID uuid.UUID) error {
-	rs, err := s.GetByIDAndTenant(rsID.String(), tenantID.String())
+func (s *ResourceServerService) Activate(rsID uuid.UUID, workspaceID uuid.UUID, activatedByUserID uuid.UUID) error {
+	rs, err := s.GetByIDAndTenant(rsID.String(), workspaceID.String())
 	if err != nil {
 		return err
 	}

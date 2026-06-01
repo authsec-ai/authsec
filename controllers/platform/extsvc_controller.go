@@ -153,18 +153,18 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 	return tenantDB, clientIDStr, tenantIDStr, nil
 }
 
-func (ctl *ExternalServiceController) ensureTenantSchema(tenantID string, tenantDB *gorm.DB) error {
-	if _, ok := ctl.tenantMigrations.Load(tenantID); ok {
+func (ctl *ExternalServiceController) ensureTenantSchema(workspaceID string, tenantDB *gorm.DB) error {
+	if _, ok := ctl.tenantMigrations.Load(workspaceID); ok {
 		return nil
 	}
 	// Schema and permissions are provisioned by the migration system
 	// (migrations/tenant/ and migrations/permissions/master/).
-	ctl.tenantMigrations.Store(tenantID, struct{}{})
-	log.Printf("EXTSVC: schema ready for tenant %s", tenantID)
+	ctl.tenantMigrations.Store(workspaceID, struct{}{})
+	log.Printf("EXTSVC: schema ready for tenant %s", workspaceID)
 	return nil
 }
 
-func (ctl *ExternalServiceController) ensureAdminBinding(c *gin.Context, tenantDB *gorm.DB, tenantID string) error {
+func (ctl *ExternalServiceController) ensureAdminBinding(c *gin.Context, tenantDB *gorm.DB, workspaceID string) error {
 	claimsAny, exists := c.Get("claims")
 	if !exists {
 		return nil
@@ -188,7 +188,7 @@ func (ctl *ExternalServiceController) ensureAdminBinding(c *gin.Context, tenantD
 	if userID == "" {
 		return fmt.Errorf("admin token missing user identifier")
 	}
-	cacheKey := fmt.Sprintf("%s:%s", tenantID, userID)
+	cacheKey := fmt.Sprintf("%s:%s", workspaceID, userID)
 	if _, ok := ctl.adminBindings.Load(cacheKey); ok {
 		return nil
 	}
@@ -215,7 +215,7 @@ func (ctl *ExternalServiceController) getVaultClient() (vault.VaultClient, error
 
 // CreateExternalService handles POST /authsec/services.
 func (ctl *ExternalServiceController) CreateExternalService(c *gin.Context) {
-	tenantDB, clientID, tenantID, err := ctl.resolveTenant(c)
+	tenantDB, clientID, workspaceID, err := ctl.resolveTenant(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -249,7 +249,7 @@ func (ctl *ExternalServiceController) CreateExternalService(c *gin.Context) {
 	}
 
 	manager := services.NewExternalServiceManager(repositories.NewExternalServiceRepository(tenantDB), vClient)
-	out, err := manager.Create(svc, clientID, tenantID, secretData)
+	out, err := manager.Create(svc, clientID, workspaceID, secretData)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

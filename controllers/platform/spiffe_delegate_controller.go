@@ -163,7 +163,7 @@ func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 
 	// 5. Extract identity from user claims.
 	userID := claimString(userClaims, "user_id", claimString(userClaims, "sub", ""))
-	tenantID := claimString(userClaims, "workspace_id", "")
+	workspaceID := claimString(userClaims, "workspace_id", "")
 	email := claimString(userClaims, "email_id", claimString(userClaims, "email", ""))
 
 	if userID == "" {
@@ -175,7 +175,7 @@ func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 	svid, err := ctrl.keySvc.IssueJWTSVID(services.DelegateSVIDRequest{
 		UserJWT:   rawJWT,
 		UserID:    userID,
-		WorkspaceID:  tenantID,
+		WorkspaceID:  workspaceID,
 		Email:     email,
 		AgentType: req.AgentType,
 		TTL:       ttl,

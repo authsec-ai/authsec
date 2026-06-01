@@ -97,8 +97,8 @@ type UpdateTenantStatusRequest struct {
 }
 
 // UpdateTenantStatus updates tenant status in ICP
-func (c *Client) UpdateTenantStatus(ctx context.Context, tenantID, status string) error {
-	url := fmt.Sprintf("%s/admin/tenants/%s/status", c.baseURL, tenantID)
+func (c *Client) UpdateTenantStatus(ctx context.Context, workspaceID, status string) error {
+	url := fmt.Sprintf("%s/admin/tenants/%s/status", c.baseURL, workspaceID)
 
 	req := UpdateTenantStatusRequest{Status: status}
 	body, err := json.Marshal(req)

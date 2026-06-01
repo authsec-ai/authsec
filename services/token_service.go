@@ -44,12 +44,12 @@ type TokenPair struct {
 }
 
 // GenerateTokenPair generates both access and refresh tokens
-func (ts *TokenService) GenerateTokenPair(userID, tenantID uuid.UUID, email string, additionalClaims map[string]interface{}) (*TokenPair, error) {
+func (ts *TokenService) GenerateTokenPair(userID, workspaceID uuid.UUID, email string, additionalClaims map[string]interface{}) (*TokenPair, error) {
 	ctx := context.Background()
 
 	// Generate access token (short-lived: 15 minutes)
 	accessTokenExpiry := time.Now().Add(15 * time.Minute)
-	accessToken, err := ts.generateAccessToken(userID, tenantID, email, accessTokenExpiry, additionalClaims)
+	accessToken, err := ts.generateAccessToken(userID, workspaceID, email, accessTokenExpiry, additionalClaims)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate access token: %w", err)
 	}
@@ -64,7 +64,7 @@ func (ts *TokenService) GenerateTokenPair(userID, tenantID uuid.UUID, email stri
 
 	// Store refresh token in Redis with user and tenant info
 	refreshTokenKey := fmt.Sprintf("refresh_token:%s", refreshToken)
-	refreshTokenData := fmt.Sprintf("%s:%s:%d", userID.String(), tenantID.String(), refreshTokenExpiry.Unix())
+	refreshTokenData := fmt.Sprintf("%s:%s:%d", userID.String(), workspaceID.String(), refreshTokenExpiry.Unix())
 
 	err = ts.redisClient.Set(ctx, refreshTokenKey, refreshTokenData, 7*24*time.Hour).Err()
 	if err != nil {
@@ -128,7 +128,7 @@ func (ts *TokenService) RefreshAccessToken(refreshToken string) (*TokenPair, err
 		return nil, fmt.Errorf("failed to retrieve refresh token: %w", err)
 	}
 
-	// Parse token data (format: userID:tenantID:expiresAt)
+	// Parse token data (format: userID:workspaceID:expiresAt)
 	var userIDStr, tenantIDStr string
 	var expiresAtUnix int64
 	_, err = fmt.Sscanf(tokenData, "%s:%s:%d", &userIDStr, &tenantIDStr, &expiresAtUnix)
@@ -141,7 +141,7 @@ func (ts *TokenService) RefreshAccessToken(refreshToken string) (*TokenPair, err
 		return nil, fmt.Errorf("invalid user ID in token")
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID in token")
 	}
@@ -155,7 +155,7 @@ func (ts *TokenService) RefreshAccessToken(refreshToken string) (*TokenPair, err
 
 	// Generate new access token (refresh token remains the same)
 	accessTokenExpiry := time.Now().Add(15 * time.Minute)
-	accessToken, err := ts.generateAccessToken(userID, tenantID, "", accessTokenExpiry, nil)
+	accessToken, err := ts.generateAccessToken(userID, workspaceID, "", accessTokenExpiry, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate new access token: %w", err)
 	}

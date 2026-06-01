@@ -123,7 +123,7 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 
 	tenantUUID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
-		log.Printf("%s: invalid tenant_id %q: %v", logPrefix, tenantIDStr, err)
+		log.Printf("%s: invalid workspace_id %q: %v", logPrefix, tenantIDStr, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
 	}
@@ -275,7 +275,7 @@ func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
 		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 
@@ -572,7 +572,7 @@ func (auc *AdminUserController) DeleteAdminUserAll(c *gin.Context) {
 	tenantUUID, err := uuid.Parse(strings.TrimSpace(req.WorkspaceID))
 	if err != nil {
 		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 
@@ -933,10 +933,10 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 	}
 
 	// Create tenant
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	tenant := &models.Tenant{
-		ID:           tenantID,
-		WorkspaceID:     tenantID,
+		ID:           workspaceID,
+		WorkspaceID:     workspaceID,
 		Email:        input.Email,
 		Username:     &input.Username,
 		PasswordHash: hashedPassword,
@@ -952,7 +952,7 @@ func (auc *AdminUserController) CreateTenant(c *gin.Context) {
 	}
 
 	// Audit log: Tenant created
-	middlewares.Audit(c, "tenant", tenantID.String(), "create", &middlewares.AuditChanges{
+	middlewares.Audit(c, "tenant", workspaceID.String(), "create", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"email":         input.Email,
 			"username":      input.Username,
@@ -975,7 +975,7 @@ func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
@@ -995,7 +995,7 @@ func (auc *AdminUserController) UpdateTenant(c *gin.Context) {
 	}
 
 	// Get existing tenant
-	existingTenant, err := auc.tenantRepo.GetTenantByTenantID(tenantID.String())
+	existingTenant, err := auc.tenantRepo.GetTenantByTenantID(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 		return
@@ -1033,8 +1033,8 @@ func (auc *AdminUserController) GetTenantUsers(c *gin.Context) {
 	})
 }
 
-func (auc *AdminUserController) fetchTenantUsers(tenantID uuid.UUID, clientID *uuid.UUID, provider string) ([]map[string]interface{}, error) {
-	tenant, err := auc.tenantRepo.GetTenantByTenantID(tenantID.String())
+func (auc *AdminUserController) fetchTenantUsers(workspaceID uuid.UUID, clientID *uuid.UUID, provider string) ([]map[string]interface{}, error) {
+	tenant, err := auc.tenantRepo.GetTenantByTenantID(workspaceID.String())
 	if err != nil {
 		return nil, errTenantNotFound
 	}
@@ -1221,7 +1221,7 @@ func (auc *AdminUserController) ToggleEndUserActive(c *gin.Context) {
 	tenantUUID, err := uuid.Parse(tenantIDStr)
 	if err != nil {
 		logger.WithError(err).WithField("workspace_id", req.WorkspaceID).Warn("Invalid tenant ID format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 
@@ -1331,8 +1331,8 @@ func (auc *AdminUserController) DeleteTenant(c *gin.Context) {
 
 	tenantUUID, err := uuid.Parse(tenantIDParam)
 	if err != nil {
-		logger.WithError(err).Warn("Invalid tenant_id format")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant_id format"})
+		logger.WithError(err).Warn("Invalid workspace_id format")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 		return
 	}
 

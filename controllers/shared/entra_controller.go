@@ -724,7 +724,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 	}
 	tenantUUID, err := uuid.Parse(tenantID)
 	if err != nil {
-		return EntraIDConfig{}, fmt.Errorf("invalid tenant_id format")
+		return EntraIDConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {

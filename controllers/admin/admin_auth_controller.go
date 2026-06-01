@@ -1655,15 +1655,15 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	}
 
 	// Generate UUIDs
-	tenantID := uuid.New()
-	clientID := tenantID // Same as tenant for admin
+	workspaceID := uuid.New()
+	clientID := workspaceID // Same as tenant for admin
 
 	// If pending registration exists, update it; otherwise create new
 	if existingPending != nil {
 		// Update existing pending registration
 		existingPending.PasswordHash = hashedPassword
 		existingPending.TenantDomain = tenantDomain
-		existingPending.WorkspaceID = tenantID
+		existingPending.WorkspaceID = workspaceID
 		existingPending.ClientID = clientID
 		existingPending.ExpiresAt = time.Now().Add(24 * time.Hour)
 
@@ -1678,7 +1678,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		pendingReg := &models.PendingRegistration{
 			Email:        input.Email,
 			PasswordHash: hashedPassword,
-			WorkspaceID:  tenantID,
+			WorkspaceID:  workspaceID,
 			ProjectID:    uuid.New(),
 			ClientID:     clientID,
 			TenantDomain: tenantDomain,
@@ -1736,7 +1736,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
 		Message:      "Bootstrap initiated. Please check your email for OTP to complete registration.",
 		Status:       "pending_verification",
-		WorkspaceID:  tenantID.String(),
+		WorkspaceID:  workspaceID.String(),
 		TenantDomain: tenantDomain,
 	})
 }

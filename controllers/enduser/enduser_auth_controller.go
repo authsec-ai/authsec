@@ -217,7 +217,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (euac *EndUserAuthController) generateJWTToken(tenantID, clientID, emailID, tenantDomain string, userID *uuid.UUID, tenantDB interface{}) (string, error) {
+func (euac *EndUserAuthController) generateJWTToken(workspaceID, clientID, emailID, tenantDomain string, userID *uuid.UUID, tenantDB interface{}) (string, error) {
 	// Collect scopes for potential inclusion in token (though auth-manager fetches from DB)
 	scopes := []string{"read", "write"}
 
@@ -229,14 +229,14 @@ func (euac *EndUserAuthController) generateJWTToken(tenantID, clientID, emailID,
 			case *gorm.DB:
 				if sqlDB, err := db.DB(); err == nil && sqlDB != nil {
 					permSvc := services.NewPermissionService(sqlDB)
-					_, dbScopes := permSvc.GetUserPermissions(userIDStr, tenantID), permSvc.GetUserScopes(userIDStr, tenantID)
+					_, dbScopes := permSvc.GetUserPermissions(userIDStr, workspaceID), permSvc.GetUserScopes(userIDStr, workspaceID)
 					if len(dbScopes) > 0 {
 						scopes = dbScopes
 					}
 				}
 			case *sql.DB:
 				permSvc := services.NewPermissionService(db)
-				_, dbScopes := permSvc.GetUserPermissions(userIDStr, tenantID), permSvc.GetUserScopes(userIDStr, tenantID)
+				_, dbScopes := permSvc.GetUserPermissions(userIDStr, workspaceID), permSvc.GetUserScopes(userIDStr, workspaceID)
 				if len(dbScopes) > 0 {
 					scopes = dbScopes
 				}
@@ -253,7 +253,7 @@ func (euac *EndUserAuthController) generateJWTToken(tenantID, clientID, emailID,
 
 	return config.TokenService.GenerateEndUserToken(
 		*userID,
-		tenantID,
+		workspaceID,
 		clientID,
 		emailID,
 		scopes,

@@ -289,14 +289,14 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 	`
 
 	state := &models.OIDCState{}
-	var tenantID sql.NullString
+	var workspaceID sql.NullString
 	var requestHost, codeVerifier, redirectAfter sql.NullString
 	var applicationID, signedState, loginChallenge sql.NullString
 
 	err := r.db.QueryRow(query, stateToken, time.Now()).Scan(
 		&state.ID,
 		&state.StateToken,
-		&tenantID,
+		&workspaceID,
 		&state.TenantDomain,
 		&requestHost,
 		&state.ProviderName,
@@ -317,8 +317,8 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 		return nil, err
 	}
 
-	if tenantID.Valid {
-		id, _ := uuid.Parse(tenantID.String)
+	if workspaceID.Valid {
+		id, _ := uuid.Parse(workspaceID.String)
 		state.WorkspaceID = &id
 	}
 	if requestHost.Valid {
@@ -458,7 +458,7 @@ func (r *OIDCUserIdentityRepository) GetIdentityByProviderUser(providerName, pro
 
 // GetIdentityByTenantAndProviderUser retrieves identity for a specific tenant
 // This answers: "Does this Google user exist in THIS tenant?"
-func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
+func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(workspaceID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
 	query := `
 		SELECT id, workspace_id, user_id, provider_name, provider_user_id,
 		       email, profile_data, last_login_at, created_at, updated_at
@@ -471,7 +471,7 @@ func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID
 	var email sql.NullString
 	var lastLoginAt sql.NullTime
 
-	err := r.db.QueryRow(query, tenantID, providerName, providerUserID).Scan(
+	err := r.db.QueryRow(query, workspaceID, providerName, providerUserID).Scan(
 		&identity.ID,
 		&identity.WorkspaceID,
 		&identity.UserID,
@@ -505,7 +505,7 @@ func (r *OIDCUserIdentityRepository) GetIdentityByTenantAndProviderUser(tenantID
 }
 
 // GetIdentitiesByUserID retrieves all OIDC identities for a user
-func (r *OIDCUserIdentityRepository) GetIdentitiesByUserID(tenantID, userID uuid.UUID) ([]models.OIDCUserIdentity, error) {
+func (r *OIDCUserIdentityRepository) GetIdentitiesByUserID(workspaceID, userID uuid.UUID) ([]models.OIDCUserIdentity, error) {
 	query := `
 		SELECT id, workspace_id, user_id, provider_name, provider_user_id,
 		       email, profile_data, last_login_at, created_at, updated_at
@@ -513,7 +513,7 @@ func (r *OIDCUserIdentityRepository) GetIdentitiesByUserID(tenantID, userID uuid
 		WHERE workspace_id = $1 AND user_id = $2
 	`
 
-	rows, err := r.db.Query(query, tenantID, userID)
+	rows, err := r.db.Query(query, workspaceID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -589,13 +589,13 @@ func (r *OIDCUserIdentityRepository) UpdateProfileData(identityID uuid.UUID, pro
 }
 
 // DeleteIdentity deletes an OIDC identity link (unlink provider)
-func (r *OIDCUserIdentityRepository) DeleteIdentity(tenantID, userID uuid.UUID, providerName string) error {
+func (r *OIDCUserIdentityRepository) DeleteIdentity(workspaceID, userID uuid.UUID, providerName string) error {
 	query := `
 		DELETE FROM oidc_user_identities
 		WHERE workspace_id = $1 AND user_id = $2 AND provider_name = $3
 	`
 
-	result, err := r.db.Exec(query, tenantID, userID, providerName)
+	result, err := r.db.Exec(query, workspaceID, userID, providerName)
 	if err != nil {
 		return err
 	}
@@ -629,11 +629,11 @@ func (r *OIDCUserIdentityRepository) GetTenantsByProviderEmail(email string) ([]
 
 	var tenantIDs []uuid.UUID
 	for rows.Next() {
-		var tenantID uuid.UUID
-		if err := rows.Scan(&tenantID); err != nil {
+		var workspaceID uuid.UUID
+		if err := rows.Scan(&workspaceID); err != nil {
 			return nil, err
 		}
-		tenantIDs = append(tenantIDs, tenantID)
+		tenantIDs = append(tenantIDs, workspaceID)
 	}
 
 	return tenantIDs, rows.Err()

@@ -178,11 +178,11 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 }
 
 // GenerateAdminToken generates a token for admin users
-func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, tenantID *uuid.UUID, tenantDomain string, roles []string) (string, error) {
+func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, tenantDomain string, roles []string) (string, error) {
 	// Use actual tenant_id if provided, otherwise default to "admin" for super-admins
 	tenantIDStr := "admin"
-	if tenantID != nil && *tenantID != uuid.Nil {
-		tenantIDStr = tenantID.String()
+	if workspaceID != nil && *workspaceID != uuid.Nil {
+		tenantIDStr = workspaceID.String()
 	}
 
 	claims := TokenClaims{
@@ -200,12 +200,12 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 // GenerateTenantUserToken generates a token for tenant users
 func (s *AuthManagerTokenService) GenerateTenantUserToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	email string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID: tenantID.String(),
+		WorkspaceID: workspaceID.String(),
 		ClientID:    userID.String(),
 		EmailID:     email,
 		UserID:      &userID,
@@ -217,14 +217,14 @@ func (s *AuthManagerTokenService) GenerateTenantUserToken(
 // GenerateEndUserToken generates a token for end users (with default project_id = tenant_id)
 func (s *AuthManagerTokenService) GenerateEndUserToken(
 	userID uuid.UUID,
-	tenantID string,
+	workspaceID string,
 	clientID string,
 	email string,
 	scopes []string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID: tenantID,
+		WorkspaceID: workspaceID,
 		ClientID:    clientID,
 		EmailID:     email,
 		UserID:      &userID,
@@ -237,13 +237,13 @@ func (s *AuthManagerTokenService) GenerateEndUserToken(
 // GenerateVoiceAuthToken generates a token for voice authentication
 func (s *AuthManagerTokenService) GenerateVoiceAuthToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	email string,
 	scopes []string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID: tenantID.String(),
+		WorkspaceID: workspaceID.String(),
 		ClientID:    userID.String(),
 		EmailID:     email,
 		UserID:      &userID,
@@ -256,13 +256,13 @@ func (s *AuthManagerTokenService) GenerateVoiceAuthToken(
 // GenerateDeviceAuthToken generates a token for device authentication flows
 func (s *AuthManagerTokenService) GenerateDeviceAuthToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	email string,
 	scopes []string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID: tenantID.String(),
+		WorkspaceID: workspaceID.String(),
 		ClientID:    userID.String(),
 		EmailID:     email,
 		UserID:      &userID,
@@ -275,13 +275,13 @@ func (s *AuthManagerTokenService) GenerateDeviceAuthToken(
 // GenerateCIBAToken generates a token for CIBA (Client-Initiated Backchannel Authentication)
 func (s *AuthManagerTokenService) GenerateCIBAToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	email string,
 	scopes []string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
+		WorkspaceID:  workspaceID.String(),
 		ClientID:  userID.String(),
 		EmailID:   email,
 		UserID:    &userID,
@@ -294,14 +294,14 @@ func (s *AuthManagerTokenService) GenerateCIBAToken(
 // GenerateTenantCIBAToken generates a CIBA token with the correct client_id (not user_id)
 func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	clientID uuid.UUID,
 	email string,
 	scopes []string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
+		WorkspaceID:  workspaceID.String(),
 		ClientID:  clientID.String(),
 		EmailID:   email,
 		UserID:    &userID,
@@ -314,12 +314,12 @@ func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 // GenerateTOTPToken generates a token for TOTP authentication
 func (s *AuthManagerTokenService) GenerateTOTPToken(
 	userID uuid.UUID,
-	tenantID uuid.UUID,
+	workspaceID uuid.UUID,
 	email string,
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  tenantID.String(),
+		WorkspaceID:  workspaceID.String(),
 		ClientID:  userID.String(),
 		EmailID:   email,
 		UserID:    &userID,

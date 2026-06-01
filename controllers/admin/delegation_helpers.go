@@ -11,7 +11,7 @@ import (
 
 // getUserRoleNames queries role_bindings to get all distinct role names for a user in a tenant.
 // RBAC tables (role_bindings, roles) live in the master database.
-func getUserRoleNames(userID, tenantID string) ([]string, error) {
+func getUserRoleNames(userID, workspaceID string) ([]string, error) {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return nil, fmt.Errorf("master database not initialized")
@@ -25,7 +25,7 @@ func getUserRoleNames(userID, tenantID string) ([]string, error) {
 		AND rb.role_name IS NOT NULL
 		AND rb.role_name != ''
 	`
-	rows, err := masterDB.DB.Query(query, userID, tenantID)
+	rows, err := masterDB.DB.Query(query, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query user roles: %w", err)
 	}
@@ -45,7 +45,7 @@ func getUserRoleNames(userID, tenantID string) ([]string, error) {
 // findDelegationPolicy looks up an enabled delegation policy matching any of
 // the user's roles and the requested agent_type within a workspace. Single-DB
 // collapse: tenant_id is now a row predicate on config.DB.
-func findDelegationPolicy(tenantID string, roleNames []string, agentType string) (*models.DelegationPolicy, error) {
+func findDelegationPolicy(workspaceID string, roleNames []string, agentType string) (*models.DelegationPolicy, error) {
 	if len(roleNames) == 0 {
 		return nil, fmt.Errorf("user has no roles")
 	}
@@ -53,7 +53,7 @@ func findDelegationPolicy(tenantID string, roleNames []string, agentType string)
 	var policy models.DelegationPolicy
 	result := config.DB.
 		Where("workspace_id::text = ? AND role_name IN ? AND agent_type = ? AND enabled = true",
-			tenantID, roleNames, agentType).
+			workspaceID, roleNames, agentType).
 		First(&policy)
 
 	if result.Error != nil {
@@ -64,7 +64,7 @@ func findDelegationPolicy(tenantID string, roleNames []string, agentType string)
 
 // getUserEffectivePermissionStrings returns permission strings ("resource:action") for a user.
 // RBAC tables (permissions, role_permissions, role_bindings) live in the master database.
-func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error) {
+func getUserEffectivePermissionStrings(userID, workspaceID string) ([]string, error) {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return nil, fmt.Errorf("master database not initialized")
@@ -78,7 +78,7 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 		WHERE rb.user_id::text = $1
 		AND rb.workspace_id::text = $2
 	`
-	rows, err := masterDB.DB.Query(query, userID, tenantID)
+	rows, err := masterDB.DB.Query(query, userID, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query user permissions: %w", err)
 	}
@@ -99,7 +99,7 @@ func getUserEffectivePermissionStrings(userID, tenantID string) ([]string, error
 // active ai_agent resource server in the given workspace. Phase B: the legacy
 // `clients` table was dropped; an "agent" is now a resource_servers row with
 // application_type='ai_agent'. The policy's client_id holds that resource_servers.id.
-func validateClientActive(clientID, tenantID string) error {
+func validateClientActive(clientID, workspaceID string) error {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return fmt.Errorf("master database not initialized")
@@ -115,8 +115,8 @@ func validateClientActive(clientID, tenantID string) error {
 		LIMIT 1
 	`
 	var id string
-	if err := masterDB.DB.QueryRow(query, clientID, tenantID).Scan(&id); err != nil {
-		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, tenantID)
+	if err := masterDB.DB.QueryRow(query, clientID, workspaceID).Scan(&id); err != nil {
+		return fmt.Errorf("agent %s not found or not active in workspace %s", clientID, workspaceID)
 	}
 	return nil
 }
@@ -125,9 +125,9 @@ func validateClientActive(clientID, tenantID string) error {
 // for the requested agent_type, resolves the user's effective permissions, intersects
 // with the policy's allowed permissions AND the client's allowed_permissions, and caps
 // the TTL. Returns the delegated permissions or an error if delegation is not allowed.
-func resolveDelegationPermissions(userID, tenantID, agentType string, ttl *time.Duration) ([]string, string, error) {
+func resolveDelegationPermissions(userID, workspaceID, agentType string, ttl *time.Duration) ([]string, string, error) {
 	// 1. Get user's role names
-	roleNames, err := getUserRoleNames(userID, tenantID)
+	roleNames, err := getUserRoleNames(userID, workspaceID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to look up user roles: %w", err)
 	}
@@ -136,7 +136,7 @@ func resolveDelegationPermissions(userID, tenantID, agentType string, ttl *time.
 	}
 
 	// 2. Find matching delegation policy
-	policy, err := findDelegationPolicy(tenantID, roleNames, agentType)
+	policy, err := findDelegationPolicy(workspaceID, roleNames, agentType)
 	if err != nil {
 		return nil, "", fmt.Errorf("no enabled delegation policy for roles %v and agent_type %q", roleNames, agentType)
 	}
@@ -145,13 +145,13 @@ func resolveDelegationPermissions(userID, tenantID, agentType string, ttl *time.
 	var clientID string
 	if policy.ClientID != nil {
 		clientID = policy.ClientID.String()
-		if err := validateClientActive(clientID, tenantID); err != nil {
+		if err := validateClientActive(clientID, workspaceID); err != nil {
 			return nil, "", fmt.Errorf("delegation client is not active: %w", err)
 		}
 	}
 
 	// 4. Get user's effective permissions
-	userPerms, err := getUserEffectivePermissionStrings(userID, tenantID)
+	userPerms, err := getUserEffectivePermissionStrings(userID, workspaceID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to resolve user permissions: %w", err)
 	}
@@ -175,14 +175,14 @@ func resolveDelegationPermissions(userID, tenantID, agentType string, ttl *time.
 }
 
 // getTenantRoleNames returns all distinct role names for a tenant.
-func getTenantRoleNames(tenantID string) ([]string, error) {
+func getTenantRoleNames(workspaceID string) ([]string, error) {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return nil, fmt.Errorf("master database not initialized")
 	}
 
 	query := `SELECT DISTINCT name FROM roles WHERE workspace_id::text = $1 ORDER BY name`
-	rows, err := masterDB.DB.Query(query, tenantID)
+	rows, err := masterDB.DB.Query(query, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query tenant roles: %w", err)
 	}
@@ -200,7 +200,7 @@ func getTenantRoleNames(tenantID string) ([]string, error) {
 }
 
 // getTenantPermissionStrings returns all distinct permission strings for a tenant.
-func getTenantPermissionStrings(tenantID string) ([]string, error) {
+func getTenantPermissionStrings(workspaceID string) ([]string, error) {
 	masterDB := config.GetDatabase()
 	if masterDB == nil {
 		return nil, fmt.Errorf("master database not initialized")
@@ -214,7 +214,7 @@ func getTenantPermissionStrings(tenantID string) ([]string, error) {
 		WHERE r.workspace_id::text = $1
 		ORDER BY 1
 	`
-	rows, err := masterDB.DB.Query(query, tenantID)
+	rows, err := masterDB.DB.Query(query, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("query tenant permissions: %w", err)
 	}

@@ -125,7 +125,7 @@ func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -134,7 +134,7 @@ func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 	email := emailStr.(string)
 
 	// Call TOTP service
-	response, err := ttc.totpService.RegisterTenantTOTPDevice(&req, userID, tenantID, email)
+	response, err := ttc.totpService.RegisterTenantTOTPDevice(&req, userID, workspaceID, email)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -194,14 +194,14 @@ func (ttc *TenantTOTPController) ConfirmTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call TOTP service
-	response, err := ttc.totpService.ConfirmTenantTOTPDevice(&req, userID, tenantID)
+	response, err := ttc.totpService.ConfirmTenantTOTPDevice(&req, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -245,14 +245,14 @@ func (ttc *TenantTOTPController) GetTenantTOTPDevices(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call TOTP service
-	response, err := ttc.totpService.GetTenantTOTPDevices(userID, tenantID)
+	response, err := ttc.totpService.GetTenantTOTPDevices(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -306,14 +306,14 @@ func (ttc *TenantTOTPController) DeleteTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call TOTP service
-	response, err := ttc.totpService.DeleteTenantTOTPDevice(&req, userID, tenantID)
+	response, err := ttc.totpService.DeleteTenantTOTPDevice(&req, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -371,14 +371,14 @@ func (ttc *TenantTOTPController) SetTenantPrimaryTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call TOTP service
-	response, err := ttc.totpService.SetTenantPrimaryTOTPDevice(&req, userID, tenantID)
+	response, err := ttc.totpService.SetTenantPrimaryTOTPDevice(&req, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

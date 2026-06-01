@@ -125,9 +125,9 @@ type AuthenticatorResponse struct {
 	ClientDataJSON    string `json:"clientDataJSON"`
 }
 
-// buildChallengeKey combines operation, email, and tenantID to index session maps
-func buildChallengeKey(operation, email, tenantID string) string {
-	return operation + ":" + email + ":" + tenantID
+// buildChallengeKey combines operation, email, and workspaceID to index session maps
+func buildChallengeKey(operation, email, workspaceID string) string {
+	return operation + ":" + email + ":" + workspaceID
 }
 
 // convertUUIDToBytes converts UUID pointer to byte slice
@@ -139,7 +139,7 @@ func convertUUIDToBytes(aaguid *uuid.UUID) []byte {
 }
 
 // resolveDB provides simple database connection using direct config calls
-func (h *WebAuthnHandler) resolveDB(tenantID string) *gorm.DB {
+func (h *WebAuthnHandler) resolveDB(workspaceID string) *gorm.DB {
 	// Try GlobalDB first
 	globalDB, err := config.ConnectGlobalDB()
 	if err != nil {
@@ -150,7 +150,7 @@ func (h *WebAuthnHandler) resolveDB(tenantID string) *gorm.DB {
 }
 
 // resolveDBWithError provides database connection with error handling
-func (h *WebAuthnHandler) resolveDBWithError(c *gin.Context, tenantID, reqID string) (*gorm.DB, bool, error) {
+func (h *WebAuthnHandler) resolveDBWithError(c *gin.Context, workspaceID, reqID string) (*gorm.DB, bool, error) {
 	globalDB, err := config.ConnectGlobalDB()
 	if err != nil {
 		log.Printf("[%s] resolveDBWithError: Failed to connect to global DB - %v", reqID, err)
@@ -161,10 +161,10 @@ func (h *WebAuthnHandler) resolveDBWithError(c *gin.Context, tenantID, reqID str
 }
 
 // validateOriginAndCreateWebAuthn validates the origin and creates a WebAuthn instance
-func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, tenantID string) (*webauthn.WebAuthn, error) {
+func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, workspaceID string) (*webauthn.WebAuthn, error) {
 	// Get the origin from the request
 	requestOrigin := c.Request.Header.Get("Origin")
-	log.Printf("validateOriginAndCreateWebAuthn: Request origin=%s, tenantID=%s", requestOrigin, tenantID)
+	log.Printf("validateOriginAndCreateWebAuthn: Request origin=%s, workspaceID=%s", requestOrigin, workspaceID)
 
 	// Check for custom domain FIRST before standard validation
 	// Custom Domain Check - check global DB for verified custom domains
@@ -184,17 +184,17 @@ func (h *WebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context, tenant
 			whereClause := "domain = ? AND is_verified = true"
 			args := []interface{}{host}
 
-			// If tenantID is provided, also check tenant ownership
-			if tenantID != "" {
+			// If workspaceID is provided, also check tenant ownership
+			if workspaceID != "" {
 				whereClause += " AND workspace_id = ?"
-				args = append(args, tenantID)
+				args = append(args, workspaceID)
 			}
 
 			if err := db.Table("workspace_domains").Where(whereClause, args...).Count(&count).Error; err == nil && count > 0 {
-				log.Printf("validateOriginAndCreateWebAuthn: Valid custom domain %s (tenant: %s)", host, tenantID)
+				log.Printf("validateOriginAndCreateWebAuthn: Valid custom domain %s (tenant: %s)", host, workspaceID)
 				return config.SetupWebAuthn("AuthSec MFA Service", host, requestOrigin), nil
 			} else if err != nil {
-				log.Printf("validateOriginAndCreateWebAuthn: Custom domain lookup failed for host=%s tenant=%s: %v", host, tenantID, err)
+				log.Printf("validateOriginAndCreateWebAuthn: Custom domain lookup failed for host=%s tenant=%s: %v", host, workspaceID, err)
 			} else {
 				log.Printf("validateOriginAndCreateWebAuthn: Domain %s not found in workspace_domains or not verified", host)
 			}
@@ -420,12 +420,12 @@ func (h *WebAuthnHandler) BeginRegistration(c *gin.Context) {
 		return
 	}
 
-	log.Printf("BeginRegistration: Starting for email=%s, tenantID=%s", req.Email, req.WorkspaceID)
+	log.Printf("BeginRegistration: Starting for email=%s, workspaceID=%s", req.Email, req.WorkspaceID)
 
 	// Validate required fields
 	if req.Email == "" || req.WorkspaceID == "" {
 		log.Printf("BeginRegistration: Missing required fields")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email and tenantID are required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email and workspaceID are required"})
 		return
 	}
 
@@ -579,16 +579,16 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		return
 	}
 
-	tenantID := reqBody.WorkspaceID
+	workspaceID := reqBody.WorkspaceID
 	email := reqBody.Email
-	if tenantID == "" || email == "" {
+	if workspaceID == "" || email == "" {
 		log.Printf("[%s] FinishRegistration: missing tenant_id or email", reqID)
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email are required"})
 		return
 	}
 
 	// Step 4: Resolve DB (global vs tenant)
-	db, isGlobalDB, err := h.resolveDBWithError(c, tenantID, reqID)
+	db, isGlobalDB, err := h.resolveDBWithError(c, workspaceID, reqID)
 	if err != nil {
 		return
 	}
@@ -603,7 +603,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		}
 	} else {
 		if err := db.Scopes(util.WithUsersMFAMethodArray).
-			Where("email = ? AND workspace_id = ?", email, tenantID).First(&userWithJSONMFA).Error; err != nil {
+			Where("email = ? AND workspace_id = ?", email, workspaceID).First(&userWithJSONMFA).Error; err != nil {
 			log.Printf("[%s] FinishRegistration: user not found in TenantDB: %v", reqID, err)
 			c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 			return
@@ -626,7 +626,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	client := &WebAuthnUser{User: &user}
 
 	// Step 7: Recover session
-	challengeKey := buildChallengeKey("biometric_setup", email, tenantID)
+	challengeKey := buildChallengeKey("biometric_setup", email, workspaceID)
 	sessionData, found := h.SessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishRegistration: session not found key=%s", reqID, challengeKey)
@@ -781,7 +781,7 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 	// Audit log for successful WebAuthn registration
 	middleware.AuditAuthentication(c, user.ID.String(), "webauthn", "register", true, map[string]interface{}{
 		"credential_id": hex.EncodeToString(credential.ID),
-		"workspace_id":  tenantID,
+		"workspace_id":  workspaceID,
 	})
 
 	// Success
@@ -806,9 +806,9 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 // the user-flow controller logic directly in-process, replacing the HTTP POST
 // to {AUTH_MANAGER_URL}/uflow/webauthn/register that existed when user-flow
 // and webauthn-service were separate microservices.
-func (h *WebAuthnHandler) callUserflowService(clientID, email, tenantID string) (accessToken, refreshToken string, err error) {
-	log.Printf("callUserflowService: invoking internal controller for email=%s, tenantID=%s", email, tenantID)
-	return adminCtrl.WebAuthnRegisterInternal(clientID, email, tenantID)
+func (h *WebAuthnHandler) callUserflowService(clientID, email, workspaceID string) (accessToken, refreshToken string, err error) {
+	log.Printf("callUserflowService: invoking internal controller for email=%s, workspaceID=%s", email, workspaceID)
+	return adminCtrl.WebAuthnRegisterInternal(clientID, email, workspaceID)
 }
 
 //
@@ -1232,9 +1232,9 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request JSON"})
 		return
 	}
-	tenantID, _ := raw["workspace_id"].(string)
+	workspaceID, _ := raw["workspace_id"].(string)
 	email, _ := raw["email"].(string)
-	if tenantID == "" || email == "" {
+	if workspaceID == "" || email == "" {
 		log.Printf("[%s] ConfirmBiometricSetup: missing tenant_id or email", reqID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and email are required"})
 		return
@@ -1245,7 +1245,7 @@ func (h *WebAuthnHandler) ConfirmBiometricSetup(c *gin.Context) {
 		WorkspaceID string
 	}{
 		Email:       strings.TrimSpace(email),
-		WorkspaceID: strings.TrimSpace(tenantID),
+		WorkspaceID: strings.TrimSpace(workspaceID),
 	}
 	if req.Email == "" || req.WorkspaceID == "" {
 		log.Printf("[%s] ConfirmBiometricSetup: trimmed email or workspace_id empty", reqID)

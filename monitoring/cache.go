@@ -215,26 +215,26 @@ func (cm *CacheManager) HealthCheck() error {
 }
 
 // CacheTenantConfig caches tenant configuration
-func (cm *CacheManager) CacheTenantConfig(tenantID string, config interface{}) error {
-	key := "tenant:config:" + tenantID
+func (cm *CacheManager) CacheTenantConfig(workspaceID string, config interface{}) error {
+	key := "tenant:config:" + workspaceID
 	return cm.Set(key, config, 30*time.Minute) // Cache for 30 minutes
 }
 
 // GetTenantConfig retrieves cached tenant configuration
-func (cm *CacheManager) GetTenantConfig(tenantID string, dest interface{}) (bool, error) {
-	key := "tenant:config:" + tenantID
+func (cm *CacheManager) GetTenantConfig(workspaceID string, dest interface{}) (bool, error) {
+	key := "tenant:config:" + workspaceID
 	return cm.Get(key, dest)
 }
 
 // CacheUserPermissions caches user permissions
-func (cm *CacheManager) CacheUserPermissions(tenantID, userID string, permissions interface{}) error {
-	key := "user:permissions:" + tenantID + ":" + userID
+func (cm *CacheManager) CacheUserPermissions(workspaceID, userID string, permissions interface{}) error {
+	key := "user:permissions:" + workspaceID + ":" + userID
 	return cm.Set(key, permissions, 15*time.Minute) // Cache for 15 minutes
 }
 
 // GetUserPermissions retrieves cached user permissions
-func (cm *CacheManager) GetUserPermissions(tenantID, userID string, dest interface{}) (bool, error) {
-	key := "user:permissions:" + tenantID + ":" + userID
+func (cm *CacheManager) GetUserPermissions(workspaceID, userID string, dest interface{}) (bool, error) {
+	key := "user:permissions:" + workspaceID + ":" + userID
 	return cm.Get(key, dest)
 }
 
@@ -251,12 +251,12 @@ func (cm *CacheManager) GetAuthToken(token string, dest interface{}) (bool, erro
 }
 
 // InvalidateTenantCache invalidates all cache entries for a tenant
-func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
-	pattern := "tenant:*:" + tenantID
+func (cm *CacheManager) InvalidateTenantCache(workspaceID string) error {
+	pattern := "tenant:*:" + workspaceID
 	keys, err := cm.scanKeys(pattern)
 	if err != nil {
 		cm.logger.WithFields(logrus.Fields{
-			"workspace_id": tenantID,
+			"workspace_id": workspaceID,
 			"error":     err.Error(),
 		}).Error("Failed to find tenant cache keys")
 		return err
@@ -266,7 +266,7 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 		err = cm.client.Del(cm.ctx, keys...).Err()
 		if err != nil {
 			cm.logger.WithFields(logrus.Fields{
-				"workspace_id": tenantID,
+				"workspace_id": workspaceID,
 				"keys":      keys,
 				"error":     err.Error(),
 			}).Error("Failed to delete tenant cache keys")
@@ -274,7 +274,7 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 		}
 
 		cm.logger.WithFields(logrus.Fields{
-			"workspace_id":    tenantID,
+			"workspace_id":    workspaceID,
 			"keys_deleted": len(keys),
 		}).Info("Tenant cache invalidated")
 	}
@@ -283,9 +283,9 @@ func (cm *CacheManager) InvalidateTenantCache(tenantID string) error {
 }
 
 // InvalidateUserCache invalidates all cache entries for a user
-func (cm *CacheManager) InvalidateUserCache(tenantID, userID string) error {
+func (cm *CacheManager) InvalidateUserCache(workspaceID, userID string) error {
 	patterns := []string{
-		"user:permissions:" + tenantID + ":" + userID,
+		"user:permissions:" + workspaceID + ":" + userID,
 		"auth:token:*", // This is broad, but safer than complex pattern matching
 	}
 
@@ -301,7 +301,7 @@ func (cm *CacheManager) InvalidateUserCache(tenantID, userID string) error {
 	}
 
 	cm.logger.WithFields(logrus.Fields{
-		"workspace_id": tenantID,
+		"workspace_id": workspaceID,
 		"user_id":   userID,
 	}).Info("User cache invalidated")
 

@@ -112,14 +112,14 @@ func (tcc *TenantCIBAController) RespondToTenantCIBA(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call CIBA service
-	response, err := tcc.cibaService.RespondToTenantCIBA(req.AuthReqID, req.Approved, req.BiometricVerified, userID, tenantID)
+	response, err := tcc.cibaService.RespondToTenantCIBA(req.AuthReqID, req.Approved, req.BiometricVerified, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -225,14 +225,14 @@ func (tcc *TenantCIBAController) RegisterTenantDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
 	// Call CIBA service
-	response, err := tcc.cibaService.RegisterTenantDevice(&req, userID, tenantID)
+	response, err := tcc.cibaService.RegisterTenantDevice(&req, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -272,7 +272,7 @@ func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -283,7 +283,7 @@ func (tcc *TenantCIBAController) GetTenantCIBARequests(c *gin.Context) {
 
 	// Get pending requests
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	requests, err := tenantRepo.GetPendingTenantCIBAAuthRequests(userID, tenantID)
+	requests, err := tenantRepo.GetPendingTenantCIBAAuthRequests(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve pending requests"})
 		return
@@ -324,7 +324,7 @@ func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -333,7 +333,7 @@ func (tcc *TenantCIBAController) ListTenantDevices(c *gin.Context) {
 	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	devices, err := tenantRepo.GetTenantDeviceTokensByUserID(userID, tenantID)
+	devices, err := tenantRepo.GetTenantDeviceTokensByUserID(userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve devices"})
 		return
@@ -401,7 +401,7 @@ func (tcc *TenantCIBAController) DeleteTenantDevice(c *gin.Context) {
 		return
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(tenantIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -410,7 +410,7 @@ func (tcc *TenantCIBAController) DeleteTenantDevice(c *gin.Context) {
 	tenantDB := config.DB
 
 	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	err = tenantRepo.DeactivateTenantDeviceToken(deviceID, userID, tenantID)
+	err = tenantRepo.DeactivateTenantDeviceToken(deviceID, userID, workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate device"})
 		return

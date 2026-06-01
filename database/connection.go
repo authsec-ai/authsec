@@ -94,7 +94,7 @@ func GetMasterDB() *DBConnection {
 // master DB (config.DB / GetMasterDB). Kept exported in case external code
 // imports the symbol; returns the master connection to preserve "happy path"
 // behavior for any straggler caller. Logs a warning so the call is visible.
-func GetTenantDB(tenantID string) (*DBConnection, error) {
+func GetTenantDB(workspaceID string) (*DBConnection, error) {
 	if GlobalConnectionManager == nil {
 		return nil, fmt.Errorf("connection manager not initialized")
 	}
