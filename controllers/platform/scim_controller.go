@@ -24,9 +24,9 @@ import (
 // SCIMController handles SCIM 2.0 provisioning endpoints for end-users (tenant DB)
 type SCIMController struct{}
 
-func countSCIMTenantUsers(tenantID uuid.UUID) (int64, error) {
+func countSCIMTenantUsers(workspaceID uuid.UUID) (int64, error) {
 	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", tenantID).Scan(&count).Error
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ?", workspaceID).Scan(&count).Error
 	return count, err
 }
 
