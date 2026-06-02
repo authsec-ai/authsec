@@ -31,8 +31,8 @@ type BillingClient struct {
 
 func NewBillingClient(baseURL, sdkSecret string) *BillingClient {
 	return &BillingClient{
-		baseURL:   baseURL,
-		sdkSecret: sdkSecret,
+		baseURL:    baseURL,
+		sdkSecret:  sdkSecret,
 		httpClient: &http.Client{Timeout: 3 * time.Second},
 	}
 }
@@ -40,7 +40,6 @@ func NewBillingClient(baseURL, sdkSecret string) *BillingClient {
 // CheckTotalUsers checks whether the workspace can add one more user given currentCount.
 // Returns allowed=true, limit=-1 when billing service is not configured (OSS mode).
 // Fails open on network errors so a billing outage never blocks user registration.
-func (c *BillingClient) CheckTotalUsers(ctx context.Context, workspaceID string, currentCount int) (*MAUEntitlementResponse, error) {
 func (c *BillingClient) CheckTotalUsers(ctx context.Context, workspaceID string, currentCount int) (*MAUEntitlementResponse, error) {
 	if c.baseURL == "" {
 		return &MAUEntitlementResponse{Allowed: true, Limit: -1}, nil

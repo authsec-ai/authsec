@@ -47,6 +47,7 @@ type CreateOIDCIDPRequest struct {
 	ClientSecret     string
 	Scopes           string
 	IconURL          string
+	RedirectURI      string
 }
 
 // CreateSAMLIDPRequest is the input for CreateSAML.
@@ -119,6 +120,7 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 			UserinfoURL:           req.UserinfoURL,
 			Scopes:                coalesceString(req.Scopes, "openid email profile"),
 			IconURL:               req.IconURL,
+			RedirectURI:           req.RedirectURI,
 			IsActive:              true,
 		}
 		if err := tx.Create(&oidcRow).Error; err != nil {

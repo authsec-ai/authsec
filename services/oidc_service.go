@@ -173,7 +173,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	log.Printf("DEBUG InitiateOIDCFlow: Successfully created state with token='%s', tenant_domain='%s', origin_domain='%s', action='%s'", stateToken, input.TenantDomain, s.requestOrigin, action)
 
 	// Build authorization URL
-	callbackURL := s.getCallbackURL()
+	callbackURL := s.resolveCallbackURL(provider)
 	log.Printf("DEBUG InitiateOIDCFlow: Using callbackURL='%s' for provider '%s'", callbackURL, provider.ProviderName)
 	authURL, err := s.buildAuthorizationURL(provider, stateToken, codeChallenge, callbackURL)
 	if err != nil {
@@ -324,11 +324,8 @@ func (s *OIDCService) UpdateProvider(providerName string, input *models.OIDCProv
 // Helper methods
 // ========================================
 
-// getCallbackURL returns the OIDC callback URL
-// Always uses BASE_URL from config to ensure the redirect_uri sent to OAuth providers
-// (Google, GitHub, Microsoft) matches exactly what is registered in their consoles.
-// Do NOT use requestHost here — that would send the API backend host (e.g., prod.api.authsec.ai)
-// instead of the registered redirect URI, causing redirect_uri_mismatch errors.
+// getCallbackURL returns the platform-default OIDC callback URL derived from
+// BASE_URL. Used when a provider row has no per-workspace redirect_uri stored.
 func (s *OIDCService) getCallbackURL() string {
 	baseURL := config.AppConfig.BaseURL
 	if baseURL == "" {
@@ -337,6 +334,18 @@ func (s *OIDCService) getCallbackURL() string {
 	callbackURL := fmt.Sprintf("%s/authsec/uflow/oidc/callback", baseURL)
 	log.Printf("DEBUG getCallbackURL: Using BASE_URL='%s', callbackURL='%s'", baseURL, callbackURL)
 	return callbackURL
+}
+
+// resolveCallbackURL returns the redirect_uri to send to the upstream OIDC
+// provider for this row. Workspace-registered apps (their own Google/GitHub
+// OAuth app) store the URI on oidc_providers.redirect_uri so it matches what
+// the operator registered in the provider console; rows without one fall back
+// to the BASE_URL default.
+func (s *OIDCService) resolveCallbackURL(provider *models.OIDCProvider) string {
+	if provider != nil && provider.RedirectURI != "" {
+		return provider.RedirectURI
+	}
+	return s.getCallbackURL()
 }
 
 // SetRequestHost sets the current request host for dynamic callback URLs
@@ -387,7 +396,7 @@ func (s *OIDCService) buildAuthorizationURL(provider *models.OIDCProvider, state
 
 // exchangeCodeForTokens exchanges the authorization code for access tokens
 func (s *OIDCService) exchangeCodeForTokens(provider *models.OIDCProvider, code, codeVerifier, clientSecret string) (*models.OIDCTokenResponse, error) {
-	callbackURL := s.getCallbackURL()
+	callbackURL := s.resolveCallbackURL(provider)
 
 	// URL decode the code before setting it, to prevent double encoding issues
 	decodedCode, err := url.QueryUnescape(code)

@@ -554,6 +554,7 @@ CREATE TABLE public.oidc_providers (
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     workspace_id uuid,
     display_name_override text,
+    redirect_uri text,
     CONSTRAINT oidc_providers_pkey PRIMARY KEY (id)
 );
 

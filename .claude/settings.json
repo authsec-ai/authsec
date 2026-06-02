@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git worktree *)",
+      "Bash(ls \"../authsec-prod-readonly\" | head -20 && echo \"---\" && ls \"../authsec-prod-readonly/cmd\" 2>&1 | head -10)",
+      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-prod-readonly/**)",
+      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-prod-readonly/cmd/**)",
+      "Bash(Get-ChildItem -Depth 2 -Directory)",
+      "Bash(Select-Object FullName)",
+      "Bash(grep -E \"\\\\.\\(go|sql\\)$\")",
+      "Bash(grep -E \"\\\\.go$\")"
+    ]
+  }
+}

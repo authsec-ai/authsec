@@ -55,6 +55,7 @@ type oidcCreateConfig struct {
 	ClientSecret     string `json:"client_secret" binding:"required"`
 	Scopes           string `json:"scopes,omitempty"`
 	IconURL          string `json:"icon_url,omitempty"`
+	RedirectURI      string `json:"redirect_uri,omitempty"`
 }
 
 type samlCreateConfig struct {
@@ -105,6 +106,7 @@ func (ctrl *IdentityProvidersController) Create(c *gin.Context) {
 			ClientSecret:     cfg.ClientSecret,
 			Scopes:           cfg.Scopes,
 			IconURL:          cfg.IconURL,
+			RedirectURI:      cfg.RedirectURI,
 		})
 		if err != nil {
 			if errors.Is(err, services.ErrIdentityProviderAlreadyExists) {

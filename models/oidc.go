@@ -22,6 +22,7 @@ type OIDCProvider struct {
 	UserinfoURL           string    `json:"userinfo_url" gorm:"not null"`                                                        // OAuth userinfo endpoint
 	Scopes                string    `json:"scopes" gorm:"default:'openid email profile'"`                                        // Space-separated scopes
 	IconURL               string    `json:"icon_url,omitempty"`                                                                  // Provider icon for UI
+	RedirectURI           string    `json:"redirect_uri,omitempty"`                                                              // OAuth redirect_uri registered with the IDP; null = derive from request host
 	IsActive              bool      `json:"is_active" gorm:"default:false"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
@@ -150,6 +151,7 @@ type OIDCProviderUpdateInput struct {
 	ClientSecretVaultPath string `json:"client_secret_vault_path,omitempty"`
 	IsActive              *bool  `json:"is_active,omitempty"`
 	IconURL               string `json:"icon_url,omitempty"`
+	RedirectURI           string `json:"redirect_uri,omitempty"`
 }
 
 // OIDCProviderListResponse represents list of available providers for UI
