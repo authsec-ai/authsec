@@ -318,6 +318,87 @@ func (s *BindingService) ListAccessUsers(tenantID string, applicationID uuid.UUI
 	return out, nil
 }
 
+// EffectiveScopesForSubject is the introspection-time RBAC filter resolver.
+// Given an Application and a token's `sub` claim, it returns the user's
+// current effective scope strings — the same set used by the admin UI's
+// /users/:user_id/effective-access endpoint, but designed for the hot
+// path on every /oauth/v2/introspect call.
+//
+// Semantics:
+//
+//   - subject parses as a uuid → look up bindings → roles → scope_grants
+//     → scopes for that user on this Application. Return the deduplicated
+//     set.
+//   - subject doesn't parse as a uuid → it's a non-end-user token
+//     (client_credentials, SPIRE workload, etc.). Return (nil, true) so
+//     the caller skips the filter and passes through Hydra's scope claim.
+//   - user exists but has no bindings → return empty slice, not nil.
+//     The caller intersects with the token's claimed scope; empty
+//     intersection means deny-all, which is correct.
+//   - user doesn't exist in the tenant → return empty slice + false.
+//     Fail-closed — we can't confirm the user, so we don't trust the
+//     token's claimed scope.
+//   - DB error → propagated as an error. Caller decides; the recommended
+//     posture is fail-closed (treat as empty scope) to avoid leaking
+//     access on infra hiccups.
+//
+// Returns (scopes, isUserSubject). isUserSubject=false means "subject
+// wasn't a user — don't filter."
+func (s *BindingService) EffectiveScopesForSubject(
+	tenantID string,
+	applicationID uuid.UUID,
+	subject string,
+) ([]string, bool, error) {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return nil, false, nil
+	}
+	userID, err := uuid.Parse(subject)
+	if err != nil {
+		// Not a UUID — non-user token. Skip the filter.
+		return nil, false, nil
+	}
+
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, true, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	// Confirm the user exists in this tenant. If not, fail closed.
+	var exists int64
+	if err := tenantDB.Table("users").
+		Where("id = ? AND deleted_at IS NULL", userID).
+		Count(&exists).Error; err != nil {
+		return nil, true, fmt.Errorf("verify user: %w", err)
+	}
+	if exists == 0 {
+		// Treat unknown users as having zero effective scopes — the
+		// intersection will be empty, blocking the call.
+		return []string{}, true, nil
+	}
+
+	// Same resolver as /users/:user_id/effective-access but returns the
+	// flat scope-string list directly (no per-role view needed here).
+	var scopes []string
+	err = tenantDB.Raw(`
+        SELECT DISTINCT s.scope_string
+          FROM application_role_bindings b
+          JOIN application_role_scope_grants g ON g.role_id = b.role_id
+          JOIN oauth_scopes s ON s.id = g.scope_id
+         WHERE b.application_id = ?
+           AND b.tenant_id = ?
+           AND b.user_id = ?
+         ORDER BY s.scope_string ASC
+    `, applicationID, tenantID, userID).Scan(&scopes).Error
+	if err != nil {
+		return nil, true, fmt.Errorf("resolve effective scopes: %w", err)
+	}
+	if scopes == nil {
+		scopes = []string{}
+	}
+	return scopes, true, nil
+}
+
 // EffectiveAccessRole is one role contributing to a user's effective access.
 type EffectiveAccessRole struct {
 	RoleID       uuid.UUID `json:"role_id"`

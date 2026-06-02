@@ -118,6 +118,34 @@ curl -X POST "$AUTHSEC/authsec/oauth/v2/introspect" \
 
 Active token returns full claims; revoked/expired returns `{"active": false}`.
 
+**Authentication:** HTTP Basic with `<application_id>:<introspection_secret>`
+is **required** (RFC 7662 §2.1). Calls without it return 401. The
+username MUST match the Application this token is being validated against.
+
+**RBAC scope filtering:** the `scope` field in the response is **not**
+what Hydra issued the token with — it's the intersection of the token's
+claimed scope AND the user's current effective scopes on this Application.
+
+This means an admin can revoke a binding and the change takes effect on
+the very next introspection call, even if the token has 50 minutes of
+life left. Specifically:
+
+- The user's `sub` is resolved through `application_role_bindings` →
+  `application_roles` → `application_role_scope_grants` → `oauth_scopes`.
+- The intersection of (claimed scope) and (effective scope) becomes the
+  response `scope`.
+- A new field `ext_authsec_scope_filtered: true` is added when the
+  filter applied (helps SDK debug logs explain narrowed scopes).
+
+Special cases:
+- `sub` doesn't parse as a UUID (service tokens, SPIRE workloads) →
+  filter is **skipped**; Hydra's scope claim passes through unchanged.
+- `sub` is a UUID but the user doesn't exist in this tenant → scope
+  filtered to **empty** (fail-closed; user can't be confirmed).
+- Resolver error → scope filtered to **empty** (fail-closed).
+- `active=false` → response unchanged (no point filtering an invalid
+  token).
+
 ### Userinfo
 
 ```bash
