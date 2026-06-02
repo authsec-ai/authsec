@@ -282,12 +282,12 @@ func (s *BindingService) ListAccessUsers(tenantID string, applicationID uuid.UUI
 	// pq.StringArray implements sql.Scanner to decode it. Same fix applies
 	// everywhere we use array_agg in a Raw().Scan() against a struct.
 	type row struct {
-		UserID       uuid.UUID
-		Email        string
-		Name         string
-		Active       bool
-		RoleNames    pq.StringArray
-		ScopeStrings pq.StringArray
+		UserID       uuid.UUID      `gorm:"column:user_id"`
+		Email        string         `gorm:"column:email"`
+		Name         string         `gorm:"column:name"`
+		Active       bool           `gorm:"column:active"`
+		RoleNames    pq.StringArray `gorm:"column:role_names;type:text[]"`
+		ScopeStrings pq.StringArray `gorm:"column:scope_strings;type:text[]"`
 	}
 	var rows []row
 	err = tenantDB.Raw(`
@@ -459,10 +459,10 @@ func (s *BindingService) GetEffectiveAccess(
 	// 2. Bindings + role names + role scopes (one query, grouped by role).
 	// pq.StringArray is required for text[] columns; see comment in ListAccessUsers.
 	type roleRow struct {
-		RoleID       uuid.UUID
-		RoleName     string
-		GrantedAt    time.Time
-		ScopeStrings pq.StringArray
+		RoleID       uuid.UUID      `gorm:"column:role_id"`
+		RoleName     string         `gorm:"column:role_name"`
+		GrantedAt    time.Time      `gorm:"column:granted_at"`
+		ScopeStrings pq.StringArray `gorm:"column:scope_strings;type:text[]"`
 	}
 	var rows []roleRow
 	err = tenantDB.Raw(`

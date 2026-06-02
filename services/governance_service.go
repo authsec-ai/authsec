@@ -66,19 +66,21 @@ func (s *GovernanceService) ListAccessAssignments(
 		return nil, fmt.Errorf("get tenant db: %w", err)
 	}
 	// pq.StringArray required for text[] columns; lib/pq returns them as
-	// []uint8 and []string doesn't implement sql.Scanner. See same fix in
-	// services/binding_service.go.
+	// []uint8 and []string doesn't implement sql.Scanner. Explicit
+	// gorm:"column" tags are also required when using Raw().Scan() into
+	// an anonymous struct — GORM's snake_case mapper isn't always applied
+	// in that path.
 	type row struct {
-		BindingID    uuid.UUID
-		UserID       uuid.UUID
-		UserEmail    string
-		UserName     string
-		UserActive   bool
-		RoleID       uuid.UUID
-		RoleName     string
-		ScopeStrings pq.StringArray
-		GrantedAt    time.Time
-		GrantedBy    *uuid.UUID
+		BindingID    uuid.UUID      `gorm:"column:binding_id"`
+		UserID       uuid.UUID      `gorm:"column:user_id"`
+		UserEmail    string         `gorm:"column:user_email"`
+		UserName     string         `gorm:"column:user_name"`
+		UserActive   bool           `gorm:"column:user_active"`
+		RoleID       uuid.UUID      `gorm:"column:role_id"`
+		RoleName     string         `gorm:"column:role_name"`
+		ScopeStrings pq.StringArray `gorm:"column:scope_strings;type:text[]"`
+		GrantedAt    time.Time      `gorm:"column:granted_at"`
+		GrantedBy    *uuid.UUID     `gorm:"column:granted_by"`
 	}
 	q := tenantDB.Table("application_role_bindings AS b").
 		Select(`b.id AS binding_id,
@@ -371,11 +373,11 @@ func (s *GovernanceService) GetApplicationEffectiveAccess(tenantID string, appli
 		return nil, fmt.Errorf("get tenant db: %w", err)
 	}
 	type row struct {
-		UserID          uuid.UUID
-		Email           string
-		Name            string
-		Active          bool
-		EffectiveScopes pq.StringArray
+		UserID          uuid.UUID      `gorm:"column:user_id"`
+		Email           string         `gorm:"column:email"`
+		Name            string         `gorm:"column:name"`
+		Active          bool           `gorm:"column:active"`
+		EffectiveScopes pq.StringArray `gorm:"column:effective_scopes;type:text[]"`
 	}
 	var rows []row
 	err = tenantDB.Raw(`
@@ -450,11 +452,11 @@ func (s *GovernanceService) EndUserAccessSummary(
 
 	offset := (page - 1) * limit
 	type row struct {
-		UserID          uuid.UUID
-		Email           string
-		Name            string
-		Active          bool
-		EffectiveScopes pq.StringArray
+		UserID          uuid.UUID      `gorm:"column:user_id"`
+		Email           string         `gorm:"column:email"`
+		Name            string         `gorm:"column:name"`
+		Active          bool           `gorm:"column:active"`
+		EffectiveScopes pq.StringArray `gorm:"column:effective_scopes;type:text[]"`
 	}
 	var rows []row
 	err = tenantDB.Raw(`
