@@ -9,6 +9,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -275,13 +276,18 @@ func (s *BindingService) ListAccessUsers(tenantID string, applicationID uuid.UUI
 
 	// Single query that aggregates by user. The trick: array_agg(DISTINCT ...)
 	// for roles and scopes, joined via the bindings→roles→grants→scopes chain.
+	//
+	// IMPORTANT: text[] columns must be scanned into pq.StringArray, not
+	// []string. The lib/pq driver returns text[] as []uint8 and only
+	// pq.StringArray implements sql.Scanner to decode it. Same fix applies
+	// everywhere we use array_agg in a Raw().Scan() against a struct.
 	type row struct {
 		UserID       uuid.UUID
 		Email        string
 		Name         string
 		Active       bool
-		RoleNames    []string `gorm:"type:text[]"`
-		ScopeStrings []string `gorm:"type:text[]"`
+		RoleNames    pq.StringArray
+		ScopeStrings pq.StringArray
 	}
 	var rows []row
 	err = tenantDB.Raw(`
@@ -311,8 +317,8 @@ func (s *BindingService) ListAccessUsers(tenantID string, applicationID uuid.UUI
 			Email:        r.Email,
 			Name:         r.Name,
 			Active:       r.Active,
-			RoleNames:    r.RoleNames,
-			ScopeStrings: r.ScopeStrings,
+			RoleNames:    []string(r.RoleNames),
+			ScopeStrings: []string(r.ScopeStrings),
 		})
 	}
 	return out, nil
@@ -451,11 +457,12 @@ func (s *BindingService) GetEffectiveAccess(
 	}
 
 	// 2. Bindings + role names + role scopes (one query, grouped by role).
+	// pq.StringArray is required for text[] columns; see comment in ListAccessUsers.
 	type roleRow struct {
 		RoleID       uuid.UUID
 		RoleName     string
 		GrantedAt    time.Time
-		ScopeStrings []string `gorm:"type:text[]"`
+		ScopeStrings pq.StringArray
 	}
 	var rows []roleRow
 	err = tenantDB.Raw(`
@@ -484,7 +491,7 @@ func (s *BindingService) GetEffectiveAccess(
 			RoleID:       r.RoleID,
 			RoleName:     r.RoleName,
 			GrantedAt:    r.GrantedAt,
-			ScopeStrings: r.ScopeStrings,
+			ScopeStrings: []string(r.ScopeStrings),
 		})
 		for _, s := range r.ScopeStrings {
 			scopeSet[s] = struct{}{}
