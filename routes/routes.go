@@ -258,6 +258,19 @@ func SetupRoutes(
 		// Authenticated; tenant_id comes from the JWT.
 		identityProvidersV2Controller := adminCtrl.NewIdentityProvidersV2Controller()
 
+		// SDK-facing endpoints first — they use Basic auth (rs_id:introspection_secret),
+		// NOT a JWT. Must be registered before the JWT-protected applicationsV2 group
+		// so they don't accidentally pick up AuthMiddleware.
+		//
+		// We expose them under BOTH paths so @authsec/sdk's runtime (which hard-codes
+		// /authsec/resource-servers/:id/sdk-policy) works without modification, AND
+		// admins using the new /applications surface in the UI find them at the
+		// expected path.
+		authsec.GET("/applications/:id/sdk-policy", applicationsV2Controller.SDKPolicy)
+		authsec.PUT("/applications/:id/sdk-manifest", applicationsV2Controller.PutSDKManifest)
+		authsec.GET("/resource-servers/:id/sdk-policy", applicationsV2Controller.SDKPolicy)
+		authsec.PUT("/resource-servers/:id/sdk-manifest", applicationsV2Controller.PutSDKManifest)
+
 		applicationsV2 := authsec.Group("/applications")
 		applicationsV2.Use(
 			middlewares.AuthMiddleware(),
