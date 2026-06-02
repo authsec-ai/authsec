@@ -227,6 +227,69 @@ func SetupRoutes(
 			oauthDiscovery.GET("/.well-known/oauth-authorization-server", mcpOAuthDiscoveryController.Discovery)
 		}
 
+		// ────────────────────────────────────────────────────────
+		// Standards-compliant MCP OAuth server (v2) — Phase 2+ of
+		// the dev-flow backport. Lives at /authsec/oauth/v2/* so it
+		// never collides with the legacy /clientms/tenants/.../clients
+		// surface. /register is anonymous (RFC 7591 DCR); the rest of
+		// the endpoints land in Phases 3-5.
+		// ────────────────────────────────────────────────────────
+		oauthASV2Controller := platformCtrl.NewOAuthASV2Controller()
+		applicationsV2Controller := platformCtrl.NewApplicationsV2Controller()
+
+		oauthV2 := authsec.Group("/oauth/v2")
+		oauthV2.Use(oauthASV2Controller.CanonicalIssuerOnly())
+		{
+			oauthV2.GET("/.well-known/oauth-authorization-server", oauthASV2Controller.ASMetadata)
+			oauthV2.GET("/.well-known/openid-configuration", oauthASV2Controller.OIDCDiscovery)
+			oauthV2.POST("/register", oauthASV2Controller.Register)
+			oauthV2.GET("/authorize", oauthASV2Controller.Authorize)
+			oauthV2.POST("/token", oauthASV2Controller.Token)
+			oauthV2.POST("/introspect", oauthASV2Controller.Introspect)
+			oauthV2.GET("/jwks", oauthASV2Controller.JWKS)
+			oauthV2.POST("/revoke", oauthASV2Controller.Revoke)
+			oauthV2.GET("/userinfo", oauthASV2Controller.Userinfo)
+			oauthV2.POST("/userinfo", oauthASV2Controller.Userinfo)
+			oauthV2.GET("/logout", oauthASV2Controller.EndSession)
+			oauthV2.POST("/par", oauthASV2Controller.PAR)
+		}
+
+		// Tenant-scoped Application registry (resource_servers rows).
+		// Authenticated; tenant_id comes from the JWT.
+		identityProvidersV2Controller := adminCtrl.NewIdentityProvidersV2Controller()
+
+		applicationsV2 := authsec.Group("/applications")
+		applicationsV2.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			applicationsV2.POST("", applicationsV2Controller.Create)
+			applicationsV2.GET("", applicationsV2Controller.List)
+			applicationsV2.GET("/:id", applicationsV2Controller.Get)
+			applicationsV2.DELETE("/:id", applicationsV2Controller.Delete)
+			applicationsV2.GET("/:id/clients", applicationsV2Controller.ListClients)
+
+			// Application ↔ IDP policy: whitelist which IDPs an Application accepts.
+			applicationsV2.GET("/:id/identity-providers", identityProvidersV2Controller.ListApplicationPolicies)
+			applicationsV2.POST("/:id/identity-providers", identityProvidersV2Controller.PinIDP)
+			applicationsV2.DELETE("/:id/identity-providers/:idp_id", identityProvidersV2Controller.UnpinIDP)
+		}
+
+		// Tenant-scoped IDP registry. Phase 4.
+		identityProvidersV2 := authsec.Group("/identity-providers")
+		identityProvidersV2.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			identityProvidersV2.POST("", identityProvidersV2Controller.Create)
+			identityProvidersV2.GET("", identityProvidersV2Controller.List)
+			identityProvidersV2.GET("/:id", identityProvidersV2Controller.Get)
+			identityProvidersV2.PUT("/:id/status", identityProvidersV2Controller.UpdateStatus)
+			identityProvidersV2.DELETE("/:id", identityProvidersV2Controller.Delete)
+		}
+
 		// ────────────────────────────────────────────────────
 		// WebAuthn routes  (/authsec/webauthn/*)
 		// Served under /authsec/webauthn (formerly webauthn-service).
