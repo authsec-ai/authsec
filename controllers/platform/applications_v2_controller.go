@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,7 @@ type ApplicationsV2Controller struct {
 	scopeSvc      *services.ScopeService
 	toolMapSvc    *services.ToolMappingService
 	roleSvc       *services.RoleService
+	bindingSvc    *services.BindingService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -46,6 +48,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		scopeSvc:      services.NewScopeService(),
 		toolMapSvc:    services.NewToolMappingService(),
 		roleSvc:       services.NewRoleService(),
+		bindingSvc:    services.NewBindingService(),
 	}
 }
 
@@ -1061,4 +1064,146 @@ func (ctrl *ApplicationsV2Controller) UpdateRoleScopeGrants(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, role)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 8 part 2 — Bindings + user access reads
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListBindings handles GET /authsec/applications/:id/bindings. Returns
+// every binding for the Application, hydrated with user email/name and
+// role name.
+func (ctrl *ApplicationsV2Controller) ListBindings(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	bindings, err := ctrl.bindingSvc.ListBindings(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, bindings)
+}
+
+// CreateBinding handles POST /authsec/applications/:id/bindings.
+// Body: {user_id, role_id}.
+func (ctrl *ApplicationsV2Controller) CreateBinding(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var req services.CreateBindingInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	grantedByStr, _ := middlewares.ResolveUserID(c)
+	grantedBy, _ := uuid.Parse(grantedByStr)
+
+	binding, err := ctrl.bindingSvc.CreateBinding(tenantID, id, req, grantedBy)
+	if err != nil {
+		if errors.Is(err, services.ErrBindingAlreadyExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrRoleNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "role not found in this application"})
+			return
+		}
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user not found in this tenant"})
+			return
+		}
+		if strings.Contains(err.Error(), "invalid user_id") || strings.Contains(err.Error(), "invalid role_id") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, binding)
+}
+
+// DeleteBinding handles DELETE /authsec/applications/:id/bindings/:binding_id.
+func (ctrl *ApplicationsV2Controller) DeleteBinding(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	bindingID, err := uuid.Parse(c.Param("binding_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid binding_id"})
+		return
+	}
+	if err := ctrl.bindingSvc.DeleteBinding(tenantID, id, bindingID); err != nil {
+		if errors.Is(err, services.ErrBindingNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// ListEligibleUsers handles GET /authsec/applications/:id/eligible-users.
+// Query params: ?search=<email or name prefix>, ?limit=<1..500>.
+func (ctrl *ApplicationsV2Controller) ListEligibleUsers(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	limit := 100
+	if v := c.Query("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			limit = parsed
+		}
+	}
+	users, err := ctrl.bindingSvc.ListEligibleUsers(tenantID, id, c.Query("search"), limit)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+// ListAccessUsers handles GET /authsec/applications/:id/access/users.
+// Returns every user with at least one binding on this Application.
+func (ctrl *ApplicationsV2Controller) ListAccessUsers(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	users, err := ctrl.bindingSvc.ListAccessUsers(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+// GetUserEffectiveAccess handles
+// GET /authsec/applications/:id/users/:user_id/effective-access.
+// Returns the user's per-role grants + aggregated effective scopes.
+func (ctrl *ApplicationsV2Controller) GetUserEffectiveAccess(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userID, err := uuid.Parse(c.Param("user_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	access, err := ctrl.bindingSvc.GetEffectiveAccess(tenantID, id, userID)
+	if err != nil {
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, access)
 }

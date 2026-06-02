@@ -450,6 +450,144 @@ the diff applies, or nothing changes.
 
 Returns 200 with the hydrated role view.
 
+### List bindings on an Application
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/bindings" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns every user ↔ role binding for the Application, hydrated with
+user email/name and role name:
+
+```json
+[
+  {
+    "id": "<binding uuid>",
+    "tenant_id": "<tenant uuid>",
+    "application_id": "<app uuid>",
+    "role_id": "<role uuid>",
+    "user_id": "<user uuid>",
+    "granted_at": "...",
+    "granted_by": "<admin user uuid>",
+    "user_email": "alice@example.com",
+    "user_name": "Alice",
+    "role_name": "viewer"
+  }
+]
+```
+
+### Create a binding (bind a user to a role)
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/bindings" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "<user_uuid_from_users_table>",
+    "role_id": "<role_uuid>"
+  }'
+```
+
+Returns 201 with the hydrated binding view. 409 if the user is already
+bound to that role on this Application. 400 if the role doesn't belong
+to this Application OR the user isn't in this tenant.
+
+`granted_by` is captured automatically from the calling admin's JWT.
+
+### Delete a binding (revoke a user's role)
+
+```bash
+curl -X DELETE "$AUTHSEC/authsec/applications/$APP/bindings/<BINDING_ID>" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns 200 with `{"status": "deleted"}`. 404 if the binding doesn't
+exist or doesn't belong to this Application.
+
+### List eligible users (not yet bound)
+
+```bash
+# All eligible users (paginated, default 100)
+curl "$AUTHSEC/authsec/applications/$APP/eligible-users" \
+  -H "Authorization: Bearer $JWT"
+
+# Search by email or name prefix, raise the limit
+curl "$AUTHSEC/authsec/applications/$APP/eligible-users?search=alice&limit=20" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns users in the tenant who have NO existing binding on this
+Application. Useful for the admin UI's "grant access" picker.
+
+Query params:
+- `?search=<prefix>` — case-insensitive LIKE on email + name
+- `?limit=<1..500>` — default 100, max 500
+
+### List users with current access
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/access/users" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns every user with at least one binding on this Application, with
+aggregated role names + the union of effective scope strings:
+
+```json
+[
+  {
+    "user_id": "<uuid>",
+    "email": "alice@example.com",
+    "name": "Alice",
+    "active": true,
+    "role_names": ["viewer", "tool_runner"],
+    "scope_strings": ["mcp_demo.read", "mcp_demo.compute"]
+  }
+]
+```
+
+### Get a single user's effective access
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/users/<USER_ID>/effective-access" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Resolves the full per-role + aggregated-scope view for one user:
+
+```json
+{
+  "user_id": "<uuid>",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "active": true,
+  "roles": [
+    {
+      "role_id": "<uuid>",
+      "role_name": "viewer",
+      "granted_at": "...",
+      "scope_strings": ["mcp_demo.read"]
+    },
+    {
+      "role_id": "<uuid>",
+      "role_name": "tool_runner",
+      "granted_at": "...",
+      "scope_strings": ["mcp_demo.compute"]
+    }
+  ],
+  "effective_scopes": ["mcp_demo.compute", "mcp_demo.read"]
+}
+```
+
+`effective_scopes` is the deduplicated union of every role's
+`scope_strings` — this is the "what can this user do?" set, computed
+fresh on every read (no caching).
+
+Returns 404 if the user doesn't exist in the tenant. Returns 200 with
+empty `roles` + `effective_scopes` if the user exists but has no
+bindings.
+
 ### Setup checklist
 
 ```bash
@@ -828,16 +966,11 @@ This makes `/launch` succeed and `/sdk-policy` return
 ## Endpoints NOT on the backport yet
 
 If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when. Phases 1+2+3+4+5+6+7 + Phase 8 part 1 (22
-endpoints) have shipped — those are documented in Sections 2 and 4b above.
+for what's coming when. Phases 1–8 (28 endpoints) have shipped — those
+are documented in Sections 2 and 4b above. Only Phase 9 (governance
+views) remains.
 
 ```
-GET    /authsec/applications/:id/bindings                  [Phase 8]
-POST   /authsec/applications/:id/bindings                  [Phase 8]
-DELETE /authsec/applications/:id/bindings/:binding_id      [Phase 8]
-GET    /authsec/applications/:id/eligible-users            [Phase 8]
-GET    /authsec/applications/:id/access/users              [Phase 8]
-GET    /authsec/applications/:id/users/:user_id/effective-access [Phase 8]
 GET    /authsec/applications/:id/access-assignments        [Phase 9]
 GET    /authsec/applications/:id/access-change-previews    [Phase 9]
 GET    /authsec/applications/:id/access-simulations        [Phase 9]

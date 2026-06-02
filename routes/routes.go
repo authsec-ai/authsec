@@ -331,6 +331,14 @@ func SetupRoutes(
 			applicationsV2.POST("/:id/roles", applicationsV2Controller.CreateRole)
 			applicationsV2.PUT("/:id/roles/:role_id/scope-grants", applicationsV2Controller.UpdateRoleScopeGrants)
 
+			// Phase 8 part 2: bindings + user access reads.
+			applicationsV2.GET("/:id/bindings", applicationsV2Controller.ListBindings)
+			applicationsV2.POST("/:id/bindings", applicationsV2Controller.CreateBinding)
+			applicationsV2.DELETE("/:id/bindings/:binding_id", applicationsV2Controller.DeleteBinding)
+			applicationsV2.GET("/:id/eligible-users", applicationsV2Controller.ListEligibleUsers)
+			applicationsV2.GET("/:id/access/users", applicationsV2Controller.ListAccessUsers)
+			applicationsV2.GET("/:id/users/:user_id/effective-access", applicationsV2Controller.GetUserEffectiveAccess)
+
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.
 			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)
