@@ -1,7 +1,10 @@
 package platform
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,14 +26,18 @@ import (
 // Phase 4 will wire: the IDP policy gate inside Authorize.
 // Phase 5 will wire: ASMetadata, OIDCDiscovery, CanonicalIssuerOnly.
 type OAuthASV2Controller struct {
-	service    *services.OAuthASService
-	idpService *services.IdentityProviderV2Service
+	service       *services.OAuthASService
+	idpService    *services.IdentityProviderV2Service
+	sdkPolicySvc  *services.SDKPolicyService
+	bindingSvc    *services.BindingService
 }
 
 func NewOAuthASV2Controller() *OAuthASV2Controller {
 	return &OAuthASV2Controller{
-		service:    services.NewOAuthASService(nil),
-		idpService: services.NewIdentityProviderV2Service(),
+		service:      services.NewOAuthASService(nil),
+		idpService:   services.NewIdentityProviderV2Service(),
+		sdkPolicySvc: services.NewSDKPolicyService(),
+		bindingSvc:   services.NewBindingService(),
 	}
 }
 
@@ -375,7 +382,35 @@ func isScopeSubset(requested, captured string) bool {
 	return true
 }
 
-// Introspect proxies to Hydra's admin introspect endpoint.
+// Introspect proxies to Hydra's admin introspect endpoint AND applies
+// per-Application RBAC scope filtering before returning the response.
+//
+// Authentication (RFC 7662 §2.1): the caller MUST present HTTP Basic auth
+// with `<application_id>:<introspection_secret>`. These are the
+// resource-server credentials minted via
+// POST /authsec/applications/:id/rotate-introspection-secret.
+//
+// RBAC filter (PHASE3 closeout):
+//
+// Hydra returns the token's *claimed* scope — what was issued at /token
+// time. That can become stale: an admin revokes a user's role, but the
+// access token is still alive for up to its remaining lifetime.
+//
+// We recompute the user's current effective scopes from the role-binding
+// stack (Phase 5/8) and intersect with the token's claim. The MCP server
+// receives the *current* set, so admin revocations take effect on the
+// very next introspection round-trip.
+//
+// Special cases:
+//
+//   - sub doesn't parse as a UUID → non-user token (client_credentials,
+//     SPIRE workload). Skip the filter; return Hydra's response unchanged.
+//   - sub is a UUID but the user doesn't exist in this tenant → narrow to
+//     empty scope. Fail closed.
+//   - resolver error (DB hiccup, etc.) → narrow to empty scope. Fail
+//     closed. Logged for ops.
+//   - active=false → return the body unchanged (no point filtering an
+//     already-invalid token).
 func (ctrl *OAuthASV2Controller) Introspect(c *gin.Context) {
 	if err := c.Request.ParseForm(); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
@@ -386,12 +421,158 @@ func (ctrl *OAuthASV2Controller) Introspect(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
 		return
 	}
+
+	// Authenticate the caller. The Basic username is the Application's
+	// UUID, which also gives us the RBAC context for filtering.
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.Header("WWW-Authenticate", `Basic realm="introspect"`)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "Basic auth required (application_id:introspection_secret)",
+		})
+		return
+	}
+	appID, rsSecret, ok := parseBasicAuth(authHeader)
+	if !ok {
+		c.Header("WWW-Authenticate", `Basic realm="introspect"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+		return
+	}
+	applicationID, err := uuid.Parse(appID)
+	if err != nil {
+		c.Header("WWW-Authenticate", `Basic realm="introspect"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+		return
+	}
+	rs, tenantID, err := ctrl.sdkPolicySvc.AuthorizeFromBasic(
+		"Basic "+basicEncode(appID, rsSecret),
+		applicationID,
+	)
+	if err != nil {
+		c.Header("WWW-Authenticate", `Basic realm="introspect"`)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+	_ = rs // not used yet; reserved for future scope-supported gating
+
+	// Proxy to Hydra.
 	status, body, err := ctrl.service.IntrospectViaHydraAdmin(token)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
-	c.Data(status, "application/json", body)
+	if status != http.StatusOK {
+		// Pass non-200 through unchanged.
+		c.Data(status, "application/json", body)
+		return
+	}
+
+	parsed, err := services.MarshalIntrospectionResponse(body)
+	if err != nil {
+		// If we can't parse the body, return it raw rather than crash.
+		c.Data(status, "application/json", body)
+		return
+	}
+	active, _ := parsed["active"].(bool)
+	if !active {
+		// No point filtering an invalid token's scope.
+		c.Data(status, "application/json", body)
+		return
+	}
+
+	// Apply the RBAC filter.
+	subject, _ := parsed["sub"].(string)
+	scopeClaim, _ := parsed["scope"].(string)
+	filtered, filterApplied := ctrl.filterScope(tenantID, applicationID, subject, scopeClaim)
+	if filterApplied {
+		parsed["scope"] = filtered
+		// Add an x-* claim so the MCP server can tell the response was filtered.
+		// Hydra-original tokens' scope is what was *issued*; our filtered
+		// scope is what the user still has *now*. Surfacing this helps
+		// SDK debug logs explain "wait, why did my token's scope shrink?"
+		parsed["ext_authsec_scope_filtered"] = true
+	}
+
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "marshal_introspect_response"})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", out)
+}
+
+// filterScope is the RBAC narrowing step. Returns (filteredScope, applied).
+// applied=false means the caller should leave the scope claim unchanged —
+// either the subject wasn't a user token, or the token had no scope claim
+// to begin with.
+//
+// On any error, returns ("", true) — applied=true forces the empty string
+// to be written back into the response, which is the fail-closed posture.
+func (ctrl *OAuthASV2Controller) filterScope(
+	tenantID string,
+	applicationID uuid.UUID,
+	subject string,
+	scopeClaim string,
+) (filtered string, applied bool) {
+	if scopeClaim == "" {
+		return "", false
+	}
+	effective, isUserSubject, err := ctrl.bindingSvc.EffectiveScopesForSubject(
+		tenantID, applicationID, subject,
+	)
+	if err != nil {
+		// Fail closed: log + return empty filtered scope.
+		log.Printf("[introspect] effective-scope resolver failed for app=%s sub=%s: %v",
+			applicationID, subject, err)
+		return "", true
+	}
+	if !isUserSubject {
+		// Non-user token: skip the filter.
+		return "", false
+	}
+	// Intersect claimed scope with effective scope.
+	effectiveSet := make(map[string]struct{}, len(effective))
+	for _, s := range effective {
+		effectiveSet[s] = struct{}{}
+	}
+	claimed := strings.Fields(scopeClaim)
+	kept := make([]string, 0, len(claimed))
+	for _, c := range claimed {
+		if _, ok := effectiveSet[c]; ok {
+			kept = append(kept, c)
+		}
+	}
+	return strings.Join(kept, " "), true
+}
+
+// parseBasicAuth pulls (username, password) out of an HTTP Basic header.
+// Returns ok=false on any decode failure.
+func parseBasicAuth(authHeader string) (username, password string, ok bool) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(authHeader[len(prefix):])
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// basicEncode rebuilds the base64-encoded credential string. Used so we
+// can delegate the verify-the-secret step to the existing
+// SDKPolicyService.AuthorizeFromBasic without re-implementing bcrypt
+// comparison here.
+func basicEncode(username, password string) string {
+	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 }
 
 // JWKS proxies Hydra's public JWKS document.
