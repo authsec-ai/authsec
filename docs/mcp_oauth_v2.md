@@ -112,21 +112,42 @@ AUTHSEC_DISABLE_HYDRA_RECONCILER_V2=true
 
 ## Things explicitly NOT done in this backport
 
-These are TODOs marked `PHASE3-TODO` / `PHASE3-SCOPE` / `PHASE5-NOTE` in
-the code:
+These are TODOs marked `PHASE3-SCOPE` / `PHASE5-NOTE` in the code:
 
 - **Deep RBAC enforcement on /token and /introspect.** The dev branch resolves
   the user's grantable scopes against `application_role_bindings` and filters
   Hydra's introspection response. We proxy the standard dance only; deeper
   filtering is a follow-up.
-- **`auth_request_context` consumption in /token.** The row is written at
-  /authorize but /token doesn't yet validate redirect_uri / scope against it.
 - **`application_type` column on legacy prod tables.** AI-agent and Clawbot
   subtypes are modeled in `resource_servers` but not surfaced through any
   legacy controller.
 - **Per-tenant `oidc_providers`.** The underlying OIDC provider config rows
   are still global. Each tenant's `identity_providers.config_ref` may point at
   a shared row.
+
+## `auth_request_context` lifecycle (done)
+
+`/authorize` writes a row to `auth_request_context` (tenant DB) with the
+captured `redirect_uri`, `scope`, `resource`, `code_challenge`, `nonce`,
+and `state`, then forwards to Hydra with `state` rewritten as
+`<context_id>~<rp_state>`.
+
+`/token` (authorization_code grant only) recovers the `context_id` two
+ways:
+
+1. **Preferred:** parses it out of the `state` form param the RP forwarded.
+2. **Fallback:** looks up the most-recent unconsumed row for
+   `(tenant_id, client_id, redirect_uri)` when the RP dropped state.
+
+Either way the row is **atomically consumed** (single UPDATE with
+`consumed=false` predicate, safe under concurrent replays) and validated:
+`client_id`, `redirect_uri`, `resource` must match the captured values;
+`scope` must be a subset of what was authorized. Validation failure
+aborts before the request reaches Hydra (fail closed).
+
+Tenant resolution on `/token` requires the `resource` form param (RFC 8707)
+so the handler can route to the right tenant DB. RPs that omit it are
+rejected with `invalid_request`.
 
 ## Wipe-and-rebootstrap
 

@@ -3,9 +3,11 @@ package platform
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -184,6 +186,21 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 
 // Token forwards to Hydra's /oauth2/token, rewriting client_id and consuming
 // the auth_request_context.
+//
+// The auth_request_context lookup uses two paths:
+//
+//  1. Preferred — the RP echoed the state value we stuffed at /authorize
+//     (`<context_id>~<rp_state>`). We split it, look up by context_id, and
+//     atomically consume the row.
+//  2. Fallback — the RP dropped state on the way to /token. We resolve the
+//     tenant via the `resource` form param (RFC 8707) and find the most
+//     recent unconsumed row for (tenant_id, client_id, redirect_uri).
+//
+// On either path we then validate:
+//   - redirect_uri matches the captured value (RFC 6749 §4.1.3)
+//   - scope (if requested) is a subset of what we captured
+//
+// If validation fails we do NOT forward to Hydra. Fail closed.
 func (ctrl *OAuthASV2Controller) Token(c *gin.Context) {
 	if err := c.Request.ParseForm(); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
@@ -207,14 +224,23 @@ func (ctrl *OAuthASV2Controller) Token(c *gin.Context) {
 		return
 	}
 
-	// Recover context_id from state (we stuffed it in at /authorize).
+	// auth_request_context binding is only required for the authorization_code
+	// grant — refresh_token replays don't have a fresh /authorize behind them.
+	grantType := form.Get("grant_type")
+	if grantType == "authorization_code" {
+		if errResp := ctrl.consumeAndValidateContext(form, clientID); errResp != nil {
+			c.JSON(http.StatusBadRequest, errResp)
+			return
+		}
+	}
+
+	// Recover and strip any context_id we tucked into state before proxying
+	// to Hydra. Hydra does not expect our custom prefix.
 	if state := form.Get("state"); state != "" {
 		if idx := strings.Index(state, "~"); idx > 0 {
 			form.Set("state", state[idx+1:])
 		}
 	}
-	// PHASE3-TODO: actually look up the auth_request_context row by context_id
-	// and validate redirect_uri / scope match. Skipped here for proxy MVP.
 
 	form.Set("client_id", client.HydraClientID)
 	status, body, err := ctrl.service.ProxyFormToHydraPublic("/oauth2/token", form)
@@ -223,6 +249,130 @@ func (ctrl *OAuthASV2Controller) Token(c *gin.Context) {
 		return
 	}
 	c.Data(status, "application/json", body)
+}
+
+// consumeAndValidateContext finds the auth_request_context row that this
+// /token call is the second leg of, atomically marks it consumed, and
+// validates the redirect_uri / scope match what we captured at /authorize.
+//
+// Returns a non-nil error map (suitable for JSON response with status 400)
+// on validation failure. Returns nil on success.
+func (ctrl *OAuthASV2Controller) consumeAndValidateContext(form url.Values, clientID string) map[string]interface{} {
+	redirectURI := form.Get("redirect_uri")
+	if redirectURI == "" {
+		return map[string]interface{}{
+			"error":             "invalid_request",
+			"error_description": "redirect_uri required for authorization_code grant",
+		}
+	}
+
+	// Try path (1): pull context_id from state.
+	var contextID string
+	if state := form.Get("state"); state != "" {
+		if idx := strings.Index(state, "~"); idx > 0 {
+			contextID = state[:idx]
+		}
+	}
+
+	// Resolve the tenant. The `resource` form param (RFC 8707) is the
+	// canonical hint; without it we can't look up tenant from master.
+	resource := form.Get("resource")
+	if resource == "" {
+		return map[string]interface{}{
+			"error":             "invalid_request",
+			"error_description": "resource parameter required on /token (RFC 8707)",
+		}
+	}
+	tenantID, err := ctrl.service.LookupTenantForClientByResource(resource)
+	if err != nil {
+		return map[string]interface{}{
+			"error":             "invalid_target",
+			"error_description": "resource not recognized",
+		}
+	}
+
+	var row interface {
+		// minimal interface so we don't pin to a single import path in the
+		// switch below — both code paths return *models.AuthRequestContext.
+	}
+	_ = row
+
+	var ctxRow *models.AuthRequestContext
+	if contextID != "" {
+		ctxRow, err = ctrl.service.ConsumeAuthRequestContext(tenantID, contextID)
+	} else {
+		// Path (2): fall back to (tenant_id, client_id, redirect_uri) lookup,
+		// then consume by context_id.
+		var found *models.AuthRequestContext
+		found, err = ctrl.service.FindLatestUnconsumedContext(tenantID, clientID, redirectURI)
+		if err != nil {
+			return map[string]interface{}{
+				"error":             "invalid_grant",
+				"error_description": "no matching authorize request found",
+			}
+		}
+		ctxRow, err = ctrl.service.ConsumeAuthRequestContext(tenantID, found.ContextID)
+	}
+	if err != nil {
+		return map[string]interface{}{
+			"error":             "invalid_grant",
+			"error_description": "auth context invalid: " + err.Error(),
+		}
+	}
+
+	// Validate the bindings.
+	if ctxRow.ClientID != clientID {
+		return map[string]interface{}{
+			"error":             "invalid_grant",
+			"error_description": "client_id mismatch between authorize and token",
+		}
+	}
+	if ctxRow.RedirectURI != redirectURI {
+		return map[string]interface{}{
+			"error":             "invalid_grant",
+			"error_description": "redirect_uri mismatch between authorize and token",
+		}
+	}
+	if ctxRow.ResourceURI != nil && *ctxRow.ResourceURI != "" && *ctxRow.ResourceURI != resource {
+		return map[string]interface{}{
+			"error":             "invalid_target",
+			"error_description": "resource mismatch between authorize and token",
+		}
+	}
+	if requested := form.Get("scope"); requested != "" {
+		captured := ""
+		if ctxRow.Scope != nil {
+			captured = *ctxRow.Scope
+		}
+		if !isScopeSubset(requested, captured) {
+			return map[string]interface{}{
+				"error":             "invalid_scope",
+				"error_description": "requested scope exceeds what was authorized",
+			}
+		}
+	}
+
+	return nil
+}
+
+// isScopeSubset returns true when every space-separated token in `requested`
+// is present in `captured`. Empty captured means we never recorded a scope
+// at /authorize, in which case we allow anything (the RP is requesting
+// whatever Hydra approves).
+func isScopeSubset(requested, captured string) bool {
+	if captured == "" {
+		return true
+	}
+	capSet := make(map[string]struct{})
+	for _, tok := range strings.Fields(captured) {
+		capSet[tok] = struct{}{}
+	}
+	for _, tok := range strings.Fields(requested) {
+		if _, ok := capSet[tok]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Introspect proxies to Hydra's admin introspect endpoint.

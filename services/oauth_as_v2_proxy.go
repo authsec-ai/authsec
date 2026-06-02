@@ -108,6 +108,56 @@ func (s *OAuthASService) ConsumeAuthRequestContext(tenantID, contextID string) (
 	return &row, nil
 }
 
+// FindLatestUnconsumedContext is the fallback /token uses when the RP does
+// not echo the state back to the token endpoint. It selects the most recent
+// unconsumed, unexpired row matching (tenant_id, client_id, redirect_uri).
+//
+// This is best-effort: if two authorize flows from the same client to the
+// same redirect_uri overlap, we may bind the wrong row. The contract is
+// "good enough for spec-compliant RPs that drop state"; well-behaved RPs
+// echo state and hit ConsumeAuthRequestContext directly by context_id.
+//
+// Does NOT consume the row — caller decides whether to call
+// ConsumeAuthRequestContext after extracting context_id from the row it
+// finds.
+func (s *OAuthASService) FindLatestUnconsumedContext(tenantID, clientID, redirectURI string) (*models.AuthRequestContext, error) {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+	now := time.Now()
+	var row models.AuthRequestContext
+	err = tenantDB.Where("tenant_id = ? AND client_id = ? AND redirect_uri = ? AND consumed = false AND expires_at > ?",
+		tenantID, clientID, redirectURI, now).
+		Order("created_at DESC").First(&row).Error
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// LookupTenantForClientID walks the master-side resource_server_tenant_index
+// indirectly: given a client_id, we find its registration row in some
+// tenant DB. Used by /token when no resource parameter is present to
+// recover the tenant for context lookup.
+//
+// The map from client_id -> tenant_id is not maintained in master directly,
+// so we scan a small set of recent tenants via the registrations. PHASE3-NOTE:
+// this is slow and we'd want a master-side client_id index for production
+// scale. For now, the fast path is: /token receives a `resource` form
+// param (RFC 8707) and uses GetByResourceURI to skip this entirely.
+func (s *OAuthASService) LookupTenantForClientByResource(resourceURI string) (string, error) {
+	if resourceURI == "" {
+		return "", fmt.Errorf("resource_uri required to resolve tenant on /token")
+	}
+	rs := NewResourceServerService()
+	_, tenantID, err := rs.GetByResourceURI(resourceURI)
+	if err != nil {
+		return "", err
+	}
+	return tenantID, nil
+}
+
 func ptrIfNonEmpty(s string) *string {
 	if s == "" {
 		return nil
