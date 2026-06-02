@@ -67,7 +67,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 var (
 	// BootstrapLimiter: 60 requests/minute, burst 20 -- for node attestation, agent renewal, PKI provision, entries lookup.
 	// Must accommodate fleet-wide agent restarts (15+ agents x 3 bootstrap calls each).
-	BootstrapLimiter = NewRateLimiter(rate.Limit(60.0/60.0), 20)
+	BootstrapLimiter = NewRateLimiter(rate.Limit(1.0), 20) // 60 req/min = 1 req/sec
 
 	// StandardLimiter: 30 requests/minute, burst 10 -- for authenticated CRUD endpoints.
 	StandardLimiter = NewRateLimiter(rate.Limit(30.0/60.0), 10)

@@ -231,11 +231,6 @@ func (auc *AdminUserController) ListAdminUsers(c *gin.Context) {
 // @Router /authsec/uflow/admin/users/active [post]
 func (auc *AdminUserController) ToggleAdminUserActive(c *gin.Context) {
 	requestID := c.GetString("request_id")
-	logPrefix := "ToggleAdminUserActive"
-	if requestID != "" {
-		logPrefix = fmt.Sprintf("%s request_id=%s", logPrefix, requestID)
-	}
-
 	logger := monitoring.GetLogger().WithField("request_id", requestID).WithField("operation", "toggle_admin_user_active")
 	logger.Info("Processing admin user activation/deactivation request")
 

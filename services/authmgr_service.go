@@ -32,13 +32,13 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 
 	required := []string{"provider", "provider_id", "user_id", "workspace_id", "email"}
 	for _, field := range required {
-		if v, _ := introspection.Ext[field]; v == nil || fmt.Sprintf("%v", v) == "" {
+		if v := introspection.Ext[field]; v == nil || fmt.Sprintf("%v", v) == "" {
 			return nil, fmt.Errorf("missing required field: %s", field)
 		}
 	}
 
 	safeStr := func(key string) string {
-		v, _ := introspection.Ext[key]
+		v := introspection.Ext[key]
 		if v == nil {
 			return ""
 		}
@@ -90,9 +90,7 @@ func introspectOIDCToken(token string) (*sharedmodels.Introspection, error) {
 	if hydraAdminURL == "" {
 		return nil, errors.New("hydra admin URL not configured")
 	}
-	if strings.HasPrefix(hydraAdminURL, "http://") {
-		hydraAdminURL = hydraAdminURL[7:]
-	}
+	hydraAdminURL = strings.TrimPrefix(hydraAdminURL, "http://")
 	cfg := hydra.NewConfiguration()
 	cfg.Host = hydraAdminURL
 	cfg.Scheme = "http"

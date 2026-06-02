@@ -225,7 +225,12 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 	}
 
 	// Get provider configuration
-	provider, err := s.providerRepo.GetProviderByName(state.ProviderName)
+	var provider *models.OIDCProvider
+	if state.WorkspaceID != nil {
+		provider, err = s.providerRepo.GetProviderByWorkspaceAndName(*state.WorkspaceID, state.ProviderName)
+	} else {
+		provider, err = s.providerRepo.GetProviderByName(state.ProviderName)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("provider not found: %s", state.ProviderName)
 	}

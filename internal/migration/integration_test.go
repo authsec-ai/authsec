@@ -139,40 +139,9 @@ func getPublicColumnCount(t *testing.T, dbName, tableName string) int {
 	return count
 }
 
-func getPublicColumnDetails(t *testing.T, dbName, tableName string) []string {
-	t.Helper()
-	db := connectTestDB(t, dbName)
-	defer db.Close()
-	return queryStringSlice(t, db, `
-		SELECT column_name || ':' || data_type || ':' || COALESCE(character_maximum_length::text, '') || ':' || is_nullable
-		FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = $1
-		ORDER BY column_name
-	`, tableName)
-}
-
-func getPublicConstraintNames(t *testing.T, dbName string) []string {
-	t.Helper()
-	db := connectTestDB(t, dbName)
-	defer db.Close()
-	return queryStringSlice(t, db, `
-		SELECT conname FROM pg_constraint
-		JOIN pg_namespace ON pg_namespace.oid = connamespace
-		WHERE nspname = 'public'
-		ORDER BY conname
-	`)
-}
-
-func getPublicIndexNames(t *testing.T, dbName string) []string {
-	t.Helper()
-	db := connectTestDB(t, dbName)
-	defer db.Close()
-	return queryStringSlice(t, db, `
-		SELECT indexname FROM pg_indexes
-		WHERE schemaname = 'public'
-		ORDER BY indexname
-	`)
-}
+// getPublicColumnDetails / getPublicConstraintNames / getPublicIndexNames were
+// removed in the dead-code sweep — they had zero callers. Re-introduce only if
+// future schema-shape assertions need them.
 
 func queryStringSlice(t *testing.T, db *sql.DB, query string, args ...interface{}) []string {
 	t.Helper()

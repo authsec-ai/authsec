@@ -102,42 +102,6 @@ func GetTenantDB(workspaceID string) (*DBConnection, error) {
 	return GlobalConnectionManager.masterDB, nil
 }
 
-// createTenantConnection creates a connection to a specific tenant database
-func createTenantConnection(dbName string) (*DBConnection, error) {
-	// Get connection details from master connection
-	// masterDB := GlobalConnectionManager.masterDB
-
-	// Get database configuration (this should come from config)
-	// For now, we'll use environment variables or default values
-	dbHost := getEnvOrDefault("DB_HOST", "localhost")
-	dbUser := getEnvOrDefault("DB_USER", "asiffinal")
-	dbPassword := getEnvOrDefault("DB_PASSWORD", "test1")
-	dbPort := getEnvOrDefault("DB_PORT", "5432")
-	sslMode := getEnvOrDefault("DB_SSL_MODE", "disable")
-
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC search_path=public",
-		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode)
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	// Configure connection pool
-	db.SetMaxIdleConns(5)
-	db.SetMaxOpenConns(50)
-	db.SetConnMaxLifetime(time.Hour)
-	db.SetConnMaxIdleTime(10 * time.Minute)
-
-	// Test connection
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to ping tenant database: %w", err)
-	}
-
-	return &DBConnection{DB: db}, nil
-}
-
 // Close closes the database connection
 func (conn *DBConnection) Close() error {
 	if conn.DB != nil {

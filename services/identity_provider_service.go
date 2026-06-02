@@ -133,6 +133,7 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 			DisplayName:     coalesceString(req.DisplayName, providerName),
 			ConfigRef:       oidcRow.ID.String(),
 			Status:          "configured",
+			RedirectURI:     req.RedirectURI,
 			CreatedByUserID: req.CreatedByUserID,
 		}
 		if err := tx.Create(&idp).Error; err != nil {
@@ -404,6 +405,7 @@ func (s *IdentityProviderService) ListByWorkspace(workspaceID uuid.UUID, provide
 	if err := q.Order("created_at ASC").Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("list identity_providers: %w", err)
 	}
+	s.populateOIDCRedirectURIs(rows)
 	return rows, nil
 }
 
@@ -414,6 +416,7 @@ func (s *IdentityProviderService) GetByID(workspaceID, providerID uuid.UUID) (*m
 	if err := s.db.Where("id = ? AND workspace_id = ?", providerID, workspaceID).First(&p).Error; err != nil {
 		return nil, err
 	}
+	s.populateOIDCRedirectURI(&p)
 	return &p, nil
 }
 
@@ -432,7 +435,33 @@ func (s *IdentityProviderService) ListForApplication(workspaceID, applicationID 
 	if err != nil {
 		return nil, fmt.Errorf("list identity_providers for application: %w", err)
 	}
+	s.populateOIDCRedirectURIs(rows)
 	return rows, nil
+}
+
+func (s *IdentityProviderService) populateOIDCRedirectURIs(rows []models.IdentityProvider) {
+	for i := range rows {
+		s.populateOIDCRedirectURI(&rows[i])
+	}
+}
+
+func (s *IdentityProviderService) populateOIDCRedirectURI(idp *models.IdentityProvider) {
+	if idp == nil || idp.ProviderType != models.IdentityProviderOIDC {
+		return
+	}
+	configUUID, err := uuid.Parse(idp.ConfigRef)
+	if err != nil {
+		return
+	}
+	var configRow struct {
+		RedirectURI string `gorm:"column:redirect_uri"`
+	}
+	if err := s.db.Table("oidc_providers").
+		Select("redirect_uri").
+		Where("id = ?", configUUID).
+		First(&configRow).Error; err == nil {
+		idp.RedirectURI = configRow.RedirectURI
+	}
 }
 
 // ResolveSAMLConfig follows an IDP row of provider_type='saml' through to the

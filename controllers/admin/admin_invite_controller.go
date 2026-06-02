@@ -148,10 +148,12 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 
 	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND workspace_id = $2 LIMIT 1", req.Username, tenantUUIDForQuery).Scan(&existingUsername)
 	if err == nil {
-		//reactivate the user just in case the user was deleted or deactivated.
-		_, err = db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, tenantUUIDForQuery)
-
-		c.JSON(http.StatusConflict, gin.H{"error": "User with this username already exists in this tenant"})
+		// Reactivate the user as a side-effect — log on failure but still surface
+		// the 409 conflict so the inviter knows the username is taken.
+		if _, reactivateErr := db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, tenantUUIDForQuery); reactivateErr != nil {
+			log.Printf("WARN: AdminInvite reactivate failed for username=%s workspace=%s: %v", req.Username, tenantUUIDForQuery, reactivateErr)
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "User with this username already exists in this workspace"})
 		return
 	}
 

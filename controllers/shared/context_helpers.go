@@ -20,13 +20,15 @@ func ContextStringValue(c *gin.Context, key string) string {
 	switch v := value.(type) {
 	case string:
 		return strings.TrimSpace(v)
-	case fmt.Stringer:
-		return strings.TrimSpace(v.String())
 	case uuid.UUID:
+		// MUST come before fmt.Stringer — uuid.UUID implements Stringer, so if
+		// Stringer matched first this Nil-check branch would be unreachable.
 		if v == uuid.Nil {
 			return ""
 		}
 		return v.String()
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
 	default:
 		return strings.TrimSpace(fmt.Sprint(v))
 	}

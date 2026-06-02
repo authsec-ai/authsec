@@ -570,6 +570,9 @@ CREATE TABLE public.oidc_states (
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     request_host character varying(255),
+    application_id uuid,
+    signed_state text,
+    login_challenge text,
     CONSTRAINT oidc_states_pkey PRIMARY KEY (id),
     CONSTRAINT oidc_states_state_token_key UNIQUE (state_token)
 );

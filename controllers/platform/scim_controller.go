@@ -26,7 +26,7 @@ type SCIMController struct{}
 
 func countSCIMTenantUsers(workspaceID uuid.UUID) (int64, error) {
 	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", workspaceID).Scan(&count).Error
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ?", workspaceID).Scan(&count).Error
 	return count, err
 }
 

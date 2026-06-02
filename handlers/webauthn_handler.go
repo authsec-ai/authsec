@@ -686,11 +686,10 @@ func (h *WebAuthnHandler) FinishRegistration(c *gin.Context) {
 		return
 	}
 
-	// Step 10: Persist credential
-	var transports pq.StringArray
-	for _, t := range credential.Transport {
-		transports = append(transports, string(t))
-	}
+	// Step 10: Persist credential.
+	// Note: credential.Transport is consumed directly by credRepo.AddCredential
+	// below; we used to build a parallel pq.StringArray here, but it was never
+	// read — removed in the dead-code sweep.
 
 	// Validate credential data before saving
 	if len(credential.ID) == 0 {

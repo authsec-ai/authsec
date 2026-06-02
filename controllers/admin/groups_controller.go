@@ -358,14 +358,13 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 		return
 	}
 
-	workspaceID, groups, parseErr := parseDeleteGroupsPayload(body)
+	// workspace_id from the body is discarded — token is the source of truth.
+	_, groups, parseErr := parseDeleteGroupsPayload(body)
 	if parseErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + parseErr.Error()})
 		return
 	}
-
-	// Override with token tenant_id for security
-	workspaceID, _ = middlewares.GetWorkspaceIDFromToken(c)
+	workspaceID, _ := middlewares.GetWorkspaceIDFromToken(c)
 
 	queryGroups := []string{}
 	queryGroups = append(queryGroups, c.QueryArray("group_ids")...)

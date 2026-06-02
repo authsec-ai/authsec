@@ -24,6 +24,7 @@ type IdentityProvider struct {
 	DisplayName     string    `json:"display_name" gorm:"type:text;not null"`
 	ConfigRef       string    `json:"config_ref" gorm:"type:text;not null"`
 	Status          string    `json:"status" gorm:"type:text;not null;default:'configured'"`
+	RedirectURI     string    `json:"redirect_uri,omitempty" gorm:"-"`
 	CreatedByUserID uuid.UUID `json:"created_by_user_id" gorm:"type:uuid;not null"`
 	CreatedAt       time.Time `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt       time.Time `json:"updated_at" gorm:"autoUpdateTime"`

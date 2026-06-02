@@ -29,31 +29,13 @@ func NewOIDCProviderRepository(db *DBConnection) *OIDCProviderRepository {
 func (r *OIDCProviderRepository) GetProviderByName(providerName string) (*models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
-		       authorization_url, token_url, userinfo_url, scopes, icon_url, is_active,
+		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
 		WHERE provider_name = $1
 	`
 
-	provider := &models.OIDCProvider{}
-	var iconURL sql.NullString
-
-	err := r.db.QueryRow(query, providerName).Scan(
-		&provider.ID,
-		&provider.ProviderName,
-		&provider.DisplayName,
-		&provider.ClientID,
-		&provider.ClientSecretVaultPath,
-		&provider.AuthorizationURL,
-		&provider.TokenURL,
-		&provider.UserinfoURL,
-		&provider.Scopes,
-		&iconURL,
-		&provider.IsActive,
-		&provider.CreatedAt,
-		&provider.UpdatedAt,
-	)
-
+	provider, err := scanOIDCProvider(r.db.QueryRow(query, providerName))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("OIDC provider not found: %s", providerName)
@@ -61,10 +43,27 @@ func (r *OIDCProviderRepository) GetProviderByName(providerName string) (*models
 		return nil, err
 	}
 
-	if iconURL.Valid {
-		provider.IconURL = iconURL.String
-	}
+	return provider, nil
+}
 
+// GetProviderByWorkspaceAndName retrieves a workspace-owned OIDC provider.
+func (r *OIDCProviderRepository) GetProviderByWorkspaceAndName(workspaceID uuid.UUID, providerName string) (*models.OIDCProvider, error) {
+	query := `
+		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
+		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
+		       created_at, updated_at
+		FROM oidc_providers
+		WHERE workspace_id = $1 AND provider_name = $2
+	`
+
+	provider, err := scanOIDCProvider(r.db.QueryRow(query, workspaceID, providerName))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("OIDC provider not found for workspace %s: %s", workspaceID, providerName)
+		}
+		return nil, err
+	}
+	provider.WorkspaceID = workspaceID
 	return provider, nil
 }
 
@@ -72,7 +71,7 @@ func (r *OIDCProviderRepository) GetProviderByName(providerName string) (*models
 func (r *OIDCProviderRepository) GetActiveProviders() ([]models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
-		       authorization_url, token_url, userinfo_url, scopes, icon_url, is_active,
+		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
 		WHERE is_active = true
@@ -87,33 +86,11 @@ func (r *OIDCProviderRepository) GetActiveProviders() ([]models.OIDCProvider, er
 
 	var providers []models.OIDCProvider
 	for rows.Next() {
-		var provider models.OIDCProvider
-		var iconURL sql.NullString
-
-		err := rows.Scan(
-			&provider.ID,
-			&provider.ProviderName,
-			&provider.DisplayName,
-			&provider.ClientID,
-			&provider.ClientSecretVaultPath,
-			&provider.AuthorizationURL,
-			&provider.TokenURL,
-			&provider.UserinfoURL,
-			&provider.Scopes,
-			&iconURL,
-			&provider.IsActive,
-			&provider.CreatedAt,
-			&provider.UpdatedAt,
-		)
+		provider, err := scanOIDCProvider(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if iconURL.Valid {
-			provider.IconURL = iconURL.String
-		}
-
-		providers = append(providers, provider)
+		providers = append(providers, *provider)
 	}
 
 	return providers, rows.Err()
@@ -123,7 +100,7 @@ func (r *OIDCProviderRepository) GetActiveProviders() ([]models.OIDCProvider, er
 func (r *OIDCProviderRepository) GetAllProviders() ([]models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
-		       authorization_url, token_url, userinfo_url, scopes, icon_url, is_active,
+		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
 		ORDER BY display_name
@@ -137,33 +114,11 @@ func (r *OIDCProviderRepository) GetAllProviders() ([]models.OIDCProvider, error
 
 	var providers []models.OIDCProvider
 	for rows.Next() {
-		var provider models.OIDCProvider
-		var iconURL sql.NullString
-
-		err := rows.Scan(
-			&provider.ID,
-			&provider.ProviderName,
-			&provider.DisplayName,
-			&provider.ClientID,
-			&provider.ClientSecretVaultPath,
-			&provider.AuthorizationURL,
-			&provider.TokenURL,
-			&provider.UserinfoURL,
-			&provider.Scopes,
-			&iconURL,
-			&provider.IsActive,
-			&provider.CreatedAt,
-			&provider.UpdatedAt,
-		)
+		provider, err := scanOIDCProvider(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if iconURL.Valid {
-			provider.IconURL = iconURL.String
-		}
-
-		providers = append(providers, provider)
+		providers = append(providers, *provider)
 	}
 
 	return providers, rows.Err()
@@ -173,19 +128,21 @@ func (r *OIDCProviderRepository) GetAllProviders() ([]models.OIDCProvider, error
 func (r *OIDCProviderRepository) UpdateProvider(providerName string, input *models.OIDCProviderUpdateInput) error {
 	query := `
 		UPDATE oidc_providers
-		SET client_id = COALESCE(NULLIF($1, ''), client_id),
-		    client_secret_vault_path = COALESCE(NULLIF($2, ''), client_secret_vault_path),
-		    is_active = COALESCE($3, is_active),
-		    icon_url = COALESCE(NULLIF($4, ''), icon_url),
-		    updated_at = $5
-		WHERE provider_name = $6
-	`
+			SET client_id = COALESCE(NULLIF($1, ''), client_id),
+			    client_secret_vault_path = COALESCE(NULLIF($2, ''), client_secret_vault_path),
+			    is_active = COALESCE($3, is_active),
+			    icon_url = COALESCE(NULLIF($4, ''), icon_url),
+			    redirect_uri = COALESCE(NULLIF($5, ''), redirect_uri),
+			    updated_at = $6
+			WHERE provider_name = $7
+		`
 
 	result, err := r.db.Exec(query,
 		input.ClientID,
 		input.ClientSecretVaultPath,
 		input.IsActive,
 		input.IconURL,
+		input.RedirectURI,
 		time.Now(),
 		providerName,
 	)
@@ -203,6 +160,41 @@ func (r *OIDCProviderRepository) UpdateProvider(providerName string, input *mode
 	}
 
 	return nil
+}
+
+type oidcProviderScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanOIDCProvider(scanner oidcProviderScanner) (*models.OIDCProvider, error) {
+	provider := &models.OIDCProvider{}
+	var iconURL, redirectURI sql.NullString
+	err := scanner.Scan(
+		&provider.ID,
+		&provider.ProviderName,
+		&provider.DisplayName,
+		&provider.ClientID,
+		&provider.ClientSecretVaultPath,
+		&provider.AuthorizationURL,
+		&provider.TokenURL,
+		&provider.UserinfoURL,
+		&provider.Scopes,
+		&iconURL,
+		&redirectURI,
+		&provider.IsActive,
+		&provider.CreatedAt,
+		&provider.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if iconURL.Valid {
+		provider.IconURL = iconURL.String
+	}
+	if redirectURI.Valid {
+		provider.RedirectURI = redirectURI.String
+	}
+	return provider, nil
 }
 
 // ========================================
