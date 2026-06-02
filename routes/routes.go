@@ -326,6 +326,11 @@ func SetupRoutes(
 			applicationsV2.PUT("/:id/tool-scope-map", applicationsV2Controller.UpdateToolScopeMap)
 			applicationsV2.POST("/:id/tools/:tool_id/public", applicationsV2Controller.MarkToolPublic)
 
+			// Phase 8 part 1: roles + scope grants.
+			applicationsV2.GET("/:id/roles", applicationsV2Controller.ListRoles)
+			applicationsV2.POST("/:id/roles", applicationsV2Controller.CreateRole)
+			applicationsV2.PUT("/:id/roles/:role_id/scope-grants", applicationsV2Controller.UpdateRoleScopeGrants)
+
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.
 			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)

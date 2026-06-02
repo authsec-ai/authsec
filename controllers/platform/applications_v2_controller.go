@@ -33,6 +33,7 @@ type ApplicationsV2Controller struct {
 	driftSvc      *services.DriftService
 	scopeSvc      *services.ScopeService
 	toolMapSvc    *services.ToolMappingService
+	roleSvc       *services.RoleService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -44,6 +45,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		driftSvc:      services.NewDriftService(),
 		scopeSvc:      services.NewScopeService(),
 		toolMapSvc:    services.NewToolMappingService(),
+		roleSvc:       services.NewRoleService(),
 	}
 }
 
@@ -978,4 +980,85 @@ func (ctrl *ApplicationsV2Controller) MarkToolPublic(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 8 part 1 — Application-scoped RBAC roles + scope grants
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListRoles handles GET /authsec/applications/:id/roles. Returns every
+// role for the Application, hydrated with the scope grants on each.
+func (ctrl *ApplicationsV2Controller) ListRoles(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	roles, err := ctrl.roleSvc.List(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, roles)
+}
+
+// CreateRole handles POST /authsec/applications/:id/roles.
+// Body: {name, description?, scope_ids?}.
+func (ctrl *ApplicationsV2Controller) CreateRole(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var req services.CreateRoleInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	role, err := ctrl.roleSvc.Create(tenantID, id, req)
+	if err != nil {
+		if errors.Is(err, services.ErrRoleAlreadyExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrInvalidScopeID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, role)
+}
+
+// UpdateRoleScopeGrants handles PUT /authsec/applications/:id/roles/:role_id/scope-grants.
+// Replace semantics: pass the complete desired set; anything not in the
+// list gets removed. Pass {"scope_ids": []} to strip all grants.
+func (ctrl *ApplicationsV2Controller) UpdateRoleScopeGrants(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	roleID, err := uuid.Parse(c.Param("role_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+		return
+	}
+	var req services.UpdateScopeGrantsInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	role, err := ctrl.roleSvc.UpdateScopeGrants(tenantID, id, roleID, req)
+	if err != nil {
+		if errors.Is(err, services.ErrRoleNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrInvalidScopeID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, role)
 }

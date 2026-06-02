@@ -371,6 +371,85 @@ Same `ToolChangeResult` shape as `/tool-scope-map`. Emits `tool_unmapped`
 drift event when flipping `false -> true` (public is a weakening of the
 protection).
 
+### List roles (Application-scoped)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/roles" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns every role for the Application, each hydrated with its scope
+grants:
+
+```json
+[
+  {
+    "id": "<role uuid>",
+    "tenant_id": "<tenant uuid>",
+    "application_id": "<app uuid>",
+    "name": "viewer",
+    "description": "Read-only access",
+    "is_system": false,
+    "created_at": "...",
+    "updated_at": "...",
+    "granted_scopes": [
+      {
+        "scope_id": "<scope uuid>",
+        "scope_string": "mcp_demo.read",
+        "display_name": "Read access",
+        "risk_level": "low"
+      }
+    ]
+  }
+]
+```
+
+### Create a role
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/roles" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "viewer",
+    "description": "Read-only access to MCP tools",
+    "scope_ids": ["<scope_id_1>", "<scope_id_2>"]
+  }'
+```
+
+`scope_ids` is optional — pass `[]` or omit to create the role without
+scope grants. Every passed `scope_id` must be registered for THIS
+Application (cross-application scope grants are rejected with 400).
+
+Returns 201 with the hydrated role view. 409 if a role with the same
+name already exists for the Application.
+
+### Update a role's scope grants (replace semantics)
+
+```bash
+# Replace with a new set
+curl -X PUT "$AUTHSEC/authsec/applications/$APP/roles/<ROLE_ID>/scope-grants" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope_ids": ["<scope_id_1>", "<scope_id_2>", "<scope_id_3>"]
+  }'
+
+# Strip all grants
+curl -X PUT "$AUTHSEC/authsec/applications/$APP/roles/<ROLE_ID>/scope-grants" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"scope_ids": []}'
+```
+
+Replace semantics — anything in the role's current grants that isn't in
+the request gets removed; anything new gets added. Idempotent: passing
+the exact current set is a no-op (with an updated_at bump). All
+validations are transactional — either every scope_id is accepted and
+the diff applies, or nothing changes.
+
+Returns 200 with the hydrated role view.
+
 ### Setup checklist
 
 ```bash
@@ -749,13 +828,10 @@ This makes `/launch` succeed and `/sdk-policy` return
 ## Endpoints NOT on the backport yet
 
 If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when. Phases 1+2+3+4+5+6+7 (19 endpoints) have shipped —
-those are documented in Sections 2 and 4b above.
+for what's coming when. Phases 1+2+3+4+5+6+7 + Phase 8 part 1 (22
+endpoints) have shipped — those are documented in Sections 2 and 4b above.
 
 ```
-GET    /authsec/applications/:id/roles                     [Phase 8]
-POST   /authsec/applications/:id/roles                     [Phase 8]
-PUT    /authsec/applications/:id/roles/:role_id/scope-grants [Phase 8]
 GET    /authsec/applications/:id/bindings                  [Phase 8]
 POST   /authsec/applications/:id/bindings                  [Phase 8]
 DELETE /authsec/applications/:id/bindings/:binding_id      [Phase 8]
