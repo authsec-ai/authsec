@@ -284,6 +284,19 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/clients", applicationsV2Controller.ListClients)
 			applicationsV2.POST("/:id/rotate-introspection-secret", applicationsV2Controller.RotateIntrospectionSecret)
 
+			// Phase 1+2+3 of the full-port plan (mcp_v2_full_port_plan.md):
+			// admin reads, activation state machine, connection prereg/revoke.
+			applicationsV2.GET("/:id/tools", applicationsV2Controller.ListTools)
+			applicationsV2.GET("/:id/scopes", applicationsV2Controller.ListScopes)
+			applicationsV2.GET("/:id/scope-matrix", applicationsV2Controller.GetScopeMatrix)
+			applicationsV2.GET("/:id/setup", applicationsV2Controller.GetSetupChecklist)
+			applicationsV2.GET("/:id/sdk-manifest-status", applicationsV2Controller.GetSDKManifestStatus)
+			applicationsV2.GET("/:id/activation-preview", applicationsV2Controller.GetActivationPreview)
+			applicationsV2.POST("/:id/activate", applicationsV2Controller.Activate)
+			applicationsV2.POST("/:id/rescan", applicationsV2Controller.Rescan)
+			applicationsV2.POST("/:id/connections", applicationsV2Controller.PreregisterConnection)
+			applicationsV2.DELETE("/:id/connections/:client_id", applicationsV2Controller.RevokeConnection)
+
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.
 			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)

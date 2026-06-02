@@ -3,8 +3,10 @@ package platform
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -25,6 +27,7 @@ type ApplicationsV2Controller struct {
 	service       *services.ResourceServerService
 	onboardingSvc *services.ApplicationOnboardingService
 	sdkPolicySvc  *services.SDKPolicyService
+	adminSvc      *services.ApplicationAdminService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -32,6 +35,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		service:       services.NewResourceServerService(),
 		onboardingSvc: services.NewApplicationOnboardingService(),
 		sdkPolicySvc:  services.NewSDKPolicyService(),
+		adminSvc:      services.NewApplicationAdminService(),
 	}
 }
 
@@ -451,4 +455,233 @@ func (ctrl *ApplicationsV2Controller) PutSDKManifest(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 1 — Easy reads (admin UI tabs: Tools, Scopes, Setup)
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListTools handles GET /authsec/applications/:id/tools — same data the SDK
+// reads via /sdk-policy but under JWT auth for the admin UI.
+func (ctrl *ApplicationsV2Controller) ListTools(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	rows, err := ctrl.adminSvc.ListTools(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// ListScopes handles GET /authsec/applications/:id/scopes.
+func (ctrl *ApplicationsV2Controller) ListScopes(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	scopes, err := ctrl.adminSvc.ListScopes(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, scopes)
+}
+
+// GetScopeMatrix handles GET /authsec/applications/:id/scope-matrix.
+func (ctrl *ApplicationsV2Controller) GetScopeMatrix(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	matrix, err := ctrl.adminSvc.GetScopeMatrix(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, matrix)
+}
+
+// GetSetupChecklist handles GET /authsec/applications/:id/setup.
+func (ctrl *ApplicationsV2Controller) GetSetupChecklist(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	checklist, err := ctrl.adminSvc.GetSetupChecklist(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, checklist)
+}
+
+// GetSDKManifestStatus handles GET /authsec/applications/:id/sdk-manifest-status.
+func (ctrl *ApplicationsV2Controller) GetSDKManifestStatus(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	status, err := ctrl.adminSvc.GetSDKManifestStatus(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, status)
+}
+
+// GetActivationPreview handles GET /authsec/applications/:id/activation-preview.
+// Combines /setup + /validate into one round-trip the UI uses on the Setup tab.
+func (ctrl *ApplicationsV2Controller) GetActivationPreview(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	preview, err := ctrl.adminSvc.GetActivationPreview(tenantID, id, ctrl.onboardingSvc)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, preview)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 2 — Activation state machine
+// ─────────────────────────────────────────────────────────────────────────
+
+// Activate handles POST /authsec/applications/:id/activate. Flips state to
+// 'ready' if the setup checklist passes (or force=true in the body).
+func (ctrl *ApplicationsV2Controller) Activate(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var body struct {
+		Force bool `json:"force,omitempty"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	userIDStr, _ := middlewares.ResolveUserID(c)
+	performedBy, _ := uuid.Parse(userIDStr)
+
+	rs, err := ctrl.adminSvc.Activate(tenantID, id, performedBy, body.Force)
+	if err != nil {
+		if errors.Is(err, services.ErrAlreadyActivated) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrNotReadyToActivate) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": err.Error(),
+				"hint":  "GET /applications/:id/setup to see what's missing, or POST with {\"force\": true} to override",
+			})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rs)
+}
+
+// Rescan handles POST /authsec/applications/:id/rescan. Bumps scan_generation
+// so SDK clients refetch /sdk-policy on next TTL.
+func (ctrl *ApplicationsV2Controller) Rescan(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	resp, err := ctrl.adminSvc.Rescan(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 — Connection admin (pre-register + revoke)
+// ─────────────────────────────────────────────────────────────────────────
+
+// PreregisterConnection handles POST /authsec/applications/:id/connections.
+// Admin-initiated OAuth client creation, bound to the Application.
+func (ctrl *ApplicationsV2Controller) PreregisterConnection(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var req services.PreregisterConnectionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	resp, err := ctrl.adminSvc.PreregisterConnection(tenantID, id, req)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, resp)
+}
+
+// RevokeConnection handles DELETE /authsec/applications/:id/connections/:client_id.
+// Marks the join row revoked + queues the master mcp_oauth_clients row for
+// Hydra-side deletion via the reconciler.
+func (ctrl *ApplicationsV2Controller) RevokeConnection(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	clientID := c.Param("client_id")
+	if clientID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "client_id required"})
+		return
+	}
+	reason := c.Query("reason")
+	if reason == "" {
+		reason = "admin-revoked"
+	}
+	if err := ctrl.adminSvc.RevokeConnection(tenantID, id, clientID, reason); err != nil {
+		if strings.Contains(err.Error(), "connection not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "already revoked") {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+// resolveTenantAndID is a one-call helper for the handlers that need
+// (tenant_id, application_id) and standard error responses. Returns ok=false
+// after writing a 400/401 if either is missing/invalid.
+func (ctrl *ApplicationsV2Controller) resolveTenantAndID(c *gin.Context) (tenantID string, id uuid.UUID, ok bool) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return "", uuid.Nil, false
+	}
+	id, err = uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return "", uuid.Nil, false
+	}
+	return tenantID, id, true
+}
+
+// respondAdminError maps service errors to consistent HTTP responses.
+func (ctrl *ApplicationsV2Controller) respondAdminError(c *gin.Context, err error) {
+	if errors.Is(err, services.ErrResourceServerNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }

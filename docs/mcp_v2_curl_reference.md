@@ -228,6 +228,127 @@ curl "$AUTHSEC/authsec/applications/$APP/access" \
   -H "Authorization: Bearer $JWT"
 ```
 
+### List tools (admin view)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/tools" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns the `mcp_tools` rows — same data the SDK reads via `/sdk-policy`,
+but JWT-authenticated for admin UI use.
+
+### List scopes (admin view)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/scopes" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `[{scope, source}, ...]` from `resource_servers.scopes_supported`.
+
+### Scope matrix (tools × scopes)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/scope-matrix" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `{scopes_supported, tools: [{tool_name, tool_id, is_public, required_scopes}, ...]}`.
+
+### Setup checklist
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/setup" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns the 5-item readiness checklist used by the Setup UI tab AND by
+`/activate`'s gate. `ready_to_activate` is true when introspection secret +
+tools + scopes + clients are all present.
+
+### SDK manifest status
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/sdk-manifest-status" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `{scan_generation, last_successful_generation, tool_count, last_published_at}`.
+
+### Activation preview (setup + validate combined)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/activation-preview" \
+  -H "Authorization: Bearer $JWT"
+```
+
+One-shot read that returns both the setup checklist AND the live validate
+result. The Setup UI tab uses this to render the full preview without two
+round trips.
+
+### Activate (flip state to ready)
+
+```bash
+# Normal activation — only succeeds when the setup checklist is fully done.
+curl -X POST "$AUTHSEC/authsec/applications/$APP/activate" \
+  -H "Authorization: Bearer $JWT"
+
+# Force activation (bypass the checklist — admin override).
+curl -X POST "$AUTHSEC/authsec/applications/$APP/activate" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"force": true}'
+```
+
+Returns the updated `resource_servers` row with `state="ready"`.
+
+400 with a hint message if the checklist isn't satisfied.
+409 if the application is already activated.
+
+### Rescan (bump scan_generation)
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/rescan" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `{scan_generation, started_at, status: "queued"}`. The backport
+doesn't actually run an outbound scan; this forces connected SDKs to
+refetch `/sdk-policy` on their next TTL.
+
+### Pre-register a connection (admin OAuth client)
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/connections" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_name": "My Admin-Provisioned Client",
+    "redirect_uris": ["http://localhost:9999/cb"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "token_endpoint_auth_method": "client_secret_basic",
+    "scope": "openid offline_access mcp_demo.read mcp_demo.compute"
+  }'
+```
+
+Returns 201 with `{client_id, client_secret, ...}`. **The client_secret is
+shown exactly once — capture it now.** The client_id can be reused for
+authorize/token; the secret is needed only for token-endpoint auth.
+
+### Revoke a connection
+
+```bash
+# Optional: ?reason=... is recorded in revoked_reason for audit
+curl -X DELETE "$AUTHSEC/authsec/applications/$APP/connections/$CLIENT?reason=admin-rotated" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Marks the join row revoked and queues the master `mcp_oauth_clients` row
+for deletion. The Hydra reconciler does the actual Hydra-side delete on its
+next tick (default 5 min, configurable).
+
 ### Update access policy
 
 ```bash
@@ -426,19 +547,10 @@ This makes `/launch` succeed and `/sdk-policy` return
 ## Endpoints NOT on the backport yet
 
 If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when:
+for what's coming when. Phases 1+2+3 (10 endpoints) shipped in this
+session — those are now in Section 2 above.
 
 ```
-GET    /authsec/applications/:id/tools                     [Phase 1]
-GET    /authsec/applications/:id/scopes                    [Phase 1]
-GET    /authsec/applications/:id/scope-matrix              [Phase 1]
-GET    /authsec/applications/:id/setup                     [Phase 1]
-GET    /authsec/applications/:id/activation-preview        [Phase 1]
-GET    /authsec/applications/:id/sdk-manifest-status       [Phase 1]
-POST   /authsec/applications/:id/activate                  [Phase 2]
-POST   /authsec/applications/:id/rescan                    [Phase 2]
-POST   /authsec/applications/:id/connections               [Phase 3]
-DELETE /authsec/applications/:id/connections/:client_id    [Phase 3]
 GET    /authsec/applications/:id/drift-events              [Phase 4]
 POST   /authsec/applications/:id/drift-events/:eid/dismiss [Phase 4]
 POST   /authsec/applications/:id/scopes                    [Phase 5]
