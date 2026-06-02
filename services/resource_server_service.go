@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -8,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -295,4 +298,51 @@ func (s *ResourceServerService) SoftDelete(tenantID string, id uuid.UUID) error 
 		return fmt.Errorf("deactivate master index: %w", err)
 	}
 	return nil
+}
+
+// RotateIntrospectionSecret generates a new 32-byte random secret for an
+// Application, stores its bcrypt hash on the tenant-DB row, and returns the
+// plaintext to the caller. The plaintext is also stored in the row's
+// introspection_secret column so existing consumers (which read it directly)
+// keep working until they migrate to fetching it once and storing it
+// themselves; the introspection_secret_hash is the authoritative validator
+// at /authsec/oauth/v2/introspect time.
+//
+// PHASE3-NOTE: long term the plaintext column should be removed and callers
+// forced to retrieve the secret once at rotation time. Keeping both columns
+// matches the dev branch's transition state.
+func (s *ResourceServerService) RotateIntrospectionSecret(tenantID string, applicationID uuid.UUID) (string, error) {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return "", fmt.Errorf("get tenant db: %w", err)
+	}
+	var row models.ResourceServer
+	if err := tenantDB.Where("id = ? AND tenant_id = ?", applicationID, tenantID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", ErrResourceServerNotFound
+		}
+		return "", err
+	}
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate secret: %w", err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(raw)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("hash secret: %w", err)
+	}
+
+	now := time.Now()
+	if err := tenantDB.Model(&row).Updates(map[string]interface{}{
+		"introspection_secret":       secret,
+		"introspection_secret_hash":  string(hash),
+		"updated_at":                 now,
+	}).Error; err != nil {
+		return "", fmt.Errorf("write rotated secret: %w", err)
+	}
+
+	return secret, nil
 }

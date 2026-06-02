@@ -133,6 +133,35 @@ func (ctrl *ApplicationsV2Controller) ListClients(c *gin.Context) {
 	c.JSON(http.StatusOK, rows)
 }
 
+// RotateIntrospectionSecret handles POST
+// /authsec/applications/:id/rotate-introspection-secret. Returns the new
+// plaintext secret in the response body. Old consumers continue to work
+// until they pick up the new value.
+func (ctrl *ApplicationsV2Controller) RotateIntrospectionSecret(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	secret, err := ctrl.service.RotateIntrospectionSecret(tenantID, id)
+	if err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"introspection_secret": secret,
+	})
+}
+
 func (ctrl *ApplicationsV2Controller) Delete(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDString(c)
 	if err != nil {

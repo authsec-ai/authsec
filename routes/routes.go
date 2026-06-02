@@ -269,6 +269,7 @@ func SetupRoutes(
 			applicationsV2.GET("/:id", applicationsV2Controller.Get)
 			applicationsV2.DELETE("/:id", applicationsV2Controller.Delete)
 			applicationsV2.GET("/:id/clients", applicationsV2Controller.ListClients)
+			applicationsV2.POST("/:id/rotate-introspection-secret", applicationsV2Controller.RotateIntrospectionSecret)
 
 			// Application ↔ IDP policy: whitelist which IDPs an Application accepts.
 			applicationsV2.GET("/:id/identity-providers", identityProvidersV2Controller.ListApplicationPolicies)
