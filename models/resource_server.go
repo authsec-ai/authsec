@@ -16,6 +16,15 @@ const (
 	ApplicationTypeAPIService = "api_service"
 )
 
+// RSState values for the `state` column on resource_servers. Subset of the
+// dev branch's state machine — only the values the backport actually emits.
+const (
+	RSStatePendingScan = "pending_scan"
+	RSStateNeedsSetup  = "needs_setup"
+	RSStateReady       = "ready"
+	RSStateScanFailed  = "scan_failed"
+)
+
 // ResourceServer is the tenant's Application row. Lives in the tenant DB.
 // TenantID is a string here because prod's tenant_id is propagated as a string
 // in the tenant-DB layer.

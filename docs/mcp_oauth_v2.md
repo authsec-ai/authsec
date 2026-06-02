@@ -112,7 +112,7 @@ AUTHSEC_DISABLE_HYDRA_RECONCILER_V2=true
 
 ## Things explicitly NOT done in this backport
 
-These are TODOs marked `PHASE3-SCOPE` / `PHASE5-NOTE` in the code:
+These are TODOs marked `PHASE3-SCOPE` / `PHASE3-NOTE` / `PHASE5-NOTE` in the code:
 
 - **Deep RBAC enforcement on /token and /introspect.** The dev branch resolves
   the user's grantable scopes against `application_role_bindings` and filters
@@ -124,6 +124,37 @@ These are TODOs marked `PHASE3-SCOPE` / `PHASE5-NOTE` in the code:
 - **Per-tenant `oidc_providers`.** The underlying OIDC provider config rows
   are still global. Each tenant's `identity_providers.config_ref` may point at
   a shared row.
+- **`mcp_tools` table.** Dev tracks discovered MCP tools per RS and validates
+  scope-coverage at `/validate` time. Backport doesn't have the table, so
+  `/test`'s `tool_count` and `unmapped_tools` are always 0 and `/validate`
+  doesn't run the tool-coverage check.
+- **`drift_events` table + DriftService.** Dev emits drift events on
+  destructive admin edits (secret rotation, policy disable, etc.) so the UI
+  can show a "what changed since activation" banner. Not ported. Rotation
+  on the backport just rotates; nothing logs.
+- **Role-option validation on access policy.** Dev's `UpdateAccessPolicy`
+  validates that the `default_role_id` resolves to a role compatible with
+  the RS's scope grants. Backport just stores the UUID. Callers can write
+  any value; runtime role resolution is the consumer's problem.
+- **`last_validated_at` / `last_validation_status` persistence.** Dev writes
+  the last `/validate` result back onto the `resource_servers` row. Backport
+  returns the result but doesn't persist.
+
+## /applications endpoints ported in this revision
+
+| Endpoint | Status | Notes |
+| --- | --- | --- |
+| `POST /authsec/applications/:id/validate` | Done (lean) | 4 checks: state, clients, access-policy, reachability (HEAD probe with 8s timeout). No mcp_tools coverage check, no persistence. |
+| `POST /authsec/applications/:id/test` | Done (lean) | Returns RS state + oauth state. `tool_count` and `unmapped_tools` always 0. |
+| `POST /authsec/applications/:id/launch` | Done (full) | Mirrors dev exactly except for `tenant_id` instead of `workspace_id` in the response. |
+| `GET /authsec/applications/:id/access-policy` | Done (lean) | `role_options` always `[]`. |
+| `PUT /authsec/applications/:id/access-policy` | Done (lean) | No role-option validation. |
+| `GET /authsec/applications/:id/access` | Done | Alias of GET /access-policy, matches dev. |
+
+The remaining dev `applications` surface (scope matrix, tool CRUD, drift
+events, RS-scoped roles + bindings, setup wizard, activation, manifest
+status) is **not ported** and likely won't be without the full RBAC stack.
+Use the dev backend if you need those flows.
 
 ## `auth_request_context` lifecycle (done)
 

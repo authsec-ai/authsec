@@ -271,6 +271,15 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/clients", applicationsV2Controller.ListClients)
 			applicationsV2.POST("/:id/rotate-introspection-secret", applicationsV2Controller.RotateIntrospectionSecret)
 
+			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
+			// applications group. See docs/mcp_oauth_v2.md for the gaps.
+			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)
+			applicationsV2.POST("/:id/test", applicationsV2Controller.TestLogin)
+			applicationsV2.POST("/:id/launch", applicationsV2Controller.Launch)
+			applicationsV2.GET("/:id/access-policy", applicationsV2Controller.GetAccessPolicy)
+			applicationsV2.PUT("/:id/access-policy", applicationsV2Controller.UpdateAccessPolicy)
+			applicationsV2.GET("/:id/access", applicationsV2Controller.GetAccessPolicy) // alias used by the v1 UI
+
 			// Application ↔ IDP policy: whitelist which IDPs an Application accepts.
 			applicationsV2.GET("/:id/identity-providers", identityProvidersV2Controller.ListApplicationPolicies)
 			applicationsV2.POST("/:id/identity-providers", identityProvidersV2Controller.PinIDP)
