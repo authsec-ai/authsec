@@ -2,8 +2,10 @@ package platform
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -28,6 +30,7 @@ type ApplicationsV2Controller struct {
 	onboardingSvc *services.ApplicationOnboardingService
 	sdkPolicySvc  *services.SDKPolicyService
 	adminSvc      *services.ApplicationAdminService
+	driftSvc      *services.DriftService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -36,6 +39,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		onboardingSvc: services.NewApplicationOnboardingService(),
 		sdkPolicySvc:  services.NewSDKPolicyService(),
 		adminSvc:      services.NewApplicationAdminService(),
+		driftSvc:      services.NewDriftService(),
 	}
 }
 
@@ -168,6 +172,11 @@ func (ctrl *ApplicationsV2Controller) RotateIntrospectionSecret(c *gin.Context) 
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// Drift: any RS that's already activated cares that its secret moved.
+	// Best-effort — log but don't block on emit failure.
+	ctrl.emitDrift(c, tenantID, id, models.DriftEventSecretRotated, map[string]interface{}{
+		"rotated_at": time.Now().UTC().Format(time.RFC3339),
+	})
 	c.JSON(http.StatusOK, gin.H{
 		"introspection_secret": secret,
 	})
@@ -390,10 +399,21 @@ func (ctrl *ApplicationsV2Controller) UpdateAccessPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
+	// Capture prior state so we can detect a transition to disabled.
+	priorPolicy, _ := ctrl.onboardingSvc.GetAccessPolicy(tenantID, id)
+	priorEnabled := priorPolicy != nil && priorPolicy.Enabled
+
 	policy, err := ctrl.onboardingSvc.UpdateAccessPolicy(tenantID, id, req)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	// Drift: enabled -> disabled means new first-time users will no longer
+	// auto-bind to the default role. Worth surfacing in the banner.
+	if priorEnabled && !policy.Enabled {
+		ctrl.emitDrift(c, tenantID, id, models.DriftEventDefaultRoleDisabled, map[string]interface{}{
+			"prior_default_role_id": priorPolicy.DefaultRoleID,
+		})
 	}
 	c.JSON(http.StatusOK, policy)
 }
@@ -653,6 +673,12 @@ func (ctrl *ApplicationsV2Controller) RevokeConnection(c *gin.Context) {
 		ctrl.respondAdminError(c, err)
 		return
 	}
+	// Drift: revoking a connection means clients holding tokens issued
+	// before this moment will fail introspection on their next call.
+	ctrl.emitDrift(c, tenantID, id, models.DriftEventConnectionRevoked, map[string]interface{}{
+		"client_id": clientID,
+		"reason":    reason,
+	})
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 
@@ -684,4 +710,77 @@ func (ctrl *ApplicationsV2Controller) respondAdminError(c *gin.Context, err erro
 		return
 	}
 	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
+// emitDrift is the best-effort wrapper around DriftService.EmitEvent. Used
+// by retrofitted handlers (RotateIntrospectionSecret, UpdateAccessPolicy,
+// RevokeConnection). Logs but never blocks the originating mutation.
+func (ctrl *ApplicationsV2Controller) emitDrift(
+	c *gin.Context,
+	tenantID string,
+	applicationID uuid.UUID,
+	eventType string,
+	payload interface{},
+) {
+	userIDStr, _ := middlewares.ResolveUserID(c)
+	var occurredBy *uuid.UUID
+	if u, err := uuid.Parse(userIDStr); err == nil {
+		occurredBy = &u
+	}
+	if err := ctrl.driftSvc.EmitEvent(tenantID, applicationID, eventType, payload, occurredBy); err != nil {
+		log.Printf("[drift] emit %s for application=%s failed: %v", eventType, applicationID, err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 4 — Drift event reads + dismissals
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListDriftEvents handles GET /authsec/applications/:id/drift-events.
+// Query params: ?undismissed=true to filter out events the calling admin
+// has already dismissed (default: include all, with `dismissed_by_me` flag).
+func (ctrl *ApplicationsV2Controller) ListDriftEvents(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userIDStr, _ := middlewares.ResolveUserID(c)
+	adminUserID, _ := uuid.Parse(userIDStr) // uuid.Nil is fine — service handles it
+	undismissedOnly := c.Query("undismissed") == "true"
+
+	events, err := ctrl.driftSvc.List(tenantID, id, adminUserID, undismissedOnly)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+// DismissDriftEvent handles POST /authsec/applications/:id/drift-events/:event_id/dismiss.
+// Idempotent — already-dismissed returns 200 without error.
+func (ctrl *ApplicationsV2Controller) DismissDriftEvent(c *gin.Context) {
+	tenantID, _, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	eventID, err := uuid.Parse(c.Param("event_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid event_id"})
+		return
+	}
+	userIDStr, _ := middlewares.ResolveUserID(c)
+	adminUserID, err := uuid.Parse(userIDStr)
+	if err != nil || adminUserID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "admin user id not in context"})
+		return
+	}
+	if err := ctrl.driftSvc.Dismiss(tenantID, eventID, adminUserID); err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "drift event not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "dismissed"})
 }

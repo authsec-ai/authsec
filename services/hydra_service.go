@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -112,6 +113,36 @@ func hydraAdminDeleteClient(clientID string) error {
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("hydra delete client status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+// hydraAdminRevokeConsentSession invalidates Hydra's cached consent session
+// for a (subject, client) pair. Called after a tenant admin or end-user
+// revokes a consent grant, so refresh-token issuance and new access tokens
+// stop succeeding immediately rather than waiting for the existing tokens
+// to expire.
+//
+// Hydra: DELETE /admin/oauth2/auth/sessions/consent?subject=...&client=...
+// Returns 204 on success. Idempotent: 204 even when no session exists.
+func hydraAdminRevokeConsentSession(subject, clientID string) error {
+	if subject == "" || clientID == "" {
+		return fmt.Errorf("subject and clientID required")
+	}
+	u := fmt.Sprintf("%s/admin/oauth2/auth/sessions/consent?subject=%s&client=%s",
+		hydraAdminURL(), url.QueryEscape(subject), url.QueryEscape(clientID))
+	req, err := http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra revoke consent: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra revoke consent status %d: %s", resp.StatusCode, body)
 	}
 	return nil
 }

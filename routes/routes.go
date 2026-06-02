@@ -271,6 +271,20 @@ func SetupRoutes(
 		authsec.GET("/resource-servers/:id/sdk-policy", applicationsV2Controller.SDKPolicy)
 		authsec.PUT("/resource-servers/:id/sdk-manifest", applicationsV2Controller.PutSDKManifest)
 
+		// Phase 7: consent grants. List + revoke. JWT-authenticated;
+		// user-scope by default, ?all=true and ?admin=true switch to
+		// admin-scope where applicable.
+		consentGrantsController := platformCtrl.NewConsentGrantsController()
+		consentGrants := authsec.Group("/oauth/consent-grants")
+		consentGrants.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			consentGrants.GET("", consentGrantsController.List)
+			consentGrants.DELETE("/:id", consentGrantsController.Revoke)
+		}
+
 		applicationsV2 := authsec.Group("/applications")
 		applicationsV2.Use(
 			middlewares.AuthMiddleware(),
@@ -296,6 +310,11 @@ func SetupRoutes(
 			applicationsV2.POST("/:id/rescan", applicationsV2Controller.Rescan)
 			applicationsV2.POST("/:id/connections", applicationsV2Controller.PreregisterConnection)
 			applicationsV2.DELETE("/:id/connections/:client_id", applicationsV2Controller.RevokeConnection)
+
+			// Phase 4: drift events (admin banner). emit calls are
+			// retrofitted into Rotate/UpdateAccessPolicy/RevokeConnection.
+			applicationsV2.GET("/:id/drift-events", applicationsV2Controller.ListDriftEvents)
+			applicationsV2.POST("/:id/drift-events/:event_id/dismiss", applicationsV2Controller.DismissDriftEvent)
 
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.

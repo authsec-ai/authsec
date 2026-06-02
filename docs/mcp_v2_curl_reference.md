@@ -347,7 +347,38 @@ curl -X DELETE "$AUTHSEC/authsec/applications/$APP/connections/$CLIENT?reason=ad
 
 Marks the join row revoked and queues the master `mcp_oauth_clients` row
 for deletion. The Hydra reconciler does the actual Hydra-side delete on its
-next tick (default 5 min, configurable).
+next tick (default 5 min, configurable). Also emits a `connection_revoked`
+drift event if the Application is in state=ready.
+
+### List drift events
+
+```bash
+# All drift events since activation (includes dismissed-by-me flag)
+curl "$AUTHSEC/authsec/applications/$APP/drift-events" \
+  -H "Authorization: Bearer $JWT"
+
+# Only events the calling admin hasn't dismissed (used for banner)
+curl "$AUTHSEC/authsec/applications/$APP/drift-events?undismissed=true" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `[{id, application_id, event_type, event_payload, occurred_at, occurred_by, dismissed_by_me}, ...]`.
+Event types: `secret_rotated`, `default_role_disabled`, `connection_revoked`
+(more in future phases: `tool_unmapped`, `scope_deleted`).
+
+Only emitted when the Application is in `state=ready` — pre-activation
+mutations are setup, not drift.
+
+### Dismiss a drift event
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/drift-events/<EVENT_ID>/dismiss" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Idempotent — already-dismissed returns `200 {"status":"dismissed"}`.
+Dismissal is per-admin; another admin can still see the event in their
+banner.
 
 ### Update access policy
 
@@ -502,6 +533,62 @@ Returns `accepted`, `removed`, `generation`, `published_at`.
 
 ---
 
+## Section 4b — Consent grants (JWT, mounted under /authsec/oauth)
+
+### List the caller's own consent grants
+
+```bash
+curl "$AUTHSEC/authsec/oauth/consent-grants" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Filters to the caller's `user_id` (decoded from the JWT). Excludes revoked
+grants by default.
+
+### List ALL grants in the tenant (admin scope)
+
+```bash
+curl "$AUTHSEC/authsec/oauth/consent-grants?all=true&include_revoked=true" \
+  -H "Authorization: Bearer $JWT"
+```
+
+`all=true` skips the user_id filter. `include_revoked=true` includes
+already-revoked grants (audit view).
+
+### Filter grants by Application
+
+```bash
+curl "$AUTHSEC/authsec/oauth/consent-grants?application_id=$APP" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Combine with `?all=true` for admin-scope per-Application listing.
+
+### Revoke a consent grant (self-service)
+
+```bash
+curl -X DELETE "$AUTHSEC/authsec/oauth/consent-grants/<GRANT_ID>" \
+  -H "Authorization: Bearer $JWT"
+```
+
+The caller can only revoke their own grants. Cross-user attempts return
+`404 consent grant not found` (existence is hidden).
+
+### Revoke a consent grant (admin scope)
+
+```bash
+curl -X DELETE "$AUTHSEC/authsec/oauth/consent-grants/<GRANT_ID>?admin=true" \
+  -H "Authorization: Bearer $JWT"
+```
+
+`admin=true` skips the user-ownership check. Side-effect: also calls
+Hydra's `/admin/oauth2/auth/sessions/consent?subject=...&client=...` to
+invalidate the upstream consent session, so refresh-token issuance fails
+immediately rather than waiting for token expiry. Idempotent — revoking
+an already-revoked grant returns `200`.
+
+---
+
 ## Section 5 — Hitting a real MCP server
 
 Once your MCP demo server is running and your Application is created
@@ -547,19 +634,15 @@ This makes `/launch` succeed and `/sdk-policy` return
 ## Endpoints NOT on the backport yet
 
 If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when. Phases 1+2+3 (10 endpoints) shipped in this
-session — those are now in Section 2 above.
+for what's coming when. Phases 1+2+3+4+7 (14 endpoints) have shipped —
+those are documented in Sections 2 and 4b above.
 
 ```
-GET    /authsec/applications/:id/drift-events              [Phase 4]
-POST   /authsec/applications/:id/drift-events/:eid/dismiss [Phase 4]
 POST   /authsec/applications/:id/scopes                    [Phase 5]
 PUT    /authsec/applications/:id/scopes/:scope_id          [Phase 5]
 DELETE /authsec/applications/:id/scopes/:scope_id          [Phase 5]
 PUT    /authsec/applications/:id/tool-scope-map            [Phase 6]
 POST   /authsec/applications/:id/tools/:tool_id/public     [Phase 6]
-GET    /authsec/oauth/consent-grants                       [Phase 7]
-DELETE /authsec/oauth/consent-grants/:id                   [Phase 7]
 GET    /authsec/applications/:id/roles                     [Phase 8]
 POST   /authsec/applications/:id/roles                     [Phase 8]
 PUT    /authsec/applications/:id/roles/:role_id/scope-grants [Phase 8]
