@@ -577,6 +577,15 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 
 	workspaceID := *state.WorkspaceID
 
+	if strings.TrimSpace(userInfo.Sub) == "" || strings.TrimSpace(userInfo.Email) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "OIDC provider did not return a usable subject and email"})
+		return
+	}
+	if state.ProviderName == "google" && !userInfo.EmailVerified {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "Google account email is not verified"})
+		return
+	}
+
 	// 1. Resolve the local user by IdP identity first, fall back to email.
 	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(
 		workspaceID, state.ProviderName, userInfo.Sub)
@@ -592,34 +601,20 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		_ = oc.oidcService.UpdateLastLogin(identity.ID)
 	} else {
 		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, workspaceID)
-		if err != nil {
-			// The end-user authenticated with their IdP but isn't a known
-			// member of this workspace. We do NOT auto-create — workspace
-			// admin must invite them first. Surface a clear error.
-			log.Printf("hydra_login callback: no user for email=%s in workspace=%s", userInfo.Email, workspaceID)
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"success": false,
-				"error":   "User not found in this workspace. Contact your administrator.",
-			})
+		if database.IsUserNotFound(err) {
+			user, err = oc.userRepo.CreateOIDCEndUser(workspaceID, state.ProviderName, userInfo)
+			if err != nil {
+				log.Printf("hydra_login callback: JIT end-user creation failed email=%s workspace=%s: %v", userInfo.Email, workspaceID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "failed to create workspace end user"})
+				return
+			}
+			log.Printf("hydra_login callback: provisioned workspace end user user=%s workspace=%s provider=%s", user.ID, workspaceID, state.ProviderName)
+		} else if err != nil {
+			log.Printf("hydra_login callback: workspace user lookup failed email=%s workspace=%s: %v", userInfo.Email, workspaceID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "workspace user lookup failed"})
 			return
 		}
-		// Cross-tenant collision: this IdP identity already belongs to a
-		// different account anywhere in the system. Refuse to silently
-		// hijack it.
-		if existing, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub); existing != nil && existing.UserID != user.ID {
-			c.JSON(http.StatusConflict, gin.H{
-				"success": false,
-				"error":   "This social login is already linked to another account.",
-			})
-			return
-		}
-		// Link or refresh the identity. The unique constraint on
-		// (tenant_id, user_id, provider_name) means a row may already
-		// exist with a stale provider_user_id (e.g. from initial admin
-		// signup that stored a different sub format). Best-effort:
-		// insert; on conflict, do nothing — the existing row is fine for
-		// completing the Hydra login. Don't block auth on identity
-		// bookkeeping.
+
 		profileJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 		if err := oc.oidcService.CreateIdentity(&models.OIDCUserIdentity{
 			WorkspaceID:    workspaceID,
@@ -629,16 +624,18 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 			Email:          userInfo.Email,
 			ProfileData:    string(profileJSON),
 		}); err != nil {
-			// Treat duplicate-key as a no-op — we already have a row for
-			// this (tenant, user, provider) tuple. Any other error is
-			// logged but doesn't block the login.
-			if strings.Contains(strings.ToLower(err.Error()), "duplicate key") ||
-				strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
-				log.Printf("hydra_login callback: oidc_user_identities row already exists for user=%s provider=%s — using existing link", user.ID, state.ProviderName)
-			} else {
-				log.Printf("hydra_login callback: CreateIdentity failed (non-fatal): %v", err)
-			}
+			log.Printf("hydra_login callback: CreateIdentity failed user=%s provider=%s: %v", user.ID, state.ProviderName, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "failed to link social identity"})
+			return
 		}
+	}
+
+	if !user.Active {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "error": "This end-user account is inactive"})
+		return
+	}
+	if err := oc.userRepo.UpdateLastLogin(user.ID); err != nil {
+		log.Printf("hydra_login callback: failed to update user last_login user=%s: %v", user.ID, err)
 	}
 
 	// 2. Accept the Hydra login challenge with the local user as subject.
@@ -783,13 +780,6 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 		user, err = oc.userRepo.GetUserByEmailAndTenant(userInfo.Email, *state.WorkspaceID)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found in this workspace"})
-			return
-		}
-
-		// Before linking, check if this OIDC identity is already in use globally.
-		existingGlobalIdentity, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
-		if existingGlobalIdentity != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "This social login is already linked to another user account."})
 			return
 		}
 

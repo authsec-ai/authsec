@@ -127,7 +127,7 @@ func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*mo
 
 	// First try via workspace_domains (custom-domain mapping).
 	query := `
-		SELECT ` + workspaceSelectCols + `
+		SELECT ` + workspaceSelectColsFromAlias + `
 		FROM workspaces w
 		INNER JOIN workspace_domains td ON w.id = td.workspace_id
 		WHERE LOWER(td.domain) = LOWER($1) AND td.is_verified = true

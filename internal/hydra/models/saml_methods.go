@@ -200,6 +200,58 @@ func (s *OAuthLoginService) GetAllProvidersForTenant(tenantIDForOIDC string, rea
 	return allProviders, nil
 }
 
+// FilterProvidersForApplication applies the same default-allow semantics used
+// by the runtime OIDC and SAML initiate gates. When an Application has no
+// explicit policies, every active workspace provider remains available. Once
+// any policy exists, only explicitly enabled providers are advertised.
+func (s *OAuthLoginService) FilterProvidersForApplication(workspaceID, applicationID string, providers []Provider) ([]Provider, error) {
+	if applicationID == "" || len(providers) == 0 {
+		return providers, nil
+	}
+
+	var policyCount int64
+	if err := config.DB.Table("application_identity_provider_policies").
+		Where("workspace_id = ? AND application_id = ?", workspaceID, applicationID).
+		Count(&policyCount).Error; err != nil {
+		return nil, fmt.Errorf("count application IDP policies: %w", err)
+	}
+	if policyCount == 0 {
+		return providers, nil
+	}
+
+	type enabledProvider struct {
+		ProviderType string
+		ProviderName string
+	}
+	var enabledRows []enabledProvider
+	if err := config.DB.
+		Table("application_identity_provider_policies p").
+		Select(`ip.provider_type,
+		        COALESCE(op.provider_name, sp.provider_name) AS provider_name`).
+		Joins("JOIN identity_providers ip ON ip.id = p.identity_provider_id").
+		Joins("LEFT JOIN oidc_providers op ON ip.provider_type = 'oidc' AND op.id::text = ip.config_ref").
+		Joins("LEFT JOIN saml_providers sp ON ip.provider_type = 'saml' AND sp.id::text = ip.config_ref").
+		Where("p.workspace_id = ? AND p.application_id = ? AND p.enabled = ?", workspaceID, applicationID, true).
+		Where("ip.workspace_id = ? AND ip.status <> 'disabled'", workspaceID).
+		Scan(&enabledRows).Error; err != nil {
+		return nil, fmt.Errorf("list enabled application IDPs: %w", err)
+	}
+
+	enabled := make(map[string]struct{}, len(enabledRows))
+	for _, row := range enabledRows {
+		enabled[strings.ToLower(row.ProviderType)+"\x00"+strings.ToLower(row.ProviderName)] = struct{}{}
+	}
+
+	filtered := make([]Provider, 0, len(providers))
+	for _, provider := range providers {
+		key := strings.ToLower(provider.Type) + "\x00" + strings.ToLower(provider.ProviderName)
+		if _, ok := enabled[key]; ok {
+			filtered = append(filtered, provider)
+		}
+	}
+	return filtered, nil
+}
+
 // GetSAMLProvider retrieves a specific SAML provider by name within the
 // workspace. v4: client_id has been dropped from saml_providers — the
 // variadic clientID parameter is kept for source compatibility but ignored.
@@ -269,7 +321,7 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	samlReq := SAMLRequest{
 		ID:             requestID,
 		LoginChallenge: loginChallenge,
-		WorkspaceID:       provider.WorkspaceID,
+		WorkspaceID:    provider.WorkspaceID,
 		ProviderName:   provider.ProviderName,
 		RelayState:     relayState,
 		CreatedAt:      time.Now(),
@@ -431,7 +483,7 @@ func (s *OAuthLoginService) GetOrCreateSPCertificate(workspaceID uuid.UUID) (*SA
 	}
 
 	newCert := SAMLSPCertificate{
-		WorkspaceID:    workspaceID,
+		WorkspaceID: workspaceID,
 		Certificate: string(certPEM),
 		PrivateKey:  encryptedPrivateKey,
 		ExpiresAt:   time.Now().AddDate(1, 0, 0),

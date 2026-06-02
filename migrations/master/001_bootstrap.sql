@@ -589,7 +589,7 @@ CREATE TABLE public.oidc_user_identities (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT oidc_user_identities_pkey PRIMARY KEY (id),
-    CONSTRAINT oidc_user_identities_provider_unique UNIQUE (provider_name, provider_user_id),
+    CONSTRAINT oidc_user_identities_workspace_provider_unique UNIQUE (workspace_id, provider_name, provider_user_id),
     CONSTRAINT oidc_user_identities_tenant_user_provider_unique UNIQUE (workspace_id, user_id, provider_name)
 );
 
@@ -1221,7 +1221,7 @@ CREATE TABLE public.workspace_user_memberships (
     CONSTRAINT chk_tm_status CHECK ((status = ANY (ARRAY['active'::text, 'invited'::text, 'suspended'::text, 'left'::text]))),
     CONSTRAINT chk_tm_type CHECK ((membership_type = ANY (ARRAY['owner'::text, 'admin'::text, 'member'::text, 'contractor'::text, 'service_operator'::text, 'readonly_auditor'::text]))),
     CONSTRAINT workspace_user_memberships_pkey PRIMARY KEY (id),
-    CONSTRAINT workspace_user_memberships_tenant_id_user_id_key UNIQUE (workspace_id, user_id)
+    CONSTRAINT workspace_user_memberships_workspace_id_user_id_key UNIQUE (workspace_id, user_id)
 );
 
 CREATE TABLE public.workspace_totp_backup_codes (
@@ -1984,15 +1984,15 @@ CREATE INDEX idx_tenant_totp_user_active ON public.workspace_totp_secrets USING 
 
 CREATE INDEX idx_teus_last_seen ON public.workspace_end_user_states USING btree (workspace_id, last_seen_at DESC);
 
-CREATE INDEX idx_teus_tenant_plan ON public.workspace_end_user_states USING btree (workspace_id, plan_tier) WHERE (plan_tier IS NOT NULL);
+CREATE INDEX idx_teus_workspace_plan ON public.workspace_end_user_states USING btree (workspace_id, plan_tier) WHERE (plan_tier IS NOT NULL);
 
-CREATE INDEX idx_teus_tenant_status ON public.workspace_end_user_states USING btree (workspace_id, status);
+CREATE INDEX idx_teus_workspace_status ON public.workspace_end_user_states USING btree (workspace_id, status);
 
 CREATE INDEX idx_tm_invited_by ON public.workspace_user_memberships USING btree (invited_by) WHERE (invited_by IS NOT NULL);
 
-CREATE INDEX idx_tm_tenant_status ON public.workspace_user_memberships USING btree (workspace_id, status);
+CREATE INDEX idx_tm_workspace_status ON public.workspace_user_memberships USING btree (workspace_id, status);
 
-CREATE INDEX idx_tm_tenant_type ON public.workspace_user_memberships USING btree (workspace_id, membership_type);
+CREATE INDEX idx_tm_workspace_type ON public.workspace_user_memberships USING btree (workspace_id, membership_type);
 
 CREATE INDEX idx_tm_user ON public.workspace_user_memberships USING btree (user_id);
 
@@ -2044,11 +2044,11 @@ CREATE INDEX idx_users_password_change_required ON public.users USING btree (pas
 
 CREATE INDEX idx_users_project_id ON public.users USING btree (project_id);
 
-CREATE INDEX idx_users_provider ON public.users USING btree (provider, provider_id);
+CREATE INDEX idx_users_provider ON public.users USING btree (workspace_id, provider, provider_id);
 
 CREATE INDEX idx_users_provider_data ON public.users USING gin (provider_data);
 
-CREATE UNIQUE INDEX idx_users_provider_provider_id ON public.users USING btree (provider, provider_id) WHERE (provider_id IS NOT NULL);
+CREATE UNIQUE INDEX idx_users_workspace_provider_provider_id ON public.users USING btree (workspace_id, provider, provider_id) WHERE (provider_id IS NOT NULL AND deleted_at IS NULL);
 
 CREATE INDEX idx_users_provider_status ON public.users USING btree (provider, active);
 
@@ -2341,10 +2341,10 @@ ALTER TABLE ONLY public.role_permissions
     ADD CONSTRAINT role_permissions_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.workspace_end_user_states
-    ADD CONSTRAINT workspace_end_user_states_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+    ADD CONSTRAINT workspace_end_user_states_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.workspace_user_memberships
-    ADD CONSTRAINT workspace_user_memberships_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+    ADD CONSTRAINT workspace_user_memberships_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT user_groups_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;

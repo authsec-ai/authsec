@@ -261,7 +261,7 @@ func (s *RBACService) PolicyDecisionPointCheck(_ uuid.UUID, _, _ string, _ *uuid
 // Rules (Phase A):
 //   - If the principal has a tenant_memberships row, it must be status='active'.
 //     Suspended/left/invited members fail closed.
-//   - If the principal has a tenant_end_user_states row, it must be status='active'.
+//   - If the principal has a workspace_end_user_states row, it must be status='active'.
 //     Suspended end users fail closed.
 //   - Service accounts have no membership/end-user-state rows; pass through.
 //   - Users with neither row (legacy / unbackfilled) pass through with a log
@@ -286,7 +286,7 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 		log.Printf("[RBACService] membership status lookup failed for %s: %v", principalID, err)
 	}
 
-	// Check tenant_end_user_states — same approach, fail closed on suspended.
+	// Check workspace_end_user_states — same approach, fail closed on suspended.
 	var eusStatus string
 	row2 := s.db.Table("workspace_end_user_states").
 		Select("status").

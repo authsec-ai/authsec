@@ -23,7 +23,7 @@ type OIDCProvider struct {
 	Scopes                string    `json:"scopes" gorm:"default:'openid email profile'"`                                        // Space-separated scopes
 	IconURL               string    `json:"icon_url,omitempty"`                                                                  // Provider icon for UI
 	RedirectURI           string    `json:"redirect_uri,omitempty"`                                                              // OAuth redirect_uri registered with the IDP; null = derive from request host
-	IsActive              bool      `json:"is_active" gorm:"default:false"`
+	IsActive              bool      `json:"is_active" gorm:"default:true"`
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }
@@ -38,7 +38,7 @@ func (OIDCProvider) TableName() string {
 type OIDCState struct {
 	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	StateToken    string     `json:"state_token" gorm:"uniqueIndex;not null"`            // Random state for CSRF
-	WorkspaceID      *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`               // NULL for new registration
+	WorkspaceID   *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`            // NULL for new registration
 	TenantDomain  string     `json:"tenant_domain" gorm:"not null"`                      // e.g., 'ritam'
 	OriginDomain  string     `json:"origin_domain,omitempty" gorm:"column:request_host"` // The actual domain user came from (maps to request_host column)
 	ProviderName  string     `json:"provider_name" gorm:"not null"`                      // 'google', 'github', etc.
@@ -67,7 +67,7 @@ func (OIDCState) TableName() string {
 // Allows lookup: "Does this Google user exist in this tenant?"
 type OIDCUserIdentity struct {
 	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	WorkspaceID       uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID    uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
 	ProviderName   string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
 	ProviderUserID string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)

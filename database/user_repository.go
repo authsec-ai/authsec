@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -17,6 +18,13 @@ import (
 // UserRepository handles user database operations without GORM
 type UserRepository struct {
 	db *DBConnection
+}
+
+var ErrUserNotFound = errors.New("user not found")
+
+// IsUserNotFound reports whether a repository lookup did not find an active record.
+func IsUserNotFound(err error) bool {
+	return errors.Is(err, ErrUserNotFound)
 }
 
 // NewUserRepository creates a new user repository
@@ -85,6 +93,74 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 	return err
 }
 
+// CreateOIDCEndUser creates a workspace-scoped consumer identity for a first
+// federated application login. It deliberately does not create a
+// workspace_memberships row or an admin role binding.
+func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName string, userInfo *models.OIDCUserInfo) (*models.ExtendedUser, error) {
+	email := strings.ToLower(strings.TrimSpace(userInfo.Email))
+	if workspaceID == uuid.Nil || email == "" || userInfo.Sub == "" {
+		return nil, fmt.Errorf("workspace_id, email, and provider subject are required")
+	}
+
+	name := strings.TrimSpace(userInfo.Name)
+	if name == "" {
+		name = email
+	}
+	username := email
+	profileData, err := json.Marshal(map[string]interface{}{
+		"name":        userInfo.Name,
+		"given_name":  userInfo.GivenName,
+		"family_name": userInfo.FamilyName,
+		"picture":     userInfo.Picture,
+		"locale":      userInfo.Locale,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal OIDC profile: %w", err)
+	}
+
+	userID := uuid.New()
+	now := time.Now().UTC()
+	query := `
+		INSERT INTO users (
+			id, workspace_id, name, username, email, tenant_domain,
+			provider, provider_id, provider_data, avatar_url, active,
+			last_login, created_at, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, 'app.authsec.dev',
+		        $6, $7, $8, $9, true, $10, $10, $10)
+		ON CONFLICT (workspace_id, LOWER(email)) WHERE deleted_at IS NULL
+		DO UPDATE SET updated_at = users.updated_at
+		RETURNING id
+	`
+	if err := ur.db.QueryRow(
+		query,
+		userID,
+		workspaceID,
+		name,
+		username,
+		email,
+		providerName,
+		userInfo.Sub,
+		profileData,
+		userInfo.Picture,
+		now,
+	).Scan(&userID); err != nil {
+		return nil, fmt.Errorf("create workspace OIDC end user: %w", err)
+	}
+
+	return ur.GetUserByID(userID)
+}
+
+// UpdateLastLogin records successful consumer authentication.
+func (ur *UserRepository) UpdateLastLogin(userID uuid.UUID) error {
+	_, err := ur.db.Exec(
+		"UPDATE users SET last_login = $1, updated_at = $1 WHERE id = $2 AND deleted_at IS NULL",
+		time.Now().UTC(),
+		userID,
+	)
+	return err
+}
+
 // GetUserByEmail retrieves a user by email (case-insensitive)
 func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, error) {
 	query := `
@@ -94,7 +170,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE LOWER(email) = LOWER($1)
+		WHERE LOWER(email) = LOWER($1) AND deleted_at IS NULL
 	`
 
 	user := &models.ExtendedUser{}
@@ -129,7 +205,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("user not found")
+			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
@@ -169,7 +245,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND client_id = $2
+		WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND deleted_at IS NULL
 	`
 
 	user := &models.ExtendedUser{}
@@ -204,7 +280,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("user not found")
+			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
@@ -242,7 +318,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE LOWER(email) = LOWER($1) AND workspace_id = $2
+		WHERE LOWER(email) = LOWER($1) AND workspace_id = $2 AND deleted_at IS NULL
 	`
 
 	user := &models.ExtendedUser{}
@@ -277,7 +353,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("user not found")
+			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
@@ -315,7 +391,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE id = $1
+		WHERE id = $1 AND deleted_at IS NULL
 	`
 
 	user := &models.ExtendedUser{}
@@ -350,7 +426,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("user not found")
+			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
@@ -381,8 +457,8 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 	return user, nil
 }
 
-// GetUserByProvider retrieves a user by OAuth provider and provider ID
-func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*models.ExtendedUser, error) {
+// GetUserByProvider retrieves a workspace user by OAuth provider and provider ID.
+func (ur *UserRepository) GetUserByProvider(workspaceID uuid.UUID, provider, providerID string) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
 			password_hash, tenant_domain, provider, provider_id, provider_data,
@@ -390,7 +466,7 @@ func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*model
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
 		FROM users
-		WHERE provider = $1 AND provider_id = $2
+		WHERE workspace_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL
 	`
 
 	user := &models.ExtendedUser{}
@@ -398,7 +474,7 @@ func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*model
 	var mfaEnrolledAt, lastLoginAt sql.NullTime
 	var mfaMethod pq.StringArray
 
-	err := ur.db.QueryRow(query, provider, providerID).Scan(
+	err := ur.db.QueryRow(query, workspaceID, provider, providerID).Scan(
 		&user.ID,
 		&user.ClientID,
 		&user.WorkspaceID,
@@ -425,7 +501,7 @@ func (ur *UserRepository) GetUserByProvider(provider, providerID string) (*model
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("user not found")
+			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
@@ -809,7 +885,7 @@ func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) err
 	}
 
 	// 5. Check for existing user with same provider/provider_id combination
-	if err := ur.checkProviderUniqueness(user.Provider, user.ProviderID, user.ID); err != nil {
+	if err := ur.checkProviderUniqueness(user.WorkspaceID, user.Provider, user.ProviderID, user.ID); err != nil {
 		return err
 	}
 
@@ -821,13 +897,13 @@ func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) err
 	return nil
 }
 
-// checkProviderUniqueness validates that provider/provider_id combination is unique
-func (ur *UserRepository) checkProviderUniqueness(provider, providerID string, excludeUserID uuid.UUID) error {
-	query := `SELECT id FROM users WHERE provider = $1 AND provider_id = $2`
-	args := []interface{}{provider, providerID}
+// checkProviderUniqueness validates that a provider identity is unique inside a workspace.
+func (ur *UserRepository) checkProviderUniqueness(workspaceID uuid.UUID, provider, providerID string, excludeUserID uuid.UUID) error {
+	query := `SELECT id FROM users WHERE workspace_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL`
+	args := []interface{}{workspaceID, provider, providerID}
 
 	if excludeUserID != uuid.Nil {
-		query += ` AND id != $3`
+		query += ` AND id != $4`
 		args = append(args, excludeUserID)
 	}
 

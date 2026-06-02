@@ -225,7 +225,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 	// it's not 'active', the user is suspended/disabled — return zero scopes so
 	// token issuance (oauth_as_controller.tokenAuthCodeGrant) fails with
 	// insufficient_scope and introspection flips active=false on the very next
-	// request. Operators/members don't have a row in tenant_end_user_states,
+	// request. Operators/members don't have a row in workspace_end_user_states,
 	// so they're unaffected by this check.
 	//
 	// Done as a separate cheap query (PK lookup) rather than a JOIN so the
@@ -234,7 +234,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 	// look like "allowed".
 	var endUserStatus string
 	row := r.db.WithContext(ctx).
-		Raw(`SELECT status FROM tenant_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, tenantUUID, userID).
+		Raw(`SELECT status FROM workspace_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, tenantUUID, userID).
 		Row()
 	if scanErr := row.Scan(&endUserStatus); scanErr == nil && endUserStatus != "" && endUserStatus != "active" {
 		return result, nil

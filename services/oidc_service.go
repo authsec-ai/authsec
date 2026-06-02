@@ -74,58 +74,9 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	}
 	workspaceID := *workspaceIDPtr
 
-	// Resolve provider through the workspace IDP gate. Find an identity_providers
-	// row for this workspace + the requested provider_name. Reject when the IDP
-	// is missing or disabled.
-	var resolved struct {
-		IdentityProviderID uuid.UUID
-		Status             string
-		ProviderModel      models.OIDCProvider `gorm:"embedded"`
-	}
-	err := config.DB.
-		Table("identity_providers ip").
-		Select(`ip.id  AS identity_provider_id,
-		        ip.status AS status,
-		        op.*`).
-		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
-		Where("ip.workspace_id = ?", workspaceID).
-		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
-		Where("op.provider_name = ?", input.Provider).
-		First(&resolved).Error
+	provider, err := s.resolveEnabledProvider(workspaceID, input.Provider, input.ApplicationID)
 	if err != nil {
-		return nil, fmt.Errorf("provider %q not enabled for workspace", input.Provider)
-	}
-	if resolved.Status == "disabled" {
-		return nil, fmt.Errorf("provider %q is disabled for workspace", input.Provider)
-	}
-	if !resolved.ProviderModel.IsActive {
-		return nil, fmt.Errorf("provider %q is inactive", input.Provider)
-	}
-	provider := &resolved.ProviderModel
-	provider.ID = resolved.ProviderModel.ID // explicit for clarity
-
-	// Optional Application gate: when input.ApplicationID is set, consult the
-	// application_identity_provider_policies whitelist. Empty policy table =
-	// default-allow.
-	if input.ApplicationID != nil {
-		var policyCount int64
-		if err := config.DB.Table("application_identity_provider_policies").
-			Where("workspace_id = ? AND application_id = ?", workspaceID, *input.ApplicationID).
-			Count(&policyCount).Error; err != nil {
-			return nil, fmt.Errorf("check application IDP policies: %w", err)
-		}
-		if policyCount > 0 {
-			var enabledCount int64
-			if err := config.DB.Table("application_identity_provider_policies").
-				Where("workspace_id = ? AND application_id = ? AND identity_provider_id = ? AND enabled = ?",
-					workspaceID, *input.ApplicationID, resolved.IdentityProviderID, true).
-				Count(&enabledCount).Error; err != nil {
-				return nil, fmt.Errorf("check application IDP enabled: %w", err)
-			}
-			if enabledCount == 0 {
-				return nil, fmt.Errorf("provider %q not enabled for application", input.Provider)
-			}
-		}
+		return nil, err
 	}
 
 	// Generate state token (for CSRF protection and tenant context)
@@ -146,7 +97,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 	// workspace context out-of-band.
 	signedState, _, err := MintSignedState(workspaceID, input.ApplicationID)
 	if err != nil {
-		log.Printf("WARN: failed to mint signed OIDC state: %v", err)
+		return nil, fmt.Errorf("failed to mint signed OIDC state: %w", err)
 	}
 
 	// Store state in database (expires in 30 minutes)
@@ -214,7 +165,7 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 			return nil, nil, fmt.Errorf("oidc state signature invalid: %w", verr)
 		}
 		if state.WorkspaceID != nil && claims.WorkspaceID != *state.WorkspaceID {
-			log.Printf("ERROR HandleCallback: signed workspace_id %s != row tenant_id %s",
+			log.Printf("ERROR HandleCallback: signed workspace_id %s != row workspace_id %s",
 				claims.WorkspaceID, state.WorkspaceID)
 			return nil, nil, fmt.Errorf("oidc state workspace mismatch")
 		}
@@ -224,10 +175,12 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 		}
 	}
 
-	// Get provider configuration
+	// Re-run the same gate used at initiation. This fails closed if an operator
+	// disables the workspace IDP or removes its Application policy while the
+	// upstream login is in flight.
 	var provider *models.OIDCProvider
 	if state.WorkspaceID != nil {
-		provider, err = s.providerRepo.GetProviderByWorkspaceAndName(*state.WorkspaceID, state.ProviderName)
+		provider, err = s.resolveEnabledProvider(*state.WorkspaceID, state.ProviderName, state.ApplicationID)
 	} else {
 		provider, err = s.providerRepo.GetProviderByName(state.ProviderName)
 	}
@@ -259,6 +212,58 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 	}
 
 	return state, userInfo, nil
+}
+
+func (s *OIDCService) resolveEnabledProvider(workspaceID uuid.UUID, providerName string, applicationID *uuid.UUID) (*models.OIDCProvider, error) {
+	var resolved struct {
+		IdentityProviderID uuid.UUID
+		Status             string
+		ProviderModel      models.OIDCProvider `gorm:"embedded"`
+	}
+	err := config.DB.
+		Table("identity_providers ip").
+		Select(`ip.id AS identity_provider_id,
+		        ip.status AS status,
+		        op.*`).
+		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
+		Where("ip.workspace_id = ?", workspaceID).
+		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
+		Where("op.provider_name = ?", providerName).
+		First(&resolved).Error
+	if err != nil {
+		return nil, fmt.Errorf("provider %q not enabled for workspace", providerName)
+	}
+	if resolved.Status == "disabled" {
+		return nil, fmt.Errorf("provider %q is disabled for workspace", providerName)
+	}
+	if !resolved.ProviderModel.IsActive {
+		return nil, fmt.Errorf("provider %q is inactive", providerName)
+	}
+
+	if applicationID != nil {
+		var policyCount int64
+		if err := config.DB.Table("application_identity_provider_policies").
+			Where("workspace_id = ? AND application_id = ?", workspaceID, *applicationID).
+			Count(&policyCount).Error; err != nil {
+			return nil, fmt.Errorf("check application IDP policies: %w", err)
+		}
+		if policyCount > 0 {
+			var enabledCount int64
+			if err := config.DB.Table("application_identity_provider_policies").
+				Where("workspace_id = ? AND application_id = ? AND identity_provider_id = ? AND enabled = ?",
+					workspaceID, *applicationID, resolved.IdentityProviderID, true).
+				Count(&enabledCount).Error; err != nil {
+				return nil, fmt.Errorf("check application IDP enabled: %w", err)
+			}
+			if enabledCount == 0 {
+				return nil, fmt.Errorf("provider %q not enabled for application", providerName)
+			}
+		}
+	}
+
+	provider := &resolved.ProviderModel
+	provider.ID = resolved.ProviderModel.ID
+	return provider, nil
 }
 
 // GetIdentityByProviderUser looks up if a provider user exists in any tenant

@@ -401,6 +401,16 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 			log.Printf("[MCP_AUTH] GetLoginPageData: no external providers for tenant=%s challenge=%s: %v", tenantIDForOIDC, loginChallenge, err)
 			allProviders = nil
 		}
+		allProviders, err = ctrl.service.FilterProvidersForApplication(tenantIDForOIDC, arcCtx.ResourceServerID, allProviders)
+		if err != nil {
+			log.Printf("[MCP_AUTH] GetLoginPageData: filter application providers workspace=%s application=%s challenge=%s: %v",
+				tenantIDForOIDC, arcCtx.ResourceServerID, loginChallenge, err)
+			c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
+				Success: false,
+				Error:   "Failed to load application identity providers",
+			})
+			return
+		}
 
 		oidcProviders := make([]hydramodels.OIDCProvider, 0, len(allProviders))
 		for _, p := range allProviders {
@@ -1290,7 +1300,6 @@ func (ctrl *HmgrController) LoginChallengeHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, loginRequest.Client)
 }
-
 
 // --- SAML Handlers ---
 

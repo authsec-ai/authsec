@@ -572,7 +572,8 @@ func (s *OAuthLoginService) GetAllHydraClients() ([]HydraClient, error) {
 // GetOIDCProvidersForTenant returns the workspace's OIDC providers by joining
 // the v4 identity_providers + oidc_providers tables. The workspace_id passed
 // in is the workspace UUID (same as legacy tenant_id during the transition).
-// Returns providers whose identity_providers row exists and is not disabled.
+// Returns providers whose identity_providers row exists and whose canonical
+// and protocol-specific active states agree.
 func (s *OAuthLoginService) GetOIDCProvidersForTenant(workspaceID string) ([]OIDCProvider, error) {
 	db := config.DB
 
@@ -606,6 +607,7 @@ func (s *OAuthLoginService) GetOIDCProvidersForTenant(workspaceID string) ([]OID
 		        AND ip.provider_type = 'oidc'
 		        AND ip.config_ref = op.id::text`).
 		Where("op.workspace_id = ?", workspaceID).
+		Where("op.is_active = ?", true).
 		Where("ip.status <> 'disabled'").
 		Order("op.provider_name ASC").
 		Scan(&rows).Error

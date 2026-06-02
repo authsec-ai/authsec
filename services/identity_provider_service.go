@@ -235,25 +235,70 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 	return &idp, nil
 }
 
-// UpdateStatus flips an IDP between 'configured' and 'disabled'. Disabling an
-// IDP makes the login-flow gates reject it without removing config data.
+// UpdateStatus flips an IDP between 'configured' and 'disabled'. The
+// identity_providers row is the product-level record, while protocol-specific
+// rows are still read by runtime flows. Keep both layers in lockstep so the
+// login UI and the runtime gate cannot disagree.
 func (s *IdentityProviderService) UpdateStatus(workspaceID, idpID uuid.UUID, status string) error {
 	if status != "configured" && status != "disabled" {
 		return fmt.Errorf("status must be 'configured' or 'disabled'")
 	}
-	res := s.db.Model(&models.IdentityProvider{}).
-		Where("id = ? AND workspace_id = ?", idpID, workspaceID).
-		Updates(map[string]interface{}{
-			"status":     status,
-			"updated_at": time.Now(),
-		})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var idp models.IdentityProvider
+		if err := tx.Where("id = ? AND workspace_id = ?", idpID, workspaceID).
+			First(&idp).Error; err != nil {
+			return err
+		}
+
+		now := time.Now()
+		isActive := status == "configured"
+		if idp.ProviderType != models.IdentityProviderSCIM {
+			configUUID, err := uuid.Parse(idp.ConfigRef)
+			if err != nil {
+				return fmt.Errorf("identity provider %s has invalid config_ref: %w", idp.ID, err)
+			}
+
+			var table string
+			switch idp.ProviderType {
+			case models.IdentityProviderOIDC:
+				table = "oidc_providers"
+			case models.IdentityProviderSAML:
+				table = "saml_providers"
+			case models.IdentityProviderAD, models.IdentityProviderEntra:
+				table = "sync_configurations"
+			default:
+				return fmt.Errorf("unsupported identity provider type %q", idp.ProviderType)
+			}
+
+			res := tx.Table(table).
+				Where("id = ? AND workspace_id = ?", configUUID, workspaceID).
+				Updates(map[string]interface{}{
+					"is_active":  isActive,
+					"updated_at": now,
+				})
+			if res.Error != nil {
+				return fmt.Errorf("update %s active state: %w", table, res.Error)
+			}
+			if res.RowsAffected == 0 {
+				return fmt.Errorf("%s config %s not found for workspace", table, configUUID)
+			}
+		}
+
+		res := tx.Model(&models.IdentityProvider{}).
+			Where("id = ? AND workspace_id = ?", idpID, workspaceID).
+			Updates(map[string]interface{}{
+				"status":     status,
+				"updated_at": now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
 }
 
 // Delete removes the workspace IDP, its underlying provider config row, and

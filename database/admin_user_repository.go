@@ -467,7 +467,14 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 		FROM users u
 		JOIN role_bindings rb ON u.id = rb.user_id
 		JOIN roles r ON rb.role_id = r.id
-		WHERE LOWER(u.email) = LOWER($1) AND u.active = true AND LOWER(r.name) = 'admin'
+		JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
+		JOIN roles workspace_role ON workspace_role.id = wm.role_id
+		WHERE LOWER(u.email) = LOWER($1)
+		  AND u.active = true
+		  AND u.deleted_at IS NULL
+		  AND LOWER(r.name) = 'admin'
+		  AND wm.status = 'active'
+		  AND LOWER(workspace_role.name) = 'admin'
 	`
 
 	fmt.Printf("UserFlow:Debug:: Query to get user for email %s: %s\n", email, strings.ReplaceAll(query, "\n", " "))
@@ -492,9 +499,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 		mfaMethodRaw          interface{} // Scan as interface{} to handle NULL and array
 	)
 	var (
-		clientID  *uuid.UUID
-		workspaceID  *uuid.UUID
-		projectID *uuid.UUID
+		clientID    *uuid.UUID
+		workspaceID *uuid.UUID
+		projectID   *uuid.UUID
 	)
 	var user models.AdminUser
 
@@ -630,11 +637,10 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 // GetAdminUserByEmailAndTenantDomain retrieves an admin user by email and tenant_domain (case-insensitive)
 // This method enforces tenant isolation by requiring the user's tenant_domain to match
 // Uses role_bindings for role assignments (user_roles is deprecated)
-// NOTE: This is a relaxed version that finds any active user with admin role AND matching tenant_domain.
-// If no role binding exists yet (e.g., newly invited user), it falls back to just email+domain match.
+// Only active workspace admins may enter the console. Invited users become
+// eligible after their membership and admin binding are active.
 func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenantDomain string) (*models.AdminUser, error) {
-	// First try with role_bindings (user has admin role)
-	queryWithRole := `
+	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
 			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
@@ -648,41 +654,19 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 		FROM users u
 		JOIN role_bindings rb ON u.id = rb.user_id
 		JOIN roles r ON rb.role_id = r.id
-		WHERE LOWER(u.email) = LOWER($1) AND LOWER(u.tenant_domain) = LOWER($2) AND u.active = true AND LOWER(r.name) = 'admin'
+		JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
+		JOIN roles workspace_role ON workspace_role.id = wm.role_id
+		WHERE LOWER(u.email) = LOWER($1)
+		  AND LOWER(u.tenant_domain) = LOWER($2)
+		  AND u.active = true
+		  AND u.deleted_at IS NULL
+		  AND LOWER(r.name) = 'admin'
+		  AND wm.status = 'active'
+		  AND LOWER(workspace_role.name) = 'admin'
 	`
 
-	fmt.Printf("UserFlow:Debug:: Query to get user for email %s, tenant_domain %s (with role check)\n", email, tenantDomain)
-
-	user, err := aur.scanAdminUserFromQuery(queryWithRole, email, tenantDomain)
-	if err == nil {
-		return user, nil
-	}
-
-	// If no role binding exists (e.g., newly invited user before role binding is complete),
-	// try without the role check - but ONLY if tenant_domain matches exactly
-	if err == sql.ErrNoRows {
-		queryWithoutRole := `
-			SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-				u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
-				u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
-				u.avatar_url, u.active, u.mfa_enabled,
-				COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
-				u.mfa_enrolled_at, u.mfa_verified,
-				u.external_id, u.sync_source,
-				u.last_sync_at, u.is_synced_user,
-				u.last_login, u.temporary_password, u.temporary_password_expires_at,
-				u.created_at, u.updated_at
-			FROM users u
-			WHERE LOWER(u.email) = LOWER($1) AND LOWER(u.tenant_domain) = LOWER($2) AND u.active = true
-		`
-		fmt.Printf("UserFlow:Debug:: Fallback query without role check for email %s, tenant_domain %s\n", email, tenantDomain)
-		user, err = aur.scanAdminUserFromQuery(queryWithoutRole, email, tenantDomain)
-		if err == nil {
-			return user, nil
-		}
-	}
-
-	return nil, err
+	fmt.Printf("UserFlow:Debug:: Query to get workspace admin for email %s, tenant_domain %s\n", email, tenantDomain)
+	return aur.scanAdminUserFromQuery(query, email, tenantDomain)
 }
 
 // scanAdminUserFromQuery is a helper to scan admin user from a query
@@ -708,9 +692,9 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 		mfaMethodRaw          interface{}
 	)
 	var (
-		clientID  *uuid.UUID
-		workspaceID  *uuid.UUID
-		projectID *uuid.UUID
+		clientID    *uuid.UUID
+		workspaceID *uuid.UUID
+		projectID   *uuid.UUID
 	)
 	var user models.AdminUser
 
@@ -1072,7 +1056,15 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 		FROM users u
 		JOIN role_bindings rb ON u.id = rb.user_id
 		JOIN roles r ON rb.role_id = r.id
-		WHERE LOWER(u.email) = LOWER($1) AND u.workspace_id = $2 AND u.active = true AND LOWER(r.name) = 'admin'
+		JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
+		JOIN roles workspace_role ON workspace_role.id = wm.role_id
+		WHERE LOWER(u.email) = LOWER($1)
+		  AND u.workspace_id = $2
+		  AND u.active = true
+		  AND u.deleted_at IS NULL
+		  AND LOWER(r.name) = 'admin'
+		  AND wm.status = 'active'
+		  AND LOWER(workspace_role.name) = 'admin'
 	`
 
 	var (
@@ -1229,9 +1221,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 
 // GetAdminUserWithProviders retrieves an admin user by email with available auth providers
 // Returns user info and list of configured providers (email, google, etc.)
-// Note: This method does NOT require the admin role to be assigned, as it's used for precheck
 func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models.AdminUser, []string, error) {
-	// Query user without requiring admin role (for precheck purposes)
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
 			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
@@ -1244,7 +1234,16 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 			u.last_login, u.temporary_password, u.temporary_password_expires_at,
 			u.created_at, u.updated_at
 		FROM users u
-		WHERE LOWER(u.email) = LOWER($1) AND u.active = true
+		JOIN role_bindings rb ON u.id = rb.user_id
+		JOIN roles r ON rb.role_id = r.id
+		JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
+		JOIN roles workspace_role ON workspace_role.id = wm.role_id
+		WHERE LOWER(u.email) = LOWER($1)
+		  AND u.active = true
+		  AND u.deleted_at IS NULL
+		  AND LOWER(r.name) = 'admin'
+		  AND wm.status = 'active'
+		  AND LOWER(workspace_role.name) = 'admin'
 	`
 
 	var (
@@ -1268,9 +1267,9 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 		mfaMethodRaw          interface{}
 	)
 	var (
-		clientID  *uuid.UUID
-		workspaceID  *uuid.UUID
-		projectID *uuid.UUID
+		clientID    *uuid.UUID
+		workspaceID *uuid.UUID
+		projectID   *uuid.UUID
 	)
 	var user models.AdminUser
 

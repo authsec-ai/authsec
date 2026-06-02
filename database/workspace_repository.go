@@ -67,6 +67,7 @@ func scanWorkspaceRow(row interface {
 }
 
 const workspaceSelectCols = `id, COALESCE(email, ''), COALESCE(password_hash, ''), provider, COALESCE(name, ''), source, status, created_at, updated_at, workspace_domain`
+const workspaceSelectColsFromAlias = `w.id, COALESCE(w.email, ''), COALESCE(w.password_hash, ''), w.provider, COALESCE(w.name, ''), w.source, w.status, w.created_at, w.updated_at, w.workspace_domain`
 
 // CreateTenant inserts a workspace identity row.
 func (tr *TenantRepository) CreateTenant(t *models.Tenant) error {

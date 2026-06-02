@@ -21,10 +21,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// countTenantUsers returns the total number of users for a tenant using a raw GORM count.
-func countTenantUsers(workspaceID uuid.UUID) (int64, error) {
+// countWorkspaceUsers returns the total number of active user records in a workspace.
+func countWorkspaceUsers(workspaceID uuid.UUID) (int64, error) {
 	var count int64
-	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE tenant_id = ?", workspaceID).Scan(&count).Error
+	err := config.DB.Raw("SELECT COUNT(*) FROM users WHERE workspace_id = ? AND deleted_at IS NULL", workspaceID).Scan(&count).Error
 	return count, err
 }
 
@@ -1749,7 +1749,7 @@ func (euc *EndUserController) CustomLoginRegister(c *gin.Context) {
 	// the client_id-as-tenant-resolver concept — workspaceID is already resolved
 	// above from host / explicit param / JWT (see shared.ResolveWorkspace at the
 	// top of this handler), so we no longer parse input.ClientID/workspaceID here.
-	if currentCount, countErr := countTenantUsers(workspaceID); countErr == nil {
+	if currentCount, countErr := countWorkspaceUsers(workspaceID); countErr == nil {
 		if resp, billErr := config.BillingClient.CheckTotalUsers(c.Request.Context(), workspaceID.String(), int(currentCount)); billErr != nil {
 			log.Printf("[REGISTER] billing check failed (fail-open) workspace=%s: %v", workspaceID, billErr)
 		} else if !resp.Allowed {

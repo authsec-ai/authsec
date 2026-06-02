@@ -371,7 +371,7 @@ func (r *OIDCUserIdentityRepository) CreateIdentity(identity *models.OIDCUserIde
 		INSERT INTO oidc_user_identities (workspace_id, user_id, provider_name, provider_user_id,
 		                                  email, profile_data, created_at, updated_at, last_login_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (provider_name, provider_user_id) DO UPDATE
+		ON CONFLICT (workspace_id, provider_name, provider_user_id) DO UPDATE
 		SET email = EXCLUDED.email,
 		    profile_data = EXCLUDED.profile_data,
 		    updated_at = EXCLUDED.updated_at,
@@ -400,8 +400,9 @@ func (r *OIDCUserIdentityRepository) CreateIdentity(identity *models.OIDCUserIde
 	return err
 }
 
-// GetIdentityByProviderUser retrieves identity by provider and provider user ID
-// This answers: "Does this Google user exist anywhere?"
+// GetIdentityByProviderUser retrieves an identity by provider slug and provider
+// user ID across workspaces. Prefer GetIdentityByTenantAndProviderUser for
+// workspace-owned provider flows.
 func (r *OIDCUserIdentityRepository) GetIdentityByProviderUser(providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
 	query := `
 		SELECT id, workspace_id, user_id, provider_name, provider_user_id,

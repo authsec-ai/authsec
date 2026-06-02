@@ -642,35 +642,22 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 
 	fmt.Printf("[AdminLoginHybrid] Tenant FOUND: domain=%s, workspace_id=%s\n", input.TenantDomain, tenant.ID)
 
-	tenantGormDB := config.DB
-
-	// Get raw SQL connection from GORM
-	tenantSQLDB, err := tenantGormDB.DB()
+	// Search for an active workspace admin. The legacy implementation fell
+	// back to any matching user row here, which allowed end users to acquire a
+	// console token. Console login now requires both the admin binding and the
+	// active workspace membership enforced by the repository.
+	fmt.Printf("[AdminLoginHybrid] Searching for workspace admin: email=%s\n", input.Email)
+	tenantUser, err := aac.adminUserRepo.GetAdminUserByEmailAndTenant(input.Email, tenant.ID)
 	if err != nil {
-		fmt.Printf("[AdminLoginHybrid] Failed to get SQL connection: error=%v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant database connection"})
-		return
-	}
-
-	// Create DBConnection wrapper
-	tenantDB := &database.DBConnection{DB: tenantSQLDB}
-
-	// Create user repository for tenant database
-	userRepo := database.NewUserRepository(tenantDB)
-
-	// Search for user in tenant database, scoped to the workspace
-	fmt.Printf("[AdminLoginHybrid] Searching for user in tenant database: email=%s\n", input.Email)
-	tenantUser, err := userRepo.GetUserByEmailAndTenant(input.Email, tenant.ID)
-	if err != nil {
-		fmt.Printf("[AdminLoginHybrid] User NOT FOUND in tenant database: email=%s, error=%v\n", input.Email, err)
+		fmt.Printf("[AdminLoginHybrid] Workspace admin NOT FOUND: email=%s, error=%v\n", input.Email, err)
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "user not found in tenant database")
+			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "workspace admin not found")
 		}
-		monitoring.RecordAuthFailure("admin-hybrid", "user_not_found_tenant_db", "admin")
+		monitoring.RecordAuthFailure("admin-hybrid", "workspace_admin_not_found", "admin")
 
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "Invalid credentials",
-			"hint":  "User not found in main database or tenant database",
+			"hint":  "No active workspace admin account found",
 		})
 		return
 	}
@@ -700,17 +687,8 @@ func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
 		return
 	}
 
-	// Check if user has admin role in tenant context
-	// TODO: Implement role check in tenant database
-	fmt.Printf("[AdminLoginHybrid] NOTE: Role verification for tenant users not yet implemented\n")
-
-	// Generate JWT token for tenant user using centralized auth-manager token service
-	token, err := config.TokenService.GenerateTenantUserToken(
-		tenantUser.ID,
-		tenant.ID,
-		tenantUser.Email,
-		24*time.Hour,
-	)
+	// Generate an admin token only after the workspace-admin guard above.
+	token, err := aac.generateAdminJWTToken(tenantUser)
 	if err != nil {
 		if config.AuditLogger != nil {
 			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", tenantUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "token generation failed (tenant DB): "+err.Error())

@@ -3,7 +3,7 @@
 // Two related resources live here:
 //
 //   - workspace_memberships   → operator-side identities (Owner/Admin/Member/...).
-//   - tenant_end_user_states  → consumer-side state (plan tier, suspension, …).
+//   - workspace_end_user_states  → consumer-side state (plan tier, suspension, …).
 //
 // Two distinct user kinds is a deliberate product decision (see
 // docs/USER_MANAGEMENT_AND_MCP_AUTHZ.md §2.3, §2.4). Members are who the
@@ -332,7 +332,7 @@ func (mc *MembershipController) DeleteMembership(c *gin.Context) {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// tenant_end_user_states
+// workspace_end_user_states
 // ────────────────────────────────────────────────────────────────────
 
 type endUserAccessApplication struct {
