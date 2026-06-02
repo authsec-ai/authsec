@@ -10,6 +10,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -64,6 +65,9 @@ func (s *GovernanceService) ListAccessAssignments(
 	if err != nil {
 		return nil, fmt.Errorf("get tenant db: %w", err)
 	}
+	// pq.StringArray required for text[] columns; lib/pq returns them as
+	// []uint8 and []string doesn't implement sql.Scanner. See same fix in
+	// services/binding_service.go.
 	type row struct {
 		BindingID    uuid.UUID
 		UserID       uuid.UUID
@@ -72,7 +76,7 @@ func (s *GovernanceService) ListAccessAssignments(
 		UserActive   bool
 		RoleID       uuid.UUID
 		RoleName     string
-		ScopeStrings []string `gorm:"type:text[]"`
+		ScopeStrings pq.StringArray
 		GrantedAt    time.Time
 		GrantedBy    *uuid.UUID
 	}
@@ -117,7 +121,7 @@ func (s *GovernanceService) ListAccessAssignments(
 			UserActive:   r.UserActive,
 			RoleID:       r.RoleID,
 			RoleName:     r.RoleName,
-			ScopeStrings: r.ScopeStrings,
+			ScopeStrings: []string(r.ScopeStrings),
 			GrantedAt:    r.GrantedAt,
 			GrantedBy:    r.GrantedBy,
 		})
@@ -371,7 +375,7 @@ func (s *GovernanceService) GetApplicationEffectiveAccess(tenantID string, appli
 		Email           string
 		Name            string
 		Active          bool
-		EffectiveScopes []string `gorm:"type:text[]"`
+		EffectiveScopes pq.StringArray
 	}
 	var rows []row
 	err = tenantDB.Raw(`
@@ -399,7 +403,7 @@ func (s *GovernanceService) GetApplicationEffectiveAccess(tenantID string, appli
 			Email:           r.Email,
 			Name:            r.Name,
 			Active:          r.Active,
-			EffectiveScopes: r.EffectiveScopes,
+			EffectiveScopes: []string(r.EffectiveScopes),
 		})
 	}
 	return out, nil
@@ -450,7 +454,7 @@ func (s *GovernanceService) EndUserAccessSummary(
 		Email           string
 		Name            string
 		Active          bool
-		EffectiveScopes []string `gorm:"type:text[]"`
+		EffectiveScopes pq.StringArray
 	}
 	var rows []row
 	err = tenantDB.Raw(`
@@ -476,7 +480,7 @@ func (s *GovernanceService) EndUserAccessSummary(
 			Email:           r.Email,
 			Name:            r.Name,
 			Active:          r.Active,
-			EffectiveScopes: r.EffectiveScopes,
+			EffectiveScopes: []string(r.EffectiveScopes),
 		})
 	}
 	return &EndUserAccessSummaryPage{
