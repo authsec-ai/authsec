@@ -566,6 +566,16 @@ func (oc *OIDCController) handleHydraLoginCallback(c *gin.Context, code, stateTo
 		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": err.Error()})
 		return
 	}
+	oc.finishHydraLogin(c, state, userInfo)
+}
+
+// finishHydraLogin resolves the local user, links the OIDC identity if new,
+// accepts the Hydra login challenge, and 302s the browser to Hydra's
+// redirect_to. It is called from both the server-side GET callback path and
+// the SPA POST exchange-code path (which already consumed the state/code via
+// HandleCallback before dispatching on action).
+func (oc *OIDCController) finishHydraLogin(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
+	var err error
 	if state.WorkspaceID == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "workspace_id missing from OIDC state"})
 		return
@@ -742,6 +752,12 @@ func (oc *OIDCController) ExchangeCode(c *gin.Context) {
 		// A better approach would be to refactor handleRegistrationCallback to not write a response
 		// and then decide here whether to return JSON or HTML.
 		// c.JSON(http.StatusOK, gin.H{"message": "Registration successful. Please login."})
+	case "hydra_login":
+		// End-user is completing a Hydra-driven OAuth flow via the SPA path.
+		// HandleCallback above already consumed the code and deleted the state
+		// row, so skip straight to the Hydra accept + redirect step.
+		log.Printf("DEBUG ExchangeCode: Delegating hydra_login to finishHydraLogin")
+		oc.finishHydraLogin(c, state, userInfo)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid action in state"})
 	}
@@ -750,21 +766,17 @@ func (oc *OIDCController) ExchangeCode(c *gin.Context) {
 // handleLoginAndGenerateToken is a modified version of handleLoginCallback for the SPA flow
 func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
 	if state.WorkspaceID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID missing from state"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id missing from state"})
 		return
 	}
 
-	// Get tenant info first
-	_, err := oc.tenantRepo.GetTenantByID(state.WorkspaceID.String())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant info"})
-		return
-	}
-
-	// Check if user has OIDC identity in this tenant
+	// Check if user has OIDC identity in this workspace
 	identity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(*state.WorkspaceID, state.ProviderName, userInfo.Sub)
 
-	var user *models.ExtendedUser
+	var (
+		err  error
+		user *models.ExtendedUser
+	)
 
 	if identity != nil {
 		// User has OIDC identity - get user by ID

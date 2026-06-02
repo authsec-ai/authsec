@@ -17,13 +17,13 @@ func AuditWithStatus(c *gin.Context, objectType string, objectID string, actionT
 	reqID := c.Writer.Header().Get("X-Request-ID")
 
 	if workspaceID == "" {
-		workspaceID = "unknown_tenant"
+		workspaceID = "unknown_workspace"
 	}
 
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: workspaceID},
+		Workspace:  Workspace{ID: workspaceID},
 		Event: AuditEvent{
 			ID:       uuid.New().String(),
 			Type:     fmt.Sprintf("%s.%s", objectType, actionType),
@@ -61,7 +61,7 @@ func AuditAuthentication(c *gin.Context, userID string, authMethod string, actio
 	reqID := c.Writer.Header().Get("X-Request-ID")
 
 	if workspaceID == "" {
-		workspaceID = "unknown_tenant"
+		workspaceID = "unknown_workspace"
 	}
 
 	status := "SUCCESS"
@@ -77,7 +77,7 @@ func AuditAuthentication(c *gin.Context, userID string, authMethod string, actio
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: workspaceID},
+		Workspace:  Workspace{ID: workspaceID},
 		Event: AuditEvent{
 			ID:       uuid.New().String(),
 			Type:     fmt.Sprintf("%s.%s", authMethod, actionType),

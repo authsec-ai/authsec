@@ -18,8 +18,8 @@ const (
 
 // --- Shared Structs for both log types ---
 
-// Tenant represents tenant information in logs
-type Tenant struct {
+// Workspace represents workspace information in logs
+type Workspace struct {
 	ID   string `json:"id"`
 	Name string `json:"name,omitempty"`
 }
@@ -43,7 +43,7 @@ type ResultInfo struct {
 type AuthLogSchema struct {
 	TS       string                 `json:"ts"`
 	LogType  string                 `json:"log_type"`
-	Tenant   Tenant                 `json:"tenant"`
+	Workspace   Workspace                 `json:"workspace"`
 	LogLevel string                 `json:"log_level"`
 	Event    AuthEvent              `json:"event"`
 	Actor    Actor                  `json:"actor"`
@@ -113,7 +113,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 
 		// Fallback for public endpoints
 		if workspaceID == "" {
-			workspaceID = "unknown_tenant"
+			workspaceID = "unknown_workspace"
 		}
 
 		status := "SUCCESS"
@@ -124,7 +124,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		logEntry := AuthLogSchema{
 			TS:       start.UTC().Format(time.RFC3339),
 			LogType:  LogTypeAuth,
-			Tenant:   Tenant{ID: workspaceID},
+			Workspace:   Workspace{ID: workspaceID},
 			LogLevel: "INFO",
 			Message:  fmt.Sprintf("%s %s request processed by %s", c.Request.Method, c.Request.URL.Path, serviceName),
 
@@ -162,7 +162,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 type AuditLogSchema struct {
 	TS          string           `json:"ts"`
 	LogType     string           `json:"log_type"` // "audit.trail"
-	Tenant      Tenant           `json:"tenant"`
+	Workspace      Workspace           `json:"workspace"`
 	Event       AuditEvent       `json:"event"`
 	Actor       Actor            `json:"actor"`
 	Object      AuditObject      `json:"object"`
@@ -231,7 +231,7 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	reqID := c.GetString("request_id") // From RequestIDMiddleware
 
 	if workspaceID == "" {
-		workspaceID = "unknown_tenant"
+		workspaceID = "unknown_workspace"
 	}
 
 	// Determine actor type based on context
@@ -246,7 +246,7 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	entry := AuditLogSchema{
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		LogType: LogTypeAudit,
-		Tenant:  Tenant{ID: workspaceID},
+		Workspace:  Workspace{ID: workspaceID},
 
 		Event: AuditEvent{
 			Type:     fmt.Sprintf("%s.%s", objectType, actionType),
