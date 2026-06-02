@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -36,6 +37,7 @@ type ApplicationsV2Controller struct {
 	toolMapSvc    *services.ToolMappingService
 	roleSvc       *services.RoleService
 	bindingSvc    *services.BindingService
+	govSvc        *services.GovernanceService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -49,6 +51,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		toolMapSvc:    services.NewToolMappingService(),
 		roleSvc:       services.NewRoleService(),
 		bindingSvc:    services.NewBindingService(),
+		govSvc:        services.NewGovernanceService(),
 	}
 }
 
@@ -1206,4 +1209,265 @@ func (ctrl *ApplicationsV2Controller) GetUserEffectiveAccess(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, access)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 9 — Governance views (read-only joins on Phase 5/6/8 tables)
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListAccessAssignments handles GET /authsec/applications/:id/access-assignments.
+// Audit-grade hydrated view of every binding. Filterable via query params:
+//   ?user_id=<uuid>     restrict to a single user
+//   ?role_id=<uuid>     restrict to a single role
+//   ?granted_after=<RFC3339>
+//   ?granted_before=<RFC3339>
+func (ctrl *ApplicationsV2Controller) ListAccessAssignments(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var filters services.AccessAssignmentFilters
+	if v := c.Query("user_id"); v != "" {
+		u, err := uuid.Parse(v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+			return
+		}
+		filters.UserID = u
+	}
+	if v := c.Query("role_id"); v != "" {
+		r, err := uuid.Parse(v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+			return
+		}
+		filters.RoleID = r
+	}
+	if v := c.Query("granted_after"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid granted_after (expect RFC3339)"})
+			return
+		}
+		filters.GrantedAfter = &t
+	}
+	if v := c.Query("granted_before"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid granted_before (expect RFC3339)"})
+			return
+		}
+		filters.GrantedBefore = &t
+	}
+	rows, err := ctrl.govSvc.ListAccessAssignments(tenantID, id, filters)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// PreviewAccessChange handles GET /authsec/applications/:id/access-change-previews.
+// Query params (NOT body — this is a GET):
+//   user_id=<uuid>             required
+//   add_role_ids=<csv of uuids>
+//   remove_role_ids=<csv of uuids>
+func (ctrl *ApplicationsV2Controller) PreviewAccessChange(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userIDStr := c.Query("user_id")
+	if userIDStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id query param required"})
+		return
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	addIDs, err := parseCSVUUIDs(c.Query("add_role_ids"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid add_role_ids: " + err.Error()})
+		return
+	}
+	removeIDs, err := parseCSVUUIDs(c.Query("remove_role_ids"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid remove_role_ids: " + err.Error()})
+		return
+	}
+	preview, err := ctrl.govSvc.PreviewAccessChange(tenantID, id, services.AccessChangePreviewRequest{
+		UserID:      userID,
+		AddRoles:    addIDs,
+		RemoveRoles: removeIDs,
+	})
+	if err != nil {
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+		if strings.Contains(err.Error(), "role") && strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, preview)
+}
+
+// SimulateAccess handles GET /authsec/applications/:id/access-simulations.
+// Query params:
+//   user_id=<uuid>     required
+//   role_ids=<csv of uuids>  the role set to simulate (empty = no roles)
+func (ctrl *ApplicationsV2Controller) SimulateAccess(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userIDStr := c.Query("user_id")
+	if userIDStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id query param required"})
+		return
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	roleIDs, err := parseCSVUUIDs(c.Query("role_ids"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_ids: " + err.Error()})
+		return
+	}
+	resp, err := ctrl.govSvc.SimulateAccess(tenantID, id, services.AccessSimulationRequest{
+		UserID:  userID,
+		RoleIDs: roleIDs,
+	})
+	if err != nil {
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+		if strings.Contains(err.Error(), "role_ids not found") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetApplicationEffectiveAccess handles
+// GET /authsec/applications/:id/effective-access. Application-wide
+// effective-scope view for all bound users.
+func (ctrl *ApplicationsV2Controller) GetApplicationEffectiveAccess(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	rows, err := ctrl.govSvc.GetApplicationEffectiveAccess(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// EndUserAccessSummary handles GET /authsec/applications/:id/end-user-access-summary.
+// Paged via ?page= and ?limit= (page is 1-indexed).
+func (ctrl *ApplicationsV2Controller) EndUserAccessSummary(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	page := 1
+	if v := c.Query("page"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			page = parsed
+		}
+	}
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			limit = parsed
+		}
+	}
+	pageData, err := ctrl.govSvc.EndUserAccessSummary(tenantID, id, page, limit)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, pageData)
+}
+
+// EvidenceExport handles GET /authsec/applications/:id/evidence-exports.
+// Returns one JSON row per (user, role, scope) — designed to be loaded
+// into CSV by the consumer.
+func (ctrl *ApplicationsV2Controller) EvidenceExport(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	rows, err := ctrl.govSvc.EvidenceExport(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// PostureSummary handles GET /authsec/applications/:id/posture-summary.
+// Single-shot compliance snapshot.
+func (ctrl *ApplicationsV2Controller) PostureSummary(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	summary, err := ctrl.govSvc.GetPostureSummary(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, summary)
+}
+
+// ToolExposure handles GET /authsec/applications/:id/tool-exposure.
+// One row per tool with the user-email list of who can reach it.
+func (ctrl *ApplicationsV2Controller) ToolExposure(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	rows, err := ctrl.govSvc.GetToolExposure(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// parseCSVUUIDs parses a comma-separated list of UUIDs. Empty input
+// returns nil, nil (caller treats nil as "none").
+func parseCSVUUIDs(raw string) ([]uuid.UUID, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]uuid.UUID, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		u, err := uuid.Parse(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid uuid %q: %w", p, err)
+		}
+		out = append(out, u)
+	}
+	return out, nil
 }

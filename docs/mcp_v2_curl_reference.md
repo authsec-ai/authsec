@@ -588,6 +588,141 @@ Returns 404 if the user doesn't exist in the tenant. Returns 200 with
 empty `roles` + `effective_scopes` if the user exists but has no
 bindings.
 
+---
+
+## Section 2b — Governance views (read-only)
+
+Phase 9 of the port plan. All read-only, all JWT-authenticated, all
+compose existing tables (bindings, roles, scope grants, scopes, tools,
+users). No new schema.
+
+### List all access assignments (audit-grade)
+
+```bash
+# All assignments
+curl "$AUTHSEC/authsec/applications/$APP/access-assignments" \
+  -H "Authorization: Bearer $JWT"
+
+# Filter by user / role / time window
+curl "$AUTHSEC/authsec/applications/$APP/access-assignments?user_id=<USER_UUID>&role_id=<ROLE_UUID>&granted_after=2026-01-01T00:00:00Z" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns one row per binding, hydrated with user email/name, role name,
+and the role's scope_strings. Suited for compliance audit.
+
+### Preview an access change (dry-run)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/access-change-previews?user_id=<USER_UUID>&add_role_ids=<ROLE1>,<ROLE2>&remove_role_ids=<ROLE3>" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Pure read — no DB writes. Returns:
+
+```json
+{
+  "user_id": "<uuid>",
+  "user_email": "alice@example.com",
+  "prior_roles": ["viewer"],
+  "next_roles": ["viewer", "tool_runner"],
+  "prior_scopes": ["mcp_demo.read"],
+  "next_scopes": ["mcp_demo.read", "mcp_demo.compute"],
+  "added_scopes": ["mcp_demo.compute"],
+  "removed_scopes": []
+}
+```
+
+Empty CSV params are fine. Use this to show admins "are you sure?" diffs
+before committing a binding mutation.
+
+### Simulate access (if user X had role set Y)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/access-simulations?user_id=<USER_UUID>&role_ids=<ROLE1>,<ROLE2>" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Replaces the user's current roles with the simulated set and reports:
+- `simulated_roles` — the named role set
+- `simulated_scopes` — union of scope strings the user would have
+- `tools_reachable` — tool names the user could call
+- `tools_not_reachable` — tool names they could not
+
+Useful for "what would my proposed role really let this user do?"
+
+### Application-wide effective access
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/effective-access" \
+  -H "Authorization: Bearer $JWT"
+```
+
+One row per bound user with their resolved scope union. Faster than
+calling `/users/:user_id/effective-access` per user (single query).
+
+### End-user access summary (paged)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/end-user-access-summary?page=1&limit=50" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Paged version of the Application-wide effective access view. Same shape
+per-user, plus `total / page / limit` for the page envelope.
+
+### Evidence export (CSV-friendly)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/evidence-exports" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns one row per `(user, role, scope)` triple — denormalized,
+spreadsheet-ready. Sorted stably by user email → role name → scope
+string for diff-friendly exports.
+
+### Posture summary (compliance snapshot)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/posture-summary" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns:
+
+```json
+{
+  "application_state": "ready",
+  "total_roles": 3,
+  "total_scopes": 5,
+  "total_tools": 12,
+  "public_tools": 3,
+  "unmapped_tools": 1,
+  "total_users_bound": 24,
+  "users_with_no_bindings": 156,
+  "total_bindings": 42,
+  "orphan_roles": 1,
+  "undismissed_drift_events": 2
+}
+```
+
+Orphan roles = roles with no scope grants AND no bindings (dead weight).
+Unmapped tools = `is_public=false AND required_scopes=[]` (deny-all).
+
+### Tool exposure (which tools are reachable by which users)
+
+```bash
+curl "$AUTHSEC/authsec/applications/$APP/tool-exposure" \
+  -H "Authorization: Bearer $JWT"
+```
+
+One row per tool, listing the emails of users who can reach it. Public
+tools are reachable by every active user. Non-public tools are reachable
+by users whose effective scopes intersect the tool's `required_scopes`.
+
+Cost is O(tools × users). Fine for typical Application sizes.
+
 ### Setup checklist
 
 ```bash
@@ -965,18 +1100,11 @@ This makes `/launch` succeed and `/sdk-policy` return
 
 ## Endpoints NOT on the backport yet
 
-If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when. Phases 1–8 (28 endpoints) have shipped — those
-are documented in Sections 2 and 4b above. Only Phase 9 (governance
-views) remains.
+**All 9 phases of `mcp_v2_full_port_plan.md` have shipped.** Every
+endpoint the deployed dev UI fires at `/authsec/applications/:id/*` is
+now backed by the prod-mcp-v2 backport. See Sections 2, 2b, and 4b for
+runnable curl for every endpoint.
 
-```
-GET    /authsec/applications/:id/access-assignments        [Phase 9]
-GET    /authsec/applications/:id/access-change-previews    [Phase 9]
-GET    /authsec/applications/:id/access-simulations        [Phase 9]
-GET    /authsec/applications/:id/effective-access          [Phase 9]
-GET    /authsec/applications/:id/end-user-access-summary   [Phase 9]
-GET    /authsec/applications/:id/evidence-exports          [Phase 9]
-GET    /authsec/applications/:id/posture-summary           [Phase 9]
-GET    /authsec/applications/:id/tool-exposure             [Phase 9]
-```
+If you find an endpoint the UI calls that doesn't have an entry here,
+that's a regression — file a bug; the inventory is intentionally
+exhaustive as of the port-plan's completion.

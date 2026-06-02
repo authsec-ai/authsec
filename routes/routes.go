@@ -339,6 +339,16 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/access/users", applicationsV2Controller.ListAccessUsers)
 			applicationsV2.GET("/:id/users/:user_id/effective-access", applicationsV2Controller.GetUserEffectiveAccess)
 
+			// Phase 9: governance read views.
+			applicationsV2.GET("/:id/access-assignments", applicationsV2Controller.ListAccessAssignments)
+			applicationsV2.GET("/:id/access-change-previews", applicationsV2Controller.PreviewAccessChange)
+			applicationsV2.GET("/:id/access-simulations", applicationsV2Controller.SimulateAccess)
+			applicationsV2.GET("/:id/effective-access", applicationsV2Controller.GetApplicationEffectiveAccess)
+			applicationsV2.GET("/:id/end-user-access-summary", applicationsV2Controller.EndUserAccessSummary)
+			applicationsV2.GET("/:id/evidence-exports", applicationsV2Controller.EvidenceExport)
+			applicationsV2.GET("/:id/posture-summary", applicationsV2Controller.PostureSummary)
+			applicationsV2.GET("/:id/tool-exposure", applicationsV2Controller.ToolExposure)
+
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.
 			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)
