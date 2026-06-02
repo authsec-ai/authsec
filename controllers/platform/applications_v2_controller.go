@@ -31,6 +31,8 @@ type ApplicationsV2Controller struct {
 	sdkPolicySvc  *services.SDKPolicyService
 	adminSvc      *services.ApplicationAdminService
 	driftSvc      *services.DriftService
+	scopeSvc      *services.ScopeService
+	toolMapSvc    *services.ToolMappingService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -40,6 +42,8 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		sdkPolicySvc:  services.NewSDKPolicyService(),
 		adminSvc:      services.NewApplicationAdminService(),
 		driftSvc:      services.NewDriftService(),
+		scopeSvc:      services.NewScopeService(),
+		toolMapSvc:    services.NewToolMappingService(),
 	}
 }
 
@@ -783,4 +787,195 @@ func (ctrl *ApplicationsV2Controller) DismissDriftEvent(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "dismissed"})
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 5 — Scope CRUD
+// ─────────────────────────────────────────────────────────────────────────
+
+// CreateScope handles POST /authsec/applications/:id/scopes.
+func (ctrl *ApplicationsV2Controller) CreateScope(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var req services.CreateScopeInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	scope, err := ctrl.scopeSvc.Create(tenantID, id, req)
+	if err != nil {
+		if errors.Is(err, services.ErrScopeAlreadyExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrInvalidRiskLevel) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, scope)
+}
+
+// UpdateScope handles PUT /authsec/applications/:id/scopes/:scope_id.
+// scope_string is immutable post-create — display name / description /
+// risk level only.
+func (ctrl *ApplicationsV2Controller) UpdateScope(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	scopeID, err := uuid.Parse(c.Param("scope_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope_id"})
+		return
+	}
+	var req services.UpdateScopeInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	scope, err := ctrl.scopeSvc.Update(tenantID, id, scopeID, req)
+	if err != nil {
+		if errors.Is(err, services.ErrScopeNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrInvalidRiskLevel) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, scope)
+}
+
+// DeleteScope handles DELETE /authsec/applications/:id/scopes/:scope_id.
+// Strips the scope from resource_servers.scopes_supported AND from every
+// affected tool's required_scopes. Emits scope_deleted drift event AND
+// tool_unmapped drift events for tools that lost their last required scope.
+func (ctrl *ApplicationsV2Controller) DeleteScope(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	scopeID, err := uuid.Parse(c.Param("scope_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope_id"})
+		return
+	}
+	result, err := ctrl.scopeSvc.Delete(tenantID, id, scopeID)
+	if err != nil {
+		if errors.Is(err, services.ErrScopeNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	// Drift: the scope itself was deleted.
+	ctrl.emitDrift(c, tenantID, id, models.DriftEventScopeDeleted, map[string]interface{}{
+		"scope_string":   result.ScopeString,
+		"affected_tools": result.AffectedTools,
+	})
+	// Drift: any tool that lost all its required scopes is now unmapped.
+	// We could be more precise (only emit when len(required_scopes) became
+	// empty), but emitting per affected tool gives clearer banner signals.
+	for _, toolName := range result.AffectedTools {
+		ctrl.emitDrift(c, tenantID, id, models.DriftEventToolUnmapped, map[string]interface{}{
+			"tool_name":      toolName,
+			"reason":         "scope_deleted",
+			"deleted_scope":  result.ScopeString,
+		})
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 6 — Tool ↔ scope mapping
+// ─────────────────────────────────────────────────────────────────────────
+
+// UpdateToolScopeMap handles PUT /authsec/applications/:id/tool-scope-map.
+// Body: {tool_id, required_scopes}. Validates every scope is registered
+// for the Application.
+func (ctrl *ApplicationsV2Controller) UpdateToolScopeMap(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	var body struct {
+		ToolID         string   `json:"tool_id" binding:"required"`
+		RequiredScopes []string `json:"required_scopes"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	toolID, err := uuid.Parse(body.ToolID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tool_id"})
+		return
+	}
+	result, err := ctrl.toolMapSvc.UpdateToolScopeMap(tenantID, id, toolID,
+		services.UpdateToolScopeMapInput{RequiredScopes: body.RequiredScopes})
+	if err != nil {
+		if errors.Is(err, services.ErrToolNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "not registered for this application") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	if result.ProtectionWeakened {
+		ctrl.emitDrift(c, tenantID, id, models.DriftEventToolUnmapped, map[string]interface{}{
+			"tool_name":       result.Tool.Name,
+			"reason":          "required_scopes_cleared",
+			"prior_required":  result.PriorRequiredScopes,
+		})
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// MarkToolPublic handles POST /authsec/applications/:id/tools/:tool_id/public.
+// Body: {is_public}. Flips the bit; emits drift event if the change makes
+// the tool publicly callable when it wasn't before.
+func (ctrl *ApplicationsV2Controller) MarkToolPublic(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	toolID, err := uuid.Parse(c.Param("tool_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tool_id"})
+		return
+	}
+	var body services.MarkToolPublicInput
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	result, err := ctrl.toolMapSvc.MarkToolPublic(tenantID, id, toolID, body)
+	if err != nil {
+		if errors.Is(err, services.ErrToolNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	if result.ProtectionWeakened {
+		ctrl.emitDrift(c, tenantID, id, models.DriftEventToolUnmapped, map[string]interface{}{
+			"tool_name": result.Tool.Name,
+			"reason":    "marked_public",
+		})
+	}
+	c.JSON(http.StatusOK, result)
 }

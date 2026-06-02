@@ -53,26 +53,16 @@ func (s *ApplicationAdminService) ListTools(tenantID string, applicationID uuid.
 	return rows, nil
 }
 
-// ScopeInfo is one row in the /scopes admin view. Mirrors what the dev UI
-// shows: the scope string plus its source. PHASE5-NOTE: dev has a richer
-// oauth_scopes table with display_name + description + risk_level.
-type ScopeInfo struct {
-	Scope  string `json:"scope"`
-	Source string `json:"source"`
-}
-
-// ListScopes returns the Application's scopes_supported as ScopeInfo rows.
-// Source is always "application" on the backport — no per-scope provenance.
-func (s *ApplicationAdminService) ListScopes(tenantID string, applicationID uuid.UUID) ([]ScopeInfo, error) {
-	rs, err := s.rs.GetByID(tenantID, applicationID)
-	if err != nil {
+// ListScopes returns the Application's scopes from the oauth_scopes table.
+// As of Phase 5 this reads from the authoritative table (vs the legacy
+// resource_servers.scopes_supported array). The array is still kept in
+// sync for back-compat with the SDK's /sdk-policy reader.
+func (s *ApplicationAdminService) ListScopes(tenantID string, applicationID uuid.UUID) ([]models.OAuthScope, error) {
+	if _, err := s.rs.GetByID(tenantID, applicationID); err != nil {
 		return nil, err
 	}
-	out := make([]ScopeInfo, 0, len(rs.ScopesSupported))
-	for _, s := range rs.ScopesSupported {
-		out = append(out, ScopeInfo{Scope: s, Source: "application"})
-	}
-	return out, nil
+	scopeSvc := NewScopeService()
+	return scopeSvc.List(tenantID, applicationID)
 }
 
 // ScopeMatrixRow is one row of the /scope-matrix view. Tools cross

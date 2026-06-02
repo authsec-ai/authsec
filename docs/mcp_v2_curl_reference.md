@@ -245,7 +245,82 @@ curl "$AUTHSEC/authsec/applications/$APP/scopes" \
   -H "Authorization: Bearer $JWT"
 ```
 
-Returns `[{scope, source}, ...]` from `resource_servers.scopes_supported`.
+Returns rows from the `oauth_scopes` table:
+```json
+[
+  {
+    "id": "<uuid>",
+    "tenant_id": "<tenant uuid>",
+    "application_id": "<app uuid>",
+    "scope_string": "mcp_demo.read",
+    "display_name": "Read access",
+    "description": "Read-only operations",
+    "risk_level": "low",
+    "source": "admin",
+    "created_at": "...",
+    "updated_at": "..."
+  }
+]
+```
+
+`source` is one of `admin`, `application_create` (backfilled from
+`scopes_supported`), or `sdk_discovered` (reserved).
+
+### Create a scope
+
+```bash
+curl -X POST "$AUTHSEC/authsec/applications/$APP/scopes" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope_string": "mcp_demo.admin",
+    "display_name": "Admin operations",
+    "description": "Privileged admin tools",
+    "risk_level": "high"
+  }'
+```
+
+`risk_level` must be one of `low`, `medium`, `high`, `critical`. Returns
+201 with the new row. 409 if `scope_string` already exists for the app.
+
+Also adds the scope to `resource_servers.scopes_supported` in lockstep so
+the SDK's `/sdk-policy` reader sees it.
+
+### Update a scope (metadata only)
+
+```bash
+curl -X PUT "$AUTHSEC/authsec/applications/$APP/scopes/<SCOPE_ID>" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "display_name": "Read-only access",
+    "description": "Updated description",
+    "risk_level": "medium"
+  }'
+```
+
+`scope_string` is **immutable** after create — Hydra and SDK clients hold
+scope strings as opaque identifiers. Renaming would break in-flight tokens.
+Display name / description / risk level only.
+
+### Delete a scope
+
+```bash
+curl -X DELETE "$AUTHSEC/authsec/applications/$APP/scopes/<SCOPE_ID>" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Returns `{scope_string, affected_tools: [...]}`. Side effects:
+- Strips the scope from `resource_servers.scopes_supported`.
+- Strips the scope from every `mcp_tools.required_scopes` array that had it.
+- Emits `scope_deleted` drift event (if state=ready).
+- Emits one `tool_unmapped` drift event per affected tool (if state=ready).
+
+Note: this is destructive — tokens with the deleted scope continue to
+exist until they expire, but introspection still returns the (now-stale)
+scope claim. SDK-side enforcement falls back to deny-all for tools that
+required the deleted scope and no longer have any non-deleted required
+scopes left.
 
 ### Scope matrix (tools × scopes)
 
@@ -255,6 +330,46 @@ curl "$AUTHSEC/authsec/applications/$APP/scope-matrix" \
 ```
 
 Returns `{scopes_supported, tools: [{tool_name, tool_id, is_public, required_scopes}, ...]}`.
+
+### Update a tool's required scopes
+
+```bash
+curl -X PUT "$AUTHSEC/authsec/applications/$APP/tool-scope-map" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tool_id": "<MCP_TOOL_UUID>",
+    "required_scopes": ["mcp_demo.compute", "mcp_demo.write"]
+  }'
+```
+
+Validates that every requested scope is registered for the Application.
+400 if any scope isn't in the Application's `scopes_supported`.
+
+Returns `{tool, prior_required_scopes, prior_is_public, protection_weakened}`.
+`protection_weakened=true` when the change made the tool more permissive
+(had scopes but now has none and isn't public). Emits `tool_unmapped`
+drift event when weakened (if state=ready).
+
+### Mark a tool public / private
+
+```bash
+# Make a tool public (no scope check)
+curl -X POST "$AUTHSEC/authsec/applications/$APP/tools/<TOOL_ID>/public" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"is_public": true}'
+
+# Un-mark a tool public
+curl -X POST "$AUTHSEC/authsec/applications/$APP/tools/<TOOL_ID>/public" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"is_public": false}'
+```
+
+Same `ToolChangeResult` shape as `/tool-scope-map`. Emits `tool_unmapped`
+drift event when flipping `false -> true` (public is a weakening of the
+protection).
 
 ### Setup checklist
 
@@ -634,15 +749,10 @@ This makes `/launch` succeed and `/sdk-policy` return
 ## Endpoints NOT on the backport yet
 
 If you hit any of these you'll get 404. See `mcp_v2_full_port_plan.md`
-for what's coming when. Phases 1+2+3+4+7 (14 endpoints) have shipped —
+for what's coming when. Phases 1+2+3+4+5+6+7 (19 endpoints) have shipped —
 those are documented in Sections 2 and 4b above.
 
 ```
-POST   /authsec/applications/:id/scopes                    [Phase 5]
-PUT    /authsec/applications/:id/scopes/:scope_id          [Phase 5]
-DELETE /authsec/applications/:id/scopes/:scope_id          [Phase 5]
-PUT    /authsec/applications/:id/tool-scope-map            [Phase 6]
-POST   /authsec/applications/:id/tools/:tool_id/public     [Phase 6]
 GET    /authsec/applications/:id/roles                     [Phase 8]
 POST   /authsec/applications/:id/roles                     [Phase 8]
 PUT    /authsec/applications/:id/roles/:role_id/scope-grants [Phase 8]

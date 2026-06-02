@@ -316,6 +316,16 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/drift-events", applicationsV2Controller.ListDriftEvents)
 			applicationsV2.POST("/:id/drift-events/:event_id/dismiss", applicationsV2Controller.DismissDriftEvent)
 
+			// Phase 5: scope CRUD (writes back to scopes_supported in sync).
+			// GET /:id/scopes already wired above by Phase 1.
+			applicationsV2.POST("/:id/scopes", applicationsV2Controller.CreateScope)
+			applicationsV2.PUT("/:id/scopes/:scope_id", applicationsV2Controller.UpdateScope)
+			applicationsV2.DELETE("/:id/scopes/:scope_id", applicationsV2Controller.DeleteScope)
+
+			// Phase 6: tool ↔ scope mapping.
+			applicationsV2.PUT("/:id/tool-scope-map", applicationsV2Controller.UpdateToolScopeMap)
+			applicationsV2.POST("/:id/tools/:tool_id/public", applicationsV2Controller.MarkToolPublic)
+
 			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
 			// applications group. See docs/mcp_oauth_v2.md for the gaps.
 			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)
