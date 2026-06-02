@@ -24,12 +24,14 @@ import (
 type ApplicationsV2Controller struct {
 	service       *services.ResourceServerService
 	onboardingSvc *services.ApplicationOnboardingService
+	sdkPolicySvc  *services.SDKPolicyService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
 	return &ApplicationsV2Controller{
 		service:       services.NewResourceServerService(),
 		onboardingSvc: services.NewApplicationOnboardingService(),
+		sdkPolicySvc:  services.NewSDKPolicyService(),
 	}
 }
 
@@ -390,4 +392,63 @@ func (ctrl *ApplicationsV2Controller) UpdateAccessPolicy(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, policy)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SDK-facing endpoints — Basic auth with RS introspection credentials.
+// These are mounted OUTSIDE the JWT auth group in routes.go.
+// ─────────────────────────────────────────────────────────────────────────
+
+// SDKPolicy handles GET /authsec/applications/:id/sdk-policy. Returns the
+// tool->scope policy the SDK uses to gate tool calls at runtime.
+//
+// Authentication: HTTP Basic with `<application_id>:<introspection_secret>`.
+// 401 if missing or invalid. 404 if the Application doesn't exist (or the
+// credentials are valid for a different application).
+func (ctrl *ApplicationsV2Controller) SDKPolicy(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	rs, tenantID, err := ctrl.sdkPolicySvc.AuthorizeFromBasic(c.GetHeader("Authorization"), id)
+	if err != nil {
+		c.Header("WWW-Authenticate", `Basic realm="sdk-policy"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	resp, err := ctrl.sdkPolicySvc.GetSDKPolicy(tenantID, rs)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// PutSDKManifest handles PUT /authsec/applications/:id/sdk-manifest. Accepts
+// the SDK's tool list and upserts mcp_tools rows. Authentication is the same
+// Basic shape as SDKPolicy.
+func (ctrl *ApplicationsV2Controller) PutSDKManifest(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	rs, tenantID, err := ctrl.sdkPolicySvc.AuthorizeFromBasic(c.GetHeader("Authorization"), id)
+	if err != nil {
+		c.Header("WWW-Authenticate", `Basic realm="sdk-manifest"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req services.PublishManifestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	resp, err := ctrl.sdkPolicySvc.PublishManifest(tenantID, rs, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
 }
