@@ -225,6 +225,13 @@ func main() {
 	// Phase 4: background workers
 	// ─────────────────────────────────────────────────────────
 
+	// mcp_oauth_clients ↔ Hydra reconciler (v2 OAuth flow).
+	// Disabled by default for the first rollout; flip the env var off after
+	// the standards-compliant DCR/token path is verified end-to-end.
+	if os.Getenv("AUTHSEC_DISABLE_HYDRA_RECONCILER_V2") != "true" {
+		services.StartHydraReconcilerV2(context.Background())
+	}
+
 	// Audit log cleanup (runs daily, removes events older than 90 days)
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
