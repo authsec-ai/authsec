@@ -690,10 +690,16 @@ func (oc *OIDCController) finishHydraLogin(c *gin.Context, state *models.OIDCSta
 		return
 	}
 
-	// 3. Hydra is in charge of the rest of the OAuth dance — bounce the
-	// browser to whatever URL it gave us (usually back to the OAuth client
-	// app's redirect_uri with an authorization code).
-	c.Redirect(http.StatusFound, accept.RedirectTo)
+	// 3. Hydra is in charge of the rest of the OAuth dance.
+	// GET path (server-side callback): 302 directly — the browser navigates.
+	// POST path (SPA exchange-code fetch): return JSON with the redirect URL
+	// so the frontend can do window.location.href = result.redirect_to.
+	// A 302 response to a cross-origin fetch() is CORS-blocked by the browser.
+	if c.Request.Method == http.MethodGet {
+		c.Redirect(http.StatusFound, accept.RedirectTo)
+	} else {
+		c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": accept.RedirectTo})
+	}
 }
 
 // ExchangeCode handles the code exchange for SPAs
