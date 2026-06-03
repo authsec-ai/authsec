@@ -35,6 +35,7 @@ type LoginV2Controller struct {
 	rsSvc          *services.ResourceServerService
 	bindingSvc     *services.BindingService
 	consentGrantSvc *services.ConsentGrantService
+	federatedSvc   *services.FederatedLoginService
 }
 
 func NewLoginV2Controller() *LoginV2Controller {
@@ -44,6 +45,7 @@ func NewLoginV2Controller() *LoginV2Controller {
 		rsSvc:           services.NewResourceServerService(),
 		bindingSvc:      services.NewBindingService(),
 		consentGrantSvc: services.NewConsentGrantService(),
+		federatedSvc:    services.NewFederatedLoginService(),
 	}
 }
 
@@ -288,11 +290,27 @@ func (ctrl *LoginV2Controller) listIDPsForApplication(tenantID string, applicati
 			ProviderType:       idp.ProviderType,
 			DisplayName:        idp.DisplayName,
 		}
-		// For OIDC/SAML, the provider_name is on the underlying config row.
-		// We don't hydrate it here — the /login/oidc/initiate and
-		// /login/saml/initiate handlers (Sessions 4-5) resolve it via
-		// config_ref. For now leave ProviderName empty; the UI uses the
-		// IdentityProviderID as the click target.
+		// Hydrate provider_name from the underlying config row so the UI
+		// can render an icon ("google", "github", "microsoft", ...) without
+		// a second lookup. config_ref is the foreign key to oidc_providers
+		// (or saml_providers when that lands). Failures are non-fatal — we
+		// just leave ProviderName empty and let the UI fall back to
+		// DisplayName.
+		if configUUID, err := uuid.Parse(idp.ConfigRef); err == nil {
+			switch idp.ProviderType {
+			case models.IdentityProviderOIDC:
+				var row struct {
+					ProviderName string `gorm:"column:provider_name"`
+				}
+				_ = tenantDB.Table("oidc_providers").
+					Select("provider_name").
+					Where("id = ?", configUUID).
+					Scan(&row).Error
+				opt.ProviderName = row.ProviderName
+			}
+			// SAML side: when SAML lands, look up saml_providers.provider_name
+			// here. Stub for now.
+		}
 		out = append(out, opt)
 	}
 	return out, nil
@@ -1047,4 +1065,273 @@ func coversAll(granted []string, required []string) bool {
 		}
 	}
 	return true
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Session 4 — OIDC federated initiate + callback
+// ─────────────────────────────────────────────────────────────────────────
+
+// InitiateOIDCRequest is what the UI POSTs when the user clicks the
+// "Continue with <provider>" button on the login page.
+type InitiateOIDCRequest struct {
+	LoginChallenge     string    `json:"login_challenge" binding:"required"`
+	IdentityProviderID uuid.UUID `json:"identity_provider_id" binding:"required"`
+}
+
+// InitiateOIDCResponse tells the UI which upstream URL to navigate to.
+type InitiateOIDCResponseAPI struct {
+	Success         bool   `json:"success"`
+	UpstreamAuthURL string `json:"upstream_auth_url,omitempty"`
+	State           string `json:"state,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+// InitiateOIDC handles POST /authsec/oauth/v2/login/oidc/initiate.
+//
+// Flow:
+//  1. Resolve auth_request_context by login_challenge → tenant_id, application_id, context_id.
+//  2. Build the absolute callback URL (config.AppConfig.OAuthBaseURL + /login/oidc/callback).
+//  3. Call FederatedLoginService.InitiateOIDC to mint state + persist
+//     oidc_states row + build the upstream provider auth URL.
+//  4. Return upstream_auth_url to the UI; the UI navigates the browser.
+func (ctrl *LoginV2Controller) InitiateOIDC(c *gin.Context) {
+	var req InitiateOIDCRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, InitiateOIDCResponseAPI{Success: false, Error: "invalid request body"})
+		return
+	}
+	arcRow, tenantID, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, InitiateOIDCResponseAPI{Success: false, Error: "login_challenge not found or expired"})
+		return
+	}
+	if arcRow.ResourceServerID == nil {
+		c.JSON(http.StatusBadRequest, InitiateOIDCResponseAPI{Success: false, Error: "auth context has no application"})
+		return
+	}
+	callbackURL := strings.TrimSuffix(config.AppConfig.OAuthBaseURL, "/") + "/authsec/oauth/v2/login/oidc/callback"
+	out, err := ctrl.federatedSvc.InitiateOIDC(services.InitiateOIDCInput{
+		TenantID:           tenantID,
+		ApplicationID:      *arcRow.ResourceServerID,
+		IdentityProviderID: req.IdentityProviderID,
+		LoginChallenge:     req.LoginChallenge,
+		ContextID:          arcRow.ContextID,
+		CallbackURL:        callbackURL,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, InitiateOIDCResponseAPI{Success: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, InitiateOIDCResponseAPI{
+		Success:         true,
+		UpstreamAuthURL: out.UpstreamAuthURL,
+		State:           out.State,
+	})
+}
+
+// CallbackOIDCResponse mirrors CompleteCustomLoginResponse so the UI can
+// reuse the same redirect handling. The UI navigates the browser to
+// redirect_to (which is Hydra's consent endpoint URL).
+type CallbackOIDCResponse struct {
+	Success    bool   `json:"success"`
+	RedirectTo string `json:"redirect_to,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// CallbackOIDC handles GET /authsec/oauth/v2/login/oidc/callback?state=...&code=...
+//
+// The upstream provider redirects the browser here after the user authenticates.
+//
+// Flow:
+//  1. Read state + code from query string.
+//  2. Call FederatedLoginService.HandleOIDCCallback — splits state into
+//     (tenant_id, random), exchanges code at upstream, fetches userinfo,
+//     resolves the AuthSec user, returns LoginChallenge + UserID.
+//  3. Call Hydra accept-login with subject=user.id, auth_method=oidc_federated.
+//  4. Stamp user_id + auth_time onto auth_request_context.
+//  5. Return Hydra's redirect_to. The UI receives this as JSON and navigates.
+//
+// Why not 302 directly? Because the (separate) UI is the consumer here — it
+// expects JSON. If callers want a browser-redirecting endpoint, they can
+// add a thin wrapper that 302s to redirect_to.
+func (ctrl *LoginV2Controller) CallbackOIDC(c *gin.Context) {
+	state := c.Query("state")
+	code := c.Query("code")
+	if upstreamErr := c.Query("error"); upstreamErr != "" {
+		c.JSON(http.StatusBadRequest, CallbackOIDCResponse{Success: false, Error: "upstream provider returned error: " + upstreamErr})
+		return
+	}
+	if state == "" || code == "" {
+		c.JSON(http.StatusBadRequest, CallbackOIDCResponse{Success: false, Error: "state and code required"})
+		return
+	}
+	callbackURL := strings.TrimSuffix(config.AppConfig.OAuthBaseURL, "/") + "/authsec/oauth/v2/login/oidc/callback"
+	result, err := ctrl.federatedSvc.HandleOIDCCallback(services.HandleOIDCCallbackInput{
+		State:       state,
+		Code:        code,
+		CallbackURL: callbackURL,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, CallbackOIDCResponse{Success: false, Error: err.Error()})
+		return
+	}
+	if result.LoginChallenge == "" {
+		c.JSON(http.StatusBadRequest, CallbackOIDCResponse{Success: false, Error: "state has no login_challenge"})
+		return
+	}
+
+	// Call Hydra accept-login. Subject must be the users.id UUID string so
+	// the introspect RBAC filter (commit 2d9f8ae) can look up effective
+	// scopes for the user.
+	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(result.LoginChallenge, services.HydraAcceptLoginRequest{
+		Subject:     result.UserID.String(),
+		Remember:    false,
+		RememberFor: 0,
+		ACR:         "fed", // federated — distinct from "pwd" for custom-login
+		Context: map[string]interface{}{
+			"email":       result.UserEmail,
+			"name":        result.UserName,
+			"provider":    "oidc",
+			"auth_method": result.AuthMethod,
+			"tenant_id":   result.TenantID,
+			"provider_name": result.ProviderName,
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, CallbackOIDCResponse{Success: false, Error: "authorization server unavailable"})
+		return
+	}
+
+	// Stamp user_id + auth_time on the auth_request_context row for the
+	// consent step. We need to look up the context row again — the
+	// federated service doesn't carry it.
+	tenantDB, dbErr := config.GetTenantGORMDB(result.TenantID)
+	if dbErr == nil {
+		now := time.Now().UTC()
+		_ = tenantDB.Model(&models.AuthRequestContext{}).
+			Where("login_challenge = ? AND tenant_id = ?", result.LoginChallenge, result.TenantID).
+			Updates(map[string]interface{}{
+				"user_id":   result.UserID,
+				"auth_time": now,
+			}).Error
+	}
+
+	c.JSON(http.StatusOK, CallbackOIDCResponse{
+		Success:    true,
+		RedirectTo: acceptResp.RedirectTo,
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Session 5 — SAML federated initiate + ACS (stubs returning 501)
+// ─────────────────────────────────────────────────────────────────────────
+
+// InitiateSAMLRequest mirrors InitiateOIDCRequest. Same shape so the UI
+// can use one code path for "click federated button".
+type InitiateSAMLRequest struct {
+	LoginChallenge     string    `json:"login_challenge" binding:"required"`
+	IdentityProviderID uuid.UUID `json:"identity_provider_id" binding:"required"`
+}
+
+// InitiateSAMLResponseAPI mirrors InitiateOIDCResponseAPI but with SAML's
+// SAMLRequest + SSO endpoint instead of upstream_auth_url.
+type InitiateSAMLResponseAPI struct {
+	Success        bool   `json:"success"`
+	UpstreamSSOURL string `json:"upstream_sso_url,omitempty"`
+	SAMLRequest    string `json:"saml_request,omitempty"` // base64; UI POSTs to UpstreamSSOURL
+	RelayState     string `json:"relay_state,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+// InitiateSAML handles POST /authsec/oauth/v2/login/saml/initiate. Currently
+// returns 501 — the underlying service stub returns
+// "SAML federated login is not yet supported on the prod-mcp-v2 backend".
+func (ctrl *LoginV2Controller) InitiateSAML(c *gin.Context) {
+	var req InitiateSAMLRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: "invalid request body"})
+		return
+	}
+	arcRow, tenantID, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: "login_challenge not found or expired"})
+		return
+	}
+	if arcRow.ResourceServerID == nil {
+		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: "auth context has no application"})
+		return
+	}
+	callbackURL := strings.TrimSuffix(config.AppConfig.OAuthBaseURL, "/") + "/authsec/oauth/v2/login/saml/acs"
+	out, err := ctrl.federatedSvc.InitiateSAML(services.InitiateSAMLInput{
+		TenantID:           tenantID,
+		ApplicationID:      *arcRow.ResourceServerID,
+		IdentityProviderID: req.IdentityProviderID,
+		LoginChallenge:     req.LoginChallenge,
+		ContextID:          arcRow.ContextID,
+		CallbackURL:        callbackURL,
+	})
+	if err != nil {
+		// Service currently stubs as 501.
+		c.JSON(http.StatusNotImplemented, InitiateSAMLResponseAPI{Success: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, InitiateSAMLResponseAPI{
+		Success:        true,
+		UpstreamSSOURL: out.UpstreamSSOURL,
+		SAMLRequest:    out.SAMLRequest,
+		RelayState:     out.RelayState,
+	})
+}
+
+// CallbackSAMLResponse mirrors CallbackOIDCResponse.
+type CallbackSAMLResponse struct {
+	Success    bool   `json:"success"`
+	RedirectTo string `json:"redirect_to,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// CallbackSAML handles POST /authsec/oauth/v2/login/saml/acs. The SAML IdP
+// posts SAMLResponse + RelayState here. Stub returns 501.
+func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
+	samlResponse := c.PostForm("SAMLResponse")
+	relayState := c.PostForm("RelayState")
+	if samlResponse == "" || relayState == "" {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "SAMLResponse and RelayState required"})
+		return
+	}
+	result, err := ctrl.federatedSvc.HandleSAMLACS(services.HandleSAMLACSInput{
+		SAMLResponse: samlResponse,
+		RelayState:   relayState,
+	})
+	if err != nil {
+		c.JSON(http.StatusNotImplemented, CallbackSAMLResponse{Success: false, Error: err.Error()})
+		return
+	}
+	// Unreachable until the service stub is replaced with a real impl.
+	if result.LoginChallenge == "" {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "state has no login_challenge"})
+		return
+	}
+	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(result.LoginChallenge, services.HydraAcceptLoginRequest{
+		Subject:     result.UserID.String(),
+		Remember:    false,
+		RememberFor: 0,
+		ACR:         "fed",
+		Context: map[string]interface{}{
+			"email":         result.UserEmail,
+			"name":          result.UserName,
+			"provider":      "saml",
+			"auth_method":   result.AuthMethod,
+			"tenant_id":     result.TenantID,
+			"provider_name": result.ProviderName,
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, CallbackSAMLResponse{Success: false, Error: "authorization server unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, CallbackSAMLResponse{
+		Success:    true,
+		RedirectTo: acceptResp.RedirectTo,
+	})
 }

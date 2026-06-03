@@ -43,6 +43,12 @@ type OIDCState struct {
 	RedirectAfter string     `json:"redirect_after,omitempty"`                // Where to redirect after success
 	ExpiresAt     time.Time  `json:"expires_at" gorm:"not null"`              // State expiry
 	CreatedAt     time.Time  `json:"created_at"`
+
+	// Federated-login fields (migration 032). Used only when Action ==
+	// "hydra_login" — i.e. the OAuth-v2 surface initiates a federated
+	// login as part of an upstream Hydra /authorize redirect.
+	ApplicationID  *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
+	LoginChallenge string     `json:"login_challenge,omitempty"`
 }
 
 // TableName specifies the table name for OIDCState

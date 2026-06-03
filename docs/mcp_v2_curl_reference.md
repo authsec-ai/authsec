@@ -412,6 +412,85 @@ RBAC enforcement.
 Sessions 4 (OIDC) + 5 (SAML) + 6 (polish) add federated paths; they're
 not required for custom-login dance.
 
+### OIDC federated — initiate (Session 4)
+
+User clicked "Continue with Google" (or any OIDC-configured IDP). The
+UI POSTs the login_challenge + identity_provider_id, and we mint state +
+return the upstream provider's authorization URL.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/oidc/initiate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge-from-page-data>",
+    "identity_provider_id": "<uuid-from-page-data.identity_providers[].identity_provider_id>"
+  }'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "upstream_auth_url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=...&state=<tenant>.<random>&...",
+  "state": "<tenant-encoded state we sent upstream>"
+}
+```
+
+The UI navigates the browser to `upstream_auth_url`. The state token is
+tenant-encoded so the callback can pick the right tenant DB without a
+master-side index — format is `<tenant-uuid-no-dashes>.<random>`.
+
+Per-Application IDP whitelist still applies: if
+`application_identity_provider_policies` has any rows for this
+Application, the chosen IDP must be among the enabled ones, else 400.
+
+### OIDC federated — callback (Session 4)
+
+The upstream provider redirects the browser to this URL after the user
+authenticates. The UI's redirect handler intercepts and calls:
+
+```bash
+curl -s "$AUTHSEC/authsec/oauth/v2/login/oidc/callback?state=<state>&code=<code>"
+```
+
+Response (success):
+```json
+{ "success": true, "redirect_to": "<hydra consent endpoint URL>" }
+```
+
+What happens server-side:
+1. Split state → (tenant_id, random); look up oidc_states row in that DB
+2. Exchange code at upstream token endpoint (with PKCE code_verifier)
+3. Fetch userinfo to get sub + email
+4. Resolve AuthSec users.id:
+   - First by (tenant, provider, provider_user_id) on oidc_user_identities
+   - Then by email match against existing users (auto-links a row)
+   - **No JIT user creation** — federated login resolves to an existing
+     AuthSec user only. If you see "no AuthSec user found for email ...",
+     register via custom-login signup first, then re-try federated login.
+5. Hydra accept-login with subject=user.id, acr="fed", auth_method=oidc_federated
+6. Stamp user_id + auth_time on auth_request_context
+7. Return Hydra's redirect_to so the UI navigates the browser to /consent
+
+### SAML federated — initiate / ACS (Session 5, stubbed 501)
+
+Routes exist but return 501 until a SAML XML library is wired in.
+
+```bash
+curl -i -X POST "$AUTHSEC/authsec/oauth/v2/login/saml/initiate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge>",
+    "identity_provider_id": "<uuid>"
+  }'
+# HTTP/1.1 501 Not Implemented
+# { "success": false, "error": "SAML federated login is not yet supported on the prod-mcp-v2 backend; use OIDC or custom-login" }
+```
+
+The route shape (request body + response JSON) matches what the
+full implementation will emit, so the UI doesn't need to change when
+SAML lands. Tracked in the codebase as "add crewjam/saml + replace stubs."
+
 ---
 
 ## Section 2 — Applications admin (JWT, requires tenant_id claim)
