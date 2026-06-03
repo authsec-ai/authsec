@@ -13,7 +13,8 @@ type OIDCProvider struct {
 	ProviderName          string    `json:"provider_name" gorm:"uniqueIndex;not null"`    // 'google', 'github', 'microsoft'
 	DisplayName           string    `json:"display_name" gorm:"not null"`                 // 'Google', 'GitHub', 'Microsoft'
 	ClientID              string    `json:"client_id" gorm:"not null"`                    // OAuth client ID
-	ClientSecretVaultPath string    `json:"client_secret_vault_path" gorm:"not null"`     // Vault path for secret
+	ClientSecret          string    `json:"-" gorm:"column:client_secret"`                  // Inline-stored secret (preferred); never serialized
+	ClientSecretVaultPath string    `json:"client_secret_vault_path,omitempty"`             // Optional Vault path; used only when ClientSecret is empty
 	AuthorizationURL      string    `json:"authorization_url" gorm:"not null"`            // OAuth authorize endpoint
 	TokenURL              string    `json:"token_url" gorm:"not null"`                    // OAuth token endpoint
 	UserinfoURL           string    `json:"userinfo_url" gorm:"not null"`                 // OAuth userinfo endpoint
