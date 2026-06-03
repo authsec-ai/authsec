@@ -182,15 +182,16 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 		return
 	}
 
-	// Forward to Hydra with the rewritten client_id and our context_id in
-	// state. Hydra's response (a redirect to redirect_uri with ?code=...)
-	// flows back to the user's browser unchanged.
+	// Forward to Hydra with the rewritten client_id. We DELIBERATELY do not
+	// rewrite the `state` query param — RFC 6749 §4.1.2 requires us to
+	// return it to the RP unchanged, and standards-compliant clients (e.g.
+	// Claude Code, Cursor) reject a callback whose state doesn't match what
+	// they sent. We previously prefixed state with "<context_id>~" as a
+	// primary lookup key for /token, but `authsec_ctx` set below survives
+	// the round-trip in Hydra's request_url and the /token handler already
+	// has a path-(2) fallback that resolves the context via the RFC 8707
+	// `resource` form param, so the state-prefix is redundant.
 	q.Set("client_id", client.HydraClientID)
-	q.Set("state", contextID+"~"+q.Get("state"))
-	// authsec_ctx survives Hydra's round-trip via request_url. The
-	// /login/page-data handler parses it out to find the matching
-	// auth_request_context row. We keep the state-prefix approach above
-	// as a redundant carrier for /token's path (2) fallback.
 	q.Set("authsec_ctx", contextID)
 	hydraAuthURL := strings.TrimSuffix(getHydraPublicBase(), "/") + "/oauth2/auth?" + q.Encode()
 	c.Redirect(http.StatusFound, hydraAuthURL)
