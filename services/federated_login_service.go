@@ -602,6 +602,7 @@ func (s *FederatedLoginService) resolveOrJITFederatedUser(
 			ProviderName:     providerName,
 			ProviderUserID:   info.Sub,
 			Email:            info.Email,
+			ProfileData:      "{}", // jsonb column rejects empty string
 		}
 		if err := tenantDB.Create(&linkRow).Error; err != nil {
 			return nil, fmt.Errorf("link existing user to federated identity: %w", err)
@@ -674,6 +675,7 @@ func (s *FederatedLoginService) resolveOrJITFederatedUser(
 		ProviderName:     providerName,
 		ProviderUserID:   info.Sub,
 		Email:            info.Email,
+		ProfileData:      "{}", // jsonb column rejects empty string
 	}
 	if err := tenantDB.Create(&linkRow).Error; err != nil {
 		// Best-effort rollback of the users row so we don't leak orphans.
