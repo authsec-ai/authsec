@@ -677,7 +677,18 @@ func (ctrl *OAuthASV2Controller) OIDCDiscovery(c *gin.Context) {
 }
 
 func (ctrl *OAuthASV2Controller) buildMetadata() map[string]interface{} {
+	// Prefer the configured canonical base URL; fall back to the request
+	// host so the well-known doc still works in deployments that haven't
+	// set AUTHSEC_OAUTH_BASE_URL yet.
 	issuer := strings.TrimSuffix(canonicalOAuthBaseURL(), "/")
+	if issuer == "" {
+		// We don't have access to the gin.Context here, so we can't read
+		// the actual request host. Use a placeholder marker — the deploy
+		// MUST set AUTHSEC_OAUTH_BASE_URL for valid RFC 8414 metadata.
+		// Logged at startup elsewhere; surfacing in the doc as "unset"
+		// makes ops grep for it.
+		issuer = "https://authsec-oauth-base-url-not-configured.invalid"
+	}
 	return map[string]interface{}{
 		"issuer":                                issuer,
 		"authorization_endpoint":                issuer + "/authsec/oauth/v2/authorize",
@@ -736,12 +747,17 @@ func (ctrl *OAuthASV2Controller) CanonicalIssuerOnly() gin.HandlerFunc {
 // derivation). Returns "" if nothing's configured — callers should treat
 // that as "skip canonical-issuer enforcement".
 func canonicalOAuthBaseURL() string {
-	// PHASE5-NOTE: prod's config.AppConfig doesn't yet expose OAuthBaseURL;
-	// for the backport we reuse HydraPublicURL as the canonical issuer.
-	// Adding a dedicated config field is a follow-up.
-	if u := config.AppConfig.HydraPublicURL; u != "" {
+	// Prefer the explicit AUTHSEC_OAUTH_BASE_URL — points at the AuthSec
+	// backend host that serves /authsec/oauth/v2/* (NOT Hydra).
+	if u := config.AppConfig.OAuthBaseURL; u != "" {
 		return strings.TrimSuffix(u, "/")
 	}
+	// Fallback: empty -> middleware is a no-op (no redirects, well-known
+	// docs fall back to the request host). Earlier versions of this
+	// function used HydraPublicURL as a fallback, which incorrectly
+	// redirected /authsec/oauth/v2/* traffic to Hydra (which serves
+	// /oauth2/* and has no idea what /authsec/oauth/v2/* means). Don't
+	// reintroduce that fallback.
 	return ""
 }
 
