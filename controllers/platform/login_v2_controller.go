@@ -158,13 +158,19 @@ func (ctrl *LoginV2Controller) GetLoginPageData(c *gin.Context) {
 		return
 	}
 
-	// Resolve the Application from the requested resource. The audience on
-	// the Hydra client is the canonical pointer to resource_uri, set at
-	// DCR/prereg time. We use the first audience entry — should always be
-	// the Application's resource_uri.
+	// Resolve the Application from the requested resource. Preferred path
+	// is the audience on the Hydra client, set at DCR/prereg time. Fallback:
+	// parse the `resource` (RFC 8707) query param from the request_url Hydra
+	// echoes back — this covers DCR clients whose audience wasn't persisted
+	// for whatever reason (older DCR flows, Hydra config drops, etc.).
 	var resourceURI string
 	if len(loginReq.Client.Audience) > 0 {
 		resourceURI = loginReq.Client.Audience[0]
+	}
+	if resourceURI == "" {
+		if u, err := url.Parse(loginReq.RequestURL); err == nil {
+			resourceURI = u.Query().Get("resource")
+		}
 	}
 	if resourceURI == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
