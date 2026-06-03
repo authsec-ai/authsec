@@ -217,6 +217,68 @@ when one exists; default-allow when no policy rows exist for the Application.
 `submit.*` URLs land in Sessions 2-5 of the port. Session 1 only wires
 this read endpoint.
 
+### Custom-login completion (Session 2 of login port)
+
+Once the user enters email+password on the login page, the UI POSTs here.
+The backend looks up the user, verifies password, calls Hydra accept-login,
+and returns the redirect_to URL the browser should follow next (usually
+the consent endpoint).
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/complete-local" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge-from-page-data>",
+    "email": "chandanak7777@gmail.com",
+    "password": "<password>",
+    "remember": false
+  }'
+```
+
+Response on success:
+```json
+{ "success": true, "redirect_to": "https://oauth.example.com/oauth2/auth?..." }
+```
+
+Response on bad credentials (401):
+```json
+{ "success": false, "error": "invalid credentials" }
+```
+
+Provider filter: only `provider IN ('custom','ad_sync','entra_id','scim')`
+users can log in via this endpoint. OIDC-federated users (`provider='oidc'`)
+must use the OIDC initiate path — coming in Session 4.
+
+`remember: true` asks Hydra to skip authentication on subsequent /authorize
+calls for this (client, user) pair for 8 hours. UI surfaces this as
+"Keep me signed in."
+
+Side effect: writes user_id + auth_time onto the auth_request_context
+row identified by login_challenge. Those are read by the consent step
+to populate access token claims.
+
+### Reject login (Session 2)
+
+User clicked Cancel on the login page.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/reject" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge>",
+    "reason": "User clicked cancel"
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?error=access_denied&..." }
+```
+
+Tells Hydra to abort the dance. Hydra returns a redirect_to that ends at
+the client's redirect_uri with error=access_denied, so the calling
+application can show "login cancelled."
+
 ---
 
 ## Section 2 — Applications admin (JWT, requires tenant_id claim)

@@ -253,10 +253,12 @@ func SetupRoutes(
 			oauthV2.GET("/logout", oauthASV2Controller.EndSession)
 			oauthV2.POST("/par", oauthASV2Controller.PAR)
 
-			// Login challenge surface — session 1 of the login port. Public:
-			// the login_challenge itself IS the auth context (Hydra signs).
+			// Login challenge surface — sessions 1+2 of the login port.
+			// Public: the login_challenge itself IS the auth context (Hydra signs).
 			loginV2Controller := platformCtrl.NewLoginV2Controller()
 			oauthV2.GET("/login/page-data", loginV2Controller.GetLoginPageData)
+			oauthV2.POST("/login/complete-local", loginV2Controller.CompleteCustomLogin)
+			oauthV2.POST("/login/reject", loginV2Controller.RejectLogin)
 		}
 
 		// Tenant-scoped Application registry (resource_servers rows).
