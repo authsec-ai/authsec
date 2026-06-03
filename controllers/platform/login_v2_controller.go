@@ -547,10 +547,22 @@ func (ctrl *LoginV2Controller) findContextByLoginChallenge(loginChallenge string
 	if contextID == "" {
 		return nil, "", errors.New("authsec_ctx not in login request")
 	}
-	if len(hydraReq.Client.Audience) == 0 {
+	// Resolve resource_uri. Preferred path is the Hydra client's audience
+	// (set at DCR/prereg time). Fallback: parse `resource` (RFC 8707) from
+	// the request_url Hydra echoes back. Same fallback as /login/page-data.
+	var resourceURI string
+	if len(hydraReq.Client.Audience) > 0 {
+		resourceURI = hydraReq.Client.Audience[0]
+	}
+	if resourceURI == "" {
+		if u, parseErr := url.Parse(hydraReq.RequestURL); parseErr == nil {
+			resourceURI = u.Query().Get("resource")
+		}
+	}
+	if resourceURI == "" {
 		return nil, "", errors.New("no resource bound to client")
 	}
-	_, tenantID, err := ctrl.rsSvc.GetByResourceURI(hydraReq.Client.Audience[0])
+	_, tenantID, err := ctrl.rsSvc.GetByResourceURI(resourceURI)
 	if err != nil {
 		return nil, "", err
 	}
