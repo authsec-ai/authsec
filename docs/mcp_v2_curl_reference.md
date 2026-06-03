@@ -167,6 +167,56 @@ curl -X POST "$AUTHSEC/authsec/oauth/v2/revoke" \
 curl "$AUTHSEC/authsec/oauth/v2/logout?post_logout_redirect_uri=https://example.com/done"
 ```
 
+### Login challenge page-data (Session 1 of login port)
+
+Public, no auth — the `login_challenge` itself is the authentication
+context (Hydra signs it). Called by whoever serves the login UI to
+fetch the workspace + IDP list to render.
+
+```bash
+# Hydra sends the user's browser to your login page with ?login_challenge=...
+# That page's backend calls:
+curl "$AUTHSEC/authsec/oauth/v2/login/page-data?login_challenge=<challenge-from-hydra>"
+```
+
+Response shape:
+```json
+{
+  "success": true,
+  "login_challenge": "<challenge>",
+  "context_id": "<authsec_ctx UUID>",
+  "tenant_id": "<tenant UUID>",
+  "application_id": "<app UUID>",
+  "application_name": "MCP Demo",
+  "resource_uri": "https://mcp-dev.mcpauthz.com/mcp",
+  "requested_scope": ["openid","offline_access","mcp_demo.read","..."],
+  "skip": false,
+  "identity_providers": [
+    {
+      "identity_provider_id": "<idp UUID>",
+      "provider_type": "oidc",
+      "display_name": "Corporate Google"
+    }
+  ],
+  "submit": {
+    "custom": "https://.../authsec/oauth/v2/login/complete-local",
+    "oidc":   "https://.../authsec/oauth/v2/login/oidc/initiate",
+    "saml":   "https://.../authsec/oauth/v2/login/saml/initiate",
+    "reject": "https://.../authsec/oauth/v2/login/reject"
+  }
+}
+```
+
+`skip: true` means Hydra has an existing session for this client; the UI
+should POST to /login/complete-local with the included subject rather than
+prompt for credentials again (auto-accept).
+
+`identity_providers` is filtered by the Application's IDP whitelist policy
+when one exists; default-allow when no policy rows exist for the Application.
+
+`submit.*` URLs land in Sessions 2-5 of the port. Session 1 only wires
+this read endpoint.
+
 ---
 
 ## Section 2 — Applications admin (JWT, requires tenant_id claim)
