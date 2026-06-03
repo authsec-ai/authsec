@@ -8,7 +8,12 @@
       "Bash(Get-ChildItem -Depth 2 -Directory)",
       "Bash(Select-Object FullName)",
       "Bash(grep -E \"\\\\.\\(go|sql\\)$\")",
-      "Bash(grep -E \"\\\\.go$\")"
+      "Bash(grep -E \"\\\\.go$\")",
+      "Read(//Users/pc/.claude/**)",
+      "Read(//Users/pc/Desktop/**)",
+      "Read(//Users/pc/**)",
+      "WebFetch(domain:mcp-dev.mcpauthz.com)",
+      "WebFetch(domain:dev.api.authsec.dev)"
     ]
   }
 }

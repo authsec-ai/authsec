@@ -1354,7 +1354,7 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	err = config.DB.
 		Table("identity_providers ip").
 		Select("ip.id AS identity_provider_id, ip.status, sp.id AS saml_id").
-		Joins("JOIN saml_providers sp ON sp.id::text = ip.config_ref").
+		Joins("JOIN saml_providers sp ON sp.id = ip.saml_provider_id").
 		Where("ip.workspace_id = ?", workspaceUUID).
 		Where("ip.provider_type = ?", models.IdentityProviderSAML).
 		Where("sp.provider_name = ?", providerName).

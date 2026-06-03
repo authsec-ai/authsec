@@ -13,6 +13,7 @@ type ResourceServerClientRegistration struct {
 	ID               uuid.UUID `json:"id" gorm:"column:id;type:uuid;primary_key;default:gen_random_uuid()"`
 	ResourceServerID uuid.UUID `json:"resource_server_id" gorm:"column:resource_server_id;type:uuid;not null;uniqueIndex:idx_rscr_rs_client"`
 	OAuthClientID    uuid.UUID `json:"oauth_client_id" gorm:"column:oauth_client_id;type:uuid;not null;uniqueIndex:idx_rscr_rs_client"`
+	WorkspaceID      uuid.UUID `json:"workspace_id" gorm:"column:workspace_id;type:uuid;not null"`
 	Status           string    `json:"status" gorm:"column:status;type:varchar(20);not null;default:'approved'"`
 	RegistrationType string    `json:"registration_type" gorm:"column:registration_type;type:varchar(20);not null"`
 	CreatedAt        time.Time `json:"created_at" gorm:"column:created_at;default:CURRENT_TIMESTAMP"`

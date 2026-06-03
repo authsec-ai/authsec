@@ -298,10 +298,11 @@ func (s *AuthorizationContextService) GetClientRegistration(resourceServerID, oa
 }
 
 // EnsureClientRegistration upserts a client registration for an RS.
-func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID, oauthClientID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
+func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID, oauthClientID, workspaceID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
 	reg := models.ResourceServerClientRegistration{
 		ResourceServerID: resourceServerID,
 		OAuthClientID:    oauthClientID,
+		WorkspaceID:      workspaceID,
 		Status:           "approved",
 		RegistrationType: regType,
 	}

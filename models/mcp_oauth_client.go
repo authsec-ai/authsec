@@ -5,7 +5,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"gorm.io/gorm"
 )
 
 // MCPOAuthClient represents an OAuth 2.1 client in the MCP plane.
@@ -35,9 +34,8 @@ type MCPOAuthClient struct {
 	SyncStatus      string         `json:"sync_status" gorm:"type:text;not null;default:'active'"`
 	SyncLastError   *string        `json:"-" gorm:"type:text"`
 	SyncLastErrorAt *time.Time     `json:"-" gorm:"type:timestamptz"`
-	CreatedAt       time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt       time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	DeletedAt       gorm.DeletedAt `json:"-" gorm:"index"`
+	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 }
 
 // MCPOAuthClient sync status constants.

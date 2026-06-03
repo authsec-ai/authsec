@@ -154,7 +154,7 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 	// lazily at that point. This accommodates DCR clients (e.g. Claude Code)
 	// that follow RFC 7591 strictly and omit `resource` at registration time.
 	if rs != nil {
-		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "dcr"); err != nil {
+		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "dcr"); err != nil {
 			return nil, fmt.Errorf("create DCR client registration: %w", err)
 		}
 	}
@@ -253,8 +253,8 @@ func (s *OAuthASService) GetClientRegistration(rsID, clientID uuid.UUID) (*model
 }
 
 // EnsureClientRegistration upserts a join row (used by CIMD).
-func (s *OAuthASService) EnsureClientRegistration(rsID, clientID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
-	return s.authzCtx.EnsureClientRegistration(rsID, clientID, regType)
+func (s *OAuthASService) EnsureClientRegistration(rsID, clientID, workspaceID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
+	return s.authzCtx.EnsureClientRegistration(rsID, clientID, workspaceID, regType)
 }
 
 // InferSingleResourceURIForClient resolves a missing RFC 8707 resource parameter
@@ -882,7 +882,7 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 		return nil, fmt.Errorf("store prereg client: %w", err)
 	}
 
-	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, "prereg"); err != nil {
+	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "prereg"); err != nil {
 		return nil, fmt.Errorf("create prereg client registration: %w", err)
 	}
 

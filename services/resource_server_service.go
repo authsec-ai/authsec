@@ -105,11 +105,8 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 
 	// Pre-check: detect duplicate resource_uri before the INSERT so we can
 	// return a clean 409-friendly error instead of leaking the raw constraint
-	// name ("resource_servers_resource_uri_key") to the operator. This is
-	// purely a UX improvement — the DB unique index is still the source of
-	// truth; we just surface a readable message before it fires.
+	// name to the operator. The DB unique index is the source of truth.
 	var existingCount int64
-	// Mirrors the partial unique index: only non-deleted rows count as conflicts.
 	if err := s.db.Model(&models.ResourceServer{}).
 		Where("resource_uri = ?", resourceURI).
 		Count(&existingCount).Error; err != nil {
@@ -371,7 +368,13 @@ func (s *ResourceServerService) Update(id string, updates map[string]interface{}
 }
 
 func (s *ResourceServerService) Delete(id string) error {
-	return s.db.Where("id = ?", id).Delete(&models.ResourceServer{}).Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("resource_server_id = ?", id).
+			Delete(&models.ResourceServerClientRegistration{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&models.ResourceServer{}).Error
+	})
 }
 
 // GetByIDAndTenant fetches a resource server by ID with tenant ownership check.
@@ -410,13 +413,21 @@ func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates m
 	return &rs, nil
 }
 
-// DeleteByTenant deletes a resource server with tenant ownership check.
+// DeleteByTenant hard-deletes a resource server with tenant ownership check.
+// Cascades to resource_server_client_registrations (FK lacks ON DELETE CASCADE
+// in older schemas; the explicit delete covers both old and new).
 func (s *ResourceServerService) DeleteByTenant(id, workspaceID string) error {
-	result := s.db.Where("id = ? AND workspace_id = ?", id, workspaceID).Delete(&models.ResourceServer{})
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("resource server not found")
-	}
-	return result.Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var rs models.ResourceServer
+		if err := tx.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
+			return fmt.Errorf("resource server not found")
+		}
+		if err := tx.Where("resource_server_id = ?", id).
+			Delete(&models.ResourceServerClientRegistration{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&rs).Error
+	})
 }
 
 // RotateIntrospectionSecret generates a new secret, stores its bcrypt hash, returns plaintext once.

@@ -96,7 +96,7 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 
 	var existingIDP models.IdentityProvider
 	existingErr := s.db.Model(&models.IdentityProvider{}).
-		Joins("JOIN oidc_providers op ON op.id::text = identity_providers.config_ref").
+		Joins("JOIN oidc_providers op ON op.id = identity_providers.oidc_provider_id").
 		Where("identity_providers.workspace_id = ?", req.WorkspaceID).
 		Where("identity_providers.provider_type = ?", models.IdentityProviderOIDC).
 		Where("op.provider_name = ?", providerName).
@@ -134,7 +134,7 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 			WorkspaceID:     req.WorkspaceID,
 			ProviderType:    models.IdentityProviderOIDC,
 			DisplayName:     coalesceString(req.DisplayName, providerName),
-			ConfigRef:       oidcRow.ID.String(),
+			OIDCProviderID:  &oidcRow.ID,
 			Status:          "configured",
 			RedirectURI:     req.RedirectURI,
 			CreatedByUserID: req.CreatedByUserID,
@@ -175,7 +175,7 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 
 	var existingIDP models.IdentityProvider
 	existingErr := s.db.Model(&models.IdentityProvider{}).
-		Joins("JOIN saml_providers sp ON sp.id::text = identity_providers.config_ref").
+		Joins("JOIN saml_providers sp ON sp.id = identity_providers.saml_provider_id").
 		Where("identity_providers.workspace_id = ?", req.WorkspaceID).
 		Where("identity_providers.provider_type = ?", models.IdentityProviderSAML).
 		Where("sp.provider_name = ?", providerName).
@@ -223,7 +223,7 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 			WorkspaceID:     req.WorkspaceID,
 			ProviderType:    models.IdentityProviderSAML,
 			DisplayName:     coalesceString(req.DisplayName, providerName),
-			ConfigRef:       samlID.String(),
+			SAMLProviderID:  &samlID,
 			Status:          "configured",
 			CreatedByUserID: req.CreatedByUserID,
 		}
@@ -257,19 +257,28 @@ func (s *IdentityProviderService) UpdateStatus(workspaceID, idpID uuid.UUID, sta
 		now := time.Now()
 		isActive := status == "configured"
 		if idp.ProviderType != models.IdentityProviderSCIM {
-			configUUID, err := uuid.Parse(idp.ConfigRef)
-			if err != nil {
-				return fmt.Errorf("identity provider %s has invalid config_ref: %w", idp.ID, err)
-			}
-
 			var table string
+			var configUUID uuid.UUID
 			switch idp.ProviderType {
 			case models.IdentityProviderOIDC:
 				table = "oidc_providers"
+				if idp.OIDCProviderID == nil {
+					return fmt.Errorf("identity provider %s has no oidc_provider_id", idp.ID)
+				}
+				configUUID = *idp.OIDCProviderID
 			case models.IdentityProviderSAML:
 				table = "saml_providers"
+				if idp.SAMLProviderID == nil {
+					return fmt.Errorf("identity provider %s has no saml_provider_id", idp.ID)
+				}
+				configUUID = *idp.SAMLProviderID
 			case models.IdentityProviderAD, models.IdentityProviderEntra:
 				table = "sync_configurations"
+				parsed, err := uuid.Parse(idp.ConfigRef)
+				if err != nil {
+					return fmt.Errorf("identity provider %s has invalid config_ref: %w", idp.ID, err)
+				}
+				configUUID = parsed
 			default:
 				return fmt.Errorf("unsupported identity provider type %q", idp.ProviderType)
 			}
@@ -319,15 +328,15 @@ func (s *IdentityProviderService) Delete(workspaceID, idpID uuid.UUID) error {
 		if cfgErr := s.ResolveOIDCConfig(idp, &oidcRow); cfgErr == nil {
 			return s.deleteOIDCArtifacts(workspaceID, idpID, oidcRow.ProviderName)
 		}
-		// If config_ref is broken, drop just the identity_providers row.
+		// If oidc_provider_id is broken, drop just the identity_providers row.
 		return s.db.Where("id = ? AND workspace_id = ?", idpID, workspaceID).
 			Delete(&models.IdentityProvider{}).Error
 	case models.IdentityProviderSAML:
-		configUUID, parseErr := uuid.Parse(idp.ConfigRef)
-		if parseErr != nil {
+		if idp.SAMLProviderID == nil {
 			return s.db.Where("id = ? AND workspace_id = ?", idpID, workspaceID).
 				Delete(&models.IdentityProvider{}).Error
 		}
+		configUUID := *idp.SAMLProviderID
 		return s.db.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Table("saml_providers").Where("id = ?", configUUID).
 				Delete(map[string]interface{}{}).Error; err != nil {
@@ -558,11 +567,7 @@ func (s *IdentityProviderService) populateOIDCRedirectURIs(rows []models.Identit
 }
 
 func (s *IdentityProviderService) populateOIDCRedirectURI(idp *models.IdentityProvider) {
-	if idp == nil || idp.ProviderType != models.IdentityProviderOIDC {
-		return
-	}
-	configUUID, err := uuid.Parse(idp.ConfigRef)
-	if err != nil {
+	if idp == nil || idp.ProviderType != models.IdentityProviderOIDC || idp.OIDCProviderID == nil {
 		return
 	}
 	var configRow struct {
@@ -570,7 +575,7 @@ func (s *IdentityProviderService) populateOIDCRedirectURI(idp *models.IdentityPr
 	}
 	if err := s.db.Table("oidc_providers").
 		Select("redirect_uri").
-		Where("id = ?", configUUID).
+		Where("id = ?", *idp.OIDCProviderID).
 		First(&configRow).Error; err == nil {
 		idp.RedirectURI = configRow.RedirectURI
 	}
@@ -591,16 +596,12 @@ func (s *IdentityProviderService) ResolveSAMLConfig(idp *models.IdentityProvider
 	if idp.ProviderType != models.IdentityProviderSAML {
 		return fmt.Errorf("identity provider %s is not a SAML provider (type=%s)", idp.ID, idp.ProviderType)
 	}
-	configUUID, err := uuid.Parse(idp.ConfigRef)
-	if err != nil {
-		return fmt.Errorf("identity provider %s has invalid SAML config_ref: %w", idp.ID, err)
+	if idp.SAMLProviderID == nil {
+		return fmt.Errorf("identity provider %s has no saml_provider_id", idp.ID)
 	}
-	if err := s.db.Table("saml_providers").
-		Where("id = ?", configUUID).
-		First(dest).Error; err != nil {
-		return err
-	}
-	return nil
+	return s.db.Table("saml_providers").
+		Where("id = ?", *idp.SAMLProviderID).
+		First(dest).Error
 }
 
 // ResolveOIDCConfig follows an IDP row of provider_type='oidc' through to the
@@ -614,11 +615,10 @@ func (s *IdentityProviderService) ResolveOIDCConfig(idp *models.IdentityProvider
 	if idp.ProviderType != models.IdentityProviderOIDC {
 		return fmt.Errorf("identity provider %s is not an OIDC provider (type=%s)", idp.ID, idp.ProviderType)
 	}
-	configUUID, err := uuid.Parse(idp.ConfigRef)
-	if err != nil {
-		return fmt.Errorf("identity provider %s has invalid OIDC config_ref: %w", idp.ID, err)
+	if idp.OIDCProviderID == nil {
+		return fmt.Errorf("identity provider %s has no oidc_provider_id", idp.ID)
 	}
-	return s.db.Table("oidc_providers").Where("id = ?", configUUID).First(dest).Error
+	return s.db.Table("oidc_providers").Where("id = ?", *idp.OIDCProviderID).First(dest).Error
 }
 
 // ResolveSyncConfig follows an IDP row of provider_type='ad' or 'entra'

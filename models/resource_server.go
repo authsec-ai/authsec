@@ -5,7 +5,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"gorm.io/gorm"
 )
 
 // ResourceServer represents an MCP server registered with AuthSec.
@@ -45,9 +44,8 @@ type ResourceServer struct {
 	LastValidationStatus     *string    `json:"last_validation_status,omitempty" gorm:"type:text"`
 	LastValidationError      *string    `json:"last_validation_error,omitempty" gorm:"type:text"`
 
-	CreatedAt time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
-	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 
 	ToolsCount        int64  `json:"tools_count,omitempty" gorm:"-"`
 	ScopesCount       int64  `json:"scopes_count,omitempty" gorm:"-"`

@@ -1266,7 +1266,7 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 		}
 		oauthClient = resolved
 		// Lazily create the join row for CIMD clients (idempotent)
-		if _, regErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, "cimd"); regErr != nil {
+		if _, regErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, rs.WorkspaceID, "cimd"); regErr != nil {
 			return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register CIMD client for resource"}
 		}
 	} else {
@@ -1297,7 +1297,7 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
 	if regErr != nil {
 		if oauthClient.RegistrationType == "dcr" {
-			if _, ensureErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, "dcr"); ensureErr != nil {
+			if _, ensureErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, rs.WorkspaceID, "dcr"); ensureErr != nil {
 				return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register DCR client for resource"}
 			}
 		} else {

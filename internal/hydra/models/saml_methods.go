@@ -134,7 +134,7 @@ func (s *OAuthLoginService) GetSAMLProvidersForTenant(workspaceID string, _ ...s
 		Joins(`JOIN identity_providers ip
 		         ON ip.workspace_id = sp.workspace_id
 		        AND ip.provider_type = 'saml'
-		        AND ip.config_ref = sp.id::text`).
+		        AND ip.saml_provider_id = sp.id`).
 		Where("sp.workspace_id = ?", workspaceID).
 		Where("sp.is_active = ?", true).
 		Where("ip.status <> 'disabled'")
@@ -229,8 +229,8 @@ func (s *OAuthLoginService) FilterProvidersForApplication(workspaceID, applicati
 		Select(`ip.provider_type,
 		        COALESCE(op.provider_name, sp.provider_name) AS provider_name`).
 		Joins("JOIN identity_providers ip ON ip.id = p.identity_provider_id").
-		Joins("LEFT JOIN oidc_providers op ON ip.provider_type = 'oidc' AND op.id::text = ip.config_ref").
-		Joins("LEFT JOIN saml_providers sp ON ip.provider_type = 'saml' AND sp.id::text = ip.config_ref").
+		Joins("LEFT JOIN oidc_providers op ON ip.provider_type = 'oidc' AND op.id = ip.oidc_provider_id").
+		Joins("LEFT JOIN saml_providers sp ON ip.provider_type = 'saml' AND sp.id = ip.saml_provider_id").
 		Where("p.workspace_id = ? AND p.application_id = ? AND p.enabled = ?", workspaceID, applicationID, true).
 		Where("ip.workspace_id = ? AND ip.status <> 'disabled'", workspaceID).
 		Scan(&enabledRows).Error; err != nil {

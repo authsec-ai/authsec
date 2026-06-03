@@ -60,7 +60,7 @@ func (s *OIDCService) GetActiveProvidersForWorkspace(workspaceID uuid.UUID) ([]m
 	err := config.DB.
 		Table("identity_providers ip").
 		Select("op.*").
-		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
+		Joins("JOIN oidc_providers op ON op.id = ip.oidc_provider_id").
 		Where("ip.workspace_id = ?", workspaceID).
 		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
 		Where("ip.status <> ?", "disabled").
@@ -294,7 +294,7 @@ func (s *OIDCService) resolveEnabledProvider(workspaceID uuid.UUID, providerName
 		Select(`ip.id AS identity_provider_id,
 		        ip.status AS status,
 		        op.*`).
-		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
+		Joins("JOIN oidc_providers op ON op.id = ip.oidc_provider_id").
 		Where("ip.workspace_id = ?", workspaceID).
 		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
 		Where("op.provider_name = ?", providerName).

@@ -608,7 +608,7 @@ func (s *OAuthLoginService) GetOIDCProvidersForTenant(workspaceID string) ([]OID
 		Joins(`JOIN identity_providers ip
 		         ON ip.workspace_id = op.workspace_id
 		        AND ip.provider_type = 'oidc'
-		        AND ip.config_ref = op.id::text`).
+		        AND ip.oidc_provider_id = op.id`).
 		Where("op.workspace_id = ?", workspaceID).
 		Where("op.is_active = ?", true).
 		Where("ip.status <> 'disabled'").

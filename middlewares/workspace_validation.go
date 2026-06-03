@@ -35,17 +35,9 @@ func ValidateTenantFromToken() gin.HandlerFunc {
 			return
 		}
 
-		if isAdminUser(c) {
-			if tokenWorkspaceIDStr != urlWorkspaceID {
-				logCrossTenantAccess(c, tokenWorkspaceIDStr, urlWorkspaceID)
-			}
-			c.Next()
-			return
-		}
-
 		if tokenWorkspaceIDStr != urlWorkspaceID {
-			log.Printf("SECURITY: Workspace mismatch - Token: %s, URL: %s, User: %v",
-				tokenWorkspaceIDStr, urlWorkspaceID, c.GetString("user_id"))
+			log.Printf("SECURITY: Workspace mismatch - Token: %s, URL: %s, User: %v, Admin: %v",
+				tokenWorkspaceIDStr, urlWorkspaceID, c.GetString("user_id"), isAdminUser(c))
 			c.JSON(http.StatusForbidden, gin.H{
 				"error": "Access denied: workspace mismatch",
 			})
@@ -89,8 +81,4 @@ func isAdminUser(c *gin.Context) bool {
 	return false
 }
 
-// logCrossTenantAccess logs admin cross-workspace access for audit
-func logCrossTenantAccess(c *gin.Context, tokenWorkspaceID, urlWorkspaceID string) {
-	log.Printf("AUDIT: Cross-workspace access | Admin: %s | Token Workspace: %s | Access Workspace: %s | Path: %s | Method: %s",
-		c.GetString("user_id"), tokenWorkspaceID, urlWorkspaceID, c.Request.URL.Path, c.Request.Method)
-}
+

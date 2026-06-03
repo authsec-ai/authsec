@@ -54,11 +54,17 @@ func IsOIDCCoreScope(s string) bool {
 	return oidcCoreScopes[s]
 }
 
-// clientIsOIDC checks whether the client has opted into OIDC by having "openid" in its
-// registered Scope field. Non-OIDC clients (legacy MCP) never get OIDC core scopes.
+// clientIsOIDC checks whether the client is OIDC-capable.
+// Empty scope = DCR client that binds scopes at /authorize time (RFC 7591).
+// These are implicitly OIDC-capable — resolveOIDCClientCapabilities() already
+// grants them refresh_token. Only explicit non-openid scopes mark a client
+// as non-OIDC.
 func clientIsOIDC(client *models.MCPOAuthClient) bool {
-	if client == nil || client.Scope == "" {
+	if client == nil {
 		return false
+	}
+	if client.Scope == "" {
+		return true
 	}
 	for _, s := range strings.Fields(client.Scope) {
 		if s == "openid" {

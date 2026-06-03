@@ -235,7 +235,7 @@ CREATE TABLE public.auth_request_contexts (
     prompt character varying(64),
     max_age integer,
     auth_time timestamp without time zone,
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     CONSTRAINT auth_request_contexts_pkey PRIMARY KEY (state)
 );
 
@@ -389,7 +389,6 @@ CREATE TABLE public.mcp_oauth_clients (
     cimd_cached_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    deleted_at timestamp with time zone,
     pending_redirect_uris text[] DEFAULT '{}'::text[],
     redirect_review_pending boolean DEFAULT false,
     post_logout_redirect_uris text[] DEFAULT '{}'::text[],
@@ -552,7 +551,7 @@ CREATE TABLE public.oidc_providers (
     is_active boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     display_name_override text,
     redirect_uri text,
     CONSTRAINT oidc_providers_pkey PRIMARY KEY (id)
@@ -561,7 +560,7 @@ CREATE TABLE public.oidc_providers (
 CREATE TABLE public.oidc_states (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     state_token character varying(255) NOT NULL,
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     tenant_domain character varying(255) NOT NULL,
     provider_name character varying(50) NOT NULL,
     action character varying(20) NOT NULL,
@@ -665,7 +664,7 @@ CREATE TABLE public.resource_server_client_registrations (
     registration_type character varying(20) NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     CONSTRAINT resource_server_client_regist_resource_server_id_oauth_clie_key UNIQUE (resource_server_id, oauth_client_id),
     CONSTRAINT resource_server_client_registrations_pkey PRIMARY KEY (id)
 );
@@ -714,7 +713,6 @@ CREATE TABLE public.resource_servers (
     active boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    deleted_at timestamp with time zone,
     introspection_secret_hash text,
     status text DEFAULT 'pending_scan'::text NOT NULL,
     scan_generation integer DEFAULT 0 NOT NULL,
@@ -741,11 +739,6 @@ CREATE TABLE public.resource_servers (
     agent_type text,
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id)
-    -- resource_uri uniqueness is enforced by the partial index below so that
-    -- soft-deleted rows (deleted_at IS NOT NULL) do not block re-registration
-    -- of the same URL. The old unconditional UNIQUE constraint caused
-    -- "duplicate key" errors whenever an operator deleted an application and
-    -- tried to recreate it with the same base URL.
 );
 
 CREATE TABLE public.risk_policies (
@@ -835,7 +828,7 @@ CREATE TABLE public.saml_callback_states (
     user_email character varying(255),
     user_name character varying(255),
     provider_name character varying(255),
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     client_id uuid,
     login_challenge text,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
@@ -1457,29 +1450,49 @@ CREATE TABLE public.identity_providers (
     workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
     provider_type text NOT NULL,
     display_name text NOT NULL,
-    config_ref text NOT NULL,
+    oidc_provider_id uuid,
+    saml_provider_id uuid,
+    config_ref text,
     status text NOT NULL DEFAULT 'configured',
     created_by_user_id uuid NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT identity_providers_type_chk
-        CHECK (provider_type IN ('oidc', 'saml', 'ad', 'entra', 'scim'))
+        CHECK (provider_type IN ('oidc', 'saml', 'ad', 'entra', 'scim')),
+    CONSTRAINT identity_providers_config_ref_chk CHECK (
+        (provider_type = 'oidc' AND oidc_provider_id IS NOT NULL AND saml_provider_id IS NULL) OR
+        (provider_type = 'saml' AND saml_provider_id IS NOT NULL AND oidc_provider_id IS NULL) OR
+        (provider_type IN ('ad', 'entra', 'scim'))
+    )
 );
 
 CREATE INDEX idx_identity_providers_workspace ON public.identity_providers(workspace_id);
 CREATE INDEX idx_identity_providers_type      ON public.identity_providers(provider_type);
+CREATE UNIQUE INDEX idx_identity_providers_id_workspace ON public.identity_providers(id, workspace_id);
+
+-- Composite FKs from identity_providers to concrete config tables.
+-- Ensures the referenced oidc/saml provider belongs to the same workspace.
+ALTER TABLE ONLY public.identity_providers
+    ADD CONSTRAINT identity_providers_oidc_fkey
+    FOREIGN KEY (oidc_provider_id, workspace_id) REFERENCES public.oidc_providers(id, workspace_id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.identity_providers
+    ADD CONSTRAINT identity_providers_saml_fkey
+    FOREIGN KEY (saml_provider_id, workspace_id) REFERENCES public.saml_providers(id, workspace_id) ON DELETE SET NULL;
 
 -- application_identity_provider_policies — opt-in restriction of which IDPs
 -- a given application (resource_servers row) accepts.
 CREATE TABLE public.application_identity_provider_policies (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
-    identity_provider_id uuid NOT NULL REFERENCES public.identity_providers(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL,
+    application_id uuid NOT NULL,
+    identity_provider_id uuid NOT NULL,
     enabled boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT application_identity_provider_policies_uq UNIQUE (application_id, identity_provider_id)
+    CONSTRAINT application_identity_provider_policies_uq UNIQUE (application_id, identity_provider_id),
+    CONSTRAINT app_idp_policies_rs_workspace_fkey FOREIGN KEY (application_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE,
+    CONSTRAINT app_idp_policies_idp_workspace_fkey FOREIGN KEY (identity_provider_id, workspace_id) REFERENCES public.identity_providers(id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_app_idp_policies_workspace ON public.application_identity_provider_policies(workspace_id);
@@ -1543,6 +1556,7 @@ CREATE TABLE public.saml_providers (
 );
 
 CREATE INDEX idx_saml_providers_tenant_id ON public.saml_providers(workspace_id);
+CREATE UNIQUE INDEX idx_saml_providers_id_workspace ON public.saml_providers(id, workspace_id);
 
 -- ---------------------------------------------------------------------------
 -- Indexes for v4 columns that were inlined into their CREATE TABLE statements
@@ -1557,7 +1571,7 @@ CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clie
 CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
 CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
 CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name);
-CREATE UNIQUE INDEX oidc_providers_global_provider_name_uq ON public.oidc_providers (provider_name) WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX idx_oidc_providers_id_workspace ON public.oidc_providers(id, workspace_id);
 CREATE INDEX idx_delegation_tokens_workspace_id         ON public.delegation_tokens(workspace_id);
 CREATE INDEX idx_delegation_policies_workspace_id       ON public.delegation_policies(workspace_id);
 CREATE INDEX idx_oauth_scopes_workspace_id              ON public.oauth_scopes(workspace_id);
@@ -1814,12 +1828,13 @@ CREATE INDEX idx_rb_tenant_group ON public.role_bindings USING btree (workspace_
 
 CREATE INDEX idx_resource_servers_resource_uri ON public.resource_servers USING btree (resource_uri);
 
--- Partial unique index: only active (non-soft-deleted) rows must have a unique
--- resource_uri. Replaces the unconditional UNIQUE constraint that was on the
--- CREATE TABLE, which blocked re-registration after soft-delete.
 CREATE UNIQUE INDEX idx_resource_servers_resource_uri_active
-    ON public.resource_servers (resource_uri)
-    WHERE deleted_at IS NULL;
+    ON public.resource_servers (resource_uri);
+
+-- Composite unique for (id, workspace_id) — enables composite FK references
+-- from child tables to enforce workspace consistency.
+CREATE UNIQUE INDEX idx_resource_servers_id_workspace
+    ON public.resource_servers (id, workspace_id);
 
 CREATE INDEX idx_resource_servers_state ON public.resource_servers USING btree (state);
 
@@ -1867,7 +1882,7 @@ CREATE INDEX idx_rs_drift_events_rs_occurred ON public.resource_server_drift_eve
 
 CREATE INDEX idx_rs_manifest_attempts_rs_at ON public.resource_server_manifest_attempts USING btree (rs_id, attempted_at DESC);
 
-CREATE INDEX idx_rs_status ON public.resource_servers USING btree (status) WHERE ((active = true) AND (deleted_at IS NULL));
+CREATE INDEX idx_rs_status ON public.resource_servers USING btree (status) WHERE (active = true);
 
 CREATE INDEX idx_rscr_client_id ON public.resource_server_client_registrations USING btree (oauth_client_id);
 
@@ -2258,19 +2273,13 @@ ALTER TABLE ONLY public.mcp_tools
     ADD CONSTRAINT mcp_tools_is_public_acknowledged_by_fkey FOREIGN KEY (is_public_acknowledged_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.mcp_tools
-    ADD CONSTRAINT mcp_tools_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
-
-ALTER TABLE ONLY public.mcp_tools
-    ADD CONSTRAINT mcp_tools_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id);
+    ADD CONSTRAINT mcp_tools_rs_workspace_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_consent_grants
     ADD CONSTRAINT oauth_consent_grants_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_consent_grants
-    ADD CONSTRAINT oauth_consent_grants_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
-
-ALTER TABLE ONLY public.oauth_consent_grants
-    ADD CONSTRAINT oauth_consent_grants_tenant_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id);
+    ADD CONSTRAINT oauth_consent_grants_rs_workspace_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_scope_permissions
     ADD CONSTRAINT oauth_scope_permissions_scope_id_fkey FOREIGN KEY (scope_id) REFERENCES public.oauth_scopes(id) ON DELETE CASCADE;
@@ -2294,10 +2303,10 @@ ALTER TABLE ONLY public.resource_server_access_policies
     ADD CONSTRAINT resource_server_access_policies_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.resource_server_client_registrations
-    ADD CONSTRAINT resource_server_client_registrations_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES public.mcp_oauth_clients(id);
+    ADD CONSTRAINT resource_server_client_registrations_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.resource_server_client_registrations
-    ADD CONSTRAINT resource_server_client_registrations_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id);
+    ADD CONSTRAINT resource_server_client_registrations_rs_workspace_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.resource_server_drift_event_dismissals
     ADD CONSTRAINT resource_server_drift_event_dismissals_admin_user_id_fkey FOREIGN KEY (admin_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
