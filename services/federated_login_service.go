@@ -301,12 +301,16 @@ func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (
 		return nil, fmt.Errorf("fetch userinfo: %w", err)
 	}
 
-	// 6. Resolve AuthSec users.id via oidc_user_identities.
+	// 6. Resolve AuthSec users.id via oidc_user_identities; JIT-create
+	// scoped to the Application (resource_server) if first login.
 	if stateRow.TenantID == nil {
 		return nil, errors.New("state has no tenant_id")
 	}
-	user, err := s.resolveFederatedUser(tenantDB, *stateRow.TenantID,
-		stateRow.ProviderName, userInfo)
+	if stateRow.ApplicationID == nil {
+		return nil, errors.New("state has no application_id")
+	}
+	user, err := s.resolveOrJITFederatedUser(tenantDB, *stateRow.TenantID,
+		*stateRow.ApplicationID, stateRow.ProviderName, userInfo)
 	if err != nil {
 		return nil, fmt.Errorf("resolve user: %w", err)
 	}
@@ -524,41 +528,48 @@ func (s *FederatedLoginService) fetchUserinfo(userinfoURL, accessToken string) (
 	return &out, nil
 }
 
-// resolveFederatedUser looks up a federated identity match for the user
-// the upstream IdP just returned.
+// resolveOrJITFederatedUser resolves the upstream-IdP user to an AuthSec
+// users row, JIT-creating one when this is a first login for this MCP.
+//
+// Per-MCP scoping (migration 034): all lookups and the JIT INSERT are
+// scoped by (tenant_id, resource_server_id). The same Google user logging
+// into two different MCPs in the same tenant produces two distinct users
+// rows — that's by design, so RBAC bindings and audit attribute per-MCP.
 //
 // Resolution order:
 //
-//  1. oidc_user_identities row matching (tenant, provider, provider_user_id)
-//     — the user has logged in via this provider before, just look up the
-//     linked ExtendedUser.
-//  2. email match against the existing users table — the user already has
-//     an AuthSec account (e.g. custom-login signup) and is logging in via
-//     a federated provider for the first time. We auto-link by creating
-//     an oidc_user_identities row.
+//  1. oidc_user_identities by (tenant, resource_server, provider, sub)
+//     — already-linked user, return immediately.
+//  2. users by (tenant, resource_server, email) — user exists for this
+//     MCP but identity not yet linked. Create the link, return.
+//  3. JIT: look up resource_servers.legacy_client_id → look up the
+//     matching clients row in the tenant → create users row with
+//     (tenant, resource_server, client_id, project_id, provider='oidc',
+//     email, name) → create identity link → return.
 //
-// We DELIBERATELY do not JIT-create new ExtendedUser rows here. JIT user
-// creation requires a clients.id (ExtendedUser.ClientID is NOT NULL) which
-// the federated-login flow doesn't carry — it carries an applications.id,
-// which is a different concept (resource server, not OAuth client). The
-// existing custom-login signup path already handles user creation; users
-// must register there first, then federated login picks them up by email.
+// The legacy_client_id anchor preserves the existing "every user has a
+// clients row" invariant without forcing us to mint a fake clients row
+// per MCP. resource_servers rows already have legacy_client_id set at
+// Application creation time.
 type federatedUser struct {
 	ID    uuid.UUID
 	Email string
 	Name  string
 }
 
-func (s *FederatedLoginService) resolveFederatedUser(
+func (s *FederatedLoginService) resolveOrJITFederatedUser(
 	tenantDB *gorm.DB,
 	tenantUUID uuid.UUID,
+	resourceServerID uuid.UUID,
 	providerName string,
 	info *federatedUserInfo,
 ) (*federatedUser, error) {
-	// 1. Try existing identity link.
+	// 1. Try existing identity link scoped to this MCP.
 	var existing models.OIDCUserIdentity
-	err := tenantDB.Where("tenant_id = ? AND provider_name = ? AND provider_user_id = ?",
-		tenantUUID, providerName, info.Sub).First(&existing).Error
+	err := tenantDB.Where(
+		"tenant_id = ? AND resource_server_id = ? AND provider_name = ? AND provider_user_id = ?",
+		tenantUUID, resourceServerID, providerName, info.Sub,
+	).First(&existing).Error
 	if err == nil {
 		var u models.ExtendedUser
 		if err := tenantDB.Where("id = ?", existing.UserID).First(&u).Error; err != nil {
@@ -572,30 +583,98 @@ func (s *FederatedLoginService) resolveFederatedUser(
 		return nil, err
 	}
 
-	// 2. No identity link. Try email match (same tenant, existing user).
 	if info.Email == "" {
 		return nil, errors.New("federated provider returned no email and no existing identity link; cannot resolve user")
 	}
+
+	// 2. Try email match scoped to this MCP — user exists for this MCP
+	// (maybe registered via custom-login) but no federated identity link yet.
 	var u models.ExtendedUser
-	emailErr := tenantDB.Where("LOWER(email) = ? AND tenant_id = ?",
-		strings.ToLower(info.Email), tenantUUID).First(&u).Error
-	if emailErr != nil {
-		if errors.Is(emailErr, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("no AuthSec user found for email %q in this tenant; register via custom-login signup first", info.Email)
+	emailErr := tenantDB.Where(
+		"LOWER(email) = ? AND tenant_id = ? AND resource_server_id = ?",
+		strings.ToLower(info.Email), tenantUUID, resourceServerID,
+	).First(&u).Error
+	if emailErr == nil {
+		linkRow := models.OIDCUserIdentity{
+			TenantID:         tenantUUID,
+			ResourceServerID: &resourceServerID,
+			UserID:           u.ID,
+			ProviderName:     providerName,
+			ProviderUserID:   info.Sub,
+			Email:            info.Email,
 		}
+		if err := tenantDB.Create(&linkRow).Error; err != nil {
+			return nil, fmt.Errorf("link existing user to federated identity: %w", err)
+		}
+		return &federatedUser{ID: u.ID, Email: u.Email, Name: u.Name}, nil
+	}
+	if !errors.Is(emailErr, gorm.ErrRecordNotFound) {
 		return nil, emailErr
 	}
+
+	// 3. JIT create. Anchor users.client_id + project_id to the
+	// resource_server's legacy_client_id (which points at a real
+	// clients row).
+	var rs models.ResourceServer
+	if err := tenantDB.Where("id = ?", resourceServerID).First(&rs).Error; err != nil {
+		return nil, fmt.Errorf("load resource_server for JIT: %w", err)
+	}
+	if rs.LegacyClientID == nil {
+		return nil, errors.New("resource_server has no legacy_client_id; cannot JIT federated user without a client anchor")
+	}
+	var clientRow struct {
+		ClientID  uuid.UUID `gorm:"column:client_id"`
+		ProjectID uuid.UUID `gorm:"column:project_id"`
+	}
+	if err := tenantDB.Table("clients").
+		Select("client_id, project_id").
+		Where("client_id = ? AND tenant_id = ?", *rs.LegacyClientID, tenantUUID).
+		First(&clientRow).Error; err != nil {
+		return nil, fmt.Errorf("load clients row for legacy_client_id=%s: %w", rs.LegacyClientID, err)
+	}
+
+	name := info.Name
+	if name == "" {
+		name = info.Email
+	}
+	now := time.Now().UTC()
+	newUserID := uuid.New()
+	// Raw INSERT — ExtendedUser has many fields with NOT NULL constraints
+	// (tenant_domain, etc.) we don't have hot at hand; legacy code does
+	// the same. tenant_domain defaults from config.
+	insertSQL := `
+		INSERT INTO users (
+			id, client_id, tenant_id, project_id, resource_server_id,
+			name, email, tenant_domain, provider, provider_id,
+			active, created_at, updated_at
+		) VALUES (
+			?, ?, ?, ?, ?,
+			?, ?, ?, 'oidc', ?,
+			true, ?, ?
+		)
+	`
+	if err := tenantDB.Exec(insertSQL,
+		newUserID, clientRow.ClientID, tenantUUID, clientRow.ProjectID, resourceServerID,
+		name, info.Email, config.AppConfig.TenantDomainSuffix, info.Sub,
+		now, now,
+	).Error; err != nil {
+		return nil, fmt.Errorf("JIT create user: %w", err)
+	}
+
 	linkRow := models.OIDCUserIdentity{
-		TenantID:       tenantUUID,
-		UserID:         u.ID,
-		ProviderName:   providerName,
-		ProviderUserID: info.Sub,
-		Email:          info.Email,
+		TenantID:         tenantUUID,
+		ResourceServerID: &resourceServerID,
+		UserID:           newUserID,
+		ProviderName:     providerName,
+		ProviderUserID:   info.Sub,
+		Email:            info.Email,
 	}
 	if err := tenantDB.Create(&linkRow).Error; err != nil {
-		return nil, fmt.Errorf("link existing user to federated identity: %w", err)
+		// Best-effort rollback of the users row so we don't leak orphans.
+		_ = tenantDB.Exec("DELETE FROM users WHERE id = ?", newUserID).Error
+		return nil, fmt.Errorf("create identity link after JIT: %w", err)
 	}
-	return &federatedUser{ID: u.ID, Email: u.Email, Name: u.Name}, nil
+	return &federatedUser{ID: newUserID, Email: info.Email, Name: name}, nil
 }
 
 // federatedRandomToken returns n cryptographically random bytes encoded
