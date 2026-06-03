@@ -612,25 +612,31 @@ func (s *FederatedLoginService) resolveOrJITFederatedUser(
 		return nil, emailErr
 	}
 
-	// 3. JIT create. Anchor users.client_id + project_id to the
-	// resource_server's legacy_client_id (which points at a real
-	// clients row).
+	// 3. JIT create. Anchor users.client_id + project_id to a real
+	// clients row in this tenant. Preference order:
+	//   (a) resource_servers.legacy_client_id, if set — the explicit
+	//       per-MCP anchor (future-proof; not currently populated by any
+	//       creation path, but honored if set).
+	//   (b) the tenant's first active clients row — keeps the legacy
+	//       NOT NULL invariant on users.client_id satisfied without
+	//       requiring per-MCP anchoring everywhere. Per-MCP scope is
+	//       carried separately on users.resource_server_id (migration 034).
 	var rs models.ResourceServer
 	if err := tenantDB.Where("id = ?", resourceServerID).First(&rs).Error; err != nil {
 		return nil, fmt.Errorf("load resource_server for JIT: %w", err)
-	}
-	if rs.LegacyClientID == nil {
-		return nil, errors.New("resource_server has no legacy_client_id; cannot JIT federated user without a client anchor")
 	}
 	var clientRow struct {
 		ClientID  uuid.UUID `gorm:"column:client_id"`
 		ProjectID uuid.UUID `gorm:"column:project_id"`
 	}
-	if err := tenantDB.Table("clients").
+	clientQuery := tenantDB.Table("clients").
 		Select("client_id, project_id").
-		Where("client_id = ? AND tenant_id = ?", *rs.LegacyClientID, tenantUUID).
-		First(&clientRow).Error; err != nil {
-		return nil, fmt.Errorf("load clients row for legacy_client_id=%s: %w", rs.LegacyClientID, err)
+		Where("tenant_id = ? AND active = true", tenantUUID)
+	if rs.LegacyClientID != nil {
+		clientQuery = clientQuery.Where("client_id = ?", *rs.LegacyClientID)
+	}
+	if err := clientQuery.Order("created_at ASC").First(&clientRow).Error; err != nil {
+		return nil, fmt.Errorf("load clients row to anchor JIT federated user: %w", err)
 	}
 
 	name := info.Name
