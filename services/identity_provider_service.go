@@ -90,6 +90,9 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 	if req.ClientSecret == "" {
 		return nil, fmt.Errorf("client_secret is required")
 	}
+	if err := validateKnownOIDCProviderConfig(providerName, req); err != nil {
+		return nil, err
+	}
 
 	var existingIDP models.IdentityProvider
 	existingErr := s.db.Model(&models.IdentityProvider{}).
@@ -436,6 +439,70 @@ func coalesceString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func validateKnownOIDCProviderConfig(providerName string, req CreateOIDCIDPRequest) error {
+	type expectedProvider struct {
+		authURLFragment     string
+		tokenURLFragment    string
+		userinfoURLFragment string
+		requiredScope       string
+	}
+
+	expected := map[string]expectedProvider{
+		"google": {
+			authURLFragment:     "accounts.google.com/",
+			tokenURLFragment:    "oauth2.googleapis.com/",
+			userinfoURLFragment: "openidconnect.googleapis.com/",
+			requiredScope:       "openid",
+		},
+		"github": {
+			authURLFragment:     "github.com/login/oauth/authorize",
+			tokenURLFragment:    "github.com/login/oauth/access_token",
+			userinfoURLFragment: "api.github.com/user",
+			requiredScope:       "user:email",
+		},
+		"microsoft": {
+			authURLFragment:     "login.microsoftonline.com/",
+			tokenURLFragment:    "login.microsoftonline.com/",
+			userinfoURLFragment: "graph.microsoft.com/oidc/userinfo",
+			requiredScope:       "openid",
+		},
+	}
+
+	rule, ok := expected[providerName]
+	if !ok {
+		return nil
+	}
+
+	authURL := strings.ToLower(strings.TrimSpace(req.AuthorizationURL))
+	tokenURL := strings.ToLower(strings.TrimSpace(req.TokenURL))
+	userinfoURL := strings.ToLower(strings.TrimSpace(req.UserinfoURL))
+	scopes := strings.ToLower(" " + strings.Join(strings.Fields(req.Scopes), " ") + " ")
+
+	if !strings.Contains(authURL, rule.authURLFragment) {
+		return fmt.Errorf("authorization_url does not match provider_name %q", providerName)
+	}
+	if !strings.Contains(tokenURL, rule.tokenURLFragment) {
+		return fmt.Errorf("token_url does not match provider_name %q", providerName)
+	}
+	if !strings.Contains(userinfoURL, rule.userinfoURLFragment) {
+		return fmt.Errorf("userinfo_url does not match provider_name %q", providerName)
+	}
+	if providerName == "microsoft" && (isMicrosoftSharedTenantEndpoint(authURL) || isMicrosoftSharedTenantEndpoint(tokenURL)) {
+		return fmt.Errorf("microsoft OIDC workspace providers require tenant-specific authorize/token URLs; replace /common, /organizations, or /consumers with the Entra tenant ID or verified tenant domain")
+	}
+	if rule.requiredScope != "" && !strings.Contains(scopes, " "+rule.requiredScope+" ") {
+		return fmt.Errorf("scopes for provider_name %q must include %q", providerName, rule.requiredScope)
+	}
+
+	return nil
+}
+
+func isMicrosoftSharedTenantEndpoint(endpoint string) bool {
+	return strings.Contains(endpoint, "login.microsoftonline.com/common/") ||
+		strings.Contains(endpoint, "login.microsoftonline.com/organizations/") ||
+		strings.Contains(endpoint, "login.microsoftonline.com/consumers/")
 }
 
 // ListByWorkspace returns all identity_providers for a workspace, optionally
