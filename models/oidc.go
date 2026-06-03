@@ -67,7 +67,7 @@ type OIDCUserIdentity struct {
 	ProviderName     string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
 	ProviderUserID   string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)
 	Email            string     `json:"email,omitempty"`                          // Email from provider
-	ProfileData      string     `json:"profile_data,omitempty" gorm:"type:jsonb"` // Additional profile info
+	ProfileData      string     `json:"profile_data,omitempty" gorm:"type:jsonb;default:'{}'"` // Additional profile info; default {} so jsonb doesn't reject empty string
 	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
