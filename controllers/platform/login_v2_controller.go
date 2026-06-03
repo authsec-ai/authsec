@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -29,16 +30,20 @@ import (
 // the login challenge IS the authentication context. Hydra signs it so
 // we can't forge.
 type LoginV2Controller struct {
-	hydraLogin *services.HydraLoginService
-	idpSvc     *services.IdentityProviderV2Service
-	rsSvc      *services.ResourceServerService
+	hydraLogin     *services.HydraLoginService
+	idpSvc         *services.IdentityProviderV2Service
+	rsSvc          *services.ResourceServerService
+	bindingSvc     *services.BindingService
+	consentGrantSvc *services.ConsentGrantService
 }
 
 func NewLoginV2Controller() *LoginV2Controller {
 	return &LoginV2Controller{
-		hydraLogin: services.NewHydraLoginService(),
-		idpSvc:     services.NewIdentityProviderV2Service(),
-		rsSvc:      services.NewResourceServerService(),
+		hydraLogin:      services.NewHydraLoginService(),
+		idpSvc:          services.NewIdentityProviderV2Service(),
+		rsSvc:           services.NewResourceServerService(),
+		bindingSvc:      services.NewBindingService(),
+		consentGrantSvc: services.NewConsentGrantService(),
 	}
 }
 
@@ -572,4 +577,474 @@ func (ctrl *LoginV2Controller) RejectLogin(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": resp.RedirectTo})
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Session 3 — Consent handler
+// ─────────────────────────────────────────────────────────────────────────
+
+// ConsentPageDataResponse is what GET /consent returns. The (separate) UI
+// reads this and either:
+//   - shows a consent screen with the grantable scopes + a remember
+//     checkbox (when auto_approved=false), OR
+//   - immediately navigates the browser to redirect_to (when auto_approved=
+//     true; happens when the user previously remembered consent for this
+//     same client+application+scopeset).
+//
+// rejected_scopes is informational only — surfaces "you asked for X but
+// don't have it" so the consent UI can show a tooltip. The dance proceeds
+// with grantable_scopes only; rejected scopes never make it into the token.
+type ConsentPageDataResponse struct {
+	Success           bool              `json:"success"`
+	ConsentChallenge  string            `json:"consent_challenge"`
+	AutoApproved      bool              `json:"auto_approved"`
+	RedirectTo        string            `json:"redirect_to,omitempty"` // set when AutoApproved=true OR after POST
+	ApplicationID     *uuid.UUID        `json:"application_id,omitempty"`
+	ApplicationName   string            `json:"application_name,omitempty"`
+	ResourceURI       string            `json:"resource_uri,omitempty"`
+	ClientID          string            `json:"client_id,omitempty"`
+	Subject           string            `json:"subject,omitempty"`
+	RequestedScopes   []string          `json:"requested_scopes,omitempty"`
+	GrantableScopes   []string          `json:"grantable_scopes,omitempty"`
+	RejectedScopes    map[string]string `json:"rejected_scopes,omitempty"` // scope -> reason
+	Error             string            `json:"error,omitempty"`
+	Submit            ConsentSubmitURLs `json:"submit"`
+}
+
+// ConsentSubmitURLs tells the UI where to POST consent decisions.
+type ConsentSubmitURLs struct {
+	Accept string `json:"accept"`
+	Reject string `json:"reject"`
+}
+
+// GetConsentPageData handles GET /authsec/oauth/v2/consent?consent_challenge=...
+//
+// Flow:
+//
+//  1. Read consent_challenge from query.
+//  2. Call Hydra GET /requests/consent to fetch metadata (subject, client,
+//     requested scopes, audience).
+//  3. Resolve the auth_request_context row by walking authsec_ctx in
+//     request_url (same pattern as /login/page-data). Bind
+//     consent_challenge to the row.
+//  4. Load the Application; compute grantable scopes via
+//     BindingService.ResolveGrantableScopes (3-way intersection).
+//  5. Look up an existing oauth_consent_grants row for this
+//     (user, client, application). If found AND its granted_scopes is
+//     a superset of grantable scopes, auto-approve: call
+//     finalizeConsent immediately and return RedirectTo. UI just navigates.
+//  6. Otherwise return ConsentPageDataResponse with AutoApproved=false
+//     and Grantable/Rejected scopes for the UI to render.
+func (ctrl *LoginV2Controller) GetConsentPageData(c *gin.Context) {
+	consentChallenge := c.Query("consent_challenge")
+	if consentChallenge == "" {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "consent_challenge required",
+		})
+		return
+	}
+
+	consentReq, err := ctrl.hydraLogin.GetConsentRequest(consentChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "consent_challenge invalid or expired",
+		})
+		return
+	}
+
+	// Resolve auth_request_context. The consent challenge's request_url
+	// is the same /oauth2/auth URL Hydra received — it still has
+	// authsec_ctx on it.
+	contextID := extractAuthsecCtx(consentReq.RequestURL)
+	if contextID == "" {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "authsec_ctx missing — dance not initiated via /authsec/oauth/v2/authorize",
+		})
+		return
+	}
+	if len(consentReq.Client.Audience) == 0 {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "no resource bound to client",
+		})
+		return
+	}
+	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(consentReq.Client.Audience[0])
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "Application not found for resource",
+		})
+		return
+	}
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ConsentPageDataResponse{
+			Success: false, Error: "tenant db unavailable",
+		})
+		return
+	}
+	var arcRow models.AuthRequestContext
+	if err := tenantDB.Where("context_id = ? AND tenant_id = ?", contextID, tenantID).
+		First(&arcRow).Error; err != nil {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "auth context not found",
+		})
+		return
+	}
+	if arcRow.Consumed {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "auth context already consumed",
+		})
+		return
+	}
+
+	// Bind consent_challenge to the row so POST can find it.
+	if err := tenantDB.Model(&arcRow).
+		Update("consent_challenge", consentChallenge).Error; err != nil {
+		log.Printf("[consent-v2] failed to bind consent_challenge ctx=%s: %v", contextID, err)
+	}
+
+	// Parse subject — must be a UUID (set by login complete-local or OIDC).
+	subjectUUID, err := uuid.Parse(consentReq.Subject)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
+			Success: false, Error: "subject is not a valid uuid; non-user tokens cannot use this consent path",
+		})
+		return
+	}
+
+	// 3-way scope intersection.
+	grant, err := ctrl.bindingSvc.ResolveGrantableScopes(
+		tenantID, rs.ID, subjectUUID, consentReq.RequestedScope,
+	)
+	if err != nil {
+		log.Printf("[consent-v2] ResolveGrantableScopes failed ctx=%s: %v", contextID, err)
+		c.JSON(http.StatusInternalServerError, ConsentPageDataResponse{
+			Success: false, Error: "scope resolution failed",
+		})
+		return
+	}
+	if len(grant.Grantable) == 0 {
+		// No scope intersection at all — reject the consent. Hydra
+		// returns a redirect_to back to the client with access_denied.
+		ctrl.rejectConsent(c, consentChallenge, "no grantable scopes", grant)
+		return
+	}
+
+	// Look for a remembered consent grant for this (user, client, app).
+	existing, err := ctrl.consentGrantSvc.LookupActiveGrant(
+		tenantID, subjectUUID, consentReq.Client.ClientID, rs.ID,
+	)
+	if err != nil {
+		log.Printf("[consent-v2] LookupActiveGrant failed: %v", err)
+		// Don't block on this — proceed without auto-approve.
+	}
+	// Auto-approve only if the remembered grant covers EVERY grantable scope.
+	if existing != nil && coversAll(existing.GrantedScopes, grant.Grantable) {
+		redirectTo, ferr := ctrl.finalizeConsent(
+			c, consentChallenge, consentReq, &arcRow, rs, tenantID,
+			grant.Grantable, subjectUUID, false /* don't double-remember */, tenantDB,
+		)
+		if ferr != nil {
+			c.JSON(http.StatusInternalServerError, ConsentPageDataResponse{
+				Success: false, Error: ferr.Error(),
+			})
+			return
+		}
+		c.JSON(http.StatusOK, ConsentPageDataResponse{
+			Success:          true,
+			ConsentChallenge: consentChallenge,
+			AutoApproved:     true,
+			RedirectTo:       redirectTo,
+			ApplicationID:    &rs.ID,
+			ApplicationName:  rs.Name,
+			ResourceURI:      rs.ResourceURI,
+			ClientID:         consentReq.Client.ClientID,
+			Subject:          consentReq.Subject,
+			RequestedScopes:  consentReq.RequestedScope,
+			GrantableScopes:  grant.Grantable,
+			RejectedScopes:   grant.Rejected,
+			Submit:           ctrl.buildConsentSubmitURLs(),
+		})
+		return
+	}
+
+	// Render path: return data for the UI to show the consent screen.
+	c.JSON(http.StatusOK, ConsentPageDataResponse{
+		Success:          true,
+		ConsentChallenge: consentChallenge,
+		AutoApproved:     false,
+		ApplicationID:    &rs.ID,
+		ApplicationName:  rs.Name,
+		ResourceURI:      rs.ResourceURI,
+		ClientID:         consentReq.Client.ClientID,
+		Subject:          consentReq.Subject,
+		RequestedScopes:  consentReq.RequestedScope,
+		GrantableScopes:  grant.Grantable,
+		RejectedScopes:   grant.Rejected,
+		Submit:           ctrl.buildConsentSubmitURLs(),
+	})
+}
+
+// AcceptConsentRequest is the body for POST /consent/accept.
+type AcceptConsentRequestBody struct {
+	ConsentChallenge string   `json:"consent_challenge" binding:"required"`
+	// GrantScope is the user's chosen subset of grantable scopes. The UI
+	// may let the user uncheck some scopes; the backend re-enforces that
+	// every entry must be in the freshly-computed grantable set (otherwise
+	// a malicious UI could request more than the user has).
+	GrantScope []string `json:"grant_scope"`
+	Remember   bool     `json:"remember,omitempty"`
+}
+
+// AcceptConsent handles POST /authsec/oauth/v2/consent/accept. User clicked
+// Approve.
+func (ctrl *LoginV2Controller) AcceptConsent(c *gin.Context) {
+	var req AcceptConsentRequestBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid request body"})
+		return
+	}
+
+	consentReq, err := ctrl.hydraLogin.GetConsentRequest(req.ConsentChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "consent_challenge invalid or expired"})
+		return
+	}
+	contextID := extractAuthsecCtx(consentReq.RequestURL)
+	if contextID == "" || len(consentReq.Client.Audience) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid consent context"})
+		return
+	}
+	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(consentReq.Client.Audience[0])
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Application not found"})
+		return
+	}
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "tenant db unavailable"})
+		return
+	}
+	var arcRow models.AuthRequestContext
+	if err := tenantDB.Where("context_id = ? AND tenant_id = ?", contextID, tenantID).
+		First(&arcRow).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "auth context not found"})
+		return
+	}
+	subjectUUID, err := uuid.Parse(consentReq.Subject)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "subject not a valid uuid"})
+		return
+	}
+
+	// Re-resolve grantable scopes — single source of truth, even if the
+	// UI somehow sent a different list.
+	grant, err := ctrl.bindingSvc.ResolveGrantableScopes(
+		tenantID, rs.ID, subjectUUID, consentReq.RequestedScope,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "scope resolution failed"})
+		return
+	}
+	grantableSet := make(map[string]struct{}, len(grant.Grantable))
+	for _, s := range grant.Grantable {
+		grantableSet[s] = struct{}{}
+	}
+
+	// Filter the user's chosen subset to what's actually grantable.
+	// If they didn't pass GrantScope, grant ALL grantable (UI didn't
+	// surface a picker).
+	var finalGrant []string
+	if len(req.GrantScope) == 0 {
+		finalGrant = grant.Grantable
+	} else {
+		for _, s := range req.GrantScope {
+			if _, ok := grantableSet[strings.TrimSpace(s)]; ok {
+				finalGrant = append(finalGrant, s)
+			}
+		}
+	}
+	if len(finalGrant) == 0 {
+		// User unchecked everything OR didn't have anything grantable.
+		ctrl.rejectConsent(c, req.ConsentChallenge, "user granted no scopes", grant)
+		return
+	}
+
+	redirectTo, ferr := ctrl.finalizeConsent(
+		c, req.ConsentChallenge, consentReq, &arcRow, rs, tenantID,
+		finalGrant, subjectUUID, req.Remember, tenantDB,
+	)
+	if ferr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": ferr.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": redirectTo})
+}
+
+// RejectConsent handles POST /authsec/oauth/v2/consent/reject. User clicked Deny.
+func (ctrl *LoginV2Controller) RejectConsent(c *gin.Context) {
+	var req struct {
+		ConsentChallenge string `json:"consent_challenge" binding:"required"`
+		Reason           string `json:"reason,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid request body"})
+		return
+	}
+	reason := req.Reason
+	if reason == "" {
+		reason = "user denied consent"
+	}
+	resp, err := ctrl.hydraLogin.RejectConsentRequest(req.ConsentChallenge, services.HydraRejectConsentRequest{
+		Error:            "access_denied",
+		ErrorDescription: reason,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": "authorization server unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": resp.RedirectTo})
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Consent helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+// finalizeConsent is the shared accept path called by both auto-approve
+// and explicit POST /accept. Calls Hydra accept-consent with the final
+// grant set + session claims, marks the auth_request_context as
+// consent_completed, and optionally remembers the grant for next time.
+//
+// Returns Hydra's redirect_to URL.
+//
+// session.access_token.ext.context_id is the critical wire: /oauth/v2/token
+// introspects the freshly-minted access token, pulls context_id from the
+// ext claim, looks up the auth_request_context, validates consent_completed,
+// and consumes the row. Skipping this breaks the token-exchange gate.
+func (ctrl *LoginV2Controller) finalizeConsent(
+	c *gin.Context,
+	consentChallenge string,
+	consentReq *services.HydraConsentRequest,
+	arcRow *models.AuthRequestContext,
+	rs *models.ResourceServer,
+	tenantID string,
+	grantedScopes []string,
+	subjectUUID uuid.UUID,
+	remember bool,
+	tenantDB *gorm.DB,
+) (string, error) {
+	// Build session claims. Both access_token (.ext) and id_token get the
+	// minimum identity payload; the access_token gets the load-bearing
+	// context_id so /token can find the auth_request_context.
+	accessExt := map[string]interface{}{
+		"context_id":         arcRow.ContextID,
+		"resource_server_id": rs.ID.String(),
+		"tenant_id":          tenantID,
+		"auth_time":          time.Now().Unix(),
+	}
+	idTokenClaims := map[string]interface{}{}
+	if consentReq.Context != nil {
+		for _, key := range []string{"email", "name", "username", "provider", "auth_method"} {
+			if v, ok := consentReq.Context[key]; ok {
+				idTokenClaims[key] = v
+			}
+		}
+	}
+
+	rememberFor := 0
+	if remember {
+		// 8 hours — same as login remember default.
+		rememberFor = 8 * 3600
+	}
+
+	acceptResp, err := ctrl.hydraLogin.AcceptConsentRequest(consentChallenge, services.HydraAcceptConsentRequest{
+		GrantScope:               grantedScopes,
+		GrantAccessTokenAudience: []string{rs.ResourceURI},
+		Remember:                 remember,
+		RememberFor:              rememberFor,
+		Session: services.HydraConsentSession{
+			AccessToken: accessExt,
+			IDToken:     idTokenClaims,
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("hydra accept consent: %w", err)
+	}
+
+	// Mark consent_completed on the auth_request_context row. Token exchange
+	// will fail closed if this isn't set.
+	if err := tenantDB.Model(arcRow).Updates(map[string]interface{}{
+		"consent_completed": true,
+		"scope":             strings.Join(grantedScopes, " "),
+	}).Error; err != nil {
+		// We've already told Hydra we accepted — log + continue. The
+		// missing flag will cause /token to fail closed on this exchange,
+		// which is the right (if frustrating) result.
+		log.Printf("[consent-v2] MarkConsentCompleted failed ctx=%s: %v", arcRow.ContextID, err)
+	}
+
+	// Remembered consent grant for next time.
+	if remember {
+		if _, err := ctrl.consentGrantSvc.UpsertGrant(
+			tenantID, subjectUUID, consentReq.Client.ClientID, rs.ID, grantedScopes,
+		); err != nil {
+			// Best-effort log. The current dance succeeds even if we can't
+			// persist for future skip-consent.
+			log.Printf("[consent-v2] UpsertGrant failed ctx=%s: %v", arcRow.ContextID, err)
+		}
+	}
+
+	return acceptResp.RedirectTo, nil
+}
+
+// rejectConsent is the shared reject path. Used by both the GET handler
+// (no grantable scopes) and AcceptConsent (user unchecked everything).
+func (ctrl *LoginV2Controller) rejectConsent(c *gin.Context, consentChallenge, reason string, grant *services.GrantableScopesResult) {
+	resp, err := ctrl.hydraLogin.RejectConsentRequest(consentChallenge, services.HydraRejectConsentRequest{
+		Error:            "access_denied",
+		ErrorDescription: reason,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": "authorization server unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, ConsentPageDataResponse{
+		Success:          true,
+		AutoApproved:     false,
+		RedirectTo:       resp.RedirectTo,
+		Error:            reason,
+		GrantableScopes:  []string{},
+		RejectedScopes:   grant.Rejected,
+	})
+}
+
+// buildConsentSubmitURLs mirrors the login submit-URLs helper.
+func (ctrl *LoginV2Controller) buildConsentSubmitURLs() ConsentSubmitURLs {
+	base := strings.TrimSuffix(config.AppConfig.OAuthBaseURL, "/")
+	if base == "" {
+		base = "https://authsec-oauth-base-url-not-configured.invalid"
+	}
+	return ConsentSubmitURLs{
+		Accept: base + "/authsec/oauth/v2/consent/accept",
+		Reject: base + "/authsec/oauth/v2/consent/reject",
+	}
+}
+
+// coversAll reports whether `granted` contains every element of `required`.
+// Used to decide whether a remembered consent grant covers the current
+// grantable set — if yes, auto-approve.
+func coversAll(granted []string, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	g := make(map[string]struct{}, len(granted))
+	for _, s := range granted {
+		g[s] = struct{}{}
+	}
+	for _, r := range required {
+		if _, ok := g[r]; !ok {
+			return false
+		}
+	}
+	return true
 }

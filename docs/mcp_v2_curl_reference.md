@@ -279,6 +279,139 @@ Tells Hydra to abort the dance. Hydra returns a redirect_to that ends at
 the client's redirect_uri with error=access_denied, so the calling
 application can show "login cancelled."
 
+### Consent page-data (Session 3 of login port)
+
+Hydra redirects to /consent?consent_challenge=... after accept-login.
+The (separate) UI calls this to fetch the consent screen data.
+
+```bash
+curl -s "$AUTHSEC/authsec/oauth/v2/consent?consent_challenge=<challenge>"
+```
+
+Two response shapes:
+
+**Auto-approved** (user previously chose "remember consent" for this
+client + application, and the remembered grant covers every grantable
+scope):
+```json
+{
+  "success": true,
+  "consent_challenge": "<challenge>",
+  "auto_approved": true,
+  "redirect_to": "<client redirect_uri>?code=...&state=...",
+  ...
+}
+```
+The UI just navigates the browser to redirect_to. No consent screen.
+
+**Render path** (no remembered grant, OR remembered grant doesn't cover):
+```json
+{
+  "success": true,
+  "consent_challenge": "<challenge>",
+  "auto_approved": false,
+  "application_name": "MCP Demo",
+  "client_id": "<uuid>",
+  "subject": "<user uuid>",
+  "requested_scopes": ["openid","offline_access","mcp_demo.read","mcp_demo.write"],
+  "grantable_scopes": ["openid","offline_access","mcp_demo.read"],
+  "rejected_scopes": { "mcp_demo.write": "not_bound" },
+  "submit": {
+    "accept": "https://.../authsec/oauth/v2/consent/accept",
+    "reject": "https://.../authsec/oauth/v2/consent/reject"
+  }
+}
+```
+
+The 3-way intersection is shown:
+- `requested_scopes` — what the client asked for at /authorize
+- `grantable_scopes` — requested ∩ Application's registered ∩ user's
+  effective via bindings (this is what the UI offers)
+- `rejected_scopes` — requested but not grantable, with a reason per scope:
+  `not_registered` (not in Application's `oauth_scopes`),
+  `not_bound` (user has no role granting it),
+
+OIDC core scopes (openid/profile/email/address/phone/offline_access)
+pass through without RBAC check; they shape ID token claims, not access.
+
+### Consent accept (Session 3)
+
+User clicked Approve.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/consent/accept" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consent_challenge": "<challenge>",
+    "grant_scope": ["openid","offline_access","mcp_demo.read"],
+    "remember": true
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?code=...&state=..." }
+```
+
+Re-enforces 3-way intersection — any scope the UI sends that isn't in
+the freshly-computed grantable set is silently dropped. Cannot escalate
+beyond what the user actually has.
+
+`remember: true` writes an `oauth_consent_grants` row so future /authorize
+for (user, client, application) auto-approves. Stored grant is the exact
+scope subset the user approved — not the broader "grantable" set.
+
+Side effects on accept:
+- `auth_request_context.consent_completed = true` (token-exchange gate
+  opens; without this, /token returns 403)
+- `auth_request_context.scope` set to the joined granted scopes
+- Hydra session `access_token.ext.context_id = <ctx>` — the load-bearing
+  bridge for /introspect's RBAC filter to find the row
+- (if remember) `oauth_consent_grants` row upserted
+
+### Consent reject (Session 3)
+
+User clicked Deny.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/consent/reject" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consent_challenge": "<challenge>",
+    "reason": "User denied scope"
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?error=access_denied&..." }
+```
+
+---
+
+## After Session 3 — full v2 dance is testable
+
+With Sessions 1+2+3 deployed, the curl runbook from earlier sessions
+finally connects end-to-end for **custom-login users**:
+
+1. `POST /authsec/oauth/v2/register` — DCR a client
+2. Browser: `GET /authsec/oauth/v2/authorize?...` — redirects to Hydra
+3. Hydra emits login_challenge → UI calls `GET /login/page-data`
+4. UI: `POST /login/complete-local` with email+password
+5. Browser follows redirect_to → Hydra emits consent_challenge
+6. UI calls `GET /consent` (or auto-approves)
+7. UI: `POST /consent/accept` with chosen scopes
+8. Browser lands at client redirect_uri with ?code=...
+9. Client: `POST /authsec/oauth/v2/token` with code+verifier
+10. Client: `POST /authsec/oauth/v2/introspect` — gets RBAC-filtered scope
+
+The introspect filter (commit 2d9f8ae) narrows further if a binding was
+revoked between token issuance and introspect call — that's the live
+RBAC enforcement.
+
+Sessions 4 (OIDC) + 5 (SAML) + 6 (polish) add federated paths; they're
+not required for custom-login dance.
+
 ---
 
 ## Section 2 — Applications admin (JWT, requires tenant_id claim)

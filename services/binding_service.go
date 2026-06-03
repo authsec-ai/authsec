@@ -405,6 +405,119 @@ func (s *BindingService) EffectiveScopesForSubject(
 	return scopes, true, nil
 }
 
+// GrantableScopesResult is what ResolveGrantableScopes returns. Grantable
+// is the narrowed set the consent handler will offer to the user / show
+// in the consent screen. Reasons explains rejections per requested scope
+// so the consent UI / logs can surface "why" feedback.
+type GrantableScopesResult struct {
+	// Grantable is the user-facing list: requested ∩ application's
+	// scopes_supported ∩ user's effective scopes via bindings.
+	Grantable []string
+	// Rejected lists requested scopes that DIDN'T make it through, with
+	// a single-word reason: "not_registered" (not in scopes_supported),
+	// "not_bound" (user has no role granting it), "oidc_core_passthrough"
+	// (OIDC core scopes like openid/profile/email aren't subject to RBAC
+	// and pass through if requested — listed here for transparency, not
+	// rejection).
+	Rejected map[string]string
+}
+
+// IsOIDCCoreScope reports whether a scope is one of the OIDC core scopes
+// that aren't subject to RBAC enforcement. The consent flow lets these
+// through automatically; they're claims-shaping, not access-gating.
+func IsOIDCCoreScope(scope string) bool {
+	switch scope {
+	case "openid", "profile", "email", "address", "phone", "offline_access":
+		return true
+	}
+	return false
+}
+
+// ResolveGrantableScopes computes the 3-way intersection used by the
+// consent handler:
+//
+//	(requested by client at /authorize) ∩
+//	(registered in oauth_scopes for this Application) ∩
+//	(user actually has via bindings → roles → grants)
+//
+// OIDC core scopes (openid, profile, email, address, phone, offline_access)
+// pass through without RBAC check — they're claims-shaping, not access
+// control.
+//
+// Fail-closed: any error returns an empty Grantable. The consent UI MUST
+// reject consent when Grantable is empty (we don't auto-approve a blank
+// grant).
+func (s *BindingService) ResolveGrantableScopes(
+	tenantID string,
+	applicationID, userID uuid.UUID,
+	requestedScopes []string,
+) (*GrantableScopesResult, error) {
+	out := &GrantableScopesResult{
+		Grantable: []string{},
+		Rejected:  map[string]string{},
+	}
+	if len(requestedScopes) == 0 {
+		return out, nil
+	}
+
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return out, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	// 1. Load the Application's registered scopes (oauth_scopes table).
+	var registered []string
+	if err := tenantDB.Table("oauth_scopes").
+		Select("scope_string").
+		Where("application_id = ? AND tenant_id = ?", applicationID, tenantID).
+		Pluck("scope_string", &registered).Error; err != nil {
+		return out, fmt.Errorf("load registered scopes: %w", err)
+	}
+	registeredSet := make(map[string]struct{}, len(registered))
+	for _, s := range registered {
+		registeredSet[s] = struct{}{}
+	}
+
+	// 2. Load the user's effective scopes (bindings → roles → grants → scopes).
+	effective, isUser, err := s.EffectiveScopesForSubject(tenantID, applicationID, userID.String())
+	if err != nil {
+		return out, fmt.Errorf("resolve effective: %w", err)
+	}
+	if !isUser {
+		// Subject wasn't a user — shouldn't happen in the consent flow
+		// (consent is always user-initiated), but defensive.
+		return out, fmt.Errorf("subject is not a user")
+	}
+	effectiveSet := make(map[string]struct{}, len(effective))
+	for _, s := range effective {
+		effectiveSet[s] = struct{}{}
+	}
+
+	// 3. Walk requested scopes and gate each.
+	for _, req := range requestedScopes {
+		req = strings.TrimSpace(req)
+		if req == "" {
+			continue
+		}
+		if IsOIDCCoreScope(req) {
+			// Pass through. Doesn't grant any application access; just
+			// shapes the id_token claims.
+			out.Grantable = append(out.Grantable, req)
+			continue
+		}
+		if _, ok := registeredSet[req]; !ok {
+			out.Rejected[req] = "not_registered"
+			continue
+		}
+		if _, ok := effectiveSet[req]; !ok {
+			out.Rejected[req] = "not_bound"
+			continue
+		}
+		out.Grantable = append(out.Grantable, req)
+	}
+	return out, nil
+}
+
 // EffectiveAccessRole is one role contributing to a user's effective access.
 type EffectiveAccessRole struct {
 	RoleID       uuid.UUID `json:"role_id"`

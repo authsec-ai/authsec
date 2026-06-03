@@ -259,6 +259,12 @@ func SetupRoutes(
 			oauthV2.GET("/login/page-data", loginV2Controller.GetLoginPageData)
 			oauthV2.POST("/login/complete-local", loginV2Controller.CompleteCustomLogin)
 			oauthV2.POST("/login/reject", loginV2Controller.RejectLogin)
+
+			// Consent challenge surface — session 3. Same public pattern
+			// as login (the consent_challenge IS the auth context, Hydra signs).
+			oauthV2.GET("/consent", loginV2Controller.GetConsentPageData)
+			oauthV2.POST("/consent/accept", loginV2Controller.AcceptConsent)
+			oauthV2.POST("/consent/reject", loginV2Controller.RejectConsent)
 		}
 
 		// Tenant-scoped Application registry (resource_servers rows).
