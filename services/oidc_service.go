@@ -206,6 +206,30 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 		return nil, nil, fmt.Errorf("failed to get user info: %w", err)
 	}
 
+	// If userinfo didn't return sub/email (e.g. v1 userinfo endpoint or missing
+	// openid scope), fall back to the id_token JWT claims. The id_token is
+	// issued directly by Google over HTTPS so we trust its payload without
+	// re-verifying the signature here.
+	if (userInfo.Sub == "" || userInfo.Email == "") && tokens.IDToken != "" {
+		if claims, parseErr := parseIDTokenClaims(tokens.IDToken); parseErr == nil {
+			if userInfo.Sub == "" {
+				userInfo.Sub = claims.Sub
+			}
+			if userInfo.Email == "" {
+				userInfo.Email = claims.Email
+			}
+			if !userInfo.EmailVerified {
+				userInfo.EmailVerified = claims.EmailVerified
+			}
+			if userInfo.Name == "" {
+				userInfo.Name = claims.Name
+			}
+			log.Printf("DEBUG HandleCallback: filled missing userinfo fields from id_token sub=%q email=%q", userInfo.Sub, userInfo.Email)
+		} else {
+			log.Printf("DEBUG HandleCallback: id_token parse failed: %v", parseErr)
+		}
+	}
+
 	// Delete used state
 	if err := s.stateRepo.DeleteState(input.State); err != nil {
 		log.Printf("Warning: failed to delete OIDC state: %v", err)
@@ -485,6 +509,8 @@ func (s *OIDCService) getUserInfo(provider *models.OIDCProvider, accessToken str
 		return nil, fmt.Errorf("userinfo request failed with status %d", resp.StatusCode)
 	}
 
+	log.Printf("DEBUG getUserInfo: provider=%q url=%q raw_body=%s", provider.ProviderName, provider.UserinfoURL, string(body))
+
 	// Parse response based on provider
 	var userInfo models.OIDCUserInfo
 	switch provider.ProviderName {
@@ -498,6 +524,7 @@ func (s *OIDCService) getUserInfo(provider *models.OIDCProvider, accessToken str
 		return nil, fmt.Errorf("failed to parse userinfo response: %w", err)
 	}
 
+	log.Printf("DEBUG getUserInfo: parsed sub=%q email=%q email_verified=%v", userInfo.Sub, userInfo.Email, userInfo.EmailVerified)
 	return &userInfo, nil
 }
 
@@ -537,6 +564,34 @@ func (s *OIDCService) getClientSecret(vaultPath string) (string, error) {
 // ========================================
 
 // generateSecureToken generates a cryptographically secure random token
+// idTokenClaims holds the fields we care about from a JWT id_token payload.
+type idTokenClaims struct {
+	Sub           string `json:"sub"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Name          string `json:"name"`
+}
+
+// parseIDTokenClaims decodes the payload of a JWT id_token without verifying
+// the signature. Safe to call when the token was received directly from the
+// provider's token endpoint over HTTPS (the transport already proves
+// authenticity).
+func parseIDTokenClaims(idToken string) (*idTokenClaims, error) {
+	parts := strings.SplitN(idToken, ".", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("id_token is not a valid JWT (expected 3 parts, got %d)", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("id_token payload base64 decode: %w", err)
+	}
+	var claims idTokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("id_token payload JSON: %w", err)
+	}
+	return &claims, nil
+}
+
 func generateSecureToken(length int) (string, error) {
 	bytes := make([]byte, length)
 	if _, err := rand.Read(bytes); err != nil {
