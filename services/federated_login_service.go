@@ -109,15 +109,14 @@ func (s *FederatedLoginService) InitiateOIDC(in InitiateOIDCInput) (*InitiateOID
 		return nil, fmt.Errorf("invalid oidc config_ref: %w", err)
 	}
 	var oidcRow struct {
-		ID               uuid.UUID
-		ProviderName     string
-		ClientID         string
-		AuthorizationURL string
-		Scopes           string
-		RedirectURI      string
+		ID               uuid.UUID `gorm:"column:id"`
+		ProviderName     string    `gorm:"column:provider_name"`
+		ClientID         string    `gorm:"column:client_id"`
+		AuthorizationURL string    `gorm:"column:authorization_url"`
+		Scopes           string    `gorm:"column:scopes"`
 	}
 	if err := tenantDB.Table("oidc_providers").
-		Select("id, provider_name, client_id, authorization_url, scopes, COALESCE(redirect_uri,'') AS redirect_uri").
+		Select("id, provider_name, client_id, authorization_url, scopes").
 		Where("id = ?", configUUID).
 		First(&oidcRow).Error; err != nil {
 		return nil, fmt.Errorf("load oidc_providers config: %w", err)
@@ -158,11 +157,10 @@ func (s *FederatedLoginService) InitiateOIDC(in InitiateOIDCInput) (*InitiateOID
 		return nil, fmt.Errorf("store oidc_states: %w", err)
 	}
 
-	// 5. Build upstream URL.
+	// 5. Build upstream URL. callbackURL is always the AuthSec backend's
+	// /login/oidc/callback — oidc_providers doesn't carry a per-provider
+	// redirect URI on this schema (it's a platform-level provider config).
 	callbackURL := in.CallbackURL
-	if oidcRow.RedirectURI != "" {
-		callbackURL = oidcRow.RedirectURI
-	}
 	scopes := oidcRow.Scopes
 	if scopes == "" {
 		scopes = "openid email profile"
