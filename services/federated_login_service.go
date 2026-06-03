@@ -334,30 +334,32 @@ func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// SAML
+// SAML — thin wrappers over the legacy hydra OAuthLoginService so we don't
+// duplicate the ~600 lines of XML parsing, signature handling, RelayState
+// encoding, and saml_requests persistence that already work in the legacy
+// /uflow/saml path. The v2 surface differs in three ways:
+//
+//  1. We thread Hydra's login_challenge (instead of generating our own).
+//  2. We carry application_id (resource_server_id) so per-MCP scoping works.
+//  3. After ValidateSAMLResponse we call our v2 resolveOrJITFederatedUser
+//     instead of legacy's resolution path — keeps federated SAML users
+//     anchored to the same MCP-scoped users + oidc_user_identities rows
+//     as federated OIDC users.
+//
+// Caveats inherited from the legacy implementation:
+//   - The legacy CreateSAMLRequest signs the SAMLRequest with the SP cert
+//     only when the IdP requires it; bare unsigned requests work with most
+//     IdPs. Signature *verification* on the SAMLResponse is performed
+//     against the saml_providers.certificate column (legacy code path).
+//   - SAML providers live in tenant.saml_providers (created at tenant
+//     bootstrap, see tenant/000_tenant_template.sql). They are keyed by
+//     (tenant_id, client_id, provider_name) — note the client_id
+//     dimension: legacy treats each clients row as a distinct SP. For
+//     the v2 federated flow we resolve client_id from the tenant's first
+//     active clients row (same anchor used by JIT user creation above).
 // ─────────────────────────────────────────────────────────────────────────
 
-// SAML on this backport is intentionally narrower than OIDC: we accept the
-// SP-initiated POST from /login/saml/initiate, build a SAMLRequest with a
-// generic NameIDPolicy + AssertionConsumerService binding, store state,
-// and return the RelayState URL the UI navigates to.
-//
-// The ACS handler at /login/saml/acs accepts the SAMLResponse POST,
-// verifies signature against the saml_providers row's certificate, extracts
-// NameID + attributes, and runs the same identity-resolution path as OIDC.
-//
-// Full SAML support requires a SAML XML library (the dev branch uses
-// crewjam/saml). The backport's go.mod doesn't currently have it. Rather
-// than pulling in a 12k-line XML SAML implementation here, this commit
-// stubs the SAML initiate/ACS to return 501 with a clear "SAML federated
-// login is not yet supported on this backend" message. Sessions can
-// re-enable it by adding the crewjam/saml dependency + filling in the
-// stubs. The route shape, request bodies, and JSON responses match what
-// a full implementation would emit, so the consuming UI doesn't need to
-// change when SAML lands.
-
-// InitiateSAMLInput / HandleSAMLACSInput are placeholders for the
-// not-yet-implemented SAML flow.
+// InitiateSAMLInput is what the controller passes in.
 type InitiateSAMLInput struct {
 	TenantID           string
 	ApplicationID      uuid.UUID
@@ -373,9 +375,49 @@ type InitiateSAMLResponse struct {
 	SAMLRequest    string // base64-encoded — the UI POSTs this to the IdP
 }
 
-// InitiateSAML returns 501 for now. See package doc above.
+// ResolveSAMLProviderForApplication validates the IdP whitelist and returns
+// the (tenant_db, identity_providers row, saml_provider config_ref UUID)
+// the controller needs to build the AuthnRequest. Controller drives the
+// actual legacy SAML library call to avoid the services ↔ internal/hydra
+// import cycle.
+func (s *FederatedLoginService) ResolveSAMLProviderForApplication(in InitiateSAMLInput) (*gorm.DB, *models.IdentityProvider, uuid.UUID, error) {
+	tenantDB, err := config.GetTenantGORMDB(in.TenantID)
+	if err != nil {
+		return nil, nil, uuid.Nil, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	var idp models.IdentityProvider
+	if err := tenantDB.Where("id = ? AND tenant_id = ? AND status = ?",
+		in.IdentityProviderID, in.TenantID, "configured").First(&idp).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, uuid.Nil, errors.New("identity provider not found or not configured")
+		}
+		return nil, nil, uuid.Nil, err
+	}
+	if idp.ProviderType != models.IdentityProviderSAML {
+		return nil, nil, uuid.Nil, errors.New("identity provider is not SAML")
+	}
+	allowed, err := s.idpAllowedForApplication(tenantDB, in.TenantID, in.ApplicationID, in.IdentityProviderID)
+	if err != nil {
+		return nil, nil, uuid.Nil, err
+	}
+	if !allowed {
+		return nil, nil, uuid.Nil, errors.New("identity provider not enabled for this application")
+	}
+
+	configUUID, err := uuid.Parse(idp.ConfigRef)
+	if err != nil {
+		return nil, nil, uuid.Nil, fmt.Errorf("invalid saml config_ref: %w", err)
+	}
+	return tenantDB, &idp, configUUID, nil
+}
+
+// InitiateSAML is intentionally stubbed at the service layer. The controller
+// drives SAML directly so we can import the legacy OAuthLoginService without
+// an import cycle (services ← internal/hydra/models ← services). See
+// LoginV2Controller.InitiateSAML.
 func (s *FederatedLoginService) InitiateSAML(in InitiateSAMLInput) (*InitiateSAMLResponse, error) {
-	return nil, errors.New("SAML federated login is not yet supported on the prod-mcp-v2 backend; use OIDC or custom-login")
+	return nil, errors.New("InitiateSAML at the service layer is a placeholder; the controller orchestrates SAML to avoid an import cycle")
 }
 
 type HandleSAMLACSInput struct {
@@ -394,9 +436,40 @@ type HandleSAMLACSResult struct {
 	AuthMethod     string // "saml_federated"
 }
 
-// HandleSAMLACS returns 501 for now. See package doc above.
+// HandleSAMLACS is intentionally stubbed at the service layer for the same
+// import-cycle reason as InitiateSAML. See LoginV2Controller.CallbackSAML.
 func (s *FederatedLoginService) HandleSAMLACS(in HandleSAMLACSInput) (*HandleSAMLACSResult, error) {
-	return nil, errors.New("SAML federated login is not yet supported on the prod-mcp-v2 backend; use OIDC or custom-login")
+	return nil, errors.New("HandleSAMLACS at the service layer is a placeholder; the controller orchestrates SAML to avoid an import cycle")
+}
+
+// ResolveOrJITFederatedUserBasic is the exported wrapper the SAML
+// controller calls. It takes the assertion's NameID, email, and name (the
+// minimal subset our JIT/email-match path needs) and runs through the same
+// user-resolution path as OIDC.
+//
+// Exported so login_v2_controller can drive the legacy SAML library and
+// then route the result through our v2 JIT path without the services
+// package needing to import internal/hydra/models.
+func (s *FederatedLoginService) ResolveOrJITFederatedUserBasic(
+	tenantDB *gorm.DB,
+	tenantUUID uuid.UUID,
+	resourceServerID uuid.UUID,
+	providerName, sub, email, name string,
+) (uuid.UUID, string, string, error) {
+	if name == "" {
+		name = email
+	}
+	info := &federatedUserInfo{
+		Sub:           sub,
+		Email:         email,
+		EmailVerified: true,
+		Name:          name,
+	}
+	user, err := s.resolveOrJITFederatedUser(tenantDB, tenantUUID, resourceServerID, providerName, info)
+	if err != nil {
+		return uuid.Nil, "", "", err
+	}
+	return user.ID, user.Email, user.Name, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────
