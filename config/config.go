@@ -111,6 +111,21 @@ type Config struct {
 	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
 	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
 
+	// OAuthBaseURL is the canonical public URL of the AuthSec backend that
+	// serves the /authsec/oauth/v2/* surface. Used by CanonicalIssuerOnly
+	// middleware to redirect non-canonical-host traffic AND by the well-known
+	// metadata builders to emit the correct `issuer` and endpoint URLs.
+	//
+	// Must point at the host where THIS backend serves the v2 OAuth handlers,
+	// NOT at Hydra. On single-host deployments this is the same as the admin
+	// API host. On multi-host deployments (e.g. prod.api.authsec.ai for admin
+	// + auth.prod.authsec.ai for v2 OAuth) this is the OAuth host.
+	//
+	// If empty, CanonicalIssuerOnly is a no-op (no redirects) and the
+	// well-knowns fall back to the request host. Set via env
+	// AUTHSEC_OAUTH_BASE_URL.
+	OAuthBaseURL string
+
 	// SDK-Manager migration (all optional)
 	OAuthAuthURL             string // OAuth authorization endpoint
 	OAuthTokenURL            string // OAuth token exchange endpoint
@@ -252,6 +267,10 @@ func LoadConfig() *Config {
 	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
 	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
 	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
+	// AUTHSEC_OAUTH_BASE_URL — public URL of this backend's /authsec/oauth/v2
+	// surface. Empty = no canonical-issuer enforcement. See OAuthBaseURL
+	// field doc on Config struct.
+	oAuthBaseURL := getEnv("AUTHSEC_OAUTH_BASE_URL", "")
 
 	// SDK-Manager migration config (all optional)
 	oauthAuthURL := getEnv("OAUTH_AUTH_URL", "")
@@ -342,6 +361,7 @@ func LoadConfig() *Config {
 		HydraPublicURL:          hydraPublicURL,
 		ReactAppURL:             reactAppURL,
 		IdentityProviderURL:     identityProviderURL,
+		OAuthBaseURL:            oAuthBaseURL,
 
 		// SDK-Manager migration
 		OAuthAuthURL:                  oauthAuthURL,

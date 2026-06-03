@@ -1,0 +1,812 @@
+package services
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/models"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// FederatedLoginService is the lean tenant-scoped OIDC+SAML federated
+// login surface for the prod-mcp-v2 backport. Two operations per
+// protocol: initiate (mint state + build upstream auth URL) and callback
+// (validate state + exchange code/assertion at upstream + resolve to
+// AuthSec users.id + return claims).
+//
+// The actual Hydra accept-login call happens in the LoginV2Controller —
+// this service just produces the user identity + login_challenge pair
+// the controller needs.
+//
+// Backport-lean equivalent of dev's services/oidc_service.go (~600 lines)
+// and the SAML side of hmgr_controller.go (~200 lines). We strip:
+//   - Multiple Action types (login, register, discover, hydra_login).
+//     This is hydra_login only — the v2 surface doesn't have a self-serve
+//     register flow.
+//   - Signed-state verification (dev has HMAC signing for cross-host
+//     state). Backport runs single-host; the state token's
+//     opaque randomness is sufficient CSRF protection.
+//   - Discovery mode for tenant_domain resolution. We always know which
+//     tenant from the auth_request_context.
+type FederatedLoginService struct {
+	httpClient *http.Client
+}
+
+func NewFederatedLoginService() *FederatedLoginService {
+	return &FederatedLoginService{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// InitiateOIDCInput is what the controller passes in.
+type InitiateOIDCInput struct {
+	TenantID          string
+	ApplicationID    uuid.UUID
+	IdentityProviderID uuid.UUID
+	LoginChallenge    string
+	ContextID         string
+	CallbackURL       string // the absolute URL to /login/oidc/callback we want upstream to redirect to
+}
+
+// InitiateOIDCResponse: where to send the browser + the state we minted.
+type InitiateOIDCResponse struct {
+	UpstreamAuthURL string
+	State           string
+}
+
+// InitiateOIDC builds the upstream provider's authorize URL. Steps:
+//
+//  1. Resolve identity_providers row; verify it's OIDC + configured.
+//  2. Resolve the oidc_providers config row via config_ref.
+//  3. Apply the per-Application IDP whitelist gate (matches the existing
+//     pattern in Authorize and login/page-data).
+//  4. Mint state_token + code_verifier; persist oidc_states row carrying
+//     login_challenge for the callback to recover.
+//  5. Build the upstream authorization URL with code_challenge (S256) +
+//     redirect_uri pointed at our /login/oidc/callback.
+func (s *FederatedLoginService) InitiateOIDC(in InitiateOIDCInput) (*InitiateOIDCResponse, error) {
+	tenantDB, err := config.GetTenantGORMDB(in.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	// 1. Resolve identity_providers row.
+	var idp models.IdentityProvider
+	if err := tenantDB.Where("id = ? AND tenant_id = ? AND status = ?",
+		in.IdentityProviderID, in.TenantID, "configured").First(&idp).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("identity provider not found or not configured")
+		}
+		return nil, err
+	}
+	if idp.ProviderType != models.IdentityProviderOIDC {
+		return nil, errors.New("identity provider is not OIDC")
+	}
+
+	// 2. Per-Application policy gate (default-allow when no policy rows).
+	allowed, err := s.idpAllowedForApplication(tenantDB, in.TenantID, in.ApplicationID, in.IdentityProviderID)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, errors.New("identity provider not enabled for this application")
+	}
+
+	// 3. Resolve underlying oidc_providers config.
+	configUUID, err := uuid.Parse(idp.ConfigRef)
+	if err != nil {
+		return nil, fmt.Errorf("invalid oidc config_ref: %w", err)
+	}
+	var oidcRow struct {
+		ID               uuid.UUID `gorm:"column:id"`
+		ProviderName     string    `gorm:"column:provider_name"`
+		ClientID         string    `gorm:"column:client_id"`
+		AuthorizationURL string    `gorm:"column:authorization_url"`
+		Scopes           string    `gorm:"column:scopes"`
+	}
+	if err := tenantDB.Table("oidc_providers").
+		Select("id, provider_name, client_id, authorization_url, scopes").
+		Where("id = ?", configUUID).
+		First(&oidcRow).Error; err != nil {
+		return nil, fmt.Errorf("load oidc_providers config: %w", err)
+	}
+
+	// 4. Mint state + PKCE.
+	randomToken, err := federatedRandomToken(32)
+	if err != nil {
+		return nil, fmt.Errorf("state token: %w", err)
+	}
+	codeVerifier, err := federatedRandomToken(64)
+	if err != nil {
+		return nil, fmt.Errorf("code verifier: %w", err)
+	}
+	codeChallenge := pkceS256Challenge(codeVerifier)
+
+	tenantUUID, err := uuid.Parse(in.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id: %w", err)
+	}
+	// State sent upstream encodes tenant so callback can pick the right DB
+	// without a master-side index. DB-side we still store just the random
+	// half in state_token (unique-indexed).
+	wireState := buildStateToken(tenantUUID, randomToken)
+
+	stateRow := models.OIDCState{
+		StateToken:     randomToken,
+		TenantID:       &tenantUUID,
+		TenantDomain:   "", // not used on backport — we resolve via auth_request_context
+		ProviderName:   oidcRow.ProviderName,
+		Action:         "hydra_login",
+		CodeVerifier:   codeVerifier,
+		ApplicationID:  &in.ApplicationID,
+		LoginChallenge: in.LoginChallenge,
+		ExpiresAt:      time.Now().Add(15 * time.Minute),
+	}
+	if err := tenantDB.Create(&stateRow).Error; err != nil {
+		return nil, fmt.Errorf("store oidc_states: %w", err)
+	}
+
+	// 5. Build upstream URL. callbackURL is always the AuthSec backend's
+	// /login/oidc/callback — oidc_providers doesn't carry a per-provider
+	// redirect URI on this schema (it's a platform-level provider config).
+	callbackURL := in.CallbackURL
+	scopes := oidcRow.Scopes
+	if scopes == "" {
+		scopes = "openid email profile"
+	}
+	params := url.Values{}
+	params.Set("client_id", oidcRow.ClientID)
+	params.Set("redirect_uri", callbackURL)
+	params.Set("response_type", "code")
+	params.Set("scope", scopes)
+	params.Set("state", wireState)
+	params.Set("code_challenge", codeChallenge)
+	params.Set("code_challenge_method", "S256")
+	// Provider-specific extras: Google wants access_type=offline for refresh tokens.
+	if oidcRow.ProviderName == "google" {
+		params.Set("access_type", "offline")
+		params.Set("prompt", "select_account")
+	}
+	authURL := oidcRow.AuthorizationURL + "?" + params.Encode()
+
+	return &InitiateOIDCResponse{
+		UpstreamAuthURL: authURL,
+		State:           wireState,
+	}, nil
+}
+
+// HandleOIDCCallbackInput is what the controller passes after upstream
+// redirects to our callback URL.
+type HandleOIDCCallbackInput struct {
+	State       string
+	Code        string
+	CallbackURL string // same one we sent upstream, for token exchange
+}
+
+// HandleOIDCCallbackResult is what we return to the controller.
+type HandleOIDCCallbackResult struct {
+	TenantID       string
+	ApplicationID  *uuid.UUID
+	LoginChallenge string
+	UserID         uuid.UUID    // the AuthSec users.id (JIT-created if first time)
+	UserEmail      string
+	UserName       string
+	ProviderName   string
+	AuthMethod     string // "oidc_federated"
+}
+
+// HandleOIDCCallback runs after upstream redirects with ?code=... &state=...
+//
+// Flow:
+//  1. Look up the oidc_states row by state_token across all tenants
+//     (state is a 32-byte random — globally unique). Find which tenant.
+//  2. Verify not expired + not consumed.
+//  3. Exchange code at upstream token endpoint (with code_verifier).
+//  4. Fetch userinfo to get sub + email.
+//  5. Resolve AuthSec users.id via oidc_user_identities; JIT-create if
+//     first time.
+//  6. Return the result so the controller can call Hydra accept-login.
+//  7. Delete the state row (one-shot).
+func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (*HandleOIDCCallbackResult, error) {
+	if in.State == "" || in.Code == "" {
+		return nil, errors.New("state and code required")
+	}
+
+	// 1. Find the state row. We don't know which tenant DB yet — we have
+	// to scan. On real prod with hundreds of tenants this would need a
+	// master-side state→tenant index; for now we walk via the
+	// resource_server_tenant_index (which we already use for resource_uri
+	// lookups) — but state isn't keyed by resource. So actual approach:
+	// state_token is globally random enough that we accept the cost of
+	// looking it up by trying the tenant DBs we know about.
+	//
+	// Pragmatic shortcut for the backport: we encoded tenant_id into the
+	// state via the oidc_states.workspace_id column. We can't read it
+	// without knowing which DB to query. Solution: ask Hydra to round-trip
+	// us through the callback with a server-side cookie OR keep the
+	// tenant_id as part of the state token itself.
+	//
+	// Easiest approach: prefix the state_token with the tenant_id as a
+	// hex-uuid: "<32hex tenant><32hex random>". Server splits and queries
+	// the right DB. Drift-proof and self-contained.
+	tenantID, randomToken, ok := splitStateToken(in.State)
+	if !ok {
+		return nil, errors.New("invalid state format")
+	}
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	var stateRow models.OIDCState
+	if err := tenantDB.Where("state_token = ?", randomToken).First(&stateRow).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("invalid or expired state")
+		}
+		return nil, err
+	}
+	if time.Now().After(stateRow.ExpiresAt) {
+		return nil, errors.New("state expired")
+	}
+
+	// 2. Resolve the provider config.
+	var oidcRow struct {
+		ID                    uuid.UUID
+		ProviderName          string
+		ClientID              string
+		ClientSecret          string `gorm:"column:client_secret"`
+		ClientSecretVaultPath string `gorm:"column:client_secret_vault_path"`
+		TokenURL              string `gorm:"column:token_url"`
+		UserinfoURL           string `gorm:"column:userinfo_url"`
+	}
+	if err := tenantDB.Table("oidc_providers").
+		Select("id, provider_name, client_id, COALESCE(client_secret,'') AS client_secret, COALESCE(client_secret_vault_path,'') AS client_secret_vault_path, token_url, userinfo_url").
+		Where("provider_name = ?", stateRow.ProviderName).
+		First(&oidcRow).Error; err != nil {
+		return nil, fmt.Errorf("load oidc_providers config: %w", err)
+	}
+
+	// 3. Resolve client_secret. Order: in-row (preferred, matches
+	// tenant_hydra_clients.hydra_client_secret pattern) → Vault → env var.
+	clientSecret := oidcRow.ClientSecret
+	if clientSecret == "" {
+		var err error
+		clientSecret, err = s.loadClientSecret(tenantID, oidcRow.ProviderName)
+		if err != nil {
+			return nil, fmt.Errorf("load client secret: %w", err)
+		}
+	}
+
+	// 4. Exchange code at upstream token endpoint.
+	tokens, err := s.exchangeCode(oidcRow.TokenURL, oidcRow.ClientID, clientSecret,
+		in.Code, stateRow.CodeVerifier, in.CallbackURL, oidcRow.ProviderName)
+	if err != nil {
+		return nil, fmt.Errorf("exchange code: %w", err)
+	}
+
+	// 5. Fetch userinfo.
+	userInfo, err := s.fetchUserinfo(oidcRow.UserinfoURL, tokens.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("fetch userinfo: %w", err)
+	}
+
+	// 6. Resolve AuthSec users.id via oidc_user_identities; JIT-create
+	// scoped to the Application (resource_server) if first login.
+	if stateRow.TenantID == nil {
+		return nil, errors.New("state has no tenant_id")
+	}
+	if stateRow.ApplicationID == nil {
+		return nil, errors.New("state has no application_id")
+	}
+	user, err := s.resolveOrJITFederatedUser(tenantDB, *stateRow.TenantID,
+		*stateRow.ApplicationID, stateRow.ProviderName, userInfo)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user: %w", err)
+	}
+
+	// 7. Delete the state row (one-shot use).
+	if err := tenantDB.Delete(&stateRow).Error; err != nil {
+		// best effort
+		_ = err
+	}
+
+	return &HandleOIDCCallbackResult{
+		TenantID:       tenantID,
+		ApplicationID:  stateRow.ApplicationID,
+		LoginChallenge: stateRow.LoginChallenge,
+		UserID:         user.ID,
+		UserEmail:      user.Email,
+		UserName:       user.Name,
+		ProviderName:   stateRow.ProviderName,
+		AuthMethod:     "oidc_federated",
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SAML — thin wrappers over the legacy hydra OAuthLoginService so we don't
+// duplicate the ~600 lines of XML parsing, signature handling, RelayState
+// encoding, and saml_requests persistence that already work in the legacy
+// /uflow/saml path. The v2 surface differs in three ways:
+//
+//  1. We thread Hydra's login_challenge (instead of generating our own).
+//  2. We carry application_id (resource_server_id) so per-MCP scoping works.
+//  3. After ValidateSAMLResponse we call our v2 resolveOrJITFederatedUser
+//     instead of legacy's resolution path — keeps federated SAML users
+//     anchored to the same MCP-scoped users + oidc_user_identities rows
+//     as federated OIDC users.
+//
+// Caveats inherited from the legacy implementation:
+//   - The legacy CreateSAMLRequest signs the SAMLRequest with the SP cert
+//     only when the IdP requires it; bare unsigned requests work with most
+//     IdPs. Signature *verification* on the SAMLResponse is performed
+//     against the saml_providers.certificate column (legacy code path).
+//   - SAML providers live in tenant.saml_providers (created at tenant
+//     bootstrap, see tenant/000_tenant_template.sql). They are keyed by
+//     (tenant_id, client_id, provider_name) — note the client_id
+//     dimension: legacy treats each clients row as a distinct SP. For
+//     the v2 federated flow we resolve client_id from the tenant's first
+//     active clients row (same anchor used by JIT user creation above).
+// ─────────────────────────────────────────────────────────────────────────
+
+// InitiateSAMLInput is what the controller passes in.
+type InitiateSAMLInput struct {
+	TenantID           string
+	ApplicationID      uuid.UUID
+	IdentityProviderID uuid.UUID
+	LoginChallenge     string
+	ContextID          string
+	CallbackURL        string
+}
+
+type InitiateSAMLResponse struct {
+	UpstreamSSOURL string
+	RelayState     string
+	SAMLRequest    string // base64-encoded — the UI POSTs this to the IdP
+}
+
+// ResolveSAMLProviderForApplication validates the IdP whitelist and returns
+// the (tenant_db, identity_providers row, saml_provider config_ref UUID)
+// the controller needs to build the AuthnRequest. Controller drives the
+// actual legacy SAML library call to avoid the services ↔ internal/hydra
+// import cycle.
+func (s *FederatedLoginService) ResolveSAMLProviderForApplication(in InitiateSAMLInput) (*gorm.DB, *models.IdentityProvider, uuid.UUID, error) {
+	tenantDB, err := config.GetTenantGORMDB(in.TenantID)
+	if err != nil {
+		return nil, nil, uuid.Nil, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	var idp models.IdentityProvider
+	if err := tenantDB.Where("id = ? AND tenant_id = ? AND status = ?",
+		in.IdentityProviderID, in.TenantID, "configured").First(&idp).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, uuid.Nil, errors.New("identity provider not found or not configured")
+		}
+		return nil, nil, uuid.Nil, err
+	}
+	if idp.ProviderType != models.IdentityProviderSAML {
+		return nil, nil, uuid.Nil, errors.New("identity provider is not SAML")
+	}
+	allowed, err := s.idpAllowedForApplication(tenantDB, in.TenantID, in.ApplicationID, in.IdentityProviderID)
+	if err != nil {
+		return nil, nil, uuid.Nil, err
+	}
+	if !allowed {
+		return nil, nil, uuid.Nil, errors.New("identity provider not enabled for this application")
+	}
+
+	configUUID, err := uuid.Parse(idp.ConfigRef)
+	if err != nil {
+		return nil, nil, uuid.Nil, fmt.Errorf("invalid saml config_ref: %w", err)
+	}
+	return tenantDB, &idp, configUUID, nil
+}
+
+// InitiateSAML is intentionally stubbed at the service layer. The controller
+// drives SAML directly so we can import the legacy OAuthLoginService without
+// an import cycle (services ← internal/hydra/models ← services). See
+// LoginV2Controller.InitiateSAML.
+func (s *FederatedLoginService) InitiateSAML(in InitiateSAMLInput) (*InitiateSAMLResponse, error) {
+	return nil, errors.New("InitiateSAML at the service layer is a placeholder; the controller orchestrates SAML to avoid an import cycle")
+}
+
+type HandleSAMLACSInput struct {
+	SAMLResponse string
+	RelayState   string
+}
+
+type HandleSAMLACSResult struct {
+	TenantID       string
+	ApplicationID  *uuid.UUID
+	LoginChallenge string
+	UserID         uuid.UUID
+	UserEmail      string
+	UserName       string
+	ProviderName   string
+	AuthMethod     string // "saml_federated"
+}
+
+// HandleSAMLACS is intentionally stubbed at the service layer for the same
+// import-cycle reason as InitiateSAML. See LoginV2Controller.CallbackSAML.
+func (s *FederatedLoginService) HandleSAMLACS(in HandleSAMLACSInput) (*HandleSAMLACSResult, error) {
+	return nil, errors.New("HandleSAMLACS at the service layer is a placeholder; the controller orchestrates SAML to avoid an import cycle")
+}
+
+// ResolveOrJITFederatedUserBasic is the exported wrapper the SAML
+// controller calls. It takes the assertion's NameID, email, and name (the
+// minimal subset our JIT/email-match path needs) and runs through the same
+// user-resolution path as OIDC.
+//
+// Exported so login_v2_controller can drive the legacy SAML library and
+// then route the result through our v2 JIT path without the services
+// package needing to import internal/hydra/models.
+func (s *FederatedLoginService) ResolveOrJITFederatedUserBasic(
+	tenantDB *gorm.DB,
+	tenantUUID uuid.UUID,
+	resourceServerID uuid.UUID,
+	providerName, sub, email, name string,
+) (uuid.UUID, string, string, error) {
+	if name == "" {
+		name = email
+	}
+	info := &federatedUserInfo{
+		Sub:           sub,
+		Email:         email,
+		EmailVerified: true,
+		Name:          name,
+	}
+	user, err := s.resolveOrJITFederatedUser(tenantDB, tenantUUID, resourceServerID, providerName, info)
+	if err != nil {
+		return uuid.Nil, "", "", err
+	}
+	return user.ID, user.Email, user.Name, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+// idpAllowedForApplication is the per-Application IDP whitelist gate.
+// Same logic the login/page-data handler uses.
+func (s *FederatedLoginService) idpAllowedForApplication(
+	tenantDB *gorm.DB, tenantID string, applicationID, idpID uuid.UUID,
+) (bool, error) {
+	var total int64
+	if err := tenantDB.Model(&models.ApplicationIdentityProviderPolicy{}).
+		Where("application_id = ? AND tenant_id = ?", applicationID, tenantID).
+		Count(&total).Error; err != nil {
+		return false, err
+	}
+	if total == 0 {
+		return true, nil
+	}
+	var enabled int64
+	if err := tenantDB.Model(&models.ApplicationIdentityProviderPolicy{}).
+		Where("application_id = ? AND identity_provider_id = ? AND enabled = true",
+			applicationID, idpID).Count(&enabled).Error; err != nil {
+		return false, err
+	}
+	return enabled > 0, nil
+}
+
+// loadClientSecret reads the OIDC client_secret from Vault. Pattern is
+// (tenant_id, provider_name) → secret. Fallback to env var when Vault
+// isn't configured (dev environments).
+func (s *FederatedLoginService) loadClientSecret(tenantID, providerName string) (string, error) {
+	secrets, err := config.GetProviderSecretFromVault(tenantID, providerName)
+	if err == nil {
+		if v, ok := secrets["client_secret"].(string); ok && v != "" {
+			return v, nil
+		}
+	}
+	// Fallback for shared/system providers in dev environments.
+	switch providerName {
+	case "google":
+		if v := config.AppConfig.GoogleClientSecret; v != "" {
+			return v, nil
+		}
+	case "github":
+		if v := config.AppConfig.GitHubClientSecret; v != "" {
+			return v, nil
+		}
+	case "microsoft":
+		if v := config.AppConfig.MicrosoftClientSecret; v != "" {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("no client_secret available for provider %q", providerName)
+}
+
+type oidcTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	IDToken      string `json:"id_token,omitempty"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+}
+
+func (s *FederatedLoginService) exchangeCode(
+	tokenURL, clientID, clientSecret, code, codeVerifier, redirectURI, providerName string,
+) (*oidcTokenResponse, error) {
+	data := url.Values{}
+	data.Set("grant_type", "authorization_code")
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("code", code)
+	data.Set("redirect_uri", redirectURI)
+	// GitHub doesn't support PKCE; everyone else does.
+	if providerName != "github" && codeVerifier != "" {
+		data.Set("code_verifier", codeVerifier)
+	}
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("token endpoint status %d: %s", resp.StatusCode, body)
+	}
+	var out oidcTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode token response: %w", err)
+	}
+	return &out, nil
+}
+
+type federatedUserInfo struct {
+	Sub           string `json:"sub"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Name          string `json:"name,omitempty"`
+	Picture       string `json:"picture,omitempty"`
+}
+
+func (s *FederatedLoginService) fetchUserinfo(userinfoURL, accessToken string) (*federatedUserInfo, error) {
+	req, err := http.NewRequest("GET", userinfoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("userinfo status %d: %s", resp.StatusCode, body)
+	}
+	var out federatedUserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode userinfo: %w", err)
+	}
+	return &out, nil
+}
+
+// resolveOrJITFederatedUser resolves the upstream-IdP user to an AuthSec
+// users row, JIT-creating one when this is a first login for this MCP.
+//
+// Per-MCP scoping (migration 034): all lookups and the JIT INSERT are
+// scoped by (tenant_id, resource_server_id). The same Google user logging
+// into two different MCPs in the same tenant produces two distinct users
+// rows — that's by design, so RBAC bindings and audit attribute per-MCP.
+//
+// Resolution order:
+//
+//  1. oidc_user_identities by (tenant, resource_server, provider, sub)
+//     — already-linked user, return immediately.
+//  2. users by (tenant, resource_server, email) — user exists for this
+//     MCP but identity not yet linked. Create the link, return.
+//  3. JIT: look up resource_servers.legacy_client_id → look up the
+//     matching clients row in the tenant → create users row with
+//     (tenant, resource_server, client_id, project_id, provider='oidc',
+//     email, name) → create identity link → return.
+//
+// The legacy_client_id anchor preserves the existing "every user has a
+// clients row" invariant without forcing us to mint a fake clients row
+// per MCP. resource_servers rows already have legacy_client_id set at
+// Application creation time.
+type federatedUser struct {
+	ID    uuid.UUID
+	Email string
+	Name  string
+}
+
+func (s *FederatedLoginService) resolveOrJITFederatedUser(
+	tenantDB *gorm.DB,
+	tenantUUID uuid.UUID,
+	resourceServerID uuid.UUID,
+	providerName string,
+	info *federatedUserInfo,
+) (*federatedUser, error) {
+	// 1. Try existing identity link scoped to this MCP.
+	var existing models.OIDCUserIdentity
+	err := tenantDB.Where(
+		"tenant_id = ? AND resource_server_id = ? AND provider_name = ? AND provider_user_id = ?",
+		tenantUUID, resourceServerID, providerName, info.Sub,
+	).First(&existing).Error
+	if err == nil {
+		var u models.ExtendedUser
+		if err := tenantDB.Where("id = ?", existing.UserID).First(&u).Error; err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+		_ = tenantDB.Model(&existing).Update("last_login_at", &now).Error
+		return &federatedUser{ID: u.ID, Email: u.Email, Name: u.Name}, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	if info.Email == "" {
+		return nil, errors.New("federated provider returned no email and no existing identity link; cannot resolve user")
+	}
+
+	// 2. Try email match scoped to this MCP — user exists for this MCP
+	// (maybe registered via custom-login) but no federated identity link yet.
+	var u models.ExtendedUser
+	emailErr := tenantDB.Where(
+		"LOWER(email) = ? AND tenant_id = ? AND resource_server_id = ?",
+		strings.ToLower(info.Email), tenantUUID, resourceServerID,
+	).First(&u).Error
+	if emailErr == nil {
+		linkRow := models.OIDCUserIdentity{
+			TenantID:         tenantUUID,
+			ResourceServerID: &resourceServerID,
+			UserID:           u.ID,
+			ProviderName:     providerName,
+			ProviderUserID:   info.Sub,
+			Email:            info.Email,
+			ProfileData:      "{}", // jsonb column rejects empty string
+		}
+		if err := tenantDB.Create(&linkRow).Error; err != nil {
+			return nil, fmt.Errorf("link existing user to federated identity: %w", err)
+		}
+		return &federatedUser{ID: u.ID, Email: u.Email, Name: u.Name}, nil
+	}
+	if !errors.Is(emailErr, gorm.ErrRecordNotFound) {
+		return nil, emailErr
+	}
+
+	// 3. JIT create. Anchor users.client_id + project_id to a real
+	// clients row in this tenant. Preference order:
+	//   (a) resource_servers.legacy_client_id, if set — the explicit
+	//       per-MCP anchor (future-proof; not currently populated by any
+	//       creation path, but honored if set).
+	//   (b) the tenant's first active clients row — keeps the legacy
+	//       NOT NULL invariant on users.client_id satisfied without
+	//       requiring per-MCP anchoring everywhere. Per-MCP scope is
+	//       carried separately on users.resource_server_id (migration 034).
+	var rs models.ResourceServer
+	if err := tenantDB.Where("id = ?", resourceServerID).First(&rs).Error; err != nil {
+		return nil, fmt.Errorf("load resource_server for JIT: %w", err)
+	}
+	var clientRow struct {
+		ClientID  uuid.UUID `gorm:"column:client_id"`
+		ProjectID uuid.UUID `gorm:"column:project_id"`
+	}
+	clientQuery := tenantDB.Table("clients").
+		Select("client_id, project_id").
+		Where("tenant_id = ? AND active = true", tenantUUID)
+	if rs.LegacyClientID != nil {
+		clientQuery = clientQuery.Where("client_id = ?", *rs.LegacyClientID)
+	}
+	if err := clientQuery.Order("created_at ASC").First(&clientRow).Error; err != nil {
+		return nil, fmt.Errorf("load clients row to anchor JIT federated user: %w", err)
+	}
+
+	name := info.Name
+	if name == "" {
+		name = info.Email
+	}
+	now := time.Now().UTC()
+	newUserID := uuid.New()
+	// Raw INSERT — ExtendedUser has many fields with NOT NULL constraints
+	// (tenant_domain, etc.) we don't have hot at hand; legacy code does
+	// the same. tenant_domain defaults from config.
+	insertSQL := `
+		INSERT INTO users (
+			id, client_id, tenant_id, project_id, resource_server_id,
+			name, email, tenant_domain, provider, provider_id,
+			active, created_at, updated_at
+		) VALUES (
+			?, ?, ?, ?, ?,
+			?, ?, ?, 'oidc', ?,
+			true, ?, ?
+		)
+	`
+	if err := tenantDB.Exec(insertSQL,
+		newUserID, clientRow.ClientID, tenantUUID, clientRow.ProjectID, resourceServerID,
+		name, info.Email, config.AppConfig.TenantDomainSuffix, info.Sub,
+		now, now,
+	).Error; err != nil {
+		return nil, fmt.Errorf("JIT create user: %w", err)
+	}
+
+	linkRow := models.OIDCUserIdentity{
+		TenantID:         tenantUUID,
+		ResourceServerID: &resourceServerID,
+		UserID:           newUserID,
+		ProviderName:     providerName,
+		ProviderUserID:   info.Sub,
+		Email:            info.Email,
+		ProfileData:      "{}", // jsonb column rejects empty string
+	}
+	if err := tenantDB.Create(&linkRow).Error; err != nil {
+		// Best-effort rollback of the users row so we don't leak orphans.
+		_ = tenantDB.Exec("DELETE FROM users WHERE id = ?", newUserID).Error
+		return nil, fmt.Errorf("create identity link after JIT: %w", err)
+	}
+	return &federatedUser{ID: newUserID, Email: info.Email, Name: name}, nil
+}
+
+// federatedRandomToken returns n cryptographically random bytes encoded
+// as base64-url-no-padding. Local to the federated service to avoid name
+// collision with services/oidc_service.go:generateSecureToken which has
+// a slightly different signature.
+func federatedRandomToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// pkceS256Challenge returns the base64-url-no-padding SHA256 hash of the
+// code verifier per RFC 7636.
+func pkceS256Challenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// buildStateToken composes the state we send upstream. Format:
+//
+//	<tenant-uuid-no-dashes>.<random>
+//
+// Splitting at callback time lets us pick the right tenant DB without
+// scanning every tenant. The tenant_uuid is public anyway (it's in our
+// JWTs); putting it in the state token isn't a leak.
+//
+// (Not used during initiate yet — we use the raw stateToken to avoid
+// double-encoding. The callback splits via splitStateToken. We compose
+// the wire-state value in the controller.)
+func buildStateToken(tenantUUID uuid.UUID, randomToken string) string {
+	return strings.ReplaceAll(tenantUUID.String(), "-", "") + "." + randomToken
+}
+
+// splitStateToken reverses buildStateToken. Returns (tenantID, randomToken, ok).
+func splitStateToken(state string) (string, string, bool) {
+	idx := strings.IndexByte(state, '.')
+	if idx <= 0 || idx == len(state)-1 {
+		return "", "", false
+	}
+	hex32 := state[:idx]
+	rest := state[idx+1:]
+	if len(hex32) != 32 {
+		return "", "", false
+	}
+	// Reassemble UUID 8-4-4-4-12.
+	tenantUUID := hex32[0:8] + "-" + hex32[8:12] + "-" + hex32[12:16] + "-" + hex32[16:20] + "-" + hex32[20:32]
+	if _, err := uuid.Parse(tenantUUID); err != nil {
+		return "", "", false
+	}
+	return tenantUUID, rest, true
+}

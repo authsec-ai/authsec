@@ -13,7 +13,8 @@ type OIDCProvider struct {
 	ProviderName          string    `json:"provider_name" gorm:"uniqueIndex;not null"`    // 'google', 'github', 'microsoft'
 	DisplayName           string    `json:"display_name" gorm:"not null"`                 // 'Google', 'GitHub', 'Microsoft'
 	ClientID              string    `json:"client_id" gorm:"not null"`                    // OAuth client ID
-	ClientSecretVaultPath string    `json:"client_secret_vault_path" gorm:"not null"`     // Vault path for secret
+	ClientSecret          string    `json:"-" gorm:"column:client_secret"`                  // Inline-stored secret (preferred); never serialized
+	ClientSecretVaultPath string    `json:"client_secret_vault_path,omitempty"`             // Optional Vault path; used only when ClientSecret is empty
 	AuthorizationURL      string    `json:"authorization_url" gorm:"not null"`            // OAuth authorize endpoint
 	TokenURL              string    `json:"token_url" gorm:"not null"`                    // OAuth token endpoint
 	UserinfoURL           string    `json:"userinfo_url" gorm:"not null"`                 // OAuth userinfo endpoint
@@ -43,6 +44,12 @@ type OIDCState struct {
 	RedirectAfter string     `json:"redirect_after,omitempty"`                // Where to redirect after success
 	ExpiresAt     time.Time  `json:"expires_at" gorm:"not null"`              // State expiry
 	CreatedAt     time.Time  `json:"created_at"`
+
+	// Federated-login fields (migration 032). Used only when Action ==
+	// "hydra_login" — i.e. the OAuth-v2 surface initiates a federated
+	// login as part of an upstream Hydra /authorize redirect.
+	ApplicationID  *uuid.UUID `json:"application_id,omitempty" gorm:"type:uuid"`
+	LoginChallenge string     `json:"login_challenge,omitempty"`
 }
 
 // TableName specifies the table name for OIDCState
@@ -53,16 +60,17 @@ func (OIDCState) TableName() string {
 // OIDCUserIdentity links OIDC provider identities to users
 // Allows lookup: "Does this Google user exist in this tenant?"
 type OIDCUserIdentity struct {
-	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID       uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
-	ProviderName   string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
-	ProviderUserID string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)
-	Email          string     `json:"email,omitempty"`                          // Email from provider
-	ProfileData    string     `json:"profile_data,omitempty" gorm:"type:jsonb"` // Additional profile info
-	LastLoginAt    *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	TenantID         uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	ResourceServerID *uuid.UUID `json:"resource_server_id,omitempty" gorm:"type:uuid"` // Per-MCP scope (migration 034); legacy rows leave NULL
+	UserID           uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
+	ProviderName     string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
+	ProviderUserID   string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)
+	Email            string     `json:"email,omitempty"`                          // Email from provider
+	ProfileData      string     `json:"profile_data,omitempty" gorm:"type:jsonb;default:'{}'"` // Additional profile info; default {} so jsonb doesn't reject empty string
+	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 // TableName specifies the table name for OIDCUserIdentity

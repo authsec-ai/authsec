@@ -197,6 +197,19 @@ func SetupRoutes(
 	})
 
 	// ════════════════════════════════════════════════════════
+	// Bare-root .well-known/* OAuth discovery — RFC 8414 compliant.
+	// MCP clients (Claude Desktop, Cursor, etc.) build the discovery URL
+	// as <issuer>/.well-known/oauth-authorization-server. Our issuer is
+	// https://prod.api.authsec.ai (bare host), so they hit /. The v2
+	// controller already serves the same metadata under
+	// /authsec/oauth/v2/.well-known/* — these routes just expose it at
+	// the bare root where standards-compliant clients look.
+	// ════════════════════════════════════════════════════════
+	bareDiscoveryController := platformCtrl.NewOAuthASV2Controller()
+	r.GET("/.well-known/oauth-authorization-server", bareDiscoveryController.ASMetadata)
+	r.GET("/.well-known/openid-configuration", bareDiscoveryController.OIDCDiscovery)
+
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
@@ -222,6 +235,181 @@ func SetupRoutes(
 		{
 			oauthDiscovery.GET("/.well-known/openid-configuration", mcpOAuthDiscoveryController.Discovery)
 			oauthDiscovery.GET("/.well-known/oauth-authorization-server", mcpOAuthDiscoveryController.Discovery)
+		}
+
+		// ────────────────────────────────────────────────────────
+		// Standards-compliant MCP OAuth server (v2) — Phase 2+ of
+		// the dev-flow backport. Lives at /authsec/oauth/v2/* so it
+		// never collides with the legacy /clientms/tenants/.../clients
+		// surface. /register is anonymous (RFC 7591 DCR); the rest of
+		// the endpoints land in Phases 3-5.
+		// ────────────────────────────────────────────────────────
+		oauthASV2Controller := platformCtrl.NewOAuthASV2Controller()
+		applicationsV2Controller := platformCtrl.NewApplicationsV2Controller()
+
+		oauthV2 := authsec.Group("/oauth/v2")
+		oauthV2.Use(oauthASV2Controller.CanonicalIssuerOnly())
+		{
+			oauthV2.GET("/.well-known/oauth-authorization-server", oauthASV2Controller.ASMetadata)
+			oauthV2.GET("/.well-known/openid-configuration", oauthASV2Controller.OIDCDiscovery)
+			oauthV2.POST("/register", oauthASV2Controller.Register)
+			oauthV2.GET("/authorize", oauthASV2Controller.Authorize)
+			oauthV2.POST("/token", oauthASV2Controller.Token)
+			oauthV2.POST("/introspect", oauthASV2Controller.Introspect)
+			oauthV2.GET("/jwks", oauthASV2Controller.JWKS)
+			oauthV2.POST("/revoke", oauthASV2Controller.Revoke)
+			oauthV2.GET("/userinfo", oauthASV2Controller.Userinfo)
+			oauthV2.POST("/userinfo", oauthASV2Controller.Userinfo)
+			oauthV2.GET("/logout", oauthASV2Controller.EndSession)
+			oauthV2.POST("/par", oauthASV2Controller.PAR)
+
+			// Login challenge surface — sessions 1+2 of the login port.
+			// Public: the login_challenge itself IS the auth context (Hydra signs).
+			loginV2Controller := platformCtrl.NewLoginV2Controller()
+			oauthV2.GET("/login/page-data", loginV2Controller.GetLoginPageData)
+			oauthV2.POST("/login/complete-local", loginV2Controller.CompleteCustomLogin)
+			oauthV2.POST("/login/reject", loginV2Controller.RejectLogin)
+
+			// Consent challenge surface — session 3. Same public pattern
+			// as login (the consent_challenge IS the auth context, Hydra signs).
+			oauthV2.GET("/consent", loginV2Controller.GetConsentPageData)
+			oauthV2.POST("/consent/accept", loginV2Controller.AcceptConsent)
+			oauthV2.POST("/consent/reject", loginV2Controller.RejectConsent)
+
+			// Federated login — sessions 4+5. OIDC is implemented; SAML
+			// returns 501 until a SAML XML library is added (see service).
+			// The OIDC callback is GET because upstream providers redirect
+			// the browser there with ?state=&code= as query params. The
+			// SAML ACS is POST because SAML IdPs POST SAMLResponse +
+			// RelayState.
+			oauthV2.POST("/login/oidc/initiate", loginV2Controller.InitiateOIDC)
+			oauthV2.GET("/login/oidc/callback", loginV2Controller.CallbackOIDC)
+			oauthV2.POST("/login/saml/initiate", loginV2Controller.InitiateSAML)
+			oauthV2.POST("/login/saml/acs", loginV2Controller.CallbackSAML)
+		}
+
+		// Tenant-scoped Application registry (resource_servers rows).
+		// Authenticated; tenant_id comes from the JWT.
+		identityProvidersV2Controller := adminCtrl.NewIdentityProvidersV2Controller()
+
+		// SDK-facing endpoints first — they use Basic auth (rs_id:introspection_secret),
+		// NOT a JWT. Must be registered before the JWT-protected applicationsV2 group
+		// so they don't accidentally pick up AuthMiddleware.
+		//
+		// We expose them under BOTH paths so @authsec/sdk's runtime (which hard-codes
+		// /authsec/resource-servers/:id/sdk-policy) works without modification, AND
+		// admins using the new /applications surface in the UI find them at the
+		// expected path.
+		authsec.GET("/applications/:id/sdk-policy", applicationsV2Controller.SDKPolicy)
+		authsec.PUT("/applications/:id/sdk-manifest", applicationsV2Controller.PutSDKManifest)
+		authsec.GET("/resource-servers/:id/sdk-policy", applicationsV2Controller.SDKPolicy)
+		authsec.PUT("/resource-servers/:id/sdk-manifest", applicationsV2Controller.PutSDKManifest)
+
+		// Phase 7: consent grants. List + revoke. JWT-authenticated;
+		// user-scope by default, ?all=true and ?admin=true switch to
+		// admin-scope where applicable.
+		consentGrantsController := platformCtrl.NewConsentGrantsController()
+		consentGrants := authsec.Group("/oauth/consent-grants")
+		consentGrants.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			consentGrants.GET("", consentGrantsController.List)
+			consentGrants.DELETE("/:id", consentGrantsController.Revoke)
+		}
+
+		applicationsV2 := authsec.Group("/applications")
+		applicationsV2.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			applicationsV2.POST("", applicationsV2Controller.Create)
+			applicationsV2.GET("", applicationsV2Controller.List)
+			applicationsV2.GET("/:id", applicationsV2Controller.Get)
+			applicationsV2.DELETE("/:id", applicationsV2Controller.Delete)
+			applicationsV2.GET("/:id/clients", applicationsV2Controller.ListClients)
+			applicationsV2.POST("/:id/rotate-introspection-secret", applicationsV2Controller.RotateIntrospectionSecret)
+
+			// Phase 1+2+3 of the full-port plan (mcp_v2_full_port_plan.md):
+			// admin reads, activation state machine, connection prereg/revoke.
+			applicationsV2.GET("/:id/tools", applicationsV2Controller.ListTools)
+			applicationsV2.GET("/:id/scopes", applicationsV2Controller.ListScopes)
+			applicationsV2.GET("/:id/scope-matrix", applicationsV2Controller.GetScopeMatrix)
+			applicationsV2.GET("/:id/setup", applicationsV2Controller.GetSetupChecklist)
+			applicationsV2.GET("/:id/sdk-manifest-status", applicationsV2Controller.GetSDKManifestStatus)
+			applicationsV2.GET("/:id/activation-preview", applicationsV2Controller.GetActivationPreview)
+			applicationsV2.POST("/:id/activate", applicationsV2Controller.Activate)
+			applicationsV2.POST("/:id/rescan", applicationsV2Controller.Rescan)
+			applicationsV2.POST("/:id/connections", applicationsV2Controller.PreregisterConnection)
+			applicationsV2.DELETE("/:id/connections/:client_id", applicationsV2Controller.RevokeConnection)
+
+			// Phase 4: drift events (admin banner). emit calls are
+			// retrofitted into Rotate/UpdateAccessPolicy/RevokeConnection.
+			applicationsV2.GET("/:id/drift-events", applicationsV2Controller.ListDriftEvents)
+			applicationsV2.POST("/:id/drift-events/:event_id/dismiss", applicationsV2Controller.DismissDriftEvent)
+
+			// Phase 5: scope CRUD (writes back to scopes_supported in sync).
+			// GET /:id/scopes already wired above by Phase 1.
+			applicationsV2.POST("/:id/scopes", applicationsV2Controller.CreateScope)
+			applicationsV2.PUT("/:id/scopes/:scope_id", applicationsV2Controller.UpdateScope)
+			applicationsV2.DELETE("/:id/scopes/:scope_id", applicationsV2Controller.DeleteScope)
+
+			// Phase 6: tool ↔ scope mapping.
+			applicationsV2.PUT("/:id/tool-scope-map", applicationsV2Controller.UpdateToolScopeMap)
+			applicationsV2.POST("/:id/tools/:tool_id/public", applicationsV2Controller.MarkToolPublic)
+
+			// Phase 8 part 1: roles + scope grants.
+			applicationsV2.GET("/:id/roles", applicationsV2Controller.ListRoles)
+			applicationsV2.POST("/:id/roles", applicationsV2Controller.CreateRole)
+			applicationsV2.PUT("/:id/roles/:role_id/scope-grants", applicationsV2Controller.UpdateRoleScopeGrants)
+
+			// Phase 8 part 2: bindings + user access reads.
+			applicationsV2.GET("/:id/bindings", applicationsV2Controller.ListBindings)
+			applicationsV2.POST("/:id/bindings", applicationsV2Controller.CreateBinding)
+			applicationsV2.DELETE("/:id/bindings/:binding_id", applicationsV2Controller.DeleteBinding)
+			applicationsV2.GET("/:id/eligible-users", applicationsV2Controller.ListEligibleUsers)
+			applicationsV2.GET("/:id/access/users", applicationsV2Controller.ListAccessUsers)
+			applicationsV2.GET("/:id/users/:user_id/effective-access", applicationsV2Controller.GetUserEffectiveAccess)
+
+			// Phase 9: governance read views.
+			applicationsV2.GET("/:id/access-assignments", applicationsV2Controller.ListAccessAssignments)
+			applicationsV2.GET("/:id/access-change-previews", applicationsV2Controller.PreviewAccessChange)
+			applicationsV2.GET("/:id/access-simulations", applicationsV2Controller.SimulateAccess)
+			applicationsV2.GET("/:id/effective-access", applicationsV2Controller.GetApplicationEffectiveAccess)
+			applicationsV2.GET("/:id/end-user-access-summary", applicationsV2Controller.EndUserAccessSummary)
+			applicationsV2.GET("/:id/evidence-exports", applicationsV2Controller.EvidenceExport)
+			applicationsV2.GET("/:id/posture-summary", applicationsV2Controller.PostureSummary)
+			applicationsV2.GET("/:id/tool-exposure", applicationsV2Controller.ToolExposure)
+
+			// Validate / TestLogin / Launch / AccessPolicy — ported from dev's
+			// applications group. See docs/mcp_oauth_v2.md for the gaps.
+			applicationsV2.POST("/:id/validate", applicationsV2Controller.Validate)
+			applicationsV2.POST("/:id/test", applicationsV2Controller.TestLogin)
+			applicationsV2.POST("/:id/launch", applicationsV2Controller.Launch)
+			applicationsV2.GET("/:id/access-policy", applicationsV2Controller.GetAccessPolicy)
+			applicationsV2.PUT("/:id/access-policy", applicationsV2Controller.UpdateAccessPolicy)
+			applicationsV2.GET("/:id/access", applicationsV2Controller.GetAccessPolicy) // alias used by the v1 UI
+
+			// Application ↔ IDP policy: whitelist which IDPs an Application accepts.
+			applicationsV2.GET("/:id/identity-providers", identityProvidersV2Controller.ListApplicationPolicies)
+			applicationsV2.POST("/:id/identity-providers", identityProvidersV2Controller.PinIDP)
+			applicationsV2.DELETE("/:id/identity-providers/:idp_id", identityProvidersV2Controller.UnpinIDP)
+		}
+
+		// Tenant-scoped IDP registry. Phase 4.
+		identityProvidersV2 := authsec.Group("/identity-providers")
+		identityProvidersV2.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			identityProvidersV2.POST("", identityProvidersV2Controller.Create)
+			identityProvidersV2.GET("", identityProvidersV2Controller.List)
+			identityProvidersV2.GET("/:id", identityProvidersV2Controller.Get)
+			identityProvidersV2.PUT("/:id/status", identityProvidersV2Controller.UpdateStatus)
+			identityProvidersV2.DELETE("/:id", identityProvidersV2Controller.Delete)
 		}
 
 		// ────────────────────────────────────────────────────
