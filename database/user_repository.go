@@ -122,11 +122,11 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 	now := time.Now().UTC()
 	query := `
 		INSERT INTO users (
-			id, workspace_id, name, username, email, tenant_domain,
+			id, workspace_id, name, username, email, password_hash, tenant_domain,
 			provider, provider_id, provider_data, avatar_url, active,
 			last_login, created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, 'app.authsec.dev',
+		VALUES ($1, $2, $3, $4, $5, '', 'app.authsec.dev',
 		        $6, $7, $8, $9, true, $10, $10, $10)
 		ON CONFLICT (workspace_id, LOWER(email)) WHERE deleted_at IS NULL
 		DO UPDATE SET updated_at = users.updated_at
@@ -165,7 +165,7 @@ func (ur *UserRepository) UpdateLastLogin(userID uuid.UUID) error {
 func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -240,7 +240,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -313,7 +313,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -386,7 +386,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid
 func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -461,7 +461,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 func (ur *UserRepository) GetUserByProvider(workspaceID uuid.UUID, provider, providerID string) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -613,7 +613,7 @@ func (ur *UserRepository) UpdateUserPassword(userID uuid.UUID, passwordHash stri
 func (ur *UserRepository) GetUsersByTenantID(workspaceID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at

@@ -1301,7 +1301,7 @@ CREATE TABLE public.users (
     email character varying(255) NOT NULL,
     name character varying(255) DEFAULT 'Not Provided'::character varying,
     username character varying(255) DEFAULT 'Not Provided'::character varying,
-    password_hash text,
+    password_hash text DEFAULT ''::text,
     tenant_domain character varying(255) DEFAULT 'app.authsec.dev'::character varying,
     provider character varying(100) DEFAULT 'local'::character varying,
     provider_id character varying(255),
