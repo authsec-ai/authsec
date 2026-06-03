@@ -167,6 +167,330 @@ curl -X POST "$AUTHSEC/authsec/oauth/v2/revoke" \
 curl "$AUTHSEC/authsec/oauth/v2/logout?post_logout_redirect_uri=https://example.com/done"
 ```
 
+### Login challenge page-data (Session 1 of login port)
+
+Public, no auth — the `login_challenge` itself is the authentication
+context (Hydra signs it). Called by whoever serves the login UI to
+fetch the workspace + IDP list to render.
+
+```bash
+# Hydra sends the user's browser to your login page with ?login_challenge=...
+# That page's backend calls:
+curl "$AUTHSEC/authsec/oauth/v2/login/page-data?login_challenge=<challenge-from-hydra>"
+```
+
+Response shape:
+```json
+{
+  "success": true,
+  "login_challenge": "<challenge>",
+  "context_id": "<authsec_ctx UUID>",
+  "tenant_id": "<tenant UUID>",
+  "application_id": "<app UUID>",
+  "application_name": "MCP Demo",
+  "resource_uri": "https://mcp-dev.mcpauthz.com/mcp",
+  "requested_scope": ["openid","offline_access","mcp_demo.read","..."],
+  "skip": false,
+  "identity_providers": [
+    {
+      "identity_provider_id": "<idp UUID>",
+      "provider_type": "oidc",
+      "display_name": "Corporate Google"
+    }
+  ],
+  "submit": {
+    "custom": "https://.../authsec/oauth/v2/login/complete-local",
+    "oidc":   "https://.../authsec/oauth/v2/login/oidc/initiate",
+    "saml":   "https://.../authsec/oauth/v2/login/saml/initiate",
+    "reject": "https://.../authsec/oauth/v2/login/reject"
+  }
+}
+```
+
+`skip: true` means Hydra has an existing session for this client; the UI
+should POST to /login/complete-local with the included subject rather than
+prompt for credentials again (auto-accept).
+
+`identity_providers` is filtered by the Application's IDP whitelist policy
+when one exists; default-allow when no policy rows exist for the Application.
+
+`submit.*` URLs land in Sessions 2-5 of the port. Session 1 only wires
+this read endpoint.
+
+### Custom-login completion (Session 2 of login port)
+
+Once the user enters email+password on the login page, the UI POSTs here.
+The backend looks up the user, verifies password, calls Hydra accept-login,
+and returns the redirect_to URL the browser should follow next (usually
+the consent endpoint).
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/complete-local" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge-from-page-data>",
+    "email": "chandanak7777@gmail.com",
+    "password": "<password>",
+    "remember": false
+  }'
+```
+
+Response on success:
+```json
+{ "success": true, "redirect_to": "https://oauth.example.com/oauth2/auth?..." }
+```
+
+Response on bad credentials (401):
+```json
+{ "success": false, "error": "invalid credentials" }
+```
+
+Provider filter: only `provider IN ('custom','ad_sync','entra_id','scim')`
+users can log in via this endpoint. OIDC-federated users (`provider='oidc'`)
+must use the OIDC initiate path — coming in Session 4.
+
+`remember: true` asks Hydra to skip authentication on subsequent /authorize
+calls for this (client, user) pair for 8 hours. UI surfaces this as
+"Keep me signed in."
+
+Side effect: writes user_id + auth_time onto the auth_request_context
+row identified by login_challenge. Those are read by the consent step
+to populate access token claims.
+
+### Reject login (Session 2)
+
+User clicked Cancel on the login page.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/reject" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge>",
+    "reason": "User clicked cancel"
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?error=access_denied&..." }
+```
+
+Tells Hydra to abort the dance. Hydra returns a redirect_to that ends at
+the client's redirect_uri with error=access_denied, so the calling
+application can show "login cancelled."
+
+### Consent page-data (Session 3 of login port)
+
+Hydra redirects to /consent?consent_challenge=... after accept-login.
+The (separate) UI calls this to fetch the consent screen data.
+
+```bash
+curl -s "$AUTHSEC/authsec/oauth/v2/consent?consent_challenge=<challenge>"
+```
+
+Two response shapes:
+
+**Auto-approved** (user previously chose "remember consent" for this
+client + application, and the remembered grant covers every grantable
+scope):
+```json
+{
+  "success": true,
+  "consent_challenge": "<challenge>",
+  "auto_approved": true,
+  "redirect_to": "<client redirect_uri>?code=...&state=...",
+  ...
+}
+```
+The UI just navigates the browser to redirect_to. No consent screen.
+
+**Render path** (no remembered grant, OR remembered grant doesn't cover):
+```json
+{
+  "success": true,
+  "consent_challenge": "<challenge>",
+  "auto_approved": false,
+  "application_name": "MCP Demo",
+  "client_id": "<uuid>",
+  "subject": "<user uuid>",
+  "requested_scopes": ["openid","offline_access","mcp_demo.read","mcp_demo.write"],
+  "grantable_scopes": ["openid","offline_access","mcp_demo.read"],
+  "rejected_scopes": { "mcp_demo.write": "not_bound" },
+  "submit": {
+    "accept": "https://.../authsec/oauth/v2/consent/accept",
+    "reject": "https://.../authsec/oauth/v2/consent/reject"
+  }
+}
+```
+
+The 3-way intersection is shown:
+- `requested_scopes` — what the client asked for at /authorize
+- `grantable_scopes` — requested ∩ Application's registered ∩ user's
+  effective via bindings (this is what the UI offers)
+- `rejected_scopes` — requested but not grantable, with a reason per scope:
+  `not_registered` (not in Application's `oauth_scopes`),
+  `not_bound` (user has no role granting it),
+
+OIDC core scopes (openid/profile/email/address/phone/offline_access)
+pass through without RBAC check; they shape ID token claims, not access.
+
+### Consent accept (Session 3)
+
+User clicked Approve.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/consent/accept" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consent_challenge": "<challenge>",
+    "grant_scope": ["openid","offline_access","mcp_demo.read"],
+    "remember": true
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?code=...&state=..." }
+```
+
+Re-enforces 3-way intersection — any scope the UI sends that isn't in
+the freshly-computed grantable set is silently dropped. Cannot escalate
+beyond what the user actually has.
+
+`remember: true` writes an `oauth_consent_grants` row so future /authorize
+for (user, client, application) auto-approves. Stored grant is the exact
+scope subset the user approved — not the broader "grantable" set.
+
+Side effects on accept:
+- `auth_request_context.consent_completed = true` (token-exchange gate
+  opens; without this, /token returns 403)
+- `auth_request_context.scope` set to the joined granted scopes
+- Hydra session `access_token.ext.context_id = <ctx>` — the load-bearing
+  bridge for /introspect's RBAC filter to find the row
+- (if remember) `oauth_consent_grants` row upserted
+
+### Consent reject (Session 3)
+
+User clicked Deny.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/consent/reject" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consent_challenge": "<challenge>",
+    "reason": "User denied scope"
+  }'
+```
+
+Response:
+```json
+{ "success": true, "redirect_to": "<client redirect_uri>?error=access_denied&..." }
+```
+
+---
+
+## After Session 3 — full v2 dance is testable
+
+With Sessions 1+2+3 deployed, the curl runbook from earlier sessions
+finally connects end-to-end for **custom-login users**:
+
+1. `POST /authsec/oauth/v2/register` — DCR a client
+2. Browser: `GET /authsec/oauth/v2/authorize?...` — redirects to Hydra
+3. Hydra emits login_challenge → UI calls `GET /login/page-data`
+4. UI: `POST /login/complete-local` with email+password
+5. Browser follows redirect_to → Hydra emits consent_challenge
+6. UI calls `GET /consent` (or auto-approves)
+7. UI: `POST /consent/accept` with chosen scopes
+8. Browser lands at client redirect_uri with ?code=...
+9. Client: `POST /authsec/oauth/v2/token` with code+verifier
+10. Client: `POST /authsec/oauth/v2/introspect` — gets RBAC-filtered scope
+
+The introspect filter (commit 2d9f8ae) narrows further if a binding was
+revoked between token issuance and introspect call — that's the live
+RBAC enforcement.
+
+Sessions 4 (OIDC) + 5 (SAML) + 6 (polish) add federated paths; they're
+not required for custom-login dance.
+
+### OIDC federated — initiate (Session 4)
+
+User clicked "Continue with Google" (or any OIDC-configured IDP). The
+UI POSTs the login_challenge + identity_provider_id, and we mint state +
+return the upstream provider's authorization URL.
+
+```bash
+curl -s -X POST "$AUTHSEC/authsec/oauth/v2/login/oidc/initiate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge-from-page-data>",
+    "identity_provider_id": "<uuid-from-page-data.identity_providers[].identity_provider_id>"
+  }'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "upstream_auth_url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=...&state=<tenant>.<random>&...",
+  "state": "<tenant-encoded state we sent upstream>"
+}
+```
+
+The UI navigates the browser to `upstream_auth_url`. The state token is
+tenant-encoded so the callback can pick the right tenant DB without a
+master-side index — format is `<tenant-uuid-no-dashes>.<random>`.
+
+Per-Application IDP whitelist still applies: if
+`application_identity_provider_policies` has any rows for this
+Application, the chosen IDP must be among the enabled ones, else 400.
+
+### OIDC federated — callback (Session 4)
+
+The upstream provider redirects the browser to this URL after the user
+authenticates. The UI's redirect handler intercepts and calls:
+
+```bash
+curl -s "$AUTHSEC/authsec/oauth/v2/login/oidc/callback?state=<state>&code=<code>"
+```
+
+Response (success):
+```json
+{ "success": true, "redirect_to": "<hydra consent endpoint URL>" }
+```
+
+What happens server-side:
+1. Split state → (tenant_id, random); look up oidc_states row in that DB
+2. Exchange code at upstream token endpoint (with PKCE code_verifier)
+3. Fetch userinfo to get sub + email
+4. Resolve AuthSec users.id:
+   - First by (tenant, provider, provider_user_id) on oidc_user_identities
+   - Then by email match against existing users (auto-links a row)
+   - **No JIT user creation** — federated login resolves to an existing
+     AuthSec user only. If you see "no AuthSec user found for email ...",
+     register via custom-login signup first, then re-try federated login.
+5. Hydra accept-login with subject=user.id, acr="fed", auth_method=oidc_federated
+6. Stamp user_id + auth_time on auth_request_context
+7. Return Hydra's redirect_to so the UI navigates the browser to /consent
+
+### SAML federated — initiate / ACS (Session 5, stubbed 501)
+
+Routes exist but return 501 until a SAML XML library is wired in.
+
+```bash
+curl -i -X POST "$AUTHSEC/authsec/oauth/v2/login/saml/initiate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login_challenge": "<challenge>",
+    "identity_provider_id": "<uuid>"
+  }'
+# HTTP/1.1 501 Not Implemented
+# { "success": false, "error": "SAML federated login is not yet supported on the prod-mcp-v2 backend; use OIDC or custom-login" }
+```
+
+The route shape (request body + response JSON) matches what the
+full implementation will emit, so the UI doesn't need to change when
+SAML lands. Tracked in the codebase as "add crewjam/saml + replace stubs."
+
 ---
 
 ## Section 2 — Applications admin (JWT, requires tenant_id claim)

@@ -252,6 +252,30 @@ func SetupRoutes(
 			oauthV2.POST("/userinfo", oauthASV2Controller.Userinfo)
 			oauthV2.GET("/logout", oauthASV2Controller.EndSession)
 			oauthV2.POST("/par", oauthASV2Controller.PAR)
+
+			// Login challenge surface — sessions 1+2 of the login port.
+			// Public: the login_challenge itself IS the auth context (Hydra signs).
+			loginV2Controller := platformCtrl.NewLoginV2Controller()
+			oauthV2.GET("/login/page-data", loginV2Controller.GetLoginPageData)
+			oauthV2.POST("/login/complete-local", loginV2Controller.CompleteCustomLogin)
+			oauthV2.POST("/login/reject", loginV2Controller.RejectLogin)
+
+			// Consent challenge surface — session 3. Same public pattern
+			// as login (the consent_challenge IS the auth context, Hydra signs).
+			oauthV2.GET("/consent", loginV2Controller.GetConsentPageData)
+			oauthV2.POST("/consent/accept", loginV2Controller.AcceptConsent)
+			oauthV2.POST("/consent/reject", loginV2Controller.RejectConsent)
+
+			// Federated login — sessions 4+5. OIDC is implemented; SAML
+			// returns 501 until a SAML XML library is added (see service).
+			// The OIDC callback is GET because upstream providers redirect
+			// the browser there with ?state=&code= as query params. The
+			// SAML ACS is POST because SAML IdPs POST SAMLResponse +
+			// RelayState.
+			oauthV2.POST("/login/oidc/initiate", loginV2Controller.InitiateOIDC)
+			oauthV2.GET("/login/oidc/callback", loginV2Controller.CallbackOIDC)
+			oauthV2.POST("/login/saml/initiate", loginV2Controller.InitiateSAML)
+			oauthV2.POST("/login/saml/acs", loginV2Controller.CallbackSAML)
 		}
 
 		// Tenant-scoped Application registry (resource_servers rows).

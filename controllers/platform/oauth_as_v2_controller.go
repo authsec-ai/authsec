@@ -187,6 +187,11 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 	// flows back to the user's browser unchanged.
 	q.Set("client_id", client.HydraClientID)
 	q.Set("state", contextID+"~"+q.Get("state"))
+	// authsec_ctx survives Hydra's round-trip via request_url. The
+	// /login/page-data handler parses it out to find the matching
+	// auth_request_context row. We keep the state-prefix approach above
+	// as a redundant carrier for /token's path (2) fallback.
+	q.Set("authsec_ctx", contextID)
 	hydraAuthURL := strings.TrimSuffix(getHydraPublicBase(), "/") + "/oauth2/auth?" + q.Encode()
 	c.Redirect(http.StatusFound, hydraAuthURL)
 }

@@ -34,6 +34,76 @@ func NewConsentGrantService() *ConsentGrantService { return &ConsentGrantService
 
 var ErrConsentGrantNotFound = errors.New("consent grant not found")
 
+// UpsertGrant is the consent-handler-side write: when the user clicks
+// "Approve + remember", we record (user, client, application, granted_scopes)
+// so the next /authorize request for the same triple can auto-approve
+// without showing the consent screen.
+//
+// Idempotent: same (user_id, client_id, resource_server_id) tuple updates
+// in place. Resets `revoked=false` on re-grant so a previously-revoked
+// grant can be re-granted by re-confirming on the consent screen.
+func (s *ConsentGrantService) UpsertGrant(
+	tenantID string,
+	userID uuid.UUID,
+	clientID string,
+	applicationID uuid.UUID,
+	grantedScopes []string,
+) (*models.OAuthConsentGrant, error) {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+	now := time.Now().UTC()
+	row := models.OAuthConsentGrant{
+		TenantID:         tenantID,
+		UserID:           userID,
+		ClientID:         clientID,
+		ResourceServerID: &applicationID,
+		GrantedScopes:    grantedScopes,
+	}
+	err = tenantDB.
+		Where("user_id = ? AND client_id = ? AND resource_server_id = ?",
+			userID, clientID, applicationID).
+		Assign(map[string]interface{}{
+			"granted_scopes": row.GrantedScopes,
+			"revoked":        false,
+			"revoked_at":     nil,
+			"updated_at":     now,
+		}).
+		FirstOrCreate(&row).Error
+	if err != nil {
+		return nil, fmt.Errorf("upsert consent grant: %w", err)
+	}
+	return &row, nil
+}
+
+// LookupActiveGrant returns the non-revoked consent grant for a
+// (user, client, application) triple if one exists. Used by the consent
+// GET handler to auto-approve when the user previously remembered consent.
+func (s *ConsentGrantService) LookupActiveGrant(
+	tenantID string,
+	userID uuid.UUID,
+	clientID string,
+	applicationID uuid.UUID,
+) (*models.OAuthConsentGrant, error) {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+	var row models.OAuthConsentGrant
+	err = tenantDB.Where(
+		"user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked = false",
+		userID, clientID, applicationID,
+	).First(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &row, nil
+}
+
 // ListFilters constrains which grants are returned.
 type ListFilters struct {
 	// UserID, when non-Nil, restricts results to grants for that user.
