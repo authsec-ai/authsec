@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -1243,9 +1244,14 @@ type InitiateSAMLResponseAPI struct {
 	Error          string `json:"error,omitempty"`
 }
 
-// InitiateSAML handles POST /authsec/oauth/v2/login/saml/initiate. Currently
-// returns 501 — the underlying service stub returns
-// "SAML federated login is not yet supported on the prod-mcp-v2 backend".
+// InitiateSAML handles POST /authsec/oauth/v2/login/saml/initiate.
+//
+// Resolves the identity_providers row (per-Application whitelist applied),
+// pulls the underlying saml_providers config row, then calls the legacy
+// OAuthLoginService.CreateSAMLRequest to build the AuthnRequest XML +
+// deflate/base64 encode + persist a saml_requests row keyed by
+// login_challenge. The UI POSTs (SAMLRequest, RelayState) to UpstreamSSOURL
+// to drive the SP-initiated dance.
 func (ctrl *LoginV2Controller) InitiateSAML(c *gin.Context) {
 	var req InitiateSAMLRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1261,25 +1267,43 @@ func (ctrl *LoginV2Controller) InitiateSAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: "auth context has no application"})
 		return
 	}
-	callbackURL := strings.TrimSuffix(config.AppConfig.OAuthBaseURL, "/") + "/authsec/oauth/v2/login/saml/acs"
-	out, err := ctrl.federatedSvc.InitiateSAML(services.InitiateSAMLInput{
+
+	// Validate IDP + whitelist via the federated service (which has all
+	// the cross-table joins). Returns the config_ref (saml_providers.id).
+	tenantDB, _, configUUID, err := ctrl.federatedSvc.ResolveSAMLProviderForApplication(services.InitiateSAMLInput{
 		TenantID:           tenantID,
 		ApplicationID:      *arcRow.ResourceServerID,
 		IdentityProviderID: req.IdentityProviderID,
 		LoginChallenge:     req.LoginChallenge,
 		ContextID:          arcRow.ContextID,
-		CallbackURL:        callbackURL,
 	})
 	if err != nil {
-		// Service currently stubs as 501.
-		c.JSON(http.StatusNotImplemented, InitiateSAMLResponseAPI{Success: false, Error: err.Error()})
+		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: err.Error()})
 		return
 	}
+
+	// Load the saml_providers row directly here (controller is allowed to
+	// import internal/hydra/models; the service isn't, due to a pre-
+	// existing import cycle).
+	var samlProv hydramodels.SAMLProvider
+	if err := tenantDB.Where("id = ?", configUUID).First(&samlProv).Error; err != nil {
+		c.JSON(http.StatusBadRequest, InitiateSAMLResponseAPI{Success: false, Error: "saml_providers config row not found: " + err.Error()})
+		return
+	}
+
+	// Mint the AuthnRequest via legacy code.
+	legacy := hydramodels.NewOAuthLoginService(*config.AppConfig)
+	samlRequest, relayState, err := legacy.CreateSAMLRequest(&samlProv, req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, InitiateSAMLResponseAPI{Success: false, Error: "create saml request: " + err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, InitiateSAMLResponseAPI{
 		Success:        true,
-		UpstreamSSOURL: out.UpstreamSSOURL,
-		SAMLRequest:    out.SAMLRequest,
-		RelayState:     out.RelayState,
+		UpstreamSSOURL: samlProv.SSOURL,
+		SAMLRequest:    samlRequest,
+		RelayState:     relayState,
 	})
 }
 
@@ -1291,7 +1315,17 @@ type CallbackSAMLResponse struct {
 }
 
 // CallbackSAML handles POST /authsec/oauth/v2/login/saml/acs. The SAML IdP
-// posts SAMLResponse + RelayState here. Stub returns 501.
+// posts (SAMLResponse, RelayState) form-encoded; we:
+//
+//  1. Validate via legacy OAuthLoginService.ValidateSAMLResponse — decodes
+//     base64, parses XML, checks Status + entity_id against saml_providers
+//     row, extracts NameID + email + attributes from the assertion.
+//  2. Look up our v2 auth_request_context row by login_challenge (recovered
+//     from RelayState) to get the resource_server_id (legacy SAML doesn't
+//     track that — it's a v2-only concept).
+//  3. Route through resolveOrJITFederatedUser so the SAML user gets the
+//     same per-MCP scoping as OIDC federated users (migration 034).
+//  4. Accept-login at Hydra.
 func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 	samlResponse := c.PostForm("SAMLResponse")
 	relayState := c.PostForm("RelayState")
@@ -1299,37 +1333,79 @@ func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "SAMLResponse and RelayState required"})
 		return
 	}
-	result, err := ctrl.federatedSvc.HandleSAMLACS(services.HandleSAMLACSInput{
-		SAMLResponse: samlResponse,
-		RelayState:   relayState,
-	})
+
+	legacy := hydramodels.NewOAuthLoginService(*config.AppConfig)
+	assertion, loginChallenge, providerName, tenantID, _, err := legacy.ValidateSAMLResponse(samlResponse, relayState)
 	if err != nil {
-		c.JSON(http.StatusNotImplemented, CallbackSAMLResponse{Success: false, Error: err.Error()})
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "validate saml response: " + err.Error()})
 		return
 	}
-	// Unreachable until the service stub is replaced with a real impl.
-	if result.LoginChallenge == "" {
-		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "state has no login_challenge"})
+	if loginChallenge == "" {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "RelayState carried no login_challenge"})
 		return
 	}
-	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(result.LoginChallenge, services.HydraAcceptLoginRequest{
-		Subject:     result.UserID.String(),
+
+	// Recover v2 context — gives us the application_id (resource_server_id).
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, CallbackSAMLResponse{Success: false, Error: "get tenant db: " + err.Error()})
+		return
+	}
+	var arc models.AuthRequestContext
+	if err := tenantDB.Where("login_challenge = ? AND tenant_id = ?", loginChallenge, tenantID).
+		First(&arc).Error; err != nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context not found; SAML must be initiated via /authsec/oauth/v2/authorize: " + err.Error()})
+		return
+	}
+	if arc.ResourceServerID == nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context has no resource_server_id; cannot scope SAML user per-MCP"})
+		return
+	}
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, CallbackSAMLResponse{Success: false, Error: "invalid tenant_id"})
+		return
+	}
+
+	// Build a display name from given+sn or fall back to email.
+	displayName := strings.TrimSpace(assertion.FirstName + " " + assertion.LastName)
+	userID, userEmail, userName, err := ctrl.federatedSvc.ResolveOrJITFederatedUserBasic(
+		tenantDB, tenantUUID, *arc.ResourceServerID, providerName,
+		assertion.NameID, assertion.Email, displayName,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "resolve user: " + err.Error()})
+		return
+	}
+
+	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(loginChallenge, services.HydraAcceptLoginRequest{
+		Subject:     userID.String(),
 		Remember:    false,
 		RememberFor: 0,
 		ACR:         "fed",
 		Context: map[string]interface{}{
-			"email":         result.UserEmail,
-			"name":          result.UserName,
+			"email":         userEmail,
+			"name":          userName,
 			"provider":      "saml",
-			"auth_method":   result.AuthMethod,
-			"tenant_id":     result.TenantID,
-			"provider_name": result.ProviderName,
+			"auth_method":   "saml_federated",
+			"tenant_id":     tenantID,
+			"provider_name": providerName,
 		},
 	})
 	if err != nil {
 		c.JSON(http.StatusBadGateway, CallbackSAMLResponse{Success: false, Error: "authorization server unavailable"})
 		return
 	}
+
+	// Stamp user_id + auth_time on auth_request_context for the consent step.
+	now := time.Now().UTC()
+	_ = tenantDB.Model(&models.AuthRequestContext{}).
+		Where("login_challenge = ? AND tenant_id = ?", loginChallenge, tenantID).
+		Updates(map[string]interface{}{
+			"user_id":   userID,
+			"auth_time": now,
+		}).Error
+
 	c.JSON(http.StatusOK, CallbackSAMLResponse{
 		Success:    true,
 		RedirectTo: acceptResp.RedirectTo,
