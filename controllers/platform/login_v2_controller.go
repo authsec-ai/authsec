@@ -699,13 +699,27 @@ func (ctrl *LoginV2Controller) GetConsentPageData(c *gin.Context) {
 		})
 		return
 	}
-	if len(consentReq.Client.Audience) == 0 {
+	// Resolve resource_uri. Preferred path is the Hydra client's audience
+	// (set at DCR/prereg time). Fallback: parse `resource` (RFC 8707) from
+	// the request_url Hydra echoes back. Same fallback as /login/page-data
+	// and findContextByLoginChallenge — DCR'd MCP clients don't always
+	// get audience persisted in Hydra.
+	var resourceURI string
+	if len(consentReq.Client.Audience) > 0 {
+		resourceURI = consentReq.Client.Audience[0]
+	}
+	if resourceURI == "" {
+		if u, parseErr := url.Parse(consentReq.RequestURL); parseErr == nil {
+			resourceURI = u.Query().Get("resource")
+		}
+	}
+	if resourceURI == "" {
 		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
 			Success: false, Error: "no resource bound to client",
 		})
 		return
 	}
-	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(consentReq.Client.Audience[0])
+	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(resourceURI)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ConsentPageDataResponse{
 			Success: false, Error: "Application not found for resource",
@@ -848,11 +862,25 @@ func (ctrl *LoginV2Controller) AcceptConsent(c *gin.Context) {
 		return
 	}
 	contextID := extractAuthsecCtx(consentReq.RequestURL)
-	if contextID == "" || len(consentReq.Client.Audience) == 0 {
+	if contextID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid consent context"})
 		return
 	}
-	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(consentReq.Client.Audience[0])
+	// Resource resolution: audience first, fallback to request_url.resource.
+	var resourceURI string
+	if len(consentReq.Client.Audience) > 0 {
+		resourceURI = consentReq.Client.Audience[0]
+	}
+	if resourceURI == "" {
+		if u, parseErr := url.Parse(consentReq.RequestURL); parseErr == nil {
+			resourceURI = u.Query().Get("resource")
+		}
+	}
+	if resourceURI == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid consent context"})
+		return
+	}
+	rs, tenantID, err := ctrl.rsSvc.GetByResourceURI(resourceURI)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Application not found"})
 		return
