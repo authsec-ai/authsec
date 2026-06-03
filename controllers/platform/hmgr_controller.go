@@ -543,7 +543,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	// OAuth client app's redirect_uri with an authorization code).
 	resp, err := ctrl.oidcSvc.InitiateOIDCFlow(&models.OIDCInitiateInput{
 		Provider:       providerName,
-		TenantDomain:   c.Request.Host,
+		TenantDomain:   originDomain,
 		ApplicationID:  appID,
 		LoginChallenge: req.LoginChallenge,
 	}, "hydra_login", &workspaceID)

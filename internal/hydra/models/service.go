@@ -254,8 +254,6 @@ func (s *OAuthLoginService) GetHydraLoginRequest(loginChallenge string) (*HydraL
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	log.Printf("Hydra login request response for challenge %s: %s", loginChallenge, string(bodyBytes))
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("login request not found, status code: %d", resp.StatusCode)
 	}
@@ -264,6 +262,11 @@ func (s *OAuthLoginService) GetHydraLoginRequest(loginChallenge string) (*HydraL
 	if err := json.Unmarshal(bodyBytes, &loginRequest); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal login request: %w", err)
 	}
+	log.Printf("Hydra login request loaded challenge=%s client_id=%s skip=%t",
+		loginChallenge,
+		loginRequest.Client.ClientID,
+		loginRequest.Skip,
+	)
 	return &loginRequest, nil
 }
 
