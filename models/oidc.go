@@ -60,16 +60,17 @@ func (OIDCState) TableName() string {
 // OIDCUserIdentity links OIDC provider identities to users
 // Allows lookup: "Does this Google user exist in this tenant?"
 type OIDCUserIdentity struct {
-	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	TenantID       uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
-	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
-	ProviderName   string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
-	ProviderUserID string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)
-	Email          string     `json:"email,omitempty"`                          // Email from provider
-	ProfileData    string     `json:"profile_data,omitempty" gorm:"type:jsonb"` // Additional profile info
-	LastLoginAt    *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	TenantID         uuid.UUID  `json:"tenant_id" gorm:"type:uuid;not null;index"`
+	ResourceServerID *uuid.UUID `json:"resource_server_id,omitempty" gorm:"type:uuid"` // Per-MCP scope (migration 034); legacy rows leave NULL
+	UserID           uuid.UUID  `json:"user_id" gorm:"type:uuid;not null"`
+	ProviderName     string     `json:"provider_name" gorm:"not null"`            // 'google', 'github', 'microsoft'
+	ProviderUserID   string     `json:"provider_user_id" gorm:"not null"`         // Provider's unique user ID (sub claim)
+	Email            string     `json:"email,omitempty"`                          // Email from provider
+	ProfileData      string     `json:"profile_data,omitempty" gorm:"type:jsonb"` // Additional profile info
+	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 // TableName specifies the table name for OIDCUserIdentity
