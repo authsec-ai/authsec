@@ -267,23 +267,27 @@ func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (
 		ID                    uuid.UUID
 		ProviderName          string
 		ClientID              string
-		ClientSecretVaultPath string
-		TokenURL              string
-		UserinfoURL           string
+		ClientSecret          string `gorm:"column:client_secret"`
+		ClientSecretVaultPath string `gorm:"column:client_secret_vault_path"`
+		TokenURL              string `gorm:"column:token_url"`
+		UserinfoURL           string `gorm:"column:userinfo_url"`
 	}
 	if err := tenantDB.Table("oidc_providers").
-		Select("id, provider_name, client_id, client_secret_vault_path, token_url, userinfo_url").
+		Select("id, provider_name, client_id, COALESCE(client_secret,'') AS client_secret, COALESCE(client_secret_vault_path,'') AS client_secret_vault_path, token_url, userinfo_url").
 		Where("provider_name = ?", stateRow.ProviderName).
 		First(&oidcRow).Error; err != nil {
 		return nil, fmt.Errorf("load oidc_providers config: %w", err)
 	}
 
-	// 3. Fetch client_secret from Vault. Backport pattern: per-tenant
-	// per-provider path. Fallback to env var (only safe for shared
-	// providers like Google).
-	clientSecret, err := s.loadClientSecret(tenantID, oidcRow.ProviderName)
-	if err != nil {
-		return nil, fmt.Errorf("load client secret: %w", err)
+	// 3. Resolve client_secret. Order: in-row (preferred, matches
+	// tenant_hydra_clients.hydra_client_secret pattern) → Vault → env var.
+	clientSecret := oidcRow.ClientSecret
+	if clientSecret == "" {
+		var err error
+		clientSecret, err = s.loadClientSecret(tenantID, oidcRow.ProviderName)
+		if err != nil {
+			return nil, fmt.Errorf("load client secret: %w", err)
+		}
 	}
 
 	// 4. Exchange code at upstream token endpoint.
