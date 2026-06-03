@@ -225,6 +225,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"project_id":   user.ProjectID,
 		"client_id":    expectedClientID,
 		"avatar_url":   user.AvatarURL,
+		"auth_method":  "password",
 	}
 	if projectID != "" {
 		loginContext["project_id"] = projectID
