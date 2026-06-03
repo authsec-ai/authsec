@@ -200,6 +200,19 @@ func SetupRoutes(
 	})
 
 	// ════════════════════════════════════════════════════════
+	// Bare-root .well-known/* OAuth discovery — RFC 8414 compliant.
+	// MCP clients (Claude Desktop, Cursor, etc.) build the discovery URL
+	// as <issuer>/.well-known/oauth-authorization-server. Our issuer is
+	// https://prod.api.authsec.ai (bare host), so they hit /. The v2
+	// controller already serves the same metadata under
+	// /authsec/oauth/v2/.well-known/* — these routes just expose it at
+	// the bare root where standards-compliant clients look.
+	// ════════════════════════════════════════════════════════
+	bareDiscoveryController := platformCtrl.NewOAuthASV2Controller()
+	r.GET("/.well-known/oauth-authorization-server", bareDiscoveryController.ASMetadata)
+	r.GET("/.well-known/openid-configuration", bareDiscoveryController.OIDCDiscovery)
+
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
