@@ -6,13 +6,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// OIDCProvider represents a workspace-owned OIDC provider configuration.
-// Each workspace registers its own OAuth client (its own Google Cloud Console
-// app, its own GitHub OAuth app) with credentials kept in workspace-scoped
-// Vault paths. (workspace_id, provider_name) is the canonical key.
+// OIDCProvider represents either a global/platform provider configuration
+// (workspace_id NULL in the database) or a workspace-owned provider
+// configuration. Workspace providers use (workspace_id, provider_name) as the
+// canonical key; global providers use provider_name with workspace_id NULL.
 type OIDCProvider struct {
 	ID                    uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	WorkspaceID           uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:oidc_providers_provider_name_workspace_uq"`
+	WorkspaceID           uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:oidc_providers_provider_name_workspace_uq"`
 	ProviderName          string    `json:"provider_name" gorm:"not null;uniqueIndex:oidc_providers_provider_name_workspace_uq"` // 'google', 'github', 'microsoft', or operator-defined slug
 	DisplayName           string    `json:"display_name" gorm:"not null"`                                                        // operator label shown to end users
 	ClientID              string    `json:"client_id" gorm:"not null"`                                                           // OAuth client ID

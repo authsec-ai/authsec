@@ -42,3 +42,25 @@ func TestOIDCProviderRedirectURIUsedForAuthorizationAndTokenExchange(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, callbackURL, tokenForm.Get("redirect_uri"))
 }
+
+func TestParseMicrosoftUserInfoSupportsOIDCAndGraphShapes(t *testing.T) {
+	oidcUser, err := parseMicrosoftUserInfo([]byte(`{
+		"sub": "subject-123",
+		"email": "person@example.com",
+		"name": "Person Example"
+	}`))
+	require.NoError(t, err)
+	require.Equal(t, "subject-123", oidcUser.Sub)
+	require.Equal(t, "person@example.com", oidcUser.Email)
+	require.Equal(t, "Person Example", oidcUser.Name)
+
+	graphUser, err := parseMicrosoftUserInfo([]byte(`{
+		"id": "graph-id-456",
+		"userPrincipalName": "person@contoso.com",
+		"displayName": "Person Contoso"
+	}`))
+	require.NoError(t, err)
+	require.Equal(t, "graph-id-456", graphUser.Sub)
+	require.Equal(t, "person@contoso.com", graphUser.Email)
+	require.Equal(t, "Person Contoso", graphUser.Name)
+}

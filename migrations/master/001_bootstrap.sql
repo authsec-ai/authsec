@@ -1557,6 +1557,7 @@ CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clie
 CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
 CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
 CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name);
+CREATE UNIQUE INDEX oidc_providers_global_provider_name_uq ON public.oidc_providers (provider_name) WHERE workspace_id IS NULL;
 CREATE INDEX idx_delegation_tokens_workspace_id         ON public.delegation_tokens(workspace_id);
 CREATE INDEX idx_delegation_policies_workspace_id       ON public.delegation_policies(workspace_id);
 CREATE INDEX idx_oauth_scopes_workspace_id              ON public.oauth_scopes(workspace_id);

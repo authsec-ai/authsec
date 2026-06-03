@@ -25,14 +25,16 @@ func NewOIDCProviderRepository(db *DBConnection) *OIDCProviderRepository {
 	return &OIDCProviderRepository{db: db}
 }
 
-// GetProviderByName retrieves an OIDC provider by name
+// GetProviderByName retrieves a global/platform OIDC provider by name.
+// Workspace-owned providers must use GetProviderByWorkspaceAndName so a
+// workspace login can never accidentally bind to another workspace's config.
 func (r *OIDCProviderRepository) GetProviderByName(providerName string) (*models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
 		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
-		WHERE provider_name = $1
+		WHERE workspace_id IS NULL AND provider_name = $1
 	`
 
 	provider, err := scanOIDCProvider(r.db.QueryRow(query, providerName))
@@ -67,14 +69,14 @@ func (r *OIDCProviderRepository) GetProviderByWorkspaceAndName(workspaceID uuid.
 	return provider, nil
 }
 
-// GetActiveProviders retrieves all active OIDC providers
+// GetActiveProviders retrieves active global/platform OIDC providers.
 func (r *OIDCProviderRepository) GetActiveProviders() ([]models.OIDCProvider, error) {
 	query := `
 		SELECT id, provider_name, display_name, client_id, client_secret_vault_path,
 		       authorization_url, token_url, userinfo_url, scopes, icon_url, redirect_uri, is_active,
 		       created_at, updated_at
 		FROM oidc_providers
-		WHERE is_active = true
+		WHERE workspace_id IS NULL AND is_active = true
 		ORDER BY display_name
 	`
 
@@ -240,6 +242,10 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 		String: state.LoginChallenge,
 		Valid:  state.LoginChallenge != "",
 	}
+	var workspaceIDParam interface{}
+	if state.WorkspaceID != nil {
+		workspaceIDParam = state.WorkspaceID.String()
+	}
 	var applicationIDParam interface{} // either uuid string or nil for NULL
 	if state.ApplicationID != nil {
 		applicationIDParam = state.ApplicationID.String()
@@ -247,7 +253,7 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 
 	err := r.db.QueryRow(query,
 		state.StateToken,
-		state.WorkspaceID,
+		workspaceIDParam,
 		state.TenantDomain,
 		requestHostParam,
 		state.ProviderName,

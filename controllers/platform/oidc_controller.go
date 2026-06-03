@@ -212,20 +212,6 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 		log.Printf("DEBUG Initiate: Set requestOrigin='%s' for post-auth redirect", origin)
 	}
 
-	// v4: OIDC is workspace-owned. The discover and register flows have no
-	// resolved workspace at this point, so they can't gate on
-	// identity_providers. Refuse cleanly and direct the caller through the
-	// signup-via-email path; once the workspace exists, the owner configures
-	// OIDC via POST /authsec/identity-providers and subsequent users can log
-	// in via Google/etc.
-	if workspaceID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":  "OIDC login requires an existing workspace; specify tenant_domain for a known workspace, or sign up via email first.",
-			"action": action,
-		})
-		return
-	}
-
 	// Initiate OIDC flow
 	response, err := oc.oidcService.InitiateOIDCFlow(&input, action, workspaceID)
 	if err != nil {
@@ -266,7 +252,9 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 	})
 }
 
-// GetProviders returns list of available OIDC providers for login UI
+// GetProviders returns OIDC providers for login UI. With no tenant_domain it
+// returns only global/platform providers (workspace_id IS NULL). With
+// tenant_domain it returns only providers configured for that workspace.
 // @Summary Get available OIDC providers
 // @Description Returns list of active OIDC providers for display on login page
 // @Tags OIDC
@@ -274,7 +262,22 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 // @Success 200 {object} models.OIDCProviderListResponse
 // @Router /authsec/uflow/oidc/providers [get]
 func (oc *OIDCController) GetProviders(c *gin.Context) {
-	providers, err := oc.oidcService.GetActiveProviders()
+	tenantDomain := strings.ToLower(strings.TrimSpace(c.Query("tenant_domain")))
+
+	var (
+		providers []models.OIDCProviderPublic
+		err       error
+	)
+	if tenantDomain != "" {
+		tenant, lookupErr := oc.tenantRepo.GetTenantByDomain(tenantDomain)
+		if lookupErr != nil || tenant == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
+			return
+		}
+		providers, err = oc.oidcService.GetActiveProvidersForWorkspace(tenant.WorkspaceID)
+	} else {
+		providers, err = oc.oidcService.GetActiveProviders()
+	}
 	if err != nil {
 		log.Printf("Failed to get OIDC providers: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get providers"})

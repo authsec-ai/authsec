@@ -41,13 +41,40 @@ func NewOIDCService(db *database.DBConnection) *OIDCService {
 	}
 }
 
-// GetActiveProviders returns list of active OIDC providers for login UI
+// GetActiveProviders returns global/platform OIDC providers for the generic
+// admin login screen. Workspace-owned providers are loaded with
+// GetActiveProvidersForWorkspace after the workspace/domain is known.
 func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) {
 	providers, err := s.providerRepo.GetActiveProviders()
 	if err != nil {
 		return nil, err
 	}
 
+	return publicOIDCProviders(providers), nil
+}
+
+// GetActiveProvidersForWorkspace returns only providers configured for the
+// resolved workspace through the canonical identity_providers table.
+func (s *OIDCService) GetActiveProvidersForWorkspace(workspaceID uuid.UUID) ([]models.OIDCProviderPublic, error) {
+	var providers []models.OIDCProvider
+	err := config.DB.
+		Table("identity_providers ip").
+		Select("op.*").
+		Joins("JOIN oidc_providers op ON op.id::text = ip.config_ref").
+		Where("ip.workspace_id = ?", workspaceID).
+		Where("ip.provider_type = ?", models.IdentityProviderOIDC).
+		Where("ip.status <> ?", "disabled").
+		Where("op.is_active = ?", true).
+		Order("op.display_name ASC").
+		Find(&providers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list workspace OIDC providers: %w", err)
+	}
+
+	return publicOIDCProviders(providers), nil
+}
+
+func publicOIDCProviders(providers []models.OIDCProvider) []models.OIDCProviderPublic {
 	publicProviders := make([]models.OIDCProviderPublic, 0, len(providers))
 	for _, p := range providers {
 		publicProviders = append(publicProviders, models.OIDCProviderPublic{
@@ -57,7 +84,7 @@ func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) 
 		})
 	}
 
-	return publicProviders, nil
+	return publicProviders
 }
 
 // InitiateOIDCFlow starts the OIDC authentication flow.
@@ -69,14 +96,31 @@ func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) 
 // application_identity_provider_policies rows, the IDP must be in the enabled
 // set (default-allow when no policies exist).
 func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action string, workspaceIDPtr *uuid.UUID) (*models.OIDCInitiateResponse, error) {
-	if workspaceIDPtr == nil {
-		return nil, fmt.Errorf("workspace_id is required for OIDC initiate")
-	}
-	workspaceID := *workspaceIDPtr
+	var provider *models.OIDCProvider
+	var signedState string
+	var err error
 
-	provider, err := s.resolveEnabledProvider(workspaceID, input.Provider, input.ApplicationID)
-	if err != nil {
-		return nil, err
+	if workspaceIDPtr != nil {
+		provider, err = s.resolveEnabledProvider(*workspaceIDPtr, input.Provider, input.ApplicationID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Mint a v4 signed state binding the workspace (and Application when known).
+		// Persisted alongside the random state token so the callback can verify the
+		// workspace context out-of-band.
+		signedState, _, err = MintSignedState(*workspaceIDPtr, input.ApplicationID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to mint signed OIDC state: %w", err)
+		}
+	} else {
+		provider, err = s.providerRepo.GetProviderByName(input.Provider)
+		if err != nil {
+			return nil, fmt.Errorf("global provider %q not configured", input.Provider)
+		}
+		if !provider.IsActive {
+			return nil, fmt.Errorf("global provider %q is inactive", input.Provider)
+		}
 	}
 
 	// Generate state token (for CSRF protection and tenant context)
@@ -91,14 +135,6 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 		return nil, fmt.Errorf("failed to generate code verifier: %w", err)
 	}
 	codeChallenge := generateCodeChallenge(codeVerifier)
-
-	// Mint a v4 signed state binding the workspace (and Application when known).
-	// Persisted alongside the random state token so the callback can verify the
-	// workspace context out-of-band.
-	signedState, _, err := MintSignedState(workspaceID, input.ApplicationID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to mint signed OIDC state: %w", err)
-	}
 
 	// Store state in database (expires in 30 minutes)
 	state := &models.OIDCState{
@@ -217,6 +253,15 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 			}
 			if userInfo.Email == "" {
 				userInfo.Email = claims.Email
+			}
+			if userInfo.Email == "" {
+				userInfo.Email = claims.PreferredUsername
+			}
+			if userInfo.Email == "" {
+				userInfo.Email = claims.UPN
+			}
+			if userInfo.Email == "" {
+				userInfo.Email = claims.UniqueName
 			}
 			if !userInfo.EmailVerified {
 				userInfo.EmailVerified = claims.EmailVerified
@@ -516,6 +561,8 @@ func (s *OIDCService) getUserInfo(provider *models.OIDCProvider, accessToken str
 	switch provider.ProviderName {
 	case "github":
 		userInfo, err = parseGitHubUserInfo(body, accessToken, s.httpClient)
+	case "microsoft":
+		userInfo, err = parseMicrosoftUserInfo(body)
 	default:
 		err = json.Unmarshal(body, &userInfo)
 	}
@@ -566,10 +613,13 @@ func (s *OIDCService) getClientSecret(vaultPath string) (string, error) {
 // generateSecureToken generates a cryptographically secure random token
 // idTokenClaims holds the fields we care about from a JWT id_token payload.
 type idTokenClaims struct {
-	Sub           string `json:"sub"`
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
-	Name          string `json:"name"`
+	Sub               string `json:"sub"`
+	Email             string `json:"email"`
+	EmailVerified     bool   `json:"email_verified"`
+	Name              string `json:"name"`
+	PreferredUsername string `json:"preferred_username"`
+	UPN               string `json:"upn"`
+	UniqueName        string `json:"unique_name"`
 }
 
 // parseIDTokenClaims decodes the payload of a JWT id_token without verifying
@@ -641,6 +691,45 @@ func parseGitHubUserInfo(body []byte, accessToken string, client *http.Client) (
 	}
 
 	return userInfo, nil
+}
+
+// parseMicrosoftUserInfo accepts both the standard Entra OIDC userinfo shape
+// and the older Graph /me shape that some existing rows may still store.
+func parseMicrosoftUserInfo(body []byte) (models.OIDCUserInfo, error) {
+	var msUser struct {
+		Sub               string `json:"sub"`
+		ID                string `json:"id"`
+		Email             string `json:"email"`
+		Mail              string `json:"mail"`
+		UserPrincipalName string `json:"userPrincipalName"`
+		PreferredUsername string `json:"preferred_username"`
+		Name              string `json:"name"`
+		DisplayName       string `json:"displayName"`
+		GivenName         string `json:"given_name"`
+		Surname           string `json:"surname"`
+	}
+
+	if err := json.Unmarshal(body, &msUser); err != nil {
+		return models.OIDCUserInfo{}, err
+	}
+
+	userInfo := models.OIDCUserInfo{
+		Sub:        coalesceProfileString(msUser.Sub, msUser.ID),
+		Email:      coalesceProfileString(msUser.Email, msUser.Mail, msUser.PreferredUsername, msUser.UserPrincipalName),
+		Name:       coalesceProfileString(msUser.Name, msUser.DisplayName),
+		GivenName:  msUser.GivenName,
+		FamilyName: msUser.Surname,
+	}
+	return userInfo, nil
+}
+
+func coalesceProfileString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // fetchGitHubPrimaryEmail fetches the primary email from GitHub API
