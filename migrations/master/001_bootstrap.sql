@@ -588,8 +588,8 @@ ON CONFLICT (id) DO NOTHING;
 CREATE TABLE public.oidc_states (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     state_token character varying(255) NOT NULL,
-    workspace_id uuid NOT NULL,
-    workspace_domain character varying(255) NOT NULL,
+    workspace_id uuid,              -- NULL for platform-level login (before workspace exists)
+    workspace_domain character varying(255),
     provider_name character varying(50) NOT NULL,
     action character varying(20) NOT NULL,
     code_verifier character varying(128),
