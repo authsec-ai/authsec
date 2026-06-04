@@ -12,8 +12,8 @@ import (
 // canonical key; global providers use provider_name with workspace_id NULL.
 type OIDCProvider struct {
 	ID                    uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	WorkspaceID           uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:oidc_providers_provider_name_workspace_uq"`
-	ProviderName          string    `json:"provider_name" gorm:"not null;uniqueIndex:oidc_providers_provider_name_workspace_uq"` // 'google', 'github', 'microsoft', or operator-defined slug
+	WorkspaceID           *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"` // NULL = platform-level provider
+	ProviderName          string     `json:"provider_name" gorm:"not null"`           // 'google', 'github', 'microsoft', or operator-defined slug
 	DisplayName           string    `json:"display_name" gorm:"not null"`                                                        // operator label shown to end users
 	ClientID              string    `json:"client_id" gorm:"not null"`                                                           // OAuth client ID
 	ClientSecretVaultPath string    `json:"client_secret_vault_path" gorm:"not null"`                                            // Vault path for secret

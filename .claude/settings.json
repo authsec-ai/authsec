@@ -48,7 +48,8 @@
       "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c ':*)",
       "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")",
       "Bash(echo \"Exit: $?\")",
-      "Bash(kubectl scale:*)"
+      "Bash(kubectl scale:*)",
+      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT provider_name, workspace_id IS NULL AS is_platform FROM oidc_providers;\")"
     ],
     "additionalDirectories": [
       "/tmp"

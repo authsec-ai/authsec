@@ -65,7 +65,7 @@ func (r *OIDCProviderRepository) GetProviderByWorkspaceAndName(workspaceID uuid.
 		}
 		return nil, err
 	}
-	provider.WorkspaceID = workspaceID
+	provider.WorkspaceID = &workspaceID
 	return provider, nil
 }
 

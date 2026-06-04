@@ -112,8 +112,9 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 
 	var idp models.IdentityProvider
 	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		wsID := req.WorkspaceID
 		oidcRow := models.OIDCProvider{
-			WorkspaceID:           req.WorkspaceID,
+			WorkspaceID:           &wsID,
 			ProviderName:          providerName,
 			DisplayName:           coalesceString(req.DisplayName, providerName),
 			ClientID:              req.ClientID,
