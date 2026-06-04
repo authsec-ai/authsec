@@ -33,7 +33,7 @@ func NewSendGridService(apiKey string) *SendGridService {
 // base URL. Used by tests to point at an httptest.Server.
 func NewSendGridServiceWithBaseURL(apiKey, baseURL string) *SendGridService {
 	return &SendGridService{
-		apiKey:     apiKey,
+		apiKey:     "Bearer " + apiKey,
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
@@ -128,8 +128,14 @@ func (s *SendGridService) RemoveFromLists(email string, listIDs []string) error 
 // resolveContactID looks up a contact by email and returns their SendGrid contact ID.
 // Returns ("", nil) when the contact does not exist.
 func (s *SendGridService) resolveContactID(email string) (string, error) {
-	query := fmt.Sprintf(`{"query":"email = '%s'"}`, email)
-	req, err := http.NewRequest(http.MethodPost, s.baseURL+"/v3/marketing/contacts/search", bytes.NewBufferString(query))
+	type searchPayload struct {
+		Query string `json:"query"`
+	}
+	searchBody, err := json.Marshal(searchPayload{Query: fmt.Sprintf("email = '%s'", email)})
+	if err != nil {
+		return "", fmt.Errorf("sendgrid: marshal search payload: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, s.baseURL+"/v3/marketing/contacts/search", bytes.NewReader(searchBody))
 	if err != nil {
 		return "", fmt.Errorf("sendgrid: build search request: %w", err)
 	}
@@ -141,6 +147,11 @@ func (s *SendGridService) resolveContactID(email string) (string, error) {
 		return "", fmt.Errorf("sendgrid: search contacts: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("sendgrid: search contacts status %d: %s", resp.StatusCode, string(b))
+	}
 
 	var result struct {
 		Result []struct {

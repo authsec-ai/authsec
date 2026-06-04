@@ -23,7 +23,7 @@ func TestUpsertContact_FirstLogin(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := services.NewSendGridServiceWithBaseURL("Bearer sg-key", srv.URL)
+	svc := services.NewSendGridServiceWithBaseURL("sg-key", srv.URL)
 
 	jobID, err := svc.UpsertContact("user@example.com", "Alice", "list-id-abc", map[string]string{
 		"e1_T": "new-signup",
