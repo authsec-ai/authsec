@@ -178,7 +178,7 @@ func (s *ConsentGrantService) Revoke(tenantID string, grantID uuid.UUID, calling
 	// Best-effort Hydra consent-session invalidation. Failure is logged but
 	// not returned — the DB row is the source of truth; introspection will
 	// fail on the next access-token validation regardless.
-	if err := hydraAdminRevokeConsentSession(grant.UserID.String(), grant.ClientID); err != nil {
+	if err := hydraV2AdminRevokeConsentSession(grant.UserID.String(), grant.ClientID); err != nil {
 		// Don't return the error — the grant IS revoked DB-side, and
 		// the introspection check on next call will deny.
 		_ = err

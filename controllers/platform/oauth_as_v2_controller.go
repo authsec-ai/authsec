@@ -193,7 +193,7 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 	// `resource` form param, so the state-prefix is redundant.
 	q.Set("client_id", client.HydraClientID)
 	q.Set("authsec_ctx", contextID)
-	hydraAuthURL := strings.TrimSuffix(getHydraPublicBase(), "/") + "/oauth2/auth?" + q.Encode()
+	hydraAuthURL := strings.TrimSuffix(getHydraV2PublicBase(), "/") + "/oauth2/auth?" + q.Encode()
 	c.Redirect(http.StatusFound, hydraAuthURL)
 }
 
@@ -786,4 +786,17 @@ func getHydraPublicBase() string {
 	}
 	admin := strings.TrimSuffix(config.AppConfig.HydraAdminURL, "/")
 	return strings.TrimSuffix(admin, "/admin")
+}
+
+// getHydraV2PublicBase returns the public URL of the v2 Hydra dedicated to
+// the MCP OAuth flow. Falls back to the legacy Hydra public URL when unset.
+// Used by /authorize (browser redirect to /oauth2/auth) and by the OIDC
+// discovery doc's `issuer` claim — both need to land on the same canonical
+// host the v2 Hydra is configured to recognize, so its login_url config
+// directs challenges to our v2 UI rather than the legacy hmgr handler.
+func getHydraV2PublicBase() string {
+	if u := config.AppConfig.HydraV2PublicURL; u != "" {
+		return strings.TrimSuffix(u, "/")
+	}
+	return getHydraPublicBase()
 }

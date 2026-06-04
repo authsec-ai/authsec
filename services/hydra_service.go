@@ -36,8 +36,30 @@ func hydraAdminURL() string {
 	return config.AppConfig.HydraAdminURL
 }
 
+// hydraV2AdminURL returns the admin URL of the v2 Hydra dedicated to the MCP
+// OAuth flow. Falls back to the legacy admin URL when unset — so a single-
+// Hydra deployment keeps working. Use this from any v2-specific call path
+// (DCR for /oauth/v2/register, login + consent admin calls keyed by v2
+// challenges, etc.) so legacy flows continue talking to the legacy Hydra.
+func hydraV2AdminURL() string {
+	if u := config.AppConfig.HydraV2AdminURL; u != "" {
+		return u
+	}
+	return config.AppConfig.HydraAdminURL
+}
+
+// hydraAdminGetClient queries the legacy Hydra. For v2-flow callers
+// (DCR + MCP login), use hydraV2AdminGetClient.
 func hydraAdminGetClient(clientID string) (*hydraClient, error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), nil)
+	return hydraAdminGetClientAt(hydraAdminURL(), clientID)
+}
+
+func hydraV2AdminGetClient(clientID string) (*hydraClient, error) {
+	return hydraAdminGetClientAt(hydraV2AdminURL(), clientID)
+}
+
+func hydraAdminGetClientAt(adminURL, clientID string) (*hydraClient, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients/%s", adminURL, clientID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -57,11 +79,19 @@ func hydraAdminGetClient(clientID string) (*hydraClient, error) {
 }
 
 func hydraAdminCreateClient(c hydraClient) error {
+	return hydraAdminCreateClientAt(hydraAdminURL(), c)
+}
+
+func hydraV2AdminCreateClient(c hydraClient) error {
+	return hydraAdminCreateClientAt(hydraV2AdminURL(), c)
+}
+
+func hydraAdminCreateClientAt(adminURL string, c hydraClient) error {
 	data, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), bytes.NewBuffer(data))
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/admin/clients", adminURL), bytes.NewBuffer(data))
 	if err != nil {
 		return err
 	}
@@ -79,11 +109,19 @@ func hydraAdminCreateClient(c hydraClient) error {
 }
 
 func hydraAdminUpdateClient(clientID string, c hydraClient) error {
+	return hydraAdminUpdateClientAt(hydraAdminURL(), clientID, c)
+}
+
+func hydraV2AdminUpdateClient(clientID string, c hydraClient) error {
+	return hydraAdminUpdateClientAt(hydraV2AdminURL(), clientID, c)
+}
+
+func hydraAdminUpdateClientAt(adminURL, clientID string, c hydraClient) error {
 	data, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("PUT", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), bytes.NewBuffer(data))
+	req, err := http.NewRequest("PUT", fmt.Sprintf("%s/admin/clients/%s", adminURL, clientID), bytes.NewBuffer(data))
 	if err != nil {
 		return err
 	}
@@ -101,7 +139,15 @@ func hydraAdminUpdateClient(clientID string, c hydraClient) error {
 }
 
 func hydraAdminDeleteClient(clientID string) error {
-	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/admin/clients/%s", hydraAdminURL(), clientID), nil)
+	return hydraAdminDeleteClientAt(hydraAdminURL(), clientID)
+}
+
+func hydraV2AdminDeleteClient(clientID string) error {
+	return hydraAdminDeleteClientAt(hydraV2AdminURL(), clientID)
+}
+
+func hydraAdminDeleteClientAt(adminURL, clientID string) error {
+	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/admin/clients/%s", adminURL, clientID), nil)
 	if err != nil {
 		return err
 	}
@@ -126,11 +172,19 @@ func hydraAdminDeleteClient(clientID string) error {
 // Hydra: DELETE /admin/oauth2/auth/sessions/consent?subject=...&client=...
 // Returns 204 on success. Idempotent: 204 even when no session exists.
 func hydraAdminRevokeConsentSession(subject, clientID string) error {
+	return hydraAdminRevokeConsentSessionAt(hydraAdminURL(), subject, clientID)
+}
+
+func hydraV2AdminRevokeConsentSession(subject, clientID string) error {
+	return hydraAdminRevokeConsentSessionAt(hydraV2AdminURL(), subject, clientID)
+}
+
+func hydraAdminRevokeConsentSessionAt(adminURL, subject, clientID string) error {
 	if subject == "" || clientID == "" {
 		return fmt.Errorf("subject and clientID required")
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/sessions/consent?subject=%s&client=%s",
-		hydraAdminURL(), url.QueryEscape(subject), url.QueryEscape(clientID))
+		adminURL, url.QueryEscape(subject), url.QueryEscape(clientID))
 	req, err := http.NewRequest("DELETE", u, nil)
 	if err != nil {
 		return err

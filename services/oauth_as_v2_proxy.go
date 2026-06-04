@@ -177,12 +177,18 @@ func ptrIfNonEmpty(s string) *string {
 // also extracts the response token + reissues with permission-filtered scope.
 // We're keeping the simpler proxy shape on prod for now.
 func (s *OAuthASService) ProxyFormToHydraPublic(path string, form url.Values) (status int, body []byte, err error) {
-	baseURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/")
+	// Prefer the v2 Hydra public URL — v2-flow endpoints (/token, /revoke,
+	// /jwks proxy) must talk to the Hydra that issued the code/token, not
+	// the legacy Hydra. v2 falls back to legacy when unset so single-Hydra
+	// deployments keep working.
+	baseURL := strings.TrimSuffix(config.AppConfig.HydraV2PublicURL, "/")
 	if baseURL == "" {
-		// AppConfig.HydraPublicURL may not be set on every deployment.
+		baseURL = strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/")
+	}
+	if baseURL == "" {
 		// Fall back to swapping /admin out of HydraAdminURL — typical for
 		// dev/staging clusters where public and admin are siblings.
-		base := strings.TrimSuffix(hydraAdminURL(), "/")
+		base := strings.TrimSuffix(hydraV2AdminURL(), "/")
 		baseURL = strings.TrimSuffix(base, "/admin")
 	}
 	if baseURL == "" {
@@ -212,7 +218,7 @@ func (s *OAuthASService) IntrospectViaHydraAdmin(token string) (status int, body
 	form := url.Values{}
 	form.Set("token", token)
 	req, err := http.NewRequest("POST",
-		fmt.Sprintf("%s/admin/oauth2/introspect", hydraAdminURL()),
+		fmt.Sprintf("%s/admin/oauth2/introspect", hydraV2AdminURL()),
 		strings.NewReader(form.Encode()))
 	if err != nil {
 		return 0, nil, err
@@ -244,11 +250,16 @@ func (s *OAuthASService) RevokeHydraToken(token string) error {
 	return nil
 }
 
-// FetchJWKS proxies Hydra's /.well-known/jwks.json.
+// FetchJWKS proxies the v2 Hydra's /.well-known/jwks.json — clients verify
+// access-token signatures against this, so it MUST come from the same Hydra
+// that signed them (v2 Hydra, not legacy).
 func (s *OAuthASService) FetchJWKS() ([]byte, error) {
-	baseURL := strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/")
+	baseURL := strings.TrimSuffix(config.AppConfig.HydraV2PublicURL, "/")
 	if baseURL == "" {
-		base := strings.TrimSuffix(hydraAdminURL(), "/")
+		baseURL = strings.TrimSuffix(config.AppConfig.HydraPublicURL, "/")
+	}
+	if baseURL == "" {
+		base := strings.TrimSuffix(hydraV2AdminURL(), "/")
 		baseURL = strings.TrimSuffix(base, "/admin")
 	}
 	req, err := http.NewRequest("GET", baseURL+"/.well-known/jwks.json", nil)
@@ -263,10 +274,10 @@ func (s *OAuthASService) FetchJWKS() ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// hydraClientGetForUpdate is a thin shim over hydraAdminGetClient used by
+// hydraClientGetForUpdate is a thin shim over hydraV2AdminGetClient used by
 // the reconciler.
 func hydraClientGetForUpdate(hydraClientID string) (*hydraClient, error) {
-	return hydraAdminGetClient(hydraClientID)
+	return hydraV2AdminGetClient(hydraClientID)
 }
 
 // rebuildHydraClientPayload reconstructs the create-client payload from the

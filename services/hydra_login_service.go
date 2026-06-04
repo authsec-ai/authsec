@@ -14,9 +14,12 @@ import (
 // these claims" or "yes, accept the consent challenge with these granted
 // scopes."
 //
-// All calls hit Hydra admin (HYDRA_ADMIN_URL). The public Hydra endpoint
-// is what the browser-facing user agents talk to; this service is for
-// backend-to-Hydra calls that happen between login and token exchange.
+// All calls hit the v2 Hydra admin URL (HYDRA_V2_ADMIN_URL, falling back to
+// HYDRA_ADMIN_URL when unset). The v2 flow runs on its own Hydra instance
+// so legacy hmgr login flows aren't disturbed by URLS_LOGIN config drift —
+// see hydraV2AdminURL() for resolution. The public Hydra endpoint is what
+// browser-facing user agents talk to; this service is for backend-to-Hydra
+// calls that happen between login and token exchange.
 //
 // Backport-lean equivalent of the dev branch's services/hydra_login.go.
 // Same shape, same fail modes, no surprises.
@@ -54,7 +57,7 @@ func (s *HydraLoginService) GetLoginRequest(challenge string) (*HydraLoginReques
 		return nil, fmt.Errorf("login_challenge required")
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/login?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -110,7 +113,7 @@ func (s *HydraLoginService) AcceptLoginRequest(challenge string, req HydraAccept
 		return nil, err
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/login/accept?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	httpReq, err := http.NewRequest("PUT", u, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -151,7 +154,7 @@ func (s *HydraLoginService) RejectLoginRequest(challenge string, req HydraReject
 		return nil, err
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/login/reject?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	httpReq, err := http.NewRequest("PUT", u, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -200,7 +203,7 @@ func (s *HydraLoginService) GetConsentRequest(challenge string) (*HydraConsentRe
 		return nil, fmt.Errorf("consent_challenge required")
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -252,7 +255,7 @@ func (s *HydraLoginService) AcceptConsentRequest(challenge string, req HydraAcce
 		return nil, err
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent/accept?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	httpReq, err := http.NewRequest("PUT", u, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -291,7 +294,7 @@ func (s *HydraLoginService) RejectConsentRequest(challenge string, req HydraReje
 		return nil, err
 	}
 	u := fmt.Sprintf("%s/admin/oauth2/auth/requests/consent/reject?challenge=%s",
-		hydraAdminURL(), challenge)
+		hydraV2AdminURL(), challenge)
 	httpReq, err := http.NewRequest("PUT", u, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err

@@ -100,6 +100,14 @@ type Config struct {
 	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
 	IdentityProviderURL string // Identity provider base URL for OIDC callbacks
 
+	// Hydra V2 fields — a separate Hydra instance dedicated to the MCP OAuth
+	// v2 flow. Empty values mean "fall back to the legacy Hydra fields" so
+	// dev environments with only one Hydra keep working. Production should
+	// set these to https://oauth-v2.<env>.authsec.ai and the cluster-internal
+	// admin URL of the v2 Hydra deployment.
+	HydraV2PublicURL string
+	HydraV2AdminURL  string
+
 	// OAuthBaseURL is the canonical public URL of the AuthSec backend that
 	// serves the /authsec/oauth/v2/* surface. Used by CanonicalIssuerOnly
 	// middleware to redirect non-canonical-host traffic AND by the well-known
@@ -185,6 +193,8 @@ func LoadConfig() *Config {
 	vaultAddr := getEnv("VAULT_ADDR", "http://localhost:8200")
 	vaultToken := getEnv("VAULT_TOKEN", "")
 	hydraAdminURL := getEnv("HYDRA_ADMIN_URL", "http://localhost:4445")
+	hydraV2AdminURL := getEnv("HYDRA_V2_ADMIN_URL", "")
+	hydraV2PublicURL := getEnv("HYDRA_V2_PUBLIC_URL", "")
 
 	corsAllowOrigin := getEnv("CORS_ALLOW_ORIGIN", "https://*.app.authsec.dev,https://app.authsec.dev,https://*.authsec.dev,https://authsec.dev,https://*.authsec.ai,https://200xx.app.authsec.dev")
 
@@ -307,6 +317,8 @@ func LoadConfig() *Config {
 		VaultAddr:               vaultAddr,
 		VaultToken:              vaultToken,
 		HydraAdminURL:           hydraAdminURL,
+		HydraV2AdminURL:         hydraV2AdminURL,
+		HydraV2PublicURL:        hydraV2PublicURL,
 		SMTPHost:                smtpHost,
 		SMTPPort:                smtpPort,
 		SMTPUser:                smtpUser,

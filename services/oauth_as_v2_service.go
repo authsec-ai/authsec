@@ -143,7 +143,7 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest) (*DCRResponse, error)
 	if rs != nil {
 		hc.Audience = []string{rs.ResourceURI}
 	}
-	if err := hydraAdminCreateClient(hc); err != nil {
+	if err := hydraV2AdminCreateClient(hc); err != nil {
 		return nil, fmt.Errorf("hydra create client: %w", err)
 	}
 
