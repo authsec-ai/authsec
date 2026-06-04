@@ -57,6 +57,8 @@ func (s *OIDCService) GetActiveProviders() ([]models.OIDCProviderPublic, error) 
 // resolved workspace through the canonical identity_providers table.
 func (s *OIDCService) GetActiveProvidersForWorkspace(workspaceID uuid.UUID) ([]models.OIDCProviderPublic, error) {
 	var providers []models.OIDCProvider
+
+	// Workspace-owned providers
 	err := config.DB.
 		Table("identity_providers ip").
 		Select("op.*").
@@ -69,6 +71,20 @@ func (s *OIDCService) GetActiveProvidersForWorkspace(workspaceID uuid.UUID) ([]m
 		Find(&providers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list workspace OIDC providers: %w", err)
+	}
+
+	// Merge in platform-level providers (workspace_id IS NULL) that aren't
+	// already overridden by a workspace-owned provider with the same name.
+	wsNames := make(map[string]bool, len(providers))
+	for _, p := range providers {
+		wsNames[p.ProviderName] = true
+	}
+	var platformProviders []models.OIDCProvider
+	config.DB.Where("workspace_id IS NULL AND is_active = true").Find(&platformProviders)
+	for _, p := range platformProviders {
+		if !wsNames[p.ProviderName] {
+			providers = append(providers, p)
+		}
 	}
 
 	return publicOIDCProviders(providers), nil

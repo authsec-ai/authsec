@@ -551,12 +551,39 @@ CREATE TABLE public.oidc_providers (
     is_active boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    workspace_id uuid NOT NULL,
+    workspace_id uuid,  -- NULL = platform-level provider available to all workspaces
     display_name_override text,
     redirect_uri text,
-    CONSTRAINT oidc_providers_pkey PRIMARY KEY (id),
-    CONSTRAINT oidc_providers_id_workspace_uq UNIQUE (id, workspace_id)
+    CONSTRAINT oidc_providers_pkey PRIMARY KEY (id)
 );
+
+-- Platform OIDC providers: available on the AuthSec login page for all admins.
+-- Secrets resolved at runtime via env vars (vault_path contains provider name).
+INSERT INTO public.oidc_providers (
+    id, provider_name, display_name, client_id, client_secret_vault_path,
+    authorization_url, token_url, userinfo_url, scopes, is_active, workspace_id
+) VALUES
+(
+    'a0000000-0000-0000-0000-000000000001',
+    'google', 'Google',
+    '239842296073-kl769rs14u18heajst55cl6e1a8qhk5m.apps.googleusercontent.com',
+    'platform/google/client_secret',
+    'https://accounts.google.com/o/oauth2/v2/auth',
+    'https://oauth2.googleapis.com/token',
+    'https://openidconnect.googleapis.com/v1/userinfo',
+    'openid email profile', true, NULL
+),
+(
+    'a0000000-0000-0000-0000-000000000002',
+    'microsoft', 'Microsoft',
+    'b762fc4d-0bb6-46fc-affc-9420fa0f9c7f',
+    'platform/microsoft/client_secret',
+    'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+    'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+    'https://graph.microsoft.com/oidc/userinfo',
+    'openid email profile', true, NULL
+)
+ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE public.oidc_states (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -1452,7 +1479,7 @@ CREATE TABLE public.identity_providers (
         (provider_type IN ('ad', 'entra', 'scim'))
     ),
     CONSTRAINT identity_providers_id_workspace_uq UNIQUE (id, workspace_id),
-    CONSTRAINT identity_providers_oidc_fkey FOREIGN KEY (oidc_provider_id, workspace_id) REFERENCES public.oidc_providers(id, workspace_id) ON DELETE SET NULL
+    CONSTRAINT identity_providers_oidc_fkey FOREIGN KEY (oidc_provider_id) REFERENCES public.oidc_providers(id) ON DELETE SET NULL
 );
 
 CREATE INDEX idx_identity_providers_workspace ON public.identity_providers(workspace_id);
@@ -1548,7 +1575,8 @@ CREATE INDEX idx_rs_access_policies_workspace_id        ON public.resource_serve
 CREATE INDEX idx_mcp_oauth_clients_sync_status          ON public.mcp_oauth_clients(sync_status) WHERE sync_status <> 'active';
 CREATE INDEX idx_scim_connections_default_client        ON public.scim_connections(default_client_id) WHERE default_client_id IS NOT NULL;
 CREATE INDEX idx_oidc_providers_workspace               ON public.oidc_providers(workspace_id);
-CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name);
+CREATE UNIQUE INDEX oidc_providers_provider_name_workspace_uq ON public.oidc_providers (workspace_id, provider_name) WHERE workspace_id IS NOT NULL;
+CREATE UNIQUE INDEX oidc_providers_provider_name_platform_uq ON public.oidc_providers (provider_name) WHERE workspace_id IS NULL;
 CREATE INDEX idx_delegation_tokens_workspace_id         ON public.delegation_tokens(workspace_id);
 CREATE INDEX idx_delegation_policies_workspace_id       ON public.delegation_policies(workspace_id);
 CREATE INDEX idx_oauth_scopes_workspace_id              ON public.oauth_scopes(workspace_id);

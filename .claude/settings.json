@@ -46,7 +46,8 @@
       "Bash(psql -h localhost -p 5432 -U postgres -c \"CREATE DATABASE authsec_test;\")",
       "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test --set ON_ERROR_STOP=on -f migrations/master/001_bootstrap.sql)",
       "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c ':*)",
-      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")"
+      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")",
+      "Bash(echo \"Exit: $?\")"
     ],
     "additionalDirectories": [
       "/tmp"
