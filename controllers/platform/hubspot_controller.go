@@ -12,13 +12,15 @@ import (
 // HubSpotController handles HubSpot integration endpoints
 type HubSpotController struct {
 	hubspotService *services.HubSpotService
+	sg             *services.SendGridService
 }
 
-// NewHubSpotController creates a new HubSpot controller
-func NewHubSpotController() *HubSpotController {
+// NewHubSpotController creates a new HubSpot controller.
+func NewHubSpotController(sg *services.SendGridService) *HubSpotController {
 	cfg := config.GetConfig()
 	return &HubSpotController{
 		hubspotService: services.NewHubSpotService(cfg.HubSpotAccessToken),
+		sg:             sg,
 	}
 }
 
@@ -58,6 +60,18 @@ func (hc *HubSpotController) SyncContact(c *gin.Context) {
 			"message": "Failed to sync contact to HubSpot",
 		})
 		return
+	}
+
+	// Update is_pql in SendGrid for segmentation/reporting.
+	// No list change — the nurture sequence continues until the user upgrades or unsubscribes.
+	if hc.sg != nil {
+		cfg := config.GetConfig()
+		if _, err := hc.sg.UpsertContact(req.Email, "", "", map[string]string{
+			cfg.SGFieldIsPQL: "true",
+		}); err != nil {
+			log.Printf("[HubSpot] SendGrid PQL field update failed for %s: %v", req.Email, err)
+			// non-fatal — HubSpot sync succeeded
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
