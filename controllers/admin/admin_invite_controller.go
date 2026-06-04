@@ -256,12 +256,21 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 				INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
 				SELECT $1, $2, $3, $4, NULL, NULL, NOW(), NOW()
 				WHERE NOT EXISTS (
-					SELECT 1 FROM role_bindings 
-					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 
+					SELECT 1 FROM role_bindings
+					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4
 					AND scope_type IS NULL AND scope_id IS NULL
 				)
 			`, uuid.New(), workspaceUUID, adminUser.ID, roleID); err != nil {
 				log.Printf("User-flow:ERROR: Failed to bind admin role to invited user: %v", err)
+			}
+
+			// Bind to workspace_memberships (RequireWorkspaceRole checks this)
+			if _, err := config.GetDatabase().Exec(`
+				INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, 'active', 'invite', NOW(), NOW())
+				ON CONFLICT (workspace_id, user_id) DO NOTHING
+			`, uuid.New(), workspaceUUID, adminUser.ID, roleID); err != nil {
+				log.Printf("User-flow:ERROR: Failed to create workspace_membership for invited admin: %v", err)
 			}
 		}
 

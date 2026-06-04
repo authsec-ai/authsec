@@ -1068,6 +1068,17 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		}
 	}
 
+	// Bind admin to workspace_memberships (RequireWorkspaceRole checks this)
+	if roleID != uuid.Nil {
+		if _, err := tx.Exec(`
+			INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, 'active', 'signup', NOW(), NOW())
+			ON CONFLICT (workspace_id, user_id) DO NOTHING
+		`, workspaceID, userID, roleID); err != nil {
+			log.Printf("WARNING: Failed to create workspace_membership for OIDC user %s: %v", userID, err)
+		}
+	}
+
 	// Commit main DB transaction
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
@@ -1311,6 +1322,15 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			log.Printf("WARNING: Failed to assign admin role to OIDC user %s: %v", userID, err)
 		} else {
 			log.Printf("INFO: Admin role assigned to OIDC user %s", userID)
+		}
+
+		// Bind admin to workspace_memberships (RequireWorkspaceRole checks this)
+		if _, err := tx.Exec(`
+			INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, 'active', 'signup', NOW(), NOW())
+			ON CONFLICT (workspace_id, user_id) DO NOTHING
+		`, workspaceID, userID, roleID); err != nil {
+			log.Printf("WARNING: Failed to create workspace_membership for OIDC user %s: %v", userID, err)
 		}
 	}
 
