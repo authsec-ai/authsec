@@ -11,7 +11,7 @@ import (
 )
 
 func TestUpsertContact_FirstLogin(t *testing.T) {
-	var gotBody map[string]interface{}
+	var gotBody map[string]any
 	var gotAuth string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,14 +40,14 @@ func TestUpsertContact_FirstLogin(t *testing.T) {
 		t.Errorf("expected auth header 'Bearer sg-key', got %s", gotAuth)
 	}
 
-	listIDs, ok := gotBody["list_ids"].([]interface{})
+	listIDs, ok := gotBody["list_ids"].([]any)
 	if !ok || len(listIDs) == 0 || listIDs[0] != "list-id-abc" {
 		t.Errorf("expected list_ids=[list-id-abc], got %v", gotBody["list_ids"])
 	}
 }
 
 func TestUpsertContact_ReturningUser_NoListAssignment(t *testing.T) {
-	var gotBody map[string]interface{}
+	var gotBody map[string]any
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
