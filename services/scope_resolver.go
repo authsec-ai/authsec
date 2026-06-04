@@ -351,7 +351,13 @@ func ValidateRequestedScopes(scopes []string, rs *models.ResourceServer, client 
 		if s == "" {
 			continue
 		}
-		// OIDC core scopes: valid only for OIDC-capable clients
+		// offline_access is always allowed — it controls refresh tokens,
+		// not OIDC identity. MCP clients need it for long-lived sessions.
+		if s == "offline_access" {
+			continue
+		}
+		// OIDC identity scopes (openid, profile, email, etc.): valid only
+		// for clients that opted into OIDC (scope includes "openid").
 		if oidcCoreScopes[s] {
 			if !isOIDC {
 				invalid = append(invalid, s)
