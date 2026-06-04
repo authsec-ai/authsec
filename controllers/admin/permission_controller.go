@@ -89,12 +89,12 @@ func (pc *PermissionController) RegisterAtomicPermission(c *gin.Context) {
 		return
 	}
 
-	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Tenant ID format"})
 		return
@@ -132,12 +132,12 @@ func (pc *PermissionController) RegisterAtomicPermissionEndUser(c *gin.Context) 
 		return
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	if err := pc.registerPermission(c, tenantDB, tenantUUID, req); err != nil {
+	if err := pc.registerPermission(c, tenantDB, workspaceUUID, req); err != nil {
 		return
 	}
 }
@@ -151,18 +151,18 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 	}
 
 	// Debug: Log permission creation details
-	log.Printf("[RegisterPermission] Creating permission '%s:%s' for tenant_id: %s", req.Resource, req.Action, workspaceID.String())
+	log.Printf("[RegisterPermission] Creating permission '%s:%s' for workspace_id: %s", req.Resource, req.Action, workspaceID.String())
 
 	if err := services.NewRBACService(db).RegisterAtomicPermission(perm); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register permission: " + err.Error()})
 		return err
 	}
 
-	// Debug: Verify permission was created with correct tenant_id
+	// Debug: Verify permission was created with correct workspace_id
 	if perm.WorkspaceID != nil {
 		log.Printf("[RegisterPermission] Permission created successfully with ID: %s, workspace_id: %s", perm.ID.String(), perm.WorkspaceID.String())
 	} else {
-		log.Printf("[RegisterPermission] WARNING: Permission created with ID: %s but tenant_id is NULL!", perm.ID.String())
+		log.Printf("[RegisterPermission] WARNING: Permission created with ID: %s but workspace_id is NULL!", perm.ID.String())
 	}
 
 	// Audit log: Permission registered
@@ -196,12 +196,12 @@ func (pc *PermissionController) registerPermission(c *gin.Context, db *gorm.DB, 
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions/{id} [delete]
 func (pc *PermissionController) DeletePermission(c *gin.Context) {
-	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Tenant ID format"})
 		return
@@ -313,12 +313,12 @@ func (pc *PermissionController) DeletePermissionEndUser(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions [delete]
 func (pc *PermissionController) DeletePermissionByBody(c *gin.Context) {
-	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Tenant ID format"})
 		return
@@ -439,12 +439,12 @@ func (pc *PermissionController) DeletePermissionEndUserByBody(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions [get]
 func (pc *PermissionController) ListPermissions(c *gin.Context) {
-	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Tenant ID format"})
 		return
@@ -475,17 +475,17 @@ func (pc *PermissionController) ListPermissionsEndUser(c *gin.Context) {
 
 	tenantDB := config.DB
 	resource := c.Query("resource")
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	pc.listPermissions(c, tenantDB, tenantUUID, resource)
+	pc.listPermissions(c, tenantDB, workspaceUUID, resource)
 }
 
 func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID, resource string) {
 	// Debug: Log query parameters
-	log.Printf("[ListPermissions] Querying with tenant_id: %s, resource: %s", workspaceID.String(), resource)
+	log.Printf("[ListPermissions] Querying with workspace_id: %s, resource: %s", workspaceID.String(), resource)
 
 	var perms []models.RBACPermission
 	query := db.Where("workspace_id = ?", workspaceID)
@@ -498,7 +498,7 @@ func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, wor
 	}
 
 	// Debug: Log number of permissions found
-	log.Printf("[ListPermissions] Found %d permissions for tenant_id: %s", len(perms), workspaceID.String())
+	log.Printf("[ListPermissions] Found %d permissions for workspace_id: %s", len(perms), workspaceID.String())
 
 	type countRow struct {
 		PermissionID uuid.UUID
@@ -543,12 +543,12 @@ func (pc *PermissionController) listPermissions(c *gin.Context, db *gorm.DB, wor
 // @Failure 500 {object} map[string]string
 // @Router /authsec/uflow/admin/permissions/resources [get]
 func (pc *PermissionController) ShowResources(c *gin.Context) {
-	tenantIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in context"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Tenant ID format"})
 		return
@@ -575,12 +575,12 @@ func (pc *PermissionController) ShowResourcesEndUser(c *gin.Context) {
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	pc.showResources(c, tenantDB, tenantUUID, false)
+	pc.showResources(c, tenantDB, workspaceUUID, false)
 }
 
 func (pc *PermissionController) showResources(c *gin.Context, db *gorm.DB, workspaceID uuid.UUID, isAdmin bool) {

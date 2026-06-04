@@ -6,7 +6,7 @@ import "time"
 type AdminLoginInput struct {
 	Email        string `json:"email" binding:"required,email"`
 	Password     string `json:"password" binding:"required,min=10"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 
 	// Anti-replay attack protection fields
 	Nonce     string `json:"nonce,omitempty"`     // Unique request identifier
@@ -26,7 +26,7 @@ type AuthChallenge struct {
 type SecureLoginRequest struct {
 	Email        string `json:"email"`
 	Password     string `json:"password"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 	Nonce        string `json:"nonce"`
 	Timestamp    int64  `json:"timestamp"`
 	Challenge    string `json:"challenge,omitempty"`
@@ -43,7 +43,7 @@ type AdminPrecheckInput struct {
 type AdminPrecheckResponse struct {
 	Exists             bool     `json:"exists"`
 	DisplayName        string   `json:"display_name,omitempty"`
-	TenantDomain       string   `json:"tenant_domain,omitempty"`
+	WorkspaceDomain       string   `json:"workspace_domain,omitempty"`
 	WorkspaceID           string   `json:"workspace_id,omitempty"`
 	NextStep           string   `json:"next_step"` // "login", "bootstrap", "register"
 	RequiresPassword   bool     `json:"requires_password"`
@@ -55,7 +55,7 @@ type AdminBootstrapInput struct {
 	Email           string `json:"email" binding:"required,email"`
 	Password        string `json:"password" binding:"required,min=10"`
 	ConfirmPassword string `json:"confirm_password,omitempty"`
-	TenantDomain    string `json:"tenant_domain" binding:"required"`
+	WorkspaceDomain    string `json:"workspace_domain" binding:"required"`
 	Name            string `json:"name,omitempty"`
 }
 
@@ -64,6 +64,6 @@ type AdminBootstrapResponse struct {
 	Message      string `json:"message"`
 	Status       string `json:"status"` // "pending_verification", "success"
 	WorkspaceID     string `json:"workspace_id,omitempty"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 }

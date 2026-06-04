@@ -336,7 +336,7 @@ func (s *ResourceServerService) ListByTenant(workspaceID string) ([]models.Resou
 }
 
 // ListByWorkspace returns Applications in a workspace, optionally filtered by
-// application_type. During the tenant_id -> workspace_id rollout this matches
+// application_type. During the workspace_id -> workspace_id rollout this matches
 // rows where workspace_id = $1 OR (workspace_id IS NULL AND workspace_id = $1) so
 // unbackfilled rows are still surfaced to their owning workspace.
 //
@@ -422,10 +422,22 @@ func (s *ResourceServerService) DeleteByTenant(id, workspaceID string) error {
 		if err := tx.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found")
 		}
-		if err := tx.Where("resource_server_id = ?", id).
-			Delete(&models.ResourceServerClientRegistration{}).Error; err != nil {
-			return err
+
+		// Clean up role_bindings scoped to this RS (polymorphic — no FK cascade).
+		// Without this, the PDP (ScopeResolver) could still authorize access
+		// to a deleted application via stale role_bindings rows.
+		if err := tx.Exec(
+			`DELETE FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ?`, rs.ID,
+		).Error; err != nil {
+			return fmt.Errorf("clean up role_bindings: %w", err)
 		}
+
+		// Delete the RS row — CASCADE FKs handle: oauth_scopes, mcp_tools,
+		// mcp_tool_scope_map, resource_server_client_registrations,
+		// resource_server_access_policies, resource_server_drift_events,
+		// resource_server_manifest_attempts, oauth_consent_grants,
+		// auth_request_contexts, application_identity_provider_policies,
+		// application_spiffe_identities.
 		return tx.Delete(&rs).Error
 	})
 }

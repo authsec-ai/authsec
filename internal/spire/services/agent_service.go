@@ -15,29 +15,29 @@ import (
 // AgentService handles agent operations
 type AgentService struct {
 	connManager *database.ConnectionManager
-	tenantRepo  repositories.TenantRepository
+	workspaceRepo  repositories.WorkspaceRepository
 	logger      *logrus.Entry
 }
 
 // NewAgentService creates a new agent service
 func NewAgentService(
 	connManager *database.ConnectionManager,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	logger *logrus.Entry,
 ) *AgentService {
 	return &AgentService{
 		connManager: connManager,
-		tenantRepo:  tenantRepo,
+		workspaceRepo:  workspaceRepo,
 		logger:      logger,
 	}
 }
 
 // ListAgentsByTenant lists all active agents for a tenant
-func (s *AgentService) ListAgentsByTenant(ctx context.Context, tenantID string) ([]*models.Agent, error) {
-	s.logger.WithField("tenant_id", tenantID).Info("Listing agents for tenant")
+func (s *AgentService) ListAgentsByTenant(ctx context.Context, workspaceID string) ([]*models.Agent, error) {
+	s.logger.WithField("workspace_id", workspaceID).Info("Listing agents for tenant")
 
 	// Get tenant-specific database connection
-	db, err := s.connManager.GetTenantDB(ctx, tenantID)
+	db, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant database connection")
 		return nil, errors.NewNotFoundError("Tenant not found", err)
@@ -47,9 +47,9 @@ func (s *AgentService) ListAgentsByTenant(ctx context.Context, tenantID string) 
 	agentRepo := infrarepos.NewPostgresAgentRepository(db, s.logger)
 
 	// List all agents for the tenant
-	agents, err := agentRepo.ListByTenant(ctx, tenantID)
+	agents, err := agentRepo.ListByTenant(ctx, workspaceID)
 	if err != nil {
-		s.logger.WithFields(logrus.Fields{"tenant_id": tenantID}).WithError(err).Error("Failed to list agents")
+		s.logger.WithFields(logrus.Fields{"workspace_id": workspaceID}).WithError(err).Error("Failed to list agents")
 		return nil, errors.NewInternalError("Failed to list agents", err)
 	}
 
@@ -61,7 +61,7 @@ func (s *AgentService) ListAgentsByTenant(ctx context.Context, tenantID string) 
 		}
 	}
 
-	s.logger.WithFields(logrus.Fields{"tenant_id": tenantID, "count": len(activeAgents)}).Info("Successfully listed agents")
+	s.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "count": len(activeAgents)}).Info("Successfully listed agents")
 
 	return activeAgents, nil
 }

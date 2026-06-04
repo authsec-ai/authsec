@@ -64,7 +64,7 @@ func NewMembershipController() *MembershipController {
 // Helpers
 // ────────────────────────────────────────────────────────────────────
 
-func parseTenantID(c *gin.Context) (uuid.UUID, bool) {
+func parseWorkspaceID(c *gin.Context) (uuid.UUID, bool) {
 	raw := c.Param("workspace_id")
 	id, err := uuid.Parse(raw)
 	if err != nil {
@@ -97,10 +97,10 @@ func (mc *MembershipController) workspaceRoleID(workspaceID uuid.UUID, roleName 
 // workspace_memberships
 // ────────────────────────────────────────────────────────────────────
 
-// ListMembers GET /v2/tenants/:tenant_id/memberships
+// ListMembers GET /v2/tenants/:workspace_id/memberships
 // Optional ?status=active|suspended|invited|left and ?type=owner|admin|...
 func (mc *MembershipController) ListMembers(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -139,9 +139,9 @@ func (mc *MembershipController) ListMembers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": rows, "count": len(rows)})
 }
 
-// GetMembership GET /v2/tenants/:tenant_id/memberships/:user_id
+// GetMembership GET /v2/tenants/:workspace_id/memberships/:user_id
 func (mc *MembershipController) GetMembership(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -191,10 +191,10 @@ type createMembershipRequest struct {
 	ExternalID     *string `json:"external_id,omitempty"`
 }
 
-// CreateMembership POST /v2/tenants/:tenant_id/memberships
-// Records that a user is a tenant operator. Idempotent on (tenant_id, user_id).
+// CreateMembership POST /v2/tenants/:workspace_id/memberships
+// Records that a user is a tenant operator. Idempotent on (workspace_id, user_id).
 func (mc *MembershipController) CreateMembership(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -250,9 +250,9 @@ type updateMembershipRequest struct {
 	ExternalID     *string `json:"external_id,omitempty"`
 }
 
-// UpdateMembership PATCH /v2/tenants/:tenant_id/memberships/:user_id
+// UpdateMembership PATCH /v2/tenants/:workspace_id/memberships/:user_id
 func (mc *MembershipController) UpdateMembership(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -306,10 +306,10 @@ func (mc *MembershipController) UpdateMembership(c *gin.Context) {
 	c.JSON(http.StatusOK, row)
 }
 
-// DeleteMembership DELETE /v2/tenants/:tenant_id/memberships/:user_id
+// DeleteMembership DELETE /v2/tenants/:workspace_id/memberships/:user_id
 // Hard-deletes the membership row. Use UpdateMembership(status=suspended) for a soft state change.
 func (mc *MembershipController) DeleteMembership(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -447,10 +447,10 @@ func (mc *MembershipController) decorateEndUserAccess(row map[string]interface{}
 	row["effective_scopes_count"] = scopesCount
 }
 
-// ListEndUsers GET /v2/tenants/:tenant_id/end-users
+// ListEndUsers GET /v2/tenants/:workspace_id/end-users
 // Optional ?status=, ?plan_tier=, ?q=<email substring>.
 func (mc *MembershipController) ListEndUsers(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -483,9 +483,9 @@ func (mc *MembershipController) ListEndUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": rows, "count": len(rows)})
 }
 
-// GetEndUser GET /v2/tenants/:tenant_id/end-users/:user_id
+// GetEndUser GET /v2/tenants/:workspace_id/end-users/:user_id
 func (mc *MembershipController) GetEndUser(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -520,9 +520,9 @@ type updateEndUserRequest struct {
 	SuspendedReason   *string `json:"suspended_reason,omitempty"`
 }
 
-// UpdateEndUser PATCH /v2/tenants/:tenant_id/end-users/:user_id
+// UpdateEndUser PATCH /v2/tenants/:workspace_id/end-users/:user_id
 func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}
@@ -610,7 +610,7 @@ func (mc *MembershipController) UpdateEndUser(c *gin.Context) {
 	c.JSON(http.StatusOK, s)
 }
 
-// SuspendEndUser POST /v2/tenants/:tenant_id/end-users/:user_id/suspend
+// SuspendEndUser POST /v2/tenants/:workspace_id/end-users/:user_id/suspend
 // Convenience over UpdateEndUser when the caller has a free-text reason.
 func (mc *MembershipController) SuspendEndUser(c *gin.Context) {
 	body := struct {
@@ -626,7 +626,7 @@ func (mc *MembershipController) SuspendEndUser(c *gin.Context) {
 	mc.runEndUserUpdate(c, req)
 }
 
-// ReactivateEndUser POST /v2/tenants/:tenant_id/end-users/:user_id/reactivate
+// ReactivateEndUser POST /v2/tenants/:workspace_id/end-users/:user_id/reactivate
 func (mc *MembershipController) ReactivateEndUser(c *gin.Context) {
 	active := models.EndUserStatusActive
 	mc.runEndUserUpdate(c, updateEndUserRequest{Status: &active})
@@ -746,7 +746,7 @@ func (mc *MembershipController) EffectiveAccess(c *gin.Context) {
 
 // runEndUserUpdate is the shared core used by the convenience handlers above.
 func (mc *MembershipController) runEndUserUpdate(c *gin.Context, req updateEndUserRequest) {
-	workspaceID, ok := parseTenantID(c)
+	workspaceID, ok := parseWorkspaceID(c)
 	if !ok {
 		return
 	}

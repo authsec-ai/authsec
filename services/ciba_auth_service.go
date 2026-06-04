@@ -18,7 +18,7 @@ import (
 type CIBAAuthService struct {
 	cibaRepo        *database.CIBAAuthRepository
 	userRepo        *database.UserRepository
-	tenantRepo      *database.AdminTenantRepository
+	workspaceRepo      *database.AdminWorkspaceRepository
 	pushService     *PushNotificationService
 	pollingInterval int
 	requestExpiry   time.Duration
@@ -32,7 +32,7 @@ func NewCIBAAuthService(
 	return &CIBAAuthService{
 		cibaRepo:        database.NewCIBAAuthRepository(db),
 		userRepo:        database.NewUserRepository(db),
-		tenantRepo:      database.NewAdminTenantRepository(db),
+		workspaceRepo:      database.NewAdminWorkspaceRepository(db),
 		pushService:     pushService,
 		pollingInterval: 5,               // 5 seconds minimum between polls
 		requestExpiry:   5 * time.Minute, // Requests expire in 5 minutes
@@ -232,7 +232,7 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 		}
 
 		// Get tenant info
-		tenant, err := s.tenantRepo.GetTenantByID(authReq.WorkspaceID.String())
+		tenant, err := s.workspaceRepo.GetWorkspaceByID(authReq.WorkspaceID.String())
 		if err != nil {
 			return &models.CIBATokenResponse{
 				Error:            "server_error",
@@ -310,7 +310,7 @@ func (s *CIBAAuthService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID
 // This is exactly like TOTP flow - email is unique identifier
 func (s *CIBAAuthService) lookupUserByEmail(email string) (*models.ExtendedUser, error) {
 	// Get all tenants
-	tenants, err := s.tenantRepo.GetAllTenants()
+	tenants, err := s.workspaceRepo.GetAllTenants()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenants: %w", err)
 	}

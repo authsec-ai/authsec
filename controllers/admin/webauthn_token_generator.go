@@ -33,7 +33,7 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, workspaceID st
 	log.Printf("[WebAuthnBridge] Generating tokens for email=%s, workspaceID=%s, clientID=%s", email, workspaceID, clientID)
 
 	// Look up tenant by workspaceID
-	tenant, err := uc.tenantRepo.GetTenantByTenantID(workspaceID)
+	tenant, err := uc.workspaceRepo.GetWorkspaceByWorkspaceID(workspaceID)
 	if err != nil {
 		log.Printf("[WebAuthnBridge] Tenant not found for workspaceID=%s: %v", workspaceID, err)
 		return "", "", fmt.Errorf("tenant not found: %w", err)
@@ -62,7 +62,7 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, workspaceID st
 	log.Printf("[WebAuthnBridge] MFA verification confirmed for email=%s, workspaceID=%s", email, workspaceID)
 
 	// Parse UUIDs
-	tenantUUID, err := uuid.Parse(tenant.WorkspaceID.String())
+	workspaceUUID, err := uuid.Parse(tenant.WorkspaceID.String())
 	if err != nil {
 		return "", "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
@@ -70,7 +70,7 @@ func (uc *UserController) generateWebAuthnTokens(clientID, email, workspaceID st
 	// Generate access token using the centralized auth-manager token service
 	token, err := config.TokenService.GenerateTenantUserToken(
 		user.ID,
-		tenantUUID,
+		workspaceUUID,
 		email,
 		24*time.Hour,
 	)

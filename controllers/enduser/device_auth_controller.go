@@ -19,7 +19,7 @@ import (
 type DeviceAuthController struct {
 	deviceService *services.DeviceAuthService
 	oidcService   *services.OIDCService
-	tenantRepo    *database.AdminTenantRepository
+	workspaceRepo    *database.AdminWorkspaceRepository
 	userRepo      *database.UserRepository
 }
 
@@ -33,13 +33,13 @@ func NewDeviceAuthController() (*DeviceAuthController, error) {
 	return &DeviceAuthController{
 		deviceService: services.NewDeviceAuthService(db),
 		oidcService:   services.NewOIDCService(db),
-		tenantRepo:    database.NewAdminTenantRepository(db),
+		workspaceRepo:    database.NewAdminWorkspaceRepository(db),
 		userRepo:      database.NewUserRepository(db),
 	}, nil
 }
 
 // RequestDeviceCode initiates the device authorization flow.
-// No authentication required. CLI sends only scopes — no client_id or tenant_domain.
+// No authentication required. CLI sends only scopes — no client_id or workspace_domain.
 // @Router /uflow/auth/device/code [post]
 func (ctrl *DeviceAuthController) RequestDeviceCode(c *gin.Context) {
 	var req models.DeviceCodeRequest
@@ -178,28 +178,28 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 		}
 	}
 
-	// tenant_id from token claims (set by AuthMiddleware)
-	tenantIDStr := ""
+	// workspace_id from token claims (set by AuthMiddleware)
+	workspaceIDStr := ""
 	if v, ok := c.Get("workspace_id"); ok && v != nil {
-		tenantIDStr, _ = v.(string)
+		workspaceIDStr, _ = v.(string)
 	}
-	if tenantIDStr == "" {
+	if workspaceIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant context missing from session"})
 		return
 	}
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
 	}
 
-	// Resolve tenant_domain via DB lookup (not in JWT claims)
-	tenant, err := ctrl.tenantRepo.GetTenantByID(tenantIDStr)
+	// Resolve workspace_domain via DB lookup (not in JWT claims)
+	tenant, err := ctrl.workspaceRepo.GetWorkspaceByID(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant not found"})
 		return
 	}
-	tenantDomain := tenant.TenantDomain
+	workspaceDomain := tenant.WorkspaceDomain
 
 	// client_id from token claims
 	var clientID *uuid.UUID
@@ -212,7 +212,7 @@ func (ctrl *DeviceAuthController) AuthorizeDevice(c *gin.Context) {
 	}
 
 	if err := ctrl.deviceService.AuthorizeDevice(
-		req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approved,
+		req.UserCode, userID, email, workspaceID, workspaceDomain, clientID, req.Approved,
 	); err != nil {
 		statusCode := http.StatusBadRequest
 		// 404 if code not found / expired
@@ -273,21 +273,21 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 		}
 	}
 
-	tenantIDStr := ""
+	workspaceIDStr := ""
 	if v, ok := c.Get("workspace_id"); ok && v != nil {
-		tenantIDStr, _ = v.(string)
+		workspaceIDStr, _ = v.(string)
 	}
 	workspaceID := uuid.Nil
-	if tenantIDStr != "" {
-		if parsed, parseErr := uuid.Parse(tenantIDStr); parseErr == nil {
+	if workspaceIDStr != "" {
+		if parsed, parseErr := uuid.Parse(workspaceIDStr); parseErr == nil {
 			workspaceID = parsed
 		}
 	}
 
-	tenantDomain := ""
+	workspaceDomain := ""
 	if workspaceID != uuid.Nil {
-		if t, tErr := ctrl.tenantRepo.GetTenantByID(tenantIDStr); tErr == nil {
-			tenantDomain = t.TenantDomain
+		if t, tErr := ctrl.workspaceRepo.GetWorkspaceByID(workspaceIDStr); tErr == nil {
+			workspaceDomain = t.WorkspaceDomain
 		}
 	}
 
@@ -300,7 +300,7 @@ func (ctrl *DeviceAuthController) VerifyDeviceCode(c *gin.Context) {
 		}
 	}
 
-	if err := ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approve); err != nil {
+	if err := ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, workspaceDomain, clientID, req.Approve); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to verify device code", "details": err.Error()})
 		return
 	}
@@ -398,7 +398,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 	}
 
 	// Step 4: Get tenant info
-	tenant, err := ctrl.tenantRepo.GetTenantByID(workspaceID.String())
+	tenant, err := ctrl.workspaceRepo.GetWorkspaceByID(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -414,7 +414,7 @@ func (ctrl *DeviceAuthController) AuthorizeDeviceWithOIDC(c *gin.Context) {
 		user.ID,
 		user.Email,
 		workspaceID,
-		tenant.TenantDomain,
+		tenant.WorkspaceDomain,
 		clientID,
 		true, // approved
 	); err != nil {

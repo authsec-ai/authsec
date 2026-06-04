@@ -53,7 +53,7 @@ func (r *PostgresWorkloadEntryRepository) Create(ctx context.Context, entry *mod
 
 	query := `
 		INSERT INTO workload_entries (
-			id, tenant_id, spiffe_id, parent_id, selectors,
+			id, workspace_id, spiffe_id, parent_id, selectors,
 			ttl, admin, downstream, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
@@ -88,7 +88,7 @@ func (r *PostgresWorkloadEntryRepository) Create(ctx context.Context, entry *mod
 // GetByID retrieves a workload entry by ID
 func (r *PostgresWorkloadEntryRepository) GetByID(ctx context.Context, id string) (*models.WorkloadEntry, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, parent_id, selectors,
+		SELECT id, workspace_id, spiffe_id, parent_id, selectors,
 		       ttl, admin, downstream, created_at, updated_at
 		FROM workload_entries
 		WHERE id = $1
@@ -127,18 +127,18 @@ func (r *PostgresWorkloadEntryRepository) GetByID(ctx context.Context, id string
 }
 
 // GetBySpiffeID retrieves a workload entry by SPIFFE ID
-func (r *PostgresWorkloadEntryRepository) GetBySpiffeID(ctx context.Context, tenantID, spiffeID string) (*models.WorkloadEntry, error) {
+func (r *PostgresWorkloadEntryRepository) GetBySpiffeID(ctx context.Context, workspaceID, spiffeID string) (*models.WorkloadEntry, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, parent_id, selectors,
+		SELECT id, workspace_id, spiffe_id, parent_id, selectors,
 		       ttl, admin, downstream, created_at, updated_at
 		FROM workload_entries
-		WHERE tenant_id = $1 AND spiffe_id = $2
+		WHERE workspace_id = $1 AND spiffe_id = $2
 	`
 
 	var entry models.WorkloadEntry
 	var selectorsJSON []byte
 
-	err := r.db.QueryRowContext(ctx, query, tenantID, spiffeID).Scan(
+	err := r.db.QueryRowContext(ctx, query, workspaceID, spiffeID).Scan(
 		&entry.ID,
 		&entry.WorkspaceID,
 		&entry.SpiffeID,
@@ -170,10 +170,10 @@ func (r *PostgresWorkloadEntryRepository) GetBySpiffeID(ctx context.Context, ten
 // List retrieves workload entries based on filter criteria
 func (r *PostgresWorkloadEntryRepository) List(ctx context.Context, filter *models.WorkloadEntryFilter) ([]*models.WorkloadEntry, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, parent_id, selectors,
+		SELECT id, workspace_id, spiffe_id, parent_id, selectors,
 		       ttl, admin, downstream, created_at, updated_at
 		FROM workload_entries
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 	`
 	args := []interface{}{filter.WorkspaceID}
 	argCount := 1
@@ -235,7 +235,7 @@ func (r *PostgresWorkloadEntryRepository) List(ctx context.Context, filter *mode
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		r.logger.WithError(err).WithField("tenant_id", filter.WorkspaceID).Error("Failed to list workload entries")
+		r.logger.WithError(err).WithField("workspace_id", filter.WorkspaceID).Error("Failed to list workload entries")
 		return nil, fmt.Errorf("failed to list workload entries: %w", err)
 	}
 	defer rows.Close()
@@ -283,7 +283,7 @@ func (r *PostgresWorkloadEntryRepository) Count(ctx context.Context, filter *mod
 	query := `
 		SELECT COUNT(*)
 		FROM workload_entries
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 	`
 	args := []interface{}{filter.WorkspaceID}
 	argCount := 1
@@ -329,7 +329,7 @@ func (r *PostgresWorkloadEntryRepository) Count(ctx context.Context, filter *mod
 	var count int
 	err := r.db.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
-		r.logger.WithError(err).WithField("tenant_id", filter.WorkspaceID).Error("Failed to count workload entries")
+		r.logger.WithError(err).WithField("workspace_id", filter.WorkspaceID).Error("Failed to count workload entries")
 		return 0, fmt.Errorf("failed to count workload entries: %w", err)
 	}
 
@@ -337,16 +337,16 @@ func (r *PostgresWorkloadEntryRepository) Count(ctx context.Context, filter *mod
 }
 
 // ListByParent retrieves all workload entries for a specific parent (agent)
-func (r *PostgresWorkloadEntryRepository) ListByParent(ctx context.Context, tenantID, parentID string) ([]*models.WorkloadEntry, error) {
+func (r *PostgresWorkloadEntryRepository) ListByParent(ctx context.Context, workspaceID, parentID string) ([]*models.WorkloadEntry, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, parent_id, selectors,
+		SELECT id, workspace_id, spiffe_id, parent_id, selectors,
 		       ttl, admin, downstream, created_at, updated_at
 		FROM workload_entries
-		WHERE tenant_id = $1 AND (parent_id = $2 OR parent_id = '')
+		WHERE workspace_id = $1 AND (parent_id = $2 OR parent_id = '')
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, tenantID, parentID)
+	rows, err := r.db.QueryContext(ctx, query, workspaceID, parentID)
 	if err != nil {
 		r.logger.WithError(err).WithField("parent_id", parentID).Error("Failed to list workload entries by parent")
 		return nil, fmt.Errorf("failed to list workload entries by parent: %w", err)
@@ -483,17 +483,17 @@ func (r *PostgresWorkloadEntryRepository) Delete(ctx context.Context, id string)
 // ClaimUnassignedEntries sets parent_id on entries that have no parent_id assigned.
 // This is called when an agent fetches its entries — unassigned entries in the tenant
 // get claimed by the requesting agent so the UI shows the actual agent SPIFFE ID.
-func (r *PostgresWorkloadEntryRepository) ClaimUnassignedEntries(ctx context.Context, tenantID, agentSpiffeID string) (int64, error) {
+func (r *PostgresWorkloadEntryRepository) ClaimUnassignedEntries(ctx context.Context, workspaceID, agentSpiffeID string) (int64, error) {
 	query := `
 		UPDATE workload_entries
 		SET parent_id = $1, updated_at = $2
-		WHERE tenant_id = $3 AND (parent_id = '' OR parent_id IS NULL)
+		WHERE workspace_id = $3 AND (parent_id = '' OR parent_id IS NULL)
 	`
 
-	result, err := r.db.ExecContext(ctx, query, agentSpiffeID, time.Now(), tenantID)
+	result, err := r.db.ExecContext(ctx, query, agentSpiffeID, time.Now(), workspaceID)
 	if err != nil {
 		r.logger.WithError(err).WithFields(logrus.Fields{
-			"tenant_id":       tenantID,
+			"workspace_id":       workspaceID,
 			"agent_spiffe_id": agentSpiffeID,
 		}).Error("Failed to claim unassigned entries")
 		return 0, fmt.Errorf("failed to claim unassigned entries: %w", err)
@@ -512,7 +512,7 @@ func (r *PostgresWorkloadEntryRepository) ClaimUnassignedEntries(ctx context.Con
 
 // FindMatchingEntries finds workload entries that match the given selectors
 // Used during workload attestation to determine which SPIFFE ID to issue
-func (r *PostgresWorkloadEntryRepository) FindMatchingEntries(ctx context.Context, tenantID string, selectors map[string]string) ([]*models.WorkloadEntry, error) {
+func (r *PostgresWorkloadEntryRepository) FindMatchingEntries(ctx context.Context, workspaceID string, selectors map[string]string) ([]*models.WorkloadEntry, error) {
 	// Convert selectors to JSONB for PostgreSQL query
 	selectorsJSON, err := json.Marshal(selectors)
 	if err != nil {
@@ -522,17 +522,17 @@ func (r *PostgresWorkloadEntryRepository) FindMatchingEntries(ctx context.Contex
 	// Query uses @> operator: entry selectors must be a subset of workload selectors
 	// This means ALL entry selectors must match (AND logic)
 	query := `
-		SELECT id, tenant_id, spiffe_id, parent_id, selectors,
+		SELECT id, workspace_id, spiffe_id, parent_id, selectors,
 		       ttl, admin, downstream, created_at, updated_at
 		FROM workload_entries
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		  AND $2::jsonb @> selectors
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, tenantID, selectorsJSON)
+	rows, err := r.db.QueryContext(ctx, query, workspaceID, selectorsJSON)
 	if err != nil {
-		r.logger.WithError(err).WithField("tenant_id", tenantID).Error("Failed to find matching workload entries")
+		r.logger.WithError(err).WithField("workspace_id", workspaceID).Error("Failed to find matching workload entries")
 		return nil, fmt.Errorf("failed to find matching workload entries: %w", err)
 	}
 	defer rows.Close()
@@ -572,7 +572,7 @@ func (r *PostgresWorkloadEntryRepository) FindMatchingEntries(ctx context.Contex
 	}
 
 	r.logger.WithFields(logrus.Fields{
-		"tenant_id": tenantID,
+		"workspace_id": workspaceID,
 		"count":     len(entries),
 	}).Info("Found matching workload entries")
 

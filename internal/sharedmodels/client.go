@@ -41,7 +41,7 @@ type Client struct {
 	DeletedAt   *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 	Description *string    `json:"description,omitempty" gorm:"type:text"`
 	// Tenant relationship fields (optional, for future use)
-	TenantDB string `json:"tenant_db,omitempty" gorm:"-"` // Not stored, populated from auth-manager
+	WorkspaceDB string `json:"workspace_db,omitempty" gorm:"-"` // Not stored, populated from auth-manager
 }
 
 // ClientStatus constants

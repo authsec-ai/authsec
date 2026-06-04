@@ -36,7 +36,7 @@ func ContextStringValue(c *gin.Context, key string) string {
 
 // RequireWorkspaceID retrieves workspace_id from the Gin context, returning an
 // error when missing. Phase 6: workspace_id is the only identity claim; no
-// tenant_id fallback.
+// workspace_id fallback.
 func RequireWorkspaceID(c *gin.Context) (string, error) {
 	workspaceID := ContextStringValue(c, "workspace_id")
 	if workspaceID == "" {

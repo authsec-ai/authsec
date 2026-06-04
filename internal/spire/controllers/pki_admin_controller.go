@@ -41,7 +41,7 @@ func (ctrl *PKIAdminController) ProvisionPKI(c *gin.Context) {
 	}
 
 	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
 		return
 	}
 
@@ -66,12 +66,12 @@ func (ctrl *PKIAdminController) ProvisionPKI(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// ProvisionPKIForTenant handles POST /spire/admin/pki/provision/:tenant_id
+// ProvisionPKIForTenant handles POST /spire/admin/pki/provision/:workspace_id
 func (ctrl *PKIAdminController) ProvisionPKIForTenant(c *gin.Context) {
-	tenantID := c.Param("tenant_id")
+	workspaceID := c.Param("workspace_id")
 
-	if tenantID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
+	if workspaceID == "" {
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
 		return
 	}
 
@@ -97,7 +97,7 @@ func (ctrl *PKIAdminController) ProvisionPKIForTenant(c *gin.Context) {
 	}
 
 	result, err := ctrl.pkiService.ProvisionPKI(c.Request.Context(), &services.ProvisionPKIRequest{
-		WorkspaceID:       tenantID,
+		WorkspaceID:       workspaceID,
 		CommonName:     req.CommonName,
 		TTL:            req.TTL,
 		MaxTTL:         req.MaxTTL,

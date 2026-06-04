@@ -16,7 +16,7 @@ var (
 	phoneRegex    = regexp.MustCompile(`^\+?[1-9]\d{1,14}$`)
 	otpRegex      = regexp.MustCompile(`^\d{6}$`)
 	clientIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	tenantIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,50}$`)
+	workspaceIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,50}$`)
 )
 
 // Input validation utility to prevent injection attacks and enforce data quality
@@ -302,8 +302,8 @@ func ValidateClientID(clientID string) error {
 	return nil
 }
 
-// ValidateTenantID validates tenant ID (typically UUID or alphanumeric)
-func ValidateTenantID(workspaceID string) error {
+// ValidateWorkspaceID validates tenant ID (typically UUID or alphanumeric)
+func ValidateWorkspaceID(workspaceID string) error {
 	if workspaceID == "" {
 		return fmt.Errorf("tenant ID is required")
 	}
@@ -316,7 +316,7 @@ func ValidateTenantID(workspaceID string) error {
 	}
 
 	// Otherwise allow alphanumeric with hyphens/underscores
-	if !tenantIDRegex.MatchString(workspaceID) {
+	if !workspaceIDRegex.MatchString(workspaceID) {
 		return fmt.Errorf("tenant ID must be a valid UUID or alphanumeric identifier (3-50 characters)")
 	}
 

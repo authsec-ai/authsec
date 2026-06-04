@@ -41,7 +41,7 @@ func NewScopeMatrixController() *ScopeMatrixController {
 // GetScopeMatrix returns the full tool × scope × role matrix for a resource server.
 // GET /authsec/resource-servers/:id/scope-matrix
 func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -187,7 +187,7 @@ func (ctrl *ScopeMatrixController) GetScopeMatrix(c *gin.Context) {
 // This is the "authenticated scan" path the wizard exposes for MCP servers
 // that require auth on tools/list.
 func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -245,7 +245,7 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 // ListScopes returns all scopes for a resource server.
 // GET /authsec/resource-servers/:id/scopes
 func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -296,7 +296,7 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 // CreateScope creates a new scope in the registry.
 // POST /authsec/resource-servers/:id/scopes
 func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -372,7 +372,7 @@ func (ctrl *ScopeMatrixController) CreateScope(c *gin.Context) {
 // UpdateScope updates scope metadata.
 // PUT /authsec/scopes/:scope_id
 func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -410,7 +410,7 @@ func (ctrl *ScopeMatrixController) UpdateScope(c *gin.Context) {
 // DeleteScope removes a scope.
 // DELETE /authsec/scopes/:scope_id
 func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -477,7 +477,7 @@ func (ctrl *ScopeMatrixController) DeleteScope(c *gin.Context) {
 // UpdateToolScopeMap manually maps/unmaps tools to scopes.
 // PUT /authsec/resource-servers/:id/tool-scope-map
 func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -882,7 +882,7 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 // Activate completes RS setup and flips state to 'ready'.
 // POST /authsec/resource-servers/:id/activate
 func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -921,7 +921,7 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 // SetupChecklist returns wizard step completion status.
 // GET /authsec/resource-servers/:id/setup
 func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -957,7 +957,7 @@ func (ctrl *ScopeMatrixController) SetupChecklist(c *gin.Context) {
 // ActivationPreview returns the activation review summary card.
 // GET /authsec/resource-servers/:id/activation-preview
 func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -984,7 +984,7 @@ func (ctrl *ScopeMatrixController) ActivationPreview(c *gin.Context) {
 // authenticated scan working).
 // POST /authsec/resource-servers/:id/tools
 func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1069,7 +1069,7 @@ func (ctrl *ScopeMatrixController) CreateManualTool(c *gin.Context) {
 // MarkToolPublic sets is_public=true on a tool with admin acknowledgement.
 // POST /authsec/resource-servers/:id/tools/:tool_id/public
 func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1146,7 +1146,7 @@ func (ctrl *ScopeMatrixController) MarkToolPublic(c *gin.Context) {
 // SDKManifestStatus returns the most-recent and most-recent-successful manifest attempt.
 // GET /authsec/resource-servers/:id/sdk-manifest-status
 func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1182,7 +1182,7 @@ func (ctrl *ScopeMatrixController) SDKManifestStatus(c *gin.Context) {
 // DriftEvents returns undismissed drift events for an RS.
 // GET /authsec/resource-servers/:id/drift-events
 func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1213,7 +1213,7 @@ func (ctrl *ScopeMatrixController) DriftEvents(c *gin.Context) {
 // DismissDriftEvent records a dismissal of a single drift event.
 // POST /authsec/resource-servers/:id/drift-events/:event_id/dismiss
 func (ctrl *ScopeMatrixController) DismissDriftEvent(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1262,7 +1262,7 @@ type rsRoleSummary struct {
 // ListRSRoles returns all roles associated with this RS (rs-{id}:* names).
 // GET /authsec/resource-servers/:id/roles
 func (ctrl *ScopeMatrixController) ListRSRoles(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1502,7 +1502,7 @@ func normalizeApplicationRoleSlug(value string) string {
 // ListApplicationRoles returns all application-scoped roles across the workspace.
 // GET /authsec/application-roles
 func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1634,7 +1634,7 @@ func (ctrl *ScopeMatrixController) ListApplicationRoles(c *gin.Context) {
 // app scopes for one application.
 // GET /authsec/applications/:id/access/users
 func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1757,7 +1757,7 @@ func (ctrl *ScopeMatrixController) ListApplicationAccessUsers(c *gin.Context) {
 // GetApplicationUserEffectiveAccess computes one user's effective app scopes.
 // GET /authsec/applications/:id/users/:user_id/effective-access
 func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1866,7 +1866,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccess(c *gin.Cont
 // application scopes, and optionally assigns it to users.
 // POST /authsec/applications/:id/roles
 func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2089,7 +2089,7 @@ func (ctrl *ScopeMatrixController) CreateApplicationRole(c *gin.Context) {
 // scopes. Catalog entries do not directly grant runtime access.
 // GET /authsec/scope-catalog
 func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2227,7 +2227,7 @@ func (ctrl *ScopeMatrixController) ListScopeCatalog(c *gin.Context) {
 // do not grant access directly; they are copied into application-owned scopes.
 // POST /authsec/scope-catalog
 func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2289,7 +2289,7 @@ func (ctrl *ScopeMatrixController) CreateScopeCatalogEntry(c *gin.Context) {
 // application scope.
 // POST /authsec/scope-catalog/:catalog_id/applications/:application_id
 func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2356,7 +2356,7 @@ func (ctrl *ScopeMatrixController) AttachScopeCatalogEntryToApplication(c *gin.C
 // oauth_scope_permissions.
 // PUT /authsec/applications/:id/roles/:role_id/scope-grants
 func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2494,7 +2494,7 @@ func (ctrl *ScopeMatrixController) UpdateRSRoleScopeGrants(c *gin.Context) {
 // for any role whose name starts with rs-{id}: (i.e. RS-scoped roles only).
 // GET /authsec/resource-servers/:id/bindings
 func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2572,7 +2572,7 @@ func (ctrl *ScopeMatrixController) ListRSBindings(c *gin.Context) {
 // consent flow via EnsureDefaultAccessBinding).
 // POST /authsec/resource-servers/:id/bindings
 func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2659,9 +2659,9 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 	if username == "" {
 		username = userRow.ID.String()
 	}
-	tenantUUID := workspaceID
+	workspaceUUID := workspaceID
 	binding := models.RoleBinding{
-		WorkspaceID:      &tenantUUID,
+		WorkspaceID:      &workspaceUUID,
 		UserID:           &userUUID,
 		Username:         username,
 		RoleID:           roleUUID,
@@ -2693,7 +2693,7 @@ func (ctrl *ScopeMatrixController) CreateRSBinding(c *gin.Context) {
 // DeleteRSBinding removes a role binding for this RS.
 // DELETE /authsec/resource-servers/:id/bindings/:binding_id
 func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2738,7 +2738,7 @@ func (ctrl *ScopeMatrixController) DeleteRSBinding(c *gin.Context) {
 // GetConnectionDynamically, with a small projection (no password hashes).
 // GET /authsec/resource-servers/:id/eligible-users
 func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2895,7 +2895,7 @@ func maybeAttempt(exists bool, a models.ResourceServerManifestAttempt) interface
 //
 // GET /authsec/resource-servers/:id/scope-resolution-preview?user_id=<uuid>&scope=<s1>&scope=<s2>
 func (ctrl *ScopeMatrixController) ScopeResolutionPreview(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -2989,7 +2989,7 @@ func (ctrl *ScopeMatrixController) GetApplicationUserEffectiveAccessQuery(c *gin
 // ScopeImpact returns the operator impact preview for deleting or changing one
 // application access label.
 func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -3051,7 +3051,7 @@ func (ctrl *ScopeMatrixController) ScopeImpact(c *gin.Context) {
 // AccessSimulation evaluates one user/application/tool path using the same
 // scope resolver used by runtime policy, with an operator-friendly trace.
 func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -3167,7 +3167,7 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 }
 
 func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -3216,7 +3216,7 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 }
 
 func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return

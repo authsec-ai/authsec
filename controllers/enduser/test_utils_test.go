@@ -7,11 +7,11 @@ import (
 
 // setTokenClaimsInContext sets JWT claims in the Gin context for testing.
 // Mirrors what the auth middleware does after validating a token.
-func setTokenClaimsInContext(c *gin.Context, tenantID string, userID string) {
+func setTokenClaimsInContext(c *gin.Context, workspaceID string, userID string) {
 	claims := jwt.MapClaims{
-		"tenant_id": tenantID,
+		"workspace_id": workspaceID,
 		"sub":       userID,
 	}
 	c.Set("claims", claims)
-	c.Set("tenant_id", tenantID)
+	c.Set("workspace_id", workspaceID)
 }

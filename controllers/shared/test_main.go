@@ -13,7 +13,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-var seededTenantID uuid.UUID
+var seededWorkspaceID uuid.UUID
 
 // createTempDB creates a throwaway Postgres database for tests and returns a cleanup fn.
 func createTempDB() (string, func(), error) {
@@ -101,34 +101,34 @@ func seedTestAdmin(dbName string, cfg *config.Config) error {
 	defer db.Close()
 
 	workspaceID := uuid.New()
-	seededTenantID = workspaceID
+	seededWorkspaceID = workspaceID
 	userID := workspaceID
 	clientID := workspaceID
 
 	// ensure tenants table
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (tenant_id uuid PRIMARY KEY, email text, tenant_domain text, tenant_db text);`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (workspace_id uuid PRIMARY KEY, email text, workspace_domain text, workspace_db text);`); err != nil {
 		return err
 	}
-	_, _ = db.Exec(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_db text;`)
+	_, _ = db.Exec(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS workspace_db text;`)
 	// ensure users table columns exist
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id uuid;`)
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id uuid;`)
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_domain text;`)
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS workspace_id uuid;`)
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS workspace_domain text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active boolean DEFAULT true;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temporary_password boolean DEFAULT false;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temporary_password_expires_at timestamp with time zone;`)
 
 	// ensure roles table
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS roles (id uuid PRIMARY KEY, workspace_id uuid, name text NOT NULL, description text, created_at timestamptz default now(), updated_at timestamptz default now(), UNIQUE(tenant_id,name));`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS roles (id uuid PRIMARY KEY, workspace_id uuid, name text NOT NULL, description text, created_at timestamptz default now(), updated_at timestamptz default now(), UNIQUE(workspace_id,name));`)
 	// ensure role_bindings table (user_roles is deprecated)
 	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, workspace_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
 
 	// upsert tenant
-	_, _ = db.Exec(`INSERT INTO workspaces (workspace_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, workspaceID, "admin@test.local", "test.local", dbName)
+	_, _ = db.Exec(`INSERT INTO workspaces (workspace_id, email, workspace_domain, workspace_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET workspace_db=EXCLUDED.workspace_db`, workspaceID, "admin@test.local", "test.local", dbName)
 
 	// upsert admin user
-	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, workspace_id, tenant_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
+	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, workspace_id, workspace_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
 		userID, "admin@test.local", clientID, workspaceID, "test.local")
 
 	// upsert admin role - use constraint name to avoid ambiguity with multiple unique indexes

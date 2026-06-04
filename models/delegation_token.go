@@ -10,7 +10,7 @@ import (
 
 // DelegationToken stores an active delegated JWT-SVID for an AI agent client.
 // The SDK/agent pulls this row to get its current token and permissions.
-// Upserted by DelegateToken, keyed by (tenant_id, client_id).
+// Upserted by DelegateToken, keyed by (workspace_id, client_id).
 type DelegationToken struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:uq_delegation_token_client"`

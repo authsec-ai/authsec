@@ -414,7 +414,7 @@ func (r *AgentActionRepository) GetActionRequestByID(actionReqID string) (*model
 }
 
 // GetPendingActionsByUser returns all non-expired pending action requests for a specific user in a tenant.
-// Filters by both tenant_id and user_id so only the affected user sees their notifications.
+// Filters by both workspace_id and user_id so only the affected user sees their notifications.
 func (r *AgentActionRepository) GetPendingActionsByUser(workspaceID uuid.UUID, userID uuid.UUID) ([]models.AgentActionRequest, error) {
 	now := time.Now().Unix()
 	query := `

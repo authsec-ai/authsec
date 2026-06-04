@@ -21,7 +21,7 @@ import (
 // NodeAttestationService handles node attestation for agents
 type NodeAttestationService struct {
 	connManager  *database.ConnectionManager
-	tenantRepo   repositories.TenantRepository
+	workspaceRepo   repositories.WorkspaceRepository
 	vaultClient  *vault.Client
 	k8sValidator *KubernetesValidator
 	logger       *logrus.Entry
@@ -48,7 +48,7 @@ type NodeAttestResponse struct {
 // NewNodeAttestationService creates a new node attestation service
 func NewNodeAttestationService(
 	connManager *database.ConnectionManager,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *NodeAttestationService {
@@ -64,7 +64,7 @@ func NewNodeAttestationService(
 
 	return &NodeAttestationService{
 		connManager:  connManager,
-		tenantRepo:   tenantRepo,
+		workspaceRepo:   workspaceRepo,
 		vaultClient:  vaultClient,
 		k8sValidator: k8sValidator,
 		logger:       logger,
@@ -74,13 +74,13 @@ func NewNodeAttestationService(
 // Attest performs node attestation and issues Agent SVID
 func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequest) (*NodeAttestResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":        req.WorkspaceID,
+		"workspace_id":        req.WorkspaceID,
 		"node_id":          req.NodeID,
 		"attestation_type": req.AttestationType,
 	}).Info("Node attestation started")
 
 	// 1. Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		return nil, errors.NewNotFoundError("Tenant not found", err)
 	}
@@ -136,9 +136,9 @@ func (s *NodeAttestationService) Attest(ctx context.Context, req *NodeAttestRequ
 	}
 
 	// 6. Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, req.WorkspaceID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, req.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", req.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("workspace_id", req.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
@@ -256,23 +256,23 @@ func (s *NodeAttestationService) validateEvidence(ctx context.Context, attestati
 
 // generateAgentSpiffeID generates a SPIFFE ID for an agent
 // Format: spiffe://{tenant-id}/agent/{node-id}
-func (s *NodeAttestationService) generateAgentSpiffeID(tenantID, nodeID string) string {
-	return fmt.Sprintf("spiffe://%s/agent/%s", tenantID, nodeID)
+func (s *NodeAttestationService) generateAgentSpiffeID(workspaceID, nodeID string) string {
+	return fmt.Sprintf("spiffe://%s/agent/%s", workspaceID, nodeID)
 }
 
 // ensureVaultRoleConfigured ensures the Vault PKI role allows URI SANs for SPIFFE IDs
 // This is called automatically during node attestation to configure the role if needed
-func (s *NodeAttestationService) ensureVaultRoleConfigured(ctx context.Context, vaultMount, tenantID string) error {
+func (s *NodeAttestationService) ensureVaultRoleConfigured(ctx context.Context, vaultMount, workspaceID string) error {
 	s.logger.WithFields(logrus.Fields{
 		"vault_mount": vaultMount,
-		"tenant_id":   tenantID,
+		"workspace_id":   workspaceID,
 	}).Info("Ensuring Vault PKI role is configured for URI SANs")
 
 	// Configure the agent role to allow URI SANs
 	// This allows SPIFFE IDs in the form: spiffe://{tenant-id}/agent/{node-id}
 	roleConfig := &vault.PKIRoleConfig{
 		AllowedDomains:  []string{},
-		AllowedURISANs:  []string{fmt.Sprintf("spiffe://%s/*", tenantID)},
+		AllowedURISANs:  []string{fmt.Sprintf("spiffe://%s/*", workspaceID)},
 		AllowSubdomains: false,
 		AllowAnyName:    false,
 		AllowURISANs:    true,

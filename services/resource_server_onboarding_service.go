@@ -75,19 +75,19 @@ func NewResourceServerOnboardingService(db *gorm.DB) *ResourceServerOnboardingSe
 }
 
 func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, workspaceID string) (*ResourceServerAccessPolicyResponse, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
+	rsUUID, workspaceUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 
-	roleOptions, err := s.listRoleOptions(rsUUID, tenantUUID)
+	roleOptions, err := s.listRoleOptions(rsUUID, workspaceUUID)
 	if err != nil {
 		return nil, err
 	}
 
 	var policy models.ResourceServerAccessPolicy
 	err = s.db.Preload("DefaultRole").
-		Where("resource_server_id = ? AND workspace_id = ?", rsUUID, tenantUUID).
+		Where("resource_server_id = ? AND workspace_id = ?", rsUUID, workspaceUUID).
 		First(&policy).Error
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return nil, err
@@ -117,12 +117,12 @@ func (s *ResourceServerOnboardingService) GetAccessPolicy(resourceServerID, work
 }
 
 func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, workspaceID string, req UpdateResourceServerAccessPolicyRequest) (*ResourceServerAccessPolicyResponse, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
+	rsUUID, workspaceUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 
-	roleOptions, err := s.listRoleOptions(rsUUID, tenantUUID)
+	roleOptions, err := s.listRoleOptions(rsUUID, workspaceUUID)
 	if err != nil {
 		return nil, err
 	}
@@ -151,13 +151,13 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, w
 	}
 
 	var existing models.ResourceServerAccessPolicy
-	err = s.db.Where("resource_server_id = ? AND workspace_id = ?", rsUUID, tenantUUID).First(&existing).Error
+	err = s.db.Where("resource_server_id = ? AND workspace_id = ?", rsUUID, workspaceUUID).First(&existing).Error
 	if err != nil {
 		if err != gorm.ErrRecordNotFound {
 			return nil, err
 		}
 		existing = models.ResourceServerAccessPolicy{
-			WorkspaceID:          tenantUUID,
+			WorkspaceID:          workspaceUUID,
 			ResourceServerID:  rsUUID,
 			Enabled:           req.Enabled,
 			DefaultRoleID:     defaultRoleID,
@@ -190,7 +190,7 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, w
 }
 
 func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerID, workspaceID string) (bool, *string, error) {
-	rsUUID, tenantUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
+	rsUUID, workspaceUUID, err := parseTenantScopedIDs(resourceServerID, workspaceID)
 	if err != nil {
 		return false, nil, err
 	}
@@ -204,7 +204,7 @@ func (s *ResourceServerOnboardingService) GetAccessPolicySummary(resourceServerI
 	err = s.db.Table("resource_server_access_policies p").
 		Select("p.enabled, r.name").
 		Joins("LEFT JOIN roles r ON r.id = p.default_role_id").
-		Where("p.resource_server_id = ? AND p.workspace_id = ?", rsUUID, tenantUUID).
+		Where("p.resource_server_id = ? AND p.workspace_id = ?", rsUUID, workspaceUUID).
 		Take(&row).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -225,13 +225,13 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	if err != nil {
 		return false, nil
 	}
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return false, nil
 	}
 
 	var policy models.ResourceServerAccessPolicy
-	err = s.db.Where("resource_server_id = ? AND workspace_id = ? AND enabled = true", rs.ID, tenantUUID).First(&policy).Error
+	err = s.db.Where("resource_server_id = ? AND workspace_id = ? AND enabled = true", rs.ID, workspaceUUID).First(&policy).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return false, nil
@@ -273,7 +273,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	emailFallback = user.Email
 
 	var role models.RBACRole
-	if err := s.db.Where("id = ? AND workspace_id = ?", *policy.DefaultRoleID, tenantUUID).First(&role).Error; err != nil {
+	if err := s.db.Where("id = ? AND workspace_id = ?", *policy.DefaultRoleID, workspaceUUID).First(&role).Error; err != nil {
 		// Stale access policy: pointer-to-deleted-role is a known edge case
 		// for RSes that predate the auto-viewer flow or where the admin
 		// deleted the default role manually. Don't 500 — log and skip.
@@ -293,7 +293,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	// to avoid creating a second row when the user already has the role.
 	var existingCount int64
 	if err := s.db.Model(&models.RoleBinding{}).
-		Where("workspace_id = ? AND user_id = ? AND role_id = ?", tenantUUID, userUUID, role.ID).
+		Where("workspace_id = ? AND user_id = ? AND role_id = ?", workspaceUUID, userUUID, role.ID).
 		Where("(scope_type IS NULL AND scope_id IS NULL) OR (scope_type = ? AND scope_id = ?)",
 			rsScopeType, rsScopeID).
 		Count(&existingCount).Error; err != nil {
@@ -315,7 +315,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	}
 
 	binding := models.RoleBinding{
-		WorkspaceID:           &tenantUUID,
+		WorkspaceID:           &workspaceUUID,
 		UserID:             &userUUID,
 		Username:           firstNonEmpty(username, emailFallback, userUUID.String()),
 		RoleID:             role.ID,
@@ -575,11 +575,11 @@ func parseTenantScopedIDs(resourceServerID, workspaceID string) (uuid.UUID, uuid
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid resource server ID")
 	}
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("invalid tenant ID")
 	}
-	return rsUUID, tenantUUID, nil
+	return rsUUID, workspaceUUID, nil
 }
 
 func roleOptionContains(options []ResourceServerRoleOption, roleID string) bool {

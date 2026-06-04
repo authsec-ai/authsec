@@ -604,12 +604,12 @@ func (s *EntraIDService) testDirectoryRead() error {
 	return nil
 }
 
-func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUser EntraIDUser, tenantID string, clientID string, projectID string) error {
+func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUser EntraIDUser, workspaceID string, clientID string, projectID string) error {
 	clientUUID, err := uuid.Parse(clientID)
 	if err != nil {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -620,7 +620,7 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 
 	// Check if user already exists (by email or external ID scoped to workspace)
 	var existingUser models.User
-	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", entraUser.Mail, entraUser.ID, tenantUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", entraUser.Mail, entraUser.ID, workspaceUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -645,7 +645,7 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 			User: sharedmodels.User{
 				ID:           uuid.New(),
 				ClientID:     clientUUID,
-				WorkspaceID:     tenantUUID,
+				WorkspaceID:     workspaceUUID,
 				ProjectID:    projectUUID,
 				Name:         entraUser.DisplayName,
 				Username:     &entraUser.MailNickname,
@@ -654,7 +654,7 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 				ProviderID:   entraUser.UserPrincipalName,
 				Active:       entraUser.AccountEnabled,
 				ProviderData: datatypes.JSON(providerData),
-				TenantDomain: config.AppConfig.TenantDomainSuffix, // Use configured domain suffix (authsec.dev)
+				WorkspaceDomain: config.AppConfig.WorkspaceDomainSuffix, // Use configured domain suffix (authsec.dev)
 				MFAEnabled:   false,                               // Explicitly set MFAEnabled as required by shared-models v0.5.0
 				CreatedAt:    now,
 				UpdatedAt:    now,
@@ -709,12 +709,12 @@ func (eic *EntraIDController) syncEntraUserToDatabase(tenantDB *gorm.DB, entraUs
 }
 
 // isTestTenant helps short-circuit external calls during unit tests.
-func isTestTenant(tenantID string) bool {
-	return tenantID == "test-tenant-id" || tenantID == "invalid-tenant"
+func isTestTenant(workspaceID string) bool {
+	return workspaceID == "test-tenant-id" || workspaceID == "invalid-tenant"
 }
 
 // loadStoredEntraConfig loads Entra ID configuration from database and decrypts credentials
-func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID string) (EntraIDConfig, error) {
+func (eic *EntraIDController) loadStoredEntraConfig(configID, workspaceID, clientID string) (EntraIDConfig, error) {
 	var syncConfig models.SyncConfiguration
 
 	// Parse UUIDs
@@ -722,7 +722,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 	if err != nil {
 		return EntraIDConfig{}, fmt.Errorf("invalid config_id format")
 	}
-	tenantUUID, err := uuid.Parse(tenantID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return EntraIDConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
@@ -733,7 +733,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 
 	// Fetch configuration from database
 	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ? AND sync_type = ?",
-		configUUID, tenantUUID, clientUUID, "entra_id").First(&syncConfig).Error; err != nil {
+		configUUID, workspaceUUID, clientUUID, "entra_id").First(&syncConfig).Error; err != nil {
 		return EntraIDConfig{}, fmt.Errorf("sync configuration not found or not authorized")
 	}
 
@@ -759,7 +759,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, tenantID, clientID
 
 	// Build EntraIDConfig
 	entraConfig := EntraIDConfig{
-		WorkspaceID:     syncConfig.EntraTenantID,
+		WorkspaceID:     syncConfig.EntraWorkspaceID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

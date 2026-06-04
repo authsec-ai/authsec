@@ -24,7 +24,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE resource_servers (
 			id                          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id                TEXT NOT NULL,
-			tenant_id                   TEXT,
+			workspace_id                   TEXT,
 			application_type            TEXT NOT NULL DEFAULT 'mcp_server',
 			legacy_client_id            TEXT,
 			name                        TEXT NOT NULL,
@@ -57,7 +57,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE roles (
 			id                TEXT PRIMARY KEY,
 			workspace_id      TEXT,
-			tenant_id         TEXT,
+			workspace_id         TEXT,
 			name              TEXT NOT NULL,
 			description       TEXT,
 			is_system         NUMERIC NOT NULL DEFAULT 0,
@@ -68,7 +68,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE resource_server_access_policies (
 			id                  TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id        TEXT NOT NULL,
-			tenant_id           TEXT,
+			workspace_id           TEXT,
 			resource_server_id  TEXT NOT NULL,
 			enabled             NUMERIC NOT NULL DEFAULT 0,
 			default_role_id     TEXT,
@@ -80,7 +80,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 		`CREATE TABLE oauth_scopes (
 			id                  TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id        TEXT NOT NULL,
-			tenant_id           TEXT,
+			workspace_id           TEXT,
 			resource_server_id  TEXT,
 			scope_string        TEXT NOT NULL,
 			display_name        TEXT NOT NULL,

@@ -9,7 +9,7 @@
 //   - auth-manager/controllers/system_controller.go
 //
 // DB access uses authsec's config.DB (single shared GORM DB). Workspace
-// isolation is row-level via tenant_id/workspace_id predicates.
+// isolation is row-level via workspace_id/workspace_id predicates.
 // All audit logging uses log.Printf (no external audit package needed).
 package platform
 
@@ -26,6 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	authmgrrepo "github.com/authsec-ai/authsec/internal/authmgr/repo"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -91,7 +92,7 @@ type authmgrAuthz struct {
 }
 
 // authmgrGetAuthz loads roles/scopes/groups for a user from the shared
-// config.DB, scoping by tenant_id at the row level.
+// config.DB, scoping by workspace_id at the row level.
 func authmgrGetAuthz(ctx context.Context, workspaceID, clientID, email string) (*authmgrAuthz, error) {
 	if workspaceID == "" || email == "" {
 		return nil, errors.New("workspaceID and email are required")
@@ -353,7 +354,9 @@ func (ac *AuthmgrController) VerifyToken(c *gin.Context) {
 	})
 }
 
-// GenerateToken issues a JWT for the given credentials.
+// GenerateToken issues a JWT for the authenticated caller.
+// All identity claims come from the validated JWT (set by AuthMiddleware),
+// never from the request body — prevents privilege escalation.
 func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 	var req sharedmodels.TokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -361,8 +364,15 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		return
 	}
 
-	dbType := authmgrGetDBTypeFromPath(c.Request.URL.Path)
-	log.Printf("[authmgr GenerateToken] db=%s", dbType)
+	// Pull identity from the authenticated JWT — ignore body-supplied values.
+	workspaceID, _ := middlewares.GetWorkspaceIDFromToken(c)
+	emailID := c.GetString("email_id")
+	userID := c.GetString("user_id")
+
+	if workspaceID == "" || emailID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id and email required in token"})
+		return
+	}
 
 	var signingSecret []byte
 	var tokenType string
@@ -374,11 +384,10 @@ func (ac *AuthmgrController) GenerateToken(c *gin.Context) {
 		tokenType = "default"
 	}
 
-	// Phase 6: workspace_id is the only identity claim.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"workspace_id": req.WorkspaceID,
-		"client_id":    req.ClientID,
-		"email_id":     req.EmailID,
+		"workspace_id": workspaceID,
+		"user_id":      userID,
+		"email_id":     emailID,
 		"token_type":   tokenType,
 		"aud":          "authsec-api",
 		"iat":          time.Now().Unix(),
@@ -433,14 +442,14 @@ func (ac *AuthmgrController) OIDCToken(c *gin.Context) {
 
 // CheckPermission checks if the authenticated user has a permission for a resource+action.
 func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
-	if tenantIDStr == "" || userIDStr == "" {
+	if workspaceIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -466,7 +475,7 @@ func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":        userIDStr,
-		"workspace_id":   tenantIDStr,
+		"workspace_id":   workspaceIDStr,
 		"resource":       resource,
 		"scope":          action,
 		"has_permission": hasPerm,
@@ -475,14 +484,14 @@ func (ac *AuthmgrController) CheckPermission(c *gin.Context) {
 
 // CheckRole checks if the authenticated user has a specific role.
 func (ac *AuthmgrController) CheckRole(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
-	if tenantIDStr == "" || userIDStr == "" {
+	if workspaceIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -514,14 +523,14 @@ func (ac *AuthmgrController) CheckRole(c *gin.Context) {
 
 // CheckRoleResource checks if the user has a role scoped to a specific resource.
 func (ac *AuthmgrController) CheckRoleResource(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
-	if tenantIDStr == "" || userIDStr == "" {
+	if workspaceIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -563,14 +572,14 @@ func (ac *AuthmgrController) CheckRoleResource(c *gin.Context) {
 
 // CheckPermissionScoped checks permission with an optional scope ID.
 func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
-	if tenantIDStr == "" || userIDStr == "" {
+	if workspaceIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -608,7 +617,7 @@ func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
 
 	resp := gin.H{
 		"user_id":        userIDStr,
-		"workspace_id":   tenantIDStr,
+		"workspace_id":   workspaceIDStr,
 		"resource":       resource,
 		"scope":          action,
 		"has_permission": hasPerm,
@@ -622,13 +631,13 @@ func (ac *AuthmgrController) CheckPermissionScoped(c *gin.Context) {
 
 // CheckOAuthScopePermission checks if an OAuth scope name grants a specific permission.
 func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
-	if tenantIDStr == "" {
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	if workspaceIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -649,7 +658,7 @@ func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"workspace_id":   tenantIDStr,
+		"workspace_id":   workspaceIDStr,
 		"scope_name":     scopeName,
 		"resource":       resource,
 		"action":         action,
@@ -659,14 +668,14 @@ func (ac *AuthmgrController) CheckOAuthScopePermission(c *gin.Context) {
 
 // ListUserPermissions returns all permissions for the authenticated user.
 func (ac *AuthmgrController) ListUserPermissions(c *gin.Context) {
-	tenantIDStr := authmgrGetStringFromCtx(c, "workspace_id")
+	workspaceIDStr := authmgrGetStringFromCtx(c, "workspace_id")
 	userIDStr := authmgrGetStringFromCtx(c, "user_id")
-	if tenantIDStr == "" || userIDStr == "" {
+	if workspaceIDStr == "" || userIDStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user context missing"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid tenant ID"})
 		return
@@ -690,7 +699,7 @@ func (ac *AuthmgrController) ListUserPermissions(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":      userIDStr,
-		"workspace_id": tenantIDStr,
+		"workspace_id": workspaceIDStr,
 		"permissions":  permStrings,
 		"count":        len(permStrings),
 	})
@@ -783,7 +792,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 func (ac *AuthmgrController) ListGroups(c *gin.Context) {
 	workspaceID := c.Query("workspace_id")
 	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
 		return
 	}
 	tid, err := uuid.Parse(workspaceID)
@@ -807,7 +816,7 @@ func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	workspaceID := c.Query("workspace_id")
 	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
 		return
 	}
 
@@ -881,7 +890,7 @@ func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	workspaceID := c.Query("workspace_id")
 	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
 		return
 	}
 
@@ -1023,7 +1032,7 @@ func (ac *AuthmgrController) ListGroupUsers(c *gin.Context) {
 	idParam := c.Param("id")
 	workspaceID := c.Query("workspace_id")
 	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
 		return
 	}
 

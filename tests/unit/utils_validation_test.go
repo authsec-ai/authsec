@@ -204,29 +204,29 @@ func TestValidateDomain_Invalid(t *testing.T) {
 	}
 }
 
-// ── ValidateTenantID ──────────────────────────────────────────────────────────
+// ── ValidateWorkspaceID ──────────────────────────────────────────────────────────
 
-func TestValidateTenantID_UUID(t *testing.T) {
-	if err := utils.ValidateTenantID("550e8400-e29b-41d4-a716-446655440000"); err != nil {
-		t.Errorf("ValidateTenantID: valid UUID should pass, got %v", err)
+func TestValidateWorkspaceID_UUID(t *testing.T) {
+	if err := utils.ValidateWorkspaceID("550e8400-e29b-41d4-a716-446655440000"); err != nil {
+		t.Errorf("ValidateWorkspaceID: valid UUID should pass, got %v", err)
 	}
 }
 
-func TestValidateTenantID_Alphanumeric(t *testing.T) {
-	if err := utils.ValidateTenantID("mytenantid"); err != nil {
-		t.Errorf("ValidateTenantID: alphanumeric id should pass, got %v", err)
+func TestValidateWorkspaceID_Alphanumeric(t *testing.T) {
+	if err := utils.ValidateWorkspaceID("mytenantid"); err != nil {
+		t.Errorf("ValidateWorkspaceID: alphanumeric id should pass, got %v", err)
 	}
 }
 
-func TestValidateTenantID_Empty(t *testing.T) {
-	if err := utils.ValidateTenantID(""); err == nil {
-		t.Error("ValidateTenantID: empty should fail")
+func TestValidateWorkspaceID_Empty(t *testing.T) {
+	if err := utils.ValidateWorkspaceID(""); err == nil {
+		t.Error("ValidateWorkspaceID: empty should fail")
 	}
 }
 
-func TestValidateTenantID_TooShort(t *testing.T) {
-	if err := utils.ValidateTenantID("ab"); err == nil {
-		t.Error("ValidateTenantID: 2-char id should fail (min 3)")
+func TestValidateWorkspaceID_TooShort(t *testing.T) {
+	if err := utils.ValidateWorkspaceID("ab"); err == nil {
+		t.Error("ValidateWorkspaceID: 2-char id should fail (min 3)")
 	}
 }
 

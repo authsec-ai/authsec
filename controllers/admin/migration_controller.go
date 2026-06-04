@@ -62,15 +62,15 @@ func (mc *MigrationController) GetMasterMigrationStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, status)
 }
 
-// CreateTenantDB POST /authsec-migration/tenants/create-db
-func (mc *MigrationController) CreateTenantDB(c *gin.Context) {
+// CreateWorkspaceDB POST /authsec-migration/tenants/create-db
+func (mc *MigrationController) CreateWorkspaceDB(c *gin.Context) {
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error": "Tenant database operations are managed by mt-plugin",
 		"hint":  "Start the mt-plugin microservice and configure MT_PLUGIN_GRPC_ADDR",
 	})
 }
 
-// RunTenantMigrations POST /authsec-migration/tenants/:tenant_id/migrations/run
+// RunTenantMigrations POST /authsec-migration/tenants/:workspace_id/migrations/run
 func (mc *MigrationController) RunTenantMigrations(c *gin.Context) {
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error": "Tenant database operations are managed by mt-plugin",
@@ -78,7 +78,7 @@ func (mc *MigrationController) RunTenantMigrations(c *gin.Context) {
 	})
 }
 
-// GetTenantMigrationStatus GET /authsec-migration/tenants/:tenant_id/migrations/status
+// GetTenantMigrationStatus GET /authsec-migration/tenants/:workspace_id/migrations/status
 func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	workspaceID := c.Param("workspace_id")
 
@@ -89,8 +89,8 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	}
 
 	dbName := ""
-	if tenant.TenantDB != nil {
-		dbName = *tenant.TenantDB
+	if tenant.WorkspaceDB != nil {
+		dbName = *tenant.WorkspaceDB
 	}
 
 	migStatus := "pending"
@@ -108,7 +108,7 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 	}
 
 	cfg := config.AppConfig
-	tenantDBConn, err := migration.ConnectToTenantDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
+	tenantDBConn, err := migration.ConnectToWorkspaceDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"workspace_id":        tenant.WorkspaceID.String(),
@@ -158,11 +158,11 @@ func (mc *MigrationController) ListTenants(c *gin.Context) {
 		item := migration.TenantListItem{
 			WorkspaceID:      t.WorkspaceID.String(),
 			Email:         t.Email,
-			TenantDomain:  t.TenantDomain,
+			WorkspaceDomain:  t.WorkspaceDomain,
 			LastMigration: t.LastMigration,
 		}
-		if t.TenantDB != nil {
-			item.DatabaseName = *t.TenantDB
+		if t.WorkspaceDB != nil {
+			item.DatabaseName = *t.WorkspaceDB
 		}
 		if t.MigrationStatus != nil {
 			item.MigrationStatus = *t.MigrationStatus

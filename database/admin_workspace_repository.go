@@ -10,23 +10,23 @@ import (
 	"github.com/google/uuid"
 )
 
-// AdminTenantRepository handles workspace identity database operations from
+// AdminWorkspaceRepository handles workspace identity database operations from
 // admin contexts.
 //
 // Phase 6 collapse: queries now target the `workspaces` table rather than the
 // dropped `tenants` table. Type name preserved for source-compat; rename to
 // AdminWorkspaceRepository is tracked as Phase 9/10 cosmetic.
-type AdminTenantRepository struct {
+type AdminWorkspaceRepository struct {
 	db *DBConnection
 }
 
-// NewAdminTenantRepository creates a new admin workspace repository.
-func NewAdminTenantRepository(db *DBConnection) *AdminTenantRepository {
-	return &AdminTenantRepository{db: db}
+// NewAdminWorkspaceRepository creates a new admin workspace repository.
+func NewAdminWorkspaceRepository(db *DBConnection) *AdminWorkspaceRepository {
+	return &AdminWorkspaceRepository{db: db}
 }
 
 // GetAllTenants retrieves all workspace identity rows.
-func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
+func (atr *AdminWorkspaceRepository) GetAllTenants() ([]models.Tenant, error) {
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces ORDER BY created_at DESC`
 	rows, err := atr.db.Query(query)
 	if err != nil {
@@ -45,8 +45,8 @@ func (atr *AdminTenantRepository) GetAllTenants() ([]models.Tenant, error) {
 	return tenants, nil
 }
 
-// GetTenantByID retrieves a workspace by its ID.
-func (atr *AdminTenantRepository) GetTenantByID(workspaceID string) (*models.Tenant, error) {
+// GetWorkspaceByID retrieves a workspace by its ID.
+func (atr *AdminWorkspaceRepository) GetWorkspaceByID(workspaceID string) (*models.Tenant, error) {
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE id = $1`
 	var t models.Tenant
 	err := scanWorkspaceRow(atr.db.QueryRow(query, workspaceID), &t)
@@ -60,7 +60,7 @@ func (atr *AdminTenantRepository) GetTenantByID(workspaceID string) (*models.Ten
 }
 
 // CreateTenant inserts a new workspace identity row.
-func (atr *AdminTenantRepository) CreateTenant(t *models.Tenant) error {
+func (atr *AdminWorkspaceRepository) CreateTenant(t *models.Tenant) error {
 	query := `
 		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -76,7 +76,7 @@ func (atr *AdminTenantRepository) CreateTenant(t *models.Tenant) error {
 		t.UpdatedAt = now
 	}
 	_, err := atr.db.Exec(query,
-		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.WorkspaceDomain, t.CreatedAt, t.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create workspace: %w", err)
@@ -85,7 +85,7 @@ func (atr *AdminTenantRepository) CreateTenant(t *models.Tenant) error {
 }
 
 // UpdateTenant updates fields on the workspace identity row keyed by id.
-func (atr *AdminTenantRepository) UpdateTenant(workspaceID string, updates map[string]interface{}) error {
+func (atr *AdminWorkspaceRepository) UpdateTenant(workspaceID string, updates map[string]interface{}) error {
 	if len(updates) == 0 {
 		return fmt.Errorf("no updates provided")
 	}
@@ -116,14 +116,14 @@ func (atr *AdminTenantRepository) UpdateTenant(workspaceID string, updates map[s
 
 // GetTenantUsers retrieves all users for a specific workspace.
 // Returns empty slice; admin user listing has dedicated repositories now.
-func (atr *AdminTenantRepository) GetTenantUsers(workspaceID string) ([]models.User, error) {
+func (atr *AdminWorkspaceRepository) GetTenantUsers(workspaceID string) ([]models.User, error) {
 	return []models.User{}, nil
 }
 
-// GetTenantByDomain retrieves a workspace by its domain. Supports
+// GetWorkspaceByDomain retrieves a workspace by its domain. Supports
 // custom domains via the workspace_domains join.
-func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*models.Tenant, error) {
-	log.Printf("DEBUG GetTenantByDomain: Looking up domain='%s'", workspaceDomain)
+func (atr *AdminWorkspaceRepository) GetWorkspaceByDomain(workspaceDomain string) (*models.Tenant, error) {
+	log.Printf("DEBUG GetWorkspaceByDomain: Looking up domain='%s'", workspaceDomain)
 
 	// First try via workspace_domains (custom-domain mapping).
 	query := `
@@ -136,10 +136,10 @@ func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*mo
 	var t models.Tenant
 	err := scanWorkspaceRow(atr.db.QueryRow(query, workspaceDomain), &t)
 	if err == nil {
-		log.Printf("DEBUG GetTenantByDomain: Found via workspace_domains: workspace_id=%s, workspace_domain=%s", t.WorkspaceID, t.TenantDomain)
+		log.Printf("DEBUG GetWorkspaceByDomain: Found via workspace_domains: workspace_id=%s, workspace_domain=%s", t.WorkspaceID, t.WorkspaceDomain)
 		return &t, nil
 	}
-	log.Printf("DEBUG GetTenantByDomain: Not found in workspace_domains (error: %v), trying fallback", err)
+	log.Printf("DEBUG GetWorkspaceByDomain: Not found in workspace_domains (error: %v), trying fallback", err)
 
 	// Fallback: direct lookup on workspaces.workspace_domain
 	fallbackQuery := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE workspace_domain LIKE $1 OR workspace_domain = $2`
@@ -153,13 +153,13 @@ func (atr *AdminTenantRepository) GetTenantByDomain(workspaceDomain string) (*mo
 	return &t, nil
 }
 
-// GetTenantByUUID retrieves a workspace by UUID.
-func (atr *AdminTenantRepository) GetTenantByUUID(workspaceID uuid.UUID) (*models.Tenant, error) {
-	return atr.GetTenantByID(workspaceID.String())
+// GetWorkspaceByUUID retrieves a workspace by UUID.
+func (atr *AdminWorkspaceRepository) GetWorkspaceByUUID(workspaceID uuid.UUID) (*models.Tenant, error) {
+	return atr.GetWorkspaceByID(workspaceID.String())
 }
 
 // CreateTenantTx inserts a workspace identity row within a transaction.
-func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
+func (atr *AdminWorkspaceRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
 	query := `
 		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -175,7 +175,7 @@ func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) e
 		t.UpdatedAt = now
 	}
 	_, err := tx.Exec(query,
-		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.WorkspaceDomain, t.CreatedAt, t.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create workspace: %w", err)
@@ -184,10 +184,10 @@ func (atr *AdminTenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) e
 }
 
 // CreateAdminUserTx creates a new admin user within a transaction.
-func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.AdminUser) error {
+func (atr *AdminWorkspaceRepository) CreateAdminUserTx(tx *sql.Tx, user *models.AdminUser) error {
 	query := `
 		INSERT INTO users (id, email, username, password_hash, name, workspace_id, project_id,
-			client_id, tenant_domain, provider, provider_id, avatar_url, active, created_at, updated_at)
+			client_id, workspace_domain, provider, provider_id, avatar_url, active, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 	now := time.Now()
@@ -196,7 +196,7 @@ func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.Adm
 	}
 	_, err := tx.Exec(query,
 		user.ID, user.Email, user.Username, user.PasswordHash, user.Name,
-		user.WorkspaceID, user.ProjectID, user.ClientID, user.TenantDomain,
+		user.WorkspaceID, user.ProjectID, user.ClientID, user.WorkspaceDomain,
 		user.Provider, user.ProviderID, user.AvatarURL, user.Active, now, now,
 	)
 	if err != nil {
@@ -206,10 +206,10 @@ func (atr *AdminTenantRepository) CreateAdminUserTx(tx *sql.Tx, user *models.Adm
 }
 
 // GetAdminUserByID retrieves an admin user by ID.
-func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.AdminUser, error) {
+func (atr *AdminWorkspaceRepository) GetAdminUserByID(userID uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT id, email, username, password_hash, name, workspace_id, project_id,
-			client_id, tenant_domain, provider, provider_id, avatar_url, active,
+			client_id, workspace_domain, provider, provider_id, avatar_url, active,
 			created_at, updated_at
 		FROM users
 		WHERE id = $1
@@ -227,7 +227,7 @@ func (atr *AdminTenantRepository) GetAdminUserByID(userID uuid.UUID) (*models.Ad
 		&workspaceID,
 		&projectID,
 		&clientID,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerID,
 		&avatarURL,

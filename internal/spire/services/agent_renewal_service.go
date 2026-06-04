@@ -19,7 +19,7 @@ import (
 // AgentRenewalService handles agent SVID renewal
 type AgentRenewalService struct {
 	connManager *database.ConnectionManager
-	tenantRepo  repositories.TenantRepository
+	workspaceRepo  repositories.WorkspaceRepository
 	vaultClient *vault.Client
 	logger      *logrus.Entry
 }
@@ -44,13 +44,13 @@ type AgentRenewResponse struct {
 // NewAgentRenewalService creates a new agent renewal service
 func NewAgentRenewalService(
 	connManager *database.ConnectionManager,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *AgentRenewalService {
 	return &AgentRenewalService{
 		connManager: connManager,
-		tenantRepo:  tenantRepo,
+		workspaceRepo:  workspaceRepo,
 		vaultClient: vaultClient,
 		logger:      logger,
 	}
@@ -62,14 +62,14 @@ func (s *AgentRenewalService) Renew(ctx context.Context, req *AgentRenewRequest)
 
 	// 1. Extract tenant ID from mTLS context only — never trust the request body.
 	// The mTLS middleware extracts this from the agent's certificate SPIFFE ID.
-	tenantID, ok := ctx.Value("tenant_id").(string)
-	if !ok || tenantID == "" {
+	workspaceID, ok := ctx.Value("workspace_id").(string)
+	if !ok || workspaceID == "" {
 		return nil, errors.NewUnauthorizedError(
 			"Tenant ID not found in mTLS context. Agent renewal requires mutual TLS authentication.", nil)
 	}
 
 	// 2. Get tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, workspaceID)
 	if err != nil {
 		return nil, errors.NewNotFoundError("Tenant not found", err)
 	}
@@ -79,9 +79,9 @@ func (s *AgentRenewalService) Renew(ctx context.Context, req *AgentRenewRequest)
 	}
 
 	// 3. Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, tenantID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", tenantID).WithError(err).Error("Failed to connect to tenant database")
+		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to connect to tenant database")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
@@ -99,7 +99,7 @@ func (s *AgentRenewalService) Renew(ctx context.Context, req *AgentRenewRequest)
 	}
 
 	// Verify agent belongs to the authenticated tenant
-	if agent.WorkspaceID != tenantID {
+	if agent.WorkspaceID != workspaceID {
 		return nil, errors.NewForbiddenError("Agent does not belong to authenticated tenant", nil)
 	}
 

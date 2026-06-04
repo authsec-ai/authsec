@@ -28,12 +28,12 @@ type BootstrapConfig struct {
 	// VaultClient is an existing Vault API client (optional — if nil, creates one from env).
 	VaultClient *api.Client
 
-	// TenantDB connection config (reads from env if zero-valued).
-	TenantDBHost     string
-	TenantDBPort     int
-	TenantDBUsername string
-	TenantDBPassword string
-	TenantDBSSLMode  string
+	// WorkspaceDB connection config (reads from env if zero-valued).
+	WorkspaceDBHost     string
+	WorkspaceDBPort     int
+	WorkspaceDBUsername string
+	WorkspaceDBPassword string
+	WorkspaceDBSSLMode  string
 
 	// Vault PKI config
 	VaultPKIBasePath string
@@ -56,16 +56,16 @@ func Bootstrap(cfg *BootstrapConfig) (*Dependencies, error) {
 	}
 
 	// ── Tenant repository (master DB) ──
-	tenantRepo := infrarepos.NewPostgresTenantRepository(cfg.MasterDB)
+	workspaceRepo := infrarepos.NewPostgresWorkspaceRepository(cfg.MasterDB)
 
 	// ── Connection manager (multi-tenant) ──
 	connMgr := database.NewConnectionManager(
 		cfg.MasterDB,
 		logger.WithField("component", "conn_manager"),
-		tenantRepo,
+		workspaceRepo,
 		10, 5, 30*time.Minute,
-		cfg.TenantDBHost, cfg.TenantDBPort,
-		cfg.TenantDBUsername, cfg.TenantDBPassword, cfg.TenantDBSSLMode,
+		cfg.WorkspaceDBHost, cfg.WorkspaceDBPort,
+		cfg.WorkspaceDBUsername, cfg.WorkspaceDBPassword, cfg.WorkspaceDBSSLMode,
 	)
 
 	// ── Vault PKI client ──
@@ -88,19 +88,19 @@ func Bootstrap(cfg *BootstrapConfig) (*Dependencies, error) {
 
 	// ── Application services ──
 	workloadEntrySvc := services.NewWorkloadEntryService(connMgr, logger.WithField("service", "workload_entry"))
-	workloadAttestSvc := services.NewWorkloadAttestationService(connMgr, tenantRepo, workloadEntrySvc, vaultPKI, logger.WithField("service", "workload_attest"))
+	workloadAttestSvc := services.NewWorkloadAttestationService(connMgr, workspaceRepo, workloadEntrySvc, vaultPKI, logger.WithField("service", "workload_attest"))
 
-	nodeAttestSvc := services.NewNodeAttestationService(connMgr, tenantRepo, vaultPKI, logger.WithField("service", "node_attest"))
-	agentRenewalSvc := services.NewAgentRenewalService(connMgr, tenantRepo, vaultPKI, logger.WithField("service", "agent_renewal"))
-	agentSvc := services.NewAgentService(connMgr, tenantRepo, logger.WithField("service", "agent"))
+	nodeAttestSvc := services.NewNodeAttestationService(connMgr, workspaceRepo, vaultPKI, logger.WithField("service", "node_attest"))
+	agentRenewalSvc := services.NewAgentRenewalService(connMgr, workspaceRepo, vaultPKI, logger.WithField("service", "agent_renewal"))
+	agentSvc := services.NewAgentService(connMgr, workspaceRepo, logger.WithField("service", "agent"))
 
-	attestSvc := services.NewAttestationService(nil, nil, policyRepo, auditRepo, tenantRepo, vaultPKI, connMgr, logger.WithField("service", "attestation"))
-	renewalSvc := services.NewRenewalService(nil, nil, auditRepo, tenantRepo, vaultPKI, connMgr, logger.WithField("service", "renewal"))
-	revocationSvc := services.NewRevocationService(nil, auditRepo, tenantRepo, vaultPKI, connMgr, logger.WithField("service", "revocation"))
+	attestSvc := services.NewAttestationService(nil, nil, policyRepo, auditRepo, workspaceRepo, vaultPKI, connMgr, logger.WithField("service", "attestation"))
+	renewalSvc := services.NewRenewalService(nil, nil, auditRepo, workspaceRepo, vaultPKI, connMgr, logger.WithField("service", "renewal"))
+	revocationSvc := services.NewRevocationService(nil, auditRepo, workspaceRepo, vaultPKI, connMgr, logger.WithField("service", "revocation"))
 
-	bundleSvc := services.NewBundleService(tenantRepo, vaultPKI, logger.WithField("service", "bundle"))
+	bundleSvc := services.NewBundleService(workspaceRepo, vaultPKI, logger.WithField("service", "bundle"))
 	jwtSvidSvc := services.NewJWTSVIDService(vaultPKI, logger.WithField("service", "jwt_svid"))
-	pkiProvSvc := services.NewPKIProvisioningService(tenantRepo, vaultPKI, logger.WithField("service", "pki_prov"))
+	pkiProvSvc := services.NewPKIProvisioningService(workspaceRepo, vaultPKI, logger.WithField("service", "pki_prov"))
 
 	// ── Controllers ──
 	healthCtrl := controllers.NewHealthController(logger.WithField("ctrl", "health"))
@@ -156,21 +156,21 @@ func Bootstrap(cfg *BootstrapConfig) (*Dependencies, error) {
 }
 
 func fillDefaults(cfg *BootstrapConfig) {
-	if cfg.TenantDBHost == "" {
-		cfg.TenantDBHost = getEnv("TENANT_DB_HOST", getEnv("DB_HOST", "localhost"))
+	if cfg.WorkspaceDBHost == "" {
+		cfg.WorkspaceDBHost = getEnv("TENANT_DB_HOST", getEnv("DB_HOST", "localhost"))
 	}
-	if cfg.TenantDBPort == 0 {
+	if cfg.WorkspaceDBPort == 0 {
 		port, _ := strconv.Atoi(getEnv("TENANT_DB_PORT", getEnv("DB_PORT", "5432")))
-		cfg.TenantDBPort = port
+		cfg.WorkspaceDBPort = port
 	}
-	if cfg.TenantDBUsername == "" {
-		cfg.TenantDBUsername = getEnv("TENANT_DB_USERNAME", getEnv("DB_USERNAME", "postgres"))
+	if cfg.WorkspaceDBUsername == "" {
+		cfg.WorkspaceDBUsername = getEnv("TENANT_DB_USERNAME", getEnv("DB_USERNAME", "postgres"))
 	}
-	if cfg.TenantDBPassword == "" {
-		cfg.TenantDBPassword = getEnv("TENANT_DB_PASSWORD", getEnv("DB_PASSWORD", ""))
+	if cfg.WorkspaceDBPassword == "" {
+		cfg.WorkspaceDBPassword = getEnv("TENANT_DB_PASSWORD", getEnv("DB_PASSWORD", ""))
 	}
-	if cfg.TenantDBSSLMode == "" {
-		cfg.TenantDBSSLMode = getEnv("TENANT_DB_SSLMODE", getEnv("DB_SSLMODE", "disable"))
+	if cfg.WorkspaceDBSSLMode == "" {
+		cfg.WorkspaceDBSSLMode = getEnv("TENANT_DB_SSLMODE", getEnv("DB_SSLMODE", "disable"))
 	}
 	if cfg.VaultPKIBasePath == "" {
 		cfg.VaultPKIBasePath = getEnv("VAULT_PKI_BASE_PATH", "")

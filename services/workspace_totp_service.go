@@ -20,13 +20,13 @@ import (
 
 // TenantTOTPService handles TOTP authentication for tenant users
 type TenantTOTPService struct {
-	adminTenantRepo *database.AdminTenantRepository
+	adminWorkspaceRepo *database.AdminWorkspaceRepository
 }
 
 // NewTenantTOTPService creates a new tenant TOTP service
 func NewTenantTOTPService() *TenantTOTPService {
 	return &TenantTOTPService{
-		adminTenantRepo: database.NewAdminTenantRepository(config.GetDatabase()),
+		adminWorkspaceRepo: database.NewAdminWorkspaceRepository(config.GetDatabase()),
 	}
 }
 
@@ -137,8 +137,8 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 		}, nil
 	}
 
-	// Step 2: Map client_id to tenant_id
-	tenantUUID, err := s.tenantMapping(clientUUID)
+	// Step 2: Map client_id to workspace_id
+	workspaceUUID, err := s.tenantMapping(clientUUID)
 	if err != nil {
 		return &models.TenantTOTPLoginResponse{
 			Success: false,
@@ -147,7 +147,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 	}
 
 	// Step 3: Get tenant information (validate existence)
-	_, err = s.adminTenantRepo.GetTenantByUUID(tenantUUID)
+	_, err = s.adminWorkspaceRepo.GetWorkspaceByUUID(workspaceUUID)
 	if err != nil {
 		return &models.TenantTOTPLoginResponse{
 			Success: false,
@@ -158,8 +158,8 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 	tenantDB := config.DB
 
 	// Step 5: Look up user in tenant database
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	user, err := tenantRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
+	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
 	if err != nil {
 		return &models.TenantTOTPLoginResponse{
 			Success: false,
@@ -168,7 +168,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 	}
 
 	// Step 6: Get user's TOTP devices
-	secrets, err := tenantRepo.GetTenantUserTOTPSecrets(user.ID, tenantUUID)
+	secrets, err := workspaceRepo.GetTenantUserTOTPSecrets(user.ID, workspaceUUID)
 	if err != nil || len(secrets) == 0 {
 		return &models.TenantTOTPLoginResponse{
 			Success: false,
@@ -196,17 +196,17 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 
 	// Step 8: Update last_used timestamp
 	if usedSecret != nil {
-		tenantRepo.UpdateTenantTOTPSecretLastUsed(usedSecret.ID)
+		workspaceRepo.UpdateTenantTOTPSecretLastUsed(usedSecret.ID)
 	}
 
 	// Step 9: Generate JWT token
-	token, err := s.generateJWTToken(user.ID, tenantUUID, user.Email)
+	token, err := s.generateJWTToken(user.ID, workspaceUUID, user.Email)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate JWT token: %w", err)
 	}
 
 	// Step 10: Update user's last login timestamp
-	tenantRepo.UpdateTenantUserLastLogin(user.ID)
+	workspaceRepo.UpdateTenantUserLastLogin(user.ID)
 
 	return &models.TenantTOTPLoginResponse{
 		Success: true,
@@ -219,7 +219,7 @@ func (s *TenantTOTPService) LoginWithTenantTOTP(req *models.TenantTOTPLoginReque
 func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegistrationRequest, userID, workspaceID uuid.UUID, email string) (*models.TenantTOTPRegistrationResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Generate TOTP secret
 	secret, err := s.GenerateSecret()
@@ -246,12 +246,12 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 	}
 
 	// Check if user has any existing TOTP devices
-	existingSecrets, err := tenantRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
+	existingSecrets, err := workspaceRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
 	if err == nil && len(existingSecrets) == 0 {
 		totpSecret.IsPrimary = true // First device is primary
 	}
 
-	if err := tenantRepo.CreateTenantTOTPSecret(totpSecret); err != nil {
+	if err := workspaceRepo.CreateTenantTOTPSecret(totpSecret); err != nil {
 		if err.Error() == "tenant_not_found" {
 			return nil, fmt.Errorf("database integrity error: workspace record missing (id=%s)", workspaceID)
 		}
@@ -273,7 +273,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 		})
 	}
 
-	if err := tenantRepo.CreateTenantBackupCodes(hashedCodes); err != nil {
+	if err := workspaceRepo.CreateTenantBackupCodes(hashedCodes); err != nil {
 		if err.Error() == "tenant_not_found" {
 			// If we got here, it's weird because secret creation should have failed first,
 			// but handle it anyway
@@ -300,7 +300,7 @@ func (s *TenantTOTPService) RegisterTenantTOTPDevice(req *models.TenantTOTPRegis
 func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegistrationConfirmRequest, userID, workspaceID uuid.UUID) (*models.TenantTOTPRegistrationConfirmResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Get TOTP secret
 	deviceUUID, err := uuid.Parse(req.DeviceID)
@@ -311,7 +311,7 @@ func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegist
 		}, nil
 	}
 
-	secret, err := tenantRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
+	secret, err := workspaceRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
 	if err != nil {
 		return &models.TenantTOTPRegistrationConfirmResponse{
 			Success: false,
@@ -339,9 +339,9 @@ func (s *TenantTOTPService) ConfirmTenantTOTPDevice(req *models.TenantTOTPRegist
 func (s *TenantTOTPService) GetTenantTOTPDevices(userID, workspaceID uuid.UUID) (*models.TenantTOTPDeviceListResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
-	devices, err := tenantRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
+	devices, err := workspaceRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
 	if err != nil {
 		return &models.TenantTOTPDeviceListResponse{
 			Success: false,
@@ -359,7 +359,7 @@ func (s *TenantTOTPService) GetTenantTOTPDevices(userID, workspaceID uuid.UUID) 
 func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceDeleteRequest, userID, workspaceID uuid.UUID) (*models.TenantTOTPDeviceDeleteResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Parse device ID
 	deviceUUID, err := uuid.Parse(req.DeviceID)
@@ -371,7 +371,7 @@ func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceD
 	}
 
 	// Check if device exists
-	secret, err := tenantRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
+	secret, err := workspaceRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
 	if err != nil {
 		return &models.TenantTOTPDeviceDeleteResponse{
 			Success: false,
@@ -381,7 +381,7 @@ func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceD
 
 	// Don't allow deletion of primary device if it's the only one
 	if secret.IsPrimary {
-		allDevices, err := tenantRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
+		allDevices, err := workspaceRepo.GetTenantUserTOTPSecrets(userID, workspaceID)
 		if err == nil && len(allDevices) == 1 {
 			return &models.TenantTOTPDeviceDeleteResponse{
 				Success: false,
@@ -391,7 +391,7 @@ func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceD
 	}
 
 	// Delete device
-	if err := tenantRepo.DeleteTenantTOTPSecret(deviceUUID, userID, workspaceID); err != nil {
+	if err := workspaceRepo.DeleteTenantTOTPSecret(deviceUUID, userID, workspaceID); err != nil {
 		return &models.TenantTOTPDeviceDeleteResponse{
 			Success: false,
 			Message: "Failed to delete device",
@@ -408,7 +408,7 @@ func (s *TenantTOTPService) DeleteTenantTOTPDevice(req *models.TenantTOTPDeviceD
 func (s *TenantTOTPService) SetTenantPrimaryTOTPDevice(req *models.TenantTOTPDeviceDeleteRequest, userID, workspaceID uuid.UUID) (*models.TenantTOTPDeviceDeleteResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Parse device ID
 	deviceUUID, err := uuid.Parse(req.DeviceID)
@@ -420,7 +420,7 @@ func (s *TenantTOTPService) SetTenantPrimaryTOTPDevice(req *models.TenantTOTPDev
 	}
 
 	// Check if device exists
-	_, err = tenantRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
+	_, err = workspaceRepo.GetTenantTOTPSecretByID(deviceUUID, userID, workspaceID)
 	if err != nil {
 		return &models.TenantTOTPDeviceDeleteResponse{
 			Success: false,
@@ -429,7 +429,7 @@ func (s *TenantTOTPService) SetTenantPrimaryTOTPDevice(req *models.TenantTOTPDev
 	}
 
 	// Set as primary
-	if err := tenantRepo.SetTenantTOTPSecretAsPrimary(deviceUUID, userID, workspaceID); err != nil {
+	if err := workspaceRepo.SetTenantTOTPSecretAsPrimary(deviceUUID, userID, workspaceID); err != nil {
 		return &models.TenantTOTPDeviceDeleteResponse{
 			Success: false,
 			Message: "Failed to set primary device",

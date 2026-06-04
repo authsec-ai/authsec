@@ -351,12 +351,12 @@ func (rc *RolesScopedBindingsController) DeleteRoleAdmin(c *gin.Context) {
 // @Failure 500 {object} map[string]string
 // @Router /uflow/admin/bindings/{binding_id} [delete]
 func (rc *RolesScopedBindingsController) DeleteRoleBindingAdmin(c *gin.Context) {
-	tenantIDPtr, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	workspaceIDPtr, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	workspaceID := *tenantIDPtr
+	workspaceID := *workspaceIDPtr
 
 	bindingID, err := uuid.Parse(c.Param("binding_id"))
 	if err != nil {
@@ -508,12 +508,12 @@ func (rc *RolesScopedBindingsController) CreateRoleCompositeEndUser(c *gin.Conte
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.createRole(c, tenantDB, services.NewRBACService(tenantDB), tenantUUID, false)
+	rc.createRole(c, tenantDB, services.NewRBACService(tenantDB), workspaceUUID, false)
 }
 
 // ListRolesEndUser godoc
@@ -533,12 +533,12 @@ func (rc *RolesScopedBindingsController) ListRolesEndUser(c *gin.Context) {
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.listRoles(c, tenantDB, tenantUUID)
+	rc.listRoles(c, tenantDB, workspaceUUID)
 }
 
 // UpdateRoleCompositeEndUser godoc
@@ -564,12 +564,12 @@ func (rc *RolesScopedBindingsController) UpdateRoleCompositeEndUser(c *gin.Conte
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.updateRole(c, tenantDB, tenantUUID)
+	rc.updateRole(c, tenantDB, workspaceUUID)
 }
 
 // DeleteRoleEndUser godoc
@@ -593,12 +593,12 @@ func (rc *RolesScopedBindingsController) DeleteRoleEndUser(c *gin.Context) {
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.deleteRole(c, tenantDB, tenantUUID)
+	rc.deleteRole(c, tenantDB, workspaceUUID)
 }
 
 // AssignRoleScopedEndUser godoc
@@ -621,12 +621,12 @@ func (rc *RolesScopedBindingsController) AssignRoleScopedEndUser(c *gin.Context)
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.assignRoleScoped(c, tenantDB, services.NewRBACService(tenantDB), tenantUUID)
+	rc.assignRoleScoped(c, tenantDB, services.NewRBACService(tenantDB), workspaceUUID)
 }
 
 // ListRoleBindingsEndUser godoc
@@ -650,12 +650,12 @@ func (rc *RolesScopedBindingsController) ListRoleBindingsEndUser(c *gin.Context)
 	}
 
 	tenantDB := config.DB
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
-	rc.listRoleBindings(c, tenantDB, tenantUUID)
+	rc.listRoleBindings(c, tenantDB, workspaceUUID)
 }
 
 // --- Shared helpers ---
@@ -697,11 +697,11 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 		return
 	}
 
-	// Debug: Verify role was created with correct tenant_id
+	// Debug: Verify role was created with correct workspace_id
 	if role.WorkspaceID != nil {
-		log.Printf("[CreateRole] Role created successfully with tenant_id: %s", role.WorkspaceID.String())
+		log.Printf("[CreateRole] Role created successfully with workspace_id: %s", role.WorkspaceID.String())
 	} else {
-		log.Printf("[CreateRole] WARNING: Role created but tenant_id is NULL!")
+		log.Printf("[CreateRole] WARNING: Role created but workspace_id is NULL!")
 	}
 
 	// Audit log: Role created
@@ -733,7 +733,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 
 	var roles []models.RBACRole
 	// Debug: Log the query parameters
-	log.Printf("[ListRoles] Querying with tenant_id: %s", workspaceID.String())
+	log.Printf("[ListRoles] Querying with workspace_id: %s", workspaceID.String())
 
 	roleQuery := freshDB.Where("workspace_id = ?", workspaceID)
 	if roleFilter != "" {
@@ -747,7 +747,7 @@ func (rc *RolesScopedBindingsController) listRoles(c *gin.Context, db *gorm.DB, 
 	}
 
 	// Debug: Log the number of roles found
-	log.Printf("[ListRoles] Found %d roles for tenant_id: %s", len(roles), workspaceID.String())
+	log.Printf("[ListRoles] Found %d roles for workspace_id: %s", len(roles), workspaceID.String())
 
 	type permRow struct {
 		RoleID     uuid.UUID

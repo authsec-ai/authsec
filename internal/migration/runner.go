@@ -176,7 +176,7 @@ func (mr *MigrationRunner) RunMigrations() error {
 		}
 	}
 
-	// Seed tenant self-reference row so DML migrations can resolve tenant_id.
+	// Seed tenant self-reference row so DML migrations can resolve workspace_id.
 	if mr.dbType == "tenant" && mr.workspaceID != nil {
 		seedSQL := `INSERT INTO workspaces (id, workspace_id, status, created_at, updated_at)
 		            VALUES ($1::uuid, $1::uuid, 'active', NOW(), NOW())

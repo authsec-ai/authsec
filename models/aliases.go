@@ -88,7 +88,7 @@ type PendingRegistration struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
-	TenantDomain string    `json:"tenant_domain"`
+	WorkspaceDomain string    `json:"workspace_domain"`
 }
 
 // TenantGroup represents a user-defined group within a tenant
@@ -122,8 +122,8 @@ type RemoveGroupsRequest struct {
 
 // UserGroup represents the many-to-many relationship between users and groups.
 // Backed by migration 110_create_user_groups.sql.
-// Primary key is the (tenant_id, user_id, group_id) tuple so all rows are
-// tenant-scoped and the composite FK to users(tenant_id, id) is satisfied.
+// Primary key is the (workspace_id, user_id, group_id) tuple so all rows are
+// tenant-scoped and the composite FK to users(workspace_id, id) is satisfied.
 type UserGroup struct {
 	WorkspaceID uuid.UUID  `json:"workspace_id" gorm:"type:uuid;primaryKey;not null"`
 	UserID   uuid.UUID  `json:"user_id" gorm:"type:uuid;primaryKey;not null"`
@@ -161,7 +161,7 @@ type InitiateRegistrationInput struct {
 	Password     string `json:"password" binding:"required,min=10"`
 	FirstName    string `json:"first_name"` // Optional - no binding:"required"
 	LastName     string `json:"last_name"`  // Optional - no binding:"required"
-	TenantDomain string `json:"tenant_domain" binding:"required"`
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
 }
 
 // DeleteRolesRequest with support for both "roles" and "role_ids" field names

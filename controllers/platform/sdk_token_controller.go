@@ -25,7 +25,7 @@ func NewSDKTokenController() *SDKTokenController {
 // GET /uflow/sdk/delegation-token?client_id=<uuid>
 func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 	// Workspace from the caller's JWT (same pattern as RevokeDelegationToken).
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -88,7 +88,7 @@ func (sc *SDKTokenController) GetDelegationToken(c *gin.Context) {
 // RevokeDelegationToken revokes the active delegation token for an AI agent.
 // POST /uflow/admin/agents/:id/revoke-token
 func (sc *SDKTokenController) RevokeDelegationToken(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return

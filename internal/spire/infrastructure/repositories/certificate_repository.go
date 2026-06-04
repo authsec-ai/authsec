@@ -22,47 +22,47 @@ func NewPostgresCertificateRepository(db *sql.DB) repositories.CertificateReposi
 }
 
 // GetByID retrieves a certificate by ID
-func (r *PostgresCertificateRepository) GetByID(ctx context.Context, tenantID, id string) (*models.Certificate, error) {
+func (r *PostgresCertificateRepository) GetByID(ctx context.Context, workspaceID, id string) (*models.Certificate, error) {
 	query := `
-		SELECT id, tenant_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, revoked_at, status, issue_type, created_at
 		FROM certificates
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
-	return r.scanCertificate(ctx, query, id, tenantID)
+	return r.scanCertificate(ctx, query, id, workspaceID)
 }
 
 // GetBySerialNumber retrieves a certificate by serial number
-func (r *PostgresCertificateRepository) GetBySerialNumber(ctx context.Context, tenantID, serialNumber string) (*models.Certificate, error) {
+func (r *PostgresCertificateRepository) GetBySerialNumber(ctx context.Context, workspaceID, serialNumber string) (*models.Certificate, error) {
 	query := `
-		SELECT id, tenant_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, revoked_at, status, issue_type, created_at
 		FROM certificates
-		WHERE serial_number = $1 AND tenant_id = $2
+		WHERE serial_number = $1 AND workspace_id = $2
 	`
 
-	return r.scanCertificate(ctx, query, serialNumber, tenantID)
+	return r.scanCertificate(ctx, query, serialNumber, workspaceID)
 }
 
 // GetActiveByWorkload retrieves the active certificate for a workload
-func (r *PostgresCertificateRepository) GetActiveByWorkload(ctx context.Context, tenantID, workloadID string) (*models.Certificate, error) {
+func (r *PostgresCertificateRepository) GetActiveByWorkload(ctx context.Context, workspaceID, workloadID string) (*models.Certificate, error) {
 	query := `
-		SELECT id, tenant_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, revoked_at, status, issue_type, created_at
 		FROM certificates
-		WHERE workload_id = $1 AND tenant_id = $2 AND status = 'active'
+		WHERE workload_id = $1 AND workspace_id = $2 AND status = 'active'
 		ORDER BY issued_at DESC
 		LIMIT 1
 	`
 
-	return r.scanCertificate(ctx, query, workloadID, tenantID)
+	return r.scanCertificate(ctx, query, workloadID, workspaceID)
 }
 
 // Create creates a new certificate record
 func (r *PostgresCertificateRepository) Create(ctx context.Context, cert *models.Certificate) error {
 	query := `
-		INSERT INTO certificates (id, tenant_id, workload_id, serial_number, sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		INSERT INTO certificates (id, workspace_id, workload_id, serial_number, sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, status, issue_type, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
@@ -102,7 +102,7 @@ func (r *PostgresCertificateRepository) Update(ctx context.Context, cert *models
 	query := `
 		UPDATE certificates
 		SET status = $3, revoked_at = $4
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
 	result, err := r.db.ExecContext(ctx, query,
@@ -129,15 +129,15 @@ func (r *PostgresCertificateRepository) Update(ctx context.Context, cert *models
 }
 
 // Revoke marks a certificate as revoked
-func (r *PostgresCertificateRepository) Revoke(ctx context.Context, tenantID, id string) error {
+func (r *PostgresCertificateRepository) Revoke(ctx context.Context, workspaceID, id string) error {
 	query := `
 		UPDATE certificates
 		SET status = 'revoked', revoked_at = $3
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
 	now := time.Now()
-	result, err := r.db.ExecContext(ctx, query, id, tenantID, now)
+	result, err := r.db.ExecContext(ctx, query, id, workspaceID, now)
 	if err != nil {
 		return errors.NewInternalError("Failed to revoke certificate", err)
 	}
@@ -155,30 +155,30 @@ func (r *PostgresCertificateRepository) Revoke(ctx context.Context, tenantID, id
 }
 
 // ListByWorkload retrieves all certificates for a workload
-func (r *PostgresCertificateRepository) ListByWorkload(ctx context.Context, tenantID, workloadID string) ([]*models.Certificate, error) {
+func (r *PostgresCertificateRepository) ListByWorkload(ctx context.Context, workspaceID, workloadID string) ([]*models.Certificate, error) {
 	query := `
-		SELECT id, tenant_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, revoked_at, status, issue_type, created_at
 		FROM certificates
-		WHERE workload_id = $1 AND tenant_id = $2
+		WHERE workload_id = $1 AND workspace_id = $2
 		ORDER BY issued_at DESC
 	`
 
-	return r.queryCertificates(ctx, query, workloadID, tenantID)
+	return r.queryCertificates(ctx, query, workloadID, workspaceID)
 }
 
 // ListExpiring retrieves certificates expiring within the given duration
-func (r *PostgresCertificateRepository) ListExpiring(ctx context.Context, tenantID string, within time.Duration) ([]*models.Certificate, error) {
+func (r *PostgresCertificateRepository) ListExpiring(ctx context.Context, workspaceID string, within time.Duration) ([]*models.Certificate, error) {
 	query := `
-		SELECT id, tenant_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
+		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
 			issued_at, expires_at, revoked_at, status, issue_type, created_at
 		FROM certificates
-		WHERE tenant_id = $1 AND status = 'active' AND expires_at < $2
+		WHERE workspace_id = $1 AND status = 'active' AND expires_at < $2
 		ORDER BY expires_at ASC
 	`
 
 	expiryThreshold := time.Now().Add(within)
-	return r.queryCertificates(ctx, query, tenantID, expiryThreshold)
+	return r.queryCertificates(ctx, query, workspaceID, expiryThreshold)
 }
 
 // scanCertificate scans a single certificate

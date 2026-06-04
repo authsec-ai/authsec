@@ -24,7 +24,7 @@ type RenewalService struct {
 	workloadRepo repositories.WorkloadRepository
 	certRepo     repositories.CertificateRepository
 	auditRepo    repositories.AuditRepository
-	tenantRepo   repositories.TenantRepository
+	workspaceRepo   repositories.WorkspaceRepository
 	vaultClient  *vault.Client
 	connManager  *database.ConnectionManager // For tenant-specific DB connections
 	logger       *logrus.Entry
@@ -35,7 +35,7 @@ func NewRenewalService(
 	workloadRepo repositories.WorkloadRepository,
 	certRepo repositories.CertificateRepository,
 	auditRepo repositories.AuditRepository,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	connManager *database.ConnectionManager,
 	logger *logrus.Entry,
@@ -44,7 +44,7 @@ func NewRenewalService(
 		workloadRepo: workloadRepo,
 		certRepo:     certRepo,
 		auditRepo:    auditRepo,
-		tenantRepo:   tenantRepo,
+		workspaceRepo:   workspaceRepo,
 		vaultClient:  vaultClient,
 		connManager:  connManager,
 		logger:       logger,
@@ -72,12 +72,12 @@ type RenewResponse struct {
 // Renew renews a certificate
 func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":   req.WorkspaceID,
+		"workspace_id":   req.WorkspaceID,
 		"workload_id": req.WorkloadID,
 	}).Info("Starting certificate renewal")
 
 	// Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		s.auditRenewal(ctx, req, false, err.Error())
 		return nil, err
@@ -89,7 +89,7 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 	}
 
 	// Get tenant-specific repositories
-	workloadRepo, certRepo, _, err := s.getTenantRepositories(ctx, req.WorkspaceID)
+	workloadRepo, certRepo, _, err := s.getWorkspaceRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
@@ -180,15 +180,15 @@ func (s *RenewalService) Renew(ctx context.Context, req *RenewRequest) (*RenewRe
 	}, nil
 }
 
-// getTenantRepositories creates repositories connected to the tenant's database
-func (s *RenewalService) getTenantRepositories(ctx context.Context, tenantID string) (
+// getWorkspaceRepositories creates repositories connected to the tenant's database
+func (s *RenewalService) getWorkspaceRepositories(ctx context.Context, workspaceID string) (
 	repositories.WorkloadRepository,
 	repositories.CertificateRepository,
 	repositories.AuditRepository,
 	error,
 ) {
 	// Get tenant database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, tenantID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
@@ -202,7 +202,7 @@ func (s *RenewalService) getTenantRepositories(ctx context.Context, tenantID str
 }
 
 // validateOldCertificate validates the old certificate
-func (s *RenewalService) validateOldCertificate(ctx context.Context, tenantID, workloadID, certPEM string) error {
+func (s *RenewalService) validateOldCertificate(ctx context.Context, workspaceID, workloadID, certPEM string) error {
 	// Parse certificate
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
@@ -215,7 +215,7 @@ func (s *RenewalService) validateOldCertificate(ctx context.Context, tenantID, w
 	}
 
 	// Get active certificate for workload
-	activeCert, err := s.certRepo.GetActiveByWorkload(ctx, tenantID, workloadID)
+	activeCert, err := s.certRepo.GetActiveByWorkload(ctx, workspaceID, workloadID)
 	if err != nil {
 		return errors.NewForbiddenError("No active certificate found for workload", err)
 	}

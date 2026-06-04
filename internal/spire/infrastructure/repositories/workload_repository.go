@@ -22,31 +22,31 @@ func NewPostgresWorkloadRepository(db *sql.DB) repositories.WorkloadRepository {
 }
 
 // GetByID retrieves a workload by ID
-func (r *PostgresWorkloadRepository) GetByID(ctx context.Context, tenantID, id string) (*models.Workload, error) {
+func (r *PostgresWorkloadRepository) GetByID(ctx context.Context, workspaceID, id string) (*models.Workload, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
+		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
 		FROM workloads
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
-	return r.scanWorkload(ctx, query, id, tenantID)
+	return r.scanWorkload(ctx, query, id, workspaceID)
 }
 
 // GetBySpiffeID retrieves a workload by SPIFFE ID
-func (r *PostgresWorkloadRepository) GetBySpiffeID(ctx context.Context, tenantID, spiffeID string) (*models.Workload, error) {
+func (r *PostgresWorkloadRepository) GetBySpiffeID(ctx context.Context, workspaceID, spiffeID string) (*models.Workload, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
+		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
 		FROM workloads
-		WHERE spiffe_id = $1 AND tenant_id = $2
+		WHERE spiffe_id = $1 AND workspace_id = $2
 	`
 
-	return r.scanWorkload(ctx, query, spiffeID, tenantID)
+	return r.scanWorkload(ctx, query, spiffeID, workspaceID)
 }
 
 // Create creates a new workload
 func (r *PostgresWorkloadRepository) Create(ctx context.Context, workload *models.Workload) error {
 	query := `
-		INSERT INTO workloads (id, tenant_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at)
+		INSERT INTO workloads (id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 
@@ -83,7 +83,7 @@ func (r *PostgresWorkloadRepository) Update(ctx context.Context, workload *model
 	query := `
 		UPDATE workloads
 		SET selectors = $3, vault_role = $4, status = $5, attestation_type = $6, updated_at = $7
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
 	workload.UpdatedAt = time.Now()
@@ -120,10 +120,10 @@ func (r *PostgresWorkloadRepository) Update(ctx context.Context, workload *model
 }
 
 // Delete deletes a workload
-func (r *PostgresWorkloadRepository) Delete(ctx context.Context, tenantID, id string) error {
-	query := `DELETE FROM workloads WHERE id = $1 AND tenant_id = $2`
+func (r *PostgresWorkloadRepository) Delete(ctx context.Context, workspaceID, id string) error {
+	query := `DELETE FROM workloads WHERE id = $1 AND workspace_id = $2`
 
-	result, err := r.db.ExecContext(ctx, query, id, tenantID)
+	result, err := r.db.ExecContext(ctx, query, id, workspaceID)
 	if err != nil {
 		return errors.NewInternalError("Failed to delete workload", err)
 	}
@@ -141,28 +141,28 @@ func (r *PostgresWorkloadRepository) Delete(ctx context.Context, tenantID, id st
 }
 
 // ListByTenant retrieves all workloads for a tenant
-func (r *PostgresWorkloadRepository) ListByTenant(ctx context.Context, tenantID string) ([]*models.Workload, error) {
+func (r *PostgresWorkloadRepository) ListByTenant(ctx context.Context, workspaceID string) ([]*models.Workload, error) {
 	query := `
-		SELECT id, tenant_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
+		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
 		FROM workloads
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 	`
 
-	return r.queryWorkloads(ctx, query, tenantID)
+	return r.queryWorkloads(ctx, query, workspaceID)
 }
 
 // FindBySelectors finds workloads matching the given selectors
-func (r *PostgresWorkloadRepository) FindBySelectors(ctx context.Context, tenantID string, selectors map[string]string) ([]*models.Workload, error) {
+func (r *PostgresWorkloadRepository) FindBySelectors(ctx context.Context, workspaceID string, selectors map[string]string) ([]*models.Workload, error) {
 	// This is a simplified implementation
 	// In production, you'd want more sophisticated JSONB querying
 	query := `
-		SELECT id, tenant_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
+		SELECT id, workspace_id, spiffe_id, selectors, vault_role, status, attestation_type, created_at, updated_at
 		FROM workloads
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 	`
 
-	workloads, err := r.queryWorkloads(ctx, query, tenantID)
+	workloads, err := r.queryWorkloads(ctx, query, workspaceID)
 	if err != nil {
 		return nil, err
 	}

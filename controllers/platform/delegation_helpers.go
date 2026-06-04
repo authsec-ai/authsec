@@ -63,13 +63,13 @@ func delegationContextString(c *gin.Context, key string) string {
 	}
 }
 
-// resolveDelegationTenantID extracts the tenant UUID from the gin context.
-func resolveDelegationTenantID(c *gin.Context) (*uuid.UUID, error) {
-	tenantIDStr := delegationContextString(c, "workspace_id")
-	if tenantIDStr == "" {
+// resolveDelegationWorkspaceID extracts the tenant UUID from the gin context.
+func resolveDelegationWorkspaceID(c *gin.Context) (*uuid.UUID, error) {
+	workspaceIDStr := delegationContextString(c, "workspace_id")
+	if workspaceIDStr == "" {
 		return nil, fmt.Errorf("workspace_id not found in authentication token")
 	}
-	tid, err := uuid.Parse(tenantIDStr)
+	tid, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid workspace_id in token: %w", err)
 	}

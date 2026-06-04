@@ -35,15 +35,15 @@ func NewAgentController(
 // ListAgents handles GET /spire/v1/agents
 // Lists all active agents for the authenticated tenant
 func (ctrl *AgentController) ListAgents(c *gin.Context) {
-	tenantID, ok := middleware.GetSpireTenantID(c)
-	if !ok || tenantID == "" {
-		ctrl.sendError(c, errors.NewUnauthorizedError("tenant_id not found in authentication context", nil))
+	workspaceID, ok := middleware.GetSpireWorkspaceID(c)
+	if !ok || workspaceID == "" {
+		ctrl.sendError(c, errors.NewUnauthorizedError("workspace_id not found in authentication context", nil))
 		return
 	}
 
-	ctrl.logger.WithField("tenant_id", tenantID).Info("Listing agents")
+	ctrl.logger.WithField("workspace_id", workspaceID).Info("Listing agents")
 
-	agents, err := ctrl.agentService.ListAgentsByTenant(c.Request.Context(), tenantID)
+	agents, err := ctrl.agentService.ListAgentsByTenant(c.Request.Context(), workspaceID)
 	if err != nil {
 		ctrl.sendError(c, err)
 		return

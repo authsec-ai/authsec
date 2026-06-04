@@ -12,11 +12,11 @@ import (
 
 // DomainService handles domain operations including DNS verification
 type DomainService struct {
-	repo *database.TenantDomainsRepository
+	repo *database.WorkspaceDomainsRepository
 }
 
 // NewDomainService creates a new domain service
-func NewDomainService(repo *database.TenantDomainsRepository) *DomainService {
+func NewDomainService(repo *database.WorkspaceDomainsRepository) *DomainService {
 	return &DomainService{repo: repo}
 }
 
@@ -28,7 +28,7 @@ func (ds *DomainService) skipRealDNSLookup() bool {
 }
 
 // RegisterDomain registers a new domain for a tenant
-func (ds *DomainService) RegisterDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*database.TenantDomain, error) {
+func (ds *DomainService) RegisterDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*database.WorkspaceDomain, error) {
 	return ds.repo.CreateDomain(workspaceID, domain, createdBy)
 }
 
@@ -115,9 +115,9 @@ func (ds *DomainService) ResolveTenantByHost(hostname string) (uuid.UUID, error)
 	return td.WorkspaceID, nil
 }
 
-// ListTenantDomains lists all domains for a tenant
-func (ds *DomainService) ListTenantDomains(workspaceID uuid.UUID) ([]database.TenantDomain, error) {
-	return ds.repo.ListTenantDomains(workspaceID)
+// ListWorkspaceDomains lists all domains for a tenant
+func (ds *DomainService) ListWorkspaceDomains(workspaceID uuid.UUID) ([]database.WorkspaceDomain, error) {
+	return ds.repo.ListWorkspaceDomains(workspaceID)
 }
 
 // SetPrimaryDomain sets a domain as the primary for a tenant

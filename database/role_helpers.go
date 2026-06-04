@@ -13,7 +13,7 @@ type roleExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// EnsureAdminRoleWithExecutor ensures an admin role exists for the given tenant_id and returns its id.
+// EnsureAdminRoleWithExecutor ensures an admin role exists for the given workspace_id and returns its id.
 func EnsureAdminRoleWithExecutor(exec roleExecutor, workspaceID uuid.UUID) (uuid.UUID, error) {
 	var roleID uuid.UUID
 	err := exec.QueryRow(`SELECT id FROM roles WHERE LOWER(name) = 'admin' AND workspace_id = $1 LIMIT 1`, workspaceID).Scan(&roleID)

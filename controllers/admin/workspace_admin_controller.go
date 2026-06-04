@@ -28,7 +28,7 @@ import (
 )
 
 type UserController struct {
-	tenantRepo             *database.TenantRepository
+	workspaceRepo             *database.WorkspaceRepository
 	userRepo               *database.UserRepository
 	otpRepo                *database.OTPRepository
 	pendingRepo            *database.PendingRegistrationRepository
@@ -56,7 +56,7 @@ func NewUserController() (*UserController, error) {
 	icpProvisioningService := services.NewICPProvisioningService(icpClient)
 
 	return &UserController{
-		tenantRepo:             database.NewTenantRepository(db),
+		workspaceRepo:             database.NewWorkspaceRepository(db),
 		userRepo:               database.NewUserRepository(db),
 		otpRepo:                database.NewOTPRepository(db),
 		pendingRepo:            database.NewPendingRegistrationRepository(db),
@@ -72,12 +72,12 @@ func (uc *UserController) SetPKIService(pkiSvc *spireservices.PKIProvisioningSer
 	}
 }
 
-// validateTenantDomain checks if the provided domain is valid for the given tenant.
+// validateWorkspaceDomain checks if the provided domain is valid for the given tenant.
 // It validates against:
-// 1. The original tenant domain (tenants.tenant_domain) - immutable, used for WebAuthn RP ID
+// 1. The original tenant domain (tenants.workspace_domain) - immutable, used for WebAuthn RP ID
 // 2. Any verified custom domain in workspace_domains table
 // This allows users to login with custom domains while preserving the original domain for WebAuthn.
-func validateTenantDomain(db *gorm.DB, workspaceID uuid.UUID, providedDomain, originalDomain string) bool {
+func validateWorkspaceDomain(db *gorm.DB, workspaceID uuid.UUID, providedDomain, originalDomain string) bool {
 	// Normalize domains for comparison
 	providedDomain = strings.ToLower(strings.TrimSpace(providedDomain))
 	originalDomain = strings.ToLower(strings.TrimSpace(originalDomain))
@@ -135,7 +135,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// Lightweight test fallback when repos are not initialized
-	if uc.tenantRepo == nil {
+	if uc.workspaceRepo == nil {
 		// simulate validations
 		if len(input.Password) < 6 {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process password"})
@@ -145,7 +145,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Email already exists"})
 			return
 		}
-		if strings.ToLower(input.TenantDomain) == "existingtenant" {
+		if strings.ToLower(input.WorkspaceDomain) == "existingtenant" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant domain already exists"})
 			return
 		}
@@ -155,7 +155,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 
 	// Check if email already exists in main tenant table
 	input.Email = strings.ToLower(input.Email)
-	if exists, err := uc.tenantRepo.TenantExists(input.Email); err != nil {
+	if exists, err := uc.workspaceRepo.TenantExists(input.Email); err != nil {
 		log.Printf("Error checking tenant existence: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
@@ -165,12 +165,12 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// check if tenant domain already exists
-	tenantDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.TenantDomain), config.AppConfig.TenantDomainSuffix)
-	if tenantDomain != "" {
+	workspaceDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.WorkspaceDomain), config.AppConfig.WorkspaceDomainSuffix)
+	if workspaceDomain != "" {
 		// Check domain existence using a custom query
 		db := config.GetDatabase()
 		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
+		err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 		if err != nil {
 			log.Printf("Error checking tenant domain: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
@@ -226,7 +226,7 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 		ProjectID:    projectID,
 		ClientID:     clientID,
 		ExpiresAt:    time.Now().Add(30 * time.Minute), // Expires in 30 minutes to match OTP
-		TenantDomain: tenantDomain,
+		WorkspaceDomain: workspaceDomain,
 	}
 
 	if err := uc.pendingRepo.CreatePendingRegistration(&pendingReg); err != nil {
@@ -340,11 +340,11 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		WorkspaceID:     pendingReg.WorkspaceID,
 		Name:            fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 		Email:           pendingReg.Email,
-		WorkspaceDomain: pendingReg.TenantDomain,
+		WorkspaceDomain: pendingReg.WorkspaceDomain,
 		Status:          "active",
 		PasswordHash:    pendingReg.PasswordHash,
 	}
-	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
+	workspaceSlug := strings.SplitN(pendingReg.WorkspaceDomain, ".", 2)[0]
 	workspaceName := strings.TrimSpace(workspace.Name)
 	if workspaceName == "" {
 		workspaceName = pendingReg.Email
@@ -360,7 +360,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 			Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 			Username:     &username, // Use email as username
 			PasswordHash: pendingReg.PasswordHash,
-			TenantDomain: pendingReg.TenantDomain,
+			WorkspaceDomain: pendingReg.WorkspaceDomain,
 			Provider:     "local",
 			ProviderID:   pendingReg.Email, // Ensure ProviderID is not null
 			Active:       true,
@@ -375,7 +375,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'manual', 'active', NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.TenantDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete registration"})
@@ -496,7 +496,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	// has a 2-minute upper bound; the user shouldn't wait for any of it.
 	// Failures are logged; the Hydra reconciler picks up missing clients
 	// on its next tick (services/hydra_reconciler.go).
-	go func(workspaceID, workspaceName, workspaceDomain, projectID, clientID, email, tenantDomain string) {
+	go func(workspaceID, workspaceName, pkiDomain, projectID, clientID, email, wsDomain string) {
 		// Provision PKI via ICP
 		log.Printf("Provisioning PKI for workspace: %s", workspaceID)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -504,7 +504,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		icpResp, err := uc.icpProvisioningService.ProvisionPKI(ctx, &icp.ProvisionPKIRequest{
 			WorkspaceID: workspaceID,
 			CommonName:  fmt.Sprintf("%s Root CA", workspaceName),
-			Domain:      workspaceDomain,
+			Domain:      pkiDomain,
 			TTL:         "87600h",
 			MaxTTL:      "24h",
 		})
@@ -522,7 +522,7 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 		if _, err := config.SaveSecretToVault(workspaceID, workspaceID); err != nil {
 			log.Printf("WARN: Failed to save secret to vault for workspace %s: %v", workspaceID, err)
 		}
-	}(workspace.WorkspaceID.String(), workspace.Name, workspace.WorkspaceDomain, pendingReg.ProjectID.String(), pendingReg.WorkspaceID.String(), pendingReg.Email, pendingReg.TenantDomain)
+	}(workspace.WorkspaceID.String(), workspace.Name, workspace.WorkspaceDomain, pendingReg.ProjectID.String(), pendingReg.WorkspaceID.String(), pendingReg.Email, pendingReg.WorkspaceDomain)
 
 	log.Printf("User registration completed successfully: %s", workspace.Email)
 
@@ -600,7 +600,7 @@ func (uc *UserController) Login(c *gin.Context) {
 	}
 
 	// Find tenant in main database
-	tenant, err := uc.tenantRepo.GetTenantByEmail(input.Email)
+	tenant, err := uc.workspaceRepo.GetWorkspaceByEmail(input.Email)
 	if err != nil {
 		log.Printf("Login failed for %s: tenant not found, error: %v", input.Email, err)
 		c.Set("error", fmt.Sprintf("Tenant not found for user: %s", input.Email))
@@ -609,12 +609,12 @@ func (uc *UserController) Login(c *gin.Context) {
 	}
 
 	// Validate tenant domain: check against original domain OR any verified custom domain
-	// This allows login via custom domains while keeping tenants.tenant_domain immutable for WebAuthn
-	if !validateTenantDomain(config.DB, tenant.WorkspaceID, input.TenantDomain, tenant.TenantDomain) {
+	// This allows login via custom domains while keeping tenants.workspace_domain immutable for WebAuthn
+	if !validateWorkspaceDomain(config.DB, tenant.WorkspaceID, input.WorkspaceDomain, tenant.WorkspaceDomain) {
 		log.Printf("Login failed for %s: invalid tenant domain. Provided: %s, Tenant ID: %s",
-			input.Email, input.TenantDomain, tenant.WorkspaceID)
+			input.Email, input.WorkspaceDomain, tenant.WorkspaceID)
 		c.Set("error", fmt.Sprintf("Invalid tenant domain: '%s' is not associated with this tenant",
-			input.TenantDomain))
+			input.WorkspaceDomain))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant domain"})
 		return
 	}
@@ -680,7 +680,7 @@ func (uc *UserController) Login(c *gin.Context) {
 	// Prepare base response
 	response := models.LoginResponse{
 		WorkspaceID:  tenant.WorkspaceID.String(),
-		TenantDomain: tenant.TenantDomain, // Include original domain for WebAuthn RP ID
+		WorkspaceDomain: tenant.WorkspaceDomain, // Include original domain for WebAuthn RP ID
 		Email:        tenant.Email,
 		FirstLogin:   isFirstLogin,
 		OTPRequired:  false,
@@ -747,7 +747,7 @@ func (uc *UserController) WebAuthnCallback(c *gin.Context) {
 	}
 
 	// Find the tenant user in main database
-	tenant, err := uc.tenantRepo.GetTenantByTenantID(input.WorkspaceID.String())
+	tenant, err := uc.workspaceRepo.GetWorkspaceByWorkspaceID(input.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
@@ -872,7 +872,7 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 	}
 
 	// Find tenant in main database
-	tenant, err := uc.tenantRepo.GetTenantByEmail(input.Email)
+	tenant, err := uc.workspaceRepo.GetWorkspaceByEmail(input.Email)
 	if err != nil {
 		log.Printf("Tenant not found after OTP verification: %s, error: %v", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
@@ -880,9 +880,9 @@ func (uc *UserController) VerifyLoginOTP(c *gin.Context) {
 	}
 
 	// Verify tenant ID matches
-	tenantIDStr := tenant.WorkspaceID.String()
-	if tenantIDStr != input.WorkspaceID {
-		log.Printf("Tenant ID mismatch for user %s: expected %s, got %s", input.Email, tenantIDStr, input.WorkspaceID)
+	workspaceIDStr := tenant.WorkspaceID.String()
+	if workspaceIDStr != input.WorkspaceID {
+		log.Printf("Tenant ID mismatch for user %s: expected %s, got %s", input.Email, workspaceIDStr, input.WorkspaceID)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant"})
 		return
 	}
@@ -1177,7 +1177,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 	}
 
 	// First, find admin user in main Tenant table
-	tenant, err := uc.tenantRepo.GetTenantByEmail(input.Email)
+	tenant, err := uc.workspaceRepo.GetWorkspaceByEmail(input.Email)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Admin user not found"})
 		return
@@ -1197,14 +1197,14 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database connection error"})
 		return
 	}
-	query := `SELECT id, client_id, workspace_id, project_id, name, username, email, password_hash, tenant_domain,
+	query := `SELECT id, client_id, workspace_id, project_id, name, username, email, password_hash, workspace_domain,
 			  provider, provider_id, provider_data, avatar_url, active, mfa_enabled, mfa_method,
 			  mfa_default_method, mfa_enrolled_at, mfa_verified,
 			  created_at, updated_at
 			  FROM users WHERE email = $1 AND workspace_id = $2 AND provider = $3`
 	err = sqlDB.QueryRow(query, input.Email, tenant.WorkspaceID.String(), "local").Scan(
 		&user.ID, &user.ClientID, &user.WorkspaceID, &user.ProjectID, &user.Name,
-		&user.Username, &user.Email, &user.PasswordHash, &user.TenantDomain,
+		&user.Username, &user.Email, &user.PasswordHash, &user.WorkspaceDomain,
 		&user.Provider, &user.ProviderID, &user.ProviderData, &user.AvatarURL,
 		&user.Active, &user.MFAEnabled, &user.MFAMethod, &user.MFADefaultMethod,
 		&user.MFAEnrolledAt, &user.MFAVerified,
@@ -1300,7 +1300,7 @@ func (uc *UserController) AdminResetPassword(c *gin.Context) {
 // Ultra-minimal token: identity only - auth-manager fetches roles/permissions from DB via GetAuthz() on every request
 func (uc *UserController) generateJWTToken(workspaceID, clientID, emailID string, roles []string, userID *uuid.UUID, tenantDB ...*sql.DB) (string, error) {
 	// Use centralized auth-manager token service
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
@@ -1315,7 +1315,7 @@ func (uc *UserController) generateJWTToken(workspaceID, clientID, emailID string
 
 	return config.TokenService.GenerateTenantUserToken(
 		effectiveUserID,
-		tenantUUID,
+		workspaceUUID,
 		emailID,
 		24*time.Hour,
 	)
@@ -1341,7 +1341,7 @@ func (uc *UserController) WebAuthnRegister(c *gin.Context) {
 	}
 
 	// Find the tenant user in main database
-	tenant, err := uc.tenantRepo.GetTenantByTenantID(input.WorkspaceID.String())
+	tenant, err := uc.workspaceRepo.GetWorkspaceByWorkspaceID(input.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
@@ -1501,7 +1501,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	tenantUUID, err := uuid.Parse(input.WorkspaceID)
+	workspaceUUID, err := uuid.Parse(input.WorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -1510,7 +1510,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ?", input.Email, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ?", input.Email, workspaceUUID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
@@ -1592,7 +1592,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 		// First, check for TOTP secrets (TOTP has priority because it's domain-independent)
 		totpQuery := `SELECT COUNT(*) FROM totp_secrets WHERE user_id = $1 AND workspace_id = $2 AND is_active = true`
 		var totpCount int
-		if err := sqlDB.QueryRow(totpQuery, user.ID, tenantUUID).Scan(&totpCount); err == nil && totpCount > 0 {
+		if err := sqlDB.QueryRow(totpQuery, user.ID, workspaceUUID).Scan(&totpCount); err == nil && totpCount > 0 {
 			log.Printf("DEBUG: Found %d TOTP secrets for user %s", totpCount, input.Email)
 			// User has TOTP configured but not in mfa_methods table
 			mfaMethods = append(mfaMethods, map[string]interface{}{
@@ -1644,7 +1644,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	// Build response
 	response := gin.H{
 		"email":        input.Email,
-		"workspace_id": tenantUUID.String(),
+		"workspace_id": workspaceUUID.String(),
 		"first_login":  isFirstLogin,
 		"mfa_required": len(mfaMethods) > 0,
 		"mfa_method":   defaultMFAMethod,

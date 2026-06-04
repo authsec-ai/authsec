@@ -185,9 +185,9 @@ func DecodeJWTToken(tokenString string) (*JWTClaims, error) {
 func (s *OAuthLoginService) CreateOrUpdateUser(accessToken string, users *User) (*User, error) {
 	workspaceID := users.WorkspaceID
 	clientID := users.ClientID
-	tenantIDStr := workspaceID.String()
+	workspaceIDStr := workspaceID.String()
 
-	if tenantIDStr == "" {
+	if workspaceIDStr == "" {
 		return nil, fmt.Errorf("missing workspace_id in JWT token")
 	}
 
@@ -481,7 +481,7 @@ func (s *OAuthLoginService) AcceptHydraConsentRequestMCP(
 		"provider":    userContext["provider"],
 		"provider_id": userContext["provider_id"],
 	}
-	// Merge extra session claims (tenant_id, resource_server_id)
+	// Merge extra session claims (workspace_id, resource_server_id)
 	for k, v := range extraSessionClaims {
 		accessTokenSession[k] = v
 	}
@@ -574,7 +574,7 @@ func (s *OAuthLoginService) GetAllHydraClients() ([]HydraClient, error) {
 
 // GetOIDCProvidersForTenant returns the workspace's OIDC providers by joining
 // the v4 identity_providers + oidc_providers tables. The workspace_id passed
-// in is the workspace UUID (same as legacy tenant_id during the transition).
+// in is the workspace UUID (same as legacy workspace_id during the transition).
 // Returns providers whose identity_providers row exists and whose canonical
 // and protocol-specific active states agree.
 func (s *OAuthLoginService) GetOIDCProvidersForTenant(workspaceID string) ([]OIDCProvider, error) {

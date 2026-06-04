@@ -21,7 +21,7 @@ import (
 // time against scim_connections.token_hash for the matching row.
 //
 // On success the handler downstream sees the same context the legacy SCIM
-// routes set up — tenant_id, client_id, project_id — so existing handler
+// routes set up — workspace_id, client_id, project_id — so existing handler
 // logic keeps working. The new fields workspace_id and scim_connection_id
 // are also set so handlers that get rewritten can drop the legacy keys.
 //

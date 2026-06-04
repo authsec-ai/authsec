@@ -325,7 +325,7 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 	//   spiffe://<trust-domain>/workspaces/{workspace_id}/applications/{application_id}
 	// Otherwise we fall back to the legacy /tenants/<id>/agents/<type>/<id>
 	// path so existing SPIRE entries continue to resolve during the
-	// transition. workspace_id == tenant_id from migration 115's backfill.
+	// transition. workspace_id == workspace_id from migration 115's backfill.
 	var (
 		applicationID    *uuid.UUID
 		workspaceUUIDStr = workspaceID
@@ -381,7 +381,7 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 	selectorMap := map[string]string{
 		"authsec:client_id":  clientID,
 		"authsec:agent_type": agentType,
-		"authsec:tenant_id":  workspaceID,
+		"authsec:workspace_id":  workspaceID,
 	}
 	for k, v := range selectors {
 		selectorMap[k] = v
@@ -401,7 +401,7 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 	}
 
 	// Save workload entry to tenant DB (workload_entries)
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("invalid workspace_id: %w", err)
 	}
@@ -410,7 +410,7 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 	{
 		entry := WorkloadEntry{
 			ID:          uuid.New(),
-			WorkspaceID: tenantUUID,
+			WorkspaceID: workspaceUUID,
 			SpiffeID:    fullSpiffeID,
 			ParentID:    parentID,
 			Selectors:   selectorsJSON,

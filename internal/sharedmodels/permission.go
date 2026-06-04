@@ -6,7 +6,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Permission is the canonical v4 permission row: tenant_id + resource + action.
+// Permission is the canonical v4 permission row: workspace_id + resource + action.
 // Authorization decisions go through services.RBACService.Check.
 type Permission struct {
 	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid();uniqueIndex:idx_permissions_tenant_resource_action"`

@@ -52,7 +52,7 @@ func (ctrl *ResourceServerController) ScopePresets(c *gin.Context) {
 // Create registers a new resource server.
 // POST /authsec/resource-servers
 func (ctrl *ResourceServerController) Create(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -96,7 +96,7 @@ func (ctrl *ResourceServerController) Create(c *gin.Context) {
 // List returns all resource servers for the tenant.
 // GET /authsec/resource-servers
 func (ctrl *ResourceServerController) List(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -124,7 +124,7 @@ func (ctrl *ResourceServerController) List(c *gin.Context) {
 // Get returns a single resource server by ID (tenant-scoped).
 // GET /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Get(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -147,7 +147,7 @@ func (ctrl *ResourceServerController) Get(c *gin.Context) {
 // Update modifies a resource server (tenant-scoped).
 // PUT /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Update(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -190,7 +190,7 @@ func (ctrl *ResourceServerController) Update(c *gin.Context) {
 // Delete removes a resource server (tenant-scoped).
 // DELETE /authsec/resource-servers/:id
 func (ctrl *ResourceServerController) Delete(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -209,7 +209,7 @@ func (ctrl *ResourceServerController) Delete(c *gin.Context) {
 // RotateIntrospectionSecret generates a new introspection secret for an RS.
 // POST /authsec/resource-servers/:id/rotate-introspection-secret
 func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -242,7 +242,7 @@ func (ctrl *ResourceServerController) RotateIntrospectionSecret(c *gin.Context) 
 // PreRegisterClient pre-registers an OAuth client for a resource server.
 // POST /authsec/resource-servers/:id/clients
 func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -284,7 +284,7 @@ func (ctrl *ResourceServerController) PreRegisterClient(c *gin.Context) {
 // ListClients lists all registered OAuth clients for a resource server.
 // GET /authsec/resource-servers/:id/clients
 func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -309,7 +309,7 @@ func (ctrl *ResourceServerController) ListClients(c *gin.Context) {
 // GetAccessPolicy returns the default access policy and role options for a resource server.
 // GET /authsec/resource-servers/:id/access-policy
 func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -333,7 +333,7 @@ func (ctrl *ResourceServerController) GetAccessPolicy(c *gin.Context) {
 // UpdateAccessPolicy persists the backend-owned default access policy for a resource server.
 // PUT /authsec/resource-servers/:id/access-policy
 func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -382,7 +382,7 @@ func (ctrl *ResourceServerController) UpdateAccessPolicy(c *gin.Context) {
 // Validate runs live onboarding checks and persists the most recent validation state.
 // POST /authsec/resource-servers/:id/validate
 func (ctrl *ResourceServerController) Validate(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -439,7 +439,7 @@ func (ctrl *ResourceServerController) buildSummary(rs *models.ResourceServer, wo
 // RevokeClient revokes a client's registration for a resource server.
 // DELETE /authsec/resource-servers/:id/clients/:client_id
 func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -466,7 +466,7 @@ func (ctrl *ResourceServerController) RevokeClient(c *gin.Context) {
 // ApproveRedirects approves pending CIMD redirect URI changes for a client.
 // PUT /authsec/resource-servers/:rs_id/clients/:client_id/approve-redirects
 func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -490,10 +490,10 @@ func (ctrl *ResourceServerController) ApproveRedirects(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "redirects approved"})
 }
 
-func extractTenantID(c *gin.Context) (uuid.UUID, error) {
+func extractWorkspaceID(c *gin.Context) (uuid.UUID, error) {
 	tidStr, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok || tidStr == "" {
-		return uuid.Nil, fmt.Errorf("tenant_id not found in token")
+		return uuid.Nil, fmt.Errorf("workspace_id not found in token")
 	}
 	return uuid.Parse(tidStr)
 }
@@ -501,7 +501,7 @@ func extractTenantID(c *gin.Context) (uuid.UUID, error) {
 // TestLogin runs both OAuth and SDK diagnostic surfaces for an RS.
 // POST /authsec/resource-servers/:id/test-login
 func (ctrl *ResourceServerController) TestLogin(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required"})
 		return

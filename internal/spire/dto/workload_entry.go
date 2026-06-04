@@ -38,7 +38,7 @@ type WorkloadEntryResponse struct {
 }
 
 // CreateAgentEntryRequest creates a workload entry for an AI agent.
-// authsec-spire generates the SPIFFE ID from tenant_id, client_id, and agent_type.
+// authsec-spire generates the SPIFFE ID from workspace_id, client_id, and agent_type.
 type CreateAgentEntryRequest struct {
 	WorkspaceID string            `json:"workspace_id" binding:"required"`
 	ClientID    string            `json:"client_id" binding:"required"`

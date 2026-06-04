@@ -77,8 +77,8 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 	// Auth-manager fetches roles/permissions from DB via GetAuthz() on every request
 	assert.Equal(t, "authsec-ai/auth-manager", claims["iss"])
 	assert.Equal(t, "authsec-api", claims["aud"])
-	assert.Equal(t, "tenant-1", claims["tenant_id"])
-	assert.Equal(t, "tenant-1", claims["project_id"]) // project_id defaults to tenant_id for endusers
+	assert.Equal(t, "tenant-1", claims["workspace_id"])
+	assert.Equal(t, "tenant-1", claims["project_id"]) // project_id defaults to workspace_id for endusers
 	assert.Equal(t, "client-1", claims["client_id"])
 	assert.Equal(t, "user@example.com", claims["email_id"])
 

@@ -608,7 +608,7 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			db := setupADTestDB(t)
-			tenantID := uuid.New()
+			workspaceID := uuid.New()
 			clientID := uuid.New()
 			projectID := uuid.New()
 
@@ -617,14 +617,14 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 					User: sharedmodels.User{
 						ID:           uuid.New(),
 						ClientID:     clientID,
-						WorkspaceID:  tenantID,
+						WorkspaceID:  workspaceID,
 						ProjectID:    projectID,
 						Name:         "Existing User",
 						Username:     strPtr(tt.adUser.Username),
 						Email:        tt.adUser.Email,
 						Provider:     "ad_sync",
 						ProviderID:   tt.adUser.UserPrincipalName,
-						TenantDomain: "app.authsec.ai",
+						WorkspaceDomain: "app.authsec.ai",
 						Active:       true,
 						CreatedAt:    time.Now(),
 						UpdatedAt:    time.Now(),
@@ -636,7 +636,7 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 				require.NoError(t, db.Create(&existing).Error)
 			}
 
-			err := controller.syncUserToDatabase(db, tt.adUser, tenantID.String(), clientID.String(), projectID.String())
+			err := controller.syncUserToDatabase(db, tt.adUser, workspaceID.String(), clientID.String(), projectID.String())
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -693,7 +693,7 @@ func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			db := setupADTestDB(t)
-			tenantID := uuid.New()
+			workspaceID := uuid.New()
 			clientID := uuid.New()
 			projectID := uuid.New()
 
@@ -702,14 +702,14 @@ func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
 					User: sharedmodels.User{
 						ID:           uuid.New(),
 						ClientID:     clientID,
-						WorkspaceID:  tenantID,
+						WorkspaceID:  workspaceID,
 						ProjectID:    projectID,
 						Name:         "Existing Agent",
 						Username:     strPtr(tt.agentUser.Username),
 						Email:        tt.agentUser.Email,
 						Provider:     tt.agentUser.Provider,
 						ProviderID:   tt.agentUser.ProviderID,
-						TenantDomain: "app.authsec.ai",
+						WorkspaceDomain: "app.authsec.ai",
 						Active:       true,
 						CreatedAt:    time.Now(),
 						UpdatedAt:    time.Now(),
@@ -721,7 +721,7 @@ func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
 				require.NoError(t, db.Create(&existing).Error)
 			}
 
-			err := controller.syncAgentUserToDatabase(db, tt.agentUser, tenantID.String(), projectID.String(), clientID.String())
+			err := controller.syncAgentUserToDatabase(db, tt.agentUser, workspaceID.String(), projectID.String(), clientID.String())
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

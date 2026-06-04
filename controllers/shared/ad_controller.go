@@ -458,7 +458,7 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 	if err != nil {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -468,12 +468,12 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 	}
 
 	domainSuffix := "app.authsec.ai"
-	if config.AppConfig != nil && config.AppConfig.TenantDomainSuffix != "" {
-		domainSuffix = config.AppConfig.TenantDomainSuffix
+	if config.AppConfig != nil && config.AppConfig.WorkspaceDomainSuffix != "" {
+		domainSuffix = config.AppConfig.WorkspaceDomainSuffix
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", adUser.Email, adUser.ObjectGUID, tenantUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", adUser.Email, adUser.ObjectGUID, workspaceUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -482,7 +482,7 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 			User: sharedmodels.User{
 				ID:         uuid.New(),
 				ClientID:   clientUUID,
-				WorkspaceID:   tenantUUID,
+				WorkspaceID:   workspaceUUID,
 				ProjectID:  projectUUID,
 				Name:       adUser.DisplayName,
 				Username:   stringPtr(adUser.Username),
@@ -502,7 +502,7 @@ func (asc *ADSyncController) syncUserToDatabase(tenantDB *gorm.DB, adUser models
 					})
 					return datatypes.JSON(data)
 				}(),
-				TenantDomain: domainSuffix,
+				WorkspaceDomain: domainSuffix,
 				MFAEnabled:   false,
 				CreatedAt:    now,
 				UpdatedAt:    now,
@@ -609,7 +609,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 	if err != nil {
 		return fmt.Errorf("invalid client ID format: %w", err)
 	}
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -619,12 +619,12 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 	}
 
 	domainSuffix := "app.authsec.ai"
-	if config.AppConfig != nil && config.AppConfig.TenantDomainSuffix != "" {
-		domainSuffix = config.AppConfig.TenantDomainSuffix
+	if config.AppConfig != nil && config.AppConfig.WorkspaceDomainSuffix != "" {
+		domainSuffix = config.AppConfig.WorkspaceDomainSuffix
 	}
 
 	var existingUser models.User
-	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", agentUser.Email, agentUser.ExternalID, tenantUUID).First(&existingUser).Error
+	err = tenantDB.Where("(LOWER(email) = LOWER(?) OR external_id = ?) AND workspace_id = ?", agentUser.Email, agentUser.ExternalID, workspaceUUID).First(&existingUser).Error
 
 	now := time.Now()
 
@@ -635,7 +635,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 			User: sharedmodels.User{
 				ID:           uuid.New(),
 				ClientID:     clientUUID,
-				WorkspaceID:     tenantUUID,
+				WorkspaceID:     workspaceUUID,
 				ProjectID:    projectUUID,
 				Name:         agentUser.Name,
 				Username:     stringPtr(agentUser.Username),
@@ -644,7 +644,7 @@ func (asc *ADSyncController) syncAgentUserToDatabase(tenantDB *gorm.DB, agentUse
 				ProviderID:   agentUser.ProviderID,
 				Active:       agentUser.IsActive,
 				ProviderData: datatypes.JSON(providerData),
-				TenantDomain: domainSuffix,
+				WorkspaceDomain: domainSuffix,
 				MFAEnabled:   false,
 				CreatedAt:    now,
 				UpdatedAt:    now,
@@ -693,7 +693,7 @@ func (asc *ADSyncController) loadStoredADConfig(configID, workspaceID, clientID 
 	if err != nil {
 		return models.ADSyncConfig{}, fmt.Errorf("invalid config_id format")
 	}
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return models.ADSyncConfig{}, fmt.Errorf("invalid workspace_id format")
 	}
@@ -715,7 +715,7 @@ func (asc *ADSyncController) loadStoredADConfig(configID, workspaceID, clientID 
 		        AND ip.provider_type IN ('ad', 'entra')
 		        AND ip.config_ref = sc.id::text`).
 		Where("sc.id = ? AND sc.workspace_id = ? AND sc.client_id = ? AND sc.sync_type = ?",
-			configUUID, tenantUUID, clientUUID, "active_directory").
+			configUUID, workspaceUUID, clientUUID, "active_directory").
 		Where("(ip.id IS NULL OR ip.status <> 'disabled')").
 		First(&syncConfig).Error; err != nil {
 		return models.ADSyncConfig{}, fmt.Errorf("sync configuration not found, not authorized, or disabled via identity_providers")

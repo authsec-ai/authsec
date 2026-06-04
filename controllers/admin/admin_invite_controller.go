@@ -45,7 +45,7 @@ type InviteAdminRequest struct {
 	ClientID     string `json:"client_id"`
 	WorkspaceID     string `json:"workspace_id"`
 	ProjectID    string `json:"project_id"`
-	TenantDomain string `json:"tenant_domain"`
+	WorkspaceDomain string `json:"workspace_domain"`
 }
 
 // InviteAdminResponse represents the response after inviting an admin
@@ -68,7 +68,7 @@ type InvitedUserPayload struct {
 	ClientID     string `json:"client_id,omitempty"`
 	WorkspaceID     string `json:"workspace_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
 // generateTemporaryPassword generates a secure random password with proper entropy
@@ -105,22 +105,22 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token (set by auth middleware)
-	var tenantIDFromToken string
-	var tenantUUID uuid.UUID
+	// Get workspace_id from token (set by auth middleware)
+	var workspaceIDFromToken string
+	var workspaceUUID uuid.UUID
 	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
-			tenantIDFromToken = tenantStr
-			if parsedUUID, parseErr := uuid.Parse(tenantIDFromToken); parseErr == nil {
-				tenantUUID = parsedUUID
+			workspaceIDFromToken = tenantStr
+			if parsedUUID, parseErr := uuid.Parse(workspaceIDFromToken); parseErr == nil {
+				workspaceUUID = parsedUUID
 			}
 		}
 	}
 
 	// Check if user with this email already exists IN THIS TENANT (tenant-scoped check)
 	// This respects the new composite UNIQUE constraint (email, workspace_id)
-	if tenantUUID != uuid.Nil {
-		u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, tenantUUID)
+	if workspaceUUID != uuid.Nil {
+		u, err := aic.adminUserRepo.GetAdminUserByEmailAndTenant(req.Email, workspaceUUID)
 		if err == nil && u != nil {
 			// User already exists in THIS tenant
 			c.JSON(http.StatusConflict, gin.H{"error": "User with this email already exists in this tenant"})
@@ -138,20 +138,20 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	db := config.GetDatabase()
 	var existingUsername string
 
-	// Parse tenant_id from token for database query
-	var tenantUUIDForQuery interface{}
-	if tenantIDFromToken != "" {
-		if parsedUUID, parseErr := uuid.Parse(tenantIDFromToken); parseErr == nil {
-			tenantUUIDForQuery = parsedUUID
+	// Parse workspace_id from token for database query
+	var workspaceUUIDForQuery interface{}
+	if workspaceIDFromToken != "" {
+		if parsedUUID, parseErr := uuid.Parse(workspaceIDFromToken); parseErr == nil {
+			workspaceUUIDForQuery = parsedUUID
 		}
 	}
 
-	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND workspace_id = $2 LIMIT 1", req.Username, tenantUUIDForQuery).Scan(&existingUsername)
+	err := db.DB.QueryRow("SELECT username FROM users WHERE username = $1 AND workspace_id = $2 LIMIT 1", req.Username, workspaceUUIDForQuery).Scan(&existingUsername)
 	if err == nil {
 		// Reactivate the user as a side-effect — log on failure but still surface
 		// the 409 conflict so the inviter knows the username is taken.
-		if _, reactivateErr := db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, tenantUUIDForQuery); reactivateErr != nil {
-			log.Printf("WARN: AdminInvite reactivate failed for username=%s workspace=%s: %v", req.Username, tenantUUIDForQuery, reactivateErr)
+		if _, reactivateErr := db.DB.Exec("UPDATE users SET active = true WHERE username = $1 AND workspace_id = $2", req.Username, workspaceUUIDForQuery); reactivateErr != nil {
+			log.Printf("WARN: AdminInvite reactivate failed for username=%s workspace=%s: %v", req.Username, workspaceUUIDForQuery, reactivateErr)
 		}
 		c.JSON(http.StatusConflict, gin.H{"error": "User with this username already exists in this workspace"})
 		return
@@ -188,15 +188,15 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		clientIDPtr = &clientUUID
 	}
 
-	var tenantIDPtr *uuid.UUID
+	var workspaceIDPtr *uuid.UUID
 	if strings.TrimSpace(req.WorkspaceID) != "" {
-		tenantUUID, parseErr := uuid.Parse(req.WorkspaceID)
+		workspaceUUID, parseErr := uuid.Parse(req.WorkspaceID)
 		if parseErr != nil {
 			log.Printf("User-flow: invalid workspace_id format: %v", parseErr)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
 			return
 		}
-		tenantIDPtr = &tenantUUID
+		workspaceIDPtr = &workspaceUUID
 	}
 
 	var projectIDPtr *uuid.UUID
@@ -223,9 +223,9 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 		CreatedAt:                  time.Now(),
 		UpdatedAt:                  time.Now(),
 		ClientID:                   clientIDPtr,
-		WorkspaceID:                   tenantIDPtr,
+		WorkspaceID:                   workspaceIDPtr,
 		ProjectID:                  projectIDPtr,
-		TenantDomain:               strings.TrimSpace(req.TenantDomain),
+		WorkspaceDomain:               strings.TrimSpace(req.WorkspaceDomain),
 	}
 
 	// Hash the password
@@ -245,8 +245,8 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	// Assign admin role and binding for this tenant/user (tenant-wide)
-	if tenantUUID != uuid.Nil {
-		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(tenantUUID)
+	if workspaceUUID != uuid.Nil {
+		roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissions(workspaceUUID)
 		if err != nil {
 			log.Printf("User-flow:ERROR: Failed to ensure admin role/perms for invited admin: %v", err)
 		} else {
@@ -260,13 +260,13 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 					WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 
 					AND scope_type IS NULL AND scope_id IS NULL
 				)
-			`, uuid.New(), tenantUUID, adminUser.ID, roleID); err != nil {
+			`, uuid.New(), workspaceUUID, adminUser.ID, roleID); err != nil {
 				log.Printf("User-flow:ERROR: Failed to bind admin role to invited user: %v", err)
 			}
 		}
 
 		// Create corresponding end user account in tenant database
-		if err := aic.createEndUserInTenantDBForInvite(&adminUser, tenantUUID, clientIDPtr, projectIDPtr); err != nil {
+		if err := aic.createEndUserInWorkspaceDBForInvite(&adminUser, workspaceUUID, clientIDPtr, projectIDPtr); err != nil {
 			log.Printf("User-flow:WARNING: Failed to create end user account in tenant database: %v", err)
 			// Don't fail the invitation - admin can still use global admin account
 		} else {
@@ -275,7 +275,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 	}
 
 	emailSent := false
-	if err := utils.SendAdminInviteEmail(adminUser.Email, adminUser.Username, adminUser.TenantDomain, temporaryPassword); err != nil {
+	if err := utils.SendAdminInviteEmail(adminUser.Email, adminUser.Username, adminUser.WorkspaceDomain, temporaryPassword); err != nil {
 		log.Printf("User-flow: failed to send admin invite email to %s: %v", adminUser.Email, err)
 	} else {
 		emailSent = true
@@ -292,7 +292,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			"email":      adminUser.Email,
 			"username":   adminUser.Username,
 			"name":       adminUser.Name,
-			"workspace_id":  tenantIDFromToken,
+			"workspace_id":  workspaceIDFromToken,
 			"email_sent": emailSent,
 		},
 	})
@@ -312,7 +312,7 @@ func (aic *AdminInviteController) InviteAdmin(c *gin.Context) {
 			ClientID:     uuidOrEmpty(adminUser.ClientID),
 			WorkspaceID:     uuidOrEmpty(adminUser.WorkspaceID),
 			ProjectID:    uuidOrEmpty(adminUser.ProjectID),
-			TenantDomain: adminUser.TenantDomain,
+			WorkspaceDomain: adminUser.WorkspaceDomain,
 		},
 	})
 }
@@ -363,12 +363,12 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token
-	var tenantUUID uuid.UUID
+	// Get workspace_id from token
+	var workspaceUUID uuid.UUID
 	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				tenantUUID = parsedUUID
+				workspaceUUID = parsedUUID
 			}
 		}
 	}
@@ -387,7 +387,7 @@ func (aic *AdminInviteController) CancelInvite(c *gin.Context) {
 	}
 
 	// Verify the user belongs to the same tenant
-	if user.WorkspaceID != nil && tenantUUID != uuid.Nil && *user.WorkspaceID != tenantUUID {
+	if user.WorkspaceID != nil && workspaceUUID != uuid.Nil && *user.WorkspaceID != workspaceUUID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot cancel invite for user in different tenant"})
 		return
 	}
@@ -445,14 +445,14 @@ type ResendInviteRequest struct {
 	UserID string `json:"user_id" binding:"required"`
 }
 
-// ResendInviteResponse represents the response after resending an invite
+// ResendInviteResponse represents the response after resending an invite.
+// The temporary password is never returned in the response — it travels only via email.
 type ResendInviteResponse struct {
-	Message           string `json:"message"`
-	UserID            string `json:"user_id"`
-	Email             string `json:"email"`
-	TemporaryPassword string `json:"temporary_password"`
-	ExpiresAt         string `json:"expires_at"`
-	EmailSent         bool   `json:"email_sent"`
+	Message   string `json:"message"`
+	UserID    string `json:"user_id"`
+	Email     string `json:"email"`
+	ExpiresAt string `json:"expires_at"`
+	EmailSent bool   `json:"email_sent"`
 }
 
 // ResendInvite resends the invitation email with a new temporary password
@@ -482,12 +482,12 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token
-	var tenantUUID uuid.UUID
+	// Get workspace_id from token
+	var workspaceUUID uuid.UUID
 	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				tenantUUID = parsedUUID
+				workspaceUUID = parsedUUID
 			}
 		}
 	}
@@ -504,7 +504,7 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 	}
 
 	// Verify the user belongs to the same tenant
-	if user.WorkspaceID != nil && tenantUUID != uuid.Nil && *user.WorkspaceID != tenantUUID {
+	if user.WorkspaceID != nil && workspaceUUID != uuid.Nil && *user.WorkspaceID != workspaceUUID {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Cannot resend invite for user in different tenant"})
 		return
 	}
@@ -559,7 +559,7 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 
 	// Send the invitation email
 	emailSent := false
-	if err := utils.SendAdminInviteEmail(user.Email, user.Username, user.TenantDomain, newTempPassword); err != nil {
+	if err := utils.SendAdminInviteEmail(user.Email, user.Username, user.WorkspaceDomain, newTempPassword); err != nil {
 		log.Printf("User-flow: failed to send admin invite email to %s: %v", user.Email, err)
 	} else {
 		emailSent = true
@@ -582,12 +582,11 @@ func (aic *AdminInviteController) ResendInvite(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, ResendInviteResponse{
-		Message:           responseMessage,
-		UserID:            userUUID.String(),
-		Email:             user.Email,
-		TemporaryPassword: newTempPassword,
-		ExpiresAt:         newExpiresAt.Format(time.RFC3339),
-		EmailSent:         emailSent,
+		Message:   responseMessage,
+		UserID:    userUUID.String(),
+		Email:     user.Email,
+		ExpiresAt: newExpiresAt.Format(time.RFC3339),
+		EmailSent: emailSent,
 	})
 }
 
@@ -597,7 +596,7 @@ type PendingInvite struct {
 	Email        string  `json:"email"`
 	Username     string  `json:"username"`
 	Name         string  `json:"name"`
-	TenantDomain string  `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string  `json:"workspace_domain,omitempty"`
 	ExpiresAt    *string `json:"expires_at,omitempty"`
 	IsExpired    bool    `json:"is_expired"`
 	CreatedAt    string  `json:"created_at"`
@@ -619,12 +618,12 @@ type ListPendingInvitesResponse struct {
 // @Failure 500 {object} map[string]interface{}
 // @Router /authsec/uflow/admin/invite/pending [get]
 func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
-	// Get tenant_id from token
-	var tenantUUID uuid.UUID
+	// Get workspace_id from token
+	var workspaceUUID uuid.UUID
 	if tenantVal, exists := c.Get("workspace_id"); exists {
 		if tenantStr, ok := tenantVal.(string); ok {
 			if parsedUUID, parseErr := uuid.Parse(tenantStr); parseErr == nil {
-				tenantUUID = parsedUUID
+				workspaceUUID = parsedUUID
 			}
 		}
 	}
@@ -637,7 +636,7 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 
 	// Query for pending invites
 	query := `
-		SELECT id, email, username, name, tenant_domain, temporary_password_expires_at, created_at
+		SELECT id, email, username, name, workspace_domain, temporary_password_expires_at, created_at
 		FROM users
 		WHERE temporary_password = true 
 		  AND last_login IS NULL
@@ -645,12 +644,12 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 		ORDER BY created_at DESC
 	`
 
-	var tenantIDParam interface{}
-	if tenantUUID != uuid.Nil {
-		tenantIDParam = tenantUUID
+	var workspaceIDParam interface{}
+	if workspaceUUID != uuid.Nil {
+		workspaceIDParam = workspaceUUID
 	}
 
-	rows, err := db.Query(query, tenantIDParam)
+	rows, err := db.Query(query, workspaceIDParam)
 	if err != nil {
 		log.Printf("User-flow: failed to query pending invites: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve pending invitations"})
@@ -667,12 +666,12 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 			email        string
 			username     string
 			name         sql.NullString
-			tenantDomain sql.NullString
+			workspaceDomain sql.NullString
 			expiresAt    sql.NullTime
 			createdAt    time.Time
 		)
 
-		if err := rows.Scan(&id, &email, &username, &name, &tenantDomain, &expiresAt, &createdAt); err != nil {
+		if err := rows.Scan(&id, &email, &username, &name, &workspaceDomain, &expiresAt, &createdAt); err != nil {
 			log.Printf("User-flow: failed to scan pending invite row: %v", err)
 			continue
 		}
@@ -687,8 +686,8 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 		if name.Valid {
 			invite.Name = name.String
 		}
-		if tenantDomain.Valid {
-			invite.TenantDomain = tenantDomain.String
+		if workspaceDomain.Valid {
+			invite.WorkspaceDomain = workspaceDomain.String
 		}
 		if expiresAt.Valid {
 			expStr := expiresAt.Time.Format(time.RFC3339)
@@ -705,9 +704,9 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 	})
 }
 
-// createEndUserInTenantDBForInvite creates a corresponding end user account in the tenant database
+// createEndUserInWorkspaceDBForInvite creates a corresponding end user account in the tenant database
 // This allows invited admins to also authenticate as end users within their tenant
-func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *models.AdminUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) error {
+func (aic *AdminInviteController) createEndUserInWorkspaceDBForInvite(adminUser *models.AdminUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) error {
 	// Get tenant information
 	var tenant models.Tenant
 	if err := config.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
@@ -750,7 +749,7 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	// Create end user with same credentials as admin
 	endUserInsert := `
 		INSERT INTO users (id, client_id, workspace_id, project_id, email, name, username, 
-			password_hash, tenant_domain, provider, provider_id, active, 
+			password_hash, workspace_domain, provider, provider_id, active, 
 			created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())
 		ON CONFLICT (email, client_id) DO NOTHING
@@ -759,13 +758,13 @@ func (aic *AdminInviteController) createEndUserInTenantDBForInvite(adminUser *mo
 	_, err = tenantDB.Exec(endUserInsert,
 		adminUser.ID,           // Use same ID as admin user for consistency
 		effectiveClientID,      // client_id
-		workspaceID,               // tenant_id
+		workspaceID,               // workspace_id
 		effectiveProjectID,     // project_id
 		adminUser.Email,        // email
 		adminUser.Name,         // name
 		adminUser.Username,     // username
 		adminUser.PasswordHash, // password_hash (same as admin)
-		adminUser.TenantDomain, // tenant_domain
+		adminUser.WorkspaceDomain, // workspace_domain
 		adminUser.Provider,     // provider
 		adminUser.Email,        // provider_id
 	)

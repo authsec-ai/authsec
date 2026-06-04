@@ -39,7 +39,7 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 type TokenClaims struct {
 	WorkspaceID           string
 	WorkspaceMembershipID string
-	TenantDomain          string // Tenant domain for display/routing
+	WorkspaceDomain          string // Tenant domain for display/routing
 	ClientID              string
 	EmailID               string
 	UserID                *uuid.UUID
@@ -117,9 +117,9 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		jwtClaims["scope"] = claims.Scopes
 	}
 
-	// Add tenant_domain if provided
-	if claims.TenantDomain != "" {
-		jwtClaims["tenant_domain"] = claims.TenantDomain
+	// Add workspace_domain if provided
+	if claims.WorkspaceDomain != "" {
+		jwtClaims["workspace_domain"] = claims.WorkspaceDomain
 	}
 
 	// Add roles if provided
@@ -178,16 +178,16 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 }
 
 // GenerateAdminToken generates a token for admin users
-func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, tenantDomain string, roles []string) (string, error) {
-	// Use actual tenant_id if provided, otherwise default to "admin" for super-admins
-	tenantIDStr := "admin"
+func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, workspaceDomain string, roles []string) (string, error) {
+	// Use actual workspace_id if provided, otherwise default to "admin" for super-admins
+	workspaceIDStr := "admin"
 	if workspaceID != nil && *workspaceID != uuid.Nil {
-		tenantIDStr = workspaceID.String()
+		workspaceIDStr = workspaceID.String()
 	}
 
 	claims := TokenClaims{
-		WorkspaceID:  tenantIDStr,  // Use actual tenant_id
-		TenantDomain: tenantDomain, // Include tenant domain
+		WorkspaceID:  workspaceIDStr,  // Use actual workspace_id
+		WorkspaceDomain: workspaceDomain, // Include tenant domain
 		ClientID:     adminUserID.String(),
 		EmailID:      email,
 		UserID:       &adminUserID,
@@ -214,7 +214,7 @@ func (s *AuthManagerTokenService) GenerateTenantUserToken(
 	return s.GenerateToken(claims)
 }
 
-// GenerateEndUserToken generates a token for end users (with default project_id = tenant_id)
+// GenerateEndUserToken generates a token for end users (with default project_id = workspace_id)
 func (s *AuthManagerTokenService) GenerateEndUserToken(
 	userID uuid.UUID,
 	workspaceID string,

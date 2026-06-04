@@ -36,7 +36,7 @@ func (ctrl *NodeAttestationController) Attest(c *gin.Context) {
 
 	// Validate required fields
 	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
 		return
 	}
 	if req.NodeID == "" {

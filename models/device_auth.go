@@ -29,7 +29,7 @@ type DeviceCode struct {
 	// User information (populated after authorization)
 	UserID       *uuid.UUID `json:"user_id,omitempty" gorm:"type:uuid;index"`
 	UserEmail    string     `json:"user_email,omitempty"`
-	TenantDomain string     `json:"tenant_domain,omitempty"` // cached at authorize time
+	WorkspaceDomain string     `json:"workspace_domain,omitempty"` // cached at authorize time
 	AccessToken  string     `json:"access_token,omitempty"`  // JWT stored at authorize time
 
 	// Authorization state
@@ -74,11 +74,11 @@ func (d *DeviceCode) IsAuthorized() bool {
 // ========================================
 
 // DeviceCodeRequest represents a request to initiate device authorization.
-// client_id and tenant_domain are optional: the CLI (authsec-shield) sends neither.
+// client_id and workspace_domain are optional: the CLI (authsec-shield) sends neither.
 // Tenant is resolved from the authenticated browser session during the /authorize step.
 type DeviceCodeRequest struct {
 	ClientID     string                 `json:"client_id,omitempty"`
-	TenantDomain string                 `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string                 `json:"workspace_domain,omitempty"`
 	Scopes       []string               `json:"scopes,omitempty"`
 	DeviceInfo   map[string]interface{} `json:"device_info,omitempty"`
 }
@@ -114,7 +114,7 @@ type DeviceTokenResponse struct {
 	Email        string `json:"email,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	WorkspaceID     string `json:"workspace_id,omitempty"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 	ClientID     string `json:"client_id,omitempty"`
 	// RFC 8628 error fields
 	Error            string `json:"error,omitempty"`
@@ -183,7 +183,7 @@ type DeviceActivationInfoRequest struct {
 type DeviceActivationInfoResponse struct {
 	Success      bool     `json:"success"`
 	UserCode     string   `json:"user_code"`
-	TenantDomain string   `json:"tenant_domain"`
+	WorkspaceDomain string   `json:"workspace_domain"`
 	DeviceInfo   JSONMap  `json:"device_info,omitempty"`
 	Scopes       []string `json:"scopes,omitempty"`
 	ExpiresAt    string   `json:"expires_at"`

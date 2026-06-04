@@ -18,7 +18,7 @@ import (
 type RevocationService struct {
 	certRepo    repositories.CertificateRepository
 	auditRepo   repositories.AuditRepository
-	tenantRepo  repositories.TenantRepository
+	workspaceRepo  repositories.WorkspaceRepository
 	vaultClient *vault.Client
 	connManager *database.ConnectionManager // For tenant-specific DB connections
 	logger      *logrus.Entry
@@ -28,7 +28,7 @@ type RevocationService struct {
 func NewRevocationService(
 	certRepo repositories.CertificateRepository,
 	auditRepo repositories.AuditRepository,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	connManager *database.ConnectionManager,
 	logger *logrus.Entry,
@@ -36,7 +36,7 @@ func NewRevocationService(
 	return &RevocationService{
 		certRepo:    certRepo,
 		auditRepo:   auditRepo,
-		tenantRepo:  tenantRepo,
+		workspaceRepo:  workspaceRepo,
 		vaultClient: vaultClient,
 		connManager: connManager,
 		logger:      logger,
@@ -55,12 +55,12 @@ type RevokeRequest struct {
 // Revoke revokes a certificate
 func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) error {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":     req.WorkspaceID,
+		"workspace_id":     req.WorkspaceID,
 		"serial_number": req.SerialNumber,
 	}).Info("Starting certificate revocation")
 
 	// Validate tenant
-	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
 		s.auditRevocation(ctx, req, false, err.Error())
 		return err
@@ -72,7 +72,7 @@ func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) erro
 	}
 
 	// Get tenant-specific repositories
-	certRepo, _, err := s.getTenantRepositories(ctx, req.WorkspaceID)
+	certRepo, _, err := s.getWorkspaceRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return errors.NewInternalError("Failed to connect to tenant database", err)
@@ -111,14 +111,14 @@ func (s *RevocationService) Revoke(ctx context.Context, req *RevokeRequest) erro
 	return nil
 }
 
-// getTenantRepositories creates repositories connected to the tenant's database
-func (s *RevocationService) getTenantRepositories(ctx context.Context, tenantID string) (
+// getWorkspaceRepositories creates repositories connected to the tenant's database
+func (s *RevocationService) getWorkspaceRepositories(ctx context.Context, workspaceID string) (
 	repositories.CertificateRepository,
 	repositories.AuditRepository,
 	error,
 ) {
 	// Get tenant database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, tenantID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}

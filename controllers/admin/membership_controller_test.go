@@ -24,16 +24,16 @@ func newMembershipRouter(t *testing.T) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	mc := NewMembershipController()
-	r.GET("/v2/tenants/:tenant_id/memberships", mc.ListMembers)
-	r.POST("/v2/tenants/:tenant_id/memberships", mc.CreateMembership)
-	r.GET("/v2/tenants/:tenant_id/memberships/:user_id", mc.GetMembership)
-	r.PATCH("/v2/tenants/:tenant_id/memberships/:user_id", mc.UpdateMembership)
-	r.DELETE("/v2/tenants/:tenant_id/memberships/:user_id", mc.DeleteMembership)
-	r.GET("/v2/tenants/:tenant_id/end-users", mc.ListEndUsers)
-	r.GET("/v2/tenants/:tenant_id/end-users/:user_id", mc.GetEndUser)
-	r.PATCH("/v2/tenants/:tenant_id/end-users/:user_id", mc.UpdateEndUser)
-	r.POST("/v2/tenants/:tenant_id/end-users/:user_id/suspend", mc.SuspendEndUser)
-	r.POST("/v2/tenants/:tenant_id/end-users/:user_id/reactivate", mc.ReactivateEndUser)
+	r.GET("/v2/tenants/:workspace_id/memberships", mc.ListMembers)
+	r.POST("/v2/tenants/:workspace_id/memberships", mc.CreateMembership)
+	r.GET("/v2/tenants/:workspace_id/memberships/:user_id", mc.GetMembership)
+	r.PATCH("/v2/tenants/:workspace_id/memberships/:user_id", mc.UpdateMembership)
+	r.DELETE("/v2/tenants/:workspace_id/memberships/:user_id", mc.DeleteMembership)
+	r.GET("/v2/tenants/:workspace_id/end-users", mc.ListEndUsers)
+	r.GET("/v2/tenants/:workspace_id/end-users/:user_id", mc.GetEndUser)
+	r.PATCH("/v2/tenants/:workspace_id/end-users/:user_id", mc.UpdateEndUser)
+	r.POST("/v2/tenants/:workspace_id/end-users/:user_id/suspend", mc.SuspendEndUser)
+	r.POST("/v2/tenants/:workspace_id/end-users/:user_id/reactivate", mc.ReactivateEndUser)
 	r.POST("/v2/groups/:group_id/role-bindings", mc.BindGroupToRole)
 	r.GET("/v2/users/:user_id/effective-access", mc.EffectiveAccess)
 	return r
@@ -53,7 +53,7 @@ func TestMembershipController_RejectsInvalidUUIDs(t *testing.T) {
 		{"GET", "/v2/tenants/not-a-uuid/memberships", nil, http.StatusBadRequest},
 		{"GET", "/v2/tenants/00000000-0000-0000-0000-000000000000/memberships/not-a-uuid", nil, http.StatusBadRequest},
 		{"PATCH", "/v2/tenants/not-a-uuid/end-users/00000000-0000-0000-0000-000000000000", []byte(`{"status":"active"}`), http.StatusBadRequest},
-		{"POST", "/v2/groups/not-a-uuid/role-bindings", []byte(`{"tenant_id":"00000000-0000-0000-0000-000000000000","role_id":"00000000-0000-0000-0000-000000000000"}`), http.StatusBadRequest},
+		{"POST", "/v2/groups/not-a-uuid/role-bindings", []byte(`{"workspace_id":"00000000-0000-0000-0000-000000000000","role_id":"00000000-0000-0000-0000-000000000000"}`), http.StatusBadRequest},
 		{"GET", "/v2/users/not-a-uuid/effective-access", nil, http.StatusBadRequest},
 	}
 
@@ -78,7 +78,7 @@ func TestMembershipController_LifecycleE2E(t *testing.T) {
 	skipIfNoSeed(t)
 
 	r := newMembershipRouter(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	// Create a fresh test user-id so we don't collide with backfill.
 	userID := uuid.New().String()
@@ -89,7 +89,7 @@ func TestMembershipController_LifecycleE2E(t *testing.T) {
 		"membership_type": models.MembershipTypeContractor,
 		"source":          "api",
 	})
-	req := httptest.NewRequest("POST", "/v2/tenants/"+tenantID+"/memberships", bytes.NewReader(body))
+	req := httptest.NewRequest("POST", "/v2/tenants/"+workspaceID+"/memberships", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

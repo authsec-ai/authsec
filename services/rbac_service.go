@@ -82,7 +82,7 @@ func (s *RBACService) CreateRoleComposite(role *models.RBACRole, permissionIDs [
 func (s *RBACService) AssignRoleScoped(binding *models.RoleBinding) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		// Validates that 'user' and 'role' belong to the same tenant.
-		// Note: The DB Foreign Key constraints (tenant_id, user_id) already enforce this.
+		// Note: The DB Foreign Key constraints (workspace_id, user_id) already enforce this.
 		// We can add an explicit check here if we want friendlier error messages,
 		// but standard DB constraints are robust.
 
@@ -269,11 +269,10 @@ func (s *RBACService) PolicyDecisionPointCheck(_ uuid.UUID, _, _ string, _ *uuid
 //
 // Returns nil on pass, error describing the failure otherwise.
 func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
-	// Check tenant_memberships — at most one row per (tenant, user) but a user
-	// may belong to multiple tenants in future. For Phase A we treat a single
-	// suspended row anywhere as a hard fail.
+	// Check workspace_memberships — at most one row per (workspace, user).
+	// A suspended membership anywhere is a hard fail.
 	var membershipStatus string
-	row := s.db.Table("workspace_user_memberships").
+	row := s.db.Table("workspace_memberships").
 		Select("status").
 		Where("user_id = ?", principalID).
 		Limit(1).
@@ -306,10 +305,10 @@ func (s *RBACService) CheckPrincipalActive(principalID uuid.UUID) error {
 
 // CheckPrincipalActiveInWorkspace is the workspace-scoped version used by the
 // new PDP surface. During the workspace rollout, workspace_id maps to the
-// existing tenant_id storage column.
+// existing workspace_id storage column.
 func (s *RBACService) CheckPrincipalActiveInWorkspace(workspaceID, principalID uuid.UUID) error {
 	var membershipStatus string
-	row := s.db.Table("workspace_user_memberships").
+	row := s.db.Table("workspace_memberships").
 		Select("status").
 		Where("workspace_id = ? AND user_id = ?", workspaceID, principalID).
 		Limit(1).

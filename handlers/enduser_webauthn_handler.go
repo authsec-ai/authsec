@@ -122,7 +122,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id and email are required"})
 		return
 	}
 
@@ -162,7 +162,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id and email are required"})
 		return
 	}
 
@@ -256,7 +256,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 	email := c.Query("email")
 
 	if workspaceID == "" || email == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email query parameters are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id and email query parameters are required"})
 		return
 	}
 
@@ -350,7 +350,7 @@ func (h *EndUserWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 // @Tags         WebAuthn, EndUser
 // @Accept       json
 // @Produce      json
-// @Param        request body object{tenant_id=string,email=string} true "Registration initiation data"
+// @Param        request body object{workspace_id=string,email=string} true "Registration initiation data"
 // @Success      200 {object} object{} "WebAuthn credential creation options"
 // @Failure      400 {object} ErrorResponse
 // @Failure      404 {object} ErrorResponse
@@ -364,7 +364,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id, email, and client_id are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id, email, and client_id are required"})
 		return
 	}
 
@@ -382,8 +382,8 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Printf("BeginRegistration: User not found, creating new user for email=%s, tenant=%s, client=%s", req.Email, req.WorkspaceID, req.ClientID)
 
-			// Parse tenant_id and client_id as UUIDs
-			tenantUUID, err := uuid.Parse(req.WorkspaceID)
+			// Parse workspace_id and client_id as UUIDs
+			workspaceUUID, err := uuid.Parse(req.WorkspaceID)
 			if err != nil {
 				log.Printf("BeginRegistration: Invalid workspace_id format: %v", err)
 				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid workspace_id format"})
@@ -401,7 +401,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 			newUser := &sharedmodels.User{
 				ID:          uuid.New(),
 				ClientID:    clientUUID,
-				WorkspaceID: tenantUUID,
+				WorkspaceID: workspaceUUID,
 				Email:       req.Email,
 				Active:      true,
 				Provider:    "local",
@@ -489,7 +489,7 @@ func (h *EndUserWebAuthnHandler) BeginRegistration(c *gin.Context) {
 // @Tags         WebAuthn, EndUser
 // @Accept       json
 // @Produce      json
-// @Param        request body object{tenant_id=string,email=string,credential=string} true "Registration completion data"
+// @Param        request body object{workspace_id=string,email=string,credential=string} true "Registration completion data"
 // @Success      200 {object} object{success=bool,credential_id=string,message=string} "Registration completion response"
 // @Failure      400 {object} ErrorResponse
 // @Failure      404 {object} ErrorResponse
@@ -504,7 +504,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id, email, client_id, and credential are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id, email, client_id, and credential are required"})
 		return
 	}
 
@@ -725,7 +725,7 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 // @Tags         WebAuthn, EndUser
 // @Accept       json
 // @Produce      json
-// @Param        request body object{tenant_id=string,email=string} true "Authentication initiation data"
+// @Param        request body object{workspace_id=string,email=string} true "Authentication initiation data"
 // @Success      200 {object} object{} "WebAuthn assertion options"
 // @Failure      400 {object} ErrorResponse
 // @Failure      404 {object} ErrorResponse
@@ -743,7 +743,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		log.Printf("[%s] BeginAuthentication: invalid request: %v", reqID, err)
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id and email are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id and email are required"})
 		return
 	}
 
@@ -763,7 +763,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 		user, err = clientRepo.GetClientByEmailAndTenant(&req.Email, &req.WorkspaceID, nil)
 	}
 	if err != nil {
-		log.Printf("[%s] BeginAuthentication: user not found email=%s tenant_id=%s err=%v", reqID, req.Email, req.WorkspaceID, err)
+		log.Printf("[%s] BeginAuthentication: user not found email=%s workspace_id=%s err=%v", reqID, req.Email, req.WorkspaceID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
 	}
@@ -821,7 +821,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[%s] BeginAuthentication: session saved for email=%s tenant_id=%s", reqID, req.Email, req.WorkspaceID)
+	log.Printf("[%s] BeginAuthentication: session saved for email=%s workspace_id=%s", reqID, req.Email, req.WorkspaceID)
 	c.JSON(http.StatusOK, options)
 }
 
@@ -831,7 +831,7 @@ func (h *EndUserWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 // @Tags         WebAuthn, EndUser
 // @Accept       json
 // @Produce      json
-// @Param        request body object{tenant_id=string,email=string,response=object} true "Authentication completion data"
+// @Param        request body object{workspace_id=string,email=string,response=object} true "Authentication completion data"
 // @Success      200 {object} object{success=bool,user_id=string} "Authentication success response"
 // @Failure      400 {object} ErrorResponse
 // @Failure      401 {object} ErrorResponse
@@ -846,7 +846,7 @@ func (h *EndUserWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "tenant_id, email, and credential are required"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id, email, and credential are required"})
 		return
 	}
 

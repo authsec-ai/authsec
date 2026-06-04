@@ -119,7 +119,7 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 		CREATE TABLE resource_servers (
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
-			tenant_id TEXT,
+			workspace_id TEXT,
 			application_type TEXT NOT NULL DEFAULT 'mcp_server',
 			legacy_client_id TEXT,
 			name TEXT NOT NULL,

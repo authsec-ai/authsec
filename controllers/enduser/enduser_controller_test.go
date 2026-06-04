@@ -49,7 +49,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		tenantID       string
+		workspaceID       string
 		userIdentifier string
 		queryString    string
 		expectedStatus int
@@ -58,7 +58,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 	}{
 		{
 			name:           "database unavailable when looking up by id",
-			tenantID:       uuid.New().String(),
+			workspaceID:       uuid.New().String(),
 			userIdentifier: uuid.New().String(),
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -70,7 +70,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 		},
 		{
 			name:           "missing client id for email lookup",
-			tenantID:       uuid.New().String(),
+			workspaceID:       uuid.New().String(),
 			userIdentifier: "nonexistent@example.com",
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
@@ -88,17 +88,17 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			c.Params = []gin.Param{
-				{Key: "tenant_id", Value: tt.tenantID},
+				{Key: "workspace_id", Value: tt.workspaceID},
 				{Key: "user_id", Value: tt.userIdentifier},
 			}
-			requestPath := "/api/enduser/" + tt.tenantID + "/" + tt.userIdentifier
+			requestPath := "/api/enduser/" + tt.workspaceID + "/" + tt.userIdentifier
 			if tt.queryString != "" {
 				requestPath += "?" + tt.queryString
 			}
 			c.Request = httptest.NewRequest("GET", requestPath, nil)
 
 			// Set token claims for auth middleware simulation
-			setTokenClaimsInContext(c, tt.tenantID, tt.userIdentifier)
+			setTokenClaimsInContext(c, tt.workspaceID, tt.userIdentifier)
 
 			controller.GetEndUser(c)
 
@@ -181,7 +181,7 @@ func TestEndUserController_GetEndUsers(t *testing.T) {
 		{
 			name:  "invalid input",
 			input: GetEndUsersFilter{
-				// Missing tenant_id
+				// Missing workspace_id
 			},
 			expectedStatus: http.StatusBadRequest,
 			setupMocks:     func() {},
@@ -233,7 +233,7 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		tenantID       string
+		workspaceID       string
 		userID         string
 		input          models.UpdateEndUserStatusInput
 		expectedStatus int
@@ -242,7 +242,7 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 	}{
 		{
 			name:     "successful status update",
-			tenantID: uuid.New().String(),
+			workspaceID: uuid.New().String(),
 			userID:   uuid.New().String(),
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
@@ -257,7 +257,7 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 		},
 		{
 			name:     "invalid user_id format",
-			tenantID: uuid.New().String(),
+			workspaceID: uuid.New().String(),
 			userID:   "invalid-uuid",
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
@@ -270,7 +270,7 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 		},
 		{
 			name:     "user not found",
-			tenantID: uuid.New().String(),
+			workspaceID: uuid.New().String(),
 			userID:   uuid.New().String(),
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
@@ -291,16 +291,16 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 			c, _ := gin.CreateTestContext(w)
 
 			c.Params = []gin.Param{
-				{Key: "tenant_id", Value: tt.tenantID},
+				{Key: "workspace_id", Value: tt.workspaceID},
 				{Key: "user_id", Value: tt.userID},
 			}
 
 			jsonData, _ := json.Marshal(tt.input)
-			c.Request = httptest.NewRequest("PUT", "/api/enduser/"+tt.tenantID+"/"+tt.userID+"/status", bytes.NewBuffer(jsonData))
+			c.Request = httptest.NewRequest("PUT", "/api/enduser/"+tt.workspaceID+"/"+tt.userID+"/status", bytes.NewBuffer(jsonData))
 			c.Request.Header.Set("Content-Type", "application/json")
 
 			// Set token claims for auth middleware simulation
-			setTokenClaimsInContext(c, tt.tenantID, tt.userID)
+			setTokenClaimsInContext(c, tt.workspaceID, tt.userID)
 
 			controller.UpdateEndUserStatus(c)
 
@@ -379,10 +379,10 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 			jsonData, _ := json.Marshal(tt.input)
 			c.Request = httptest.NewRequest("DELETE", "/api/enduser/delete", bytes.NewBuffer(jsonData))
 			c.Request.Header.Set("Content-Type", "application/json")
-			if tenantID, ok := tt.input["workspace_id"]; ok {
+			if workspaceID, ok := tt.input["workspace_id"]; ok {
 				// Set token claims for auth middleware simulation
-				setTokenClaimsInContext(c, tenantID, tt.input["user_id"])
-				c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID})
+				setTokenClaimsInContext(c, workspaceID, tt.input["user_id"])
+				c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
 			}
 
 			controller.DeleteEndUser(c)
@@ -918,9 +918,9 @@ func TestAuthMiddleware_WithValidToken(t *testing.T) {
 	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
 	r.GET("/protected", func(c *gin.Context) {
 		// Check if user info is properly extracted
-		tenantID, exists := c.Get("tenant_id")
-		assert.True(t, exists, "tenant_id should be set")
-		assert.Equal(t, "test-tenant-123", tenantID)
+		workspaceID, exists := c.Get("workspace_id")
+		assert.True(t, exists, "workspace_id should be set")
+		assert.Equal(t, "test-tenant-123", workspaceID)
 
 		userID, exists := c.Get("user_id")
 		assert.True(t, exists, "user_id should be set")
@@ -1000,7 +1000,7 @@ func generateTestJWT() (string, error) {
 		"exp":        time.Now().Add(time.Hour).Unix(),
 		"iat":        time.Now().Unix(),
 		"nbf":        time.Now().Unix(),
-		"tenant_id":  "test-tenant-123",
+		"workspace_id":  "test-tenant-123",
 		"project_id": "test-project-456",
 		"client_id":  "test-client-789",
 		"user_id":    "test-user-456",
@@ -1126,7 +1126,7 @@ func generateTestJWTWithRoles(roles []string) (string, error) {
 		"exp":        time.Now().Add(time.Hour).Unix(),
 		"iat":        time.Now().Unix(),
 		"nbf":        time.Now().Unix(),
-		"tenant_id":  "test-tenant-123",
+		"workspace_id":  "test-tenant-123",
 		"project_id": "test-project-456",
 		"client_id":  "test-client-789",
 		"user_id":    "test-user-456",

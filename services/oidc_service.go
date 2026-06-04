@@ -142,7 +142,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 		WorkspaceID:    workspaceIDPtr,
 		ApplicationID:  input.ApplicationID,
 		SignedState:    signedState,
-		TenantDomain:   input.TenantDomain,
+		WorkspaceDomain:   input.WorkspaceDomain,
 		OriginDomain:   s.requestOrigin, // Store origin domain for post-auth redirect
 		ProviderName:   input.Provider,
 		Action:         action, // "login" | "register" | "discover" | "hydra_login"
@@ -157,7 +157,7 @@ func (s *OIDCService) InitiateOIDCFlow(input *models.OIDCInitiateInput, action s
 		log.Printf("ERROR: Failed to store OIDC state: %v", err)
 		return nil, fmt.Errorf("failed to store OIDC state: %w", err)
 	}
-	log.Printf("DEBUG InitiateOIDCFlow: Successfully created state with token='%s', tenant_domain='%s', origin_domain='%s', action='%s'", stateToken, input.TenantDomain, s.requestOrigin, action)
+	log.Printf("DEBUG InitiateOIDCFlow: Successfully created state with token='%s', workspace_domain='%s', origin_domain='%s', action='%s'", stateToken, input.WorkspaceDomain, s.requestOrigin, action)
 
 	// Build authorization URL
 	callbackURL := s.resolveCallbackURL(provider)
@@ -188,7 +188,7 @@ func (s *OIDCService) HandleCallback(input *models.OIDCCallbackInput) (*models.O
 		log.Printf("ERROR HandleCallback: Failed to get state for token='%s': %v", input.State, err)
 		return nil, nil, fmt.Errorf("invalid or expired state: %w", err)
 	}
-	log.Printf("DEBUG HandleCallback: Found state: tenant_domain='%s', action='%s', provider='%s'", state.TenantDomain, state.Action, state.ProviderName)
+	log.Printf("DEBUG HandleCallback: Found state: workspace_domain='%s', action='%s', provider='%s'", state.WorkspaceDomain, state.Action, state.ProviderName)
 
 	// If the row carries a v4 signed-state payload, verify it before
 	// trusting the workspace/application columns. Mismatches mean either
@@ -335,12 +335,8 @@ func (s *OIDCService) resolveEnabledProvider(workspaceID uuid.UUID, providerName
 	return provider, nil
 }
 
-// GetIdentityByProviderUser looks up if a provider user exists in any tenant
-func (s *OIDCService) GetIdentityByProviderUser(providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
-	return s.identityRepo.GetIdentityByProviderUser(providerName, providerUserID)
-}
-
-// GetIdentityByTenantAndProviderUser looks up if a provider user exists in a specific tenant
+// GetIdentityByTenantAndProviderUser looks up if a provider user exists in a specific workspace.
+// This is the only sanctioned identity lookup — global (cross-workspace) lookups are forbidden.
 func (s *OIDCService) GetIdentityByTenantAndProviderUser(workspaceID uuid.UUID, providerName, providerUserID string) (*models.OIDCUserIdentity, error) {
 	return s.identityRepo.GetIdentityByTenantAndProviderUser(workspaceID, providerName, providerUserID)
 }

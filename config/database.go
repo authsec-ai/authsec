@@ -70,8 +70,8 @@ func GetDatabase() *database.DBConnection {
 }
 
 // Multi-tenant routing helpers (GetTenantDatabase, GetTenantGORMDB,
-// middlewares.GetConnectionDynamically, middlewares.ConnectToTenantDB,
-// middlewares.CloseTenantDB) have been removed. AuthSec is single-DB at the
+// middlewares.GetConnectionDynamically, middlewares.ConnectToWorkspaceDB,
+// middlewares.CloseWorkspaceDB) have been removed. AuthSec is single-DB at the
 // product layer; tenant/workspace separation is row-level via WHERE predicates
 // against config.DB. Migration-only tooling in internal/migration still opens
 // per-tenant connections.

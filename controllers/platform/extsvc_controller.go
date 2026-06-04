@@ -119,8 +119,8 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 		return nil, "", "", fmt.Errorf("invalid claims format: %T", claimsInterface)
 	}
 
-	tenantIDStr, ok := claims["workspace_id"].(string)
-	if !ok || tenantIDStr == "" {
+	workspaceIDStr, ok := claims["workspace_id"].(string)
+	if !ok || workspaceIDStr == "" {
 		return nil, "", "", fmt.Errorf("workspace_id not found in claims")
 	}
 	clientIDStr, ok := claims["client_id"].(string)
@@ -128,7 +128,7 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 		return nil, "", "", fmt.Errorf("client_id not found in claims")
 	}
 
-	tenantUUID, err := uuid.Parse(tenantIDStr)
+	workspaceUUID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("invalid tenant ID: %w", err)
 	}
@@ -136,21 +136,21 @@ func (ctl *ExternalServiceController) resolveTenant(c *gin.Context) (*gorm.DB, s
 	// Single-DB mode: no per-tenant database. Validate the workspace exists,
 	// then operate on the single global connection.
 	var ws struct{ ID uuid.UUID }
-	if err := ctl.globalDB.Table("workspaces").Select("id").Where("id = ?", tenantUUID).First(&ws).Error; err != nil {
+	if err := ctl.globalDB.Table("workspaces").Select("id").Where("id = ?", workspaceUUID).First(&ws).Error; err != nil {
 		return nil, "", "", fmt.Errorf("workspace not found: %w", err)
 	}
 
 	tenantDB := config.DB
 
-	if err := ctl.ensureTenantSchema(tenantIDStr, tenantDB); err != nil {
+	if err := ctl.ensureTenantSchema(workspaceIDStr, tenantDB); err != nil {
 		return nil, "", "", fmt.Errorf("failed to prepare tenant schema: %w", err)
 	}
 
-	if err := ctl.ensureAdminBinding(c, tenantDB, tenantIDStr); err != nil {
+	if err := ctl.ensureAdminBinding(c, tenantDB, workspaceIDStr); err != nil {
 		return nil, "", "", fmt.Errorf("failed to ensure admin role binding: %w", err)
 	}
 
-	return tenantDB, clientIDStr, tenantIDStr, nil
+	return tenantDB, clientIDStr, workspaceIDStr, nil
 }
 
 func (ctl *ExternalServiceController) ensureTenantSchema(workspaceID string, tenantDB *gorm.DB) error {

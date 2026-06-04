@@ -143,7 +143,7 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize CIBA auth controller: %v", err)
 	}
 
-	tenantCIBAController, err := userCtrl.NewTenantCIBAController()
+	workspaceCIBAController, err := userCtrl.NewTenantCIBAController()
 	if err != nil {
 		log.Fatalf("Failed to initialize tenant CIBA auth controller: %v", err)
 	}
@@ -154,7 +154,7 @@ func SetupRoutes(
 		log.Fatalf("Failed to initialize agent action controller: %v", err)
 	}
 
-	tenantTOTPController := userCtrl.NewTenantTOTPController()
+	workspaceTOTPController := userCtrl.NewTenantTOTPController()
 
 	spiffeDelegateController, err := platformCtrl.NewSpiffeDelegateController()
 	if err != nil {
@@ -256,7 +256,7 @@ func SetupRoutes(
 		scopePresets.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			scopePresets.GET("", rsController.ScopePresets)
@@ -266,7 +266,7 @@ func SetupRoutes(
 		resourceServers.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			resourceServers.POST("", rsController.Create)
@@ -331,7 +331,7 @@ func SetupRoutes(
 		applications.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			applications.POST("", applicationsController.Create)
@@ -397,7 +397,7 @@ func SetupRoutes(
 		v1.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			v1.GET("/workspaces/:workspace_id/applications/posture-summary", applicationsController.PostureSummary)
@@ -419,25 +419,25 @@ func SetupRoutes(
 		authsec.GET("/application-roles",
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 			scopeMatrixController.ListApplicationRoles,
 		)
 		authsec.GET("/scope-catalog",
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 			scopeMatrixController.ListScopeCatalog,
 		)
 		authsec.POST("/scope-catalog",
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 			scopeMatrixController.CreateScopeCatalogEntry,
 		)
 		authsec.POST("/scope-catalog/:catalog_id/applications/:application_id",
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 			scopeMatrixController.AttachScopeCatalogEntryToApplication,
 		)
 
@@ -448,7 +448,7 @@ func SetupRoutes(
 		scimConnections.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			scimConnections.POST("", scimConnectionsController.Create)
@@ -464,7 +464,7 @@ func SetupRoutes(
 		idps.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			idps.POST("", identityProvidersController.Create)
@@ -479,7 +479,7 @@ func SetupRoutes(
 		scopes.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			scopes.PUT("/:scope_id", scopeMatrixController.UpdateScope)
@@ -491,7 +491,7 @@ func SetupRoutes(
 		consentGrants.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			consentGrants.GET("", oauthASController.ListConsentGrants)
@@ -552,7 +552,7 @@ func SetupRoutes(
 		adminRBAC.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			adminRBAC.POST("/roles", rolesScopedBindingsController.CreateRoleCompositeAdmin)
@@ -600,7 +600,7 @@ func SetupRoutes(
 
 		// Authenticated OIDC endpoints
 		oidcAuth := uflow.Group("/oidc")
-		oidcAuth.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+		oidcAuth.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
 		{
 			oidcAuth.POST("/link", oidcController.LinkIdentity)
 			oidcAuth.GET("/identities", oidcController.GetLinkedIdentities)
@@ -613,7 +613,7 @@ func SetupRoutes(
 		auth := uflow.Group("/auth")
 		{
 			notify := auth.Group("/notify")
-			notify.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+			notify.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
 			{
 				notify.POST("/new-user-registration", endUserController.NotifyOwnerNewRegistration)
 			}
@@ -627,7 +627,6 @@ func SetupRoutes(
 				adminAuth.POST("/login/bootstrap", adminAuthController.AdminBootstrap)
 				adminAuth.POST("/login/resend-otp", adminAuthController.AdminResendOTP)
 				adminAuth.POST("/login", adminAuthController.AdminLogin)
-				adminAuth.POST("/login-hybrid", adminAuthController.AdminLoginHybrid)
 				adminAuth.POST("/register", adminAuthController.AdminRegister)
 				adminAuth.POST("/complete-registration", adminAuthController.AdminCompleteRegistration)
 				adminAuth.POST("/forgot-password", adminAuthController.AdminForgotPassword)
@@ -707,23 +706,23 @@ func SetupRoutes(
 		{
 			workspaceCIBA := workspaceAuth.Group("/ciba")
 			{
-				workspaceCIBA.POST("/initiate", tenantCIBAController.InitiateTenantCIBA)
-				workspaceCIBA.POST("/token", tenantCIBAController.PollTenantCIBAToken)
-				workspaceCIBA.POST("/respond", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RespondToTenantCIBA)
-				workspaceCIBA.POST("/register-device", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.RegisterTenantDevice)
-				workspaceCIBA.GET("/requests", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.GetTenantCIBARequests)
-				workspaceCIBA.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.ListTenantDevices)
-				workspaceCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantCIBAController.DeleteTenantDevice)
+				workspaceCIBA.POST("/initiate", workspaceCIBAController.InitiateTenantCIBA)
+				workspaceCIBA.POST("/token", workspaceCIBAController.PollTenantCIBAToken)
+				workspaceCIBA.POST("/respond", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceCIBAController.RespondToTenantCIBA)
+				workspaceCIBA.POST("/register-device", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceCIBAController.RegisterTenantDevice)
+				workspaceCIBA.GET("/requests", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceCIBAController.GetTenantCIBARequests)
+				workspaceCIBA.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceCIBAController.ListTenantDevices)
+				workspaceCIBA.DELETE("/devices/:device_id", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceCIBAController.DeleteTenantDevice)
 			}
 
 			workspaceTOTP := workspaceAuth.Group("/totp")
 			{
-				workspaceTOTP.POST("/login", tenantTOTPController.LoginWithTenantTOTP)
-				workspaceTOTP.POST("/register", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.RegisterTenantTOTPDevice)
-				workspaceTOTP.POST("/confirm", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.ConfirmTenantTOTPDevice)
-				workspaceTOTP.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.GetTenantTOTPDevices)
-				workspaceTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.DeleteTenantTOTPDevice)
-				workspaceTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken(), tenantTOTPController.SetTenantPrimaryTOTPDevice)
+				workspaceTOTP.POST("/login", workspaceTOTPController.LoginWithTenantTOTP)
+				workspaceTOTP.POST("/register", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceTOTPController.RegisterTenantTOTPDevice)
+				workspaceTOTP.POST("/confirm", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceTOTPController.ConfirmTenantTOTPDevice)
+				workspaceTOTP.GET("/devices", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceTOTPController.GetTenantTOTPDevices)
+				workspaceTOTP.POST("/devices/delete", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceTOTPController.DeleteTenantTOTPDevice)
+				workspaceTOTP.POST("/devices/primary", middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken(), workspaceTOTPController.SetTenantPrimaryTOTPDevice)
 			}
 		}
 
@@ -734,7 +733,7 @@ func SetupRoutes(
 		admin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			admin.GET("/tenants", adminUserController.ListTenants)
@@ -769,7 +768,7 @@ func SetupRoutes(
 		adminPlatform.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			adminPlatform.GET("/oidc/providers", oidcController.GetAllProviders)
@@ -802,7 +801,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 
 		// SCIM token
 		scimToken := uflow.Group("/admin/scim")
-		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+		scimToken.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
 		{
 			scimToken.POST("/generate-token", scimController.GenerateSCIMToken)
 		}
@@ -817,7 +816,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		v2.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			// Tenant memberships (operators)
@@ -848,7 +847,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		delegationPolicies.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			delegationPolicies.POST("", delegationPolicyCtrl.CreateDelegationPolicy)
@@ -873,7 +872,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		enduserAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 		}
@@ -895,7 +894,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			user.POST("/oidc/login", endUserController.OIDCLogin)
 		}
 
-		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+		user.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
 		{
 			user.GET("/enduser/:workspace_id/:user_id", endUserController.GetEndUser)
 			user.POST("/enduser/list", endUserController.GetEndUsers)
@@ -933,7 +932,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		// HubSpot integration
 		// ────────────────────────────────────────────────────
 		hubspot := uflow.Group("/hubspot")
-		hubspot.Use(middlewares.AuthMiddleware(), middlewares.ValidateTenantFromToken())
+		hubspot.Use(middlewares.AuthMiddleware(), middlewares.ValidateWorkspaceFromToken())
 		{
 			hubspot.POST("/contacts/sync", hubspotController.SyncContact)
 		}
@@ -977,7 +976,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		scimAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			scimAdmin.GET("/Users", scimAdminController.ListAdminUsers)
@@ -1007,7 +1006,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		agentGuardAdmin.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			agentGuardAdmin.GET("", agentActionController.ListRiskPolicies)
@@ -1021,7 +1020,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		agentGuardSettings.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			agentGuardSettings.GET("/settings", agentActionController.GetSettings)
@@ -1033,7 +1032,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		agentAudit.Use(
 			middlewares.AuthMiddleware(),
 			middlewares.RequireWorkspaceRole("owner", "admin"),
-			middlewares.ValidateTenantFromToken(),
+			middlewares.ValidateWorkspaceFromToken(),
 		)
 		{
 			agentAudit.GET("", agentActionController.GetAuditLog)
@@ -1084,23 +1083,13 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			tenants.Use(middlewares.AuthMiddleware())
 			{
 				tenants.GET("", migCtrl.ListTenants)
-				tenants.POST("/create-db", migCtrl.CreateTenantDB)
+				tenants.POST("/create-db", migCtrl.CreateWorkspaceDB)
 				tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
 				tenants.GET("/template-status", migCtrl.GetTemplateStatus)
 				tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
 				tenants.POST("/:workspace_id/migrations/run", migCtrl.RunTenantMigrations)
 				tenants.GET("/:workspace_id/migrations/status", migCtrl.GetTenantMigrationStatus)
 			}
-		}
-
-		// ────────────────────────────────────────────────────
-		// Purge (temporary dev/ops utility — remove before prod)
-		// Served under /authsec/admin/purge.
-		// ────────────────────────────────────────────────────
-		purgeCtrl := adminCtrl.NewPurgeController()
-		purge := authsec.Group("/admin/purge")
-		{
-			purge.DELETE("/user", purgeCtrl.PurgeUserByEmail)
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1366,11 +1355,11 @@ func registerOocmgrRoutes(r gin.IRouter) {
 func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
 
-	// Public / unauthenticated token endpoints (no /authmgr prefix — these are standalone)
+	// Token endpoints — /verify is public, /generate and /oidc require auth.
 	tokenGroup := r.Group("/auth/token")
 	{
 		tokenGroup.POST("/verify", ac.VerifyToken)
-		tokenGroup.POST("/generate", ac.GenerateToken)
+		tokenGroup.POST("/generate", middlewares.AuthMiddleware(), ac.GenerateToken)
 		tokenGroup.POST("/oidc", ac.OIDCToken)
 	}
 
@@ -1424,8 +1413,8 @@ func registerSpireRoutes(r gin.IRouter) {
 	spire.GET("/.well-known/openid-configuration", sc.OIDCDiscovery)
 	spire.GET("/.well-known/jwks.json", sc.OIDCJWKSHandler)
 
-	// ── Registry ──
-	registry := spire.Group("/registry")
+	// ── Registry (requires authentication) ──
+	registry := spire.Group("/registry", middlewares.AuthMiddleware())
 	{
 		registry.POST("/workloads", sc.RegisterWorkload)
 		registry.PUT("/workloads/:id", sc.UpdateWorkload)

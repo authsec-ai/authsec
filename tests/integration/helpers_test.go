@@ -64,18 +64,18 @@ func doUnauthRequest(method, path string, body interface{}) *testResponse {
 // generateAdminToken creates a valid admin JWT token.
 func generateAdminToken() string {
 	return generateTokenForTenant(
-		testTenantID, testAdminUserID, testAdminEmail,
+		testWorkspaceID, testAdminUserID, testAdminEmail,
 		[]string{"admin", "super_admin"},
-		testTenantDomain,
+		testWorkspaceDomain,
 	)
 }
 
 // generateEndUserToken creates a valid end-user JWT token.
 func generateEndUserToken() string {
 	return generateTokenForTenant(
-		testTenantID, testEndUserID, testEndUserEmail,
+		testWorkspaceID, testEndUserID, testEndUserEmail,
 		[]string{"user"},
-		testTenantDomain,
+		testWorkspaceDomain,
 	)
 }
 
@@ -83,19 +83,19 @@ func generateEndUserToken() string {
 // Use this to assert that non-admin callers receive 403 on admin-gated endpoints.
 func generateNonAdminToken() string {
 	return generateTokenForTenant(
-		testTenantID, testEndUserID, testEndUserEmail,
+		testWorkspaceID, testEndUserID, testEndUserEmail,
 		[]string{"user"},
-		testTenantDomain,
+		testWorkspaceDomain,
 	)
 }
 
 // generateOtherTenantAdminToken creates a JWT for an admin in a different tenant.
 // Use this to assert that cross-tenant callers receive 404 on ownership-checked endpoints.
-func generateOtherTenantAdminToken(otherTenantID uuid.UUID) string {
+func generateOtherTenantAdminToken(otherWorkspaceID uuid.UUID) string {
 	otherUserID := uuid.New()
 	otherEmail := "admin@other.authsec.local"
 	otherDomain := "other.authsec.local"
-	return generateTokenForTenant(otherTenantID, otherUserID, otherEmail, []string{"admin", "super_admin"}, otherDomain)
+	return generateTokenForTenant(otherWorkspaceID, otherUserID, otherEmail, []string{"admin", "super_admin"}, otherDomain)
 }
 
 // generateExpiredToken creates an expired JWT token for auth rejection tests.
@@ -105,7 +105,7 @@ func generateExpiredToken() string {
 		"sub":       testAdminUserID.String(),
 		"user_id":   testAdminUserID.String(),
 		"email":     testAdminEmail,
-		"tenant_id": testTenantID.String(),
+		"workspace_id": testWorkspaceID.String(),
 		"roles":     []string{"admin"},
 		"iss":       "authsec-ai/auth-manager",
 		"aud":       "authsec-api",
@@ -119,17 +119,17 @@ func generateExpiredToken() string {
 }
 
 // generateTokenForTenant creates a JWT token with configurable claims.
-func generateTokenForTenant(tenantID, userID uuid.UUID, email string, roles []string, tenantDomain string) string {
+func generateTokenForTenant(workspaceID, userID uuid.UUID, email string, roles []string, workspaceDomain string) string {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"sub":           userID.String(),
 		"user_id":       userID.String(),
 		"email":         email,
 		"email_id":      email,
-		"tenant_id":     tenantID.String(),
+		"workspace_id":     workspaceID.String(),
 		"client_id":     testClientID.String(),
 		"project_id":    testProjectID.String(),
-		"tenant_domain": tenantDomain,
+		"workspace_domain": workspaceDomain,
 		"roles":         roles,
 		"scope":         "admin:* users:* tenants:* clients:* roles:* permissions:* external-service:*",
 		"token_type":    "default",

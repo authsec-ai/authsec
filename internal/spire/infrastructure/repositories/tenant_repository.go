@@ -10,28 +10,28 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire/errors"
 )
 
-// PostgresTenantRepository implements the TenantRepository interface
-type PostgresTenantRepository struct {
+// PostgresWorkspaceRepository implements the WorkspaceRepository interface
+type PostgresWorkspaceRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresTenantRepository creates a new tenant repository
-func NewPostgresTenantRepository(db *sql.DB) repositories.TenantRepository {
-	return &PostgresTenantRepository{db: db}
+// NewPostgresWorkspaceRepository creates a new tenant repository
+func NewPostgresWorkspaceRepository(db *sql.DB) repositories.WorkspaceRepository {
+	return &PostgresWorkspaceRepository{db: db}
 }
 
-// GetByID retrieves a tenant by ID (queries by tenant_id UUID from JWT)
-func (r *PostgresTenantRepository) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
+// GetByID retrieves a tenant by ID (queries by workspace_id UUID from JWT)
+func (r *PostgresWorkspaceRepository) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
 	query := `
 		SELECT
-			tenant_id::text,
+			workspace_id::text,
 			name,
-			COALESCE(vault_mount, tenant_domain) as vault_mount,
+			COALESCE(vault_mount, workspace_domain) as vault_mount,
 			status,
 			created_at,
 			updated_at
 		FROM tenants
-		WHERE tenant_id = $1::uuid AND status = 'active'
+		WHERE workspace_id = $1::uuid AND status = 'active'
 	`
 
 	tenant := &models.Tenant{}
@@ -55,17 +55,17 @@ func (r *PostgresTenantRepository) GetByID(ctx context.Context, id string) (*mod
 }
 
 // GetByDomain retrieves a tenant by domain name
-func (r *PostgresTenantRepository) GetByDomain(ctx context.Context, domain string) (*models.Tenant, error) {
+func (r *PostgresWorkspaceRepository) GetByDomain(ctx context.Context, domain string) (*models.Tenant, error) {
 	query := `
 		SELECT
-			tenant_id::text,
+			workspace_id::text,
 			name,
-			COALESCE(vault_mount, tenant_domain) as vault_mount,
+			COALESCE(vault_mount, workspace_domain) as vault_mount,
 			status,
 			created_at,
 			updated_at
 		FROM tenants
-		WHERE tenant_domain = $1 AND status = 'active'
+		WHERE workspace_domain = $1 AND status = 'active'
 	`
 
 	tenant := &models.Tenant{}
@@ -89,7 +89,7 @@ func (r *PostgresTenantRepository) GetByDomain(ctx context.Context, domain strin
 }
 
 // Create creates a new tenant
-func (r *PostgresTenantRepository) Create(ctx context.Context, tenant *models.Tenant) error {
+func (r *PostgresWorkspaceRepository) Create(ctx context.Context, tenant *models.Tenant) error {
 	query := `
 		INSERT INTO tenants (id, name, vault_mount, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -121,7 +121,7 @@ func (r *PostgresTenantRepository) Create(ctx context.Context, tenant *models.Te
 }
 
 // Update updates an existing tenant
-func (r *PostgresTenantRepository) Update(ctx context.Context, tenant *models.Tenant) error {
+func (r *PostgresWorkspaceRepository) Update(ctx context.Context, tenant *models.Tenant) error {
 	query := `
 		UPDATE tenants
 		SET name = $2, vault_mount = $3,status = $4, updated_at = $5
@@ -156,7 +156,7 @@ func (r *PostgresTenantRepository) Update(ctx context.Context, tenant *models.Te
 }
 
 // Delete soft deletes a tenant
-func (r *PostgresTenantRepository) Delete(ctx context.Context, id string) error {
+func (r *PostgresWorkspaceRepository) Delete(ctx context.Context, id string) error {
 	query := `
 		UPDATE tenants
 		SET status = 'deleted', updated_at = $2
@@ -181,7 +181,7 @@ func (r *PostgresTenantRepository) Delete(ctx context.Context, id string) error 
 }
 
 // List retrieves all active tenants
-func (r *PostgresTenantRepository) List(ctx context.Context) ([]*models.Tenant, error) {
+func (r *PostgresWorkspaceRepository) List(ctx context.Context) ([]*models.Tenant, error) {
 	query := `
 		SELECT id, name, vault_mount, status, created_at, updated_at
 		FROM tenants

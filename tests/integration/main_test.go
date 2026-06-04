@@ -27,7 +27,7 @@ var (
 	testRouter *gin.Engine
 	testDBName string
 
-	testTenantID     uuid.UUID
+	testWorkspaceID     uuid.UUID
 	testAdminUserID  uuid.UUID
 	testEndUserID    uuid.UUID
 	testClientID     uuid.UUID
@@ -35,7 +35,7 @@ var (
 	testAdminRoleID  uuid.UUID
 	testAdminEmail   = "admin@test.authsec.local"
 	testEndUserEmail = "enduser@test.authsec.local"
-	testTenantDomain = "test.authsec.local"
+	testWorkspaceDomain = "test.authsec.local"
 	testPassword     = "TestPassword123!"
 
 	jwtDefSecret = "test-integration-jwt-def-secret-32chars!"
@@ -45,15 +45,15 @@ var (
 	testResourceServerID uuid.UUID
 	testScopeID          uuid.UUID
 	testConsentGrantID   uuid.UUID
-	testOtherTenantID    uuid.UUID
+	testOtherWorkspaceID    uuid.UUID
 
 	// Foreign rows for ownership-check tests (real DB rows, not random UUIDs)
-	testOtherTenantRSID    uuid.UUID // RS owned by testOtherTenantID
-	testOtherTenantScopeID uuid.UUID // scope owned by testOtherTenantID's RS
-	testOtherTenantPermID  uuid.UUID // permission owned by testOtherTenantID
-	testOtherTenantToolID  uuid.UUID // MCP tool owned by testOtherTenantID's RS
+	testOtherTenantRSID    uuid.UUID // RS owned by testOtherWorkspaceID
+	testOtherTenantScopeID uuid.UUID // scope owned by testOtherWorkspaceID's RS
+	testOtherTenantPermID  uuid.UUID // permission owned by testOtherWorkspaceID
+	testOtherTenantToolID  uuid.UUID // MCP tool owned by testOtherWorkspaceID's RS
 
-	// Second RS in testTenantID — for same-tenant cross-RS parent isolation test
+	// Second RS in testWorkspaceID — for same-tenant cross-RS parent isolation test
 	testSecondRSID      uuid.UUID
 	testSecondRSScopeID uuid.UUID
 

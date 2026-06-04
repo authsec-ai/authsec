@@ -21,10 +21,10 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controller := &EndUserController{}
 
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	userID := uuid.New()
 
-	db := setupTenantTestDB(t, tenantID, userID, false)
+	db := setupTenantTestDB(t, workspaceID, userID, false)
 
 	overrideTenantConnection(t, db)
 	overrideTimeNow(t)
@@ -32,7 +32,7 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 
 	if err := db.Table("users").Create(map[string]interface{}{
 		"id":         uuid.New().String(),
-		"tenant_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"active":     true,
 		"updated_at": time.Now(),
 	}).Error; err != nil {
@@ -40,7 +40,7 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	}
 
 	payload := map[string]interface{}{
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"user_id":      userID.String(),
 		"active":       true,
 	}
@@ -61,7 +61,7 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	assert.Equal(t, "User updated successfully", response["message"])
 
 	var active bool
-	if err := db.Table("users").Where("id = ? AND tenant_id = ?", userID.String(), tenantID.String()).Pluck("active", &active).Error; err != nil {
+	if err := db.Table("users").Where("id = ? AND workspace_id = ?", userID.String(), workspaceID.String()).Pluck("active", &active).Error; err != nil {
 		t.Fatalf("failed to fetch user row: %v", err)
 	}
 	assert.True(t, active)
@@ -71,10 +71,10 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controller := &EndUserController{}
 
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	userID := uuid.New()
 
-	db := setupTenantTestDB(t, tenantID, userID, true)
+	db := setupTenantTestDB(t, workspaceID, userID, true)
 
 	overrideTenantConnection(t, db)
 	overrideTimeNow(t)
@@ -82,7 +82,7 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 
 	if err := db.Table("users").Create(map[string]interface{}{
 		"id":         uuid.New().String(),
-		"tenant_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"active":     true,
 		"updated_at": time.Now(),
 	}).Error; err != nil {
@@ -90,7 +90,7 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	}
 
 	payload := map[string]string{
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"user_id":      userID.String(),
 	}
 
@@ -101,8 +101,8 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	c.Request = httptest.NewRequest("DELETE", "/uflow/user/enduser/delete", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
-	setTokenClaimsInContext(c, tenantID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID.String()})
+	setTokenClaimsInContext(c, workspaceID.String(), userID.String())
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
 
 	controller.DeleteEndUser(c)
 
@@ -113,7 +113,7 @@ func TestDeleteEndUser_SoftDeletesRecord(t *testing.T) {
 	assert.Equal(t, "User deleted successfully", response["message"])
 
 	var active bool
-	if err := db.Table("users").Where("id = ? AND tenant_id = ?", userID.String(), tenantID.String()).Pluck("active", &active).Error; err != nil {
+	if err := db.Table("users").Where("id = ? AND workspace_id = ?", userID.String(), workspaceID.String()).Pluck("active", &active).Error; err != nil {
 		t.Fatalf("failed to fetch user row: %v", err)
 	}
 	assert.False(t, active)
@@ -123,10 +123,10 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controller := &EndUserController{}
 
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	userID := uuid.New()
 
-	db := setupTenantTestDB(t, tenantID, userID, true)
+	db := setupTenantTestDB(t, workspaceID, userID, true)
 
 	overrideTenantConnection(t, db)
 	overrideTimeNow(t)
@@ -134,7 +134,7 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 
 	if err := db.Table("users").Create(map[string]interface{}{
 		"id":         uuid.New().String(),
-		"tenant_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"active":     true,
 		"updated_at": time.Now(),
 	}).Error; err != nil {
@@ -142,7 +142,7 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	}
 
 	payload := map[string]interface{}{
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"user_id":      userID.String(),
 		"active":       "false",
 	}
@@ -163,7 +163,7 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	assert.Equal(t, "User updated successfully", response["message"])
 
 	var active bool
-	if err := db.Table("users").Where("id = ? AND tenant_id = ?", userID.String(), tenantID.String()).Pluck("active", &active).Error; err != nil {
+	if err := db.Table("users").Where("id = ? AND workspace_id = ?", userID.String(), workspaceID.String()).Pluck("active", &active).Error; err != nil {
 		t.Fatalf("failed to fetch user row: %v", err)
 	}
 	assert.False(t, active)
@@ -173,17 +173,17 @@ func TestActiveOrDeactiveEndUser_BlocksLastActive(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controller := &EndUserController{}
 
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	userID := uuid.New()
 
-	db := setupTenantTestDB(t, tenantID, userID, true)
+	db := setupTenantTestDB(t, workspaceID, userID, true)
 
 	overrideTenantConnection(t, db)
 	overrideTimeNow(t)
 	overrideConfigDB(t, db)
 
 	payload := map[string]interface{}{
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"user_id":      userID.String(),
 		"active":       false,
 	}
@@ -207,10 +207,10 @@ func TestDeleteEndUser_BlocksLastActive(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controller := &EndUserController{}
 
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 	userID := uuid.New()
 
-	db := setupTenantTestDB(t, tenantID, userID, true)
+	db := setupTenantTestDB(t, workspaceID, userID, true)
 
 	overrideTenantConnection(t, db)
 	overrideTimeNow(t)
@@ -220,15 +220,15 @@ func TestDeleteEndUser_BlocksLastActive(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 
 	body, _ := json.Marshal(map[string]string{
-		"workspace_id": tenantID.String(),
+		"workspace_id": workspaceID.String(),
 		"user_id":      userID.String(),
 	})
 
 	c.Request = httptest.NewRequest("DELETE", "/uflow/user/enduser/delete", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Set token claims for auth middleware simulation
-	setTokenClaimsInContext(c, tenantID.String(), userID.String())
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: tenantID.String()})
+	setTokenClaimsInContext(c, workspaceID.String(), userID.String())
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
 
 	controller.DeleteEndUser(c)
 
@@ -238,7 +238,7 @@ func TestDeleteEndUser_BlocksLastActive(t *testing.T) {
 	assert.Equal(t, "cannot deactivate the last active user in this tenant", response["error"])
 }
 
-func setupTenantTestDB(t *testing.T, tenantID, userID uuid.UUID, initialActive bool) *gorm.DB {
+func setupTenantTestDB(t *testing.T, workspaceID, userID uuid.UUID, initialActive bool) *gorm.DB {
 	t.Helper()
 
 	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
@@ -252,7 +252,7 @@ func setupTenantTestDB(t *testing.T, tenantID, userID uuid.UUID, initialActive b
 
 	if err := db.Exec(`CREATE TABLE users (
 		id TEXT PRIMARY KEY,
-		tenant_id TEXT NOT NULL,
+		workspace_id TEXT NOT NULL,
 		active BOOLEAN NOT NULL DEFAULT 1,
 		updated_at DATETIME
 	)`).Error; err != nil {
@@ -261,7 +261,7 @@ func setupTenantTestDB(t *testing.T, tenantID, userID uuid.UUID, initialActive b
 
 	if err := db.Table("users").Create(map[string]interface{}{
 		"id":         userID.String(),
-		"tenant_id":  tenantID.String(),
+		"workspace_id":  workspaceID.String(),
 		"active":     initialActive,
 		"updated_at": time.Now(),
 	}).Error; err != nil {

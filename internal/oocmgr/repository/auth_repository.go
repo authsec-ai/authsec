@@ -23,9 +23,9 @@ func NewAuthRepository() *AuthRepository {
 	}
 }
 
-// getTenantDB extracts the tenant database from the Gin context.
-func (ar *AuthRepository) getTenantDB(c *gin.Context) (*gorm.DB, error) {
-	tenantDB, exists := c.Get("tenant_db")
+// getWorkspaceDB extracts the tenant database from the Gin context.
+func (ar *AuthRepository) getWorkspaceDB(c *gin.Context) (*gorm.DB, error) {
+	tenantDB, exists := c.Get("workspace_db")
 	if !exists {
 		return nil, fmt.Errorf("tenant database not found in context")
 	}
@@ -38,7 +38,7 @@ func (ar *AuthRepository) getTenantDB(c *gin.Context) (*gorm.DB, error) {
 
 // CreateConfig creates a new authentication configuration in the tenant database.
 func (ar *AuthRepository) CreateConfig(c *gin.Context, cfg *oocmgrdto.OAuthOIDCConfiguration) (*oocmgrdto.OAuthOIDCConfiguration, error) {
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -64,7 +64,7 @@ func (ar *AuthRepository) GetConfigs(c *gin.Context, req *oocmgrdto.GetConfigsRe
 	var configs []*oocmgrdto.OAuthOIDCConfiguration
 	var total int64
 
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -95,7 +95,7 @@ func (ar *AuthRepository) GetConfigs(c *gin.Context, req *oocmgrdto.GetConfigsRe
 // GetConfigByID retrieves a configuration by ID from the tenant database.
 func (ar *AuthRepository) GetConfigByID(c *gin.Context, req *oocmgrdto.GetConfigByIDRequest) (*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var cfg oocmgrdto.OAuthOIDCConfiguration
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -112,7 +112,7 @@ func (ar *AuthRepository) GetConfigByID(c *gin.Context, req *oocmgrdto.GetConfig
 // GetConfigByName retrieves a configuration by name from the tenant database.
 func (ar *AuthRepository) GetConfigByName(c *gin.Context, req *oocmgrdto.GetConfigByNameRequest) (*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var cfg oocmgrdto.OAuthOIDCConfiguration
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -129,7 +129,7 @@ func (ar *AuthRepository) GetConfigByName(c *gin.Context, req *oocmgrdto.GetConf
 // UpdateConfig updates an existing configuration in the tenant database.
 func (ar *AuthRepository) UpdateConfig(c *gin.Context, req *oocmgrdto.UpdateConfigRequest) (*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var cfg oocmgrdto.OAuthOIDCConfiguration
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -178,7 +178,7 @@ func (ar *AuthRepository) UpdateConfig(c *gin.Context, req *oocmgrdto.UpdateConf
 
 // DeleteConfig soft deletes a configuration from the tenant database.
 func (ar *AuthRepository) DeleteConfig(c *gin.Context, req *oocmgrdto.DeleteConfigRequest) error {
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -198,7 +198,7 @@ func (ar *AuthRepository) GetTenantConfigs(c *gin.Context, req *oocmgrdto.GetTen
 	var configs []*oocmgrdto.OAuthOIDCConfiguration
 	var total int64
 
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -226,7 +226,7 @@ func (ar *AuthRepository) GetTenantConfigs(c *gin.Context, req *oocmgrdto.GetTen
 // GetConfigsByType retrieves configurations by type for a tenant.
 func (ar *AuthRepository) GetConfigsByType(c *gin.Context, req *oocmgrdto.GetConfigsByTypeRequest) ([]*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var configs []*oocmgrdto.OAuthOIDCConfiguration
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -245,7 +245,7 @@ func (ar *AuthRepository) GetConfigsByType(c *gin.Context, req *oocmgrdto.GetCon
 // CheckTenantHasConfig checks if a tenant has a specific configuration type.
 func (ar *AuthRepository) CheckTenantHasConfig(c *gin.Context, req *oocmgrdto.CheckTenantConfigRequest) (*oocmgrdto.TenantConfigCheckResponse, error) {
 	var count int64
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -271,7 +271,7 @@ func (ar *AuthRepository) CheckTenantHasConfig(c *gin.Context, req *oocmgrdto.Ch
 // GetActiveConfigByType retrieves the active configuration by type for a tenant.
 func (ar *AuthRepository) GetActiveConfigByType(c *gin.Context, workspaceID, orgID uuid.UUID, configType string) (*oocmgrdto.OAuthOIDCConfiguration, error) {
 	var cfg oocmgrdto.OAuthOIDCConfiguration
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -287,7 +287,7 @@ func (ar *AuthRepository) GetActiveConfigByType(c *gin.Context, workspaceID, org
 
 // DeactivateOtherConfigs deactivates other configurations of the same type.
 func (ar *AuthRepository) DeactivateOtherConfigs(c *gin.Context, workspaceID, orgID uuid.UUID, configType string, excludeID uuid.UUID) error {
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return fmt.Errorf("failed to get tenant database: %w", err)
 	}
@@ -309,7 +309,7 @@ func (ar *AuthRepository) GetConfigStats(c *gin.Context, req *oocmgrdto.GetConfi
 		ByType:   make(map[string]int64),
 	}
 
-	tenantDB, err := ar.getTenantDB(c)
+	tenantDB, err := ar.getWorkspaceDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant database: %w", err)
 	}

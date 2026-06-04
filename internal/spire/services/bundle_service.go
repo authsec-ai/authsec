@@ -14,19 +14,19 @@ import (
 
 // BundleService handles CA bundle retrieval
 type BundleService struct {
-	tenantRepo  repositories.TenantRepository
+	workspaceRepo  repositories.WorkspaceRepository
 	vaultClient *vault.Client
 	logger      *logrus.Entry
 }
 
 // NewBundleService creates a new bundle service
 func NewBundleService(
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *BundleService {
 	return &BundleService{
-		tenantRepo:  tenantRepo,
+		workspaceRepo:  workspaceRepo,
 		vaultClient: vaultClient,
 		logger:      logger,
 	}
@@ -34,7 +34,7 @@ func NewBundleService(
 
 // GetBundle retrieves the CA bundle for a tenant
 func (s *BundleService) GetBundle(ctx context.Context, tenantIdentifier string) (string, error) {
-	s.logger.WithField("tenant_identifier", tenantIdentifier).Debug("Getting CA bundle")
+	s.logger.WithField("workspace_identifier", tenantIdentifier).Debug("Getting CA bundle")
 
 	// Determine if identifier is a UUID or domain
 	// UUIDs contain hyphens, domains contain dots
@@ -45,13 +45,13 @@ func (s *BundleService) GetBundle(ctx context.Context, tenantIdentifier string) 
 
 	if isUUID {
 		// Try to get tenant by ID (UUID)
-		tenant, err = s.tenantRepo.GetByID(ctx, tenantIdentifier)
+		tenant, err = s.workspaceRepo.GetByID(ctx, tenantIdentifier)
 		if err != nil {
 			return "", err
 		}
 	} else {
 		// Try to get tenant by domain
-		tenant, err = s.tenantRepo.GetByDomain(ctx, tenantIdentifier)
+		tenant, err = s.workspaceRepo.GetByDomain(ctx, tenantIdentifier)
 		if err != nil {
 			return "", err
 		}

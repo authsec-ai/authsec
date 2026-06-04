@@ -103,7 +103,7 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt Entra ID config if applicable
 	if req.SyncType == "entra_id" && req.EntraConfig != nil {
-		syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
+		syncConfig.EntraWorkspaceID = req.EntraConfig.WorkspaceID
 		syncConfig.EntraClientID = req.EntraConfig.ClientID
 		syncConfig.EntraSkipVerify = req.EntraConfig.SkipVerify
 
@@ -293,7 +293,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	// Update Entra ID config if provided
 	if req.EntraConfig != nil && syncConfig.SyncType == "entra_id" {
 		if req.EntraConfig.WorkspaceID != "" {
-			syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
+			syncConfig.EntraWorkspaceID = req.EntraConfig.WorkspaceID
 		}
 		if req.EntraConfig.ClientID != "" {
 			syncConfig.EntraClientID = req.EntraConfig.ClientID

@@ -44,7 +44,7 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uui
 	// Build query with optional provider filter
 	queryBase := `
 		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
-		       u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
+		       u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
 		       COALESCE(u.provider_id, '') AS provider_id,
 		       COALESCE(u.provider_data, '{}'::jsonb) AS provider_data,
 		       COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
@@ -91,7 +91,7 @@ func (aur *AdminUserRepository) ListAdminUsersByTenantWithFilter(workspaceID uui
 			&user.ClientID,
 			&user.WorkspaceID,
 			&user.ProjectID,
-			&user.TenantDomain,
+			&user.WorkspaceDomain,
 			&user.Provider,
 			&user.ProviderID,
 			&user.ProviderData,
@@ -211,8 +211,8 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(workspaceID uuid
 	}
 
 	// Try to find admin users for this tenant by:
-	// 1. Matching tenant_id and email with tenants table
-	// 2. Or just by tenant_id if the join fails (for OIDC users)
+	// 1. Matching workspace_id and email with tenants table
+	// 2. Or just by workspace_id if the join fails (for OIDC users)
 	var adminUserID uuid.UUID
 	query := `
 		SELECT u.id
@@ -225,7 +225,7 @@ func (aur *AdminUserRepository) EnsureTenantAdminRoleAssignment(workspaceID uuid
 	err = aur.db.QueryRow(query, workspaceID.String()).Scan(&adminUserID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// Fallback: try to find any user with this tenant_id (for OIDC registered users)
+			// Fallback: try to find any user with this workspace_id (for OIDC registered users)
 			fallbackQuery := `
 				SELECT id
 				FROM users
@@ -377,7 +377,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 	query := `
 		INSERT INTO users (id, email, username, password_hash, name,
 			provider, active, temporary_password, temporary_password_expires_at,
-			created_at, updated_at, client_id, workspace_id, project_id, tenant_domain)
+			created_at, updated_at, client_id, workspace_id, project_id, workspace_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
@@ -407,7 +407,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 		user.ClientID,
 		user.WorkspaceID,
 		user.ProjectID,
-		user.TenantDomain,
+		user.WorkspaceDomain,
 	)
 
 	if err != nil {
@@ -455,7 +455,7 @@ func (aur *AdminUserRepository) CreateAdminUser(user *models.AdminUser) error {
 func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.workspace_domain, '') AS workspace_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -482,9 +482,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 		username              sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
-		tenantIDStr           sql.NullString
+		workspaceIDStr           sql.NullString
 		projectIDStr          sql.NullString
-		tenantDomain          sql.NullString
+		workspaceDomain          sql.NullString
 		provider              sql.NullString
 		providerID            sql.NullString
 		providerData          sql.NullString
@@ -512,9 +512,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 		&user.PasswordHash,
 		&name,
 		&clientIDStr,
-		&tenantIDStr,
+		&workspaceIDStr,
 		&projectIDStr,
-		&tenantDomain,
+		&workspaceDomain,
 		&provider,
 		&providerID,
 		&providerData,
@@ -569,8 +569,8 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	if name.Valid {
 		user.Name = name.String
 	}
-	if tenantDomain.Valid {
-		user.TenantDomain = tenantDomain.String
+	if workspaceDomain.Valid {
+		user.WorkspaceDomain = workspaceDomain.String
 	}
 	if provider.Valid {
 		user.Provider = provider.String
@@ -616,8 +616,8 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 			clientID = &parsed
 		}
 	}
-	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
-		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
+	if workspaceIDStr.Valid && strings.TrimSpace(workspaceIDStr.String) != "" {
+		if parsed, err := uuid.Parse(workspaceIDStr.String); err == nil {
 			workspaceID = &parsed
 		}
 	}
@@ -634,15 +634,15 @@ func (aur *AdminUserRepository) GetAdminUserByEmail(email string) (*models.Admin
 	return &user, nil
 }
 
-// GetAdminUserByEmailAndTenantDomain retrieves an admin user by email and tenant_domain (case-insensitive)
-// This method enforces tenant isolation by requiring the user's tenant_domain to match
+// GetAdminUserByEmailAndWorkspaceDomain retrieves an admin user by email and workspace_domain (case-insensitive)
+// This method enforces tenant isolation by requiring the user's workspace_domain to match
 // Uses role_bindings for role assignments (user_roles is deprecated)
 // Only active workspace admins may enter the console. Invited users become
 // eligible after their membership and admin binding are active.
-func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenantDomain string) (*models.AdminUser, error) {
+func (aur *AdminUserRepository) GetAdminUserByEmailAndWorkspaceDomain(email, workspaceDomain string) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.workspace_domain, '') AS workspace_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -657,7 +657,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 		JOIN workspace_memberships wm ON wm.user_id = u.id AND wm.workspace_id = u.workspace_id
 		JOIN roles workspace_role ON workspace_role.id = wm.role_id
 		WHERE LOWER(u.email) = LOWER($1)
-		  AND LOWER(u.tenant_domain) = LOWER($2)
+		  AND LOWER(u.workspace_domain) = LOWER($2)
 		  AND u.active = true
 		  AND u.deleted_at IS NULL
 		  AND LOWER(r.name) = 'admin'
@@ -665,8 +665,8 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenantDomain(email, tenant
 		  AND LOWER(workspace_role.name) = 'admin'
 	`
 
-	fmt.Printf("UserFlow:Debug:: Query to get workspace admin for email %s, tenant_domain %s\n", email, tenantDomain)
-	return aur.scanAdminUserFromQuery(query, email, tenantDomain)
+	fmt.Printf("UserFlow:Debug:: Query to get workspace admin for email %s, workspace_domain %s\n", email, workspaceDomain)
+	return aur.scanAdminUserFromQuery(query, email, workspaceDomain)
 }
 
 // scanAdminUserFromQuery is a helper to scan admin user from a query
@@ -675,9 +675,9 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 		username              sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
-		tenantIDStr           sql.NullString
+		workspaceIDStr           sql.NullString
 		projectIDStr          sql.NullString
-		tenantDomain          sql.NullString
+		workspaceDomain          sql.NullString
 		provider              sql.NullString
 		providerID            sql.NullString
 		providerData          sql.NullString
@@ -705,9 +705,9 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 		&user.PasswordHash,
 		&name,
 		&clientIDStr,
-		&tenantIDStr,
+		&workspaceIDStr,
 		&projectIDStr,
-		&tenantDomain,
+		&workspaceDomain,
 		&provider,
 		&providerID,
 		&providerData,
@@ -757,8 +757,8 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 	if name.Valid {
 		user.Name = name.String
 	}
-	if tenantDomain.Valid {
-		user.TenantDomain = tenantDomain.String
+	if workspaceDomain.Valid {
+		user.WorkspaceDomain = workspaceDomain.String
 	}
 	if provider.Valid {
 		user.Provider = provider.String
@@ -803,8 +803,8 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 			clientID = &parsed
 		}
 	}
-	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
-		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
+	if workspaceIDStr.Valid && strings.TrimSpace(workspaceIDStr.String) != "" {
+		if parsed, err := uuid.Parse(workspaceIDStr.String); err == nil {
 			workspaceID = &parsed
 		}
 	}
@@ -826,7 +826,7 @@ func (aur *AdminUserRepository) scanAdminUserFromQuery(query string, args ...int
 func (aur *AdminUserRepository) GetAdminUserByID(id uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
+			u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
 			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
@@ -851,7 +851,7 @@ func (aur *AdminUserRepository) GetAdminUserByID(id uuid.UUID) (*models.AdminUse
 		&user.ClientID,
 		&user.WorkspaceID,
 		&user.ProjectID,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&user.ProviderID,
 		&user.ProviderData,
@@ -949,7 +949,7 @@ func (aur *AdminUserRepository) UpdateAdminUserActiveStatus(id uuid.UUID, active
 func (aur *AdminUserRepository) GetAllAdminUsers() ([]models.AdminUser, error) {
 	query := `
 		SELECT DISTINCT u.id, u.email, u.username, u.password_hash, u.name,
-			u.client_id, u.workspace_id, u.project_id, u.tenant_domain, u.provider,
+			u.client_id, u.workspace_id, u.project_id, u.workspace_domain, u.provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			COALESCE(u.avatar_url, '') AS avatar_url, u.active, u.mfa_enabled,
 			u.mfa_method, COALESCE(u.mfa_default_method, '') AS mfa_default_method,
@@ -983,7 +983,7 @@ func (aur *AdminUserRepository) GetAllAdminUsers() ([]models.AdminUser, error) {
 			&user.ClientID,
 			&user.WorkspaceID,
 			&user.ProjectID,
-			&user.TenantDomain,
+			&user.WorkspaceDomain,
 			&user.Provider,
 			&user.ProviderID,
 			&user.ProviderData,
@@ -1044,7 +1044,7 @@ func (aur *AdminUserRepository) VerifyPassword(email, password string) (*models.
 func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.AdminUser, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.workspace_domain, '') AS workspace_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -1071,9 +1071,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 		username              sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
-		tenantIDStr           sql.NullString
+		workspaceIDStr           sql.NullString
 		projectIDStr          sql.NullString
-		tenantDomain          sql.NullString
+		workspaceDomain          sql.NullString
 		provider              sql.NullString
 		providerID            sql.NullString
 		providerData          sql.NullString
@@ -1089,7 +1089,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 	)
 	var (
 		clientID       *uuid.UUID
-		tenantIDParsed *uuid.UUID
+		workspaceIDParsed *uuid.UUID
 		projectID      *uuid.UUID
 	)
 	var user models.AdminUser
@@ -1101,9 +1101,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 		&user.PasswordHash,
 		&name,
 		&clientIDStr,
-		&tenantIDStr,
+		&workspaceIDStr,
 		&projectIDStr,
-		&tenantDomain,
+		&workspaceDomain,
 		&provider,
 		&providerID,
 		&providerData,
@@ -1155,8 +1155,8 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 	if name.Valid {
 		user.Name = name.String
 	}
-	if tenantDomain.Valid {
-		user.TenantDomain = tenantDomain.String
+	if workspaceDomain.Valid {
+		user.WorkspaceDomain = workspaceDomain.String
 	}
 	if provider.Valid {
 		user.Provider = provider.String
@@ -1201,9 +1201,9 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 			clientID = &parsed
 		}
 	}
-	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
-		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
-			tenantIDParsed = &parsed
+	if workspaceIDStr.Valid && strings.TrimSpace(workspaceIDStr.String) != "" {
+		if parsed, err := uuid.Parse(workspaceIDStr.String); err == nil {
+			workspaceIDParsed = &parsed
 		}
 	}
 	if projectIDStr.Valid && strings.TrimSpace(projectIDStr.String) != "" {
@@ -1213,7 +1213,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 	}
 
 	user.ClientID = clientID
-	user.WorkspaceID = tenantIDParsed
+	user.WorkspaceID = workspaceIDParsed
 	user.ProjectID = projectID
 
 	return &user, nil
@@ -1224,7 +1224,7 @@ func (aur *AdminUserRepository) GetAdminUserByEmailAndTenant(email string, works
 func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models.AdminUser, []string, error) {
 	query := `
 		SELECT u.id, u.email, u.username, u.password_hash, COALESCE(u.name, '') AS name,
-			u.client_id, u.workspace_id, u.project_id, COALESCE(u.tenant_domain, '') AS tenant_domain, COALESCE(u.provider, '') AS provider,
+			u.client_id, u.workspace_id, u.project_id, COALESCE(u.workspace_domain, '') AS workspace_domain, COALESCE(u.provider, '') AS provider,
 			u.provider_id, COALESCE(u.provider_data::text, '{}') AS provider_data,
 			u.avatar_url, u.active, u.mfa_enabled,
 			COALESCE(u.mfa_method, ARRAY[]::text[]) AS mfa_method, u.mfa_default_method,
@@ -1250,9 +1250,9 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 		username              sql.NullString
 		name                  sql.NullString
 		clientIDStr           sql.NullString
-		tenantIDStr           sql.NullString
+		workspaceIDStr           sql.NullString
 		projectIDStr          sql.NullString
-		tenantDomain          sql.NullString
+		workspaceDomain          sql.NullString
 		provider              sql.NullString
 		providerID            sql.NullString
 		providerData          sql.NullString
@@ -1280,9 +1280,9 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 		&user.PasswordHash,
 		&name,
 		&clientIDStr,
-		&tenantIDStr,
+		&workspaceIDStr,
 		&projectIDStr,
-		&tenantDomain,
+		&workspaceDomain,
 		&provider,
 		&providerID,
 		&providerData,
@@ -1335,8 +1335,8 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 	if name.Valid {
 		user.Name = name.String
 	}
-	if tenantDomain.Valid {
-		user.TenantDomain = tenantDomain.String
+	if workspaceDomain.Valid {
+		user.WorkspaceDomain = workspaceDomain.String
 	}
 	if provider.Valid {
 		user.Provider = provider.String
@@ -1381,8 +1381,8 @@ func (aur *AdminUserRepository) GetAdminUserWithProviders(email string) (*models
 			clientID = &parsed
 		}
 	}
-	if tenantIDStr.Valid && strings.TrimSpace(tenantIDStr.String) != "" {
-		if parsed, err := uuid.Parse(tenantIDStr.String); err == nil {
+	if workspaceIDStr.Valid && strings.TrimSpace(workspaceIDStr.String) != "" {
+		if parsed, err := uuid.Parse(workspaceIDStr.String); err == nil {
 			workspaceID = &parsed
 		}
 	}

@@ -87,7 +87,7 @@ func createMigrationLogsTable(t *testing.T, db *sql.DB) {
 			success BOOLEAN NOT NULL DEFAULT false,
 			error_msg TEXT,
 			db_type VARCHAR(50) NOT NULL,
-			tenant_id VARCHAR(255),
+			workspace_id VARCHAR(255),
 			execution_ms BIGINT NOT NULL DEFAULT 0
 		)
 	`)
@@ -302,22 +302,22 @@ func TestTenantMigrations_FullFlow(t *testing.T) {
 
 	mDir := testMigrationsDir(t)
 	tenantDir := filepath.Join(mDir, "tenant")
-	tenantID := "test-tenant-001"
+	workspaceID := "test-tenant-001"
 
-	runner := NewTenantMigrationRunner(tenantID, tenantConn, tenantDir, masterConn)
+	runner := NewTenantMigrationRunner(workspaceID, tenantConn, tenantDir, masterConn)
 
 	err := runner.RunMigrations()
 	require.NoError(t, err, "tenant migrations should complete without error")
 
-	t.Run("users_has_tenant_id_unique_constraint", func(t *testing.T) {
+	t.Run("users_has_workspace_id_unique_constraint", func(t *testing.T) {
 		var count int
 		err := tenantConn.QueryRow(`
 			SELECT COUNT(*) FROM pg_constraint
-			WHERE conname = 'users_tenant_id_id_unique'
+			WHERE conname = 'users_workspace_id_id_unique'
 			AND conrelid = 'users'::regclass
 		`).Scan(&count)
 		require.NoError(t, err)
-		assert.Equal(t, 1, count, "users table should have users_tenant_id_id_unique constraint")
+		assert.Equal(t, 1, count, "users table should have users_workspace_id_id_unique constraint")
 	})
 
 	t.Run("permissions_has_resource_action", func(t *testing.T) {
@@ -383,7 +383,7 @@ func TestTenantMigrations_FullFlow(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, status, "GetMigrationStatus should not return nil")
 		assert.Equal(t, "tenant", status.DBType)
-		assert.Equal(t, &tenantID, status.WorkspaceID)
+		assert.Equal(t, &workspaceID, status.WorkspaceID)
 		assert.Greater(t, status.LastMigration, 0, "should have recorded migrations")
 		assert.Greater(t, status.TotalMigrations, 0, "should know total migration count")
 	})
@@ -415,15 +415,15 @@ func TestTenantMigrations_Idempotent(t *testing.T) {
 
 	mDir := testMigrationsDir(t)
 	tenantDir := filepath.Join(mDir, "tenant")
-	tenantID := "test-tenant-idemp"
+	workspaceID := "test-tenant-idemp"
 
 	// First run
-	runner1 := NewTenantMigrationRunner(tenantID, tenantConn, tenantDir, masterConn)
+	runner1 := NewTenantMigrationRunner(workspaceID, tenantConn, tenantDir, masterConn)
 	err := runner1.RunMigrations()
 	require.NoError(t, err, "first migration run should succeed")
 
 	// Second run (should be idempotent)
-	runner2 := NewTenantMigrationRunner(tenantID, tenantConn, tenantDir, masterConn)
+	runner2 := NewTenantMigrationRunner(workspaceID, tenantConn, tenantDir, masterConn)
 	err = runner2.RunMigrations()
 	require.NoError(t, err, "second migration run should succeed (idempotent)")
 
@@ -463,8 +463,8 @@ func TestRunMigrations_ReturnsErrorOnFailure(t *testing.T) {
 	err := os.WriteFile(filepath.Join(tmpDir, "001_bad_migration.sql"), []byte(badSQL), 0644)
 	require.NoError(t, err)
 
-	tenantID := "test-tenant-fail"
-	runner := NewTenantMigrationRunner(tenantID, tenantConn, tmpDir, masterConn)
+	workspaceID := "test-tenant-fail"
+	runner := NewTenantMigrationRunner(workspaceID, tenantConn, tmpDir, masterConn)
 	err = runner.RunMigrations()
 
 	assert.Error(t, err, "RunMigrations should return error when migrations fail")
@@ -545,9 +545,9 @@ func TestGetMigrationStatus_Empty(t *testing.T) {
 
 	mDir := testMigrationsDir(t)
 	tenantDir := filepath.Join(mDir, "tenant")
-	tenantID := "test-tenant-empty"
+	workspaceID := "test-tenant-empty"
 
-	runner := NewTenantMigrationRunner(tenantID, masterConn, tenantDir, masterConn)
+	runner := NewTenantMigrationRunner(workspaceID, masterConn, tenantDir, masterConn)
 	status, err := runner.GetMigrationStatus()
 
 	require.NoError(t, err, "GetMigrationStatus should not error even with no migrations run")

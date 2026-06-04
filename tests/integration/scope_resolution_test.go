@@ -109,7 +109,7 @@ func TestConsentService_ValidGrant_AutoAccept(t *testing.T) {
 	cs := services.NewConsentService(config.DB)
 
 	grant, stale, err := cs.CheckExistingConsent(
-		testTenantID, testEndUserID, testW4MCPClientID, testW4RSID,
+		testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID,
 		[]string{"tools:w4:read", "tools:w4:write"},
 		// Full RBAC set covers both scopes
 		[]string{"tools:w4:read", "tools:w4:write"},
@@ -129,17 +129,17 @@ func TestConsentService_StaleGrant_Revoked(t *testing.T) {
 	// Create a fresh consent grant for this test so we don't interfere with Test 4
 	freshGrantID := uuid.New()
 	_, err := config.Database.DB.Exec(`
-		INSERT INTO oauth_consent_grants (id, tenant_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
+		INSERT INTO oauth_consent_grants (id, workspace_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, ARRAY['tools:w4:read','tools:w4:write'], NOW() + INTERVAL '30 days', NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`,
-		freshGrantID, testTenantID, testEndUserID, testW4MCPClientID, testW4RSID)
+		freshGrantID, testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID)
 	require.NoError(t, err)
 
 	cs := services.NewConsentService(config.DB)
 
 	// RBAC revocation: user no longer has write binding
 	grant, stale, err := cs.CheckExistingConsent(
-		testTenantID, testEndUserID, testW4MCPClientID, testW4RSID,
+		testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID,
 		[]string{"tools:w4:read", "tools:w4:write"},
 		[]string{"tools:w4:read"}, // write revoked from RBAC
 		[]string{"tools:w4:read", "tools:w4:write"},
@@ -160,14 +160,14 @@ func TestConsentService_StaleGrant_Revoked(t *testing.T) {
 	// Insert another clean grant
 	safeGrantID := uuid.New()
 	_, err = config.Database.DB.Exec(`
-		INSERT INTO oauth_consent_grants (id, tenant_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
+		INSERT INTO oauth_consent_grants (id, workspace_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, ARRAY['tools:w4:read'], NOW() + INTERVAL '30 days', NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`,
-		safeGrantID, testTenantID, testEndUserID, testW4MCPClientID, testW4RSID)
+		safeGrantID, testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID)
 	require.NoError(t, err)
 
 	safeGrant, safeStale, safeErr := cs.CheckExistingConsent(
-		testTenantID, testEndUserID, testW4MCPClientID, testW4RSID,
+		testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID,
 		[]string{"tools:w4:read"},                   // only read requested
 		[]string{"tools:w4:read", "tools:w4:write"}, // user still has write in RBAC
 		[]string{"tools:w4:read", "tools:w4:write"},
@@ -187,10 +187,10 @@ func TestConsentService_StaleGrant_RSWithdrawal(t *testing.T) {
 	// Insert a fresh grant so we have a clean row for this test.
 	freshGrantID := uuid.New()
 	_, err := config.Database.DB.Exec(`
-		INSERT INTO oauth_consent_grants (id, tenant_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
+		INSERT INTO oauth_consent_grants (id, workspace_id, user_id, client_id, resource_server_id, granted_scopes, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, ARRAY['tools:w4:read','tools:w4:write'], NOW() + INTERVAL '30 days', NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING`,
-		freshGrantID, testTenantID, testEndUserID, testW4MCPClientID, testW4RSID)
+		freshGrantID, testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID)
 	require.NoError(t, err)
 
 	cs := services.NewConsentService(config.DB)
@@ -198,7 +198,7 @@ func TestConsentService_StaleGrant_RSWithdrawal(t *testing.T) {
 	// RS withdrawal: RBAC still grants both scopes, but RS has removed 'tools:w4:write'
 	// from scopes_supported. The stored grant covering write must be revoked.
 	grant, stale, err := cs.CheckExistingConsent(
-		testTenantID, testEndUserID, testW4MCPClientID, testW4RSID,
+		testWorkspaceID, testEndUserID, testW4MCPClientID, testW4RSID,
 		[]string{"tools:w4:read", "tools:w4:write"},
 		[]string{"tools:w4:read", "tools:w4:write"}, // RBAC intact — user still has both
 		[]string{"tools:w4:read"},                   // RS withdrew write from scopes_supported

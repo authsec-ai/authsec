@@ -26,6 +26,6 @@ func ConnectGlobalDB() (*gorm.DB, error) {
 	return gorm.Open(postgres.Open(dsn), &gorm.Config{})
 }
 
-// Phase E/P0-3: GetTenantDBName + ConnectTenantDB (the per-tenant-database
+// Phase E/P0-3: GetWorkspaceDBName + ConnectWorkspaceDB (the per-tenant-database
 // model) were deleted. AuthSec runs against exactly one PostgreSQL database
 // (config.DB / ConnectGlobalDB); there are no per-tenant DBs to resolve.

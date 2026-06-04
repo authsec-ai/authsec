@@ -18,7 +18,7 @@ type VoiceAuthController struct {
 	voiceService  *services.VoiceAuthService
 	deviceService *services.DeviceAuthService
 	deviceRepo    *database.DeviceAuthRepository
-	tenantRepo    *database.AdminTenantRepository
+	workspaceRepo    *database.AdminWorkspaceRepository
 }
 
 // NewVoiceAuthController creates a new voice authentication controller
@@ -35,7 +35,7 @@ func NewVoiceAuthController() (*VoiceAuthController, error) {
 		voiceService:  services.NewVoiceAuthService(db, deviceService),
 		deviceService: deviceService,
 		deviceRepo:    deviceRepo,
-		tenantRepo:    database.NewAdminTenantRepository(db),
+		workspaceRepo:    database.NewAdminWorkspaceRepository(db),
 	}, nil
 }
 
@@ -181,13 +181,13 @@ func (ctrl *VoiceAuthController) LinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	tenantIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -242,13 +242,13 @@ func (ctrl *VoiceAuthController) UnlinkVoiceAssistant(c *gin.Context) {
 	}
 
 	// Extract tenant ID from JWT token
-	tenantIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -299,13 +299,13 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 	}
 
 	// Extract tenant ID
-	tenantIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -337,13 +337,13 @@ func (ctrl *VoiceAuthController) ListVoiceLinks(c *gin.Context) {
 // @Failure 401 {object} map[string]string "Unauthorized"
 // @Router /authsec/uflow/auth/voice/device-pending [get]
 func (ctrl *VoiceAuthController) GetPendingDeviceCodes(c *gin.Context) {
-	tenantIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID missing in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid tenant ID in token"})
 		return
@@ -442,7 +442,7 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 
 	// Resolve tenant context from JWT claims (set by AuthMiddleware)
 	workspaceID := uuid.Nil
-	tenantDomain := ""
+	workspaceDomain := ""
 	if v, ok := c.Get("workspace_id"); ok && v != nil {
 		if tidStr, ok := v.(string); ok && tidStr != "" {
 			if parsed, parseErr := uuid.Parse(tidStr); parseErr == nil {
@@ -451,8 +451,8 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 		}
 	}
 	if workspaceID != uuid.Nil {
-		if t, tErr := ctrl.tenantRepo.GetTenantByID(workspaceID.String()); tErr == nil {
-			tenantDomain = t.TenantDomain
+		if t, tErr := ctrl.workspaceRepo.GetWorkspaceByID(workspaceID.String()); tErr == nil {
+			workspaceDomain = t.WorkspaceDomain
 		}
 	}
 	var clientID *uuid.UUID
@@ -465,7 +465,7 @@ func (ctrl *VoiceAuthController) ApproveDeviceCode(c *gin.Context) {
 	}
 
 	// Use existing device service to verify (approve/deny)
-	err = ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, tenantDomain, clientID, req.Approve)
+	err = ctrl.deviceService.VerifyDeviceCode(req.UserCode, userID, email, workspaceID, workspaceDomain, clientID, req.Approve)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,

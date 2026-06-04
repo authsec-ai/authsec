@@ -17,7 +17,7 @@ type DomainController struct {
 }
 
 func NewDomainController(db *database.DBConnection) *DomainController {
-	repo := database.NewTenantDomainsRepository(db)
+	repo := database.NewWorkspaceDomainsRepository(db)
 	svc := services.NewDomainService(repo)
 	return &DomainController{
 		service: svc,
@@ -46,19 +46,19 @@ type DomainResponse struct {
 	UpdatedAt            string `json:"updated_at"`
 }
 
-func getTenantIDFromRequest(c *gin.Context) (uuid.UUID, error) {
-	// Get tenant_id from context (set by ValidateTenantFromPath middleware)
-	tenantIDAny, ok := c.Get("workspace_id")
+func getWorkspaceIDFromRequest(c *gin.Context) (uuid.UUID, error) {
+	// Get workspace_id from context (set by ValidateTenantFromPath middleware)
+	workspaceIDAny, ok := c.Get("workspace_id")
 	if !ok {
-		return uuid.Nil, fmt.Errorf("tenant_id not found in request context")
+		return uuid.Nil, fmt.Errorf("workspace_id not found in request context")
 	}
 
-	tenantIDStr, ok := tenantIDAny.(string)
-	if !ok || strings.TrimSpace(tenantIDStr) == "" {
-		return uuid.Nil, fmt.Errorf("tenant_id not found in request context")
+	workspaceIDStr, ok := workspaceIDAny.(string)
+	if !ok || strings.TrimSpace(workspaceIDStr) == "" {
+		return uuid.Nil, fmt.Errorf("workspace_id not found in request context")
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("invalid workspace_id format: %w", err)
 	}
@@ -79,7 +79,7 @@ func getUserIDFromRequest(c *gin.Context) *uuid.UUID {
 	return nil
 }
 
-func domainToResponse(td *database.TenantDomain) DomainResponse {
+func domainToResponse(td *database.WorkspaceDomain) DomainResponse {
 	resp := DomainResponse{
 		ID:                 td.ID.String(),
 		WorkspaceID:           td.WorkspaceID.String(),
@@ -108,13 +108,13 @@ func domainToResponse(td *database.TenantDomain) DomainResponse {
 
 // ListDomains retrieves all domains for the authenticated tenant
 func (dc *DomainController) ListDomains(c *gin.Context) {
-	workspaceID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getWorkspaceIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	domains, err := dc.service.ListTenantDomains(workspaceID)
+	domains, err := dc.service.ListWorkspaceDomains(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list domains", "details": err.Error()})
 		return
@@ -146,13 +146,13 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 		return
 	}
 
-	workspaceID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getWorkspaceIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	repo := database.NewTenantDomainsRepository(dc.db)
+	repo := database.NewWorkspaceDomainsRepository(dc.db)
 	td, err := repo.GetDomainByID(domainID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
@@ -172,7 +172,7 @@ func (dc *DomainController) GetDomainByID(c *gin.Context) {
 
 // CreateDomain registers a new custom domain (pending verification)
 func (dc *DomainController) CreateDomain(c *gin.Context) {
-	workspaceID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getWorkspaceIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -218,26 +218,26 @@ func (dc *DomainController) VerifyDomain(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context (set by ValidateTenantFromPath middleware)
-	tenantIDAny, ok := c.Get("workspace_id")
+	// Get workspace_id from context (set by ValidateTenantFromPath middleware)
+	workspaceIDAny, ok := c.Get("workspace_id")
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in request"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in request"})
 		return
 	}
 
-	tenantIDStr, ok := tenantIDAny.(string)
-	if !ok || strings.TrimSpace(tenantIDStr) == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in request"})
+	workspaceIDStr, ok := workspaceIDAny.(string)
+	if !ok || strings.TrimSpace(workspaceIDStr) == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in request"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id format"})
 		return
 	}
 
-	repo := database.NewTenantDomainsRepository(dc.db)
+	repo := database.NewWorkspaceDomainsRepository(dc.db)
 	td, err := repo.GetDomainByID(domainID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
@@ -277,13 +277,13 @@ func (dc *DomainController) SetPrimaryDomain(c *gin.Context) {
 		return
 	}
 
-	workspaceID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getWorkspaceIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	repo := database.NewTenantDomainsRepository(dc.db)
+	repo := database.NewWorkspaceDomainsRepository(dc.db)
 	td, err := repo.GetDomainByID(domainID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
@@ -329,13 +329,13 @@ func (dc *DomainController) DeleteDomain(c *gin.Context) {
 		return
 	}
 
-	workspaceID, err := getTenantIDFromRequest(c)
+	workspaceID, err := getWorkspaceIDFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	repo := database.NewTenantDomainsRepository(dc.db)
+	repo := database.NewWorkspaceDomainsRepository(dc.db)
 	td, err := repo.GetDomainByID(domainID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})

@@ -25,12 +25,12 @@ func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
 	err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS roles (
 			id TEXT PRIMARY KEY,
-			tenant_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
 			name TEXT NOT NULL,
 			description TEXT,
 			is_system INTEGER DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(tenant_id, name)
+			UNIQUE(workspace_id, name)
 		)
 	`).Error
 	require.NoError(t, err)
@@ -39,12 +39,12 @@ func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
 	err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS permissions (
 			id TEXT PRIMARY KEY,
-			tenant_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
 			resource TEXT NOT NULL,
 			action TEXT NOT NULL,
 			description TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(tenant_id, resource, action)
+			UNIQUE(workspace_id, resource, action)
 		)
 	`).Error
 	require.NoError(t, err)
@@ -63,7 +63,7 @@ func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
 	err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY,
-			tenant_id TEXT,
+			workspace_id TEXT,
 			email TEXT NOT NULL,
 			username TEXT,
 			password_hash TEXT,
@@ -78,7 +78,7 @@ func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
 	err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS role_bindings (
 			id TEXT PRIMARY KEY,
-			tenant_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
 			user_id TEXT,
 			username TEXT,
 			service_account_id TEXT,
@@ -99,7 +99,7 @@ func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
 }
 
 // seedRolesScopedTestData creates test data (tenant, permissions, user)
-func seedRolesScopedTestData(t *testing.T, db *gorm.DB, tenantID uuid.UUID) ([]uuid.UUID, uuid.UUID) {
+func seedRolesScopedTestData(t *testing.T, db *gorm.DB, workspaceID uuid.UUID) ([]uuid.UUID, uuid.UUID) {
 	// Create some permissions
 	permIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
 	perms := []struct {
@@ -113,22 +113,22 @@ func seedRolesScopedTestData(t *testing.T, db *gorm.DB, tenantID uuid.UUID) ([]u
 	}
 
 	for _, p := range perms {
-		err := db.Exec("INSERT INTO permissions (id, tenant_id, resource, action, description) VALUES (?, ?, ?, ?, ?)",
-			p.id.String(), tenantID.String(), p.resource, p.action, p.resource+":"+p.action).Error
+		err := db.Exec("INSERT INTO permissions (id, workspace_id, resource, action, description) VALUES (?, ?, ?, ?, ?)",
+			p.id.String(), workspaceID.String(), p.resource, p.action, p.resource+":"+p.action).Error
 		require.NoError(t, err)
 	}
 
 	// Create a user for binding tests
 	userID := uuid.New()
-	err := db.Exec("INSERT INTO users (id, tenant_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
-		userID.String(), tenantID.String(), "testuser@test.com", "testuser", 1).Error
+	err := db.Exec("INSERT INTO users (id, workspace_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
+		userID.String(), workspaceID.String(), "testuser@test.com", "testuser", 1).Error
 	require.NoError(t, err)
 
 	return permIDs, userID
 }
 
 // setupRolesScopedTestRouter creates a test router with the controller
-func setupRolesScopedTestRouter(db *gorm.DB, tenantID uuid.UUID) *gin.Engine {
+func setupRolesScopedTestRouter(db *gorm.DB, workspaceID uuid.UUID) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
@@ -137,28 +137,28 @@ func setupRolesScopedTestRouter(db *gorm.DB, tenantID uuid.UUID) *gin.Engine {
 
 	// Mock tenant context middleware
 	r.Use(func(c *gin.Context) {
-		c.Set("tenant_id", tenantID.String())
+		c.Set("workspace_id", workspaceID.String())
 		c.Next()
 	})
 
 	// Routes
 	r.POST("/roles", func(c *gin.Context) {
-		controller.createRole(c, db, rbacService, tenantID, true)
+		controller.createRole(c, db, rbacService, workspaceID, true)
 	})
 	r.GET("/roles", func(c *gin.Context) {
-		controller.listRoles(c, db, tenantID)
+		controller.listRoles(c, db, workspaceID)
 	})
 	r.PUT("/roles/:role_id", func(c *gin.Context) {
-		controller.updateRole(c, db, tenantID)
+		controller.updateRole(c, db, workspaceID)
 	})
 	r.DELETE("/roles/:role_id", func(c *gin.Context) {
-		controller.deleteRole(c, db, tenantID)
+		controller.deleteRole(c, db, workspaceID)
 	})
 	r.POST("/bindings", func(c *gin.Context) {
-		controller.assignRoleScoped(c, db, rbacService, tenantID)
+		controller.assignRoleScoped(c, db, rbacService, workspaceID)
 	})
 	r.GET("/bindings", func(c *gin.Context) {
-		controller.listRoleBindings(c, db, tenantID)
+		controller.listRoleBindings(c, db, workspaceID)
 	})
 
 	return r
@@ -170,9 +170,9 @@ func setupRolesScopedTestRouter(db *gorm.DB, tenantID uuid.UUID) *gin.Engine {
 
 func TestCreateRole_Success(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, _ := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	payload := CreateRoleRequest{
 		Name:          "admin",
@@ -198,9 +198,9 @@ func TestCreateRole_Success(t *testing.T) {
 
 func TestCreateRole_WithPermissionStrings(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	payload := CreateRoleRequest{
 		Name:              "viewer",
@@ -225,9 +225,9 @@ func TestCreateRole_WithPermissionStrings(t *testing.T) {
 
 func TestCreateRole_NoPermissions(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	payload := CreateRoleRequest{
 		Name:        "empty-role",
@@ -259,9 +259,9 @@ func TestCreateRole_NoPermissions(t *testing.T) {
 
 func TestCreateRole_MissingName(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	payload := CreateRoleRequest{
 		Description: "Role without name",
@@ -282,14 +282,14 @@ func TestCreateRole_MissingName(t *testing.T) {
 
 func TestListRoles_Success(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, _ := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role first
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "test-role", "Test role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "test-role", "Test role").Error
 	require.NoError(t, err)
 
 	// Link permissions
@@ -315,9 +315,9 @@ func TestListRoles_Success(t *testing.T) {
 
 func TestListRoles_Empty(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	req, _ := http.NewRequest("GET", "/roles", nil)
 	w := httptest.NewRecorder()
@@ -337,14 +337,14 @@ func TestListRoles_Empty(t *testing.T) {
 
 func TestAssignRoleScoped_TenantWide_NoScope(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "admin", "Admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "admin", "Admin role").Error
 	require.NoError(t, err)
 
 	// Assign role WITHOUT scope (should be tenant-wide)
@@ -391,14 +391,14 @@ func TestAssignRoleScoped_TenantWide_NoScope(t *testing.T) {
 
 func TestAssignRoleScoped_TenantWide_EmptyScope(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "editor", "Editor role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "editor", "Editor role").Error
 	require.NoError(t, err)
 
 	// Assign role WITH empty scope (blank type and id) - should be treated as tenant-wide
@@ -438,14 +438,14 @@ func TestAssignRoleScoped_TenantWide_EmptyScope(t *testing.T) {
 
 func TestAssignRoleScoped_TenantWide_WildcardScope(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "manager", "Manager role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "manager", "Manager role").Error
 	require.NoError(t, err)
 
 	// Assign role WITH wildcard scope ("*") - should be treated as tenant-wide
@@ -485,14 +485,14 @@ func TestAssignRoleScoped_TenantWide_WildcardScope(t *testing.T) {
 
 func TestAssignRoleScoped_SpecificScope(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "project-admin", "Project admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "project-admin", "Project admin role").Error
 	require.NoError(t, err)
 
 	// Assign role WITH specific scope (project)
@@ -536,14 +536,14 @@ func TestAssignRoleScoped_SpecificScope(t *testing.T) {
 
 func TestAssignRoleScoped_InvalidUser(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "admin", "Admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "admin", "Admin role").Error
 	require.NoError(t, err)
 
 	// Try to assign role to non-existent user
@@ -563,9 +563,9 @@ func TestAssignRoleScoped_InvalidUser(t *testing.T) {
 
 func TestAssignRoleScoped_InvalidRole(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Try to assign non-existent role
 	payload := BindingRequest{
@@ -584,14 +584,14 @@ func TestAssignRoleScoped_InvalidRole(t *testing.T) {
 
 func TestAssignRoleScoped_InvalidScopeID(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "admin", "Admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "admin", "Admin role").Error
 	require.NoError(t, err)
 
 	// Try to assign role with invalid scope ID (not UUID and not "*")
@@ -622,24 +622,24 @@ func TestListRoleBindings_Success(t *testing.T) {
 	// with json.RawMessage scanning. The actual list functionality works
 	// correctly with PostgreSQL in production.
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "admin", "Admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "admin", "Admin role").Error
 	require.NoError(t, err)
 
 	// Create a binding directly in DB
 	bindingID := uuid.New()
-	err = db.Exec("INSERT INTO role_bindings (id, tenant_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
-		bindingID.String(), tenantID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+		bindingID.String(), workspaceID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
 	require.NoError(t, err)
 
 	// Verify binding was created
 	var count int64
-	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE tenant_id = ?", tenantID.String()).Scan(&count)
+	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE workspace_id = ?", workspaceID.String()).Scan(&count)
 	assert.Equal(t, int64(1), count, "Expected 1 binding in database")
 }
 
@@ -648,39 +648,39 @@ func TestListRoleBindings_FilterByUser(t *testing.T) {
 	// with json.RawMessage scanning. The actual filter functionality works
 	// correctly with PostgreSQL in production.
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	_, userID := seedRolesScopedTestData(t, db, tenantID)
+	workspaceID := uuid.New()
+	_, userID := seedRolesScopedTestData(t, db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "admin", "Admin role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "admin", "Admin role").Error
 	require.NoError(t, err)
 
 	// Create bindings for different users
 	user2ID := uuid.New()
-	err = db.Exec("INSERT INTO users (id, tenant_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
-		user2ID.String(), tenantID.String(), "user2@test.com", "user2", 1).Error
+	err = db.Exec("INSERT INTO users (id, workspace_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
+		user2ID.String(), workspaceID.String(), "user2@test.com", "user2", 1).Error
 	require.NoError(t, err)
 
 	// Binding 1 for user1
-	err = db.Exec("INSERT INTO role_bindings (id, tenant_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
-		uuid.New().String(), tenantID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+		uuid.New().String(), workspaceID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
 	require.NoError(t, err)
 
 	// Binding 2 for user2
-	err = db.Exec("INSERT INTO role_bindings (id, tenant_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
-		uuid.New().String(), tenantID.String(), user2ID.String(), roleID.String(), "admin", "user2").Error
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+		uuid.New().String(), workspaceID.String(), user2ID.String(), roleID.String(), "admin", "user2").Error
 	require.NoError(t, err)
 
 	// Verify both bindings were created
 	var totalCount int64
-	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE tenant_id = ?", tenantID.String()).Scan(&totalCount)
+	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE workspace_id = ?", workspaceID.String()).Scan(&totalCount)
 	assert.Equal(t, int64(2), totalCount, "Expected 2 bindings in database")
 
 	// Verify filter by user_id would return 1 result
 	var userCount int64
-	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE tenant_id = ? AND user_id = ?", tenantID.String(), userID.String()).Scan(&userCount)
+	db.Raw("SELECT COUNT(*) FROM role_bindings WHERE workspace_id = ? AND user_id = ?", workspaceID.String(), userID.String()).Scan(&userCount)
 	assert.Equal(t, int64(1), userCount, "Expected 1 binding for specific user")
 }
 
@@ -690,14 +690,14 @@ func TestListRoleBindings_FilterByUser(t *testing.T) {
 
 func TestUpdateRole_Success(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, _ := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role first
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "original-role", "Original description").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "original-role", "Original description").Error
 	require.NoError(t, err)
 
 	// Add initial permissions
@@ -741,14 +741,14 @@ func TestUpdateRole_Success(t *testing.T) {
 
 func TestUpdateRole_WithPermissionStrings(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role first
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "original-role", "Original description").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "original-role", "Original description").Error
 	require.NoError(t, err)
 
 	// Update the role using permission strings (using permissions from seedRolesScopedTestData)
@@ -775,9 +775,9 @@ func TestUpdateRole_WithPermissionStrings(t *testing.T) {
 
 func TestUpdateRole_NotFound(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, _ := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Try to update a non-existent role (with valid permissions so we can hit the "role not found" error)
 	payload := CreateRoleRequest{
@@ -798,9 +798,9 @@ func TestUpdateRole_NotFound(t *testing.T) {
 
 func TestUpdateRole_InvalidRoleID(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	payload := CreateRoleRequest{
 		Name:        "updated-role",
@@ -818,14 +818,14 @@ func TestUpdateRole_InvalidRoleID(t *testing.T) {
 
 func TestUpdateRole_InvalidPayload(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role first
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "original-role", "Original description").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "original-role", "Original description").Error
 	require.NoError(t, err)
 
 	// Send invalid JSON
@@ -839,14 +839,14 @@ func TestUpdateRole_InvalidPayload(t *testing.T) {
 
 func TestUpdateRole_AllowsClearingPermissions(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, _ := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, _ := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role with permissions
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "role-with-perms", "Role with permissions").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "role-with-perms", "Role with permissions").Error
 	require.NoError(t, err)
 
 	// Add initial permissions
@@ -890,14 +890,14 @@ func TestUpdateRole_AllowsClearingPermissions(t *testing.T) {
 
 func TestDeleteRole_Success(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	permIDs, userID := seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	permIDs, userID := seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	// Create a role
 	roleID := uuid.New()
-	err := db.Exec("INSERT INTO roles (id, tenant_id, name, description) VALUES (?, ?, ?, ?)",
-		roleID.String(), tenantID.String(), "temp-role", "Temporary role").Error
+	err := db.Exec("INSERT INTO roles (id, workspace_id, name, description) VALUES (?, ?, ?, ?)",
+		roleID.String(), workspaceID.String(), "temp-role", "Temporary role").Error
 	require.NoError(t, err)
 
 	// Add role_permissions
@@ -910,8 +910,8 @@ func TestDeleteRole_Success(t *testing.T) {
 
 	// Add role_bindings
 	bindingID := uuid.New()
-	err = db.Exec("INSERT INTO role_bindings (id, tenant_id, user_id, role_id) VALUES (?, ?, ?, ?)",
-		bindingID.String(), tenantID.String(), userID.String(), roleID.String()).Error
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id) VALUES (?, ?, ?, ?)",
+		bindingID.String(), workspaceID.String(), userID.String(), roleID.String()).Error
 	require.NoError(t, err)
 
 	// Verify initial data exists
@@ -944,9 +944,9 @@ func TestDeleteRole_Success(t *testing.T) {
 
 func TestDeleteRole_NotFound(t *testing.T) {
 	db := setupRolesScopedTestDB(t)
-	tenantID := uuid.New()
-	seedRolesScopedTestData(t, db, tenantID)
-	router := setupRolesScopedTestRouter(db, tenantID)
+	workspaceID := uuid.New()
+	seedRolesScopedTestData(t, db, workspaceID)
+	router := setupRolesScopedTestRouter(db, workspaceID)
 
 	req, _ := http.NewRequest("DELETE", "/roles/"+uuid.New().String(), nil)
 	w := httptest.NewRecorder()
@@ -970,10 +970,10 @@ func setupScopeResourceTestDB(t *testing.T) *gorm.DB {
 	err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS scope_resource_mappings (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			tenant_id TEXT NOT NULL,
+			workspace_id TEXT NOT NULL,
 			scope_name TEXT NOT NULL,
 			resource_name TEXT NOT NULL,
-			UNIQUE(tenant_id, scope_name, resource_name)
+			UNIQUE(workspace_id, scope_name, resource_name)
 		)
 	`).Error
 	require.NoError(t, err)
@@ -983,22 +983,22 @@ func setupScopeResourceTestDB(t *testing.T) *gorm.DB {
 
 func TestScopeResourceMappings_ListScopes(t *testing.T) {
 	db := setupScopeResourceTestDB(t)
-	tenantID := uuid.New()
+	workspaceID := uuid.New()
 
 	// Insert scope mappings
-	err := db.Exec("INSERT INTO scope_resource_mappings (tenant_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		tenantID.String(), "admin", "users").Error
+	err := db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
+		workspaceID.String(), "admin", "users").Error
 	require.NoError(t, err)
-	err = db.Exec("INSERT INTO scope_resource_mappings (tenant_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		tenantID.String(), "admin", "projects").Error
+	err = db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
+		workspaceID.String(), "admin", "projects").Error
 	require.NoError(t, err)
-	err = db.Exec("INSERT INTO scope_resource_mappings (tenant_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		tenantID.String(), "viewer", "users").Error
+	err = db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
+		workspaceID.String(), "viewer", "users").Error
 	require.NoError(t, err)
 
 	// Query unique scope names
 	var scopes []string
-	rows, err := db.Raw("SELECT DISTINCT scope_name FROM scope_resource_mappings WHERE tenant_id = ? ORDER BY scope_name", tenantID.String()).Rows()
+	rows, err := db.Raw("SELECT DISTINCT scope_name FROM scope_resource_mappings WHERE workspace_id = ? ORDER BY scope_name", workspaceID.String()).Rows()
 	require.NoError(t, err)
 	defer rows.Close()
 

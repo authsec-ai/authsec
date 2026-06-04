@@ -41,7 +41,7 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 
 	query := `
 		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at)
@@ -74,7 +74,7 @@ func (ur *UserRepository) CreateUser(user *models.ExtendedUser) error {
 		user.Username,
 		user.Email,
 		user.PasswordHash,
-		user.TenantDomain,
+		user.WorkspaceDomain,
 		user.Provider,
 		user.ProviderID,
 		user.ProviderData,
@@ -122,7 +122,7 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 	now := time.Now().UTC()
 	query := `
 		INSERT INTO users (
-			id, workspace_id, name, username, email, password_hash, tenant_domain,
+			id, workspace_id, name, username, email, password_hash, workspace_domain,
 			provider, provider_id, provider_data, avatar_url, active,
 			last_login, created_at, updated_at
 		)
@@ -165,7 +165,7 @@ func (ur *UserRepository) UpdateLastLogin(userID uuid.UUID) error {
 func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -187,7 +187,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 		&username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerID,
 		&user.ProviderData,
@@ -240,7 +240,7 @@ func (ur *UserRepository) GetUserByEmail(email string) (*models.ExtendedUser, er
 func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -262,7 +262,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 		&username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerID,
 		&user.ProviderData,
@@ -313,7 +313,7 @@ func (ur *UserRepository) GetUserByEmailAndClient(email string, clientID uuid.UU
 func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -335,7 +335,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid
 		&username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerID,
 		&user.ProviderData,
@@ -386,7 +386,7 @@ func (ur *UserRepository) GetUserByEmailAndTenant(email string, workspaceID uuid
 func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -408,7 +408,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 		&username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerID,
 		&user.ProviderData,
@@ -461,7 +461,7 @@ func (ur *UserRepository) GetUserByID(userID uuid.UUID) (*models.ExtendedUser, e
 func (ur *UserRepository) GetUserByProvider(workspaceID uuid.UUID, provider, providerID string) (*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -483,7 +483,7 @@ func (ur *UserRepository) GetUserByProvider(workspaceID uuid.UUID, provider, pro
 		&username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&providerIDNull,
 		&user.ProviderData,
@@ -609,11 +609,11 @@ func (ur *UserRepository) UpdateUserPassword(userID uuid.UUID, passwordHash stri
 	return nil
 }
 
-// GetUsersByTenantID retrieves users by tenant ID with pagination
-func (ur *UserRepository) GetUsersByTenantID(workspaceID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
+// GetUsersByWorkspaceID retrieves users by tenant ID with pagination
+func (ur *UserRepository) GetUsersByWorkspaceID(workspaceID uuid.UUID, limit, offset int) ([]*models.ExtendedUser, error) {
 	query := `
 		SELECT id, client_id, workspace_id, project_id, name, username, email,
-			COALESCE(password_hash, '') AS password_hash, tenant_domain, provider, provider_id, provider_data,
+			COALESCE(password_hash, '') AS password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at
@@ -646,7 +646,7 @@ func (ur *UserRepository) GetUsersByTenantID(workspaceID uuid.UUID, limit, offse
 			&username,
 			&user.Email,
 			&user.PasswordHash,
-			&user.TenantDomain,
+			&user.WorkspaceDomain,
 			&user.Provider,
 			&providerID,
 			&user.ProviderData,
@@ -695,8 +695,8 @@ func (ur *UserRepository) GetUsersByTenantID(workspaceID uuid.UUID, limit, offse
 	return users, rows.Err()
 }
 
-// CountUsersByTenantID counts users for a tenant
-func (ur *UserRepository) CountUsersByTenantID(workspaceID uuid.UUID) (int, error) {
+// CountUsersByWorkspaceID counts users for a tenant
+func (ur *UserRepository) CountUsersByWorkspaceID(workspaceID uuid.UUID) (int, error) {
 	query := `SELECT COUNT(*) FROM users WHERE workspace_id = $1`
 
 	var count int
@@ -746,7 +746,7 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 
 	query := `
 		INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
-			password_hash, tenant_domain, provider, provider_id, provider_data,
+			password_hash, workspace_domain, provider, provider_id, provider_data,
 			avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 			mfa_enrolled_at, mfa_verified, last_login,
 			created_at, updated_at)
@@ -779,7 +779,7 @@ func (ur *UserRepository) CreateUserTx(tx *sql.Tx, user *models.ExtendedUser) er
 		user.Username,
 		user.Email,
 		user.PasswordHash,
-		user.TenantDomain,
+		user.WorkspaceDomain,
 		user.Provider,
 		user.ProviderID,
 		user.ProviderData,
@@ -847,14 +847,14 @@ func (ur *UserRepository) validateUserForCreation(user *models.ExtendedUser) err
 		return fmt.Errorf("client_id is required")
 	}
 	if user.WorkspaceID == uuid.Nil {
-		return fmt.Errorf("tenant_id is required")
+		return fmt.Errorf("workspace_id is required")
 	}
 	// Note: project_id is optional and can be nil for admin users
 	if strings.TrimSpace(user.Email) == "" {
 		return fmt.Errorf("email is required")
 	}
-	if strings.TrimSpace(user.TenantDomain) == "" {
-		return fmt.Errorf("tenant_domain is required")
+	if strings.TrimSpace(user.WorkspaceDomain) == "" {
+		return fmt.Errorf("workspace_domain is required")
 	}
 	if strings.TrimSpace(user.Provider) == "" {
 		return fmt.Errorf("provider is required")

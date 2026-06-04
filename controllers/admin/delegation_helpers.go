@@ -44,7 +44,7 @@ func getUserRoleNames(userID, workspaceID string) ([]string, error) {
 
 // findDelegationPolicy looks up an enabled delegation policy matching any of
 // the user's roles and the requested agent_type within a workspace. Single-DB
-// collapse: tenant_id is now a row predicate on config.DB.
+// collapse: workspace_id is now a row predicate on config.DB.
 func findDelegationPolicy(workspaceID string, roleNames []string, agentType string) (*models.DelegationPolicy, error) {
 	if len(roleNames) == 0 {
 		return nil, fmt.Errorf("user has no roles")

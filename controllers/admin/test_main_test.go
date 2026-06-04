@@ -13,7 +13,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-var seededTenantID uuid.UUID
+var seededWorkspaceID uuid.UUID
 
 func TestMain(m *testing.M) {
 	if os.Getenv("RUN_INTEGRATION") == "1" {
@@ -104,50 +104,50 @@ func seedAdminTestData(dbName string, cfg *config.Config) error {
 	}
 	defer db.Close()
 
-	tenantID := uuid.New()
-	seededTenantID = tenantID
-	userID := tenantID
-	clientID := tenantID
+	workspaceID := uuid.New()
+	seededWorkspaceID = workspaceID
+	userID := workspaceID
+	clientID := workspaceID
 
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (tenant_id uuid PRIMARY KEY, email text, tenant_domain text, tenant_db text);`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenants (workspace_id uuid PRIMARY KEY, email text, workspace_domain text, workspace_db text);`); err != nil {
 		return err
 	}
 
 	// Create users table (needed for group operations that look up users)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, email text, name text, provider text, password_hash text, client_id uuid, tenant_id uuid, tenant_domain text, active boolean DEFAULT true, temporary_password boolean DEFAULT false, temporary_password_expires_at timestamptz, failed_login_attempts integer DEFAULT 0, account_locked_at timestamptz, password_reset_required boolean DEFAULT false, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, email text, name text, provider text, password_hash text, client_id uuid, workspace_id uuid, workspace_domain text, active boolean DEFAULT true, temporary_password boolean DEFAULT false, temporary_password_expires_at timestamptz, failed_login_attempts integer DEFAULT 0, account_locked_at timestamptz, password_reset_required boolean DEFAULT false, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
 
-	_, _ = db.Exec(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tenant_db text;`)
+	_, _ = db.Exec(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS workspace_db text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id uuid;`)
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id uuid;`)
-	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_domain text;`)
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS workspace_id uuid;`)
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS workspace_domain text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active boolean DEFAULT true;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temporary_password boolean DEFAULT false;`)
 	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS temporary_password_expires_at timestamp with time zone;`)
 
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS roles (id uuid PRIMARY KEY, tenant_id uuid, name text NOT NULL, description text, created_at timestamptz default now(), updated_at timestamptz default now(), UNIQUE(tenant_id,name));`)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, tenant_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS roles (id uuid PRIMARY KEY, workspace_id uuid, name text NOT NULL, description text, created_at timestamptz default now(), updated_at timestamptz default now(), UNIQUE(workspace_id,name));`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS role_bindings (id uuid PRIMARY KEY, workspace_id uuid, user_id uuid, role_id uuid, scope_type text, scope_id uuid, created_at timestamptz default now(), updated_at timestamptz default now());`)
 
 	// Create groups table (for group controller operations)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS groups (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, tenant_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS groups (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, workspace_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());`)
 
 	// Create user_groups table (for group-user membership)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS user_groups (user_id uuid NOT NULL, group_id uuid NOT NULL, tenant_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, group_id));`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS user_groups (user_id uuid NOT NULL, group_id uuid NOT NULL, workspace_id uuid, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, group_id));`)
 
 	// Create projects table (for project controller operations)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS projects (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, user_id uuid, tenant_id uuid, active boolean DEFAULT true, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), deleted_at timestamptz);`)
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS projects (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, description text, user_id uuid, workspace_id uuid, active boolean DEFAULT true, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), deleted_at timestamptz);`)
 
-	_, _ = db.Exec(`INSERT INTO tenants (tenant_id, email, tenant_domain, tenant_db) VALUES ($1,$2,$3,$4) ON CONFLICT (tenant_id) DO UPDATE SET tenant_db=EXCLUDED.tenant_db`, tenantID, "admin@test.local", "test.local", dbName)
-	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, tenant_id, tenant_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
-		userID, "admin@test.local", clientID, tenantID, "test.local")
+	_, _ = db.Exec(`INSERT INTO tenants (workspace_id, email, workspace_domain, workspace_db) VALUES ($1,$2,$3,$4) ON CONFLICT (workspace_id) DO UPDATE SET workspace_db=EXCLUDED.workspace_db`, workspaceID, "admin@test.local", "test.local", dbName)
+	_, _ = db.Exec(`INSERT INTO users (id, email, password_hash, client_id, workspace_id, workspace_domain, active) VALUES ($1,$2,'', $3, $4, $5, true) ON CONFLICT (id) DO NOTHING`,
+		userID, "admin@test.local", clientID, workspaceID, "test.local")
 
 	var roleID uuid.UUID
-	if err := db.QueryRow(`INSERT INTO roles (id, tenant_id, name, description) VALUES ($1, $2, 'admin', 'admin role') ON CONFLICT (tenant_id, name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
-		uuid.New(), tenantID).Scan(&roleID); err != nil {
+	if err := db.QueryRow(`INSERT INTO roles (id, workspace_id, name, description) VALUES ($1, $2, 'admin', 'admin role') ON CONFLICT (workspace_id, name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
+		uuid.New(), workspaceID).Scan(&roleID); err != nil {
 		return err
 	}
 	bindingID := uuid.New()
-	_, _ = db.Exec(`INSERT INTO role_bindings (id, tenant_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) SELECT $1,$2,$3,$4,NULL,NULL,now(),now() WHERE NOT EXISTS (SELECT 1 FROM role_bindings WHERE tenant_id=$2 AND user_id=$3 AND role_id=$4)`, bindingID, tenantID, userID, roleID)
+	_, _ = db.Exec(`INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at) SELECT $1,$2,$3,$4,NULL,NULL,now(),now() WHERE NOT EXISTS (SELECT 1 FROM role_bindings WHERE workspace_id=$2 AND user_id=$3 AND role_id=$4)`, bindingID, workspaceID, userID, roleID)
 
 	return nil
 }

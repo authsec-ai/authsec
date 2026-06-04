@@ -20,7 +20,7 @@ import (
 // This avoids import cycles while providing type-safe token generation
 type AuthManagerTokenService interface {
 	GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error)
-	GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, tenantDomain string, roles []string) (string, error)
+	GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, workspaceDomain string, roles []string) (string, error)
 	GenerateTenantUserToken(userID uuid.UUID, workspaceID uuid.UUID, email string, expiresIn time.Duration) (string, error)
 	GenerateEndUserToken(userID uuid.UUID, workspaceID string, clientID string, email string, scopes []string, expiresIn time.Duration) (string, error)
 	GenerateVoiceAuthToken(userID uuid.UUID, workspaceID uuid.UUID, email string, scopes []string, expiresIn time.Duration) (string, error)
@@ -51,7 +51,7 @@ type Config struct {
 	SMTPUser           string
 	SMTPPassword       string
 	SMTPFromName       string // Display name for the From: header (e.g. "AuthSec"). Optional; defaults to just the email.
-	TenantDomainSuffix string
+	WorkspaceDomainSuffix string
 	CorsAllowOrigin    string
 	RedisURL           string
 	ICPServiceURL      string // ICP service URL for PKI provisioning
@@ -112,7 +112,7 @@ type Config struct {
 	OAuthUserInfoURL         string // OAuth userinfo endpoint
 	PKCEChallenge            string // Pre-computed PKCE challenge (if static)
 	OAuthRedirectURI         string // Default OAuth redirect URI
-	OAuthRedirectURITemplate string // Redirect URI template with {tenant_id}
+	OAuthRedirectURITemplate string // Redirect URI template with {workspace_id}
 	MCPToolTimeout           int    // MCP tool execution timeout in seconds (default 15)
 
 	// Azure OpenAI (for playground + voice)
@@ -186,7 +186,7 @@ func LoadConfig() *Config {
 	corsAllowOrigin := getEnv("CORS_ALLOW_ORIGIN", "https://*.app.authsec.dev,https://app.authsec.dev,https://*.authsec.dev,https://authsec.dev,https://*.authsec.ai,https://200xx.app.authsec.dev")
 
 	// Load Tenant Domain Suffix
-	tenantDomainSuffix := getEnv("TENANT_DOMAIN_SUFFIX", "app.authsec.ai")
+	workspaceDomainSuffix := getEnv("TENANT_DOMAIN_SUFFIX", "app.authsec.ai")
 
 	// Load Redis configuration
 	redisURL := getEnv("REDIS_URL", "")
@@ -322,7 +322,7 @@ func LoadConfig() *Config {
 		SMTPUser:                smtpUser,
 		SMTPPassword:            smtpPassword,
 		SMTPFromName:            smtpFromName,
-		TenantDomainSuffix:      tenantDomainSuffix,
+		WorkspaceDomainSuffix:      workspaceDomainSuffix,
 		CorsAllowOrigin:         corsAllowOrigin,
 		RedisURL:                redisURL,
 		ICPServiceURL:           icpServiceURL,

@@ -72,14 +72,14 @@ func (m *JWTAuthMiddleware) Authenticate() gin.HandlerFunc {
 		}
 
 		// Set Gin context values
-		c.Set(SpireTenantIDKey, claims.WorkspaceID)
+		c.Set(SpireWorkspaceIDKey, claims.WorkspaceID)
 		c.Set(SpireUserIDKey, claims.UserID)
 		c.Set(SpireClaimsKey, claims)
 		c.Set(SpireIsAgentKey, false)
 
 		m.logger.WithFields(logrus.Fields{
 			"user_id":   claims.UserID,
-			"tenant_id": claims.WorkspaceID,
+			"workspace_id": claims.WorkspaceID,
 		}).Debug("JWT authenticated")
 
 		c.Next()

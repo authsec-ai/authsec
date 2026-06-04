@@ -121,8 +121,8 @@ func CloneTenantDatabase(databaseName string) (bool, error) {
 	return true, nil
 }
 
-// ConnectToTenantDB opens a raw SQL connection to the named tenant database.
-func ConnectToTenantDB(host, port, user, password, databaseName string) (*sql.DB, error) {
+// ConnectToWorkspaceDB opens a raw SQL connection to the named tenant database.
+func ConnectToWorkspaceDB(host, port, user, password, databaseName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		host, port, user, password, databaseName,
@@ -228,8 +228,8 @@ func IsValidDatabaseName(name string) bool {
 	return true
 }
 
-// GenerateTenantDBName produces a deterministic database name from a tenant UUID string.
-func GenerateTenantDBName(workspaceID string) string {
+// GenerateWorkspaceDBName produces a deterministic database name from a tenant UUID string.
+func GenerateWorkspaceDBName(workspaceID string) string {
 	clean := ""
 	for _, c := range workspaceID {
 		if c == '-' {
@@ -257,7 +257,7 @@ func RunTenantMigrationsInProcess(workspaceID, host, port, user, password, dbNam
 		migrationsDir = MigrationsDir("tenant")
 	}
 
-	tenantDBConn, err := ConnectToTenantDB(host, port, user, password, dbName)
+	tenantDBConn, err := ConnectToWorkspaceDB(host, port, user, password, dbName)
 	if err != nil {
 		return fmt.Errorf("failed to connect to tenant database %s: %w", dbName, err)
 	}

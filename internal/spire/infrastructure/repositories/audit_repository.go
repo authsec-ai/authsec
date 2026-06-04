@@ -26,7 +26,7 @@ func NewPostgresAuditRepository(db *sql.DB) repositories.AuditRepository {
 // Create creates a new audit log entry
 func (r *PostgresAuditRepository) Create(ctx context.Context, log *models.AuditLog) error {
 	query := `
-		INSERT INTO audit_icp_logs (id, tenant_id, event_type, workload_id, certificate_id, spiffe_id,
+		INSERT INTO audit_icp_logs (id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
 			success, error_message, metadata, ip_address, user_agent, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
@@ -65,59 +65,59 @@ func (r *PostgresAuditRepository) Create(ctx context.Context, log *models.AuditL
 }
 
 // List retrieves audit logs for a tenant
-func (r *PostgresAuditRepository) List(ctx context.Context, tenantID string, limit, offset int) ([]*models.AuditLog, error) {
+func (r *PostgresAuditRepository) List(ctx context.Context, workspaceID string, limit, offset int) ([]*models.AuditLog, error) {
 	query := `
-		SELECT id, tenant_id, event_type, workload_id, certificate_id, spiffe_id,
+		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
 			success, error_message, metadata, ip_address, user_agent, created_at
 		FROM audit_icp_logs
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3
 	`
 
-	return r.queryAuditLogs(ctx, query, tenantID, limit, offset)
+	return r.queryAuditLogs(ctx, query, workspaceID, limit, offset)
 }
 
 // ListByWorkload retrieves audit logs for a specific workload
-func (r *PostgresAuditRepository) ListByWorkload(ctx context.Context, tenantID, workloadID string, limit, offset int) ([]*models.AuditLog, error) {
+func (r *PostgresAuditRepository) ListByWorkload(ctx context.Context, workspaceID, workloadID string, limit, offset int) ([]*models.AuditLog, error) {
 	query := `
-		SELECT id, tenant_id, event_type, workload_id, certificate_id, spiffe_id,
+		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
 			success, error_message, metadata, ip_address, user_agent, created_at
 		FROM audit_icp_logs
-		WHERE tenant_id = $1 AND workload_id = $2
+		WHERE workspace_id = $1 AND workload_id = $2
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4
 	`
 
-	return r.queryAuditLogs(ctx, query, tenantID, workloadID, limit, offset)
+	return r.queryAuditLogs(ctx, query, workspaceID, workloadID, limit, offset)
 }
 
 // ListByEventType retrieves audit logs by event type
-func (r *PostgresAuditRepository) ListByEventType(ctx context.Context, tenantID string, eventType models.AuditEventType, limit, offset int) ([]*models.AuditLog, error) {
+func (r *PostgresAuditRepository) ListByEventType(ctx context.Context, workspaceID string, eventType models.AuditEventType, limit, offset int) ([]*models.AuditLog, error) {
 	query := `
-		SELECT id, tenant_id, event_type, workload_id, certificate_id, spiffe_id,
+		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
 			success, error_message, metadata, ip_address, user_agent, created_at
 		FROM audit_icp_logs
-		WHERE tenant_id = $1 AND event_type = $2
+		WHERE workspace_id = $1 AND event_type = $2
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4
 	`
 
-	return r.queryAuditLogs(ctx, query, tenantID, eventType, limit, offset)
+	return r.queryAuditLogs(ctx, query, workspaceID, eventType, limit, offset)
 }
 
 // ListByDateRange retrieves audit logs within a date range
-func (r *PostgresAuditRepository) ListByDateRange(ctx context.Context, tenantID string, from, to time.Time, limit, offset int) ([]*models.AuditLog, error) {
+func (r *PostgresAuditRepository) ListByDateRange(ctx context.Context, workspaceID string, from, to time.Time, limit, offset int) ([]*models.AuditLog, error) {
 	query := `
-		SELECT id, tenant_id, event_type, workload_id, certificate_id, spiffe_id,
+		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
 			success, error_message, metadata, ip_address, user_agent, created_at
 		FROM audit_icp_logs
-		WHERE tenant_id = $1 AND created_at BETWEEN $2 AND $3
+		WHERE workspace_id = $1 AND created_at BETWEEN $2 AND $3
 		ORDER BY created_at DESC
 		LIMIT $4 OFFSET $5
 	`
 
-	return r.queryAuditLogs(ctx, query, tenantID, from, to, limit, offset)
+	return r.queryAuditLogs(ctx, query, workspaceID, from, to, limit, offset)
 }
 
 // queryAuditLogs is a helper function to execute audit log queries

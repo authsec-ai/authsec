@@ -131,7 +131,7 @@ func createTestRS(t *testing.T, name, publicBaseURL string) *models.ResourceServ
 
 	rs := &models.ResourceServer{
 		ID:                      uuid.New(),
-		WorkspaceID:             testTenantID,
+		WorkspaceID:             testWorkspaceID,
 		Name:                    name,
 		PublicBaseURL:           publicBaseURL,
 		ProtectedBasePath:       "/mcp",
@@ -478,7 +478,7 @@ func TestSDKPolicy_503BeforeAnySuccessfulScan(t *testing.T) {
 
 	rs := &models.ResourceServer{
 		ID:                       uuid.New(),
-		WorkspaceID:              testTenantID,
+		WorkspaceID:              testWorkspaceID,
 		Name:                     "sdk-policy-test-" + uuid.New().String()[:8],
 		PublicBaseURL:            "https://localhost:9998",
 		ProtectedBasePath:        "/mcp",
@@ -579,7 +579,7 @@ func TestGetScopeMatrix_FiltersToolsByLastSuccessfulGeneration(t *testing.T) {
 	// Manually inject a "staged" tool at gen=2 (simulates a partial scan that didn't advance serving pointer)
 	stagedTool := models.MCPTool{
 		ID:                 uuid.New(),
-		WorkspaceID:        testTenantID,
+		WorkspaceID:        testWorkspaceID,
 		ResourceServerID:   rs.ID,
 		Name:               "staged_tool_gen2",
 		LastScanGeneration: 2,

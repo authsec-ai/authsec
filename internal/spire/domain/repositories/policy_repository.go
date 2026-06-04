@@ -8,10 +8,10 @@ import (
 
 // PolicyRepository defines the interface for policy data operations
 type PolicyRepository interface {
-	GetByID(ctx context.Context, tenantID, id string) (*models.AttestationPolicy, error)
+	GetByID(ctx context.Context, workspaceID, id string) (*models.AttestationPolicy, error)
 	Create(ctx context.Context, policy *models.AttestationPolicy) error
 	Update(ctx context.Context, policy *models.AttestationPolicy) error
-	Delete(ctx context.Context, tenantID, id string) error
-	ListByTenant(ctx context.Context, tenantID string) ([]*models.AttestationPolicy, error)
-	FindMatchingPolicy(ctx context.Context, tenantID, attestationType string, selectors map[string]string) (*models.AttestationPolicy, error)
+	Delete(ctx context.Context, workspaceID, id string) error
+	ListByTenant(ctx context.Context, workspaceID string) ([]*models.AttestationPolicy, error)
+	FindMatchingPolicy(ctx context.Context, workspaceID, attestationType string, selectors map[string]string) (*models.AttestationPolicy, error)
 }

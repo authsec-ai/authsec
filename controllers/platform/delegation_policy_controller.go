@@ -63,7 +63,7 @@ type UpdateDelegationPolicyRequest struct {
 
 // CreateDelegationPolicy creates a new delegation policy for a tenant.
 func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -346,7 +346,7 @@ func (dc *DelegationPolicyController) CreateDelegationPolicy(c *gin.Context) {
 
 // ListDelegationPolicies lists all delegation policies for a tenant.
 func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -379,7 +379,7 @@ func (dc *DelegationPolicyController) ListDelegationPolicies(c *gin.Context) {
 
 // GetDelegationPolicy retrieves a single delegation policy by ID.
 func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -405,7 +405,7 @@ func (dc *DelegationPolicyController) GetDelegationPolicy(c *gin.Context) {
 
 // UpdateDelegationPolicy updates an existing delegation policy.
 func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
@@ -491,7 +491,7 @@ func (dc *DelegationPolicyController) UpdateDelegationPolicy(c *gin.Context) {
 
 // DeleteDelegationPolicy deletes a delegation policy.
 func (dc *DelegationPolicyController) DeleteDelegationPolicy(c *gin.Context) {
-	workspaceID, err := resolveDelegationTenantID(c)
+	workspaceID, err := resolveDelegationWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return

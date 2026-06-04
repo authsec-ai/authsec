@@ -1497,9 +1497,9 @@ func extractContextIDFromToken(accessToken string) string {
 }
 
 // ListConsentGrants lists consent grants for the admin (filterable by user, client, RS).
-// GET /platform/consent-grants?tenant_id=...&user_id=...&client_id=...&rs_id=...
+// GET /platform/consent-grants?workspace_id=...&user_id=...&client_id=...&rs_id=...
 func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1534,7 +1534,7 @@ func (ctrl *OAuthASController) ListConsentGrants(c *gin.Context) {
 // RevokeConsentGrant revokes a consent grant (admin).
 // DELETE /authsec/consent-grants/:id
 func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
 		return
@@ -1601,7 +1601,7 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 }
 
 func (ctrl *OAuthASController) requireAuthenticatedUserContext(c *gin.Context) (uuid.UUID, uuid.UUID, error) {
-	workspaceID, err := extractTenantID(c)
+	workspaceID, err := extractWorkspaceID(c)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, fmt.Errorf("workspace_id required in JWT")
 	}

@@ -70,7 +70,7 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 		adminUser.ID,
 		adminUser.Email,
 		adminUser.WorkspaceID,
-		adminUser.TenantDomain,
+		adminUser.WorkspaceDomain,
 		roles,
 	)
 	if err != nil {
@@ -83,7 +83,7 @@ func (oc *OIDCController) generateAdminJWTToken(adminUser *models.AdminUser) (st
 // OIDCController handles OIDC authentication flows
 type OIDCController struct {
 	oidcService            *services.OIDCService
-	tenantRepo             *database.AdminTenantRepository
+	workspaceRepo             *database.AdminWorkspaceRepository
 	userRepo               *database.UserRepository
 	adminUserRepo          *database.AdminUserRepository
 	pendingRepo            *database.PendingRegistrationRepository
@@ -119,7 +119,7 @@ func NewOIDCController() (*OIDCController, error) {
 
 	return &OIDCController{
 		oidcService:            services.NewOIDCService(db),
-		tenantRepo:             database.NewAdminTenantRepository(db),
+		workspaceRepo:             database.NewAdminWorkspaceRepository(db),
 		userRepo:               database.NewUserRepository(db),
 		adminUserRepo:          database.NewAdminUserRepository(db),
 		pendingRepo:            database.NewPendingRegistrationRepository(db),
@@ -138,7 +138,7 @@ func (oc *OIDCController) SetPKIService(pkiSvc *spireservices.PKIProvisioningSer
 
 // Initiate handles unified OIDC flow - automatically determines register vs login
 // @Summary Initiate OIDC flow (unified)
-// @Description Starts OIDC flow. If tenant_domain is empty, uses "discover" mode to find existing user.
+// @Description Starts OIDC flow. If workspace_domain is empty, uses "discover" mode to find existing user.
 // @Tags OIDC
 // @Accept json
 // @Produce json
@@ -154,38 +154,38 @@ func (oc *OIDCController) Initiate(c *gin.Context) {
 	}
 
 	// Normalize tenant domain
-	input.TenantDomain = strings.ToLower(strings.TrimSpace(input.TenantDomain))
+	input.WorkspaceDomain = strings.ToLower(strings.TrimSpace(input.WorkspaceDomain))
 
 	var action string
 	var workspaceID *uuid.UUID
 
 	// Case 1: No tenant domain provided (from app.authsec.dev) - DISCOVER mode
-	if input.TenantDomain == "" {
+	if input.WorkspaceDomain == "" {
 		action = "discover"
 		workspaceID = nil
 		log.Printf("OIDC: No tenant domain, initiating DISCOVER flow for provider '%s'", input.Provider)
 	} else {
 		// Validate tenant domain format when provided
 		// Allow full custom domains (test.auth-sec.org) in addition to subdomain prefixes (mycompany)
-		if !isValidTenantDomainOrCustomDomain(input.TenantDomain) {
+		if !isValidWorkspaceDomainOrCustomDomain(input.WorkspaceDomain) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant domain format"})
 			return
 		}
 
 		// Check if tenant exists - this determines register vs login
-		log.Printf("OIDC Initiate: Looking up tenant for domain: %s", input.TenantDomain)
-		existingTenant, err := oc.tenantRepo.GetTenantByDomain(input.TenantDomain)
+		log.Printf("OIDC Initiate: Looking up tenant for domain: %s", input.WorkspaceDomain)
+		existingTenant, err := oc.workspaceRepo.GetWorkspaceByDomain(input.WorkspaceDomain)
 
 		if err == nil && existingTenant != nil {
 			// Tenant exists → LOGIN flow (user must exist in this tenant)
 			action = "login"
 			workspaceID = &existingTenant.WorkspaceID
-			log.Printf("OIDC: Tenant '%s' found (tenant_id=%s), initiating LOGIN flow", input.TenantDomain, existingTenant.WorkspaceID)
+			log.Printf("OIDC: Tenant '%s' found (workspace_id=%s), initiating LOGIN flow", input.WorkspaceDomain, existingTenant.WorkspaceID)
 		} else {
 			// Tenant doesn't exist → REGISTER flow (create new tenant)
 			action = "register"
 			workspaceID = nil
-			log.Printf("OIDC: Tenant '%s' not found (error: %v), initiating REGISTER flow", input.TenantDomain, err)
+			log.Printf("OIDC: Tenant '%s' not found (error: %v), initiating REGISTER flow", input.WorkspaceDomain, err)
 		}
 	}
 
@@ -242,7 +242,7 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 		return
 	}
 
-	existingTenant, err := oc.tenantRepo.GetTenantByDomain(domain)
+	existingTenant, err := oc.workspaceRepo.GetWorkspaceByDomain(domain)
 	exists := err == nil && existingTenant != nil
 
 	c.JSON(http.StatusOK, gin.H{
@@ -252,9 +252,9 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 	})
 }
 
-// GetProviders returns OIDC providers for login UI. With no tenant_domain it
+// GetProviders returns OIDC providers for login UI. With no workspace_domain it
 // returns only global/platform providers (workspace_id IS NULL). With
-// tenant_domain it returns only providers configured for that workspace.
+// workspace_domain it returns only providers configured for that workspace.
 // @Summary Get available OIDC providers
 // @Description Returns list of active OIDC providers for display on login page
 // @Tags OIDC
@@ -262,14 +262,14 @@ func (oc *OIDCController) CheckTenantExists(c *gin.Context) {
 // @Success 200 {object} models.OIDCProviderListResponse
 // @Router /authsec/uflow/oidc/providers [get]
 func (oc *OIDCController) GetProviders(c *gin.Context) {
-	tenantDomain := strings.ToLower(strings.TrimSpace(c.Query("tenant_domain")))
+	workspaceDomain := strings.ToLower(strings.TrimSpace(c.Query("workspace_domain")))
 
 	var (
 		providers []models.OIDCProviderPublic
 		err       error
 	)
-	if tenantDomain != "" {
-		tenant, lookupErr := oc.tenantRepo.GetTenantByDomain(tenantDomain)
+	if workspaceDomain != "" {
+		tenant, lookupErr := oc.workspaceRepo.GetWorkspaceByDomain(workspaceDomain)
 		if lookupErr != nil || tenant == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "workspace not found"})
 			return
@@ -314,21 +314,21 @@ func (oc *OIDCController) GetAuthURL(c *gin.Context) {
 	}
 
 	// Look up workspace by workspace_id (client_id == workspace_id for v4 clients)
-	tenant, err := oc.tenantRepo.GetTenantByID(input.ClientID)
+	tenant, err := oc.workspaceRepo.GetWorkspaceByID(input.ClientID)
 	if err != nil {
 		log.Printf("Failed to find tenant for client_id %s: %v", input.ClientID, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "Client ID not found or associated with any tenant"})
 		return
 	}
 
-	if tenant.TenantDomain == "" {
+	if tenant.WorkspaceDomain == "" {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant found but has no domain configured"})
 		return
 	}
 
 	// Construct the URL
 	baseURL := "https://oauth.prod.authsec.ai/oauth2/auth"
-	redirectURI := fmt.Sprintf("https://%s/oidc/auth/callback", tenant.TenantDomain)
+	redirectURI := fmt.Sprintf("https://%s/oidc/auth/callback", tenant.WorkspaceDomain)
 
 	oauthClientID := input.ClientID
 
@@ -389,16 +389,16 @@ func (oc *OIDCController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// Normalize tenant domain (lowercase, no spaces)
-	input.TenantDomain = strings.ToLower(strings.TrimSpace(input.TenantDomain))
+	input.WorkspaceDomain = strings.ToLower(strings.TrimSpace(input.WorkspaceDomain))
 
 	// Validate tenant domain format
-	if !isValidTenantDomain(input.TenantDomain) {
+	if !isValidWorkspaceDomain(input.WorkspaceDomain) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant domain format. Use only lowercase letters, numbers, and hyphens."})
 		return
 	}
 
 	// Check if tenant domain already exists
-	existingTenant, err := oc.tenantRepo.GetTenantByDomain(input.TenantDomain)
+	existingTenant, err := oc.workspaceRepo.GetWorkspaceByDomain(input.WorkspaceDomain)
 	if err == nil && existingTenant != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "Tenant domain already exists"})
 		return
@@ -431,10 +431,10 @@ func (oc *OIDCController) InitiateLogin(c *gin.Context) {
 	}
 
 	// Normalize tenant domain
-	input.TenantDomain = strings.ToLower(strings.TrimSpace(input.TenantDomain))
+	input.WorkspaceDomain = strings.ToLower(strings.TrimSpace(input.WorkspaceDomain))
 
 	// Verify tenant exists
-	tenant, err := oc.tenantRepo.GetTenantByDomain(input.TenantDomain)
+	tenant, err := oc.workspaceRepo.GetWorkspaceByDomain(input.WorkspaceDomain)
 	if err != nil || tenant == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 		return
@@ -473,17 +473,17 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 	state := c.Query("state")
 	errorParam := c.Query("error")
 
-	// Helper function to get tenant_domain from state token
-	// Priority: OriginDomain > TenantDomain
-	getTenantDomain := func(stateToken string) string {
+	// Helper function to get workspace_domain from state token
+	// Priority: OriginDomain > WorkspaceDomain
+	getWorkspaceDomain := func(stateToken string) string {
 		if stateToken != "" {
 			oidcState, err := oc.oidcService.GetStateByToken(stateToken)
 			if err == nil && oidcState != nil {
 				if oidcState.OriginDomain != "" {
 					return oidcState.OriginDomain
 				}
-				if oidcState.TenantDomain != "" {
-					return oidcState.TenantDomain
+				if oidcState.WorkspaceDomain != "" {
+					return oidcState.WorkspaceDomain
 				}
 			}
 		}
@@ -495,8 +495,8 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 		errorDesc := c.Query("error_description")
 		log.Printf("OIDC provider error: %s - %s", errorParam, errorDesc)
 		data := gin.H{"success": false, "error": errorParam, "description": errorDesc}
-		if tenantDomain := getTenantDomain(state); tenantDomain != "" {
-			data["tenant_domain"] = tenantDomain
+		if workspaceDomain := getWorkspaceDomain(state); workspaceDomain != "" {
+			data["workspace_domain"] = workspaceDomain
 		}
 		renderOAuthCallbackHTML(c, data)
 		return
@@ -504,8 +504,8 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 
 	if code == "" || state == "" {
 		data := gin.H{"success": false, "error": "Missing code or state parameter"}
-		if tenantDomain := getTenantDomain(state); tenantDomain != "" {
-			data["tenant_domain"] = tenantDomain
+		if workspaceDomain := getWorkspaceDomain(state); workspaceDomain != "" {
+			data["workspace_domain"] = workspaceDomain
 		}
 		renderOAuthCallbackHTML(c, data)
 		return
@@ -522,25 +522,25 @@ func (oc *OIDCController) Callback(c *gin.Context) {
 		return
 	}
 
-	// Retrieve the state from database to get tenant_domain for proper redirect
+	// Retrieve the state from database to get workspace_domain for proper redirect
 	oidcState, err := oc.oidcService.GetStateByToken(state)
 	data := gin.H{
 		"code":  code,
 		"state": state,
 	}
 
-	// Add tenant_domain from state if available
-	// Priority: OriginDomain (custom domain user came from) > TenantDomain (constructed subdomain)
+	// Add workspace_domain from state if available
+	// Priority: OriginDomain (custom domain user came from) > WorkspaceDomain (constructed subdomain)
 	if err == nil && oidcState != nil {
 		if oidcState.OriginDomain != "" {
-			data["tenant_domain"] = oidcState.OriginDomain
+			data["workspace_domain"] = oidcState.OriginDomain
 			log.Printf("DEBUG Callback: Using origin_domain='%s' from state for redirect", oidcState.OriginDomain)
-		} else if oidcState.TenantDomain != "" {
-			data["tenant_domain"] = oidcState.TenantDomain
-			log.Printf("DEBUG Callback: Using tenant_domain='%s' from state for redirect (fallback)", oidcState.TenantDomain)
+		} else if oidcState.WorkspaceDomain != "" {
+			data["workspace_domain"] = oidcState.WorkspaceDomain
+			log.Printf("DEBUG Callback: Using workspace_domain='%s' from state for redirect (fallback)", oidcState.WorkspaceDomain)
 		} else {
-			log.Printf("DEBUG Callback: No domain found in state (origin_domain='%s', tenant_domain='%s'), will use default or Host header",
-				oidcState.OriginDomain, oidcState.TenantDomain)
+			log.Printf("DEBUG Callback: No domain found in state (origin_domain='%s', workspace_domain='%s'), will use default or Host header",
+				oidcState.OriginDomain, oidcState.WorkspaceDomain)
 		}
 	} else {
 		log.Printf("DEBUG Callback: Failed to get state or state is nil, will use default or Host header")
@@ -742,8 +742,8 @@ func (oc *OIDCController) ExchangeCode(c *gin.Context) {
 	// For now, let's inline the logic for clarity.
 
 	// Handle based on action (register, login, or discover)
-	log.Printf("DEBUG ExchangeCode: Processing action='%s', state.OriginDomain='%s', state.TenantDomain='%s'",
-		state.Action, state.OriginDomain, state.TenantDomain)
+	log.Printf("DEBUG ExchangeCode: Processing action='%s', state.OriginDomain='%s', state.WorkspaceDomain='%s'",
+		state.Action, state.OriginDomain, state.WorkspaceDomain)
 
 	switch state.Action {
 	// For simplicity, we will focus on the "login" and "discover" which result in a token.
@@ -832,7 +832,7 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 	if err == nil && existingUser != nil {
 		// User EXISTS by email - auto-login to their tenant
 		// Link identity if it doesn't exist
-		existingIdentity, _ := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
+		existingIdentity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(existingUser.WorkspaceID, state.ProviderName, userInfo.Sub)
 		if existingIdentity == nil {
 			profileDataJSON, _ := json.Marshal(map[string]interface{}{"name": userInfo.Name, "picture": userInfo.Picture})
 			identity := &models.OIDCUserIdentity{
@@ -854,8 +854,8 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 	}
 
 	// User DOES NOT EXIST by email
-	// Check if this is from app.authsec.dev (empty tenant_domain) or custom domain
-	if state.TenantDomain == "" {
+	// Check if this is from app.authsec.dev (empty workspace_domain) or custom domain
+	if state.WorkspaceDomain == "" {
 		// From app.authsec.dev or custom domain - allow registration with needs_domain
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":         "User not found",
@@ -880,12 +880,12 @@ func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *
 }
 
 func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, user *models.ExtendedUser, originDomain string) {
-	// user.TenantDomain is the authoritative workspace domain (e.g., papa.dev.authsec.dev).
+	// user.WorkspaceDomain is the authoritative workspace domain (e.g., papa.dev.authsec.dev).
 	// originDomain is just where the request came from (e.g., dev.authsec.dev for generic login).
 	// Always return the DB value so the frontend knows which workspace to redirect to.
-	tenantDomain := user.TenantDomain
-	log.Printf("DEBUG generateAndRespondWithTokenAndOrigin: tenantDomain='%s' (from DB), originDomain='%s'",
-		tenantDomain, originDomain)
+	workspaceDomain := user.WorkspaceDomain
+	log.Printf("DEBUG generateAndRespondWithTokenAndOrigin: workspaceDomain='%s' (from DB), originDomain='%s'",
+		workspaceDomain, originDomain)
 
 	// Look up the AdminUser to generate a properly-scoped JWT
 	adminUser, err := oc.adminUserRepo.GetAdminUserByEmail(user.Email)
@@ -904,7 +904,7 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 
 	c.JSON(http.StatusOK, models.LoginResponse{
 		WorkspaceID:  user.WorkspaceID.String(),
-		TenantDomain: tenantDomain,
+		WorkspaceDomain: workspaceDomain,
 		Email:        user.Email,
 		FirstLogin:   user.LastLogin == nil,
 		Token:        tokenStr,
@@ -913,16 +913,20 @@ func (oc *OIDCController) generateAndRespondWithTokenAndOrigin(c *gin.Context, u
 
 // handleRegistrationCallback processes registration after OIDC callback
 func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
-	// Check if user already exists with this OIDC identity
-	existingIdentity, err := oc.oidcService.GetIdentityByProviderUser(state.ProviderName, userInfo.Sub)
+	// Check if user already exists with this OIDC identity (workspace-scoped when available).
+	var existingIdentity *models.OIDCUserIdentity
+	var err error
+	if state.WorkspaceID != nil {
+		existingIdentity, err = oc.oidcService.GetIdentityByTenantAndProviderUser(*state.WorkspaceID, state.ProviderName, userInfo.Sub)
+	}
 	if err == nil && existingIdentity != nil {
-		// User already registered with this provider - redirect to their tenant
-		tenant, _ := oc.tenantRepo.GetTenantByID(existingIdentity.WorkspaceID.String())
+		// User already registered with this provider - redirect to their workspace
+		tenant, _ := oc.workspaceRepo.GetWorkspaceByID(existingIdentity.WorkspaceID.String())
 		if tenant != nil {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":         "Account already exists",
 				"message":       "You already have an account. Please login instead.",
-				"tenant_domain": tenant.TenantDomain,
+				"workspace_domain": tenant.WorkspaceDomain,
 			})
 			return
 		}
@@ -948,18 +952,18 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	defer tx.Rollback()
 
 	// Create tenant
-	fullDomain := fmt.Sprintf("%s.%s", state.TenantDomain, config.AppConfig.TenantDomainSuffix)
+	fullDomain := fmt.Sprintf("%s.%s", state.WorkspaceDomain, config.AppConfig.WorkspaceDomainSuffix)
 	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := userInfo.Email
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
 		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:  workspaceID,
-		TenantDB:     tenantDBName,
+		WorkspaceDB:     tenantDBName,
 		Email:        userInfo.Email,
 		Username:     &username,
 		Name:         userInfo.Name,
-		TenantDomain: fullDomain,
+		WorkspaceDomain: fullDomain,
 		Provider:     state.ProviderName,
 		ProviderID:   &providerID,
 		Status:       "active",
@@ -968,7 +972,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		UpdatedAt:    time.Now(),
 	}
 
-	if err := oc.tenantRepo.CreateTenantTx(tx, tenant); err != nil {
+	if err := oc.workspaceRepo.CreateTenantTx(tx, tenant); err != nil {
 		log.Printf("Failed to create tenant: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
 		return
@@ -987,7 +991,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 			ClientID:     clientID,
 			WorkspaceID:  workspaceID,
 			ProjectID:    projectID,
-			TenantDomain: fullDomain,
+			WorkspaceDomain: fullDomain,
 			Provider:     state.ProviderName,
 			ProviderID:   userInfo.Sub,
 			Username:     &usernameStr,
@@ -1143,7 +1147,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	middlewares.Audit(c, "oidc", workspaceID.String(), "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"workspace_id":  workspaceID.String(),
-			"tenant_domain": fullDomain,
+			"workspace_domain": fullDomain,
 			"user_id":       userID.String(),
 			"email":         userInfo.Email,
 			"provider":      state.ProviderName,
@@ -1162,7 +1166,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	renderOAuthCallbackHTML(c, map[string]interface{}{
 		"success":       true,
 		"message":       "Registration successful",
-		"tenant_domain": redirectDomain,
+		"workspace_domain": redirectDomain,
 		"workspace_id":  workspaceID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true,
@@ -1181,7 +1185,7 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 // @Router /authsec/uflow/oidc/complete-registration [post]
 func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	var input struct {
-		TenantDomain   string `json:"tenant_domain" binding:"required"`
+		WorkspaceDomain   string `json:"workspace_domain" binding:"required"`
 		Provider       string `json:"provider" binding:"required"`
 		Email          string `json:"email" binding:"required"`
 		Name           string `json:"name"`
@@ -1195,27 +1199,24 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	}
 
 	// Normalize and validate tenant domain
-	tenantDomain := strings.ToLower(strings.TrimSpace(input.TenantDomain))
-	if !isValidTenantDomain(tenantDomain) {
+	workspaceDomain := strings.ToLower(strings.TrimSpace(input.WorkspaceDomain))
+	if !isValidWorkspaceDomain(workspaceDomain) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant domain format. Use only lowercase letters, numbers, and hyphens."})
 		return
 	}
 
 	// Check if tenant domain already exists
-	existingTenant, err := oc.tenantRepo.GetTenantByDomain(tenantDomain)
+	existingTenant, err := oc.workspaceRepo.GetWorkspaceByDomain(workspaceDomain)
 	if err == nil && existingTenant != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "Tenant domain already exists. Please choose a different name."})
 		return
 	}
 
-	// Check if this OIDC identity is already registered (double check)
-	existingIdentity, err := oc.oidcService.GetIdentityByProviderUser(input.Provider, input.ProviderUserID)
-	if err == nil && existingIdentity != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "This social login is already registered with another account."})
-		return
-	}
+	// Duplicate OIDC identity check removed — the unique constraint on
+	// oidc_user_identities(workspace_id, provider_name, provider_user_id) catches
+	// duplicates at the DB level. A global (cross-workspace) check is not safe.
 
-	// Create new tenant and user (similar to handleRegistrationCallback)
+	// Create new workspace and user (similar to handleRegistrationCallback)
 	// Note: In admin registration pattern, workspace_id = client_id for the default client
 	workspaceID := uuid.New()
 	projectID := uuid.New()
@@ -1233,18 +1234,18 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	defer tx.Rollback()
 
 	// Create tenant
-	fullDomain := fmt.Sprintf("%s.%s", tenantDomain, config.AppConfig.TenantDomainSuffix)
+	fullDomain := fmt.Sprintf("%s.%s", workspaceDomain, config.AppConfig.WorkspaceDomainSuffix)
 	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := input.Email
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
 		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:  workspaceID,
-		TenantDB:     tenantDBName,
+		WorkspaceDB:     tenantDBName,
 		Email:        input.Email,
 		Username:     &username,
 		Name:         input.Name,
-		TenantDomain: fullDomain,
+		WorkspaceDomain: fullDomain,
 		Provider:     input.Provider,
 		ProviderID:   &providerIDPtr,
 		Status:       "active",
@@ -1253,7 +1254,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		UpdatedAt:    time.Now(),
 	}
 
-	if err := oc.tenantRepo.CreateTenantTx(tx, tenant); err != nil {
+	if err := oc.workspaceRepo.CreateTenantTx(tx, tenant); err != nil {
 		log.Printf("Failed to create tenant: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
 		return
@@ -1272,7 +1273,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 			ClientID:     clientID,
 			WorkspaceID:  workspaceID,
 			ProjectID:    projectID,
-			TenantDomain: fullDomain,
+			WorkspaceDomain: fullDomain,
 			Provider:     input.Provider,
 			ProviderID:   input.ProviderUserID,
 			Username:     &usernameStr,
@@ -1392,7 +1393,7 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success":       true,
 		"message":       "Registration successful - welcome to your new workspace!",
-		"tenant_domain": fullDomain,
+		"workspace_domain": fullDomain,
 		"workspace_id":  workspaceID.String(),
 		"client_id":     clientID.String(),
 		"first_login":   true, // Always true for new registrations
@@ -1431,25 +1432,25 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 	}
 
 	// Safely extract tenant ID string
-	var tenantIDStr string
+	var workspaceIDStr string
 	switch v := workspaceID.(type) {
 	case uuid.UUID:
-		tenantIDStr = v.String()
+		workspaceIDStr = v.String()
 	case string:
-		tenantIDStr = v
+		workspaceIDStr = v
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID format"})
 		return
 	}
 
-	tid, err := uuid.Parse(tenantIDStr)
+	tid, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
 	}
 
 	// Get tenant domain
-	tenant, tErr := oc.tenantRepo.GetTenantByID(tenantIDStr)
+	tenant, tErr := oc.workspaceRepo.GetWorkspaceByID(workspaceIDStr)
 	if tErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
 		return
@@ -1457,7 +1458,7 @@ func (oc *OIDCController) LinkIdentity(c *gin.Context) {
 
 	// Initiate OIDC flow with action "link"
 	oidcInput := &models.OIDCInitiateInput{
-		TenantDomain: tenant.TenantDomain,
+		WorkspaceDomain: tenant.WorkspaceDomain,
 		Provider:     input.Provider,
 	}
 	response, err := oc.oidcService.InitiateOIDCFlow(oidcInput, "link", &tid)
@@ -1588,22 +1589,22 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	// Convert data to JSON string for embedding in JavaScript
 	dataJSON, _ := json.Marshal(data)
 
-	log.Printf("DEBUG renderOAuthCallbackHTML: Received data with tenant_domain='%v'", data["tenant_domain"])
+	log.Printf("DEBUG renderOAuthCallbackHTML: Received data with workspace_domain='%v'", data["workspace_domain"])
 
 	// Determine the frontend redirect URL
-	// Priority: 1. tenant_domain from data (preserves user's login domain), 2. Host header, 3. Default
+	// Priority: 1. workspace_domain from data (preserves user's login domain), 2. Host header, 3. Default
 	defaultBaseURL := config.AppConfig.BaseURL
 	if defaultBaseURL == "" {
 		defaultBaseURL = "https://app.authsec.dev"
 	}
 	redirectURL := defaultBaseURL + "/authsec/uflow/oidc/callback"
 
-	// Try to use tenant_domain from data first (this preserves the domain the user logged in from)
-	if tenantDomain, ok := data["tenant_domain"].(string); ok && tenantDomain != "" {
+	// Try to use workspace_domain from data first (this preserves the domain the user logged in from)
+	if workspaceDomain, ok := data["workspace_domain"].(string); ok && workspaceDomain != "" {
 		// Use the tenant domain that was passed in (from state or database)
 		// No validation needed - trust the domain from the state/database
-		redirectURL = "https://" + tenantDomain + "/authsec/uflow/oidc/callback"
-		log.Printf("DEBUG renderOAuthCallbackHTML: Using tenant_domain from data, redirectURL='%s'", redirectURL)
+		redirectURL = "https://" + workspaceDomain + "/authsec/uflow/oidc/callback"
+		log.Printf("DEBUG renderOAuthCallbackHTML: Using workspace_domain from data, redirectURL='%s'", redirectURL)
 	} else {
 		// Fallback: Try to extract from Host or X-Forwarded-Host header
 		host := c.GetHeader("X-Forwarded-Host")
@@ -1734,8 +1735,8 @@ func isAllowedFrontendDomain(host string) bool {
 	return false
 }
 
-// isValidTenantDomain validates tenant domain format (subdomain prefix only)
-func isValidTenantDomain(domain string) bool {
+// isValidWorkspaceDomain validates tenant domain format (subdomain prefix only)
+func isValidWorkspaceDomain(domain string) bool {
 	if len(domain) < 3 || len(domain) > 63 {
 		return false
 	}
@@ -1760,8 +1761,8 @@ func isValidTenantDomain(domain string) bool {
 	return true
 }
 
-// isValidTenantDomainOrCustomDomain validates both subdomain prefixes and full custom domains
-func isValidTenantDomainOrCustomDomain(domain string) bool {
+// isValidWorkspaceDomainOrCustomDomain validates both subdomain prefixes and full custom domains
+func isValidWorkspaceDomainOrCustomDomain(domain string) bool {
 	if len(domain) == 0 || len(domain) > 253 {
 		return false
 	}
@@ -1802,5 +1803,5 @@ func isValidTenantDomainOrCustomDomain(domain string) bool {
 	}
 
 	// If no dot, treat as subdomain prefix - use original validation
-	return isValidTenantDomain(domain)
+	return isValidWorkspaceDomain(domain)
 }

@@ -13,8 +13,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// TenantDomain represents a verified or pending custom domain for a tenant
-type TenantDomain struct {
+// WorkspaceDomain represents a verified or pending custom domain for a tenant
+type WorkspaceDomain struct {
 	ID                   uuid.UUID  `db:"id"`
 	WorkspaceID             uuid.UUID  `db:"workspace_id"`
 	Domain               string     `db:"domain"`
@@ -34,18 +34,18 @@ type TenantDomain struct {
 	UpdatedBy            *uuid.UUID `db:"updated_by"`
 }
 
-// TenantDomainsRepository handles database operations for tenant domains
-type TenantDomainsRepository struct {
+// WorkspaceDomainsRepository handles database operations for tenant domains
+type WorkspaceDomainsRepository struct {
 	db *DBConnection
 }
 
-// NewTenantDomainsRepository creates a new repository
-func NewTenantDomainsRepository(db *DBConnection) *TenantDomainsRepository {
-	return &TenantDomainsRepository{db: db}
+// NewWorkspaceDomainsRepository creates a new repository
+func NewWorkspaceDomainsRepository(db *DBConnection) *WorkspaceDomainsRepository {
+	return &WorkspaceDomainsRepository{db: db}
 }
 
 // generateVerificationToken creates a random 32-byte token (hex encoded)
-func (tdr *TenantDomainsRepository) generateVerificationToken() (string, error) {
+func (tdr *WorkspaceDomainsRepository) generateVerificationToken() (string, error) {
 	token := make([]byte, 32)
 	if _, err := rand.Read(token); err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
@@ -60,7 +60,7 @@ func normalizeDomain(domain string) string {
 }
 
 // CreateDomain registers a new domain for a tenant (pending verification)
-func (tdr *TenantDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*TenantDomain, error) {
+func (tdr *WorkspaceDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain string, createdBy *uuid.UUID) (*WorkspaceDomain, error) {
 	// Validate and normalize domain
 	domain = normalizeDomain(domain)
 	if domain == "" {
@@ -71,15 +71,15 @@ func (tdr *TenantDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain s
 	}
 
 	// Check if domain is already claimed by another tenant
-	var existingTenantID uuid.UUID
+	var existingWorkspaceID uuid.UUID
 	err := tdr.db.QueryRow(
 		"SELECT workspace_id FROM workspace_domains WHERE domain = $1",
 		domain,
-	).Scan(&existingTenantID)
+	).Scan(&existingWorkspaceID)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to check domain uniqueness: %w", err)
 	}
-	if err == nil && existingTenantID != workspaceID {
+	if err == nil && existingWorkspaceID != workspaceID {
 		return nil, fmt.Errorf("domain already claimed by another tenant")
 	}
 
@@ -110,7 +110,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain s
 			failure_reason, created_at, updated_at, created_by, updated_by
 	`
 
-	td := &TenantDomain{
+	td := &WorkspaceDomain{
 		ID:                   id,
 		WorkspaceID:             workspaceID,
 		Domain:               domain,
@@ -141,7 +141,7 @@ func (tdr *TenantDomainsRepository) CreateDomain(workspaceID uuid.UUID, domain s
 }
 
 // GetDomainByID retrieves a domain by ID
-func (tdr *TenantDomainsRepository) GetDomainByID(id uuid.UUID) (*TenantDomain, error) {
+func (tdr *WorkspaceDomainsRepository) GetDomainByID(id uuid.UUID) (*WorkspaceDomain, error) {
 	query := `
 		SELECT id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
@@ -151,7 +151,7 @@ func (tdr *TenantDomainsRepository) GetDomainByID(id uuid.UUID) (*TenantDomain, 
 		WHERE id = $1
 	`
 
-	td := &TenantDomain{}
+	td := &WorkspaceDomain{}
 	err := tdr.db.QueryRow(query, id).Scan(
 		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
@@ -169,7 +169,7 @@ func (tdr *TenantDomainsRepository) GetDomainByID(id uuid.UUID) (*TenantDomain, 
 }
 
 // GetDomainByHostname retrieves a verified domain by hostname (for Host → tenant resolution)
-func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*TenantDomain, error) {
+func (tdr *WorkspaceDomainsRepository) GetDomainByHostname(hostname string) (*WorkspaceDomain, error) {
 	hostname = normalizeDomain(hostname)
 
 	query := `
@@ -182,7 +182,7 @@ func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*Tenan
 		LIMIT 1
 	`
 
-	td := &TenantDomain{}
+	td := &WorkspaceDomain{}
 	err := tdr.db.QueryRow(query, hostname).Scan(
 		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
@@ -199,8 +199,8 @@ func (tdr *TenantDomainsRepository) GetDomainByHostname(hostname string) (*Tenan
 	return td, nil
 }
 
-// ListTenantDomains retrieves all domains for a tenant
-func (tdr *TenantDomainsRepository) ListTenantDomains(workspaceID uuid.UUID) ([]TenantDomain, error) {
+// ListWorkspaceDomains retrieves all domains for a tenant
+func (tdr *WorkspaceDomainsRepository) ListWorkspaceDomains(workspaceID uuid.UUID) ([]WorkspaceDomain, error) {
 	query := `
 		SELECT id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
@@ -217,9 +217,9 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(workspaceID uuid.UUID) ([]
 	}
 	defer rows.Close()
 
-	var domains []TenantDomain
+	var domains []WorkspaceDomain
 	for rows.Next() {
-		td := TenantDomain{}
+		td := WorkspaceDomain{}
 		err := rows.Scan(
 			&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 			&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
@@ -235,8 +235,8 @@ func (tdr *TenantDomainsRepository) ListTenantDomains(workspaceID uuid.UUID) ([]
 	return domains, nil
 }
 
-// GetPrimaryDomainByTenantID retrieves the primary domain for a tenant
-func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(workspaceID uuid.UUID) (*TenantDomain, error) {
+// GetPrimaryDomainByWorkspaceID retrieves the primary domain for a tenant
+func (tdr *WorkspaceDomainsRepository) GetPrimaryDomainByWorkspaceID(workspaceID uuid.UUID) (*WorkspaceDomain, error) {
 	query := `
 		SELECT id, workspace_id, domain, kind, is_primary, is_verified,
 			verification_method, verification_token, verification_txt_name,
@@ -247,7 +247,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(workspaceID uuid.
 		LIMIT 1
 	`
 
-	td := &TenantDomain{}
+	td := &WorkspaceDomain{}
 	err := tdr.db.QueryRow(query, workspaceID).Scan(
 		&td.ID, &td.WorkspaceID, &td.Domain, &td.Kind, &td.IsPrimary, &td.IsVerified,
 		&td.VerificationMethod, &td.VerificationToken, &td.VerificationTXTName,
@@ -266,7 +266,7 @@ func (tdr *TenantDomainsRepository) GetPrimaryDomainByTenantID(workspaceID uuid.
 }
 
 // VerifyDomain marks a domain as verified
-func (tdr *TenantDomainsRepository) VerifyDomain(id uuid.UUID, updatedBy *uuid.UUID) error {
+func (tdr *WorkspaceDomainsRepository) VerifyDomain(id uuid.UUID, updatedBy *uuid.UUID) error {
 	now := time.Now()
 	query := `
 		UPDATE workspace_domains
@@ -291,7 +291,7 @@ func (tdr *TenantDomainsRepository) VerifyDomain(id uuid.UUID, updatedBy *uuid.U
 }
 
 // SetPrimaryDomain sets a domain as primary for a tenant (and unsets others)
-func (tdr *TenantDomainsRepository) SetPrimaryDomain(workspaceID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
+func (tdr *WorkspaceDomainsRepository) SetPrimaryDomain(workspaceID, domainID uuid.UUID, updatedBy *uuid.UUID) error {
 	now := time.Now()
 
 	// First, unset all other primary domains for this tenant
@@ -328,7 +328,7 @@ func (tdr *TenantDomainsRepository) SetPrimaryDomain(workspaceID, domainID uuid.
 }
 
 // DeleteDomain soft-deletes (or hard-deletes) a domain
-func (tdr *TenantDomainsRepository) DeleteDomain(id uuid.UUID) error {
+func (tdr *WorkspaceDomainsRepository) DeleteDomain(id uuid.UUID) error {
 	query := `DELETE FROM workspace_domains WHERE id = $1`
 	result, err := tdr.db.Exec(query, id)
 	if err != nil {
@@ -347,7 +347,7 @@ func (tdr *TenantDomainsRepository) DeleteDomain(id uuid.UUID) error {
 }
 
 // GetVerifiedDomainsForTenant returns only verified domains for a tenant
-func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(workspaceID uuid.UUID) ([]string, error) {
+func (tdr *WorkspaceDomainsRepository) GetVerifiedDomainsForTenant(workspaceID uuid.UUID) ([]string, error) {
 	query := `
 		SELECT domain
 		FROM workspace_domains
@@ -374,7 +374,7 @@ func (tdr *TenantDomainsRepository) GetVerifiedDomainsForTenant(workspaceID uuid
 }
 
 // UpdateVerificationStatus updates verification attempt details
-func (tdr *TenantDomainsRepository) UpdateVerificationStatus(id uuid.UUID, isVerified bool, failureReason *string) error {
+func (tdr *WorkspaceDomainsRepository) UpdateVerificationStatus(id uuid.UUID, isVerified bool, failureReason *string) error {
 	now := time.Now()
 	query := `
 		UPDATE workspace_domains
@@ -399,7 +399,7 @@ func (tdr *TenantDomainsRepository) UpdateVerificationStatus(id uuid.UUID, isVer
 }
 
 // IsDomainOwnedByTenant checks if a hostname is owned by the tenant and is verified
-func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(workspaceID uuid.UUID, hostname string) (bool, error) {
+func (tdr *WorkspaceDomainsRepository) IsDomainOwnedByTenant(workspaceID uuid.UUID, hostname string) (bool, error) {
 	hostname = normalizeDomain(hostname)
 
 	var count int
@@ -415,7 +415,7 @@ func (tdr *TenantDomainsRepository) IsDomainOwnedByTenant(workspaceID uuid.UUID,
 }
 
 // ValidateRedirectURIs validates all redirect URIs for a tenant
-func (tdr *TenantDomainsRepository) ValidateRedirectURIs(workspaceID uuid.UUID, redirectURIs []string) ([]string, error) {
+func (tdr *WorkspaceDomainsRepository) ValidateRedirectURIs(workspaceID uuid.UUID, redirectURIs []string) ([]string, error) {
 	// Special case: allow localhost in development (can be made configurable via env)
 	isDev := os.Getenv("ENVIRONMENT") == "development" || os.Getenv("ENVIRONMENT") == ""
 
@@ -452,7 +452,7 @@ func (tdr *TenantDomainsRepository) ValidateRedirectURIs(workspaceID uuid.UUID, 
 }
 
 // NormalizeHostnameAndCheckOwnership validates a redirect URI hostname and checks tenant ownership
-func (tdr *TenantDomainsRepository) NormalizeHostnameAndCheckOwnership(workspaceID uuid.UUID, redirectURI string) (string, error) {
+func (tdr *WorkspaceDomainsRepository) NormalizeHostnameAndCheckOwnership(workspaceID uuid.UUID, redirectURI string) (string, error) {
 	// Parse redirect URI to extract host
 	if !strings.HasPrefix(redirectURI, "http://") && !strings.HasPrefix(redirectURI, "https://") {
 		return "", &InvalidRedirectURIError{Message: "invalid redirect URI: must start with http:// or https://"}

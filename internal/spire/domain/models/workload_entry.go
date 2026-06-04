@@ -45,7 +45,7 @@ func (we *WorkloadEntry) MatchesSelectors(workloadSelectors map[string]string) b
 // Validate performs basic validation on the workload entry
 func (we *WorkloadEntry) Validate() error {
 	if we.WorkspaceID == "" {
-		return ErrInvalidInput("tenant_id is required")
+		return ErrInvalidInput("workspace_id is required")
 	}
 	if we.SpiffeID == "" {
 		return ErrInvalidInput("spiffe_id is required")

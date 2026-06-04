@@ -409,7 +409,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 		Status:      "active",
 	}
 
-	// Upsert: update if (tenant_id, client_id) exists, else insert
+	// Upsert: update if (workspace_id, client_id) exists, else insert
 	var existing models.DelegationToken
 	upsertResult := tenantDB.
 		Where("workspace_id = ? AND client_id = ?", workspaceID, clientUUID).

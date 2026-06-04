@@ -89,7 +89,7 @@ func ensureControllerDB(t *testing.T) {
 
 func skipIfNoSeed(t *testing.T) {
 	t.Helper()
-	if seededTenantID == uuid.Nil {
+	if seededWorkspaceID == uuid.Nil {
 		t.Skip("seed tenant not initialized (set RUN_INTEGRATION=1 to enable)")
 	}
 }
@@ -99,7 +99,7 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 	controller := &GroupController{}
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name           string
@@ -111,7 +111,7 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group addition",
 			input: models.UserDefinedGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{"Developers", "Administrators", "Users"},
 			},
 			expectedStatus: http.StatusOK,
@@ -124,18 +124,18 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 			name:  "invalid request payload",
 			input: models.UserDefinedGroupsRequest{
 				// Missing required fields — controller binds to GroupRequest;
-				// json.RawMessage with null passes required, so only TenantID fails
+				// json.RawMessage with null passes required, so only WorkspaceID fails
 			},
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "Invalid request payload: Key: 'GroupRequest.WorkspaceID' Error:Field validation for 'TenantID' failed on the 'required' tag",
+				"error": "Invalid request payload: Key: 'GroupRequest.WorkspaceID' Error:Field validation for 'WorkspaceID' failed on the 'required' tag",
 			},
 			setupMocks: func() {},
 		},
 		{
 			name: "empty groups list",
 			input: models.UserDefinedGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{},
 			},
 			expectedStatus: http.StatusBadRequest,
@@ -147,7 +147,7 @@ func TestGroupController_AddUserDefinedGroups(t *testing.T) {
 		{
 			name: "database error",
 			input: models.UserDefinedGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
@@ -196,7 +196,7 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 	controller := &GroupController{}
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name           string
@@ -209,8 +209,8 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 		{
 			name: "successful mapping",
 			input: models.MapGroupsRequest{
-				WorkspaceID: tenantID,
-				ClientID:    tenantID,
+				WorkspaceID: workspaceID,
+				ClientID:    workspaceID,
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusOK,
@@ -227,8 +227,8 @@ func TestGroupController_MapGroupsToClient(t *testing.T) {
 		{
 			name: "database error",
 			input: models.MapGroupsRequest{
-				WorkspaceID: tenantID,
-				ClientID:    tenantID,
+				WorkspaceID: workspaceID,
+				ClientID:    workspaceID,
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
@@ -281,7 +281,7 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 	controller := &GroupController{}
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name           string
@@ -294,8 +294,8 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 		{
 			name: "successful removal",
 			input: models.RemoveGroupsRequest{
-				WorkspaceID: tenantID,
-				ClientID:    tenantID,
+				WorkspaceID: workspaceID,
+				ClientID:    workspaceID,
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusOK,
@@ -312,8 +312,8 @@ func TestGroupController_RemoveGroupsFromClient(t *testing.T) {
 		{
 			name: "database error",
 			input: models.RemoveGroupsRequest{
-				WorkspaceID: tenantID,
-				ClientID:    tenantID,
+				WorkspaceID: workspaceID,
+				ClientID:    workspaceID,
 				Groups:      []string{"Developers"},
 			},
 			expectedStatus: http.StatusInternalServerError,
@@ -367,11 +367,11 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 	controller := &GroupController{}
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name           string
-		tenantID       string
+		workspaceID       string
 		expectedStatus int
 		expectedBody   map[string]interface{}
 		setTenant      bool
@@ -379,20 +379,20 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 	}{
 		{
 			name:           "successful retrieval",
-			tenantID:       tenantID,
+			workspaceID:       workspaceID,
 			expectedStatus: http.StatusOK,
 			setTenant:      true,
 		},
 		{
 			name:           "missing tenant ID",
-			tenantID:       "",
+			workspaceID:       "",
 			expectedStatus: http.StatusUnauthorized,
 			expectedBody:   map[string]interface{}{"error": "Tenant ID not found in authentication token"},
 			setTenant:      false,
 		},
 		{
 			name:           "database error",
-			tenantID:       tenantID,
+			workspaceID:       workspaceID,
 			expectedStatus: http.StatusInternalServerError,
 			expectedBody:   map[string]interface{}{"error": "Failed to fetch groups: database connection not available"},
 			setTenant:      true,
@@ -405,8 +405,8 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 
-			if tt.setTenant && tt.tenantID != "" {
-				c.Set("tenant_id", tt.tenantID)
+			if tt.setTenant && tt.workspaceID != "" {
+				c.Set("workspace_id", tt.workspaceID)
 			}
 
 			origDB := config.DB
@@ -415,7 +415,7 @@ func TestGroupController_GetUserDefinedGroups(t *testing.T) {
 			}
 			defer func() { config.DB = origDB }()
 
-			req := httptest.NewRequest("GET", "/uflow/groups/"+tt.tenantID, nil)
+			req := httptest.NewRequest("GET", "/uflow/groups/"+tt.workspaceID, nil)
 			c.Request = req
 
 			controller.GetUserDefinedGroups(c)
@@ -438,7 +438,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 	controller := &GroupController{}
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name           string
@@ -451,7 +451,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group deletion",
 			input: models.DeleteGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{uuid.New().String()},
 			},
 			expectedStatus: http.StatusOK,
@@ -461,7 +461,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "successful group deletion - single group",
 			input: models.DeleteGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{uuid.New().String()},
 			},
 			expectedStatus: http.StatusOK,
@@ -474,13 +474,13 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 				Groups: []string{"GroupToDelete"},
 			},
 			expectedStatus: http.StatusUnauthorized,
-			expectedBody:   map[string]interface{}{"error": "tenant_id not found in authentication token"},
+			expectedBody:   map[string]interface{}{"error": "workspace_id not found in authentication token"},
 			setTenant:      false,
 		},
 		{
 			name: "empty groups list",
 			input: models.DeleteGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{},
 			},
 			expectedStatus: http.StatusBadRequest,
@@ -490,7 +490,7 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 		{
 			name: "database error",
 			input: models.DeleteGroupsRequest{
-				WorkspaceID: tenantID,
+				WorkspaceID: workspaceID,
 				Groups:      []string{"GroupToDelete"},
 			},
 			expectedStatus: http.StatusInternalServerError,
@@ -505,12 +505,12 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 
-			if tt.setTenant && tenantID != "" {
-				c.Set("tenant_id", tenantID)
+			if tt.setTenant && workspaceID != "" {
+				c.Set("workspace_id", workspaceID)
 			}
 
-			if tt.input.WorkspaceID == "" && tt.setTenant && tenantID != "" {
-				tt.input.WorkspaceID = tenantID
+			if tt.input.WorkspaceID == "" && tt.setTenant && workspaceID != "" {
+				tt.input.WorkspaceID = workspaceID
 			}
 
 			origDB := config.DB
@@ -541,18 +541,18 @@ func TestGroupController_DeleteUserDefinedGroups(t *testing.T) {
 func TestAddUserDefinedGroups(t *testing.T) {
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name       string
-		tenantID   string
+		workspaceID   string
 		groups     []string
 		wantErr    bool
 		setupMocks func()
 	}{
 		{
 			name:     "successful group addition",
-			tenantID: tenantID,
+			workspaceID: workspaceID,
 			groups:   []string{"Developers", "Administrators"},
 			wantErr:  false,
 			setupMocks: func() {
@@ -560,14 +560,14 @@ func TestAddUserDefinedGroups(t *testing.T) {
 		},
 		{
 			name:       "empty groups list",
-			tenantID:   tenantID,
+			workspaceID:   workspaceID,
 			groups:     []string{},
 			wantErr:    false,
 			setupMocks: func() {},
 		},
 		{
 			name:     "database error",
-			tenantID: tenantID,
+			workspaceID: workspaceID,
 			groups:   []string{"TestGroup"},
 			wantErr:  true,
 			setupMocks: func() {
@@ -585,7 +585,7 @@ func TestAddUserDefinedGroups(t *testing.T) {
 			}
 			defer func() { config.DB = origDB }()
 
-			_, err := AddUserDefinedGroups(tt.tenantID, tt.groups)
+			_, err := AddUserDefinedGroups(tt.workspaceID, tt.groups)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -598,11 +598,11 @@ func TestAddUserDefinedGroups(t *testing.T) {
 func TestMapGroupsToClient(t *testing.T) {
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name       string
-		tenantID   string
+		workspaceID   string
 		clientID   string
 		groups     []string
 		wantErr    bool
@@ -610,8 +610,8 @@ func TestMapGroupsToClient(t *testing.T) {
 	}{
 		{
 			name:     "successful mapping",
-			tenantID: tenantID,
-			clientID: tenantID,
+			workspaceID: workspaceID,
+			clientID: workspaceID,
 			groups:   []string{"Developers", "Administrators"},
 			wantErr:  false,
 			setupMocks: func() {
@@ -619,7 +619,7 @@ func TestMapGroupsToClient(t *testing.T) {
 		},
 		{
 			name:     "user not found",
-			tenantID: tenantID,
+			workspaceID: workspaceID,
 			clientID: "non-existent-client",
 			groups:   []string{"Developers"},
 			wantErr:  true,
@@ -628,8 +628,8 @@ func TestMapGroupsToClient(t *testing.T) {
 		},
 		{
 			name:     "groups not found",
-			tenantID: tenantID,
-			clientID: tenantID,
+			workspaceID: workspaceID,
+			clientID: workspaceID,
 			groups:   []string{"NonExistentGroup"},
 			wantErr:  true,
 			setupMocks: func() {
@@ -641,7 +641,7 @@ func TestMapGroupsToClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			err := MapGroupsToClient(tt.tenantID, tt.clientID, tt.groups)
+			err := MapGroupsToClient(tt.workspaceID, tt.clientID, tt.groups)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -654,24 +654,24 @@ func TestMapGroupsToClient(t *testing.T) {
 func TestGetUserDefinedGroups(t *testing.T) {
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name       string
-		tenantID   string
+		workspaceID   string
 		wantErr    bool
 		tamperDB   bool
 		setupMocks func()
 	}{
 		{
 			name:       "successful retrieval",
-			tenantID:   tenantID,
+			workspaceID:   workspaceID,
 			wantErr:    false,
 			setupMocks: func() {},
 		},
 		{
 			name:       "database error",
-			tenantID:   tenantID,
+			workspaceID:   workspaceID,
 			wantErr:    true,
 			tamperDB:   true,
 			setupMocks: func() {},
@@ -688,7 +688,7 @@ func TestGetUserDefinedGroups(t *testing.T) {
 			}
 			defer func() { config.DB = origDB }()
 
-			groups, err := GetUserDefinedGroups(tt.tenantID)
+			groups, err := GetUserDefinedGroups(tt.workspaceID)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -702,11 +702,11 @@ func TestGetUserDefinedGroups(t *testing.T) {
 func TestDeleteUserDefinedGroups(t *testing.T) {
 	ensureControllerDB(t)
 	skipIfNoSeed(t)
-	tenantID := seededTenantID.String()
+	workspaceID := seededWorkspaceID.String()
 
 	tests := []struct {
 		name       string
-		tenantID   string
+		workspaceID   string
 		groups     []string
 		wantErr    bool
 		tamperDB   bool
@@ -714,7 +714,7 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 	}{
 		{
 			name:     "successful deletion",
-			tenantID: tenantID,
+			workspaceID: workspaceID,
 			groups:   []string{uuid.New().String(), uuid.New().String()},
 			wantErr:  false,
 			setupMocks: func() {
@@ -722,7 +722,7 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 		},
 		{
 			name:     "successful deletion - single group",
-			tenantID: tenantID,
+			workspaceID: workspaceID,
 			groups:   []string{uuid.New().String()},
 			wantErr:  false,
 			setupMocks: func() {
@@ -730,14 +730,14 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 		},
 		{
 			name:       "empty groups list",
-			tenantID:   tenantID,
+			workspaceID:   workspaceID,
 			groups:     []string{},
 			wantErr:    false,
 			setupMocks: func() {},
 		},
 		{
 			name:       "database error",
-			tenantID:   tenantID,
+			workspaceID:   workspaceID,
 			groups:     []string{"GroupToDelete"},
 			wantErr:    true,
 			tamperDB:   true,
@@ -755,7 +755,7 @@ func TestDeleteUserDefinedGroups(t *testing.T) {
 			}
 			defer func() { config.DB = origDB }()
 
-			err := DeleteUserDefinedGroups(tt.tenantID, tt.groups)
+			err := DeleteUserDefinedGroups(tt.workspaceID, tt.groups)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

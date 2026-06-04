@@ -27,14 +27,14 @@ func NewBundleController(service *services.BundleService, logger *logrus.Entry) 
 
 // GetBundle handles GET /spire/v1/bundle/:tenant
 func (ctrl *BundleController) GetBundle(c *gin.Context) {
-	tenantID := c.Param("tenant")
+	workspaceID := c.Param("tenant")
 
-	if tenantID == "" {
+	if workspaceID == "" {
 		ctrl.sendError(c, errors.NewBadRequestError("Tenant ID is required", nil))
 		return
 	}
 
-	bundle, err := ctrl.service.GetBundle(c.Request.Context(), tenantID)
+	bundle, err := ctrl.service.GetBundle(c.Request.Context(), workspaceID)
 	if err != nil {
 		ctrl.sendError(c, err)
 		return
@@ -42,7 +42,7 @@ func (ctrl *BundleController) GetBundle(c *gin.Context) {
 
 	c.JSON(http.StatusOK, dto.BundleResponse{
 		CABundle: bundle,
-		WorkspaceID: tenantID,
+		WorkspaceID: workspaceID,
 	})
 }
 

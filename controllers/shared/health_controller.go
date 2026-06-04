@@ -121,6 +121,14 @@ func (hc *HealthController) checkDatabaseHealth() map[string]interface{} {
 		return result
 	}
 
+	// Verify bootstrap schema is present by checking a critical table
+	var tableCount int64
+	if err := config.DB.Raw("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'workspaces'").Scan(&tableCount).Error; err != nil || tableCount == 0 {
+		result["healthy"] = false
+		result["message"] = "Bootstrap schema missing: workspaces table not found"
+		return result
+	}
+
 	result["connection_pool_stats"] = map[string]interface{}{
 		"open_connections": sqlDB.Stats().OpenConnections,
 		"in_use":           sqlDB.Stats().InUse,
@@ -248,11 +256,11 @@ func (hc *HealthController) checkMetricsHealth() map[string]interface{} {
 // @Description Verifies that a tenant database is accessible and healthy
 // @Tags Health
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Tenant ID"
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/health/tenant/{tenant_id} [get]
+// @Router /authsec/uflow/health/tenant/{workspace_id} [get]
 func (hc *HealthController) CheckTenantDatabase(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "delegated",

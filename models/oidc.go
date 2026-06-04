@@ -39,7 +39,7 @@ type OIDCState struct {
 	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	StateToken    string     `json:"state_token" gorm:"uniqueIndex;not null"`            // Random state for CSRF
 	WorkspaceID   *uuid.UUID `json:"workspace_id,omitempty" gorm:"type:uuid"`            // NULL for new registration
-	TenantDomain  string     `json:"tenant_domain" gorm:"not null"`                      // e.g., 'ritam'
+	WorkspaceDomain  string     `json:"workspace_domain" gorm:"not null"`                      // e.g., 'ritam'
 	OriginDomain  string     `json:"origin_domain,omitempty" gorm:"column:request_host"` // The actual domain user came from (maps to request_host column)
 	ProviderName  string     `json:"provider_name" gorm:"not null"`                      // 'google', 'github', etc.
 	Action        string     `json:"action" gorm:"not null"`                             // 'login' or 'register'
@@ -89,7 +89,7 @@ func (OIDCUserIdentity) TableName() string {
 
 // OIDCInitiateInput represents the input for initiating OIDC flow
 type OIDCInitiateInput struct {
-	TenantDomain  string     `json:"tenant_domain"`               // e.g., 'ritam' (optional - empty = discover mode)
+	WorkspaceDomain  string     `json:"workspace_domain"`               // e.g., 'ritam' (optional - empty = discover mode)
 	Provider      string     `json:"provider" binding:"required"` // workspace's provider_name slug ('google', 'github', 'okta-acme', …)
 	RedirectAfter string     `json:"redirect_after,omitempty"`    // Optional: where to go after
 	ApplicationID *uuid.UUID `json:"application_id,omitempty"`    // Optional: Application this login targets; used by application_identity_provider_policies gate
@@ -117,7 +117,7 @@ type OIDCCallbackInput struct {
 type OIDCCallbackResponse struct {
 	Success      bool   `json:"success"`
 	Message      string `json:"message"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 	RedirectURL  string `json:"redirect_url,omitempty"` // Where to redirect user
 	Token        string `json:"token,omitempty"`        // JWT token if login
 	FirstLogin   bool   `json:"first_login,omitempty"`  // True if first OIDC login

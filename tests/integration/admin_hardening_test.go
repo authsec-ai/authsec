@@ -46,8 +46,8 @@ func TestRS_Create_Admin(t *testing.T) {
 	rsID, _ := resp.JSON["id"].(string)
 	// Audit row must exist
 	assertRowExists(t, "audit_events",
-		"action = 'rs_created' AND tenant_id = $1 AND resource_id = $2",
-		testTenantID.String(), rsID)
+		"action = 'rs_created' AND workspace_id = $1 AND resource_id = $2",
+		testWorkspaceID.String(), rsID)
 }
 
 func TestRS_Update_NonAdmin(t *testing.T) {
@@ -77,10 +77,10 @@ func TestRS_PreRegister_NonAdmin(t *testing.T) {
 }
 
 func TestRS_CrossTenant_Delete(t *testing.T) {
-	// An admin from testOtherTenantID tries to delete testTenantID's RS.
+	// An admin from testOtherWorkspaceID tries to delete testWorkspaceID's RS.
 	resp := doRequest("DELETE",
 		fmt.Sprintf("/authsec/resource-servers/%s", testResourceServerID),
-		nil, generateOtherTenantAdminToken(testOtherTenantID))
+		nil, generateOtherTenantAdminToken(testOtherWorkspaceID))
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
@@ -108,14 +108,14 @@ func TestScope_Create_Admin(t *testing.T) {
 
 	scopeID, _ := resp.JSON["id"].(string)
 	assertRowExists(t, "audit_events",
-		"action = 'scope_created' AND tenant_id = $1 AND resource_id = $2",
-		testTenantID.String(), scopeID)
+		"action = 'scope_created' AND workspace_id = $1 AND resource_id = $2",
+		testWorkspaceID.String(), scopeID)
 }
 
 func TestScope_Create_CrossTenantRS(t *testing.T) {
-	// testOtherTenantRSID is a real RS row owned by testOtherTenantID.
-	// An admin from testTenantID must receive 404 because the ownership check
-	// (GetByIDAndTenant) filters by the token's tenant_id.
+	// testOtherTenantRSID is a real RS row owned by testOtherWorkspaceID.
+	// An admin from testWorkspaceID must receive 404 because the ownership check
+	// (GetByIDAndTenant) filters by the token's workspace_id.
 	resp := doAdminRequest("POST",
 		fmt.Sprintf("/authsec/resource-servers/%s/scopes", testOtherTenantRSID),
 		map[string]interface{}{"scope_string": "tools:injected:read"})
@@ -123,8 +123,8 @@ func TestScope_Create_CrossTenantRS(t *testing.T) {
 }
 
 func TestScope_Create_CrossTenantParent(t *testing.T) {
-	// testOtherTenantScopeID is a real scope row owned by testOtherTenantID's RS.
-	// Using it as parent_scope_id for a scope in testTenantID's RS must return 400.
+	// testOtherTenantScopeID is a real scope row owned by testOtherWorkspaceID's RS.
+	// Using it as parent_scope_id for a scope in testWorkspaceID's RS must return 400.
 	resp := doAdminRequest("POST",
 		fmt.Sprintf("/authsec/resource-servers/%s/scopes", testResourceServerID),
 		map[string]interface{}{
@@ -135,7 +135,7 @@ func TestScope_Create_CrossTenantParent(t *testing.T) {
 }
 
 func TestScope_Create_SameTenantCrossRS_Parent(t *testing.T) {
-	// testSecondRSScopeID is a real scope owned by testTenantID but under testSecondRSID.
+	// testSecondRSScopeID is a real scope owned by testWorkspaceID but under testSecondRSID.
 	// Using it as parent_scope_id when creating a scope for testResourceServerID must
 	// return 400: both scopes belong to the same tenant, but the RS domains differ,
 	// and the hierarchy isolation rule blocks cross-RS parent links.
@@ -149,7 +149,7 @@ func TestScope_Create_SameTenantCrossRS_Parent(t *testing.T) {
 }
 
 func TestScope_Create_CrossTenantPermission(t *testing.T) {
-	// testOtherTenantPermID is a real permission row owned by testOtherTenantID.
+	// testOtherTenantPermID is a real permission row owned by testOtherWorkspaceID.
 	// The scope must still be created (201) but that specific permission ID must
 	// NOT appear in oauth_scope_permissions because the tenant filter rejects it.
 	resp := doAdminRequest("POST",
@@ -179,21 +179,21 @@ func TestScope_Update_Admin(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.Code)
 
 	assertRowExists(t, "audit_events",
-		"action = 'scope_updated' AND tenant_id = $1 AND resource_id = $2",
-		testTenantID.String(), testScopeID.String())
+		"action = 'scope_updated' AND workspace_id = $1 AND resource_id = $2",
+		testWorkspaceID.String(), testScopeID.String())
 }
 
 func TestScope_Update_CrossTenant(t *testing.T) {
 	resp := doRequest("PUT",
 		fmt.Sprintf("/authsec/scopes/%s", testScopeID),
 		map[string]interface{}{"display_name": "Hijacked"},
-		generateOtherTenantAdminToken(testOtherTenantID))
+		generateOtherTenantAdminToken(testOtherWorkspaceID))
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
 func TestScope_Update_CrossTenantParent(t *testing.T) {
-	// testOtherTenantScopeID is a real scope owned by testOtherTenantID.
-	// Passing it as parent_scope_id for a scope in testTenantID must return 400.
+	// testOtherTenantScopeID is a real scope owned by testOtherWorkspaceID.
+	// Passing it as parent_scope_id for a scope in testWorkspaceID must return 400.
 	resp := doAdminRequest("PUT",
 		fmt.Sprintf("/authsec/scopes/%s", testScopeID),
 		map[string]interface{}{"parent_scope_id": testOtherTenantScopeID.String()})
@@ -223,7 +223,7 @@ func TestScope_Delete_NonAdmin(t *testing.T) {
 func TestScope_Delete_CrossTenant(t *testing.T) {
 	resp := doRequest("DELETE",
 		fmt.Sprintf("/authsec/scopes/%s", testScopeID),
-		nil, generateOtherTenantAdminToken(testOtherTenantID))
+		nil, generateOtherTenantAdminToken(testOtherWorkspaceID))
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
@@ -243,20 +243,20 @@ func TestToolScopeMap_NonAdmin(t *testing.T) {
 }
 
 func TestToolScopeMap_CrossTenantRS(t *testing.T) {
-	// testOtherTenantRSID is a real RS row owned by testOtherTenantID.
-	// A token for testOtherTenantID must receive 404 because GetByIDAndTenant
-	// checks the token's tenant_id against the RS row.
+	// testOtherTenantRSID is a real RS row owned by testOtherWorkspaceID.
+	// A token for testOtherWorkspaceID must receive 404 because GetByIDAndTenant
+	// checks the token's workspace_id against the RS row.
 	resp := doRequest("PUT",
 		fmt.Sprintf("/authsec/resource-servers/%s/tool-scope-map", testOtherTenantRSID),
 		map[string]interface{}{
 			"mappings": []map[string]interface{}{
 				{"tool_id": testOtherTenantToolID.String(), "scope_id": testOtherTenantScopeID.String()},
 			},
-		}, generateOtherTenantAdminToken(testOtherTenantID))
-	// The other-tenant admin's token is for testOtherTenantID, but the RS row was
-	// created under testOtherTenantID — this should succeed for the route gate but
-	// the real test is that testTenantID's admin cannot reach testOtherTenantID's RS.
-	// Use testTenantID's admin token against the other tenant's RS to confirm 404.
+		}, generateOtherTenantAdminToken(testOtherWorkspaceID))
+	// The other-tenant admin's token is for testOtherWorkspaceID, but the RS row was
+	// created under testOtherWorkspaceID — this should succeed for the route gate but
+	// the real test is that testWorkspaceID's admin cannot reach testOtherWorkspaceID's RS.
+	// Use testWorkspaceID's admin token against the other tenant's RS to confirm 404.
 	resp2 := doAdminRequest("PUT",
 		fmt.Sprintf("/authsec/resource-servers/%s/tool-scope-map", testOtherTenantRSID),
 		map[string]interface{}{
@@ -268,10 +268,10 @@ func TestToolScopeMap_CrossTenantRS(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, resp2.Code)
 }
 
-func TestToolScopeMap_CrossTenantIDs_Skipped(t *testing.T) {
+func TestToolScopeMap_CrossWorkspaceIDs_Skipped(t *testing.T) {
 	// testOtherTenantToolID and testOtherTenantScopeID are real rows owned by
-	// testOtherTenantID. testTenantID's admin sends them against testTenantID's RS.
-	// Per-mapping ownership check (tenant_id = ? AND resource_server_id = ?) rejects
+	// testOtherWorkspaceID. testWorkspaceID's admin sends them against testWorkspaceID's RS.
+	// Per-mapping ownership check (workspace_id = ? AND resource_server_id = ?) rejects
 	// both → applied:0 and zero bridge rows written.
 	resp := doAdminRequest("PUT",
 		fmt.Sprintf("/authsec/resource-servers/%s/tool-scope-map", testResourceServerID),
@@ -329,24 +329,24 @@ func TestConsent_Revoke_Admin(t *testing.T) {
 	// Use a fresh grant so this test is idempotent regardless of ordering.
 	freshGrantID := uuid.New()
 	_ = runSQL(
-		`INSERT INTO oauth_consent_grants (id, tenant_id, user_id, client_id, resource_server_id, scopes, created_at, updated_at)
+		`INSERT INTO oauth_consent_grants (id, workspace_id, user_id, client_id, resource_server_id, scopes, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, ARRAY['tools:test:read'], NOW(), NOW()) ON CONFLICT DO NOTHING`,
-		freshGrantID, testTenantID, testEndUserID, testClientID, testResourceServerID)
+		freshGrantID, testWorkspaceID, testEndUserID, testClientID, testResourceServerID)
 
 	resp := doAdminRequest("DELETE",
 		fmt.Sprintf("/authsec/consent-grants/%s", freshGrantID), nil)
 	require.Equal(t, http.StatusOK, resp.Code)
 
 	assertRowExists(t, "audit_events",
-		"action = 'consent_grant_revoked' AND tenant_id = $1 AND resource_id = $2",
-		testTenantID.String(), freshGrantID.String())
+		"action = 'consent_grant_revoked' AND workspace_id = $1 AND resource_id = $2",
+		testWorkspaceID.String(), freshGrantID.String())
 }
 
 func TestConsent_Revoke_CrossTenant(t *testing.T) {
-	// An admin from testOtherTenantID tries to revoke a grant owned by testTenantID.
+	// An admin from testOtherWorkspaceID tries to revoke a grant owned by testWorkspaceID.
 	resp := doRequest("DELETE",
 		fmt.Sprintf("/authsec/consent-grants/%s", testConsentGrantID),
-		nil, generateOtherTenantAdminToken(testOtherTenantID))
+		nil, generateOtherTenantAdminToken(testOtherWorkspaceID))
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
@@ -354,9 +354,9 @@ func TestConsent_Revoke_AlreadyRevoked(t *testing.T) {
 	// Insert a pre-revoked grant.
 	alreadyRevokedID := uuid.New()
 	_ = runSQL(
-		`INSERT INTO oauth_consent_grants (id, tenant_id, user_id, client_id, resource_server_id, scopes, revoked_at, created_at, updated_at)
+		`INSERT INTO oauth_consent_grants (id, workspace_id, user_id, client_id, resource_server_id, scopes, revoked_at, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, ARRAY['tools:test:read'], NOW(), NOW(), NOW()) ON CONFLICT DO NOTHING`,
-		alreadyRevokedID, testTenantID, testEndUserID, testClientID, testResourceServerID)
+		alreadyRevokedID, testWorkspaceID, testEndUserID, testClientID, testResourceServerID)
 
 	resp := doAdminRequest("DELETE",
 		fmt.Sprintf("/authsec/consent-grants/%s", alreadyRevokedID), nil)

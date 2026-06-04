@@ -19,7 +19,7 @@ import (
 // WorkloadAttestationService handles workload attestation and SVID issuance
 type WorkloadAttestationService struct {
 	connManager          *database.ConnectionManager
-	tenantRepo           repositories.TenantRepository
+	workspaceRepo           repositories.WorkspaceRepository
 	workloadEntryService *WorkloadEntryService
 	vaultClient          *vault.Client
 	logger               *logrus.Entry
@@ -28,14 +28,14 @@ type WorkloadAttestationService struct {
 // NewWorkloadAttestationService creates a new workload attestation service
 func NewWorkloadAttestationService(
 	connManager *database.ConnectionManager,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	workloadEntryService *WorkloadEntryService,
 	vaultClient *vault.Client,
 	logger *logrus.Entry,
 ) *WorkloadAttestationService {
 	return &WorkloadAttestationService{
 		connManager:          connManager,
-		tenantRepo:           tenantRepo,
+		workspaceRepo:           workspaceRepo,
 		workloadEntryService: workloadEntryService,
 		vaultClient:          vaultClient,
 		logger:               logger,
@@ -62,40 +62,40 @@ type AttestWorkloadResponse struct {
 // AttestWorkload performs workload attestation and issues SVID
 func (s *WorkloadAttestationService) AttestWorkload(ctx context.Context, req *AttestWorkloadRequest) (*AttestWorkloadResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id": req.WorkspaceID,
+		"workspace_id": req.WorkspaceID,
 		"agent_id":  req.AgentID,
 		"selectors": req.Selectors,
 	}).Info("Attesting workload")
 
 	// Get tenant from master database to retrieve Vault mount configuration
-	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", req.WorkspaceID).WithError(err).Error("Failed to fetch tenant from master database")
+		s.logger.WithField("workspace_id", req.WorkspaceID).WithError(err).Error("Failed to fetch tenant from master database")
 		return nil, fmt.Errorf("failed to fetch tenant vault mount: %w", err)
 	}
 
 	if !tenant.IsActive() {
-		s.logger.WithField("tenant_id", req.WorkspaceID).Error("Tenant is not active")
+		s.logger.WithField("workspace_id", req.WorkspaceID).Error("Tenant is not active")
 		return nil, fmt.Errorf("tenant is not active")
 	}
 
 	// Use vault mount as-is (should be in format: pki/tenant.domain.com)
 	tenantVaultMount := tenant.VaultMount
 	if tenantVaultMount == "" {
-		s.logger.WithField("tenant_id", req.WorkspaceID).Error("Tenant vault mount is empty")
+		s.logger.WithField("workspace_id", req.WorkspaceID).Error("Tenant vault mount is empty")
 		return nil, fmt.Errorf("tenant vault mount is not configured")
 	}
 
 	// 1. Find matching workload entries based on selectors
 	matchingEntries, err := s.workloadEntryService.FindMatchingEntries(ctx, req.WorkspaceID, req.Selectors)
 	if err != nil {
-		s.logger.WithField("tenant_id", req.WorkspaceID).WithError(err).Error("Failed to find matching workload entries")
+		s.logger.WithField("workspace_id", req.WorkspaceID).WithError(err).Error("Failed to find matching workload entries")
 		return nil, fmt.Errorf("failed to find matching workload entries: %w", err)
 	}
 
 	if len(matchingEntries) == 0 {
 		s.logger.WithFields(logrus.Fields{
-			"tenant_id": req.WorkspaceID,
+			"workspace_id": req.WorkspaceID,
 			"selectors": req.Selectors,
 		}).Warn("No matching workload entries found")
 		return nil, fmt.Errorf("no workload entry matches the provided selectors")
@@ -225,9 +225,9 @@ func (s *WorkloadAttestationService) AttestWorkload(ctx context.Context, req *At
 }
 
 // recordWorkloadSVID stores a record of issued workload SVID for audit/tracking
-func (s *WorkloadAttestationService) recordWorkloadSVID(ctx context.Context, tenantID, entryID, spiffeID, serialNumber string, ttl int) error {
+func (s *WorkloadAttestationService) recordWorkloadSVID(ctx context.Context, workspaceID, entryID, spiffeID, serialNumber string, ttl int) error {
 	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetTenantDB(ctx, tenantID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
@@ -235,7 +235,7 @@ func (s *WorkloadAttestationService) recordWorkloadSVID(ctx context.Context, ten
 	// Insert workload SVID record for audit/tracking
 	query := `
 		INSERT INTO workload_svids (
-			id, tenant_id, entry_id, spiffe_id, serial_number, ttl,
+			id, workspace_id, entry_id, spiffe_id, serial_number, ttl,
 			issued_at, expires_at, created_at
 		) VALUES (
 			gen_random_uuid(), $1, $2, $3, $4, $5,
@@ -244,7 +244,7 @@ func (s *WorkloadAttestationService) recordWorkloadSVID(ctx context.Context, ten
 		ON CONFLICT DO NOTHING
 	`
 
-	_, err = tenantDB.ExecContext(ctx, query, tenantID, entryID, spiffeID, serialNumber, ttl)
+	_, err = tenantDB.ExecContext(ctx, query, workspaceID, entryID, spiffeID, serialNumber, ttl)
 	if err != nil {
 		// Don't fail the attestation if we can't record it
 		s.logger.WithField("spiffe_id", spiffeID).WithError(err).Warn("Failed to record workload SVID (non-critical)")
@@ -255,21 +255,21 @@ func (s *WorkloadAttestationService) recordWorkloadSVID(ctx context.Context, ten
 }
 
 // RevokeWorkloadSVID revokes a workload SVID by serial number
-func (s *WorkloadAttestationService) RevokeWorkloadSVID(ctx context.Context, tenantID, serialNumber string) error {
+func (s *WorkloadAttestationService) RevokeWorkloadSVID(ctx context.Context, workspaceID, serialNumber string) error {
 	s.logger.WithFields(logrus.Fields{
-		"tenant_id":     tenantID,
+		"workspace_id":     workspaceID,
 		"serial_number": serialNumber,
 	}).Info("Revoking workload SVID")
 
 	// Get tenant from master database to retrieve Vault mount configuration
-	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, workspaceID)
 	if err != nil {
-		s.logger.WithField("tenant_id", tenantID).WithError(err).Error("Failed to fetch tenant from master database")
+		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to fetch tenant from master database")
 		return fmt.Errorf("failed to fetch tenant vault mount: %w", err)
 	}
 
 	if !tenant.IsActive() {
-		s.logger.WithField("tenant_id", tenantID).Error("Tenant is not active")
+		s.logger.WithField("workspace_id", workspaceID).Error("Tenant is not active")
 		return fmt.Errorf("tenant is not active")
 	}
 

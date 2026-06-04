@@ -218,7 +218,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 ) (map[string]struct{}, error) {
 	result := make(map[string]struct{})
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return result, nil // invalid UUID = no scopes (fail-closed)
 	}
@@ -240,7 +240,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 	// look like "allowed".
 	var endUserStatus string
 	row := r.db.WithContext(ctx).
-		Raw(`SELECT status FROM workspace_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, tenantUUID, userID).
+		Raw(`SELECT status FROM workspace_end_user_states WHERE workspace_id = ? AND user_id::text = ? LIMIT 1`, workspaceUUID, userID).
 		Row()
 	if scanErr := row.Scan(&endUserStatus); scanErr == nil && endUserStatus != "" && endUserStatus != "active" {
 		return result, nil
@@ -270,11 +270,11 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
 		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
 		Where("(rb.user_id::text = ? OR rb.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id::text = ?))", userID, userID).
-		Where("(rb.workspace_id IS NULL OR rb.workspace_id = ?)", tenantUUID).
+		Where("(rb.workspace_id IS NULL OR rb.workspace_id = ?)", workspaceUUID).
 		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
-		Where("(ro.workspace_id IS NULL OR ro.workspace_id = ?)", tenantUUID).
-		Where("(p.workspace_id IS NULL OR p.workspace_id = ?)", tenantUUID).
-		Where("os.workspace_id = ? AND os.resource_server_id = ?", tenantUUID, rsUUID).
+		Where("(ro.workspace_id IS NULL OR ro.workspace_id = ?)", workspaceUUID).
+		Where("(p.workspace_id IS NULL OR p.workspace_id = ?)", workspaceUUID).
+		Where("os.workspace_id = ? AND os.resource_server_id = ?", workspaceUUID, rsUUID).
 		Where(`
 			rb.scope_type IS NULL
 			OR rb.scope_type = '*'
@@ -292,7 +292,7 @@ func (r *ScopeResolver) resolveUserEffectiveScopes(
 
 	// Expand wildcards: if user has "tools:*", also grant "tools:weather:read", etc.
 	if len(result) > 0 {
-		r.expandWildcards(ctx, tenantUUID, rsUUID, result)
+		r.expandWildcards(ctx, workspaceUUID, rsUUID, result)
 	}
 
 	return result, nil

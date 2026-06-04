@@ -21,7 +21,7 @@ import (
 )
 
 type EndUserAuthController struct {
-	tenantRepo        *database.TenantRepository
+	workspaceRepo        *database.WorkspaceRepository
 	otpRepo           *database.OTPRepository
 	pendingRepo       *database.PendingRegistrationRepository
 	antiReplayService *services.AntiReplayService
@@ -40,7 +40,7 @@ func NewEndUserAuthController() (*EndUserAuthController, error) {
 	}
 
 	return &EndUserAuthController{
-		tenantRepo:        database.NewTenantRepository(db),
+		workspaceRepo:        database.NewWorkspaceRepository(db),
 		otpRepo:           database.NewOTPRepository(db),
 		pendingRepo:       database.NewPendingRegistrationRepository(db),
 		antiReplayService: services.NewAntiReplayService(redisClient),
@@ -154,13 +154,13 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		return
 	}
 
-	tenant, err := euac.tenantRepo.GetTenantByTenantID(input.WorkspaceID.String())
+	tenant, err := euac.workspaceRepo.GetWorkspaceByWorkspaceID(input.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
 	}
 
-	tenantIDStr := tenant.WorkspaceID.String()
+	workspaceIDStr := tenant.WorkspaceID.String()
 	tenantDB := config.DB
 
 	var user models.User
@@ -184,7 +184,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		clientIDStr = user.ClientID.String()
 	}
 
-	token, err := euac.generateJWTToken(tenantIDStr, clientIDStr, user.Email, user.TenantDomain, &user.ID, tenantDB)
+	token, err := euac.generateJWTToken(workspaceIDStr, clientIDStr, user.Email, user.WorkspaceDomain, &user.ID, tenantDB)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
@@ -200,7 +200,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 		"token_type":   "Bearer",
 		"expires_in":   365 * 24 * 60 * 60,
 		"first_login":  isFirstLogin,
-		"workspace_id": tenantIDStr,
+		"workspace_id": workspaceIDStr,
 		"email":        user.Email,
 	}
 
@@ -208,7 +208,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	middlewares.Audit(c, "enduser", user.ID.String(), "webauthn_login", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"email":        user.Email,
-			"workspace_id": tenantIDStr,
+			"workspace_id": workspaceIDStr,
 			"first_login":  isFirstLogin,
 			"mfa_method":   "webauthn",
 		},
@@ -217,7 +217,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (euac *EndUserAuthController) generateJWTToken(workspaceID, clientID, emailID, tenantDomain string, userID *uuid.UUID, tenantDB interface{}) (string, error) {
+func (euac *EndUserAuthController) generateJWTToken(workspaceID, clientID, emailID, workspaceDomain string, userID *uuid.UUID, tenantDB interface{}) (string, error) {
 	// Collect scopes for potential inclusion in token (though auth-manager fetches from DB)
 	scopes := []string{"read", "write"}
 

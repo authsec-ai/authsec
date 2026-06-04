@@ -252,7 +252,7 @@ Your Security Team
 }
 
 // SendAdminInviteEmail sends a tailored invite email for admin users with login URL, username, and temp password.
-func SendAdminInviteEmail(email, username, tenantDomain, tempPassword string) error {
+func SendAdminInviteEmail(email, username, workspaceDomain, tempPassword string) error {
 	log.Printf("SendAdminInviteEmail: preparing admin invite email for %s", email)
 	// Email configuration from environment variables
 	smtpHost := config.AppConfig.SMTPHost
@@ -266,7 +266,7 @@ func SendAdminInviteEmail(email, username, tenantDomain, tempPassword string) er
 	}
 
 	// Build login URL from tenant domain; fall back to base URL if tenant domain missing.
-	loginURL := strings.TrimSpace(tenantDomain)
+	loginURL := strings.TrimSpace(workspaceDomain)
 	if loginURL == "" {
 		loginURL = strings.TrimSpace(config.AppConfig.BaseURL)
 	}
@@ -372,7 +372,7 @@ Your Security Team
 }
 
 // SendNewUserRegistrationNotificationEmail sends a notification to the tenant owner when a new user registers.
-func SendNewUserRegistrationNotificationEmail(ownerEmail, userName, userEmail, tenantDomain string) error {
+func SendNewUserRegistrationNotificationEmail(ownerEmail, userName, userEmail, workspaceDomain string) error {
 	log.Printf("SendNewUserRegistrationNotificationEmail: preparing notification email for owner %s", ownerEmail)
 
 	smtpHost := config.AppConfig.SMTPHost
@@ -402,7 +402,7 @@ If you did not expect this registration, please review your tenant settings.
 
 Regards,
 AuthSec Team
-`, userName, userEmail, tenantDomain, time.Now().UTC().Format(time.RFC1123))
+`, userName, userEmail, workspaceDomain, time.Now().UTC().Format(time.RFC1123))
 
 
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)

@@ -69,7 +69,7 @@ type Client struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 	DeletedAt     *time.Time `json:"deleted_at,omitempty" gorm:"index"`
 	// Tenant relationship fields (optional, for future use)
-	TenantDB string `json:"tenant_db,omitempty" gorm:"-"` // Not stored, populated from auth-manager
+	WorkspaceDB string `json:"workspace_db,omitempty" gorm:"-"` // Not stored, populated from auth-manager
 }
 */
 type User struct {
@@ -81,7 +81,7 @@ type User struct {
 	Username         *string        `json:"username,omitempty" gorm:"type:text"`
 	Email            string         `json:"email" gorm:"type:text;not null;uniqueIndex:idx_users_email_tenant"`
 	PasswordHash     string         `json:"password_hash,omitempty"`
-	TenantDomain     string         `json:"tenant_domain" gorm:"type:text;not null"`
+	WorkspaceDomain     string         `json:"workspace_domain" gorm:"type:text;not null"`
 	Provider         string         `json:"provider" gorm:"type:text;not null;index:idx_users_provider"`
 	ProviderID       string         `json:"provider_id" gorm:"type:text;not null;index:idx_users_provider"`
 	ProviderData     datatypes.JSON `json:"provider_data,omitempty" gorm:"type:jsonb"`

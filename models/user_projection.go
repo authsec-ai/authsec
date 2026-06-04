@@ -21,7 +21,7 @@ type UserWithJSONMFAMethods struct {
 	Username         *string        `gorm:"column:username"`
 	Email            string         `gorm:"column:email"`
 	PasswordHash     string         `gorm:"column:password_hash"`
-	TenantDomain     string         `gorm:"column:tenant_domain"`
+	WorkspaceDomain     string         `gorm:"column:workspace_domain"`
 	Provider         string         `gorm:"column:provider"`
 	ProviderID       string         `gorm:"column:provider_id"`
 	ProviderData     datatypes.JSON `gorm:"column:provider_data"`
@@ -57,7 +57,7 @@ func (u UserWithJSONMFAMethods) ToShared() sharedmodels.User {
 		Username:         u.Username,
 		Email:            u.Email,
 		PasswordHash:     u.PasswordHash,
-		TenantDomain:     u.TenantDomain,
+		WorkspaceDomain:     u.WorkspaceDomain,
 		Provider:         u.Provider,
 		ProviderID:       u.ProviderID,
 		ProviderData:     u.ProviderData,

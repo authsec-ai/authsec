@@ -72,7 +72,7 @@ func (r *DeviceAuthRepository) FindByDeviceCode(deviceCode string) (*models.Devi
 	query := `
 		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
-		       user_id, user_email, tenant_domain, access_token, status, scopes, device_info,
+		       user_id, user_email, workspace_domain, access_token, status, scopes, device_info,
 		       expires_at, last_polled_at, authorized_at,
 		       created_at, updated_at
 		FROM device_codes
@@ -87,7 +87,7 @@ func (r *DeviceAuthRepository) FindByUserCode(userCode string) (*models.DeviceCo
 	query := `
 		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
-		       user_id, user_email, tenant_domain, access_token, status, scopes, device_info,
+		       user_id, user_email, workspace_domain, access_token, status, scopes, device_info,
 		       expires_at, last_polled_at, authorized_at,
 		       created_at, updated_at
 		FROM device_codes
@@ -97,11 +97,11 @@ func (r *DeviceAuthRepository) FindByUserCode(userCode string) (*models.DeviceCo
 }
 
 // scanDeviceCode scans a single device_codes row into a DeviceCode model.
-// Handles all nullable columns (tenant_id, client_id, user_id, tenant_domain, access_token, etc.).
+// Handles all nullable columns (workspace_id, client_id, user_id, workspace_domain, access_token, etc.).
 func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode, error) {
 	dc := &models.DeviceCode{}
 	var workspaceID, clientID, userID sql.NullString
-	var verificationURIComplete, userEmail, tenantDomain, accessToken sql.NullString
+	var verificationURIComplete, userEmail, workspaceDomain, accessToken sql.NullString
 	var scopesJSON, deviceInfoJSON []byte
 	var lastPolledAt, authorizedAt sql.NullInt64
 
@@ -115,7 +115,7 @@ func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode,
 		&verificationURIComplete,
 		&userID,
 		&userEmail,
-		&tenantDomain,
+		&workspaceDomain,
 		&accessToken,
 		&dc.Status,
 		&scopesJSON,
@@ -151,8 +151,8 @@ func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode,
 	if userEmail.Valid {
 		dc.UserEmail = userEmail.String
 	}
-	if tenantDomain.Valid {
-		dc.TenantDomain = tenantDomain.String
+	if workspaceDomain.Valid {
+		dc.WorkspaceDomain = workspaceDomain.String
 	}
 	if accessToken.Valid {
 		dc.AccessToken = accessToken.String
@@ -214,13 +214,13 @@ func (r *DeviceAuthRepository) UpdateLastPolled(deviceCode string, minIntervalSe
 
 // AuthorizeDeviceCode authorizes or denies a device code with full user + tenant context.
 // accessToken is the pre-generated JWT; stored here so /token poll can return it directly.
-// workspaceID, tenantDomain, and clientID come from the authenticated browser session.
+// workspaceID, workspaceDomain, and clientID come from the authenticated browser session.
 func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 	userCode string,
 	userID uuid.UUID,
 	userEmail string,
 	workspaceID uuid.UUID,
-	tenantDomain string,
+	workspaceDomain string,
 	clientID *uuid.UUID,
 	accessToken string,
 	approve bool,
@@ -235,7 +235,7 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 		SET user_id       = $1,
 		    user_email    = $2,
 		    workspace_id = $3,
-		    tenant_domain = $4,
+		    workspace_domain = $4,
 		    client_id     = $5,
 		    access_token  = $6,
 		    status        = $7,
@@ -245,7 +245,7 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 	`
 
 	now := time.Now().Unix()
-	result, err := r.db.Exec(query, userID, userEmail, workspaceID, tenantDomain, clientID, accessToken, status, now, now, userCode)
+	result, err := r.db.Exec(query, userID, userEmail, workspaceID, workspaceDomain, clientID, accessToken, status, now, now, userCode)
 	if err != nil {
 		return err
 	}
@@ -314,7 +314,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 		query = `
 			SELECT id, workspace_id, client_id, device_code, user_code,
 			       verification_uri, verification_uri_complete,
-			       user_id, user_email, tenant_domain, status, scopes, device_info,
+			       user_id, user_email, workspace_domain, status, scopes, device_info,
 			       expires_at, last_polled_at, authorized_at,
 			       created_at, updated_at
 			FROM device_codes
@@ -326,7 +326,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 		query = `
 			SELECT id, workspace_id, client_id, device_code, user_code,
 			       verification_uri, verification_uri_complete,
-			       user_id, user_email, tenant_domain, status, scopes, device_info,
+			       user_id, user_email, workspace_domain, status, scopes, device_info,
 			       expires_at, last_polled_at, authorized_at,
 			       created_at, updated_at
 			FROM device_codes
@@ -346,7 +346,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 	for rows.Next() {
 		dc := models.DeviceCode{}
 		var tID, cID, uID sql.NullString
-		var verificationURIComplete, userEmail, tenantDomain sql.NullString
+		var verificationURIComplete, userEmail, workspaceDomain sql.NullString
 		var scopesJSON, deviceInfoJSON []byte
 		var lastPolledAt, authorizedAt sql.NullInt64
 
@@ -360,7 +360,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 			&verificationURIComplete,
 			&uID,
 			&userEmail,
-			&tenantDomain,
+			&workspaceDomain,
 			&dc.Status,
 			&scopesJSON,
 			&deviceInfoJSON,
@@ -392,8 +392,8 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 		if userEmail.Valid {
 			dc.UserEmail = userEmail.String
 		}
-		if tenantDomain.Valid {
-			dc.TenantDomain = tenantDomain.String
+		if workspaceDomain.Valid {
+			dc.WorkspaceDomain = workspaceDomain.String
 		}
 		if lastPolledAt.Valid {
 			dc.LastPolledAt = &lastPolledAt.Int64

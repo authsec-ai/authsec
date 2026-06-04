@@ -67,7 +67,7 @@ func TestCustomDomainRPIDPriority(t *testing.T) {
 			// Create handler
 			handler := &EndUserWebAuthnHandler{}
 
-			// If test requires custom domain setup, we would insert into tenant_domains table here
+			// If test requires custom domain setup, we would insert into workspace_domains table here
 			// For now, we're testing the logic flow
 
 			// Call the validation function
@@ -102,7 +102,7 @@ func TestOriginValidationOrder(t *testing.T) {
 
 		handler := &EndUserWebAuthnHandler{}
 
-		// This should fail because custom.example.com is not in tenant_domains
+		// This should fail because custom.example.com is not in workspace_domains
 		// But the important thing is it should try custom domain check first
 		_, err := handler.validateOriginAndCreateWebAuthn(c)
 

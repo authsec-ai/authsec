@@ -6,7 +6,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type TenantDomain struct {
+type WorkspaceDomain struct {
 	ID                   uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	WorkspaceID             uuid.UUID  `gorm:"type:uuid;not null"`
 	Domain               string     `gorm:"type:varchar(255);not null;uniqueIndex"`
@@ -22,6 +22,6 @@ type TenantDomain struct {
 	UpdatedAt            time.Time  `gorm:"type:timestamp;default:now()"`
 }
 
-func (TenantDomain) TableName() string {
+func (WorkspaceDomain) TableName() string {
 	return "workspace_domains"
 }

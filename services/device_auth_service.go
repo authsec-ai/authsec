@@ -15,7 +15,7 @@ import (
 // DeviceAuthService handles device authorization business logic (RFC 8628)
 type DeviceAuthService struct {
 	deviceRepo      *database.DeviceAuthRepository
-	tenantRepo      *database.AdminTenantRepository
+	workspaceRepo      *database.AdminWorkspaceRepository
 	userRepo        *database.UserRepository
 	verificationURI string
 	pollingInterval int // minimum seconds between polling attempts
@@ -31,7 +31,7 @@ func NewDeviceAuthService(db *database.DBConnection) *DeviceAuthService {
 
 	return &DeviceAuthService{
 		deviceRepo:      database.NewDeviceAuthRepository(db),
-		tenantRepo:      database.NewAdminTenantRepository(db),
+		workspaceRepo:      database.NewAdminWorkspaceRepository(db),
 		userRepo:        database.NewUserRepository(db),
 		verificationURI: verificationURI,
 		pollingInterval: 5,               // RFC 8628 recommended minimum
@@ -40,7 +40,7 @@ func NewDeviceAuthService(db *database.DBConnection) *DeviceAuthService {
 }
 
 // InitiateDeviceFlow creates a new device authorization request.
-// No client_id or tenant_domain is required — the CLI sends only scopes.
+// No client_id or workspace_domain is required — the CLI sends only scopes.
 // Tenant context is bound during the /authorize step from the user's browser session.
 func (s *DeviceAuthService) InitiateDeviceFlow(req *models.DeviceCodeRequest) (*models.DeviceCodeResponse, error) {
 	deviceCode, err := database.GenerateDeviceCode()
@@ -109,7 +109,7 @@ func (s *DeviceAuthService) GetDeviceActivationInfo(userCode string) (*models.De
 		DeviceInfo: dc.DeviceInfo,
 	}
 
-	// Tenant info is unknown until /authorize — omit tenant_domain from info response
+	// Tenant info is unknown until /authorize — omit workspace_domain from info response
 	return resp, nil
 }
 
@@ -121,7 +121,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 	userID uuid.UUID,
 	userEmail string,
 	workspaceID uuid.UUID,
-	tenantDomain string,
+	workspaceDomain string,
 	clientID *uuid.UUID,
 	approve bool,
 ) error {
@@ -140,7 +140,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 	// Generate token at authorize time (empty string when denied)
 	accessToken := ""
 	if approve {
-		tenant, tErr := s.tenantRepo.GetTenantByID(workspaceID.String())
+		tenant, tErr := s.workspaceRepo.GetWorkspaceByID(workspaceID.String())
 		if tErr != nil {
 			return fmt.Errorf("tenant not found")
 		}
@@ -163,7 +163,7 @@ func (s *DeviceAuthService) AuthorizeDevice(
 		}
 	}
 
-	return s.deviceRepo.AuthorizeDeviceCode(userCode, userID, userEmail, workspaceID, tenantDomain, clientID, accessToken, approve)
+	return s.deviceRepo.AuthorizeDeviceCode(userCode, userID, userEmail, workspaceID, workspaceDomain, clientID, accessToken, approve)
 }
 
 // VerifyDeviceCode is the legacy alias for AuthorizeDevice (used by legacy /verify endpoint).
@@ -172,11 +172,11 @@ func (s *DeviceAuthService) VerifyDeviceCode(
 	userID uuid.UUID,
 	userEmail string,
 	workspaceID uuid.UUID,
-	tenantDomain string,
+	workspaceDomain string,
 	clientID *uuid.UUID,
 	approve bool,
 ) error {
-	return s.AuthorizeDevice(userCode, userID, userEmail, workspaceID, tenantDomain, clientID, approve)
+	return s.AuthorizeDevice(userCode, userID, userEmail, workspaceID, workspaceDomain, clientID, approve)
 }
 
 // ValidateUserCode looks up a user_code and returns its record ID and remaining TTL.
@@ -258,9 +258,9 @@ func (s *DeviceAuthService) PollForToken(deviceCode string) (*models.DeviceToken
 		if dc.UserID != nil {
 			userIDStr = dc.UserID.String()
 		}
-		tenantIDStr := ""
+		workspaceIDStr := ""
 		if dc.WorkspaceID != nil {
-			tenantIDStr = dc.WorkspaceID.String()
+			workspaceIDStr = dc.WorkspaceID.String()
 		}
 
 		// Invalidate device code (one-time use)
@@ -273,8 +273,8 @@ func (s *DeviceAuthService) PollForToken(deviceCode string) (*models.DeviceToken
 			Scope:        strings.Join(dc.Scopes, " "),
 			Email:        dc.UserEmail,
 			UserID:       userIDStr,
-			WorkspaceID:     tenantIDStr,
-			TenantDomain: dc.TenantDomain,
+			WorkspaceID:     workspaceIDStr,
+			WorkspaceDomain: dc.WorkspaceDomain,
 			ClientID:     clientIDStr,
 		}, nil
 

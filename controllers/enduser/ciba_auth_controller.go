@@ -199,14 +199,14 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from token
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return
@@ -257,14 +257,14 @@ func (ctrl *CIBAAuthController) GetDevices(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from token
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return
@@ -320,14 +320,14 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from token
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from token
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid workspace_id in token"})
 		return

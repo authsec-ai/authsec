@@ -203,13 +203,13 @@ func (gc *GroupController) RemoveGroupsFromClient(c *gin.Context) {
 // @Description Retrieves all groups created by the tenant
 // @Tags Groups
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Tenant ID"
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/groups/{tenant_id} [get]
+// @Router /authsec/uflow/groups/{workspace_id} [get]
 func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
-	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
+	// Get workspace_id from validated JWT token (not URL parameter to prevent spoofing)
 	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
@@ -231,15 +231,15 @@ func (gc *GroupController) GetUserDefinedGroups(c *gin.Context) {
 // @Tags Groups
 // @Accept json
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Tenant ID"
 // @Param input body models.AddUsersToGroupRequest true "Add users to group payload"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/groups/{tenant_id}/users/bulk [post]
+// @Router /authsec/uflow/groups/{workspace_id}/users/bulk [post]
 func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
-	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
+	// Get workspace_id from validated JWT token (not URL parameter to prevent spoofing)
 	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
@@ -284,15 +284,15 @@ func (gc *GroupController) AddUsersToGroup(c *gin.Context) {
 // @Tags Groups
 // @Accept json
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Tenant ID"
 // @Param input body models.RemoveUsersFromGroupRequest true "Remove users from group payload"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/groups/{tenant_id}/users/bulk [delete]
+// @Router /authsec/uflow/groups/{workspace_id}/users/bulk [delete]
 func (gc *GroupController) RemoveUsersFromGroup(c *gin.Context) {
-	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
+	// Get workspace_id from validated JWT token (not URL parameter to prevent spoofing)
 	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
@@ -351,10 +351,10 @@ func (gc *GroupController) DeleteUserDefinedGroups(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from validated JWT token
+	// Get workspace_id from validated JWT token
 	_, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in authentication token"})
 		return
 	}
 
@@ -764,14 +764,14 @@ func (gc *GroupController) ListTenantGroupsForAdmin(c *gin.Context) {
 // @Description Retrieves all users in a specific group within a tenant
 // @Tags Groups
 // @Produce json
-// @Param tenant_id path string true "Tenant ID"
+// @Param workspace_id path string true "Tenant ID"
 // @Param group_id path string true "Group ID"
 // @Success 200 {object} object
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /authsec/uflow/groups/{tenant_id}/{group_id}/users [get]
+// @Router /authsec/uflow/groups/{workspace_id}/{group_id}/users [get]
 func (gc *GroupController) GetGroupUsers(c *gin.Context) {
-	// Get tenant_id from validated JWT token (not URL parameter to prevent spoofing)
+	// Get workspace_id from validated JWT token (not URL parameter to prevent spoofing)
 	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in authentication token"})
@@ -824,7 +824,7 @@ func MapGroupsToClient(workspaceID, clientID string, groups []string) error {
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -839,13 +839,13 @@ func MapGroupsToClient(workspaceID, clientID string, groups []string) error {
 
 	// Find the user in tenant database
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, workspaceUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
@@ -857,7 +857,7 @@ func MapGroupsToClient(workspaceID, clientID string, groups []string) error {
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
 			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			user.ID, group.ID, tenantUUID,
+			user.ID, group.ID, workspaceUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to map group to user: %w", err)
 		}
@@ -871,7 +871,7 @@ func RemoveGroupsFromClient(workspaceID, clientID string, groups []string) error
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -884,19 +884,19 @@ func RemoveGroupsFromClient(workspaceID, clientID string, groups []string) error
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, workspaceUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
 			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
-			user.ID, group.ID, tenantUUID,
+			user.ID, group.ID, workspaceUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to remove group from user: %w", err)
 		}
@@ -911,7 +911,7 @@ func GetUserDefinedGroups(workspaceID string) ([]models.TenantGroup, error) {
 		return nil, fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -921,7 +921,7 @@ func GetUserDefinedGroups(workspaceID string) ([]models.TenantGroup, error) {
 
 	var groups []models.TenantGroup
 	// Query groups from tenant database
-	if err := tenantDB.Where("workspace_id = ? OR workspace_id IS NULL", tenantUUID).Find(&groups).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? OR workspace_id IS NULL", workspaceUUID).Find(&groups).Error; err != nil {
 		return nil, fmt.Errorf("failed to query groups: %w", err)
 	}
 	return groups, nil
@@ -933,7 +933,7 @@ func DeleteUserDefinedGroups(workspaceID string, groups []string) error {
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -941,7 +941,7 @@ func DeleteUserDefinedGroups(workspaceID string, groups []string) error {
 	// Connect to tenant database
 	tenantDB := config.DB
 
-	return tenantDB.Where("id IN ? AND workspace_id = ?", groups, tenantUUID).Delete(&models.TenantGroup{}).Error
+	return tenantDB.Where("id IN ? AND workspace_id = ?", groups, workspaceUUID).Delete(&models.TenantGroup{}).Error
 }
 
 func UpdateUserDefinedGroup(groupID, workspaceID, name, description string) error {
@@ -949,7 +949,7 @@ func UpdateUserDefinedGroup(groupID, workspaceID, name, description string) erro
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -969,7 +969,7 @@ func UpdateUserDefinedGroup(groupID, workspaceID, name, description string) erro
 		Description: &description,
 	}
 
-	return tenantDB.Model(&models.TenantGroup{}).Where("id = ? AND workspace_id = ?", groupUUID, tenantUUID).Updates(updateData).Error
+	return tenantDB.Model(&models.TenantGroup{}).Where("id = ? AND workspace_id = ?", groupUUID, workspaceUUID).Updates(updateData).Error
 }
 
 // AddUserToGroups adds a user to specified groups within a tenant
@@ -978,7 +978,7 @@ func AddUserToGroups(workspaceID, userID string, groups []string) error {
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -992,13 +992,13 @@ func AddUserToGroups(workspaceID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, workspaceUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
@@ -1010,7 +1010,7 @@ func AddUserToGroups(workspaceID, userID string, groups []string) error {
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
 			"INSERT INTO user_groups (user_id, group_id, workspace_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-			userUUID, group.ID, tenantUUID,
+			userUUID, group.ID, workspaceUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to add user to group: %w", err)
 		}
@@ -1025,7 +1025,7 @@ func RemoveUserFromGroups(workspaceID, userID string, groups []string) error {
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -1039,13 +1039,13 @@ func RemoveUserFromGroups(workspaceID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, tenantUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
 	// Find the groups in tenant database
 	var groupModels []models.TenantGroup
-	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, tenantUUID).Find(&groupModels).Error; err != nil {
+	if err := tenantDB.Where("name IN ? AND workspace_id = ?", groups, workspaceUUID).Find(&groupModels).Error; err != nil {
 		return fmt.Errorf("failed to find groups: %w", err)
 	}
 
@@ -1053,7 +1053,7 @@ func RemoveUserFromGroups(workspaceID, userID string, groups []string) error {
 	for _, group := range groupModels {
 		if err := tenantDB.Exec(
 			"DELETE FROM user_groups WHERE user_id = $1 AND group_id = $2 AND workspace_id = $3",
-			userUUID, group.ID, tenantUUID,
+			userUUID, group.ID, workspaceUUID,
 		).Error; err != nil {
 			return fmt.Errorf("failed to remove user from group: %w", err)
 		}
@@ -1068,7 +1068,7 @@ func GetUserGroups(workspaceID, userID string) ([]models.TenantGroup, error) {
 		return nil, fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -1087,7 +1087,7 @@ func GetUserGroups(workspaceID, userID string) ([]models.TenantGroup, error) {
 		INNER JOIN user_groups ug ON g.id = ug.group_id
 		WHERE ug.user_id = $1 AND g.workspace_id = $2 AND ug.workspace_id = $2
 	`
-	if err := tenantDB.Raw(query, userUUID, tenantUUID).Scan(&groups).Error; err != nil {
+	if err := tenantDB.Raw(query, userUUID, workspaceUUID).Scan(&groups).Error; err != nil {
 		return nil, fmt.Errorf("failed to query user groups: %w", err)
 	}
 
@@ -1135,13 +1135,13 @@ func fetchTenantAdmins(workspaceID string) ([]groupAdminSummary, error) {
 		return nil, fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
 
 	adminRepo := database.NewAdminUserRepository(db)
-	admins, err := adminRepo.ListAdminUsersByTenant(tenantUUID)
+	admins, err := adminRepo.ListAdminUsersByTenant(workspaceUUID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tenant admins: %w", err)
 	}
@@ -1181,7 +1181,7 @@ func GetGroupUsers(workspaceID, groupID string) ([]models.User, error) {
 		return nil, fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -1200,7 +1200,7 @@ func GetGroupUsers(workspaceID, groupID string) ([]models.User, error) {
 		INNER JOIN user_groups ug ON u.id = ug.user_id
 		WHERE ug.group_id = $1 AND ug.workspace_id = $2
 	`
-	if err := tenantDB.Raw(query, groupUUID, tenantUUID).Scan(&users).Error; err != nil {
+	if err := tenantDB.Raw(query, groupUUID, workspaceUUID).Scan(&users).Error; err != nil {
 		return nil, fmt.Errorf("failed to query group users: %w", err)
 	}
 
@@ -1213,7 +1213,7 @@ func AddUsersToGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []uuid.U
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -1222,7 +1222,7 @@ func AddUsersToGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []uuid.U
 
 	// Verify the group exists
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, workspaceUUID).First(&group).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("group not found in tenant")
 		}
@@ -1250,7 +1250,7 @@ func AddUsersToGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []uuid.U
 			// Use raw SQL with ON CONFLICT DO NOTHING to handle duplicates
 			if err := tx.Exec(
 				"INSERT INTO user_groups (user_id, group_id, workspace_id, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) ON CONFLICT (user_id, group_id) DO NOTHING",
-				userID, groupID, tenantUUID,
+				userID, groupID, workspaceUUID,
 			).Error; err != nil {
 				tx.Rollback()
 				return fmt.Errorf("failed to add users to group: %w", err)
@@ -1271,7 +1271,7 @@ func RemoveUsersFromGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []u
 		return fmt.Errorf("database connection not available")
 	}
 
-	tenantUUID, err := uuid.Parse(workspaceID)
+	workspaceUUID, err := uuid.Parse(workspaceID)
 	if err != nil {
 		return fmt.Errorf("invalid tenant ID format: %w", err)
 	}
@@ -1280,7 +1280,7 @@ func RemoveUsersFromGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []u
 
 	// Verify the group exists
 	var group models.TenantGroup
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, tenantUUID).First(&group).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", groupID, workspaceUUID).First(&group).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("group not found in tenant")
 		}
@@ -1296,7 +1296,7 @@ func RemoveUsersFromGroupBulk(workspaceID string, groupID uuid.UUID, userIDs []u
 		}
 		batch := userIDs[i:end]
 
-		if err := tenantDB.Where("group_id = ? AND workspace_id = ? AND user_id IN ?", groupID, tenantUUID, batch).
+		if err := tenantDB.Where("group_id = ? AND workspace_id = ? AND user_id IN ?", groupID, workspaceUUID, batch).
 			Delete(&models.UserGroup{}).Error; err != nil {
 			return fmt.Errorf("failed to remove users from group: %w", err)
 		}

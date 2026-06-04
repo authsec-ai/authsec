@@ -129,9 +129,9 @@ func (ts *TokenService) RefreshAccessToken(refreshToken string) (*TokenPair, err
 	}
 
 	// Parse token data (format: userID:workspaceID:expiresAt)
-	var userIDStr, tenantIDStr string
+	var userIDStr, workspaceIDStr string
 	var expiresAtUnix int64
-	_, err = fmt.Sscanf(tokenData, "%s:%s:%d", &userIDStr, &tenantIDStr, &expiresAtUnix)
+	_, err = fmt.Sscanf(tokenData, "%s:%s:%d", &userIDStr, &workspaceIDStr, &expiresAtUnix)
 	if err != nil {
 		return nil, fmt.Errorf("invalid refresh token data")
 	}
@@ -141,7 +141,7 @@ func (ts *TokenService) RefreshAccessToken(refreshToken string) (*TokenPair, err
 		return nil, fmt.Errorf("invalid user ID in token")
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr)
+	workspaceID, err := uuid.Parse(workspaceIDStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant ID in token")
 	}

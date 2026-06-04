@@ -19,7 +19,7 @@ import (
 //
 // Compared with ResourceServerController:
 //   - workspace_id is sourced from the JWT and used for ownership filtering,
-//     falling back to tenant_id during the rollout.
+//     falling back to workspace_id during the rollout.
 //   - application_type is accepted on create and used as a list filter.
 //   - The OAuth client subresource is exposed under "connections" instead of
 //     "clients" to remove the product-vs-protocol confusion.

@@ -7,7 +7,7 @@ import (
 	"gorm.io/gorm"
 )
 
-type TenantDomain struct {
+type WorkspaceDomain struct {
 	ID                   uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	WorkspaceID             uuid.UUID  `gorm:"type:uuid;not null"`
 	Domain               string     `gorm:"type:varchar(255);not null;uniqueIndex"`
@@ -23,11 +23,11 @@ type TenantDomain struct {
 	UpdatedAt            time.Time  `gorm:"type:timestamp;default:now()"`
 }
 
-func (TenantDomain) TableName() string { return "workspace_domains" }
+func (WorkspaceDomain) TableName() string { return "workspace_domains" }
 
 // GetVerifiedDomainsForTenant returns a list of verified domain hosts for a tenant
 func GetVerifiedDomainsForTenant(db *gorm.DB, workspaceID string) ([]string, error) {
-	var domains []TenantDomain
+	var domains []WorkspaceDomain
 	if err := db.Where("workspace_id = ? AND is_verified = ?", workspaceID, true).Find(&domains).Error; err != nil {
 		return nil, err
 	}

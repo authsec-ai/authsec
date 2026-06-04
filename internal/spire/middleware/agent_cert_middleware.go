@@ -12,9 +12,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// TenantDBProvider is an interface for obtaining a tenant-scoped database connection.
-type TenantDBProvider interface {
-	GetTenantDB(tenantID string) (*sql.DB, error)
+// WorkspaceDBProvider is an interface for obtaining a tenant-scoped database connection.
+type WorkspaceDBProvider interface {
+	GetWorkspaceDB(workspaceID string) (*sql.DB, error)
 }
 
 // AgentCertMiddleware authenticates AI agents via client certificates
@@ -24,14 +24,14 @@ type TenantDBProvider interface {
 // When strict=false (permissive), requests without the header are allowed
 // through so the system works before ingress mTLS forwarding is configured.
 type AgentCertMiddleware struct {
-	dbProvider TenantDBProvider
+	dbProvider WorkspaceDBProvider
 	logger     *logrus.Logger
 	strict     bool
 }
 
 // NewAgentCertMiddleware creates a new agent certificate middleware.
 // Set strict=true to require a valid agent cert on every request.
-func NewAgentCertMiddleware(dbProvider TenantDBProvider, logger *logrus.Logger, strict bool) *AgentCertMiddleware {
+func NewAgentCertMiddleware(dbProvider WorkspaceDBProvider, logger *logrus.Logger, strict bool) *AgentCertMiddleware {
 	return &AgentCertMiddleware{
 		dbProvider: dbProvider,
 		logger:     logger,
@@ -151,8 +151,8 @@ func (m *AgentCertMiddleware) authenticateFromTLSCert(c *gin.Context, cert *x509
 		return false
 	}
 
-	// Parse SPIFFE ID: spiffe://<tenant_id>/agent/<node_id>
-	tenantID, isAgent, err := parseAgentSpiffeID(spiffeID)
+	// Parse SPIFFE ID: spiffe://<workspace_id>/agent/<node_id>
+	workspaceID, isAgent, err := parseAgentSpiffeID(spiffeID)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{
@@ -174,11 +174,11 @@ func (m *AgentCertMiddleware) authenticateFromTLSCert(c *gin.Context, cert *x509
 	}
 
 	// Look up the agent in the tenant database
-	agentRecord, err := m.lookupAgent(c, tenantID, spiffeID)
+	agentRecord, err := m.lookupAgent(c, workspaceID, spiffeID)
 	if err != nil {
 		m.logger.WithFields(logrus.Fields{
 			"spiffe_id": spiffeID,
-			"tenant_id": tenantID,
+			"workspace_id": workspaceID,
 		}).WithError(err).Error("Failed to look up agent in database")
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -211,7 +211,7 @@ func (m *AgentCertMiddleware) authenticateFromTLSCert(c *gin.Context, cert *x509
 
 	// Set context for downstream handlers
 	c.Set(SpireAgentIDKey, agentRecord.ID)
-	c.Set(SpireTenantIDKey, tenantID)
+	c.Set(SpireWorkspaceIDKey, workspaceID)
 	c.Set(SpireSpiffeIDKey, spiffeID)
 	c.Set(SpireIsAgentKey, true)
 	c.Set(SpireClientCertKey, cert)
@@ -219,15 +219,15 @@ func (m *AgentCertMiddleware) authenticateFromTLSCert(c *gin.Context, cert *x509
 	m.logger.WithFields(logrus.Fields{
 		"agent_id":  agentRecord.ID,
 		"spiffe_id": spiffeID,
-		"tenant_id": tenantID,
+		"workspace_id": workspaceID,
 	}).Debug("Agent authenticated via certificate")
 
 	return true
 }
 
 // lookupAgent queries the tenant database for an agent by SPIFFE ID.
-func (m *AgentCertMiddleware) lookupAgent(c *gin.Context, tenantID, spiffeID string) (*agentLookupResult, error) {
-	tenantDB, err := m.dbProvider.GetTenantDB(tenantID)
+func (m *AgentCertMiddleware) lookupAgent(c *gin.Context, workspaceID, spiffeID string) (*agentLookupResult, error) {
+	tenantDB, err := m.dbProvider.GetWorkspaceDB(workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +255,7 @@ type agentLookupResult struct {
 }
 
 // parseAgentSpiffeID extracts tenant ID and validates agent path from a SPIFFE ID.
-func parseAgentSpiffeID(spiffeID string) (tenantID string, isAgent bool, err error) {
+func parseAgentSpiffeID(spiffeID string) (workspaceID string, isAgent bool, err error) {
 	if !strings.HasPrefix(spiffeID, "spiffe://") {
 		return "", false, &spireError{Code: "BAD_REQUEST", Message: "Not a SPIFFE ID"}
 	}
@@ -266,7 +266,7 @@ func parseAgentSpiffeID(spiffeID string) (tenantID string, isAgent bool, err err
 		return "", false, &spireError{Code: "BAD_REQUEST", Message: "Tenant ID missing in SPIFFE ID"}
 	}
 
-	tenantID = parts[0]
+	workspaceID = parts[0]
 	if len(parts) >= 2 {
 		pathParts := strings.Split(parts[1], "/")
 		if len(pathParts) >= 1 && pathParts[0] == "agent" {
@@ -274,5 +274,5 @@ func parseAgentSpiffeID(spiffeID string) (tenantID string, isAgent bool, err err
 		}
 	}
 
-	return tenantID, isAgent, nil
+	return workspaceID, isAgent, nil
 }

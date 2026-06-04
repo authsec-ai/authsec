@@ -22,7 +22,7 @@ type TenantMapping struct {
 // LoginResponse represents the response for login operations
 type LoginResponse struct {
 	WorkspaceID      string   `json:"workspace_id"`
-	TenantDomain     string   `json:"tenant_domain,omitempty"`
+	WorkspaceDomain     string   `json:"workspace_domain,omitempty"`
 	Email            string   `json:"email"`
 	FirstLogin       bool     `json:"first_login"`
 	OTPRequired      bool     `json:"otp_required"`
@@ -97,7 +97,7 @@ type AdminUser struct {
 	ClientID                   *uuid.UUID      `json:"client_id,omitempty" gorm:"column:client_id"`
 	WorkspaceID                *uuid.UUID      `json:"workspace_id,omitempty" gorm:"column:workspace_id"`
 	ProjectID                  *uuid.UUID      `json:"project_id,omitempty" gorm:"column:project_id"`
-	TenantDomain               string          `json:"tenant_domain,omitempty" gorm:"column:tenant_domain"`
+	WorkspaceDomain               string          `json:"workspace_domain,omitempty" gorm:"column:workspace_domain"`
 	Provider                   string          `json:"provider,omitempty" gorm:"column:provider;default:'local'"`
 	ProviderID                 string          `json:"provider_id,omitempty" gorm:"column:provider_id"`
 	ProviderData               json.RawMessage `json:"provider_data,omitempty" gorm:"column:provider_data;type:jsonb"`
@@ -179,7 +179,7 @@ type UpdateUserRequest struct {
 	Username     *string `json:"username,omitempty"`
 	Email        *string `json:"email,omitempty"`
 	AvatarURL    *string `json:"avatar_url,omitempty"`
-	TenantDomain *string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain *string `json:"workspace_domain,omitempty"`
 }
 
 // GetAuthURLInput represents input for constructing the Auth URL

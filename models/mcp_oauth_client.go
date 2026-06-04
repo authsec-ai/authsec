@@ -10,7 +10,7 @@ import (
 // MCPOAuthClient represents an OAuth 2.1 client in the MCP plane.
 // These are MCP clients (Codex, Claude, Cursor, Inspector) — NOT MCP servers.
 // Clients register via DCR, CIMD, or are pre-registered by an admin.
-// This table is global (no tenant_id) — clients can access any RS via the join table.
+// This table is global (no workspace_id) — clients can access any RS via the join table.
 type MCPOAuthClient struct {
 	ID                      uuid.UUID      `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	ClientID                string         `json:"client_id" gorm:"type:varchar(512);uniqueIndex;not null"`

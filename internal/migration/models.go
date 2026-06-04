@@ -31,15 +31,15 @@ type MigrationStatusResponse struct {
 	LastExecuted    time.Time `json:"last_executed"`
 }
 
-// CreateTenantDBRequest is the payload for the create-tenant-db endpoint.
-type CreateTenantDBRequest struct {
+// CreateWorkspaceDBRequest is the payload for the create-tenant-db endpoint.
+type CreateWorkspaceDBRequest struct {
 	WorkspaceID     string `json:"workspace_id"     binding:"required"`
 	DatabaseName string `json:"database_name,omitempty"`
-	TenantDomain string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
-// CreateTenantDBResponse is the response for the create-tenant-db endpoint.
-type CreateTenantDBResponse struct {
+// CreateWorkspaceDBResponse is the response for the create-tenant-db endpoint.
+type CreateWorkspaceDBResponse struct {
 	WorkspaceID        string    `json:"workspace_id"`
 	DatabaseName    string    `json:"database_name"`
 	MigrationStatus string    `json:"migration_status"`
@@ -52,9 +52,9 @@ type CreateTenantDBResponse struct {
 type TenantInfo struct {
 	ID              uuid.UUID  `gorm:"type:uuid;primary_key"                  json:"id"`
 	WorkspaceID        uuid.UUID  `gorm:"type:uuid;not null;unique"              json:"workspace_id"`
-	TenantDB        *string    `gorm:"type:text"                              json:"tenant_db"`
+	WorkspaceDB        *string    `gorm:"type:text"                              json:"workspace_db"`
 	Email           string     `gorm:"type:text;not null"                     json:"email"`
-	TenantDomain    string     `gorm:"type:text;not null"                     json:"tenant_domain"`
+	WorkspaceDomain    string     `gorm:"type:text;not null"                     json:"workspace_domain"`
 	Status          *string    `gorm:"type:text"                              json:"status"`
 	MigrationStatus *string    `gorm:"type:varchar(50);default:'pending'"     json:"migration_status"`
 	LastMigration   *int       `gorm:"type:integer"                           json:"last_migration"`
@@ -68,7 +68,7 @@ func (TenantInfo) TableName() string { return "tenants" }
 type TenantListItem struct {
 	WorkspaceID        string `json:"workspace_id"`
 	Email           string `json:"email"`
-	TenantDomain    string `json:"tenant_domain"`
+	WorkspaceDomain    string `json:"workspace_domain"`
 	DatabaseName    string `json:"database_name"`
 	MigrationStatus string `json:"migration_status"`
 	LastMigration   *int   `json:"last_migration"`

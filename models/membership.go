@@ -1,19 +1,14 @@
-// Package models — tenant membership and end-user state.
+// Package models — workspace membership and end-user state.
 //
-// Two distinct kinds of users coexist in AuthSec; this file models both:
+// Two distinct kinds of users coexist in AuthSec:
 //
-//  1. TenantMembership — operators with operational rights inside the tenant
-//     (Owner, Admin, Member, Contractor, Service Operator, Readonly Auditor).
-//     One row per (tenant, user). Members are managed under Settings → Team
-//     in the admin UI and are the subject of admin-tier role bindings.
+//  1. Workspace members (operators) — modeled via workspace_memberships table
+//     with a role_id FK. Managed by the membership controller + RequireWorkspaceRole
+//     middleware. See models/workspace.go for the WorkspaceMembership struct.
 //
-//  2. TenantEndUserState — consumers of a tenant's published Applications.
-//     End users have a global identity (currently the per-tenant users row;
-//     Phase D migrates this to a global identities table) and a tenant-scoped
-//     state object that captures plan tier, status, and rate-limit overrides.
-//     End users are NOT modeled as members.
-//
-// Backed by migrations 108 and 109.
+//  2. TenantEndUserState — consumers of a workspace's published Applications.
+//     Created lazily on first OAuth consent. Governs suspension, plan tier,
+//     and rate-limit overrides. Checked by ScopeResolver at consent time.
 package models
 
 import (
@@ -23,7 +18,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Membership status enum values.
+// Membership status enum values (shared by workspace_memberships and end-user states).
 const (
 	MembershipStatusActive    = "active"
 	MembershipStatusInvited   = "invited"
@@ -31,9 +26,8 @@ const (
 	MembershipStatusLeft      = "left"
 )
 
-// Membership type enum values. These describe the lifecycle/relationship of an
-// operator to a tenant. They are NOT the same thing as RBAC roles — a member
-// of type "admin" still needs a role binding to actually receive permissions.
+// Membership type values — used by the membership controller to resolve role names.
+// These map to roles.name in the workspace's roles table.
 const (
 	MembershipTypeOwner           = "owner"
 	MembershipTypeAdmin           = "admin"
@@ -45,42 +39,14 @@ const (
 
 // Membership source enum values — how the membership was created.
 const (
-	MembershipSourceSignup    = "signup"
-	MembershipSourceInvite    = "invite"
-	MembershipSourceSCIM      = "scim"
-	MembershipSourceOIDCJIT   = "oidc_jit"
-	MembershipSourceSAMLJIT   = "saml_jit"
-	MembershipSourceAPI       = "api"
-	MembershipSourceMigration = "migration"
+	MembershipSourceSignup  = "signup"
+	MembershipSourceInvite  = "invite"
+	MembershipSourceSCIM    = "scim"
+	MembershipSourceOIDCJIT = "oidc_jit"
+	MembershipSourceSAMLJIT = "saml_jit"
+	MembershipSourceAPI     = "api"
+	MembershipSourceManual  = "manual"
 )
-
-// TenantMembership models a user's operational relationship with a tenant.
-// One row per (tenant_id, user_id).
-type TenantMembership struct {
-	ID             uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID       uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex:idx_tm_tenant_user"`
-	UserID         uuid.UUID  `json:"user_id" gorm:"type:uuid;not null;uniqueIndex:idx_tm_tenant_user"`
-	Status         string     `json:"status" gorm:"type:text;not null;default:'active'"`
-	MembershipType string     `json:"membership_type" gorm:"type:text;not null;default:'member'"`
-	Source         string     `json:"source" gorm:"type:text;not null;default:'manual'"`
-	ExternalID     *string    `json:"external_id,omitempty" gorm:"type:text"`
-	InvitedBy      *uuid.UUID `json:"invited_by,omitempty" gorm:"type:uuid"`
-	JoinedAt       *time.Time `json:"joined_at,omitempty"`
-	SuspendedAt    *time.Time `json:"suspended_at,omitempty"`
-	CreatedAt      time.Time  `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt      time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-}
-
-// TableName overrides the default GORM table name (would otherwise pluralize to "tenant_memberships" anyway).
-func (TenantMembership) TableName() string {
-	return "workspace_user_memberships"
-}
-
-// IsActive returns true when the membership is in a state that should pass
-// the membership-status precheck during scope resolution.
-func (m *TenantMembership) IsActive() bool {
-	return m.Status == MembershipStatusActive
-}
 
 // End-user state status enum values.
 const (
@@ -98,7 +64,7 @@ const (
 
 // TenantEndUserState models the per-(tenant, user) state of an end user
 // (a consumer who has consented to one of the tenant's published Applications).
-// Created lazily on first consent. Primary key is (tenant_id, user_id).
+// Created lazily on first consent. Primary key is (workspace_id, user_id).
 type TenantEndUserState struct {
 	WorkspaceID          uuid.UUID       `json:"workspace_id" gorm:"type:uuid;primaryKey"`
 	UserID            uuid.UUID       `json:"user_id" gorm:"type:uuid;primaryKey"`

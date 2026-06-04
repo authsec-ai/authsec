@@ -84,11 +84,11 @@ func insertTestRS(t *testing.T, resourceURI string, registrationModes []string) 
 	modesArray := "{" + strings.Join(registrationModes, ",") + "}"
 	_, err := db.Exec(`
 		INSERT INTO resource_servers
-			(id, tenant_id, name, public_base_url, protected_base_path, resource_uri,
+			(id, workspace_id, name, public_base_url, protected_base_path, resource_uri,
 			 registration_modes, introspection_secret, active, status,
 			 scan_generation, last_successful_generation, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, '/mcp', $5, $6::text[], $7, true, 'scan_completed', 1, 1, NOW(), NOW())`,
-		rsID, testTenantID,
+		rsID, testWorkspaceID,
 		"TestRS-"+rsID.String()[:8],
 		"https://"+rsID.String()[:8]+".example.com",
 		resourceURI,
@@ -437,19 +437,19 @@ func withMockHydra(t *testing.T, cfg mockHydraConfig) *mockHydraRecorder {
 // the DB, bypassing the normal authorize→login→consent flow. This simulates the state
 // after a user completes consent and the hmgr ConsentHandler has called MarkConsentCompleted.
 // Returns the server-generated context_id that the mock Hydra must embed in ext.context_id.
-func insertAuthRequestContext(t *testing.T, hydraClientID, rsID, tenantID, resourceURI, redirectURI string) string {
+func insertAuthRequestContext(t *testing.T, hydraClientID, rsID, workspaceID, resourceURI, redirectURI string) string {
 	t.Helper()
 	db := config.Database.DB
 	state := uuid.New().String()
 	contextID := uuid.New().String()
 	_, err := db.Exec(`
 		INSERT INTO auth_request_contexts
-			(state, context_id, hydra_client_id, resource_server_id, tenant_id,
+			(state, context_id, hydra_client_id, resource_server_id, workspace_id,
 			 resource_uri, redirect_uri, requested_scopes,
 			 consent_completed, consumed, expires_at, created_at)
 		VALUES ($1, $2, $3, $4::uuid, $5::uuid, $6, $7, $8,
 			true, false, NOW() + INTERVAL '10 minutes', NOW())`,
-		state, contextID, hydraClientID, rsID, tenantID,
+		state, contextID, hydraClientID, rsID, workspaceID,
 		resourceURI, redirectURI, "tools:read tools:write",
 	)
 	require.NoError(t, err, "insertAuthRequestContext")
@@ -460,13 +460,13 @@ func insertAuthRequestContext(t *testing.T, hydraClientID, rsID, tenantID, resou
 }
 
 // insertRBACChainForScope creates a minimal RBAC chain that entitles userID to
-// scopeString on the given RS within tenantID. The chain is:
+// scopeString on the given RS within workspaceID. The chain is:
 //
 //	oauth_scope ← oauth_scope_permission ← permission ← role_permission ← role ← role_binding (user)
 //
 // All rows are cleaned up via t.Cleanup in reverse insertion order.
 // This is the minimum viable setup for ResolveGrantableScopes to return scopeString.
-func insertRBACChainForScope(t *testing.T, tenantID, rsID uuid.UUID, userID, scopeString string) {
+func insertRBACChainForScope(t *testing.T, workspaceID, rsID uuid.UUID, userID, scopeString string) {
 	t.Helper()
 	db := config.Database.DB
 
@@ -478,16 +478,16 @@ func insertRBACChainForScope(t *testing.T, tenantID, rsID uuid.UUID, userID, sco
 
 	_, err := db.Exec(`
 		INSERT INTO oauth_scopes
-			(id, tenant_id, resource_server_id, scope_string, display_name, risk_level, created_at, updated_at)
+			(id, workspace_id, resource_server_id, scope_string, display_name, risk_level, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, 'low', NOW(), NOW())`,
-		scopeID, tenantID, rsID, scopeString, scopeString,
+		scopeID, workspaceID, rsID, scopeString, scopeString,
 	)
 	require.NoError(t, err, "insertRBACChainForScope: oauth_scopes %s", scopeString)
 
 	_, err = db.Exec(`
-		INSERT INTO permissions (id, tenant_id, resource, action, created_at)
+		INSERT INTO permissions (id, workspace_id, resource, action, created_at)
 		VALUES ($1, $2, 'mcp-tool', $3, NOW())`,
-		permID, tenantID, scopeString,
+		permID, workspaceID, scopeString,
 	)
 	require.NoError(t, err, "insertRBACChainForScope: permissions %s", scopeString)
 
@@ -496,9 +496,9 @@ func insertRBACChainForScope(t *testing.T, tenantID, rsID uuid.UUID, userID, sco
 	require.NoError(t, err, "insertRBACChainForScope: oauth_scope_permissions %s", scopeString)
 
 	_, err = db.Exec(`
-		INSERT INTO roles (id, tenant_id, name, is_system, created_at)
+		INSERT INTO roles (id, workspace_id, name, is_system, created_at)
 		VALUES ($1, $2, $3, false, NOW())`,
-		roleID, tenantID, roleName,
+		roleID, workspaceID, roleName,
 	)
 	require.NoError(t, err, "insertRBACChainForScope: roles %s", scopeString)
 
@@ -508,9 +508,9 @@ func insertRBACChainForScope(t *testing.T, tenantID, rsID uuid.UUID, userID, sco
 
 	_, err = db.Exec(`
 		INSERT INTO role_bindings
-			(id, tenant_id, user_id, username, role_id, role_name, conditions, created_at)
+			(id, workspace_id, user_id, username, role_id, role_name, conditions, created_at)
 		VALUES ($1, $2, $3::uuid, 'testuser', $4, $5, '{}', NOW())`,
-		rbID, tenantID, userID, roleID, roleName,
+		rbID, workspaceID, userID, roleID, roleName,
 	)
 	require.NoError(t, err, "insertRBACChainForScope: role_bindings %s", scopeString)
 
@@ -603,7 +603,7 @@ func TestRevokedRoleBeforeTokenExchange(t *testing.T) {
 	// User sub has no RBAC bindings → full scope loss.
 	userSub := uuid.New().String()
 	contextID := insertAuthRequestContext(
-		t, hydraClientID, rsRowID.String(), testTenantID.String(),
+		t, hydraClientID, rsRowID.String(), testWorkspaceID.String(),
 		resourceURI, redirectURI,
 	)
 
@@ -670,10 +670,10 @@ func TestPartialScopeLossBeforeExchange(t *testing.T) {
 
 	// User has RBAC for tools:read only. tools:write is in the token but not in RBAC.
 	userSub := uuid.New().String()
-	insertRBACChainForScope(t, testTenantID, rsRowID, userSub, "tools:read")
+	insertRBACChainForScope(t, testWorkspaceID, rsRowID, userSub, "tools:read")
 
 	contextID := insertAuthRequestContext(
-		t, hydraClientID, rsRowID.String(), testTenantID.String(),
+		t, hydraClientID, rsRowID.String(), testWorkspaceID.String(),
 		resourceURI, redirectURI,
 	)
 
@@ -740,7 +740,7 @@ func TestPartialScopeLossOnRefresh(t *testing.T) {
 
 	// User has RBAC for tools:read only. tools:write is in the token but not in RBAC.
 	userSub := uuid.New().String()
-	insertRBACChainForScope(t, testTenantID, rsRowID, userSub, "tools:read")
+	insertRBACChainForScope(t, testWorkspaceID, rsRowID, userSub, "tools:read")
 
 	newAccessToken := "mock-new-at-" + uuid.New().String()
 	newRefreshToken := "mock-new-rt-" + uuid.New().String()

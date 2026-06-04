@@ -111,7 +111,7 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			}
 		}
 
-		// Backfill missing identifiers (tenant_id, user_id, etc.) for legacy controllers
+		// Backfill missing identifiers (workspace_id, user_id, etc.) for legacy controllers
 		ensureWorkspaceContext(c)
 		ensureUserContextIdentifiers(c)
 
@@ -442,7 +442,7 @@ func extractUserInfo(c *gin.Context) (*UserInfo, error) {
 
 	// Extract basic user info.
 	//
-	// Phase 6: workspace_id is the only identity claim. tenant_id fallback removed.
+	// Phase 6: workspace_id is the only identity claim. workspace_id fallback removed.
 	workspaceClaim, _ := claimsMap["workspace_id"].(string)
 	if workspaceClaim == "" {
 		return nil, fmt.Errorf("workspace_id claim missing from token")
@@ -765,7 +765,7 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 }
 
 // ensureWorkspaceContext makes sure workspace_id is available even when omitted from JWTs.
-// Phase 6: tenant_id fallback removed; only workspace_id is consulted.
+// Phase 6: workspace_id fallback removed; only workspace_id is consulted.
 func ensureWorkspaceContext(c *gin.Context) {
 	if workspaceID := getContextString(c, "workspace_id"); workspaceID != "" {
 		setWorkspaceContext(c, workspaceID)
@@ -980,7 +980,7 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 }
 
 // ExtractTenantFromPath is a middleware that extracts the workspace_id from the URL path
-// and sets it in the Gin context. Phase 5.1 renamed the URL param from :tenant_id to
+// and sets it in the Gin context. Phase 5.1 renamed the URL param from :workspace_id to
 // :workspace_id; the function name is kept (deprecated) to avoid churning route
 // registrations — Phase 10 sweeps it.
 func ExtractTenantFromPath() gin.HandlerFunc {

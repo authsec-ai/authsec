@@ -39,7 +39,7 @@ func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agen
 
 	query := `
 		INSERT INTO agents (
-			id, tenant_id, node_id, spiffe_id, attestation_type,
+			id, workspace_id, node_id, spiffe_id, attestation_type,
 			node_selectors, certificate_serial, status, cluster_name,
 			last_seen, last_heartbeat, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -65,7 +65,7 @@ func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agen
 
 	r.logger.WithFields(logrus.Fields{
 		"agent_id":  agent.ID,
-		"tenant_id": agent.WorkspaceID,
+		"workspace_id": agent.WorkspaceID,
 		"spiffe_id": agent.SpiffeID,
 	}).Info("Agent created")
 
@@ -75,7 +75,7 @@ func (r *PostgresAgentRepository) Create(ctx context.Context, agent *models.Agen
 // GetByID retrieves an agent by ID
 func (r *PostgresAgentRepository) GetByID(ctx context.Context, id string) (*models.Agent, error) {
 	query := `
-		SELECT id, tenant_id, node_id, spiffe_id, attestation_type,
+		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
 		       node_selectors, certificate_serial, status, cluster_name,
 		       last_seen, last_heartbeat, created_at, updated_at
 		FROM agents
@@ -123,7 +123,7 @@ func (r *PostgresAgentRepository) GetByID(ctx context.Context, id string) (*mode
 // GetBySpiffeID retrieves an agent by SPIFFE ID
 func (r *PostgresAgentRepository) GetBySpiffeID(ctx context.Context, spiffeID string) (*models.Agent, error) {
 	query := `
-		SELECT id, tenant_id, node_id, spiffe_id, attestation_type,
+		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
 		       node_selectors, certificate_serial, status, cluster_name,
 		       last_seen, last_heartbeat, created_at, updated_at
 		FROM agents
@@ -169,13 +169,13 @@ func (r *PostgresAgentRepository) GetBySpiffeID(ctx context.Context, spiffeID st
 }
 
 // GetByTenantAndNode retrieves an agent by tenant ID and node ID
-func (r *PostgresAgentRepository) GetByTenantAndNode(ctx context.Context, tenantID, nodeID string) (*models.Agent, error) {
+func (r *PostgresAgentRepository) GetByTenantAndNode(ctx context.Context, workspaceID, nodeID string) (*models.Agent, error) {
 	query := `
-		SELECT id, tenant_id, node_id, spiffe_id, attestation_type,
+		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
 		       node_selectors, certificate_serial, status, cluster_name,
 		       last_seen, last_heartbeat, created_at, updated_at
 		FROM agents
-		WHERE tenant_id = $1 AND node_id = $2
+		WHERE workspace_id = $1 AND node_id = $2
 	`
 
 	agent := &models.Agent{}
@@ -183,7 +183,7 @@ func (r *PostgresAgentRepository) GetByTenantAndNode(ctx context.Context, tenant
 	var clusterName sql.NullString
 	var lastHeartbeat sql.NullTime
 
-	err := r.db.QueryRowContext(ctx, query, tenantID, nodeID).Scan(
+	err := r.db.QueryRowContext(ctx, query, workspaceID, nodeID).Scan(
 		&agent.ID, &agent.WorkspaceID, &agent.NodeID, &agent.SpiffeID,
 		&agent.AttestationType, &nodeSelectorsJSON, &agent.CertificateSerial,
 		&agent.Status, &clusterName, &agent.LastSeen, &lastHeartbeat,
@@ -294,17 +294,17 @@ func (r *PostgresAgentRepository) Delete(ctx context.Context, id string) error {
 }
 
 // ListByTenant lists all agents for a tenant
-func (r *PostgresAgentRepository) ListByTenant(ctx context.Context, tenantID string) ([]*models.Agent, error) {
+func (r *PostgresAgentRepository) ListByTenant(ctx context.Context, workspaceID string) ([]*models.Agent, error) {
 	query := `
-		SELECT id, tenant_id, node_id, spiffe_id, attestation_type,
+		SELECT id, workspace_id, node_id, spiffe_id, attestation_type,
 		       node_selectors, certificate_serial, status, last_seen,
 		       created_at, updated_at
 		FROM agents
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY created_at DESC
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, tenantID)
+	rows, err := r.db.QueryContext(ctx, query, workspaceID)
 	if err != nil {
 		r.logger.WithError(err).Error("Failed to list agents by tenant")
 		return nil, errors.NewInternalError("Failed to list agents", err)

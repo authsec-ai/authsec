@@ -155,7 +155,7 @@ func TestEntraIDController_TestEntraIDConnection(t *testing.T) {
 			expectedBody: map[string]interface{}{
 				"success":   true,
 				"message":   "Successfully connected to Entra ID",
-				"tenant_id": "test-tenant-id",
+				"workspace_id": "test-tenant-id",
 			},
 			setupMocks: func() {
 				// Mock successful authentication and user fetch
@@ -560,7 +560,7 @@ func TestEntraIDController_syncEntraUserToDatabase(t *testing.T) {
 	tests := []struct {
 		name      string
 		entraUser EntraIDUser
-		tenantID  string
+		workspaceID  string
 		clientID  string
 		projectID string
 		wantErr   bool
@@ -579,7 +579,7 @@ func TestEntraIDController_syncEntraUserToDatabase(t *testing.T) {
 				Department:        "IT",
 				AccountEnabled:    true,
 			},
-			tenantID:  uuid.New().String(),
+			workspaceID:  uuid.New().String(),
 			clientID:  uuid.New().String(),
 			projectID: uuid.New().String(),
 			wantErr:   false,
@@ -598,7 +598,7 @@ func TestEntraIDController_syncEntraUserToDatabase(t *testing.T) {
 				Department:        "Engineering",
 				AccountEnabled:    true,
 			},
-			tenantID:  uuid.New().String(),
+			workspaceID:  uuid.New().String(),
 			clientID:  uuid.New().String(),
 			projectID: uuid.New().String(),
 			wantErr:   false,
@@ -609,7 +609,7 @@ func TestEntraIDController_syncEntraUserToDatabase(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Note: This test would require a test database setup
 			// For now, we'll just test the method signature and basic logic
-			// err := controller.syncEntraUserToDatabase(db, tt.entraUser, tt.tenantID, tt.clientID, tt.projectID)
+			// err := controller.syncEntraUserToDatabase(db, tt.entraUser, tt.workspaceID, tt.clientID, tt.projectID)
 			// if tt.wantErr {
 			// 	assert.Error(t, err)
 			// } else {
@@ -619,7 +619,7 @@ func TestEntraIDController_syncEntraUserToDatabase(t *testing.T) {
 			// Placeholder assertion
 			assert.NotNil(t, controller)
 			assert.NotEmpty(t, tt.entraUser.ID)
-			assert.NotEmpty(t, tt.tenantID)
+			assert.NotEmpty(t, tt.workspaceID)
 			assert.NotEmpty(t, tt.clientID)
 			assert.NotEmpty(t, tt.projectID)
 		})

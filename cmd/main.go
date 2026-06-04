@@ -90,7 +90,7 @@ func main() {
 			config.DB,
 		)
 		if err := masterRunner.RunMigrations(); err != nil {
-			log.Printf("Warning: master migrations encountered errors (service continuing): %v", err)
+			log.Fatalf("FATAL: master migrations failed — refusing to start: %v", err)
 		} else {
 			log.Println("Master migrations completed successfully")
 		}

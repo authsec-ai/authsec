@@ -102,7 +102,7 @@ func (ac *OocmgrController) DumpHydraRawData(c *gin.Context) {
 
 	workspaceID := strings.TrimSpace(req.WorkspaceID)
 	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "tenant_id is required", Message: "Provide a tenant_id to dump Hydra data.", Code: http.StatusBadRequest, Timestamp: time.Now()})
+		c.JSON(http.StatusBadRequest, oocmgrdto.ErrorResponse{Error: "workspace_id is required", Message: "Provide a workspace_id to dump Hydra data.", Code: http.StatusBadRequest, Timestamp: time.Now()})
 		return
 	}
 
@@ -168,7 +168,7 @@ func (ac *OocmgrController) getAllHydraClients() ([]oocmgrHydraClient, error) {
 
 // ===== PACKAGE-LEVEL HELPERS =====
 
-// oocmgrGetTenantDB is a vestigial helper from the multi-tenant era. The
+// oocmgrGetWorkspaceDB is a vestigial helper from the multi-tenant era. The
 // single-DB collapse removed tenant routing, so this always returns the shared
 // config.DB. Kept for backward compatibility with callers — remove once they're
 // inlined.
@@ -181,7 +181,7 @@ func oocmgrBelongsToTenant(metadata map[string]interface{}, workspaceID string) 
 	if metadata == nil || workspaceID == "" {
 		return false
 	}
-	if metaTenantID, ok := metadata["workspace_id"].(string); ok && metaTenantID == workspaceID {
+	if metaWorkspaceID, ok := metadata["workspace_id"].(string); ok && metaWorkspaceID == workspaceID {
 		return true
 	}
 	if cid, ok := metadata["c_id"].(string); ok && cid == workspaceID {

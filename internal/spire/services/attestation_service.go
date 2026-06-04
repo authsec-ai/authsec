@@ -25,7 +25,7 @@ type AttestationService struct {
 	certRepo     repositories.CertificateRepository
 	policyRepo   repositories.PolicyRepository
 	auditRepo    repositories.AuditRepository
-	tenantRepo   repositories.TenantRepository
+	workspaceRepo   repositories.WorkspaceRepository
 	vaultClient  *vault.Client
 	connManager  *database.ConnectionManager // For tenant-specific DB connections
 	logger       *logrus.Entry
@@ -37,7 +37,7 @@ func NewAttestationService(
 	certRepo repositories.CertificateRepository,
 	policyRepo repositories.PolicyRepository,
 	auditRepo repositories.AuditRepository,
-	tenantRepo repositories.TenantRepository,
+	workspaceRepo repositories.WorkspaceRepository,
 	vaultClient *vault.Client,
 	connManager *database.ConnectionManager,
 	logger *logrus.Entry,
@@ -47,15 +47,15 @@ func NewAttestationService(
 		certRepo:     certRepo,
 		policyRepo:   policyRepo,
 		auditRepo:    auditRepo,
-		tenantRepo:   tenantRepo,
+		workspaceRepo:   workspaceRepo,
 		vaultClient:  vaultClient,
 		connManager:  connManager,
 		logger:       logger,
 	}
 }
 
-// getTenantRepositories creates repositories connected to the tenant's database
-func (s *AttestationService) getTenantRepositories(ctx context.Context, tenantID string) (
+// getWorkspaceRepositories creates repositories connected to the tenant's database
+func (s *AttestationService) getWorkspaceRepositories(ctx context.Context, workspaceID string) (
 	repositories.WorkloadRepository,
 	repositories.CertificateRepository,
 	repositories.PolicyRepository,
@@ -63,7 +63,7 @@ func (s *AttestationService) getTenantRepositories(ctx context.Context, tenantID
 	error,
 ) {
 	// Query tenants table in master DB to get tenant database connection info
-	tenantDB, err := s.connManager.GetTenantDB(ctx, tenantID)
+	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("failed to connect to tenant database: %w", err)
 	}
@@ -100,22 +100,22 @@ type AttestResponse struct {
 
 // Attest performs workload attestation and issues a certificate
 func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*AttestResponse, error) {
-	s.logger.WithFields(logrus.Fields{"tenant_id": req.WorkspaceID, "attestation_type": req.AttestationType}).Info("Starting attestation")
+	s.logger.WithFields(logrus.Fields{"workspace_id": req.WorkspaceID, "attestation_type": req.AttestationType}).Info("Starting attestation")
 
 	// Get tenant-specific repositories (connected to tenant's database)
-	workloadRepo, certRepo, policyRepo, auditRepo, err := s.getTenantRepositories(ctx, req.WorkspaceID)
+	workloadRepo, certRepo, policyRepo, auditRepo, err := s.getWorkspaceRepositories(ctx, req.WorkspaceID)
 	if err != nil {
 		s.logger.WithError(err).Error("Failed to get tenant repositories")
 		return nil, errors.NewInternalError("Failed to connect to tenant database", err)
 	}
 
 	// Try to get tenant from local database (optional - tenant may only exist in user-flow DB)
-	tenant, err := s.tenantRepo.GetByID(ctx, req.WorkspaceID)
+	tenant, err := s.workspaceRepo.GetByID(ctx, req.WorkspaceID)
 	var vaultMount string
 
 	if err != nil {
 		// Tenant doesn't exist in ICP database - this is OK
-		s.logger.WithField("tenant_id", req.WorkspaceID).Info("Tenant not found in ICP database, using request parameters")
+		s.logger.WithField("workspace_id", req.WorkspaceID).Info("Tenant not found in ICP database, using request parameters")
 
 		// Use provided vault_mount or generate default
 		if req.VaultMount != "" {
@@ -159,7 +159,7 @@ func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*A
 
 	if err != nil {
 		// No policy found - use defaults
-		s.logger.WithField("tenant_id", req.WorkspaceID).Info("No matching policy found, using defaults")
+		s.logger.WithField("workspace_id", req.WorkspaceID).Info("No matching policy found, using defaults")
 		vaultRole = "workload" // Default role created during PKI provisioning
 		ttl = 86400            // 24 hours default
 	} else {
@@ -229,9 +229,9 @@ func (s *AttestationService) Attest(ctx context.Context, req *AttestRequest) (*A
 }
 
 // generateSpiffeID generates a SPIFFE ID based on tenant and selectors
-func (s *AttestationService) generateSpiffeID(tenantID string, selectors map[string]string) string {
+func (s *AttestationService) generateSpiffeID(workspaceID string, selectors map[string]string) string {
 	// Simple implementation - customize based on your requirements
-	base := fmt.Sprintf("spiffe://%s", tenantID)
+	base := fmt.Sprintf("spiffe://%s", workspaceID)
 
 	if ns, ok := selectors["k8s:namespace"]; ok {
 		base += "/ns/" + ns
@@ -247,12 +247,12 @@ func (s *AttestationService) generateSpiffeID(tenantID string, selectors map[str
 func (s *AttestationService) getOrCreateWorkloadInRepo(
 	ctx context.Context,
 	workloadRepo repositories.WorkloadRepository,
-	tenantID, spiffeID string,
+	workspaceID, spiffeID string,
 	selectors map[string]string,
 	vaultRole, attestationType string,
 ) (*models.Workload, error) {
 	// Try to find existing workload
-	workload, err := workloadRepo.GetBySpiffeID(ctx, tenantID, spiffeID)
+	workload, err := workloadRepo.GetBySpiffeID(ctx, workspaceID, spiffeID)
 	if err == nil {
 		return workload, nil
 	}
@@ -260,7 +260,7 @@ func (s *AttestationService) getOrCreateWorkloadInRepo(
 	// Create new workload
 	workload = &models.Workload{
 		ID:              uuid.New().String(),
-		WorkspaceID:        tenantID,
+		WorkspaceID:        workspaceID,
 		SpiffeID:        spiffeID,
 		Selectors:       selectors,
 		VaultRole:       vaultRole,

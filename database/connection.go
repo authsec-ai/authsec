@@ -89,12 +89,12 @@ func GetMasterDB() *DBConnection {
 	return GlobalConnectionManager.masterDB
 }
 
-// GetTenantDB is a Phase 6 no-op stub. Dynamic tenant-DB routing was removed
+// GetWorkspaceDB is a Phase 6 no-op stub. Dynamic tenant-DB routing was removed
 // when the tenants table was deleted; everything now lives in the single shared
 // master DB (config.DB / GetMasterDB). Kept exported in case external code
 // imports the symbol; returns the master connection to preserve "happy path"
 // behavior for any straggler caller. Logs a warning so the call is visible.
-func GetTenantDB(workspaceID string) (*DBConnection, error) {
+func GetWorkspaceDB(workspaceID string) (*DBConnection, error) {
 	if GlobalConnectionManager == nil {
 		return nil, fmt.Errorf("connection manager not initialized")
 	}

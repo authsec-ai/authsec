@@ -70,7 +70,7 @@ func NewGlobalRepository(db *gorm.DB) *GlobalRepository {
 	return &GlobalRepository{DB: db}
 }
 
-func (r *GlobalRepository) GetTenantByID(workspaceID string) (*sharedmodels.Tenant, error) {
+func (r *GlobalRepository) GetWorkspaceByID(workspaceID string) (*sharedmodels.Tenant, error) {
 	var tenant sharedmodels.Tenant
 	if err := r.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
 		return nil, err
@@ -99,7 +99,7 @@ func (r *GlobalRepository) GetVerifiedCustomDomainForTenant(workspaceID string) 
 
 // GetCustomDomainVerificationTime returns when the custom domain was verified
 func (r *GlobalRepository) GetCustomDomainVerificationTime(workspaceID string) (*time.Time, error) {
-	var domain appmodels.TenantDomain
+	var domain appmodels.WorkspaceDomain
 	err := r.DB.Table("workspace_domains").
 		Select("verified_at").
 		Where("workspace_id = ? AND is_verified = ? AND kind = ?", workspaceID, true, "custom").

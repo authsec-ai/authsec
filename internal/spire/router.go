@@ -53,7 +53,7 @@ func RegisterRoutes(rg *gin.RouterGroup, deps *Dependencies) {
 	rg.POST("/v1/jwt/validate", middleware.SensitiveLimiter.Middleware(), deps.JWTSVID.ValidateJWTSVID)
 	rg.POST("/v1/jwt/renew", middleware.SensitiveLimiter.Middleware(), deps.JWTSVID.RenewJWTSVID)
 	rg.POST("/admin/pki/provision", middleware.SensitiveLimiter.Middleware(), deps.PKIAdmin.ProvisionPKI)
-	rg.POST("/admin/pki/provision/:tenant_id", middleware.SensitiveLimiter.Middleware(), deps.PKIAdmin.ProvisionPKIForTenant)
+	rg.POST("/admin/pki/provision/:workspace_id", middleware.SensitiveLimiter.Middleware(), deps.PKIAdmin.ProvisionPKIForTenant)
 
 	// ────────────────────────────────────────
 	// Agent-protected endpoints

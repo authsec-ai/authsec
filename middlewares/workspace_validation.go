@@ -7,9 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ValidateTenantFromToken ensures URL workspace_id matches JWT token workspace_id.
-// Function name preserved (deprecated) to avoid churning route registrations.
-func ValidateTenantFromToken() gin.HandlerFunc {
+// ValidateWorkspaceFromToken ensures URL workspace_id matches JWT token workspace_id.
+func ValidateWorkspaceFromToken() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		urlWorkspaceID := c.Param("workspace_id")
 		if urlWorkspaceID == "" {

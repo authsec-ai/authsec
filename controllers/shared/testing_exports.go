@@ -89,12 +89,12 @@ func (es *EntraIDService) TokenExpiryForTest() time.Time {
 	return es.tokenExpiry
 }
 
-// SetSeededTenantID allows tests to set the seeded tenant ID.
-var SetSeededTenantID = func(id uuid.UUID) {
-	seededTenantID = id
+// SetSeededWorkspaceID allows tests to set the seeded tenant ID.
+var SetSeededWorkspaceID = func(id uuid.UUID) {
+	seededWorkspaceID = id
 }
 
-// GetSeededTenantID returns the seeded tenant ID.
-func GetSeededTenantID() uuid.UUID {
-	return seededTenantID
+// GetSeededWorkspaceID returns the seeded tenant ID.
+func GetSeededWorkspaceID() uuid.UUID {
+	return seededWorkspaceID
 }

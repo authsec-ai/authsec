@@ -168,7 +168,7 @@ type TenantDeviceTokenRegistrationResponse struct {
 type TenantCIBAInitiateRequest struct {
 	ClientID       string   `json:"client_id"` // legacy: workspace now resolved from host/JWT
 	Email          string   `json:"email" binding:"required,email"` // User email
-	TenantDomain   string   `json:"tenant_domain"`                  // Optional: For validation if provided
+	WorkspaceDomain   string   `json:"workspace_domain"`                  // Optional: For validation if provided
 	BindingMessage string   `json:"binding_message,omitempty"`      // Message shown to user
 	Scopes         []string `json:"scopes,omitempty"`               // OAuth scopes
 }
@@ -218,7 +218,7 @@ type TenantTOTPLoginRequest struct {
 	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
 	Email        string `json:"email" binding:"required,email"`     // User email
 	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
-	TenantDomain string `json:"tenant_domain"`                      // For validation
+	WorkspaceDomain string `json:"workspace_domain"`                      // For validation
 }
 
 // TenantTOTPLoginResponse contains TOTP login result
@@ -282,7 +282,7 @@ type TenantTOTPDeviceApprovalRequest struct {
 	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
 	Email        string `json:"email" binding:"required,email"`     // User email (to find user and validate TOTP)
 	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code from authenticator app
-	TenantDomain string `json:"tenant_domain" binding:"required"`   // For validation
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"`   // For validation
 }
 
 // TenantTOTPDeviceApprovalResponse contains approval result

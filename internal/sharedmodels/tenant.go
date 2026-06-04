@@ -11,12 +11,12 @@ import (
 // Note: This replaces the previous GORM hooks functionality
 type TenantDatabaseUtils struct{}
 
-// GenerateTenantDBName generates a tenant database name from tenant ID
-func (TenantDatabaseUtils) GenerateTenantDBName(workspaceID uuid.UUID) string {
+// GenerateWorkspaceDBName generates a tenant database name from tenant ID
+func (TenantDatabaseUtils) GenerateWorkspaceDBName(workspaceID uuid.UUID) string {
 	return fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 }
 
-// ValidateTenantDBName validates a tenant database name format
-func (TenantDatabaseUtils) ValidateTenantDBName(dbName string) bool {
+// ValidateWorkspaceDBName validates a tenant database name format
+func (TenantDatabaseUtils) ValidateWorkspaceDBName(dbName string) bool {
 	return strings.HasPrefix(dbName, "tenant_") && len(dbName) > 7
 }

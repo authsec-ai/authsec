@@ -164,10 +164,10 @@ func (s *OAuthLoginService) GetSAMLProvidersForTenant(workspaceID string, _ ...s
 }
 
 // GetAllProvidersForTenant returns both OIDC and SAML providers
-func (s *OAuthLoginService) GetAllProvidersForTenant(tenantIDForOIDC string, realTenantID string, clientID ...string) ([]Provider, error) {
+func (s *OAuthLoginService) GetAllProvidersForTenant(workspaceIDForOIDC string, realWorkspaceID string, clientID ...string) ([]Provider, error) {
 	var allProviders []Provider
 
-	oidcProviders, err := s.GetOIDCProvidersForTenant(tenantIDForOIDC)
+	oidcProviders, err := s.GetOIDCProvidersForTenant(workspaceIDForOIDC)
 	if err != nil {
 		log.Printf("Warning: Failed to get OIDC providers: %v", err)
 	} else {
@@ -183,7 +183,7 @@ func (s *OAuthLoginService) GetAllProvidersForTenant(tenantIDForOIDC string, rea
 		}
 	}
 
-	samlProviders, err := s.GetSAMLProvidersForTenant(realTenantID, clientID...)
+	samlProviders, err := s.GetSAMLProvidersForTenant(realWorkspaceID, clientID...)
 	if err != nil {
 		log.Printf("Warning: Failed to get SAML providers: %v", err)
 	} else {

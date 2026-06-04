@@ -9,7 +9,7 @@ import (
 
 // Context keys used across SPIRE middleware
 const (
-	SpireTenantIDKey   = "spire_tenant_id"
+	SpireWorkspaceIDKey   = "spire_workspace_id"
 	SpireUserIDKey     = "spire_user_id"
 	SpireClaimsKey     = "spire_claims"
 	SpireSpiffeIDKey   = "spire_spiffe_id"
@@ -18,9 +18,9 @@ const (
 	SpireAgentIDKey    = "spire_agent_id"
 )
 
-// GetSpireTenantID extracts the tenant ID from the Gin context.
-func GetSpireTenantID(c *gin.Context) (string, bool) {
-	val, exists := c.Get(SpireTenantIDKey)
+// GetSpireWorkspaceID extracts the tenant ID from the Gin context.
+func GetSpireWorkspaceID(c *gin.Context) (string, bool) {
+	val, exists := c.Get(SpireWorkspaceIDKey)
 	if !exists {
 		return "", false
 	}

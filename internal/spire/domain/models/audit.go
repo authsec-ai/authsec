@@ -15,7 +15,7 @@ const (
 // AuditLog represents an audit log entry
 type AuditLog struct {
 	ID            string                 `json:"id" db:"id"`
-	WorkspaceID      string                 `json:"workspace_id" db:"tenant_id"`
+	WorkspaceID      string                 `json:"workspace_id" db:"workspace_id"`
 	EventType     AuditEventType         `json:"event_type" db:"event_type"`
 	WorkloadID    string                 `json:"workload_id,omitempty" db:"workload_id"`
 	CertificateID string                 `json:"certificate_id,omitempty" db:"certificate_id"`

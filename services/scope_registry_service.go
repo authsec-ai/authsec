@@ -246,7 +246,7 @@ func (s *ScopeRegistryService) applyUpdate(
 			if err != nil {
 				continue
 			}
-			// SECURITY: only link permissions owned by this tenant or globally scoped (tenant_id IS NULL).
+			// SECURITY: only link permissions owned by this tenant or globally scoped (workspace_id IS NULL).
 			// Never remove this filter — it prevents cross-tenant permission bridges.
 			var count int64
 			s.db.Model(&models.RBACPermission{}).
@@ -306,7 +306,7 @@ func (s *ScopeRegistryService) LinkPermissionsTenantScoped(scopeID, workspaceID 
 		if err != nil {
 			continue
 		}
-		// SECURITY: only link permissions owned by this tenant or globally scoped (tenant_id IS NULL).
+		// SECURITY: only link permissions owned by this tenant or globally scoped (workspace_id IS NULL).
 		// Never remove this filter — it prevents cross-tenant permission bridges.
 		var count int64
 		s.db.Model(&models.RBACPermission{}).

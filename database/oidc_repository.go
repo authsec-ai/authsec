@@ -218,7 +218,7 @@ func NewOIDCStateRepository(db *DBConnection) *OIDCStateRepository {
 // pre-v4 callers can leave them empty and they'll be NULL in the DB.
 func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 	query := `
-		INSERT INTO oidc_states (state_token, workspace_id, tenant_domain, request_host, provider_name,
+		INSERT INTO oidc_states (state_token, workspace_id, workspace_domain, request_host, provider_name,
 		                         action, code_verifier, redirect_after, expires_at, created_at,
 		                         application_id, signed_state, login_challenge)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -254,7 +254,7 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 	err := r.db.QueryRow(query,
 		state.StateToken,
 		workspaceIDParam,
-		state.TenantDomain,
+		state.WorkspaceDomain,
 		requestHostParam,
 		state.ProviderName,
 		state.Action,
@@ -279,7 +279,7 @@ func (r *OIDCStateRepository) CreateState(state *models.OIDCState) error {
 // and the callback branches accordingly.
 func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCState, error) {
 	query := `
-		SELECT id, state_token, workspace_id, tenant_domain, request_host, provider_name,
+		SELECT id, state_token, workspace_id, workspace_domain, request_host, provider_name,
 		       action, code_verifier, redirect_after, expires_at, created_at,
 		       application_id, signed_state, login_challenge
 		FROM oidc_states
@@ -295,7 +295,7 @@ func (r *OIDCStateRepository) GetStateByToken(stateToken string) (*models.OIDCSt
 		&state.ID,
 		&state.StateToken,
 		&workspaceID,
-		&state.TenantDomain,
+		&state.WorkspaceDomain,
 		&requestHost,
 		&state.ProviderName,
 		&state.Action,
@@ -626,14 +626,14 @@ func (r *OIDCUserIdentityRepository) GetTenantsByProviderEmail(email string) ([]
 	}
 	defer rows.Close()
 
-	var tenantIDs []uuid.UUID
+	var workspaceIDs []uuid.UUID
 	for rows.Next() {
 		var workspaceID uuid.UUID
 		if err := rows.Scan(&workspaceID); err != nil {
 			return nil, err
 		}
-		tenantIDs = append(tenantIDs, workspaceID)
+		workspaceIDs = append(workspaceIDs, workspaceID)
 	}
 
-	return tenantIDs, rows.Err()
+	return workspaceIDs, rows.Err()
 }

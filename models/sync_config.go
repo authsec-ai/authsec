@@ -33,7 +33,7 @@ type SyncConfiguration struct {
 	ADSkipVerify bool   `json:"ad_skip_verify,omitempty" gorm:"default:false"`
 
 	// Entra ID-specific fields (encrypted in DB)
-	EntraTenantID     string `json:"entra_tenant_id,omitempty" gorm:"type:varchar(500)"`
+	EntraWorkspaceID     string `json:"entra_tenant_id,omitempty" gorm:"type:varchar(500)"`
 	EntraClientID     string `json:"entra_client_id,omitempty" gorm:"type:varchar(500)"`
 	EntraClientSecret string `json:"entra_client_secret,omitempty" gorm:"type:text"` // Encrypted
 	EntraScopes       string `json:"entra_scopes,omitempty" gorm:"type:text"`        // JSON array as text

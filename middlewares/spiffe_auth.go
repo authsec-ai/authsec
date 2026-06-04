@@ -59,14 +59,14 @@ func SpiffeAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Determine tenant_id from token claims or issuer.
+		// Determine workspace_id from token claims or issuer.
 		workspaceID, _ := claims["workspace_id"].(string)
 		if workspaceID == "" {
 			iss, _ := claims["iss"].(string)
 			workspaceID = strings.TrimPrefix(iss, "spiffe://")
 		}
 		if workspaceID == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Cannot determine tenant_id from SPIFFE JWT-SVID"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Cannot determine workspace_id from SPIFFE JWT-SVID"})
 			return
 		}
 
@@ -184,9 +184,9 @@ func spiffeGetPublicKey(workspaceID string) (*rsa.PublicKey, error) {
 		spireURL = "http://localhost:7001"
 	}
 
-	// TODO(phase9): ICP service still expects ?tenant_id= here; update to
+	// TODO(phase9): ICP service still expects ?workspace_id= here; update to
 	// ?workspace_id= once the SPIRE-layer has been swept in Phase 9.
-	url := fmt.Sprintf("%s/v1/jwt/bundle?tenant_id=%s", spireURL, workspaceID)
+	url := fmt.Sprintf("%s/v1/jwt/bundle?workspace_id=%s", spireURL, workspaceID)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {

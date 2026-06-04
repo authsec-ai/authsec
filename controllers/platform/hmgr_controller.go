@@ -176,7 +176,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	hydraClientID := loginRequest.Client.ClientID
 	expectedClientID := hydraClientID
-	expectedTenantID := workspaceID
+	expectedWorkspaceID := workspaceID
 	var mcpAuthCtx *models.AuthRequestContext
 
 	arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
@@ -195,7 +195,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		return
 	}
 	mcpAuthCtx = arcCtx
-	expectedTenantID = arcCtx.WorkspaceID
+	expectedWorkspaceID = arcCtx.WorkspaceID
 
 	tenantDB := config.DB
 
@@ -259,7 +259,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		"login_challenge": req.LoginChallenge,
 		"redirect_to":     acceptResponse.RedirectTo,
 		"client_id":       expectedClientID,
-		"workspace_id":    expectedTenantID,
+		"workspace_id":    expectedWorkspaceID,
 		"email":           user.Email,
 	})
 }
@@ -344,7 +344,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 			return
 		}
 
-		tenantIDForOIDC := arcCtx.WorkspaceID
+		workspaceIDForOIDC := arcCtx.WorkspaceID
 
 		// OIDC prompt/max_age enforcement (OpenID Connect Core 1.0 §3.1.2.1)
 		if arcCtx.Prompt != nil {
@@ -395,17 +395,17 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 			rsName = rs.Name
 		}
 
-		allProviders, err := ctrl.service.GetAllProvidersForTenant(tenantIDForOIDC, tenantIDForOIDC, hydraClientID)
+		allProviders, err := ctrl.service.GetAllProvidersForTenant(workspaceIDForOIDC, workspaceIDForOIDC, hydraClientID)
 		if err != nil {
 			// No external OIDC/SAML providers — the login page can still render with
 			// built-in email/password flows as long as page-data succeeds.
-			log.Printf("[MCP_AUTH] GetLoginPageData: no external providers for tenant=%s challenge=%s: %v", tenantIDForOIDC, loginChallenge, err)
+			log.Printf("[MCP_AUTH] GetLoginPageData: no external providers for tenant=%s challenge=%s: %v", workspaceIDForOIDC, loginChallenge, err)
 			allProviders = nil
 		}
-		allProviders, err = ctrl.service.FilterProvidersForApplication(tenantIDForOIDC, arcCtx.ResourceServerID, allProviders)
+		allProviders, err = ctrl.service.FilterProvidersForApplication(workspaceIDForOIDC, arcCtx.ResourceServerID, allProviders)
 		if err != nil {
 			log.Printf("[MCP_AUTH] GetLoginPageData: filter application providers workspace=%s application=%s challenge=%s: %v",
-				tenantIDForOIDC, arcCtx.ResourceServerID, loginChallenge, err)
+				workspaceIDForOIDC, arcCtx.ResourceServerID, loginChallenge, err)
 			c.JSON(http.StatusInternalServerError, hydramodels.LoginPageDataResponse{
 				Success: false,
 				Error:   "Failed to load application identity providers",
@@ -432,7 +432,7 @@ func (ctrl *HmgrController) GetLoginPageDataHandler(c *gin.Context) {
 			// WorkspaceID is the real workspace resolved from the login_challenge
 			// via the auth_request_context. ClientID is the OAuth client (display
 			// only) — no longer overloaded to carry the workspace.
-			WorkspaceID:       tenantIDForOIDC,
+			WorkspaceID:       workspaceIDForOIDC,
 			ClientID:          hydraClientID,
 			Success:           true,
 			LoginChallenge:    loginChallenge,
@@ -543,7 +543,7 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	// OAuth client app's redirect_uri with an authorization code).
 	resp, err := ctrl.oidcSvc.InitiateOIDCFlow(&models.OIDCInitiateInput{
 		Provider:       providerName,
-		TenantDomain:   originDomain,
+		WorkspaceDomain:   originDomain,
 		ApplicationID:  appID,
 		LoginChallenge: req.LoginChallenge,
 	}, "hydra_login", &workspaceID)
@@ -724,8 +724,8 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 
 	baseURL := strings.TrimSuffix(callbackURL, "/oidc/auth/callback")
 
-	if tenantIDObj, ok := clientDetails.Metadata["workspace_id"].(string); ok && tenantIDObj != "" {
-		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, tenantIDObj)
+	if workspaceIDObj, ok := clientDetails.Metadata["workspace_id"].(string); ok && workspaceIDObj != "" {
+		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, workspaceIDObj)
 		if err == nil && len(verifiedDomains) > 0 {
 			if u, err := url.Parse(baseURL); err == nil {
 				host := u.Hostname()
@@ -902,9 +902,9 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		forceConsent := arcCtx.Prompt != nil && *arcCtx.Prompt == "consent"
 		var existingGrant *models.OAuthConsentGrant
 		if !forceConsent && mcpClient != nil {
-			tenantUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
+			workspaceUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
 			subjectUUID, _ := uuid.Parse(consentRequest.Subject)
-			if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+			if workspaceUUID != uuid.Nil && subjectUUID != uuid.Nil {
 				// Pass report.UserEffective (full RBAC set), NOT report.Grantable.
 				// Using the request-scoped grantable set would falsely revoke grants covering
 				// scopes the user still holds but didn't request in this particular flow.
@@ -917,7 +917,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 				// the lookup must find a stored grant covering the same effective
 				// scope set that finalize will issue.
 				existingGrant, stale, consentLookupErr = ctrl.consentService.CheckExistingConsent(
-					tenantUUID, subjectUUID, mcpClient.ID, rs.ID,
+					workspaceUUID, subjectUUID, mcpClient.ID, rs.ID,
 					requestedScopes,
 					report.UserEffective,
 					rs.ScopesSupported,
@@ -945,8 +945,8 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 				return
 			}
 			// Load scope metadata for enriched consent page rendering
-			tenantUUIDForMeta, _ := uuid.Parse(arcCtx.WorkspaceID)
-			allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(tenantUUIDForMeta, rs.ID)
+			workspaceUUIDForMeta, _ := uuid.Parse(arcCtx.WorkspaceID)
+			allScopes, _ := ctrl.scopeRegistry.ListByResourceServer(workspaceUUIDForMeta, rs.ID)
 			scopeMeta := make(map[string]*models.OAuthScope, len(allScopes))
 			for i := range allScopes {
 				scopeMeta[allScopes[i].ScopeString] = &allScopes[i]
@@ -1069,19 +1069,19 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 		return false
 	}
 
-	tenantUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
+	workspaceUUID, _ := uuid.Parse(arcCtx.WorkspaceID)
 	subjectUUID, _ := uuid.Parse(consentRequest.Subject)
-	if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+	if workspaceUUID != uuid.Nil && subjectUUID != uuid.Nil {
 		now := time.Now().UTC()
 		state := models.TenantEndUserState{
-			WorkspaceID:    tenantUUID,
+			WorkspaceID:    workspaceUUID,
 			UserID:         subjectUUID,
 			Status:         models.EndUserStatusActive,
 			FirstConsentAt: now,
 			LastSeenAt:     &now,
 		}
 		if err := config.DB.
-			Where("workspace_id = ? AND user_id = ?", tenantUUID, subjectUUID).
+			Where("workspace_id = ? AND user_id = ?", workspaceUUID, subjectUUID).
 			Assign(map[string]interface{}{
 				"status":       models.EndUserStatusActive,
 				"last_seen_at": now,
@@ -1094,9 +1094,9 @@ func (ctrl *HmgrController) finalizeMCPConsent(
 	}
 
 	if remember && mcpClient != nil {
-		if tenantUUID != uuid.Nil && subjectUUID != uuid.Nil {
+		if workspaceUUID != uuid.Nil && subjectUUID != uuid.Nil {
 			_, consentErr := ctrl.consentService.UpsertConsent(
-				tenantUUID, subjectUUID, mcpClient.ID, rs.ID,
+				workspaceUUID, subjectUUID, mcpClient.ID, rs.ID,
 				grantedScopes, services.DefaultConsentTTL,
 			)
 			if consentErr != nil {
@@ -1334,12 +1334,12 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 		return
 	}
 
-	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
-	if realTenantID == "" {
+	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
+	if realWorkspaceID == "" {
 		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid client configuration - missing c_id"})
 		return
 	}
-	workspaceUUID, err := uuid.Parse(realTenantID)
+	workspaceUUID, err := uuid.Parse(realWorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid workspace id"})
 		return
@@ -1392,7 +1392,7 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	}
 
 	// Resolve full SAML provider row for issuer / SSO URL / cert.
-	samlProvider, err := ctrl.service.GetSAMLProvider(realTenantID, providerName)
+	samlProvider, err := ctrl.service.GetSAMLProvider(realWorkspaceID, providerName)
 	if err != nil {
 		c.JSON(http.StatusNotFound, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider row missing"})
 		return
@@ -1484,7 +1484,7 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 }
 
 // HandleSAMLACSClientHandler handles workspace-scoped ACS callback. The legacy
-// per-client URL form (/saml/acs/:tenant_id/:client_id) is retained as a path
+// per-client URL form (/saml/acs/:workspace_id/:client_id) is retained as a path
 // shape, but only the workspace_id segment is validated against the relay
 // state — per-Application restriction is enforced at initiate, not here.
 func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
@@ -1588,10 +1588,10 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	}
 
 	clientIDFromMetadata, _ := clientDetails.Metadata["workspace_id"].(string)
-	realTenantID, _ := clientDetails.Metadata["c_id"].(string)
+	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
 
-	if realTenantID != workspaceID {
-		return "", nil, fmt.Errorf("tenant ID mismatch: expected %s, got %s", realTenantID, workspaceID)
+	if realWorkspaceID != workspaceID {
+		return "", nil, fmt.Errorf("tenant ID mismatch: expected %s, got %s", realWorkspaceID, workspaceID)
 	}
 
 	name := fmt.Sprintf("%s %s", firstName, lastName)
@@ -1608,7 +1608,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		username = strings.Split(username, "@")[0]
 	}
 
-	parsedTenantID, err := hydrautils.ValidateUUID(realTenantID, "workspace_id")
+	parsedWorkspaceID, err := hydrautils.ValidateUUID(realWorkspaceID, "workspace_id")
 	if err != nil {
 		return "", nil, err
 	}
@@ -1625,7 +1625,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		Provider:    "saml-" + providerName,
 		ProviderID:  nameID,
 		ClientID:    parsedClientID,
-		WorkspaceID: parsedTenantID,
+		WorkspaceID: parsedWorkspaceID,
 		Active:      true,
 	}
 

@@ -34,8 +34,8 @@ func NewAgentActionService(
 }
 
 // EvaluateAction is the main entry point — any agent calls this.
-// userID, userEmail, tenantIDStr come from the JWT (set by AuthMiddleware).
-func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateRequest, jwtUserID, jwtUserEmail, jwtTenantID string) (*models.AgentActionEvaluateResponse, error) {
+// userID, userEmail, workspaceIDStr come from the JWT (set by AuthMiddleware).
+func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateRequest, jwtUserID, jwtUserEmail, jwtWorkspaceID string) (*models.AgentActionEvaluateResponse, error) {
 
 	// Step 1: Use identity from JWT — already authenticated by middleware
 	userID, err := uuid.Parse(jwtUserID)
@@ -48,8 +48,8 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 
 	// Resolve tenant: prefer JWT tenant, fallback to client_id lookup
 	var workspaceID uuid.UUID
-	if jwtTenantID != "" {
-		workspaceID, err = uuid.Parse(jwtTenantID)
+	if jwtWorkspaceID != "" {
+		workspaceID, err = uuid.Parse(jwtWorkspaceID)
 		if err != nil {
 			return &models.AgentActionEvaluateResponse{
 				Error:            models.AgentErrorInvalidAction,
@@ -74,7 +74,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	} else {
 		return &models.AgentActionEvaluateResponse{
 			Error:            models.AgentErrorInvalidAction,
-			ErrorDescription: "No tenant_id in token and no client_id in request",
+			ErrorDescription: "No workspace_id in token and no client_id in request",
 		}, nil
 	}
 
@@ -177,8 +177,8 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	var deviceToken string
 	var deviceTokenID *uuid.UUID
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	if devices, devErr := tenantRepo.GetTenantDeviceTokensByUserID(userID, workspaceID); devErr == nil && len(devices) > 0 {
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
+	if devices, devErr := workspaceRepo.GetTenantDeviceTokensByUserID(userID, workspaceID); devErr == nil && len(devices) > 0 {
 		deviceToken = devices[0].DeviceToken
 		deviceTokenID = &devices[0].ID
 	}

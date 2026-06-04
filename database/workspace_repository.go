@@ -9,24 +9,24 @@ import (
 	"github.com/google/uuid"
 )
 
-// TenantRepository handles workspace identity database operations.
+// WorkspaceRepository handles workspace identity database operations.
 //
 // Phase 6 collapse: the `tenants` table has been dropped. All queries here
 // now target the `workspaces` table (which absorbed the legacy identity
 // columns email/password_hash/provider/workspace_domain/status/source/vault_mount/ca_cert).
 // The repository type name is retained for source-compatibility with existing
 // callers; rename to WorkspaceRepository is tracked as Phase 9/10 cosmetic.
-type TenantRepository struct {
+type WorkspaceRepository struct {
 	db *DBConnection
 }
 
-// NewTenantRepository creates a new workspace identity repository.
-func NewTenantRepository(db *DBConnection) *TenantRepository {
-	return &TenantRepository{db: db}
+// NewWorkspaceRepository creates a new workspace identity repository.
+func NewWorkspaceRepository(db *DBConnection) *WorkspaceRepository {
+	return &WorkspaceRepository{db: db}
 }
 
 // scanWorkspaceRow scans a workspaces row into a models.Tenant. Columns absent
-// from the workspaces schema (username, provider_id, avatar, last_login, tenant_db)
+// from the workspaces schema (username, provider_id, avatar, last_login, workspace_db)
 // are left as zero-value on the struct.
 func scanWorkspaceRow(row interface {
 	Scan(dest ...interface{}) error
@@ -61,7 +61,7 @@ func scanWorkspaceRow(row interface {
 		t.Status = statusHolder.String
 	}
 	if domainHolder.Valid {
-		t.TenantDomain = domainHolder.String
+		t.WorkspaceDomain = domainHolder.String
 	}
 	return nil
 }
@@ -70,7 +70,7 @@ const workspaceSelectCols = `id, COALESCE(email, ''), COALESCE(password_hash, ''
 const workspaceSelectColsFromAlias = `w.id, COALESCE(w.email, ''), COALESCE(w.password_hash, ''), w.provider, COALESCE(w.name, ''), w.source, w.status, w.created_at, w.updated_at, w.workspace_domain`
 
 // CreateTenant inserts a workspace identity row.
-func (tr *TenantRepository) CreateTenant(t *models.Tenant) error {
+func (tr *WorkspaceRepository) CreateTenant(t *models.Tenant) error {
 	query := `
 		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -86,13 +86,13 @@ func (tr *TenantRepository) CreateTenant(t *models.Tenant) error {
 		t.UpdatedAt = now
 	}
 	_, err := tr.db.Exec(query,
-		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.WorkspaceDomain, t.CreatedAt, t.UpdatedAt,
 	)
 	return err
 }
 
-// GetTenantByEmail retrieves a workspace identity by email (case-insensitive).
-func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, error) {
+// GetWorkspaceByEmail retrieves a workspace identity by email (case-insensitive).
+func (tr *WorkspaceRepository) GetWorkspaceByEmail(email string) (*models.Tenant, error) {
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE LOWER(email) = LOWER($1)`
 	t := &models.Tenant{}
 	err := scanWorkspaceRow(tr.db.QueryRow(query, email), t)
@@ -105,8 +105,8 @@ func (tr *TenantRepository) GetTenantByEmail(email string) (*models.Tenant, erro
 	return t, nil
 }
 
-// GetTenantByTenantID retrieves a workspace by its ID (workspace_id == id).
-func (tr *TenantRepository) GetTenantByTenantID(workspaceID string) (*models.Tenant, error) {
+// GetWorkspaceByWorkspaceID retrieves a workspace by its ID (workspace_id == id).
+func (tr *WorkspaceRepository) GetWorkspaceByWorkspaceID(workspaceID string) (*models.Tenant, error) {
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces WHERE id = $1`
 	t := &models.Tenant{}
 	err := scanWorkspaceRow(tr.db.QueryRow(query, workspaceID), t)
@@ -119,20 +119,20 @@ func (tr *TenantRepository) GetTenantByTenantID(workspaceID string) (*models.Ten
 	return t, nil
 }
 
-// UpdateTenantDB is a no-op under the single-DB collapse (workspaces has no tenant_db column).
-func (tr *TenantRepository) UpdateTenantDB(workspaceID uuid.UUID, dbName string) error {
+// UpdateWorkspaceDB is a no-op under the single-DB collapse (workspaces has no workspace_db column).
+func (tr *WorkspaceRepository) UpdateWorkspaceDB(workspaceID uuid.UUID, dbName string) error {
 	return nil
 }
 
 // UpdateTenantLogin is a no-op under the workspaces schema (no last_login column on workspaces yet).
 // If last-login tracking is needed it should live on admin_users or a sessions row.
-func (tr *TenantRepository) UpdateTenantLogin(workspaceID uuid.UUID) error {
+func (tr *WorkspaceRepository) UpdateTenantLogin(workspaceID uuid.UUID) error {
 	_, err := tr.db.Exec(`UPDATE workspaces SET updated_at = $1 WHERE id = $2`, time.Now(), workspaceID)
 	return err
 }
 
 // TenantExists checks whether a workspace identity exists for the given email.
-func (tr *TenantRepository) TenantExists(email string) (bool, error) {
+func (tr *WorkspaceRepository) TenantExists(email string) (bool, error) {
 	if tr.db == nil || tr.db.DB == nil {
 		return false, fmt.Errorf("database connection is not initialized")
 	}
@@ -148,8 +148,8 @@ func (tr *TenantRepository) TenantExists(email string) (bool, error) {
 	return exists, nil
 }
 
-// TenantExistsByTenantID checks whether a workspace exists with the given ID.
-func (tr *TenantRepository) TenantExistsByTenantID(workspaceID string) (bool, error) {
+// TenantExistsByWorkspaceID checks whether a workspace exists with the given ID.
+func (tr *WorkspaceRepository) TenantExistsByWorkspaceID(workspaceID string) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`
 	var exists bool
 	err := tr.db.QueryRow(query, workspaceID).Scan(&exists)
@@ -157,7 +157,7 @@ func (tr *TenantRepository) TenantExistsByTenantID(workspaceID string) (bool, er
 }
 
 // CreateTenantTx inserts a workspace identity row within a transaction.
-func (tr *TenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
+func (tr *WorkspaceRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
 	query := `
 		INSERT INTO workspaces (id, name, email, password_hash, provider, source, status, workspace_domain, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -173,18 +173,18 @@ func (tr *TenantRepository) CreateTenantTx(tx *sql.Tx, t *models.Tenant) error {
 		t.UpdatedAt = now
 	}
 	_, err := tx.Exec(query,
-		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.TenantDomain, t.CreatedAt, t.UpdatedAt,
+		t.ID, t.Name, t.Email, t.PasswordHash, t.Provider, t.Source, t.Status, t.WorkspaceDomain, t.CreatedAt, t.UpdatedAt,
 	)
 	return err
 }
 
-// UpdateTenantDBTx is a no-op under the single-DB collapse.
-func (tr *TenantRepository) UpdateTenantDBTx(tx *sql.Tx, workspaceID uuid.UUID, dbName string) error {
+// UpdateWorkspaceDBTx is a no-op under the single-DB collapse.
+func (tr *WorkspaceRepository) UpdateWorkspaceDBTx(tx *sql.Tx, workspaceID uuid.UUID, dbName string) error {
 	return nil
 }
 
 // GetAllTenants retrieves every workspace identity row.
-func (tr *TenantRepository) GetAllTenants() ([]*models.Tenant, error) {
+func (tr *WorkspaceRepository) GetAllTenants() ([]*models.Tenant, error) {
 	query := `SELECT ` + workspaceSelectCols + ` FROM workspaces ORDER BY created_at DESC`
 	rows, err := tr.db.Query(query)
 	if err != nil {
@@ -207,7 +207,7 @@ func (tr *TenantRepository) GetAllTenants() ([]*models.Tenant, error) {
 }
 
 // UpdateTenantStatusTx updates a workspace's status within a transaction.
-func (tr *TenantRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid.UUID, status string) error {
+func (tr *WorkspaceRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid.UUID, status string) error {
 	query := `UPDATE workspaces SET status = $1, updated_at = $2 WHERE id = $3`
 	result, err := tx.Exec(query, status, time.Now(), workspaceID)
 	if err != nil {
@@ -224,7 +224,7 @@ func (tr *TenantRepository) UpdateTenantStatusTx(tx *sql.Tx, workspaceID uuid.UU
 }
 
 // DeleteTenant permanently deletes a workspace and all related scoped rows.
-func (tr *TenantRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int64, error) {
+func (tr *WorkspaceRepository) DeleteTenant(workspaceID uuid.UUID) (map[string]int64, error) {
 	deletedCounts := make(map[string]int64)
 
 	tx, err := tr.db.Begin()

@@ -36,16 +36,16 @@ func (m *MTLSMiddleware) Authenticate() gin.HandlerFunc {
 		if m.devModeBypass && c.Request.TLS == nil {
 			m.logger.Warn("DEV MODE: Bypassing mTLS authentication (DO NOT USE IN PRODUCTION)")
 
-			tenantID := c.GetHeader("X-Tenant-ID")
-			if tenantID == "" {
-				tenantID = "4e615215-66b4-4414-bb39-4e0c6daa8f8b" // Default dev tenant
+			workspaceID := c.GetHeader("X-Tenant-ID")
+			if workspaceID == "" {
+				workspaceID = "4e615215-66b4-4414-bb39-4e0c6daa8f8b" // Default dev tenant
 			}
 
-			c.Set(SpireTenantIDKey, tenantID)
-			c.Set(SpireSpiffeIDKey, "spiffe://"+tenantID+"/dev/admin")
+			c.Set(SpireWorkspaceIDKey, workspaceID)
+			c.Set(SpireSpiffeIDKey, "spiffe://"+workspaceID+"/dev/admin")
 			c.Set(SpireIsAgentKey, false)
 
-			m.logger.WithField("tenant_id", tenantID).Debug("Dev mode authentication bypassed")
+			m.logger.WithField("workspace_id", workspaceID).Debug("Dev mode authentication bypassed")
 			c.Next()
 			return
 		}
@@ -87,7 +87,7 @@ func (m *MTLSMiddleware) Authenticate() gin.HandlerFunc {
 		}
 
 		// Parse SPIFFE ID to extract tenant and type
-		tenantID, isAgent, err := parseSpiffeID(spiffeID)
+		workspaceID, isAgent, err := parseSpiffeID(spiffeID)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": gin.H{
@@ -99,14 +99,14 @@ func (m *MTLSMiddleware) Authenticate() gin.HandlerFunc {
 		}
 
 		// Set Gin context values
-		c.Set(SpireTenantIDKey, tenantID)
+		c.Set(SpireWorkspaceIDKey, workspaceID)
 		c.Set(SpireSpiffeIDKey, spiffeID)
 		c.Set(SpireIsAgentKey, isAgent)
 		c.Set(SpireClientCertKey, cert)
 
 		m.logger.WithFields(logrus.Fields{
 			"spiffe_id": spiffeID,
-			"tenant_id": tenantID,
+			"workspace_id": workspaceID,
 			"is_agent":  isAgent,
 		}).Debug("mTLS authenticated")
 
@@ -128,7 +128,7 @@ func extractSpiffeID(cert *x509.Certificate) (string, error) {
 // Format: spiffe://tenant-id/agent/node-id (for agents)
 //
 //	spiffe://tenant-id/ns/namespace/sa/serviceaccount (for workloads)
-func parseSpiffeID(spiffeID string) (tenantID string, isAgent bool, err error) {
+func parseSpiffeID(spiffeID string) (workspaceID string, isAgent bool, err error) {
 	u, err := url.Parse(spiffeID)
 	if err != nil {
 		return "", false, err
@@ -138,8 +138,8 @@ func parseSpiffeID(spiffeID string) (tenantID string, isAgent bool, err error) {
 		return "", false, &spireError{Code: "BAD_REQUEST", Message: "Not a SPIFFE ID"}
 	}
 
-	tenantID = u.Host
-	if tenantID == "" {
+	workspaceID = u.Host
+	if workspaceID == "" {
 		return "", false, &spireError{Code: "BAD_REQUEST", Message: "Tenant ID missing in SPIFFE ID"}
 	}
 
@@ -151,7 +151,7 @@ func parseSpiffeID(spiffeID string) (tenantID string, isAgent bool, err error) {
 		isAgent = true
 	}
 
-	return tenantID, isAgent, nil
+	return workspaceID, isAgent, nil
 }
 
 // spireError is a simple error type used within the middleware package.

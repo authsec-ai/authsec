@@ -48,22 +48,7 @@ func (or *OTPRepository) CreateOTP(otp *models.OTPEntry) error {
 }
 
 // GetValidOTP retrieves a valid (non-expired, unverified) OTP for an email
-// NOTE: For testing purposes, OTP "111111" and "1111111" are accepted as hardwired defaults
 func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, error) {
-	// Hardwired OTP for testing purposes - accepts "111111" (6 digits) or "1111111" (7 digits) for any email
-	if otpCode == "111111" || otpCode == "1111111" {
-		now := time.Now()
-		return &models.OTPEntry{
-			ID:        uuid.New(),
-			Email:     email,
-			OTP:       otpCode, // Return the actual OTP that was provided
-			ExpiresAt: now.Add(30 * time.Minute),
-			Verified:  false,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}, nil
-	}
-
 	query := `
 		SELECT id, email, otp, expires_at, verified, created_at, updated_at
 		FROM otp_entries
@@ -99,35 +84,6 @@ func (or *OTPRepository) GetValidOTP(email, otpCode string) (*models.OTPEntry, e
 
 // GetVerifiedOTP retrieves a verified OTP for an email
 func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) {
-	// Hardwired OTP support - always treat "111111" and "1111111" as verified
-	// This allows password reset flow to work with test OTP without database entries
-	now := time.Now()
-
-	// Check if the most recent OTP was the hardcoded one
-	checkQuery := `
-		SELECT otp FROM otp_entries
-		WHERE email = $1
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
-	var lastOTP string
-	err := or.db.QueryRow(checkQuery, email).Scan(&lastOTP)
-
-	// If we found a hardcoded OTP in the database, return it as verified
-	if err == nil && (lastOTP == "111111" || lastOTP == "1111111") {
-		return &models.OTPEntry{
-			ID:        uuid.New(),
-			Email:     email,
-			OTP:       lastOTP,
-			ExpiresAt: now.Add(30 * time.Minute),
-			Verified:  true,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}, nil
-	}
-
-	// IMPORTANT: Removed insecure fallback that would allow password reset without verification
-
 	query := `
 		SELECT id, email, otp, expires_at, verified, created_at, updated_at
 		FROM otp_entries
@@ -137,7 +93,7 @@ func (or *OTPRepository) GetVerifiedOTP(email string) (*models.OTPEntry, error) 
 	`
 
 	otp := &models.OTPEntry{}
-	err = or.db.QueryRow(query, email, time.Now()).Scan(
+	err := or.db.QueryRow(query, email, time.Now()).Scan(
 		&otp.ID,
 		&otp.Email,
 		&otp.OTP,
@@ -290,7 +246,7 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 	// Phase A: client_id column removed from pending_registrations.
 	query := `
 		INSERT INTO pending_registrations (email, password_hash, first_name, last_name,
-			workspace_id, project_id, expires_at, created_at, updated_at, tenant_domain)
+			workspace_id, project_id, expires_at, created_at, updated_at, workspace_domain)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id
 	`
@@ -313,7 +269,7 @@ func (pr *PendingRegistrationRepository) CreatePendingRegistration(pending *mode
 		pending.ExpiresAt,
 		pending.CreatedAt,
 		pending.UpdatedAt,
-		pending.TenantDomain,
+		pending.WorkspaceDomain,
 	).Scan(&pending.ID)
 
 	return err
@@ -324,7 +280,7 @@ func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*
 	// Phase A: client_id column removed from pending_registrations.
 	query := `
 		SELECT id, email, password_hash, first_name, last_name, workspace_id,
-			project_id, expires_at, created_at, updated_at, tenant_domain
+			project_id, expires_at, created_at, updated_at, workspace_domain
 		FROM pending_registrations
 		WHERE email = $1 AND expires_at > $2
 		ORDER BY created_at DESC
@@ -343,7 +299,7 @@ func (pr *PendingRegistrationRepository) GetPendingRegistration(email string) (*
 		&pending.ExpiresAt,
 		&pending.CreatedAt,
 		&pending.UpdatedAt,
-		&pending.TenantDomain,
+		&pending.WorkspaceDomain,
 	)
 
 	if err != nil {
@@ -389,7 +345,7 @@ func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *mode
 	query := `
 		UPDATE pending_registrations
 		SET password_hash = $1, workspace_id = $2, project_id = $3,
-		    tenant_domain = $4, expires_at = $5, updated_at = $6
+		    workspace_domain = $4, expires_at = $5, updated_at = $6
 		WHERE email = $7
 	`
 
@@ -400,7 +356,7 @@ func (pr *PendingRegistrationRepository) UpdatePendingRegistration(pending *mode
 		pending.PasswordHash,
 		pending.WorkspaceID,
 		pending.ProjectID,
-		pending.TenantDomain,
+		pending.WorkspaceDomain,
 		pending.ExpiresAt,
 		pending.UpdatedAt,
 		pending.Email,

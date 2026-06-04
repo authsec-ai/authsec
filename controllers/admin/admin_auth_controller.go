@@ -23,7 +23,7 @@ import (
 
 type AdminAuthController struct {
 	adminUserRepo     *database.AdminUserRepository
-	adminTenantRepo   *database.AdminTenantRepository
+	adminWorkspaceRepo   *database.AdminWorkspaceRepository
 	otpRepo           *database.OTPRepository
 	pendingRepo       *database.PendingRegistrationRepository
 	antiReplayService *services.AntiReplayService
@@ -34,7 +34,7 @@ type RegisterInput struct {
 	Email        string `json:"email" binding:"required,email"`
 	Password     string `json:"password" binding:"required,min=10"`
 	Name         string `json:"name" binding:"required"`
-	TenantDomain string `json:"tenant_domain" binding:"required"`
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
 }
 
 // ForgotPasswordInput represents the input for forgot password
@@ -60,7 +60,7 @@ func NewAdminAuthController() (*AdminAuthController, error) {
 
 	return &AdminAuthController{
 		adminUserRepo:     database.NewAdminUserRepository(db),
-		adminTenantRepo:   database.NewAdminTenantRepository(db),
+		adminWorkspaceRepo:   database.NewAdminWorkspaceRepository(db),
 		otpRepo:           database.NewOTPRepository(db),
 		pendingRepo:       database.NewPendingRegistrationRepository(db),
 		antiReplayService: services.NewAntiReplayService(redisClient),
@@ -117,7 +117,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		secureReq := &models.SecureLoginRequest{
 			Email:        input.Email,
 			Password:     input.Password,
-			TenantDomain: input.TenantDomain,
+			WorkspaceDomain: input.WorkspaceDomain,
 			Nonce:        input.Nonce,
 			Timestamp:    input.Timestamp,
 			Challenge:    input.Challenge,
@@ -144,15 +144,15 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	}
 	// ========== END ANTI-REPLAY VALIDATION ==========
 
-	// Get admin user by email - with optional tenant_domain filtering for tenant isolation
-	fmt.Printf("[AdminLogin] Searching for admin user with email: %s, tenant_domain: %s in MAIN DATABASE\n", input.Email, input.TenantDomain)
+	// Get admin user by email - with optional workspace_domain filtering for tenant isolation
+	fmt.Printf("[AdminLogin] Searching for admin user with email: %s, workspace_domain: %s in MAIN DATABASE\n", input.Email, input.WorkspaceDomain)
 
 	var adminUser *models.AdminUser
 	var err error
 
-	if input.TenantDomain != "" {
-		// TENANT ISOLATION: When tenant_domain is provided, only find users belonging to that domain
-		adminUser, err = aac.adminUserRepo.GetAdminUserByEmailAndTenantDomain(input.Email, input.TenantDomain)
+	if input.WorkspaceDomain != "" {
+		// TENANT ISOLATION: When workspace_domain is provided, only find users belonging to that domain
+		adminUser, err = aac.adminUserRepo.GetAdminUserByEmailAndWorkspaceDomain(input.Email, input.WorkspaceDomain)
 	} else {
 		// Global admin lookup (no tenant restriction) - for super admins
 		adminUser, err = aac.adminUserRepo.GetAdminUserByEmail(input.Email)
@@ -160,28 +160,28 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	if err != nil {
 		// Audit: Failed login - user not found
-		fmt.Printf("[AdminLogin] User NOT FOUND in main database: email=%s, tenant_domain=%s, error=%v\n", input.Email, input.TenantDomain, err)
+		fmt.Printf("[AdminLogin] User NOT FOUND in main database: email=%s, workspace_domain=%s, error=%v\n", input.Email, input.WorkspaceDomain, err)
 		if config.AuditLogger != nil {
 			config.AuditLogger.LogAuthentication(requestID, "admin", "", "admin_login", clientIP, userAgent, false, "user not found in main database")
 		}
 		monitoring.RecordAuthFailure("admin", "user_not_found", "admin")
 
 		errorMsg := "Invalid credentials"
-		if input.TenantDomain != "" {
+		if input.WorkspaceDomain != "" {
 			errorMsg = "Invalid credentials for this tenant"
 		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": errorMsg, "hint": "User not found. Ensure you are using the correct tenant domain."})
 		return
 	}
 
-	// TENANT ISOLATION: Verify user's tenant_domain matches the requested tenant_domain
-	if input.TenantDomain != "" && adminUser.TenantDomain != "" && adminUser.TenantDomain != input.TenantDomain {
+	// TENANT ISOLATION: Verify user's workspace_domain matches the requested workspace_domain
+	if input.WorkspaceDomain != "" && adminUser.WorkspaceDomain != "" && adminUser.WorkspaceDomain != input.WorkspaceDomain {
 		fmt.Printf("[AdminLogin] TENANT ISOLATION VIOLATION: user=%s belongs to domain=%s but tried to login to domain=%s\n",
-			adminUser.Email, adminUser.TenantDomain, input.TenantDomain)
+			adminUser.Email, adminUser.WorkspaceDomain, input.WorkspaceDomain)
 		if config.AuditLogger != nil {
 			config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "tenant domain mismatch")
 		}
-		monitoring.RecordAuthFailure("admin", "tenant_domain_mismatch", "admin")
+		monitoring.RecordAuthFailure("admin", "workspace_domain_mismatch", "admin")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials for this tenant"})
 		return
 	}
@@ -347,7 +347,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		}
 	}
 
-	// Determine tenant_domain to return (custom domain support)
+	// Determine workspace_domain to return (custom domain support)
 	// Prefer Origin header (where user is accessing from) over Host header (API backend)
 	currentDomain := c.GetHeader("Origin")
 	if currentDomain != "" {
@@ -371,25 +371,25 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		strings.HasPrefix(currentDomain, "dev") && strings.Contains(currentDomain, ".authsec.dev")
 
 	// Check workspace_domains table for primary domain
-	var tenantDomainToReturn string
+	var workspaceDomainToReturn string
 	if adminUser.WorkspaceID != nil {
-		tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
-		primaryDomain, err := tenantDomainRepo.GetPrimaryDomainByTenantID(*adminUser.WorkspaceID)
+		workspaceDomainRepo := database.NewWorkspaceDomainsRepository(config.GetDatabase())
+		primaryDomain, err := workspaceDomainRepo.GetPrimaryDomainByWorkspaceID(*adminUser.WorkspaceID)
 		if err != nil {
-			// No custom domain configured, use stored tenant_domain
-			tenantDomainToReturn = adminUser.TenantDomain
-			log.Printf("DEBUG AdminLogin: Using stored tenant_domain=%s", tenantDomainToReturn)
+			// No custom domain configured, use stored workspace_domain
+			workspaceDomainToReturn = adminUser.WorkspaceDomain
+			log.Printf("DEBUG AdminLogin: Using stored workspace_domain=%s", workspaceDomainToReturn)
 		} else if primaryDomain != nil {
-			tenantDomainToReturn = primaryDomain.Domain
-			log.Printf("DEBUG AdminLogin: primaryTenantDomain=%s from workspace_domains table", tenantDomainToReturn)
+			workspaceDomainToReturn = primaryDomain.Domain
+			log.Printf("DEBUG AdminLogin: primaryWorkspaceDomain=%s from workspace_domains table", workspaceDomainToReturn)
 
 			// Check if current domain is a verified custom domain for this tenant
 			// Skip this check if the current domain is an API backend domain
 			if !isAPIBackendDomain && currentDomain != primaryDomain.Domain {
-				customDomain, err := tenantDomainRepo.GetDomainByHostname(currentDomain)
+				customDomain, err := workspaceDomainRepo.GetDomainByHostname(currentDomain)
 				if err == nil && customDomain != nil && customDomain.WorkspaceID == *adminUser.WorkspaceID && customDomain.IsVerified {
 					// User is on a verified custom domain - use it
-					tenantDomainToReturn = currentDomain
+					workspaceDomainToReturn = currentDomain
 					log.Printf("DEBUG AdminLogin: Using custom domain %s", currentDomain)
 				}
 			} else if isAPIBackendDomain {
@@ -397,14 +397,14 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 			}
 		}
 	} else {
-		tenantDomainToReturn = adminUser.TenantDomain
+		workspaceDomainToReturn = adminUser.WorkspaceDomain
 	}
-	log.Printf("DEBUG AdminLogin: Returning tenantDomain=%s", tenantDomainToReturn)
+	log.Printf("DEBUG AdminLogin: Returning workspaceDomain=%s", workspaceDomainToReturn)
 
 	// Build response with MFA information
 	response := gin.H{
 		"workspace_id":      adminUser.WorkspaceID,
-		"tenant_domain":     tenantDomainToReturn,
+		"workspace_domain":     workspaceDomainToReturn,
 		"email":             adminUser.Email,
 		"first_login":       adminUser.LastLogin == nil,
 		"otp_required":      otpRequired,
@@ -451,315 +451,6 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-// AdminLoginHybrid handles admin user login with hybrid database lookup
-// @Summary Admin login (hybrid mode - checks both main and tenant databases)
-// @Description Authenticates admin user by first checking main database, then tenant database if tenant_domain is provided
-// @Tags Admin Authentication
-// @Accept json
-// @Produce json
-// @Param input body models.AdminLoginInput true "Admin login credentials with optional tenant_domain"
-// @Success 200 {object} object "Login successful"
-// @Failure 400 {object} map[string]string "Bad request"
-// @Failure 401 {object} map[string]string "Unauthorized"
-// @Failure 500 {object} map[string]string "Internal server error"
-// @Router /authsec/uflow/auth/admin/login-hybrid [post]
-func (aac *AdminAuthController) AdminLoginHybrid(c *gin.Context) {
-	startTime := time.Now()
-	requestID := c.GetString("request_id")
-	clientIP := c.ClientIP()
-	userAgent := c.GetHeader("User-Agent")
-
-	var input models.AdminLoginInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "invalid input: "+err.Error())
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "invalid_input", "admin")
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Validate input
-	if input.Email == "" || input.Password == "" {
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "missing email or password")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "missing_credentials", "admin")
-
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email and password are required"})
-		return
-	}
-
-	// STEP 1: Try to find user in MAIN DATABASE as admin
-	fmt.Printf("[AdminLoginHybrid] Step 1: Checking MAIN DATABASE for admin user: %s\n", input.Email)
-	adminUser, err := aac.adminUserRepo.GetAdminUserByEmail(input.Email)
-
-	if err == nil && adminUser != nil {
-		// Found in main database as admin user
-		fmt.Printf("[AdminLoginHybrid] User FOUND in MAIN DATABASE: email=%s, user_id=%s, active=%v\n",
-			adminUser.Email, adminUser.ID, adminUser.Active)
-
-		// Check if admin user is active
-		if !adminUser.Active {
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", adminUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "account disabled (main DB)")
-			}
-			monitoring.RecordAuthFailure("admin-hybrid", "account_disabled", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Account is disabled"})
-			return
-		}
-
-		// Verify password
-		if !adminUser.CheckPassword(input.Password) {
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", adminUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "invalid password (main DB)")
-			}
-			monitoring.RecordAuthFailure("admin-hybrid", "invalid_password", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-			return
-		}
-
-		// Update last login
-		if err := aac.adminUserRepo.UpdateLastLogin(adminUser.ID); err != nil {
-			fmt.Printf("Failed to update last login: %v\n", err)
-		}
-
-		// Check if temporary password has expired
-		if adminUser.TemporaryPassword && adminUser.TemporaryPasswordExpiresAt != nil {
-			if time.Now().After(*adminUser.TemporaryPasswordExpiresAt) {
-				if config.AuditLogger != nil {
-					config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", adminUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "temporary password expired (main DB)")
-				}
-				monitoring.RecordAuthFailure("admin-hybrid", "temporary_password_expired", "admin")
-
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Temporary password has expired. Please use forgot password to reset."})
-				return
-			}
-		}
-
-		// Generate JWT token for admin
-		token, err := aac.generateAdminJWTToken(adminUser)
-		if err != nil {
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", adminUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "token generation failed (main DB): "+err.Error())
-			}
-			monitoring.RecordAuthFailure("admin-hybrid", "token_generation_failed", "admin")
-
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
-			return
-		}
-
-		response := gin.H{
-			"workspace_id": "admin",
-			"email":        adminUser.Email,
-			"first_login":  adminUser.LastLogin == nil,
-			"otp_required": false,
-			"token":        token,
-			"source":       "main_database",
-			"user_type":    "global_admin",
-		}
-
-		if adminUser.TemporaryPassword {
-			response["password_change_required"] = true
-			response["temporary_password"] = true
-			response["message"] = "Please change your password on first login"
-		}
-
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", adminUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, true, "authenticated from main database")
-		}
-		monitoring.RecordAuthRequest("admin-hybrid", "success", "admin")
-		monitoring.RecordDBQuery("SELECT", "users", "admin", time.Since(startTime))
-
-		c.JSON(http.StatusOK, response)
-		return
-	}
-
-	// STEP 2: User not found in main database, try TENANT DATABASE if tenant_domain provided
-	fmt.Printf("[AdminLoginHybrid] User NOT FOUND in main database: %s\n", input.Email)
-
-	if input.TenantDomain == "" {
-		fmt.Printf("[AdminLoginHybrid] No tenant_domain provided, cannot check tenant database\n")
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "user not found in main DB and no tenant_domain provided")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "user_not_found", "admin")
-
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "Invalid credentials",
-			"hint":  "User not found in main database. Provide tenant_domain to search tenant database.",
-		})
-		return
-	}
-
-	fmt.Printf("[AdminLoginHybrid] Step 2: Checking TENANT DATABASE for tenant: %s\n", input.TenantDomain)
-
-	// Get tenant by domain from database
-	db := config.GetDatabase()
-	var tenant models.Tenant
-	// Phase 6: tenants table dropped; workspaces is the new home.
-	// tenant_db column was for the legacy dynamic-DB feature (removed).
-	query := `
-		SELECT id, id AS workspace_id, '' AS tenant_db, email, '' AS username, password_hash,
-			provider, '' AS provider_id, '' AS avatar, name, source, status, NULL::timestamptz AS last_login,
-			created_at, updated_at, workspace_domain
-		FROM workspaces
-		WHERE workspace_domain = $1
-	`
-
-	err = db.QueryRow(query, input.TenantDomain).Scan(
-		&tenant.ID,
-		&tenant.WorkspaceID,
-		&tenant.TenantDB,
-		&tenant.Email,
-		&tenant.Username,
-		&tenant.PasswordHash,
-		&tenant.Provider,
-		&tenant.ProviderID,
-		&tenant.Avatar,
-		&tenant.Name,
-		&tenant.Source,
-		&tenant.Status,
-		&tenant.LastLogin,
-		&tenant.CreatedAt,
-		&tenant.UpdatedAt,
-		&tenant.TenantDomain,
-	)
-
-	if err != nil {
-		fmt.Printf("[AdminLoginHybrid] Tenant NOT FOUND: domain=%s, error=%v\n", input.TenantDomain, err)
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "tenant not found: "+input.TenantDomain)
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "tenant_not_found", "admin")
-
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials", "hint": "Tenant not found"})
-		return
-	}
-
-	fmt.Printf("[AdminLoginHybrid] Tenant FOUND: domain=%s, workspace_id=%s\n", input.TenantDomain, tenant.ID)
-
-	// Search for an active workspace admin. The legacy implementation fell
-	// back to any matching user row here, which allowed end users to acquire a
-	// console token. Console login now requires both the admin binding and the
-	// active workspace membership enforced by the repository.
-	fmt.Printf("[AdminLoginHybrid] Searching for workspace admin: email=%s\n", input.Email)
-	tenantUser, err := aac.adminUserRepo.GetAdminUserByEmailAndTenant(input.Email, tenant.ID)
-	if err != nil {
-		fmt.Printf("[AdminLoginHybrid] Workspace admin NOT FOUND: email=%s, error=%v\n", input.Email, err)
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", "", "admin_login_hybrid", clientIP, userAgent, false, "workspace admin not found")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "workspace_admin_not_found", "admin")
-
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "Invalid credentials",
-			"hint":  "No active workspace admin account found",
-		})
-		return
-	}
-
-	fmt.Printf("[AdminLoginHybrid] User FOUND in TENANT DATABASE: email=%s, user_id=%s, active=%v\n",
-		tenantUser.Email, tenantUser.ID, tenantUser.Active)
-
-	// Check if user is active
-	if !tenantUser.Active {
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", tenantUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "account disabled (tenant DB)")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "account_disabled", "tenant")
-
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Account is disabled"})
-		return
-	}
-
-	// Verify password using tenant user's CheckPassword method
-	if !tenantUser.CheckPassword(input.Password) {
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", tenantUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "invalid password (tenant DB)")
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "invalid_password", "tenant")
-
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-		return
-	}
-
-	// Generate an admin token only after the workspace-admin guard above.
-	token, err := aac.generateAdminJWTToken(tenantUser)
-	if err != nil {
-		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", tenantUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, false, "token generation failed (tenant DB): "+err.Error())
-		}
-		monitoring.RecordAuthFailure("admin-hybrid", "token_generation_failed", "tenant")
-
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
-		return
-	}
-
-	// Determine tenant_domain to return (custom domain support)
-	// Prefer Origin header (where user is accessing from) over Host header (API backend)
-	currentDomain := c.GetHeader("Origin")
-	if currentDomain != "" {
-		// Parse Origin to extract domain
-		currentDomain = strings.TrimPrefix(currentDomain, "https://")
-		currentDomain = strings.TrimPrefix(currentDomain, "http://")
-		if idx := strings.Index(currentDomain, "/"); idx != -1 {
-			currentDomain = currentDomain[:idx] // strip path
-		}
-	} else {
-		// Fallback to Host header if Origin not present
-		currentDomain = c.Request.Host
-	}
-	if idx := strings.Index(currentDomain, ":"); idx != -1 {
-		currentDomain = currentDomain[:idx] // strip port
-	}
-
-	// Skip custom domain check for API backend domains (infrastructure domains)
-	isAPIBackendDomain := strings.Contains(currentDomain, ".api.") ||
-		currentDomain == "api.authsec.dev" ||
-		strings.HasPrefix(currentDomain, "dev") && strings.Contains(currentDomain, ".authsec.dev")
-
-	tenantDomainToReturn := input.TenantDomain // default to input
-	tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
-	primaryDomain, err := tenantDomainRepo.GetPrimaryDomainByTenantID(tenant.ID)
-	if err == nil && primaryDomain != nil {
-		tenantDomainToReturn = primaryDomain.Domain
-		// Check if current domain is a verified custom domain
-		// Skip this check if the current domain is an API backend domain
-		if !isAPIBackendDomain && currentDomain != primaryDomain.Domain {
-			customDomain, err := tenantDomainRepo.GetDomainByHostname(currentDomain)
-			if err == nil && customDomain != nil && customDomain.WorkspaceID == tenant.ID && customDomain.IsVerified {
-				tenantDomainToReturn = currentDomain
-				log.Printf("DEBUG AdminLoginHybrid: Using custom domain %s", currentDomain)
-			}
-		} else if isAPIBackendDomain {
-			log.Printf("DEBUG AdminLoginHybrid: Skipping custom domain check for API backend domain: %s", currentDomain)
-		}
-	}
-
-	response := gin.H{
-		"workspace_id":  tenant.ID.String(),
-		"email":         tenantUser.Email,
-		"first_login":   tenantUser.LastLogin == nil,
-		"otp_required":  false,
-		"token":         token,
-		"source":        "tenant_database",
-		"user_type":     "tenant_user",
-		"tenant_domain": tenantDomainToReturn,
-	}
-
-	if config.AuditLogger != nil {
-		config.AuditLogger.LogAuthentication(requestID, "admin-hybrid", tenantUser.ID.String(), "admin_login_hybrid", clientIP, userAgent, true, "authenticated from tenant database")
-	}
-	monitoring.RecordAuthRequest("admin-hybrid", "success", "tenant")
-	monitoring.RecordDBQuery("SELECT", "users", tenant.ID.String(), time.Since(startTime))
-
-	c.JSON(http.StatusOK, response)
-}
-
 // AdminRegister handles admin user registration
 // @Summary Register a new admin user and tenant
 // @Description Creates a new admin user account and associated tenant in the global database
@@ -791,8 +482,8 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	}
 
 	// Validate input
-	if input.Email == "" || input.Password == "" || input.TenantDomain == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email, password, and tenant_domain are required"})
+	if input.Email == "" || input.Password == "" || input.WorkspaceDomain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Email, password, and workspace_domain are required"})
 		return
 	}
 
@@ -804,10 +495,10 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	}
 
 	// Check if tenant domain already exists
-	tenantDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.TenantDomain), config.AppConfig.TenantDomainSuffix)
+	workspaceDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.WorkspaceDomain), config.AppConfig.WorkspaceDomainSuffix)
 	db := config.GetDatabase()
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
+	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("Failed to check tenant domain existence: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant domain"})
@@ -900,7 +591,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		WorkspaceID:  adminUUID,
 		ProjectID:    uuid.New(),
 		ClientID:     adminUUID, // Same as tenant for admin
-		TenantDomain: tenantDomain,
+		WorkspaceDomain: workspaceDomain,
 		ExpiresAt:    time.Now().Add(24 * time.Hour), // 24 hours for admin registration
 	}
 
@@ -918,10 +609,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Also allow a fixed OTP for testing purposes
-	const fixedOTP = "1111111"
-	const fixedOTP6 = "111111" // 6-digit version for backwards compatibility
-
 	// Create OTP entry
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
@@ -936,24 +623,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Insert fixed OTP as alternative codes for testing
-	if err := aac.otpRepo.CreateOTP(&models.OTPEntry{
-		Email:     input.Email,
-		OTP:       fixedOTP,
-		ExpiresAt: time.Now().Add(24 * time.Hour),
-		Verified:  false,
-	}); err != nil {
-		log.Printf("Failed to create fixed OTP override (7-digit): %v", err)
-	}
-
-	if err := aac.otpRepo.CreateOTP(&models.OTPEntry{
-		Email:     input.Email,
-		OTP:       fixedOTP6,
-		ExpiresAt: time.Now().Add(24 * time.Hour),
-		Verified:  false,
-	}); err != nil {
-		log.Printf("Failed to create fixed OTP override (6-digit): %v", err)
-	}
 
 	// Send OTP via email — fire-and-forget. OTP already persisted.
 	go func(addr, code string) {
@@ -1077,50 +746,20 @@ func (aac *AdminAuthController) AdminVerifyOTP(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	// Check if using hardcoded test OTP
-	isHardcodedOTP := input.OTP == "1111111" || input.OTP == "111111"
-
-	// Log for debugging
-	if isHardcodedOTP {
-		log.Printf("AdminVerifyOTP: Using hardcoded OTP %s for email %s", input.OTP, input.Email)
-	}
-
-	// Verify OTP (allow fixed override as well)
 	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
-	if err != nil && !isHardcodedOTP {
+	if err != nil {
 		log.Printf("AdminVerifyOTP: OTP validation failed for %s: %v", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
 	}
 
-	// Mark OTP as verified
-	// For hardcoded OTP: create a database entry and mark it verified so password reset flow works
-	if isHardcodedOTP {
-		// Delete any existing OTPs for this email first
-		aac.otpRepo.DeleteOTPsByEmail(input.Email)
-
-		// Create a verified OTP entry in the database
-		verifiedEntry := &models.OTPEntry{
-			Email:     input.Email,
-			OTP:       input.OTP,
-			ExpiresAt: time.Now().Add(30 * time.Minute),
-			Verified:  true, // Mark as verified immediately
-		}
-		if err := aac.otpRepo.CreateOTP(verifiedEntry); err != nil {
-			log.Printf("AdminVerifyOTP: Failed to create verified hardcoded OTP entry: %v", err)
-			// Continue anyway - this is just for password reset flow
-		}
-		log.Printf("AdminVerifyOTP: Created verified hardcoded OTP entry for %s", input.Email)
-	} else if err == nil {
-		// Normal OTP - mark existing entry as verified
-		if err := aac.otpRepo.VerifyOTP(otpEntry.ID); err != nil {
-			log.Printf("AdminVerifyOTP: Failed to mark OTP as verified for %s: %v", input.Email, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
-			return
-		}
+	if err := aac.otpRepo.VerifyOTP(otpEntry.ID); err != nil {
+		log.Printf("AdminVerifyOTP: Failed to mark OTP as verified for %s: %v", input.Email, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
+		return
 	}
 
-	log.Printf("AdminVerifyOTP: OTP verified successfully for %s (hardcoded: %v)", input.Email, isHardcodedOTP)
+	log.Printf("AdminVerifyOTP: OTP verified successfully for %s", input.Email)
 	c.JSON(http.StatusOK, gin.H{"message": "OTP verified successfully"})
 }
 
@@ -1208,20 +847,10 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	// Verify OTP (allow fixed override)
-	fixedOTP := "1111111"
-	fixedOTP2 := "111111" // Backwards compatibility
-	fixedOverride := false
 	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
 	if err != nil {
-		if input.OTP != fixedOTP && input.OTP != fixedOTP2 {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
-			return
-		}
-		fixedOverride = true
-	} else if input.OTP == fixedOTP || input.OTP == fixedOTP2 {
-		// If using hardwired OTP, skip VerifyOTPTx since the entry is synthetic
-		fixedOverride = true
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
+		return
 	}
 
 	// Get pending registration
@@ -1245,19 +874,16 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		}
 	}()
 
-	// Mark OTP as verified unless using fixed override
-	if !fixedOverride {
-		if err := aac.otpRepo.VerifyOTPTx(tx, otpEntry.ID); err != nil {
-			tx.Rollback()
-			log.Printf("Failed to mark OTP as verified: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
-			return
-		}
+	if err := aac.otpRepo.VerifyOTPTx(tx, otpEntry.ID); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to mark OTP as verified: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify OTP"})
+		return
 	}
 
 	// Phase 6: tenants table dropped. Workspace creation moved below; project FKs now
 	// reference workspaces(id). We must create the workspace first so projects FK is valid.
-	workspaceSlug := strings.SplitN(pendingReg.TenantDomain, ".", 2)[0]
+	workspaceSlug := strings.SplitN(pendingReg.WorkspaceDomain, ".", 2)[0]
 	workspaceName := strings.TrimSpace(fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName))
 	if workspaceName == "" {
 		workspaceName = pendingReg.Email
@@ -1266,7 +892,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, vault_mount, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'admin_registration', 'active', NULL, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.TenantDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
@@ -1287,7 +913,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 			PasswordHash: pendingReg.PasswordHash,
 			ClientID:     pendingReg.ClientID,
 			WorkspaceID:  pendingReg.WorkspaceID,
-			TenantDomain: pendingReg.TenantDomain,
+			WorkspaceDomain: pendingReg.WorkspaceDomain,
 			Provider:     "local",
 			ProviderID:   pendingReg.Email,
 			Username:     &username,
@@ -1369,7 +995,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Single-tenant: no per-tenant DB provisioning. The master DB row above is
-	// the workspace; all workspace-scoped tables key off tenant_id.
+	// the workspace; all workspace-scoped tables key off workspace_id.
 
 	// Save secret to Vault + register with Hydra — fire-and-forget. Vault can
 	// be unreachable for 5+ seconds before timing out; Hydra registration is
@@ -1420,8 +1046,8 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	token, err := config.TokenService.GenerateAdminToken(
 		adminUser.ID,
 		adminUser.Email,
-		adminUser.WorkspaceID,  // Pass actual tenant_id
-		adminUser.TenantDomain, // Pass tenant_domain
+		adminUser.WorkspaceID,  // Pass actual workspace_id
+		adminUser.WorkspaceDomain, // Pass workspace_domain
 		roles,                  // Pass admin roles
 	)
 	if err != nil {
@@ -1469,7 +1095,7 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 
 	// User exists - determine which domain to return
 	// Return the CURRENT domain they're accessing from (preserves custom domain UX)
-	// For WebAuthn RP ID coordination, the actual login will return original tenant_domain
+	// For WebAuthn RP ID coordination, the actual login will return original workspace_domain
 	currentDomain := input.CurrentDomain
 	if currentDomain == "" {
 		// Try Origin header (where user is accessing from)
@@ -1487,43 +1113,36 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 	}
 	log.Printf("DEBUG AdminLoginPrecheck: currentDomain=%s (from Origin or Host), email=%s", currentDomain, input.Email)
 
-	// Get tenant's primary domain from workspace_domains table (source of truth)
-	// If not found, fall back to tenants.tenant_domain for backward compatibility
-	var primaryTenantDomain string
+	// Get tenant's primary domain from workspace_domains table (sole source of truth).
+	var primaryWorkspaceDomain string
 	if user.WorkspaceID != nil {
-		tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
-		primaryDomain, err := tenantDomainRepo.GetPrimaryDomainByTenantID(*user.WorkspaceID)
+		workspaceDomainRepo := database.NewWorkspaceDomainsRepository(config.GetDatabase())
+		primaryDomain, err := workspaceDomainRepo.GetPrimaryDomainByWorkspaceID(*user.WorkspaceID)
 		if err != nil {
-			log.Printf("WARN: No primary domain in workspace_domains table, falling back to tenants.tenant_domain: %v", err)
-			// Fall back to querying tenants table
-			tenantRepo := database.NewTenantRepository(config.GetDatabase())
-			tenant, tenantErr := tenantRepo.GetTenantByTenantID(user.WorkspaceID.String())
-			if tenantErr != nil {
-				log.Printf("ERROR: Failed to get tenant for precheck fallback: %v", tenantErr)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve tenant domain information"})
-				return
+			log.Printf("WARN: No primary domain in workspace_domains for workspace %s: %v", user.WorkspaceID, err)
+			// Fall back to workspaces.workspace_domain
+			var wsDomain string
+			if dbErr := config.DB.Table("workspaces").Select("workspace_domain").Where("id = ?", user.WorkspaceID).Row().Scan(&wsDomain); dbErr == nil && wsDomain != "" {
+				primaryWorkspaceDomain = wsDomain
 			}
-			primaryTenantDomain = tenant.TenantDomain
-			log.Printf("DEBUG AdminLoginPrecheck: Using fallback tenant_domain=%s", primaryTenantDomain)
 		} else if primaryDomain != nil {
-			primaryTenantDomain = primaryDomain.Domain
-			log.Printf("DEBUG AdminLoginPrecheck: primaryTenantDomain=%s from workspace_domains table", primaryTenantDomain)
+			primaryWorkspaceDomain = primaryDomain.Domain
 		}
 	}
 
 	// Check if current domain is a verified custom domain for this tenant
-	tenantDomainToReturn := primaryTenantDomain // default to primary domain
+	workspaceDomainToReturn := primaryWorkspaceDomain // default to primary domain
 
 	// Skip custom domain check for API backend domains (infrastructure domains)
 	isAPIBackendDomain := strings.Contains(currentDomain, ".api.") ||
 		currentDomain == "api.authsec.dev" ||
 		strings.HasPrefix(currentDomain, "dev") && strings.Contains(currentDomain, ".authsec.dev")
 
-	if !isAPIBackendDomain && currentDomain != primaryTenantDomain && user.WorkspaceID != nil {
+	if !isAPIBackendDomain && currentDomain != primaryWorkspaceDomain && user.WorkspaceID != nil {
 		log.Printf("DEBUG AdminLoginPrecheck: Checking if %s is a verified custom domain", currentDomain)
 		// Check if current domain is a verified custom domain
-		tenantDomainRepo := database.NewTenantDomainsRepository(config.GetDatabase())
-		customDomain, err := tenantDomainRepo.GetDomainByHostname(currentDomain)
+		workspaceDomainRepo := database.NewWorkspaceDomainsRepository(config.GetDatabase())
+		customDomain, err := workspaceDomainRepo.GetDomainByHostname(currentDomain)
 		if err != nil {
 			log.Printf("DEBUG AdminLoginPrecheck: GetDomainByHostname error: %v", err)
 		} else if customDomain == nil {
@@ -1533,19 +1152,19 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 		}
 		if err == nil && customDomain != nil && customDomain.WorkspaceID == *user.WorkspaceID && customDomain.IsVerified {
 			// User is on a verified custom domain - return it to prevent redirect
-			tenantDomainToReturn = currentDomain
+			workspaceDomainToReturn = currentDomain
 			log.Printf("DEBUG AdminLoginPrecheck: Using custom domain %s", currentDomain)
 		}
 	} else if isAPIBackendDomain {
 		log.Printf("DEBUG AdminLoginPrecheck: Skipping custom domain check for API backend domain: %s", currentDomain)
 	}
-	log.Printf("DEBUG AdminLoginPrecheck: Returning tenantDomain=%s", tenantDomainToReturn)
+	log.Printf("DEBUG AdminLoginPrecheck: Returning workspaceDomain=%s", workspaceDomainToReturn)
 
 	// Prepare login response
 	response := models.AdminPrecheckResponse{
 		Exists:             true,
 		DisplayName:        user.Name,
-		TenantDomain:       tenantDomainToReturn,
+		WorkspaceDomain:       workspaceDomainToReturn,
 		NextStep:           "login",
 		RequiresPassword:   true,
 		AvailableProviders: providers,
@@ -1584,9 +1203,9 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	}
 
 	// Validate tenant domain format
-	tenantDomain := strings.ToLower(input.TenantDomain)
-	if !strings.HasSuffix(tenantDomain, config.AppConfig.TenantDomainSuffix) {
-		tenantDomain = fmt.Sprintf("%s.%s", tenantDomain, config.AppConfig.TenantDomainSuffix)
+	workspaceDomain := strings.ToLower(input.WorkspaceDomain)
+	if !strings.HasSuffix(workspaceDomain, config.AppConfig.WorkspaceDomainSuffix) {
+		workspaceDomain = fmt.Sprintf("%s.%s", workspaceDomain, config.AppConfig.WorkspaceDomainSuffix)
 	}
 
 	// Check if admin user already exists
@@ -1605,7 +1224,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	// Phase 6: tenants table deleted, workspaces.workspace_domain is the new home.
 	db := config.GetDatabase()
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", tenantDomain).Scan(&count)
+	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("ERROR: Failed to check workspace domain: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check workspace domain"})
@@ -1640,7 +1259,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	if existingPending != nil {
 		// Update existing pending registration
 		existingPending.PasswordHash = hashedPassword
-		existingPending.TenantDomain = tenantDomain
+		existingPending.WorkspaceDomain = workspaceDomain
 		existingPending.WorkspaceID = workspaceID
 		existingPending.ClientID = clientID
 		existingPending.ExpiresAt = time.Now().Add(24 * time.Hour)
@@ -1659,7 +1278,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 			WorkspaceID:  workspaceID,
 			ProjectID:    uuid.New(),
 			ClientID:     clientID,
-			TenantDomain: tenantDomain,
+			WorkspaceDomain: workspaceDomain,
 			ExpiresAt:    time.Now().Add(24 * time.Hour),
 		}
 
@@ -1709,13 +1328,13 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		}
 	}(input.Email, otp)
 
-	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, tenantDomain, otp)
+	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, workspaceDomain, otp)
 
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
 		Message:      "Bootstrap initiated. Please check your email for OTP to complete registration.",
 		Status:       "pending_verification",
 		WorkspaceID:  workspaceID.String(),
-		TenantDomain: tenantDomain,
+		WorkspaceDomain: workspaceDomain,
 	})
 }
 
@@ -1724,7 +1343,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 // powers the "Resend code" button on the OTP verification screen.
 //
 // Why this exists separately from AdminBootstrap:
-//   - AdminBootstrap binds required password + tenant_domain (it's the
+//   - AdminBootstrap binds required password + workspace_domain (it's the
 //     ground-truth signup path). The UI on the verify screen no longer has
 //     those — it just has the email — so reusing bootstrap there would 400.
 //   - Resend is intentionally narrower: it does NOT create/update pending

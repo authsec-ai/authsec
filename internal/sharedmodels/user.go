@@ -29,7 +29,7 @@ func init() {
 type Tenant struct {
 	ID           uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID     uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;uniqueIndex"`
-	TenantDB     string     `json:"tenant_db"`
+	WorkspaceDB     string     `json:"workspace_db"`
 	Email        string     `json:"email" gorm:"type:text;uniqueIndex;not null"`
 	Username     *string    `json:"username,omitempty" gorm:"type:text"`
 	PasswordHash string     `json:"password_hash,omitempty"`
@@ -42,7 +42,7 @@ type Tenant struct {
 	LastLogin    *time.Time `json:"last_login,omitempty" gorm:"type:timestamptz"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
-	TenantDomain string     `json:"tenant_domain,omitempty" gorm:"uniqueIndex;not null"`
+	WorkspaceDomain string     `json:"workspace_domain,omitempty" gorm:"uniqueIndex;not null"`
 }
 
 // TableName returns the table name for the Tenant model.
@@ -56,7 +56,7 @@ type RegisterResponse struct {
 	ProjectID    uuid.UUID `json:"project_id"`
 	ClientID     uuid.UUID `json:"client_id"`
 	EmailID      string    `json:"email_id"`
-	TenantDomain string    `json:"tenant_domain"`
+	WorkspaceDomain string    `json:"workspace_domain"`
 }
 
 type OTPEntry struct {
@@ -82,7 +82,7 @@ type PendingRegistration struct {
 	ExpiresAt    time.Time  `json:"expires_at"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
-	TenantDomain string     `json:"tenant_domain"`
+	WorkspaceDomain string     `json:"workspace_domain"`
 }
 
 // Updated Input/Response models using your existing structures
@@ -91,7 +91,7 @@ type InitiateRegistrationInput struct {
 	Password     string `json:"password" binding:"required,min=10"`
 	FirstName    string `json:"first_name" binding:"required"`
 	LastName     string `json:"last_name" binding:"required"`
-	TenantDomain string `json:"tenant_domain" binding:"required"`
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
 }
 
 type InitiateRegistrationResponse struct {
@@ -111,7 +111,7 @@ type ResendOTPInput struct {
 type LoginInput struct {
 	Email        string `json:"email" binding:"required,email"`
 	Password     string `json:"password" binding:"required,min=10"`
-	TenantDomain string `json:"tenant_domain" binding:"required"`
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
 }
 
 // MFAMethod represents an MFA method for a client

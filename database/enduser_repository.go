@@ -62,7 +62,7 @@ func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 	// Password should already be hashed in PasswordHash field
 	query := `
 	INSERT INTO users (id, client_id, workspace_id, project_id, name, username, email,
-		password_hash, tenant_domain, provider, provider_id, provider_data,
+		password_hash, workspace_domain, provider, provider_id, provider_data,
 		avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 		mfa_enrolled_at, mfa_verified, last_login,
 		created_at, updated_at)
@@ -89,7 +89,7 @@ func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 		user.Username,
 		user.Email,
 		user.PasswordHash,
-		user.TenantDomain,
+		user.WorkspaceDomain,
 		user.Provider,
 		user.ProviderID,
 		user.ProviderData,
@@ -116,7 +116,7 @@ func (eur *EndUserRepository) CreateUser(user *models.ExtendedUser) error {
 func (eur *EndUserRepository) GetUserByEmail(email string, clientID string) (*models.User, error) {
 	query := `
 SELECT id, client_id, workspace_id, project_id, name, username, email,
-password_hash, tenant_domain, provider, provider_id, provider_data,
+password_hash, workspace_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
 FROM users
@@ -138,7 +138,7 @@ WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND active = true
 		&user.Username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&user.ProviderID,
 		&user.ProviderData,
@@ -168,7 +168,7 @@ WHERE LOWER(email) = LOWER($1) AND client_id = $2 AND active = true
 func (eur *EndUserRepository) GetUserByID(id uuid.UUID) (*models.User, error) {
 	query := `
 SELECT id, client_id, workspace_id, project_id, name, username, email,
-password_hash, tenant_domain, provider, provider_id, provider_data,
+password_hash, workspace_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
 FROM users
@@ -190,7 +190,7 @@ WHERE id = $1 AND active = true
 		&user.Username,
 		&user.Email,
 		&user.PasswordHash,
-		&user.TenantDomain,
+		&user.WorkspaceDomain,
 		&user.Provider,
 		&user.ProviderID,
 		&user.ProviderData,
@@ -263,7 +263,7 @@ func (eur *EndUserRepository) DeleteUser(id uuid.UUID) error {
 func (eur *EndUserRepository) GetUsersByTenant(workspaceID string, limit, offset int) ([]models.User, error) {
 	query := `
 SELECT id, client_id, workspace_id, project_id, name, username, email,
-password_hash, tenant_domain, provider, provider_id, provider_data,
+password_hash, workspace_domain, provider, provider_id, provider_data,
 avatar_url, active, mfa_enabled, mfa_method, mfa_default_method,
 mfa_enrolled_at, mfa_verified, last_login, created_at, updated_at
 FROM users
@@ -290,7 +290,7 @@ LIMIT $2 OFFSET $3
 			&user.Username,
 			&user.Email,
 			&user.PasswordHash,
-			&user.TenantDomain,
+			&user.WorkspaceDomain,
 			&user.Provider,
 			&user.ProviderID,
 			&user.ProviderData,

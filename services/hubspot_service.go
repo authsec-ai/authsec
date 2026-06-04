@@ -31,7 +31,7 @@ func NewHubSpotService(accessToken string) *HubSpotService {
 // hubSpotContactProperties represents the properties sent to HubSpot
 type hubSpotContactProperties struct {
 	Email            string `json:"email,omitempty"`
-	TenantDomain     string `json:"tenant_domain,omitempty"`
+	WorkspaceDomain     string `json:"workspace_domain,omitempty"`
 	WorkspaceID         string `json:"workspace_id,omitempty"`
 	RegistrationDate string `json:"registration_date,omitempty"`
 	LifecycleStage   string `json:"lifecyclestage,omitempty"`
@@ -69,14 +69,14 @@ type hubSpotSearchResponse struct {
 
 // SyncContact creates or updates a contact in HubSpot.
 // Returns the HubSpot contact ID on success.
-func (s *HubSpotService) SyncContact(email, tenantDomain, workspaceID string) (string, error) {
+func (s *HubSpotService) SyncContact(email, workspaceDomain, workspaceID string) (string, error) {
 	today := time.Now().Format("2006-01-02")
 
 	// Step 1: Try to create the contact
 	createReq := hubSpotCreateRequest{
 		Properties: hubSpotContactProperties{
 			Email:            email,
-			TenantDomain:     tenantDomain,
+			WorkspaceDomain:     workspaceDomain,
 			WorkspaceID:         workspaceID,
 			RegistrationDate: today,
 			LifecycleStage:   "lead",
@@ -99,7 +99,7 @@ func (s *HubSpotService) SyncContact(email, tenantDomain, workspaceID string) (s
 		}
 
 		err = s.updateContact(contactID, hubSpotContactProperties{
-			TenantDomain:     tenantDomain,
+			WorkspaceDomain:     workspaceDomain,
 			WorkspaceID:         workspaceID,
 			RegistrationDate: today,
 		})

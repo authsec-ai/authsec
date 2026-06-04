@@ -136,7 +136,7 @@ type OIDCTokenRequest struct {
 // SAML models
 
 // SAMLProvider is the underlying config row referenced by an identity_providers
-// row with provider_type='saml'. Scoped by workspace (tenant_id == workspace_id
+// row with provider_type='saml'. Scoped by workspace (workspace_id == workspace_id
 // during the rollout). Per-Application restriction is opt-in via
 // application_identity_provider_policies — not via a column here.
 type SAMLProvider struct {

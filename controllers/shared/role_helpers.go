@@ -61,7 +61,7 @@ func DerefString(s *string) string {
 
 // ResolveWorkspaceIDFromTokenPtr extracts the active workspace_id from the JWT and
 // returns a pointer UUID. This is the canonical helper post-Phase-4 for the call
-// sites that previously used ResolveTenantIDFromToken (pointer signature preserved
+// sites that previously used ResolveWorkspaceIDFromToken (pointer signature preserved
 // for caller compatibility — they often dereference via *workspaceID).
 func ResolveWorkspaceIDFromTokenPtr(c *gin.Context) (*uuid.UUID, error) {
 	workspaceIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)

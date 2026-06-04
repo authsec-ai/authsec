@@ -15,7 +15,7 @@ import (
 
 // TenantCIBAAuthService handles CIBA authentication for tenant users
 type TenantCIBAAuthService struct {
-	adminTenantRepo *database.AdminTenantRepository
+	adminWorkspaceRepo *database.AdminWorkspaceRepository
 	pushService     *PushNotificationService
 	pollingInterval int
 	requestExpiry   time.Duration
@@ -26,7 +26,7 @@ func NewTenantCIBAAuthService(
 	pushService *PushNotificationService,
 ) *TenantCIBAAuthService {
 	return &TenantCIBAAuthService{
-		adminTenantRepo: database.NewAdminTenantRepository(config.GetDatabase()),
+		adminWorkspaceRepo: database.NewAdminWorkspaceRepository(config.GetDatabase()),
 		pushService:     pushService,
 		pollingInterval: 5,               // 5 seconds minimum between polls
 		requestExpiry:   5 * time.Minute, // Requests expire in 5 minutes
@@ -67,8 +67,8 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 		}, nil
 	}
 
-	// Step 2: Map client_id to tenant_id
-	tenantUUID, err := s.tenantMapping(clientUUID)
+	// Step 2: Map client_id to workspace_id
+	workspaceUUID, err := s.tenantMapping(clientUUID)
 	if err != nil {
 		return &models.TenantCIBAInitiateResponse{
 			Error:            models.TenantCIBAErrorInvalidClient,
@@ -77,7 +77,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	}
 
 	// Step 3: Get tenant information (validate existence)
-	// tenant, err := s.adminTenantRepo.GetTenantByUUID(tenantUUID)
+	// tenant, err := s.adminWorkspaceRepo.GetWorkspaceByUUID(workspaceUUID)
 	// if err != nil {
 	// 	return &models.TenantCIBAInitiateResponse{
 	// 		Error:            models.TenantCIBAErrorTenantNotFound,
@@ -88,8 +88,8 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	tenantDB := config.DB
 
 	// Step 5: Look up user in tenant database
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
-	user, err := tenantRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
+	user, err := workspaceRepo.GetTenantUserByEmail(strings.ToLower(req.Email), clientUUID)
 	if err != nil {
 		return &models.TenantCIBAInitiateResponse{
 			Error:            models.TenantCIBAErrorUserNotFound,
@@ -98,7 +98,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	}
 
 	// Step 6: Get user's registered push devices from tenant DB
-	devices, err := tenantRepo.GetTenantDeviceTokensByUserID(user.ID, tenantUUID)
+	devices, err := workspaceRepo.GetTenantDeviceTokensByUserID(user.ID, workspaceUUID)
 	if err != nil || len(devices) == 0 {
 		return &models.TenantCIBAInitiateResponse{
 			Error:            models.TenantCIBAErrorNoDevice,
@@ -125,7 +125,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 	cibaRequest := &models.TenantCIBAAuthRequest{
 		AuthReqID:      authReqID,
 		UserID:         user.ID,
-		WorkspaceID:       tenantUUID,
+		WorkspaceID:       workspaceUUID,
 		UserEmail:      strings.ToLower(req.Email),
 		ClientID:       &clientUUID,
 		DeviceTokenID:  device.ID,
@@ -134,7 +134,7 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 		Status:         "pending",
 	}
 
-	if err := tenantRepo.CreateTenantCIBAAuthRequest(cibaRequest); err != nil {
+	if err := workspaceRepo.CreateTenantCIBAAuthRequest(cibaRequest); err != nil {
 		return nil, fmt.Errorf("failed to create CIBA request: %w", err)
 	}
 
@@ -168,10 +168,10 @@ func (s *TenantCIBAAuthService) InitiateTenantCIBAAuth(req *models.TenantCIBAIni
 func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved bool, biometricVerified bool, userID, workspaceID uuid.UUID) (*models.TenantCIBARespondResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Step 1: Retrieve and validate the CIBA request
-	request, err := tenantRepo.GetTenantCIBAAuthRequestByAuthReqID(authReqID, workspaceID)
+	request, err := workspaceRepo.GetTenantCIBAAuthRequestByAuthReqID(authReqID, workspaceID)
 	if err != nil {
 		return &models.TenantCIBARespondResponse{
 			Success: false,
@@ -201,7 +201,7 @@ func (s *TenantCIBAAuthService) RespondToTenantCIBA(authReqID string, approved b
 		status = "denied"
 	}
 
-	err = tenantRepo.UpdateTenantCIBAAuthRequestStatus(
+	err = workspaceRepo.UpdateTenantCIBAAuthRequestStatus(
 		authReqID,
 		workspaceID,
 		status,
@@ -229,8 +229,8 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 		}, nil
 	}
 
-	// Map client_id to tenant_id
-	tenantUUID, err := s.tenantMapping(clientUUID)
+	// Map client_id to workspace_id
+	workspaceUUID, err := s.tenantMapping(clientUUID)
 	if err != nil {
 		return &models.TenantCIBATokenResponse{
 			Error:            models.TenantCIBAErrorInvalidClient,
@@ -240,15 +240,15 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Update last polled timestamp (do this asynchronously to avoid slowing down response)
 	go func() {
-		tenantRepo.UpdateTenantCIBAAuthRequestLastPolled(req.AuthReqID, tenantUUID)
+		workspaceRepo.UpdateTenantCIBAAuthRequestLastPolled(req.AuthReqID, workspaceUUID)
 	}()
 
 	// Retrieve the CIBA request
-	request, err := tenantRepo.GetTenantCIBAAuthRequestByAuthReqID(req.AuthReqID, tenantUUID)
+	request, err := workspaceRepo.GetTenantCIBAAuthRequestByAuthReqID(req.AuthReqID, workspaceUUID)
 	if err != nil {
 		return &models.TenantCIBATokenResponse{
 			Error:            models.TenantCIBAErrorExpiredToken,
@@ -285,22 +285,22 @@ func (s *TenantCIBAAuthService) PollTenantCIBAToken(req *models.TenantCIBATokenR
 		if request.ClientID != nil {
 			clientID = *request.ClientID
 		}
-		token, err := s.generateJWTToken(request.UserID, tenantUUID, clientID, request.UserEmail, request.Scopes)
+		token, err := s.generateJWTToken(request.UserID, workspaceUUID, clientID, request.UserEmail, request.Scopes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate JWT token: %w", err)
 		}
 
 		// Mark request as consumed to prevent reuse
-		tenantRepo.UpdateTenantCIBAAuthRequestStatus(
+		workspaceRepo.UpdateTenantCIBAAuthRequestStatus(
 			req.AuthReqID,
-			tenantUUID,
+			workspaceUUID,
 			"consumed",
 			true,
 			request.BiometricVerified,
 		)
 
 		// Update user's last login timestamp
-		tenantRepo.UpdateTenantUserLastLogin(request.UserID)
+		workspaceRepo.UpdateTenantUserLastLogin(request.UserID)
 
 		return &models.TenantCIBATokenResponse{
 			AccessToken: token,
@@ -333,10 +333,10 @@ func (s *TenantCIBAAuthService) generateJWTToken(userID, workspaceID, clientID u
 func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTokenRegistrationRequest, userID, workspaceID uuid.UUID) (*models.TenantDeviceTokenRegistrationResponse, error) {
 	tenantDB := config.DB
 
-	tenantRepo := database.NewTenantDeviceRepository(tenantDB)
+	workspaceRepo := database.NewTenantDeviceRepository(tenantDB)
 
 	// Check if device token already exists
-	existingDevice, err := tenantRepo.GetTenantDeviceTokenByToken(req.DeviceToken, workspaceID)
+	existingDevice, err := workspaceRepo.GetTenantDeviceTokenByToken(req.DeviceToken, workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check device token: %w", err)
 	}
@@ -349,7 +349,7 @@ func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTok
 		existingDevice.OSVersion = req.OSVersion
 		existingDevice.IsActive = true
 
-		if err := tenantRepo.UpdateTenantDeviceToken(existingDevice); err != nil {
+		if err := workspaceRepo.UpdateTenantDeviceToken(existingDevice); err != nil {
 			return nil, fmt.Errorf("failed to update device token: %w", err)
 		}
 
@@ -374,7 +374,7 @@ func (s *TenantCIBAAuthService) RegisterTenantDevice(req *models.TenantDeviceTok
 		IsActive:    true,
 	}
 
-	if err := tenantRepo.CreateTenantDeviceToken(deviceToken); err != nil {
+	if err := workspaceRepo.CreateTenantDeviceToken(deviceToken); err != nil {
 		return nil, fmt.Errorf("failed to register device: %w", err)
 	}
 

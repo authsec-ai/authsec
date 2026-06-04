@@ -22,21 +22,21 @@ func NewPostgresPolicyRepository(db *sql.DB) repositories.PolicyRepository {
 }
 
 // GetByID retrieves a policy by ID
-func (r *PostgresPolicyRepository) GetByID(ctx context.Context, tenantID, id string) (*models.AttestationPolicy, error) {
+func (r *PostgresPolicyRepository) GetByID(ctx context.Context, workspaceID, id string) (*models.AttestationPolicy, error) {
 	query := `
-		SELECT id, tenant_id, name, description, attestation_type, selector_rules, vault_role,
+		SELECT id, workspace_id, name, description, attestation_type, selector_rules, vault_role,
 			ttl, priority, enabled, created_at, updated_at
 		FROM attestation_policies
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
-	return r.scanPolicy(ctx, query, id, tenantID)
+	return r.scanPolicy(ctx, query, id, workspaceID)
 }
 
 // Create creates a new policy
 func (r *PostgresPolicyRepository) Create(ctx context.Context, policy *models.AttestationPolicy) error {
 	query := `
-		INSERT INTO attestation_policies (id, tenant_id, name, description, attestation_type,
+		INSERT INTO attestation_policies (id, workspace_id, name, description, attestation_type,
 			selector_rules, vault_role, ttl, priority, enabled, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
@@ -78,7 +78,7 @@ func (r *PostgresPolicyRepository) Update(ctx context.Context, policy *models.At
 		UPDATE attestation_policies
 		SET name = $3, description = $4, attestation_type = $5, selector_rules = $6,
 			vault_role = $7, ttl = $8, priority = $9, enabled = $10, updated_at = $11
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND workspace_id = $2
 	`
 
 	policy.UpdatedAt = time.Now()
@@ -119,10 +119,10 @@ func (r *PostgresPolicyRepository) Update(ctx context.Context, policy *models.At
 }
 
 // Delete deletes a policy
-func (r *PostgresPolicyRepository) Delete(ctx context.Context, tenantID, id string) error {
-	query := `DELETE FROM attestation_policies WHERE id = $1 AND tenant_id = $2`
+func (r *PostgresPolicyRepository) Delete(ctx context.Context, workspaceID, id string) error {
+	query := `DELETE FROM attestation_policies WHERE id = $1 AND workspace_id = $2`
 
-	result, err := r.db.ExecContext(ctx, query, id, tenantID)
+	result, err := r.db.ExecContext(ctx, query, id, workspaceID)
 	if err != nil {
 		return errors.NewInternalError("Failed to delete policy", err)
 	}
@@ -140,29 +140,29 @@ func (r *PostgresPolicyRepository) Delete(ctx context.Context, tenantID, id stri
 }
 
 // ListByTenant retrieves all policies for a tenant
-func (r *PostgresPolicyRepository) ListByTenant(ctx context.Context, tenantID string) ([]*models.AttestationPolicy, error) {
+func (r *PostgresPolicyRepository) ListByTenant(ctx context.Context, workspaceID string) ([]*models.AttestationPolicy, error) {
 	query := `
-		SELECT id, tenant_id, name, description, attestation_type, selector_rules, vault_role,
+		SELECT id, workspace_id, name, description, attestation_type, selector_rules, vault_role,
 			ttl, priority, enabled, created_at, updated_at
 		FROM attestation_policies
-		WHERE tenant_id = $1
+		WHERE workspace_id = $1
 		ORDER BY priority DESC, created_at DESC
 	`
 
-	return r.queryPolicies(ctx, query, tenantID)
+	return r.queryPolicies(ctx, query, workspaceID)
 }
 
 // FindMatchingPolicy finds the best matching policy for given selectors
-func (r *PostgresPolicyRepository) FindMatchingPolicy(ctx context.Context, tenantID, attestationType string, selectors map[string]string) (*models.AttestationPolicy, error) {
+func (r *PostgresPolicyRepository) FindMatchingPolicy(ctx context.Context, workspaceID, attestationType string, selectors map[string]string) (*models.AttestationPolicy, error) {
 	query := `
-		SELECT id, tenant_id, name, description, attestation_type, selector_rules, vault_role,
+		SELECT id, workspace_id, name, description, attestation_type, selector_rules, vault_role,
 			ttl, priority, enabled, created_at, updated_at
 		FROM attestation_policies
-		WHERE tenant_id = $1 AND attestation_type = $2 AND enabled = true
+		WHERE workspace_id = $1 AND attestation_type = $2 AND enabled = true
 		ORDER BY priority DESC
 	`
 
-	policies, err := r.queryPolicies(ctx, query, tenantID, attestationType)
+	policies, err := r.queryPolicies(ctx, query, workspaceID, attestationType)
 	if err != nil {
 		return nil, err
 	}

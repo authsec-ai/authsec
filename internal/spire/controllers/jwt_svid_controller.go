@@ -127,8 +127,8 @@ func (ctrl *JWTSVIDController) ValidateJWTSVID(c *gin.Context) {
 		if sub, ok := validResp.Claims["sub"].(string); ok {
 			resp["sub"] = sub
 		}
-		if tid, ok := validResp.Claims["tenant_id"].(string); ok {
-			resp["tenant_id"] = tid
+		if tid, ok := validResp.Claims["workspace_id"].(string); ok {
+			resp["workspace_id"] = tid
 		}
 		if perms, ok := validResp.Claims["permissions"]; ok {
 			resp["permissions"] = perms
@@ -149,13 +149,13 @@ func (ctrl *JWTSVIDController) ValidateJWTSVID(c *gin.Context) {
 
 // GetJWTBundle handles GET /spire/v1/jwt/bundle
 func (ctrl *JWTSVIDController) GetJWTBundle(c *gin.Context) {
-	tenantID := c.Query("tenant_id")
-	if tenantID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id query parameter is required", nil))
+	workspaceID := c.Query("workspace_id")
+	if workspaceID == "" {
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id query parameter is required", nil))
 		return
 	}
 
-	bundle, err := ctrl.service.GetJWTBundle(c.Request.Context(), tenantID)
+	bundle, err := ctrl.service.GetJWTBundle(c.Request.Context(), workspaceID)
 	if err != nil {
 		ctrl.sendError(c, errors.NewInternalError(err.Error(), err))
 		return
@@ -169,7 +169,7 @@ func (ctrl *JWTSVIDController) GetJWTBundle(c *gin.Context) {
 // Protected by JWT auth middleware rather than mTLS.
 //
 // Authorization checks:
-//  1. Caller's tenant must match the requested tenant_id
+//  1. Caller's tenant must match the requested workspace_id
 //  2. Requested SPIFFE ID must belong to the caller's tenant trust domain
 //  3. Custom claims cannot inject elevated roles/permissions
 //  4. TTL is capped to prevent long-lived delegated tokens
@@ -187,11 +187,11 @@ func (ctrl *JWTSVIDController) IssueDelegatedJWTSVID(c *gin.Context) {
 	}
 
 	// Extract caller identity from context
-	callerTenantID, _ := middleware.GetSpireTenantID(c)
+	callerWorkspaceID, _ := middleware.GetSpireWorkspaceID(c)
 	claims, _ := middleware.GetSpireClaims(c)
 
 	// Validate delegation authorization
-	if err := ctrl.validateDelegationAuth(claims, callerTenantID, req.WorkspaceID, req.SpiffeID); err != nil {
+	if err := ctrl.validateDelegationAuth(claims, callerWorkspaceID, req.WorkspaceID, req.SpiffeID); err != nil {
 		ctrl.sendError(c, errors.NewForbiddenError(err.Error(), err))
 		return
 	}
@@ -260,7 +260,7 @@ func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 	}
 
 	if req.WorkspaceID == "" || req.Token == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id and token are required", nil))
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id and token are required", nil))
 		return
 	}
 
@@ -329,20 +329,20 @@ func (ctrl *JWTSVIDController) RenewJWTSVID(c *gin.Context) {
 }
 
 // validateDelegationAuth checks that the caller is authorized to issue a delegated JWT-SVID.
-func (ctrl *JWTSVIDController) validateDelegationAuth(claims *utils.JWTClaims, callerTenantID, reqTenantID, reqSpiffeID string) error {
-	if callerTenantID == "" {
+func (ctrl *JWTSVIDController) validateDelegationAuth(claims *utils.JWTClaims, callerWorkspaceID, reqWorkspaceID, reqSpiffeID string) error {
+	if callerWorkspaceID == "" {
 		return fmt.Errorf("caller tenant ID not found in authentication context")
 	}
 
 	// Tenant must match
-	if callerTenantID != reqTenantID {
-		return fmt.Errorf("tenant mismatch: authenticated as tenant %s but requesting delegation for tenant %s", callerTenantID, reqTenantID)
+	if callerWorkspaceID != reqWorkspaceID {
+		return fmt.Errorf("tenant mismatch: authenticated as tenant %s but requesting delegation for tenant %s", callerWorkspaceID, reqWorkspaceID)
 	}
 
 	// SPIFFE ID must belong to the caller's tenant trust domain
-	expectedPrefix := fmt.Sprintf("spiffe://%s/", reqTenantID)
+	expectedPrefix := fmt.Sprintf("spiffe://%s/", reqWorkspaceID)
 	if !strings.HasPrefix(reqSpiffeID, expectedPrefix) {
-		return fmt.Errorf("spiffe_id %s does not belong to tenant %s trust domain", reqSpiffeID, reqTenantID)
+		return fmt.Errorf("spiffe_id %s does not belong to tenant %s trust domain", reqSpiffeID, reqWorkspaceID)
 	}
 
 	return nil

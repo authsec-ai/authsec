@@ -41,7 +41,7 @@ func (ctrl *CertificateController) Renew(c *gin.Context) {
 
 	// Validate request
 	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
 		return
 	}
 	if req.CSR == "" {
@@ -86,7 +86,7 @@ func (ctrl *CertificateController) Revoke(c *gin.Context) {
 
 	// Validate request
 	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("tenant_id is required", nil))
+		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
 		return
 	}
 	if req.SerialNumber == "" {

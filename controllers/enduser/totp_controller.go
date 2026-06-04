@@ -19,7 +19,7 @@ import (
 type TOTPController struct {
 	totpService *services.TOTPService
 	userRepo    *database.UserRepository
-	tenantRepo  *database.AdminTenantRepository
+	workspaceRepo  *database.AdminWorkspaceRepository
 	deviceRepo  *database.DeviceAuthRepository
 }
 
@@ -33,7 +33,7 @@ func NewTOTPController() (*TOTPController, error) {
 	return &TOTPController{
 		totpService: services.NewTOTPService(database.NewTOTPRepository(db.DB)),
 		userRepo:    database.NewUserRepository(db),
-		tenantRepo:  database.NewAdminTenantRepository(db),
+		workspaceRepo:  database.NewAdminWorkspaceRepository(db),
 		deviceRepo:  database.NewDeviceAuthRepository(db),
 	}, nil
 }
@@ -71,14 +71,14 @@ func (ctrl *TOTPController) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -147,14 +147,14 @@ func (ctrl *TOTPController) ConfirmRegistration(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -217,14 +217,14 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -257,7 +257,7 @@ func (ctrl *TOTPController) VerifyTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details
-	tenant, err := ctrl.tenantRepo.GetTenantByID(workspaceID.String())
+	tenant, err := ctrl.workspaceRepo.GetWorkspaceByID(workspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -309,14 +309,14 @@ func (ctrl *TOTPController) GetUserDevices(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -368,14 +368,14 @@ func (ctrl *TOTPController) DeleteDevice(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -440,14 +440,14 @@ func (ctrl *TOTPController) SetPrimaryDevice(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -504,14 +504,14 @@ func (ctrl *TOTPController) RegenerateBackupCodes(c *gin.Context) {
 		return
 	}
 
-	// Get tenant_id from context
-	tenantIDStr, exists := c.Get("workspace_id")
+	// Get workspace_id from context
+	workspaceIDStr, exists := c.Get("workspace_id")
 	if !exists {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant ID not found in token"})
 		return
 	}
 
-	workspaceID, err := uuid.Parse(tenantIDStr.(string))
+	workspaceID, err := uuid.Parse(workspaceIDStr.(string))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tenant ID"})
 		return
@@ -573,7 +573,7 @@ func (ctrl *TOTPController) LoginWithTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details
-	tenant, err := ctrl.tenantRepo.GetTenantByID(user.WorkspaceID.String())
+	tenant, err := ctrl.workspaceRepo.GetWorkspaceByID(user.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -659,7 +659,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 	}
 
 	// Get tenant details (needed for authorize and token generation)
-	tenant, err := ctrl.tenantRepo.GetTenantByID(user.WorkspaceID.String())
+	tenant, err := ctrl.workspaceRepo.GetWorkspaceByID(user.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant not found"})
 		return
@@ -681,7 +681,7 @@ func (ctrl *TOTPController) ApproveDeviceCodeWithTOTP(c *gin.Context) {
 	}
 
 	// Authorize device with full tenant context and pre-generated token
-	if err := ctrl.deviceRepo.AuthorizeDeviceCode(req.UserCode, user.ID, user.Email, user.WorkspaceID, tenant.TenantDomain, clientID, token, true); err != nil {
+	if err := ctrl.deviceRepo.AuthorizeDeviceCode(req.UserCode, user.ID, user.Email, user.WorkspaceID, tenant.WorkspaceDomain, clientID, token, true); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve device", "details": err.Error()})
 		return
 	}

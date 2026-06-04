@@ -21,7 +21,7 @@ import (
 )
 
 // jwtKVMount is the Vault KV v2 mount used for JWT signing keys.
-// The actual Vault path becomes: kv/data/secret/spire/jwt-signing-keys/{tenant_id}
+// The actual Vault path becomes: kv/data/secret/spire/jwt-signing-keys/{workspace_id}
 const jwtKVMount = "kv"
 
 // JWTSVIDService handles JWT-SVID issuance and validation
@@ -78,7 +78,7 @@ func (s *JWTSVIDService) IssueJWTSVID(
 ) (*IssueJWTSVIDResponse, error) {
 	// Validate request
 	if req.WorkspaceID == "" {
-		return nil, fmt.Errorf("tenant_id is required")
+		return nil, fmt.Errorf("workspace_id is required")
 	}
 	if req.SpiffeID == "" {
 		return nil, fmt.Errorf("spiffe_id is required")
@@ -217,10 +217,10 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 // GetJWTBundle returns the JWT bundle (JWKS) for a tenant
 func (s *JWTSVIDService) GetJWTBundle(
 	ctx context.Context,
-	tenantID string,
+	workspaceID string,
 ) (string, error) {
 	// Get public key
-	publicKey, err := s.getPublicKey(ctx, tenantID)
+	publicKey, err := s.getPublicKey(ctx, workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get public key: %w", err)
 	}
@@ -256,11 +256,11 @@ func (s *JWTSVIDService) GetJWTBundle(
 // Lookup order: in-memory cache -> Vault KV -> generate new & persist to Vault.
 func (s *JWTSVIDService) getOrCreateSigningKey(
 	ctx context.Context,
-	tenantID string,
+	workspaceID string,
 ) (*rsa.PrivateKey, error) {
 	// Fast path: read lock
 	s.keyCacheMu.RLock()
-	if key, ok := s.keyCache[tenantID]; ok {
+	if key, ok := s.keyCache[workspaceID]; ok {
 		s.keyCacheMu.RUnlock()
 		return key, nil
 	}
@@ -271,25 +271,25 @@ func (s *JWTSVIDService) getOrCreateSigningKey(
 	defer s.keyCacheMu.Unlock()
 
 	// Double-check after acquiring write lock
-	if key, ok := s.keyCache[tenantID]; ok {
+	if key, ok := s.keyCache[workspaceID]; ok {
 		return key, nil
 	}
 
-	// Try loading from Vault (stored under kv/data/secret/spire/jwt-signing-keys/{tenant_id})
-	vaultPath := fmt.Sprintf("secret/spire/jwt-signing-keys/%s", tenantID)
+	// Try loading from Vault (stored under kv/data/secret/spire/jwt-signing-keys/{workspace_id})
+	vaultPath := fmt.Sprintf("secret/spire/jwt-signing-keys/%s", workspaceID)
 	data, err := s.vaultClient.ReadKVSecret(ctx, jwtKVMount, vaultPath)
 	if err != nil {
-		s.logger.WithField("tenant_id", tenantID).WithError(err).Warn("Failed to read JWT signing key from Vault, will generate new key")
+		s.logger.WithField("workspace_id", workspaceID).WithError(err).Warn("Failed to read JWT signing key from Vault, will generate new key")
 	}
 
 	if data != nil {
 		if pemStr, ok := data["private_key_pem"].(string); ok && pemStr != "" {
 			key, parseErr := parseRSAPrivateKeyPEM(pemStr)
 			if parseErr != nil {
-				s.logger.WithField("tenant_id", tenantID).WithError(parseErr).Warn("Failed to parse stored JWT signing key, will regenerate")
+				s.logger.WithField("workspace_id", workspaceID).WithError(parseErr).Warn("Failed to parse stored JWT signing key, will regenerate")
 			} else {
-				s.logger.WithField("tenant_id", tenantID).Info("Loaded JWT signing key from Vault")
-				s.keyCache[tenantID] = key
+				s.logger.WithField("workspace_id", workspaceID).Info("Loaded JWT signing key from Vault")
+				s.keyCache[workspaceID] = key
 				return key, nil
 			}
 		}
@@ -309,12 +309,12 @@ func (s *JWTSVIDService) getOrCreateSigningKey(
 	})
 	if writeErr != nil {
 		// Log but don't fail — key works in-memory, next restart will retry
-		s.logger.WithField("tenant_id", tenantID).WithError(writeErr).Error("Failed to persist JWT signing key to Vault — key is ephemeral until next restart")
+		s.logger.WithField("workspace_id", workspaceID).WithError(writeErr).Error("Failed to persist JWT signing key to Vault — key is ephemeral until next restart")
 	} else {
-		s.logger.WithField("tenant_id", tenantID).Info("JWT signing key generated and persisted to Vault")
+		s.logger.WithField("workspace_id", workspaceID).Info("JWT signing key generated and persisted to Vault")
 	}
 
-	s.keyCache[tenantID] = privateKey
+	s.keyCache[workspaceID] = privateKey
 	return privateKey, nil
 }
 
@@ -356,9 +356,9 @@ func parseRSAPrivateKeyPEM(pemStr string) (*rsa.PrivateKey, error) {
 // getPublicKey retrieves the public key for JWT verification using the same cache.
 func (s *JWTSVIDService) getPublicKey(
 	ctx context.Context,
-	tenantID string,
+	workspaceID string,
 ) (*rsa.PublicKey, error) {
-	privateKey, err := s.getOrCreateSigningKey(ctx, tenantID)
+	privateKey, err := s.getOrCreateSigningKey(ctx, workspaceID)
 	if err != nil {
 		return nil, err
 	}

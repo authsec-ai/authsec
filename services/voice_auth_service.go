@@ -17,7 +17,7 @@ import (
 type VoiceAuthService struct {
 	voiceRepo      *database.VoiceAuthRepository
 	deviceRepo     *database.DeviceAuthRepository
-	tenantRepo     *database.AdminTenantRepository
+	workspaceRepo     *database.AdminWorkspaceRepository
 	userRepo       *database.UserRepository
 	deviceService  *DeviceAuthService
 	sessionExpiry  time.Duration
@@ -29,7 +29,7 @@ func NewVoiceAuthService(db *database.DBConnection, deviceService *DeviceAuthSer
 	return &VoiceAuthService{
 		voiceRepo:      database.NewVoiceAuthRepository(db),
 		deviceRepo:     database.NewDeviceAuthRepository(db),
-		tenantRepo:     database.NewAdminTenantRepository(db),
+		workspaceRepo:     database.NewAdminWorkspaceRepository(db),
 		userRepo:       database.NewUserRepository(db),
 		deviceService:  deviceService,
 		sessionExpiry:  3 * time.Minute, // Voice sessions expire quickly (3 minutes)
@@ -56,7 +56,7 @@ func (s *VoiceAuthService) InitiateVoiceAuth(req *models.VoiceInitiateRequest) (
 		return nil, fmt.Errorf("invalid client_id format")
 	}
 
-	// Look up tenant_id from tenant_mappings table using client_id
+	// Look up workspace_id from tenant_mappings table using client_id
 	workspaceID, err := s.tenantMapping(clientID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve tenant from client_id: %w", err)
@@ -185,7 +185,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 			}
 
 			// Get tenant info
-			tenant, err := s.tenantRepo.GetTenantByID(session.WorkspaceID.String())
+			tenant, err := s.workspaceRepo.GetWorkspaceByID(session.WorkspaceID.String())
 			if err != nil {
 				return &models.VoiceVerifyResponse{
 					Success: false,
@@ -229,7 +229,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 	// This allows user to complete authentication in browser
 	deviceReq := &models.DeviceCodeRequest{
 		ClientID:     session.ClientID.String(),
-		TenantDomain: "", // Will be populated from tenant_id
+		WorkspaceDomain: "", // Will be populated from workspace_id
 		Scopes:       session.Scopes,
 		DeviceInfo: map[string]interface{}{
 			"source":         "voice_authentication",
@@ -239,7 +239,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 	}
 
 	// Get tenant info
-	tenant, err := s.tenantRepo.GetTenantByID(session.WorkspaceID.String())
+	tenant, err := s.workspaceRepo.GetWorkspaceByID(session.WorkspaceID.String())
 	if err != nil {
 		return &models.VoiceVerifyResponse{
 			Success: false,
@@ -247,7 +247,7 @@ func (s *VoiceAuthService) VerifyVoiceOTP(req *models.VoiceVerifyRequest) (*mode
 			Message: "Tenant not found",
 		}, nil
 	}
-	deviceReq.TenantDomain = tenant.TenantDomain
+	deviceReq.WorkspaceDomain = tenant.WorkspaceDomain
 
 	// Create device code
 	deviceResp, err := s.deviceService.InitiateDeviceFlow(deviceReq)
@@ -296,7 +296,7 @@ func (s *VoiceAuthService) AuthenticateWithCredentials(req *models.VoiceTokenReq
 	}
 
 	// Validate tenant
-	tenant, err := s.tenantRepo.GetTenantByDomain(req.TenantDomain)
+	tenant, err := s.workspaceRepo.GetWorkspaceByDomain(req.WorkspaceDomain)
 	if err != nil {
 		return &models.VoiceTokenResponse{
 			Error:            "invalid_request",
