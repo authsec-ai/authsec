@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/controllers/shared"
+	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -38,6 +39,7 @@ type ApplicationsV2Controller struct {
 	roleSvc       *services.RoleService
 	bindingSvc    *services.BindingService
 	govSvc        *services.GovernanceService
+	idpConfigSvc  *services.IDPConfigService
 }
 
 func NewApplicationsV2Controller() *ApplicationsV2Controller {
@@ -52,6 +54,7 @@ func NewApplicationsV2Controller() *ApplicationsV2Controller {
 		roleSvc:       services.NewRoleService(),
 		bindingSvc:    services.NewBindingService(),
 		govSvc:        services.NewGovernanceService(),
+		idpConfigSvc:  services.NewIDPConfigService(),
 	}
 }
 
@@ -1470,4 +1473,397 @@ func parseCSVUUIDs(raw string) ([]uuid.UUID, error) {
 		out = append(out, u)
 	}
 	return out, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-MCP IDP config CRUD (migration 035)
+//
+// Each Application can override the tenant's default Google/Okta/SAML IDP
+// configuration with its own row. Tenant-wide rows (resource_server_id IS
+// NULL) stay managed via the legacy /authsec/oocmgr/* surface; this CRUD
+// only writes per-MCP rows scoped to the URL's :id Application.
+// ─────────────────────────────────────────────────────────────────────────
+
+// ListOIDCProviders handles GET /authsec/applications/:id/oidc-providers.
+// Returns both per-MCP rows for this Application and the tenant-wide
+// defaults so admins can see the full resolved view in one call.
+func (ctrl *ApplicationsV2Controller) ListOIDCProviders(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	rows, err := ctrl.idpConfigSvc.ListOIDCProviders(tenantID, id)
+	if err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// CreateOIDCProvider handles POST /authsec/applications/:id/oidc-providers.
+func (ctrl *ApplicationsV2Controller) CreateOIDCProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	var in services.OIDCProviderInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	row, err := ctrl.idpConfigSvc.CreateOIDCProvider(tenantID, id, in)
+	if err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, row)
+}
+
+// UpdateOIDCProvider handles PUT /authsec/applications/:id/oidc-providers/:provider_id.
+func (ctrl *ApplicationsV2Controller) UpdateOIDCProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	providerID, err := uuid.Parse(c.Param("provider_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider id"})
+		return
+	}
+	var in services.OIDCProviderInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	row, err := ctrl.idpConfigSvc.UpdateOIDCProvider(tenantID, id, providerID, in)
+	if err != nil {
+		if errors.Is(err, services.ErrIDPConfigNotFound) || errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// DeleteOIDCProvider handles DELETE /authsec/applications/:id/oidc-providers/:provider_id.
+func (ctrl *ApplicationsV2Controller) DeleteOIDCProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	providerID, err := uuid.Parse(c.Param("provider_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider id"})
+		return
+	}
+	if err := ctrl.idpConfigSvc.DeleteOIDCProvider(tenantID, id, providerID); err != nil {
+		if errors.Is(err, services.ErrIDPConfigNotFound) || errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// SAMLProviderInput is the body of POST + PUT for SAML provider CRUD. Same
+// partial-update pattern as OIDC. Lives in the controller (not services)
+// because the SAML model lives in internal/hydra/models which can't be
+// imported from services (would cause a cycle).
+type SAMLProviderInput struct {
+	ProviderName     string  `json:"provider_name"`
+	DisplayName      string  `json:"display_name"`
+	EntityID         string  `json:"entity_id"`
+	SSOURL           string  `json:"sso_url"`
+	SLOURL           string  `json:"slo_url,omitempty"`
+	Certificate      string  `json:"certificate"`
+	MetadataURL      string  `json:"metadata_url,omitempty"`
+	NameIDFormat     string  `json:"name_id_format,omitempty"`
+	AttributeMapping *string `json:"attribute_mapping,omitempty"` // JSON string; nil = don't change
+	IsActive         *bool   `json:"is_active,omitempty"`
+	SortOrder        *int    `json:"sort_order,omitempty"`
+}
+
+// ListSAMLProviders handles GET /authsec/applications/:id/saml-providers.
+func (ctrl *ApplicationsV2Controller) ListSAMLProviders(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	if _, err := ctrl.idpConfigSvc.EnsureApplication(tenantID, id); err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	tenantDB, err := ctrl.idpConfigSvc.TenantDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant db unavailable"})
+		return
+	}
+	var rows []hydramodels.SAMLProvider
+	if err := tenantDB.
+		Where("resource_server_id = ? OR resource_server_id IS NULL", id).
+		Order("resource_server_id NULLS LAST, sort_order ASC, provider_name ASC").
+		Find(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list saml_providers: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// CreateSAMLProvider handles POST /authsec/applications/:id/saml-providers.
+func (ctrl *ApplicationsV2Controller) CreateSAMLProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	if _, err := ctrl.idpConfigSvc.EnsureApplication(tenantID, id); err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var in SAMLProviderInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if in.ProviderName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider_name required"})
+		return
+	}
+	if in.EntityID == "" || in.SSOURL == "" || in.Certificate == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "entity_id, sso_url, and certificate are all required"})
+		return
+	}
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id"})
+		return
+	}
+	tenantDB, err := ctrl.idpConfigSvc.TenantDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant db unavailable"})
+		return
+	}
+	displayName := in.DisplayName
+	if displayName == "" {
+		displayName = in.ProviderName
+	}
+	nameIDFormat := in.NameIDFormat
+	if nameIDFormat == "" {
+		nameIDFormat = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+	}
+	sortOrder := 0
+	if in.SortOrder != nil {
+		sortOrder = *in.SortOrder
+	}
+	rs := id
+	row := hydramodels.SAMLProvider{
+		TenantID:         tenantUUID,
+		ResourceServerID: &rs,
+		ProviderName:     in.ProviderName,
+		DisplayName:      displayName,
+		EntityID:         in.EntityID,
+		SSOURL:           in.SSOURL,
+		SLOURL:           in.SLOURL,
+		Certificate:      in.Certificate,
+		MetadataURL:      in.MetadataURL,
+		NameIDFormat:     nameIDFormat,
+		IsActive:         in.IsActive == nil || *in.IsActive,
+		SortOrder:        sortOrder,
+	}
+	if in.AttributeMapping != nil {
+		row.AttributeMapping = []byte(*in.AttributeMapping)
+	}
+	if err := tenantDB.Create(&row).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "insert saml_providers: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, row)
+}
+
+// UpdateSAMLProvider handles PUT /authsec/applications/:id/saml-providers/:provider_id.
+func (ctrl *ApplicationsV2Controller) UpdateSAMLProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	providerID, err := uuid.Parse(c.Param("provider_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider id"})
+		return
+	}
+	if _, err := ctrl.idpConfigSvc.EnsureApplication(tenantID, id); err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var in SAMLProviderInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	tenantDB, err := ctrl.idpConfigSvc.TenantDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant db unavailable"})
+		return
+	}
+	var row hydramodels.SAMLProvider
+	if err := tenantDB.
+		Where("id = ? AND resource_server_id = ?", providerID, id).
+		First(&row).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+		return
+	}
+	updates := map[string]interface{}{}
+	if in.ProviderName != "" {
+		updates["provider_name"] = in.ProviderName
+	}
+	if in.DisplayName != "" {
+		updates["display_name"] = in.DisplayName
+	}
+	if in.EntityID != "" {
+		updates["entity_id"] = in.EntityID
+	}
+	if in.SSOURL != "" {
+		updates["sso_url"] = in.SSOURL
+	}
+	if in.SLOURL != "" {
+		updates["slo_url"] = in.SLOURL
+	}
+	if in.Certificate != "" {
+		updates["certificate"] = in.Certificate
+	}
+	if in.MetadataURL != "" {
+		updates["metadata_url"] = in.MetadataURL
+	}
+	if in.NameIDFormat != "" {
+		updates["name_id_format"] = in.NameIDFormat
+	}
+	if in.AttributeMapping != nil {
+		updates["attribute_mapping"] = []byte(*in.AttributeMapping)
+	}
+	if in.IsActive != nil {
+		updates["is_active"] = *in.IsActive
+	}
+	if in.SortOrder != nil {
+		updates["sort_order"] = *in.SortOrder
+	}
+	if len(updates) > 0 {
+		if err := tenantDB.Model(&row).Updates(updates).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "update saml_providers: " + err.Error()})
+			return
+		}
+		if err := tenantDB.Where("id = ?", providerID).First(&row).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// DeleteSAMLProvider handles DELETE /authsec/applications/:id/saml-providers/:provider_id.
+func (ctrl *ApplicationsV2Controller) DeleteSAMLProvider(c *gin.Context) {
+	tenantID, err := shared.ResolveTenantIDString(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id required in JWT"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	providerID, err := uuid.Parse(c.Param("provider_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider id"})
+		return
+	}
+	if _, err := ctrl.idpConfigSvc.EnsureApplication(tenantID, id); err != nil {
+		if errors.Is(err, services.ErrResourceServerNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	tenantDB, err := ctrl.idpConfigSvc.TenantDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant db unavailable"})
+		return
+	}
+	res := tenantDB.
+		Where("id = ? AND resource_server_id = ?", providerID, id).
+		Delete(&hydramodels.SAMLProvider{})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete saml_providers: " + res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

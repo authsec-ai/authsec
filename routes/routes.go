@@ -399,6 +399,20 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/identity-providers", identityProvidersV2Controller.ListApplicationPolicies)
 			applicationsV2.POST("/:id/identity-providers", identityProvidersV2Controller.PinIDP)
 			applicationsV2.DELETE("/:id/identity-providers/:idp_id", identityProvidersV2Controller.UnpinIDP)
+
+			// Per-MCP IDP config CRUD (migration 035). These manage rows in
+			// tenant.oidc_providers / saml_providers scoped to a single
+			// Application via the resource_server_id column. Tenant-wide
+			// defaults (NULL resource_server_id) keep going through the
+			// legacy /oocmgr/* surface.
+			applicationsV2.GET("/:id/oidc-providers", applicationsV2Controller.ListOIDCProviders)
+			applicationsV2.POST("/:id/oidc-providers", applicationsV2Controller.CreateOIDCProvider)
+			applicationsV2.PUT("/:id/oidc-providers/:provider_id", applicationsV2Controller.UpdateOIDCProvider)
+			applicationsV2.DELETE("/:id/oidc-providers/:provider_id", applicationsV2Controller.DeleteOIDCProvider)
+			applicationsV2.GET("/:id/saml-providers", applicationsV2Controller.ListSAMLProviders)
+			applicationsV2.POST("/:id/saml-providers", applicationsV2Controller.CreateSAMLProvider)
+			applicationsV2.PUT("/:id/saml-providers/:provider_id", applicationsV2Controller.UpdateSAMLProvider)
+			applicationsV2.DELETE("/:id/saml-providers/:provider_id", applicationsV2Controller.DeleteSAMLProvider)
 		}
 
 		// Tenant-scoped IDP registry. Phase 4.
