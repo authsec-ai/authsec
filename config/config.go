@@ -95,6 +95,19 @@ type Config struct {
 	// HubSpot integration
 	HubSpotAccessToken string
 
+	// SendGrid marketing integration
+	SendGridAPIKey         string
+	SendGridListNewSignups string
+	SendGridListTrialUsers string
+	SendGridListLeads      string
+	SendGridListDormant    string
+	SGFieldSegment         string
+	SGFieldTenantID        string
+	SGFieldFirstLoginAt    string
+	SGFieldLastLoginAt     string
+	SGFieldIsPQL           string
+	SGFieldPlanType        string
+
 	// Hydra service fields
 	HydraPublicURL      string // Hydra public endpoint (e.g., https://hydra.authsec.dev)
 	ReactAppURL         string // Frontend app URL for redirects (e.g., https://app.authsec.dev)
@@ -256,6 +269,19 @@ func LoadConfig() *Config {
 	// Load HubSpot configuration
 	hubSpotAccessToken := getEnv("HUBSPOT_ACCESS_TOKEN", "")
 
+	// Load SendGrid configuration
+	sendGridAPIKey         := getEnv("SENDGRID_API_KEY", "")
+	sendGridListNewSignups := getEnv("SENDGRID_LIST_NEW_SIGNUPS", "")
+	sendGridListTrialUsers := getEnv("SENDGRID_LIST_TRIAL_USERS", "")
+	sendGridListLeads      := getEnv("SENDGRID_LIST_LEADS", "")
+	sendGridListDormant    := getEnv("SENDGRID_LIST_DORMANT", "")
+	sgFieldSegment         := getEnv("SG_FIELD_SEGMENT", "e1_T")
+	sgFieldTenantID        := getEnv("SG_FIELD_TENANT_ID", "e2_T")
+	sgFieldFirstLoginAt    := getEnv("SG_FIELD_FIRST_LOGIN_AT", "e3_D")
+	sgFieldLastLoginAt     := getEnv("SG_FIELD_LAST_LOGIN_AT", "e4_D")
+	sgFieldIsPQL           := getEnv("SG_FIELD_IS_PQL", "e5_T")
+	sgFieldPlanType        := getEnv("SG_FIELD_PLAN_TYPE", "w6_T")
+
 	// Load Hydra service configuration
 	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
 	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
@@ -350,6 +376,17 @@ func LoadConfig() *Config {
 		GitHubClientSecret:      githubClientSecret,
 		MicrosoftClientSecret:   microsoftClientSecret,
 		HubSpotAccessToken:      hubSpotAccessToken,
+		SendGridAPIKey:          sendGridAPIKey,
+		SendGridListNewSignups:  sendGridListNewSignups,
+		SendGridListTrialUsers:  sendGridListTrialUsers,
+		SendGridListLeads:       sendGridListLeads,
+		SendGridListDormant:     sendGridListDormant,
+		SGFieldSegment:          sgFieldSegment,
+		SGFieldTenantID:         sgFieldTenantID,
+		SGFieldFirstLoginAt:     sgFieldFirstLoginAt,
+		SGFieldLastLoginAt:      sgFieldLastLoginAt,
+		SGFieldIsPQL:            sgFieldIsPQL,
+		SGFieldPlanType:         sgFieldPlanType,
 		HydraPublicURL:          hydraPublicURL,
 		ReactAppURL:             reactAppURL,
 		IdentityProviderURL:     identityProviderURL,
