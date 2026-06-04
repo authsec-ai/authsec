@@ -35,7 +35,18 @@
       "Bash(sed -i '' \"s/Create tenant databases by cloning/Create workspace databases by cloning/g\" migrations/master/001_bootstrap.sql)",
       "Bash(echo \"Build exit: $?\")",
       "Bash(echo \"Vet exit: $?\")",
-      "Bash(awk '{:*)"
+      "Bash(awk '{:*)",
+      "Bash(psql --version)",
+      "Bash(pg_isready)",
+      "Read(//Applications/Postgres.app/Contents/Versions/16/bin/**)",
+      "Bash(echo \"---Exit code: $?---\")",
+      "Bash(open -a Postgres)",
+      "Bash(pg_isready -h localhost -p 5432)",
+      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE IF EXISTS authsec_test;\")",
+      "Bash(psql -h localhost -p 5432 -U postgres -c \"CREATE DATABASE authsec_test;\")",
+      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test --set ON_ERROR_STOP=on -f migrations/master/001_bootstrap.sql)",
+      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c ':*)",
+      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")"
     ],
     "additionalDirectories": [
       "/tmp"

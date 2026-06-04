@@ -1754,10 +1754,14 @@ CREATE INDEX idx_mfa_methods_type ON public.mfa_methods USING btree (method_type
 
 CREATE INDEX idx_mfa_methods_user_id ON public.mfa_methods USING btree (user_id);
 
--- migration_logs indexes — add them defensively in case GORM AutoMigrate didn't
--- create them (older runner versions only created the table, not the helper indexes).
-CREATE INDEX IF NOT EXISTS idx_migration_logs_workspace_id ON public.migration_logs USING btree (workspace_id);
-CREATE INDEX IF NOT EXISTS idx_migration_logs_version      ON public.migration_logs USING btree (version);
+-- migration_logs indexes — created defensively only if the table exists.
+-- migration_logs is created by GORM AutoMigrate before this SQL runs.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'migration_logs') THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_migration_logs_workspace_id ON public.migration_logs USING btree (workspace_id)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_migration_logs_version ON public.migration_logs USING btree (version)';
+  END IF;
+END $$;
 
 CREATE INDEX idx_oauth_scope_perms_permission ON public.oauth_scope_permissions USING btree (permission_id);
 
@@ -1978,13 +1982,7 @@ CREATE INDEX idx_teus_workspace_plan ON public.workspace_end_user_states USING b
 
 CREATE INDEX idx_teus_workspace_status ON public.workspace_end_user_states USING btree (workspace_id, status);
 
-CREATE INDEX idx_tm_invited_by ON public.workspace_user_memberships USING btree (invited_by) WHERE (invited_by IS NOT NULL);
-
-CREATE INDEX idx_tm_workspace_status ON public.workspace_user_memberships USING btree (workspace_id, status);
-
-CREATE INDEX idx_tm_workspace_type ON public.workspace_user_memberships USING btree (workspace_id, membership_type);
-
-CREATE INDEX idx_tm_user ON public.workspace_user_memberships USING btree (user_id);
+-- workspace_user_memberships indexes removed (table dropped)
 
 CREATE INDEX idx_totp_active ON public.totp_secrets USING btree (is_active, is_primary);
 
@@ -2216,11 +2214,7 @@ ALTER TABLE ONLY public.workspace_end_user_states
 ALTER TABLE ONLY public.workspace_end_user_states
     ADD CONSTRAINT fk_teus_user FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.workspace_user_memberships
-    ADD CONSTRAINT fk_tm_invited_by FOREIGN KEY (invited_by) REFERENCES public.users(id) ON DELETE SET NULL;
-
-ALTER TABLE ONLY public.workspace_user_memberships
-    ADD CONSTRAINT fk_tm_user FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
+-- workspace_user_memberships FKs removed (table dropped)
 
 ALTER TABLE ONLY public.totp_secrets
     ADD CONSTRAINT fk_totp_workspace FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
@@ -2333,8 +2327,7 @@ ALTER TABLE ONLY public.role_permissions
 ALTER TABLE ONLY public.workspace_end_user_states
     ADD CONSTRAINT workspace_end_user_states_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.workspace_user_memberships
-    ADD CONSTRAINT workspace_user_memberships_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+-- workspace_user_memberships FK removed (table dropped)
 
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT user_groups_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
