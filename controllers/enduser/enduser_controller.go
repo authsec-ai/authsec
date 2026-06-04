@@ -3018,7 +3018,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 
 	// SendGrid sync — fire-and-forget; failures are logged but do not affect the response.
 	if euc.sg != nil {
-		euc.syncSendGrid(userEmail, tenantID, input.FirstLogin)
+		euc.syncSendGrid(userEmail, tenantID, input.FirstLogin, input.Segment)
 	}
 
 	log.Printf("NotifyOwnerNewRegistration: notification sent to %s for new user %s in tenant %s", ownerEmail, userEmail, tenantID)
@@ -3031,13 +3031,17 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 }
 
 // syncSendGrid handles the SendGrid branch of NotifyOwnerNewRegistration.
-func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogin bool) {
+func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogin bool, segment string) {
 	cfg := config.GetConfig()
 	today := time.Now().UTC().Format("2006-01-02")
 
+	if segment == "" {
+		segment = "new-signup"
+	}
+
 	if firstLogin {
 		jobID, err := euc.sg.UpsertContact(userEmail, "", cfg.SendGridListNewSignups, map[string]string{
-			cfg.SGFieldSegment:      "new-signup",
+			cfg.SGFieldSegment:      segment,
 			cfg.SGFieldTenantID:     tenantID,
 			cfg.SGFieldFirstLoginAt: today,
 			cfg.SGFieldPlanType:     "trial",
@@ -3161,8 +3165,6 @@ func (euc *EndUserController) NotifyPlanUpgrade(c *gin.Context) {
 		cfg.SGFieldPlanType: input.NewPlan,
 	}); err != nil {
 		log.Printf("NotifyPlanUpgrade: field update failed for %s: %v", userEmail, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update SendGrid contact"})
-		return
 	}
 
 	allNurtureLists := []string{
@@ -3173,8 +3175,6 @@ func (euc *EndUserController) NotifyPlanUpgrade(c *gin.Context) {
 	}
 	if err := euc.sg.RemoveFromLists(userEmail, allNurtureLists); err != nil {
 		log.Printf("NotifyPlanUpgrade: list removal failed for %s: %v", userEmail, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove contact from nurture lists"})
-		return
 	}
 
 	log.Printf("NotifyPlanUpgrade: %s upgraded to %s — removed from all nurture lists", userEmail, input.NewPlan)
