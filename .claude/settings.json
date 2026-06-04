@@ -13,7 +13,29 @@
       "Read(//Users/pc/Desktop/**)",
       "Read(//Users/pc/**)",
       "WebFetch(domain:mcp-dev.mcpauthz.com)",
-      "WebFetch(domain:dev.api.authsec.dev)"
-    ]
+      "WebFetch(domain:dev.api.authsec.dev)",
+      "Bash(git fetch:*)",
+      "Bash(xargs -I{} git show origin/authsec-dev:{})",
+      "WebFetch(domain:blog.modelcontextprotocol.io)",
+      "WebFetch(domain:stytch.com)",
+      "Bash(sed -i '' 's/uni_groups_tenant_name/uni_groups_workspace_name/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/tenant_user_provider_unique/workspace_user_provider_unique/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_tenant_device_token/fk_workspace_device_token/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/uq_tenant_device_id_tenant/uq_workspace_device_id/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/uq_voice_identity_tenant_platform_user/uq_voice_identity_workspace_platform_user/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_agent_action_tenant/fk_agent_action_workspace/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_agent_guard_settings_tenant/fk_agent_guard_settings_workspace/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_backup_tenant/fk_backup_workspace/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_ciba_auth_tenant/fk_ciba_auth_workspace/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/fk_device_token_tenant/fk_device_token_workspace/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' \"s/relation \\\\\"tenants\\\\\" does not exist/relation does not exist \\(legacy comment\\)/g\" migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' 's/the tenants table; the/the workspaces table; the/g' migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' \"s/Create new tenant databases/Create new workspace databases/g\" migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' \"s/tenant DB creation/workspace DB creation/g\" migrations/master/001_bootstrap.sql)",
+      "Bash(sed -i '' \"s/Create tenant databases by cloning/Create workspace databases by cloning/g\" migrations/master/001_bootstrap.sql)",
+      "Bash(echo \"Build exit: $?\")",
+      "Bash(echo \"Vet exit: $?\")"
+    ],
+    "additionalDirectories": ["/tmp"]
   }
 }

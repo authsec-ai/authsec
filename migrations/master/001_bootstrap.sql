@@ -1812,7 +1812,7 @@ CREATE UNIQUE INDEX idx_resource_servers_resource_uri_active
 
 CREATE INDEX idx_resource_servers_state ON public.resource_servers USING btree (state);
 
-CREATE INDEX idx_resource_servers_workspace_id ON public.resource_servers USING btree (workspace_id);
+-- idx_resource_servers_workspace_id already created at line 1544 (v4 block)
 
 CREATE INDEX idx_risk_policies_action ON public.risk_policies USING btree (action_pattern);
 
@@ -2052,7 +2052,7 @@ CREATE INDEX idx_users_temporary_password ON public.users USING btree (temporary
 
 CREATE INDEX idx_users_workspace_domain ON public.users USING btree (workspace_domain);
 
-CREATE INDEX idx_users_workspace_email ON public.users USING btree (workspace_id, email);
+-- idx_users_workspace_email: the UNIQUE partial index (line ~2064) supersedes this plain index
 
 CREATE INDEX idx_users_workspace_id ON public.users USING btree (workspace_id);
 
