@@ -345,3 +345,63 @@ func (eur *EndUserRepository) VerifyPassword(email, password, clientID string) (
 
 	return user, nil
 }
+
+// DormantUserRow holds the fields needed by the dormant enrollment job.
+type DormantUserRow struct {
+	Email     string
+	FirstName string
+	TenantID  string
+}
+
+// GetDormantUsers returns users who have not logged in since cutoff, are active,
+// and either have never been enrolled in the dormant list or were enrolled before
+// cooloffDate (90-day re-enrollment guard).
+func (eur *EndUserRepository) GetDormantUsers(cutoff, cooloffDate time.Time) ([]DormantUserRow, error) {
+	query := `
+		SELECT COALESCE(email, ''), COALESCE(name, ''), COALESCE(tenant_id::text, '')
+		FROM users
+		WHERE last_login < $1
+		  AND active = true
+		  AND (
+		        dormant_enrolled = false
+		        OR (dormant_enrolled = true AND dormant_enrolled_at < $2)
+		      )
+	`
+	rows, err := eur.executeQuery(query, cutoff, cooloffDate)
+	if err != nil {
+		return nil, fmt.Errorf("GetDormantUsers: %w", err)
+	}
+	defer rows.Close()
+
+	var users []DormantUserRow
+	for rows.Next() {
+		var u DormantUserRow
+		if err := rows.Scan(&u.Email, &u.FirstName, &u.TenantID); err != nil {
+			return nil, fmt.Errorf("GetDormantUsers scan: %w", err)
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// MarkDormantEnrolled sets dormant_enrolled=true and records the current timestamp.
+// Call this after successfully adding the user to the SendGrid dormant list.
+func (eur *EndUserRepository) MarkDormantEnrolled(email string) error {
+	query := `UPDATE users SET dormant_enrolled = true, dormant_enrolled_at = NOW(), updated_at = NOW() WHERE email = $1`
+	_, err := eur.executeExec(query, email)
+	if err != nil {
+		return fmt.Errorf("MarkDormantEnrolled(%s): %w", email, err)
+	}
+	return nil
+}
+
+// ResetDormantEnrolled clears the dormant flag when a dormant user logs back in,
+// so the nightly job can re-enroll them if they go quiet again.
+func (eur *EndUserRepository) ResetDormantEnrolled(email string) error {
+	query := `UPDATE users SET dormant_enrolled = false, dormant_enrolled_at = NULL, updated_at = NOW() WHERE email = $1`
+	_, err := eur.executeExec(query, email)
+	if err != nil {
+		return fmt.Errorf("ResetDormantEnrolled(%s): %w", email, err)
+	}
+	return nil
+}
