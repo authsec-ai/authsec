@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -1381,7 +1382,43 @@ func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 	}
 
 	legacy := hydramodels.NewOAuthLoginService(*config.AppConfig)
-	assertion, loginChallenge, providerName, tenantID, _, err := legacy.ValidateSAMLResponse(samlResponse, relayState)
+
+	// Two-phase validation so the entity_id check honors per-MCP SAML rows:
+	//
+	//  1. Decode RelayState to pull login_challenge + tenant_id WITHOUT
+	//     calling ValidateSAMLResponse (which would do entity_id check
+	//     against a possibly-wrong tenant-wide row).
+	//  2. Look up auth_request_context by login_challenge to find this
+	//     dance's application_id (= resource_server_id).
+	//  3. Call ValidateSAMLResponseForApplication so the entity_id check
+	//     uses the per-MCP saml_providers row if one exists.
+	//
+	// The relay state format is base64("<challenge>:<provider>:<tenant>:<client>"),
+	// minted by CreateSAMLRequest. We parse it inline here rather than
+	// exporting a helper.
+	preLoginChallenge, preTenantID, preParseErr := parseSAMLRelayStateLoginAndTenant(relayState)
+	if preParseErr != nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "parse relay state: " + preParseErr.Error()})
+		return
+	}
+	tenantDB, err := config.GetTenantGORMDB(preTenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, CallbackSAMLResponse{Success: false, Error: "get tenant db: " + err.Error()})
+		return
+	}
+	var arc models.AuthRequestContext
+	if err := tenantDB.Where("login_challenge = ? AND tenant_id = ?", preLoginChallenge, preTenantID).
+		First(&arc).Error; err != nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context not found; SAML must be initiated via /authsec/oauth/v2/authorize: " + err.Error()})
+		return
+	}
+	if arc.ResourceServerID == nil {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context has no resource_server_id; cannot scope SAML user per-MCP"})
+		return
+	}
+
+	// Now do the per-MCP-aware validation.
+	assertion, loginChallenge, providerName, tenantID, _, err := legacy.ValidateSAMLResponseForApplication(samlResponse, relayState, *arc.ResourceServerID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "validate saml response: " + err.Error()})
 		return
@@ -1390,21 +1427,11 @@ func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "RelayState carried no login_challenge"})
 		return
 	}
-
-	// Recover v2 context — gives us the application_id (resource_server_id).
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, CallbackSAMLResponse{Success: false, Error: "get tenant db: " + err.Error()})
-		return
-	}
-	var arc models.AuthRequestContext
-	if err := tenantDB.Where("login_challenge = ? AND tenant_id = ?", loginChallenge, tenantID).
-		First(&arc).Error; err != nil {
-		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context not found; SAML must be initiated via /authsec/oauth/v2/authorize: " + err.Error()})
-		return
-	}
-	if arc.ResourceServerID == nil {
-		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "v2 auth_request_context has no resource_server_id; cannot scope SAML user per-MCP"})
+	// Sanity-check the relay state didn't shapeshift between the pre-parse
+	// and the full validate (it shouldn't — same input both times — but
+	// guard explicitly).
+	if loginChallenge != preLoginChallenge || tenantID != preTenantID {
+		c.JSON(http.StatusBadRequest, CallbackSAMLResponse{Success: false, Error: "relay state inconsistent"})
 		return
 	}
 	tenantUUID, err := uuid.Parse(tenantID)
@@ -1456,4 +1483,27 @@ func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 		Success:    true,
 		RedirectTo: acceptResp.RedirectTo,
 	})
+}
+
+// parseSAMLRelayStateLoginAndTenant pulls login_challenge + tenant_id out of
+// the SAML RelayState without doing any of the heavier XML / signature
+// validation ValidateSAMLResponseForApplication does. Mirror of the format
+// produced by hydramodels.CreateSAMLRequest:
+//
+//	base64("<login_challenge>:<provider_name>:<tenant_id>:<client_id>")
+//
+// Returns (loginChallenge, tenantID, error). Used in the v2 SAML callback
+// to look up the auth_request_context (and thus application_id) BEFORE
+// running full validation, so the entity_id check can target the per-MCP
+// saml_providers row instead of the tenant-wide default.
+func parseSAMLRelayStateLoginAndTenant(relayState string) (string, string, error) {
+	raw, err := base64.StdEncoding.DecodeString(relayState)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid relay state base64: %w", err)
+	}
+	parts := strings.Split(string(raw), ":")
+	if len(parts) < 4 {
+		return "", "", fmt.Errorf("invalid relay state format, expected 4 colon-separated parts, got %d", len(parts))
+	}
+	return parts[0], parts[2], nil
 }

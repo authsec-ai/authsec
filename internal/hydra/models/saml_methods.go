@@ -215,6 +215,43 @@ func (s *OAuthLoginService) GetSAMLProvider(tenantID, providerName string, clien
 	return &provider, nil
 }
 
+// GetSAMLProviderForApplication retrieves a SAML provider with per-MCP
+// scoping (migration 035). Prefers a row scoped to the given Application
+// (resource_server_id = applicationID); falls back to the tenant-wide
+// default (resource_server_id IS NULL). Used by the v2 federated SAML
+// callback path so each MCP can swap in its own Okta/IdP configuration
+// without disturbing the tenant-wide default rows the legacy hmgr flow
+// relies on.
+//
+// The legacy GetSAMLProvider above keeps its signature untouched — it's
+// still keyed on (tenant_id, client_id, provider_name) which is what the
+// legacy hmgr SAML handler expects.
+func (s *OAuthLoginService) GetSAMLProviderForApplication(
+	tenantID, providerName string,
+	applicationID uuid.UUID,
+) (*SAMLProvider, error) {
+	db, err := middlewares.GetConnectionDynamically(config.DB, nil, &tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenant database: %w", err)
+	}
+
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+
+	// ORDER BY resource_server_id NULLS LAST puts the per-MCP override (if
+	// it exists) ahead of the tenant-wide fallback. LIMIT 1 picks whichever
+	// wins. The OR makes both candidate rows visible to the query — the
+	// ORDER BY decides between them.
+	var provider SAMLProvider
+	if err := db.
+		Where("tenant_id = ? AND provider_name = ?", tenantID, providerName).
+		Where("resource_server_id = ? OR resource_server_id IS NULL", applicationID).
+		Order("resource_server_id NULLS LAST").
+		First(&provider).Error; err != nil {
+		return nil, fmt.Errorf("SAML provider not found for application %s: %w", applicationID, err)
+	}
+	return &provider, nil
+}
+
 // CreateSAMLRequest creates a SAML authentication request
 func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChallenge string) (string, string, error) {
 	requestID := fmt.Sprintf("_%s", uuid.New().String())
@@ -353,6 +390,103 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 		}
 	}
 
+	if email == "" {
+		email = nameID
+	}
+
+	return &SAMLAssertion{
+		NameID:     nameID,
+		Email:      email,
+		FirstName:  firstName,
+		LastName:   lastName,
+		Attributes: attributes,
+	}, loginChallenge, providerName, tenantID, clientID, nil
+}
+
+// ValidateSAMLResponseForApplication is the v2-aware variant of
+// ValidateSAMLResponse. Same decode + status check + attribute extraction;
+// the only difference is the entity_id sanity check uses
+// GetSAMLProviderForApplication so per-MCP overrides win over tenant-wide
+// rows. Callers in the v2 federated flow should use this; the legacy
+// hmgr SAML handler should keep using ValidateSAMLResponse.
+//
+// Returns the same tuple shape as ValidateSAMLResponse so callers swap
+// in/out cleanly.
+func (s *OAuthLoginService) ValidateSAMLResponseForApplication(
+	samlResponse, relayState string,
+	applicationID uuid.UUID,
+) (*SAMLAssertion, string, string, string, string, error) {
+	relayBytes, err := base64.StdEncoding.DecodeString(relayState)
+	if err != nil {
+		return nil, "", "", "", "", fmt.Errorf("invalid relay state: %w", err)
+	}
+	parts := []byte(relayBytes)
+	relayParts := make([]string, 0)
+	current := ""
+	for _, b := range parts {
+		if b == ':' {
+			relayParts = append(relayParts, current)
+			current = ""
+		} else {
+			current += string(b)
+		}
+	}
+	relayParts = append(relayParts, current)
+	if len(relayParts) < 4 {
+		return nil, "", "", "", "", fmt.Errorf("invalid relay state format, expected 4 parts, got %d", len(relayParts))
+	}
+	loginChallenge := relayParts[0]
+	providerName := relayParts[1]
+	tenantID := relayParts[2]
+	clientID := relayParts[3]
+
+	responseBytes, err := base64.StdEncoding.DecodeString(samlResponse)
+	if err != nil {
+		return nil, "", "", "", "", fmt.Errorf("failed to decode SAML response: %w", err)
+	}
+	var samlResp SAMLResponseEnvelope
+	if err := xml.Unmarshal(responseBytes, &samlResp); err != nil {
+		return nil, "", "", "", "", fmt.Errorf("failed to unmarshal SAML response: %w", err)
+	}
+	if samlResp.Status.StatusCode.Value != "urn:oasis:names:tc:SAML:2.0:status:Success" {
+		return nil, "", "", "", "", fmt.Errorf("SAML authentication failed: %s", samlResp.Status.StatusCode.Value)
+	}
+
+	// Per-MCP-aware entity_id validation.
+	provider, err := s.GetSAMLProviderForApplication(tenantID, providerName, applicationID)
+	if err != nil {
+		// Fall back to legacy lookup so v2 callers don't break for tenants
+		// that haven't created a per-MCP row yet.
+		var fallbackErr error
+		provider, fallbackErr = s.GetSAMLProvider(tenantID, providerName, clientID)
+		if fallbackErr != nil {
+			return nil, "", "", "", "", fmt.Errorf("SAML provider not found (per-MCP nor tenant-wide): %w", fallbackErr)
+		}
+	}
+	responseEntityID := samlResp.Assertion.Issuer.Value
+	if responseEntityID != provider.EntityID {
+		return nil, "", "", "", "", fmt.Errorf("SAML entity ID validation failed: response from unexpected identity provider")
+	}
+
+	nameID := trimSpace(samlResp.Assertion.Subject.NameID.Value)
+	attributes := make(map[string]interface{})
+	email, firstName, lastName := "", "", ""
+	for _, attr := range samlResp.Assertion.AttributeStatement.Attributes {
+		attrName := attr.Name
+		var attrValue string
+		if len(attr.Values) > 0 {
+			attrValue = trimSpace(attr.Values[0].Value)
+		}
+		attributes[attrName] = attrValue
+		switch attrName {
+		case "email", "emailAddress", "mail", "urn:oid:0.9.2342.19200300.100.1.3":
+			email = attrValue
+		case "givenName", "firstName", "urn:oid:2.5.4.42":
+			firstName = attrValue
+		case "surname", "lastName", "sn", "urn:oid:2.5.4.4":
+			lastName = attrValue
+		}
+	}
 	if email == "" {
 		email = nameID
 	}
