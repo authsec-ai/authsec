@@ -24,11 +24,11 @@ import (
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
-	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
+	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/routes"
@@ -273,6 +273,25 @@ func main() {
 			pkiWorker.Start()
 			log.Printf("PKI retry worker started")
 		}
+	}
+
+	// Dormant user re-engagement job (runs nightly at 02:00 UTC).
+	// Moves users inactive for 30+ days into the SendGrid dormant list.
+	if cfg.SendGridAPIKey != "" {
+		sgSvcForCron := services.NewSendGridService(cfg.SendGridAPIKey)
+		dormantWorker := services.NewDormantWorker(
+			config.Database,
+			sgSvcForCron,
+			cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort, cfg.DBSSLMode,
+			cfg.SendGridListNewSignups, cfg.SendGridListTrialUsers,
+			cfg.SendGridListLeads, cfg.SendGridListDormant,
+			cfg.SGFieldSegment,
+		)
+		stopDormant := dormantWorker.Start()
+		defer stopDormant()
+		log.Println("Dormant worker: scheduled (02:00 UTC daily)")
+	} else {
+		log.Println("Dormant worker: skipped (SENDGRID_API_KEY not set)")
 	}
 
 	// ─────────────────────────────────────────────────────────
