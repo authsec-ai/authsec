@@ -29,7 +29,16 @@ var (
 	timeNow                  = time.Now
 )
 
-type EndUserController struct{}
+// EndUserController handles end-user HTTP endpoints.
+type EndUserController struct {
+	sg *services.SendGridService // nil-safe: SendGrid calls are skipped if not configured
+}
+
+// NewEndUserController creates an EndUserController with a SendGrid service.
+// Pass nil for sg to run without SendGrid (e.g., in unit tests).
+func NewEndUserController(sg *services.SendGridService) *EndUserController {
+	return &EndUserController{sg: sg}
+}
 
 // RegisterEndUser godoc
 // @Summary Register a new end user in tenant database
@@ -2952,13 +2961,14 @@ func (euc *EndUserController) GetClientsByTenantID(c *gin.Context) {
 }
 
 // NotifyOwnerNewRegistration godoc
-// @Summary Notify tenant owner about a new user registration
-// @Description Sends a notification email to the specified owner email with details of the newly registered user
+// @Summary Notify tenant owner about a new user registration and sync to SendGrid
+// @Description Sends owner notification email on every login. On first_login=true enrolls the
+// user in the SendGrid nurture sequence. On first_login=false updates last_login_at only.
 // @Tags EndUser
 // @Accept json
 // @Produce json
 // @Security BearerAuth
-// @Param input body object true "Notification request with owner_email and optional user details"
+// @Param input body object true "Login notification payload"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
@@ -2970,11 +2980,11 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 	var input struct {
 		UserName     string `json:"user_name,omitempty"`
 		TenantDomain string `json:"tenant_domain,omitempty"`
+		FirstLogin   bool   `json:"first_login"`
+		Segment      string `json:"segment,omitempty"`
 	}
-	// Body is optional — ignore bind errors for empty body
 	_ = c.ShouldBindJSON(&input)
 
-	// Extract user email from JWT context
 	userEmail := c.GetString("email_id")
 	if userEmail == "" {
 		userEmail = c.GetString("email")
@@ -2984,29 +2994,31 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 		return
 	}
 
-	// Extract tenant ID from JWT context
 	tenantID, ok := amMiddlewares.GetTenantIDFromToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found in authentication token"})
 		return
 	}
 
-	// Use provided user_name or fall back to email
 	userName := input.UserName
 	if userName == "" {
 		userName = userEmail
 	}
-
-	// Use provided tenant_domain or fall back to tenant ID
 	tenantDomain := input.TenantDomain
 	if tenantDomain == "" {
 		tenantDomain = tenantID
 	}
 
+	// Existing behaviour: notify tenant owner.
 	if err := utils.SendNewUserRegistrationNotificationEmail(ownerEmail, userName, userEmail, tenantDomain); err != nil {
 		log.Printf("NotifyOwnerNewRegistration: failed to send notification email to %s: %v", ownerEmail, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send notification email"})
 		return
+	}
+
+	// SendGrid sync — fire-and-forget; failures are logged but do not affect the response.
+	if euc.sg != nil {
+		euc.syncSendGrid(userEmail, tenantID, input.FirstLogin)
 	}
 
 	log.Printf("NotifyOwnerNewRegistration: notification sent to %s for new user %s in tenant %s", ownerEmail, userEmail, tenantID)
@@ -3015,5 +3027,159 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 		"message":     "Owner notification email sent successfully",
 		"owner_email": ownerEmail,
 		"user_email":  userEmail,
+	})
+}
+
+// syncSendGrid handles the SendGrid branch of NotifyOwnerNewRegistration.
+func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogin bool) {
+	cfg := config.GetConfig()
+	today := time.Now().UTC().Format("2006-01-02")
+
+	if firstLogin {
+		jobID, err := euc.sg.UpsertContact(userEmail, "", cfg.SendGridListNewSignups, map[string]string{
+			cfg.SGFieldSegment:      "new-signup",
+			cfg.SGFieldTenantID:     tenantID,
+			cfg.SGFieldFirstLoginAt: today,
+			cfg.SGFieldPlanType:     "trial",
+			cfg.SGFieldIsPQL:        "false",
+		})
+		if err != nil {
+			log.Printf("syncSendGrid: first-login upsert failed for %s: %v", userEmail, err)
+			return
+		}
+		log.Printf(`{"sendgrid_job_id":%q,"list":"seg-new-signups","contact":%q}`, jobID, userEmail)
+		return
+	}
+
+	// Returning user — check if they were dormant.
+	isDormant, err := euc.isDormantEnrolled(userEmail, tenantID)
+	if err != nil {
+		log.Printf("syncSendGrid: dormant check failed for %s: %v", userEmail, err)
+	}
+
+	if isDormant {
+		jobID, err := euc.sg.UpsertContact(userEmail, "", cfg.SendGridListTrialUsers, map[string]string{
+			cfg.SGFieldLastLoginAt: today,
+			cfg.SGFieldSegment:     "trial",
+		})
+		if err != nil {
+			log.Printf("syncSendGrid: dormant re-enroll failed for %s: %v", userEmail, err)
+		} else {
+			log.Printf(`{"sendgrid_job_id":%q,"list":"seg-trial-users","contact":%q}`, jobID, userEmail)
+		}
+		if removeErr := euc.sg.RemoveFromLists(userEmail, []string{cfg.SendGridListDormant}); removeErr != nil {
+			log.Printf("syncSendGrid: remove from dormant failed for %s: %v", userEmail, removeErr)
+		}
+		euc.resetDormantFlag(userEmail, tenantID)
+		return
+	}
+
+	// Normal returning user — update last_login_at only, no list assignment.
+	jobID, err := euc.sg.UpsertContact(userEmail, "", "", map[string]string{
+		cfg.SGFieldLastLoginAt: today,
+	})
+	if err != nil {
+		log.Printf("syncSendGrid: returning-user update failed for %s: %v", userEmail, err)
+		return
+	}
+	log.Printf(`{"sendgrid_job_id":%q,"list":"none","contact":%q}`, jobID, userEmail)
+}
+
+// isDormantEnrolled queries the tenant DB to check whether the user has dormant_enrolled=true.
+func (euc *EndUserController) isDormantEnrolled(email, tenantID string) (bool, error) {
+	tenantDB, err := tenantConnectionProvider(config.DB, nil, &tenantID)
+	if err != nil {
+		return false, fmt.Errorf("isDormantEnrolled: get tenant db: %w", err)
+	}
+
+	var enrolled bool
+	result := tenantDB.Raw(
+		"SELECT dormant_enrolled FROM users WHERE LOWER(email) = LOWER(?) AND active = true LIMIT 1",
+		email,
+	).Scan(&enrolled)
+	if result.Error != nil {
+		return false, fmt.Errorf("isDormantEnrolled: query: %w", result.Error)
+	}
+	return enrolled, nil
+}
+
+// resetDormantFlag sets dormant_enrolled=false for the user in their tenant DB.
+func (euc *EndUserController) resetDormantFlag(email, tenantID string) {
+	tenantDB, err := tenantConnectionProvider(config.DB, nil, &tenantID)
+	if err != nil {
+		log.Printf("resetDormantFlag: get tenant db: %v", err)
+		return
+	}
+	if err := tenantDB.Exec(
+		"UPDATE users SET dormant_enrolled = false, dormant_enrolled_at = NULL, updated_at = NOW() WHERE LOWER(email) = LOWER(?)",
+		email,
+	).Error; err != nil {
+		log.Printf("resetDormantFlag: update failed for %s: %v", email, err)
+	}
+}
+
+// NotifyPlanUpgrade godoc
+// @Summary Record a plan upgrade in SendGrid and exit all nurture lists
+// @Description Updates plan_type in SendGrid and removes the user from all four nurture lists,
+// stopping the sequence. Call this when a user's subscription moves to a paid plan.
+// @Tags EndUser
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param input body object true "Upgrade payload"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /uflow/auth/notify/plan-upgrade [post]
+func (euc *EndUserController) NotifyPlanUpgrade(c *gin.Context) {
+	var input struct {
+		NewPlan string `json:"new_plan" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new_plan is required"})
+		return
+	}
+
+	userEmail := c.GetString("email_id")
+	if userEmail == "" {
+		userEmail = c.GetString("email")
+	}
+	if userEmail == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "user email not found in token"})
+		return
+	}
+
+	if euc.sg == nil {
+		c.JSON(http.StatusOK, gin.H{"message": "plan upgrade recorded (SendGrid not configured)", "new_plan": input.NewPlan})
+		return
+	}
+
+	cfg := config.GetConfig()
+
+	if _, err := euc.sg.UpsertContact(userEmail, "", "", map[string]string{
+		cfg.SGFieldPlanType: input.NewPlan,
+	}); err != nil {
+		log.Printf("NotifyPlanUpgrade: field update failed for %s: %v", userEmail, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update SendGrid contact"})
+		return
+	}
+
+	allNurtureLists := []string{
+		cfg.SendGridListNewSignups,
+		cfg.SendGridListTrialUsers,
+		cfg.SendGridListLeads,
+		cfg.SendGridListDormant,
+	}
+	if err := euc.sg.RemoveFromLists(userEmail, allNurtureLists); err != nil {
+		log.Printf("NotifyPlanUpgrade: list removal failed for %s: %v", userEmail, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove contact from nurture lists"})
+		return
+	}
+
+	log.Printf("NotifyPlanUpgrade: %s upgraded to %s — removed from all nurture lists", userEmail, input.NewPlan)
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "plan upgrade recorded",
+		"new_plan": input.NewPlan,
 	})
 }
