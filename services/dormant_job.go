@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/database"
+	_ "github.com/lib/pq"
 	"github.com/robfig/cron/v3"
 )
 
