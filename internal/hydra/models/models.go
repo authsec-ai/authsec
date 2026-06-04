@@ -131,6 +131,12 @@ type SAMLProvider struct {
 	ID               uuid.UUID      `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
 	TenantID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"tenant_id"`
 	ClientID         uuid.UUID      `gorm:"type:uuid;not null;index:idx_saml_provider_unique" json:"client_id"`
+	// ResourceServerID scopes a SAML provider config to a specific Application
+	// (migration 035). NULL = tenant-wide default (legacy behaviour).
+	// Lookups in the v2 federated path prefer rows where
+	// resource_server_id = <Application.id>; if none match they fall back to
+	// the NULL row for the same (tenant_id, client_id, provider_name).
+	ResourceServerID *uuid.UUID     `gorm:"type:uuid" json:"resource_server_id,omitempty"`
 	ProviderName     string         `gorm:"type:varchar(255);not null;index:idx_saml_provider_unique;uniqueIndex:idx_saml_provider_unique" json:"provider_name"`
 	DisplayName      string         `gorm:"type:varchar(255);not null" json:"display_name"`
 	EntityID         string         `gorm:"type:varchar(500);not null" json:"entity_id"`

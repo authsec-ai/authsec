@@ -270,10 +270,20 @@ func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (
 		TokenURL              string `gorm:"column:token_url"`
 		UserinfoURL           string `gorm:"column:userinfo_url"`
 	}
-	if err := tenantDB.Table("oidc_providers").
+	// Per-MCP scoping (migration 035): prefer a row scoped to this Application;
+	// fall back to a tenant-wide row (resource_server_id IS NULL) when no
+	// per-MCP override exists. ORDER BY resource_server_id NULLS LAST puts
+	// the scoped row first when both exist for the same provider_name.
+	scopeQ := tenantDB.Table("oidc_providers").
 		Select("id, provider_name, client_id, COALESCE(client_secret,'') AS client_secret, COALESCE(client_secret_vault_path,'') AS client_secret_vault_path, token_url, userinfo_url").
-		Where("provider_name = ?", stateRow.ProviderName).
-		First(&oidcRow).Error; err != nil {
+		Where("provider_name = ?", stateRow.ProviderName)
+	if stateRow.ApplicationID != nil {
+		scopeQ = scopeQ.Where("resource_server_id = ? OR resource_server_id IS NULL", *stateRow.ApplicationID).
+			Order("resource_server_id NULLS LAST")
+	} else {
+		scopeQ = scopeQ.Where("resource_server_id IS NULL")
+	}
+	if err := scopeQ.First(&oidcRow).Error; err != nil {
 		return nil, fmt.Errorf("load oidc_providers config: %w", err)
 	}
 
