@@ -43,6 +43,7 @@ import (
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
+	"github.com/authsec-ai/authsec/services"
 	sdkmgrSvc "github.com/authsec-ai/authsec/services/sdkmgr"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -98,7 +99,8 @@ func SetupRoutes(
 
 	// Legacy / existing controllers
 	groupController := &adminCtrl.GroupController{}
-	endUserController := &userCtrl.EndUserController{}
+	sgSvc := services.NewSendGridService(config.GetConfig().SendGridAPIKey)
+	endUserController := userCtrl.NewEndUserController(sgSvc)
 	adSyncController := &sharedCtrl.ADSyncController{}
 	entraIDController := &sharedCtrl.EntraIDController{}
 	syncConfigController := &adminCtrl.SyncConfigController{}
@@ -109,7 +111,7 @@ func SetupRoutes(
 	}
 
 	domainController := adminCtrl.NewDomainController(config.GetDatabase())
-	hubspotController := platformCtrl.NewHubSpotController()
+	hubspotController := platformCtrl.NewHubSpotController(sgSvc)
 
 	scimController := &platformCtrl.SCIMController{}
 	scimAdminController, err := adminCtrl.NewSCIMAdminController()
@@ -557,6 +559,7 @@ func SetupRoutes(
 			notify.Use(middlewares.AuthMiddleware(), amMiddlewares.ValidateTenantFromToken())
 			{
 				notify.POST("/new-user-registration", endUserController.NotifyOwnerNewRegistration)
+				notify.POST("/plan-upgrade", endUserController.NotifyPlanUpgrade)
 			}
 
 			// Admin authentication (strict rate limit: 5 req/min)
