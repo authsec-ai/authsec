@@ -1844,13 +1844,13 @@ CREATE UNIQUE INDEX idx_roles_global_name ON public.roles USING btree (name) WHE
 
 CREATE INDEX idx_roles_name ON public.roles USING btree (name);
 
-CREATE INDEX idx_roles_workspace_id ON public.roles USING btree (workspace_id);
+-- idx_roles_workspace_id already created in v4 block (line ~1555)
 
 CREATE INDEX idx_roles_workspace_name ON public.roles USING btree (workspace_id, name);
 
 CREATE INDEX idx_roles_updated_at ON public.roles USING btree (updated_at);
 
-CREATE INDEX idx_rs_access_policies_workspace_id ON public.resource_server_access_policies USING btree (workspace_id);
+-- idx_rs_access_policies_workspace_id already created in v4 block (line ~1547)
 
 CREATE INDEX idx_rs_drift_events_rs_occurred ON public.resource_server_drift_events USING btree (rs_id, occurred_at DESC);
 

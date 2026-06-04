@@ -34,8 +34,11 @@
       "Bash(sed -i '' \"s/tenant DB creation/workspace DB creation/g\" migrations/master/001_bootstrap.sql)",
       "Bash(sed -i '' \"s/Create tenant databases by cloning/Create workspace databases by cloning/g\" migrations/master/001_bootstrap.sql)",
       "Bash(echo \"Build exit: $?\")",
-      "Bash(echo \"Vet exit: $?\")"
+      "Bash(echo \"Vet exit: $?\")",
+      "Bash(awk '{:*)"
     ],
-    "additionalDirectories": ["/tmp"]
+    "additionalDirectories": [
+      "/tmp"
+    ]
   }
 }
