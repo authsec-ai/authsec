@@ -3018,7 +3018,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 
 	// SendGrid sync — fire-and-forget; failures are logged but do not affect the response.
 	if euc.sg != nil {
-		euc.syncSendGrid(userEmail, tenantID, input.FirstLogin, input.Segment)
+		go euc.syncSendGrid(userEmail, tenantID, input.FirstLogin, input.Segment)
 	}
 
 	log.Printf("NotifyOwnerNewRegistration: notification sent to %s for new user %s in tenant %s", ownerEmail, userEmail, tenantID)
@@ -3103,6 +3103,9 @@ func (euc *EndUserController) isDormantEnrolled(email, tenantID string) (bool, e
 	).Scan(&enrolled)
 	if result.Error != nil {
 		return false, fmt.Errorf("isDormantEnrolled: query: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		log.Printf("isDormantEnrolled: no active user row found for %s in tenant %s", email, tenantID)
 	}
 	return enrolled, nil
 }

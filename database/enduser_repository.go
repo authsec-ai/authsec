@@ -360,7 +360,7 @@ func (eur *EndUserRepository) GetDormantUsers(cutoff, cooloffDate time.Time) ([]
 	query := `
 		SELECT COALESCE(email, ''), COALESCE(name, ''), COALESCE(tenant_id::text, '')
 		FROM users
-		WHERE last_login < $1
+		WHERE (last_login IS NULL OR last_login < $1)
 		  AND active = true
 		  AND (
 		        dormant_enrolled = false

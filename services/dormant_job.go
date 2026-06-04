@@ -149,7 +149,7 @@ func (w *DormantWorker) queryDormantUsers(db *sql.DB, cutoff, cooloff time.Time)
 	query := `
 		SELECT COALESCE(email, ''), COALESCE(name, '')
 		FROM users
-		WHERE last_login < $1
+		WHERE (last_login IS NULL OR last_login < $1)
 		  AND active = true
 		  AND (
 		        dormant_enrolled = false
