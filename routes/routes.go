@@ -585,6 +585,7 @@ func SetupRoutes(
 				enduserAuth.GET("/challenge", endUserAuthController.GetAuthChallenge)
 				enduserAuth.POST("/initiate-registration", endUserAuthController.InitiateRegistration)
 				enduserAuth.POST("/verify-otp", endUserAuthController.VerifyOTPAndCompleteRegistration)
+				enduserAuth.POST("/resend-otp", endUserAuthController.ResendOTP)
 				enduserAuth.POST("/login/precheck", endUserAuthController.EndUserLoginPrecheck)
 				enduserAuth.POST("/webauthn-callback", endUserAuthController.WebAuthnCallback)
 				enduserAuth.POST("/delegate-svid", spiffeDelegateController.DelegateSVID)
@@ -1105,6 +1106,7 @@ func SetupRoutes(
 
 		// Legacy login/register endpoints
 		uflow.POST("/register/verify", userController.VerifyOTPAndCompleteRegistration)
+		uflow.POST("/register/resendOtp", userController.ResendOTP)
 		uflow.POST("/login/webauthn-callback", userController.WebAuthnCallback)
 		uflow.POST("/login", userController.Login)
 
