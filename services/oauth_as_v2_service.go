@@ -126,6 +126,14 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest) (*DCRResponse, error)
 		req.TokenEndpointAuthMethod = "none"
 	}
 
+	// Make sure DCR'd clients can always request the OIDC core scopes —
+	// MCP clients (Claude Code, Cursor) ask for these at /authorize and
+	// Hydra rejects with invalid_scope if the client wasn't created with
+	// them in its allowed `scope` field. Union req.Scope with the OIDC
+	// core set so the client's allowed list is the superset, even if the
+	// DCR call only sent the resource-specific scopes.
+	req.Scope = unionScopes(req.Scope, "openid email profile offline_access")
+
 	clientID := uuid.New().String()
 	hydraClientID := uuid.New().String()
 
@@ -240,4 +248,30 @@ func validateRedirectURI(raw string) error {
 		}
 	}
 	return fmt.Errorf("must be https:// (or http://localhost for dev)")
+}
+
+// unionScopes returns a deduplicated space-separated scope string covering
+// every token in `existing` plus every token in `ensure`. Preserves the
+// order tokens first appear in (existing wins; new ones from ensure get
+// appended at the end). Used at DCR time to make sure clients always have
+// the OIDC core scopes in their allowed list even if the DCR request only
+// asked for resource-specific scopes.
+func unionScopes(existing, ensure string) string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 8)
+	for _, s := range strings.Fields(existing) {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	for _, s := range strings.Fields(ensure) {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return strings.Join(out, " ")
 }
