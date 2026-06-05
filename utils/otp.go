@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/smtp"
 	"strings"
 	"time"
@@ -64,18 +65,40 @@ Your App Team
 
 	message := fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", email, subject, body)
 
-	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
-	// Send email
 	log.Printf("SendOTPEmail: attempting to send OTP email to %s", email)
-	err := smtp.SendMail(
-		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
-		auth,
-		smtpUser,
-		[]string{email},
-		[]byte(message),
-	)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", smtpHost, smtpPort), 10*time.Second)
+	if err != nil {
+		log.Printf("SendOTPEmail: SMTP dial failed for %s: %v", email, err)
+		return fmt.Errorf("SMTP dial failed: %w", err)
+	}
+	defer conn.Close()
+	conn.(*net.TCPConn).SetDeadline(time.Now().Add(15 * time.Second))
+
+	client, err := smtp.NewClient(conn, smtpHost)
+	if err != nil {
+		return fmt.Errorf("SMTP client create failed: %w", err)
+	}
+	defer client.Quit()
+
+	if err = client.Auth(auth); err != nil {
+		return fmt.Errorf("SMTP auth failed: %w", err)
+	}
+	if err = client.Mail(smtpUser); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM failed: %w", err)
+	}
+	if err = client.Rcpt(email); err != nil {
+		return fmt.Errorf("SMTP RCPT TO failed: %w", err)
+	}
+	wc, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA failed: %w", err)
+	}
+	if _, err = fmt.Fprint(wc, string(message)); err != nil {
+		return fmt.Errorf("SMTP write body failed: %w", err)
+	}
+	err = wc.Close()
 
 	if err != nil {
 		log.Printf("SendOTPEmail: failed to send OTP email to %s: %v", email, err)

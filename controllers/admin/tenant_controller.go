@@ -1041,6 +1041,7 @@ func (uc *UserController) ResendOTP(c *gin.Context) {
 		return
 	}
 
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
 	log.Printf("ResendOTP: Processing request for email: %s", input.Email)
 
 	// Check if there's a pending registration for this email
