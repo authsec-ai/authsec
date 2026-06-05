@@ -49,7 +49,9 @@
       "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")",
       "Bash(echo \"Exit: $?\")",
       "Bash(kubectl scale:*)",
-      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT provider_name, workspace_id IS NULL AS is_platform FROM oidc_providers;\")"
+      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT provider_name, workspace_id IS NULL AS is_platform FROM oidc_providers;\")",
+      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT column_name FROM information_schema.columns WHERE table_name = 'saml_providers' AND column_name IN \\('sp_entity_id','sp_acs_url','want_assertions_signed'\\);\")",
+      "Bash(echo \"SQL Exit: $?\")"
     ],
     "additionalDirectories": [
       "/tmp"

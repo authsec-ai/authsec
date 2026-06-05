@@ -456,7 +456,14 @@ func (asc *AdminSyncController) syncADUserToMainDB(adUser models.ADUser, workspa
 		// Create tenant record for this admin user with same tenant configuration
 		if err := asc.createTenantForAdminUser(newUser, existingTenant); err != nil {
 			log.Printf("Warning: Failed to create tenant record for admin user %s: %v", adUser.Email, err)
-			// Don't fail the sync if tenant creation fails, just log it
+		}
+
+		// Write workspace_memberships for the synced user.
+		var memberRoleID uuid.UUID
+		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
+			config.DB.Exec(`INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+				VALUES (?, ?, ?, ?, 'active', 'ad', NOW(), NOW()) ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+				uuid.New(), workspaceID, newUser.ID, memberRoleID)
 		}
 
 		log.Printf("Created new AD admin user: %s (%s)", adUser.Email, adUser.ObjectGUID)
@@ -654,7 +661,14 @@ func (asc *AdminSyncController) syncEntraUserToMainDB(entraUser shared.EntraIDUs
 		// Create tenant record for this admin user with same tenant configuration
 		if err := asc.createTenantForAdminUser(newUser, existingTenant); err != nil {
 			log.Printf("Warning: Failed to create tenant record for admin user %s: %v", entraUser.Mail, err)
-			// Don't fail the sync if tenant creation fails, just log it
+		}
+
+		// Write workspace_memberships for the synced user.
+		var memberRoleID uuid.UUID
+		if err := config.DB.Raw(`SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1`, workspaceID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
+			config.DB.Exec(`INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+				VALUES (?, ?, ?, ?, 'active', 'entra', NOW(), NOW()) ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+				uuid.New(), workspaceID, newUser.ID, memberRoleID)
 		}
 
 		log.Printf("Created new Entra ID admin user: %s (%s)", entraUser.Mail, entraUser.ID)

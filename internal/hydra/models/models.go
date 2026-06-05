@@ -151,10 +151,13 @@ type SAMLProvider struct {
 	MetadataURL      string         `gorm:"type:varchar(500)" json:"metadata_url"`
 	NameIDFormat     string         `gorm:"type:varchar(255);default:'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress'" json:"name_id_format"`
 	AttributeMapping datatypes.JSON `gorm:"type:jsonb" json:"attribute_mapping"`
-	IsActive         bool           `gorm:"default:true" json:"is_active"`
-	SortOrder        int            `gorm:"default:0" json:"sort_order"`
-	CreatedAt        time.Time      `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
-	UpdatedAt        time.Time      `gorm:"default:CURRENT_TIMESTAMP" json:"updated_at"`
+	IsActive              bool           `gorm:"default:true" json:"is_active"`
+	SortOrder             int            `gorm:"default:0" json:"sort_order"`
+	SPEntityID            string         `gorm:"type:text" json:"sp_entity_id"`
+	SPACSURL              string         `gorm:"type:text;column:sp_acs_url" json:"sp_acs_url"`
+	WantAssertionsSigned  bool           `gorm:"default:true" json:"want_assertions_signed"`
+	CreatedAt             time.Time      `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt             time.Time      `gorm:"default:CURRENT_TIMESTAMP" json:"updated_at"`
 }
 
 func (SAMLProvider) TableName() string { return "saml_providers" }

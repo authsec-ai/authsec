@@ -401,6 +401,21 @@ func (sc *SCIMController) CreateUser(c *gin.Context) {
 
 	log.Printf("SCIM: Created user %s (tenant: %s)", email, workspaceID)
 
+	// Write workspace_memberships row with default "member" role.
+	// Look up (or create) the "member" role for this workspace.
+	var memberRoleID uuid.UUID
+	if err := config.DB.Raw(`
+		SELECT id FROM roles WHERE workspace_id = ? AND LOWER(name) = 'member' LIMIT 1
+	`, workspaceUUID).Scan(&memberRoleID).Error; err == nil && memberRoleID != uuid.Nil {
+		config.DB.Exec(`
+			INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, source, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 'active', 'scim', NOW(), NOW())
+			ON CONFLICT (workspace_id, user_id) DO NOTHING
+		`, uuid.New(), workspaceUUID, newUser.ID, memberRoleID)
+	} else {
+		log.Printf("SCIM: no 'member' role found for workspace %s — workspace_memberships not created", workspaceID)
+	}
+
 	// Send temporary password email to the user (async — don't block SCIM response)
 	go func() {
 		if err := utils.SendTemporaryPasswordEmail(strings.ToLower(email), tempPassword); err != nil {
@@ -562,6 +577,18 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	// Re-fetch
 	tenantDB.Where("id = ?", userUUID).First(&user)
 
+	// Sync membership status when active flag changes.
+	workspaceUUID, _ := uuid.Parse(workspaceID)
+	if active, ok := updates["active"]; ok {
+		if activeBool, isBool := active.(bool); isBool {
+			if activeBool {
+				config.DB.Exec(`UPDATE workspace_memberships SET status = 'active', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
+			} else {
+				config.DB.Exec(`UPDATE workspace_memberships SET status = 'suspended', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
+			}
+		}
+	}
+
 	middlewares.Audit(c, "scim", workspaceID, "patch_user", &middlewares.AuditChanges{
 		After: map[string]interface{}{
 			"user_id":    userID,
@@ -604,6 +631,10 @@ func (sc *SCIMController) DeleteUser(c *gin.Context) {
 	}
 
 	log.Printf("SCIM: Deleted user %s (tenant: %s)", userID, workspaceID)
+
+	// Mark membership as 'left' (soft delete — matches the user soft-delete above).
+	workspaceUUID, _ := uuid.Parse(workspaceID)
+	config.DB.Exec(`UPDATE workspace_memberships SET status = 'left', updated_at = NOW() WHERE workspace_id = ? AND user_id = ?`, workspaceUUID, userUUID)
 
 	middlewares.Audit(c, "scim", workspaceID, "delete_user", &middlewares.AuditChanges{
 		Before: map[string]interface{}{"user_id": userID},

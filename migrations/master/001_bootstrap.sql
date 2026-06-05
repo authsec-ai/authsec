@@ -1555,6 +1555,9 @@ CREATE TABLE public.saml_providers (
     attribute_mapping jsonb,
     is_active boolean DEFAULT true,
     sort_order int DEFAULT 0,
+    sp_entity_id text,                  -- our SP entity ID (audience restriction check)
+    sp_acs_url text,                    -- our assertion consumer service URL (destination check)
+    want_assertions_signed boolean DEFAULT true,
     created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamptz DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT idx_saml_provider_unique UNIQUE (workspace_id, provider_name),
