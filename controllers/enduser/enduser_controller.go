@@ -2980,10 +2980,14 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 	var input struct {
 		UserName     string `json:"user_name,omitempty"`
 		TenantDomain string `json:"tenant_domain,omitempty"`
-		FirstLogin   bool   `json:"first_login"`
+		FirstLogin   *bool  `json:"first_login"`
 		Segment      string `json:"segment,omitempty"`
 	}
 	_ = c.ShouldBindJSON(&input)
+	if input.FirstLogin == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "first_login is required"})
+		return
+	}
 
 	userEmail := c.GetString("email_id")
 	if userEmail == "" {
@@ -3018,7 +3022,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 
 	// SendGrid sync — fire-and-forget; failures are logged but do not affect the response.
 	if euc.sg != nil {
-		go euc.syncSendGrid(userEmail, tenantID, input.FirstLogin, input.Segment)
+		go euc.syncSendGrid(userEmail, tenantID, *input.FirstLogin, input.Segment)
 	}
 
 	log.Printf("NotifyOwnerNewRegistration: notification sent to %s for new user %s in tenant %s", ownerEmail, userEmail, tenantID)
@@ -3033,7 +3037,7 @@ func (euc *EndUserController) NotifyOwnerNewRegistration(c *gin.Context) {
 // syncSendGrid handles the SendGrid branch of NotifyOwnerNewRegistration.
 func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogin bool, segment string) {
 	cfg := config.GetConfig()
-	today := time.Now().UTC().Format("2006-01-02")
+	todayUnix := time.Now().UTC().Format(time.RFC3339)
 
 	if segment == "" {
 		segment = "new-signup"
@@ -3043,7 +3047,7 @@ func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogi
 		jobID, err := euc.sg.UpsertContact(userEmail, "", cfg.SendGridListNewSignups, map[string]string{
 			cfg.SGFieldSegment:      segment,
 			cfg.SGFieldTenantID:     tenantID,
-			cfg.SGFieldFirstLoginAt: today,
+			cfg.SGFieldFirstLoginAt: todayUnix,
 			cfg.SGFieldPlanType:     "trial",
 			cfg.SGFieldIsPQL:        "false",
 		})
@@ -3063,7 +3067,7 @@ func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogi
 
 	if isDormant {
 		jobID, err := euc.sg.UpsertContact(userEmail, "", cfg.SendGridListTrialUsers, map[string]string{
-			cfg.SGFieldLastLoginAt: today,
+			cfg.SGFieldLastLoginAt: todayUnix,
 			cfg.SGFieldSegment:     "trial",
 		})
 		if err != nil {
@@ -3080,7 +3084,7 @@ func (euc *EndUserController) syncSendGrid(userEmail, tenantID string, firstLogi
 
 	// Normal returning user — update last_login_at only, no list assignment.
 	jobID, err := euc.sg.UpsertContact(userEmail, "", "", map[string]string{
-		cfg.SGFieldLastLoginAt: today,
+		cfg.SGFieldLastLoginAt: todayUnix,
 	})
 	if err != nil {
 		log.Printf("syncSendGrid: returning-user update failed for %s: %v", userEmail, err)
