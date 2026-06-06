@@ -116,20 +116,20 @@ func (s *ConsentService) UpsertConsent(
 	}
 
 	grant := models.OAuthConsentGrant{
-		WorkspaceID:         workspaceID,
+		WorkspaceID:      workspaceID,
 		UserID:           userID,
-		ClientID:         clientID,
+		OAuthClientID:    clientID,
 		ResourceServerID: resourceServerID,
 		GrantedScopes:    pq.StringArray(grantedScopes),
 		ExpiresAt:        time.Now().Add(ttl),
 	}
 
-	// Upsert: on conflict (workspace_id, user_id, client_id, resource_server_id) → update
+	// Upsert: on conflict (workspace_id, user_id, oauth_client_id, resource_server_id) → update
 	result := s.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"},
 			{Name: "user_id"},
-			{Name: "client_id"},
+			{Name: "oauth_client_id"},
 			{Name: "resource_server_id"},
 		},
 		DoUpdates: clause.AssignmentColumns([]string{"granted_scopes", "expires_at", "revoked_at", "updated_at"}),

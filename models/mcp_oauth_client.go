@@ -28,6 +28,7 @@ type MCPOAuthClient struct {
 	RedirectReviewPending   bool           `json:"-" gorm:"default:false"`
 	PostLogoutRedirectURIs  pq.StringArray `json:"post_logout_redirect_uris,omitempty" gorm:"type:text[];default:'{}'"`
 	SupportsRefreshToken    bool           `json:"supports_refresh_token" gorm:"default:false"`
+	IsConfidential          bool           `json:"is_confidential" gorm:"default:false"`
 	// SyncStatus tracks Hydra synchronisation: active | sync_error | pending_delete.
 	// The reconciler service walks non-'active' rows and re-attempts the Hydra
 	// side so we never strand a half-created/half-deleted client.

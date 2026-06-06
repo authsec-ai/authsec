@@ -325,10 +325,19 @@ func (ctrl *OAuthASController) Token(c *gin.Context) {
 			return
 		}
 		ctrl.tokenRefreshGrant(c, oauthClient)
+	case "client_credentials":
+		if !oauthClient.IsConfidential {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "unauthorized_client",
+				"error_description": "client_credentials grant requires a confidential client",
+			})
+			return
+		}
+		ctrl.tokenClientCredentialsGrant(c, oauthClient)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "unsupported_grant_type",
-			"error_description": "only authorization_code and refresh_token are supported",
+			"error_description": "only authorization_code, refresh_token, and client_credentials are supported",
 		})
 		return
 	}
@@ -741,6 +750,60 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 
 	// All checks passed — return the refreshed token set.
 	log.Printf("[MCP_AUTH] tokenRefreshGrant: success client=%s resource=%s", oauthClient.ClientID, resourceParam)
+	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
+}
+
+// tokenClientCredentialsGrant handles client_credentials token exchange for
+// confidential clients (AI agents, service accounts). No user involvement —
+// the token represents the client itself.
+func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
+	resourceParam := c.PostForm("resource")
+	scopeParam := c.PostForm("scope")
+
+	if resourceParam == "" {
+		inferredResource, err := ctrl.service.InferSingleResourceURIForClient(oauthClient)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_request",
+				"error_description": "resource parameter required for client_credentials grant",
+			})
+			return
+		}
+		resourceParam = inferredResource
+	}
+
+	// Validate resource — client must be registered for this RS.
+	rs, err := ctrl.rsService.GetByResourceURI(resourceParam)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "unknown resource",
+		})
+		return
+	}
+	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
+	if regErr != nil || reg.Status != "approved" {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "client not authorized for this resource",
+		})
+		return
+	}
+
+	// Proxy to Hydra — Hydra handles client_credentials natively.
+	c.Request.PostForm.Set("client_id", oauthClient.HydraClientID)
+	if scopeParam != "" {
+		c.Request.PostForm.Set("scope", scopeParam)
+	}
+	statusCode, body, respHeader, err := ctrl.service.ProxyFormToHydraPublicCapture(
+		"/oauth2/token", c.Request.PostForm, c.Request.Header,
+	)
+	if err != nil {
+		log.Printf("[MCP_AUTH] tokenClientCredentialsGrant: Hydra unavailable: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server unavailable"})
+		return
+	}
+
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
 

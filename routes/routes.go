@@ -215,10 +215,10 @@ func SetupRoutes(
 	oauth := r.Group("/oauth")
 	oauth.Use(oauthASController.CanonicalIssuerOnly())
 	{
-		oauth.GET("/authorize", oauthASController.Authorize)
-		oauth.POST("/token", oauthASController.Token)
+		oauth.GET("/authorize", middlewares.StrictAuthRateLimitMiddleware(30, time.Minute), oauthASController.Authorize)
+		oauth.POST("/token", middlewares.StrictAuthRateLimitMiddleware(30, time.Minute), oauthASController.Token)
 		oauth.POST("/register", middlewares.StrictAuthRateLimitMiddleware(10, time.Minute), oauthASController.Register)
-		oauth.POST("/introspect", oauthASController.Introspect)
+		oauth.POST("/introspect", middlewares.StrictAuthRateLimitMiddleware(60, time.Minute), oauthASController.Introspect)
 		oauth.GET("/jwks", oauthASController.JWKS)
 		oauth.POST("/revoke", oauthASController.Revoke)
 		// OIDC endpoints
@@ -1070,6 +1070,8 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		// Migration API (formerly authsec-migration microservice)
 		// Served under /authsec/migration.
 		// ────────────────────────────────────────────────────
+		// Migration API — master bootstrap only. Per-tenant DB routes removed
+		// (single-DB architecture; per-workspace databases do not exist).
 		migCtrl := adminCtrl.NewMigrationController()
 		mig := authsec.Group("/migration")
 		{
@@ -1078,17 +1080,6 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			{
 				master.POST("/run", migCtrl.RunMasterMigrations)
 				master.GET("/status", migCtrl.GetMasterMigrationStatus)
-			}
-			tenants := mig.Group("/tenants")
-			tenants.Use(middlewares.AuthMiddleware())
-			{
-				tenants.GET("", migCtrl.ListTenants)
-				tenants.POST("/create-db", migCtrl.CreateWorkspaceDB)
-				tenants.POST("/create-from-template", migCtrl.CreateTenantFromTemplate)
-				tenants.GET("/template-status", migCtrl.GetTemplateStatus)
-				tenants.POST("/migrate-all", migCtrl.MigrateAllTenants)
-				tenants.POST("/:workspace_id/migrations/run", migCtrl.RunTenantMigrations)
-				tenants.GET("/:workspace_id/migrations/status", migCtrl.GetTenantMigrationStatus)
 			}
 		}
 

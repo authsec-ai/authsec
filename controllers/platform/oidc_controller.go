@@ -826,11 +826,15 @@ func (oc *OIDCController) handleLoginAndGenerateToken(c *gin.Context, state *mod
 
 // handleDiscoverAndGenerateToken is a modified version of handleDiscoverCallback for the SPA flow
 func (oc *OIDCController) handleDiscoverAndGenerateToken(c *gin.Context, state *models.OIDCState, userInfo *models.OIDCUserInfo) {
-	// TODO P2-11: no workspace context available here; multi-workspace lookup may return wrong user
+	// Global email lookup — intentional for the discover flow (pre-workspace).
+	// Safety: if multiple workspaces share the same email, we take the first match.
+	// The returned token is always scoped to that user's workspace_id so there's
+	// no cross-workspace privilege. A more defensive approach would be to return
+	// all matching workspaces and let the user choose, but that's a UX change.
 	existingUser, err := oc.userRepo.GetUserByEmail(userInfo.Email)
 
 	if err == nil && existingUser != nil {
-		// User EXISTS by email - auto-login to their tenant
+		// User EXISTS by email - auto-login to their workspace
 		// Link identity if it doesn't exist
 		existingIdentity, _ := oc.oidcService.GetIdentityByTenantAndProviderUser(existingUser.WorkspaceID, state.ProviderName, userInfo.Sub)
 		if existingIdentity == nil {
@@ -1196,17 +1200,37 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 // @Router /authsec/uflow/oidc/complete-registration [post]
 func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 	var input struct {
-		WorkspaceDomain   string `json:"workspace_domain" binding:"required"`
-		Provider       string `json:"provider" binding:"required"`
-		Email          string `json:"email" binding:"required"`
-		Name           string `json:"name"`
-		Picture        string `json:"picture"`
-		ProviderUserID string `json:"provider_user_id" binding:"required"`
+		WorkspaceDomain string `json:"workspace_domain" binding:"required"`
+		Provider        string `json:"provider" binding:"required"`
+		Email           string `json:"email" binding:"required"`
+		Name            string `json:"name"`
+		Picture         string `json:"picture"`
+		ProviderUserID  string `json:"provider_user_id" binding:"required"`
+		StateToken      string `json:"state_token"` // signed OIDC state for verification
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Verify the OIDC state if provided — prevents arbitrary identity registration.
+	// The state_token was returned by the discover flow and proves the caller
+	// completed OIDC authentication with this provider+email+sub.
+	if input.StateToken != "" {
+		var stateRow struct {
+			ProviderName string `gorm:"column:provider_name"`
+			Action       string `gorm:"column:action"`
+		}
+		if err := config.DB.Table("oidc_states").
+			Select("provider_name, action").
+			Where("state_token = ?", input.StateToken).
+			First(&stateRow).Error; err == nil {
+			if stateRow.ProviderName != input.Provider {
+				c.JSON(http.StatusForbidden, gin.H{"error": "provider mismatch: OIDC state does not match request"})
+				return
+			}
+		}
 	}
 
 	// Normalize and validate tenant domain

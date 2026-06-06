@@ -11,27 +11,26 @@ import (
 )
 
 // PostgresWorkspaceRepository implements the WorkspaceRepository interface
+// using the `workspaces` table (the canonical workspace identity table).
 type PostgresWorkspaceRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresWorkspaceRepository creates a new tenant repository
 func NewPostgresWorkspaceRepository(db *sql.DB) repositories.WorkspaceRepository {
 	return &PostgresWorkspaceRepository{db: db}
 }
 
-// GetByID retrieves a tenant by ID (queries by workspace_id UUID from JWT)
 func (r *PostgresWorkspaceRepository) GetByID(ctx context.Context, id string) (*models.Tenant, error) {
 	query := `
 		SELECT
-			workspace_id::text,
+			id::text,
 			name,
 			COALESCE(vault_mount, workspace_domain) as vault_mount,
 			status,
 			created_at,
 			updated_at
-		FROM tenants
-		WHERE workspace_id = $1::uuid AND status = 'active'
+		FROM workspaces
+		WHERE id = $1::uuid AND status = 'active'
 	`
 
 	tenant := &models.Tenant{}
@@ -45,26 +44,25 @@ func (r *PostgresWorkspaceRepository) GetByID(ctx context.Context, id string) (*
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Tenant not found", err)
+		return nil, errors.NewNotFoundError("Workspace not found", err)
 	}
 	if err != nil {
-		return nil, errors.NewInternalError("Failed to get tenant", err)
+		return nil, errors.NewInternalError("Failed to get workspace", err)
 	}
 
 	return tenant, nil
 }
 
-// GetByDomain retrieves a tenant by domain name
 func (r *PostgresWorkspaceRepository) GetByDomain(ctx context.Context, domain string) (*models.Tenant, error) {
 	query := `
 		SELECT
-			workspace_id::text,
+			id::text,
 			name,
 			COALESCE(vault_mount, workspace_domain) as vault_mount,
 			status,
 			created_at,
 			updated_at
-		FROM tenants
+		FROM workspaces
 		WHERE workspace_domain = $1 AND status = 'active'
 	`
 
@@ -79,119 +77,97 @@ func (r *PostgresWorkspaceRepository) GetByDomain(ctx context.Context, domain st
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, errors.NewNotFoundError("Tenant not found", err)
+		return nil, errors.NewNotFoundError("Workspace not found", err)
 	}
 	if err != nil {
-		return nil, errors.NewInternalError("Failed to get tenant", err)
+		return nil, errors.NewInternalError("Failed to get workspace", err)
 	}
 
 	return tenant, nil
 }
 
-// Create creates a new tenant
 func (r *PostgresWorkspaceRepository) Create(ctx context.Context, tenant *models.Tenant) error {
 	query := `
-		INSERT INTO tenants (id, name, vault_mount, status, created_at, updated_at)
+		INSERT INTO workspaces (id, name, vault_mount, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`
 
 	now := time.Now()
 	tenant.CreatedAt = now
 	tenant.UpdatedAt = now
-
 	if tenant.Status == "" {
 		tenant.Status = "active"
 	}
 
 	_, err := r.db.ExecContext(ctx, query,
-		tenant.ID,
-		tenant.Name,
-		tenant.VaultMount,
-		//tenant.VaultNamespace,
-		tenant.Status,
-		tenant.CreatedAt,
-		tenant.UpdatedAt,
+		tenant.ID, tenant.Name, tenant.VaultMount, tenant.Status,
+		tenant.CreatedAt, tenant.UpdatedAt,
 	)
-
 	if err != nil {
-		return errors.NewInternalError("Failed to create tenant", err)
+		return errors.NewInternalError("Failed to create workspace", err)
 	}
-
 	return nil
 }
 
-// Update updates an existing tenant
 func (r *PostgresWorkspaceRepository) Update(ctx context.Context, tenant *models.Tenant) error {
 	query := `
-		UPDATE tenants
-		SET name = $2, vault_mount = $3,status = $4, updated_at = $5
+		UPDATE workspaces
+		SET name = $2, vault_mount = $3, status = $4, updated_at = $5
 		WHERE id = $1
 	`
 
 	tenant.UpdatedAt = time.Now()
 
 	result, err := r.db.ExecContext(ctx, query,
-		tenant.ID,
-		tenant.Name,
-		tenant.VaultMount,
-		//tenant.VaultNamespace,
-		tenant.Status,
-		tenant.UpdatedAt,
+		tenant.ID, tenant.Name, tenant.VaultMount, tenant.Status, tenant.UpdatedAt,
 	)
-
 	if err != nil {
-		return errors.NewInternalError("Failed to update tenant", err)
+		return errors.NewInternalError("Failed to update workspace", err)
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return errors.NewInternalError("Failed to get affected rows", err)
 	}
-
 	if rows == 0 {
-		return errors.NewNotFoundError("Tenant not found", nil)
+		return errors.NewNotFoundError("Workspace not found", nil)
 	}
-
 	return nil
 }
 
-// Delete soft deletes a tenant
 func (r *PostgresWorkspaceRepository) Delete(ctx context.Context, id string) error {
 	query := `
-		UPDATE tenants
+		UPDATE workspaces
 		SET status = 'deleted', updated_at = $2
 		WHERE id = $1
 	`
 
 	result, err := r.db.ExecContext(ctx, query, id, time.Now())
 	if err != nil {
-		return errors.NewInternalError("Failed to delete tenant", err)
+		return errors.NewInternalError("Failed to delete workspace", err)
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return errors.NewInternalError("Failed to get affected rows", err)
 	}
-
 	if rows == 0 {
-		return errors.NewNotFoundError("Tenant not found", nil)
+		return errors.NewNotFoundError("Workspace not found", nil)
 	}
-
 	return nil
 }
 
-// List retrieves all active tenants
 func (r *PostgresWorkspaceRepository) List(ctx context.Context) ([]*models.Tenant, error) {
 	query := `
 		SELECT id, name, vault_mount, status, created_at, updated_at
-		FROM tenants
+		FROM workspaces
 		WHERE status = 'active'
 		ORDER BY created_at DESC
 	`
 
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, errors.NewInternalError("Failed to list tenants", err)
+		return nil, errors.NewInternalError("Failed to list workspaces", err)
 	}
 	defer rows.Close()
 
@@ -199,22 +175,17 @@ func (r *PostgresWorkspaceRepository) List(ctx context.Context) ([]*models.Tenan
 	for rows.Next() {
 		tenant := &models.Tenant{}
 		err := rows.Scan(
-			&tenant.ID,
-			&tenant.Name,
-			&tenant.VaultMount,
-			//&tenant.VaultNamespace,
-			&tenant.Status,
-			&tenant.CreatedAt,
-			&tenant.UpdatedAt,
+			&tenant.ID, &tenant.Name, &tenant.VaultMount,
+			&tenant.Status, &tenant.CreatedAt, &tenant.UpdatedAt,
 		)
 		if err != nil {
-			return nil, errors.NewInternalError("Failed to scan tenant", err)
+			return nil, errors.NewInternalError("Failed to scan workspace", err)
 		}
 		tenants = append(tenants, tenant)
 	}
 
 	if err = rows.Err(); err != nil {
-		return nil, errors.NewInternalError("Error iterating tenants", err)
+		return nil, errors.NewInternalError("Error iterating workspaces", err)
 	}
 
 	return tenants, nil

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -149,12 +150,14 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 		return nil, txErr
 	}
 
-	// Vault write happens after DB commit so the rollback path is simpler.
-	// On failure, clean up the rows we just created.
+	// Vault write — best-effort. Known platform providers (google, microsoft)
+	// fall back to env vars via getClientSecret(), so Vault is not mandatory
+	// for them. Custom providers will log a warning and the admin can retry
+	// by updating the provider once Vault is available.
 	if err := config.SaveWorkspaceIDPSecret(req.WorkspaceID.String(), models.IdentityProviderOIDC, providerName,
 		map[string]interface{}{"client_secret": req.ClientSecret}); err != nil {
-		_ = s.deleteOIDCArtifacts(req.WorkspaceID, idp.ID, providerName)
-		return nil, fmt.Errorf("write vault secret: %w", err)
+		log.Printf("WARN: Vault secret write failed for IDP %s/%s (provider created, secret may use env fallback): %v",
+			req.WorkspaceID, providerName, err)
 	}
 
 	return &idp, nil

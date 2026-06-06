@@ -54,7 +54,10 @@
       "Bash(echo \"SQL Exit: $?\")"
     ],
     "additionalDirectories": [
-      "/tmp"
+      "/tmp",
+      "/Users/pc/Desktop/authnull/Authsec-ui/src/features/directory-sync",
+      "/Users/pc/Desktop/authnull/Authsec-ui/src/components/layout",
+      "/Users/pc/Desktop/authnull/Authsec-ui/src"
     ]
   }
 }

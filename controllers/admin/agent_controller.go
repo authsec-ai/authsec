@@ -75,7 +75,7 @@ func (ac *AgentController) ListAgents(c *gin.Context) {
 	var agents []agentClient
 	query := tenantDB.Table("resource_servers").
 		Where("workspace_id = ? AND application_type = 'ai_agent'", workspaceID).
-		Where("deleted_at IS NULL")
+		Where("active = true")
 
 	if agentType := c.Query("agent_type"); agentType != "" {
 		query = query.Where("agent_type = ?", agentType)
@@ -112,7 +112,7 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 	var agent agentClient
 	result := tenantDB.Table("resource_servers").
 		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("deleted_at IS NULL").
+		Where("active = true").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
@@ -152,7 +152,7 @@ func (ac *AgentController) ProvisionIdentity(c *gin.Context) {
 	var agent agentClient
 	result := tenantDB.Table("resource_servers").
 		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("deleted_at IS NULL").
+		Where("active = true").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
@@ -239,7 +239,7 @@ func (ac *AgentController) RevokeIdentity(c *gin.Context) {
 	var agent agentClient
 	result := tenantDB.Table("resource_servers").
 		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("deleted_at IS NULL").
+		Where("active = true").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
@@ -303,7 +303,7 @@ func (ac *AgentController) DelegateToken(c *gin.Context) {
 	var agent agentClient
 	result := tenantDB.Table("resource_servers").
 		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", clientID, workspaceID).
-		Where("deleted_at IS NULL").
+		Where("active = true").
 		First(&agent)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})

@@ -754,7 +754,7 @@ func (ac *AuthmgrController) ValidatePermissions(c *gin.Context) {
 // Group management endpoints
 // ────────────────────────────────────────────────────────────────────────────
 
-// CreateGroup creates one or more groups in the tenant database.
+// CreateGroup creates one or more groups in the workspace.
 func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 	var req sharedmodels.UserDefinedGroupsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -762,9 +762,15 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	workspaceID, err := uuid.Parse(req.WorkspaceID)
+	// Use workspace_id from JWT — never trust the body.
+	wsIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok || wsIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in token"})
+		return
+	}
+	workspaceID, err := uuid.Parse(wsIDStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id in token"})
 		return
 	}
 
@@ -788,16 +794,17 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"message": "groups created", "groups": created, "count": len(created)})
 }
 
-// ListGroups lists all groups for a tenant.
+// ListGroups lists all groups for the caller's workspace.
 func (ac *AuthmgrController) ListGroups(c *gin.Context) {
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+	// Use workspace_id from JWT — never trust the query param.
+	wsIDStr, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok || wsIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in token"})
 		return
 	}
-	tid, err := uuid.Parse(workspaceID)
+	tid, err := uuid.Parse(wsIDStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id in token"})
 		return
 	}
 

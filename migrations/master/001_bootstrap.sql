@@ -217,6 +217,34 @@ CREATE SEQUENCE public.audit_events_id_seq
 
 ALTER SEQUENCE public.audit_events_id_seq OWNED BY public.audit_events.id;
 
+-- Authorization decision logs — dedicated table for PDP audit trail.
+-- Records every allow/deny decision made by the ScopeResolver at consent time.
+-- Enterprise buyers expect this for compliance and incident investigation.
+CREATE TABLE public.authorization_decision_logs (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    request_id text,
+    user_id uuid,
+    oauth_client_id uuid,
+    resource_server_id uuid,
+    action text,
+    requested_scopes text[],
+    granted_scopes text[],
+    blocked_scopes text[],
+    decision text NOT NULL,
+    reason text,
+    policy_snapshot jsonb,
+    ip_address text,
+    user_agent text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT authorization_decision_logs_decision_chk CHECK (decision IN ('allow', 'deny', 'partial'))
+);
+
+CREATE INDEX idx_authz_decision_workspace ON public.authorization_decision_logs(workspace_id);
+CREATE INDEX idx_authz_decision_user ON public.authorization_decision_logs(user_id);
+CREATE INDEX idx_authz_decision_rs ON public.authorization_decision_logs(resource_server_id);
+CREATE INDEX idx_authz_decision_created ON public.authorization_decision_logs(created_at DESC);
+
 CREATE TABLE public.auth_request_contexts (
     state character varying(255) NOT NULL,
     hydra_client_id character varying(255) NOT NULL,
@@ -393,6 +421,9 @@ CREATE TABLE public.mcp_oauth_clients (
     redirect_review_pending boolean DEFAULT false,
     post_logout_redirect_uris text[] DEFAULT '{}'::text[],
     supports_refresh_token boolean DEFAULT false,
+    is_confidential boolean DEFAULT false,
+    software_statement_issuer text,
+    software_statement_verified boolean DEFAULT false,
     sync_status text DEFAULT 'active'::text NOT NULL,
     sync_last_error text,
     sync_last_error_at timestamp with time zone,
@@ -466,6 +497,7 @@ CREATE TABLE public.mcp_tools (
     is_public_acknowledged_by uuid,
     CONSTRAINT mcp_tools_inventory_source_check CHECK ((inventory_source = ANY (ARRAY['mcp_scan'::text, 'sdk_manifest'::text, 'manual'::text]))),
     CONSTRAINT mcp_tools_pkey PRIMARY KEY (id),
+    CONSTRAINT mcp_tools_id_workspace_uq UNIQUE (id, workspace_id),
     CONSTRAINT mcp_tools_resource_server_id_name_key UNIQUE (resource_server_id, name)
 );
 
@@ -500,7 +532,7 @@ CREATE TABLE public.oauth_consent_grants (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     workspace_id uuid NOT NULL,
     user_id uuid NOT NULL,
-    client_id uuid NOT NULL,
+    oauth_client_id uuid NOT NULL,
     resource_server_id uuid NOT NULL,
     granted_scopes text[] NOT NULL,
     expires_at timestamp with time zone NOT NULL,
@@ -508,7 +540,7 @@ CREATE TABLE public.oauth_consent_grants (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT oauth_consent_grants_pkey PRIMARY KEY (id),
-    CONSTRAINT oauth_consent_grants_workspace_id_user_id_client_id_resource_s_key UNIQUE (workspace_id, user_id, client_id, resource_server_id)
+    CONSTRAINT oauth_consent_grants_workspace_user_client_rs_uq UNIQUE (workspace_id, user_id, oauth_client_id, resource_server_id)
 );
 
 CREATE TABLE public.oauth_scope_permissions (
@@ -534,6 +566,7 @@ CREATE TABLE public.oauth_scopes (
     CONSTRAINT oauth_scopes_risk_level_check CHECK ((risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
     CONSTRAINT oauth_scopes_source_check CHECK ((source = ANY (ARRAY['discovered'::text, 'preset'::text, 'manifest'::text, 'manual'::text]))),
     CONSTRAINT oauth_scopes_pkey PRIMARY KEY (id),
+    CONSTRAINT oauth_scopes_id_workspace_uq UNIQUE (id, workspace_id),
     CONSTRAINT oauth_scopes_workspace_id_resource_server_id_scope_string_key UNIQUE (workspace_id, resource_server_id, scope_string)
 );
 
@@ -659,6 +692,7 @@ CREATE TABLE public.permissions (
     full_permission_string text,
     workspace_id uuid,
     CONSTRAINT permissions_pkey PRIMARY KEY (id),
+    CONSTRAINT permissions_id_workspace_uq UNIQUE (id, workspace_id),
     CONSTRAINT permissions_workspace_resource_action_key UNIQUE (workspace_id, resource, action)
 );
 
@@ -767,7 +801,8 @@ CREATE TABLE public.resource_servers (
     agent_type text,
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
-    CONSTRAINT resource_servers_id_workspace_uq UNIQUE (id, workspace_id)
+    CONSTRAINT resource_servers_id_workspace_uq UNIQUE (id, workspace_id),
+    CONSTRAINT resource_servers_workspace_resource_uri_uq UNIQUE (workspace_id, resource_uri)
 );
 
 CREATE TABLE public.risk_policies (
@@ -1443,7 +1478,7 @@ CREATE TABLE public.workspace_memberships (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
     user_id uuid NOT NULL,
-    role_id uuid NOT NULL REFERENCES public.roles(id) ON DELETE RESTRICT,
+    role_id uuid NOT NULL,
     status text NOT NULL DEFAULT 'active',
     source text NOT NULL DEFAULT 'manual',
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -1719,7 +1754,7 @@ CREATE INDEX idx_ciba_auth_user ON public.ciba_auth_requests USING btree (user_i
 
 CREATE INDEX idx_consent_grants_workspace ON public.oauth_consent_grants USING btree (workspace_id) WHERE (revoked_at IS NULL);
 
-CREATE INDEX idx_consent_grants_user_client ON public.oauth_consent_grants USING btree (user_id, client_id, resource_server_id) WHERE (revoked_at IS NULL);
+CREATE INDEX idx_consent_grants_user_client ON public.oauth_consent_grants USING btree (user_id, oauth_client_id, resource_server_id) WHERE (revoked_at IS NULL);
 
 CREATE INDEX idx_credentials_created_at ON public.credentials USING btree (created_at);
 
@@ -2278,7 +2313,7 @@ ALTER TABLE ONLY public.identity_providers
     ADD CONSTRAINT identity_providers_saml_fkey FOREIGN KEY (saml_provider_id, workspace_id) REFERENCES public.saml_providers(id, workspace_id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.oauth_consent_grants
-    ADD CONSTRAINT oauth_consent_grants_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;
+    ADD CONSTRAINT oauth_consent_grants_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_consent_grants
     ADD CONSTRAINT oauth_consent_grants_rs_workspace_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
@@ -2298,11 +2333,12 @@ ALTER TABLE ONLY public.oauth_scopes
 ALTER TABLE ONLY public.oidc_user_identities
     ADD CONSTRAINT oidc_user_identities_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
+-- Composite workspace-safe FKs: guarantee referenced role/RS is in the same workspace.
 ALTER TABLE ONLY public.resource_server_access_policies
-    ADD CONSTRAINT resource_server_access_policies_default_role_id_fkey FOREIGN KEY (default_role_id) REFERENCES public.roles(id) ON DELETE SET NULL;
+    ADD CONSTRAINT resource_server_access_policies_default_role_id_fkey FOREIGN KEY (default_role_id, workspace_id) REFERENCES public.roles(id, workspace_id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.resource_server_access_policies
-    ADD CONSTRAINT resource_server_access_policies_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+    ADD CONSTRAINT resource_server_access_policies_resource_server_id_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.resource_server_client_registrations
     ADD CONSTRAINT resource_server_client_registrations_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;
@@ -2335,30 +2371,34 @@ ALTER TABLE ONLY public.role_assignment_requests
     ADD CONSTRAINT role_assignment_requests_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id);
 
 ALTER TABLE ONLY public.role_assignment_requests
-    ADD CONSTRAINT role_assignment_requests_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE CASCADE;
+    ADD CONSTRAINT role_assignment_requests_role_id_fkey FOREIGN KEY (role_id, workspace_id) REFERENCES public.roles(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.role_assignment_requests
-    ADD CONSTRAINT role_assignment_requests_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+    ADD CONSTRAINT role_assignment_requests_user_id_fkey FOREIGN KEY (user_id, workspace_id) REFERENCES public.users(id, workspace_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.role_bindings
-    ADD CONSTRAINT role_bindings_role_fk_simple FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE CASCADE;
-
+-- role_bindings: composite FKs guarantee role and user are in the same workspace.
+-- Simple (single-column) FKs removed — the composite ones are strictly stronger.
 ALTER TABLE ONLY public.role_bindings
     ADD CONSTRAINT role_bindings_workspace_role_fk FOREIGN KEY (workspace_id, role_id) REFERENCES public.roles(workspace_id, id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.role_bindings
     ADD CONSTRAINT role_bindings_workspace_user_fk FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.role_bindings
-    ADD CONSTRAINT role_bindings_user_fk_simple FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
-
+-- role_permissions: simple FK kept because this table has no workspace_id column.
+-- Cross-workspace safety is enforced by the application layer (ScopeRegistryService
+-- validates workspace ownership before writing rows).
 ALTER TABLE ONLY public.role_permissions
     ADD CONSTRAINT role_permissions_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.roles(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.role_permissions
+    ADD CONSTRAINT role_permissions_permission_id_fkey FOREIGN KEY (permission_id) REFERENCES public.permissions(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.workspace_end_user_states
     ADD CONSTRAINT workspace_end_user_states_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
--- workspace_user_memberships FK removed (table dropped)
+-- workspace_memberships: composite FK guarantees role is in the same workspace.
+ALTER TABLE ONLY public.workspace_memberships
+    ADD CONSTRAINT workspace_memberships_role_workspace_fk FOREIGN KEY (role_id, workspace_id) REFERENCES public.roles(id, workspace_id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT user_groups_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
