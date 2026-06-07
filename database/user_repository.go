@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -126,12 +127,16 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 			provider, provider_id, provider_data, avatar_url, active,
 			last_login, created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, '', 'app.authsec.dev',
+		VALUES ($1, $2, $3, $4, $5, '', $11,
 		        $6, $7, $8, $9, true, $10, $10, $10)
 		ON CONFLICT (workspace_id, LOWER(email)) WHERE deleted_at IS NULL
 		DO UPDATE SET updated_at = users.updated_at
 		RETURNING id
 	`
+	domainSuffix := os.Getenv("TENANT_DOMAIN_SUFFIX")
+	if domainSuffix == "" {
+		domainSuffix = "authsec.dev"
+	}
 	if err := ur.db.QueryRow(
 		query,
 		userID,
@@ -144,6 +149,7 @@ func (ur *UserRepository) CreateOIDCEndUser(workspaceID uuid.UUID, providerName 
 		profileData,
 		userInfo.Picture,
 		now,
+		domainSuffix,
 	).Scan(&userID); err != nil {
 		return nil, fmt.Errorf("create workspace OIDC end user: %w", err)
 	}

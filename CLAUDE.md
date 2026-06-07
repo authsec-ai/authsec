@@ -127,12 +127,10 @@ match what you're doing to the current phase. Don't freelance ahead of phase.
 ## Cluster / deploy quick reference
 
 - Cluster: Azure AKS, cluster name `authsec`
-- Backend namespace: `authsec-dev`, deployment `dev-authsec`
-- Database namespace: `database-dev`, pod `postgresql-dev-primary-0`,
-  user/db `authdev`/`authdev`, password at
-  `/opt/bitnami/postgresql/secrets/password` inside the pod
-- CI: Jenkins builds `docker-repo.authsec.ai/authsec:authsec-dev-<N>-<SHA>` and
-  retags `:development`; deploy is `kubectl set image`
+- Backend namespace: `authsec-staging`, deployment `stage-authsec`
+- Database namespace: `database-staging`, pod `postgresql-stage-primary-0`,
+  user/db `authstage`/`authstage`
+- CI: Jenkins builds on push to `authsec-staging` branch; deploy is `kubectl set image`
 - Wipe-and-rebootstrap is the standard recovery move; the user does this
   freely and has said "i will wipe 1000 times if needed"
 

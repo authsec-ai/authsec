@@ -51,13 +51,17 @@
       "Bash(kubectl scale:*)",
       "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT provider_name, workspace_id IS NULL AS is_platform FROM oidc_providers;\")",
       "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT column_name FROM information_schema.columns WHERE table_name = 'saml_providers' AND column_name IN \\('sp_entity_id','sp_acs_url','want_assertions_signed'\\);\")",
-      "Bash(echo \"SQL Exit: $?\")"
+      "Bash(echo \"SQL Exit: $?\")",
+      "Bash(kubectl set:*)"
     ],
     "additionalDirectories": [
       "/tmp",
       "/Users/pc/Desktop/authnull/Authsec-ui/src/features/directory-sync",
       "/Users/pc/Desktop/authnull/Authsec-ui/src/components/layout",
-      "/Users/pc/Desktop/authnull/Authsec-ui/src"
+      "/Users/pc/Desktop/authnull/Authsec-ui/src",
+      "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/src/authsec_sdk/runtime",
+      "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/examples",
+      "/Users/pc/Desktop/authnull/Authsec-ui"
     ]
   }
 }

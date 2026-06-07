@@ -42,7 +42,7 @@ func (s *ConsentService) CheckExistingConsent(
 ) (*models.OAuthConsentGrant, bool, error) {
 	var grant models.OAuthConsentGrant
 	err := s.db.Where(
-		"workspace_id = ? AND user_id = ? AND client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
+		"workspace_id = ? AND user_id = ? AND oauth_client_id = ? AND resource_server_id = ? AND revoked_at IS NULL AND expires_at > ?",
 		workspaceID, userID, clientID, resourceServerID, time.Now(),
 	).First(&grant).Error
 
@@ -203,7 +203,7 @@ func (s *ConsentService) ListByTenant(workspaceID uuid.UUID, userID, clientID, r
 		query = query.Where("user_id = ?", *userID)
 	}
 	if clientID != nil {
-		query = query.Where("client_id = ?", *clientID)
+		query = query.Where("oauth_client_id = ?", *clientID)
 	}
 	if rsID != nil {
 		query = query.Where("resource_server_id = ?", *rsID)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 )
@@ -30,7 +31,14 @@ func resolveUIConfig(publicUIOrigin, publicUIBasePath, legacyReactAppURL string)
 	}
 
 	if legacyReactAppURL == "" {
-		legacyReactAppURL = "https://app.authsec.dev"
+		// Fall back to PUBLIC_UI_ORIGIN or BASE_URL rather than a hardcoded domain.
+		if origin := os.Getenv("PUBLIC_UI_ORIGIN"); origin != "" {
+			legacyReactAppURL = origin
+		} else if base := os.Getenv("BASE_URL"); base != "" {
+			legacyReactAppURL = base
+		} else {
+			legacyReactAppURL = "http://localhost:3000"
+		}
 	}
 
 	parsed, err := url.Parse(legacyReactAppURL)

@@ -252,8 +252,17 @@ func LoadConfig() *Config {
 	hydraPublicURL := getEnv("HYDRA_PUBLIC_URL", "http://localhost:4444")
 	publicUIOrigin := getEnv("PUBLIC_UI_ORIGIN", "")
 	publicUIBasePath := getEnv("PUBLIC_UI_BASE_PATH", "")
-	reactAppURL := getEnv("REACT_APP_URL", "https://app.authsec.dev")
-	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", "https://app.authsec.dev")
+	// REACT_APP_URL and IDENTITY_PROVIDER_URL fall back to PUBLIC_UI_ORIGIN
+	// (or BASE_URL) so there's no hardcoded domain. Only localhost if nothing is set.
+	uiFallback := publicUIOrigin
+	if uiFallback == "" {
+		uiFallback = baseURL
+	}
+	if uiFallback == "" {
+		uiFallback = "http://localhost:3000"
+	}
+	reactAppURL := getEnv("REACT_APP_URL", uiFallback)
+	identityProviderURL := getEnv("IDENTITY_PROVIDER_URL", uiFallback)
 
 	uiOrigin, uiBasePath, err := resolveUIConfig(publicUIOrigin, publicUIBasePath, reactAppURL)
 	if err != nil {

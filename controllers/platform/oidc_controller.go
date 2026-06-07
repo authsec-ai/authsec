@@ -1639,7 +1639,10 @@ func renderOAuthCallbackHTML(c *gin.Context, data map[string]interface{}) {
 	// Priority: 1. workspace_domain from data (preserves user's login domain), 2. Host header, 3. Default
 	defaultBaseURL := config.AppConfig.BaseURL
 	if defaultBaseURL == "" {
-		defaultBaseURL = "https://app.authsec.dev"
+		defaultBaseURL = config.AppConfig.UIOrigin
+	}
+	if defaultBaseURL == "" {
+		defaultBaseURL = "https://localhost:3000"
 	}
 	redirectURL := defaultBaseURL + "/authsec/uflow/oidc/callback"
 

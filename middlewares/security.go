@@ -42,8 +42,8 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 			// to this middleware.
 			csp = BuildConsentCSP(nil)
 		} else {
-			// Strict CSP for all other endpoints
-			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+			// Strict CSP for all other endpoints (allows Google Fonts for server-rendered HTML pages)
+			csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
 		}
 		c.Header("Content-Security-Policy", csp)
 
@@ -130,7 +130,7 @@ func BuildConsentCSP(extraFormActionSources []string) string {
 			formAction = append(formAction, src)
 		}
 	}
-	return "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action " + strings.Join(formAction, " ") + ";"
+	return "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'none'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action " + strings.Join(formAction, " ") + ";"
 }
 
 // hydraPublicOrigin extracts the scheme+host from HYDRA_PUBLIC_URL so it can
