@@ -77,10 +77,18 @@ func (s *AuthorizationContextService) BindByContextID(contextID, loginChallenge 
 		return &ctx, nil
 	}
 
-	// Bound to a DIFFERENT login_challenge → error (should not happen in normal flow)
-	log.Printf("[MCP_AUTH] BindByContextID: context_id=%s bound to challenge=%s but received challenge=%s",
+	// Bound to a DIFFERENT login_challenge — happens on browser refresh / retry.
+	// Hydra issues a new challenge each time. Re-bind to the new one.
+	log.Printf("[MCP_AUTH] BindByContextID: context_id=%s re-binding from challenge=%s to challenge=%s (retry/refresh)",
 		contextID, *ctx.LoginChallenge, loginChallenge)
-	return nil, fmt.Errorf("auth context already bound to a different login challenge")
+	result := s.db.Model(&models.AuthRequestContext{}).
+		Where("context_id = ? AND consumed = false", contextID).
+		Update("login_challenge", loginChallenge)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to re-bind auth context: %w", result.Error)
+	}
+	ctx.LoginChallenge = &loginChallenge
+	return &ctx, nil
 }
 
 func loginChallengeBlank(challenge *string) bool {
@@ -277,7 +285,14 @@ func (s *AuthorizationContextService) BindByHydraRequestURI(requestURI, loginCha
 		return &ctx, nil
 	}
 
-	return nil, fmt.Errorf("auth context already bound to a different login challenge")
+	// Bound to a different challenge — re-bind (retry/refresh).
+	log.Printf("[MCP_AUTH] BindByHydraRequestURI: re-binding from challenge=%s to challenge=%s (retry/refresh)",
+		*ctx.LoginChallenge, loginChallenge)
+	s.db.Model(&models.AuthRequestContext{}).
+		Where("hydra_request_uri = ? AND consumed = false", requestURI).
+		Update("login_challenge", loginChallenge)
+	ctx.LoginChallenge = &loginChallenge
+	return &ctx, nil
 }
 
 // CleanupExpired removes expired auth request contexts.
