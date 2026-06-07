@@ -1335,11 +1335,15 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	}
 
 	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
+	log.Printf("[SAML] InitiateSAML: provider=%s c_id=%q metadata=%v", providerName, realWorkspaceID, clientDetails.Metadata)
 	// Fallback: resolve workspace from auth_request_context when Hydra client
 	// metadata doesn't carry c_id (DCR'd MCP clients use authsec_ctx instead).
 	if realWorkspaceID == "" {
 		if arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge); arcErr == nil && arcCtx != nil {
 			realWorkspaceID = arcCtx.WorkspaceID
+			log.Printf("[SAML] InitiateSAML: resolved workspace=%s from auth_request_context", realWorkspaceID)
+		} else {
+			log.Printf("[SAML] InitiateSAML: auth_request_context lookup failed: %v", arcErr)
 		}
 	}
 	if realWorkspaceID == "" {
@@ -1353,6 +1357,7 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	}
 
 	// Workspace IDP gate: resolve through identity_providers + saml_providers.
+	log.Printf("[SAML] InitiateSAML: looking up IDP workspace=%s type=saml provider=%s", workspaceUUID, providerName)
 	var resolved struct {
 		IdentityProviderID uuid.UUID
 		Status             string
