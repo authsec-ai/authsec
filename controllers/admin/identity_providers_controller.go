@@ -3,6 +3,7 @@ package admin
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/authsec-ai/authsec/config"
@@ -94,6 +95,7 @@ func (ctrl *IdentityProvidersController) Create(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid oidc config: " + err.Error()})
 			return
 		}
+		log.Printf("[IDP] CreateOIDC: provider=%s workspace=%s client_id=%s", cfg.ProviderName, workspaceID, cfg.ClientID)
 		idp, err := ctrl.service.CreateOIDC(services.CreateOIDCIDPRequest{
 			WorkspaceID:      workspaceID,
 			CreatedByUserID:  userID,
