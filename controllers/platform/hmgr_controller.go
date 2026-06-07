@@ -1335,8 +1335,15 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	}
 
 	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
+	// Fallback: resolve workspace from auth_request_context when Hydra client
+	// metadata doesn't carry c_id (DCR'd MCP clients use authsec_ctx instead).
 	if realWorkspaceID == "" {
-		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Invalid client configuration - missing c_id"})
+		if arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge); arcErr == nil && arcCtx != nil {
+			realWorkspaceID = arcCtx.WorkspaceID
+		}
+	}
+	if realWorkspaceID == "" {
+		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Unable to resolve workspace for this login flow"})
 		return
 	}
 	workspaceUUID, err := uuid.Parse(realWorkspaceID)
