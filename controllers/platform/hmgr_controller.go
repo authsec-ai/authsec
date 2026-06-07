@@ -1358,24 +1358,22 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 
 	// Workspace IDP gate: resolve through identity_providers + saml_providers.
 	log.Printf("[SAML] InitiateSAML: looking up IDP workspace=%s type=saml provider=%s", workspaceUUID, providerName)
-	var resolved struct {
-		IdentityProviderID uuid.UUID
-		Status             string
-		SAMLID             uuid.UUID `gorm:"column:saml_id"`
-	}
-	err = config.DB.
-		Table("identity_providers ip").
-		Select("ip.id AS identity_provider_id, ip.status, sp.id AS saml_id").
-		Joins("JOIN saml_providers sp ON sp.id = ip.saml_provider_id").
-		Where("ip.workspace_id = ?", workspaceUUID).
-		Where("ip.provider_type = ?", models.IdentityProviderSAML).
-		Where("sp.provider_name = ?", providerName).
-		First(&resolved).Error
-	if err != nil {
+	var idpID, samlID uuid.UUID
+	var idpStatus string
+	row := config.DB.Raw(`
+		SELECT ip.id, ip.status, sp.id
+		FROM identity_providers ip
+		JOIN saml_providers sp ON sp.id = ip.saml_provider_id
+		WHERE ip.workspace_id = ? AND ip.provider_type = 'saml' AND sp.provider_name = ?
+		LIMIT 1
+	`, workspaceUUID, providerName).Row()
+	if scanErr := row.Scan(&idpID, &idpStatus, &samlID); scanErr != nil {
+		log.Printf("[SAML] InitiateSAML: IDP lookup failed: %v", scanErr)
 		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider not enabled for workspace"})
 		return
 	}
-	if resolved.Status == "disabled" {
+	log.Printf("[SAML] InitiateSAML: found IDP id=%s status=%s saml_id=%s", idpID, idpStatus, samlID)
+	if idpStatus == "disabled" {
 		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider is disabled for workspace"})
 		return
 	}
@@ -1394,7 +1392,7 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 			var enabledCount int64
 			config.DB.Table("application_identity_provider_policies").
 				Where("workspace_id = ? AND application_id = ? AND identity_provider_id = ? AND enabled = ?",
-					workspaceUUID, appUUID, resolved.IdentityProviderID, true).
+					workspaceUUID, appUUID, idpID, true).
 				Count(&enabledCount)
 			if enabledCount == 0 {
 				c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider not enabled for application"})
