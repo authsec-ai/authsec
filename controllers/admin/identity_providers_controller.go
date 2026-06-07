@@ -84,14 +84,17 @@ func (ctrl *IdentityProvidersController) Create(c *gin.Context) {
 
 	var req createIDPRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[IDP] Create: JSON binding failed: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
 		return
 	}
+	log.Printf("[IDP] Create: type=%s display=%s config_len=%d", req.ProviderType, req.DisplayName, len(req.Config))
 
 	switch req.ProviderType {
 	case models.IdentityProviderOIDC:
 		var cfg oidcCreateConfig
 		if err := json.Unmarshal(req.Config, &cfg); err != nil {
+			log.Printf("[IDP] Create: OIDC config unmarshal failed: %v (raw: %s)", err, string(req.Config))
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid oidc config: " + err.Error()})
 			return
 		}

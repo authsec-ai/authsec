@@ -22,8 +22,8 @@ type IdentityProvider struct {
 	WorkspaceID    uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ProviderType   string     `json:"provider_type" gorm:"type:text;not null;index"`
 	DisplayName    string     `json:"display_name" gorm:"type:text;not null"`
-	OIDCProviderID *uuid.UUID `json:"oidc_provider_id,omitempty" gorm:"type:uuid"`
-	SAMLProviderID *uuid.UUID `json:"saml_provider_id,omitempty" gorm:"type:uuid"`
+	OIDCProviderID *uuid.UUID `json:"oidc_provider_id,omitempty" gorm:"type:uuid;column:oidc_provider_id"`
+	SAMLProviderID *uuid.UUID `json:"saml_provider_id,omitempty" gorm:"type:uuid;column:saml_provider_id"`
 	// ConfigRef is kept for AD/Entra/SCIM types that reference sync_configurations.
 	// For OIDC/SAML use the typed FK columns above instead.
 	ConfigRef       string    `json:"config_ref,omitempty" gorm:"type:text"`
