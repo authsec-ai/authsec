@@ -194,10 +194,10 @@ func (s *SAMLSPCertificate) BeforeCreate(tx *gorm.DB) error {
 }
 
 type SAMLRequest struct {
-	ID             string    `gorm:"type:varchar(255);primary_key" json:"id"`
-	LoginChallenge string    `gorm:"type:varchar(255);not null;index" json:"login_challenge"`
-	WorkspaceID       uuid.UUID `gorm:"type:uuid;not null" json:"workspace_id"`
-	ProviderName   string    `gorm:"type:varchar(255);not null" json:"provider_name"`
+	ID             string    `gorm:"type:text;primary_key" json:"id"`
+	LoginChallenge string    `gorm:"type:text;not null;index" json:"login_challenge"`
+	WorkspaceID    uuid.UUID `gorm:"type:uuid;not null" json:"workspace_id"`
+	ProviderName   string    `gorm:"type:text;not null" json:"provider_name"`
 	RelayState     string    `gorm:"type:text" json:"relay_state"`
 	CreatedAt      time.Time `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
 	ExpiresAt      time.Time `json:"expires_at"`

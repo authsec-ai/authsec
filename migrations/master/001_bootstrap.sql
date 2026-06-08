@@ -901,11 +901,11 @@ CREATE TABLE public.saml_callback_states (
 );
 
 CREATE TABLE public.saml_requests (
-    id character varying(255) NOT NULL,
-    login_challenge character varying(255) NOT NULL,
+    id text NOT NULL,
+    login_challenge text NOT NULL,
     workspace_id uuid NOT NULL,
-    client_id uuid NOT NULL,
-    provider_name character varying(255) NOT NULL,
+    client_id uuid,
+    provider_name text NOT NULL,
     relay_state text,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     expires_at timestamp without time zone NOT NULL,
