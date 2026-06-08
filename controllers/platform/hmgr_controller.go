@@ -1632,7 +1632,7 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	}
 
 	userID := fmt.Sprintf("saml-%s-%s", providerName, nameID)
-	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, map[string]interface{}{
+	hydraCtx := map[string]interface{}{
 		"email":        user.Email,
 		"name":         user.Name,
 		"username":     user.Username,
@@ -1640,7 +1640,21 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		"provider_id":  user.ProviderID,
 		"workspace_id": user.WorkspaceID,
 		"client_id":    user.ClientID,
-	})
+		"auth_method":  "saml_federated",
+	}
+	// Propagate the auth_request_contexts.context_id so the consent handler
+	// can re-resolve the workspace+application binding when Hydra issues a
+	// fresh consent_challenge whose login_challenge no longer matches the one
+	// we bound at /login. Mirrors the OIDC federated path in oidc_controller.go.
+	if arcCtx, lookupErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge); lookupErr == nil && arcCtx != nil && arcCtx.ContextID != "" {
+		hydraCtx["context_id"] = arcCtx.ContextID
+		hydraCtx["resource_server_id"] = arcCtx.ResourceServerID
+		hydraCtx["resource_uri"] = arcCtx.ResourceURI
+	} else if lookupErr != nil {
+		log.Printf("[SAML] ProcessSAMLAssertion: auth_request_context lookup failed for login_challenge=%s: %v", loginChallenge, lookupErr)
+	}
+
+	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, hydraCtx)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to accept login request: %w", err)
 	}
