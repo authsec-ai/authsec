@@ -88,6 +88,27 @@ func (ctrl *HmgrController) isNewMCPClient(hydraClientID string) bool {
 	return err == nil
 }
 
+// resolveWorkspaceForLoginChallenge resolves the workspace_id for a given
+// Hydra login challenge. This is the SINGLE canonical lookup path — it checks:
+//  1. auth_request_contexts (created at /authorize time — always has workspace_id)
+//  2. Hydra client metadata c_id (legacy pre-registered clients only)
+//
+// DCR/CIMD MCP clients never have c_id in Hydra metadata. The auth_request_context
+// is the authoritative source for workspace context in the v4 architecture.
+func (ctrl *HmgrController) resolveWorkspaceForLoginChallenge(loginChallenge string, hydraClientID string) string {
+	// Primary: auth_request_context (always set by /authorize)
+	if arcCtx, err := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge); err == nil && arcCtx != nil && arcCtx.WorkspaceID != "" {
+		return arcCtx.WorkspaceID
+	}
+	// Fallback: Hydra client metadata (legacy pre-registered clients)
+	if clientDetails, _, err := ctrl.service.GetHydraClient(hydraClientID); err == nil {
+		if cid, ok := clientDetails.Metadata["c_id"].(string); ok && cid != "" {
+			return cid
+		}
+	}
+	return ""
+}
+
 // StorePKCEVerifierHandler pre-registers a PKCE code_verifier from an external client
 // so it can be retrieved at token-exchange time.
 // POST /hmgr/pkce/store  { "state": "...", "code_verifier": "..." }
@@ -585,17 +606,14 @@ func (ctrl *HmgrController) ExchangeTokenHandler(c *gin.Context) {
 	}
 
 	clientID := loginRequest.Client.ClientID
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to retrieve client information"})
+
+	orgID := ctrl.resolveWorkspaceForLoginChallenge(req.LoginChallenge, clientID)
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Unable to resolve workspace"})
 		return
 	}
 
-	orgID := clientDetails.Metadata["c_id"].(string)
-
-	// Phase B/E: the legacy `clients` table lookup (for project_id) was removed.
-	// The OAuth client secret lives in Vault at kv/data/secret/{workspace}/{workspace};
-	// orgID (Hydra client metadata c_id) is the workspace UUID.
+	// The OAuth client secret lives in Vault at kv/data/secret/{workspace}/{workspace}.
 	clientSecret, err := config.SecretInVault(orgID, orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Failed to retrieve client secret"})
@@ -724,8 +742,9 @@ func (ctrl *HmgrController) LoginRedirectHandler(c *gin.Context) {
 
 	baseURL := strings.TrimSuffix(callbackURL, "/oidc/auth/callback")
 
-	if workspaceIDObj, ok := clientDetails.Metadata["workspace_id"].(string); ok && workspaceIDObj != "" {
-		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, workspaceIDObj)
+	workspaceIDForDomain := ctrl.resolveWorkspaceForLoginChallenge(loginChallenge, loginRequest.Client.ClientID)
+	if workspaceIDForDomain != "" {
+		verifiedDomains, err := hydramodels.GetVerifiedDomainsForTenant(config.DB, workspaceIDForDomain)
 		if err == nil && len(verifiedDomains) > 0 {
 			if u, err := url.Parse(baseURL); err == nil {
 				host := u.Hostname()
@@ -1328,24 +1347,8 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 		return
 	}
 
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, hydramodels.SAMLInitiateResponse{Success: false, Error: "Client not found"})
-		return
-	}
-
-	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
-	log.Printf("[SAML] InitiateSAML: provider=%s c_id=%q metadata=%v", providerName, realWorkspaceID, clientDetails.Metadata)
-	// Fallback: resolve workspace from auth_request_context when Hydra client
-	// metadata doesn't carry c_id (DCR'd MCP clients use authsec_ctx instead).
-	if realWorkspaceID == "" {
-		if arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge); arcErr == nil && arcCtx != nil {
-			realWorkspaceID = arcCtx.WorkspaceID
-			log.Printf("[SAML] InitiateSAML: resolved workspace=%s from auth_request_context", realWorkspaceID)
-		} else {
-			log.Printf("[SAML] InitiateSAML: auth_request_context lookup failed: %v", arcErr)
-		}
-	}
+	realWorkspaceID := ctrl.resolveWorkspaceForLoginChallenge(req.LoginChallenge, loginRequest.Client.ClientID)
+	log.Printf("[SAML] InitiateSAML: provider=%s workspace=%s", providerName, realWorkspaceID)
 	if realWorkspaceID == "" {
 		c.JSON(http.StatusBadRequest, hydramodels.SAMLInitiateResponse{Success: false, Error: "Unable to resolve workspace for this login flow"})
 		return
@@ -1604,17 +1607,13 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		return "", nil, fmt.Errorf("failed to get login request: %w", err)
 	}
 
-	clientDetails, _, err := ctrl.service.GetHydraClient(loginRequest.Client.ClientID)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to get client details: %w", err)
-	}
-
-	clientIDFromMetadata, _ := clientDetails.Metadata["workspace_id"].(string)
-	realWorkspaceID, _ := clientDetails.Metadata["c_id"].(string)
-
+	realWorkspaceID := ctrl.resolveWorkspaceForLoginChallenge(loginChallenge, loginRequest.Client.ClientID)
 	if realWorkspaceID != workspaceID {
-		return "", nil, fmt.Errorf("tenant ID mismatch: expected %s, got %s", realWorkspaceID, workspaceID)
+		return "", nil, fmt.Errorf("workspace ID mismatch: expected %s, got %s", realWorkspaceID, workspaceID)
 	}
+	// Legacy: clientIDFromMetadata was used for user.ClientID. In the workspace
+	// model, client_id on users is deprecated — use workspace_id as fallback.
+	clientIDFromMetadata := realWorkspaceID
 
 	name := fmt.Sprintf("%s %s", firstName, lastName)
 	if name == " " || name == "" {
