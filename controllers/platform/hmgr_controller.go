@@ -1473,18 +1473,28 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 	}
 	log.Printf("[SAML] ACS: user resolved id=%s email=%s redirect=%s", user.ID, user.Email, redirectTo[:min(80, len(redirectTo))])
 
-	parsedURL, err := url.Parse(redirectTo)
+	finalRedirectURL := buildSAMLRedirectURL(redirectTo, loginChallenge, user)
+	log.Printf("[SAML] ACS: final redirect to %s", finalRedirectURL[:min(120, len(finalRedirectURL))])
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, finalRedirectURL, finalRedirectURL))
+}
+
+// buildSAMLRedirectURL builds the final redirect URL after SAML authentication.
+// For MCP OAuth flows, redirectTo is a Hydra continuation URL (no redirect_uri param)
+// — just redirect there directly. For legacy flows, it builds a frontend URL.
+func buildSAMLRedirectURL(redirectTo, loginChallenge string, user *hydramodels.User) string {
+	parsed, err := url.Parse(redirectTo)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to generate redirect URL"})
-		return
+		return redirectTo
 	}
 
-	redirectURI := parsedURL.Query().Get("redirect_uri")
+	redirectURI := parsed.Query().Get("redirect_uri")
 	if redirectURI == "" {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid OAuth redirect URL"})
-		return
+		// MCP path: Hydra redirectTo is the continuation URL — use it directly.
+		return redirectTo
 	}
 
+	// Legacy path: build a frontend URL from the redirect_uri.
 	query := url.Values{}
 	query.Set("login_challenge", loginChallenge)
 	query.Set("success", "true")
@@ -1492,20 +1502,16 @@ func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
 	query.Set("user_email", user.Email)
 	query.Set("user_name", user.Name)
 	query.Set("provider", user.Provider)
-	query.Set("client_id", user.ClientID.String())
 	query.Set("workspace_id", user.WorkspaceID.String())
-	query.Set("project_id", user.ProjectID.String())
 	query.Set("provider_id", user.ProviderID)
 	query.Set("active", fmt.Sprintf("%t", user.Active))
 
-	redirectURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
+	builtURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to build frontend redirect URL"})
-		return
+		log.Printf("[SAML] buildSAMLRedirectURL: BuildUIRouteURL failed, falling back to direct redirect: %v", err)
+		return redirectTo
 	}
-
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, redirectURL, redirectURL))
+	return builtURL
 }
 
 // HandleSAMLACSClientHandler handles workspace-scoped ACS callback. The legacy
@@ -1543,39 +1549,9 @@ func (ctrl *HmgrController) HandleSAMLACSClientHandler(c *gin.Context) {
 		return
 	}
 
-	parsedURL, err := url.Parse(redirectTo)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to generate redirect URL"})
-		return
-	}
-
-	redirectURI := parsedURL.Query().Get("redirect_uri")
-	if redirectURI == "" {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid OAuth redirect URL"})
-		return
-	}
-
-	query := url.Values{}
-	query.Set("login_challenge", loginChallenge)
-	query.Set("success", "true")
-	query.Set("user_id", user.ID.String())
-	query.Set("user_email", user.Email)
-	query.Set("user_name", user.Name)
-	query.Set("provider", user.Provider)
-	query.Set("client_id", user.ClientID.String())
-	query.Set("workspace_id", user.WorkspaceID.String())
-	query.Set("project_id", user.ProjectID.String())
-	query.Set("provider_id", user.ProviderID)
-	query.Set("active", fmt.Sprintf("%t", user.Active))
-
-	redirectURL, err := config.BuildUIRouteURLFromRedirectURI(redirectURI, "/oidc/login", query)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Failed to build frontend redirect URL"})
-		return
-	}
-
+	finalRedirectURL := buildSAMLRedirectURL(redirectTo, loginChallenge, user)
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, redirectURL, redirectURL))
+	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Successful</title></head><body><p>Authentication successful. Redirecting...</p><script>window.location.href = "%s";</script><noscript><a href="%s">Click here to continue</a></noscript></body></html>`, finalRedirectURL, finalRedirectURL))
 }
 
 // ProcessSAMLAssertion processes a SAML assertion and creates/updates user
