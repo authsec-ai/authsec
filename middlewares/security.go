@@ -31,9 +31,10 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		// Relaxed for OIDC callback page (needs inline script for OAuth redirect handling)
 		path := c.Request.URL.Path
 		var csp string
-		if strings.HasPrefix(path, "/authsec/uflow/oidc/callback") {
-			// Allow inline scripts for OAuth callback (postMessage to opener window)
-			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';"
+		if strings.HasPrefix(path, "/authsec/uflow/oidc/callback") ||
+			strings.HasPrefix(path, "/authsec/hmgr/saml/acs") {
+			// Allow inline scripts for OAuth/SAML callback (redirect via inline JS)
+			csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https:; media-src 'none'; object-src 'none'; child-src 'self'; worker-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action * 'self';"
 		} else if strings.HasPrefix(path, "/authsec/hmgr/consent") {
 			// Default CSP for the consent path. The handler overrides this just before
 			// rendering to add the registered redirect_uri origins of the OAuth client —
