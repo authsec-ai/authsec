@@ -1404,9 +1404,11 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 	// Resolve full SAML provider row for issuer / SSO URL / cert.
 	samlProvider, err := ctrl.service.GetSAMLProvider(realWorkspaceID, providerName)
 	if err != nil {
+		log.Printf("[SAML] InitiateSAML: GetSAMLProvider failed: %v", err)
 		c.JSON(http.StatusNotFound, hydramodels.SAMLInitiateResponse{Success: false, Error: "SAML provider row missing"})
 		return
 	}
+	log.Printf("[SAML] InitiateSAML: provider loaded entity_id=%s sso_url=%s active=%v", samlProvider.EntityID, samlProvider.SSOURL, samlProvider.IsActive)
 	if !samlProvider.IsActive {
 		c.JSON(http.StatusForbidden, hydramodels.SAMLInitiateResponse{Success: false, Error: "Provider is not active"})
 		return
@@ -1414,7 +1416,8 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 
 	samlRequest, relayState, err := ctrl.service.CreateSAMLRequest(samlProvider, req.LoginChallenge)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, hydramodels.SAMLInitiateResponse{Success: false, Error: "Failed to create SAML request"})
+		log.Printf("[SAML] InitiateSAML: CreateSAMLRequest failed: %v", err)
+		c.JSON(http.StatusInternalServerError, hydramodels.SAMLInitiateResponse{Success: false, Error: "Failed to create SAML request: " + err.Error()})
 		return
 	}
 
@@ -1435,28 +1438,37 @@ func (ctrl *HmgrController) InitiateSAMLAuthHandler(c *gin.Context) {
 
 // HandleSAMLACSHandler handles SAML Assertion Consumer Service (ACS) callback
 func (ctrl *HmgrController) HandleSAMLACSHandler(c *gin.Context) {
+	log.Printf("[SAML] ACS: received POST saml_response_len=%d relay_state_len=%d", len(c.PostForm("SAMLResponse")), len(c.PostForm("RelayState")))
+
 	var req hydramodels.SAMLCallbackRequest
 	if err := c.ShouldBind(&req); err != nil {
+		log.Printf("[SAML] ACS: binding failed: %v", err)
 		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid SAML response: " + err.Error()})
 		return
 	}
 
 	if req.SAMLResponse == "" || req.RelayState == "" {
+		log.Printf("[SAML] ACS: missing SAMLResponse=%v RelayState=%v", req.SAMLResponse == "", req.RelayState == "")
 		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Missing required SAML parameters"})
 		return
 	}
 
+	log.Printf("[SAML] ACS: validating SAML response")
 	assertion, loginChallenge, providerName, workspaceID, err := ctrl.service.ValidateSAMLResponse(req.SAMLResponse, req.RelayState)
 	if err != nil {
+		log.Printf("[SAML] ACS: validation failed: %v", err)
 		c.JSON(http.StatusBadRequest, hydramodels.CallbackValidationResponse{Success: false, Error: "Invalid SAML response: " + err.Error()})
 		return
 	}
+	log.Printf("[SAML] ACS: validated OK email=%s provider=%s workspace=%s", assertion.Email, providerName, workspaceID)
 
 	redirectTo, user, err := ctrl.ProcessSAMLAssertion(assertion, loginChallenge, providerName, workspaceID)
 	if err != nil {
+		log.Printf("[SAML] ACS: ProcessSAMLAssertion failed: %v", err)
 		c.JSON(http.StatusInternalServerError, hydramodels.CallbackValidationResponse{Success: false, Error: "Authentication processing failed: " + err.Error()})
 		return
 	}
+	log.Printf("[SAML] ACS: user resolved id=%s email=%s redirect=%s", user.ID, user.Email, redirectTo[:min(80, len(redirectTo))])
 
 	parsedURL, err := url.Parse(redirectTo)
 	if err != nil {

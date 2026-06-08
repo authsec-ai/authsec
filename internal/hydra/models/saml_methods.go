@@ -274,10 +274,22 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	requestID := fmt.Sprintf("_%s", uuid.New().String())
 	issueInstant := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
-	// Workspace-scoped SP entity / ACS URL. Per-Application restriction is
-	// expressed via application_identity_provider_policies, not URL paths.
-	spEntityID := fmt.Sprintf("%s/saml/metadata/%s", s.cfg.BaseURL, provider.WorkspaceID.String())
-	acsURL := fmt.Sprintf("%s/saml/acs/%s", s.cfg.BaseURL, provider.WorkspaceID.String())
+	// Use provider's SP metadata if configured, otherwise derive from config.
+	// The ACS URL must be the actual backend route where Auth0/Okta POSTs the SAMLResponse.
+	apiBase := config.AppConfig.OAuthBaseURL()
+	if apiBase == "" {
+		apiBase = s.cfg.BaseURL
+	}
+	spEntityID := provider.SPEntityID
+	if spEntityID == "" {
+		spEntityID = fmt.Sprintf("%s/authsec/uflow/saml/metadata", apiBase)
+	}
+	acsURL := provider.SPACSURL
+	if acsURL == "" {
+		acsURL = fmt.Sprintf("%s/authsec/uflow/saml/acs", apiBase)
+	}
+	log.Printf("[SAML] CreateSAMLRequest: provider=%s entity_id=%s sso_url=%s sp_entity=%s acs_url=%s api_base=%s",
+		provider.ProviderName, provider.EntityID, provider.SSOURL, spEntityID, acsURL, apiBase)
 
 	authnRequest := SAMLAuthnRequest{
 		ID:                          requestID,
@@ -331,8 +343,10 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	}
 
 	if err := db.Create(&samlReq).Error; err != nil {
+		log.Printf("[SAML] CreateSAMLRequest: DB store failed: %v", err)
 		return "", "", fmt.Errorf("failed to store SAML request: %w", err)
 	}
+	log.Printf("[SAML] CreateSAMLRequest: stored request_id=%s relay_state_len=%d", requestID, len(relayState))
 	return samlRequest, relayState, nil
 }
 
@@ -343,35 +357,45 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 // Validates: XML signature, audience restriction, destination, time window,
 // InResponseTo, and entity ID. Rejects forged, expired, and replayed responses.
 func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState string) (*SAMLAssertion, string, string, string, error) {
+	log.Printf("[SAML] ValidateSAMLResponse: relay_state_len=%d saml_response_len=%d", len(relayState), len(samlResponse))
+
 	// 1. Parse relay state: base64(loginChallenge:providerName:workspaceID)
 	relayBytes, err := base64.StdEncoding.DecodeString(relayState)
 	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: relay state decode failed: %v", err)
 		return nil, "", "", "", fmt.Errorf("invalid relay state: %w", err)
 	}
 
 	relayParts := strings.SplitN(string(relayBytes), ":", 3)
 	if len(relayParts) < 3 {
+		log.Printf("[SAML] ValidateSAMLResponse: relay state has %d parts (expected 3): %q", len(relayParts), string(relayBytes))
 		return nil, "", "", "", fmt.Errorf("invalid relay state format, expected 3 parts, got %d", len(relayParts))
 	}
 
 	loginChallenge := relayParts[0]
 	providerName := relayParts[1]
 	workspaceID := relayParts[2]
+	log.Printf("[SAML] ValidateSAMLResponse: challenge=%s...(truncated) provider=%s workspace=%s", loginChallenge[:min(20, len(loginChallenge))], providerName, workspaceID)
 
 	// 2. Look up SAML provider — must be active.
 	provider, err := s.GetSAMLProvider(workspaceID, providerName)
 	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: provider lookup failed workspace=%s provider=%s: %v", workspaceID, providerName, err)
 		return nil, "", "", "", fmt.Errorf("SAML provider lookup failed: %w", err)
 	}
 	if !provider.IsActive {
+		log.Printf("[SAML] ValidateSAMLResponse: provider %s is not active", providerName)
 		return nil, "", "", "", fmt.Errorf("SAML provider %q is not active", providerName)
 	}
+	log.Printf("[SAML] ValidateSAMLResponse: provider loaded entity_id=%s cert_len=%d", provider.EntityID, len(provider.Certificate))
 
 	// 3. Parse IdP certificate for signature verification.
 	idpCert, err := parsePEMCertificate(provider.Certificate)
 	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: certificate parse failed: %v (first 50 chars: %q)", err, provider.Certificate[:min(50, len(provider.Certificate))])
 		return nil, "", "", "", fmt.Errorf("failed to parse IdP certificate: %w", err)
 	}
+	log.Printf("[SAML] ValidateSAMLResponse: certificate parsed OK subject=%s", idpCert.Subject.CommonName)
 
 	// 4. Build the crewjam/saml ServiceProvider for validation.
 	spEntityID := provider.SPEntityID
@@ -419,10 +443,13 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	}
 
 	// 5. Decode and validate the SAML response (signature, audience, time, destination).
+	log.Printf("[SAML] ValidateSAMLResponse: decoding SAML response (base64 len=%d)", len(samlResponse))
 	responseBytes, err := base64.StdEncoding.DecodeString(samlResponse)
 	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: base64 decode failed: %v", err)
 		return nil, "", "", "", fmt.Errorf("failed to decode SAML response: %w", err)
 	}
+	log.Printf("[SAML] ValidateSAMLResponse: decoded XML len=%d, parsing with sp_entity=%s acs_url=%s", len(responseBytes), spEntityID, spACSURL)
 
 	// ParseXMLResponse validates: XML signature against IdP cert, audience
 	// restriction, destination URL, NotBefore/NotOnOrAfter time window.
@@ -430,8 +457,10 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	// the relay state already binds the response to the login challenge.
 	assertion, err := sp.ParseXMLResponse(responseBytes, nil, *mustParseURL(spACSURL))
 	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: VALIDATION FAILED: %v", err)
 		return nil, "", "", "", fmt.Errorf("SAML response validation failed: %w", err)
 	}
+	log.Printf("[SAML] ValidateSAMLResponse: VALIDATION SUCCESS")
 
 	// 6. Extract user attributes from the validated assertion.
 	nameID := ""
@@ -471,6 +500,9 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	if email == "" {
 		email = nameID
 	}
+
+	log.Printf("[SAML] ValidateSAMLResponse: extracted name_id=%s email=%s first_name=%s last_name=%s attrs=%d",
+		nameID, email, firstName, lastName, len(attributes))
 
 	return &SAMLAssertion{
 		NameID:     nameID,
