@@ -1631,7 +1631,12 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 		return "", nil, fmt.Errorf("failed to create/update user: %w", err)
 	}
 
-	userID := fmt.Sprintf("saml-%s-%s", providerName, nameID)
+	// Hydra subject must be the user's UUID so the consent handler's RBAC
+	// scope resolver (ResolveWithReport) can find user roles and effective
+	// scopes. Mirrors the OIDC federated and local login paths — they both
+	// pass user.ID.String() here. The SAML provider identity (provider name +
+	// NameID) is still recorded on the user row via user.Provider / user.ProviderID.
+	userID := user.ID.String()
 	hydraCtx := map[string]interface{}{
 		"email":        user.Email,
 		"name":         user.Name,
