@@ -458,9 +458,25 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	// restriction, destination URL, NotBefore/NotOnOrAfter time window.
 	// possibleRequestIDs is empty — we don't enforce InResponseTo because
 	// the relay state already binds the response to the login challenge.
+	// Pre-parse: log raw SAML response fields for debugging before crewjam validates.
+	var rawResp SAMLResponseEnvelope
+	if xmlErr := xml.Unmarshal(responseBytes, &rawResp); xmlErr == nil {
+		log.Printf("[SAML] ValidateSAMLResponse: raw_status=%s raw_issuer=%s raw_destination=%s raw_in_response_to=%s",
+			rawResp.Status.StatusCode.Value,
+			rawResp.Assertion.Issuer.Value,
+			rawResp.Destination,
+			rawResp.InResponseTo)
+		// Log audience if present in conditions
+		log.Printf("[SAML] ValidateSAMLResponse: raw_conditions not_before=%s not_on_or_after=%s",
+			rawResp.Assertion.Conditions.NotBefore,
+			rawResp.Assertion.Conditions.NotOnOrAfter)
+	}
+
 	assertion, err := sp.ParseXMLResponse(responseBytes, nil, *mustParseURL(spACSURL))
 	if err != nil {
 		log.Printf("[SAML] ValidateSAMLResponse: VALIDATION FAILED: %v", err)
+		log.Printf("[SAML] ValidateSAMLResponse: expected sp_entity=%s acs_url=%s idp_entity=%s",
+			spEntityID, spACSURL, provider.EntityID)
 		return nil, "", "", "", fmt.Errorf("SAML response validation failed: %w", err)
 	}
 	log.Printf("[SAML] ValidateSAMLResponse: VALIDATION SUCCESS")
@@ -517,26 +533,38 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 }
 
 // parsePEMCertificate parses a PEM-encoded or raw base64 X.509 certificate.
+// Handles certificates with leading whitespace on each line (common when
+// pasted from web UIs or stored in databases with text formatting).
 func parsePEMCertificate(certData string) (*x509.Certificate, error) {
 	certData = strings.TrimSpace(certData)
+
+	// Normalize: strip leading whitespace from each line (DB/UI paste artifacts).
+	lines := strings.Split(certData, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimSpace(line)
+	}
+	certData = strings.Join(lines, "\n")
 
 	// Try PEM decode first
 	block, _ := pem.Decode([]byte(certData))
 	if block != nil {
+		log.Printf("[SAML] parsePEMCertificate: PEM decoded OK, %d bytes", len(block.Bytes))
 		return x509.ParseCertificate(block.Bytes)
 	}
 
-	// Try raw base64 (no PEM headers)
-	raw, err := base64.StdEncoding.DecodeString(certData)
+	// Try raw base64 (no PEM headers) — strip all whitespace
+	cleaned := strings.NewReplacer("\n", "", "\r", "", " ", "", "\t", "").Replace(certData)
+	// Also strip PEM headers if present but malformed
+	cleaned = strings.ReplaceAll(cleaned, "-----BEGINCERTIFICATE-----", "")
+	cleaned = strings.ReplaceAll(cleaned, "-----ENDCERTIFICATE-----", "")
+	cleaned = strings.TrimSpace(cleaned)
+
+	raw, err := base64.StdEncoding.DecodeString(cleaned)
 	if err != nil {
-		// Try with newlines stripped
-		cleaned := strings.ReplaceAll(certData, "\n", "")
-		cleaned = strings.ReplaceAll(cleaned, "\r", "")
-		raw, err = base64.StdEncoding.DecodeString(cleaned)
-		if err != nil {
-			return nil, fmt.Errorf("certificate is not valid PEM or base64: %w", err)
-		}
+		log.Printf("[SAML] parsePEMCertificate: base64 decode failed after cleanup: %v (first 80 chars: %q)", err, cleaned[:min(80, len(cleaned))])
+		return nil, fmt.Errorf("certificate is not valid PEM or base64: %w", err)
 	}
+	log.Printf("[SAML] parsePEMCertificate: raw base64 decoded OK, %d bytes", len(raw))
 	return x509.ParseCertificate(raw)
 }
 
