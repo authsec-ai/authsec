@@ -282,11 +282,11 @@ func (s *OAuthLoginService) CreateSAMLRequest(provider *SAMLProvider, loginChall
 	}
 	spEntityID := provider.SPEntityID
 	if spEntityID == "" {
-		spEntityID = fmt.Sprintf("%s/authsec/uflow/saml/metadata", apiBase)
+		spEntityID = fmt.Sprintf("%s/authsec/hmgr/saml/metadata", apiBase)
 	}
 	acsURL := provider.SPACSURL
 	if acsURL == "" {
-		acsURL = fmt.Sprintf("%s/authsec/uflow/saml/acs", apiBase)
+		acsURL = fmt.Sprintf("%s/authsec/hmgr/saml/acs", apiBase)
 	}
 	log.Printf("[SAML] CreateSAMLRequest: provider=%s entity_id=%s sso_url=%s sp_entity=%s acs_url=%s api_base=%s",
 		provider.ProviderName, provider.EntityID, provider.SSOURL, spEntityID, acsURL, apiBase)
@@ -398,14 +398,17 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 	log.Printf("[SAML] ValidateSAMLResponse: certificate parsed OK subject=%s", idpCert.Subject.CommonName)
 
 	// 4. Build the crewjam/saml ServiceProvider for validation.
+	apiBase := config.AppConfig.OAuthBaseURL()
+	if apiBase == "" {
+		apiBase = config.AppConfig.BaseURL
+	}
 	spEntityID := provider.SPEntityID
 	if spEntityID == "" {
-		// Derive from BASE_URL if not explicitly configured.
-		spEntityID = config.AppConfig.BaseURL + "/saml/metadata"
+		spEntityID = apiBase + "/authsec/hmgr/saml/metadata"
 	}
 	spACSURL := provider.SPACSURL
 	if spACSURL == "" {
-		spACSURL = config.AppConfig.BaseURL + "/authsec/uflow/saml/acs"
+		spACSURL = apiBase + "/authsec/hmgr/saml/acs"
 	}
 
 	sp := saml.ServiceProvider{
