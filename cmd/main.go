@@ -24,6 +24,7 @@ import (
 	authManagerConfig "github.com/authsec-ai/auth-manager/pkg/config"
 	"github.com/authsec-ai/authsec/config"
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/handlers"
 	"github.com/authsec-ai/authsec/internal/clients/icp"
 	"github.com/authsec-ai/authsec/internal/migration"
@@ -272,6 +273,34 @@ func main() {
 			pkiWorker := services.NewPKIRetryWorker(config.GetDatabase(), icpService, 5*time.Minute)
 			pkiWorker.Start()
 			log.Printf("PKI retry worker started")
+		}
+	}
+
+	// Tenant provisioning resumer — heals tenants whose post-commit provisioning
+	// (tenant DB creation + migrations + mappings) was interrupted, e.g. by a
+	// pod eviction mid-registration. Runs an initial sweep at startup and
+	// re-sweeps every 5 minutes. Idempotent (see database.ProvisionTenantInfra).
+	if config.Database != nil && config.Database.DB != nil {
+		tenantDBSvc, svcErr := database.NewTenantDBService(config.Database, cfg.DBHost, cfg.DBUser, cfg.DBPassword, cfg.DBPort)
+		if svcErr != nil {
+			log.Printf("Warning: tenant provisioning resumer disabled (init failed): %v", svcErr)
+		} else {
+			runResume := func() {
+				if n, err := tenantDBSvc.ResumePendingTenants(); err != nil {
+					log.Printf("[provisioning-resume] sweep error: %v", err)
+				} else if n > 0 {
+					log.Printf("[provisioning-resume] repaired %d tenant(s)", n)
+				}
+			}
+			go runResume() // initial sweep on startup
+			go func() {
+				ticker := time.NewTicker(5 * time.Minute)
+				defer ticker.Stop()
+				for range ticker.C {
+					runResume()
+				}
+			}()
+			log.Printf("Tenant provisioning resumer started (startup sweep + every 5m)")
 		}
 	}
 

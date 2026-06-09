@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -77,13 +78,38 @@ func CreateDynamicWebAuthnConfig(rpDisplayName, rpID, origin string) *webauthn.C
 	}
 }
 
+// legacyTOTPDevKeyHex was the hard-coded fallback key. Due to a typo
+// (`TOTP_ENCRYPTION_key` vs `TOTP_ENCRYPTION_KEY`) it was silently used to
+// encrypt TOTP/SMS secrets in every environment, including production. It is
+// retained ONLY as a decryption fallback so secrets written under it still
+// decrypt during rotation; it is never used to encrypt new data once a real
+// key is configured.
+const legacyTOTPDevKeyHex = "6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6"
+
+// TOTPEncryptionKey is the key used to ENCRYPT new TOTP/SMS secrets.
 var TOTPEncryptionKey []byte
 
+// TOTPDecryptionKeys are tried in order when DECRYPTING. The active key comes
+// first, followed by the legacy dev key so data written before the env-var
+// name was fixed still decrypts (and gets re-encrypted under the active key on
+// next write). See utils.DecryptString.
+var TOTPDecryptionKeys [][]byte
+
 func init() {
-	keyHex := os.Getenv("TOTP_ENCRYPTION_key")
+	legacyDevKey, err := hex.DecodeString(legacyTOTPDevKeyHex)
+	if err != nil {
+		log.Fatalf("invalid legacy TOTP dev key constant: %v", err)
+	}
+
+	keyHex := os.Getenv("TOTP_ENCRYPTION_KEY")
 	if keyHex == "" {
-		log.Println("[WARN] TOTP_ENCRYPTION_KEY not set, using default dev key.")
-		keyHex = "6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6"
+		// No key configured — development fallback only. Never run production
+		// without TOTP_ENCRYPTION_KEY set (the dev key is published in source).
+		log.Println("[WARN] TOTP_ENCRYPTION_KEY not set, using default dev key. " +
+			"DEVELOPMENT ONLY — set TOTP_ENCRYPTION_KEY (64 hex chars) in production.")
+		TOTPEncryptionKey = legacyDevKey
+		TOTPDecryptionKeys = [][]byte{legacyDevKey}
+		return
 	}
 
 	key, err := hex.DecodeString(keyHex)
@@ -95,6 +121,13 @@ func init() {
 	}
 
 	TOTPEncryptionKey = key
+
+	// Active key first; fall back to the legacy dev key on decrypt so any
+	// secrets encrypted while the env-var name was mis-read still open.
+	TOTPDecryptionKeys = [][]byte{key}
+	if !bytes.Equal(key, legacyDevKey) {
+		TOTPDecryptionKeys = append(TOTPDecryptionKeys, legacyDevKey)
+	}
 }
 
 // SetupWebAuthn configures and returns a WebAuthn instance

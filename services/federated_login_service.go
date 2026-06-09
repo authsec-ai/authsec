@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -306,7 +307,7 @@ func (s *FederatedLoginService) HandleOIDCCallback(in HandleOIDCCallbackInput) (
 	}
 
 	// 5. Fetch userinfo.
-	userInfo, err := s.fetchUserinfo(oidcRow.UserinfoURL, tokens.AccessToken)
+	userInfo, err := s.fetchUserinfo(oidcRow.UserinfoURL, tokens.AccessToken, oidcRow.ProviderName)
 	if err != nil {
 		return nil, fmt.Errorf("fetch userinfo: %w", err)
 	}
@@ -554,8 +555,11 @@ func (s *FederatedLoginService) exchangeCode(
 	data.Set("client_secret", clientSecret)
 	data.Set("code", code)
 	data.Set("redirect_uri", redirectURI)
-	// GitHub doesn't support PKCE; everyone else does.
-	if providerName != "github" && codeVerifier != "" {
+	// The authorize request always includes a code_challenge (S256), so the
+	// token exchange MUST include the matching code_verifier — GitHub Apps now
+	// enforce this just like everyone else (an older provider that ignores PKCE
+	// will simply ignore the verifier, so sending it is always safe).
+	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
 	}
 	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
@@ -588,27 +592,106 @@ type federatedUserInfo struct {
 	Picture       string `json:"picture,omitempty"`
 }
 
-func (s *FederatedLoginService) fetchUserinfo(userinfoURL, accessToken string) (*federatedUserInfo, error) {
-	req, err := http.NewRequest("GET", userinfoURL, nil)
+func (s *FederatedLoginService) fetchUserinfo(userinfoURL, accessToken, providerName string) (*federatedUserInfo, error) {
+	body, err := s.getJSONWithBearer(userinfoURL, accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("userinfo: %w", err)
+	}
+
+	// GitHub is not a standard OIDC provider: its /user endpoint returns a
+	// numeric "id" (not "sub"), and "email" is null when the user keeps their
+	// address private. Map id→sub and, when no public email is present, fall
+	// back to /user/emails to pull the primary verified address (requires the
+	// "user:email" scope on the provider config).
+	if providerName == "github" {
+		var gh struct {
+			ID    int64  `json:"id"`
+			Login string `json:"login"`
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		}
+		if err := json.Unmarshal(body, &gh); err != nil {
+			return nil, fmt.Errorf("decode github userinfo: %w", err)
+		}
+		out := &federatedUserInfo{
+			Sub:   strconv.FormatInt(gh.ID, 10),
+			Email: gh.Email,
+			Name:  gh.Name,
+		}
+		if out.Name == "" {
+			out.Name = gh.Login
+		}
+		if out.Email == "" {
+			email, verified, eerr := s.fetchGitHubPrimaryEmail(userinfoURL, accessToken)
+			if eerr != nil {
+				return nil, eerr
+			}
+			out.Email, out.EmailVerified = email, verified
+		} else {
+			out.EmailVerified = true
+		}
+		return out, nil
+	}
+
+	var out federatedUserInfo
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode userinfo: %w", err)
+	}
+	return &out, nil
+}
+
+// fetchGitHubPrimaryEmail pulls the user's primary verified email from
+// GitHub's /user/emails endpoint, used when the /user response carries no
+// public email. Requires the token to have the "user:email" scope.
+func (s *FederatedLoginService) fetchGitHubPrimaryEmail(userinfoURL, accessToken string) (string, bool, error) {
+	emailsURL := strings.TrimSuffix(userinfoURL, "/") + "/emails"
+	body, err := s.getJSONWithBearer(emailsURL, accessToken)
+	if err != nil {
+		return "", false, fmt.Errorf("github emails (grant the user:email scope): %w", err)
+	}
+	var emails []struct {
+		Email    string `json:"email"`
+		Primary  bool   `json:"primary"`
+		Verified bool   `json:"verified"`
+	}
+	if err := json.Unmarshal(body, &emails); err != nil {
+		return "", false, fmt.Errorf("decode github emails: %w", err)
+	}
+	var fallback string
+	for _, e := range emails {
+		if e.Primary && e.Verified {
+			return e.Email, true, nil
+		}
+		if e.Verified && fallback == "" {
+			fallback = e.Email
+		}
+	}
+	if fallback != "" {
+		return fallback, true, nil
+	}
+	return "", false, errors.New("github returned no verified email (the account needs a verified email and the user:email scope)")
+}
+
+// getJSONWithBearer GETs a JSON resource with a bearer token. A User-Agent is
+// always set — GitHub's API rejects requests without one (403).
+func (s *FederatedLoginService) getJSONWithBearer(u, accessToken string) ([]byte, error) {
+	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "AuthSec")
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("userinfo status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
 	}
-	var out federatedUserInfo
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode userinfo: %w", err)
-	}
-	return &out, nil
+	return body, nil
 }
 
 // resolveOrJITFederatedUser resolves the upstream-IdP user to an AuthSec

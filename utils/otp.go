@@ -2,6 +2,7 @@ package utils
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"math/big"
@@ -81,6 +82,15 @@ Your App Team
 		return fmt.Errorf("SMTP client create failed: %w", err)
 	}
 	defer client.Quit()
+
+	// Upgrade to TLS before authenticating. smtp.PlainAuth refuses to send
+	// credentials over an unencrypted connection, so without STARTTLS this
+	// fails with "unencrypted connection" (e.g. ElasticEmail on :2525).
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err = client.StartTLS(&tls.Config{ServerName: smtpHost}); err != nil {
+			return fmt.Errorf("SMTP STARTTLS failed: %w", err)
+		}
+	}
 
 	if err = client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP auth failed: %w", err)

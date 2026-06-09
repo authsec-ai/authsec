@@ -14,6 +14,7 @@ import (
 	hydramodels "github.com/authsec-ai/authsec/internal/hydra/models"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
+	sharedmodels "github.com/authsec-ai/sharedmodels"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -71,9 +72,17 @@ type LoginPageDataResponse struct {
 	RequestedScope  []string               `json:"requested_scope,omitempty"`
 	Skip            bool                   `json:"skip"`              // Hydra says "we have a session already, skip auth"
 	Subject         string                 `json:"subject,omitempty"` // pre-existing subject if Skip=true
+	RedirectTo      string                 `json:"redirect_to,omitempty"` // set on Skip: where the browser should continue (Hydra)
+	Error           string                 `json:"error,omitempty"`
 	IdentityProviders []LoginIDPOption     `json:"identity_providers"`
 	OIDCContext     map[string]interface{} `json:"oidc_context,omitempty"` // prompt, max_age — UI may show re-auth gate
 	Submit          LoginSubmitURLs        `json:"submit"`
+	// Step drives the SPA: "" / "login" = show login form; "webauthn" = primary
+	// auth already done (user_id stamped), run the 2FA ceremony. WebauthnMode is
+	// "enroll" (no passkey yet) or "authenticate". Email identifies the user.
+	Step         string `json:"step,omitempty"`
+	WebauthnMode string `json:"webauthn_mode,omitempty"`
+	Email        string `json:"email,omitempty"`
 }
 
 // LoginIDPOption is one row the UI renders as a "Continue with X" button.
@@ -129,22 +138,10 @@ func (ctrl *LoginV2Controller) GetLoginPageData(c *gin.Context) {
 		return
 	}
 
-	// Hydra "skip=true" means there's an existing user session for this
-	// client — we should accept-login immediately with the existing subject
-	// rather than show the page. The UI doesn't render anything; the
-	// caller should POST to /login/skip-accept (Session 2) with this
-	// challenge to complete the dance. For now we just surface it.
-	if loginReq.Skip {
-		c.JSON(http.StatusOK, LoginPageDataResponse{
-			Success:        true,
-			LoginChallenge: loginChallenge,
-			Skip:           true,
-			Subject:        loginReq.Subject,
-			RequestedScope: loginReq.RequestedScope,
-			Submit:         ctrl.buildSubmitURLs(),
-		})
-		return
-	}
+	// Note: Hydra "skip=true" (an existing session for this client) is handled
+	// below, AFTER we resolve + bind the auth_request_context — we auto-accept
+	// the login with the existing subject and continue to consent rather than
+	// dead-ending the user on a "sign in again" page.
 
 	// Pull authsec_ctx out of the request_url Hydra echoes back.
 	contextID := extractAuthsecCtx(loginReq.RequestURL)
@@ -198,6 +195,59 @@ func (ctrl *LoginV2Controller) GetLoginPageData(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"error":   "auth context lookup failed: " + err.Error(),
+		})
+		return
+	}
+
+	// Pending second factor: primary auth already stamped user_id (e.g. the
+	// browser was bounced back here after an OIDC/SAML callback, or the page
+	// was reloaded mid-2FA) but the WebAuthn ceremony isn't done. Surface the
+	// 2FA step instead of the login form so the SPA runs it.
+	if tdb, derr := config.GetTenantGORMDB(tenantID); derr == nil {
+		var arc models.AuthRequestContext
+		if ferr := tdb.Where("login_challenge = ? AND tenant_id = ?", loginChallenge, tenantID).
+			First(&arc).Error; ferr == nil && arc.UserID != nil && !arc.SecondFactorCompleted {
+			mode := "authenticate"
+			var credCount int64
+			_ = tdb.Table("credentials").Where("client_id = ?", *arc.UserID).Count(&credCount).Error
+			if credCount == 0 {
+				mode = "enroll"
+			}
+			var email string
+			_ = tdb.Raw(`SELECT COALESCE(email,'') FROM users WHERE id = ?`, *arc.UserID).Scan(&email).Error
+			c.JSON(http.StatusOK, LoginPageDataResponse{
+				Success:         true,
+				LoginChallenge:  loginChallenge,
+				TenantID:        tenantID,
+				ApplicationName: rs.Name,
+				RequestedScope:  loginReq.RequestedScope,
+				Step:            "webauthn",
+				WebauthnMode:    mode,
+				Email:           email,
+				Submit:          ctrl.buildSubmitURLs(),
+			})
+			return
+		}
+	}
+
+	// Skip mode: Hydra already has a remembered session for this client. Don't
+	// silently accept — surface the existing subject so the UI can offer a
+	// quick "Continue as <subject>" (SkipAccept) or "Sign in as a different
+	// user" (SwitchUser, which revokes the Hydra login session and re-prompts).
+	// The login_challenge is already bound above, so SkipAccept can resolve the
+	// context to stamp user_id.
+	if loginReq.Skip && strings.TrimSpace(loginReq.Subject) != "" {
+		c.JSON(http.StatusOK, LoginPageDataResponse{
+			Success:         true,
+			LoginChallenge:  loginChallenge,
+			ContextID:       contextID,
+			TenantID:        tenantID,
+			ApplicationID:   &rs.ID,
+			ApplicationName: rs.Name,
+			ResourceURI:     rs.ResourceURI,
+			RequestedScope:  loginReq.RequestedScope,
+			Skip:            true,
+			Subject:         loginReq.Subject,
 		})
 		return
 	}
@@ -382,6 +432,12 @@ type CompleteCustomLoginResponse struct {
 	Success    bool   `json:"success"`
 	RedirectTo string `json:"redirect_to,omitempty"`
 	Error      string `json:"error,omitempty"`
+	// NeedsWebauthn signals the UI to run the WebAuthn 2FA step before the
+	// login is accepted. Email + TenantID are echoed so the UI can drive the
+	// ceremony. When true, RedirectTo is empty.
+	NeedsWebauthn bool   `json:"needs_webauthn,omitempty"`
+	Email         string `json:"email,omitempty"`
+	TenantID      string `json:"tenant_id,omitempty"`
 }
 
 // CompleteCustomLogin handles POST /authsec/oauth/v2/login/complete-local.
@@ -473,54 +529,146 @@ func (ctrl *LoginV2Controller) CompleteCustomLogin(c *gin.Context) {
 		return
 	}
 
-	// 4. Call Hydra accept-login.
-	rememberFor := 0
-	if req.Remember {
-		// 8 hours default — same as dev. Hydra caches the consent session
-		// for this duration; subsequent /authorize calls for the same
-		// (client, subject) within the window skip the login prompt.
-		rememberFor = 8 * 3600
-	}
-	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(req.LoginChallenge, services.HydraAcceptLoginRequest{
-		Subject:     user.ID.String(),
-		Remember:    req.Remember,
-		RememberFor: rememberFor,
-		ACR:         "pwd", // bare password — acr=pwd per RFC 8176
-		Context: map[string]interface{}{
-			"email":       user.Email,
-			"name":        user.Name,
-			"provider":    user.Provider,
-			"auth_method": "custom_login",
-			"tenant_id":   tenantID,
-			"context_id":  arcRow.ContextID,
-		},
-	})
-	if err != nil {
-		// Hydra accept failed — log server-side, return generic to UI.
-		c.JSON(http.StatusBadGateway, CompleteCustomLoginResponse{
+	// 4. Stamp user_id onto auth_request_context but DO NOT accept the Hydra
+	// login yet — the WebAuthn 2FA step (enroll first time, challenge after)
+	// runs next and accepts the login on success. auth_time is stamped then.
+	if err := tenantDB.Model(&arcRow).Updates(map[string]interface{}{
+		"user_id": user.ID,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{
 			Success: false,
-			Error:   "authorization server unavailable",
+			Error:   "failed to persist login state",
 		})
 		return
 	}
 
-	// 5. Stamp user_id + auth_time onto auth_request_context. The consent
-	// step (Session 3) reads these to populate the access token's session
-	// claims.
+	c.JSON(http.StatusOK, CompleteCustomLoginResponse{
+		Success:       true,
+		NeedsWebauthn: true,
+		Email:         user.Email,
+		TenantID:      tenantID,
+	})
+}
+
+// RegisterEndUserRequest is the body for OAuth-flow email/pass self-registration.
+type RegisterEndUserRequest struct {
+	LoginChallenge string `json:"login_challenge" binding:"required"`
+	Email          string `json:"email" binding:"required,email"`
+	Password       string `json:"password" binding:"required,min=8"`
+	Name           string `json:"name,omitempty"`
+}
+
+// RegisterEndUser handles POST /authsec/oauth/v2/login/register. It creates a
+// `custom` end-user scoped to the Application (mirrors the OIDC JIT anchoring),
+// stamps user_id on the auth_request_context, and returns needs_webauthn so the
+// UI immediately enrolls a passkey before the login is accepted. No email OTP.
+func (ctrl *LoginV2Controller) RegisterEndUser(c *gin.Context) {
+	var req RegisterEndUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, CompleteCustomLoginResponse{Success: false, Error: "email and a password of at least 8 characters are required"})
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	arcRow, tenantID, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, CompleteCustomLoginResponse{Success: false, Error: "login_challenge invalid or expired"})
+		return
+	}
+	if arcRow.ResourceServerID == nil {
+		c.JSON(http.StatusBadRequest, CompleteCustomLoginResponse{Success: false, Error: "no application bound to this request"})
+		return
+	}
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "tenant db unavailable"})
+		return
+	}
+
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "invalid tenant"})
+		return
+	}
+
+	// Reject if an account with this email already exists in the tenant — they
+	// should sign in instead. Matches the login lookup (email + local providers).
+	var existing int64
+	if err := tenantDB.Table("users").
+		Where("LOWER(email) = ? AND tenant_id = ? AND provider IN ?",
+			req.Email, tenantUUID, []string{"custom", "ad_sync", "entra_id", "scim"}).
+		Count(&existing).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "registration check failed"})
+		return
+	}
+	if existing > 0 {
+		c.JSON(http.StatusConflict, CompleteCustomLoginResponse{Success: false, Error: "an account with this email already exists; please sign in"})
+		return
+	}
+
+	// Anchor users.client_id + project_id to a real clients row, preferring
+	// the Application's legacy_client_id (mirrors resolveOrJITFederatedUser).
+	var rs models.ResourceServer
+	if err := tenantDB.Where("id = ?", *arcRow.ResourceServerID).First(&rs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "application lookup failed"})
+		return
+	}
+	var clientRow struct {
+		ClientID  uuid.UUID `gorm:"column:client_id"`
+		ProjectID uuid.UUID `gorm:"column:project_id"`
+	}
+	cq := tenantDB.Table("clients").Select("client_id, project_id").Where("tenant_id = ? AND active = true", tenantUUID)
+	if rs.LegacyClientID != nil {
+		cq = cq.Where("client_id = ?", *rs.LegacyClientID)
+	}
+	if err := cq.Order("created_at ASC").First(&clientRow).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "could not anchor account"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = req.Email
+	}
+	hashUser := sharedmodels.User{PasswordHash: req.Password}
+	if err := hashUser.HashPassword(); err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "could not secure password"})
+		return
+	}
+
 	now := time.Now().UTC()
-	if err := tenantDB.Model(&arcRow).Updates(map[string]interface{}{
-		"user_id":   user.ID,
-		"auth_time": now,
-	}).Error; err != nil {
-		// We've already told Hydra we accepted — best-effort log + continue.
-		// The token exchange downstream will work because Hydra has the
-		// subject; only our session-claim hydration is degraded.
-		log.Printf("[login-v2] failed to write user_id onto context_id=%s: %v", arcRow.ContextID, err)
+	newUserID := uuid.New()
+	insertSQL := `
+		INSERT INTO users (
+			id, client_id, tenant_id, project_id, resource_server_id,
+			name, email, password_hash, tenant_domain, provider, provider_id,
+			active, created_at, updated_at
+		) VALUES (
+			?, ?, ?, ?, ?,
+			?, ?, ?, ?, 'custom', ?,
+			true, ?, ?
+		)`
+	if err := tenantDB.Exec(insertSQL,
+		newUserID, clientRow.ClientID, tenantUUID, clientRow.ProjectID, *arcRow.ResourceServerID,
+		name, req.Email, hashUser.PasswordHash, config.AppConfig.TenantDomainSuffix, req.Email,
+		now, now,
+	).Error; err != nil {
+		log.Printf("[login-v2-register] create user failed: %v", err)
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "could not create account"})
+		return
+	}
+
+	// Stamp user_id; the WebAuthn enrollment step accepts the login next.
+	if err := tenantDB.Model(&arcRow).Updates(map[string]interface{}{"user_id": newUserID}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, CompleteCustomLoginResponse{Success: false, Error: "failed to persist registration"})
+		return
 	}
 
 	c.JSON(http.StatusOK, CompleteCustomLoginResponse{
-		Success:    true,
-		RedirectTo: acceptResp.RedirectTo,
+		Success:       true,
+		NeedsWebauthn: true,
+		Email:         req.Email,
+		TenantID:      tenantID,
 	})
 }
 
@@ -615,6 +763,85 @@ func (ctrl *LoginV2Controller) RejectLogin(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": resp.RedirectTo})
+}
+
+// SkipAccept handles POST /authsec/oauth/v2/login/skip-accept. Called when the
+// user chooses "Continue as <existing account>" on the skip chooser. Accepts
+// the Hydra login with the remembered subject and stamps the context so the
+// consent step can resolve scopes.
+func (ctrl *LoginV2Controller) SkipAccept(c *gin.Context) {
+	var req struct {
+		LoginChallenge string `json:"login_challenge" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid request body"})
+		return
+	}
+	loginReq, err := ctrl.hydraLogin.GetLoginRequest(req.LoginChallenge)
+	if err != nil || strings.TrimSpace(loginReq.Subject) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "login_challenge invalid or no existing session"})
+		return
+	}
+	arcRow, tenantID, ctxErr := ctrl.findContextByLoginChallenge(req.LoginChallenge)
+	acceptResp, aerr := ctrl.hydraLogin.AcceptLoginRequest(req.LoginChallenge, services.HydraAcceptLoginRequest{
+		Subject:     loginReq.Subject,
+		Remember:    true,
+		RememberFor: 8 * 3600,
+		ACR:         "skip", // existing session reuse
+		Context: map[string]interface{}{
+			"auth_method": "session_reuse",
+			"tenant_id":   tenantID,
+		},
+	})
+	if aerr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": "authorization server unavailable"})
+		return
+	}
+	// Best-effort stamp of user_id + auth_time so consent can resolve scopes.
+	if ctxErr == nil {
+		if tenantDB, dbErr := config.GetTenantGORMDB(tenantID); dbErr == nil {
+			now := time.Now().UTC()
+			_ = tenantDB.Model(&arcRow).Updates(map[string]interface{}{
+				"user_id":   loginReq.Subject,
+				"auth_time": now,
+			}).Error
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": acceptResp.RedirectTo})
+}
+
+// SwitchUser handles POST /authsec/oauth/v2/login/switch-user. Called when the
+// user chooses "Sign in as a different user" on the skip chooser. Revokes the
+// remembered Hydra LOGIN session for the current subject (server-side — the CLI
+// dropping its local token does NOT clear this, which is why clearing the CLI
+// alone didn't change anything) and returns the original authorize URL so the
+// browser can re-run the dance; with the session gone, Hydra no longer skips
+// and the login form is shown.
+func (ctrl *LoginV2Controller) SwitchUser(c *gin.Context) {
+	var req struct {
+		LoginChallenge string `json:"login_challenge" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid request body"})
+		return
+	}
+	loginReq, err := ctrl.hydraLogin.GetLoginRequest(req.LoginChallenge)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "login_challenge invalid or expired"})
+		return
+	}
+	if subject := strings.TrimSpace(loginReq.Subject); subject != "" {
+		if rerr := services.RevokeV2LoginSession(subject); rerr != nil {
+			// Non-fatal: log and still send them back to re-authorize. Worst
+			// case Hydra still has the session and skips again.
+			log.Printf("[login-v2] switch-user: revoke login session for subject=%s failed: %v", subject, rerr)
+		}
+	}
+	if strings.TrimSpace(loginReq.RequestURL) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no authorize URL to re-initiate login"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": loginReq.RequestURL})
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1228,46 +1455,37 @@ func (ctrl *LoginV2Controller) CallbackOIDC(c *gin.Context) {
 		return
 	}
 
-	// Call Hydra accept-login. Subject must be the users.id UUID string so
-	// the introspect RBAC filter (commit 2d9f8ae) can look up effective
-	// scopes for the user.
-	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(result.LoginChallenge, services.HydraAcceptLoginRequest{
-		Subject:     result.UserID.String(),
-		Remember:    false,
-		RememberFor: 0,
-		ACR:         "fed", // federated — distinct from "pwd" for custom-login
-		Context: map[string]interface{}{
-			"email":       result.UserEmail,
-			"name":        result.UserName,
-			"provider":    "oidc",
-			"auth_method": result.AuthMethod,
-			"tenant_id":   result.TenantID,
-			"provider_name": result.ProviderName,
-		},
-	})
-	if err != nil {
-		c.JSON(http.StatusBadGateway, CallbackOIDCResponse{Success: false, Error: "authorization server unavailable"})
-		return
-	}
-
-	// Stamp user_id + auth_time on the auth_request_context row for the
-	// consent step. We need to look up the context row again — the
-	// federated service doesn't carry it.
+	// Stamp user_id on the auth_request_context row but DO NOT accept the Hydra
+	// login yet — the WebAuthn 2FA step runs next and accepts on success.
 	tenantDB, dbErr := config.GetTenantGORMDB(result.TenantID)
 	if dbErr == nil {
-		now := time.Now().UTC()
 		_ = tenantDB.Model(&models.AuthRequestContext{}).
 			Where("login_challenge = ? AND tenant_id = ?", result.LoginChallenge, result.TenantID).
-			Updates(map[string]interface{}{
-				"user_id":   result.UserID,
-				"auth_time": now,
-			}).Error
+			Updates(map[string]interface{}{"user_id": result.UserID}).Error
 	}
 
-	c.JSON(http.StatusOK, CallbackOIDCResponse{
-		Success:    true,
-		RedirectTo: acceptResp.RedirectTo,
-	})
+	// The upstream OIDC provider redirects the *browser* straight to this
+	// endpoint, so bounce it to the SPA login page, which detects the pending
+	// second factor (user_id stamped, second_factor_completed=false) and runs
+	// the WebAuthn ceremony before the login is accepted → consent.
+	c.Redirect(http.StatusFound, oauthLoginUIURL(result.LoginChallenge))
+}
+
+// oauthLoginUIURL builds the SPA login-page URL the browser is sent to so the
+// WebAuthn 2FA step can run (used after the OIDC/SAML callbacks).
+//
+// The login page is served at the tenant-domain-suffix host (stage.authsec.dev,
+// app.authsec.ai, …) — the same host WebAuthn's RP ID/origin uses — which is
+// reliable across environments. REACT_APP_URL is NOT (it carries release- or
+// path-specific values like ".../oidc/auth"), so we don't use it here.
+func oauthLoginUIURL(loginChallenge string) string {
+	host := strings.TrimSpace(config.AppConfig.TenantDomainSuffix)
+	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://"), "/")
+	if host == "" {
+		// Last-resort fallback so we never emit a bare path.
+		host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(config.AppConfig.ReactAppURL, "https://"), "http://"), "/")
+	}
+	return "https://" + host + "/oauth/login?login_challenge=" + url.QueryEscape(loginChallenge)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1451,38 +1669,21 @@ func (ctrl *LoginV2Controller) CallbackSAML(c *gin.Context) {
 		return
 	}
 
-	acceptResp, err := ctrl.hydraLogin.AcceptLoginRequest(loginChallenge, services.HydraAcceptLoginRequest{
-		Subject:     userID.String(),
-		Remember:    false,
-		RememberFor: 0,
-		ACR:         "fed",
-		Context: map[string]interface{}{
-			"email":         userEmail,
-			"name":          userName,
-			"provider":      "saml",
-			"auth_method":   "saml_federated",
-			"tenant_id":     tenantID,
-			"provider_name": providerName,
-		},
-	})
-	if err != nil {
-		c.JSON(http.StatusBadGateway, CallbackSAMLResponse{Success: false, Error: "authorization server unavailable"})
-		return
-	}
-
-	// Stamp user_id + auth_time on auth_request_context for the consent step.
-	now := time.Now().UTC()
+	// Stamp user_id but DO NOT accept the Hydra login yet — the WebAuthn 2FA
+	// step runs next (in the SPA) and accepts on success. provider/name are
+	// captured here for completeness but the accept's Context is rebuilt at
+	// the WebAuthn-finish step from the user row.
+	_ = userEmail
+	_ = userName
+	_ = providerName
 	_ = tenantDB.Model(&models.AuthRequestContext{}).
 		Where("login_challenge = ? AND tenant_id = ?", loginChallenge, tenantID).
-		Updates(map[string]interface{}{
-			"user_id":   userID,
-			"auth_time": now,
-		}).Error
+		Updates(map[string]interface{}{"user_id": userID}).Error
 
-	c.JSON(http.StatusOK, CallbackSAMLResponse{
-		Success:    true,
-		RedirectTo: acceptResp.RedirectTo,
-	})
+	// The SAML ACS is reached by a browser POST, so bounce it to the SPA login
+	// page, which detects the pending second factor and runs WebAuthn before
+	// the login is accepted → consent.
+	c.Redirect(http.StatusFound, oauthLoginUIURL(loginChallenge))
 }
 
 // parseSAMLRelayStateLoginAndTenant pulls login_challenge + tenant_id out of

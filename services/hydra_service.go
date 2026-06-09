@@ -201,6 +201,35 @@ func hydraAdminRevokeConsentSessionAt(adminURL, subject, clientID string) error 
 	return nil
 }
 
+// RevokeV2LoginSession revokes the subject's remembered LOGIN session on the
+// v2 Hydra, so the next /authorize re-prompts instead of skipping. Used by the
+// "sign in as a different user" path. Idempotent (204 even if no session).
+func RevokeV2LoginSession(subject string) error {
+	return hydraAdminRevokeLoginSessionAt(hydraV2AdminURL(), subject)
+}
+
+func hydraAdminRevokeLoginSessionAt(adminURL, subject string) error {
+	if strings.TrimSpace(subject) == "" {
+		return fmt.Errorf("subject required")
+	}
+	u := fmt.Sprintf("%s/admin/oauth2/auth/sessions/login?subject=%s",
+		adminURL, url.QueryEscape(subject))
+	req, err := http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra revoke login: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra revoke login status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
 func hydraAdminGetAllClients() ([]hydraClient, error) {
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), nil)
 	if err != nil {

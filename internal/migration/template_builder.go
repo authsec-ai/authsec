@@ -10,14 +10,24 @@ import (
 const syntheticTenantID = "00000000-0000-0000-0000-000000000001"
 
 // requiredTables is the list of tables that a fully-migrated tenant DB must contain.
+//
+// NOTE: this must match the actual tenant schema in 000_tenant_template.sql.
+// Three tables that used to be listed here are intentionally NOT required:
+//   - resource_methods — master-only RBAC table (CheckResourceMethodAccess queries
+//     the master DB); it is never created in tenant DBs.
+//   - client_scopes — dropped (see master migration 035_drop_client_scopes).
+//   - client_resources — not part of the tenant schema.
+// Listing them caused the golden-template verification to fail on every boot,
+// disabling the fast CREATE DATABASE ... WITH TEMPLATE clone path and forcing
+// every new tenant through the slow full base-template run.
 var requiredTables = []string{
 	"tenants", "users", "roles", "permissions", "clients",
 	"role_bindings", "role_permissions", "service_accounts",
 	"api_scopes", "scope_permissions", "api_scope_permissions",
-	"groups", "user_groups", "resources", "resource_methods",
+	"groups", "user_groups", "resources",
 	"user_scopes", "client_roles", "credentials", "scopes",
-	"services", "projects", "group_roles", "client_resources",
-	"client_scopes", "client_groups", "user_roles",
+	"services", "projects", "group_roles",
+	"client_groups", "user_roles",
 	"delegation_policies", "delegation_tokens",
 }
 
@@ -29,8 +39,14 @@ var requiredColumns = map[string][]string{
 }
 
 // requiredConstraints lists constraint names that must exist.
+//
+// The UNIQUE(tenant_id, id) constraint on users exists in the tenant template
+// under its pg_dump name `users_tenant_id_id_key`. Migration 003 would (re)create
+// the same logical constraint as `users_tenant_id_id_unique`, but the template
+// short-circuit marks incrementals as applied without running them, so only the
+// `_key` name is ever present in tenant DBs. Verify the name that actually exists.
 var requiredConstraints = []string{
-	"users_tenant_id_id_unique",
+	"users_tenant_id_id_key",
 }
 
 // SetupTenantTemplate drops and recreates the golden template DB, runs all

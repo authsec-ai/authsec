@@ -12,6 +12,7 @@ import (
 
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/utils"
 	"github.com/google/uuid"
 )
 
@@ -66,6 +67,9 @@ func (s *TOTPService) HashBackupCode(code string) string {
 // ValidateTOTPCode validates a 6-digit TOTP code against the secret
 // Allows for time drift (±1 time step = 30 seconds window)
 func (s *TOTPService) ValidateTOTPCode(secret string, code string) bool {
+	// Stored secrets are encrypted at rest (legacy rows may be plaintext).
+	secret = utils.DecryptStringCompat(secret)
+
 	// Get current time
 	now := time.Now()
 
@@ -130,15 +134,21 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, tenantID uuid.UUID, email
 		return nil, fmt.Errorf("failed to generate backup codes: %w", err)
 	}
 
-	// Generate QR code URL
+	// Generate QR code URL (uses the plaintext secret — shown to the user once)
 	qrCodeURL := s.GenerateQRCodeURL(secret, email, "AuthSec")
+
+	// Encrypt the secret for storage at rest.
+	encryptedSecret, err := utils.EncryptString(secret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt TOTP secret: %w", err)
+	}
 
 	// Create device record (not confirmed yet)
 	device := &models.TOTPSecret{
 		ID:         uuid.New(),
 		UserID:     userID,
 		TenantID:   tenantID,
-		Secret:     secret,
+		Secret:     encryptedSecret,
 		DeviceName: deviceName,
 		DeviceType: deviceType,
 		IsActive:   false, // Not active until confirmed

@@ -924,6 +924,14 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		}
 	}
 
+	// Mark provisioning as pending within the SAME atomic commit as the tenant
+	// row, so if the post-commit infra steps below are interrupted (e.g. a pod
+	// eviction mid-registration) the tenant is left observably incomplete and
+	// gets repaired by the resumer (database.ResumePendingTenants).
+	if _, err := tx.Exec("UPDATE tenants SET provisioning_state = 'pending' WHERE id = $1", tenantID); err != nil {
+		log.Printf("WARNING: failed to mark tenant %s provisioning_state=pending: %v", tenantID, err)
+	}
+
 	// Commit main DB transaction
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
@@ -1105,6 +1113,13 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 		}
 	} else {
 		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
+	}
+
+	// Load-bearing infrastructure is in place (tenant DB created+migrated,
+	// tenant_mappings written). Mark provisioning complete so the resumer leaves
+	// this tenant alone.
+	if _, err := config.GetDatabase().Exec("UPDATE tenants SET provisioning_state = 'complete', updated_at = NOW() WHERE id = $1", tenantID); err != nil {
+		log.Printf("WARNING: failed to mark tenant %s provisioning_state=complete: %v", tenantID, err)
 	}
 
 	// Audit log: OIDC registration completed
@@ -1503,6 +1518,14 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		}
 	}
 
+	// Mark provisioning as pending within the SAME atomic commit as the tenant
+	// row, so if the post-commit infra steps below are interrupted (e.g. a pod
+	// eviction mid-registration) the tenant is left observably incomplete and
+	// gets repaired by the resumer (database.ResumePendingTenants).
+	if _, err := tx.Exec("UPDATE tenants SET provisioning_state = 'pending' WHERE id = $1", tenantID); err != nil {
+		log.Printf("WARNING: failed to mark tenant %s provisioning_state=pending: %v", tenantID, err)
+	}
+
 	// Commit main DB transaction
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
@@ -1680,6 +1703,13 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 		}
 	} else {
 		log.Printf("Skipping Hydra registration for tenant %s because no Vault secret was stored", tenantID.String())
+	}
+
+	// All load-bearing infrastructure is in place (tenant DB created+migrated,
+	// tenant_mappings written). Mark provisioning complete so the resumer leaves
+	// this tenant alone.
+	if _, err := config.GetDatabase().Exec("UPDATE tenants SET provisioning_state = 'complete', updated_at = NOW() WHERE id = $1", tenantID); err != nil {
+		log.Printf("WARNING: failed to mark tenant %s provisioning_state=complete: %v", tenantID, err)
 	}
 
 	// Return JSON response without token (frontend should login separately)

@@ -4,7 +4,7 @@
 
 
 -- Dumped from database version 16.1
--- Dumped by pg_dump version 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
+-- Dumped by pg_dump version 18.4 (Ubuntu 18.4-1.pgdg24.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -600,6 +600,116 @@ COMMENT ON COLUMN public.api_scopes.name IS 'OAuth scope name, e.g., files:read,
 
 
 --
+-- Name: application_access_policies; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_access_policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    default_role_id uuid,
+    assignment_trigger text DEFAULT 'first_successful_login'::text NOT NULL,
+    assignment_source text DEFAULT 'default_policy'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: application_drift_event_dismissals; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_drift_event_dismissals (
+    event_id uuid NOT NULL,
+    admin_user_id uuid NOT NULL,
+    dismissed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: application_drift_events; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_drift_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    event_type text NOT NULL,
+    event_payload jsonb,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    occurred_by uuid,
+    CONSTRAINT application_drift_events_type_chk CHECK ((event_type = ANY (ARRAY['secret_rotated'::text, 'default_role_disabled'::text, 'connection_revoked'::text, 'tool_unmapped'::text, 'scope_deleted'::text])))
+);
+
+
+
+--
+-- Name: application_identity_provider_policies; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_identity_provider_policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    identity_provider_id uuid NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: application_role_bindings; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_role_bindings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    role_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    granted_at timestamp with time zone DEFAULT now() NOT NULL,
+    granted_by uuid
+);
+
+
+
+--
+-- Name: application_role_scope_grants; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_role_scope_grants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    role_id uuid NOT NULL,
+    scope_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: application_roles; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.application_roles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    is_system boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
 -- Name: attestation_policies; Type: TABLE; Schema: public; Owner: authprod
 --
 
@@ -790,6 +900,37 @@ COMMENT ON COLUMN public.auth_agents.api_key IS 'Public API key for agent authen
 --
 
 COMMENT ON COLUMN public.auth_agents.api_secret_hash IS 'Bcrypt hash of API secret (never returned in responses)';
+
+
+--
+-- Name: auth_request_context; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.auth_request_context (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    context_id text NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    client_id character varying(512) NOT NULL,
+    resource_uri text,
+    resource_server_id uuid,
+    redirect_uri text NOT NULL,
+    scope text,
+    state text,
+    code_challenge text,
+    code_challenge_method character varying(20),
+    nonce text,
+    consumed boolean DEFAULT false NOT NULL,
+    consumed_at timestamp with time zone,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    consent_completed boolean DEFAULT false NOT NULL,
+    login_challenge text,
+    consent_challenge text,
+    user_id uuid,
+    auth_time timestamp with time zone,
+    second_factor_completed boolean DEFAULT false NOT NULL
+);
+
 
 
 --
@@ -1011,9 +1152,7 @@ CREATE TABLE public.delegation_policies (
     client_id uuid,
     created_by uuid,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT pk_delegation_policies PRIMARY KEY (id),
-    CONSTRAINT uq_deleg_policy_tenant_role_agent UNIQUE (tenant_id, role_name, agent_type)
+    updated_at timestamp with time zone DEFAULT now()
 );
 
 
@@ -1701,6 +1840,25 @@ CREATE TABLE public.hydra_oauth2_trusted_jwt_bearer_issuer (
 
 
 --
+-- Name: identity_providers; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.identity_providers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    provider_type text NOT NULL,
+    display_name text NOT NULL,
+    config_ref text NOT NULL,
+    status text DEFAULT 'configured'::text NOT NULL,
+    created_by_user_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT identity_providers_type_chk CHECK ((provider_type = ANY (ARRAY['oidc'::text, 'saml'::text, 'ad'::text, 'entra'::text, 'scim'::text])))
+);
+
+
+
+--
 -- Name: join_tokens; Type: TABLE; Schema: public; Owner: authprod
 --
 
@@ -2175,6 +2333,29 @@ COMMENT ON TABLE public.m2m_workloads IS 'Registered machine identities (service
 
 
 --
+-- Name: mcp_tools; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.mcp_tools (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    resource_server_id uuid NOT NULL,
+    name text NOT NULL,
+    title text,
+    description text,
+    input_schema jsonb,
+    is_public boolean DEFAULT false NOT NULL,
+    required_scopes text[] DEFAULT '{}'::text[],
+    inventory_source text DEFAULT 'sdk_manifest'::text NOT NULL,
+    last_published_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT mcp_tools_inventory_source_check CHECK ((inventory_source = ANY (ARRAY['sdk_manifest'::text, 'manual'::text])))
+);
+
+
+
+--
 -- Name: mfa_methods; Type: TABLE; Schema: public; Owner: authprod
 --
 
@@ -2239,6 +2420,46 @@ CREATE TABLE public.networks (
 
 
 --
+-- Name: oauth_consent_grants; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.oauth_consent_grants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    user_id uuid NOT NULL,
+    client_id character varying(512) NOT NULL,
+    resource_server_id uuid,
+    granted_scopes text[] DEFAULT '{}'::text[] NOT NULL,
+    revoked boolean DEFAULT false NOT NULL,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+
+--
+-- Name: oauth_scopes; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.oauth_scopes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_id uuid NOT NULL,
+    scope_string text NOT NULL,
+    display_name text,
+    description text,
+    risk_level text DEFAULT 'low'::text NOT NULL,
+    source text DEFAULT 'admin'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT oauth_scopes_risk_level_chk CHECK ((risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'critical'::text]))),
+    CONSTRAINT oauth_scopes_source_chk CHECK ((source = ANY (ARRAY['admin'::text, 'application_create'::text, 'sdk_discovered'::text])))
+);
+
+
+
+--
 -- Name: oauth_sessions; Type: TABLE; Schema: public; Owner: authprod
 --
 
@@ -2276,7 +2497,7 @@ CREATE TABLE public.oidc_providers (
     provider_name character varying(50) NOT NULL,
     display_name character varying(100) NOT NULL,
     client_id character varying(255) NOT NULL,
-    client_secret_vault_path character varying(255) NOT NULL,
+    client_secret_vault_path character varying(255),
     authorization_url character varying(500) NOT NULL,
     token_url character varying(500) NOT NULL,
     userinfo_url character varying(500) NOT NULL,
@@ -2284,7 +2505,9 @@ CREATE TABLE public.oidc_providers (
     icon_url character varying(500),
     is_active boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP
+    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    client_secret text,
+    resource_server_id uuid
 );
 
 
@@ -2325,7 +2548,9 @@ CREATE TABLE public.oidc_states (
     redirect_after character varying(500),
     expires_at timestamp without time zone NOT NULL,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    request_host character varying(255)
+    request_host character varying(255),
+    application_id uuid,
+    login_challenge text
 );
 
 
@@ -2372,7 +2597,8 @@ CREATE TABLE public.oidc_user_identities (
     profile_data jsonb,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    last_login_at timestamp with time zone
+    last_login_at timestamp with time zone,
+    resource_server_id uuid
 );
 
 
@@ -2476,6 +2702,65 @@ COMMENT ON TABLE public.projects IS 'Projects table with UUID primary key for sh
 --
 
 COMMENT ON COLUMN public.projects.id IS 'UUID primary key for shared-models compatibility';
+
+
+--
+-- Name: resource_server_client_registrations; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.resource_server_client_registrations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    resource_server_id uuid NOT NULL,
+    client_id character varying(512) NOT NULL,
+    status text DEFAULT 'approved'::text NOT NULL,
+    registration_type character varying(20) DEFAULT 'dcr'::character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    revoked_at timestamp with time zone,
+    revoked_reason text
+);
+
+
+
+--
+-- Name: resource_servers; Type: TABLE; Schema: public; Owner: authprod
+--
+
+CREATE TABLE public.resource_servers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id character varying(255) NOT NULL,
+    application_type text DEFAULT 'mcp_server'::text NOT NULL,
+    legacy_client_id uuid,
+    name character varying(255) NOT NULL,
+    public_base_url text NOT NULL,
+    protected_base_path text DEFAULT '/mcp'::text NOT NULL,
+    resource_uri text NOT NULL,
+    scopes_supported text[] DEFAULT '{}'::text[],
+    registration_modes text[] DEFAULT '{dcr,cimd,prereg}'::text[],
+    introspection_secret text DEFAULT ''::text,
+    introspection_secret_hash text,
+    active boolean DEFAULT true,
+    status text DEFAULT 'pending_scan'::text NOT NULL,
+    state text DEFAULT 'pending_scan'::text NOT NULL,
+    setup_completed_at timestamp with time zone,
+    setup_completed_by uuid,
+    scan_generation integer DEFAULT 0 NOT NULL,
+    last_successful_generation integer DEFAULT 0 NOT NULL,
+    scan_in_progress boolean DEFAULT false NOT NULL,
+    last_scan_status text,
+    last_scan_error text,
+    last_scan_started_at timestamp with time zone,
+    last_scan_completed_at timestamp with time zone,
+    last_validated_at timestamp with time zone,
+    last_validation_status text,
+    last_validation_error text,
+    spiffe_id text,
+    agent_type text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    deleted_at timestamp with time zone
+);
+
 
 
 --
@@ -2631,7 +2916,8 @@ CREATE TABLE public.saml_providers (
     is_active boolean DEFAULT true,
     sort_order integer DEFAULT 0,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    resource_server_id uuid
 );
 
 
@@ -3778,7 +4064,10 @@ CREATE TABLE public.users (
     voice_last_verified timestamp without time zone,
     failed_login_attempts integer DEFAULT 0,
     account_locked_at timestamp with time zone,
-    password_reset_required boolean DEFAULT false
+    password_reset_required boolean DEFAULT false,
+    resource_server_id uuid,
+    dormant_enrolled boolean DEFAULT false NOT NULL,
+    dormant_enrolled_at timestamp with time zone
 );
 
 
@@ -4518,6 +4807,102 @@ ALTER TABLE ONLY public.api_scopes
 
 
 --
+-- Name: application_access_policies application_access_policies_application_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_access_policies
+    ADD CONSTRAINT application_access_policies_application_uq UNIQUE (application_id);
+
+
+--
+-- Name: application_access_policies application_access_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_access_policies
+    ADD CONSTRAINT application_access_policies_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_drift_event_dismissals application_drift_event_dismissals_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_drift_event_dismissals
+    ADD CONSTRAINT application_drift_event_dismissals_pkey PRIMARY KEY (event_id, admin_user_id);
+
+
+--
+-- Name: application_drift_events application_drift_events_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_drift_events
+    ADD CONSTRAINT application_drift_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_identity_provider_policies application_identity_provider_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_identity_provider_policies
+    ADD CONSTRAINT application_identity_provider_policies_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_identity_provider_policies application_idp_policies_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_identity_provider_policies
+    ADD CONSTRAINT application_idp_policies_uq UNIQUE (application_id, identity_provider_id);
+
+
+--
+-- Name: application_role_bindings application_role_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_bindings
+    ADD CONSTRAINT application_role_bindings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_role_bindings application_role_bindings_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_bindings
+    ADD CONSTRAINT application_role_bindings_uq UNIQUE (application_id, role_id, user_id);
+
+
+--
+-- Name: application_role_scope_grants application_role_scope_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_scope_grants
+    ADD CONSTRAINT application_role_scope_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_role_scope_grants application_role_scope_grants_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_scope_grants
+    ADD CONSTRAINT application_role_scope_grants_uq UNIQUE (role_id, scope_id);
+
+
+--
+-- Name: application_roles application_roles_application_name_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_roles
+    ADD CONSTRAINT application_roles_application_name_uq UNIQUE (application_id, name);
+
+
+--
+-- Name: application_roles application_roles_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_roles
+    ADD CONSTRAINT application_roles_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: attestation_policies attestation_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
@@ -4558,6 +4943,22 @@ ALTER TABLE ONLY public.auth_agents
 
 
 --
+-- Name: auth_request_context auth_request_context_context_id_key; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.auth_request_context
+    ADD CONSTRAINT auth_request_context_context_id_key UNIQUE (context_id);
+
+
+--
+-- Name: auth_request_context auth_request_context_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.auth_request_context
+    ADD CONSTRAINT auth_request_context_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: certificate_revocation_list certificate_revocation_list_ca_id_serial_number_key; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
@@ -4595,14 +4996,6 @@ ALTER TABLE ONLY public.ciba_auth_requests
 
 ALTER TABLE ONLY public.ciba_requests
     ADD CONSTRAINT ciba_requests_auth_req_id_key UNIQUE (auth_req_id);
-
-
---
--- Name: clients clients_hydra_client_id_key; Type: INDEX; Schema: public; Owner: -
--- Partial unique index: allows empty/NULL hydra_client_id (e.g. AI agent clients)
---
-
-CREATE UNIQUE INDEX clients_hydra_client_id_key ON public.clients (hydra_client_id) WHERE hydra_client_id != '';
 
 
 --
@@ -4894,6 +5287,14 @@ ALTER TABLE ONLY public.hydra_oauth2_trusted_jwt_bearer_issuer
 
 
 --
+-- Name: identity_providers identity_providers_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.identity_providers
+    ADD CONSTRAINT identity_providers_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: join_tokens join_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
@@ -5062,6 +5463,22 @@ ALTER TABLE ONLY public.m2m_workloads
 
 
 --
+-- Name: mcp_tools mcp_tools_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.mcp_tools
+    ADD CONSTRAINT mcp_tools_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: mcp_tools mcp_tools_resource_server_name_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.mcp_tools
+    ADD CONSTRAINT mcp_tools_resource_server_name_uq UNIQUE (resource_server_id, name);
+
+
+--
 -- Name: mfa_methods mfa_methods_client_id_method_type_key; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
@@ -5098,6 +5515,38 @@ ALTER TABLE ONLY public.migration_logs
 
 ALTER TABLE ONLY public.networks
     ADD CONSTRAINT networks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: oauth_consent_grants oauth_consent_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_consent_grants
+    ADD CONSTRAINT oauth_consent_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: oauth_consent_grants oauth_consent_grants_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_consent_grants
+    ADD CONSTRAINT oauth_consent_grants_uq UNIQUE (user_id, client_id, resource_server_id);
+
+
+--
+-- Name: oauth_scopes oauth_scopes_application_string_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_scopes
+    ADD CONSTRAINT oauth_scopes_application_string_uq UNIQUE (application_id, scope_string);
+
+
+--
+-- Name: oauth_scopes oauth_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_scopes
+    ADD CONSTRAINT oauth_scopes_pkey PRIMARY KEY (id);
 
 
 --
@@ -5181,11 +5630,51 @@ ALTER TABLE ONLY public.permissions
 
 
 --
+-- Name: delegation_policies pk_delegation_policies; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.delegation_policies
+    ADD CONSTRAINT pk_delegation_policies PRIMARY KEY (id);
+
+
+--
 -- Name: projects projects_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
 --
 
 ALTER TABLE ONLY public.projects
     ADD CONSTRAINT projects_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_server_client_registrations resource_server_client_registrations_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.resource_server_client_registrations
+    ADD CONSTRAINT resource_server_client_registrations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_server_client_registrations resource_server_client_registrations_uq; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.resource_server_client_registrations
+    ADD CONSTRAINT resource_server_client_registrations_uq UNIQUE (resource_server_id, client_id);
+
+
+--
+-- Name: resource_servers resource_servers_pkey; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.resource_servers
+    ADD CONSTRAINT resource_servers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_servers resource_servers_resource_uri_key; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.resource_servers
+    ADD CONSTRAINT resource_servers_resource_uri_key UNIQUE (resource_uri);
 
 
 --
@@ -5724,6 +6213,12 @@ ALTER TABLE ONLY public.api_scopes
     ADD CONSTRAINT uq_api_scopes_tenant_name UNIQUE (tenant_id, name);
 
 
+--
+-- Name: delegation_policies uq_deleg_policy_tenant_role_agent; Type: CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.delegation_policies
+    ADD CONSTRAINT uq_deleg_policy_tenant_role_agent UNIQUE (tenant_id, role_name, agent_type);
 
 
 --
@@ -5940,6 +6435,13 @@ ALTER TABLE ONLY public.workload_entries
 
 ALTER TABLE ONLY public.workloads
     ADD CONSTRAINT workloads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: clients_hydra_client_id_key; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE UNIQUE INDEX clients_hydra_client_id_key ON public.clients USING btree (hydra_client_id) WHERE (hydra_client_id <> ''::text);
 
 
 --
@@ -6195,6 +6697,83 @@ CREATE INDEX idx_api_scopes_tenant_id ON public.api_scopes USING btree (tenant_i
 
 
 --
+-- Name: idx_app_drift_events_application; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_drift_events_application ON public.application_drift_events USING btree (application_id);
+
+
+--
+-- Name: idx_app_drift_events_occurred_at; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_drift_events_occurred_at ON public.application_drift_events USING btree (occurred_at);
+
+
+--
+-- Name: idx_app_idp_policies_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_idp_policies_tenant ON public.application_identity_provider_policies USING btree (tenant_id);
+
+
+--
+-- Name: idx_app_role_bindings_application; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_role_bindings_application ON public.application_role_bindings USING btree (application_id);
+
+
+--
+-- Name: idx_app_role_bindings_role; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_role_bindings_role ON public.application_role_bindings USING btree (role_id);
+
+
+--
+-- Name: idx_app_role_bindings_user; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_role_bindings_user ON public.application_role_bindings USING btree (user_id);
+
+
+--
+-- Name: idx_app_role_scope_grants_role; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_role_scope_grants_role ON public.application_role_scope_grants USING btree (role_id);
+
+
+--
+-- Name: idx_app_role_scope_grants_scope; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_app_role_scope_grants_scope ON public.application_role_scope_grants USING btree (scope_id);
+
+
+--
+-- Name: idx_application_access_policies_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_application_access_policies_tenant ON public.application_access_policies USING btree (tenant_id);
+
+
+--
+-- Name: idx_application_roles_application; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_application_roles_application ON public.application_roles USING btree (application_id);
+
+
+--
+-- Name: idx_application_roles_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_application_roles_tenant ON public.application_roles USING btree (tenant_id);
+
+
+--
 -- Name: idx_attestation_policies_enabled; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -6339,6 +6918,34 @@ CREATE INDEX idx_auth_pref_method ON public.user_auth_preferences USING btree (p
 --
 
 CREATE INDEX idx_auth_pref_user ON public.user_auth_preferences USING btree (user_id);
+
+
+--
+-- Name: idx_auth_request_context_client; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_auth_request_context_client ON public.auth_request_context USING btree (client_id);
+
+
+--
+-- Name: idx_auth_request_context_consent_challenge; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_auth_request_context_consent_challenge ON public.auth_request_context USING btree (consent_challenge) WHERE (consent_challenge IS NOT NULL);
+
+
+--
+-- Name: idx_auth_request_context_expires; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_auth_request_context_expires ON public.auth_request_context USING btree (expires_at);
+
+
+--
+-- Name: idx_auth_request_context_login_challenge; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_auth_request_context_login_challenge ON public.auth_request_context USING btree (login_challenge) WHERE (login_challenge IS NOT NULL);
 
 
 --
@@ -6741,6 +7348,20 @@ CREATE INDEX idx_groups_tenant_id ON public.groups USING btree (tenant_id);
 
 
 --
+-- Name: idx_identity_providers_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_identity_providers_tenant ON public.identity_providers USING btree (tenant_id);
+
+
+--
+-- Name: idx_identity_providers_type; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_identity_providers_type ON public.identity_providers USING btree (provider_type);
+
+
+--
 -- Name: idx_m2m_agent_attestations_agent_id; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -7133,6 +7754,20 @@ CREATE INDEX idx_m2m_workloads_tenant_id ON public.m2m_workloads USING btree (te
 
 
 --
+-- Name: idx_mcp_tools_resource_server; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_mcp_tools_resource_server ON public.mcp_tools USING btree (resource_server_id);
+
+
+--
+-- Name: idx_mcp_tools_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_mcp_tools_tenant ON public.mcp_tools USING btree (tenant_id);
+
+
+--
 -- Name: idx_mfa_methods_client_id; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -7196,6 +7831,41 @@ CREATE INDEX idx_migration_logs_version ON public.migration_logs USING btree (ve
 
 
 --
+-- Name: idx_oauth_consent_grants_revoked; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oauth_consent_grants_revoked ON public.oauth_consent_grants USING btree (revoked);
+
+
+--
+-- Name: idx_oauth_consent_grants_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oauth_consent_grants_tenant ON public.oauth_consent_grants USING btree (tenant_id);
+
+
+--
+-- Name: idx_oauth_consent_grants_user; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oauth_consent_grants_user ON public.oauth_consent_grants USING btree (user_id);
+
+
+--
+-- Name: idx_oauth_scopes_application; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oauth_scopes_application ON public.oauth_scopes USING btree (application_id);
+
+
+--
+-- Name: idx_oauth_scopes_tenant; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oauth_scopes_tenant ON public.oauth_scopes USING btree (tenant_id);
+
+
+--
 -- Name: idx_oauth_sessions_org_id; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -7224,6 +7894,13 @@ CREATE INDEX idx_oidc_identities_tenant ON public.oidc_user_identities USING btr
 
 
 --
+-- Name: idx_oidc_identities_tenant_rs_provider_sub; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oidc_identities_tenant_rs_provider_sub ON public.oidc_user_identities USING btree (tenant_id, resource_server_id, provider_name, provider_user_id) WHERE (resource_server_id IS NOT NULL);
+
+
+--
 -- Name: idx_oidc_identities_tenant_user; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -7249,6 +7926,13 @@ CREATE INDEX idx_oidc_providers_active ON public.oidc_providers USING btree (is_
 --
 
 CREATE INDEX idx_oidc_states_expires ON public.oidc_states USING btree (expires_at);
+
+
+--
+-- Name: idx_oidc_states_login_challenge; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_oidc_states_login_challenge ON public.oidc_states USING btree (login_challenge) WHERE (login_challenge IS NOT NULL);
 
 
 --
@@ -7371,6 +8055,34 @@ CREATE INDEX idx_projects_user_id ON public.projects USING btree (user_id);
 
 
 --
+-- Name: idx_resource_servers_active; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_resource_servers_active ON public.resource_servers USING btree (active);
+
+
+--
+-- Name: idx_resource_servers_application_type; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_resource_servers_application_type ON public.resource_servers USING btree (application_type);
+
+
+--
+-- Name: idx_resource_servers_deleted_at; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_resource_servers_deleted_at ON public.resource_servers USING btree (deleted_at);
+
+
+--
+-- Name: idx_resource_servers_tenant_id; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_resource_servers_tenant_id ON public.resource_servers USING btree (tenant_id);
+
+
+--
 -- Name: idx_resources_name; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -7487,6 +8199,20 @@ CREATE INDEX idx_roles_name ON public.roles USING btree (name);
 --
 
 CREATE INDEX idx_roles_tenant_id ON public.roles USING btree (tenant_id);
+
+
+--
+-- Name: idx_rscr_client_id; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_rscr_client_id ON public.resource_server_client_registrations USING btree (client_id);
+
+
+--
+-- Name: idx_rscr_status; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_rscr_status ON public.resource_server_client_registrations USING btree (status);
 
 
 --
@@ -8148,6 +8874,13 @@ CREATE INDEX idx_users_deleted_at ON public.users USING btree (deleted_at);
 
 
 --
+-- Name: idx_users_dormant_enrolled; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_users_dormant_enrolled ON public.users USING btree (dormant_enrolled, last_login) WHERE (active = true);
+
+
+--
 -- Name: idx_users_email; Type: INDEX; Schema: public; Owner: authprod
 --
 
@@ -8257,6 +8990,13 @@ CREATE INDEX idx_users_tenant_id ON public.users USING btree (tenant_id);
 --
 
 CREATE INDEX idx_users_tenant_project ON public.users USING btree (tenant_id, project_id);
+
+
+--
+-- Name: idx_users_tenant_rs_email; Type: INDEX; Schema: public; Owner: authprod
+--
+
+CREATE INDEX idx_users_tenant_rs_email ON public.users USING btree (tenant_id, resource_server_id, lower(email)) WHERE (resource_server_id IS NOT NULL);
 
 
 --
@@ -8734,6 +9474,94 @@ CREATE TRIGGER users_set_updated_at BEFORE UPDATE ON public.users FOR EACH ROW E
 
 ALTER TABLE ONLY public.api_scope_permissions
     ADD CONSTRAINT api_scope_permissions_scope_id_fkey FOREIGN KEY (scope_id) REFERENCES public.api_scopes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_access_policies application_access_policies_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_access_policies
+    ADD CONSTRAINT application_access_policies_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_drift_event_dismissals application_drift_event_dismissals_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_drift_event_dismissals
+    ADD CONSTRAINT application_drift_event_dismissals_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.application_drift_events(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_drift_events application_drift_events_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_drift_events
+    ADD CONSTRAINT application_drift_events_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_identity_provider_policies application_identity_provider_policie_identity_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_identity_provider_policies
+    ADD CONSTRAINT application_identity_provider_policie_identity_provider_id_fkey FOREIGN KEY (identity_provider_id) REFERENCES public.identity_providers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_identity_provider_policies application_identity_provider_policies_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_identity_provider_policies
+    ADD CONSTRAINT application_identity_provider_policies_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_role_bindings application_role_bindings_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_bindings
+    ADD CONSTRAINT application_role_bindings_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_role_bindings application_role_bindings_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_bindings
+    ADD CONSTRAINT application_role_bindings_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.application_roles(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_role_bindings application_role_bindings_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_bindings
+    ADD CONSTRAINT application_role_bindings_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_role_scope_grants application_role_scope_grants_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_scope_grants
+    ADD CONSTRAINT application_role_scope_grants_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.application_roles(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_role_scope_grants application_role_scope_grants_scope_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_role_scope_grants
+    ADD CONSTRAINT application_role_scope_grants_scope_id_fkey FOREIGN KEY (scope_id) REFERENCES public.oauth_scopes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_roles application_roles_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.application_roles
+    ADD CONSTRAINT application_roles_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
 
 
 --
@@ -9406,6 +10234,38 @@ ALTER TABLE ONLY public.m2m_credentials
 
 ALTER TABLE ONLY public.m2m_workloads
     ADD CONSTRAINT m2m_workloads_ca_id_fkey FOREIGN KEY (ca_id) REFERENCES public.tenant_certificate_authorities(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: mcp_tools mcp_tools_resource_server_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.mcp_tools
+    ADD CONSTRAINT mcp_tools_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: oauth_consent_grants oauth_consent_grants_resource_server_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_consent_grants
+    ADD CONSTRAINT oauth_consent_grants_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: oauth_scopes oauth_scopes_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.oauth_scopes
+    ADD CONSTRAINT oauth_scopes_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: resource_server_client_registrations resource_server_client_registrations_resource_server_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: authprod
+--
+
+ALTER TABLE ONLY public.resource_server_client_registrations
+    ADD CONSTRAINT resource_server_client_registrations_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
 
 
 --

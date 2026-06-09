@@ -43,6 +43,10 @@ type AuthRequestContext struct {
 	// AuthSec users.id; auth_time is the moment login completed.
 	UserID   *uuid.UUID `json:"user_id,omitempty" gorm:"type:uuid"`
 	AuthTime *time.Time `json:"auth_time,omitempty"`
+	// Second-factor gate. Primary auth (password/OIDC/SAML) stamps user_id but
+	// does NOT accept the Hydra login until a WebAuthn ceremony (enroll first
+	// time, challenge thereafter) sets this true.
+	SecondFactorCompleted bool `json:"second_factor_completed" gorm:"not null;default:false"`
 	// Consent gate. Token exchange fails closed when false.
 	ConsentCompleted bool       `json:"consent_completed" gorm:"not null;default:false"`
 	Consumed         bool       `json:"consumed" gorm:"not null;default:false"`

@@ -273,7 +273,19 @@ func SetupRoutes(
 			loginV2Controller := platformCtrl.NewLoginV2Controller()
 			oauthV2.GET("/login/page-data", loginV2Controller.GetLoginPageData)
 			oauthV2.POST("/login/complete-local", loginV2Controller.CompleteCustomLogin)
+			oauthV2.POST("/login/register", loginV2Controller.RegisterEndUser)
 			oauthV2.POST("/login/reject", loginV2Controller.RejectLogin)
+			// Skip-chooser actions: continue as the remembered subject, or
+			// revoke the Hydra login session and re-prompt as a different user.
+			oauthV2.POST("/login/skip-accept", loginV2Controller.SkipAccept)
+			oauthV2.POST("/login/switch-user", loginV2Controller.SwitchUser)
+			// WebAuthn 2FA, interposed between primary auth and consent.
+			oauthV2.POST("/login/webauthn/begin", loginV2Controller.WebauthnBegin)
+			oauthV2.POST("/login/webauthn/finish", loginV2Controller.WebauthnFinish)
+			// TOTP (authenticator app) — alternative second factor.
+			oauthV2.POST("/login/2fa/methods", loginV2Controller.Login2FAMethods)
+			oauthV2.POST("/login/totp/begin", loginV2Controller.TotpBegin)
+			oauthV2.POST("/login/totp/verify", loginV2Controller.TotpVerify)
 
 			// Consent challenge surface — session 3. Same public pattern
 			// as login (the consent_challenge IS the auth context, Hydra signs).

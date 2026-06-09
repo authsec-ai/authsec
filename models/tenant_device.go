@@ -105,8 +105,8 @@ type TenantTOTPSecret struct {
 	UserID   uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
 	TenantID uuid.UUID `json:"tenant_id" gorm:"type:uuid;not null;index"`
 
-	// TOTP secret (base32 encoded)
-	Secret string `json:"-" gorm:"size:64;not null"` // Never expose this in JSON
+	// TOTP secret, encrypted at rest via utils.EncryptString (base64 ciphertext).
+	Secret string `json:"-" gorm:"size:255;not null"` // Never expose this in JSON
 
 	// Device metadata
 	DeviceName string `json:"device_name" gorm:"size:100"`
