@@ -124,13 +124,18 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 		resolvedTenantID = tenantID
 		resourceServerID = &rs.ID
 
-		// RFC 8707 audience: the client must have this resource URI in its
-		// Hydra `audience` array, or /token will reject with "audience not
-		// whitelisted". DCR per RFC 7591 doesn't carry the resource indicator,
-		// so freshly DCR'd MCP clients land in Hydra with audience=[]. Append
-		// on the fly. Idempotent.
-		if err := services.EnsureV2ClientAudience(client.HydraClientID, resource); err != nil {
-			log.Printf("[oauth_v2] ensure audience failed for client=%s resource=%s: %v",
+		// RFC 8707 audience + per-app scope allow-list. Two gaps to bridge:
+		//   - audience: /token rejects with "audience not whitelisted" unless
+		//     the client's stored audience array contains the requested URI.
+		//   - scope:   Hydra silently strips any requested scope not in the
+		//     client's stored `scope` field. DCR clients land with just OIDC
+		//     core scopes, so app-specific scopes (e.g. demo:write) get dropped
+		//     before consent sees them and ResolveGrantableScopes runs on an
+		//     empty list. Union the app's scopes_supported into the client.
+		// Idempotent — no-op when both are already present.
+		appScopes := []string(rs.ScopesSupported)
+		if err := services.EnsureV2ClientAudienceAndScopes(client.HydraClientID, resource, appScopes); err != nil {
+			log.Printf("[oauth_v2] ensure audience/scopes failed for client=%s resource=%s: %v",
 				client.HydraClientID, resource, err)
 			// Not fatal — fall through and let Hydra surface the real error
 			// to the RP if the audience really matters for this flow.

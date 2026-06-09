@@ -230,33 +230,106 @@ func hydraAdminRevokeLoginSessionAt(adminURL, subject string) error {
 	return nil
 }
 
-// EnsureV2ClientAudience makes sure the Hydra v2 client has `audience` in its
-// audience list. RFC 8707 audience is sent at /authorize (and /token) but
-// Hydra rejects unless the client's stored audience array already contains the
-// requested URI. DCR per RFC 7591 doesn't carry a resource indicator, so DCR'd
-// MCP clients land in Hydra with audience=[]. This bridges the gap: when our
-// /authorize sees a resource the client hasn't been pre-bound to, we append
-// it on the fly and PUT the client. Idempotent — a no-op when the audience
-// already includes the URI.
-func EnsureV2ClientAudience(hydraClientID, audience string) error {
+// EnsureV2ClientAudienceAndScopes makes the Hydra v2 client request-ready for
+// (resource, appScopes). Two gaps to bridge in one call:
+//
+//   - audience: RFC 8707 audience is sent at /authorize (and /token) but Hydra
+//     rejects unless the client's stored audience array already contains the
+//     requested URI. DCR per RFC 7591 doesn't carry a resource indicator, so
+//     DCR'd MCP clients land in Hydra with audience=[].
+//
+//   - scope: Hydra silently strips any scope token the RP requests at /authorize
+//     that isn't in the client's stored `scope` field. DCR clients land with
+//     just OIDC core scopes (openid email profile offline_access — see
+//     unionScopes in oauth_as_v2_service); the Application's actual scopes
+//     (e.g. demo:write) aren't on the client's allow-list yet, so requested
+//     scopes are silently dropped and consent ends up with requested=[].
+//
+// Both fixes are idempotent GET-modify-PUT — no-op when the audience and every
+// requested scope are already present.
+func EnsureV2ClientAudienceAndScopes(hydraClientID, audience string, appScopes []string) error {
 	audience = strings.TrimSpace(audience)
-	if hydraClientID == "" || audience == "" {
+	if hydraClientID == "" {
 		return nil
 	}
 	cl, err := hydraV2AdminGetClient(hydraClientID)
 	if err != nil {
 		return fmt.Errorf("get client: %w", err)
 	}
-	for _, a := range cl.Audience {
-		if a == audience {
-			return nil
+	changed := false
+
+	if audience != "" {
+		seen := false
+		for _, a := range cl.Audience {
+			if a == audience {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			cl.Audience = append(cl.Audience, audience)
+			changed = true
 		}
 	}
-	cl.Audience = append(cl.Audience, audience)
+
+	if len(appScopes) > 0 {
+		have := map[string]struct{}{}
+		for _, s := range strings.Fields(cl.Scope) {
+			have[s] = struct{}{}
+		}
+		added := false
+		for _, s := range appScopes {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if _, ok := have[s]; ok {
+				continue
+			}
+			have[s] = struct{}{}
+			added = true
+		}
+		if added {
+			out := make([]string, 0, len(have))
+			// preserve original order then append new tokens
+			for _, s := range strings.Fields(cl.Scope) {
+				out = append(out, s)
+			}
+			for _, s := range appScopes {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				skip := false
+				for _, existing := range strings.Fields(cl.Scope) {
+					if existing == s {
+						skip = true
+						break
+					}
+				}
+				if !skip {
+					out = append(out, s)
+				}
+			}
+			cl.Scope = strings.Join(out, " ")
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
 	if err := hydraV2AdminUpdateClient(hydraClientID, *cl); err != nil {
-		return fmt.Errorf("update client audience: %w", err)
+		return fmt.Errorf("update client: %w", err)
 	}
 	return nil
+}
+
+// EnsureV2ClientAudience is a thin wrapper kept for callers that only need to
+// bridge the audience gap. Forwards to EnsureV2ClientAudienceAndScopes with
+// no scope changes.
+func EnsureV2ClientAudience(hydraClientID, audience string) error {
+	return EnsureV2ClientAudienceAndScopes(hydraClientID, audience, nil)
 }
 
 func hydraAdminGetAllClients() ([]hydraClient, error) {
