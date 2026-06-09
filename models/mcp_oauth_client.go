@@ -40,7 +40,7 @@ type MCPOAuthClient struct {
 	SoftwareID        *string        `json:"software_id,omitempty" gorm:"type:varchar(255)"`
 	SoftwareVersion   *string        `json:"software_version,omitempty" gorm:"type:varchar(64)"`
 	LastTokenIssuedAt              *time.Time     `json:"last_token_issued_at,omitempty" gorm:"column:last_token_issued_at"`
-	Tags                           pq.StringArray `json:"tags" gorm:"type:jsonb;not null;default:'[]'"`
+	Tags                           pq.StringArray `json:"tags" gorm:"type:text[];not null;default:'{}'"`
 	RegistrationAccessTokenHash    *string        `json:"-" gorm:"type:varchar(64);column:registration_access_token_hash"`
 	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`

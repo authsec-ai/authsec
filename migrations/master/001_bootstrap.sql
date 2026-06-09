@@ -432,7 +432,7 @@ CREATE TABLE public.mcp_oauth_clients (
     software_id            VARCHAR(255),
     software_version       VARCHAR(64),
     last_token_issued_at   TIMESTAMPTZ,
-    tags                   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    tags                   TEXT[] NOT NULL DEFAULT '{}'::text[],
     registration_access_token_hash VARCHAR(64),
     CONSTRAINT mcp_oauth_clients_sync_status_chk CHECK (sync_status IN ('active', 'sync_error', 'pending_delete')),
     CONSTRAINT mcp_oauth_clients_client_id_key UNIQUE (client_id),
