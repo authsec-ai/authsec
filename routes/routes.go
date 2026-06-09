@@ -394,7 +394,12 @@ func SetupRoutes(
 		}
 
 		// Workspace-wide OAuth client list (across all applications).
-		authsec.GET("/clients", applicationsController.ListWorkspaceClients)
+		authsec.GET("/clients",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+			applicationsController.ListWorkspaceClients,
+		)
 
 		// v1 IAM cockpit aggregate/read-model aliases. These routes expose the
 		// product vocabulary used by the AI/MCP access-control UI while reusing
