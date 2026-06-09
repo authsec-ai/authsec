@@ -62,7 +62,8 @@
       "/Users/pc/Desktop/authnull/Authsec-ui/src",
       "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/src/authsec_sdk/runtime",
       "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/examples",
-      "/Users/pc/Desktop/authnull/Authsec-ui"
+      "/Users/pc/Desktop/authnull/Authsec-ui",
+      "/Users/pc/Desktop/authnull/sdk-authsec/packages/typescript-sdk/src"
     ]
   }
 }

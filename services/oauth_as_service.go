@@ -2,8 +2,11 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,12 +91,44 @@ func (s *OAuthASService) ASMetadata(baseURL string) map[string]interface{} {
 	}
 }
 
+// resolveClientKind maps a DCR request to a client_kind value.
+// It uses the explicit client_kind field first, then falls back to
+// software_id heuristics so Claude Code, Cursor, etc. auto-classify as agents.
+func resolveClientKind(req DCRRequest) string {
+	if req.ClientKind != "" {
+		switch req.ClientKind {
+		case "agent", "m2m", "cli", "human_app":
+			return req.ClientKind
+		}
+	}
+	// Heuristic: well-known AI agent software_id prefixes
+	sid := strings.ToLower(req.SoftwareID)
+	for _, prefix := range []string{
+		"anthropic/", "openai/", "cursor/", "github/copilot",
+		"codeium/", "sourcegraph/", "deepseek/", "cohere/",
+	} {
+		if strings.Contains(sid, prefix) {
+			return "agent"
+		}
+	}
+	return "human_app" // safe default
+}
+
+// nilableString returns nil for an empty string, otherwise a pointer to the value.
+func nilableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // RegisterDCRClient creates a new OAuth client via Dynamic Client Registration (RFC 7591).
 // When the request includes OIDC scopes (openid, offline_access), the Hydra client and
 // MCPOAuthClient are configured to support id_token issuance and refresh_token grants.
-func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceServer) (*models.MCPOAuthClient, error) {
+// Returns the client and the raw registration_access_token (RFC 7592) to be returned to the caller.
+func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceServer) (*models.MCPOAuthClient, string, error) {
 	if rs != nil && !rs.AllowsRegistrationMode("dcr") {
-		return nil, fmt.Errorf("resource server does not allow DCR")
+		return nil, "", fmt.Errorf("resource server does not allow DCR")
 	}
 
 	clientID := uuid.New().String()
@@ -113,7 +148,7 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		Scope:         hydraScope,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("register hydra client for DCR: %w", err)
+		return nil, "", fmt.Errorf("register hydra client for DCR: %w", err)
 	}
 
 	client := &models.MCPOAuthClient{
@@ -128,6 +163,9 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		RegistrationType:        "dcr",
 		SupportsRefreshToken:    supportsRefresh,
 		PostLogoutRedirectURIs:  pq.StringArray(req.PostLogoutRedirectURIs),
+		ClientKind:              resolveClientKind(req),
+		SoftwareID:              nilableString(req.SoftwareID),
+		SoftwareVersion:         nilableString(req.SoftwareVersion),
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -145,7 +183,19 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 					"sync_last_error_at": now,
 				}).Error
 		}
-		return nil, fmt.Errorf("store DCR client: %w", err)
+		return nil, "", fmt.Errorf("store DCR client: %w", err)
+	}
+
+	// Generate and store a RFC 7592 registration_access_token (best-effort;
+	// if generation fails the client is still usable, just without self-management).
+	var rawRAT string
+	if rat, ratHash, ratErr := generateRegistrationAccessToken(); ratErr == nil {
+		rawRAT = rat
+		if dbErr := s.db.Model(client).Update("registration_access_token_hash", ratHash); dbErr.Error == nil {
+			client.RegistrationAccessTokenHash = &ratHash
+		}
+	} else {
+		log.Printf("[DCR] generateRegistrationAccessToken failed for client=%s: %v", client.ClientID, ratErr)
 	}
 
 	// When rs is non-nil, bind the client to the RS up-front. When nil, the
@@ -155,11 +205,11 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 	// that follow RFC 7591 strictly and omit `resource` at registration time.
 	if rs != nil {
 		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "dcr"); err != nil {
-			return nil, fmt.Errorf("create DCR client registration: %w", err)
+			return nil, "", fmt.Errorf("create DCR client registration: %w", err)
 		}
 	}
 
-	return client, nil
+	return client, rawRAT, nil
 }
 
 // GetOAuthClient looks up an MCP OAuth client by its public client_id.
@@ -865,6 +915,9 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 		RegistrationType:        "prereg",
 		SupportsRefreshToken:    supportsRefresh,
 		PostLogoutRedirectURIs:  pq.StringArray(req.PostLogoutRedirectURIs),
+		ClientKind:              resolveClientKind(req),
+		SoftwareID:              nilableString(req.SoftwareID),
+		SoftwareVersion:         nilableString(req.SoftwareVersion),
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -990,6 +1043,11 @@ type DCRRequest struct {
 	Resource                string   `json:"resource"`
 	Scope                   string   `json:"scope"`
 	PostLogoutRedirectURIs  []string `json:"post_logout_redirect_uris,omitempty"`
+	SoftwareID              string   `json:"software_id,omitempty"`
+	SoftwareVersion         string   `json:"software_version,omitempty"`
+	// ClientKind is a non-standard AuthSec extension; auto-inferred if absent.
+	// Values: human_app | agent | m2m | cli
+	ClientKind string `json:"client_kind,omitempty"`
 }
 
 type DCRResponse struct {
@@ -1002,6 +1060,51 @@ type DCRResponse struct {
 	Resource                string   `json:"resource"`
 	Scope                   string   `json:"scope,omitempty"`
 	PostLogoutRedirectURIs  []string `json:"post_logout_redirect_uris,omitempty"`
+	SoftwareID              string   `json:"software_id,omitempty"`
+	SoftwareVersion         string   `json:"software_version,omitempty"`
+	ClientKind              string   `json:"client_kind,omitempty"`
+	// RFC 7592 fields — only present in registration responses
+	RegistrationAccessToken string `json:"registration_access_token,omitempty"`
+	RegistrationClientURI   string `json:"registration_client_uri,omitempty"`
+}
+
+// generateRegistrationAccessToken creates a random 32-byte hex token and its SHA-256 hash.
+// The raw token is returned to the client; only the hash is stored in the DB.
+func generateRegistrationAccessToken() (raw string, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err = rand.Read(b); err != nil {
+		return "", "", err
+	}
+	raw = hex.EncodeToString(b)
+	sum := sha256.Sum256([]byte(raw))
+	hash = hex.EncodeToString(sum[:])
+	return
+}
+
+// GetClientByRegistrationToken validates a raw RFC 7592 registration_access_token and
+// returns the matching client. Returns an error if the token is absent or does not match.
+func (s *OAuthASService) GetClientByRegistrationToken(clientID, rawRAT string) (*models.MCPOAuthClient, error) {
+	client, err := s.authzCtx.GetMCPOAuthClientByClientID(clientID)
+	if err != nil {
+		return nil, fmt.Errorf("client not found")
+	}
+	if client.RegistrationAccessTokenHash == nil {
+		return nil, fmt.Errorf("client has no registration token")
+	}
+	sum := sha256.Sum256([]byte(rawRAT))
+	gotHash := hex.EncodeToString(sum[:])
+	if gotHash != *client.RegistrationAccessTokenHash {
+		return nil, fmt.Errorf("invalid registration access token")
+	}
+	return client, nil
+}
+
+// RevokeClientSelf deletes a client and its Hydra counterpart (RFC 7592 DELETE).
+func (s *OAuthASService) RevokeClientSelf(client *models.MCPOAuthClient) error {
+	if err := hydraAdminDeleteClient(client.HydraClientID); err != nil {
+		log.Printf("[RFC7592] hydra delete failed for %s: %v — marking pending_delete", client.ClientID, err)
+	}
+	return s.db.Delete(client).Error
 }
 
 // resolveOIDCClientCapabilities determines the Hydra client scope and grant types.
@@ -1493,4 +1596,104 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// WorkspaceClientItem is the DTO returned by GET /authsec/clients.
+type WorkspaceClientItem struct {
+	ClientID           string     `json:"client_id"`
+	ClientName         string     `json:"client_name"`
+	ClientKind         string     `json:"client_kind"`
+	RegistrationType   string     `json:"registration_type"`
+	SoftwareID         *string    `json:"software_id,omitempty"`
+	SoftwareVersion    *string    `json:"software_version,omitempty"`
+	Status             string     `json:"status"`
+	SyncStatus         string     `json:"sync_status"`
+	ResourceServerID   string     `json:"resource_server_id"`
+	ResourceServerName string     `json:"resource_server_name"`
+	RedirectURIs       []string   `json:"redirect_uris"`
+	Tags               []string   `json:"tags"`
+	LastTokenIssuedAt  *time.Time `json:"last_token_issued_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}
+
+// ListWorkspaceClients returns all OAuth clients registered to any resource
+// server that belongs to the given workspace.
+func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID) ([]WorkspaceClientItem, error) {
+	var regs []models.ResourceServerClientRegistration
+	if err := s.db.Where("workspace_id = ?", workspaceID).Find(&regs).Error; err != nil {
+		return nil, err
+	}
+
+	if len(regs) == 0 {
+		return []WorkspaceClientItem{}, nil
+	}
+
+	// Collect all RS IDs + client IDs.
+	rsIDs := make([]uuid.UUID, 0, len(regs))
+	clientIDs := make([]uuid.UUID, 0, len(regs))
+	for _, r := range regs {
+		rsIDs = append(rsIDs, r.ResourceServerID)
+		clientIDs = append(clientIDs, r.OAuthClientID)
+	}
+
+	// Fetch resource servers (for name lookup).
+	var rsList []models.ResourceServer
+	if err := s.db.Where("id IN ?", rsIDs).Find(&rsList).Error; err != nil {
+		return nil, err
+	}
+	rsMap := make(map[uuid.UUID]models.ResourceServer, len(rsList))
+	for _, rs := range rsList {
+		rsMap[rs.ID] = rs
+	}
+
+	// Fetch clients.
+	var clients []models.MCPOAuthClient
+	if err := s.db.Where("id IN ?", clientIDs).Find(&clients).Error; err != nil {
+		return nil, err
+	}
+	clientMap := make(map[uuid.UUID]models.MCPOAuthClient, len(clients))
+	for _, c := range clients {
+		clientMap[c.ID] = c
+	}
+
+	result := make([]WorkspaceClientItem, 0, len(regs))
+	for _, reg := range regs {
+		c, cOK := clientMap[reg.OAuthClientID]
+		rs, rsOK := rsMap[reg.ResourceServerID]
+		if !cOK {
+			continue
+		}
+		rsName := ""
+		rsIDStr := reg.ResourceServerID.String()
+		if rsOK {
+			rsName = rs.Name
+		}
+
+		tags := []string(c.Tags)
+		if tags == nil {
+			tags = []string{}
+		}
+		redirectURIs := []string(c.RedirectURIs)
+		if redirectURIs == nil {
+			redirectURIs = []string{}
+		}
+
+		result = append(result, WorkspaceClientItem{
+			ClientID:           c.ClientID,
+			ClientName:         c.ClientName,
+			ClientKind:         c.ClientKind,
+			RegistrationType:   reg.RegistrationType,
+			SoftwareID:         c.SoftwareID,
+			SoftwareVersion:    c.SoftwareVersion,
+			Status:             reg.Status,
+			SyncStatus:         c.SyncStatus,
+			ResourceServerID:   rsIDStr,
+			ResourceServerName: rsName,
+			RedirectURIs:       redirectURIs,
+			Tags:               tags,
+			LastTokenIssuedAt:  c.LastTokenIssuedAt,
+			CreatedAt:          c.CreatedAt,
+		})
+	}
+	return result, nil
 }

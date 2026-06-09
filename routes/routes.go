@@ -218,6 +218,9 @@ func SetupRoutes(
 		oauth.GET("/authorize", middlewares.StrictAuthRateLimitMiddleware(30, time.Minute), oauthASController.Authorize)
 		oauth.POST("/token", middlewares.StrictAuthRateLimitMiddleware(30, time.Minute), oauthASController.Token)
 		oauth.POST("/register", middlewares.StrictAuthRateLimitMiddleware(10, time.Minute), oauthASController.Register)
+		// RFC 7592 — Client Registration Management endpoints (self-service via registration_access_token)
+		oauth.GET("/register/:client_id", oauthASController.RFC7592Get)
+		oauth.DELETE("/register/:client_id", oauthASController.RFC7592Delete)
 		oauth.POST("/introspect", middlewares.StrictAuthRateLimitMiddleware(60, time.Minute), oauthASController.Introspect)
 		oauth.GET("/jwks", oauthASController.JWKS)
 		oauth.POST("/revoke", oauthASController.Revoke)
@@ -390,6 +393,9 @@ func SetupRoutes(
 			applications.DELETE("/:id/identity-providers/:idp_id", applicationIDPPoliciesController.Remove)
 		}
 
+		// Workspace-wide OAuth client list (across all applications).
+		authsec.GET("/clients", applicationsController.ListWorkspaceClients)
+
 		// v1 IAM cockpit aggregate/read-model aliases. These routes expose the
 		// product vocabulary used by the AI/MCP access-control UI while reusing
 		// the existing scope matrix, bindings, and runtime resolver backends.
@@ -470,6 +476,7 @@ func SetupRoutes(
 			idps.POST("", identityProvidersController.Create)
 			idps.GET("", identityProvidersController.List)
 			idps.GET("/:id", identityProvidersController.Get)
+			idps.PUT("/:id", identityProvidersController.Update)
 			idps.PUT("/:id/status", identityProvidersController.UpdateStatus)
 			idps.DELETE("/:id", identityProvidersController.Delete)
 		}

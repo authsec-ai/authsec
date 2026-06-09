@@ -1651,12 +1651,24 @@ func (ctrl *HmgrController) ProcessSAMLAssertion(assertion *hydramodels.SAMLAsse
 	// can re-resolve the workspace+application binding when Hydra issues a
 	// fresh consent_challenge whose login_challenge no longer matches the one
 	// we bound at /login. Mirrors the OIDC federated path in oidc_controller.go.
-	if arcCtx, lookupErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge); lookupErr == nil && arcCtx != nil && arcCtx.ContextID != "" {
+	arcCtx, lookupErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(loginChallenge)
+	if lookupErr != nil || arcCtx == nil {
+		log.Printf("[SAML] ProcessSAMLAssertion: login_challenge lookup failed (%v), trying latest unconsumed for workspace=%s", lookupErr, workspaceID)
+		// Fallback: find the most recent unconsumed context for this workspace.
+		// This handles retries, re-bindings, and Hydra challenge ID mismatches.
+		var fallbackCtx models.AuthRequestContext
+		if dbErr := config.DB.Where("workspace_id = ? AND consumed = false AND expires_at > ?", workspaceID, time.Now()).
+			Order("created_at DESC").First(&fallbackCtx).Error; dbErr == nil {
+			arcCtx = &fallbackCtx
+			log.Printf("[SAML] ProcessSAMLAssertion: found fallback context_id=%s", arcCtx.ContextID)
+		}
+	}
+	if arcCtx != nil && arcCtx.ContextID != "" {
 		hydraCtx["context_id"] = arcCtx.ContextID
 		hydraCtx["resource_server_id"] = arcCtx.ResourceServerID
 		hydraCtx["resource_uri"] = arcCtx.ResourceURI
-	} else if lookupErr != nil {
-		log.Printf("[SAML] ProcessSAMLAssertion: auth_request_context lookup failed for login_challenge=%s: %v", loginChallenge, lookupErr)
+	} else {
+		log.Printf("[SAML] ProcessSAMLAssertion: WARNING — no auth_request_context found, consent may fail")
 	}
 
 	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(loginChallenge, userID, hydraCtx)

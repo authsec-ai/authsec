@@ -427,6 +427,13 @@ CREATE TABLE public.mcp_oauth_clients (
     sync_status text DEFAULT 'active'::text NOT NULL,
     sync_last_error text,
     sync_last_error_at timestamp with time zone,
+    client_kind            VARCHAR(32) NOT NULL DEFAULT 'human_app'
+                           CHECK (client_kind IN ('human_app','agent','m2m','cli')),
+    software_id            VARCHAR(255),
+    software_version       VARCHAR(64),
+    last_token_issued_at   TIMESTAMPTZ,
+    tags                   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    registration_access_token_hash VARCHAR(64),
     CONSTRAINT mcp_oauth_clients_sync_status_chk CHECK (sync_status IN ('active', 'sync_error', 'pending_delete')),
     CONSTRAINT mcp_oauth_clients_client_id_key UNIQUE (client_id),
     CONSTRAINT mcp_oauth_clients_hydra_client_id_key UNIQUE (hydra_client_id),
@@ -1805,6 +1812,8 @@ CREATE INDEX idx_groups_updated_at ON public.groups USING btree (updated_at);
 CREATE INDEX idx_mcp_oauth_clients_client_id ON public.mcp_oauth_clients USING btree (client_id);
 
 CREATE INDEX idx_mcp_oauth_clients_hydra_client_id ON public.mcp_oauth_clients USING btree (hydra_client_id);
+
+CREATE INDEX idx_mcp_oauth_clients_software_id ON public.mcp_oauth_clients(software_id) WHERE software_id IS NOT NULL;
 
 CREATE INDEX idx_mcp_tools_rs ON public.mcp_tools USING btree (resource_server_id);
 

@@ -175,6 +175,11 @@ func (ctrl *IdentityProvidersController) List(c *gin.Context) {
 }
 
 // Get handles GET /authsec/identity-providers/:id.
+//
+// For SAML and OIDC providers, the underlying protocol config row
+// (saml_providers / oidc_providers) is attached to the response under
+// `config` so the admin UI can render Edit forms without a second round-trip
+// or fabricated defaults.
 func (ctrl *IdentityProvidersController) Get(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
@@ -191,7 +196,128 @@ func (ctrl *IdentityProvidersController) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "identity provider not found"})
 		return
 	}
-	c.JSON(http.StatusOK, idp)
+
+	// Attach protocol config row when available. Gorm scans the saml_providers
+	// row into a map so we don't need to import the hydra SAML model here
+	// (that would create an import cycle). OIDC uses its typed model.
+	resp := gin.H{
+		"id":                idp.ID,
+		"workspace_id":      idp.WorkspaceID,
+		"provider_type":     idp.ProviderType,
+		"display_name":      idp.DisplayName,
+		"status":            idp.Status,
+		"redirect_uri":      idp.RedirectURI,
+		"saml_provider_id":  idp.SAMLProviderID,
+		"oidc_provider_id":  idp.OIDCProviderID,
+		"created_at":        idp.CreatedAt,
+		"updated_at":        idp.UpdatedAt,
+	}
+
+	switch idp.ProviderType {
+	case models.IdentityProviderSAML:
+		var samlCfg map[string]interface{}
+		if cfgErr := ctrl.service.ResolveSAMLConfig(idp, &samlCfg); cfgErr == nil {
+			resp["config"] = samlCfg
+		} else {
+			log.Printf("[IDP] Get: ResolveSAMLConfig failed for idp=%s: %v", idp.ID, cfgErr)
+		}
+	case models.IdentityProviderOIDC:
+		var oidcCfg models.OIDCProvider
+		if cfgErr := ctrl.service.ResolveOIDCConfig(idp, &oidcCfg); cfgErr == nil {
+			// Drop the Vault path — secret never leaves the server.
+			oidcCfg.ClientSecretVaultPath = ""
+			resp["config"] = oidcCfg
+		} else {
+			log.Printf("[IDP] Get: ResolveOIDCConfig failed for idp=%s: %v", idp.ID, cfgErr)
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// updateIDPRequest matches the create payload shape so admin UIs can reuse
+// their form serialization. `config` is unmarshalled per provider_type.
+type updateIDPRequest struct {
+	ProviderType string          `json:"provider_type" binding:"required"`
+	DisplayName  string          `json:"display_name"`
+	Config       json.RawMessage `json:"config"`
+}
+
+type samlUpdateConfig struct {
+	ProviderName     string          `json:"provider_name,omitempty"`
+	EntityID         string          `json:"entity_id,omitempty"`
+	SSOUrl           string          `json:"sso_url,omitempty"`
+	SLOUrl           *string         `json:"slo_url,omitempty"`
+	Certificate      string          `json:"certificate,omitempty"`
+	NameIDFormat     string          `json:"name_id_format,omitempty"`
+	AttributeMapping json.RawMessage `json:"attribute_mapping,omitempty"`
+}
+
+// Update handles PUT /authsec/identity-providers/:id — full SAML/OIDC config
+// update. Body shape matches Create: `{provider_type, display_name, config}`.
+// Status toggling stays on its dedicated PUT .../status endpoint.
+func (ctrl *IdentityProvidersController) Update(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	idpID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity provider id"})
+		return
+	}
+
+	var req updateIDPRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+
+	switch req.ProviderType {
+	case models.IdentityProviderSAML:
+		var cfg samlUpdateConfig
+		if len(req.Config) > 0 {
+			if err := json.Unmarshal(req.Config, &cfg); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saml config: " + err.Error()})
+				return
+			}
+		}
+		idp, err := ctrl.service.UpdateSAML(services.UpdateSAMLIDPRequest{
+			WorkspaceID:      workspaceID,
+			IDPID:            idpID,
+			DisplayName:      req.DisplayName,
+			ProviderName:     cfg.ProviderName,
+			EntityID:         cfg.EntityID,
+			SSOUrl:           cfg.SSOUrl,
+			SLOUrl:           cfg.SLOUrl,
+			Certificate:      cfg.Certificate,
+			NameIDFormat:     cfg.NameIDFormat,
+			AttributeMapping: cfg.AttributeMapping,
+		})
+		if err != nil {
+			if errors.Is(err, services.ErrIdentityProviderAlreadyExists) {
+				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+				return
+			}
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "identity provider not found"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, idp)
+
+	case models.IdentityProviderOIDC:
+		// OIDC update is out of scope for this change — keep the door open
+		// rather than 500ing. Add a service method here when needed.
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "OIDC full-config update is not yet supported; use PUT .../status for now"})
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "unsupported provider_type; must be 'oidc' or 'saml'",
+		})
+	}
 }
 
 // UpdateStatus handles PUT /authsec/identity-providers/:id/status.

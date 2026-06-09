@@ -242,6 +242,132 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 	return &idp, nil
 }
 
+// UpdateSAMLIDPRequest is the input for UpdateSAML. Only non-zero/non-empty
+// fields are applied; pass empty strings for fields you do not want to touch.
+// AttributeMapping is always rewritten when non-nil; pass an empty JSON `{}`
+// to clear it.
+type UpdateSAMLIDPRequest struct {
+	WorkspaceID      uuid.UUID
+	IDPID            uuid.UUID
+	DisplayName      string
+	ProviderName     string
+	EntityID         string
+	SSOUrl           string
+	SLOUrl           *string
+	Certificate      string
+	NameIDFormat     string
+	AttributeMapping json.RawMessage
+}
+
+// UpdateSAML rewrites the saml_providers row for an existing SAML IDP and
+// keeps identity_providers.display_name in lockstep. Both writes happen in one
+// transaction so the runtime gate never sees a half-applied edit.
+//
+// We do NOT allow re-keying the provider_name to one that already exists in
+// the workspace — that would silently break SAML initiate URLs in flight.
+func (s *IdentityProviderService) UpdateSAML(req UpdateSAMLIDPRequest) (*models.IdentityProvider, error) {
+	if req.WorkspaceID == uuid.Nil {
+		return nil, fmt.Errorf("workspace_id is required")
+	}
+	if req.IDPID == uuid.Nil {
+		return nil, fmt.Errorf("idp id is required")
+	}
+
+	var idp models.IdentityProvider
+	if err := s.db.Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+		First(&idp).Error; err != nil {
+		return nil, err
+	}
+	if idp.ProviderType != models.IdentityProviderSAML {
+		return nil, fmt.Errorf("identity provider %s is not a SAML provider", idp.ID)
+	}
+	if idp.SAMLProviderID == nil {
+		return nil, fmt.Errorf("identity provider %s has no saml_provider_id", idp.ID)
+	}
+
+	providerName := strings.ToLower(strings.TrimSpace(req.ProviderName))
+	if providerName != "" {
+		// Enforce slug uniqueness within the workspace. Allow no-op (same value).
+		var collision models.IdentityProvider
+		collisionErr := s.db.Model(&models.IdentityProvider{}).
+			Joins("JOIN saml_providers sp ON sp.id = identity_providers.saml_provider_id").
+			Where("identity_providers.workspace_id = ?", req.WorkspaceID).
+			Where("identity_providers.provider_type = ?", models.IdentityProviderSAML).
+			Where("identity_providers.id != ?", req.IDPID).
+			Where("sp.provider_name = ?", providerName).
+			First(&collision).Error
+		if collisionErr == nil {
+			return nil, fmt.Errorf("%w: saml provider %q is already configured for this workspace", ErrIdentityProviderAlreadyExists, providerName)
+		}
+		if collisionErr != gorm.ErrRecordNotFound {
+			return nil, collisionErr
+		}
+	}
+
+	now := time.Now()
+	samlUpdates := map[string]interface{}{"updated_at": now}
+	if providerName != "" {
+		samlUpdates["provider_name"] = providerName
+	}
+	if req.DisplayName != "" {
+		samlUpdates["display_name"] = req.DisplayName
+	}
+	if req.EntityID != "" {
+		samlUpdates["entity_id"] = req.EntityID
+	}
+	if req.SSOUrl != "" {
+		samlUpdates["sso_url"] = req.SSOUrl
+	}
+	if req.SLOUrl != nil {
+		samlUpdates["slo_url"] = *req.SLOUrl
+	}
+	if req.Certificate != "" {
+		samlUpdates["certificate"] = req.Certificate
+	}
+	if req.NameIDFormat != "" {
+		samlUpdates["name_id_format"] = req.NameIDFormat
+	}
+	if req.AttributeMapping != nil {
+		samlUpdates["attribute_mapping"] = datatypes.JSON(req.AttributeMapping)
+	}
+
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Table("saml_providers").
+			Where("id = ? AND workspace_id = ?", *idp.SAMLProviderID, req.WorkspaceID).
+			Updates(samlUpdates)
+		if res.Error != nil {
+			return fmt.Errorf("update saml_providers: %w", res.Error)
+		}
+		if res.RowsAffected == 0 && len(samlUpdates) > 1 {
+			// >1 because updated_at is always in the map; if RowsAffected==0 with
+			// real content, the row vanished between our Read and Write.
+			return fmt.Errorf("saml_providers row %s not found for workspace", *idp.SAMLProviderID)
+		}
+
+		if req.DisplayName != "" {
+			if err := tx.Model(&models.IdentityProvider{}).
+				Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+				Updates(map[string]interface{}{
+					"display_name": req.DisplayName,
+					"updated_at":   now,
+				}).Error; err != nil {
+				return fmt.Errorf("update identity_providers: %w", err)
+			}
+		}
+		return nil
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+
+	// Re-read for the response.
+	if err := s.db.Where("id = ? AND workspace_id = ?", req.IDPID, req.WorkspaceID).
+		First(&idp).Error; err != nil {
+		return nil, err
+	}
+	return &idp, nil
+}
+
 // UpdateStatus flips an IDP between 'configured' and 'disabled'. The
 // identity_providers row is the product-level record, while protocol-specific
 // rows are still read by runtime flows. Keep both layers in lockstep so the

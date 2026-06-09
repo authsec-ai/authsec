@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -43,10 +45,15 @@ func NewHydraReconciler(db *gorm.DB, interval time.Duration) *HydraReconciler {
 // Run blocks until ctx is cancelled, ticking on r.interval. It logs but does
 // not return errors — convergence failures stay logged and are retried on
 // the next tick.
+// It also launches a background goroutine that marks stale DCR clients
+// (no token in DCR_STALE_DAYS days, default 30) as pending_delete daily.
 func (r *HydraReconciler) Run(ctx context.Context) {
 	log.Printf("[HydraReconciler] starting; interval=%s", r.interval)
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
+
+	// Launch the stale-DCR cleanup goroutine alongside the main reconcile loop.
+	go r.runStaleDCRCleanup(ctx)
 
 	// First pass immediately so a restart picks up any in-flight failures
 	// without waiting for the first interval.
@@ -59,6 +66,58 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.tick(ctx)
+		}
+	}
+}
+
+// runStaleDCRCleanup runs once immediately on startup and then every 24h.
+// It marks DCR clients that have never issued a token (or whose last token
+// was issued more than DCR_STALE_DAYS days ago) as pending_delete so the
+// main reconciler loop can clean them up from Hydra.
+func (r *HydraReconciler) runStaleDCRCleanup(ctx context.Context) {
+	staleDays := 30
+	if v := os.Getenv("DCR_STALE_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			staleDays = n
+		}
+	}
+	log.Printf("[HydraReconciler] stale DCR cleanup: staleDays=%d", staleDays)
+
+	cleanup := func() {
+		cutoff := time.Now().AddDate(0, 0, -staleDays)
+		var staleClients []models.MCPOAuthClient
+		if err := r.db.WithContext(ctx).Where(
+			"registration_type = 'dcr' AND sync_status = ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)",
+			models.MCPClientSyncActive,
+			cutoff,
+		).Find(&staleClients).Error; err != nil {
+			log.Printf("[HydraReconciler] stale DCR query failed: %v", err)
+			return
+		}
+		if len(staleClients) == 0 {
+			return
+		}
+		log.Printf("[HydraReconciler] stale DCR cleanup: marking %d client(s) pending_delete (cutoff=%s)", len(staleClients), cutoff.Format(time.RFC3339))
+		for i := range staleClients {
+			c := &staleClients[i]
+			if err := r.db.WithContext(ctx).Model(c).Update("sync_status", models.MCPClientSyncPendingDelete).Error; err != nil {
+				log.Printf("[HydraReconciler] stale DCR: failed to mark pending_delete client_id=%s: %v", c.ClientID, err)
+			} else {
+				log.Printf("[HydraReconciler] stale DCR: marked pending_delete client_id=%s", c.ClientID)
+			}
+		}
+	}
+
+	// Run once immediately, then every 24 hours.
+	cleanup()
+	dailyTicker := time.NewTicker(24 * time.Hour)
+	defer dailyTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-dailyTicker.C:
+			cleanup()
 		}
 	}
 }

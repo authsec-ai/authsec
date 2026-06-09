@@ -448,3 +448,21 @@ func (ctrl *ApplicationsController) Launch(c *gin.Context) {
 		"workspace_id":     workspaceID.String(),
 	})
 }
+
+// ListWorkspaceClients handles GET /authsec/clients.
+// Returns all OAuth clients registered to any application in the workspace.
+func (ctrl *ApplicationsController) ListWorkspaceClients(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	clients, err := ctrl.oauthSvc.ListWorkspaceClients(workspaceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, clients)
+}

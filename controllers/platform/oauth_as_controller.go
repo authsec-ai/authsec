@@ -576,6 +576,14 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 
 	log.Printf("[MCP_AUTH] tokenAuthCodeGrant: success context_id=%s client=%s rs=%s", contextID, oauthClient.ClientID, arcCtx.ResourceURI)
 
+	// Stamp last_token_issued_at on the client row (best-effort; don't block on failure).
+	now := time.Now()
+	if dbErr := config.DB.Model(&models.MCPOAuthClient{}).
+		Where("id = ?", oauthClient.ID).
+		Update("last_token_issued_at", now).Error; dbErr != nil {
+		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: failed to stamp last_token_issued_at for client=%s: %v", oauthClient.ClientID, dbErr)
+	}
+
 	// 9. Forward response
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
@@ -855,7 +863,7 @@ func (ctrl *OAuthASController) Register(c *gin.Context) {
 		}
 	}
 
-	client, err := ctrl.service.RegisterDCRClient(req, rs)
+	client, rawRAT, err := ctrl.service.RegisterDCRClient(req, rs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "registration failed", "detail": err.Error()})
 		return
@@ -872,8 +880,60 @@ func (ctrl *OAuthASController) Register(c *gin.Context) {
 		Scope:                   req.Scope,
 		PostLogoutRedirectURIs:  []string(client.PostLogoutRedirectURIs),
 	}
+	resp.ClientKind = client.ClientKind
+	if client.SoftwareID != nil {
+		resp.SoftwareID = *client.SoftwareID
+	}
+	if client.SoftwareVersion != nil {
+		resp.SoftwareVersion = *client.SoftwareVersion
+	}
+	// RFC 7592 — include registration management token and URI when available
+	if rawRAT != "" {
+		resp.RegistrationAccessToken = rawRAT
+		resp.RegistrationClientURI = fmt.Sprintf("%s/oauth/register/%s", config.AppConfig.OAuthBaseURL(), client.ClientID)
+	}
 
 	c.JSON(http.StatusCreated, resp)
+}
+
+// RFC7592Get handles GET /oauth/register/:client_id (RFC 7592 client read).
+// The caller must present the registration_access_token issued at registration time
+// as a Bearer token in the Authorization header.
+func (ctrl *OAuthASController) RFC7592Get(c *gin.Context) {
+	clientID := c.Param("client_id")
+	rawRAT := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+	client, err := ctrl.service.GetClientByRegistrationToken(clientID, rawRAT)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"client_id":                  client.ClientID,
+		"client_name":                client.ClientName,
+		"redirect_uris":              []string(client.RedirectURIs),
+		"grant_types":                []string(client.GrantTypes),
+		"token_endpoint_auth_method": client.TokenEndpointAuthMethod,
+		"software_id":                client.SoftwareID,
+		"software_version":           client.SoftwareVersion,
+		"client_kind":                client.ClientKind,
+	})
+}
+
+// RFC7592Delete handles DELETE /oauth/register/:client_id (RFC 7592 client self-revoke).
+// The caller must present the registration_access_token as a Bearer token.
+func (ctrl *OAuthASController) RFC7592Delete(c *gin.Context) {
+	clientID := c.Param("client_id")
+	rawRAT := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+	client, err := ctrl.service.GetClientByRegistrationToken(clientID, rawRAT)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+		return
+	}
+	if err := ctrl.service.RevokeClientSelf(client); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "revocation failed"})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // Introspect handles OAuth token introspection (RFC 7662).
@@ -1260,10 +1320,22 @@ func (ctrl *OAuthASController) inferAuthorizeResource(clientID string) (string, 
 		return resourceURI, nil
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceAmbiguous) {
+		// List available resource URIs to help the client developer.
+		var uris []string
+		var servers []models.ResourceServer
+		if dbErr := config.DB.Where("active = true").Select("resource_uri").Find(&servers).Error; dbErr == nil {
+			for _, s := range servers {
+				uris = append(uris, s.ResourceURI)
+			}
+		}
+		desc := "resource parameter required because client maps to multiple resource servers"
+		if len(uris) > 0 {
+			desc += ". Available: " + strings.Join(uris, ", ")
+		}
 		return "", &policyError{
 			Status:      http.StatusBadRequest,
 			Code:        "invalid_request",
-			Description: "resource parameter required because client maps to multiple resource servers",
+			Description: desc,
 		}
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceUnavailable) {

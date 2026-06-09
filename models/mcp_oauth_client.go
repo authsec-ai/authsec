@@ -35,6 +35,13 @@ type MCPOAuthClient struct {
 	SyncStatus      string         `json:"sync_status" gorm:"type:text;not null;default:'active'"`
 	SyncLastError   *string        `json:"-" gorm:"type:text"`
 	SyncLastErrorAt *time.Time     `json:"-" gorm:"type:timestamptz"`
+	// Client classification + software identity.
+	ClientKind        string         `json:"client_kind" gorm:"type:varchar(32);not null;default:'human_app'"`
+	SoftwareID        *string        `json:"software_id,omitempty" gorm:"type:varchar(255)"`
+	SoftwareVersion   *string        `json:"software_version,omitempty" gorm:"type:varchar(64)"`
+	LastTokenIssuedAt              *time.Time     `json:"last_token_issued_at,omitempty" gorm:"column:last_token_issued_at"`
+	Tags                           pq.StringArray `json:"tags" gorm:"type:jsonb;not null;default:'[]'"`
+	RegistrationAccessTokenHash    *string        `json:"-" gorm:"type:varchar(64);column:registration_access_token_hash"`
 	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 }
