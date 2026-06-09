@@ -230,6 +230,35 @@ func hydraAdminRevokeLoginSessionAt(adminURL, subject string) error {
 	return nil
 }
 
+// EnsureV2ClientAudience makes sure the Hydra v2 client has `audience` in its
+// audience list. RFC 8707 audience is sent at /authorize (and /token) but
+// Hydra rejects unless the client's stored audience array already contains the
+// requested URI. DCR per RFC 7591 doesn't carry a resource indicator, so DCR'd
+// MCP clients land in Hydra with audience=[]. This bridges the gap: when our
+// /authorize sees a resource the client hasn't been pre-bound to, we append
+// it on the fly and PUT the client. Idempotent — a no-op when the audience
+// already includes the URI.
+func EnsureV2ClientAudience(hydraClientID, audience string) error {
+	audience = strings.TrimSpace(audience)
+	if hydraClientID == "" || audience == "" {
+		return nil
+	}
+	cl, err := hydraV2AdminGetClient(hydraClientID)
+	if err != nil {
+		return fmt.Errorf("get client: %w", err)
+	}
+	for _, a := range cl.Audience {
+		if a == audience {
+			return nil
+		}
+	}
+	cl.Audience = append(cl.Audience, audience)
+	if err := hydraV2AdminUpdateClient(hydraClientID, *cl); err != nil {
+		return fmt.Errorf("update client audience: %w", err)
+	}
+	return nil
+}
+
 func hydraAdminGetAllClients() ([]hydraClient, error) {
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), nil)
 	if err != nil {
