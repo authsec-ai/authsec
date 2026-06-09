@@ -992,6 +992,8 @@ func (ctrl *LoginV2Controller) GetConsentPageData(c *gin.Context) {
 	}
 
 	// 3-way scope intersection.
+	log.Printf("[consent-v2] resolving grant: tenant=%s app=%s subject=%s requested=%v client_id=%s",
+		tenantID, rs.ID, subjectUUID, consentReq.RequestedScope, consentReq.Client.ClientID)
 	grant, err := ctrl.bindingSvc.ResolveGrantableScopes(
 		tenantID, rs.ID, subjectUUID, consentReq.RequestedScope,
 	)
@@ -1002,6 +1004,7 @@ func (ctrl *LoginV2Controller) GetConsentPageData(c *gin.Context) {
 		})
 		return
 	}
+	log.Printf("[consent-v2] resolved grant: grantable=%v rejected=%v", grant.Grantable, grant.Rejected)
 	if len(grant.Grantable) == 0 {
 		// No scope intersection at all — reject the consent. Hydra
 		// returns a redirect_to back to the client with access_denied.
