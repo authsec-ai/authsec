@@ -28,8 +28,15 @@ ALTER TABLE saml_providers
 
 -- Partial unique indexes so admins can register the same provider_name
 -- multiple times (once per Application + once tenant-wide).
+--
+-- NOTE: oidc_providers has NO tenant_id column — it's a per-tenant DB table, so
+-- the tenant is implicit and uniqueness is per (resource_server_id, provider_name).
+-- (saml_providers DOES carry tenant_id, so its index includes it.) The original
+-- index referenced oidc_providers.tenant_id, which doesn't exist — it only never
+-- failed because this migration was marked applied-without-running on template-
+-- born tenants and so never actually executed until a force re-run.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_oidc_providers_tenant_rs_name
-  ON oidc_providers (tenant_id, resource_server_id, provider_name)
+  ON oidc_providers (resource_server_id, provider_name)
   WHERE resource_server_id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_saml_providers_tenant_rs_name

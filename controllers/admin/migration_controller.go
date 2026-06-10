@@ -303,7 +303,13 @@ func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
 
 // MigrateAllTenants POST /authsec-migration/tenants/migrate-all
 func (mc *MigrationController) MigrateAllTenants(c *gin.Context) {
-	log.Println("[MigrationController] Migrate all tenants")
+	// force=true: clear each tenant's migration_logs before running so EVERY
+	// incremental re-applies — even ones marked applied-without-running when the
+	// tenant was created from the template snapshot. The base template (000) is
+	// still skipped when the schema already exists, so no tables are re-created;
+	// only the incremental ALTER/ADD migrations re-run. Manual-use admin tool.
+	force := c.Query("force") == "true" || c.Query("force") == "1"
+	log.Printf("[MigrationController] Migrate all tenants (force=%v)", force)
 
 	var tenants []migration.TenantInfo
 	if err := config.DB.Find(&tenants).Error; err != nil {
@@ -323,7 +329,7 @@ func (mc *MigrationController) MigrateAllTenants(c *gin.Context) {
 		tenantID := tenant.TenantID.String()
 		result := migration.TenantMigrateResult{TenantID: tenantID}
 
-		if tenant.MigrationStatus != nil && *tenant.MigrationStatus == "completed" {
+		if !force && tenant.MigrationStatus != nil && *tenant.MigrationStatus == "completed" {
 			if tenant.TenantDB != nil {
 				result.DatabaseName = *tenant.TenantDB
 			}
@@ -362,6 +368,17 @@ func (mc *MigrationController) MigrateAllTenants(c *gin.Context) {
 			response.Failed++
 			response.Results = append(response.Results, result)
 			continue
+		}
+
+		// Force: wipe this tenant's migration tracking so every incremental
+		// re-applies. migration_logs lives in master and is keyed per tenant.
+		if force && masterRaw != nil {
+			if res, derr := masterRaw.Exec(
+				`DELETE FROM migration_logs WHERE db_type = 'tenant' AND tenant_id = $1`, tenantID); derr != nil {
+				log.Printf("[MigrationController] force: failed clearing migration_logs for %s: %v", tenantID, derr)
+			} else if n, _ := res.RowsAffected(); n > 0 {
+				log.Printf("[MigrationController] force: cleared %d migration_logs rows for tenant %s", n, tenantID)
+			}
 		}
 
 		runner := migration.NewTenantMigrationRunner(tenantID, tenantDBConn, mc.tenantMigrationsDir, masterRaw)

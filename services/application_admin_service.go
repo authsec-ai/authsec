@@ -219,8 +219,15 @@ func (s *ApplicationAdminService) GetSDKManifestStatus(tenantID string, applicat
 // ActivationPreviewResponse extends the Setup checklist with the validate
 // result. Same idea as Validate but unified so the UI can do one fetch.
 type ActivationPreviewResponse struct {
-	Checklist     *SetupChecklistResponse      `json:"checklist"`
+	Checklist      *SetupChecklistResponse      `json:"checklist"`
 	ValidateResult *ApplicationValidationResult `json:"validate"`
+	// Flattened view the UI binds to directly. `ready` mirrors the actual
+	// Activate gate (checklist.ReadyToActivate). `blocking` lists the unmet
+	// required checklist items; `warnings` surfaces non-pass live checks
+	// (state, reachability, access policy) which are advisory, not blocking.
+	Ready    bool     `json:"ready"`
+	Blocking []string `json:"blocking"`
+	Warnings []string `json:"warnings"`
 }
 
 // GetActivationPreview is the convenience read the UI uses on the Setup tab
@@ -243,9 +250,38 @@ func (s *ApplicationAdminService) GetActivationPreview(tenantID string, applicat
 		return nil, err
 	}
 	validate := onboarding.ValidateResourceServer(rs, int(clientCount), policyEnabled)
+
+	// Flatten into the {ready, blocking, warnings} contract the UI binds to.
+	// `ready` mirrors the real Activate gate (checklist.ReadyToActivate).
+	blocking := []string{}
+	requiredKeys := map[string]bool{
+		"introspection_secret": true,
+		"tools_published":      true,
+		"scopes_defined":       true,
+		"clients_registered":   true,
+	}
+	if checklist != nil {
+		for _, item := range checklist.Items {
+			if requiredKeys[item.Key] && !item.Done {
+				blocking = append(blocking, item.Label)
+			}
+		}
+	}
+	warnings := []string{}
+	if validate != nil {
+		for _, c := range validate.Checks {
+			if c.Status != "pass" {
+				warnings = append(warnings, c.Message)
+			}
+		}
+	}
+
 	return &ActivationPreviewResponse{
 		Checklist:      checklist,
 		ValidateResult: validate,
+		Ready:          checklist != nil && checklist.ReadyToActivate,
+		Blocking:       blocking,
+		Warnings:       warnings,
 	}, nil
 }
 

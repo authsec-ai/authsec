@@ -269,6 +269,78 @@ type AccessUser struct {
 // ListAccessUsers returns every user with at least one binding on this
 // Application, aggregating their role names and the union of scope
 // strings they've earned across all their bindings.
+// AppEndUser is one end-user who registered / authenticated into an
+// Application (OIDC JIT or email/pass self-registration both stamp
+// users.resource_server_id). Independent of whether they have an RBAC binding.
+type AppEndUser struct {
+	UserID    uuid.UUID `json:"user_id" gorm:"column:user_id"`
+	Email     string    `json:"email" gorm:"column:email"`
+	Name      string    `json:"name" gorm:"column:name"`
+	Provider  string    `json:"provider" gorm:"column:provider"`
+	Active    bool      `json:"active" gorm:"column:active"`
+	CreatedAt time.Time `json:"created_at" gorm:"column:created_at"`
+}
+
+// ListEndUsers returns every user scoped to this Application via
+// users.resource_server_id — i.e. the people who actually signed in to this
+// MCP — regardless of RBAC bindings. (ListAccessUsers only returns users that
+// already have a binding; ListEligibleUsers returns unbound tenant users.)
+func (s *BindingService) ListEndUsers(tenantID string, applicationID uuid.UUID) ([]AppEndUser, error) {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+	var rows []AppEndUser
+	if err := tenantDB.Table("users").
+		Select("id AS user_id, email, COALESCE(name,'') AS name, COALESCE(provider,'') AS provider, active, created_at").
+		Where("resource_server_id = ? AND deleted_at IS NULL", applicationID).
+		Order("created_at DESC").
+		Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list end users: %w", err)
+	}
+	return rows, nil
+}
+
+// SetEndUserActive suspends (active=false) or re-activates an end-user of this
+// Application. Scoped by resource_server_id so it can't touch another app's
+// user. A suspended user is rejected at login (custom + federated).
+func (s *BindingService) SetEndUserActive(tenantID string, applicationID, userID uuid.UUID, active bool) error {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return fmt.Errorf("get tenant db: %w", err)
+	}
+	res := tenantDB.Table("users").
+		Where("id = ? AND resource_server_id = ? AND deleted_at IS NULL", userID, applicationID).
+		Updates(map[string]interface{}{"active": active, "updated_at": time.Now().UTC()})
+	if res.Error != nil {
+		return fmt.Errorf("set end user active: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrUserNotInTenant
+	}
+	return nil
+}
+
+// DeleteEndUser soft-deletes an end-user of this Application (sets deleted_at +
+// active=false). Scoped by resource_server_id.
+func (s *BindingService) DeleteEndUser(tenantID string, applicationID, userID uuid.UUID) error {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return fmt.Errorf("get tenant db: %w", err)
+	}
+	now := time.Now().UTC()
+	res := tenantDB.Table("users").
+		Where("id = ? AND resource_server_id = ? AND deleted_at IS NULL", userID, applicationID).
+		Updates(map[string]interface{}{"deleted_at": now, "active": false, "updated_at": now})
+	if res.Error != nil {
+		return fmt.Errorf("delete end user: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrUserNotInTenant
+	}
+	return nil
+}
+
 func (s *BindingService) ListAccessUsers(tenantID string, applicationID uuid.UUID) ([]AccessUser, error) {
 	tenantDB, err := config.GetTenantGORMDB(tenantID)
 	if err != nil {

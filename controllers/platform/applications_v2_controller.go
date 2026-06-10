@@ -1174,6 +1174,75 @@ func (ctrl *ApplicationsV2Controller) ListEligibleUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, users)
 }
 
+// ListEndUsers handles GET /authsec/applications/:id/end-users.
+// Returns every end-user who registered / signed in to this Application
+// (users.resource_server_id), regardless of whether they have an RBAC binding.
+func (ctrl *ApplicationsV2Controller) ListEndUsers(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	users, err := ctrl.bindingSvc.ListEndUsers(tenantID, id)
+	if err != nil {
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+// SetEndUserActive handles PATCH /authsec/applications/:id/end-users/:user_id.
+// Body: {"active": bool}. Suspends or re-activates an end-user — a suspended
+// user can no longer authenticate (custom-login + federated both reject).
+func (ctrl *ApplicationsV2Controller) SetEndUserActive(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userID, err := uuid.Parse(c.Param("user_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	var body struct {
+		Active *bool `json:"active"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Active == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "active (bool) is required"})
+		return
+	}
+	if err := ctrl.bindingSvc.SetEndUserActive(tenantID, id, userID, *body.Active); err != nil {
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "end user not found for this application"})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "active": *body.Active})
+}
+
+// DeleteEndUser handles DELETE /authsec/applications/:id/end-users/:user_id.
+func (ctrl *ApplicationsV2Controller) DeleteEndUser(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	userID, err := uuid.Parse(c.Param("user_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		return
+	}
+	if err := ctrl.bindingSvc.DeleteEndUser(tenantID, id, userID); err != nil {
+		if errors.Is(err, services.ErrUserNotInTenant) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "end user not found for this application"})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
 // ListAccessUsers handles GET /authsec/applications/:id/access/users.
 // Returns every user with at least one binding on this Application.
 func (ctrl *ApplicationsV2Controller) ListAccessUsers(c *gin.Context) {

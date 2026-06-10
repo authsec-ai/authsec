@@ -387,6 +387,9 @@ func SetupRoutes(
 			applicationsV2.POST("/:id/bindings", applicationsV2Controller.CreateBinding)
 			applicationsV2.DELETE("/:id/bindings/:binding_id", applicationsV2Controller.DeleteBinding)
 			applicationsV2.GET("/:id/eligible-users", applicationsV2Controller.ListEligibleUsers)
+			applicationsV2.GET("/:id/end-users", applicationsV2Controller.ListEndUsers)
+			applicationsV2.PATCH("/:id/end-users/:user_id", applicationsV2Controller.SetEndUserActive)
+			applicationsV2.DELETE("/:id/end-users/:user_id", applicationsV2Controller.DeleteEndUser)
 			applicationsV2.GET("/:id/access/users", applicationsV2Controller.ListAccessUsers)
 			applicationsV2.GET("/:id/users/:user_id/effective-access", applicationsV2Controller.GetUserEffectiveAccess)
 

@@ -1458,6 +1458,24 @@ func (ctrl *LoginV2Controller) CallbackOIDC(c *gin.Context) {
 		return
 	}
 
+	// Block suspended end-users (active=false) — reject the login so the client
+	// gets access_denied. Custom-login enforces this inline; mirror it here.
+	if tdb, e := config.GetTenantGORMDB(result.TenantID); e == nil {
+		var active bool
+		if scanErr := tdb.Raw(`SELECT COALESCE(active,false) FROM users WHERE id = ?`, result.UserID).
+			Row().Scan(&active); scanErr == nil && !active {
+			if resp, rerr := ctrl.hydraLogin.RejectLoginRequest(result.LoginChallenge, services.HydraRejectLoginRequest{
+				Error:            "access_denied",
+				ErrorDescription: "account is suspended",
+			}); rerr == nil && resp.RedirectTo != "" {
+				c.Redirect(http.StatusFound, resp.RedirectTo)
+				return
+			}
+			c.JSON(http.StatusForbidden, CallbackOIDCResponse{Success: false, Error: "account is suspended"})
+			return
+		}
+	}
+
 	// Stamp user_id on the auth_request_context row but DO NOT accept the Hydra
 	// login yet — the WebAuthn 2FA step runs next and accepts on success.
 	tenantDB, dbErr := config.GetTenantGORMDB(result.TenantID)
