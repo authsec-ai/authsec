@@ -133,13 +133,6 @@ func (s *ApplicationAdminService) GetSetupChecklist(tenantID string, application
 		return nil, fmt.Errorf("get tenant db: %w", err)
 	}
 
-	var clientCount int64
-	if err := tenantDB.Model(&models.ResourceServerClientRegistration{}).
-		Where("resource_server_id = ? AND status = ?", applicationID, models.RegistrationStatusApproved).
-		Count(&clientCount).Error; err != nil {
-		return nil, fmt.Errorf("count clients: %w", err)
-	}
-
 	var toolCount int64
 	if err := tenantDB.Model(&models.MCPTool{}).
 		Where("resource_server_id = ?", applicationID).
@@ -160,13 +153,11 @@ func (s *ApplicationAdminService) GetSetupChecklist(tenantID string, application
 		{Key: "tools_published", Label: "Tool manifest published by SDK", Done: toolCount > 0},
 		{Key: "scopes_defined", Label: "At least one scope defined", Done: len(rs.ScopesSupported) > 0},
 		{Key: "access_policy", Label: "Access policy configured", Done: policyEnabled},
-		{Key: "clients_registered", Label: "At least one OAuth client registered", Done: clientCount > 0},
 	}
 
-	readyToActivate := hasSecret && toolCount > 0 && len(rs.ScopesSupported) > 0 && clientCount > 0
-	// access_policy is not required for activation — clients can still get
-	// tokens; per-tool scope enforcement still works through sdk-policy.
-	// We surface it as a checklist item but don't gate on it.
+	readyToActivate := hasSecret && toolCount > 0 && len(rs.ScopesSupported) > 0
+	// access_policy and client registration are not required for activation —
+	// DCR clients register on first connect; sdk-policy handles scope enforcement.
 
 	return &SetupChecklistResponse{
 		State:           rs.State,
@@ -258,7 +249,6 @@ func (s *ApplicationAdminService) GetActivationPreview(tenantID string, applicat
 		"introspection_secret": true,
 		"tools_published":      true,
 		"scopes_defined":       true,
-		"clients_registered":   true,
 	}
 	if checklist != nil {
 		for _, item := range checklist.Items {
