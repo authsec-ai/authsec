@@ -47,7 +47,7 @@ func RequireAll(needs ...Need) gin.HandlerFunc {
 				log.Printf("[AUTHZ RequireAll] Checking resource '%s': %t", n.Resource, hasRes)
 				if !hasRes {
 					log.Printf("[AUTHZ RequireAll] FAIL: Resource '%s' not found in token resources", n.Resource)
-					denyInsufficientScope(c)
+					denyInsufficientScope(c, n)
 					return
 				}
 			}
@@ -72,7 +72,7 @@ func RequireAll(needs ...Need) gin.HandlerFunc {
 				n.Resource, n.Action, hasPermCheck, hasScopeCheck, hasDBPermCheck, result)
 			if !result {
 				log.Printf("[AUTHZ RequireAll] FAIL: Need not satisfied - Resource='%s', Action='%s'", n.Resource, n.Action)
-				denyInsufficientScope(c)
+				denyInsufficientScope(c, n)
 				return
 			}
 		}
@@ -113,7 +113,7 @@ func RequireAny(needs ...Need) gin.HandlerFunc {
 			}
 			if !found {
 				log.Printf("[AUTHZ RequireAny] FAIL: No required resources found in token")
-				denyInsufficientScope(c)
+				denyInsufficientScope(c, needs...)
 				return
 			}
 			log.Printf("[AUTHZ RequireAny] At least one resource validated")
@@ -138,20 +138,43 @@ func RequireAny(needs ...Need) gin.HandlerFunc {
 			}
 		}
 		log.Printf("[AUTHZ RequireAny] FAIL: No needs satisfied")
-		denyInsufficientScope(c)
+		denyInsufficientScope(c, needs...)
 	}
 }
 
 // ---------- helpers ----------
 
-func denyInsufficientScope(c *gin.Context) {
-	log.Printf("[AUTHZ] Access denied: insufficient scope/permissions for path %s", c.Request.URL.Path)
+// denyInsufficientScope emits a 403 with a structured body so client SDKs
+// can surface "you tried users:read, your token lacks it" instead of just
+// "you can't do this". The `needs` slice carries the permission(s) that
+// failed — callers should pass the same needs they were checking so the
+// response can echo them.
+func denyInsufficientScope(c *gin.Context, needs ...Need) {
+	log.Printf("[AUTHZ] Access denied: insufficient scope/permissions for path %s (needs=%v)", c.Request.URL.Path, needs)
 
-	c.Header("WWW-Authenticate", `Bearer error="insufficient_scope"`)
-	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+	required := make([]string, 0, len(needs))
+	for _, n := range needs {
+		required = append(required, n.Resource+":"+n.Action)
+	}
+	description := "Your token does not include the permission this endpoint requires."
+	if len(required) > 0 {
+		description = "Your token is missing the permission required for this endpoint: " + strings.Join(required, " OR ") + ". Ask an AuthSec admin to grant a role that includes it."
+	}
+
+	scopeHeader := strings.Join(required, " ")
+	if scopeHeader == "" {
+		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope"`)
+	} else {
+		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scopeHeader+`", error_description="`+strings.ReplaceAll(description, `"`, `'`)+`"`)
+	}
+	body := gin.H{
 		"error":             "insufficient_scope",
-		"error_description": "token is valid but lacks required permissions",
-	})
+		"error_description": description,
+	}
+	if len(required) > 0 {
+		body["required_permissions"] = required
+	}
+	c.AbortWithStatusJSON(http.StatusForbidden, body)
 }
 
 func hasDBPermission(claims jwt.MapClaims, resource, action string) bool {

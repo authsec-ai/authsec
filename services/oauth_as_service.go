@@ -345,22 +345,33 @@ var ErrCrossWorkspacePending = errors.New("client requires admin approval in thi
 // attach itself to workspace B's MCP servers with zero admin gating.
 func (s *OAuthASService) BindClientToRS(client *models.MCPOAuthClient, rs *models.ResourceServer, regType string) error {
 	if client.HomeWorkspaceID == nil {
-		// First bind anywhere: this workspace adopts the client.
+		// First bind anywhere: try to stamp this workspace as home via a
+		// conditional UPDATE so only one winner is possible under concurrency.
 		ws := rs.WorkspaceID
-		if err := s.db.Model(&models.MCPOAuthClient{}).
+		result := s.db.Model(&models.MCPOAuthClient{}).
 			Where("id = ? AND home_workspace_id IS NULL", client.ID).
-			Update("home_workspace_id", ws).Error; err != nil {
-			return fmt.Errorf("stamp home workspace: %w", err)
+			Update("home_workspace_id", ws)
+		if result.Error != nil {
+			return fmt.Errorf("stamp home workspace: %w", result.Error)
 		}
-		client.HomeWorkspaceID = &ws
-		// Note: a concurrent first-bind in another workspace may have won the
-		// IS NULL race; that's fine — both workspaces get an approved row for
-		// the very first bind, and the stamped home gates all later binds.
-		_, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusApproved)
-		return err
+		if result.RowsAffected > 0 {
+			// We won the race: this workspace is now home; approve immediately.
+			client.HomeWorkspaceID = &ws
+			_, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusApproved)
+			return err
+		}
+		// RowsAffected == 0: another goroutine already stamped a different
+		// workspace as home. Re-read from DB so we can make the correct call.
+		var current models.MCPOAuthClient
+		if err := s.db.Select("id, home_workspace_id").First(&current, "id = ?", client.ID).Error; err != nil {
+			return fmt.Errorf("re-read client after concurrent home stamp: %w", err)
+		}
+		client.HomeWorkspaceID = current.HomeWorkspaceID
+		log.Printf("[MCP_AUTH] BindClientToRS: lost IS NULL race for client=%s, actual home=%v", client.ClientID, client.HomeWorkspaceID)
+		// Fall through to the standard home-vs-rs.WorkspaceID check.
 	}
 
-	if *client.HomeWorkspaceID == rs.WorkspaceID {
+	if client.HomeWorkspaceID != nil && *client.HomeWorkspaceID == rs.WorkspaceID {
 		_, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusApproved)
 		return err
 	}
@@ -369,7 +380,7 @@ func (s *OAuthASService) BindClientToRS(client *models.MCPOAuthClient, rs *model
 	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusPendingApproval); err != nil {
 		return fmt.Errorf("create pending registration: %w", err)
 	}
-	log.Printf("[MCP_AUTH] BindClientToRS: cross-workspace bind parked as pending_approval client=%s home_ws=%s rs_ws=%s rs=%s",
+	log.Printf("[MCP_AUTH] BindClientToRS: cross-workspace bind parked as pending_approval client=%s home_ws=%v rs_ws=%s rs=%s",
 		client.ClientID, client.HomeWorkspaceID, rs.WorkspaceID, rs.ResourceURI)
 	return ErrCrossWorkspacePending
 }
