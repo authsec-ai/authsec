@@ -209,8 +209,8 @@ func (s *BindingService) DeleteBinding(tenantID string, applicationID, bindingID
 // User access reads
 // ─────────────────────────────────────────────────────────────────────────
 
-// EligibleUser is one row of /eligible-users — a user in the tenant who
-// could be bound (i.e. not already bound to any role on this Application).
+// EligibleUser is one row of /eligible-users — any active user in the tenant
+// who can receive a role binding on this Application.
 type EligibleUser struct {
 	UserID uuid.UUID `json:"user_id"`
 	Email  string    `json:"email"`
@@ -218,9 +218,12 @@ type EligibleUser struct {
 	Active bool      `json:"active"`
 }
 
-// ListEligibleUsers returns users in the tenant who have NO existing binding
-// to this Application. Useful for the admin UI's "grant access to user"
-// picker. Supports `?search=` for prefix matching on email or name.
+// ListEligibleUsers returns all active users in the tenant, regardless of
+// whether they already have bindings on this Application. A user can hold
+// multiple roles, so already-bound users must stay visible in the picker.
+// Duplicate (user, role) pairs are rejected by CreateBinding with
+// ErrBindingAlreadyExists; the UI skips those silently.
+// Supports `?search=` for prefix matching on email or name.
 func (s *BindingService) ListEligibleUsers(
 	tenantID string,
 	applicationID uuid.UUID,
@@ -236,11 +239,7 @@ func (s *BindingService) ListEligibleUsers(
 	}
 	q := tenantDB.Table("users AS u").
 		Select("u.id AS user_id, u.email, COALESCE(u.name,'') AS name, u.active").
-		Where("u.deleted_at IS NULL").
-		Where(`u.id NOT IN (
-            SELECT user_id FROM application_role_bindings
-             WHERE application_id = ? AND tenant_id = ?
-        )`, applicationID, tenantID)
+		Where("u.deleted_at IS NULL")
 	if search = strings.TrimSpace(search); search != "" {
 		needle := "%" + strings.ToLower(search) + "%"
 		q = q.Where("LOWER(u.email) LIKE ? OR LOWER(u.name) LIKE ?", needle, needle)
