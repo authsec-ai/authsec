@@ -1192,7 +1192,7 @@ CREATE TABLE public.sync_configurations (
 -- sync_runs — one row per directory sync attempt (manual or scheduled).
 CREATE TABLE public.sync_runs (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id         UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    workspace_id         UUID NOT NULL,
     sync_config_id       UUID NOT NULL REFERENCES public.sync_configurations(id) ON DELETE CASCADE,
     started_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at          TIMESTAMPTZ,
@@ -1203,7 +1203,7 @@ CREATE TABLE public.sync_runs (
     users_failed         INT NOT NULL DEFAULT 0,
     users_skipped        INT NOT NULL DEFAULT 0,
     error_text           TEXT,
-    triggered_by_user_id UUID REFERENCES public.users(id) ON DELETE SET NULL,
+    triggered_by_user_id UUID,
     triggered_by_kind    VARCHAR(32) NOT NULL DEFAULT 'manual'
 );
 CREATE INDEX idx_sync_runs_config ON public.sync_runs(sync_config_id, started_at DESC);
@@ -2302,6 +2302,12 @@ ALTER TABLE ONLY public.spire_policy_resources
 
 ALTER TABLE ONLY public.spire_policy_subjects
     ADD CONSTRAINT fk_spire_policy_rules_subjects FOREIGN KEY (rule_id) REFERENCES public.spire_policy_rules(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.sync_runs
+    ADD CONSTRAINT sync_runs_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.sync_runs
+    ADD CONSTRAINT sync_runs_triggered_by_user_id_fkey FOREIGN KEY (triggered_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.workspace_totp_backup_codes
     ADD CONSTRAINT fk_workspace_backup FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
