@@ -114,6 +114,15 @@ func (ctrl *ApplicationsV2Controller) List(c *gin.Context) {
 	c.JSON(http.StatusOK, rows)
 }
 
+// applicationGetResponse embeds the ResourceServer row and adds computed
+// access-policy fields so the UI can drive the readiness ribbon without a
+// second round-trip.
+type applicationGetResponse struct {
+	*models.ResourceServer
+	AccessPolicyEnabled  bool    `json:"access_policy_enabled"`
+	AccessPolicyRoleName *string `json:"access_policy_role_name,omitempty"`
+}
+
 func (ctrl *ApplicationsV2Controller) Get(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDString(c)
 	if err != nil {
@@ -134,7 +143,13 @@ func (ctrl *ApplicationsV2Controller) Get(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, row)
+
+	resp := applicationGetResponse{ResourceServer: row}
+	if policy, pErr := ctrl.onboardingSvc.GetAccessPolicy(tenantID, id); pErr == nil {
+		resp.AccessPolicyEnabled = policy.Enabled
+		resp.AccessPolicyRoleName = policy.DefaultRoleName
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // ListClients handles GET /authsec/applications/:id/clients. Returns the
@@ -259,6 +274,35 @@ func (ctrl *ApplicationsV2Controller) Validate(c *gin.Context) {
 		return
 	}
 	result := ctrl.onboardingSvc.ValidateResourceServer(rs, int(clientCount), accessPolicyEnabled)
+
+	// Persist last_validation_status / last_validated_at so the ribbon reflects
+	// the latest run without a separate fetch. "passed"/"failed" matches what
+	// computeReadiness.ts expects.
+	persistedStatus := "failed"
+	if result.Status == "pass" {
+		persistedStatus = "passed"
+	}
+	if tenantDB, dbErr := ctrl.idpConfigSvc.TenantDB(tenantID); dbErr == nil {
+		updates := map[string]any{
+			"last_validation_status": persistedStatus,
+			"last_validated_at":      result.LastValidatedAt,
+			"last_validation_error":  nil,
+		}
+		if result.Status != "pass" {
+			var msgs []string
+			for _, ch := range result.Checks {
+				if ch.Status != "pass" {
+					msgs = append(msgs, ch.Message)
+				}
+			}
+			if len(msgs) > 0 {
+				errMsg := strings.Join(msgs, "; ")
+				updates["last_validation_error"] = errMsg
+			}
+		}
+		tenantDB.Model(&models.ResourceServer{}).Where("id = ?", id).Updates(updates)
+	}
+
 	c.JSON(http.StatusOK, result)
 }
 
