@@ -446,11 +446,14 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 		return nil, "", "", "", fmt.Errorf("SAML authentication failed: %s", samlResp.Status.StatusCode.Value)
 	}
 
-	// Check entity ID (issuer)
-	responseEntityID := samlResp.Assertion.Issuer.Value
-	if responseEntityID != provider.EntityID {
-		log.Printf("[SAML] ValidateSAMLResponse: entity ID mismatch: got=%s expected=%s", responseEntityID, provider.EntityID)
-		return nil, "", "", "", fmt.Errorf("SAML entity ID mismatch: response from %s, expected %s", responseEntityID, provider.EntityID)
+	// Check entity ID (issuer). TrimSpace both sides — a single trailing space
+	// pasted into the admin UI used to silently break SAML login with an error
+	// where the two strings looked identical to a human.
+	responseEntityID := strings.TrimSpace(samlResp.Assertion.Issuer.Value)
+	expectedEntityID := strings.TrimSpace(provider.EntityID)
+	if responseEntityID != expectedEntityID {
+		log.Printf("[SAML] ValidateSAMLResponse: entity ID mismatch: got=%q expected=%q", responseEntityID, expectedEntityID)
+		return nil, "", "", "", fmt.Errorf("SAML entity ID mismatch: response from %q, expected %q", responseEntityID, expectedEntityID)
 	}
 
 	// Check destination matches our ACS URL

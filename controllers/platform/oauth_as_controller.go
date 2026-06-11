@@ -218,7 +218,7 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 		ContextID:        contextID,
 		HydraClientID:    oauthClient.HydraClientID,
 		ResourceServerID: rs.ID.String(),
-		WorkspaceID:         rs.WorkspaceID.String(),
+		WorkspaceID:      rs.WorkspaceID.String(),
 		ResourceURI:      rs.ResourceURI,
 		RedirectURI:      redirectURIToUse,
 		RequestedScopes:  scopeParam,
@@ -765,6 +765,23 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 // confidential clients (AI agents, service accounts). No user involvement —
 // the token represents the client itself.
 func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
+	// Defence-in-depth: client_credentials issues a token that represents the
+	// client itself, so the client MUST authenticate with a secret. Every
+	// client AuthSec creates today uses token_endpoint_auth_method="none"
+	// (public + PKCE) and there is no secret store yet — so a "none" client
+	// reaching this path could only do so via a manually flipped
+	// IsConfidential flag, which would make this an UNAUTHENTICATED M2M token
+	// issuer. Refuse until confidential-client secret auth is implemented.
+	if oauthClient.TokenEndpointAuthMethod == "none" || oauthClient.TokenEndpointAuthMethod == "" {
+		log.Printf("[MCP_AUTH] tokenClientCredentialsGrant: refused — client=%s has no confidential auth method (token_endpoint_auth_method=%q)",
+			oauthClient.ClientID, oauthClient.TokenEndpointAuthMethod)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "unauthorized_client",
+			"error_description": "client_credentials requires a confidential client with a secret-based auth method",
+		})
+		return
+	}
+
 	resourceParam := c.PostForm("resource")
 	scopeParam := c.PostForm("scope")
 
@@ -936,6 +953,47 @@ func (ctrl *OAuthASController) RFC7592Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// RFC7592Put handles PUT /oauth/register/:client_id (RFC 7592 §2 client update).
+// Mutable fields: client_name, redirect_uris (queued for admin review), software_version.
+// Immutable: grant_types, token_endpoint_auth_method — escalation prevention.
+func (ctrl *OAuthASController) RFC7592Put(c *gin.Context) {
+	clientID := c.Param("client_id")
+	rawRAT := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+	client, err := ctrl.service.GetClientByRegistrationToken(clientID, rawRAT)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+		return
+	}
+
+	var req services.RFC7592UpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
+		return
+	}
+
+	redirectPending, err := ctrl.service.UpdateClientMetadata(client, req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_client_metadata", "error_description": err.Error()})
+		return
+	}
+
+	resp := gin.H{
+		"client_id":                  client.ClientID,
+		"client_name":                client.ClientName,
+		"redirect_uris":              []string(client.RedirectURIs),
+		"grant_types":                []string(client.GrantTypes),
+		"token_endpoint_auth_method": client.TokenEndpointAuthMethod,
+		"software_id":                client.SoftwareID,
+		"software_version":           client.SoftwareVersion,
+		"client_kind":                client.ClientKind,
+	}
+	if redirectPending {
+		resp["redirect_review_pending"] = true
+		resp["redirect_review_message"] = "redirect_uris change requires admin approval; current URIs remain active until approved"
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 // Introspect handles OAuth token introspection (RFC 7662).
 // POST /oauth/introspect
 //
@@ -997,6 +1055,32 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		log.Printf("[MCP_AUTH] Introspect: audience mismatch rs=%s token_aud=%v", rs.ResourceURI, tokenInfo["aud"])
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
+	}
+
+	// Registration-status gate. Per models/resource_server_client_registration.go:
+	// "All access paths (/oauth/authorize, /oauth/register, consent, introspection)
+	// must check this table." Without this, a revoked client's existing access
+	// tokens keep working against the MCP server until natural Hydra TTL.
+	//
+	// Resolve the AuthSec client by Hydra client_id (what the token carries) and
+	// look up the join row for (rs, client). Missing row or non-approved status
+	// → fail closed.
+	hydraClientID, _ := tokenInfo["client_id"].(string)
+	if hydraClientID != "" {
+		mcpClient, lookupErr := ctrl.service.GetMCPOAuthClientByHydraID(hydraClientID)
+		if lookupErr != nil {
+			log.Printf("[MCP_AUTH] Introspect: no AuthSec client for hydra_client_id=%s rs=%s — failing closed",
+				hydraClientID, rs.ResourceURI)
+			c.JSON(http.StatusOK, gin.H{"active": false})
+			return
+		}
+		reg, regErr := ctrl.service.GetClientRegistration(rs.ID, mcpClient.ID)
+		if regErr != nil || reg.Status != "approved" {
+			log.Printf("[MCP_AUTH] Introspect: client registration not approved client=%s rs=%s status=%v — failing closed",
+				mcpClient.ClientID, rs.ResourceURI, regStatusOr(reg, regErr))
+			c.JSON(http.StatusOK, gin.H{"active": false})
+			return
+		}
 	}
 
 	// LIVE RBAC enforcement with OIDC-only token fix.
@@ -1400,8 +1484,12 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 			return nil, &policyError{http.StatusBadRequest, "invalid_client", "failed to resolve CIMD client: " + cimdErr.Error()}
 		}
 		oauthClient = resolved
-		// Lazily create the join row for CIMD clients (idempotent)
-		if _, regErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, rs.WorkspaceID, "cimd"); regErr != nil {
+		// Lazily bind the CIMD client (adopt-on-first-bind; cross-workspace
+		// binds park as pending_approval and are denied until approved).
+		if bindErr := ctrl.service.BindClientToRS(oauthClient, rs, "cimd"); bindErr != nil {
+			if errors.Is(bindErr, services.ErrCrossWorkspacePending) {
+				return nil, &policyError{http.StatusForbidden, "access_denied", "client requires admin approval in this workspace"}
+			}
 			return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register CIMD client for resource"}
 		}
 	} else {
@@ -1432,7 +1520,14 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
 	if regErr != nil {
 		if oauthClient.RegistrationType == "dcr" {
-			if _, ensureErr := ctrl.service.EnsureClientRegistration(rs.ID, oauthClient.ID, rs.WorkspaceID, "dcr"); ensureErr != nil {
+			// Adopt-on-first-bind: the client's first lazy bind stamps its home
+			// workspace and auto-approves. A bind against a DIFFERENT
+			// workspace's RS is parked as pending_approval and denied until
+			// that workspace's admin approves it in the Clients page.
+			if bindErr := ctrl.service.BindClientToRS(oauthClient, rs, "dcr"); bindErr != nil {
+				if errors.Is(bindErr, services.ErrCrossWorkspacePending) {
+					return nil, &policyError{http.StatusForbidden, "access_denied", "client requires admin approval in this workspace"}
+				}
 				return nil, &policyError{http.StatusInternalServerError, "server_error", "failed to register DCR client for resource"}
 			}
 		} else {
@@ -1553,6 +1648,18 @@ func containsString(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// regStatusOr returns a readable status for log lines: the registration's
+// status string when one was found, otherwise the lookup error's message.
+func regStatusOr(reg *models.ResourceServerClientRegistration, err error) string {
+	if reg != nil {
+		return reg.Status
+	}
+	if err != nil {
+		return "lookup_error:" + err.Error()
+	}
+	return "unknown"
 }
 
 // proxyResponseSkipHeaders are headers that must NOT be copied from the upstream

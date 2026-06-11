@@ -12,6 +12,10 @@ type SCIMConnection struct {
 	WorkspaceID        uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	IdentityProviderID *uuid.UUID `json:"identity_provider_id,omitempty" gorm:"type:uuid;index"`
 	TokenHash          string     `json:"-" gorm:"type:text;not null"`
+	// PreviousTokenHash + PreviousTokenExpiresAt support a 5-minute grace window
+	// during rotation so the IdP can swap tokens without a gap in provisioning.
+	PreviousTokenHash      *string    `json:"-" gorm:"type:text"`
+	PreviousTokenExpiresAt *time.Time `json:"previous_token_expires_at,omitempty"`
 	// DefaultClientID and DefaultProjectID let a connection anchor the existing
 	// SCIM handlers (which still expect client_id/project_id) during the
 	// workspace transition. Both nullable — once handlers are workspace-only

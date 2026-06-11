@@ -422,8 +422,6 @@ CREATE TABLE public.mcp_oauth_clients (
     post_logout_redirect_uris text[] DEFAULT '{}'::text[],
     supports_refresh_token boolean DEFAULT false,
     is_confidential boolean DEFAULT false,
-    software_statement_issuer text,
-    software_statement_verified boolean DEFAULT false,
     sync_status text DEFAULT 'active'::text NOT NULL,
     sync_last_error text,
     sync_last_error_at timestamp with time zone,
@@ -434,6 +432,13 @@ CREATE TABLE public.mcp_oauth_clients (
     last_token_issued_at   TIMESTAMPTZ,
     tags                   TEXT[] NOT NULL DEFAULT '{}'::text[],
     registration_access_token_hash VARCHAR(64),
+    -- Home workspace: stamped at registration when the workspace is known
+    -- (DCR with resource / prereg) or adopted on first lazy bind at /authorize.
+    -- NULL = unbound (fresh DCR-without-resource or CIMD client). Lazy binds to
+    -- an RS in a DIFFERENT workspace create the registration as
+    -- pending_approval instead of approved. FK added in the constraints
+    -- section below (workspaces is created later in this file).
+    home_workspace_id      UUID,
     CONSTRAINT mcp_oauth_clients_sync_status_chk CHECK (sync_status IN ('active', 'sync_error', 'pending_delete')),
     CONSTRAINT mcp_oauth_clients_client_id_key UNIQUE (client_id),
     CONSTRAINT mcp_oauth_clients_hydra_client_id_key UNIQUE (hydra_client_id),
@@ -1184,6 +1189,26 @@ CREATE TABLE public.sync_configurations (
     CONSTRAINT sync_configurations_workspace_id_config_name_key UNIQUE (workspace_id, config_name)
 );
 
+-- sync_runs — one row per directory sync attempt (manual or scheduled).
+CREATE TABLE public.sync_runs (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id         UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    sync_config_id       UUID NOT NULL REFERENCES public.sync_configurations(id) ON DELETE CASCADE,
+    started_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at          TIMESTAMPTZ,
+    status               VARCHAR(32) NOT NULL CHECK (status IN ('running','success','failed','dry_run')),
+    dry_run              BOOLEAN NOT NULL DEFAULT FALSE,
+    users_created        INT NOT NULL DEFAULT 0,
+    users_updated        INT NOT NULL DEFAULT 0,
+    users_failed         INT NOT NULL DEFAULT 0,
+    users_skipped        INT NOT NULL DEFAULT 0,
+    error_text           TEXT,
+    triggered_by_user_id UUID REFERENCES public.users(id) ON DELETE SET NULL,
+    triggered_by_kind    VARCHAR(32) NOT NULL DEFAULT 'manual'
+);
+CREATE INDEX idx_sync_runs_config ON public.sync_runs(sync_config_id, started_at DESC);
+CREATE INDEX idx_sync_runs_workspace ON public.sync_runs(workspace_id, started_at DESC);
+
 CREATE TABLE public.workspace_ciba_auth_requests (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     auth_req_id character varying(255) NOT NULL,
@@ -1551,6 +1576,10 @@ CREATE TABLE public.scim_connections (
     workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
     identity_provider_id uuid REFERENCES public.identity_providers(id) ON DELETE SET NULL,
     token_hash text NOT NULL,
+    -- Rotation: previous token stays valid for 5 min after rotate so the IdP
+    -- can swap without downtime. previous_token_expires_at is the cutoff.
+    previous_token_hash       text,
+    previous_token_expires_at timestamptz,
     status text NOT NULL DEFAULT 'active',
     created_at timestamptz NOT NULL DEFAULT now(),
     revoked_at timestamptz,
@@ -1561,6 +1590,25 @@ CREATE TABLE public.scim_connections (
 
 CREATE INDEX idx_scim_connections_workspace          ON public.scim_connections(workspace_id);
 CREATE INDEX idx_scim_connections_identity_provider  ON public.scim_connections(identity_provider_id);
+
+-- scim_events — per-request audit log for SCIM 2.0 operations. Written by the
+-- SCIMEventLogger middleware after every request on the /scim/v2/c/:id/... path.
+CREATE TABLE public.scim_events (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id       UUID NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    scim_connection_id UUID NOT NULL REFERENCES public.scim_connections(id) ON DELETE CASCADE,
+    ts                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    method             VARCHAR(8)  NOT NULL,
+    path               TEXT        NOT NULL,
+    resource_type      VARCHAR(16) NOT NULL DEFAULT '',
+    resource_id        TEXT,
+    status_code        INT         NOT NULL,
+    error_text         TEXT,
+    ip_address         VARCHAR(64),
+    user_agent         TEXT
+);
+CREATE INDEX idx_scim_events_conn ON public.scim_events(scim_connection_id, ts DESC);
+CREATE INDEX idx_scim_events_workspace ON public.scim_events(workspace_id, ts DESC);
 
 -- application_spiffe_identities — workspace-scoped SPIFFE ID ↔ Application
 -- binding. Used by the agent-guard plane.
@@ -1814,6 +1862,8 @@ CREATE INDEX idx_mcp_oauth_clients_client_id ON public.mcp_oauth_clients USING b
 CREATE INDEX idx_mcp_oauth_clients_hydra_client_id ON public.mcp_oauth_clients USING btree (hydra_client_id);
 
 CREATE INDEX idx_mcp_oauth_clients_software_id ON public.mcp_oauth_clients(software_id) WHERE software_id IS NOT NULL;
+
+CREATE INDEX idx_mcp_oauth_clients_home_ws ON public.mcp_oauth_clients(home_workspace_id) WHERE home_workspace_id IS NOT NULL;
 
 CREATE INDEX idx_mcp_tools_rs ON public.mcp_tools USING btree (resource_server_id);
 
@@ -2320,6 +2370,9 @@ ALTER TABLE ONLY public.mcp_tools
 
 ALTER TABLE ONLY public.identity_providers
     ADD CONSTRAINT identity_providers_saml_fkey FOREIGN KEY (saml_provider_id, workspace_id) REFERENCES public.saml_providers(id, workspace_id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.mcp_oauth_clients
+    ADD CONSTRAINT mcp_oauth_clients_home_workspace_fkey FOREIGN KEY (home_workspace_id) REFERENCES public.workspaces(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.oauth_consent_grants
     ADD CONSTRAINT oauth_consent_grants_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE;

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
@@ -52,10 +53,17 @@ func SCIMConnectionAuth() gin.HandlerFunc {
 			return
 		}
 
-		// Constant-time compare against the stored SHA-256 hash.
+		// Constant-time compare against the current token hash.
 		incoming := sha256.Sum256([]byte(token))
 		incomingHex := hex.EncodeToString(incoming[:])
-		if subtle.ConstantTimeCompare([]byte(incomingHex), []byte(conn.TokenHash)) != 1 {
+		matchesCurrent := subtle.ConstantTimeCompare([]byte(incomingHex), []byte(conn.TokenHash)) == 1
+		// Also accept the previous token during its grace window (rotation overlap).
+		matchesPrevious := false
+		if !matchesCurrent && conn.PreviousTokenHash != nil && conn.PreviousTokenExpiresAt != nil &&
+			conn.PreviousTokenExpiresAt.After(time.Now()) {
+			matchesPrevious = subtle.ConstantTimeCompare([]byte(incomingHex), []byte(*conn.PreviousTokenHash)) == 1
+		}
+		if !matchesCurrent && !matchesPrevious {
 			scimUnauthorized(c, "invalid scim bearer token")
 			return
 		}

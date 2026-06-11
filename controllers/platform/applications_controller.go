@@ -9,6 +9,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // ApplicationsController serves the workspace-scoped Application facade.
@@ -399,6 +400,33 @@ func (ctrl *ApplicationsController) RevokeConnection(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 
+// ApproveConnection handles PUT /authsec/applications/:id/connections/:connection_id/approve.
+// It flips a pending_approval registration (created when a client from another
+// workspace attempted a lazy bind) to approved.
+func (ctrl *ApplicationsController) ApproveConnection(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	id := c.Param("id")
+	if _, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	connectionID := c.Param("connection_id")
+	if err := ctrl.oauthSvc.ApproveClientRegistration(id, connectionID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, workspaceID.String(), "application_connection_approved", "oauth_client",
+		connectionID, http.StatusOK, nil, map[string]interface{}{"application_id": id})
+	c.JSON(http.StatusOK, gin.H{"status": "approved"})
+}
+
 // Launch handles POST /authsec/applications/:id/launch.
 //
 // At v1 this returns the data the UI needs to drive a "Launch" CTA — issuer,
@@ -450,7 +478,8 @@ func (ctrl *ApplicationsController) Launch(c *gin.Context) {
 }
 
 // ListWorkspaceClients handles GET /authsec/clients.
-// Returns all OAuth clients registered to any application in the workspace.
+// Optional ?resource_server_id=<uuid> scopes the result to a single application
+// (used by the app-scoped Clients tab via GET /authsec/clients?resource_server_id=X).
 func (ctrl *ApplicationsController) ListWorkspaceClients(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
@@ -458,7 +487,17 @@ func (ctrl *ApplicationsController) ListWorkspaceClients(c *gin.Context) {
 		return
 	}
 
-	clients, err := ctrl.oauthSvc.ListWorkspaceClients(workspaceID)
+	var rsID *uuid.UUID
+	if rsIDStr := c.Query("resource_server_id"); rsIDStr != "" {
+		parsed, parseErr := uuid.Parse(rsIDStr)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource_server_id"})
+			return
+		}
+		rsID = &parsed
+	}
+
+	clients, err := ctrl.oauthSvc.ListWorkspaceClients(workspaceID, rsID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

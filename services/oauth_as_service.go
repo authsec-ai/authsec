@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -151,6 +152,15 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		return nil, "", fmt.Errorf("register hydra client for DCR: %w", err)
 	}
 
+	// Home workspace is known only when the client bound itself to a resource
+	// at registration time. Unbound clients (rs == nil) adopt a home workspace
+	// on their first lazy bind at /authorize (see BindClientToRS).
+	var homeWorkspaceID *uuid.UUID
+	if rs != nil {
+		ws := rs.WorkspaceID
+		homeWorkspaceID = &ws
+	}
+
 	client := &models.MCPOAuthClient{
 		ClientID:                clientID,
 		HydraClientID:           hydraClientID,
@@ -166,6 +176,7 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 		ClientKind:              resolveClientKind(req),
 		SoftwareID:              nilableString(req.SoftwareID),
 		SoftwareVersion:         nilableString(req.SoftwareVersion),
+		HomeWorkspaceID:         homeWorkspaceID,
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -204,7 +215,7 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 	// lazily at that point. This accommodates DCR clients (e.g. Claude Code)
 	// that follow RFC 7591 strictly and omit `resource` at registration time.
 	if rs != nil {
-		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "dcr"); err != nil {
+		if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "dcr", models.ClientRegStatusApproved); err != nil {
 			return nil, "", fmt.Errorf("create DCR client registration: %w", err)
 		}
 	}
@@ -215,6 +226,13 @@ func (s *OAuthASService) RegisterDCRClient(req DCRRequest, rs *models.ResourceSe
 // GetOAuthClient looks up an MCP OAuth client by its public client_id.
 func (s *OAuthASService) GetOAuthClient(clientID string) (*models.MCPOAuthClient, error) {
 	return s.authzCtx.GetMCPOAuthClientByClientID(clientID)
+}
+
+// GetMCPOAuthClientByHydraID looks up an MCP OAuth client by its Hydra client_id.
+// Introspection uses this because access-token introspections carry the Hydra
+// client_id (the internal UUID), not the public AuthSec client_id.
+func (s *OAuthASService) GetMCPOAuthClientByHydraID(hydraClientID string) (*models.MCPOAuthClient, error) {
+	return s.authzCtx.GetMCPOAuthClientByHydraID(hydraClientID)
 }
 
 // EnsureHydraClientHasRSScopes is the lazy-binding fix for DCR'd clients
@@ -302,9 +320,83 @@ func (s *OAuthASService) GetClientRegistration(rsID, clientID uuid.UUID) (*model
 	return s.authzCtx.GetClientRegistration(rsID, clientID)
 }
 
-// EnsureClientRegistration upserts a join row (used by CIMD).
-func (s *OAuthASService) EnsureClientRegistration(rsID, clientID, workspaceID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
-	return s.authzCtx.EnsureClientRegistration(rsID, clientID, workspaceID, regType)
+// EnsureClientRegistration upserts a join row with an explicit status.
+func (s *OAuthASService) EnsureClientRegistration(rsID, clientID, workspaceID uuid.UUID, regType, status string) (*models.ResourceServerClientRegistration, error) {
+	return s.authzCtx.EnsureClientRegistration(rsID, clientID, workspaceID, regType, status)
+}
+
+// ErrCrossWorkspacePending is returned by BindClientToRS when a client whose
+// home workspace differs from the RS's workspace attempts a lazy bind. The
+// registration row is created as pending_approval; the workspace admin must
+// approve it before the client can authorize.
+var ErrCrossWorkspacePending = errors.New("client requires admin approval in this workspace")
+
+// BindClientToRS implements adopt-on-first-bind for lazy client registration
+// at /authorize:
+//
+//	home == nil            → stamp home = rs.WorkspaceID, create reg approved
+//	home == rs.WorkspaceID → create reg approved
+//	home != rs.WorkspaceID → create reg pending_approval, ErrCrossWorkspacePending
+//
+// Rationale: mcp_oauth_clients is global (one issuer serves every workspace,
+// and MCP clients cache one DCR registration per issuer), so the same
+// client_id may legitimately need access to several workspaces — but silently
+// auto-approving it in EVERY workspace let a client minted by workspace A
+// attach itself to workspace B's MCP servers with zero admin gating.
+func (s *OAuthASService) BindClientToRS(client *models.MCPOAuthClient, rs *models.ResourceServer, regType string) error {
+	if client.HomeWorkspaceID == nil {
+		// First bind anywhere: this workspace adopts the client.
+		ws := rs.WorkspaceID
+		if err := s.db.Model(&models.MCPOAuthClient{}).
+			Where("id = ? AND home_workspace_id IS NULL", client.ID).
+			Update("home_workspace_id", ws).Error; err != nil {
+			return fmt.Errorf("stamp home workspace: %w", err)
+		}
+		client.HomeWorkspaceID = &ws
+		// Note: a concurrent first-bind in another workspace may have won the
+		// IS NULL race; that's fine — both workspaces get an approved row for
+		// the very first bind, and the stamped home gates all later binds.
+		_, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusApproved)
+		return err
+	}
+
+	if *client.HomeWorkspaceID == rs.WorkspaceID {
+		_, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusApproved)
+		return err
+	}
+
+	// Cross-workspace: park the registration for admin review.
+	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, regType, models.ClientRegStatusPendingApproval); err != nil {
+		return fmt.Errorf("create pending registration: %w", err)
+	}
+	log.Printf("[MCP_AUTH] BindClientToRS: cross-workspace bind parked as pending_approval client=%s home_ws=%s rs_ws=%s rs=%s",
+		client.ClientID, client.HomeWorkspaceID, rs.WorkspaceID, rs.ResourceURI)
+	return ErrCrossWorkspacePending
+}
+
+// ApproveClientRegistration flips a pending_approval registration to approved.
+// Only pending rows are eligible — re-approving a revoked client is a separate,
+// deliberate admin action (delete + re-register or manual status change).
+func (s *OAuthASService) ApproveClientRegistration(rsID, clientID string) error {
+	rsUUID, err := uuid.Parse(rsID)
+	if err != nil {
+		return fmt.Errorf("invalid RS ID: %w", err)
+	}
+	client, err := s.authzCtx.GetMCPOAuthClientByClientID(clientID)
+	if err != nil {
+		return fmt.Errorf("client not found: %w", err)
+	}
+	result := s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
+			rsUUID, client.ID, models.ClientRegStatusPendingApproval).
+		Update("status", models.ClientRegStatusApproved)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("no pending registration found for this client")
+	}
+	return nil
 }
 
 // InferSingleResourceURIForClient resolves a missing RFC 8707 resource parameter
@@ -711,14 +803,14 @@ func (s *OAuthASService) revokeHydraConsentForSubject(subject string) error {
 //
 // Strategy:
 //
-//	1. UPDATE oauth_consent_grants SET revoked_at=now() WHERE workspace_id=? AND user_id=? AND revoked_at IS NULL
-//	   — our /authorize re-validates RBAC against consent state on every flow,
-//	   so any new token issuance will see the fresh permission set.
-//	2. DELETE Hydra consent sessions for subject=user_id
-//	   — invalidates all in-flight access tokens issued via those consents.
-//	   On the user's next protected call, introspection returns active=false
-//	   and the SDK responds 401 → user gets routed back through /authorize
-//	   → fresh consent runs the updated RBAC check.
+//  1. UPDATE oauth_consent_grants SET revoked_at=now() WHERE workspace_id=? AND user_id=? AND revoked_at IS NULL
+//     — our /authorize re-validates RBAC against consent state on every flow,
+//     so any new token issuance will see the fresh permission set.
+//  2. DELETE Hydra consent sessions for subject=user_id
+//     — invalidates all in-flight access tokens issued via those consents.
+//     On the user's next protected call, introspection returns active=false
+//     and the SDK responds 401 → user gets routed back through /authorize
+//     → fresh consent runs the updated RBAC check.
 //
 // Idempotent: zero-row UPDATEs and 404s from Hydra are normal and non-fatal.
 // Best-effort: call sites SHOULD fire-and-forget (`go s.RevokeUserTokensForWorkspace(...)`)
@@ -918,6 +1010,7 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 		ClientKind:              resolveClientKind(req),
 		SoftwareID:              nilableString(req.SoftwareID),
 		SoftwareVersion:         nilableString(req.SoftwareVersion),
+		HomeWorkspaceID:         &rs.WorkspaceID,
 	}
 
 	if err := s.authzCtx.CreateMCPOAuthClient(client); err != nil {
@@ -935,7 +1028,7 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 		return nil, fmt.Errorf("store prereg client: %w", err)
 	}
 
-	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "prereg"); err != nil {
+	if _, err := s.authzCtx.EnsureClientRegistration(rs.ID, client.ID, rs.WorkspaceID, "prereg", models.ClientRegStatusApproved); err != nil {
 		return nil, fmt.Errorf("create prereg client registration: %w", err)
 	}
 
@@ -985,11 +1078,33 @@ func (s *OAuthASService) RevokeClientRegistration(rsID, clientID string) error {
 
 	result := s.db.Model(&models.ResourceServerClientRegistration{}).
 		Where("resource_server_id = ? AND oauth_client_id = ?", rsUUID, client.ID).
-		Update("status", "revoked")
+		Update("status", models.ClientRegStatusRevoked)
+	if result.Error != nil {
+		return result.Error
+	}
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("client registration not found")
 	}
-	return result.Error
+
+	// Hydra-side hygiene: when this was the client's LAST approved
+	// registration, flush all its access tokens so they don't linger until
+	// TTL. Best-effort — the introspection registration gate is the
+	// authoritative access cut; a flush failure must not fail the revoke.
+	var remaining int64
+	if cntErr := s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("oauth_client_id = ? AND status = ?", client.ID, models.ClientRegStatusApproved).
+		Count(&remaining).Error; cntErr != nil {
+		log.Printf("[MCP_AUTH] RevokeClientRegistration: count remaining approved regs failed for client=%s: %v — skipping token flush", client.ClientID, cntErr)
+		return nil
+	}
+	if remaining == 0 {
+		if flushErr := hydraAdminDeleteClientTokens(client.HydraClientID); flushErr != nil {
+			log.Printf("[MCP_AUTH] RevokeClientRegistration: hydra token flush failed for client=%s: %v — tokens expire at TTL; introspection gate already denies them", client.ClientID, flushErr)
+		} else {
+			log.Printf("[MCP_AUTH] RevokeClientRegistration: flushed hydra tokens for client=%s (last approved registration revoked)", client.ClientID)
+		}
+	}
+	return nil
 }
 
 // ApprovePendingRedirects copies pending redirect URIs to approved, updates Hydra, clears flag.
@@ -1030,6 +1145,86 @@ func (s *OAuthASService) ApprovePendingRedirects(clientID string) error {
 	}
 
 	return s.authzCtx.UpdateMCPOAuthClient(client)
+}
+
+// RFC7592UpdateRequest carries mutable fields from a PUT /oauth/register/:client_id body.
+// Only listed fields may be changed; grant_types and token_endpoint_auth_method are read-only
+// (escalation prevention).
+type RFC7592UpdateRequest struct {
+	ClientName      string   `json:"client_name"`
+	RedirectURIs    []string `json:"redirect_uris"`
+	SoftwareVersion string   `json:"software_version,omitempty"`
+}
+
+// UpdateClientMetadata applies a RFC 7592 PUT update to a client.
+// - client_name and software_version are applied immediately + synced to Hydra.
+// - redirect_uris changes are staged as pending (redirect_review_pending=true);
+//   an admin must call ApprovePendingRedirects before they take effect.
+//   This prevents a client from silently widening its own callback surface.
+// Returns whether redirect review was triggered.
+func (s *OAuthASService) UpdateClientMetadata(client *models.MCPOAuthClient, req RFC7592UpdateRequest) (redirectReviewPending bool, err error) {
+	updates := map[string]interface{}{}
+
+	if req.ClientName != "" && req.ClientName != client.ClientName {
+		client.ClientName = req.ClientName
+		updates["client_name"] = req.ClientName
+	}
+
+	if req.SoftwareVersion != "" && (client.SoftwareVersion == nil || req.SoftwareVersion != *client.SoftwareVersion) {
+		client.SoftwareVersion = &req.SoftwareVersion
+		updates["software_version"] = req.SoftwareVersion
+	}
+
+	// Check whether redirect_uris changed.
+	redirectsChanged := false
+	if len(req.RedirectURIs) > 0 {
+		existing := make(map[string]struct{}, len(client.RedirectURIs))
+		for _, u := range client.RedirectURIs {
+			existing[u] = struct{}{}
+		}
+		for _, u := range req.RedirectURIs {
+			if _, ok := existing[u]; !ok {
+				redirectsChanged = true
+				break
+			}
+		}
+		if !redirectsChanged && len(req.RedirectURIs) != len(client.RedirectURIs) {
+			redirectsChanged = true
+		}
+	}
+
+	if redirectsChanged {
+		if err = validateRedirectURIs(req.RedirectURIs); err != nil {
+			return false, fmt.Errorf("invalid redirect_uris: %w", err)
+		}
+		updates["pending_redirect_uris"] = pq.StringArray(req.RedirectURIs)
+		updates["redirect_review_pending"] = true
+		redirectReviewPending = true
+	}
+
+	if len(updates) == 0 {
+		return false, nil // nothing to do
+	}
+
+	if err = s.db.Model(client).Updates(updates).Error; err != nil {
+		return false, fmt.Errorf("db update failed: %w", err)
+	}
+
+	// Sync non-redirect changes to Hydra immediately (name). Redirects only sync after admin approval.
+	if _, hasName := updates["client_name"]; hasName {
+		hydraScope, grantTypes, _ := resolveOIDCClientCapabilities(client.Scope)
+		_ = hydraAdminUpdateClient(client.HydraClientID, hydraClient{
+			ClientID:      client.HydraClientID,
+			ClientName:    client.ClientName,
+			GrantTypes:    grantTypes,
+			RedirectURIs:  []string(client.RedirectURIs),
+			ResponseTypes: []string{"code"},
+			TokenEndpoint: client.TokenEndpointAuthMethod,
+			Scope:         hydraScope,
+		})
+	}
+
+	return redirectReviewPending, nil
 }
 
 // --- DCR Request/Response types ---
@@ -1093,7 +1288,9 @@ func (s *OAuthASService) GetClientByRegistrationToken(clientID, rawRAT string) (
 	}
 	sum := sha256.Sum256([]byte(rawRAT))
 	gotHash := hex.EncodeToString(sum[:])
-	if gotHash != *client.RegistrationAccessTokenHash {
+	// Constant-time compare — a plain != on the hash is a timing oracle that
+	// lets a remote caller recover the stored hash byte-by-byte (CWE-208).
+	if subtle.ConstantTimeCompare([]byte(gotHash), []byte(*client.RegistrationAccessTokenHash)) != 1 {
 		return nil, fmt.Errorf("invalid registration access token")
 	}
 	return client, nil
@@ -1613,14 +1810,24 @@ type WorkspaceClientItem struct {
 	RedirectURIs       []string   `json:"redirect_uris"`
 	Tags               []string   `json:"tags"`
 	LastTokenIssuedAt  *time.Time `json:"last_token_issued_at,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	// AdoptedElsewhere is true when the client's home workspace is a DIFFERENT
+	// workspace than the caller's. We expose only this boolean — never the
+	// foreign workspace UUID — so one tenant can't enumerate another tenant's
+	// workspace IDs by listing a globally-shared client.
+	AdoptedElsewhere bool      `json:"adopted_elsewhere"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // ListWorkspaceClients returns all OAuth clients registered to any resource
-// server that belongs to the given workspace.
-func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID) ([]WorkspaceClientItem, error) {
+// server that belongs to the given workspace. If resourceServerID is non-nil,
+// results are filtered to that single RS (used by the app-scoped Clients tab).
+func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID, resourceServerID *uuid.UUID) ([]WorkspaceClientItem, error) {
 	var regs []models.ResourceServerClientRegistration
-	if err := s.db.Where("workspace_id = ?", workspaceID).Find(&regs).Error; err != nil {
+	q := s.db.Where("workspace_id = ?", workspaceID)
+	if resourceServerID != nil {
+		q = q.Where("resource_server_id = ?", *resourceServerID)
+	}
+	if err := q.Find(&regs).Error; err != nil {
 		return nil, err
 	}
 
@@ -1692,6 +1899,7 @@ func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID) ([]Workspac
 			RedirectURIs:       redirectURIs,
 			Tags:               tags,
 			LastTokenIssuedAt:  c.LastTokenIssuedAt,
+			AdoptedElsewhere:   c.HomeWorkspaceID != nil && *c.HomeWorkspaceID != workspaceID,
 			CreatedAt:          c.CreatedAt,
 		})
 	}

@@ -408,6 +408,46 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 	})
 }
 
+// ListSyncRuns handles GET /authsec/uflow/admin/sync-configs/:id/runs.
+// Returns the most recent sync run records for a given sync configuration,
+// visible to admins within the same workspace.
+func (scc *SyncConfigController) ListSyncRuns(c *gin.Context) {
+	configID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sync config id"})
+		return
+	}
+
+	wsIDStr, exists := c.Get("workspace_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required"})
+		return
+	}
+	workspaceID, err := uuid.Parse(fmt.Sprintf("%v", wsIDStr))
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id"})
+		return
+	}
+
+	// Confirm the config belongs to this workspace before returning runs.
+	var cfg models.SyncConfiguration
+	if err := config.DB.Select("id").Where("id = ? AND workspace_id = ?", configID, workspaceID).First(&cfg).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "sync configuration not found"})
+		return
+	}
+
+	var runs []models.SyncRun
+	if err := config.DB.
+		Where("sync_config_id = ?", configID).
+		Order("started_at DESC").
+		Limit(100).
+		Find(&runs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, runs)
+}
+
 // maskSensitiveFields masks sensitive credential fields in the response
 func (scc *SyncConfigController) maskSensitiveFields(config models.SyncConfiguration) models.SyncConfiguration {
 	if config.ADPassword != "" {

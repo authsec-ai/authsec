@@ -312,13 +312,15 @@ func (s *AuthorizationContextService) GetClientRegistration(resourceServerID, oa
 	return &reg, nil
 }
 
-// EnsureClientRegistration upserts a client registration for an RS.
-func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID, oauthClientID, workspaceID uuid.UUID, regType string) (*models.ResourceServerClientRegistration, error) {
+// EnsureClientRegistration upserts a client registration for an RS with the
+// given status ("approved" or "pending_approval"). An existing row is never
+// modified (DoNothing) — so a revoked or pending row keeps its status.
+func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID, oauthClientID, workspaceID uuid.UUID, regType, status string) (*models.ResourceServerClientRegistration, error) {
 	reg := models.ResourceServerClientRegistration{
 		ResourceServerID: resourceServerID,
 		OAuthClientID:    oauthClientID,
 		WorkspaceID:      workspaceID,
-		Status:           "approved",
+		Status:           status,
 		RegistrationType: regType,
 	}
 	err := s.db.Clauses(clause.OnConflict{

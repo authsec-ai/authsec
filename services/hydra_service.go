@@ -113,6 +113,29 @@ func hydraAdminDeleteClient(clientID string) error {
 	return nil
 }
 
+// hydraAdminDeleteClientTokens flushes all access tokens Hydra has issued to a
+// client. Used when an admin revokes the client's LAST approved registration —
+// per-app gating is enforced at introspection, this is Hydra-side hygiene so
+// dead tokens don't linger until TTL. 204 and 404 both count as success
+// (idempotent: nothing to flush is fine).
+func hydraAdminDeleteClientTokens(clientID string) error {
+	req, err := http.NewRequest("DELETE",
+		fmt.Sprintf("%s/admin/oauth2/tokens?client_id=%s", hydraAdminURL(), url.QueryEscape(clientID)), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := CircuitDoHydra(req)
+	if err != nil {
+		return fmt.Errorf("hydra delete client tokens: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("hydra delete client tokens status %d: %s", resp.StatusCode, body)
+	}
+	return nil
+}
+
 func hydraAdminGetAllClients() ([]hydraClient, error) {
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/admin/clients", hydraAdminURL()), nil)
 	if err != nil {

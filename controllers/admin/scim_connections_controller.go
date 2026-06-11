@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -46,7 +48,8 @@ type scimConnectionCreateResponse struct {
 	WorkspaceID string `json:"workspace_id"`
 	// Token is the plaintext bearer token. Shown once — operators must save it
 	// immediately. Subsequent reads return only the hash.
-	Token string `json:"token"`
+	Token    string `json:"token"`
+	Endpoint string `json:"endpoint"`
 }
 
 // Create handles POST /authsec/scim-connections.
@@ -124,11 +127,107 @@ func (ctrl *SCIMConnectionsController) Create(c *gin.Context) {
 		return
 	}
 
+	base := strings.TrimRight(config.AppConfig.OAuthBaseURL(), "/")
+	endpoint := fmt.Sprintf("%s/authsec/uflow/scim/v2/c/%s", base, conn.ID.String())
+
 	c.JSON(http.StatusCreated, scimConnectionCreateResponse{
 		ID:          conn.ID.String(),
 		WorkspaceID: workspaceID.String(),
 		Token:       token,
+		Endpoint:    endpoint,
 	})
+}
+
+// Rotate handles POST /authsec/scim-connections/:id/rotate.
+// Mints a new bearer token, moves the current token to the previous slot with a
+// 5-minute grace window so the IdP can swap tokens without a provisioning gap.
+func (ctrl *SCIMConnectionsController) Rotate(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	connectionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scim connection id"})
+		return
+	}
+
+	var conn models.SCIMConnection
+	if err := config.DB.Where("id = ? AND workspace_id = ?", connectionID, workspaceID).First(&conn).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scim connection not found"})
+		return
+	}
+	if conn.Status != "active" {
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot rotate a non-active connection"})
+		return
+	}
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "token generation failed"})
+		return
+	}
+	newToken := base64.RawURLEncoding.EncodeToString(raw)
+	newHash := sha256.Sum256([]byte(newToken))
+	newHashHex := hex.EncodeToString(newHash[:])
+
+	// Move current token to previous slot with 5-min grace window.
+	graceCutoff := time.Now().Add(5 * time.Minute)
+	if err := config.DB.Model(&conn).Updates(map[string]interface{}{
+		"previous_token_hash":       conn.TokenHash,
+		"previous_token_expires_at": graceCutoff,
+		"token_hash":                newHashHex,
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	base := strings.TrimRight(config.AppConfig.OAuthBaseURL(), "/")
+	endpoint := fmt.Sprintf("%s/authsec/uflow/scim/v2/c/%s", base, conn.ID.String())
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":       conn.ID.String(),
+		"token":    newToken,
+		"endpoint": endpoint,
+		"previous_token_expires_at": graceCutoff,
+	})
+}
+
+// ListEvents handles GET /authsec/scim-connections/:id/events.
+// Returns the last N SCIM operations logged against this connection.
+func (ctrl *SCIMConnectionsController) ListEvents(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	connectionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scim connection id"})
+		return
+	}
+
+	// Verify ownership before returning events.
+	var conn models.SCIMConnection
+	if err := config.DB.Select("id").Where("id = ? AND workspace_id = ?", connectionID, workspaceID).First(&conn).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scim connection not found"})
+		return
+	}
+
+	limit := 100
+	var events []models.SCIMEvent
+	if err := config.DB.
+		Where("scim_connection_id = ?", connectionID).
+		Order("ts DESC").
+		Limit(limit).
+		Find(&events).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, events)
 }
 
 // List handles GET /authsec/scim-connections — returns metadata only, never

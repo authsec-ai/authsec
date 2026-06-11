@@ -52,8 +52,9 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
-	// Launch the stale-DCR cleanup goroutine alongside the main reconcile loop.
+	// Launch background housekeeping goroutines alongside the main reconcile loop.
 	go r.runStaleDCRCleanup(ctx)
+	go r.runPendingApprovalExpiry(ctx)
 
 	// First pass immediately so a restart picks up any in-flight failures
 	// without waiting for the first interval.
@@ -118,6 +119,49 @@ func (r *HydraReconciler) runStaleDCRCleanup(ctx context.Context) {
 			return
 		case <-dailyTicker.C:
 			cleanup()
+		}
+	}
+}
+
+// runPendingApprovalExpiry auto-expires pending_approval registrations that
+// have been sitting unanswered for more than PENDING_APPROVAL_TTL_DAYS days
+// (default 7). This bounds the drip-DoS where DCR-minted fresh client_ids
+// accumulate junk pending rows in a victim workspace's Clients page.
+// The rows are set to "revoked" rather than deleted so the workspace admin
+// can still see what was denied rather than having rows silently vanish.
+func (r *HydraReconciler) runPendingApprovalExpiry(ctx context.Context) {
+	ttlDays := 7
+	if v := os.Getenv("PENDING_APPROVAL_TTL_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ttlDays = n
+		}
+	}
+	log.Printf("[HydraReconciler] pending approval expiry: ttlDays=%d", ttlDays)
+
+	expire := func() {
+		cutoff := time.Now().AddDate(0, 0, -ttlDays)
+		result := r.db.WithContext(ctx).
+			Model(&models.ResourceServerClientRegistration{}).
+			Where("status = 'pending_approval' AND created_at < ?", cutoff).
+			Update("status", "revoked")
+		if result.Error != nil {
+			log.Printf("[HydraReconciler] pending approval expiry query failed: %v", result.Error)
+			return
+		}
+		if result.RowsAffected > 0 {
+			log.Printf("[HydraReconciler] pending approval expiry: expired %d row(s) (cutoff=%s)", result.RowsAffected, cutoff.Format(time.RFC3339))
+		}
+	}
+
+	expire()
+	dailyTicker := time.NewTicker(24 * time.Hour)
+	defer dailyTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-dailyTicker.C:
+			expire()
 		}
 	}
 }

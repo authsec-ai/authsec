@@ -220,6 +220,7 @@ func SetupRoutes(
 		oauth.POST("/register", middlewares.StrictAuthRateLimitMiddleware(10, time.Minute), oauthASController.Register)
 		// RFC 7592 — Client Registration Management endpoints (self-service via registration_access_token)
 		oauth.GET("/register/:client_id", oauthASController.RFC7592Get)
+		oauth.PUT("/register/:client_id", oauthASController.RFC7592Put)
 		oauth.DELETE("/register/:client_id", oauthASController.RFC7592Delete)
 		oauth.POST("/introspect", middlewares.StrictAuthRateLimitMiddleware(60, time.Minute), oauthASController.Introspect)
 		oauth.GET("/jwks", oauthASController.JWKS)
@@ -348,6 +349,7 @@ func SetupRoutes(
 			applications.POST("/:id/connections", rsController.PreRegisterClient)
 			applications.GET("/:id/connections", applicationsController.ListConnections)
 			applications.DELETE("/:id/connections/:connection_id", applicationsController.RevokeConnection)
+			applications.PUT("/:id/connections/:connection_id/approve", applicationsController.ApproveConnection)
 
 			// Access policy + validate + access surface
 			applications.GET("/:id/access-policy", rsController.GetAccessPolicy)
@@ -465,6 +467,8 @@ func SetupRoutes(
 			scimConnections.POST("", scimConnectionsController.Create)
 			scimConnections.GET("", scimConnectionsController.List)
 			scimConnections.DELETE("/:id", scimConnectionsController.Revoke)
+			scimConnections.POST("/:id/rotate", scimConnectionsController.Rotate)
+			scimConnections.GET("/:id/events", scimConnectionsController.ListEvents)
 		}
 
 		// Workspace IDP management. One POST endpoint dispatches on
@@ -807,6 +811,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			adminPlatform.POST("/sync-configs/list", syncConfigController.ListSyncConfigs)
 			adminPlatform.POST("/sync-configs/update", syncConfigController.UpdateSyncConfig)
 			adminPlatform.POST("/sync-configs/delete", syncConfigController.DeleteSyncConfig)
+			adminPlatform.GET("/sync-configs/:id/runs", syncConfigController.ListSyncRuns)
 			adminPlatform.POST("/admin-users/ad/sync", adminSyncController.SyncADAdminUsers)
 			adminPlatform.POST("/admin-users/entra/sync", adminSyncController.SyncEntraAdminUsers)
 		}
@@ -967,7 +972,7 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 		// handlers. No client_id/project_id in URL — those come from the
 		// connection's default_client_id / default_project_id columns.
 		scimConn := uflow.Group("/scim/v2/c/:scim_connection_id")
-		scimConn.Use(middlewares.SCIMConnectionAuth())
+		scimConn.Use(middlewares.SCIMConnectionAuth(), middlewares.SCIMEventLogger())
 		{
 			scimConn.GET("/Users", scimController.ListUsers)
 			scimConn.GET("/Users/:id", scimController.GetUser)

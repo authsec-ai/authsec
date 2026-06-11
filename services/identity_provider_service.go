@@ -208,10 +208,10 @@ func (s *IdentityProviderService) CreateSAML(req CreateSAMLIDPRequest) (*models.
 			"workspace_id":      req.WorkspaceID,
 			"provider_name":     providerName,
 			"display_name":      coalesceString(req.DisplayName, providerName),
-			"entity_id":         req.EntityID,
-			"sso_url":           req.SSOUrl,
-			"slo_url":           req.SLOUrl,
-			"certificate":       req.Certificate,
+			"entity_id":         strings.TrimSpace(req.EntityID),
+			"sso_url":           strings.TrimSpace(req.SSOUrl),
+			"slo_url":           strings.TrimSpace(req.SLOUrl),
+			"certificate":       strings.TrimSpace(req.Certificate),
 			"name_id_format":    nameIDFormat,
 			"attribute_mapping": attrMapping,
 			"is_active":         true,
@@ -312,17 +312,17 @@ func (s *IdentityProviderService) UpdateSAML(req UpdateSAMLIDPRequest) (*models.
 	if req.DisplayName != "" {
 		samlUpdates["display_name"] = req.DisplayName
 	}
-	if req.EntityID != "" {
-		samlUpdates["entity_id"] = req.EntityID
+	if v := strings.TrimSpace(req.EntityID); v != "" {
+		samlUpdates["entity_id"] = v
 	}
-	if req.SSOUrl != "" {
-		samlUpdates["sso_url"] = req.SSOUrl
+	if v := strings.TrimSpace(req.SSOUrl); v != "" {
+		samlUpdates["sso_url"] = v
 	}
 	if req.SLOUrl != nil {
-		samlUpdates["slo_url"] = *req.SLOUrl
+		samlUpdates["slo_url"] = strings.TrimSpace(*req.SLOUrl)
 	}
-	if req.Certificate != "" {
-		samlUpdates["certificate"] = req.Certificate
+	if v := strings.TrimSpace(req.Certificate); v != "" {
+		samlUpdates["certificate"] = v
 	}
 	if req.NameIDFormat != "" {
 		samlUpdates["name_id_format"] = req.NameIDFormat

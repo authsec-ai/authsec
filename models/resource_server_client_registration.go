@@ -20,6 +20,15 @@ type ResourceServerClientRegistration struct {
 	UpdatedAt        time.Time `json:"updated_at" gorm:"column:updated_at;default:CURRENT_TIMESTAMP"`
 }
 
+// Registration status constants. pending_approval is created when a client
+// whose home_workspace_id differs from the RS's workspace attempts a lazy bind
+// at /authorize — the workspace admin must approve before access is granted.
+const (
+	ClientRegStatusApproved        = "approved"
+	ClientRegStatusPendingApproval = "pending_approval"
+	ClientRegStatusRevoked         = "revoked"
+)
+
 func (ResourceServerClientRegistration) TableName() string {
 	return "resource_server_client_registrations"
 }

@@ -201,6 +201,12 @@ func main() {
 	// ─────────────────────────────────────────────────────────
 
 	r := gin.New()
+	// CIMD-registered OAuth clients carry their metadata URL as the public
+	// client_id (services/oauth_as_service.go:850). URL-encoded slashes in
+	// path params must survive routing, otherwise DELETE
+	// /authsec/applications/:id/connections/:client_id 404s for these rows.
+	r.UseRawPath = true
+	r.UnescapePathValues = true
 
 	// Metrics (must be first)
 	r.Use(monitoring.Middleware())
