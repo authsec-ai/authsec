@@ -43,6 +43,11 @@ type oidcCreateConfig struct {
 	ConfigRef    string `json:"config_ref" binding:"required"`
 }
 
+type samlCreateConfig struct {
+	ProviderName string `json:"provider_name" binding:"required"`
+	ConfigRef    string `json:"config_ref" binding:"required"`
+}
+
 func (ctrl *IdentityProvidersV2Controller) Create(c *gin.Context) {
 	tenantID, err := shared.ResolveTenantIDString(c)
 	if err != nil {
@@ -81,9 +86,31 @@ func (ctrl *IdentityProvidersV2Controller) Create(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusCreated, idp)
+	case models.IdentityProviderSAML:
+		var cfg samlCreateConfig
+		if err := json.Unmarshal(req.Config, &cfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saml config: " + err.Error()})
+			return
+		}
+		idp, err := ctrl.service.CreateSAML(services.CreateSAMLIDPRequest{
+			TenantID:        tenantID,
+			CreatedByUserID: userID,
+			DisplayName:     req.DisplayName,
+			ProviderName:    cfg.ProviderName,
+			ConfigRef:       cfg.ConfigRef,
+		})
+		if err != nil {
+			if errors.Is(err, services.ErrIdentityProviderAlreadyExists) {
+				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, idp)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "unsupported provider_type; only 'oidc' implemented in Phase 4",
+			"error": "unsupported provider_type; supported: 'oidc', 'saml'",
 		})
 	}
 }

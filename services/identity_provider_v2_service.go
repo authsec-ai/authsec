@@ -86,6 +86,62 @@ func (s *IdentityProviderV2Service) CreateOIDC(req CreateOIDCIDPRequest) (*model
 	return &row, nil
 }
 
+// CreateSAMLIDPRequest is the input for CreateSAML. Mirrors CreateOIDCIDPRequest
+// — same fields, different ProviderType written to the row.
+type CreateSAMLIDPRequest struct {
+	TenantID        string
+	CreatedByUserID uuid.UUID
+	DisplayName     string
+	ProviderName    string
+	// ConfigRef is the stringified UUID of an existing saml_providers row
+	// the tenant wants to use. Empty = caller hasn't provisioned the
+	// protocol-specific config yet; the service rejects.
+	ConfigRef string
+}
+
+// CreateSAML inserts a row into the tenant's identity_providers table pointing
+// at the named saml_providers row. Same shape as CreateOIDC.
+func (s *IdentityProviderV2Service) CreateSAML(req CreateSAMLIDPRequest) (*models.IdentityProvider, error) {
+	if req.TenantID == "" {
+		return nil, fmt.Errorf("tenant_id required")
+	}
+	if req.ConfigRef == "" {
+		return nil, fmt.Errorf("config_ref required (point at an existing saml_providers row)")
+	}
+	providerName := strings.ToLower(strings.TrimSpace(req.ProviderName))
+	if providerName == "" {
+		return nil, fmt.Errorf("provider_name required")
+	}
+	tenantDB, err := config.GetTenantGORMDB(req.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get tenant db: %w", err)
+	}
+
+	var existingCount int64
+	if err := tenantDB.Model(&models.IdentityProvider{}).
+		Where("tenant_id = ? AND provider_type = ? AND config_ref = ?",
+			req.TenantID, models.IdentityProviderSAML, req.ConfigRef).
+		Count(&existingCount).Error; err != nil {
+		return nil, fmt.Errorf("uniqueness check: %w", err)
+	}
+	if existingCount > 0 {
+		return nil, ErrIdentityProviderAlreadyExists
+	}
+
+	row := models.IdentityProvider{
+		TenantID:        req.TenantID,
+		ProviderType:    models.IdentityProviderSAML,
+		DisplayName:     coalesce(req.DisplayName, providerName),
+		ConfigRef:       req.ConfigRef,
+		Status:          "configured",
+		CreatedByUserID: req.CreatedByUserID,
+	}
+	if err := tenantDB.Create(&row).Error; err != nil {
+		return nil, fmt.Errorf("insert identity_providers: %w", err)
+	}
+	return &row, nil
+}
+
 // List returns the tenant's identity_providers rows, optionally filtered by
 // provider_type.
 func (s *IdentityProviderV2Service) List(tenantID, providerType string) ([]models.IdentityProvider, error) {
