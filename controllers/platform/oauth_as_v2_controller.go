@@ -124,6 +124,17 @@ func (ctrl *OAuthASV2Controller) Authorize(c *gin.Context) {
 		resolvedTenantID = tenantID
 		resourceServerID = &rs.ID
 
+		// RFC 7591 DCR clients don't carry a resource indicator, so they have
+		// no tenant-DB registration row linking them to this Application —
+		// which would leave the admin Clients tab empty even though the
+		// client just did the dance. Upsert the join row here (idempotent).
+		if err := rsService.EnsureClientRegistration(tenantID, rs.ID, client.ClientID); err != nil {
+			log.Printf("[oauth_v2] ensure client registration failed for client=%s app=%s: %v",
+				client.ClientID, rs.ID, err)
+			// Not fatal — the registration row is purely an admin-view nicety;
+			// the OAuth flow itself doesn't depend on it.
+		}
+
 		// RFC 8707 audience + per-app scope allow-list. Two gaps to bridge:
 		//   - audience: /token rejects with "audience not whitelisted" unless
 		//     the client's stored audience array contains the requested URI.

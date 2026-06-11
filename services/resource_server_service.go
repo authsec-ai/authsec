@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -186,6 +187,46 @@ func AllowsRegistrationMode(rs *models.ResourceServer, mode string) bool {
 		}
 	}
 	return false
+}
+
+// EnsureClientRegistration upserts a resource_server_client_registrations row
+// linking the (Application, OAuth client) pair. Called from /authorize when
+// the RP arrives with an RFC 8707 `resource` param — DCR (RFC 7591) doesn't
+// carry a resource indicator, so clients land in master's mcp_oauth_clients
+// without any tenant-DB registration row. Without this row, the Clients
+// admin tab shows nothing despite Hydra holding live clients. Idempotent:
+// no-op when a row already exists for this (resource_server_id, client_id).
+func (s *ResourceServerService) EnsureClientRegistration(
+	tenantID string,
+	applicationID uuid.UUID,
+	clientID string,
+) error {
+	if strings.TrimSpace(clientID) == "" {
+		return nil
+	}
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return fmt.Errorf("get tenant db: %w", err)
+	}
+	var count int64
+	if err := tenantDB.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND client_id = ?", applicationID, clientID).
+		Count(&count).Error; err != nil {
+		return fmt.Errorf("count registrations: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	row := models.ResourceServerClientRegistration{
+		ResourceServerID: applicationID,
+		ClientID:         clientID,
+		Status:           models.RegistrationStatusApproved,
+		RegistrationType: "dcr",
+	}
+	if err := tenantDB.Create(&row).Error; err != nil {
+		return fmt.Errorf("insert registration: %w", err)
+	}
+	return nil
 }
 
 // ApplicationClient is the join shape returned by ListClientsForApplication —
