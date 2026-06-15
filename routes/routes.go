@@ -286,6 +286,13 @@ func SetupRoutes(
 			oauthV2.POST("/login/2fa/methods", loginV2Controller.Login2FAMethods)
 			oauthV2.POST("/login/totp/begin", loginV2Controller.TotpBegin)
 			oauthV2.POST("/login/totp/verify", loginV2Controller.TotpVerify)
+			// Email OTP — third 2FA option (send code to registered address).
+			oauthV2.POST("/login/email-otp/send", loginV2Controller.EmailOTPSend)
+			oauthV2.POST("/login/email-otp/verify", loginV2Controller.EmailOTPVerify)
+			// Forgot password — inline reset flow on the OAuth login page.
+			oauthV2.POST("/login/forgot-password", loginV2Controller.ForgotPassword)
+			oauthV2.POST("/login/forgot-password/verify-otp", loginV2Controller.ForgotPasswordVerifyOTP)
+			oauthV2.POST("/login/forgot-password/reset", loginV2Controller.ForgotPasswordReset)
 
 			// Consent challenge surface — session 3. Same public pattern
 			// as login (the consent_challenge IS the auth context, Hydra signs).
