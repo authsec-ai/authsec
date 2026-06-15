@@ -251,6 +251,7 @@ func SetupRoutes(
 		// ────────────────────────────────────────────────────────
 		oauthASV2Controller := platformCtrl.NewOAuthASV2Controller()
 		applicationsV2Controller := platformCtrl.NewApplicationsV2Controller()
+		idjagController := platformCtrl.NewIDJAGController()
 
 		oauthV2 := authsec.Group("/oauth/v2")
 		oauthV2.Use(oauthASV2Controller.CanonicalIssuerOnly())
@@ -267,6 +268,12 @@ func SetupRoutes(
 			oauthV2.POST("/userinfo", oauthASV2Controller.Userinfo)
 			oauthV2.GET("/logout", oauthASV2Controller.EndSession)
 			oauthV2.POST("/par", oauthASV2Controller.PAR)
+
+			// Cross-App Access (XAA / ID-JAG, RFC 8693 + draft-ietf-oauth-
+			// identity-assertion-authz-grant). IdP-side issuance of ID-JAGs.
+			// The Resource AS verification step (jwt-bearer grant) is wired
+			// onto /oauth/v2/token in TICKET-B.
+			oauthV2.POST("/idjag/token", idjagController.IssueIDJAG)
 
 			// Login challenge surface — sessions 1+2 of the login port.
 			// Public: the login_challenge itself IS the auth context (Hydra signs).
