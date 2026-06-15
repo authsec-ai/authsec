@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,26 +15,30 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────
-// Email-OTP second factor for the OAuth v2 login flow.
+// Email-OTP verification — confirms that a newly registered email+password
+// user owns the email address they signed up with.
 //
-// After primary auth (password or OIDC/SAML), the UI can offer email OTP as
-// an alternative to passkeys or TOTP. The user clicks "Send code", receives
-// a 6-digit OTP at their registered address, enters it, and the login is
-// accepted.
+// Called only after RegisterEndUser succeeds (arcRow.UserID is already set).
+// OIDC/SAML users skip this step because the upstream provider guarantees
+// email ownership.
 //
-// OTP namespace: "emailotp_v2:<login_challenge>" so rows are tied to the
-// specific login session and never collide with password-reset OTPs.
-// Expiry: 10 minutes (short because the challenge context is active).
+// The OTP does NOT accept the Hydra login — that happens later when the
+// passkey enrollment WebAuthn step completes. This handler only confirms
+// email ownership and returns needs_webauthn: true so the UI proceeds.
+//
+// OTP namespace: "emailotp_v2:<login_challenge>"
+// Expiry: 10 minutes.
 // ─────────────────────────────────────────────────────────────────────────
 
 func emailOTPKey(loginChallenge string) string {
-	return "emailotp_v2:" + loginChallenge
+	h := sha256.Sum256([]byte(loginChallenge))
+	return fmt.Sprintf("emailotp_v2:%x", h)
 }
 
 // EmailOTPSend handles POST /authsec/oauth/v2/login/email-otp/send.
 // Body: { login_challenge }
-// Resolves the authenticated user from the ongoing challenge, fetches their
-// email from the tenant DB, generates a 6-digit OTP and sends it.
+// The user must have already registered (arcRow.UserID set by RegisterEndUser).
+// Sends a 6-digit OTP to the user's registered email address.
 func (ctrl *LoginV2Controller) EmailOTPSend(c *gin.Context) {
 	var req struct {
 		LoginChallenge string `json:"login_challenge" binding:"required"`
@@ -45,7 +50,7 @@ func (ctrl *LoginV2Controller) EmailOTPSend(c *gin.Context) {
 
 	arcRow, tenantID, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
 	if err != nil || arcRow.UserID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no authenticated user for this challenge"})
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no registered user for this challenge"})
 		return
 	}
 
@@ -64,7 +69,7 @@ func (ctrl *LoginV2Controller) EmailOTPSend(c *gin.Context) {
 
 	otp, err := utils.GenerateOTP()
 	if err != nil {
-		log.Printf("[email-otp-v2] OTP generation failed for challenge=%s: %v", req.LoginChallenge, err)
+		log.Printf("[email-otp-v2] OTP generation failed challenge=%s: %v", req.LoginChallenge, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "could not generate code"})
 		return
 	}
@@ -79,25 +84,22 @@ func (ctrl *LoginV2Controller) EmailOTPSend(c *gin.Context) {
 		Verified:  false,
 	}
 	if err := config.DB.Create(&entry).Error; err != nil {
-		log.Printf("[email-otp-v2] failed to store OTP for challenge=%s: %v", req.LoginChallenge, err)
+		log.Printf("[email-otp-v2] failed to store OTP challenge=%s: %v", req.LoginChallenge, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "could not create code"})
 		return
 	}
 
-	// Send via the standard OTP email; the subject line makes the purpose clear.
 	if err := utils.SendOTPEmail(email, otp); err != nil {
-		log.Printf("[email-otp-v2] email send failed for %s: %v", email, err)
-		// OTP is stored; email delivery failure is non-fatal on the API side.
+		log.Printf("[email-otp-v2] email send failed %s: %v", email, err)
 	}
 
-	// Return a masked hint of the email so the UI can confirm which address to check.
-	maskedEmail := maskEmail(email)
-	c.JSON(http.StatusOK, gin.H{"success": true, "masked_email": maskedEmail})
+	c.JSON(http.StatusOK, gin.H{"success": true, "masked_email": maskEmail(email)})
 }
 
 // EmailOTPVerify handles POST /authsec/oauth/v2/login/email-otp/verify.
 // Body: { login_challenge, otp }
-// Verifies the code, then calls acceptSecondFactor to accept the Hydra login.
+// Verifies the code. On success returns needs_webauthn: true — the Hydra
+// login is accepted later by the WebAuthn finish step.
 func (ctrl *LoginV2Controller) EmailOTPVerify(c *gin.Context) {
 	var req struct {
 		LoginChallenge string `json:"login_challenge" binding:"required"`
@@ -109,9 +111,9 @@ func (ctrl *LoginV2Controller) EmailOTPVerify(c *gin.Context) {
 	}
 	req.OTP = strings.TrimSpace(req.OTP)
 
-	arcRow, tenantID, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
+	arcRow, _, err := ctrl.findContextByLoginChallenge(req.LoginChallenge)
 	if err != nil || arcRow.UserID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no authenticated user for this challenge"})
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "no registered user for this challenge"})
 		return
 	}
 
@@ -125,30 +127,13 @@ func (ctrl *LoginV2Controller) EmailOTPVerify(c *gin.Context) {
 		return
 	}
 
-	// Mark used — idempotency guard.
 	_ = config.DB.Model(&entry).Update("verified", true).Error
-
-	tenantDB, err := config.GetTenantGORMDB(tenantID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "tenant database unavailable"})
-		return
-	}
-
-	redirectTo, aerr := ctrl.acceptSecondFactor(req.LoginChallenge, tenantID, *arcRow.UserID, "email_otp_2fa", tenantDB)
-	if aerr != nil {
-		log.Printf("[email-otp-v2] acceptSecondFactor failed challenge=%s: %v", req.LoginChallenge, aerr)
-		c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": "authorization server unavailable"})
-		return
-	}
-
-	// Clean up OTP row.
 	_ = config.DB.Where("email = ?", key).Delete(&models.OTPEntry{}).Error
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "redirect_to": redirectTo})
+	c.JSON(http.StatusOK, gin.H{"success": true, "needs_webauthn": true})
 }
 
-// maskEmail returns a privacy-safe hint like "a***@example.com" so the UI
-// can tell the user which inbox to check without exposing the full address.
+// maskEmail returns a privacy-safe hint like "ab***@example.com".
 func maskEmail(email string) string {
 	at := strings.Index(email, "@")
 	if at <= 0 {

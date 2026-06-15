@@ -51,10 +51,9 @@ func (ctrl *LoginV2Controller) Login2FAMethods(c *gin.Context) {
 	_ = tenantDB.Table("credentials").Where("client_id = ?", *arcRow.UserID).Count(&credCount).Error
 	secrets, _ := database.NewTenantDeviceRepository(tenantDB).GetTenantUserTOTPSecrets(*arcRow.UserID, tenantUUID)
 	c.JSON(http.StatusOK, gin.H{
-		"success":             true,
-		"webauthn_enrolled":   credCount > 0,
-		"totp_enrolled":       len(secrets) > 0,
-		"email_otp_available": true, // always offered; user's email is their registered address
+		"success":           true,
+		"webauthn_enrolled": credCount > 0,
+		"totp_enrolled":     len(secrets) > 0,
 	})
 }
 
