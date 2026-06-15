@@ -395,6 +395,7 @@ func SetupRoutes(
 			applicationsV2.GET("/:id/roles", applicationsV2Controller.ListRoles)
 			applicationsV2.POST("/:id/roles", applicationsV2Controller.CreateRole)
 			applicationsV2.PUT("/:id/roles/:role_id/scope-grants", applicationsV2Controller.UpdateRoleScopeGrants)
+			applicationsV2.DELETE("/:id/roles/:role_id", applicationsV2Controller.DeleteRole)
 
 			// Phase 8 part 2: bindings + user access reads.
 			applicationsV2.GET("/:id/bindings", applicationsV2Controller.ListBindings)

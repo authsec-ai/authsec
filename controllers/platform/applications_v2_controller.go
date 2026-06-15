@@ -1116,6 +1116,34 @@ func (ctrl *ApplicationsV2Controller) UpdateRoleScopeGrants(c *gin.Context) {
 	c.JSON(http.StatusOK, role)
 }
 
+// DeleteRole handles DELETE /authsec/applications/:id/roles/:role_id.
+// Fails with 409 if the role still has user bindings — caller must revoke
+// those first via DELETE /bindings/:binding_id.
+func (ctrl *ApplicationsV2Controller) DeleteRole(c *gin.Context) {
+	tenantID, id, ok := ctrl.resolveTenantAndID(c)
+	if !ok {
+		return
+	}
+	roleID, err := uuid.Parse(c.Param("role_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+		return
+	}
+	if err := ctrl.roleSvc.Delete(tenantID, id, roleID); err != nil {
+		if errors.Is(err, services.ErrRoleNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, services.ErrRoleHasBindings) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		ctrl.respondAdminError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Phase 8 part 2 — Bindings + user access reads
 // ─────────────────────────────────────────────────────────────────────────

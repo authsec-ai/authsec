@@ -30,6 +30,7 @@ var (
 	ErrRoleNotFound      = errors.New("role not found")
 	ErrRoleAlreadyExists = errors.New("role already exists for this application")
 	ErrInvalidScopeID    = errors.New("scope_id is not registered for this application")
+	ErrRoleHasBindings   = errors.New("role has active user bindings; remove them first")
 )
 
 // CreateRoleInput is the body of POST /:id/roles.
@@ -330,6 +331,43 @@ func (s *RoleService) UpdateScopeGrants(
 	}
 
 	return &RoleView{ApplicationRole: role, GrantedScopes: grants}, nil
+}
+
+// Delete removes a role and its scope grants. Refuses if any user bindings
+// still reference the role (callers must revoke those first).
+func (s *RoleService) Delete(tenantID string, applicationID, roleID uuid.UUID) error {
+	tenantDB, err := config.GetTenantGORMDB(tenantID)
+	if err != nil {
+		return fmt.Errorf("get tenant db: %w", err)
+	}
+
+	var role models.ApplicationRole
+	if err := tenantDB.Where("id = ? AND application_id = ?", roleID, applicationID).
+		First(&role).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrRoleNotFound
+		}
+		return fmt.Errorf("fetch role: %w", err)
+	}
+
+	var bindCount int64
+	if err := tenantDB.Model(&models.ApplicationRoleBinding{}).
+		Where("role_id = ?", roleID).Count(&bindCount).Error; err != nil {
+		return fmt.Errorf("count bindings: %w", err)
+	}
+	if bindCount > 0 {
+		return ErrRoleHasBindings
+	}
+
+	if err := tenantDB.Where("role_id = ?", roleID).
+		Delete(&models.ApplicationRoleScopeGrant{}).Error; err != nil {
+		return fmt.Errorf("delete scope grants: %w", err)
+	}
+
+	if err := tenantDB.Delete(&role).Error; err != nil {
+		return fmt.Errorf("delete role: %w", err)
+	}
+	return nil
 }
 
 // validateAndHydrateScopes parses the inbound scope_id strings, checks each

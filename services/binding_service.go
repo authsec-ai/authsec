@@ -3,7 +3,6 @@ package services
 import (
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -551,12 +550,8 @@ func (s *BindingService) ResolveGrantableScopes(
 		return out, fmt.Errorf("load registered scopes: %w", err)
 	}
 	registeredSet := make(map[string]struct{}, len(regRows))
-	lowRiskRegistered := make(map[string]struct{}, len(regRows))
 	for _, r := range regRows {
 		registeredSet[r.ScopeString] = struct{}{}
-		if r.RiskLevel == "" || strings.EqualFold(strings.TrimSpace(r.RiskLevel), "low") {
-			lowRiskRegistered[r.ScopeString] = struct{}{}
-		}
 	}
 
 	// 2. Load the user's effective scopes (bindings → roles → grants → scopes).
@@ -574,13 +569,6 @@ func (s *BindingService) ResolveGrantableScopes(
 		effectiveSet[s] = struct{}{}
 	}
 
-	// A subject with NO effective scopes for this app is treated as brand-new /
-	// unassigned (e.g. a fresh OIDC registration before any role binding). For
-	// these, we grant a minimal default so the consent flow can complete and
-	// they have baseline access to work with — see the not_bound branch below.
-	unassigned := len(effectiveSet) == 0
-	defaultGranted := false
-
 	// 3. Walk requested scopes and gate each.
 	for _, req := range requestedScopes {
 		req = strings.TrimSpace(req)
@@ -589,7 +577,7 @@ func (s *BindingService) ResolveGrantableScopes(
 		}
 		if IsOIDCCoreScope(req) {
 			// Pass through. Doesn't grant any application access; just
-			// shapes the id_token claims.
+			// shapes the id_token claims. offline_access is included here.
 			out.Grantable = append(out.Grantable, req)
 			continue
 		}
@@ -598,26 +586,12 @@ func (s *BindingService) ResolveGrantableScopes(
 			continue
 		}
 		if _, ok := effectiveSet[req]; !ok {
-			// Default baseline access for unassigned users: grant the requested
-			// scopes that are registered AND low-risk so a new OIDC user gets
-			// minimal access without manual role assignment. Higher-risk
-			// scopes (write/admin) still require an explicit role binding.
-			if unassigned {
-				if _, lowOK := lowRiskRegistered[req]; lowOK {
-					out.Grantable = append(out.Grantable, req)
-					defaultGranted = true
-					continue
-				}
-			}
+			// No role binding — reject. Application scopes always require
+			// an explicit role assignment regardless of how the user registered.
 			out.Rejected[req] = "not_bound"
 			continue
 		}
 		out.Grantable = append(out.Grantable, req)
-	}
-
-	if defaultGranted {
-		log.Printf("[binding] default baseline scopes granted to unassigned user %s on app %s: %v",
-			userID, applicationID, out.Grantable)
 	}
 	return out, nil
 }
