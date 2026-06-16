@@ -1,8 +1,10 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 
@@ -129,7 +131,7 @@ func (ctl *ExternalServiceOAuthController) OAuthCallback(c *gin.Context) {
 	redirectAfter, err := svc.HandleCallback(workspaceID, code, state)
 	if err != nil {
 		if redirectAfter != "" {
-			c.Redirect(http.StatusFound, redirectAfter+"?error="+err.Error())
+			c.Redirect(http.StatusFound, redirectAfter+"?error="+url.QueryEscape(err.Error()))
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -147,6 +149,10 @@ func (ctl *ExternalServiceOAuthController) GetServiceToken(c *gin.Context) {
 	}
 
 	workspaceID, _ := claims["workspace_id"].(string)
+	if workspaceID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in claims"})
+		return
+	}
 	userID, _ := claims["user_id"].(string)
 	if userID == "" {
 		userID, _ = claims["sub"].(string)
@@ -177,11 +183,11 @@ func (ctl *ExternalServiceOAuthController) GetServiceToken(c *gin.Context) {
 
 	oauthSvc := ctl.newOAuthService(vaultClient)
 	tokenResp, connectURL, err := oauthSvc.GetToken(serviceID, userID, workspaceID)
-	if err == services.ErrNotConnected {
+	if errors.Is(err, services.ErrNotConnected) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not_connected", "connect_url": connectURL})
 		return
 	}
-	if err == services.ErrTokenRefreshFailed {
+	if errors.Is(err, services.ErrTokenRefreshFailed) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "token_refresh_failed", "connect_url": connectURL})
 		return
 	}
