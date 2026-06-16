@@ -52,6 +52,21 @@ func (m *externalServiceManager) Create(in *repositories.ExternalService, client
 		return nil, errors.New("resource_id is required")
 	}
 
+	// Auto-fill authorize/token URLs from the static provider registry for known providers.
+	if in.AuthType == "oauth2_code" && in.OAuthProvider != "" && in.OAuthProvider != "custom" {
+		if tmpl, ok := GetOAuthProviderTemplate(in.OAuthProvider); ok {
+			if in.OAuthAuthorizeURL == "" {
+				in.OAuthAuthorizeURL = tmpl.AuthorizeURL
+			}
+			if in.OAuthTokenURL == "" {
+				in.OAuthTokenURL = tmpl.TokenURL
+			}
+			if len(in.OAuthDefaultScopes) == 0 && len(tmpl.DefaultScopes) > 0 {
+				in.OAuthDefaultScopes = pq.StringArray(tmpl.DefaultScopes)
+			}
+		}
+	}
+
 	serviceID := uuid.NewString()
 	vaultPath := fmt.Sprintf("kv/data/secret/tenants/%s/services/%s", workspaceID, serviceID)
 
