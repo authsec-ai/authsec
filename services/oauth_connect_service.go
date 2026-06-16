@@ -245,7 +245,7 @@ func (s *OAuthConnectService) GetToken(serviceID, userID, workspaceID string) (*
 
 	needsRefresh := row.ExpiresAt != nil && row.ExpiresAt.Before(time.Now().Add(5*time.Minute))
 	if needsRefresh {
-		return s.refreshToken(row, serviceID, workspaceID)
+		return s.refreshToken(row, serviceID)
 	}
 
 	secrets, err := s.vault.ReadSecret(row.VaultPath)
@@ -261,7 +261,7 @@ func (s *OAuthConnectService) GetToken(serviceID, userID, workspaceID string) (*
 	}, "", nil
 }
 
-func (s *OAuthConnectService) refreshToken(row *repositories.ServiceUserToken, serviceID, workspaceID string) (*TokenResponse, string, error) {
+func (s *OAuthConnectService) refreshToken(row *repositories.ServiceUserToken, serviceID string) (*TokenResponse, string, error) {
 	connectURL := fmt.Sprintf("/authsec/exsvc/services/%s/connect", serviceID)
 
 	vaultSecrets, err := s.vault.ReadSecret(row.VaultPath)
@@ -304,7 +304,13 @@ func (s *OAuthConnectService) refreshToken(row *repositories.ServiceUserToken, s
 	form.Set("client_secret", clientSecret)
 	form.Set("grant_type", "refresh_token")
 
-	req, _ := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		row.RefreshError = fmt.Sprintf("failed to build refresh request: %v", err)
+		row.UpdatedAt = time.Now()
+		_ = s.tokenRepo.Update(row)
+		return nil, connectURL, ErrTokenRefreshFailed
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
