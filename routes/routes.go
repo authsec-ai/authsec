@@ -1151,6 +1151,17 @@ adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			extSvcs.GET("/:id/credentials", middlewares.Require("external-service", "credentials"), extSvcController.GetExternalServiceCredentials)
 		}
 
+		oauthCtrl := platformCtrl.NewExternalServiceOAuthController(config.DB)
+
+		// OAuth per-user token routes (SpiffeAuthMiddleware inherited from extSvcs group)
+		extSvcs.POST("/:id/connect", middlewares.Require("external-service", "read"), oauthCtrl.ConnectOAuthService)
+		extSvcs.GET("/:id/token", middlewares.Require("external-service", "read"), oauthCtrl.GetServiceToken)
+		extSvcs.DELETE("/:id/token", middlewares.Require("external-service", "read"), oauthCtrl.DisconnectService)
+		extSvcs.GET("/:id/connections", middlewares.Require("external-service", "read"), oauthCtrl.ListServiceConnections)
+
+		// OAuth callback — no auth middleware, provider hits this directly
+		exsvc.GET("/oauth/callback/:workspace_id", oauthCtrl.OAuthCallback)
+
 		// Legacy login/register endpoints
 		uflow.POST("/register/verify", userController.VerifyOTPAndCompleteRegistration)
 		uflow.POST("/login/webauthn-callback", userController.WebAuthnCallback)
