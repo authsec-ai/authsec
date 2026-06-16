@@ -29,9 +29,13 @@ type ExternalServiceUpdateInput struct {
 	Description     *string
 	Tags            []string
 	ResourceID      *string
-	AuthType        *string
-	AgentAccessible *bool
-	SecretData      map[string]interface{}
+	AuthType           *string
+	AgentAccessible    *bool
+	OAuthProvider      *string
+	OAuthAuthorizeURL  *string
+	OAuthTokenURL      *string
+	OAuthDefaultScopes []string
+	SecretData         map[string]interface{}
 }
 
 type externalServiceManager struct {
@@ -142,6 +146,22 @@ func (m *externalServiceManager) Update(id, clientID string, in ExternalServiceU
 	}
 	if in.AgentAccessible != nil {
 		svc.AgentAccessible = *in.AgentAccessible
+		touch = true
+	}
+	if in.OAuthProvider != nil {
+		svc.OAuthProvider = *in.OAuthProvider
+		touch = true
+	}
+	if in.OAuthAuthorizeURL != nil {
+		svc.OAuthAuthorizeURL = *in.OAuthAuthorizeURL
+		touch = true
+	}
+	if in.OAuthTokenURL != nil {
+		svc.OAuthTokenURL = *in.OAuthTokenURL
+		touch = true
+	}
+	if in.OAuthDefaultScopes != nil {
+		svc.OAuthDefaultScopes = pq.StringArray(in.OAuthDefaultScopes)
 		touch = true
 	}
 

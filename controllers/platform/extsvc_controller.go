@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -51,9 +52,13 @@ type ExternalServiceCreateRequest struct {
 	Description     string                    `json:"description"`
 	Tags            []string                  `json:"tags"`
 	ResourceID      ExternalServiceResourceID `json:"resource_id" validate:"required,uuid"`
-	AuthType        string                    `json:"auth_type" validate:"required"`
-	AgentAccessible bool                      `json:"agent_accessible"`
-	SecretData      map[string]string         `json:"secret_data,omitempty"`
+	AuthType           string                    `json:"auth_type" validate:"required"`
+	AgentAccessible    bool                      `json:"agent_accessible"`
+	OAuthProvider      string                    `json:"oauth_provider,omitempty"`
+	OAuthAuthorizeURL  string                    `json:"oauth_authorize_url,omitempty"`
+	OAuthTokenURL      string                    `json:"oauth_token_url,omitempty"`
+	OAuthDefaultScopes []string                  `json:"oauth_default_scopes,omitempty"`
+	SecretData         map[string]string         `json:"secret_data,omitempty"`
 }
 
 // ExternalServiceUpdateRequest is the JSON body for PUT /authsec/services/:id.
@@ -64,9 +69,13 @@ type ExternalServiceUpdateRequest struct {
 	URL             *string                    `json:"url,omitempty"`
 	Tags            []string                   `json:"tags,omitempty"`
 	ResourceID      *ExternalServiceResourceID `json:"resource_id,omitempty"`
-	AuthType        *string                    `json:"auth_type,omitempty"`
-	AgentAccessible *bool                      `json:"agent_accessible,omitempty"`
-	SecretData      map[string]string          `json:"secret_data,omitempty"`
+	AuthType           *string                    `json:"auth_type,omitempty"`
+	AgentAccessible    *bool                      `json:"agent_accessible,omitempty"`
+	OAuthProvider      *string                    `json:"oauth_provider,omitempty"`
+	OAuthAuthorizeURL  *string                    `json:"oauth_authorize_url,omitempty"`
+	OAuthTokenURL      *string                    `json:"oauth_token_url,omitempty"`
+	OAuthDefaultScopes []string                   `json:"oauth_default_scopes,omitempty"`
+	SecretData         map[string]string          `json:"secret_data,omitempty"`
 }
 
 // ExternalServiceResourceID is a string UUID that also accepts positive integers over JSON.
@@ -243,6 +252,13 @@ func (ctl *ExternalServiceController) CreateExternalService(c *gin.Context) {
 		AgentAccessible: input.AgentAccessible,
 	}
 
+	svc.OAuthProvider = input.OAuthProvider
+	svc.OAuthAuthorizeURL = input.OAuthAuthorizeURL
+	svc.OAuthTokenURL = input.OAuthTokenURL
+	if input.OAuthDefaultScopes != nil {
+		svc.OAuthDefaultScopes = pq.StringArray(input.OAuthDefaultScopes)
+	}
+
 	secretData := make(map[string]interface{}, len(input.SecretData))
 	for k, v := range input.SecretData {
 		secretData[k] = v
@@ -310,6 +326,18 @@ func (ctl *ExternalServiceController) UpdateExternalService(c *gin.Context) {
 		Tags:            req.Tags,
 		AuthType:        req.AuthType,
 		AgentAccessible: req.AgentAccessible,
+	}
+	if req.OAuthProvider != nil {
+		updateInput.OAuthProvider = req.OAuthProvider
+	}
+	if req.OAuthAuthorizeURL != nil {
+		updateInput.OAuthAuthorizeURL = req.OAuthAuthorizeURL
+	}
+	if req.OAuthTokenURL != nil {
+		updateInput.OAuthTokenURL = req.OAuthTokenURL
+	}
+	if req.OAuthDefaultScopes != nil {
+		updateInput.OAuthDefaultScopes = req.OAuthDefaultScopes
 	}
 	if req.ResourceID != nil {
 		rid := req.ResourceID.String()
