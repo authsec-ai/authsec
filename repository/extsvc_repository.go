@@ -20,8 +20,12 @@ type ExternalService struct {
 	AuthConfig      string         `json:"auth_config"` // JSON blob
 	VaultPath       string         `json:"vault_path"`
 	CreatedBy       string         `json:"created_by" gorm:"not null"`
-	AgentAccessible bool           `json:"agent_accessible" gorm:"default:true"`
-	CreatedAt       time.Time      `json:"created_at"`
+	AgentAccessible    bool           `json:"agent_accessible" gorm:"default:true"`
+	OAuthProvider      string         `json:"oauth_provider,omitempty"`
+	OAuthAuthorizeURL  string         `json:"oauth_authorize_url,omitempty"`
+	OAuthTokenURL      string         `json:"oauth_token_url,omitempty"`
+	OAuthDefaultScopes pq.StringArray `json:"oauth_default_scopes,omitempty" gorm:"type:text[]" swaggertype:"array,string"`
+	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
 }
 
