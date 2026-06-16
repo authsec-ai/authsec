@@ -445,6 +445,15 @@ func SetupRoutes(
 			applicationsV2.POST("/:id/saml-providers", applicationsV2Controller.CreateSAMLProvider)
 			applicationsV2.PUT("/:id/saml-providers/:provider_id", applicationsV2Controller.UpdateSAMLProvider)
 			applicationsV2.DELETE("/:id/saml-providers/:provider_id", applicationsV2Controller.DeleteSAMLProvider)
+
+			// Cross-App Access policies (TICKET-D). Per-Application allowlist
+			// of which xaa_client_apps may exchange an ID-JAG here. Default
+			// deny when no row exists — see IDJAGService.IssueIDJAG.
+			xaaAdminController := platformCtrl.NewXAAAdminController()
+			applicationsV2.GET("/:id/xaa-policies", xaaAdminController.ListPolicies)
+			applicationsV2.POST("/:id/xaa-policies", xaaAdminController.CreatePolicy)
+			applicationsV2.PUT("/:id/xaa-policies/:policy_id", xaaAdminController.UpdatePolicy)
+			applicationsV2.DELETE("/:id/xaa-policies/:policy_id", xaaAdminController.DeletePolicy)
 		}
 
 		// Tenant-scoped IDP registry. Phase 4.
@@ -459,6 +468,25 @@ func SetupRoutes(
 			identityProvidersV2.GET("/:id", identityProvidersV2Controller.Get)
 			identityProvidersV2.PUT("/:id/status", identityProvidersV2Controller.UpdateStatus)
 			identityProvidersV2.DELETE("/:id", identityProvidersV2Controller.Delete)
+		}
+
+		// Cross-App Access client registry (TICKET-D). Master-DB
+		// xaa_client_apps — the requesting-agent identities. Tenant-scoped:
+		// admins only see / mutate their own tenant's rows. CreateClient +
+		// RotateSecret surface the plaintext secret in the response once;
+		// after that only the bcrypt hash exists.
+		xaaClientsController := platformCtrl.NewXAAAdminController()
+		xaaClients := authsec.Group("/xaa/clients")
+		xaaClients.Use(
+			middlewares.AuthMiddleware(),
+			amMiddlewares.ValidateTenantFromToken(),
+		)
+		{
+			xaaClients.POST("", xaaClientsController.CreateClient)
+			xaaClients.GET("", xaaClientsController.ListClients)
+			xaaClients.GET("/:id", xaaClientsController.GetClient)
+			xaaClients.POST("/:id/rotate-secret", xaaClientsController.RotateSecret)
+			xaaClients.DELETE("/:id", xaaClientsController.DeleteClient)
 		}
 
 		// ────────────────────────────────────────────────────
