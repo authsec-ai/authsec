@@ -30,14 +30,20 @@ type OAuthASV2Controller struct {
 	idpService    *services.IdentityProviderV2Service
 	sdkPolicySvc  *services.SDKPolicyService
 	bindingSvc    *services.BindingService
+	// idjagSvc handles the XAA / ID-JAG paths: JWT-bearer grant on /token,
+	// JWKS augmentation, and self-issued introspect. nil-safe — the handlers
+	// no-op when ID-JAG infrastructure isn't wired (early-deploy safety).
+	idjagSvc *services.IDJAGService
 }
 
 func NewOAuthASV2Controller() *OAuthASV2Controller {
+	rs := services.NewResourceServerService()
 	return &OAuthASV2Controller{
-		service:      services.NewOAuthASService(nil),
+		service:      services.NewOAuthASService(rs),
 		idpService:   services.NewIdentityProviderV2Service(),
 		sdkPolicySvc: services.NewSDKPolicyService(),
 		bindingSvc:   services.NewBindingService(),
+		idjagSvc:     services.NewIDJAGService(rs),
 	}
 }
 
@@ -248,6 +254,17 @@ func (ctrl *OAuthASV2Controller) Token(c *gin.Context) {
 		return
 	}
 	form := c.Request.PostForm
+
+	// Cross-App Access path (TICKET-B): if the grant is JWT-bearer with an
+	// ID-JAG assertion, AuthSec mints the access token itself rather than
+	// forwarding to Hydra (Hydra can't resolve ID-JAGs). The assertion
+	// already carries client_id, so we don't require a separate client_id
+	// form field here.
+	if form.Get("grant_type") == services.JWTBearerGrantType {
+		ctrl.tokenJWTBearer(c, form)
+		return
+	}
+
 	clientID := form.Get("client_id")
 	if clientID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -290,6 +307,52 @@ func (ctrl *OAuthASV2Controller) Token(c *gin.Context) {
 		return
 	}
 	c.Data(status, "application/json", body)
+}
+
+// tokenJWTBearer handles grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer.
+//
+// The assertion in this flow is the ID-JAG minted by the IdP side
+// (POST /idjag/token). The client redeems it here for a usable access token.
+// We do the verification ourselves because Hydra's JWT-bearer support assumes
+// the assertion's `sub` is a registered client — ID-JAGs put a USER uuid in
+// `sub`, so Hydra would reject. See TICKET-B commit for the full rationale.
+func (ctrl *OAuthASV2Controller) tokenJWTBearer(c *gin.Context, form url.Values) {
+	if ctrl.idjagSvc == nil {
+		writeOAuthError(c, http.StatusInternalServerError, "server_error",
+			"id-jag exchange service not initialised")
+		return
+	}
+	assertion := strings.TrimSpace(form.Get("assertion"))
+	if assertion == "" {
+		writeOAuthError(c, http.StatusBadRequest, "invalid_request", "assertion required")
+		return
+	}
+	scopes := splitScope(form.Get("scope"))
+
+	issued, err := ctrl.idjagSvc.ExchangeForAccessToken(services.ExchangeForAccessTokenInput{
+		Assertion:       assertion,
+		RequestedScopes: scopes,
+		OurIssuer:       idjagIssuer(),
+	})
+	if err != nil {
+		var verifyErr services.ErrIDJAGVerify
+		switch {
+		case errors.As(err, &verifyErr):
+			writeOAuthError(c, http.StatusBadRequest, "invalid_grant", verifyErr.Reason)
+		case errors.Is(err, services.ErrXAAPolicyDenied):
+			writeOAuthError(c, http.StatusForbidden, "access_denied",
+				"no XAA policy authorises this client at this resource")
+		default:
+			if strings.Contains(err.Error(), "do not intersect") {
+				writeOAuthError(c, http.StatusBadRequest, "invalid_scope", err.Error())
+				return
+			}
+			writeOAuthError(c, http.StatusInternalServerError, "server_error", err.Error())
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, issued)
 }
 
 // consumeAndValidateContext finds the auth_request_context row that this
@@ -493,6 +556,28 @@ func (ctrl *OAuthASV2Controller) Introspect(c *gin.Context) {
 	}
 	_ = rs // not used yet; reserved for future scope-supported gating
 
+	// Cross-App Access path (TICKET-B): if the token was minted by us via
+	// the JWT-bearer ID-JAG flow, Hydra doesn't know about it. Detect
+	// AuthSec-as-issuer JWTs and introspect locally before falling through
+	// to Hydra. Tokens issued via the regular browser flow have iss=Hydra
+	// (or some Hydra-internal value) and skip this branch.
+	if ctrl.idjagSvc != nil && ctrl.idjagSvc.IsAuthSecIssuedToken(token, idjagIssuer()) {
+		resp, _ := ctrl.idjagSvc.IntrospectSelfIssued(token, idjagIssuer())
+		if active, _ := resp["active"].(bool); active {
+			// Apply the same RBAC filter Hydra-issued tokens get below.
+			// Cheap because we have the claims in hand already.
+			subStr, _ := resp["sub"].(string)
+			scopeStr, _ := resp["scope"].(string)
+			if _, perr := uuid.Parse(subStr); perr == nil && tenantID != "" {
+				if filtered, applied := ctrl.filterScope(tenantID, applicationID, subStr, scopeStr); applied {
+					resp["scope"] = filtered
+				}
+			}
+		}
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+
 	// Proxy to Hydra.
 	status, body, err := ctrl.service.IntrospectViaHydraAdmin(token)
 	if err != nil {
@@ -609,12 +694,35 @@ func basicEncode(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 }
 
-// JWKS proxies Hydra's public JWKS document.
+// JWKS publishes the union of Hydra's public keys (for tokens issued via the
+// authorization_code flow) and AuthSec's own ID-JAG / access-token keys (for
+// tokens issued via the XAA jwt-bearer flow). Verifiers like the MCP SDK can
+// validate either kind against this single document.
 func (ctrl *OAuthASV2Controller) JWKS(c *gin.Context) {
 	body, err := ctrl.service.FetchJWKS()
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Splice in our own signing keys if any exist. Best-effort — if the
+	// id-jag table isn't migrated yet, fall back to the bare Hydra doc.
+	if ctrl.idjagSvc != nil {
+		ours, err := ctrl.idjagSvc.JWKSEntries()
+		if err == nil && len(ours) > 0 {
+			var doc map[string]any
+			if err := json.Unmarshal(body, &doc); err == nil {
+				keys, _ := doc["keys"].([]any)
+				for _, k := range ours {
+					keys = append(keys, k)
+				}
+				doc["keys"] = keys
+				if merged, err := json.Marshal(doc); err == nil {
+					c.Data(http.StatusOK, "application/json", merged)
+					return
+				}
+			}
+		}
 	}
 	c.Data(http.StatusOK, "application/json", body)
 }
