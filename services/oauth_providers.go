@@ -4,9 +4,10 @@ import "strings"
 
 // OAuthProviderTemplate holds the well-known URLs for a pre-built OAuth provider.
 type OAuthProviderTemplate struct {
-	AuthorizeURL  string
-	TokenURL      string
-	DefaultScopes []string
+	AuthorizeURL      string
+	TokenURL          string
+	DefaultScopes     []string
+	RequiresBasicAuth bool
 }
 
 var oauthProviderTemplates = map[string]OAuthProviderTemplate{
@@ -36,9 +37,10 @@ var oauthProviderTemplates = map[string]OAuthProviderTemplate{
 		DefaultScopes: []string{"read"},
 	},
 	"notion": {
-		AuthorizeURL:  "https://api.notion.com/v1/oauth/authorize",
-		TokenURL:      "https://api.notion.com/v1/oauth/token",
-		DefaultScopes: []string{},
+		AuthorizeURL:      "https://api.notion.com/v1/oauth/authorize",
+		TokenURL:          "https://api.notion.com/v1/oauth/token",
+		DefaultScopes:     []string{},
+		RequiresBasicAuth: true,
 	},
 }
 

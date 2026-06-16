@@ -105,6 +105,10 @@ func (s *OAuthConnectService) InitiateConnect(serviceID, userID, workspaceID, re
 		}
 	}
 
+	if svc.VaultPath == "" {
+		return ConnectURLs{}, fmt.Errorf("service has no vault credentials configured")
+	}
+
 	callbackURL := fmt.Sprintf("%s/authsec/exsvc/oauth/callback/%s", s.appBaseURL, workspaceID)
 	scopes := []string(svc.OAuthDefaultScopes)
 
@@ -178,6 +182,9 @@ func (s *OAuthConnectService) HandleCallback(workspaceID, code, stateJWT string)
 		}
 	}
 
+	if svc.VaultPath == "" {
+		return claims.RedirectAfter, fmt.Errorf("service has no vault credentials configured")
+	}
 	secrets, err := s.vault.ReadSecret(svc.VaultPath)
 	if err != nil {
 		return claims.RedirectAfter, fmt.Errorf("failed to read service credentials")
@@ -187,7 +194,11 @@ func (s *OAuthConnectService) HandleCallback(workspaceID, code, stateJWT string)
 
 	callbackURL := fmt.Sprintf("%s/authsec/exsvc/oauth/callback/%s", s.appBaseURL, workspaceID)
 
-	providerResp, err := s.exchangeCode(tokenURL, clientID, clientSecret, callbackURL, code)
+	useBasicAuth := false
+	if tmpl, ok := GetOAuthProviderTemplate(svc.OAuthProvider); ok {
+		useBasicAuth = tmpl.RequiresBasicAuth
+	}
+	providerResp, err := s.exchangeCode(tokenURL, clientID, clientSecret, callbackURL, code, useBasicAuth)
 	if err != nil {
 		return claims.RedirectAfter, err
 	}
@@ -238,7 +249,7 @@ func (s *OAuthConnectService) HandleCallback(workspaceID, code, stateJWT string)
 func (s *OAuthConnectService) GetToken(serviceID, userID, workspaceID string) (*TokenResponse, string, error) {
 	connectURL := fmt.Sprintf("/authsec/exsvc/services/%s/connect", serviceID)
 
-	row, err := s.tokenRepo.GetByServiceAndUser(serviceID, userID)
+	row, err := s.tokenRepo.GetByServiceAndUser(serviceID, userID, workspaceID)
 	if err != nil {
 		return nil, connectURL, ErrNotConnected
 	}
@@ -253,6 +264,9 @@ func (s *OAuthConnectService) GetToken(serviceID, userID, workspaceID string) (*
 		return nil, "", fmt.Errorf("failed to read token from vault: %w", err)
 	}
 	accessToken, _ := secrets["access_token"].(string)
+	if accessToken == "" {
+		return nil, connectURL, fmt.Errorf("access token not found in vault")
+	}
 
 	return &TokenResponse{
 		AccessToken: accessToken,
@@ -375,15 +389,31 @@ func (s *OAuthConnectService) refreshToken(row *repositories.ServiceUserToken, s
 }
 
 // DisconnectUser removes the user's token from Vault and the DB.
-func (s *OAuthConnectService) DisconnectUser(serviceID, userID string) error {
-	row, err := s.tokenRepo.GetByServiceAndUser(serviceID, userID)
+func (s *OAuthConnectService) DisconnectUser(serviceID, userID, workspaceID string) error {
+	row, err := s.tokenRepo.GetByServiceAndUser(serviceID, userID, workspaceID)
 	if err != nil {
 		return nil // already disconnected
 	}
 	if s.vault != nil && row.VaultPath != "" {
 		_ = s.vault.DeleteSecret(row.VaultPath) // best effort
 	}
-	return s.tokenRepo.DeleteByServiceAndUser(serviceID, userID)
+	return s.tokenRepo.DeleteByServiceAndUser(serviceID, userID, workspaceID)
+}
+
+// ParseStateRedirect extracts only the redirect_after field from a state JWT.
+// Used to recover the redirect destination when the provider returns an error.
+func (s *OAuthConnectService) ParseStateRedirect(stateJWT string) (string, error) {
+	var claims oauthStateClaims
+	tok, err := jwt.ParseWithClaims(stateJWT, &claims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return s.jwtSecret, nil
+	})
+	if err != nil || !tok.Valid {
+		return "", fmt.Errorf("invalid state token")
+	}
+	return claims.RedirectAfter, nil
 }
 
 // ListConnections returns all user token rows for a service (admin use).
@@ -391,13 +421,15 @@ func (s *OAuthConnectService) ListConnections(serviceID string) ([]repositories.
 	return s.tokenRepo.ListByService(serviceID)
 }
 
-func (s *OAuthConnectService) exchangeCode(tokenURL, clientID, clientSecret, redirectURI, code string) (*providerTokenResponse, error) {
+func (s *OAuthConnectService) exchangeCode(tokenURL, clientID, clientSecret, redirectURI, code string, useBasicAuth bool) (*providerTokenResponse, error) {
 	form := url.Values{}
 	form.Set("code", code)
-	form.Set("client_id", clientID)
-	form.Set("client_secret", clientSecret)
 	form.Set("redirect_uri", redirectURI)
 	form.Set("grant_type", "authorization_code")
+	if !useBasicAuth {
+		form.Set("client_id", clientID)
+		form.Set("client_secret", clientSecret)
+	}
 
 	req, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -405,6 +437,9 @@ func (s *OAuthConnectService) exchangeCode(tokenURL, clientID, clientSecret, red
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	if useBasicAuth {
+		req.SetBasicAuth(clientID, clientSecret)
+	}
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	res, err := httpClient.Do(req)

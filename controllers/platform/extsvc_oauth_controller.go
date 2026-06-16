@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/authsec-ai/authsec/config"
@@ -98,6 +99,13 @@ func (ctl *ExternalServiceOAuthController) ConnectOAuthService(c *gin.Context) {
 	if body.RedirectAfter == "" && config.AppConfig != nil {
 		body.RedirectAfter = config.AppConfig.UIBaseURL()
 	}
+	// Validate redirect_after is same-origin as the UI to prevent open redirect.
+	if body.RedirectAfter != "" && config.AppConfig != nil {
+		uiBase := config.AppConfig.UIBaseURL()
+		if !strings.HasPrefix(body.RedirectAfter, uiBase) && !strings.HasPrefix(body.RedirectAfter, "/") {
+			body.RedirectAfter = uiBase
+		}
+	}
 
 	vaultClient, err := ctl.getVaultClient()
 	if err != nil {
@@ -121,6 +129,25 @@ func (ctl *ExternalServiceOAuthController) OAuthCallback(c *gin.Context) {
 	code := c.Query("code")
 	state := c.Query("state")
 
+	// Handle provider-side denial (e.g. user clicked "Deny").
+	if providerError := c.Query("error"); providerError != "" {
+		// Try to recover redirect_after from the state JWT so we can redirect gracefully.
+		if state != "" {
+			if svc := ctl.newOAuthService(nil); svc != nil {
+				if redirectAfter, _ := svc.ParseStateRedirect(state); redirectAfter != "" {
+					sep := "?"
+					if strings.Contains(redirectAfter, "?") {
+						sep = "&"
+					}
+					c.Redirect(http.StatusFound, redirectAfter+sep+"error="+url.QueryEscape(providerError))
+					return
+				}
+			}
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": providerError})
+		return
+	}
+
 	vaultClient, err := ctl.getVaultClient()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -131,7 +158,11 @@ func (ctl *ExternalServiceOAuthController) OAuthCallback(c *gin.Context) {
 	redirectAfter, err := svc.HandleCallback(workspaceID, code, state)
 	if err != nil {
 		if redirectAfter != "" {
-			c.Redirect(http.StatusFound, redirectAfter+"?error="+url.QueryEscape(err.Error()))
+			sep := "?"
+			if strings.Contains(redirectAfter, "?") {
+				sep = "&"
+			}
+			c.Redirect(http.StatusFound, redirectAfter+sep+"error="+url.QueryEscape(err.Error()))
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -206,6 +237,7 @@ func (ctl *ExternalServiceOAuthController) DisconnectService(c *gin.Context) {
 		return
 	}
 
+	workspaceID, _ := claims["workspace_id"].(string)
 	userID, _ := claims["user_id"].(string)
 	if userID == "" {
 		userID, _ = claims["sub"].(string)
@@ -222,7 +254,7 @@ func (ctl *ExternalServiceOAuthController) DisconnectService(c *gin.Context) {
 	}
 
 	oauthSvc := ctl.newOAuthService(vaultClient)
-	if err := oauthSvc.DisconnectUser(c.Param("id"), userID); err != nil {
+	if err := oauthSvc.DisconnectUser(c.Param("id"), userID, workspaceID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
