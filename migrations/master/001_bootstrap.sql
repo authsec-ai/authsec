@@ -901,10 +901,32 @@ CREATE TABLE public.services (
     vault_path text,
     created_by text NOT NULL,
     agent_accessible boolean DEFAULT false,
+    oauth_provider        text,
+    oauth_authorize_url   text,
+    oauth_token_url       text,
+    oauth_default_scopes  text[] DEFAULT '{}'::text[],
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
     CONSTRAINT services_pkey PRIMARY KEY (id)
 );
+
+CREATE TABLE public.service_user_tokens (
+    id            uuid DEFAULT gen_random_uuid() NOT NULL,
+    service_id    uuid NOT NULL REFERENCES public.services(id) ON DELETE CASCADE,
+    user_id       uuid NOT NULL,
+    workspace_id  uuid NOT NULL,
+    vault_path    text NOT NULL,
+    scopes        text[] DEFAULT '{}'::text[],
+    expires_at    timestamp with time zone,
+    refresh_error text,
+    connected_at  timestamp with time zone DEFAULT now(),
+    updated_at    timestamp with time zone DEFAULT now(),
+    CONSTRAINT service_user_tokens_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_service_user UNIQUE (service_id, user_id)
+);
+CREATE INDEX idx_service_user_tokens_service_id ON public.service_user_tokens (service_id);
+CREATE INDEX idx_service_user_tokens_user_id    ON public.service_user_tokens (user_id);
+CREATE INDEX idx_service_user_tokens_workspace  ON public.service_user_tokens (workspace_id);
 
 CREATE TABLE public.spire_audit_logs (
     id bigint NOT NULL,
