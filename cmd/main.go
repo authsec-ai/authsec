@@ -27,6 +27,8 @@ import (
 	"github.com/authsec-ai/authsec/internal/migration"
 	session "github.com/authsec-ai/authsec/internal/session"
 	"github.com/authsec-ai/authsec/internal/spire"
+	spirevault "github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
+	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -37,6 +39,7 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 )
 
 // @title           AuthSec API
@@ -250,6 +253,22 @@ func main() {
 		}
 	} else {
 		log.Printf("Warning: Master database not available for SPIRE bootstrap")
+	}
+
+	// ── NativeSealer signing keys (Agent Identity) ──
+	// Vault-backed when available so the global native keyset persists and is
+	// shared across pods (required once native issuance ships in Phase 2);
+	// ephemeral per-process otherwise. Safe even when XAA_NATIVE_SEALER is off —
+	// nothing reads the keys until the flag turns the native paths on.
+	if config.VaultClient != nil {
+		nativeVault := spirevault.NewClientFromExisting(
+			config.VaultClient, logrus.WithField("component", "native_keys"), "", "",
+		)
+		tokens.InitNativeKeys(nativeVault)
+		log.Printf("[NATIVE_KEYS] initialized Vault-backed native signing keyset")
+	} else {
+		tokens.InitNativeKeys(nil)
+		log.Printf("[NATIVE_KEYS] Vault not configured — using ephemeral native signing keyset")
 	}
 
 	// All routes (user-flow + webauthn + spire identity)

@@ -18,7 +18,7 @@ import (
 type CIBAAuthService struct {
 	cibaRepo        *database.CIBAAuthRepository
 	userRepo        *database.UserRepository
-	workspaceRepo      *database.AdminWorkspaceRepository
+	workspaceRepo   *database.AdminWorkspaceRepository
 	pushService     *PushNotificationService
 	pollingInterval int
 	requestExpiry   time.Duration
@@ -32,7 +32,7 @@ func NewCIBAAuthService(
 	return &CIBAAuthService{
 		cibaRepo:        database.NewCIBAAuthRepository(db),
 		userRepo:        database.NewUserRepository(db),
-		workspaceRepo:      database.NewAdminWorkspaceRepository(db),
+		workspaceRepo:   database.NewAdminWorkspaceRepository(db),
 		pushService:     pushService,
 		pollingInterval: 5,               // 5 seconds minimum between polls
 		requestExpiry:   5 * time.Minute, // Requests expire in 5 minutes
@@ -99,7 +99,7 @@ func (s *CIBAAuthService) InitiateCIBAAuth(req *models.CIBAInitiateRequest) (*mo
 		ID:             uuid.New(),
 		AuthReqID:      authReqID,
 		UserID:         user.ID,
-		WorkspaceID:       user.WorkspaceID,
+		WorkspaceID:    user.WorkspaceID,
 		UserEmail:      user.Email,
 		ClientID:       clientID,
 		DeviceTokenID:  device.ID,
@@ -143,21 +143,30 @@ func (s *CIBAAuthService) InitiateCIBAAuth(req *models.CIBAInitiateRequest) (*mo
 	}, nil
 }
 
-// RespondToCIBA handles user's approve/deny response from mobile app
-func (s *CIBAAuthService) RespondToCIBA(req *models.CIBARespondRequest) (*models.CIBARespondResponse, error) {
+// RespondToCIBA handles user's approve/deny response from mobile app.
+// responderUserID and responderWorkspaceID are extracted from the caller's JWT
+// and must match the challenged user on the request — prevents a different user
+// or a user from a foreign workspace from approving.
+func (s *CIBAAuthService) RespondToCIBA(req *models.CIBARespondRequest, responderUserID uuid.UUID, responderWorkspaceID uuid.UUID) (*models.CIBARespondResponse, error) {
 	// Get CIBA request
 	authReq, err := s.cibaRepo.GetCIBAAuthRequestByID(req.AuthReqID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid auth_req_id")
 	}
 
-	// Check if expired
+	// Caller-identity binding: only the challenged user may respond.
+	if authReq.UserID != responderUserID || authReq.WorkspaceID != responderWorkspaceID {
+		return nil, fmt.Errorf("unauthorized: responder identity does not match challenged user")
+	}
+
+	// Check if expired. Conditional pending→expired so we never clobber a
+	// concurrently-set approved/denied/consumed terminal state.
 	if authReq.IsExpired() {
-		s.cibaRepo.UpdateCIBAAuthRequestStatus(req.AuthReqID, "expired", false)
+		s.cibaRepo.UpdateCIBAAuthRequestStatusIf(req.AuthReqID, "pending", "expired", false)
 		return nil, fmt.Errorf("request expired")
 	}
 
-	// Check if already processed
+	// Fast-path reject (advisory only; the conditional UPDATE below is authority).
 	if authReq.Status != "pending" {
 		return nil, fmt.Errorf("request already processed")
 	}
@@ -170,8 +179,15 @@ func (s *CIBAAuthService) RespondToCIBA(req *models.CIBARespondRequest) (*models
 		message = "Authentication approved"
 	}
 
-	if err := s.cibaRepo.UpdateCIBAAuthRequestStatus(req.AuthReqID, status, req.BiometricVerified); err != nil {
+	// Atomic first-responder-wins transition: only the caller that flips
+	// pending → status wins; a concurrent responder gets the recorded outcome
+	// idempotently (no double-flip).
+	won, err := s.cibaRepo.UpdateCIBAAuthRequestStatusIf(req.AuthReqID, "pending", status, req.BiometricVerified)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update status: %w", err)
+	}
+	if !won {
+		return nil, fmt.Errorf("request already processed")
 	}
 
 	return &models.CIBARespondResponse{
@@ -195,9 +211,10 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 	// Update last polled timestamp
 	s.cibaRepo.UpdateLastPolled(authReqID)
 
-	// Check if expired
+	// Check if expired. Conditional pending→expired so a slow poll cannot
+	// overwrite an approved/consumed request that a concurrent caller just set.
 	if authReq.IsExpired() {
-		s.cibaRepo.UpdateCIBAAuthRequestStatus(authReqID, "expired", false)
+		s.cibaRepo.UpdateCIBAAuthRequestStatusIf(authReqID, "pending", "expired", false)
 		return &models.CIBATokenResponse{
 			Error:            models.CIBAErrorExpiredToken,
 			ErrorDescription: "Request expired",
@@ -221,10 +238,29 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 		}, nil
 
 	case "approved":
+		// Atomically claim approved → consumed BEFORE minting so two concurrent
+		// polls cannot both issue a token (single-mint, Appendix §6).
+		won, cerr := s.cibaRepo.MarkAsConsumedIf(authReqID)
+		if cerr != nil {
+			return &models.CIBATokenResponse{
+				Error:            "server_error",
+				ErrorDescription: "Failed to consume request",
+			}, nil
+		}
+		if !won {
+			// A concurrent poll already consumed it — don't re-mint.
+			return &models.CIBATokenResponse{
+				Error:            models.CIBAErrorExpiredToken,
+				ErrorDescription: "Request already used",
+			}, nil
+		}
+
 		// User approved - generate token
 		// Get user from tenant database
 		user, err := s.userRepo.GetUserByID(authReq.UserID)
 		if err != nil {
+			// Revert so a retry can mint (best-effort); we own the consume.
+			s.cibaRepo.UpdateCIBAAuthRequestStatusIf(authReqID, "consumed", "approved", authReq.BiometricVerified)
 			return &models.CIBATokenResponse{
 				Error:            "server_error",
 				ErrorDescription: "User not found",
@@ -234,6 +270,7 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 		// Get tenant info
 		tenant, err := s.workspaceRepo.GetWorkspaceByID(authReq.WorkspaceID.String())
 		if err != nil {
+			s.cibaRepo.UpdateCIBAAuthRequestStatusIf(authReqID, "consumed", "approved", authReq.BiometricVerified)
 			return &models.CIBATokenResponse{
 				Error:            "server_error",
 				ErrorDescription: "Tenant not found",
@@ -243,14 +280,12 @@ func (s *CIBAAuthService) PollForToken(authReqID string) (*models.CIBATokenRespo
 		// Generate JWT token (same logic as device flow)
 		token, err := s.generateJWTToken(user, tenant, authReq.Scopes)
 		if err != nil {
+			s.cibaRepo.UpdateCIBAAuthRequestStatusIf(authReqID, "consumed", "approved", authReq.BiometricVerified)
 			return &models.CIBATokenResponse{
 				Error:            "server_error",
 				ErrorDescription: "Failed to generate token",
 			}, nil
 		}
-
-		// Mark as consumed
-		s.cibaRepo.MarkAsConsumed(authReqID)
 
 		return &models.CIBATokenResponse{
 			AccessToken: token,
@@ -285,7 +320,7 @@ func (s *CIBAAuthService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID
 	deviceToken := &models.DeviceToken{
 		ID:          uuid.New(),
 		UserID:      userID,
-		WorkspaceID:    workspaceID,
+		WorkspaceID: workspaceID,
 		DeviceToken: req.DeviceToken,
 		Platform:    req.Platform,
 		DeviceName:  req.DeviceName,

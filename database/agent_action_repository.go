@@ -248,7 +248,7 @@ func (r *AgentActionRepository) GetOrCreateSettings(workspaceID uuid.UUID) (*mod
 	now := time.Now().Unix()
 	s = models.AgentGuardSettings{
 		ID:                        uuid.New(),
-		WorkspaceID:                  workspaceID,
+		WorkspaceID:               workspaceID,
 		AutoApproveBelow:          30,
 		RequireApprovalAbove:      31,
 		RequireMultiApprovalAbove: 81,
@@ -500,23 +500,6 @@ func (r *AgentActionRepository) UpdateActionRequestStatus(actionReqID string, st
 	return nil
 }
 
-// IncrementApprovalCount increments the received_approvals count
-func (r *AgentActionRepository) IncrementApprovalCount(actionReqID string) (int, int, error) {
-	query := `
-		UPDATE agent_action_requests
-		SET received_approvals = received_approvals + 1
-		WHERE action_req_id = $1
-		RETURNING received_approvals, required_approvals
-	`
-
-	var received, required int
-	err := r.db.QueryRow(query, actionReqID).Scan(&received, &required)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to increment approval count: %w", err)
-	}
-
-	return received, required, nil
-}
 
 // UpdateLastPolled updates the last_polled_at timestamp
 func (r *AgentActionRepository) UpdateLastPolled(actionReqID string) error {
@@ -567,8 +550,10 @@ func (r *AgentActionRepository) HasPriorAction(agentID string, action string, re
 // Agent Action Decision Operations
 // ========================================
 
-// CreateDecision records a human's approval/denial
-func (r *AgentActionRepository) CreateDecision(decision *models.AgentActionDecision) error {
+// CreateDecision records a human's approval/denial.
+// Returns (true, nil) if the row was inserted, (false, nil) if the approver already voted
+// (the unique constraint on (action_request_id, approver_user_id) enforces one vote per user).
+func (r *AgentActionRepository) CreateDecision(decision *models.AgentActionDecision) (bool, error) {
 	now := time.Now().Unix()
 	decision.CreatedAt = now
 
@@ -577,18 +562,44 @@ func (r *AgentActionRepository) CreateDecision(decision *models.AgentActionDecis
 			id, action_request_id, approver_user_id, approver_email,
 			decision, reason, biometric_verified, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (action_request_id, approver_user_id) DO NOTHING
 	`
 
-	_, err := r.db.Exec(query,
+	result, err := r.db.Exec(query,
 		decision.ID, decision.ActionRequestID, decision.ApproverUserID, decision.ApproverEmail,
 		decision.Decision, decision.Reason, decision.BiometricVerified, decision.CreatedAt,
 	)
 
 	if err != nil {
-		return fmt.Errorf("failed to create decision: %w", err)
+		return false, fmt.Errorf("failed to create decision: %w", err)
 	}
 
-	return nil
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
+// CountDistinctApprovers returns (distinctApproveVotes, requiredApprovals) for the request.
+// It counts only decisions with decision='approved' to prevent a single deny vote from
+// blocking the threshold count.
+func (r *AgentActionRepository) CountDistinctApprovers(actionReqID string) (int, int, error) {
+	query := `
+		SELECT
+			COUNT(DISTINCT d.approver_user_id),
+			r.required_approvals
+		FROM agent_action_requests r
+		LEFT JOIN agent_action_decisions d
+			ON d.action_request_id = r.id AND d.decision = 'approved'
+		WHERE r.action_req_id = $1
+		GROUP BY r.required_approvals
+	`
+
+	var received, required int
+	err := r.db.QueryRow(query, actionReqID).Scan(&received, &required)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to count approvers: %w", err)
+	}
+
+	return received, required, nil
 }
 
 // ========================================

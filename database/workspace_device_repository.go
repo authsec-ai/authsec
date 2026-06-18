@@ -129,8 +129,17 @@ func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequest(request *models.Ten
 	return r.db.Save(request).Error
 }
 
-// UpdateTenantCIBAAuthRequestStatus updates only the status of a CIBA request
-func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestStatus(authReqID string, workspaceID uuid.UUID, status string, approved bool, biometricVerified bool) error {
+// UpdateTenantCIBAAuthRequestStatusIf atomically transitions a CIBA request from
+// fromStatus → status in a single conditional UPDATE (Appendix §6 first-responder-
+// wins). It returns (won, err): won is true iff exactly one row transitioned
+// (RowsAffected==1) — i.e. this caller observed the request still in fromStatus
+// and flipped it. A won==false with nil err means another caller already moved
+// it out of fromStatus (the loser must treat this idempotently, never re-mint).
+//
+// The `AND status = ?` guard is the whole point: without it two concurrent
+// responders (multi-device CIBA) or two concurrent token polls would both
+// "succeed" and the second would clobber the first / double-mint.
+func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestStatusIf(authReqID string, workspaceID uuid.UUID, fromStatus, status string, approved bool, biometricVerified bool) (bool, error) {
 	updates := map[string]interface{}{
 		"status":             status,
 		"biometric_verified": biometricVerified,
@@ -141,9 +150,13 @@ func (r *TenantDeviceRepository) UpdateTenantCIBAAuthRequestStatus(authReqID str
 		updates["responded_at"] = now
 	}
 
-	return r.db.Model(&models.TenantCIBAAuthRequest{}).
-		Where("auth_req_id = ? AND workspace_id = ?", authReqID, workspaceID).
-		Updates(updates).Error
+	res := r.db.Model(&models.TenantCIBAAuthRequest{}).
+		Where("auth_req_id = ? AND workspace_id = ? AND status = ?", authReqID, workspaceID, fromStatus).
+		Updates(updates)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // UpdateTenantCIBAAuthRequestLastPolled updates the last_polled_at timestamp

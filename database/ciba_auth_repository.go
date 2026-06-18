@@ -201,7 +201,13 @@ func (r *CIBAAuthRepository) GetCIBAAuthRequestByID(authReqID string) (*models.C
 	return &req, nil
 }
 
-// UpdateCIBAAuthRequestStatus updates the status of a CIBA request
+// UpdateCIBAAuthRequestStatus updates the status of a CIBA request unconditionally.
+//
+// Deprecated: this is not concurrency-safe — an unconditional UPDATE can clobber a
+// terminal state set by a concurrent responder/poll (double-approve / double-mint).
+// Use UpdateCIBAAuthRequestStatusIf (conditional CAS on fromStatus) instead. Kept
+// only because removing an exported method is a breaking API change; it has no
+// callers in the respond/poll hot paths.
 func (r *CIBAAuthRepository) UpdateCIBAAuthRequestStatus(authReqID string, status string, biometricVerified bool) error {
 	now := time.Now().Unix()
 	query := `
@@ -226,11 +232,48 @@ func (r *CIBAAuthRepository) UpdateLastPolled(authReqID string) error {
 	return err
 }
 
-// MarkAsConsumed marks a CIBA request as consumed (token issued)
+// MarkAsConsumed marks a CIBA request as consumed (token issued) unconditionally.
+//
+// Deprecated: not concurrency-safe — two concurrent polls would both "consume" and
+// both mint. Use MarkAsConsumedIf (CAS on status='approved') so only one poll wins.
 func (r *CIBAAuthRepository) MarkAsConsumed(authReqID string) error {
 	query := `UPDATE ciba_auth_requests SET status = 'consumed' WHERE auth_req_id = $1`
 	_, err := r.db.Exec(query, authReqID)
 	return err
+}
+
+// UpdateCIBAAuthRequestStatusIf atomically transitions a request from fromStatus
+// → status in a single conditional UPDATE (mirrors the workspace-plane fix,
+// Appendix §6 first-responder-wins). Returns (won, err): won is true iff exactly
+// one row transitioned. Without the `AND status = fromStatus` guard two concurrent
+// responders (multi-device) or two concurrent polls would both "succeed" and the
+// second would clobber the first / double-mint.
+func (r *CIBAAuthRepository) UpdateCIBAAuthRequestStatusIf(authReqID, fromStatus, status string, biometricVerified bool) (bool, error) {
+	now := time.Now().Unix()
+	query := `
+		UPDATE ciba_auth_requests
+		SET status = $1, biometric_verified = $2, responded_at = $3
+		WHERE auth_req_id = $4 AND status = $5
+	`
+	res, err := r.db.Exec(query, status, biometricVerified, now, authReqID, fromStatus)
+	if err != nil {
+		return false, fmt.Errorf("failed to conditionally update CIBA request status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// MarkAsConsumedIf atomically transitions approved → consumed, returning whether
+// this caller won the transition (RowsAffected==1). Only the winner should mint a
+// token, so two concurrent polls cannot both issue.
+func (r *CIBAAuthRepository) MarkAsConsumedIf(authReqID string) (bool, error) {
+	query := `UPDATE ciba_auth_requests SET status = 'consumed' WHERE auth_req_id = $1 AND status = 'approved'`
+	res, err := r.db.Exec(query, authReqID)
+	if err != nil {
+		return false, fmt.Errorf("failed to consume CIBA request: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // ExpireOldRequests marks expired CIBA requests

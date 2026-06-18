@@ -119,7 +119,6 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 		CREATE TABLE resource_servers (
 			id TEXT PRIMARY KEY,
 			workspace_id TEXT NOT NULL,
-			workspace_id TEXT,
 			application_type TEXT NOT NULL DEFAULT 'mcp_server',
 			legacy_client_id TEXT,
 			name TEXT NOT NULL,
@@ -145,6 +144,9 @@ func newOnboardingTestDB(t *testing.T) *gorm.DB {
 			last_validated_at DATETIME,
 			last_validation_status TEXT,
 			last_validation_error TEXT,
+			prm_source TEXT DEFAULT 'fetched',
+			prm_override_expires_at DATETIME,
+			metadata_stale NUMERIC DEFAULT 0,
 			created_at DATETIME,
 			updated_at DATETIME,
 			deleted_at DATETIME

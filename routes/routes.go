@@ -82,6 +82,7 @@ func SetupRoutes(
 	}
 	// Scoped RBAC Controllers
 	rolesScopedBindingsController := adminCtrl.NewRolesScopedBindingsController()
+	serviceAccountsController := adminCtrl.NewServiceAccountsController()
 	authController := platformCtrl.NewAuthorizationController()
 	permissionController := adminCtrl.NewPermissionController()
 
@@ -231,6 +232,21 @@ func SetupRoutes(
 		oauth.GET("/logout", oauthASController.EndSession)
 		// RFC 9126 — Pushed Authorization Request (public)
 		oauth.POST("/par", oauthASController.PAR)
+		// XAA access-request status poll (Journey B — no auth, capability by ID)
+		oauth.GET("/access-requests/:id", oauthASController.AccessRequestStatus)
+		// Requester SDK bootstrap (client-authenticated; XAA_ISSUANCE flag gates it).
+		// Returns the list of approved RS targets + recommended flow for the SDK.
+		// POST is preferred: clients using private_key_jwt put the client_assertion
+		// in the request body, never the query string (query-string JWTs leak into
+		// access logs, proxies, and browser history). GET remains for clients that
+		// authenticate with a header credential (client_secret_basic / Bearer).
+		oauth.GET("/requester-bootstrap", oauthASController.RequesterBootstrap)
+		oauth.POST("/requester-bootstrap", oauthASController.RequesterBootstrap)
+		// OIDC CIBA backchannel authorization (client-authenticated; XAA_CIBA gates it).
+		// The ciba grant poll rides /oauth/token (urn:openid:params:grant-type:ciba).
+		// Rate-limited like the other client-auth endpoints — each call fans out a
+		// push notification, so it must not be cheaply spammable.
+		oauth.POST("/bc-authorize", middlewares.StrictAuthRateLimitMiddleware(30, time.Minute), oauthASController.BackchannelAuthorize)
 		// Consent grant management (user self-service, authenticated)
 		oauthSelfService := oauth.Group("")
 		oauthSelfService.Use(middlewares.AuthMiddleware())
@@ -350,12 +366,14 @@ func SetupRoutes(
 			applications.GET("/:id/connections", applicationsController.ListConnections)
 			applications.DELETE("/:id/connections/:connection_id", applicationsController.RevokeConnection)
 			applications.PUT("/:id/connections/:connection_id/approve", applicationsController.ApproveConnection)
+			applications.PUT("/:id/connections/:connection_id/deny", applicationsController.DenyConnection)
 
 			// Access policy + validate + access surface
 			applications.GET("/:id/access-policy", rsController.GetAccessPolicy)
 			applications.PUT("/:id/access-policy", rsController.UpdateAccessPolicy)
 			applications.GET("/:id/access", rsController.GetAccessPolicy) // alias used by the new UI
 			applications.POST("/:id/validate", rsController.Validate)
+			applications.POST("/:id/prm-override", applicationsController.SetPRMOverride)
 			applications.POST("/:id/test", rsController.TestLogin)
 			applications.POST("/:id/launch", applicationsController.Launch)
 
@@ -401,6 +419,24 @@ func SetupRoutes(
 			middlewares.RequireWorkspaceRole("owner", "admin"),
 			middlewares.ValidateWorkspaceFromToken(),
 			applicationsController.ListWorkspaceClients,
+		)
+
+		// Cross-workspace Connections governance view — admin sees all foreign
+		// client registrations + pending access_requests for this workspace.
+		authsec.GET("/connections",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+			applicationsController.ListCrossWorkspaceConnections,
+		)
+
+		// Admin native-token revocation by JTI. Workspace-scoped: only tokens
+		// that belong to this workspace can be revoked here.
+		authsec.DELETE("/tokens/:jti",
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+			applicationsController.RevokeTokenByJTI,
 		)
 
 		// v1 IAM cockpit aggregate/read-model aliases. These routes expose the
@@ -594,6 +630,14 @@ func SetupRoutes(
 			adminRBAC.POST("/agents/:id/delegate-token", agentController.DelegateToken)
 			adminRBAC.POST("/agents/:id/revoke-token", sdkTokenController.RevokeDelegationToken)
 
+			// Service accounts (Agent Identity Phase 1)
+			adminRBAC.POST("/service-accounts", serviceAccountsController.CreateServiceAccount)
+			adminRBAC.GET("/service-accounts", serviceAccountsController.ListServiceAccounts)
+			adminRBAC.GET("/service-accounts/:sa_id", serviceAccountsController.GetServiceAccount)
+			adminRBAC.PUT("/service-accounts/:sa_id", serviceAccountsController.UpdateServiceAccount)
+			adminRBAC.DELETE("/service-accounts/:sa_id", serviceAccountsController.DeleteServiceAccount)
+			adminRBAC.POST("/service-accounts/:sa_id/credentials", serviceAccountsController.CredentialServiceAccount)
+
 			// Admin self-introspection (delegation UI)
 			adminRBAC.GET("/me/roles-permissions", delegationPolicyController.GetMyRolesAndPermissions)
 		}
@@ -656,7 +700,17 @@ func SetupRoutes(
 			{
 				enduserAuth.GET("/challenge", endUserAuthController.GetAuthChallenge)
 				enduserAuth.POST("/webauthn-callback", endUserAuthController.WebAuthnCallback)
-				enduserAuth.POST("/delegate-svid", spiffeDelegateController.DelegateSVID)
+				// /delegate-svid is deprecated: plane C bespoke SVID issuance is
+				// being retired in favour of NativeSealer XAA/M2M. Use
+				// POST /oauth/token (grant_type=client_credentials or jwt-bearer)
+				// with a SPIFFE JWT-SVID client assertion instead.
+				enduserAuth.POST("/delegate-svid", func(c *gin.Context) {
+					sunset := time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
+					c.Header("Deprecation", "true")
+					c.Header("Sunset", sunset.Format(time.RFC1123))
+					c.Header("Link", `</oauth/token>; rel="successor-version"`)
+					c.Next()
+				}, spiffeDelegateController.DelegateSVID)
 			}
 
 			// Device Authorization Grant (RFC 8628)
@@ -703,8 +757,17 @@ func SetupRoutes(
 				totp.POST("/backup/regenerate", middlewares.AuthMiddleware(), totpController.RegenerateBackupCodes)
 			}
 
-			// CIBA
+			// CIBA (user-plane — deprecated; migrate to /auth/workspace/ciba)
+			// Emits Deprecation + Sunset headers per RFC 8594 and the Phase 4d plan.
+			// The HMAC token path stays intact for middlewares/auth.go consumers.
 			ciba := auth.Group("/ciba")
+			ciba.Use(func(c *gin.Context) {
+				sunset := time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
+				c.Header("Deprecation", "true")
+				c.Header("Sunset", sunset.Format(time.RFC1123))
+				c.Header("Link", `</authsec/uflow/auth/workspace/ciba>; rel="successor-version"`)
+				c.Next()
+			})
 			{
 				ciba.POST("/initiate", cibaAuthController.InitiateCIBAAuth)
 				ciba.POST("/token", cibaAuthController.PollCIBAToken)
@@ -789,7 +852,7 @@ func SetupRoutes(
 		{
 			adminPlatform.GET("/oidc/providers", oidcController.GetAllProviders)
 			adminPlatform.PUT("/oidc/providers/:provider", oidcController.UpdateProvider)
-adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
+			adminPlatform.POST("/users/active", adminUserController.ToggleAdminUserActive)
 			adminPlatform.POST("/groups", groupController.AddUserDefinedGroups)
 			adminPlatform.POST("/groups/map", groupController.MapGroupsToClient)
 			adminPlatform.POST("/groups/list", groupController.ListTenantGroupsForAdmin)
@@ -1362,6 +1425,7 @@ func registerOocmgrRoutes(r gin.IRouter) {
 // Legacy /authmgr/* routes have been removed — all consumers must migrate to /authz/*.
 func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
+	authzCtrl := platformCtrl.NewAuthorizationController()
 
 	// Token endpoints — /verify is public, /generate and /oidc require auth.
 	tokenGroup := r.Group("/auth/token")
@@ -1392,6 +1456,9 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		authz.GET("/check/permission-scoped", ac.CheckPermissionScoped)
 		authz.GET("/check/oauth-scope", ac.CheckOAuthScopePermission)
 		authz.GET("/permissions", ac.ListUserPermissions)
+
+		// Per-tool PEP (Phase 4b) — SDK calls this before executing a tool.
+		authz.POST("/decision", authzCtrl.Decision)
 
 		// Group management
 		authz.POST("/groups", ac.CreateGroup)

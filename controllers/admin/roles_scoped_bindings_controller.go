@@ -63,10 +63,13 @@ type RoleListItem struct {
 }
 
 // BindingRequest represents the payload for role assignment.
+// Exactly one of UserID, GroupID, or ServiceAccountID must be non-empty.
 type BindingRequest struct {
-	UserID string        `json:"user_id" binding:"required"`
-	RoleID string        `json:"role_id" binding:"required"`
-	Scope  *BindingScope `json:"scope,omitempty"`
+	UserID           string        `json:"user_id"`
+	GroupID          string        `json:"group_id"`
+	ServiceAccountID string        `json:"service_account_id"`
+	RoleID           string        `json:"role_id" binding:"required"`
+	Scope            *BindingScope `json:"scope,omitempty"`
 	// Conditions can include metadata such as {"mfa_required": true}
 	Conditions map[string]interface{} `json:"conditions"`
 }
@@ -684,7 +687,7 @@ func (rc *RolesScopedBindingsController) createRole(c *gin.Context, db *gorm.DB,
 
 	role := &models.RBACRole{
 		ID:          uuid.New(), // Explicitly generate UUID to ensure it's available in response
-		WorkspaceID:    &workspaceID,
+		WorkspaceID: &workspaceID,
 		Name:        req.Name,
 		Description: req.Description,
 	}
@@ -937,9 +940,19 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		return
 	}
 
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid User ID format"})
+	// Exactly one principal field must be set.
+	principalCount := 0
+	if req.UserID != "" {
+		principalCount++
+	}
+	if req.GroupID != "" {
+		principalCount++
+	}
+	if req.ServiceAccountID != "" {
+		principalCount++
+	}
+	if principalCount != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of user_id, group_id, or service_account_id must be set"})
 		return
 	}
 
@@ -949,35 +962,25 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		return
 	}
 
-	// Use a fresh session to avoid stale transaction states from connection pooling
-	// This prevents "transaction is aborted" errors (SQLSTATE 25P02)
 	freshDB := db.Session(&gorm.Session{NewDB: true})
-
-	// Create a new RBAC service with the fresh session
 	freshRBAC := services.NewRBACService(freshDB)
 
-	// Validate role exists for tenant and capture role name
+	// Validate role exists for this workspace.
 	var role models.RBACRole
 	if err := freshDB.Where("id = ? AND workspace_id = ?", roleID, workspaceID).First(&role).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Role not found for tenant"})
 		return
 	}
-	var user models.User
-	if err := freshDB.Where("id = ?", userID).First(&user).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
 
+	// Resolve scope fields.
 	var scopeType *string
 	var scopeID *uuid.UUID
 	scopeDesc := "Tenant-Wide"
 	if req.Scope != nil {
 		st := req.Scope.Type
-		// Handle wildcard scope: "*" or empty means tenant-wide (no specific scope)
 		if st != "" && st != "*" {
 			scopeType = &st
 		}
-		// Handle wildcard scope ID: "*" means tenant-wide (null scope_id)
 		if req.Scope.ID != "" && req.Scope.ID != "*" {
 			sid, err := uuid.Parse(req.Scope.ID)
 			if err != nil {
@@ -987,7 +990,6 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			scopeID = &sid
 			scopeDesc = fmt.Sprintf("%s: %s", st, req.Scope.ID)
 		} else {
-			// Wildcard scope - tenant-wide
 			scopeDesc = "Tenant-Wide (wildcard)"
 		}
 	}
@@ -995,15 +997,65 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 	conditionsJSON, _ := services.MapToJSON(req.Conditions)
 
 	binding := &models.RoleBinding{
-		ID:         uuid.New(), // Generate UUID in Go, don't rely on DB default
-		WorkspaceID:   &workspaceID,
-		UserID:     &userID,
-		Username:   shared.DerefString(user.Username),
-		RoleID:     roleID,
-		RoleName:   role.Name,
-		ScopeType:  scopeType,
-		ScopeID:    scopeID,
-		Conditions: []byte(conditionsJSON),
+		ID:          uuid.New(),
+		WorkspaceID: &workspaceID,
+		RoleID:      roleID,
+		RoleName:    role.Name,
+		ScopeType:   scopeType,
+		ScopeID:     scopeID,
+		Conditions:  []byte(conditionsJSON),
+	}
+
+	auditExtra := map[string]interface{}{
+		"role_id":          req.RoleID,
+		"role_name":        role.Name,
+		"scope":            scopeDesc,
+		"scope_type":       scopeType,
+		"scope_id":         scopeID,
+		"conditions_count": len(req.Conditions),
+	}
+
+	switch {
+	case req.UserID != "":
+		userID, err := uuid.Parse(req.UserID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid User ID format"})
+			return
+		}
+		var user models.User
+		if err := freshDB.Where("id = ?", userID).First(&user).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		binding.UserID = &userID
+		binding.Username = shared.DerefString(user.Username)
+		auditExtra["user_id"] = req.UserID
+		auditExtra["username"] = user.Username
+
+	case req.GroupID != "":
+		groupID, err := uuid.Parse(req.GroupID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Group ID format"})
+			return
+		}
+		binding.GroupID = &groupID
+		auditExtra["group_id"] = req.GroupID
+
+	case req.ServiceAccountID != "":
+		saID, err := uuid.Parse(req.ServiceAccountID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ServiceAccount ID format"})
+			return
+		}
+		// Verify SA exists in this workspace.
+		var sa models.ServiceAccount
+		if err := freshDB.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Service account not found"})
+			return
+		}
+		binding.ServiceAccountID = &saID
+		auditExtra["service_account_id"] = req.ServiceAccountID
+		auditExtra["service_account_name"] = sa.Name
 	}
 
 	if err := freshRBAC.AssignRoleScoped(binding); err != nil {
@@ -1011,27 +1063,16 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 		return
 	}
 
-	// Audit log: Role binding created
 	middlewares.Audit(c, "role_binding", binding.ID.String(), "assign", &middlewares.AuditChanges{
-		After: map[string]interface{}{
-			"user_id":          req.UserID,
-			"username":         user.Username,
-			"role_id":          req.RoleID,
-			"role_name":        role.Name,
-			"scope":            scopeDesc,
-			"scope_type":       scopeType,
-			"scope_id":         scopeID,
-			"conditions_count": len(req.Conditions),
-		},
+		After: auditExtra,
 	})
 
-	resp := BindingResponse{
+	c.JSON(http.StatusOK, BindingResponse{
 		ID:               binding.ID.String(),
 		Status:           "active",
 		ScopeDescription: scopeDesc,
 		RoleName:         role.Name,
-	}
-	c.JSON(http.StatusOK, resp)
+	})
 }
 
 // listRoleBindings retrieves role bindings with optional filters

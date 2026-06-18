@@ -30,15 +30,58 @@ import (
 // existing ResourceServerController/ScopeMatrixController handlers — they
 // don't care which URL prefix invoked them.
 type ApplicationsController struct {
-	service  *services.ResourceServerService
-	oauthSvc *services.OAuthASService
+	service       *services.ResourceServerService
+	oauthSvc      *services.OAuthASService
+	onboardingSvc *services.ResourceServerOnboardingService
 }
 
 func NewApplicationsController() *ApplicationsController {
 	return &ApplicationsController{
-		service:  services.NewResourceServerService(config.DB),
-		oauthSvc: services.NewOAuthASService(config.DB),
+		service:       services.NewResourceServerService(config.DB),
+		oauthSvc:      services.NewOAuthASService(config.DB),
+		onboardingSvc: services.NewResourceServerOnboardingService(config.DB),
 	}
+}
+
+// prmOverrideBody is the inbound payload for SetPRMOverride.
+type prmOverrideBody struct {
+	ScopesSupported []string `json:"scopes_supported"`
+	TTLDays         int      `json:"ttl_days,omitempty"`
+}
+
+// SetPRMOverride handles POST /authsec/applications/:id/prm-override — the
+// operator escape hatch (plan §7) for resource servers that can't serve RFC 9728
+// metadata cleanly. The admin supplies scopes_supported; the RS is flipped to a
+// time-boxed manual override that the reconciler re-verifies.
+func (ctrl *ApplicationsController) SetPRMOverride(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+	id := c.Param("id")
+	app, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+	var body prmOverrideBody
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	ttl := time.Duration(body.TTLDays) * 24 * time.Hour
+	if err := ctrl.onboardingSvc.SetManualPRMOverride(app.ID, workspaceID, body.ScopesSupported, ttl); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, workspaceID.String(), "application_prm_override_set", "application",
+		id, http.StatusOK, nil, map[string]interface{}{"scopes_supported": body.ScopesSupported})
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "manual_override_active",
+		"prm_source": "manual_override",
+		"note":       "Manual PRM metadata recorded. The reconciler will re-verify the real metadata endpoint and auto-clear the override on success, or flag metadata_stale at expiry.",
+	})
 }
 
 // applicationCreateRequest is the inbound payload for POST /authsec/applications.
@@ -400,9 +443,21 @@ func (ctrl *ApplicationsController) RevokeConnection(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 
+// approveConnectionBody is the OPTIONAL body for ApproveConnection. When a
+// role_id (+ subject) is supplied, the approval also creates the role binding
+// atomically (plan §1). Omit it for connection-only approval (default).
+type approveConnectionBody struct {
+	RoleID      string `json:"role_id,omitempty"`
+	SubjectType string `json:"subject_type,omitempty"` // "user" | "service_account"
+	SubjectID   string `json:"subject_id,omitempty"`
+}
+
 // ApproveConnection handles PUT /authsec/applications/:id/connections/:connection_id/approve.
-// It flips a pending_approval registration (created when a client from another
-// workspace attempted a lazy bind) to approved.
+// It flips a pending_approval registration to approved. If the body carries a
+// role_id + subject, it ALSO grants that RS-scoped role binding in the same
+// transaction so the subject obtains usable scopes immediately (plan §1).
+// Without a role_id the approval is connection-only (decision #1) and the
+// response reports which subjects still lack scopes.
 func (ctrl *ApplicationsController) ApproveConnection(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
@@ -417,14 +472,49 @@ func (ctrl *ApplicationsController) ApproveConnection(c *gin.Context) {
 	}
 
 	connectionID := c.Param("connection_id")
-	if err := ctrl.oauthSvc.ApproveClientRegistration(id, connectionID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+
+	// Optional atomic role grant. Body is optional, so ignore bind errors on an
+	// empty/absent body.
+	var body approveConnectionBody
+	_ = c.ShouldBindJSON(&body)
+	var binding *services.ApprovalRoleBinding
+	if body.RoleID != "" {
+		roleUUID, rErr := uuid.Parse(body.RoleID)
+		subjUUID, sErr := uuid.Parse(body.SubjectID)
+		if rErr != nil || sErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id or subject_id"})
+			return
+		}
+		if body.SubjectType != "user" && body.SubjectType != "service_account" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_type must be 'user' or 'service_account' when role_id is supplied"})
+			return
+		}
+		binding = &services.ApprovalRoleBinding{
+			RoleID:      roleUUID,
+			SubjectType: body.SubjectType,
+			SubjectID:   subjUUID,
+		}
+	}
+
+	if err := ctrl.oauthSvc.ApproveClientRegistrationWithBinding(id, connectionID, binding); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "application_connection_approved", "oauth_client",
-		connectionID, http.StatusOK, nil, map[string]interface{}{"application_id": id})
-	c.JSON(http.StatusOK, gin.H{"status": "approved"})
+		connectionID, http.StatusOK, nil, map[string]interface{}{"application_id": id, "role_bound": binding != nil})
+
+	// Honesty contract (finding #1): without an atomic role grant, approving a
+	// connection authorizes the client↔RS link only — it does NOT grant scopes.
+	// Report the subjects that still resolve zero effective scopes so the UI
+	// never implies usable access.
+	resp := gin.H{"status": "approved"}
+	if gap, gerr := ctrl.oauthSvc.ConnectionSubjectScopeGap(c.Request.Context(), id, connectionID); gerr == nil && len(gap) > 0 {
+		resp["subjects_without_scopes"] = gap
+		resp["scopes_granted"] = false
+		resp["note"] = "Connection approved, but the listed subjects have no role bindings yet and will receive zero scopes until a role is assigned."
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // Launch handles POST /authsec/applications/:id/launch.
@@ -475,6 +565,80 @@ func (ctrl *ApplicationsController) Launch(c *gin.Context) {
 		"connections":      conns,
 		"workspace_id":     workspaceID.String(),
 	})
+}
+
+// DenyConnection handles PUT /authsec/applications/:id/connections/:connection_id/deny.
+// It removes a pending_approval registration and marks any open access_requests denied.
+func (ctrl *ApplicationsController) DenyConnection(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	id := c.Param("id")
+	if _, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	connectionID := c.Param("connection_id")
+	if err := ctrl.oauthSvc.DenyClientRegistration(id, connectionID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, workspaceID.String(), "application_connection_denied", "oauth_client",
+		connectionID, http.StatusOK, nil, map[string]interface{}{"application_id": id})
+	c.JSON(http.StatusOK, gin.H{"status": "denied"})
+}
+
+// ListCrossWorkspaceConnections handles GET /authsec/connections.
+// Returns all cross-workspace client registrations and pending access_requests
+// for resource servers owned by this workspace — the admin governance view.
+func (ctrl *ApplicationsController) ListCrossWorkspaceConnections(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	conns, err := ctrl.oauthSvc.ListCrossWorkspaceConnections(workspaceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"connections": conns})
+}
+
+// RevokeTokenByJTI handles DELETE /authsec/tokens/:jti.
+// Admin endpoint to explicitly revoke a native token by JTI. Workspace-scoped:
+// an admin can only revoke tokens that belong to their workspace.
+func (ctrl *ApplicationsController) RevokeTokenByJTI(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	jti := c.Param("jti")
+	if jti == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "jti required"})
+		return
+	}
+
+	if err := ctrl.oauthSvc.RevokeNativeTokenByJTI(workspaceID, jti); err != nil {
+		if err.Error() == "token not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "token not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	auditAdminMutation(c, workspaceID.String(), "token_revoked_by_jti", "native_token",
+		jti, http.StatusOK, nil, nil)
+	c.JSON(http.StatusOK, gin.H{"status": "revoked", "jti": jti})
 }
 
 // ListWorkspaceClients handles GET /authsec/clients.

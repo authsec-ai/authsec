@@ -121,7 +121,7 @@ func (s *AgentActionService) EvaluateAction(req *models.AgentActionEvaluateReque
 	actionRequest := &models.AgentActionRequest{
 		ID:          uuid.New(),
 		ActionReqID: actionReqID,
-		WorkspaceID:    workspaceID,
+		WorkspaceID: workspaceID,
 		UserID:      userID,
 		UserEmail:   userEmail,
 
@@ -310,7 +310,10 @@ func (s *AgentActionService) PollActionStatus(actionReqID string) (*models.Agent
 	}
 }
 
-// RespondToAction processes a human's approval or denial
+// RespondToAction processes a human's approval or denial.
+// responderWorkspaceID is extracted from the caller's JWT and must match the
+// request's workspace — prevents a user in workspace A from approving a
+// request that belongs to workspace B.
 func (s *AgentActionService) RespondToAction(
 	actionReqID string,
 	approverUserID uuid.UUID,
@@ -318,6 +321,7 @@ func (s *AgentActionService) RespondToAction(
 	approved bool,
 	reason string,
 	biometricVerified bool,
+	responderWorkspaceID uuid.UUID,
 ) (*models.AgentActionRespondResponse, error) {
 
 	req, err := s.actionRepo.GetActionRequestByID(actionReqID)
@@ -325,6 +329,15 @@ func (s *AgentActionService) RespondToAction(
 		return &models.AgentActionRespondResponse{
 			Success: false,
 			Message: "Action request not found",
+		}, nil
+	}
+
+	// Caller-identity binding: the responder must belong to the same workspace
+	// as the challenged user.
+	if req.WorkspaceID != responderWorkspaceID {
+		return &models.AgentActionRespondResponse{
+			Success: false,
+			Message: "Unauthorized: workspace mismatch",
 		}, nil
 	}
 
@@ -350,8 +363,16 @@ func (s *AgentActionService) RespondToAction(
 		decision.Reason = reason
 	}
 
-	if err := s.actionRepo.CreateDecision(decision); err != nil {
+	inserted, err := s.actionRepo.CreateDecision(decision)
+	if err != nil {
 		return nil, fmt.Errorf("failed to record decision: %w", err)
+	}
+	if !inserted {
+		// Idempotent: this approver already voted; return success without re-counting.
+		return &models.AgentActionRespondResponse{
+			Success: true,
+			Message: "Decision already recorded for this approver",
+		}, nil
 	}
 
 	if !approved {
@@ -366,9 +387,11 @@ func (s *AgentActionService) RespondToAction(
 		}, nil
 	}
 
-	received, required, err := s.actionRepo.IncrementApprovalCount(actionReqID)
+	// Count distinct approvers (not a blind increment) to prevent one user
+	// from counting multiple times toward the threshold.
+	received, required, err := s.actionRepo.CountDistinctApprovers(actionReqID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to update approval count: %w", err)
+		return nil, fmt.Errorf("failed to count approvals: %w", err)
 	}
 
 	if received >= required {
@@ -403,7 +426,7 @@ func (s *AgentActionService) GetRiskPolicies(workspaceID uuid.UUID) ([]models.Ri
 func (s *AgentActionService) CreateRiskPolicy(workspaceID uuid.UUID, req *models.RiskPolicyCreateRequest) (*models.RiskPolicy, error) {
 	policy := &models.RiskPolicy{
 		ID:                        uuid.New(),
-		WorkspaceID:                  workspaceID,
+		WorkspaceID:               workspaceID,
 		Name:                      req.Name,
 		Description:               req.Description,
 		ActionPattern:             req.ActionPattern,
@@ -607,7 +630,7 @@ func (s *AgentActionService) writeAuditLog(req *models.AgentActionRequest, final
 
 	entry := &models.AgentActionAuditLog{
 		ID:                  uuid.New(),
-		WorkspaceID:            req.WorkspaceID,
+		WorkspaceID:         req.WorkspaceID,
 		ActionRequestID:     &req.ID,
 		AgentID:             req.AgentID,
 		AgentName:           req.AgentName,

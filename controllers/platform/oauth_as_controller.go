@@ -1,22 +1,28 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/policy"
+	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -27,15 +33,79 @@ type OAuthASController struct {
 	rsService      *services.ResourceServerService
 	scopeResolver  *services.ScopeResolver
 	consentService *services.ConsentService
+	nativeIssuer   *tokens.NativeIssuer
+	xaaService     *services.XAAService
+	cibaService    *services.TenantCIBAAuthService // nil when XAA_CIBA=off
+	pdp            policy.PDP                      // nil when POLICY_ENGINE_MODE=off
 }
 
 func NewOAuthASController() *OAuthASController {
-	return &OAuthASController{
+	issuerURL := ""
+	if config.AppConfig != nil {
+		issuerURL = config.AppConfig.OAuthBaseURL()
+	}
+	ctrl := &OAuthASController{
 		service:        services.NewOAuthASService(config.DB),
 		rsService:      services.NewResourceServerService(config.DB),
 		scopeResolver:  services.NewScopeResolver(config.DB),
 		consentService: services.NewConsentService(config.DB),
+		nativeIssuer:   tokens.NewNativeIssuer(config.DB, tokens.NativeKeys(), issuerURL),
+		xaaService:     services.NewXAAService(config.DB),
 	}
+	if config.AppConfig != nil && config.DB != nil {
+		mode := config.AppConfig.PolicyEngineMode
+		if mode == "shadow" || mode == "enforce" {
+			ctrl.pdp = policy.NewSimplePDP(config.DB)
+		}
+	}
+	// Wire the workspace-plane CIBA service only when native RS-bearer CIBA is
+	// enabled — it backs the standards POST /oauth/bc-authorize + ciba grant.
+	if config.AppConfig != nil && config.AppConfig.XAACiba {
+		pushService, perr := services.NewPushNotificationService()
+		if perr != nil {
+			pushService = nil // service degrades gracefully without push
+		}
+		ctrl.cibaService = services.NewTenantCIBAAuthService(pushService)
+	}
+	return ctrl
+}
+
+// evalPDP consults the PDP and, in shadow mode, writes an audit record.
+// Returns true (block) only in enforce mode when the PDP says EffectDeny.
+// gatePermit must always be true at call-site (thin gates have already passed).
+func (ctrl *OAuthASController) evalPDP(ctx context.Context, req policy.PolicyRequest, grantedScopes string) (block bool) {
+	if ctrl.pdp == nil {
+		return false
+	}
+	mode := "shadow"
+	if config.AppConfig != nil {
+		mode = config.AppConfig.PolicyEngineMode
+	}
+
+	decision, _ := ctrl.pdp.Decide(ctx, req)
+
+	// thin gates passed → gateEffect is always permit at this point
+	pdpAgrees := decision.Effect != policy.EffectDeny
+	sid := req.SubjectID
+	policy.RecordAudit(ctx, config.DB, policy.IssuanceAuditRow{
+		WorkspaceID:      req.WorkspaceID,
+		TokenFamily:      req.TokenFamily,
+		ClientID:         req.ClientID,
+		SubjectType:      req.SubjectType,
+		SubjectID:        &sid,
+		ResourceServerID: req.ResourceServerID,
+		PDPEffect:        string(decision.Effect),
+		GateEffect:       "permit",
+		PDPAgrees:        pdpAgrees,
+		ScopesRequested:  req.RequestedScopes,
+		ScopesGranted:    grantedScopes,
+		PDPReason:        decision.Reason,
+	})
+
+	if mode == "enforce" && decision.Effect == policy.EffectDeny {
+		return true
+	}
+	return false
 }
 
 // CanonicalIssuerOnly redirects discovery and OAuth requests to the configured
@@ -291,11 +361,18 @@ func (ctrl *OAuthASController) Token(c *gin.Context) {
 		c.Request.ParseForm()
 	}
 
-	clientID := c.PostForm("client_id")
 	grantType := c.PostForm("grant_type")
 
-	// client_id is mandatory — no anonymous/legacy passthrough
+	// Resolve client_id: body first, then Basic auth header. client_credentials
+	// callers use Basic auth and may omit client_id from the body.
+	clientID := c.PostForm("client_id")
 	if clientID == "" {
+		clientID = services.ExtractClientIDFromBasicAuth(c.Request)
+	}
+	// For private_key_jwt the client_id is embedded in the assertion; we defer
+	// extraction to authenticateClient in the M2M handler.
+	assertionType := c.PostForm("client_assertion_type")
+	if clientID == "" && assertionType != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "invalid_request",
 			"error_description": "client_id is required",
@@ -303,14 +380,41 @@ func (ctrl *OAuthASController) Token(c *gin.Context) {
 		return
 	}
 
-	// Look up MCP OAuth client — must be registered
-	oauthClient, err := ctrl.service.GetOAuthClient(clientID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_client",
-			"error_description": "unknown client_id",
-		})
-		return
+	// For client_credentials with private_key_jwt the client lookup happens
+	// inside the handler (client_id must be extracted from the assertion).
+	// For all other grants we look up the client now.
+	var oauthClient *models.MCPOAuthClient
+	if clientID != "" {
+		var err error
+		oauthClient, err = ctrl.service.GetOAuthClient(clientID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_client",
+				"error_description": "unknown client_id",
+			})
+			return
+		}
+	}
+
+	// authorization_code and refresh_token consume the pre-resolved oauthClient
+	// directly; only the confidential machine grants defer client resolution to
+	// their own AuthenticateClient call. When client_id was omitted (legal only
+	// for private_key_jwt), oauthClient is nil — reject those grants here rather
+	// than dereferencing nil downstream (panic / DoS).
+	if oauthClient == nil {
+		switch grantType {
+		case "client_credentials",
+			"urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"urn:ietf:params:oauth:grant-type:token-exchange",
+			"urn:openid:params:grant-type:ciba":
+			// these authenticate the client themselves
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_client",
+				"error_description": "client_id is required for this grant type",
+			})
+			return
+		}
 	}
 
 	switch grantType {
@@ -326,18 +430,17 @@ func (ctrl *OAuthASController) Token(c *gin.Context) {
 		}
 		ctrl.tokenRefreshGrant(c, oauthClient)
 	case "client_credentials":
-		if !oauthClient.IsConfidential {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "unauthorized_client",
-				"error_description": "client_credentials grant requires a confidential client",
-			})
-			return
-		}
 		ctrl.tokenClientCredentialsGrant(c, oauthClient)
+	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
+		ctrl.tokenJWTBearerGrant(c, oauthClient)
+	case "urn:ietf:params:oauth:grant-type:token-exchange":
+		ctrl.tokenExchangeGrant(c, oauthClient)
+	case "urn:openid:params:grant-type:ciba":
+		ctrl.tokenCIBAGrant(c, oauthClient)
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "unsupported_grant_type",
-			"error_description": "only authorization_code, refresh_token, and client_credentials are supported",
+			"error_description": "only authorization_code, refresh_token, client_credentials, urn:ietf:params:oauth:grant-type:jwt-bearer, urn:ietf:params:oauth:grant-type:token-exchange, and urn:openid:params:grant-type:ciba are supported",
 		})
 		return
 	}
@@ -762,74 +865,979 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 }
 
 // tokenClientCredentialsGrant handles client_credentials token exchange for
-// confidential clients (AI agents, service accounts). No user involvement —
-// the token represents the client itself.
-func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
-	// Defence-in-depth: client_credentials issues a token that represents the
-	// client itself, so the client MUST authenticate with a secret. Every
-	// client AuthSec creates today uses token_endpoint_auth_method="none"
-	// (public + PKCE) and there is no secret store yet — so a "none" client
-	// reaching this path could only do so via a manually flipped
-	// IsConfidential flag, which would make this an UNAUTHENTICATED M2M token
-	// issuer. Refuse until confidential-client secret auth is implemented.
-	if oauthClient.TokenEndpointAuthMethod == "none" || oauthClient.TokenEndpointAuthMethod == "" {
-		log.Printf("[MCP_AUTH] tokenClientCredentialsGrant: refused — client=%s has no confidential auth method (token_endpoint_auth_method=%q)",
-			oauthClient.ClientID, oauthClient.TokenEndpointAuthMethod)
+// confidential service-account clients via the NativeSealer (M2M path).
+// Requires XAA_M2M feature flag; the Hydra proxy is gone — native issuance only.
+func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *models.MCPOAuthClient) {
+	if config.AppConfig == nil || !config.AppConfig.XAAm2m {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "unauthorized_client",
-			"error_description": "client_credentials requires a confidential client with a secret-based auth method",
+			"error":             "unsupported_grant_type",
+			"error_description": "client_credentials is not enabled on this authorization server",
 		})
 		return
 	}
 
-	resourceParam := c.PostForm("resource")
-	scopeParam := c.PostForm("scope")
+	ctx := c.Request.Context()
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
 
+	// ── 1. Authenticate the client (private_key_jwt or client_secret_basic).
+	client, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: auth failed: %v", err)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	// ── 2. Resolve the linked service account (must exist and be active).
+	sa, err := ctrl.service.GetServiceAccountByClientID(ctx, client.ID)
+	if err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: SA lookup failed client=%s: %v", client.ClientID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	if sa == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "no service account linked to this client",
+		})
+		return
+	}
+	if sa.Status != "active" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "service account is not active",
+		})
+		return
+	}
+
+	// ── 3. Resolve the resource server.
+	resourceParam := c.PostForm("resource")
 	if resourceParam == "" {
-		inferredResource, err := ctrl.service.InferSingleResourceURIForClient(oauthClient)
-		if err != nil {
+		inferred, iErr := ctrl.service.InferSingleResourceURIForClient(client)
+		if iErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_request",
-				"error_description": "resource parameter required for client_credentials grant",
+				"error":             "invalid_target",
+				"error_description": "resource parameter required",
 			})
 			return
 		}
-		resourceParam = inferredResource
+		resourceParam = inferred
 	}
-
-	// Validate resource — client must be registered for this RS.
 	rs, err := ctrl.rsService.GetByResourceURI(resourceParam)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error":             "invalid_request",
+			"error":             "invalid_target",
 			"error_description": "unknown resource",
 		})
 		return
 	}
-	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, oauthClient.ID)
+
+	// ── 4. Registration gate — client must be approved for this RS.
+	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, client.ID)
 	if regErr != nil || reg.Status != "approved" {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
-			"error_description": "client not authorized for this resource",
+			"error_description": "client not authorized for this resource server",
 		})
 		return
 	}
 
-	// Proxy to Hydra — Hydra handles client_credentials natively.
-	c.Request.PostForm.Set("client_id", oauthClient.HydraClientID)
-	if scopeParam != "" {
-		c.Request.PostForm.Set("scope", scopeParam)
+	// ── 5. Resolve scopes via RBAC (SA principal).
+	requestedScopes := strings.Fields(c.PostForm("scope"))
+	principal := tokens.Principal{
+		SubjectType: tokens.SubjectTypeServiceAccount,
+		SubjectID:   sa.ID,
+		WorkspaceID: sa.WorkspaceID,
 	}
-	statusCode, body, respHeader, err := ctrl.service.ProxyFormToHydraPublicCapture(
-		"/oauth2/token", c.Request.PostForm, c.Request.Header,
+	grantedScopes, err := ctrl.scopeResolver.ResolvePrincipalEffectiveScopes(
+		ctx, principal, rs.ID.String(), requestedScopes, rs, client,
 	)
 	if err != nil {
-		log.Printf("[MCP_AUTH] tokenClientCredentialsGrant: Hydra unavailable: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server unavailable"})
+		log.Printf("[M2M] tokenClientCredentialsGrant: scope resolution failed sa=%s: %v", sa.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	if len(grantedScopes) == 0 {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "no scopes granted to this service account for the requested resource",
+		})
 		return
 	}
 
-	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
+	// ── 6. PDP gate (shadow/enforce).
+	if ctrl.evalPDP(ctx, policy.PolicyRequest{
+		WorkspaceID:      sa.WorkspaceID,
+		ClientID:         client.ClientID,
+		SubjectType:      "service_account",
+		SubjectID:        sa.ID,
+		ResourceServerID: rs.ID,
+		TokenFamily:      "m2m",
+		RequestedScopes:  strings.Join(requestedScopes, " "),
+	}, strings.Join(grantedScopes, " ")) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "policy denied this request",
+		})
+		return
+	}
+
+	// ── 7. Mint a native M2M token.
+	claims := tokens.NativeClaims{
+		Family:           models.TokenFamilyM2M,
+		WorkspaceID:      sa.WorkspaceID,
+		SubjectType:      tokens.SubjectTypeServiceAccount,
+		SubjectID:        sa.ID,
+		ClientID:         client.ClientID,
+		ResourceServerID: rs.ID,
+		Audience:         rs.ResourceURI,
+		Scope:            strings.Join(grantedScopes, " "),
+		TTL:              time.Hour,
+	}
+	tokenStr, jti, err := ctrl.nativeIssuer.Issue(ctx, claims)
+	if err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: issue failed sa=%s: %v", sa.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+
+	log.Printf("[M2M] tokenClientCredentialsGrant: issued jti=%s sa=%s client=%s rs=%s scopes=%q",
+		jti, sa.ID, client.ClientID, rs.ID, claims.Scope)
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token": tokenStr,
+		"token_type":   "Bearer",
+		"expires_in":   int(time.Hour.Seconds()),
+		"scope":        claims.Scope,
+	})
+}
+
+// tokenJWTBearerGrant handles the XAA redemption grant
+// (urn:ietf:params:oauth:grant-type:jwt-bearer): validates an ID-JAG assertion,
+// maps the external subject to a local user, and mints a native XAA token.
+//
+// Requires XAA_REDEMPTION flag. Does NOT call BindClientToRS — uses read-only
+// CheckClientApprovedForRS; side-effects (access_requests pending row) are
+// recorded when approval is missing.
+func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCPOAuthClient) {
+	if config.AppConfig == nil || !config.AppConfig.XAARedemption {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "unsupported_grant_type",
+			"error_description": "jwt-bearer is not enabled on this authorization server",
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	selfIssuer := config.AppConfig.OAuthBaseURL()
+
+	// ── 1. Authenticate the requesting agent client.
+	agentClient, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil {
+		log.Printf("[XAA] tokenJWTBearerGrant: client auth failed: %v", err)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	// ── 2. Check for DPoP — reject if present but XAA_DPOP is off (§plan).
+	if c.GetHeader("DPoP") != "" && (config.AppConfig == nil || !config.AppConfig.XAADPOP) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "DPoP is not enabled on this server",
+		})
+		return
+	}
+
+	// ── 3. Validate the ID-JAG assertion.
+	assertion := c.PostForm("assertion")
+	if assertion == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "assertion parameter required",
+		})
+		return
+	}
+	idjagClaims, trustedIssuer, err := ctrl.xaaService.ValidateIDJAG(ctx, assertion, agentClient.ClientID, selfIssuer)
+	if err != nil {
+		log.Printf("[XAA] tokenJWTBearerGrant: ID-JAG validation failed client=%s: %v", agentClient.ClientID, err)
+		errCode := "invalid_grant"
+		if err == services.ErrUntrustedIssuer {
+			errCode = "invalid_grant"
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             errCode,
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	// ── 4. Resolve target resource server.
+	resourceParam := c.PostForm("resource")
+	if resourceParam == "" {
+		inferred, iErr := ctrl.service.InferSingleResourceURIForClient(agentClient)
+		if iErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_target",
+				"error_description": "resource parameter required",
+			})
+			return
+		}
+		resourceParam = inferred
+	}
+	rs, err := ctrl.rsService.GetByResourceURI(resourceParam)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_target",
+			"error_description": "unknown resource",
+		})
+		return
+	}
+
+	// ── 5. §19 same-domain rejection — issuance workspace == target workspace.
+	if idjagClaims.IssuanceWorkspaceID != nil && *idjagClaims.IssuanceWorkspaceID == rs.WorkspaceID {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_grant",
+			"error_description": services.ErrSameDomainXAA.Error(),
+		})
+		return
+	}
+
+	// ── 6. mapSubject FIRST: resolve / JIT-provision the local user before any
+	// access_request is written, so every pending row carries the real subject.
+	// (Journey B: "login worked" precedes the approval/RBAC gates; writing a
+	// uuid.Nil placeholder here would collapse distinct users into one pending
+	// row under the (ws,rs,subject_type,subject_id,client) partial-unique index,
+	// destroying provenance and letting one user's approval satisfy another's.)
+	localUserID, err := ctrl.xaaService.MapSubject(ctx, idjagClaims.Subject, trustedIssuer, rs.WorkspaceID)
+	if err != nil {
+		log.Printf("[XAA] tokenJWTBearerGrant: mapSubject failed sub=%s ws=%s: %v", idjagClaims.Subject, rs.WorkspaceID, err)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	// ── 7. Read-only brokering gate: client must be approved for this RS.
+	approved, err := ctrl.service.CheckClientApprovedForRS(ctx, agentClient.ID, rs.ID)
+	if err != nil {
+		log.Printf("[XAA] tokenJWTBearerGrant: approval check error client=%s: %v", agentClient.ClientID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	// RFC 9396 authorization_details (raw RAR JSON), preserved on the access
+	// request so the admin approves with the full structured payload, not just
+	// a scope string (finding #2). Empty when the request carries no RAR.
+	authzDetails := c.PostForm("authorization_details")
+	if !approved {
+		// Upsert a pending access_request keyed to the REAL subject so the admin
+		// queue shows who is waiting and approvals don't bleed across users.
+		scopes := strings.Join(strings.Fields(c.PostForm("scope")), " ")
+		reqID, _ := ctrl.service.UpsertAccessRequest(
+			ctx, rs.WorkspaceID, rs.ID,
+			"user", localUserID,
+			agentClient.ClientID, scopes,
+			authzDetails, nil,
+		)
+		log.Printf("[XAA] tokenJWTBearerGrant: client not approved, access_request=%s user=%s", reqID, localUserID)
+		ctrl.service.NotifyAdminsOfPendingAccessRequest(
+			rs.WorkspaceID, rs.ID, reqID,
+			agentClient.ClientID, scopes,
+			time.Now().UTC().Add(7*24*time.Hour), false,
+		)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "access_pending",
+			"request_id":        reqID.String(),
+			"status_url":        selfIssuer + "/oauth/access-requests/" + reqID.String(),
+		})
+		return
+	}
+
+	// ── 8. Resolve scopes via RBAC (user principal acting via agent).
+	requestedScopes := strings.Fields(c.PostForm("scope"))
+	principal := tokens.Principal{
+		SubjectType: tokens.SubjectTypeUser,
+		SubjectID:   localUserID,
+		WorkspaceID: rs.WorkspaceID,
+	}
+	grantedScopes, err := ctrl.scopeResolver.ResolvePrincipalEffectiveScopes(
+		ctx, principal, rs.ID.String(), requestedScopes, rs, agentClient,
+	)
+	if err != nil {
+		log.Printf("[XAA] tokenJWTBearerGrant: scope resolution failed user=%s: %v", localUserID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	if len(grantedScopes) == 0 {
+		// RBAC resolved to zero scopes — upsert access_request with known subject.
+		scopeStr := strings.Join(requestedScopes, " ")
+		reqID, _ := ctrl.service.UpsertAccessRequest(
+			ctx, rs.WorkspaceID, rs.ID,
+			"user", localUserID,
+			agentClient.ClientID, scopeStr,
+			authzDetails, nil,
+		)
+		ctrl.service.NotifyAdminsOfPendingAccessRequest(
+			rs.WorkspaceID, rs.ID, reqID,
+			agentClient.ClientID, scopeStr,
+			time.Now().UTC().Add(7*24*time.Hour), false,
+		)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "access_pending",
+			"request_id":        reqID.String(),
+			"status_url":        selfIssuer + "/oauth/access-requests/" + reqID.String(),
+		})
+		return
+	}
+
+	// ── 9. PDP gate (shadow/enforce).
+	if ctrl.evalPDP(ctx, policy.PolicyRequest{
+		WorkspaceID:      rs.WorkspaceID,
+		ClientID:         agentClient.ClientID,
+		SubjectType:      "user",
+		SubjectID:        localUserID,
+		ResourceServerID: rs.ID,
+		TokenFamily:      "xaa",
+		RequestedScopes:  strings.Join(requestedScopes, " "),
+	}, strings.Join(grantedScopes, " ")) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "policy denied this request",
+		})
+		return
+	}
+
+	// ── 10. Mint a native XAA token; replay guard is atomic in the issuance tx.
+	actClientID := agentClient.ClientID
+	nativeClaims := tokens.NativeClaims{
+		Family:           models.TokenFamilyXAA,
+		WorkspaceID:      rs.WorkspaceID,
+		SubjectType:      tokens.SubjectTypeUser,
+		SubjectID:        localUserID,
+		ClientID:         agentClient.ClientID,
+		ActorClientID:    &actClientID,
+		ResourceServerID: rs.ID,
+		Audience:         rs.ResourceURI,
+		Scope:            strings.Join(grantedScopes, " "),
+		SourceGrantJTI:   &idjagClaims.JTI,
+		TTL:              time.Hour,
+	}
+	replayHook := services.IDJAGReplayInsert(config.DB, idjagClaims.Issuer, idjagClaims.JTI, idjagClaims.ExpiresAt)
+	tokenStr, jti, err := ctrl.nativeIssuer.Issue(ctx, nativeClaims, replayHook)
+	if err != nil {
+		if err == services.ErrIDJAGReplayed {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": services.ErrIDJAGReplayed.Error(),
+			})
+			return
+		}
+		log.Printf("[XAA] tokenJWTBearerGrant: issue failed user=%s: %v", localUserID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+
+	log.Printf("[XAA] tokenJWTBearerGrant: issued jti=%s user=%s client=%s rs=%s scopes=%q",
+		jti, localUserID, agentClient.ClientID, rs.ID, nativeClaims.Scope)
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token": tokenStr,
+		"token_type":   "Bearer",
+		"expires_in":   int(time.Hour.Seconds()),
+		"scope":        nativeClaims.Scope,
+	})
+}
+
+// tokenExchangeGrant handles RFC 8693 token exchange for ID-JAG issuance
+// (draft-ietf-oauth-identity-assertion-authz-grant-04).
+//
+// Flow:
+//  1. XAAIssuance flag guard.
+//  2. requested_token_type must be urn:ietf:params:oauth:token-type:id-jag.
+//  3. subject_token verified → extract (sub=user, workspace_id, issuing client_id).
+//  4. Client binding: issuing client_id must match the authenticated client.
+//  5. Issuance brokering gate (a2a_brokering_policies side='issuance').
+//  6. Mint ID-JAG via NativeIssuer.IssueIDJAG — NOT stored in native_tokens.
+//  7. RFC 8693 response: issued_token_type, access_token, token_type:"N_A", expires_in.
+func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
+	ctx := c.Request.Context()
+
+	// ── 1. Flag guard.
+	if config.AppConfig == nil || !config.AppConfig.XAAIssuance {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "unsupported_grant_type",
+			"error_description": "token-exchange (ID-JAG issuance) is not enabled",
+		})
+		return
+	}
+
+	// ── 2. requested_token_type check.
+	requestedType := c.PostForm("requested_token_type")
+	if requestedType != tokens.IDJAGTokenType {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "requested_token_type must be " + tokens.IDJAGTokenType,
+		})
+		return
+	}
+
+	// ── 3. Verify subject_token — extracts (sub, workspace_id, client_id).
+	subjectToken := c.PostForm("subject_token")
+	if subjectToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "subject_token parameter required",
+		})
+		return
+	}
+
+	type subjectCtx struct {
+		UserID      uuid.UUID
+		WorkspaceID uuid.UUID
+		ClientID    string
+	}
+
+	var subject subjectCtx
+	cls := tokens.Classify(subjectToken, tokens.NativeKeys().NativeKeyIDs())
+	if cls.Family == tokens.FamilyNative {
+		// Native token path: verify signature, look up native_tokens row.
+		pub, ok := tokens.NativeKeys().PublicKeyForKID(cls.Kid)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token has unknown native kid",
+			})
+			return
+		}
+		nativeClaims := jwt.MapClaims{}
+		parsed, perr := jwt.ParseWithClaims(subjectToken, nativeClaims, func(t *jwt.Token) (interface{}, error) {
+			if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
+				return nil, fmt.Errorf("unexpected alg %s", t.Method.Alg())
+			}
+			return pub, nil
+		})
+		if perr != nil || !parsed.Valid {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token signature/claims invalid",
+			})
+			return
+		}
+		jti, _ := nativeClaims["jti"].(string)
+		row, lerr := tokens.LookupNativeToken(ctx, config.DB, jti)
+		if lerr != nil || row == nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token not found or already revoked",
+			})
+			return
+		}
+		// Check revocation.
+		issuerURL := config.AppConfig.OAuthBaseURL()
+		if rev, _ := tokens.IsRevoked(ctx, config.DB, issuerURL, "access_token", jti); rev {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token has been revoked",
+			})
+			return
+		}
+		if row.SubjectType != "user" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token must carry a user subject for ID-JAG issuance",
+			})
+			return
+		}
+		subject = subjectCtx{
+			UserID:      row.SubjectID,
+			WorkspaceID: row.WorkspaceID,
+			ClientID:    row.ClientID,
+		}
+	} else {
+		// Hydra token path: use admin introspect.
+		tokenInfo, ierr := ctrl.service.IntrospectViaHydraAdmin(subjectToken)
+		if ierr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token introspection failed",
+			})
+			return
+		}
+		active, _ := tokenInfo["active"].(bool)
+		if !active {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token is not active",
+			})
+			return
+		}
+		subStr, _ := tokenInfo["sub"].(string)
+		wsStr, _ := tokenInfo["workspace_id"].(string)
+		clientIDStr, _ := tokenInfo["client_id"].(string)
+		subjectUserID, uerr := uuid.Parse(subStr)
+		workspaceID, werr := uuid.Parse(wsStr)
+		if uerr != nil || werr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "subject_token missing sub or workspace_id",
+			})
+			return
+		}
+		subject = subjectCtx{
+			UserID:      subjectUserID,
+			WorkspaceID: workspaceID,
+			ClientID:    clientIDStr,
+		}
+	}
+
+	// ── 4. Client binding: the authenticated client must match the subject_token's client.
+	if subject.ClientID != oauthClient.ClientID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "access_denied",
+			"error_description": "authenticated client does not match subject_token client",
+		})
+		return
+	}
+
+	// ── 5. Issuance brokering gate (a2a_brokering_policies side='issuance').
+	// Explicit-deny-wins: any deny row for (workspace, client) blocks issuance.
+	// No matching row = permit (ownership of a valid subject_token is sufficient consent).
+	type brokeringRow struct{ Effect string }
+	var brokeringRows []brokeringRow
+	config.DB.WithContext(ctx).Raw(`
+		SELECT effect FROM a2a_brokering_policies
+		WHERE workspace_id = ? AND side = 'issuance'
+		  AND (client_id IS NULL OR client_id = ?)`,
+		subject.WorkspaceID, oauthClient.ClientID,
+	).Scan(&brokeringRows)
+	for _, br := range brokeringRows {
+		if br.Effect == "deny" {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "ID-JAG issuance is not permitted for this client in this workspace",
+			})
+			return
+		}
+	}
+
+	// ── 6. Determine target issuer (audience for the ID-JAG).
+	// Default to this AS's own issuer (cross-workspace same-AS scenario).
+	targetIssuer := c.PostForm("audience")
+	selfIssuer := config.AppConfig.OAuthBaseURL()
+	if targetIssuer == "" {
+		targetIssuer = selfIssuer
+	}
+
+	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
+	idjagClaims := tokens.IDJAGClaims{
+		WorkspaceID:  subject.WorkspaceID,
+		SubjectID:    subject.UserID,
+		ClientID:     oauthClient.ClientID,
+		TargetIssuer: targetIssuer,
+	}
+	tokenStr, jti, err := ctrl.nativeIssuer.IssueIDJAG(ctx, idjagClaims)
+	if err != nil {
+		log.Printf("[ISSUANCE] tokenExchangeGrant: IssueIDJAG failed user=%s: %v", subject.UserID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+
+	log.Printf("[ISSUANCE] tokenExchangeGrant: issued id-jag jti=%s user=%s client=%s ws=%s",
+		jti, subject.UserID, oauthClient.ClientID, subject.WorkspaceID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"issued_token_type": tokens.IDJAGTokenType,
+		"access_token":      tokenStr,
+		"token_type":        "N_A",
+		"expires_in":        int(tokens.IDJAGTLL.Seconds()),
+	})
+}
+
+// BackchannelAuthorize is the OIDC CIBA backchannel authorization endpoint
+// (POST /oauth/bc-authorize). Unlike the legacy workspace-plane /ciba/initiate
+// (which takes client_id in the body), this standards endpoint resolves the
+// client from client authentication, so SDK callers never hand-craft a
+// client_id. It maps onto the workspace-plane InitiateTenantCIBAAuth and
+// returns the standard CIBA response (auth_req_id, expires_in, interval).
+//
+// Gated on XAA_CIBA. Delivery mode is poll-only (matches AS metadata).
+func (ctrl *OAuthASController) BackchannelAuthorize(c *gin.Context) {
+	if config.AppConfig == nil || !config.AppConfig.XAACiba || ctrl.cibaService == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "unsupported_grant_type",
+			"error_description": "CIBA is not enabled on this authorization server",
+		})
+		return
+	}
+
+	if c.Request.PostForm == nil {
+		c.Request.ParseForm()
+	}
+	ctx := c.Request.Context()
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+
+	// Resolve + authenticate the client from credentials (not a body field).
+	client, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	// login_hint carries the user identifier (email) per OIDC CIBA.
+	loginHint := strings.TrimSpace(c.PostForm("login_hint"))
+	if loginHint == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "login_hint is required",
+		})
+		return
+	}
+
+	resp, err := ctrl.cibaService.InitiateTenantCIBAAuth(&models.TenantCIBAInitiateRequest{
+		ClientID:       client.ClientID,
+		Email:          loginHint,
+		BindingMessage: c.PostForm("binding_message"),
+		Scopes:         strings.Fields(c.PostForm("scope")),
+		Resource:       c.PostForm("resource"),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	if resp.Error != "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             resp.Error,
+			"error_description": resp.ErrorDescription,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"auth_req_id": resp.AuthReqID,
+		"expires_in":  resp.ExpiresIn,
+		"interval":    resp.Interval,
+	})
+}
+
+// tokenCIBAGrant handles the CIBA token poll on /oauth/token
+// (grant_type=urn:openid:params:grant-type:ciba). The client authenticates and
+// polls with auth_req_id; the handler maps onto the workspace-plane poll and
+// returns either a native RS-bearer token (tf=ciba when XAA_CIBA on) or the
+// standard CIBA pending/terminal error (authorization_pending, access_denied,
+// expired_token).
+func (ctrl *OAuthASController) tokenCIBAGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
+	if config.AppConfig == nil || !config.AppConfig.XAACiba || ctrl.cibaService == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "unsupported_grant_type",
+			"error_description": "CIBA is not enabled on this authorization server",
+		})
+		return
+	}
+	ctx := c.Request.Context()
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+
+	// Authenticate the polling client confidentially.
+	client, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	authReqID := strings.TrimSpace(c.PostForm("auth_req_id"))
+	if authReqID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "auth_req_id is required",
+		})
+		return
+	}
+
+	resp, err := ctrl.cibaService.PollTenantCIBAToken(&models.TenantCIBATokenRequest{
+		AuthReqID: authReqID,
+		ClientID:  client.ClientID,
+		Resource:  c.PostForm("resource"),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+	if resp.Error != "" {
+		// authorization_pending / slow_down are 400 per RFC; map terminal ones too.
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             resp.Error,
+			"error_description": resp.ErrorDescription,
+		})
+		return
+	}
+
+	out := gin.H{
+		"access_token": resp.AccessToken,
+		"token_type":   resp.TokenType,
+		"expires_in":   resp.ExpiresIn,
+	}
+	if resp.Scope != "" {
+		out["scope"] = resp.Scope
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// RequesterBootstrapTarget is one RS entry in the bootstrap bundle (Appendix §4).
+type RequesterBootstrapTarget struct {
+	ResourceServerID   string                 `json:"resource_server_id"`
+	Resource           string                 `json:"resource"`
+	WorkspaceID        string                 `json:"workspace_id"`
+	Relationship       string                 `json:"relationship"`        // "same_workspace" | "cross_workspace"
+	RecommendedFlow    string                 `json:"recommended_flow"`    // "direct" | "id_jag"
+	RegistrationStatus string                 `json:"registration_status"` // "approved" | "pending_approval" | "revoked" | "none"
+	AccessStatus       string                 `json:"access_status"`       // "granted" | "pending" | "denied" | "none"
+	ScopesSupported    []string               `json:"scopes_supported"`
+	PRM                map[string]interface{} `json:"prm"`
+}
+
+// RequesterBootstrapPending is one open access request in the bundle.
+type RequesterBootstrapPending struct {
+	RequestID        string `json:"request_id"`
+	ResourceServerID string `json:"resource_server_id"`
+	Status           string `json:"status"`
+	ExpiresAt        string `json:"expires_at,omitempty"`
+}
+
+// RequesterBootstrap returns the launch bundle for a client-authenticated
+// requester SDK (Appendix §4). The client authenticates itself (same as
+// /oauth/token client_credentials) and receives:
+//   - one target per RS it is registered for, PLUS first-contact targets for any
+//     `resource` it names that it isn't yet registered for (so an unbound client
+//     learns where to request access);
+//   - recommended_flow: a CLIENT-LEVEL recommendation derived from the client's
+//     resolved workspace context (service-account workspace ∪ approved-registration
+//     workspaces) vs the RS workspace — NOT the mutable home_workspace_id. Caveat:
+//     bootstrap is client-authenticated and does not know which human user will
+//     later arrive on the ID-JAG/browser path, so for XAA this is a hint, not a
+//     per-user determination. The §19 same-domain check at redemption is the
+//     authoritative backstop if the recommendation and the acting user disagree;
+//   - per-target access_status, a top-level pending[] of open access requests,
+//     and a content-hashed metadata_version for drift detection.
+//
+// GET and POST. POST is preferred for private_key_jwt (assertion in body). On GET
+// a client_assertion in the query string is REJECTED (query-string JWTs leak),
+// so GET is for header-credential auth (client_secret_basic) only.
+func (ctrl *OAuthASController) RequesterBootstrap(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	if config.AppConfig == nil || !config.AppConfig.XAAIssuance {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		return
+	}
+
+	if c.Request.Method == http.MethodGet && c.Request.URL.Query().Get("client_assertion") != "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "client_assertion must not be sent in the query string; use POST (assertion in body) or client_secret_basic",
+		})
+		return
+	}
+
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	client, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": err.Error(),
+		})
+		return
+	}
+
+	issuerURL := config.AppConfig.OAuthBaseURL()
+
+	// ── Registrations for this client.
+	var regs []models.ResourceServerClientRegistration
+	if err := config.DB.WithContext(ctx).
+		Where("oauth_client_id = ?", client.ID).
+		Find(&regs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+		return
+	}
+
+	// ── Resolved requester workspace context (NOT home_workspace_id authority):
+	// the service-account workspace(s) this client backs, plus the workspaces it
+	// already holds an approved registration in. A target is "same_workspace" iff
+	// its workspace is in this set.
+	requesterWorkspaces := map[uuid.UUID]bool{}
+	var saWs []uuid.UUID
+	config.DB.WithContext(ctx).
+		Raw(`SELECT workspace_id FROM service_accounts WHERE oauth_client_id = ?`, client.ID).
+		Scan(&saWs)
+	for _, w := range saWs {
+		requesterWorkspaces[w] = true
+	}
+	regByRS := make(map[uuid.UUID]models.ResourceServerClientRegistration, len(regs))
+	for _, reg := range regs {
+		regByRS[reg.ResourceServerID] = reg
+		if reg.Status == models.ClientRegStatusApproved {
+			requesterWorkspaces[reg.WorkspaceID] = true
+		}
+	}
+
+	// ── access_requests for this client → per-RS aggregate + pending[] list.
+	var ars []models.AccessRequest
+	config.DB.WithContext(ctx).
+		Where("requested_by_client = ?", client.ClientID).
+		Find(&ars)
+	// Only the in-flight signals matter here; access_requests.approved is NOT
+	// tracked because it is never grant authority (see accessStatus below).
+	type arAgg struct{ pending, denied bool }
+	arByRS := map[uuid.UUID]*arAgg{}
+	pending := make([]RequesterBootstrapPending, 0)
+	for _, ar := range ars {
+		agg := arByRS[ar.ResourceServerID]
+		if agg == nil {
+			agg = &arAgg{}
+			arByRS[ar.ResourceServerID] = agg
+		}
+		switch ar.Status {
+		case "pending":
+			agg.pending = true
+			p := RequesterBootstrapPending{
+				RequestID:        ar.ID.String(),
+				ResourceServerID: ar.ResourceServerID.String(),
+				Status:           ar.Status,
+			}
+			if ar.ExpiresAt != nil {
+				p.ExpiresAt = ar.ExpiresAt.UTC().Format(time.RFC3339)
+			}
+			pending = append(pending, p)
+		case "denied":
+			agg.denied = true
+		}
+	}
+
+	// accessStatus folds the coordination record into the §4 enum. "granted"
+	// comes from LIVE authority only — an approved client↔RS registration — and
+	// NEVER from access_requests.approved, which is a coordination record, not a
+	// grant (a stale approved request must not survive a revoked registration or
+	// removed RBAC). access_requests only contributes the in-flight signals:
+	// a live pending wins (a re-request must not be hidden by a past denial),
+	// then a live registration grant, then a recorded denial, else none.
+	// NB: "granted" reflects the CONNECTION-level grant; per-subject scopes are
+	// resolved at token time (decision #1), so the SDK still confirms scopes then.
+	accessStatus := func(rsID uuid.UUID, regApproved bool) string {
+		agg := arByRS[rsID]
+		switch {
+		case agg != nil && agg.pending:
+			return "pending"
+		case regApproved:
+			return "granted"
+		case agg != nil && agg.denied:
+			return "denied"
+		default:
+			return "none"
+		}
+	}
+
+	buildTarget := func(rs *models.ResourceServer, regStatus string) RequesterBootstrapTarget {
+		regApproved := regStatus == models.ClientRegStatusApproved
+		relationship := "cross_workspace"
+		flow := "id_jag"
+		if requesterWorkspaces[rs.WorkspaceID] {
+			relationship = "same_workspace"
+			if regApproved {
+				flow = "direct"
+			}
+		}
+		// Capability disclosure rule: only reveal scopes_supported once the client
+		// is actually registered for the RS. First-contact ("none") targets get an
+		// empty list so a client can't enumerate any RS's scope surface just by
+		// naming its resource_uri — it learns the scopes after approval.
+		scopesSupported := []string{}
+		if regStatus != "none" {
+			scopesSupported = []string(rs.ScopesSupported)
+		}
+		return RequesterBootstrapTarget{
+			ResourceServerID:   rs.ID.String(),
+			Resource:           rs.ResourceURI,
+			WorkspaceID:        rs.WorkspaceID.String(),
+			Relationship:       relationship,
+			RecommendedFlow:    flow,
+			RegistrationStatus: regStatus,
+			AccessStatus:       accessStatus(rs.ID, regApproved),
+			ScopesSupported:    scopesSupported,
+			// PRM is owned and served by the resource server (RFC 9728); AuthSec
+			// only names the source. The SDK fetches the RS's own PRM document.
+			PRM: map[string]interface{}{"source": "resource_server"},
+		}
+	}
+
+	targets := make([]RequesterBootstrapTarget, 0, len(regs)+2)
+	covered := map[uuid.UUID]bool{}
+	for _, reg := range regs {
+		rs, rsErr := ctrl.rsService.GetByID(reg.ResourceServerID.String())
+		if rsErr != nil || rs == nil || !rs.Active {
+			continue
+		}
+		covered[rs.ID] = true
+		targets = append(targets, buildTarget(rs, reg.Status))
+	}
+
+	// ── First-contact: surface any `resource` the caller names that it isn't
+	// registered for yet, as a target with registration_status="none" so the SDK
+	// can route through ID-JAG + approval instead of getting an empty bundle.
+	requested := append(c.QueryArray("resource"), c.PostFormArray("resource")...)
+	seenResource := map[string]bool{}
+	for _, resURI := range requested {
+		if resURI == "" || seenResource[resURI] {
+			continue
+		}
+		seenResource[resURI] = true
+		rs, rsErr := ctrl.rsService.GetByResourceURI(resURI)
+		if rsErr != nil || rs == nil || !rs.Active || covered[rs.ID] {
+			continue
+		}
+		covered[rs.ID] = true
+		targets = append(targets, buildTarget(rs, "none"))
+	}
+
+	// ── Content-hashed metadata_version (drift detection): changes whenever the
+	// client metadata or any target's registration/access status changes.
+	sortedKeys := make([]string, 0, len(targets))
+	for _, t := range targets {
+		sortedKeys = append(sortedKeys, t.ResourceServerID+":"+t.RegistrationStatus+":"+t.AccessStatus)
+	}
+	sort.Strings(sortedKeys)
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d", client.UpdatedAt.Unix())
+	for _, k := range sortedKeys {
+		fmt.Fprintf(h, "|%s", k)
+	}
+	metadataVersion := fmt.Sprintf("%x", h.Sum64())
+
+	c.JSON(http.StatusOK, gin.H{
+		"client": gin.H{
+			"client_id":   client.ClientID,
+			"client_kind": client.ClientKind,
+			// home_workspace_id is a hint only — recommended_flow is derived from
+			// the resolved workspace context above, not this field.
+			"home_workspace_id": client.HomeWorkspaceID,
+		},
+		"issuer":           issuerURL,
+		"as_metadata_url":  issuerURL + "/.well-known/oauth-authorization-server",
+		"metadata_version": metadataVersion,
+		"targets":          targets,
+		"pending":          pending,
+	})
 }
 
 // Register handles Dynamic Client Registration (RFC 7591).
@@ -1023,6 +2031,16 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		return
 	}
 
+	// Forgery-safe classification (§1): a token bearing a native kid commits to
+	// the native validation path and NEVER falls back to Hydra. Everything else
+	// (opaque/JWT-with-other-kid/unparseable) takes the existing Hydra path.
+	if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+		if cls := tokens.Classify(token, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
+			ctrl.introspectNative(c, token, cls.Kid, rs)
+			return
+		}
+	}
+
 	tokenInfo, err := ctrl.service.IntrospectViaHydraAdmin(token)
 	if err != nil {
 		log.Printf("[MCP_AUTH] Introspect: Hydra admin introspection error rs=%s: %v", rs.ResourceURI, err)
@@ -1163,6 +2181,147 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 	c.JSON(http.StatusOK, tokenInfo)
 }
 
+// introspectNative is the native (NativeSealer) introspection path. A native-kid
+// token is validated here or rejected — it is NEVER retried on Hydra (§1, §3).
+// The JWT proves signature + jti; the native_tokens row is the authoritative
+// source for workspace/subject/rs/family/scope. We additionally enforce the same
+// registration gate as the Hydra path and re-resolve live RBAC, normalizing to
+// the identical RS-facing shape (only ext.* varies by family).
+func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid string, rs *models.ResourceServer) {
+	inactive := func(reason string) {
+		log.Printf("[MCP_AUTH] introspectNative: inactive rs=%s: %s", rs.ResourceURI, reason)
+		c.JSON(http.StatusOK, gin.H{"active": false})
+	}
+
+	pub, ok := tokens.NativeKeys().PublicKeyForKID(kid)
+	if !ok {
+		inactive("unknown native kid")
+		return
+	}
+	claims := jwt.MapClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
+			return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
+		}
+		return pub, nil
+	})
+	if err != nil || parsed == nil || !parsed.Valid {
+		// Bad signature / expired / malformed → active:false. No Hydra fallback.
+		inactive("signature/claims invalid")
+		return
+	}
+
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		inactive("no jti")
+		return
+	}
+
+	ctx := c.Request.Context()
+	row, err := tokens.LookupNativeToken(ctx, config.DB, jti)
+	if err != nil {
+		inactive("native_tokens lookup error")
+		return
+	}
+	if row == nil {
+		inactive("no native_tokens row for jti")
+		return
+	}
+
+	// Revocation source of truth.
+	revoked, err := tokens.IsRevoked(ctx, config.DB, row.Iss, models.RevokedKindAccessToken, jti)
+	if err != nil || revoked {
+		inactive("revoked")
+		return
+	}
+	if time.Now().After(row.ExpiresAt) {
+		inactive("expired (row)")
+		return
+	}
+	if row.Aud != rs.ResourceURI {
+		inactive("audience mismatch")
+		return
+	}
+
+	// Registration gate (parity with the Hydra path): revoking the client's
+	// (resource_server, client) approval must kill still-live native tokens.
+	mcpClient, lookupErr := ctrl.service.GetMCPOAuthClientByClientID(row.ClientID)
+	if lookupErr != nil {
+		inactive("no AuthSec client for client_id")
+		return
+	}
+	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, mcpClient.ID)
+	if regErr != nil || reg.Status != "approved" {
+		inactive("client registration not approved")
+		return
+	}
+
+	// Live scope re-resolution + strict-subset (mirrors the Hydra path).
+	storedScopes := strings.Fields(row.Scope)
+	oidcScopes, rsScopes := services.PartitionScopes(storedScopes)
+	var finalScopes []string
+	if len(rsScopes) > 0 {
+		// Live RBAC re-resolution + strict-subset for BOTH families, via the
+		// Principal dispatcher. A disabled service account or a removed role
+		// binding yields zero effective scopes, so a still-live M2M token flips
+		// to active:false at the next introspection — same revoke-on-introspect
+		// guarantee the user/XAA path already has.
+		principal := tokens.Principal{
+			SubjectType: row.SubjectType,
+			SubjectID:   row.SubjectID,
+			WorkspaceID: row.WorkspaceID,
+		}
+		currentRS, rbacErr := ctrl.scopeResolver.ResolvePrincipalEffectiveScopes(
+			ctx, principal, rs.ID.String(), rsScopes, rs, nil,
+		)
+		if rbacErr != nil || len(currentRS) == 0 {
+			inactive("RBAC revoked all RS scopes")
+			return
+		}
+		if lost := services.ScopesLost(rsScopes, currentRS); len(lost) > 0 {
+			inactive("partial RS scope loss")
+			return
+		}
+		finalScopes = append(oidcScopes, currentRS...)
+	} else {
+		finalScopes = oidcScopes
+	}
+	if len(finalScopes) == 0 {
+		inactive("no scopes after enforcement")
+		return
+	}
+
+	ext := gin.H{
+		"workspace_id":       row.WorkspaceID.String(),
+		"resource_server_id": rs.ID.String(),
+		"token_family":       row.TokenFamily,
+	}
+	if row.ActorClientID != nil {
+		ext["act"] = gin.H{"client_id": *row.ActorClientID, "spiffe_id": row.ActorSpiffeID}
+	}
+	if row.SourceGrantJTI != nil {
+		ext["id_jag_jti"] = *row.SourceGrantJTI
+	}
+
+	resp := gin.H{
+		"active":    true,
+		"sub":       row.SubjectID.String(),
+		"client_id": row.ClientID,
+		"aud":       []string{row.Aud},
+		"scope":     strings.Join(finalScopes, " "),
+		"ext":       ext,
+	}
+	if exp, ok := claims["exp"].(float64); ok {
+		resp["exp"] = int64(exp)
+	}
+	if iat, ok := claims["iat"].(float64); ok {
+		resp["iat"] = int64(iat)
+	}
+	log.Printf("[MCP_AUTH] introspectNative: active=true family=%s sub=%s rs=%s scopes=%v",
+		row.TokenFamily, row.SubjectID, rs.ResourceURI, finalScopes)
+	c.JSON(http.StatusOK, resp)
+}
+
 // JWKS serves the cached Hydra JWKS.
 // GET /oauth/jwks
 func (ctrl *OAuthASController) JWKS(c *gin.Context) {
@@ -1192,6 +2351,17 @@ func (ctrl *OAuthASController) Userinfo(c *gin.Context) {
 		return
 	}
 	token := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Native tokens are not userinfo subjects in Phase 0: M2M has no user, and
+	// XAA/CIBA userinfo (gated on `openid`) lands with those families. A native
+	// kid here is rejected — never introspected against Hydra (§1, specifics (d)).
+	if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+		if cls := tokens.Classify(token, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
+			c.Header("WWW-Authenticate", `Bearer error="invalid_token"`)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+			return
+		}
+	}
 
 	// 2. Introspect via Hydra admin
 	tokenInfo, err := ctrl.service.IntrospectViaHydraAdmin(token)
@@ -1618,6 +2788,15 @@ func (ctrl *OAuthASController) Revoke(c *gin.Context) {
 		c.Request.ParseForm()
 	}
 
+	// Native-family dispatch (§1): a native-kid token is revoked in
+	// revoked_tokens (source of truth) and never proxied to Hydra.
+	if token := c.PostForm("token"); token != "" && config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+		if cls := tokens.Classify(token, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
+			ctrl.revokeNative(c, token, cls.Kid)
+			return
+		}
+	}
+
 	clientID := c.PostForm("client_id")
 	if clientID != "" {
 		oauthClient, err := ctrl.service.GetOAuthClient(clientID)
@@ -1627,6 +2806,44 @@ func (ctrl *OAuthASController) Revoke(c *gin.Context) {
 	}
 
 	ctrl.service.ProxyFormToHydraPublic("/oauth2/revoke", c.Request.PostForm, c.Request.Header, c.Writer)
+}
+
+// revokeNative records a native access-token revocation in revoked_tokens.
+// Per RFC 7009 the endpoint returns 200 regardless of whether the token was
+// valid or known — we only persist a revocation for a verifiably-signed token.
+func (ctrl *OAuthASController) revokeNative(c *gin.Context, token, kid string) {
+	if pub, ok := tokens.NativeKeys().PublicKeyForKID(kid); ok {
+		claims := jwt.MapClaims{}
+		parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
+			if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
+				return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
+			}
+			return pub, nil
+		})
+		// Allow revoking an already-expired token too (jwt marks it invalid):
+		// extract jti/iss/exp from claims regardless of the validity error, as
+		// long as the signature itself verified.
+		if parsed != nil {
+			jti, _ := claims["jti"].(string)
+			iss, _ := claims["iss"].(string)
+			exp := time.Now().Add(24 * time.Hour)
+			if e, ok := claims["exp"].(float64); ok {
+				exp = time.Unix(int64(e), 0)
+			}
+			if jti != "" && iss != "" && (err == nil || parsed.Valid || isExpiryOnlyError(err)) {
+				if rerr := tokens.RevokeAccessToken(c.Request.Context(), config.DB, iss, jti, "oauth_revoke", exp); rerr != nil {
+					log.Printf("[MCP_AUTH] revokeNative: revoke failed jti=%s: %v", jti, rerr)
+				}
+			}
+		}
+	}
+	c.Status(http.StatusOK)
+}
+
+// isExpiryOnlyError reports whether a jwt parse error is solely token expiry
+// (signature was valid) — we still allow revoking such a token.
+func isExpiryOnlyError(err error) bool {
+	return errors.Is(err, jwt.ErrTokenExpired)
 }
 
 // --- Helpers ---
@@ -1840,6 +3057,39 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+// AccessRequestStatus returns the current status of an access_request by ID.
+// This is the requester-facing status-poll endpoint (Journey B, §5). No auth
+// is required — the request ID is a capability token; it doesn't reveal anything
+// about other requests. Returns status, expires_at, and reason if denied.
+func (ctrl *OAuthASController) AccessRequestStatus(c *gin.Context) {
+	reqID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request id"})
+		return
+	}
+
+	var req models.AccessRequest
+	if err := config.DB.WithContext(c.Request.Context()).
+		Where("id = ?", reqID).First(&req).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "access request not found"})
+		return
+	}
+
+	resp := gin.H{
+		"id":         req.ID.String(),
+		"status":     req.Status,
+		"created_at": req.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at": req.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if req.ExpiresAt != nil {
+		resp["expires_at"] = req.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	if req.Reason != nil {
+		resp["reason"] = *req.Reason
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (ctrl *OAuthASController) requireAuthenticatedUserContext(c *gin.Context) (uuid.UUID, uuid.UUID, error) {

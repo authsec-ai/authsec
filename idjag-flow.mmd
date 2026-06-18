@@ -1,0 +1,52 @@
+sequenceDiagram
+    autonumber
+    participant Agent as "Requesting Agent"
+    participant TK as "/oauth/token<br>Token() oauth_as_controller.go:289"
+    participant REG as "trusted_issuers<br>registry (new)"
+    participant VAL as "ID-JAG validator<br>revoked_jti (new)"
+    participant PDP as "Brokering PDP<br>a2a_brokering_policies"
+    participant SR as "ScopeResolver<br>scope_resolver.go:81"
+    participant NS as "NativeSealer<br>Vault keys + native_tokens"
+    participant INT as "/oauth/introspect<br>dispatcher :1003"
+    participant RS as "MCP Resource Server"
+
+    rect rgb(238,244,255)
+    Note over Agent,NS: A. Obtain ID-JAG - AuthSec as IdP
+    Agent->>TK: token-exchange: user ID token to ID-JAG
+    TK->>PDP: issuance check: may agent act for user at resource?
+    PDP-->>TK: allow
+    TK->>NS: seal ID-JAG: sub=user, aud=AuthSec, client_id=agent
+    NS-->>TK: ID-JAG
+    TK-->>Agent: short-lived ID-JAG
+    end
+
+    rect rgb(232,244,234)
+    Note over Agent,NS: B. Redeem ID-JAG to access token
+    Agent->>TK: jwt-bearer: assertion=ID-JAG, resource=RS, client auth
+    TK->>TK: authenticate client
+    TK->>TK: reject cnf unless DPoP enabled
+    TK->>VAL: validate ID-JAG
+    VAL->>REG: lookup issuer policy and JWKS
+    REG-->>VAL: keys and trust policy
+    VAL->>VAL: verify signature, typ, iss, aud, exp, iat, client_id, jti
+    VAL-->>TK: valid subject, client_id, jti
+    TK->>PDP: redemption check and BindClientToRS
+    PDP-->>TK: allow
+    TK->>TK: map subject to Principal user plus actor agent
+    TK->>SR: resolve scopes for Principal on RS
+    SR-->>TK: granted scopes
+    TK->>NS: assemble access token claims and seal
+    NS->>NS: sign with Vault key and record native_tokens jti
+    NS-->>TK: access_token
+    TK-->>Agent: short-lived access_token with audit envelope
+    end
+
+    rect rgb(255,247,238)
+    Note over Agent,RS: C. Call resource and introspect
+    Agent->>RS: MCP call with Bearer access_token
+    RS->>INT: POST /oauth/introspect using rs_id and secret
+    INT->>INT: classify native and verify signature
+    INT->>INT: check revoked_jti, live RBAC, and audience
+    INT-->>RS: active true with sub, client_id, aud, scope, act, id_jag_jti
+    RS-->>Agent: result
+    end

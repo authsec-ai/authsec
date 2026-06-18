@@ -1,0 +1,83 @@
+sequenceDiagram
+    autonumber
+    participant C as "Claude / MCP Client"
+    participant M as "Your MCP Server"
+    participant AS as "AuthSec OAuth Facade"
+    participant H as "Hydra"
+    participant L as "AuthSec Login / Consent"
+    participant I as "External IdP / Local Auth"
+
+    C->>M: POST /mcp tools/list
+    M-->>C: 401 WWW-Authenticate: Bearer resource_metadata=...
+
+    C->>M: GET /.well-known/oauth-protected-resource/mcp
+    M-->>C: resource, authorization_servers, scopes_supported
+
+    C->>AS: GET /.well-known/oauth-authorization-server
+    AS-->>C: authorize/token/register/introspect endpoints
+
+    opt Client not registered
+        C->>AS: POST /oauth/register
+        AS->>H: Create Hydra OAuth client
+        H-->>AS: Hydra client created
+        AS-->>C: client_id, registration_access_token
+    end
+
+    C->>AS: GET /oauth/authorize<br/>client_id, resource, scope, PKCE
+    AS->>AS: Validate client, resource, redirect_uri, scopes
+    AS->>AS: Store auth_request_context<br/>context_id, rs_id, workspace_id
+    AS-->>C: 302 redirect to Hydra /oauth2/auth<br/>with authsec_ctx
+
+    C->>H: GET /oauth2/auth
+    H-->>C: 302 redirect to AuthSec login<br/>login_challenge
+
+    C->>L: GET /authsec/hmgr/login/page-data<br/>login_challenge
+    L->>H: GET /admin/oauth2/auth/requests/login
+    H-->>L: login request details
+    L-->>C: login page data/providers
+
+    C->>I: User signs in
+    I-->>L: User identity verified
+
+    L->>H: PUT /admin/oauth2/auth/requests/login/accept<br/>subject + user context
+    H-->>L: redirect_to
+    L-->>C: Continue Hydra flow
+
+    C->>H: Follow Hydra continuation
+    H-->>C: 302 redirect to AuthSec consent<br/>consent_challenge
+
+    C->>L: GET /authsec/hmgr/consent<br/>consent_challenge
+    L->>H: GET /admin/oauth2/auth/requests/consent
+    H-->>L: consent request
+
+    L->>AS: Resolve scopes/RBAC/resource policy
+    AS-->>L: grantable scopes
+
+    C->>L: POST /authsec/hmgr/consent<br/>approved scopes
+    L->>H: PUT /admin/oauth2/auth/requests/consent/accept<br/>grant_scope, audience, session claims
+    H-->>L: redirect_to
+    L-->>C: Continue Hydra flow
+
+    C->>H: Follow Hydra continuation
+    H-->>C: 302 redirect to client callback<br/>code,state
+
+    C->>AS: POST /oauth/token<br/>code, client_id, verifier, resource
+    AS->>H: POST /oauth2/token
+    H-->>AS: access_token, refresh_token?, id_token?
+    AS->>H: POST /admin/oauth2/introspect<br/>access_token
+    H-->>AS: active, sub, aud, scope, ext.context_id
+    AS->>AS: Validate context/resource/client/RBAC
+    AS-->>C: access_token
+
+    C->>M: POST /mcp tools/call<br/>Authorization: Bearer access_token
+    M->>AS: POST /oauth/introspect<br/>Basic rs_id:introspection_secret
+    AS->>H: POST /admin/oauth2/introspect
+    H-->>AS: token claims
+    AS->>AS: Check audience, client registration, live RBAC
+    AS-->>M: active=true + scopes OR active=false
+
+    alt active=true and required scope present
+        M-->>C: MCP tool result
+    else inactive / missing scope
+        M-->>C: 401 or 403
+    end

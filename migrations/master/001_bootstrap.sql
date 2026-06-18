@@ -131,7 +131,8 @@ CREATE TABLE public.agent_action_decisions (
     reason text,
     biometric_verified boolean DEFAULT false,
     created_at bigint NOT NULL,
-    CONSTRAINT agent_action_decisions_pkey PRIMARY KEY (id)
+    CONSTRAINT agent_action_decisions_pkey PRIMARY KEY (id),
+    CONSTRAINT uq_agent_action_decision_per_user UNIQUE (action_request_id, approver_user_id)
 );
 
 CREATE TABLE public.agent_action_requests (
@@ -439,6 +440,10 @@ CREATE TABLE public.mcp_oauth_clients (
     -- pending_approval instead of approved. FK added in the constraints
     -- section below (workspaces is created later in this file).
     home_workspace_id      UUID,
+    -- Authoritative confidential-client state (specifics (g)). Runtime auth, metadata,
+    -- and the promotion endpoint read ONLY this array. Legacy token_endpoint_auth_method
+    -- + is_confidential become derived mirrors; nothing writes them directly.
+    allowed_token_endpoint_auth_methods text[] NOT NULL DEFAULT ARRAY['none'::text],
     CONSTRAINT mcp_oauth_clients_sync_status_chk CHECK (sync_status IN ('active', 'sync_error', 'pending_delete')),
     CONSTRAINT mcp_oauth_clients_client_id_key UNIQUE (client_id),
     CONSTRAINT mcp_oauth_clients_hydra_client_id_key UNIQUE (hydra_client_id),
@@ -482,6 +487,55 @@ INSERT INTO public.mcp_oauth_clients (
     NOW(),
     NOW()
 ) ON CONFLICT (client_id) DO NOTHING;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Agent Identity Phase 2: confidential-client credential stores
+-- These tables back the allowed_token_endpoint_auth_methods array on
+-- mcp_oauth_clients. The promotion endpoint writes here; authenticateClient
+-- reads here. RFC 7592 PUT remains immutable (cannot change auth methods).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Client secrets for client_secret_basic / client_secret_post.
+-- secret_hash is bcrypt. At most one active (revoked_at IS NULL) secret per client.
+CREATE TABLE public.oauth_client_secrets (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    client_id uuid NOT NULL,
+    secret_hash text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz,
+    revoked_at timestamptz,
+    CONSTRAINT oauth_client_secrets_pkey PRIMARY KEY (id),
+    CONSTRAINT oauth_client_secrets_client_fkey
+        FOREIGN KEY (client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_oauth_client_secrets_active ON public.oauth_client_secrets(client_id)
+    WHERE revoked_at IS NULL;
+
+-- Client JWKS for private_key_jwt. One row per client (uq).
+-- jwks_uri takes precedence; jwks is the last-fetched copy (refresh cache).
+CREATE TABLE public.oauth_client_jwks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    client_id uuid NOT NULL,
+    jwks_uri text,
+    jwks jsonb,
+    last_fetched_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT oauth_client_jwks_pkey PRIMARY KEY (id),
+    CONSTRAINT oauth_client_jwks_client_uq UNIQUE (client_id),
+    CONSTRAINT oauth_client_jwks_client_fkey
+        FOREIGN KEY (client_id) REFERENCES public.mcp_oauth_clients(id) ON DELETE CASCADE
+);
+
+-- Replay cache for private_key_jwt client assertions (jti uniqueness).
+-- Rows expire naturally; a periodic cleaner can prune expires_at < NOW().
+CREATE TABLE public.client_assertion_replay_cache (
+    client_id text NOT NULL,
+    jti text NOT NULL,
+    expires_at timestamptz NOT NULL,
+    CONSTRAINT client_assertion_replay_cache_pkey PRIMARY KEY (client_id, jti)
+);
+CREATE INDEX idx_client_assertion_replay_exp ON public.client_assertion_replay_cache(expires_at);
 
 CREATE TABLE public.mcp_tool_scope_map (
     tool_id uuid NOT NULL,
@@ -811,6 +865,17 @@ CREATE TABLE public.resource_servers (
     -- application_type='ai_agent'. These columns hold its SPIRE identity + type.
     spiffe_id text,
     agent_type text,
+    -- PRM (RFC 9728) manual-override escape hatch (plan §7): when a resource
+    -- server can't serve /.well-known/oauth-protected-resource cleanly (un-patchable
+    -- server / awkward proxy), an operator supplies scopes_supported manually.
+    -- prm_source flips to 'manual_override' with prm_override_expires_at; a
+    -- reconciler re-attempts the real fetch and auto-clears on success, or sets
+    -- metadata_stale=true on expiry (existing tokens keep working; new scope
+    -- changes are blocked until metadata refreshes).
+    prm_source text DEFAULT 'fetched'::text NOT NULL,
+    prm_override_expires_at timestamp with time zone,
+    metadata_stale boolean DEFAULT false NOT NULL,
+    CONSTRAINT resource_servers_prm_source_chk CHECK (prm_source IN ('fetched', 'manual_override')),
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
     CONSTRAINT resource_servers_id_workspace_uq UNIQUE (id, workspace_id),
@@ -857,6 +922,31 @@ CREATE TABLE public.role_assignment_requests (
     CONSTRAINT role_assignment_requests_pkey PRIMARY KEY (id)
 );
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Agent Identity Phase 1: service_accounts
+-- Non-human machine principals. PK is (workspace_id, id) so the SA is always
+-- workspace-scoped. Two global partial-unique indexes enforce the one-credential-
+-- one-principal rule: a confidential client or SPIFFE ID can back at most one SA
+-- across all workspaces.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE public.service_accounts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    status text NOT NULL DEFAULT 'disabled'
+        CONSTRAINT service_accounts_status_chk CHECK (status IN ('active', 'disabled', 'suspended')),
+    oauth_client_id uuid,
+    spiffe_id text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT service_accounts_pkey PRIMARY KEY (workspace_id, id)
+);
+
+CREATE UNIQUE INDEX uq_sa_client ON public.service_accounts (oauth_client_id) WHERE oauth_client_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_sa_spiffe ON public.service_accounts (spiffe_id)       WHERE spiffe_id IS NOT NULL;
+CREATE INDEX idx_sa_workspace_id ON public.service_accounts (workspace_id);
+
 CREATE TABLE public.role_bindings (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid,
@@ -876,6 +966,9 @@ CREATE TABLE public.role_bindings (
     group_id uuid,
     CONSTRAINT check_principal CHECK ((((((user_id IS NOT NULL))::integer + ((group_id IS NOT NULL))::integer) + ((service_account_id IS NOT NULL))::integer) = 1)),
     workspace_id uuid,
+    CONSTRAINT chk_rb_sa_workspace CHECK (service_account_id IS NULL OR workspace_id IS NOT NULL),
+    CONSTRAINT fk_rb_service_account FOREIGN KEY (workspace_id, service_account_id)
+        REFERENCES public.service_accounts(workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT role_bindings_pkey PRIMARY KEY (id)
 );
 
@@ -1657,6 +1750,69 @@ CREATE TABLE public.saml_providers (
 CREATE INDEX idx_saml_providers_workspace_id ON public.saml_providers(workspace_id);
 
 -- ---------------------------------------------------------------------------
+-- Agent Identity (Phase 0) — NativeSealer token families (M2M + XAA/ID-JAG + CIBA).
+-- AuthSec mints these RS256 `at+jwt` tokens itself (iss = OAUTH_ISSUER_URL),
+-- separate from the Hydra-sealed interactive flows. These tables are the
+-- authoritative metadata + replay/revocation stores for native tokens.
+--   * native_tokens        — metadata-only registry (no raw tokens); authoritative
+--                            for introspection (workspace/subject/rs/family/scope).
+--   * id_jag_replay_cache  — one-shot redemption guard for ID-JAGs, keyed per issuer.
+--   * revoked_tokens       — revocation source of truth (native_tokens.revoked_at is
+--                            display-only; if they disagree, revoked_tokens wins).
+-- No FKs on native_tokens.workspace_id/resource_server_id by design: the row is
+-- append-only audit metadata whose lifecycle is independent of those entities.
+-- ---------------------------------------------------------------------------
+CREATE TABLE public.native_tokens (
+    jti uuid PRIMARY KEY,
+    iss text NOT NULL,                       -- = OAUTH_ISSUER_URL; keeps table honest with revoked_tokens(iss,…)
+    workspace_id uuid NOT NULL,
+    token_family text NOT NULL CHECK (token_family IN ('xaa', 'm2m', 'ciba')),
+    subject_type text NOT NULL,              -- 'user' | 'service_account'
+    subject_id uuid NOT NULL,
+    actor_client_id text,                    -- XAA/CIBA: the acting agent client
+    actor_spiffe_id text,
+    client_id text NOT NULL,                 -- authenticating client_id (claim)
+    resource_server_id uuid NOT NULL,
+    aud text NOT NULL,                       -- = resource_servers.resource_uri
+    scope text NOT NULL,
+    source_grant_jti text,                   -- XAA: the redeemed ID-JAG jti
+    rar_id uuid,                             -- CIBA: server-side RAR reference (RFC 9396)
+    issued_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz                   -- display/audit only; revoked_tokens is authoritative
+);
+
+CREATE INDEX idx_native_tokens_expires_at    ON public.native_tokens(expires_at);
+CREATE INDEX idx_native_tokens_workspace_id  ON public.native_tokens(workspace_id);
+CREATE INDEX idx_native_tokens_source_grant  ON public.native_tokens(source_grant_jti) WHERE source_grant_jti IS NOT NULL;
+CREATE INDEX idx_native_tokens_client_id     ON public.native_tokens(client_id);
+
+-- jti is unique only PER ISSUER → key on (iss, jti). A redeemed ID-JAG is recorded
+-- here as *seen* (replay guard), never as *revoked*.
+CREATE TABLE public.id_jag_replay_cache (
+    iss text NOT NULL,
+    jti text NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (iss, jti)
+);
+
+CREATE INDEX idx_id_jag_replay_expires_at ON public.id_jag_replay_cache(expires_at);
+
+-- Revocation meaning differs by kind → key on (iss, kind, jti). For AuthSec-minted
+-- access tokens iss = OAUTH_ISSUER_URL; for external ID-JAGs iss is the trusted issuer.
+CREATE TABLE public.revoked_tokens (
+    iss text NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('id_jag', 'access_token')),
+    jti text NOT NULL,
+    revoked_at timestamptz NOT NULL DEFAULT now(),
+    reason text,
+    expires_at timestamptz NOT NULL,         -- prune after the underlying token would have expired
+    PRIMARY KEY (iss, kind, jti)
+);
+
+CREATE INDEX idx_revoked_tokens_expires_at ON public.revoked_tokens(expires_at);
+
+-- ---------------------------------------------------------------------------
 -- Indexes for v4 columns that were inlined into their CREATE TABLE statements
 -- above. Placed here (after the v4 IDP block) so that every referenced table
 -- already exists at index-creation time.
@@ -1931,6 +2087,19 @@ CREATE UNIQUE INDEX idx_permissions_workspace_resource_action_unique ON public.p
 CREATE INDEX idx_pkce_verifiers_expires_at ON public.pkce_verifiers USING btree (expires_at);
 
 CREATE INDEX idx_rb_workspace_group ON public.role_bindings USING btree (workspace_id, group_id) WHERE (group_id IS NOT NULL);
+
+-- Atomic approve-with-role (plan §1) creates RS-scoped bindings
+-- (scope_type='resource_server', scope_id=rs.id). These partial unique indexes
+-- make the grant idempotent and race-proof: two admins approving the identical
+-- connection+role+subject can no longer create duplicate bindings (the insert
+-- uses ON CONFLICT DO NOTHING). Scoped to scope_type='resource_server' so
+-- tenant-wide / wildcard bindings are unaffected.
+CREATE UNIQUE INDEX uq_rb_user_rs
+    ON public.role_bindings (workspace_id, role_id, scope_id, user_id)
+    WHERE scope_type = 'resource_server' AND user_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_rb_sa_rs
+    ON public.role_bindings (workspace_id, role_id, scope_id, service_account_id)
+    WHERE scope_type = 'resource_server' AND service_account_id IS NOT NULL;
 
 CREATE INDEX idx_resource_servers_resource_uri ON public.resource_servers USING btree (resource_uri);
 
@@ -2478,6 +2647,101 @@ ALTER TABLE ONLY public.voice_sessions
     ADD CONSTRAINT voice_sessions_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 
 -- ============================================================================
+-- Phase 3: XAA / ID-JAG redemption (Agent Identity)
+-- ============================================================================
+
+-- trusted_issuers: known external AS principals that may issue ID-JAGs
+-- redeemable at this AuthSec instance. provider_name links to
+-- oidc_user_identities for subject materialization (spec (a)).
+CREATE TABLE public.trusted_issuers (
+    id              uuid    DEFAULT gen_random_uuid() NOT NULL,
+    iss             text    NOT NULL,
+    jwks_uri        text    NOT NULL,
+    allowed_algs    text[]  NOT NULL DEFAULT ARRAY['RS256'::text],
+    allowed_auds    text[]  NOT NULL DEFAULT ARRAY[]::text[],
+    clock_skew_secs int     NOT NULL DEFAULT 30,
+    workspace_claim_mapping text,
+    subject_mapping text,
+    provider_name   text    NOT NULL,
+    jit_provisioning bool   NOT NULL DEFAULT false,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT trusted_issuers_pkey PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX uq_trusted_issuers_iss ON public.trusted_issuers (iss);
+CREATE INDEX idx_trusted_issuers_provider_name ON public.trusted_issuers (provider_name);
+
+-- a2a_brokering_policies: permit/deny rules for XAA requester→RS pairings.
+-- side='redemption' gates incoming ID-JAG redemption; side='issuance' gates
+-- outbound ID-JAG issuance (Phase 5).
+CREATE TABLE public.a2a_brokering_policies (
+    id              uuid    DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id    uuid    NOT NULL,
+    side            text    NOT NULL CONSTRAINT a2a_brokering_policies_side_chk
+                        CHECK (side IN ('redemption','issuance')),
+    client_id       text,
+    resource_server_id uuid,
+    effect          text    NOT NULL DEFAULT 'permit'
+                        CONSTRAINT a2a_brokering_policies_effect_chk
+                        CHECK (effect IN ('permit','deny')),
+    conditions      jsonb,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT a2a_brokering_policies_pkey PRIMARY KEY (id)
+);
+CREATE INDEX idx_a2a_brokering_ws ON public.a2a_brokering_policies (workspace_id);
+CREATE INDEX idx_a2a_brokering_side_rs ON public.a2a_brokering_policies (side, resource_server_id);
+
+-- access_requests: coordination table for "identity wants access but has no
+-- grant yet". Drives the admin queue, requester status, and notifications.
+-- NOT an authority for token issuance — that remains registration + live RBAC.
+CREATE TABLE public.access_requests (
+    id                  uuid    DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id        uuid    NOT NULL,
+    resource_server_id  uuid    NOT NULL,
+    subject_type        text    NOT NULL
+                            CONSTRAINT access_requests_subject_type_chk
+                            CHECK (subject_type IN ('user','service_account')),
+    subject_id          uuid    NOT NULL,
+    requested_by_client text    NOT NULL,
+    requested_scopes    text    NOT NULL DEFAULT '',
+    requested_rar_id    uuid,
+    authorization_details jsonb,
+    status              text    NOT NULL DEFAULT 'pending'
+                            CONSTRAINT access_requests_status_chk
+                            CHECK (status IN ('pending','approved','denied','expired','revoked')),
+    reason              text,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    expires_at          timestamptz,
+    decided_by          uuid,
+    decided_at          timestamptz,
+    CONSTRAINT access_requests_pkey PRIMARY KEY (id)
+);
+-- §2: at most one open pending row per (subject, rs, client). ON CONFLICT
+-- refreshes updated_at so the requester sees a live record.
+CREATE UNIQUE INDEX uq_access_req_open ON public.access_requests
+    (workspace_id, resource_server_id, subject_type, subject_id, requested_by_client)
+    WHERE status = 'pending';
+CREATE INDEX idx_access_requests_workspace ON public.access_requests (workspace_id);
+CREATE INDEX idx_access_requests_status ON public.access_requests (status);
+CREATE INDEX idx_access_requests_resource_server ON public.access_requests (resource_server_id);
+CREATE INDEX idx_access_requests_expires_at ON public.access_requests (expires_at)
+    WHERE status = 'pending';
+
+ALTER TABLE ONLY public.access_requests
+    ADD CONSTRAINT fk_access_requests_workspace
+    FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.access_requests
+    ADD CONSTRAINT fk_access_requests_resource_server
+    FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.a2a_brokering_policies
+    ADD CONSTRAINT fk_a2a_brokering_workspace
+    FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- ============================================================================
 -- Seed data: system workspace + base permissions + role bindings
 -- ============================================================================
 -- IMPORTANT: pg_dump set `search_path = ''` at the top of this file (line 42)
@@ -2598,6 +2862,61 @@ BEGIN
       AND p.action IN ('admin', 'run', 'create_workspace_db')
     ON CONFLICT DO NOTHING;
 END $$;
+-- Phase 4a: PDP policies + issuance audit ---------------------------------
+
+-- policies — permit/deny rules evaluated by the token-issuance PDP.
+-- explicit-deny-wins: a deny rule at any priority beats any permit.
+-- subject_id / client_id / resource_server_id NULL means "wildcard".
+CREATE TABLE public.policies (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    subject_type text CHECK (subject_type IN ('user', 'service_account', '*')),
+    subject_id uuid,
+    client_id text,
+    resource_server_id uuid,
+    token_family text NOT NULL DEFAULT '*'
+        CHECK (token_family IN ('m2m', 'xaa', 'ciba', '*')),
+    effect text NOT NULL DEFAULT 'permit'
+        CHECK (effect IN ('permit', 'deny')),
+    priority int NOT NULL DEFAULT 0,
+    conditions jsonb,
+    is_active bool NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT policies_pkey PRIMARY KEY (id),
+    CONSTRAINT fk_policies_workspace FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_policies_workspace ON public.policies(workspace_id);
+CREATE INDEX idx_policies_active ON public.policies(workspace_id, is_active, priority DESC);
+
+-- auth_issuance_audit — shadow-mode comparison log.
+-- pdp_effect: what the PDP decided ('permit'/'deny'/'no_policy').
+-- gate_effect: what the thin gate (P2/P3 RBAC+registration checks) decided.
+-- pdp_agrees: true when they agree (or pdp has no opinion).
+CREATE TABLE public.auth_issuance_audit (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    token_family text NOT NULL,
+    client_id text NOT NULL,
+    subject_type text NOT NULL,
+    subject_id uuid,
+    resource_server_id uuid NOT NULL,
+    pdp_effect text NOT NULL CHECK (pdp_effect IN ('permit', 'deny', 'no_policy')),
+    gate_effect text NOT NULL CHECK (gate_effect IN ('permit', 'deny')),
+    pdp_agrees bool NOT NULL,
+    scopes_requested text NOT NULL DEFAULT '',
+    scopes_granted text NOT NULL DEFAULT '',
+    pdp_reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT auth_issuance_audit_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX idx_auth_issuance_audit_ws ON public.auth_issuance_audit(workspace_id);
+CREATE INDEX idx_auth_issuance_audit_created ON public.auth_issuance_audit(created_at);
+
 -- Migration 201: RBAC permission for template-based workspace DB creation
 -- Requires JWT + admin role (not service token)
 

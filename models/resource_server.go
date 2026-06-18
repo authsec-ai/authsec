@@ -44,6 +44,11 @@ type ResourceServer struct {
 	LastValidationStatus     *string    `json:"last_validation_status,omitempty" gorm:"type:text"`
 	LastValidationError      *string    `json:"last_validation_error,omitempty" gorm:"type:text"`
 
+	// PRM (RFC 9728) manual-override escape hatch (plan §7).
+	PRMSource            string     `json:"prm_source" gorm:"type:text;default:'fetched'"`
+	PRMOverrideExpiresAt *time.Time `json:"prm_override_expires_at,omitempty" gorm:"type:timestamptz"`
+	MetadataStale        bool       `json:"metadata_stale" gorm:"default:false"`
+
 	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 

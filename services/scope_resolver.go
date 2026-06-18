@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -55,16 +56,17 @@ func IsOIDCCoreScope(s string) bool {
 }
 
 // clientIsOIDC checks whether the client is OIDC-capable.
-// Empty scope = DCR client that binds scopes at /authorize time (RFC 7591).
-// These are implicitly OIDC-capable — resolveOIDCClientCapabilities() already
-// grants them refresh_token. Only explicit non-openid scopes mark a client
-// as non-OIDC.
+//
+// Fail-closed: a client is OIDC-capable only when it explicitly registered the
+// "openid" scope. An empty scope is NOT treated as OIDC — that would silently
+// grant openid/profile/email to agent/M2M clients that never asked for identity
+// (the very thing XAA/M2M must not do). offline_access (refresh-token capability)
+// is handled independently of this function — see ValidateRequestedScopes and
+// resolveOIDCClientCapabilities — so a non-OIDC DCR client still gets its refresh
+// token without being mislabeled OIDC-capable.
 func clientIsOIDC(client *models.MCPOAuthClient) bool {
 	if client == nil {
 		return false
-	}
-	if client.Scope == "" {
-		return true
 	}
 	for _, s := range strings.Fields(client.Scope) {
 		if s == "openid" {
@@ -118,6 +120,25 @@ func (r *ScopeResolver) HasEffectiveScopes(
 		return false, err
 	}
 	return len(userEffective) > 0, nil
+}
+
+// PrincipalHasEffectiveScopes reports whether the principal (user or service
+// account) currently resolves any RBAC-derived scopes for the resource server.
+// Governance surfaces use this to honestly show "approved but no usable scopes
+// yet" — connection approval grants the client access to the RS, but the subject
+// still needs a role binding to obtain any scopes.
+func (r *ScopeResolver) PrincipalHasEffectiveScopes(
+	ctx context.Context,
+	subjectType, workspaceID, subjectID, resourceServerID string,
+) (bool, error) {
+	if subjectType == "service_account" {
+		scopes, err := r.resolveServiceAccountEffectiveScopes(ctx, workspaceID, subjectID, resourceServerID)
+		if err != nil {
+			return false, err
+		}
+		return len(scopes) > 0, nil
+	}
+	return r.HasEffectiveScopes(ctx, workspaceID, subjectID, resourceServerID)
 }
 
 // ResolveWithReport performs the 3-way intersection and returns a full diagnostic report.
@@ -416,6 +437,161 @@ func ScopeSetEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ResolvePrincipalEffectiveScopes is the dispatcher used by native grant handlers
+// and native introspection. It routes user subjects to the existing RBAC chain
+// and service_account subjects to the SA-keyed chain. requestedScopes, rs, and
+// client are the same as ResolveGrantableScopes — the result is the 3-way
+// intersection (requested ∩ rs_supported ∩ principal_effective).
+func (r *ScopeResolver) ResolvePrincipalEffectiveScopes(
+	ctx context.Context,
+	principal tokens.Principal,
+	resourceServerID string,
+	requestedScopes []string,
+	rs *models.ResourceServer,
+	client *models.MCPOAuthClient,
+) ([]string, error) {
+	switch principal.SubjectType {
+	case tokens.SubjectTypeUser:
+		return r.ResolveGrantableScopes(
+			ctx,
+			principal.WorkspaceID.String(),
+			principal.SubjectID.String(),
+			resourceServerID,
+			requestedScopes,
+			rs,
+			client,
+		)
+	case tokens.SubjectTypeServiceAccount:
+		effective, err := r.resolveServiceAccountEffectiveScopes(
+			ctx,
+			principal.WorkspaceID.String(),
+			principal.SubjectID.String(),
+			resourceServerID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return r.intersectWithRS(requestedScopes, effective, rs, client), nil
+	default:
+		return nil, fmt.Errorf("unknown principal subject_type %q", principal.SubjectType)
+	}
+}
+
+// resolveServiceAccountEffectiveScopes resolves the OAuth scopes a service account
+// is entitled to via its role_bindings, using the same join chain as the user
+// resolver but keyed on role_bindings.service_account_id. Only active SAs
+// (status='active') produce scopes — a disabled or suspended SA gets zero.
+func (r *ScopeResolver) resolveServiceAccountEffectiveScopes(
+	ctx context.Context,
+	workspaceID, serviceAccountID, resourceServerID string,
+) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+
+	workspaceUUID, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return result, nil
+	}
+	rsUUID, err := uuid.Parse(resourceServerID)
+	if err != nil {
+		return result, nil
+	}
+	saUUID, err := uuid.Parse(serviceAccountID)
+	if err != nil {
+		return result, nil
+	}
+
+	// Gate: SA must be active.
+	var saStatus string
+	row := r.db.WithContext(ctx).
+		Raw(`SELECT status FROM service_accounts WHERE workspace_id = ? AND id = ? LIMIT 1`,
+			workspaceUUID, saUUID).Row()
+	if scanErr := row.Scan(&saStatus); scanErr != nil || saStatus != "active" {
+		return result, nil
+	}
+
+	// Same join chain as the user resolver, but keyed on service_account_id.
+	var scopeStrings []string
+	err = r.db.WithContext(ctx).
+		Table("role_bindings rb").
+		Select("DISTINCT os.scope_string").
+		Joins("JOIN roles ro ON rb.role_id = ro.id").
+		Joins("JOIN role_permissions rp ON ro.id = rp.role_id").
+		Joins("JOIN permissions p ON rp.permission_id = p.id").
+		Joins("JOIN oauth_scope_permissions osp ON osp.permission_id = p.id").
+		Joins("JOIN oauth_scopes os ON osp.scope_id = os.id").
+		Where("rb.service_account_id = ?", saUUID).
+		Where("(rb.workspace_id IS NULL OR rb.workspace_id = ?)", workspaceUUID).
+		Where("(rb.expires_at IS NULL OR rb.expires_at > NOW())").
+		Where("(ro.workspace_id IS NULL OR ro.workspace_id = ?)", workspaceUUID).
+		Where("(p.workspace_id IS NULL OR p.workspace_id = ?)", workspaceUUID).
+		Where("os.workspace_id = ? AND os.resource_server_id = ?", workspaceUUID, rsUUID).
+		Where(`
+			rb.scope_type IS NULL
+			OR rb.scope_type = '*'
+			OR (rb.scope_type = 'resource_server' AND rb.scope_id::text = ?)
+		`, rsUUID.String()).
+		Pluck("os.scope_string", &scopeStrings).Error
+
+	if err != nil {
+		return result, err
+	}
+
+	for _, s := range scopeStrings {
+		result[s] = struct{}{}
+	}
+
+	if len(result) > 0 {
+		r.expandWildcards(ctx, workspaceUUID, rsUUID, result)
+	}
+
+	return result, nil
+}
+
+// intersectWithRS applies the RS-supported and OIDC-capability filters to an
+// already-resolved effective set. Used by ResolvePrincipalEffectiveScopes so
+// service accounts go through the same final gate as user scopes.
+func (r *ScopeResolver) intersectWithRS(
+	requestedScopes []string,
+	effective map[string]struct{},
+	rs *models.ResourceServer,
+	client *models.MCPOAuthClient,
+) []string {
+	isOIDC := clientIsOIDC(client)
+	rsSupported := make(map[string]struct{})
+	if rs != nil {
+		for _, s := range rs.ScopesSupported {
+			rsSupported[s] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{}, len(requestedScopes))
+	var grantable []string
+	for _, s := range requestedScopes {
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+
+		if oidcCoreScopes[s] {
+			if isOIDC {
+				grantable = append(grantable, s)
+			}
+			continue
+		}
+		if _, ok := rsSupported[s]; !ok {
+			continue
+		}
+		if _, ok := effective[s]; !ok {
+			continue
+		}
+		grantable = append(grantable, s)
+	}
+	return grantable
 }
 
 // ScopesLost returns the RS-specific scopes that are present in granted but absent

@@ -104,8 +104,19 @@ func (ctrl *CIBAAuthController) RespondToCIBA(c *gin.Context) {
 		return
 	}
 
+	// Extract caller identity from JWT context — required for caller-identity binding.
+	userIDStr, err := middlewares.ResolveUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	responderUserID, _ := uuid.Parse(userIDStr)
+
+	workspaceIDStr, _ := c.Get("workspace_id")
+	responderWorkspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
+
 	// Respond to CIBA request
-	resp, err := ctrl.cibaService.RespondToCIBA(&req)
+	resp, err := ctrl.cibaService.RespondToCIBA(&req, responderUserID, responderWorkspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to respond", "details": err.Error()})
 		return
@@ -222,10 +233,10 @@ func (ctrl *CIBAAuthController) RegisterDevice(c *gin.Context) {
 	// Audit log
 	middlewares.Audit(c, "ciba_device", resp.DeviceID, "register", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"user_id":     userID.String(),
-			"workspace_id":   workspaceID.String(),
-			"platform":    req.Platform,
-			"device_name": req.DeviceName,
+			"user_id":      userID.String(),
+			"workspace_id": workspaceID.String(),
+			"platform":     req.Platform,
+			"device_name":  req.DeviceName,
 		},
 	})
 
@@ -342,8 +353,8 @@ func (ctrl *CIBAAuthController) DeleteDevice(c *gin.Context) {
 	// Audit log
 	middlewares.Audit(c, "ciba_device", deviceIDStr, "delete", &middlewares.AuditChanges{
 		Before: map[string]interface{}{
-			"device_id": deviceIDStr,
-			"user_id":   userID.String(),
+			"device_id":    deviceIDStr,
+			"user_id":      userID.String(),
 			"workspace_id": workspaceID.String(),
 		},
 	})

@@ -31,33 +31,33 @@ type AuthManagerTokenService interface {
 }
 
 type Config struct {
-	Port               string
-	DBName             string
-	DBUser             string
-	DBPassword         string
-	DBHost             string
-	DBPort             string
-	DBSchema           string
-	DBSSLMode          string
-	DatabaseURL        string
-	JWTDefSecret       string
-	JWTSdkSecret       string
-	JWTSecret          string // Primary JWT secret (ext-service / hydra-service / SPIFFE delegate)
-	VaultAddr          string
-	VaultToken         string
-	HydraAdminURL      string
-	SMTPHost           string
-	SMTPPort           string
-	SMTPUser           string
-	SMTPPassword       string
-	SMTPFromName       string // Display name for the From: header (e.g. "AuthSec"). Optional; defaults to just the email.
+	Port                  string
+	DBName                string
+	DBUser                string
+	DBPassword            string
+	DBHost                string
+	DBPort                string
+	DBSchema              string
+	DBSSLMode             string
+	DatabaseURL           string
+	JWTDefSecret          string
+	JWTSdkSecret          string
+	JWTSecret             string // Primary JWT secret (ext-service / hydra-service / SPIFFE delegate)
+	VaultAddr             string
+	VaultToken            string
+	HydraAdminURL         string
+	SMTPHost              string
+	SMTPPort              string
+	SMTPUser              string
+	SMTPPassword          string
+	SMTPFromName          string // Display name for the From: header (e.g. "AuthSec"). Optional; defaults to just the email.
 	WorkspaceDomainSuffix string
-	CorsAllowOrigin    string
-	RedisURL           string
-	ICPServiceURL      string // ICP service URL for PKI provisioning
-	BillingServiceURL  string // BILLING_SERVICE_URL — empty disables MAU gating (OSS / single-tenant mode)
-	BaseURL            string // Base URL for app/browser callbacks (e.g., https://dev.authsec.dev)
-	OAuthIssuerURL     string // Public OAuth/OIDC issuer base URL (e.g., https://dev.api.authsec.dev)
+	CorsAllowOrigin       string
+	RedisURL              string
+	ICPServiceURL         string // ICP service URL for PKI provisioning
+	BillingServiceURL     string // BILLING_SERVICE_URL — empty disables MAU gating (OSS / single-tenant mode)
+	BaseURL               string // Base URL for app/browser callbacks (e.g., https://dev.authsec.dev)
+	OAuthIssuerURL        string // Public OAuth/OIDC issuer base URL (e.g., https://dev.api.authsec.dev)
 
 	// Runtime environment ("development" | "production" | "staging")
 	Environment string
@@ -76,6 +76,35 @@ type Config struct {
 	SpiffeJWKSKeyID        string
 	SpiffeRSAPrivateKeyB64 string
 	SpiffeTrustDomain      string
+
+	// Agent Identity feature flags (all default off). XAA_NATIVE_SEALER is the
+	// one-way migration gate for the NativeSealer token families: when on,
+	// AuthSec validates native tokens, publishes native keys on /oauth/jwks, and
+	// revokes them. The per-grant flags (XAA_M2M / XAA_REDEMPTION / XAA_ISSUANCE
+	// / XAA_CIBA) — added in later phases — gate new issuance only.
+	XAANativeSealer bool
+	// XAAm2m enables client_credentials (M2M) issuance via the NativeSealer.
+	// When true, AuthSec re-adds client_credentials to grant_types_supported
+	// in AS metadata and routes M2M token requests through the native handler.
+	XAAm2m bool
+	// XAARedemption enables jwt-bearer (ID-JAG redemption) grant type.
+	XAARedemption bool
+	// XAADPOP enables DPoP binding on XAA tokens (requires XAARedemption).
+	XAADPOP bool
+	// XAACiba enables native RS-bearer CIBA minting via the NativeIssuer (tf=ciba,
+	// RS256, short-lived). When true the workspace-plane CIBA stack mints native
+	// tokens introspected at /oauth/introspect; the user-plane HMAC stack is frozen.
+	XAACiba bool
+	// XAAIssuance enables token-exchange → ID-JAG issuance and the
+	// client-authenticated GET /oauth/requester-bootstrap endpoint.
+	// Requires XAA_NATIVE_SEALER. token-exchange is only advertised in AS
+	// metadata when this flag is on.
+	XAAIssuance bool
+	// PolicyEngineMode controls the token-issuance PDP (internal/policy/).
+	// "off" (default) — PDP not consulted.
+	// "shadow" — PDP runs but never blocks; discrepancies logged to auth_issuance_audit.
+	// "enforce" — PDP deny blocks issuance; no_policy defers to existing gates.
+	PolicyEngineMode string
 
 	// Okta CIBA integration
 	OktaDomain       string
@@ -331,7 +360,7 @@ func LoadConfig() *Config {
 		SMTPUser:                smtpUser,
 		SMTPPassword:            smtpPassword,
 		SMTPFromName:            smtpFromName,
-		WorkspaceDomainSuffix:      workspaceDomainSuffix,
+		WorkspaceDomainSuffix:   workspaceDomainSuffix,
 		CorsAllowOrigin:         corsAllowOrigin,
 		RedisURL:                redisURL,
 		ICPServiceURL:           icpServiceURL,
@@ -348,6 +377,13 @@ func LoadConfig() *Config {
 		SpiffeJWKSKeyID:         spiffeJWKSKeyID,
 		SpiffeRSAPrivateKeyB64:  spiffeRSAPrivateKeyB64,
 		SpiffeTrustDomain:       spiffeTrustDomain,
+		XAANativeSealer:         getEnvBool("XAA_NATIVE_SEALER", false),
+		XAAm2m:                  getEnvBool("XAA_M2M", false),
+		XAARedemption:           getEnvBool("XAA_REDEMPTION", false),
+		XAADPOP:                 getEnvBool("XAA_DPOP", false),
+		XAACiba:                 getEnvBool("XAA_CIBA", false),
+		XAAIssuance:             getEnvBool("XAA_ISSUANCE", false),
+		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "off"),
 		OktaDomain:              oktaDomain,
 		OktaClientID:            oktaClientID,
 		OktaClientSecret:        oktaClientSecret,
@@ -485,6 +521,25 @@ func getEnv(key, fallback string) string {
 // GetEnv is a public wrapper for getEnv
 func GetEnv(key, fallback string) string {
 	return getEnv(key, fallback)
+}
+
+// getEnvBool reads a boolean env var (true/1/yes/on, case-insensitive),
+// returning fallback when unset or unparseable.
+func getEnvBool(key string, fallback bool) bool {
+	v, exists := os.LookupEnv(key)
+	if !exists {
+		log.Printf("Using fallback for %s: %t", key, fallback)
+		return fallback
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		log.Printf("Unparseable bool for %s=%q, using fallback %t", key, v, fallback)
+		return fallback
+	}
 }
 
 // GetRedisClient returns a singleton Redis client instance

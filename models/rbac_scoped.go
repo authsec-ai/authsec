@@ -65,15 +65,22 @@ func (RolePermission) TableName() string {
 	return "role_permissions"
 }
 
-// ServiceAccount represents a non-human identity
+// ServiceAccount represents a non-human machine principal.
+// PK is (workspace_id, id) — workspace_id is non-null.
+// Status starts 'disabled' and flips to 'active' once a confidential credential is attached.
 type ServiceAccount struct {
-	ID          uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID *uuid.UUID `json:"workspace_id" gorm:"type:uuid;uniqueIndex:idx_sa_workspace_id"`
-	Name        string     `json:"name" gorm:"type:text;not null"`
-	Description string     `json:"description" gorm:"type:text"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID            uuid.UUID  `json:"id"             gorm:"type:uuid;not null;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID   uuid.UUID  `json:"workspace_id"   gorm:"type:uuid;not null;primaryKey"`
+	Name          string     `json:"name"           gorm:"type:text;not null"`
+	Description   string     `json:"description"    gorm:"type:text"`
+	Status        string     `json:"status"         gorm:"type:text;not null;default:'disabled'"`
+	OAuthClientID *uuid.UUID `json:"oauth_client_id" gorm:"type:uuid"`
+	SpiffeID      *string    `json:"spiffe_id"      gorm:"type:text"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
+
+func (ServiceAccount) TableName() string { return "service_accounts" }
 
 // RoleBinding represents an assignment of a Role to a Principal
 // (User, Group, or Service Account). Migration 111 added group_id; exactly one

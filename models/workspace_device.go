@@ -14,7 +14,7 @@ import (
 type TenantDeviceToken struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
 	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	WorkspaceID    uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	DeviceToken string    `json:"device_token" gorm:"uniqueIndex;size:500;not null"`
 	Platform    string    `json:"platform" gorm:"size:20;not null"` // ios, android
 
@@ -48,9 +48,9 @@ type TenantCIBAAuthRequest struct {
 	AuthReqID string    `json:"auth_req_id" gorm:"uniqueIndex;size:255;not null"`
 
 	// User identification
-	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	UserEmail string    `json:"user_email" gorm:"size:255;not null"`
+	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	UserEmail   string    `json:"user_email" gorm:"size:255;not null"`
 
 	// Client information
 	ClientID *uuid.UUID `json:"client_id,omitempty" gorm:"type:uuid"`
@@ -101,8 +101,8 @@ func (c *TenantCIBAAuthRequest) IsApproved() bool {
 
 // TenantTOTPSecret represents a TOTP authenticator device in tenant DB
 type TenantTOTPSecret struct {
-	ID       uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	UserID   uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
 	// TOTP secret (base32 encoded)
@@ -129,13 +129,13 @@ func (TenantTOTPSecret) TableName() string {
 
 // TenantBackupCode represents a recovery backup code for TOTP in tenant DB
 type TenantBackupCode struct {
-	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	UserID    uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	Code      string    `json:"code" gorm:"size:32;not null;uniqueIndex"` // Hashed code
-	IsUsed    bool      `json:"is_used" gorm:"default:false;index"`
-	CreatedAt int64     `json:"created_at" gorm:"not null"`
-	UsedAt    *int64    `json:"used_at,omitempty"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	UserID      uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	Code        string    `json:"code" gorm:"size:32;not null;uniqueIndex"` // Hashed code
+	IsUsed      bool      `json:"is_used" gorm:"default:false;index"`
+	CreatedAt   int64     `json:"created_at" gorm:"not null"`
+	UsedAt      *int64    `json:"used_at,omitempty"`
 }
 
 // TableName specifies the table name for TenantBackupCode
@@ -166,11 +166,12 @@ type TenantDeviceTokenRegistrationResponse struct {
 
 // TenantCIBAInitiateRequest - Initiate CIBA authentication for tenant user
 type TenantCIBAInitiateRequest struct {
-	ClientID       string   `json:"client_id"` // legacy: workspace now resolved from host/JWT
-	Email          string   `json:"email" binding:"required,email"` // User email
-	WorkspaceDomain   string   `json:"workspace_domain"`                  // Optional: For validation if provided
-	BindingMessage string   `json:"binding_message,omitempty"`      // Message shown to user
-	Scopes         []string `json:"scopes,omitempty"`               // OAuth scopes
+	ClientID        string   `json:"client_id"`                      // legacy: workspace now resolved from host/JWT
+	Email           string   `json:"email" binding:"required,email"` // User email
+	WorkspaceDomain string   `json:"workspace_domain"`               // Optional: For validation if provided
+	BindingMessage  string   `json:"binding_message,omitempty"`      // Message shown to user
+	Scopes          []string `json:"scopes,omitempty"`               // OAuth scopes
+	Resource        string   `json:"resource,omitempty"`             // RFC 8707 target RS — disambiguates multi-RS clients
 }
 
 // TenantCIBAInitiateResponse
@@ -200,6 +201,7 @@ type TenantCIBARespondResponse struct {
 type TenantCIBATokenRequest struct {
 	AuthReqID string `json:"auth_req_id" binding:"required"`
 	ClientID  string `json:"client_id"`
+	Resource  string `json:"resource,omitempty"` // RFC 8707 target RS — must match the initiate resource
 }
 
 // TenantCIBATokenResponse - Returns token or status
@@ -215,10 +217,10 @@ type TenantCIBATokenResponse struct {
 
 // TenantTOTPLoginRequest represents a TOTP login for tenant user
 type TenantTOTPLoginRequest struct {
-	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
-	Email        string `json:"email" binding:"required,email"`     // User email
-	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
-	WorkspaceDomain string `json:"workspace_domain"`                      // For validation
+	ClientID        string `json:"client_id"`                          // legacy: workspace resolved from host/JWT
+	Email           string `json:"email" binding:"required,email"`     // User email
+	TOTPCode        string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
+	WorkspaceDomain string `json:"workspace_domain"`                   // For validation
 }
 
 // TenantTOTPLoginResponse contains TOTP login result
@@ -278,11 +280,11 @@ type TenantTOTPDeviceDeleteResponse struct {
 
 // TenantTOTPDeviceApprovalRequest approves device code using TOTP in tenant context
 type TenantTOTPDeviceApprovalRequest struct {
-	UserCode     string `json:"user_code" binding:"required"`       // Device user code to approve
-	ClientID     string `json:"client_id"`       // legacy: workspace resolved from host/JWT
-	Email        string `json:"email" binding:"required,email"`     // User email (to find user and validate TOTP)
-	TOTPCode     string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code from authenticator app
-	WorkspaceDomain string `json:"workspace_domain" binding:"required"`   // For validation
+	UserCode        string `json:"user_code" binding:"required"`        // Device user code to approve
+	ClientID        string `json:"client_id"`                           // legacy: workspace resolved from host/JWT
+	Email           string `json:"email" binding:"required,email"`      // User email (to find user and validate TOTP)
+	TOTPCode        string `json:"totp_code" binding:"required,len=6"`  // 6-digit TOTP code from authenticator app
+	WorkspaceDomain string `json:"workspace_domain" binding:"required"` // For validation
 }
 
 // TenantTOTPDeviceApprovalResponse contains approval result

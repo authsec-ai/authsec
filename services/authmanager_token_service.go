@@ -39,13 +39,18 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 type TokenClaims struct {
 	WorkspaceID           string
 	WorkspaceMembershipID string
-	WorkspaceDomain          string // Tenant domain for display/routing
+	WorkspaceDomain       string // Tenant domain for display/routing
 	ClientID              string
 	EmailID               string
 	UserID                *uuid.UUID
 	Scopes                []string
 	Roles                 []string // User roles for authorization
-	ExpiresIn             time.Duration
+	// ProjectID is a backward-compat mirror of workspace_id, emitted ONLY for
+	// end-user tokens (GenerateEndUserToken) where downstream consumers still read
+	// project_id. Phase 6 dropped tenant_id entirely; project_id is a separate,
+	// documented end-user affordance and is omitted from every other token type.
+	ProjectID string
+	ExpiresIn time.Duration
 }
 
 // GenerateToken generates a JWT token following auth-manager patterns
@@ -104,6 +109,13 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 	}
 	if claims.WorkspaceMembershipID != "" {
 		jwtClaims["workspace_membership_id"] = claims.WorkspaceMembershipID
+	}
+
+	// project_id (end-user backward-compat mirror of workspace_id) — emitted only
+	// when set, i.e. only for end-user tokens. Not tenant_id; other token types
+	// stay workspace_id-only per Phase 6.
+	if claims.ProjectID != "" {
+		jwtClaims["project_id"] = claims.ProjectID
 	}
 
 	// Add optional user_id if provided
@@ -186,13 +198,13 @@ func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, emai
 	}
 
 	claims := TokenClaims{
-		WorkspaceID:  workspaceIDStr,  // Use actual workspace_id
+		WorkspaceID:     workspaceIDStr,  // Use actual workspace_id
 		WorkspaceDomain: workspaceDomain, // Include tenant domain
-		ClientID:     adminUserID.String(),
-		EmailID:      email,
-		UserID:       &adminUserID,
-		Roles:        roles, // Include admin roles
-		ExpiresIn:    24 * time.Hour,
+		ClientID:        adminUserID.String(),
+		EmailID:         email,
+		UserID:          &adminUserID,
+		Roles:           roles, // Include admin roles
+		ExpiresIn:       24 * time.Hour,
 	}
 	return s.GenerateToken(claims)
 }
@@ -225,6 +237,7 @@ func (s *AuthManagerTokenService) GenerateEndUserToken(
 ) (string, error) {
 	claims := TokenClaims{
 		WorkspaceID: workspaceID,
+		ProjectID:   workspaceID, // end-user compat: project_id mirrors workspace_id
 		ClientID:    clientID,
 		EmailID:     email,
 		UserID:      &userID,
@@ -281,12 +294,12 @@ func (s *AuthManagerTokenService) GenerateCIBAToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  workspaceID.String(),
-		ClientID:  userID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		Scopes:    scopes,
-		ExpiresIn: expiresIn,
+		WorkspaceID: workspaceID.String(),
+		ClientID:    userID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		Scopes:      scopes,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -301,12 +314,12 @@ func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  workspaceID.String(),
-		ClientID:  clientID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		Scopes:    scopes,
-		ExpiresIn: expiresIn,
+		WorkspaceID: workspaceID.String(),
+		ClientID:    clientID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		Scopes:      scopes,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }
@@ -319,11 +332,11 @@ func (s *AuthManagerTokenService) GenerateTOTPToken(
 	expiresIn time.Duration,
 ) (string, error) {
 	claims := TokenClaims{
-		WorkspaceID:  workspaceID.String(),
-		ClientID:  userID.String(),
-		EmailID:   email,
-		UserID:    &userID,
-		ExpiresIn: expiresIn,
+		WorkspaceID: workspaceID.String(),
+		ClientID:    userID.String(),
+		EmailID:     email,
+		UserID:      &userID,
+		ExpiresIn:   expiresIn,
 	}
 	return s.GenerateToken(claims)
 }

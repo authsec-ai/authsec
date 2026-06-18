@@ -41,7 +41,6 @@ func ensureNoDatabase(t *testing.T) {
 	})
 }
 
-
 func TestEndUserController_GetEndUser(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ensureNoDatabase(t)
@@ -49,7 +48,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		workspaceID       string
+		workspaceID    string
 		userIdentifier string
 		queryString    string
 		expectedStatus int
@@ -58,7 +57,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 	}{
 		{
 			name:           "database unavailable when looking up by id",
-			workspaceID:       uuid.New().String(),
+			workspaceID:    uuid.New().String(),
 			userIdentifier: uuid.New().String(),
 			expectedStatus: http.StatusInternalServerError, // Database connection error expected
 			expectedBody: map[string]interface{}{
@@ -70,7 +69,7 @@ func TestEndUserController_GetEndUser(t *testing.T) {
 		},
 		{
 			name:           "missing client id for email lookup",
-			workspaceID:       uuid.New().String(),
+			workspaceID:    uuid.New().String(),
 			userIdentifier: "nonexistent@example.com",
 			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
@@ -233,7 +232,7 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		workspaceID       string
+		workspaceID    string
 		userID         string
 		input          models.UpdateEndUserStatusInput
 		expectedStatus int
@@ -241,9 +240,9 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 		setupMocks     func()
 	}{
 		{
-			name:     "successful status update",
+			name:        "successful status update",
 			workspaceID: uuid.New().String(),
-			userID:   uuid.New().String(),
+			userID:      uuid.New().String(),
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
 			},
@@ -256,9 +255,9 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 			},
 		},
 		{
-			name:     "invalid user_id format",
+			name:        "invalid user_id format",
 			workspaceID: uuid.New().String(),
-			userID:   "invalid-uuid",
+			userID:      "invalid-uuid",
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
 			},
@@ -269,9 +268,9 @@ func TestEndUserController_UpdateEndUserStatus(t *testing.T) {
 			setupMocks: func() {},
 		},
 		{
-			name:     "user not found",
+			name:        "user not found",
 			workspaceID: uuid.New().String(),
-			userID:   uuid.New().String(),
+			userID:      uuid.New().String(),
 			input: models.UpdateEndUserStatusInput{
 				Active: true,
 			},
@@ -521,9 +520,11 @@ func TestEndUserController_CustomLogin(t *testing.T) {
 				Password: "password123",
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			// Post tenant→workspace migration: workspace resolution runs first and
+			// fails closed (no DB in test) → 400, not the legacy 500/"map tenant".
+			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "failed to map tenant: database connection not available",
+				"error": "workspace resolution failed: database not initialized",
 			},
 			setupMocks: func() {
 				// Mock tenant mapping and database lookup
@@ -536,9 +537,9 @@ func TestEndUserController_CustomLogin(t *testing.T) {
 				Password: "wrongpassword",
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "failed to map tenant: database connection not available",
+				"error": "workspace resolution failed: database not initialized",
 			},
 			setupMocks: func() {},
 		},
@@ -549,7 +550,7 @@ func TestEndUserController_CustomLogin(t *testing.T) {
 				Password: "password123",
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			expectedStatus: http.StatusBadRequest,
 			setupMocks: func() {
 				// Mock MFA-enabled user
 			},
@@ -601,9 +602,11 @@ func TestEndUserController_CustomLoginRegister(t *testing.T) {
 				Password: "password123",
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			// Post tenant→workspace migration: workspace resolution runs first and
+			// fails closed (no DB in test) → 400, not the legacy 500/"map tenant".
+			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "failed to map tenant: database connection not available",
+				"error": "workspace resolution failed: database not initialized",
 			},
 			setupMocks: func() {
 				// Mock tenant mapping and database operations
@@ -616,9 +619,9 @@ func TestEndUserController_CustomLoginRegister(t *testing.T) {
 				Password: "password123",
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "failed to map tenant: database connection not available",
+				"error": "workspace resolution failed: database not initialized",
 			},
 			setupMocks: func() {},
 		},
@@ -629,9 +632,9 @@ func TestEndUserController_CustomLoginRegister(t *testing.T) {
 				Password: "123", // Too short
 				ClientID: uuid.New().String(),
 			},
-			expectedStatus: http.StatusInternalServerError, // Database connection error expected
+			expectedStatus: http.StatusBadRequest,
 			expectedBody: map[string]interface{}{
-				"error": "failed to map tenant: database connection not available",
+				"error": "workspace resolution failed: database not initialized",
 			},
 			setupMocks: func() {},
 		},
@@ -995,21 +998,21 @@ func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 // generateTestJWT generates a test JWT token with known claims
 func generateTestJWT() (string, error) {
 	claims := jwt.MapClaims{
-		"iss":        "authsec-ai/auth-manager",
-		"aud":        "authsec-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"iat":        time.Now().Unix(),
-		"nbf":        time.Now().Unix(),
-		"workspace_id":  "test-tenant-123",
-		"project_id": "test-project-456",
-		"client_id":  "test-client-789",
-		"user_id":    "test-user-456",
-		"email_id":   "test@example.com",
-		"roles":      []string{"admin", "user"},
-		"groups":     []string{"developers"},
-		"scopes":     []string{"read", "write"},
-		"resources":  []string{"users", "projects"},
-		"token_type": "sdk-agent",
+		"iss":          "authsec-ai/auth-manager",
+		"aud":          "authsec-api",
+		"exp":          time.Now().Add(time.Hour).Unix(),
+		"iat":          time.Now().Unix(),
+		"nbf":          time.Now().Unix(),
+		"workspace_id": "test-tenant-123",
+		"project_id":   "test-project-456",
+		"client_id":    "test-client-789",
+		"user_id":      "test-user-456",
+		"email_id":     "test@example.com",
+		"roles":        []string{"admin", "user"},
+		"groups":       []string{"developers"},
+		"scopes":       []string{"read", "write"},
+		"resources":    []string{"users", "projects"},
+		"token_type":   "sdk-agent",
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -1121,21 +1124,21 @@ func TestRBAC_UserAccessGranted(t *testing.T) {
 // generateTestJWTWithRoles generates a test JWT token with specific roles
 func generateTestJWTWithRoles(roles []string) (string, error) {
 	claims := jwt.MapClaims{
-		"iss":        "authsec-ai/auth-manager",
-		"aud":        "authsec-api",
-		"exp":        time.Now().Add(time.Hour).Unix(),
-		"iat":        time.Now().Unix(),
-		"nbf":        time.Now().Unix(),
-		"workspace_id":  "test-tenant-123",
-		"project_id": "test-project-456",
-		"client_id":  "test-client-789",
-		"user_id":    "test-user-456",
-		"email_id":   "test@example.com",
-		"roles":      roles,
-		"groups":     []string{"developers"},
-		"scopes":     []string{"read", "write"},
-		"resources":  []string{"users", "projects"},
-		"token_type": "sdk-agent",
+		"iss":          "authsec-ai/auth-manager",
+		"aud":          "authsec-api",
+		"exp":          time.Now().Add(time.Hour).Unix(),
+		"iat":          time.Now().Unix(),
+		"nbf":          time.Now().Unix(),
+		"workspace_id": "test-tenant-123",
+		"project_id":   "test-project-456",
+		"client_id":    "test-client-789",
+		"user_id":      "test-user-456",
+		"email_id":     "test@example.com",
+		"roles":        roles,
+		"groups":       []string{"developers"},
+		"scopes":       []string{"read", "write"},
+		"resources":    []string{"users", "projects"},
+		"token_type":   "sdk-agent",
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

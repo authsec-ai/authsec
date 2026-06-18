@@ -13,6 +13,7 @@ import (
 
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -157,7 +158,7 @@ func (s *ResourceServerOnboardingService) UpdateAccessPolicy(resourceServerID, w
 			return nil, err
 		}
 		existing = models.ResourceServerAccessPolicy{
-			WorkspaceID:          workspaceUUID,
+			WorkspaceID:       workspaceUUID,
 			ResourceServerID:  rsUUID,
 			Enabled:           req.Enabled,
 			DefaultRoleID:     defaultRoleID,
@@ -315,7 +316,7 @@ func (s *ResourceServerOnboardingService) EnsureDefaultAccessBinding(ctx context
 	}
 
 	binding := models.RoleBinding{
-		WorkspaceID:           &workspaceUUID,
+		WorkspaceID:        &workspaceUUID,
 		UserID:             &userUUID,
 		Username:           firstNonEmpty(username, emailFallback, userUUID.String()),
 		RoleID:             role.ID,
@@ -343,7 +344,18 @@ func (s *ResourceServerOnboardingService) ValidateResourceServer(rs *models.Reso
 		return nil, fmt.Errorf("resource server is required")
 	}
 
-	metadataStatus, metadataMessage, metadataObserved := s.checkMetadataURL(rs.ResourceURI)
+	// PRM manual-override escape hatch (plan §7): when an operator has supplied
+	// metadata manually and the override hasn't expired, skip the live PRM probe
+	// and treat metadata as passing. Onboarding is recoverable for un-patchable
+	// servers / awkward proxies instead of being a hard dead end.
+	var metadataStatus, metadataMessage, metadataObserved string
+	if rs.PRMSource == "manual_override" && rs.PRMOverrideExpiresAt != nil && rs.PRMOverrideExpiresAt.After(time.Now().UTC()) {
+		metadataStatus = "passing"
+		metadataMessage = fmt.Sprintf("Manual metadata override active (re-verify by %s).", rs.PRMOverrideExpiresAt.UTC().Format(time.RFC3339))
+		metadataObserved = "manual_override"
+	} else {
+		metadataStatus, metadataMessage, metadataObserved = s.checkMetadataURL(rs.ResourceURI)
+	}
 	challengeStatus, challengeMessage, challengeObserved := s.checkMCPChallenge(rs.ResourceURI)
 	dcrAllowed := rs.AllowsRegistrationMode("dcr")
 
@@ -497,6 +509,80 @@ func (s *ResourceServerOnboardingService) listRoleOptions(resourceServerID, work
 		})
 	}
 	return options, nil
+}
+
+// DefaultPRMOverrideTTL is how long a manual PRM override stays valid before a
+// successful re-fetch must replace it (plan §7: expiring exception, never
+// silent-forever).
+const DefaultPRMOverrideTTL = 30 * 24 * time.Hour
+
+// SetManualPRMOverride records an operator-supplied PRM exception for an RS that
+// cannot serve RFC 9728 metadata cleanly. It writes the supplied scopes_supported,
+// flips prm_source='manual_override' with an expiry, and clears metadata_stale.
+// Scoped to the caller's workspace.
+func (s *ResourceServerOnboardingService) SetManualPRMOverride(rsID, workspaceID uuid.UUID, scopesSupported []string, ttl time.Duration) error {
+	if ttl <= 0 {
+		ttl = DefaultPRMOverrideTTL
+	}
+	expires := time.Now().UTC().Add(ttl)
+	updates := map[string]interface{}{
+		"prm_source":              "manual_override",
+		"prm_override_expires_at": expires,
+		"metadata_stale":          false,
+		"updated_at":              time.Now().UTC(),
+	}
+	if scopesSupported != nil {
+		updates["scopes_supported"] = pq.StringArray(scopesSupported)
+	}
+	res := s.db.Model(&models.ResourceServer{}).
+		Where("id = ? AND workspace_id = ?", rsID, workspaceID).
+		Updates(updates)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("resource server not found in workspace")
+	}
+	return nil
+}
+
+// ReverifyManualPRMOverrides is the reconciler step (plan §7): for every RS on a
+// manual override, re-attempt the real PRM fetch. On success it auto-replaces the
+// override (prm_source='fetched', clears expiry+stale). On override expiry without
+// a successful fetch it flags metadata_stale=true — existing tokens keep working,
+// but new scope changes are gated until metadata refreshes. Best-effort; per-RS
+// errors are logged and skipped.
+func (s *ResourceServerOnboardingService) ReverifyManualPRMOverrides(ctx context.Context) (replaced int, staled int) {
+	var rss []models.ResourceServer
+	if err := s.db.WithContext(ctx).
+		Where("prm_source = ?", "manual_override").
+		Find(&rss).Error; err != nil {
+		log.Printf("[PRM reverify] load overrides failed: %v", err)
+		return 0, 0
+	}
+	now := time.Now().UTC()
+	for _, rs := range rss {
+		status, _, _ := s.checkMetadataURL(rs.ResourceURI)
+		if status == "passing" {
+			s.db.WithContext(ctx).Model(&models.ResourceServer{}).
+				Where("id = ?", rs.ID).
+				Updates(map[string]interface{}{
+					"prm_source":              "fetched",
+					"prm_override_expires_at": nil,
+					"metadata_stale":          false,
+					"updated_at":              now,
+				})
+			replaced++
+			continue
+		}
+		if rs.PRMOverrideExpiresAt != nil && rs.PRMOverrideExpiresAt.Before(now) && !rs.MetadataStale {
+			s.db.WithContext(ctx).Model(&models.ResourceServer{}).
+				Where("id = ?", rs.ID).
+				Update("metadata_stale", true)
+			staled++
+		}
+	}
+	return replaced, staled
 }
 
 func (s *ResourceServerOnboardingService) checkMetadataURL(resourceURI string) (string, string, string) {

@@ -1,10 +1,14 @@
 package platform
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/policy"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -28,10 +32,134 @@ type PolicyCheckResponse struct {
 }
 
 // AuthorizationController exposes PDP checks for admin and end-user contexts.
-type AuthorizationController struct{}
+type AuthorizationController struct {
+	riskEngine *services.RiskEngineService
+	actionRepo *database.AgentActionRepository
+	pdp        policy.PDP // nil when POLICY_ENGINE_MODE=off
+}
 
 func NewAuthorizationController() *AuthorizationController {
-	return &AuthorizationController{}
+	ctrl := &AuthorizationController{}
+	if config.DB != nil {
+		repo := database.NewAgentActionRepository(config.GetDatabase())
+		ctrl.actionRepo = repo
+		ctrl.riskEngine = services.NewRiskEngineService(repo)
+	}
+	if config.AppConfig != nil && config.DB != nil {
+		mode := config.AppConfig.PolicyEngineMode
+		if mode == "shadow" || mode == "enforce" {
+			ctrl.pdp = policy.NewSimplePDP(config.DB)
+		}
+	}
+	return ctrl
+}
+
+// DecisionRequest is the body for POST /authz/decision.
+type DecisionRequest struct {
+	Tool     string                 `json:"tool"`
+	Resource string                 `json:"resource"`
+	Action   string                 `json:"action"`
+	Context  map[string]interface{} `json:"context,omitempty"`
+}
+
+// DecisionResponse is the response for POST /authz/decision.
+type DecisionResponse struct {
+	Effect      string   `json:"effect"`      // "permit" or "deny"
+	Obligations []string `json:"obligations"` // e.g. ["require_approval"]
+	RiskScore   int      `json:"risk_score"`
+	RiskLevel   string   `json:"risk_level"`
+	Reason      string   `json:"reason,omitempty"`
+}
+
+// Decision is the per-tool PEP endpoint used by SDK/AgentCore to check
+// whether a tool call is permitted before executing it. The bearer token
+// identifies the subject (user or SA) and workspace; the body carries the
+// tool details. Requires POLICY_OBLIGATIONS flag to enforce approval obligations.
+//
+// POST /authz/decision
+func (ac *AuthorizationController) Decision(c *gin.Context) {
+	var req DecisionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body", "details": err.Error()})
+		return
+	}
+
+	userIDStr, err := middlewares.ResolveUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	userID, _ := uuid.Parse(userIDStr)
+
+	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
+
+	// action defaults to tool name when not specified separately
+	action := req.Action
+	if action == "" {
+		action = req.Tool
+	}
+	resource := req.Resource
+	if resource == "" {
+		resource = req.Tool
+	}
+
+	obligations := []string{}
+	riskScore := 0
+	riskLevel := "low"
+	reason := ""
+
+	// ── Risk evaluation ──
+	if ac.riskEngine != nil && ac.actionRepo != nil {
+		settings, settErr := ac.actionRepo.GetOrCreateSettings(workspaceID)
+		if settErr == nil {
+			clientID, _ := c.Get("client_id")
+			agentID := fmt.Sprintf("%v", clientID)
+
+			eval, evalErr := ac.riskEngine.Evaluate(
+				workspaceID, agentID, action, resource,
+				req.Context, settings,
+			)
+			if evalErr == nil {
+				riskScore = eval.Score
+				riskLevel = eval.Level
+				if eval.ApprovalType == "single" || eval.ApprovalType == "multi" {
+					obligations = append(obligations, "require_approval")
+				}
+			}
+		}
+	}
+
+	// ── PDP gate ──
+	effect := "permit"
+	if ac.pdp != nil {
+		pdpReq := policy.PolicyRequest{
+			WorkspaceID: workspaceID,
+			SubjectType: "user",
+			SubjectID:   userID,
+			TokenFamily: "xaa", // per-tool decisions are in the agent (xaa/m2m) context
+		}
+		clientIDVal, _ := c.Get("client_id")
+		pdpReq.ClientID = fmt.Sprintf("%v", clientIDVal)
+
+		decision, _ := ac.pdp.Decide(c.Request.Context(), pdpReq)
+		mode := ""
+		if config.AppConfig != nil {
+			mode = config.AppConfig.PolicyEngineMode
+		}
+		if mode == "enforce" && decision.Effect == policy.EffectDeny {
+			effect = "deny"
+			reason = decision.Reason
+		}
+	}
+
+	c.JSON(http.StatusOK, DecisionResponse{
+		Effect:      effect,
+		Obligations: obligations,
+		RiskScore:   riskScore,
+		RiskLevel:   riskLevel,
+		Reason:      reason,
+	})
 }
 
 // buildPDPRequest parses the inbound payload + token into a typed PDPRequest.

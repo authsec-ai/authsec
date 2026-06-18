@@ -32,23 +32,27 @@ type MCPOAuthClient struct {
 	// SyncStatus tracks Hydra synchronisation: active | sync_error | pending_delete.
 	// The reconciler service walks non-'active' rows and re-attempts the Hydra
 	// side so we never strand a half-created/half-deleted client.
-	SyncStatus      string         `json:"sync_status" gorm:"type:text;not null;default:'active'"`
-	SyncLastError   *string        `json:"-" gorm:"type:text"`
-	SyncLastErrorAt *time.Time     `json:"-" gorm:"type:timestamptz"`
+	SyncStatus      string     `json:"sync_status" gorm:"type:text;not null;default:'active'"`
+	SyncLastError   *string    `json:"-" gorm:"type:text"`
+	SyncLastErrorAt *time.Time `json:"-" gorm:"type:timestamptz"`
 	// Client classification + software identity.
-	ClientKind        string         `json:"client_kind" gorm:"type:varchar(32);not null;default:'human_app'"`
-	SoftwareID        *string        `json:"software_id,omitempty" gorm:"type:varchar(255)"`
-	SoftwareVersion   *string        `json:"software_version,omitempty" gorm:"type:varchar(64)"`
-	LastTokenIssuedAt              *time.Time     `json:"last_token_issued_at,omitempty" gorm:"column:last_token_issued_at"`
-	Tags                           pq.StringArray `json:"tags" gorm:"type:text[];not null;default:'{}'"`
-	RegistrationAccessTokenHash    *string        `json:"-" gorm:"type:varchar(64);column:registration_access_token_hash"`
+	ClientKind                  string         `json:"client_kind" gorm:"type:varchar(32);not null;default:'human_app'"`
+	SoftwareID                  *string        `json:"software_id,omitempty" gorm:"type:varchar(255)"`
+	SoftwareVersion             *string        `json:"software_version,omitempty" gorm:"type:varchar(64)"`
+	LastTokenIssuedAt           *time.Time     `json:"last_token_issued_at,omitempty" gorm:"column:last_token_issued_at"`
+	Tags                        pq.StringArray `json:"tags" gorm:"type:text[];not null;default:'{}'"`
+	RegistrationAccessTokenHash *string        `json:"-" gorm:"type:varchar(64);column:registration_access_token_hash"`
 	// HomeWorkspaceID is the workspace that first registered or bound this
 	// client. nil = unbound (fresh DCR-without-resource or CIMD client).
 	// Adopted on first lazy bind at /authorize; lazy binds against a DIFFERENT
 	// workspace's RS create the registration as pending_approval instead.
 	HomeWorkspaceID *uuid.UUID `json:"home_workspace_id,omitempty" gorm:"type:uuid;column:home_workspace_id"`
-	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
-	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
+	// AllowedTokenEndpointAuthMethods is the authoritative confidential-client
+	// state (specifics (g)). authenticateClient and metadata read ONLY this array.
+	// Legacy TokenEndpointAuthMethod / IsConfidential are derived mirrors.
+	AllowedTokenEndpointAuthMethods pq.StringArray `json:"allowed_token_endpoint_auth_methods" gorm:"type:text[];not null;default:'{none}'"`
+	CreatedAt                       time.Time      `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	UpdatedAt                       time.Time      `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 }
 
 // MCPOAuthClient sync status constants.

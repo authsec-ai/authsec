@@ -96,7 +96,6 @@ Best regards,
 Your App Team
     `, otp)
 
-
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
@@ -156,7 +155,6 @@ If you didn't request a password reset, please ignore this email or contact supp
 Best regards,
 Your App Team
     `, otp)
-
 
 	// SMTP authentication (same as existing function)
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
@@ -235,7 +233,6 @@ Best regards,
 Your Security Team
     `, tempPassword)
 
-
 	// SMTP authentication (same as existing function)
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
@@ -294,7 +291,6 @@ Regards,
 AuthSec Team
 `, username, tempPassword, loginURL)
 
-
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
@@ -348,7 +344,6 @@ Best regards,
 Your Security Team
     `
 
-
 	// SMTP authentication
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
@@ -372,6 +367,76 @@ Your Security Team
 }
 
 // SendNewUserRegistrationNotificationEmail sends a notification to the tenant owner when a new user registers.
+// SendAccessRequestNotificationEmail notifies a workspace admin that a new
+// cross-workspace access request is pending their approval or that an existing
+// pending request is about to expire (indicated by expiryWarning=true).
+func SendAccessRequestNotificationEmail(adminEmail, requestID, clientID, rsName, requestedScopes, statusURL string, expiresAt time.Time, expiryWarning bool) error {
+	smtpHost := config.AppConfig.SMTPHost
+	smtpPort := config.AppConfig.SMTPPort
+	smtpUser := config.AppConfig.SMTPUser
+	smtpPass := config.AppConfig.SMTPPassword
+	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
+		log.Printf("SendAccessRequestNotificationEmail: SMTP not configured")
+		return fmt.Errorf("SMTP configuration is incomplete")
+	}
+
+	var subject, body string
+	if expiryWarning {
+		subject = "Action required: cross-workspace access request expiring soon"
+		body = fmt.Sprintf(`Hello,
+
+A pending cross-workspace access request for "%s" will expire at %s unless approved.
+
+- Request ID:      %s
+- Requesting client: %s
+- Requested scopes:  %s
+- Expires at:        %s
+
+Review and approve or deny at:
+%s
+
+Regards,
+AuthSec Team
+`, rsName, expiresAt.UTC().Format(time.RFC1123),
+			requestID, clientID, requestedScopes,
+			expiresAt.UTC().Format(time.RFC1123), statusURL)
+	} else {
+		subject = "New cross-workspace access request pending approval"
+		body = fmt.Sprintf(`Hello,
+
+A new cross-workspace access request requires your approval.
+
+- Request ID:        %s
+- Requesting client: %s
+- Target resource:   %s
+- Requested scopes:  %s
+- Expires at:        %s
+
+Review and approve or deny at:
+%s
+
+Regards,
+AuthSec Team
+`, requestID, clientID, rsName, requestedScopes,
+			expiresAt.UTC().Format(time.RFC1123), statusURL)
+	}
+
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+	err := smtp.SendMail(
+		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
+		auth,
+		smtpUser,
+		[]string{adminEmail},
+		buildEmailMessage(adminEmail, subject, body),
+	)
+	if err != nil {
+		log.Printf("SendAccessRequestNotificationEmail: failed to notify %s: %v", adminEmail, err)
+	} else {
+		log.Printf("SendAccessRequestNotificationEmail: notified %s (req=%s expiry_warning=%v)", adminEmail, requestID, expiryWarning)
+	}
+	return err
+}
+
 func SendNewUserRegistrationNotificationEmail(ownerEmail, userName, userEmail, workspaceDomain string) error {
 	log.Printf("SendNewUserRegistrationNotificationEmail: preparing notification email for owner %s", ownerEmail)
 
@@ -403,7 +468,6 @@ If you did not expect this registration, please review your tenant settings.
 Regards,
 AuthSec Team
 `, userName, userEmail, workspaceDomain, time.Now().UTC().Format(time.RFC1123))
-
 
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 

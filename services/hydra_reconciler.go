@@ -7,7 +7,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/utils"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -55,6 +58,8 @@ func (r *HydraReconciler) Run(ctx context.Context) {
 	// Launch background housekeeping goroutines alongside the main reconcile loop.
 	go r.runStaleDCRCleanup(ctx)
 	go r.runPendingApprovalExpiry(ctx)
+	go r.runAccessRequestExpiryAndReminder(ctx)
+	go r.runPRMOverrideReverify(ctx)
 
 	// First pass immediately so a restart picks up any in-flight failures
 	// without waiting for the first interval.
@@ -162,6 +167,148 @@ func (r *HydraReconciler) runPendingApprovalExpiry(ctx context.Context) {
 			return
 		case <-dailyTicker.C:
 			expire()
+		}
+	}
+}
+
+// runAccessRequestExpiryAndReminder runs hourly and does two things:
+//
+//  1. Flips pending access_requests whose expires_at has passed to 'expired'.
+//  2. Sends an email warning to workspace admins for requests expiring within
+//     the next 24 hours (pre-expiry reminder, Journey B finding 6).
+func (r *HydraReconciler) runAccessRequestExpiryAndReminder(ctx context.Context) {
+	log.Printf("[HydraReconciler] access_request expiry+reminder goroutine started")
+
+	run := func() {
+		now := time.Now().UTC()
+
+		// ── 1. expire stale pending rows ─────────────────────────────────────
+		res := r.db.WithContext(ctx).Exec(`
+			UPDATE access_requests
+			SET status='expired', updated_at=?
+			WHERE status='pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+			now, now,
+		)
+		if res.Error != nil {
+			log.Printf("[HydraReconciler] access_request expiry update failed: %v", res.Error)
+		} else if res.RowsAffected > 0 {
+			log.Printf("[HydraReconciler] access_request expiry: expired %d row(s)", res.RowsAffected)
+		}
+
+		// ── 2. find requests expiring in the next 24 hours ───────────────────
+		warn := now.Add(24 * time.Hour)
+		type arRow struct {
+			ID                uuid.UUID
+			WorkspaceID       uuid.UUID
+			ResourceServerID  uuid.UUID
+			RequestedByClient string
+			RequestedScopes   string
+			ExpiresAt         time.Time
+		}
+		var rows []arRow
+		if err := r.db.WithContext(ctx).Raw(`
+			SELECT id, workspace_id, resource_server_id,
+			       requested_by_client, requested_scopes, expires_at
+			FROM access_requests
+			WHERE status='pending'
+			  AND expires_at IS NOT NULL
+			  AND expires_at > ? AND expires_at <= ?`,
+			now, warn,
+		).Scan(&rows).Error; err != nil {
+			log.Printf("[HydraReconciler] access_request reminder query failed: %v", err)
+			return
+		}
+
+		if len(rows) == 0 {
+			return
+		}
+
+		// Collect RS names.
+		rsIDs := make([]uuid.UUID, 0, len(rows))
+		for _, row := range rows {
+			rsIDs = append(rsIDs, row.ResourceServerID)
+		}
+		type rsRow struct {
+			ID   uuid.UUID
+			Name string
+		}
+		var rsList []rsRow
+		r.db.WithContext(ctx).Raw("SELECT id, name FROM resource_servers WHERE id IN ?", rsIDs).Scan(&rsList)
+		rsNames := make(map[uuid.UUID]string, len(rsList))
+		for _, rs := range rsList {
+			rsNames[rs.ID] = rs.Name
+		}
+
+		selfIssuer := ""
+		if config.AppConfig != nil {
+			selfIssuer = config.AppConfig.OAuthBaseURL()
+		}
+
+		for _, row := range rows {
+			rsName := rsNames[row.ResourceServerID]
+			if rsName == "" {
+				rsName = row.ResourceServerID.String()
+			}
+
+			// Load workspace admins.
+			type adminEmail struct{ Email string }
+			var admins []adminEmail
+			r.db.WithContext(ctx).Raw(`
+				SELECT DISTINCT u.email
+				FROM users u
+				JOIN role_bindings rb ON u.id = rb.user_id AND rb.workspace_id = ?
+				JOIN roles ro ON rb.role_id = ro.id AND ro.workspace_id = ?
+				WHERE u.active = true AND u.workspace_id = ?
+				  AND LOWER(ro.name) IN ('admin', 'administrator', 'owner', 'super_admin')`,
+				row.WorkspaceID, row.WorkspaceID, row.WorkspaceID,
+			).Scan(&admins)
+
+			statusURL := selfIssuer + "/oauth/access-requests/" + row.ID.String()
+			for _, a := range admins {
+				_ = utils.SendAccessRequestNotificationEmail(
+					a.Email, row.ID.String(),
+					row.RequestedByClient, rsName, row.RequestedScopes,
+					statusURL, row.ExpiresAt, true,
+				)
+			}
+			log.Printf("[HydraReconciler] access_request pre-expiry reminder sent for req=%s (expires=%s)",
+				row.ID, row.ExpiresAt.Format(time.RFC3339))
+		}
+	}
+
+	run()
+	hourlyTicker := time.NewTicker(time.Hour)
+	defer hourlyTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hourlyTicker.C:
+			run()
+		}
+	}
+}
+
+// runPRMOverrideReverify runs hourly and re-attempts the real PRM fetch for any
+// resource server on a manual override (plan §7): success auto-replaces the
+// override; expiry without success flags metadata_stale.
+func (r *HydraReconciler) runPRMOverrideReverify(ctx context.Context) {
+	svc := NewResourceServerOnboardingService(r.db)
+	run := func() {
+		replaced, staled := svc.ReverifyManualPRMOverrides(ctx)
+		if replaced > 0 || staled > 0 {
+			log.Printf("[HydraReconciler] PRM reverify: replaced=%d staled=%d", replaced, staled)
+		}
+	}
+	run()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
 		}
 	}
 }

@@ -154,6 +154,9 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 	}
 	userID, _ := uuid.Parse(userIDStr)
 
+	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
+
 	approverEmail := ""
 	if email, exists := c.Get("email"); exists {
 		approverEmail = email.(string)
@@ -166,6 +169,7 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 		req.Approved,
 		req.Reason,
 		req.BiometricVerified,
+		workspaceID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to respond to action", "details": err.Error()})
