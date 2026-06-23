@@ -220,9 +220,12 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	tenantDB := config.DB
 
+	// Scope the user lookup to the validated workspace. expectedWorkspaceID was
+	// pinned to the login-challenge workspace above; without this filter a user
+	// row with a matching id/email in a different workspace could be loaded.
 	var user models.User
-	if err := tenantDB.Where("id = ?", userID).First(&user).Error; err != nil {
-		if err := tenantDB.Where("LOWER(email) = LOWER(?)", email).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", userID, expectedWorkspaceID).First(&user).Error; err != nil {
+		if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ?", email, expectedWorkspaceID).First(&user).Error; err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"success": false,
 				"error":   "authenticated user not found in tenant database",

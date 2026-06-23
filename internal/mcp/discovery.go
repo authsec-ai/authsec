@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -304,9 +305,15 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 }
 
 // ssrfSafeDialer rejects connections to private/loopback IPs.
+// Set MCP_ALLOW_LOOPBACK=true to bypass the check (integration-test use only).
 func ssrfSafeDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	allowLoopback := os.Getenv("MCP_ALLOW_LOOPBACK") == "true"
 	dialer := &net.Dialer{Timeout: connectTimeout}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if allowLoopback {
+			return dialer.DialContext(ctx, network, addr)
+		}
+
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid address: %w", err)

@@ -3,8 +3,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +10,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
-	spireerrors "github.com/authsec-ai/authsec/internal/spire/errors"
 )
 
 // ConnectionManager manages database connections for multiple tenants.
@@ -62,137 +59,26 @@ func NewConnectionManager(
 	}
 }
 
-// GetWorkspaceDB returns a database connection for the given tenant
+// GetWorkspaceDB returns the master database connection.
+//
+// Single master DB architecture: there are no per-tenant databases. All
+// workspace data lives in the one master DB, scoped by workspace_id columns.
+// This returns masterDB unconditionally so no code path ever tries to open a
+// tenant_<workspaceID> database (which does not exist).
 func (cm *ConnectionManager) GetWorkspaceDB(ctx context.Context, workspaceID string) (*sql.DB, error) {
-	cm.mu.RLock()
-	db, exists := cm.tenantConnections[workspaceID]
-	cm.mu.RUnlock()
-
-	if exists {
-		if err := db.PingContext(ctx); err == nil {
-			return db, nil
-		}
-		cm.removeTenantConnection(workspaceID)
-	}
-
-	return cm.createTenantConnection(ctx, workspaceID)
+	return cm.masterDB, nil
 }
 
-// GetWorkspaceDBByName returns a database connection using the tenant database name directly
+// GetWorkspaceDBByName returns the master database connection.
+// See GetWorkspaceDB — single master DB architecture, no per-tenant databases.
 func (cm *ConnectionManager) GetWorkspaceDBByName(ctx context.Context, workspaceID, dbName string) (*sql.DB, error) {
-	cm.mu.RLock()
-	db, exists := cm.tenantConnections[workspaceID]
-	cm.mu.RUnlock()
-
-	if exists {
-		if err := db.PingContext(ctx); err == nil {
-			return db, nil
-		}
-		cm.removeTenantConnection(workspaceID)
-	}
-
-	return cm.createTenantConnectionByName(ctx, workspaceID, dbName)
+	return cm.masterDB, nil
 }
 
-func (cm *ConnectionManager) createTenantConnection(ctx context.Context, workspaceID string) (*sql.DB, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if db, exists := cm.tenantConnections[workspaceID]; exists {
-		return db, nil
-	}
-
-	tenant, err := cm.workspaceRepo.GetByID(ctx, workspaceID)
-	if err != nil {
-		return nil, spireerrors.NewNotFoundError("Tenant not found", err)
-	}
-
-	if !tenant.IsActive() {
-		return nil, spireerrors.NewForbiddenError("Tenant is not active", nil)
-	}
-
-	tenantDBName := "tenant_" + strings.ReplaceAll(workspaceID, "-", "_")
-
-	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
-		cm.dbHost, cm.dbPort, tenantDBName, cm.dbUsername, cm.dbPassword, cm.dbSSLMode)
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": tenantDBName}).WithError(err).Error("Failed to open tenant database")
-		return nil, spireerrors.NewInternalError("Failed to connect to tenant database", err)
-	}
-
-	db.SetMaxOpenConns(cm.maxOpenConns)
-	db.SetMaxIdleConns(cm.maxIdleConns)
-	db.SetConnMaxLifetime(cm.connMaxLifetime)
-
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": tenantDBName}).WithError(err).Error("Failed to ping tenant database")
-		return nil, spireerrors.NewInternalError("Failed to connect to tenant database", err)
-	}
-
-	cm.tenantConnections[workspaceID] = db
-	cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": tenantDBName}).Info("Created tenant database connection")
-	return db, nil
-}
-
-func (cm *ConnectionManager) createTenantConnectionByName(ctx context.Context, workspaceID, dbName string) (*sql.DB, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if db, exists := cm.tenantConnections[workspaceID]; exists {
-		return db, nil
-	}
-
-	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
-		cm.dbHost, cm.dbPort, dbName, cm.dbUsername, cm.dbPassword, cm.dbSSLMode)
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": dbName}).WithError(err).Error("Failed to open tenant database")
-		return nil, spireerrors.NewInternalError("Failed to connect to tenant database", err)
-	}
-
-	db.SetMaxOpenConns(cm.maxOpenConns)
-	db.SetMaxIdleConns(cm.maxIdleConns)
-	db.SetConnMaxLifetime(cm.connMaxLifetime)
-
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": dbName}).WithError(err).Error("Failed to ping tenant database")
-		return nil, spireerrors.NewInternalError("Failed to connect to tenant database", err)
-	}
-
-	cm.tenantConnections[workspaceID] = db
-	cm.logger.WithFields(logrus.Fields{"workspace_id": workspaceID, "db_name": dbName}).Info("Created tenant database connection by name")
-	return db, nil
-}
-
-func (cm *ConnectionManager) removeTenantConnection(workspaceID string) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if db, exists := cm.tenantConnections[workspaceID]; exists {
-		db.Close()
-		delete(cm.tenantConnections, workspaceID)
-		cm.logger.WithField("workspace_id", workspaceID).Info("Removed tenant database connection")
-	}
-}
-
-// Close closes all connections
+// Close is a no-op. The master DB is owned by the caller (GORM), not this
+// manager, and there are no per-tenant connections to close.
 func (cm *ConnectionManager) Close() error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	var lastErr error
-	for workspaceID, db := range cm.tenantConnections {
-		if err := db.Close(); err != nil {
-			cm.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to close tenant connection")
-			lastErr = err
-		}
-	}
-	return lastErr
+	return nil
 }
 
 // GetMasterDB returns the master database connection

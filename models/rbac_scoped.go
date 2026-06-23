@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -74,13 +75,38 @@ type ServiceAccount struct {
 	Name          string     `json:"name"           gorm:"type:text;not null"`
 	Description   string     `json:"description"    gorm:"type:text"`
 	Status        string     `json:"status"         gorm:"type:text;not null;default:'disabled'"`
-	OAuthClientID *uuid.UUID `json:"oauth_client_id" gorm:"type:uuid"`
-	SpiffeID      *string    `json:"spiffe_id"      gorm:"type:text"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	OAuthClientID   *uuid.UUID `json:"oauth_client_id" gorm:"type:uuid;column:oauth_client_id"`
+	SpiffeID        *string    `json:"spiffe_id"      gorm:"type:text"`
+	ExternalSubject *string    `json:"external_subject,omitempty" gorm:"type:text"`
+	OwnerEmail      *string    `json:"owner_email,omitempty"      gorm:"type:text"`
+	OwnerTeam       *string    `json:"owner_team,omitempty"       gorm:"type:text"`
+	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 func (ServiceAccount) TableName() string { return "service_accounts" }
+
+// WorkloadIdentityProvider is a registered external token issuer that workloads
+// authenticate with (kind 'spiffe' = a SPIRE trust domain; kind 'oidc' = a
+// generic OIDC issuer such as GitHub Actions). Replaces the single global
+// SPIFFE_OIDC_ISSUER env. Backing table: public.workload_identity_providers.
+type WorkloadIdentityProvider struct {
+	ID               uuid.UUID      `json:"id"            gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID      uuid.UUID      `json:"workspace_id"  gorm:"type:uuid;not null"`
+	Name             string         `json:"name"          gorm:"type:text;not null"`
+	Kind             string         `json:"kind"          gorm:"type:text;not null;default:'spiffe'"`
+	Issuer           string         `json:"issuer"        gorm:"type:text;not null"`
+	JWKSUri          *string        `json:"jwks_uri,omitempty"     gorm:"type:text"`
+	TrustDomain      *string        `json:"trust_domain,omitempty" gorm:"type:text"`
+	AllowedAudiences pq.StringArray `json:"allowed_audiences" gorm:"type:text[];default:'{}'"`
+	SubjectClaim     string         `json:"subject_claim" gorm:"type:text;not null;default:'sub'"`
+	Status           string         `json:"status"        gorm:"type:text;not null;default:'active'"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
+func (WorkloadIdentityProvider) TableName() string { return "workload_identity_providers" }
 
 // RoleBinding represents an assignment of a Role to a Principal
 // (User, Group, or Service Account). Migration 111 added group_id; exactly one

@@ -10,9 +10,13 @@ import (
 
 // AuditEvent represents an auditable event
 type AuditEvent struct {
-	ID         uint      `json:"id" gorm:"primaryKey"`
-	RequestID  string    `json:"request_id" gorm:"index"`
-	WorkspaceID   string    `json:"workspace_id" gorm:"index"`
+	ID          uint   `json:"id" gorm:"primaryKey"`
+	RequestID   string `json:"request_id" gorm:"index"`
+	WorkspaceID string `json:"workspace_id" gorm:"index"`
+	// ActorRealm records which login surface the event came from
+	// (admin / enduser / service / system). Keeps workspace_id clean — see
+	// migrations/master/001_bootstrap.sql audit_events.
+	ActorRealm string    `json:"actor_realm"`
 	UserID     string    `json:"user_id" gorm:"index"`
 	Action     string    `json:"action" gorm:"index"`
 	Resource   string    `json:"resource" gorm:"index"`
@@ -73,38 +77,44 @@ func (al *AuditLogger) LogEvent(event *AuditEvent) {
 
 	// Log to structured logger
 	al.logger.WithFields(logrus.Fields{
-		"request_id":  event.RequestID,
-		"workspace_id":   event.WorkspaceID,
-		"user_id":     event.UserID,
-		"action":      event.Action,
-		"resource":    event.Resource,
-		"resource_id": event.ResourceID,
-		"method":      event.Method,
-		"path":        event.Path,
-		"status_code": event.StatusCode,
-		"duration_ms": event.Duration,
-		"client_ip":   event.ClientIP,
-		"error":       event.Error,
+		"request_id":   event.RequestID,
+		"workspace_id": event.WorkspaceID,
+		"user_id":      event.UserID,
+		"action":       event.Action,
+		"resource":     event.Resource,
+		"resource_id":  event.ResourceID,
+		"method":       event.Method,
+		"path":         event.Path,
+		"status_code":  event.StatusCode,
+		"duration_ms":  event.Duration,
+		"client_ip":    event.ClientIP,
+		"error":        event.Error,
 	}).Info("Audit event")
 }
 
-// LogAuthentication logs authentication events
-func (al *AuditLogger) LogAuthentication(requestID, workspaceID, userID, action, clientIP, userAgent string, success bool, errorMsg string) {
+// LogAuthentication logs authentication events.
+//
+// workspaceID must be a real workspace UUID, or "" when the flow has no
+// workspace yet (e.g. a pre-auth admin login failure). Do NOT pass the realm
+// here — that's what actorRealm is for ("admin" / "enduser" / "service" /
+// "system"). This separation keeps audit_events.workspace_id queryable.
+func (al *AuditLogger) LogAuthentication(requestID, workspaceID, actorRealm, userID, action, clientIP, userAgent string, success bool, errorMsg string) {
 	status := "success"
 	if !success {
 		status = "failure"
 	}
 
 	event := &AuditEvent{
-		RequestID:  requestID,
-		WorkspaceID:   workspaceID,
-		UserID:     userID,
-		Action:     action,
-		Resource:   "authentication",
-		ClientIP:   clientIP,
-		UserAgent:  userAgent,
-		StatusCode: 200,
-		Error:      errorMsg,
+		RequestID:   requestID,
+		WorkspaceID: workspaceID,
+		ActorRealm:  actorRealm,
+		UserID:      userID,
+		Action:      action,
+		Resource:    "authentication",
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
+		StatusCode:  200,
+		Error:       errorMsg,
 	}
 
 	// Add status to action
@@ -116,19 +126,19 @@ func (al *AuditLogger) LogAuthentication(requestID, workspaceID, userID, action,
 // LogAdminAction logs administrative actions
 func (al *AuditLogger) LogAdminAction(requestID, workspaceID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, oldValues, newValues interface{}, errorMsg string) {
 	event := &AuditEvent{
-		RequestID:  requestID,
-		WorkspaceID:   workspaceID,
-		UserID:     userID,
-		Action:     action,
-		Resource:   resource,
-		ResourceID: resourceID,
-		Method:     method,
-		Path:       path,
-		ClientIP:   clientIP,
-		UserAgent:  userAgent,
-		StatusCode: statusCode,
-		Duration:   duration.Milliseconds(),
-		Error:      errorMsg,
+		RequestID:   requestID,
+		WorkspaceID: workspaceID,
+		UserID:      userID,
+		Action:      action,
+		Resource:    resource,
+		ResourceID:  resourceID,
+		Method:      method,
+		Path:        path,
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
+		StatusCode:  statusCode,
+		Duration:    duration.Milliseconds(),
+		Error:       errorMsg,
 	}
 
 	// Serialize old/new values to JSON if provided
@@ -158,19 +168,19 @@ func (al *AuditLogger) LogAdminAction(requestID, workspaceID, userID, action, re
 // LogTenantAction logs tenant-specific actions
 func (al *AuditLogger) LogTenantAction(requestID, workspaceID, userID, action, resource, resourceID, method, path, clientIP, userAgent string, statusCode int, duration time.Duration, errorMsg string) {
 	event := &AuditEvent{
-		RequestID:  requestID,
-		WorkspaceID:   workspaceID,
-		UserID:     userID,
-		Action:     action,
-		Resource:   resource,
-		ResourceID: resourceID,
-		Method:     method,
-		Path:       path,
-		ClientIP:   clientIP,
-		UserAgent:  userAgent,
-		StatusCode: statusCode,
-		Duration:   duration.Milliseconds(),
-		Error:      errorMsg,
+		RequestID:   requestID,
+		WorkspaceID: workspaceID,
+		UserID:      userID,
+		Action:      action,
+		Resource:    resource,
+		ResourceID:  resourceID,
+		Method:      method,
+		Path:        path,
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
+		StatusCode:  statusCode,
+		Duration:    duration.Milliseconds(),
+		Error:       errorMsg,
 	}
 
 	al.LogEvent(event)

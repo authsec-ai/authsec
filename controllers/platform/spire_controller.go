@@ -185,19 +185,20 @@ type SpirePolicyResult struct {
 
 // SpireAuditLog stores policy audit entries.
 type SpireAuditLog struct {
-	ID        uint                   `json:"id" gorm:"primaryKey"`
-	RequestID string                 `json:"request_id"`
-	Subject   string                 `json:"subject"`
-	Resource  string                 `json:"resource"`
-	Action    string                 `json:"action"`
-	Decision  string                 `json:"decision"`
-	Reason    string                 `json:"reason"`
-	PolicyID  *uint                  `json:"policy_id,omitempty"`
-	RuleID    *uint                  `json:"rule_id,omitempty"`
-	Context   map[string]interface{} `json:"context" gorm:"serializer:json"`
-	IPAddress string                 `json:"ip_address"`
-	UserAgent string                 `json:"user_agent"`
-	Timestamp time.Time              `json:"timestamp"`
+	ID          uint                   `json:"id" gorm:"primaryKey"`
+	RequestID   string                 `json:"request_id"`
+	WorkspaceID string                 `json:"workspace_id"`
+	Subject     string                 `json:"subject"`
+	Resource    string                 `json:"resource"`
+	Action      string                 `json:"action"`
+	Decision    string                 `json:"decision"`
+	Reason      string                 `json:"reason"`
+	PolicyID    *uint                  `json:"policy_id,omitempty"`
+	RuleID      *uint                  `json:"rule_id,omitempty"`
+	Context     map[string]interface{} `json:"context" gorm:"serializer:json"`
+	IPAddress   string                 `json:"ip_address"`
+	UserAgent   string                 `json:"user_agent"`
+	Timestamp   time.Time              `json:"timestamp"`
 }
 
 func (SpireAuditLog) TableName() string { return "spire_audit_logs" }
@@ -379,9 +380,9 @@ func RegisterAgentWorkload(workspaceID, clientID, agentType, platform string, se
 
 	// Build selectors JSON for the workload_entries record
 	selectorMap := map[string]string{
-		"authsec:client_id":  clientID,
-		"authsec:agent_type": agentType,
-		"authsec:workspace_id":  workspaceID,
+		"authsec:client_id":    clientID,
+		"authsec:agent_type":   agentType,
+		"authsec:workspace_id": workspaceID,
 	}
 	for k, v := range selectors {
 		selectorMap[k] = v
@@ -1281,10 +1282,17 @@ func (sc *SpireController) ListRoleBindings(c *gin.Context) {
 	c.JSON(http.StatusOK, bindings)
 }
 
-// GetAuditLogs returns paginated audit logs.
+// GetAuditLogs returns paginated audit logs, scoped to the caller's workspace.
 func (sc *SpireController) GetAuditLogs(c *gin.Context) {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "workspace context required"})
+		return
+	}
 	var logs []SpireAuditLog
-	q := sc.db.Model(&SpireAuditLog{}).Order("timestamp DESC")
+	q := sc.db.Model(&SpireAuditLog{}).
+		Where("workspace_id = ?", workspaceID).
+		Order("timestamp DESC")
 	if s := c.Query("subject"); s != "" {
 		q = q.Where("subject ILIKE ?", "%"+s+"%")
 	}
@@ -1296,6 +1304,12 @@ func (sc *SpireController) GetAuditLogs(c *gin.Context) {
 	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 200 {
+		limit = 100
+	}
 	if err := q.Offset((page - 1) * limit).Limit(limit).Find(&logs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1303,10 +1317,44 @@ func (sc *SpireController) GetAuditLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"logs": logs, "page": page, "limit": limit})
 }
 
-// ExportAuditLogs exports all audit logs as JSON.
+// ExportAuditLogs exports audit logs as JSON, scoped to the caller's workspace
+// and bounded by a required time window. Never dumps the whole table.
 func (sc *SpireController) ExportAuditLogs(c *gin.Context) {
+	workspaceID := c.GetString("workspace_id")
+	if workspaceID == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "workspace context required"})
+		return
+	}
+
+	const maxExportRows = 10000
+	q := sc.db.Model(&SpireAuditLog{}).
+		Where("workspace_id = ?", workspaceID).
+		Order("timestamp DESC")
+
+	// Require an explicit, bounded time window so this can't be used to dump
+	// arbitrarily large slices of history in one call.
+	from, to := c.Query("from"), c.Query("to")
+	if from == "" || to == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "from and to (RFC3339) query params are required"})
+		return
+	}
+	fromTS, err := time.Parse(time.RFC3339, from)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'from' timestamp; expected RFC3339"})
+		return
+	}
+	toTS, err := time.Parse(time.RFC3339, to)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'to' timestamp; expected RFC3339"})
+		return
+	}
+	q = q.Where("timestamp >= ? AND timestamp <= ?", fromTS, toTS)
+
 	var logs []SpireAuditLog
-	sc.db.Find(&logs)
+	if err := q.Limit(maxExportRows).Find(&logs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.Header("Content-Disposition", "attachment; filename=spire-audit-logs.json")
 	c.JSON(http.StatusOK, logs)
 }
@@ -1469,7 +1517,8 @@ func (sc *SpireController) spireAuditLog(c *gin.Context, action, resource, decis
 		subject = "unknown"
 	}
 	sc.db.Create(&SpireAuditLog{
-		RequestID: rid, Subject: subject, Resource: resource,
+		RequestID: rid, WorkspaceID: c.GetString("workspace_id"),
+		Subject: subject, Resource: resource,
 		Action: action, Decision: decision, Reason: reason,
 		Context:   map[string]interface{}{},
 		IPAddress: c.ClientIP(), UserAgent: c.GetHeader("User-Agent"),

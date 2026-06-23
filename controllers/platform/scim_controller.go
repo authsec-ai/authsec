@@ -230,8 +230,8 @@ func (sc *SCIMController) ListUsers(c *gin.Context) {
 	filter := c.Query("filter")
 	baseURL := scimBaseURL(c)
 
-	// Build query — scoped by workspace_id
-	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ?", workspaceID)
+	// Build query — scoped by workspace_id, excluding soft-deleted users.
+	query := tenantDB.Model(&models.ExtendedUser{}).Where("workspace_id = ? AND deleted_at IS NULL", workspaceID)
 
 	// When no filter: return only SCIM-provisioned users
 	// When filter is provided (e.g., Okta searching by userName): search ALL users for duplicate detection
@@ -278,7 +278,7 @@ func (sc *SCIMController) GetUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -464,7 +464,7 @@ func (sc *SCIMController) ReplaceUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -542,7 +542,7 @@ func (sc *SCIMController) PatchUser(c *gin.Context) {
 	}
 
 	var user models.ExtendedUser
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceID).First(&user).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			c.JSON(http.StatusNotFound, models.NewSCIMError("404", "User not found", ""))
 			return
@@ -1111,7 +1111,7 @@ func (sc *SCIMController) getGroupMembers(tenantDB *gorm.DB, groupID, workspaceI
 	members := make([]models.SCIMMemberRef, 0, len(userGroups))
 	for _, ug := range userGroups {
 		var user models.ExtendedUser
-		if err := tenantDB.Select("id, name, email").Where("id = ?", ug.UserID).First(&user).Error; err == nil {
+		if err := tenantDB.Select("id, name, email").Where("id = ? AND deleted_at IS NULL", ug.UserID).First(&user).Error; err == nil {
 			display := user.Name
 			if display == "" {
 				display = user.Email

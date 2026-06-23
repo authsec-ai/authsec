@@ -47,60 +47,6 @@ type CreateWorkspaceDBResponse struct {
 	Existed         bool      `json:"existed"`
 }
 
-// TenantInfo maps to the tenants table in the master DB.
-// Not managed by GORM auto-migrate; the table already exists in production.
-type TenantInfo struct {
-	ID              uuid.UUID  `gorm:"type:uuid;primary_key"                  json:"id"`
-	WorkspaceID        uuid.UUID  `gorm:"type:uuid;not null;unique"              json:"workspace_id"`
-	WorkspaceDB        *string    `gorm:"type:text"                              json:"workspace_db"`
-	Email           string     `gorm:"type:text;not null"                     json:"email"`
-	WorkspaceDomain    string     `gorm:"type:text;not null"                     json:"workspace_domain"`
-	Status          *string    `gorm:"type:text"                              json:"status"`
-	MigrationStatus *string    `gorm:"type:varchar(50);default:'pending'"     json:"migration_status"`
-	LastMigration   *int       `gorm:"type:integer"                           json:"last_migration"`
-	CreatedAt       *time.Time `gorm:"type:timestamptz"                       json:"created_at"`
-	UpdatedAt       *time.Time `gorm:"type:timestamptz"                       json:"updated_at"`
-}
-
-func (TenantInfo) TableName() string { return "tenants" }
-
-// TenantListItem is a lightweight tenant representation for list responses.
-type TenantListItem struct {
-	WorkspaceID        string `json:"workspace_id"`
-	Email           string `json:"email"`
-	WorkspaceDomain    string `json:"workspace_domain"`
-	DatabaseName    string `json:"database_name"`
-	MigrationStatus string `json:"migration_status"`
-	LastMigration   *int   `json:"last_migration"`
-}
-
-// MigrateAllResponse summarises a bulk tenant migration run.
-type MigrateAllResponse struct {
-	Total     int                   `json:"total"`
-	Succeeded int                   `json:"succeeded"`
-	Failed    int                   `json:"failed"`
-	Skipped   int                   `json:"skipped"`
-	Results   []TenantMigrateResult `json:"results"`
-}
-
-// TenantMigrateResult is the per-tenant outcome within a MigrateAllResponse.
-type TenantMigrateResult struct {
-	WorkspaceID     string `json:"workspace_id"`
-	DatabaseName string `json:"database_name"`
-	Status       string `json:"status"`
-	Error        string `json:"error,omitempty"`
-}
-
-// CreateTenantFromTemplateResponse is returned by the create-from-template endpoint.
-type CreateTenantFromTemplateResponse struct {
-	WorkspaceID           string    `json:"workspace_id"`
-	DatabaseName       string    `json:"database_name"`
-	MigrationStatus    string    `json:"migration_status"`
-	CreatedAt          time.Time `json:"created_at"`
-	ClonedFromTemplate bool      `json:"cloned_from_template"`
-	CloneDurationMS    int64     `json:"clone_duration_ms"`
-}
-
 // TemplateStatusResponse is returned by the template-status endpoint.
 type TemplateStatusResponse struct {
 	TemplateName string `json:"template_name"`

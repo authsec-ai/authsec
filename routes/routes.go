@@ -203,6 +203,9 @@ func SetupRoutes(
 	scopeMatrixController := platformCtrl.NewScopeMatrixController()
 	workspaceController := platformCtrl.NewWorkspaceController()
 	applicationsController := platformCtrl.NewApplicationsController()
+	trustedIssuersController := platformCtrl.NewTrustedIssuersController()
+	a2aBrokeringController := platformCtrl.NewA2ABrokeringController()
+	workloadProvidersController := platformCtrl.NewWorkloadIdentityProvidersController()
 	scimConnectionsController := adminCtrl.NewSCIMConnectionsController()
 	identityProvidersController := adminCtrl.NewIdentityProvidersController()
 	applicationIDPPoliciesController := adminCtrl.NewApplicationIDPPoliciesController()
@@ -407,6 +410,35 @@ func SetupRoutes(
 			applications.GET("/:id/access/users", scopeMatrixController.ListApplicationAccessUsers)
 			applications.GET("/:id/users/:user_id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccess)
 
+			// Access assignments — union view of user + SA bindings with effective
+			// scopes; explicit create/delete paths per identity type.
+			applications.GET("/:id/access-assignments", scopeMatrixController.ListAccessAssignments)
+			applications.GET("/:id/access-assignments/summary", scopeMatrixController.GetAccessSummary)
+			applications.POST("/:id/access-assignments/users", scopeMatrixController.CreateUserAssignment)
+			applications.POST("/:id/access-assignments/service-accounts", scopeMatrixController.CreateSAAssignment)
+			applications.DELETE("/:id/access-assignments/:assignment_id", scopeMatrixController.DeleteAssignment)
+
+			// Per-app access requests: list pending + approve (binds role to acting
+			// user + approves connection atomically) + deny.
+			applications.GET("/:id/requests", applicationsController.ListRequests)
+			applications.POST("/:id/requests/:rid/approve", applicationsController.ApproveRequest)
+			applications.POST("/:id/requests/:rid/deny", applicationsController.DenyRequest)
+
+			// Machine access — create a service account + API credential + role +
+			// approved registration in one call; dry-run the resulting mint.
+			applications.POST("/:id/machine-access/api-credential", applicationsController.CreateAPICredentialAccess)
+			applications.POST("/:id/token-test/simulate", applicationsController.SimulateToken)
+			applications.POST("/:id/token-test/simulate-xaa", applicationsController.SimulateXAA)
+
+			// Workload identity (SPIFFE/SVID, K8s-first).
+			applications.POST("/:id/machine-access/workload", applicationsController.CreateWorkloadAccess)
+			applications.GET("/:id/workloads", applicationsController.ListWorkloads)
+			applications.DELETE("/:id/workloads/:wid", applicationsController.RevokeWorkload)
+
+			// Grant an EXISTING workload access to this MCP server (role binding +
+			// approved registration only — never mints/changes the workload identity).
+			applications.POST("/:id/access/workloads", applicationsController.GrantWorkloadAccess)
+
 			// Application↔IDP policy (optional whitelist; default-allow when empty).
 			applications.GET("/:id/identity-providers", applicationIDPPoliciesController.List)
 			applications.POST("/:id/identity-providers", applicationIDPPoliciesController.Add)
@@ -439,6 +471,60 @@ func SetupRoutes(
 			applicationsController.RevokeTokenByJTI,
 		)
 
+		// Trusted issuers CRUD + test (G7). Issuers are instance-wide but CRUD
+		// requires workspace admin JWT.
+		trustedIssuers := authsec.Group("/trusted-issuers")
+		trustedIssuers.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+		)
+		{
+			trustedIssuers.GET("", trustedIssuersController.List)
+			trustedIssuers.POST("", trustedIssuersController.Create)
+			trustedIssuers.POST("/test", trustedIssuersController.Test)
+			trustedIssuers.DELETE("/:id", trustedIssuersController.Revoke)
+		}
+
+		// A2A brokering policies (cross-app permit/deny) — same workspace-admin
+		// guard as trusted issuers; the token-endpoint gate already enforces them.
+		brokering := authsec.Group("/brokering-policies")
+		brokering.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+		)
+		{
+			brokering.GET("", a2aBrokeringController.List)
+			brokering.POST("", a2aBrokeringController.Create)
+			brokering.DELETE("/:id", a2aBrokeringController.Delete)
+		}
+
+		// Workload identity providers (multi-cluster SPIFFE + OIDC/CI federation).
+		workloadProviders := authsec.Group("/workload-identity-providers")
+		workloadProviders.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+		)
+		{
+			workloadProviders.GET("", workloadProvidersController.List)
+			workloadProviders.POST("", workloadProvidersController.Create)
+			workloadProviders.DELETE("/:id", workloadProvidersController.Delete)
+		}
+
+		// A2A agent registration — mint a confidential authorization_code +
+		// token-exchange client in the caller's workspace (self-serve J5).
+		agents := authsec.Group("/agents")
+		agents.Use(
+			middlewares.AuthMiddleware(),
+			middlewares.RequireWorkspaceRole("owner", "admin"),
+			middlewares.ValidateWorkspaceFromToken(),
+		)
+		{
+			agents.POST("", applicationsController.RegisterAgent)
+		}
+
 		// v1 IAM cockpit aggregate/read-model aliases. These routes expose the
 		// product vocabulary used by the AI/MCP access-control UI while reusing
 		// the existing scope matrix, bindings, and runtime resolver backends.
@@ -456,7 +542,7 @@ func SetupRoutes(
 				v1Applications.GET("/:id/tool-exposure", scopeMatrixController.GetScopeMatrix)
 				v1Applications.GET("/:id/scopes", scopeMatrixController.ListScopes)
 				v1Applications.GET("/:id/scopes/:scope_id/impact", scopeMatrixController.ScopeImpact)
-				v1Applications.GET("/:id/access-assignments", scopeMatrixController.ListRSBindings)
+				v1Applications.GET("/:id/access-assignments", scopeMatrixController.ListAccessAssignments)
 				v1Applications.GET("/:id/end-user-access-summary", scopeMatrixController.ListApplicationAccessUsers)
 				v1Applications.GET("/:id/effective-access", scopeMatrixController.GetApplicationUserEffectiveAccessQuery)
 				v1Applications.POST("/:id/access-simulations", scopeMatrixController.AccessSimulation)
@@ -634,6 +720,7 @@ func SetupRoutes(
 			adminRBAC.POST("/service-accounts", serviceAccountsController.CreateServiceAccount)
 			adminRBAC.GET("/service-accounts", serviceAccountsController.ListServiceAccounts)
 			adminRBAC.GET("/service-accounts/:sa_id", serviceAccountsController.GetServiceAccount)
+			adminRBAC.GET("/service-accounts/:sa_id/access", serviceAccountsController.ListServiceAccountAccess)
 			adminRBAC.PUT("/service-accounts/:sa_id", serviceAccountsController.UpdateServiceAccount)
 			adminRBAC.DELETE("/service-accounts/:sa_id", serviceAccountsController.DeleteServiceAccount)
 			adminRBAC.POST("/service-accounts/:sa_id/credentials", serviceAccountsController.CredentialServiceAccount)
@@ -1164,18 +1251,28 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
-		// SPIRE Headless (formerly spire-headless microservice)
-		// Served under /authsec/spire.
+		// Logs API — serves the Logs UI from the existing audit tables.
+		// Served under /authsec/logs.
 		// ────────────────────────────────────────────────────
-		registerSpireRoutes(authsec)
+		registerLogsRoutes(authsec)
 
 		// ────────────────────────────────────────────────────
-		// SPIRE Identity Service (merged from authsec-spire)
-		// Served under /authsec/spiresvc.
+		// Legacy embedded SPIRE control plane — quarantined behind
+		// ENABLE_EMBEDDED_SPIRE (default off). Both mounts back onto
+		// internal/spire repositories that query control-plane tables
+		// (agents, workloads, certificates, …) absent from the single
+		// master bootstrap, so they 500 if mounted. The SPIFFE-SVID M2M
+		// path is independent of this flag and stays available.
+		//   - /authsec/spire     : SPIRE Headless (spire-headless microservice)
+		//   - /authsec/spiresvc  : SPIRE Identity Service (authsec-spire)
 		// ────────────────────────────────────────────────────
-		if spireDeps != nil {
-			spiresvc := authsec.Group("/spiresvc")
-			spire.RegisterRoutes(spiresvc, spireDeps)
+		embeddedSpireEnabled := config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire
+		if embeddedSpireEnabled {
+			registerSpireRoutes(authsec)
+			if spireDeps != nil {
+				spiresvc := authsec.Group("/spiresvc")
+				spire.RegisterRoutes(spiresvc, spireDeps)
+			}
 		}
 
 		// ────────────────────────────────────────────────────
@@ -1227,9 +1324,15 @@ func SetupRoutes(
 		uflow.POST("/login/webauthn-callback", userController.WebAuthnCallback)
 		uflow.POST("/login", userController.Login)
 
-		// Misrouted health-check helpers for monitoring
+		// Misrouted health-check helpers for monitoring. When the embedded SPIRE
+		// control plane is quarantined (default), report it as disabled rather
+		// than pointing at a /spiresvc/health endpoint that is not mounted.
 		uflow.GET("/spire/health", func(c *gin.Context) {
-			c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/spiresvc/health"})
+			if config.AppConfig != nil && config.AppConfig.EnableEmbeddedSpire {
+				c.JSON(404, gin.H{"error": "Health check URL misconfigured", "correct_url": "/spiresvc/health"})
+				return
+			}
+			c.JSON(503, gin.H{"status": "disabled", "service": "embedded-spire", "hint": "set ENABLE_EMBEDDED_SPIRE=true to mount /authsec/spire and /authsec/spiresvc"})
 		})
 		uflow.GET("/clients/clients/api/v1/health", func(c *gin.Context) {
 			c.JSON(410, gin.H{"error": "clientms routes have been removed", "correct_url": "/authsec/applications"})
@@ -1427,7 +1530,11 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 	ac := platformCtrl.NewAuthmgrController()
 	authzCtrl := platformCtrl.NewAuthorizationController()
 
-	// Token endpoints — /verify is public, /generate and /oidc require auth.
+	// Token endpoints. /verify and /oidc are intentionally public and
+	// workspace-agnostic: they validate a presented token and return only claims
+	// that token already proves — they must never expand the caller's authority
+	// or expose another workspace's data beyond the token itself. /generate mints
+	// a token and therefore requires authentication.
 	tokenGroup := r.Group("/auth/token")
 	{
 		tokenGroup.POST("/verify", ac.VerifyToken)
@@ -1460,15 +1567,39 @@ func registerAuthmgrRoutes(r gin.IRouter) {
 		// Per-tool PEP (Phase 4b) — SDK calls this before executing a tool.
 		authz.POST("/decision", authzCtrl.Decision)
 
-		// Group management
-		authz.POST("/groups", ac.CreateGroup)
+		// Group management. Reads are available to any authenticated workspace
+		// member; mutations require an admin/owner role. All handlers derive the
+		// workspace from the JWT (never from query/body) — see authmgr_controller.
+		adminOnly := middlewares.RequireWorkspaceRole("owner", "admin")
 		authz.GET("/groups", ac.ListGroups)
 		authz.GET("/groups/:id", ac.GetGroup)
-		authz.PUT("/groups/:id", ac.UpdateGroup)
-		authz.DELETE("/groups/:id", ac.DeleteGroup)
-		authz.POST("/groups/:id/users", ac.AddUsersToGroup)
-		authz.DELETE("/groups/:id/users", ac.RemoveUsersFromGroup)
 		authz.GET("/groups/:id/users", ac.ListGroupUsers)
+		authz.POST("/groups", adminOnly, ac.CreateGroup)
+		authz.PUT("/groups/:id", adminOnly, ac.UpdateGroup)
+		authz.DELETE("/groups/:id", adminOnly, ac.DeleteGroup)
+		authz.POST("/groups/:id/users", adminOnly, ac.AddUsersToGroup)
+		authz.DELETE("/groups/:id/users", adminOnly, ac.RemoveUsersFromGroup)
+	}
+}
+
+// registerLogsRoutes registers the Logs API under /logs. All routes are
+// admin-only and workspace-scoped; handlers read workspace_id from the JWT
+// context set by ValidateWorkspaceFromToken and serve the existing audit tables.
+func registerLogsRoutes(r gin.IRouter) {
+	lc := platformCtrl.NewLogsController()
+
+	logs := r.Group("/logs")
+	logs.Use(
+		middlewares.AuthMiddleware(),
+		middlewares.RequireWorkspaceRole("owner", "admin"),
+		middlewares.ValidateWorkspaceFromToken(),
+	)
+	{
+		logs.GET("/auth/paginated", lc.GetAuthLogs)
+		logs.GET("/audit/paginated", lc.GetAuditLogs)
+		logs.GET("/m2m/paginated", lc.GetM2MLogs)
+		logs.GET("/status", lc.GetStatus)
+		logs.POST("/admin/fluent-bit", lc.ConfigureFluentBit)
 	}
 }
 
@@ -1532,8 +1663,13 @@ func registerSpireRoutes(r gin.IRouter) {
 		roles.GET("/bindings", sc.ListRoleBindings)
 	}
 
-	// ── Audit ──
+	// ── Audit (admin + workspace-scoped) ──
 	audit := spire.Group("/audit")
+	audit.Use(
+		middlewares.AuthMiddleware(),
+		middlewares.RequireWorkspaceRole("owner", "admin"),
+		middlewares.ValidateWorkspaceFromToken(),
+	)
 	{
 		audit.GET("/logs", sc.GetAuditLogs)
 		audit.GET("/logs/export", sc.ExportAuditLogs)

@@ -392,11 +392,40 @@ func (ctrl *ApplicationsController) Delete(c *gin.Context) {
 	c.JSON(http.StatusNoContent, nil)
 }
 
+// connectionAuthority is the identity that bears the access for a connection:
+// the service account (M2M) or the acting user (XAA/A2A).
+type connectionAuthority struct {
+	Type  string `json:"type"` // "service_account" | "user"
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+}
+
+// connectionGrantedThrough describes the role + scopes through which the
+// authority holds access to this MCP server.
+type connectionGrantedThrough struct {
+	RoleID   string   `json:"role_id,omitempty"`
+	RoleName string   `json:"role_name,omitempty"`
+	Scopes   []string `json:"scopes"`
+}
+
+type connectionItem struct {
+	ConnectionID     string                    `json:"connection_id"`
+	ClientID         string                    `json:"client_id"`
+	ClientName       string                    `json:"client_name"`
+	ClientKind       string                    `json:"client_kind"`
+	RegistrationType string                    `json:"registration_type"`
+	Status           string                    `json:"status"`
+	AccessMethod     string                    `json:"access_method"` // "m2m" | "xaa"
+	Authority        *connectionAuthority      `json:"authority,omitempty"`
+	GrantedThrough   *connectionGrantedThrough `json:"granted_through,omitempty"`
+	CreatedAt        string                    `json:"created_at"`
+}
+
 // ListConnections handles GET /authsec/applications/:id/connections.
-// "Connections" is the new product name for OAuth client registrations against
-// the Application — the underlying records are still in mcp_oauth_clients via
-// resource_server_client_registrations. The legacy /clients URL stays as a
-// compatibility shim under resource_server_controller.
+// Reshaped to include Authority (who bears access) and GrantedThrough (their
+// role + scopes). Authority is the linked service account for M2M connections
+// or the acting user for XAA/A2A connections.
 func (ctrl *ApplicationsController) ListConnections(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
@@ -405,17 +434,179 @@ func (ctrl *ApplicationsController) ListConnections(c *gin.Context) {
 	}
 
 	id := c.Param("id")
-	if _, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String()); err != nil {
+	rs, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String())
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
 		return
 	}
 
-	conns, err := ctrl.oauthSvc.ListClientsForRS(id)
+	type rawConn struct {
+		RegID        string    `gorm:"column:reg_id"`
+		RegStatus    string    `gorm:"column:reg_status"`
+		RegType      string    `gorm:"column:reg_type"`
+		ClientID     string    `gorm:"column:client_id"`
+		ClientName   string    `gorm:"column:client_name"`
+		ClientKind   string    `gorm:"column:client_kind"`
+		SAID         string    `gorm:"column:sa_id"`
+		SAName       string    `gorm:"column:sa_name"`
+		SARoleID     string    `gorm:"column:sa_role_id"`
+		SARoleName   string    `gorm:"column:sa_role_name"`
+		UserID       string    `gorm:"column:user_id"`
+		UserEmail    string    `gorm:"column:user_email"`
+		UserName     string    `gorm:"column:user_name"`
+		UserRoleID   string    `gorm:"column:user_role_id"`
+		UserRoleName string    `gorm:"column:user_role_name"`
+		CreatedAt    time.Time `gorm:"column:created_at"`
+	}
+
+	var rows []rawConn
+	err = config.DB.Raw(`
+		SELECT
+			r.id::text                                               AS reg_id,
+			r.status                                                 AS reg_status,
+			r.registration_type                                      AS reg_type,
+			c.client_id                                              AS client_id,
+			COALESCE(c.client_name, c.client_id)                    AS client_name,
+			COALESCE(c.client_kind, '')                              AS client_kind,
+			COALESCE(sa.id::text, '')                               AS sa_id,
+			COALESCE(sa.name, '')                                    AS sa_name,
+			COALESCE(rb_sa.role_id::text, '')                       AS sa_role_id,
+			COALESCE(rb_sa.role_name, '')                           AS sa_role_name,
+			COALESCE(u.id::text, '')                                AS user_id,
+			COALESCE(u.email, '')                                    AS user_email,
+			COALESCE(u.name, '')                                     AS user_name,
+			COALESCE(rb_u.role_id::text, '')                        AS user_role_id,
+			COALESCE(rb_u.role_name, '')                            AS user_role_name,
+			r.created_at                                             AS created_at
+		FROM resource_server_client_registrations r
+		JOIN mcp_oauth_clients c ON c.id = r.oauth_client_id
+		LEFT JOIN service_accounts sa ON sa.oauth_client_id = c.id
+		LEFT JOIN role_bindings rb_sa
+			ON  rb_sa.service_account_id = sa.id
+			AND rb_sa.workspace_id = r.workspace_id
+			AND rb_sa.scope_type = 'resource_server'
+			AND rb_sa.scope_id = r.resource_server_id
+		LEFT JOIN LATERAL (
+			SELECT subject_id FROM access_requests
+			WHERE requested_by_client = c.client_id
+			  AND resource_server_id = r.resource_server_id
+			  AND status = 'approved'
+			ORDER BY updated_at DESC LIMIT 1
+		) ar ON true
+		LEFT JOIN users u ON u.id = ar.subject_id
+		LEFT JOIN role_bindings rb_u
+			ON  rb_u.user_id = u.id
+			AND rb_u.workspace_id = r.workspace_id
+			AND rb_u.scope_type = 'resource_server'
+			AND rb_u.scope_id = r.resource_server_id
+		WHERE r.resource_server_id = ?
+		  AND r.workspace_id = ?
+		ORDER BY r.created_at DESC
+	`, rs.ID, workspaceID).Scan(&rows).Error
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, conns)
+
+	// Collect role IDs to batch-resolve effective scopes.
+	roleIDSet := map[string]struct{}{}
+	for _, r := range rows {
+		if r.SARoleID != "" {
+			roleIDSet[r.SARoleID] = struct{}{}
+		}
+		if r.UserRoleID != "" {
+			roleIDSet[r.UserRoleID] = struct{}{}
+		}
+	}
+	scopesByRole := map[string][]string{}
+	if len(roleIDSet) > 0 {
+		roleIDs := make([]string, 0, len(roleIDSet))
+		for rid := range roleIDSet {
+			roleIDs = append(roleIDs, rid)
+		}
+		type sr struct {
+			RoleID      string `gorm:"column:role_id"`
+			ScopeString string `gorm:"column:scope_string"`
+		}
+		var scopeRows []sr
+		config.DB.Raw(`
+			SELECT rp.role_id::text AS role_id, os.scope_string AS scope_string
+			FROM role_permissions rp
+			JOIN oauth_scope_permissions osp ON osp.permission_id = rp.permission_id
+			JOIN oauth_scopes os ON os.id = osp.scope_id
+			WHERE rp.role_id::text IN ?
+			  AND os.resource_server_id = ?
+		`, roleIDs, rs.ID).Scan(&scopeRows)
+		for _, s := range scopeRows {
+			scopesByRole[s.RoleID] = append(scopesByRole[s.RoleID], s.ScopeString)
+		}
+	}
+
+	items := make([]connectionItem, 0, len(rows))
+	for _, r := range rows {
+		accessMethod := "xaa"
+		if r.ClientKind == "m2m" {
+			accessMethod = "m2m"
+		}
+
+		item := connectionItem{
+			// connection_id is the public client_id — the identifier every
+			// connection mutation (revoke/approve/deny) and ConnectionSubjectScopeGap
+			// resolves by. Exposing the registration-row UUID here (the old bug)
+			// made revoke 404, since RevokeClientRegistration looks the client up by
+			// client_id, not reg id.
+			ConnectionID:     r.ClientID,
+			ClientID:         r.ClientID,
+			ClientName:       r.ClientName,
+			ClientKind:       r.ClientKind,
+			RegistrationType: r.RegType,
+			Status:           r.RegStatus,
+			AccessMethod:     accessMethod,
+			CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
+		}
+
+		// Authority + GrantedThrough: prefer SA (M2M), fall back to acting user (XAA).
+		if r.SAID != "" {
+			item.Authority = &connectionAuthority{
+				Type: "service_account",
+				ID:   r.SAID,
+				Name: r.SAName,
+			}
+			if r.SARoleID != "" {
+				scopes := scopesByRole[r.SARoleID]
+				if scopes == nil {
+					scopes = []string{}
+				}
+				item.GrantedThrough = &connectionGrantedThrough{
+					RoleID:   r.SARoleID,
+					RoleName: r.SARoleName,
+					Scopes:   scopes,
+				}
+			}
+		} else if r.UserID != "" {
+			item.Authority = &connectionAuthority{
+				Type:  "user",
+				ID:    r.UserID,
+				Name:  r.UserName,
+				Email: r.UserEmail,
+			}
+			if r.UserRoleID != "" {
+				scopes := scopesByRole[r.UserRoleID]
+				if scopes == nil {
+					scopes = []string{}
+				}
+				item.GrantedThrough = &connectionGrantedThrough{
+					RoleID:   r.UserRoleID,
+					RoleName: r.UserRoleName,
+					Scopes:   scopes,
+				}
+			}
+		}
+
+		items = append(items, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 // RevokeConnection handles DELETE /authsec/applications/:id/connections/:connection_id.

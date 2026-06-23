@@ -146,6 +146,14 @@ func (oc *OIDCController) SetPKIService(pkiSvc *spireservices.PKIProvisioningSer
 // @Success 200 {object} models.OIDCInitiateResponse
 // @Failure 400 {object} map[string]string
 // @Router /authsec/uflow/oidc/initiate [post]
+//
+// Security note: this is a public endpoint and the caller may supply a
+// workspace_domain to pick which workspace's IdP config to advertise. That
+// choice is not authority — the resolved workspace is persisted in server-side
+// OIDCState bound to the Hydra login_challenge, and finishHydraLogin reads the
+// workspace strictly from that state (not from any later caller input). So
+// workspace selection here cannot escalate privilege; it only selects which
+// public IdP configuration to begin a login against.
 func (oc *OIDCController) Initiate(c *gin.Context) {
 	var input models.OIDCInitiateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -955,15 +963,13 @@ func (oc *OIDCController) handleRegistrationCallback(c *gin.Context, state *mode
 	}
 	defer tx.Rollback()
 
-	// Create tenant
+	// Create the workspace identity row (single master DB — no per-tenant database).
 	fullDomain := fmt.Sprintf("%s.%s", state.WorkspaceDomain, config.AppConfig.WorkspaceDomainSuffix)
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := userInfo.Email
 	providerID := userInfo.Sub
 	tenant := &models.Tenant{
 		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:  workspaceID,
-		WorkspaceDB:     tenantDBName,
 		Email:        userInfo.Email,
 		Username:     &username,
 		Name:         userInfo.Name,
@@ -1270,13 +1276,11 @@ func (oc *OIDCController) CompleteRegistration(c *gin.Context) {
 
 	// Create tenant
 	fullDomain := fmt.Sprintf("%s.%s", workspaceDomain, config.AppConfig.WorkspaceDomainSuffix)
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
 	username := input.Email
 	providerIDPtr := input.ProviderUserID
 	tenant := &models.Tenant{
 		ID:           workspaceID, // Use same ID for both id and workspace_id for simplicity
 		WorkspaceID:  workspaceID,
-		WorkspaceDB:     tenantDBName,
 		Email:        input.Email,
 		Username:     &username,
 		Name:         input.Name,

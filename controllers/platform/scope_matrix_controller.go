@@ -2756,7 +2756,7 @@ func (ctrl *ScopeMatrixController) ListRSEndUsers(c *gin.Context) {
 	var users []u
 	tenantDB.Table("users").
 		Select("id::text AS id, email, COALESCE(NULLIF(name, ''), email) AS name").
-		Where("active = true").
+		Where("workspace_id = ? AND active = true", workspaceID).
 		Order("created_at DESC").Limit(200).Scan(&users)
 	// Always emit a JSON array, never null — destructuring defaults on the
 	// frontend catch undefined but not null.

@@ -116,7 +116,7 @@ func authmgrGetAuthz(ctx context.Context, workspaceID, clientID, email string) (
 
 func authmgrLoadAuthzFromDB(ctx context.Context, db *gorm.DB, tid uuid.UUID, workspaceID, clientID, email string) (*authmgrAuthz, error) {
 	var user sharedmodels.User
-	if err := db.WithContext(ctx).Where("email = ? AND workspace_id = ?", email, tid).First(&user).Error; err != nil {
+	if err := db.WithContext(ctx).Where("email = ? AND workspace_id = ? AND deleted_at IS NULL", email, tid).First(&user).Error; err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
@@ -200,7 +200,7 @@ func authmgrLookupClientByEmail(ctx context.Context, workspaceID, email string) 
 	var user sharedmodels.User
 	if err := config.DB.WithContext(ctx).
 		Select("client_id").
-		Where("workspace_id = ? AND email = ?", tid, email).
+		Where("workspace_id = ? AND email = ? AND deleted_at IS NULL", tid, email).
 		First(&user).Error; err != nil {
 		return "", fmt.Errorf("client lookup: %w", err)
 	}
@@ -234,12 +234,18 @@ func (ac *AuthmgrController) GetProfile(c *gin.Context) {
 	})
 }
 
-// GetAuthStatus returns auth debug info for a tenant/email combination.
+// GetAuthStatus returns auth debug info for an email within the caller's
+// workspace. The workspace is taken from the JWT — never from the request — so a
+// token for workspace A cannot inspect workspace B's authorization data.
 func (ac *AuthmgrController) GetAuthStatus(c *gin.Context) {
-	workspaceID := c.Query("workspace_id")
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
+		return
+	}
 	email := c.Query("email")
-	if workspaceID == "" || email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and email are required"})
+	if email == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
 		return
 	}
 
@@ -779,7 +785,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 	var created []sharedmodels.Group
 	for _, name := range req.Groups {
 		var existing sharedmodels.Group
-		if db.Where("name = ? AND (workspace_id = ? OR workspace_id IS NULL)", name, workspaceID).First(&existing).Error == nil {
+		if db.Where("name = ? AND workspace_id = ?", name, workspaceID).First(&existing).Error == nil {
 			continue
 		}
 		g := sharedmodels.Group{WorkspaceID: &workspaceID, Name: name}
@@ -790,7 +796,7 @@ func (ac *AuthmgrController) CreateGroup(c *gin.Context) {
 		created = append(created, g)
 	}
 
-	log.Printf("[authmgr CreateGroup] tenant=%s created %d groups", req.WorkspaceID, len(created))
+	log.Printf("[authmgr CreateGroup] workspace=%s created %d groups", workspaceID, len(created))
 	c.JSON(http.StatusCreated, gin.H{"message": "groups created", "groups": created, "count": len(created)})
 }
 
@@ -811,19 +817,20 @@ func (ac *AuthmgrController) ListGroups(c *gin.Context) {
 	db := config.DB
 
 	var groups []sharedmodels.Group
-	if err := db.Where("workspace_id = ? OR workspace_id IS NULL", tid).Find(&groups).Error; err != nil {
+	if err := db.Where("workspace_id = ?", tid).Find(&groups).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"groups": groups, "count": len(groups)})
 }
 
-// GetGroup retrieves a specific group by ID.
+// GetGroup retrieves a specific group by ID, scoped to the caller's workspace
+// (taken from the JWT, never from the request).
 func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 	idParam := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
 		return
 	}
 
@@ -841,18 +848,18 @@ func (ac *AuthmgrController) GetGroup(c *gin.Context) {
 	db := config.DB
 
 	var group sharedmodels.Group
-	if err := db.Where("id = ? AND (workspace_id = ? OR workspace_id IS NULL)", uint(groupID), tid).First(&group).Error; err != nil {
+	if err := db.Where("id = ? AND workspace_id = ?", uint(groupID), tid).First(&group).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
 	c.JSON(http.StatusOK, group)
 }
 
-// UpdateGroup updates a group's name or description.
+// UpdateGroup updates a group's name or description, scoped to the caller's
+// workspace (from the JWT). Any workspace_id in the body is ignored.
 func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		WorkspaceID    string `json:"workspace_id" binding:"required"`
 		Name        string `json:"name"`
 		Description string `json:"description"`
 	}
@@ -861,12 +868,18 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 		return
 	}
 
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
+		return
+	}
+
 	groupID, err := strconv.ParseUint(idParam, 10, 32)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.WorkspaceID)
+	tid, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
 		return
@@ -892,12 +905,12 @@ func (ac *AuthmgrController) UpdateGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, group)
 }
 
-// DeleteGroup removes a group from the tenant database.
+// DeleteGroup removes a group, scoped to the caller's workspace (from the JWT).
 func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 	idParam := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
 		return
 	}
 
@@ -926,15 +939,21 @@ func (ac *AuthmgrController) DeleteGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "group deleted"})
 }
 
-// AddUsersToGroup adds users to a group.
+// AddUsersToGroup adds users to a group, scoped to the caller's workspace
+// (from the JWT). Any workspace_id in the body is ignored.
 func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		WorkspaceID string   `json:"workspace_id" binding:"required"`
-		UserIDs  []string `json:"user_ids" binding:"required"`
+		UserIDs []string `json:"user_ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
 		return
 	}
 
@@ -943,7 +962,7 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.WorkspaceID)
+	tid, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
 		return
@@ -980,15 +999,21 @@ func (ac *AuthmgrController) AddUsersToGroup(c *gin.Context) {
 	})
 }
 
-// RemoveUsersFromGroup removes users from a group.
+// RemoveUsersFromGroup removes users from a group, scoped to the caller's
+// workspace (from the JWT). Any workspace_id in the body is ignored.
 func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 	idParam := c.Param("id")
 	var req struct {
-		WorkspaceID string   `json:"workspace_id" binding:"required"`
-		UserIDs  []string `json:"user_ids" binding:"required"`
+		UserIDs []string `json:"user_ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
 		return
 	}
 
@@ -997,7 +1022,7 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group ID"})
 		return
 	}
-	tid, err := uuid.Parse(req.WorkspaceID)
+	tid, err := uuid.Parse(workspaceID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
 		return
@@ -1034,12 +1059,13 @@ func (ac *AuthmgrController) RemoveUsersFromGroup(c *gin.Context) {
 	})
 }
 
-// ListGroupUsers returns users belonging to a group.
+// ListGroupUsers returns users belonging to a group, scoped to the caller's
+// workspace (from the JWT).
 func (ac *AuthmgrController) ListGroupUsers(c *gin.Context) {
 	idParam := c.Param("id")
-	workspaceID := c.Query("workspace_id")
-	if workspaceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id is required"})
+	workspaceID, ok := middlewares.GetWorkspaceIDFromToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace not found in token"})
 		return
 	}
 

@@ -316,6 +316,13 @@ func (s *AuthorizationContextService) GetClientRegistration(resourceServerID, oa
 // given status ("approved" or "pending_approval"). An existing row is never
 // modified (DoNothing) — so a revoked or pending row keeps its status.
 func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID, oauthClientID, workspaceID uuid.UUID, regType, status string) (*models.ResourceServerClientRegistration, error) {
+	return s.EnsureClientRegistrationTx(s.db, resourceServerID, oauthClientID, workspaceID, regType, status)
+}
+
+// EnsureClientRegistrationTx is EnsureClientRegistration bound to a specific
+// *gorm.DB (a transaction handle) so client registration can be committed in
+// the same transaction as the rest of a machine-access creation.
+func (s *AuthorizationContextService) EnsureClientRegistrationTx(db *gorm.DB, resourceServerID, oauthClientID, workspaceID uuid.UUID, regType, status string) (*models.ResourceServerClientRegistration, error) {
 	reg := models.ResourceServerClientRegistration{
 		ResourceServerID: resourceServerID,
 		OAuthClientID:    oauthClientID,
@@ -323,7 +330,7 @@ func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID,
 		Status:           status,
 		RegistrationType: regType,
 	}
-	err := s.db.Clauses(clause.OnConflict{
+	err := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "resource_server_id"}, {Name: "oauth_client_id"}},
 		DoNothing: true,
 	}).Create(&reg).Error
@@ -332,7 +339,7 @@ func (s *AuthorizationContextService) EnsureClientRegistration(resourceServerID,
 	}
 
 	var result models.ResourceServerClientRegistration
-	err = s.db.Where("resource_server_id = ? AND oauth_client_id = ?", resourceServerID, oauthClientID).First(&result).Error
+	err = db.Where("resource_server_id = ? AND oauth_client_id = ?", resourceServerID, oauthClientID).First(&result).Error
 	return &result, err
 }
 
