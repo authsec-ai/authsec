@@ -481,9 +481,17 @@ func (s *OAuthLoginService) AcceptHydraConsentRequestMCP(
 		"provider":    userContext["provider"],
 		"provider_id": userContext["provider_id"],
 	}
+	idTokenSession := map[string]interface{}{
+		"user_id":     consentRequest.Subject,
+		"email":       userContext["email"],
+		"name":        userContext["name"],
+		"provider":    userContext["provider"],
+		"provider_id": userContext["provider_id"],
+	}
 	// Merge extra session claims (workspace_id, resource_server_id)
 	for k, v := range extraSessionClaims {
 		accessTokenSession[k] = v
+		idTokenSession[k] = v
 	}
 
 	acceptRequest := HydraAcceptConsentRequest{
@@ -493,13 +501,7 @@ func (s *OAuthLoginService) AcceptHydraConsentRequestMCP(
 		RememberFor:              3600,
 		Session: map[string]interface{}{
 			"access_token": accessTokenSession,
-			"id_token": map[string]interface{}{
-				"user_id":     consentRequest.Subject,
-				"email":       userContext["email"],
-				"name":        userContext["name"],
-				"provider":    userContext["provider"],
-				"provider_id": userContext["provider_id"],
-			},
+			"id_token":     idTokenSession,
 		},
 	}
 

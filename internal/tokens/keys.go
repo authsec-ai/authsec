@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +31,13 @@ const (
 	// keyReloadInterval mirrors the Hydra jwksCache TTL so multiple pods
 	// converge on a rotated keyset within one interval (keys live in Vault).
 	keyReloadInterval = 5 * time.Minute
+
+	// nativeKeyEnvB64 pins the ACTIVE native signing key to a fixed base64
+	// (PKCS8 PEM) value, mirroring SPIFFE_RSA_PRIVATE_KEY_B64. When set, the
+	// active key (and thus its kid) is stable across restarts WITHOUT Vault —
+	// so already-issued id_tokens/ID-JAGs keep validating after a redeploy.
+	// Intended for single-node/dev where no Vault is wired; prod should use Vault.
+	nativeKeyEnvB64 = "NATIVE_RSA_PRIVATE_KEY_B64"
 )
 
 // KVStore is the minimal Vault KV surface the key manager needs. *vault.Client
@@ -71,8 +80,14 @@ func NewNativeKeyManager(kv KVStore) *NativeKeyManager {
 func (m *NativeKeyManager) Reload() { m.reload() }
 
 func (m *NativeKeyManager) reload() {
-	active, err := m.loadOrCreate(nativeKeyPathActive)
-	if err != nil {
+	var active nativeKey
+	if envKey, ok := keyFromEnvB64(); ok {
+		// Env-pinned active key takes precedence over Vault/ephemeral: stable
+		// kid across restarts so outstanding tokens keep validating.
+		active = envKey
+	} else if a, err := m.loadOrCreate(nativeKeyPathActive); err == nil {
+		active = a
+	} else {
 		log.Printf("[NATIVE_KEYS] active key load failed, using ephemeral: %v", err)
 		active = mustGenerate()
 	}
@@ -219,6 +234,28 @@ func deriveKID(pub *rsa.PublicKey) string {
 	}
 	sum := sha256.Sum256(der)
 	return NativeKIDPrefix + hex.EncodeToString(sum[:8])
+}
+
+// keyFromEnvB64 builds the active native key from NATIVE_RSA_PRIVATE_KEY_B64
+// (base64 of a PKCS8 PEM, the same shape marshalPKCS8RSA emits). Returns ok=false
+// when unset; bad values are logged and ignored so the manager falls back safely.
+func keyFromEnvB64() (nativeKey, bool) {
+	raw := strings.TrimSpace(os.Getenv(nativeKeyEnvB64))
+	if raw == "" {
+		return nativeKey{}, false
+	}
+	pemBytes, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		log.Printf("[NATIVE_KEYS] %s set but not valid base64, ignoring: %v", nativeKeyEnvB64, err)
+		return nativeKey{}, false
+	}
+	priv, err := parsePKCS8RSA(string(pemBytes))
+	if err != nil {
+		log.Printf("[NATIVE_KEYS] %s set but unparseable PKCS8 PEM, ignoring: %v", nativeKeyEnvB64, err)
+		return nativeKey{}, false
+	}
+	log.Printf("[NATIVE_KEYS] active key pinned from %s (kid=%s) — stable across restarts", nativeKeyEnvB64, deriveKID(&priv.PublicKey))
+	return nativeKey{kid: deriveKID(&priv.PublicKey), priv: priv}, true
 }
 
 func generate() *rsa.PrivateKey {

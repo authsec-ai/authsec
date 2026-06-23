@@ -588,6 +588,13 @@ func (s *OAuthASService) EnsureClientRegistration(rsID, clientID, workspaceID uu
 	return s.authzCtx.EnsureClientRegistration(rsID, clientID, workspaceID, regType, status)
 }
 
+// EnsureClientRegistrationTx is EnsureClientRegistration bound to a transaction
+// handle, so a caller can commit the registration atomically with the rest of a
+// machine-access creation (workload / api-credential).
+func (s *OAuthASService) EnsureClientRegistrationTx(db *gorm.DB, rsID, clientID, workspaceID uuid.UUID, regType, status string) (*models.ResourceServerClientRegistration, error) {
+	return s.authzCtx.EnsureClientRegistrationTx(db, rsID, clientID, workspaceID, regType, status)
+}
+
 // ErrCrossWorkspacePending is returned by BindClientToRS when a client whose
 // home workspace differs from the RS's workspace attempts a lazy bind. The
 // registration row is created as pending_approval; the workspace admin must
@@ -705,6 +712,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		// Try pending_approval → approved first (normal DCR approval flow).
 		result := tx.Model(&models.ResourceServerClientRegistration{}).
 			Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
 				rsUUID, client.ID, models.ClientRegStatusPendingApproval).
@@ -713,7 +721,18 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return fmt.Errorf("no pending registration found for this client")
+			// The registration may already be approved (e.g. XAA cross-workspace
+			// flow where the client was auto-registered during bootstrap). In that
+			// case the admin is approving the access_request + binding a role, not
+			// the registration itself. Verify the registration exists at all.
+			var count int64
+			tx.Model(&models.ResourceServerClientRegistration{}).
+				Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
+					rsUUID, client.ID, models.ClientRegStatusApproved).
+				Count(&count)
+			if count == 0 {
+				return fmt.Errorf("no pending registration found for this client")
+			}
 		}
 
 		// Optional atomic role grant — RS-scoped so the resolver honors it for
@@ -1464,6 +1483,89 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 	}
 
 	return client, nil
+}
+
+// RegisterAgentClient mints a CONFIDENTIAL agent OAuth client for the A2A flow.
+// It carries both legs the cross-app agent needs:
+//   - authorization_code + refresh_token: the user-login leg (PKCE via Hydra),
+//   - urn:ietf:params:oauth:grant-type:token-exchange: the AuthSec-native ID-JAG
+//     issuance leg, which requires confidential client auth.
+//
+// The client is homed in workspaceID so its ID-JAG carries that issuance
+// workspace (§19 makes the call genuinely cross-workspace). The Hydra client is
+// public/PKCE for the login leg; the secret is used only for the token-exchange
+// leg (checked against oauth_client_secrets by AuthenticateClient). Returns the
+// client_id and the one-time plaintext secret.
+func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string, redirectURIs []string) (string, string, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", "", fmt.Errorf("name is required")
+	}
+	if len(redirectURIs) == 0 {
+		return "", "", fmt.Errorf("at least one redirect URI is required")
+	}
+
+	clientUUID := uuid.New()
+	clientIDStr := clientUUID.String()
+
+	if err := hydraAdminCreateClient(hydraClient{
+		ClientID:      clientIDStr,
+		ClientName:    name,
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		RedirectURIs:  redirectURIs,
+		ResponseTypes: []string{"code"},
+		TokenEndpoint: "none",
+		Scope:         "openid profile email offline_access",
+	}); err != nil {
+		return "", "", fmt.Errorf("register hydra client for agent: %w", err)
+	}
+
+	now := time.Now().UTC()
+	mcpClient := &models.MCPOAuthClient{
+		ID:            clientUUID,
+		ClientID:      clientIDStr,
+		HydraClientID: clientIDStr,
+		ClientName:    name,
+		RedirectURIs:  pq.StringArray(redirectURIs),
+		GrantTypes:    pq.StringArray{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"},
+		ResponseTypes: pq.StringArray{"code"},
+		// "dcr" so the agent self-binds to each RS it targets via
+		// adopt-on-first-bind: same-workspace auto-approves; a cross-workspace
+		// RS (the A2A case, §19) parks as pending_approval until that
+		// workspace's owner approves — the first-contact signal. "admin" is the
+		// workspace default-client type and no RS accepts it from a caller.
+		RegistrationType:                "dcr",
+		ClientKind:                      "agent",
+		SyncStatus:                      "active",
+		IsConfidential:                  true,
+		HomeWorkspaceID:                 &workspaceID,
+		AllowedTokenEndpointAuthMethods: pq.StringArray{"client_secret_basic"},
+		Scope:                           "openid profile email offline_access",
+		SupportsRefreshToken:            true,
+		CreatedAt:                       now,
+		UpdatedAt:                       now,
+	}
+	if err := s.authzCtx.CreateMCPOAuthClient(mcpClient); err != nil {
+		_ = hydraAdminDeleteClient(clientIDStr)
+		return "", "", fmt.Errorf("store agent client: %w", err)
+	}
+
+	secret, genErr := GenerateClientSecret()
+	if genErr != nil {
+		return "", "", genErr
+	}
+	hash, hashErr := HashClientSecret(secret)
+	if hashErr != nil {
+		return "", "", hashErr
+	}
+	if err := s.db.Create(&models.OAuthClientSecret{
+		ID:         uuid.New(),
+		ClientID:   mcpClient.ID,
+		SecretHash: hash,
+	}).Error; err != nil {
+		return "", "", fmt.Errorf("store agent secret: %w", err)
+	}
+
+	return clientIDStr, secret, nil
 }
 
 // ListClientsForRS returns all client registrations for a resource server.

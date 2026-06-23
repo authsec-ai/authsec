@@ -3,8 +3,10 @@ package services
 // XAAService handles ID-JAG (Identity Assertion Authorization Grant) validation
 // and subject materialization for the XAA redemption grant (jwt-bearer).
 //
-// Flow: authenticateClient → validateIDJAG → §19 same-domain reject →
-//       CheckClientApprovedForRS → mapSubject → NativeIssuer.Issue(xaa).
+// Flow: authenticateClient → validateIDJAG → CheckClientApprovedForRS →
+//       mapSubject → NativeIssuer.Issue(xaa). The trust boundary is the resource
+//       server (audience), per ID-JAG draft §4.1/§7.3 — NOT the workspace; a
+//       same-workspace agent→MCP-server delegation is conformant XAA.
 
 import (
 	"context"
@@ -26,9 +28,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// ErrSameDomainXAA is returned when the ID-JAG's issuance workspace matches the
-// target resource's workspace (§19: same-domain use-direct).
-var ErrSameDomainXAA = errors.New("same_workspace_use_direct: use direct issuance instead of ID-JAG")
+// selfIssuedProviderName is the reserved trusted-issuer provider name used for
+// ID-JAGs that AuthSec issued itself (iss == this AS). Self-issued `sub` claims
+// are local user UUIDs, not external federated subjects.
+const selfIssuedProviderName = "authsec:id-jag"
 
 // ErrUntrustedIssuer is returned when the ID-JAG's iss is not in trusted_issuers.
 var ErrUntrustedIssuer = errors.New("untrusted_issuer: ID-JAG issuer not recognised")
@@ -42,6 +45,8 @@ type IDJAGClaims struct {
 	Subject   string    // sub (external provider subject)
 	ClientID  string    // client_id claim (must match authenticated client)
 	JTI       string    // jti (replay guard key)
+	Resource  string    // resource claim, when the IdP scoped the ID-JAG to a resource
+	Scope     string    // scope claim, when the IdP scoped the ID-JAG to scopes
 	IssuedAt  time.Time // iat
 	ExpiresAt time.Time // exp
 	// IssuanceWorkspaceID is derived from workspace_claim_mapping if present.
@@ -65,6 +70,13 @@ func NewXAAService(db *gorm.DB) *XAAService {
 		identRepo: database.NewOIDCUserIdentityRepository(dbConn),
 		jwksCache: newTrustedIssuerJWKSCache(),
 	}
+}
+
+func claimString(claims jwt.MapClaims, name string) string {
+	if v, ok := claims[name].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // ValidateIDJAG validates the raw assertion JWT and returns its claims.
@@ -109,7 +121,7 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 		wsMapping := "issuance_workspace"
 		issuer = models.TrustedIssuer{
 			Iss:                   iss,
-			ProviderName:          "authsec:id-jag",
+			ProviderName:          selfIssuedProviderName,
 			JITProvisioning:       true,
 			ClockSkewSecs:         30,
 			WorkspaceClaimMapping: &wsMapping,
@@ -126,7 +138,10 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 			return nil, fmt.Errorf("self-issued ID-JAG kid %q is not a known native signing key", kid)
 		}
 	} else {
-		if err := s.db.WithContext(ctx).Where("iss = ?", iss).First(&issuer).Error; err != nil {
+		// Only ACTIVE issuers are trusted. A revoked issuer must fail closed —
+		// matching by iss alone would let ID-JAGs from a revoked issuer keep
+		// redeeming after the admin revoked it.
+		if err := s.db.WithContext(ctx).Where("iss = ? AND status = 'active'", iss).First(&issuer).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, nil, ErrUntrustedIssuer
 			}
@@ -195,6 +210,8 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 		Subject:   sub,
 		ClientID:  claimClientID,
 		JTI:       jti,
+		Resource:  claimString(ac, "resource"),
+		Scope:     claimString(ac, "scope"),
 		IssuedAt:  time.Unix(int64(iatF), 0),
 		ExpiresAt: time.Unix(int64(expF), 0),
 	}
@@ -241,6 +258,33 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 		return uuid.Nil, fmt.Errorf("identity lookup: %w", err)
 	}
 
+	// Self-issued ID-JAG (AuthSec is both IdP and resource AS): the `sub` is a
+	// real local user UUID we minted in tokenExchangeGrant, not an external
+	// federated subject. Resolve that existing user instead of JIT-creating a
+	// duplicate `<uuid>@jit.local` shadow — but only when the user actually lives
+	// in the target (RS) workspace, so we never grant RS-workspace roles to a
+	// user rooted elsewhere (cross-workspace stays the federated-guest path below).
+	if issuer.ProviderName == selfIssuedProviderName {
+		if subUUID, perr := uuid.Parse(mappedSub); perr == nil {
+			if existing, uerr := s.userRepo.GetUserByID(subUUID); uerr == nil && existing != nil && existing.WorkspaceID == targetWorkspaceID {
+				// Best-effort link row for audit/traceability (the real email, not a
+				// placeholder). A failure here is non-fatal — the user is already real.
+				now := time.Now().UTC()
+				_ = s.identRepo.CreateIdentity(&models.OIDCUserIdentity{
+					WorkspaceID:    targetWorkspaceID,
+					UserID:         existing.ID,
+					ProviderName:   issuer.ProviderName,
+					ProviderUserID: mappedSub,
+					Email:          existing.Email,
+					ProfileData:    "{}",
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				})
+				return existing.ID, nil
+			}
+		}
+	}
+
 	// Not found.
 	if !issuer.JITProvisioning {
 		return uuid.Nil, fmt.Errorf("access_denied: subject not provisioned and jit_provisioning is disabled")
@@ -265,6 +309,7 @@ func (s *XAAService) MapSubject(ctx context.Context, externalSub string, issuer 
 		ProviderName:   issuer.ProviderName,
 		ProviderUserID: mappedSub,
 		Email:          userInfo.Email,
+		ProfileData:    "{}",
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}

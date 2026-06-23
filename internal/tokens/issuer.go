@@ -24,6 +24,7 @@ type NativeClaims struct {
 	Audience         string // = resource_servers.resource_uri
 	Scope            string // space-delimited granted scopes
 	SourceGrantJTI   *string
+	SourceGrantIss   *string
 	RarID            *uuid.UUID
 	TTL              time.Duration
 }
@@ -46,8 +47,9 @@ func NewNativeIssuer(db *gorm.DB, keys *NativeKeyManager, issuer string) *Native
 
 // IDJAGClaims carries the inputs for IssueIDJAG.
 type IDJAGClaims struct {
-	// WorkspaceID is the minting workspace (carried as `issuance_workspace`
-	// claim so the redemption path can apply §19 same-domain rejection).
+	// WorkspaceID is the minting workspace, carried as the `issuance_workspace`
+	// claim for audit/provenance only. It is NOT a redemption gate — the XAA
+	// trust boundary is the resource server (audience), per ID-JAG draft §4.1/§7.3.
 	WorkspaceID uuid.UUID
 	// SubjectID is the local user UUID who is being delegated (becomes `sub`).
 	SubjectID uuid.UUID
@@ -56,6 +58,10 @@ type IDJAGClaims struct {
 	// TargetIssuer is the AS that should accept this ID-JAG as an assertion
 	// (becomes `aud`). Typically the same issuer or a trusted peer.
 	TargetIssuer string
+	// Resource is the downstream resource indicator the ID-JAG is for.
+	Resource string
+	// Scope is the delegated scope string granted into the ID-JAG.
+	Scope string
 }
 
 // IDJAGTyp is the JWT typ header for ID-JAG tokens (draft-ietf-oauth-identity-assertion-authz-grant-04).
@@ -86,6 +92,12 @@ func (i *NativeIssuer) IssueIDJAG(ctx context.Context, c IDJAGClaims) (string, u
 		"iat":                now.Unix(),
 		"exp":                exp.Unix(),
 		"issuance_workspace": c.WorkspaceID.String(),
+	}
+	if c.Resource != "" {
+		claims["resource"] = c.Resource
+	}
+	if c.Scope != "" {
+		claims["scope"] = c.Scope
 	}
 
 	tokenStr, err := i.keys.SignWithTyp(claims, IDJAGTyp)
@@ -131,6 +143,9 @@ func (i *NativeIssuer) Issue(ctx context.Context, c NativeClaims, inTx ...func(t
 	if c.SourceGrantJTI != nil {
 		claims["source_grant_jti"] = *c.SourceGrantJTI
 	}
+	if c.SourceGrantIss != nil {
+		claims["source_grant_iss"] = *c.SourceGrantIss
+	}
 
 	token, err := i.keys.Sign(claims)
 	if err != nil {
@@ -151,6 +166,7 @@ func (i *NativeIssuer) Issue(ctx context.Context, c NativeClaims, inTx ...func(t
 		Aud:              c.Audience,
 		Scope:            c.Scope,
 		SourceGrantJTI:   c.SourceGrantJTI,
+		SourceGrantIss:   c.SourceGrantIss,
 		RarID:            c.RarID,
 		IssuedAt:         now,
 		ExpiresAt:        exp,

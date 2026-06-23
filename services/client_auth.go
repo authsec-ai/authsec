@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -47,7 +48,7 @@ func AuthenticateClient(ctx context.Context, db *gorm.DB, r *http.Request, token
 	// type. The SVID's `sub` is the SPIFFE ID which maps to a service_account
 	// (via service_accounts.spiffe_id) and from there to an mcp_oauth_client.
 	if assertionType == "urn:authsec:params:oauth:client-assertion-type:spiffe-svid" && assertion != "" {
-		return authenticateSPIFFESVID(ctx, db, assertion)
+		return authenticateSPIFFESVID(ctx, db, assertion, tokenEndpoint)
 	}
 
 	// ── 2. client_secret_basic ───────────────────────────────────────────────
@@ -183,14 +184,21 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 
 // ── SPIFFE JWT-SVID ──────────────────────────────────────────────────────────
 
-// authenticateSPIFFESVID verifies a JWT-SVID and resolves the corresponding
-// mcp_oauth_client via service_accounts.spiffe_id. The SVID is verified against
-// the SPIFFE OIDC issuer's JWKS (fetched from <iss>/.well-known/jwks.json).
+// authenticateSPIFFESVID verifies a presented workload token (a SPIFFE JWT-SVID
+// or a federated OIDC token) and resolves the corresponding mcp_oauth_client.
 //
-// Trust model: the issuer URL in the SVID must match the configured
-// SpiffeOIDCIssuer (env SPIFFE_OIDC_ISSUER). The SPIFFE ID (sub) must be
-// associated with an active service account.
-func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid string) (*models.MCPOAuthClient, error) {
+// Trust model (fail-closed): the token's issuer must be a registered, active
+// workload_identity_provider OR (for back-compat) the single global
+// SPIFFE_OIDC_ISSUER env. The signature is verified against that issuer's JWKS
+// (via OIDC discovery or the provider's jwks_uri), the audience is checked, and
+// the subject must map to an ACTIVE service account:
+//   - kind 'spiffe': sub (a spiffe:// id) == service_accounts.spiffe_id
+//   - kind 'oidc'  : the provider.subject_claim value == service_accounts.external_subject
+//     (scoped to the provider's workspace)
+//
+// Only explicitly-registered (issuer, subject) pairs authenticate — an attacker
+// with a token from an unregistered issuer, or a subject we never mapped, fails.
+func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoint string) (*models.MCPOAuthClient, error) {
 	// Step 1: parse without verification to extract iss + sub.
 	unverified, _, err := new(jwt.Parser).ParseUnverified(svid, jwt.MapClaims{})
 	if err != nil {
@@ -203,45 +211,74 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid string) (*mod
 	iss, _ := claims["iss"].(string)
 	sub, _ := claims["sub"].(string)
 	if iss == "" || sub == "" {
-		return nil, fmt.Errorf("invalid_client: SVID must have iss and sub")
+		return nil, fmt.Errorf("invalid_client: token must have iss and sub")
 	}
-	if !strings.HasPrefix(sub, "spiffe://") {
+
+	// Step 1b: resolve the issuer to a trusted provider (fail-closed). Prefer a
+	// registered workload_identity_provider; fall back to the legacy single
+	// global SPIFFE_OIDC_ISSUER env for spiffe. Anything else is rejected.
+	var (
+		kind         = "spiffe"
+		jwksURL      string
+		allowedAuds  []string
+		subjectClaim = "sub"
+		providerWS   *uuid.UUID
+	)
+	var provider models.WorkloadIdentityProvider
+	perr := db.WithContext(ctx).
+		Where("issuer = ? AND status = 'active'", iss).
+		First(&provider).Error
+	if perr == nil {
+		kind = provider.Kind
+		if provider.JWKSUri != nil && *provider.JWKSUri != "" {
+			jwksURL = *provider.JWKSUri
+		} else {
+			jwksURL = jwksURLForIssuer(iss)
+		}
+		allowedAuds = []string(provider.AllowedAudiences)
+		if provider.SubjectClaim != "" {
+			subjectClaim = provider.SubjectClaim
+		}
+		ws := provider.WorkspaceID
+		providerWS = &ws
+	} else if errors.Is(perr, gorm.ErrRecordNotFound) {
+		expectedIssuer := ""
+		if config.AppConfig != nil {
+			expectedIssuer = config.AppConfig.SpiffeOIDCIssuer
+		}
+		if expectedIssuer == "" {
+			return nil, fmt.Errorf("invalid_client: no workload identity provider for this issuer")
+		}
+		if iss != expectedIssuer {
+			// Unknown/untrusted caller — surface it (sub is UNVERIFIED here).
+			log.Printf("auth.unverified_caller: workload auth attempt with untrusted issuer iss=%q claimed_sub=%q", iss, sub)
+			return nil, fmt.Errorf("invalid_client: token issuer is not a trusted workload identity provider")
+		}
+		jwksURL = jwksURLForIssuer(iss)
+		kind = "spiffe"
+	} else {
+		return nil, fmt.Errorf("invalid_client: %w", perr)
+	}
+
+	if kind == "spiffe" && !strings.HasPrefix(sub, "spiffe://") {
 		return nil, fmt.Errorf("invalid_client: SVID sub must be a SPIFFE ID")
 	}
 
-	// Step 1b: PIN the issuer to the configured SPIFFE OIDC issuer (fail-closed).
-	// Without this, an attacker who runs any OIDC provider could sign a JWT with
-	// sub=spiffe://<known-id> served from their own JWKS and authenticate as that
-	// service account — the signature would verify against the attacker's keys.
-	// We must only trust SVIDs minted by OUR trust domain. If SPIFFE_OIDC_ISSUER
-	// is unset, SPIFFE client-auth is disabled entirely (no implicit any-issuer trust).
-	expectedIssuer := ""
-	if config.AppConfig != nil {
-		expectedIssuer = config.AppConfig.SpiffeOIDCIssuer
-	}
-	if expectedIssuer == "" {
-		return nil, fmt.Errorf("invalid_client: SPIFFE SVID authentication is not configured")
-	}
-	if iss != expectedIssuer {
-		return nil, fmt.Errorf("invalid_client: SVID issuer is not the trusted SPIFFE OIDC issuer")
-	}
-
-	// Step 2: fetch the trusted issuer's JWKS and verify the signature.
-	jwksURL := strings.TrimRight(iss, "/") + "/.well-known/jwks.json"
+	// Step 2: fetch the issuer's JWKS and verify the signature.
 	jwksBody, err := fetchURL(jwksURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_client: cannot fetch SPIFFE OIDC JWKS: %w", err)
+		return nil, fmt.Errorf("invalid_client: cannot fetch workload issuer JWKS: %w", err)
 	}
 	keyMap, err := parseJWKSKeys(string(jwksBody))
 	if err != nil {
-		return nil, fmt.Errorf("invalid_client: SPIFFE JWKS parse error: %w", err)
+		return nil, fmt.Errorf("invalid_client: workload issuer JWKS parse error: %w", err)
 	}
 
 	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
 		switch t.Method.(type) {
 		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
 		default:
-			return nil, fmt.Errorf("unsupported SVID alg: %v", t.Header["alg"])
+			return nil, fmt.Errorf("unsupported token alg: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
 		if key, ok := keyMap[kid]; ok {
@@ -250,22 +287,65 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid string) (*mod
 		for _, k := range keyMap {
 			return k, nil
 		}
-		return nil, fmt.Errorf("kid not found in SPIFFE JWKS")
+		return nil, fmt.Errorf("kid not found in workload issuer JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
 		jwt.WithLeeway(30*time.Second))
 	if err != nil || !parsed.Valid {
-		return nil, fmt.Errorf("invalid_client: SVID verification failed: %w", err)
+		return nil, fmt.Errorf("invalid_client: token verification failed: %w", err)
 	}
 
-	// Step 3: look up service_account by spiffe_id.
-	var sa models.ServiceAccount
-	if err := db.WithContext(ctx).
-		Where("spiffe_id = ? AND status = 'active'", sub).
-		First(&sa).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("invalid_client: no active service account for SPIFFE ID")
+	// Step 2b: validate audience. If the provider declares allowed audiences,
+	// require one of them; otherwise require this token endpoint (the SPIFFE
+	// default — `spire-agent api fetch jwt -audience <token-endpoint>`).
+	if len(allowedAuds) > 0 {
+		matched := false
+		for _, a := range allowedAuds {
+			if validateAud(claims, a) == nil {
+				matched = true
+				break
+			}
 		}
-		return nil, fmt.Errorf("invalid_client: %w", err)
+		if !matched {
+			return nil, fmt.Errorf("invalid_client: token aud must include one of the provider's allowed audiences")
+		}
+	} else if tokenEndpoint != "" {
+		if err := validateAud(claims, tokenEndpoint); err != nil {
+			return nil, fmt.Errorf("invalid_client: token aud must include this token endpoint")
+		}
+	}
+
+	// Step 3: map the verified subject to an ACTIVE service account.
+	var sa models.ServiceAccount
+	if kind == "oidc" {
+		// Extract the configured subject claim (defaults to "sub").
+		subjVal := sub
+		if subjectClaim != "sub" {
+			subjVal, _ = claims[subjectClaim].(string)
+		}
+		if subjVal == "" {
+			return nil, fmt.Errorf("invalid_client: token has no %q claim to map", subjectClaim)
+		}
+		q := db.WithContext(ctx).Where("external_subject = ? AND status = 'active'", subjVal)
+		if providerWS != nil {
+			q = q.Where("workspace_id = ?", *providerWS)
+		}
+		if err := q.First(&sa).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Printf("auth.unknown_caller: verified federated token for unmapped subject %q (issuer %q)", subjVal, iss)
+				return nil, fmt.Errorf("invalid_client: no active workload mapped to this federated subject")
+			}
+			return nil, fmt.Errorf("invalid_client: %w", err)
+		}
+	} else {
+		if err := db.WithContext(ctx).
+			Where("spiffe_id = ? AND status = 'active'", sub).
+			First(&sa).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Printf("auth.unknown_caller: verified SVID for unregistered SPIFFE ID sub=%q", sub)
+				return nil, fmt.Errorf("invalid_client: no active service account for SPIFFE ID")
+			}
+			return nil, fmt.Errorf("invalid_client: %w", err)
+		}
 	}
 	if sa.OAuthClientID == nil {
 		return nil, fmt.Errorf("invalid_client: service account has no linked OAuth client")
@@ -279,6 +359,38 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid string) (*mod
 	if isPublicOnly(client.AllowedTokenEndpointAuthMethods) {
 		return nil, fmt.Errorf("invalid_client: linked client is not confidential")
 	}
+
+	// Lifecycle gate (spiffe): a revoked/disabled application_spiffe_identities
+	// row must not keep minting tokens even if the SA stays active.
+	if kind == "spiffe" {
+		var revokedCount int64
+		if err := db.WithContext(ctx).
+			Table("application_spiffe_identities").
+			Where("spiffe_id = ? AND (revoked_at IS NOT NULL OR status IN ('revoked','disabled'))", sub).
+			Count(&revokedCount).Error; err != nil {
+			return nil, fmt.Errorf("invalid_client: %w", err)
+		}
+		if revokedCount > 0 {
+			return nil, fmt.Errorf("invalid_client: SPIFFE identity is revoked or disabled")
+		}
+	}
+
+	now := time.Now().UTC()
+	// Best-effort: advance attestation_pending → attested (spiffe only).
+	if kind == "spiffe" {
+		db.WithContext(ctx).Exec(
+			`UPDATE application_spiffe_identities
+			    SET status = 'attested', last_attested_at = ?, last_error = NULL, last_error_at = NULL
+			  WHERE spiffe_id = ? AND status = 'attestation_pending'`,
+			now, sub,
+		)
+	}
+	// Best-effort: stamp last_seen_at so the inventory can age out stale workloads.
+	db.WithContext(ctx).Exec(
+		`UPDATE service_accounts SET last_seen_at = ? WHERE workspace_id = ? AND id = ?`,
+		now, sa.WorkspaceID, sa.ID,
+	)
+
 	return &client, nil
 }
 
@@ -333,6 +445,125 @@ func resolveJWKS(row models.OAuthClientJWKS) (map[string]interface{}, error) {
 	}
 
 	return parseJWKSKeys(rawJWKS)
+}
+
+// jwksURLForIssuer resolves an OIDC issuer's JWKS endpoint via discovery
+// (OIDC Discovery / RFC 8414): GET <issuer>/.well-known/openid-configuration
+// and read `jwks_uri`. This is the standards-correct way to find the keys and
+// works with any compliant issuer — crucially, upstream SPIRE's
+// oidc-discovery-provider serves JWKS at /keys (advertised via jwks_uri), not
+// at /.well-known/jwks.json. If discovery is unavailable (or omits jwks_uri),
+// we fall back to the legacy <issuer>/.well-known/jwks.json path so
+// already-working issuers that publish there keep verifying.
+func jwksURLForIssuer(iss string) string {
+	base := strings.TrimRight(iss, "/")
+	if body, err := fetchURL(base + "/.well-known/openid-configuration"); err == nil {
+		var doc struct {
+			JWKSUri string `json:"jwks_uri"`
+		}
+		if json.Unmarshal(body, &doc) == nil && doc.JWKSUri != "" {
+			return doc.JWKSUri
+		}
+	}
+	return base + "/.well-known/jwks.json"
+}
+
+// VerifySVID verifies a pasted JWT-SVID's signature against the configured
+// SPIFFE OIDC issuer's JWKS and checks iss + aud — returning the SVID's `sub`
+// (its SPIFFE ID). It performs NO database access and NO state changes (it does
+// not advance attestation or consume replay state): it is purely for the access
+// debugger's paste-SVID mode, which validates a real SVID without minting.
+// The returned sub is best-effort even on error so the caller can still compare
+// it to the registered SPIFFE ID.
+func VerifySVID(svid, tokenEndpoint string) (string, error) {
+	unverified, _, err := new(jwt.Parser).ParseUnverified(svid, jwt.MapClaims{})
+	if err != nil {
+		return "", fmt.Errorf("malformed SVID: %w", err)
+	}
+	claims, ok := unverified.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("malformed SVID claims")
+	}
+	iss, _ := claims["iss"].(string)
+	sub, _ := claims["sub"].(string)
+	if iss == "" || sub == "" {
+		return sub, fmt.Errorf("SVID must have iss and sub")
+	}
+
+	expectedIssuer := ""
+	if config.AppConfig != nil {
+		expectedIssuer = config.AppConfig.SpiffeOIDCIssuer
+	}
+	if expectedIssuer == "" {
+		return sub, fmt.Errorf("SPIFFE_OIDC_ISSUER is not configured")
+	}
+	if iss != expectedIssuer {
+		return sub, fmt.Errorf("SVID issuer %q is not the trusted SPIFFE OIDC issuer", iss)
+	}
+
+	body, err := fetchURL(jwksURLForIssuer(iss))
+	if err != nil {
+		return sub, fmt.Errorf("cannot fetch SPIFFE OIDC JWKS: %w", err)
+	}
+	keyMap, err := parseJWKSKeys(string(body))
+	if err != nil {
+		return sub, fmt.Errorf("SPIFFE JWKS parse error: %w", err)
+	}
+
+	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
+		switch t.Method.(type) {
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+		default:
+			return nil, fmt.Errorf("unsupported SVID alg: %v", t.Header["alg"])
+		}
+		kid, _ := t.Header["kid"].(string)
+		if key, ok := keyMap[kid]; ok {
+			return key, nil
+		}
+		for _, k := range keyMap {
+			return k, nil
+		}
+		return nil, fmt.Errorf("kid not found in SPIFFE JWKS")
+	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
+		jwt.WithLeeway(30*time.Second))
+	if err != nil || !parsed.Valid {
+		return sub, fmt.Errorf("SVID signature/expiry verification failed: %w", err)
+	}
+
+	if tokenEndpoint != "" {
+		if err := validateAud(claims, tokenEndpoint); err != nil {
+			return sub, fmt.Errorf("SVID aud must include the token endpoint %s", tokenEndpoint)
+		}
+	}
+	return sub, nil
+}
+
+// ProbeSpiffeOIDC checks the two config preconditions a SPIFFE/Kubernetes
+// workload needs before any SVID can verify: that SPIFFE_OIDC_ISSUER is set and
+// that its JWKS is reachable + parseable from THIS backend (the same server-side
+// fetch authenticateSPIFFESVID performs at auth time). The access debugger's
+// config dry-run uses it. Returns the configured issuer (empty if unset) and a
+// non-nil error when the issuer is unset or its keys can't be fetched/parsed.
+func ProbeSpiffeOIDC() (string, error) {
+	iss := ""
+	if config.AppConfig != nil {
+		iss = config.AppConfig.SpiffeOIDCIssuer
+	}
+	if iss == "" {
+		return "", fmt.Errorf("SPIFFE_OIDC_ISSUER is not configured")
+	}
+	body, err := fetchURL(jwksURLForIssuer(iss))
+	if err != nil {
+		return iss, fmt.Errorf("cannot fetch SPIFFE OIDC JWKS: %w", err)
+	}
+	keys, err := parseJWKSKeys(string(body))
+	if err != nil {
+		return iss, fmt.Errorf("SPIFFE OIDC JWKS parse error: %w", err)
+	}
+	if len(keys) == 0 {
+		return iss, fmt.Errorf("SPIFFE OIDC JWKS has no signing keys")
+	}
+	return iss, nil
 }
 
 func fetchURL(u string) ([]byte, error) {

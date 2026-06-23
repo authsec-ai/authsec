@@ -23,6 +23,8 @@ type TrustedIssuer struct {
 	SubjectMapping        *string        `json:"subject_mapping,omitempty" gorm:"type:text"`
 	ProviderName          string         `json:"provider_name" gorm:"type:text;not null"`
 	JITProvisioning       bool           `json:"jit_provisioning" gorm:"not null;default:false"`
+	Status                string         `json:"status" gorm:"type:text;not null;default:'active'"`
+	RevokedAt             *time.Time     `json:"revoked_at,omitempty" gorm:"column:revoked_at"`
 	CreatedAt             time.Time      `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt             time.Time      `json:"updated_at" gorm:"not null;default:now()"`
 }

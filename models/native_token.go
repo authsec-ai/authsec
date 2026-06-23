@@ -40,6 +40,7 @@ type NativeToken struct {
 	Aud              string     `json:"aud" gorm:"column:aud;type:text;not null"`
 	Scope            string     `json:"scope" gorm:"column:scope;type:text;not null"`
 	SourceGrantJTI   *string    `json:"source_grant_jti,omitempty" gorm:"column:source_grant_jti;type:text"`
+	SourceGrantIss   *string    `json:"source_grant_iss,omitempty" gorm:"column:source_grant_iss;type:text"`
 	RarID            *uuid.UUID `json:"rar_id,omitempty" gorm:"column:rar_id;type:uuid"`
 	IssuedAt         time.Time  `json:"issued_at" gorm:"column:issued_at;not null"`
 	ExpiresAt        time.Time  `json:"expires_at" gorm:"column:expires_at;not null"`

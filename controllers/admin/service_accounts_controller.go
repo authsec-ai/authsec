@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -11,7 +12,6 @@ import (
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -35,31 +35,42 @@ type UpdateServiceAccountRequest struct {
 }
 
 type ServiceAccountResponse struct {
-	ID            string  `json:"id"`
-	WorkspaceID   string  `json:"workspace_id"`
-	Name          string  `json:"name"`
-	Description   string  `json:"description"`
-	Status        string  `json:"status"`
-	OAuthClientID *string `json:"oauth_client_id,omitempty"`
-	SpiffeID      *string `json:"spiffe_id,omitempty"`
-	CreatedAt     string  `json:"created_at"`
-	UpdatedAt     string  `json:"updated_at"`
+	ID              string  `json:"id"`
+	WorkspaceID     string  `json:"workspace_id"`
+	Name            string  `json:"name"`
+	Description     string  `json:"description"`
+	Status          string  `json:"status"`
+	OAuthClientID   *string `json:"oauth_client_id,omitempty"`
+	SpiffeID        *string `json:"spiffe_id,omitempty"`
+	ExternalSubject *string `json:"external_subject,omitempty"`
+	OwnerEmail      *string `json:"owner_email,omitempty"`
+	OwnerTeam       *string `json:"owner_team,omitempty"`
+	LastSeenAt      *string `json:"last_seen_at,omitempty"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
 }
 
 func saToResponse(sa models.ServiceAccount) ServiceAccountResponse {
 	r := ServiceAccountResponse{
-		ID:          sa.ID.String(),
-		WorkspaceID: sa.WorkspaceID.String(),
-		Name:        sa.Name,
-		Description: sa.Description,
-		Status:      sa.Status,
-		SpiffeID:    sa.SpiffeID,
-		CreatedAt:   sa.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:   sa.UpdatedAt.UTC().Format(time.RFC3339),
+		ID:              sa.ID.String(),
+		WorkspaceID:     sa.WorkspaceID.String(),
+		Name:            sa.Name,
+		Description:     sa.Description,
+		Status:          sa.Status,
+		SpiffeID:        sa.SpiffeID,
+		ExternalSubject: sa.ExternalSubject,
+		OwnerEmail:      sa.OwnerEmail,
+		OwnerTeam:       sa.OwnerTeam,
+		CreatedAt:       sa.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:       sa.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 	if sa.OAuthClientID != nil {
 		s := sa.OAuthClientID.String()
 		r.OAuthClientID = &s
+	}
+	if sa.LastSeenAt != nil {
+		s := sa.LastSeenAt.UTC().Format(time.RFC3339)
+		r.LastSeenAt = &s
 	}
 	return r
 }
@@ -91,16 +102,9 @@ func (ctrl *ServiceAccountsController) CreateServiceAccount(c *gin.Context) {
 		return
 	}
 
-	sa := models.ServiceAccount{
-		ID:          uuid.New(),
-		WorkspaceID: *workspaceID,
-		Name:        req.Name,
-		Description: req.Description,
-		Status:      "disabled",
-	}
-
-	if err := config.DB.Session(&gorm.Session{NewDB: true}).Create(&sa).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create service account: " + err.Error()})
+	sa, err := services.NewServiceAccountService(config.DB).CreateServiceAccount(*workspaceID, req.Name, req.Description)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -112,7 +116,7 @@ func (ctrl *ServiceAccountsController) CreateServiceAccount(c *gin.Context) {
 		},
 	})
 
-	c.JSON(http.StatusCreated, saToResponse(sa))
+	c.JSON(http.StatusCreated, saToResponse(*sa))
 }
 
 // ListServiceAccounts godoc
@@ -347,119 +351,107 @@ func (ctrl *ServiceAccountsController) CredentialServiceAccount(c *gin.Context) 
 		return
 	}
 
-	// Validate: exactly one credential type.
-	hasJWKS := (req.JWKSUri != nil && *req.JWKSUri != "") || (req.JWKS != nil && *req.JWKS != "")
-	if !hasJWKS && !req.UseClientSecret {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provide jwks_uri, jwks, or use_client_secret=true"})
-		return
-	}
-	if hasJWKS && req.UseClientSecret {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provide exactly one of jwks/jwks_uri or use_client_secret"})
-		return
-	}
-
-	db := config.DB.Session(&gorm.Session{NewDB: true})
-
-	// Load the service account.
-	var sa models.ServiceAccount
-	if err := db.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
-		return
-	}
-	if sa.OAuthClientID != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "service account already has a credential client"})
-		return
-	}
-
-	authMethod := "private_key_jwt"
-	if req.UseClientSecret {
-		authMethod = "client_secret_basic"
-	}
-
-	// Build the new confidential M2M client.
-	newClientID := uuid.New()
-	newClientIDStr := newClientID.String()
-	now := time.Now().UTC()
-	mcpClient := models.MCPOAuthClient{
-		ID:                              newClientID,
-		ClientID:                        newClientIDStr,
-		HydraClientID:                   newClientIDStr, // never synced to Hydra
-		ClientName:                      sa.Name + " (m2m)",
-		RedirectURIs:                    pq.StringArray{},
-		GrantTypes:                      pq.StringArray{"client_credentials"},
-		ResponseTypes:                   pq.StringArray{},
-		RegistrationType:                "admin",
-		ClientKind:                      "m2m",
-		SyncStatus:                      "active",
-		HomeWorkspaceID:                 workspaceID,
-		AllowedTokenEndpointAuthMethods: pq.StringArray{authMethod},
-		CreatedAt:                       now,
-		UpdatedAt:                       now,
-	}
-
-	var plainSecret *string
-
-	txErr := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&mcpClient).Error; err != nil {
-			return err
+	cred, err := services.NewServiceAccountService(config.DB).ProvisionCredential(
+		*workspaceID, saID, services.CredentialOptions{
+			JWKSUri:         req.JWKSUri,
+			JWKS:            req.JWKS,
+			UseClientSecret: req.UseClientSecret,
+		})
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrServiceAccountNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrCredentialTypeMissing),
+			errors.Is(err, services.ErrCredentialTypeAmbiguous),
+			errors.Is(err, services.ErrServiceAccountHasCredential):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
-
-		if hasJWKS {
-			jwksRow := models.OAuthClientJWKS{
-				ID:       uuid.New(),
-				ClientID: mcpClient.ID,
-				JWKSUri:  req.JWKSUri,
-				JWKS:     req.JWKS,
-			}
-			if err := tx.Create(&jwksRow).Error; err != nil {
-				return err
-			}
-		} else {
-			// Generate and hash a client secret.
-			secret, genErr := services.GenerateClientSecret()
-			if genErr != nil {
-				return genErr
-			}
-			hash, hashErr := services.HashClientSecret(secret)
-			if hashErr != nil {
-				return hashErr
-			}
-			secretRow := models.OAuthClientSecret{
-				ID:         uuid.New(),
-				ClientID:   mcpClient.ID,
-				SecretHash: hash,
-			}
-			if err := tx.Create(&secretRow).Error; err != nil {
-				return err
-			}
-			plainSecret = &secret
-		}
-
-		// Link SA → client and flip status to active.
-		return tx.Model(&models.ServiceAccount{}).
-			Where("workspace_id = ? AND id = ?", workspaceID, saID).
-			Updates(map[string]interface{}{
-				"oauth_client_id": mcpClient.ID,
-				"status":          "active",
-				"updated_at":      now,
-			}).Error
-	})
-	if txErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to provision credentials: " + txErr.Error()})
 		return
 	}
 
 	middlewares.Audit(c, "service_account", saID.String(), "credential_provisioned", &middlewares.AuditChanges{
 		After: map[string]interface{}{
-			"client_id":   newClientIDStr,
-			"auth_method": authMethod,
+			"client_id":   cred.ClientID,
+			"auth_method": cred.AuthMethod,
 		},
 	})
 
-	resp := CredentialResponse{
-		ClientID:     newClientIDStr,
-		AuthMethod:   authMethod,
-		ClientSecret: plainSecret,
+	c.JSON(http.StatusCreated, CredentialResponse{
+		ClientID:     cred.ClientID,
+		AuthMethod:   cred.AuthMethod,
+		ClientSecret: cred.Secret,
+	})
+}
+
+// ServiceAccountAccessItem is one MCP server a workload can reach, with the
+// role it was granted and the scopes that role currently yields on that server.
+type ServiceAccountAccessItem struct {
+	ResourceServerID   string   `json:"resource_server_id"`
+	ResourceServerName string   `json:"resource_server_name"`
+	ResourceURI        string   `json:"resource_uri"`
+	RoleID             string   `json:"role_id"`
+	RoleName           string   `json:"role_name"`
+	EffectiveScopes    []string `json:"effective_scopes"`
+}
+
+// ListServiceAccountAccess handles GET /uflow/admin/service-accounts/:sa_id/access.
+// It is the reverse index of the per-application access lists: "which MCP
+// servers can THIS workload call, and with what scopes" — powering the Workloads
+// inventory (plan Journey 3). Read-only.
+func (ctrl *ServiceAccountsController) ListServiceAccountAccess(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
 	}
-	c.JSON(http.StatusCreated, resp)
+	saUUID, err := uuid.Parse(c.Param("sa_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid service account id"})
+		return
+	}
+	sa, err := services.NewServiceAccountService(config.DB).GetServiceAccount(*workspaceID, saUUID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
+		return
+	}
+
+	// All RS-scoped role bindings for this workload.
+	var bindings []models.RoleBinding
+	if err := config.DB.
+		Where("workspace_id = ? AND service_account_id = ? AND scope_type = 'resource_server'", *workspaceID, saUUID).
+		Find(&bindings).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	resolver := services.NewScopeResolver(config.DB)
+	items := make([]ServiceAccountAccessItem, 0, len(bindings))
+	for _, b := range bindings {
+		if b.ScopeID == nil {
+			continue
+		}
+		var rs models.ResourceServer
+		if err := config.DB.Where("id = ?", *b.ScopeID).First(&rs).Error; err != nil {
+			continue // RS deleted out from under the binding — skip
+		}
+		scopes, _ := resolver.ServiceAccountEffectiveScopes(
+			c.Request.Context(), workspaceID.String(), saUUID.String(), b.ScopeID.String(),
+		)
+		items = append(items, ServiceAccountAccessItem{
+			ResourceServerID:   b.ScopeID.String(),
+			ResourceServerName: rs.Name,
+			ResourceURI:        rs.ResourceURI,
+			RoleID:             b.RoleID.String(),
+			RoleName:           b.RoleName,
+			EffectiveScopes:    scopes,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"service_account_id":   saUUID.String(),
+		"service_account_name": sa.Name,
+		"items":                items,
+	})
 }

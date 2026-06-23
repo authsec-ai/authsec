@@ -549,6 +549,29 @@ func (r *ScopeResolver) resolveServiceAccountEffectiveScopes(
 	return result, nil
 }
 
+// ServiceAccountEffectiveScopes is the public, list-form accessor for a service
+// account's RBAC-derived scopes on a resource server (sorted, deduped). It is
+// used by the token-test/simulate dry run, which needs the actual scope list —
+// not just the boolean PrincipalHasEffectiveScopes — to show the admin exactly
+// what a real mint would grant. This is pre-RS-supported intersection (the raw
+// RBAC entitlement); callers that want the mintable set should intersect with
+// rs.scopes_supported as the real grant path does.
+func (r *ScopeResolver) ServiceAccountEffectiveScopes(
+	ctx context.Context,
+	workspaceID, serviceAccountID, resourceServerID string,
+) ([]string, error) {
+	set, err := r.resolveServiceAccountEffectiveScopes(ctx, workspaceID, serviceAccountID, resourceServerID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // intersectWithRS applies the RS-supported and OIDC-capability filters to an
 // already-resolved effective set. Used by ResolvePrincipalEffectiveScopes so
 // service accounts go through the same final gate as user scopes.

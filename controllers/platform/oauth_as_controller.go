@@ -2,12 +2,14 @@ package platform
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -933,7 +935,6 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		})
 		return
 	}
-
 	// ── 4. Registration gate — client must be approved for this RS.
 	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, client.ID)
 	if regErr != nil || reg.Status != "approved" {
@@ -1005,6 +1006,17 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 
 	log.Printf("[M2M] tokenClientCredentialsGrant: issued jti=%s sa=%s client=%s rs=%s scopes=%q",
 		jti, sa.ID, client.ClientID, rs.ID, claims.Scope)
+
+	// Best-effort: advance attested → token_issued in application_spiffe_identities
+	// for SPIFFE-backed service accounts.
+	if sa.SpiffeID != nil {
+		config.DB.WithContext(ctx).Exec(
+			`UPDATE application_spiffe_identities
+			    SET status = 'token_issued', last_token_issued_at = NOW()
+			  WHERE spiffe_id = ? AND status IN ('attested', 'token_issued')`,
+			*sa.SpiffeID,
+		)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": tokenStr,
@@ -1098,12 +1110,28 @@ func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCP
 		})
 		return
 	}
-
-	// ── 5. §19 same-domain rejection — issuance workspace == target workspace.
-	if idjagClaims.IssuanceWorkspaceID != nil && *idjagClaims.IssuanceWorkspaceID == rs.WorkspaceID {
+	if idjagClaims.Resource != "" && idjagClaims.Resource != resourceParam {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "invalid_grant",
-			"error_description": services.ErrSameDomainXAA.Error(),
+			"error_description": "ID-JAG resource does not match requested resource",
+		})
+		return
+	}
+
+	// ── 5. Conformant XAA boundary (ID-JAG draft §4.1 / §7.3): the trust boundary
+	// is the resource server (audience), NOT the workspace. An agent in the SAME
+	// workspace as the MCP server is still a distinct application and may use XAA —
+	// this is the canonical single-org Okta case (one IdP, many apps). §7.3 ("the
+	// IdP must not mint a token from an ID-JAG to reach its own resources") is
+	// already enforced above: the target must resolve to a registered
+	// resource_servers row, and AuthSec's own admin API is not one. The only thing
+	// left to forbid is literal self-delegation: a resource server's own client
+	// redeeming an ID-JAG to reach itself (no delegation actually occurs).
+	// issuance_workspace remains on the ID-JAG as audit/provenance only.
+	if rs.LegacyClientID != nil && *rs.LegacyClientID == agentClient.ID {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_grant",
+			"error_description": "self_delegation: a client cannot use an ID-JAG to reach its own resource server",
 		})
 		return
 	}
@@ -1162,6 +1190,16 @@ func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCP
 
 	// ── 8. Resolve scopes via RBAC (user principal acting via agent).
 	requestedScopes := strings.Fields(c.PostForm("scope"))
+	if len(requestedScopes) == 0 && idjagClaims.Scope != "" {
+		requestedScopes = strings.Fields(idjagClaims.Scope)
+	}
+	if !scopesWithin(strings.Join(requestedScopes, " "), idjagClaims.Scope) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_scope",
+			"error_description": "requested scope exceeds ID-JAG scope",
+		})
+		return
+	}
 	principal := tokens.Principal{
 		SubjectType: tokens.SubjectTypeUser,
 		SubjectID:   localUserID,
@@ -1228,6 +1266,7 @@ func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCP
 		Audience:         rs.ResourceURI,
 		Scope:            strings.Join(grantedScopes, " "),
 		SourceGrantJTI:   &idjagClaims.JTI,
+		SourceGrantIss:   &idjagClaims.Issuer,
 		TTL:              time.Hour,
 	}
 	replayHook := services.IDJAGReplayInsert(config.DB, idjagClaims.Issuer, idjagClaims.JTI, idjagClaims.ExpiresAt)
@@ -1254,6 +1293,138 @@ func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCP
 		"expires_in":   int(time.Hour.Seconds()),
 		"scope":        nativeClaims.Scope,
 	})
+}
+
+type oauthJWK struct {
+	Kty string `json:"kty"`
+	Kid string `json:"kid"`
+	Use string `json:"use,omitempty"`
+	Alg string `json:"alg,omitempty"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+// verifySelfIssuedIDToken validates an OIDC id_token issued by this AuthSec AS
+// and intended for the authenticated OAuth client. This is the standards path
+// for token-exchange subject_token_type=id_token; ID tokens are JWT assertions,
+// not Hydra-introspectable access tokens.
+func (ctrl *OAuthASController) verifySelfIssuedIDToken(raw string, expectedClientID string) (jwt.MapClaims, error) {
+	if config.AppConfig == nil {
+		return nil, fmt.Errorf("server configuration unavailable")
+	}
+	selfIssuer := config.AppConfig.OAuthBaseURL()
+	jwks, err := ctrl.service.FetchJWKS()
+	if err != nil {
+		return nil, fmt.Errorf("id_token JWKS unavailable")
+	}
+	keys, err := parseRSAJWKS(jwks)
+	if err != nil {
+		return nil, fmt.Errorf("id_token JWKS invalid: %w", err)
+	}
+
+	claims := jwt.MapClaims{}
+	parsed, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected id_token alg %s", t.Method.Alg())
+		}
+		kid, _ := t.Header["kid"].(string)
+		if kid == "" {
+			return nil, fmt.Errorf("id_token missing kid")
+		}
+		key, ok := keys[kid]
+		if !ok {
+			return nil, fmt.Errorf("id_token kid %q not found in issuer JWKS", kid)
+		}
+		return key, nil
+	})
+	if err != nil || !parsed.Valid {
+		if err == nil {
+			err = fmt.Errorf("id_token invalid")
+		}
+		return nil, fmt.Errorf("id_token signature/claims invalid: %w", err)
+	}
+	if iss, _ := claims["iss"].(string); iss != selfIssuer {
+		return nil, fmt.Errorf("id_token issuer mismatch")
+	}
+	if !claimHasAudience(claims["aud"], expectedClientID) {
+		return nil, fmt.Errorf("id_token audience does not include authenticated client")
+	}
+	if sub, _ := claims["sub"].(string); sub == "" {
+		return nil, fmt.Errorf("id_token missing sub")
+	}
+	if ws, _ := claims["workspace_id"].(string); ws == "" {
+		return nil, fmt.Errorf("id_token missing workspace_id")
+	}
+	return claims, nil
+}
+
+func parseRSAJWKS(raw json.RawMessage) (map[string]*rsa.PublicKey, error) {
+	var doc struct {
+		Keys []oauthJWK `json:"keys"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	keys := make(map[string]*rsa.PublicKey, len(doc.Keys))
+	for _, jwk := range doc.Keys {
+		if jwk.Kid == "" || jwk.Kty != "RSA" || jwk.N == "" || jwk.E == "" {
+			continue
+		}
+		nBytes, nErr := base64.RawURLEncoding.DecodeString(jwk.N)
+		eBytes, eErr := base64.RawURLEncoding.DecodeString(jwk.E)
+		if nErr != nil || eErr != nil || len(eBytes) == 0 {
+			continue
+		}
+		e := 0
+		for _, b := range eBytes {
+			e = e<<8 + int(b)
+		}
+		if e == 0 {
+			continue
+		}
+		keys[jwk.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: e}
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no RSA signing keys")
+	}
+	return keys, nil
+}
+
+func claimHasAudience(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, item := range v {
+			if s, _ := item.(string); s == expected {
+				return true
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if s == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func scopesWithin(requested, allowed string) bool {
+	requestedFields := strings.Fields(requested)
+	if len(requestedFields) == 0 || strings.TrimSpace(allowed) == "" {
+		return true
+	}
+	allowedSet := make(map[string]struct{}, len(strings.Fields(allowed)))
+	for _, s := range strings.Fields(allowed) {
+		allowedSet[s] = struct{}{}
+	}
+	for _, s := range requestedFields {
+		if _, ok := allowedSet[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // tokenExchangeGrant handles RFC 8693 token exchange for ID-JAG issuance
@@ -1306,8 +1477,43 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	}
 
 	var subject subjectCtx
-	cls := tokens.Classify(subjectToken, tokens.NativeKeys().NativeKeyIDs())
-	if cls.Family == tokens.FamilyNative {
+	subjectTokenType := c.PostForm("subject_token_type")
+	if subjectTokenType == "urn:ietf:params:oauth:token-type:id_token" {
+		// OIDC ID tokens are identity assertions, not introspectable access
+		// tokens. Validate the JWT against this issuer's JWKS and extract the
+		// MCP consent session claims needed to mint the native ID-JAG.
+		claims, verr := ctrl.verifySelfIssuedIDToken(subjectToken, oauthClient.ClientID)
+		if verr != nil {
+			log.Printf("[ISSUANCE] tokenExchangeGrant: id_token validation failed client=%s: %v", oauthClient.ClientID, verr)
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": verr.Error(),
+			})
+			return
+		}
+		subStr, _ := claims["sub"].(string)
+		wsStr, _ := claims["workspace_id"].(string)
+		clientIDStr, _ := claims["client_id"].(string)
+		if clientIDStr == "" {
+			// Hydra's id_token uses aud as the OAuth client binding. The verifier
+			// already checked aud contains oauthClient.ClientID.
+			clientIDStr = oauthClient.ClientID
+		}
+		subjectUserID, uerr := uuid.Parse(subStr)
+		workspaceID, werr := uuid.Parse(wsStr)
+		if uerr != nil || werr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":             "invalid_grant",
+				"error_description": "id_token missing sub or workspace_id",
+			})
+			return
+		}
+		subject = subjectCtx{
+			UserID:      subjectUserID,
+			WorkspaceID: workspaceID,
+			ClientID:    clientIDStr,
+		}
+	} else if cls := tokens.Classify(subjectToken, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
 		// Native token path: verify signature, look up native_tokens row.
 		pub, ok := tokens.NativeKeys().PublicKeyForKID(cls.Kid)
 		if !ok {
@@ -1380,8 +1586,13 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 			return
 		}
 		subStr, _ := tokenInfo["sub"].(string)
-		wsStr, _ := tokenInfo["workspace_id"].(string)
 		clientIDStr, _ := tokenInfo["client_id"].(string)
+		// Hydra nests custom session claims under "ext"; workspace_id is a
+		// consent-time session claim, not a top-level introspection field.
+		wsStr := ""
+		if ext, ok := tokenInfo["ext"].(map[string]interface{}); ok {
+			wsStr, _ = ext["workspace_id"].(string)
+		}
 		subjectUserID, uerr := uuid.Parse(subStr)
 		workspaceID, werr := uuid.Parse(wsStr)
 		if uerr != nil || werr != nil {
@@ -1435,13 +1646,26 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	if targetIssuer == "" {
 		targetIssuer = selfIssuer
 	}
+	resource := c.PostForm("resource")
+	scope := strings.Join(strings.Fields(c.PostForm("scope")), " ")
 
 	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
+	// The issuance_workspace is the CLIENT's home workspace — the workspace
+	// that registered/owns the agent client. This is NOT the user's workspace
+	// or the RS workspace. The §19 same-domain check compares
+	// issuance_workspace vs the target RS workspace; if the client and RS
+	// live in the same workspace, XAA is unnecessary (use direct M2M).
+	issuanceWorkspace := subject.WorkspaceID
+	if oauthClient.HomeWorkspaceID != nil {
+		issuanceWorkspace = *oauthClient.HomeWorkspaceID
+	}
 	idjagClaims := tokens.IDJAGClaims{
-		WorkspaceID:  subject.WorkspaceID,
+		WorkspaceID:  issuanceWorkspace,
 		SubjectID:    subject.UserID,
 		ClientID:     oauthClient.ClientID,
 		TargetIssuer: targetIssuer,
+		Resource:     resource,
+		Scope:        scope,
 	}
 	tokenStr, jti, err := ctrl.nativeIssuer.IssueIDJAG(ctx, idjagClaims)
 	if err != nil {
@@ -1453,12 +1677,16 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	log.Printf("[ISSUANCE] tokenExchangeGrant: issued id-jag jti=%s user=%s client=%s ws=%s",
 		jti, subject.UserID, oauthClient.ClientID, subject.WorkspaceID)
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"issued_token_type": tokens.IDJAGTokenType,
 		"access_token":      tokenStr,
 		"token_type":        "N_A",
 		"expires_in":        int(tokens.IDJAGTLL.Seconds()),
-	})
+	}
+	if scope != "" {
+		resp["scope"] = scope
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // BackchannelAuthorize is the OIDC CIBA backchannel authorization endpoint
@@ -2303,13 +2531,38 @@ func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid strin
 		ext["id_jag_jti"] = *row.SourceGrantJTI
 	}
 
+	// G9: resolve role_ids for the subject+RS binding.
+	var roleIDs []string
+	roleIDCol := "user_id"
+	if row.SubjectType == "service_account" {
+		roleIDCol = "service_account_id"
+	}
+	config.DB.WithContext(ctx).
+		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, row.SubjectID).
+		Scan(&roleIDs)
+	if roleIDs == nil {
+		roleIDs = []string{}
+	}
+
 	resp := gin.H{
-		"active":    true,
-		"sub":       row.SubjectID.String(),
-		"client_id": row.ClientID,
-		"aud":       []string{row.Aud},
-		"scope":     strings.Join(finalScopes, " "),
-		"ext":       ext,
+		"active":       true,
+		"sub":          row.SubjectID.String(),
+		"subject_type": row.SubjectType,
+		"token_family": row.TokenFamily,
+		"workspace_id": row.WorkspaceID.String(),
+		"client_id":    row.ClientID,
+		"aud":          []string{row.Aud},
+		"scope":        strings.Join(finalScopes, " "),
+		"role_ids":     roleIDs,
+		"ext":          ext,
+	}
+	// G9: typed identity fields for SDK / policy consumers.
+	if row.SubjectType == "service_account" {
+		resp["service_account_id"] = row.SubjectID.String()
+		resp["acting_user_id"] = nil
+	} else {
+		resp["acting_user_id"] = row.SubjectID.String()
+		resp["service_account_id"] = nil
 	}
 	if exp, ok := claims["exp"].(float64); ok {
 		resp["exp"] = int64(exp)

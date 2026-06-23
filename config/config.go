@@ -100,6 +100,16 @@ type Config struct {
 	// Requires XAA_NATIVE_SEALER. token-exchange is only advertised in AS
 	// metadata when this flag is on.
 	XAAIssuance bool
+	// EnableEmbeddedSpire (default off) mounts the legacy embedded SPIRE control
+	// plane: the /authsec/spire headless routes and the /authsec/spiresvc
+	// identity service. Those paths back onto internal/spire repositories that
+	// query control-plane tables (agents, workloads, certificates, …) which are
+	// not part of the single master bootstrap, so they 500 when mounted. Off by
+	// default quarantines them. The SPIFFE-SVID M2M path (service_accounts,
+	// application_spiffe_identities, external SPIFFE_OIDC_ISSUER verification) is
+	// independent of this flag and always available.
+	EnableEmbeddedSpire bool
+
 	// PolicyEngineMode controls the token-issuance PDP (internal/policy/).
 	// "off" (default) — PDP not consulted.
 	// "shadow" — PDP runs but never blocks; discrepancies logged to auth_issuance_audit.
@@ -383,6 +393,7 @@ func LoadConfig() *Config {
 		XAADPOP:                 getEnvBool("XAA_DPOP", false),
 		XAACiba:                 getEnvBool("XAA_CIBA", false),
 		XAAIssuance:             getEnvBool("XAA_ISSUANCE", false),
+		EnableEmbeddedSpire:     getEnvBool("ENABLE_EMBEDDED_SPIRE", false),
 		PolicyEngineMode:        getEnv("POLICY_ENGINE_MODE", "off"),
 		OktaDomain:              oktaDomain,
 		OktaClientID:            oktaClientID,
