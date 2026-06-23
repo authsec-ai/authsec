@@ -839,7 +839,7 @@ func MapGroupsToClient(workspaceID, clientID string, groups []string) error {
 
 	// Find the user in tenant database
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ? AND deleted_at IS NULL", clientUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
@@ -884,7 +884,7 @@ func RemoveGroupsFromClient(workspaceID, clientID string, groups []string) error
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("client_id = ? AND workspace_id = ?", clientUUID, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("client_id = ? AND workspace_id = ? AND deleted_at IS NULL", clientUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
@@ -920,8 +920,9 @@ func GetUserDefinedGroups(workspaceID string) ([]models.TenantGroup, error) {
 	tenantDB := config.DB
 
 	var groups []models.TenantGroup
-	// Query groups from tenant database
-	if err := tenantDB.Where("workspace_id = ? OR workspace_id IS NULL", workspaceUUID).Find(&groups).Error; err != nil {
+	// Groups are always workspace-owned (groups.workspace_id is NOT NULL); scope
+	// strictly to the caller's workspace so no workspace can read another's groups.
+	if err := tenantDB.Where("workspace_id = ?", workspaceUUID).Find(&groups).Error; err != nil {
 		return nil, fmt.Errorf("failed to query groups: %w", err)
 	}
 	return groups, nil
@@ -992,7 +993,7 @@ func AddUserToGroups(workspaceID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 
@@ -1039,7 +1040,7 @@ func RemoveUserFromGroups(workspaceID, userID string, groups []string) error {
 	}
 
 	var user models.User
-	if err := tenantDB.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceUUID).First(&user).Error; err != nil {
 		return fmt.Errorf("failed to find user: %w", err)
 	}
 

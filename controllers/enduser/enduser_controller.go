@@ -102,7 +102,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 	var user models.User
 	if lookupByID {
 		if err := tenantDB.Preload("Groups").
-			Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).First(&user).Error; err != nil {
+			Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userUUID, workspaceUUID).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -112,7 +112,7 @@ func (euc *EndUserController) GetEndUser(c *gin.Context) {
 		}
 	} else {
 		if err := tenantDB.Preload("Groups").
-			Where("workspace_id = ? AND LOWER(email) = LOWER(?)", workspaceUUID, emailIdentifier).First(&user).Error; err != nil {
+			Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL", workspaceUUID, emailIdentifier).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -242,8 +242,9 @@ func (euc *EndUserController) GetEndUsers(c *gin.Context) {
 	}
 	tenantDB := config.DB
 
-	// Build query - no base tenant filter needed since we're in tenant-specific DB
-	query := tenantDB.Model(&models.User{})
+	// Build query - no base tenant filter needed since we're in tenant-specific DB.
+	// Exclude soft-deleted users from all listings.
+	query := tenantDB.Model(&models.User{}).Where("deleted_at IS NULL")
 
 	// Apply filters
 	if filter.Active != nil {
@@ -833,43 +834,19 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		deletedCounts["totp_secrets"] = result.RowsAffected
 
-		// 3. Delete backup_codes
+		// 3. Delete totp_backup_codes
 
-		result = tx.Exec("DELETE FROM backup_codes WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete backup_codes: %w", result.Error)
-
-		}
-
-		deletedCounts["backup_codes"] = result.RowsAffected
-
-		// 4. Delete webauthn_credentials
-
-		result = tx.Exec("DELETE FROM webauthn_credentials WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
+		result = tx.Exec("DELETE FROM totp_backup_codes WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
 
 		if result.Error != nil {
 
-			return fmt.Errorf("failed to delete webauthn_credentials: %w", result.Error)
+			return fmt.Errorf("failed to delete totp_backup_codes: %w", result.Error)
 
 		}
 
-		deletedCounts["webauthn_credentials"] = result.RowsAffected
+		deletedCounts["totp_backup_codes"] = result.RowsAffected
 
-		// 5. Delete ciba_push_devices
-
-		result = tx.Exec("DELETE FROM ciba_push_devices WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete ciba_push_devices: %w", result.Error)
-
-		}
-
-		deletedCounts["ciba_push_devices"] = result.RowsAffected
-
-		// 6. Delete ciba_auth_requests
+		// 4. Delete ciba_auth_requests
 
 		result = tx.Exec("DELETE FROM ciba_auth_requests WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
 
@@ -881,9 +858,9 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		deletedCounts["ciba_auth_requests"] = result.RowsAffected
 
-		// 7. Delete voice_identity_links
+		// 5. Delete voice_identity_links
 
-		result = tx.Exec("DELETE FROM voice_identity_links WHERE user_id = ?", userUUID)
+		result = tx.Exec("DELETE FROM voice_identity_links WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
 
 		if result.Error != nil {
 
@@ -893,9 +870,9 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		deletedCounts["voice_identity_links"] = result.RowsAffected
 
-		// 8. Delete user_groups
+		// 6. Delete user_groups
 
-		result = tx.Exec("DELETE FROM user_groups WHERE user_id = ?", userUUID)
+		result = tx.Exec("DELETE FROM user_groups WHERE user_id = ? AND workspace_id = ?", userUUID, workspaceUUID)
 
 		if result.Error != nil {
 
@@ -905,31 +882,7 @@ func (euc *EndUserController) DeleteUserAll(c *gin.Context) {
 
 		deletedCounts["user_groups"] = result.RowsAffected
 
-		// 9. Delete refresh_tokens
-
-		result = tx.Exec("DELETE FROM refresh_tokens WHERE user_id = ?", userUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete refresh_tokens: %w", result.Error)
-
-		}
-
-		deletedCounts["refresh_tokens"] = result.RowsAffected
-
-		// 10. Delete sessions
-
-		result = tx.Exec("DELETE FROM sessions WHERE user_id = ?", userUUID)
-
-		if result.Error != nil {
-
-			return fmt.Errorf("failed to delete sessions: %w", result.Error)
-
-		}
-
-		deletedCounts["sessions"] = result.RowsAffected
-
-		// 11. Finally, delete the user
+		// 7. Finally, delete the user
 
 		result = tx.Where("id = ? AND workspace_id = ?", userUUID, workspaceUUID).Delete(&models.User{})
 
@@ -1023,6 +976,18 @@ func (euc *EndUserController) ActiveOrDeactiveEndUser(c *gin.Context) {
 	userID := strings.TrimSpace(req.UserID)
 	if workspaceID == "" || userID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "workspace_id and user_id are required"})
+		return
+	}
+
+	// Verify the caller's workspace (from the JWT) matches the target workspace.
+	// Without this, a workspace-A admin could toggle a user in workspace B.
+	userInfo := middlewares.GetUserInfo(c)
+	if userInfo == nil || strings.TrimSpace(userInfo.WorkspaceID) == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "workspace scope is required"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(userInfo.WorkspaceID), workspaceID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cross-workspace operation is not allowed"})
 		return
 	}
 
@@ -1156,7 +1121,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 	// that issued the token. MFA check is attempted first, then falls back to active check.
 	tenantDB := config.DB
 	var user models.User
-	err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ? AND mfa_enabled = ?",
+	err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ? AND mfa_enabled = ? AND deleted_at IS NULL",
 		workspaceIDUUID, emailID, true, true).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1168,7 +1133,7 @@ func (euc *EndUserController) OIDCLogin(c *gin.Context) {
 		}
 
 		// Fallback: user exists but MFA is not enabled
-		err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ?",
+		err = tenantDB.Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND active = ? AND deleted_at IS NULL",
 			workspaceIDUUID, emailID, true).First(&user).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1307,8 +1272,9 @@ func (euc *EndUserController) CustomLogin(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Find user by (workspace_id, email) — the canonical identity tuple.
+	// Soft-deleted users (deleted_at set) must never authenticate.
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?)", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND deleted_at IS NULL", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -1832,7 +1798,7 @@ func (euc *EndUserController) CustomForgotPassword(c *gin.Context) {
 
 	// Check if user exists with custom provider in this workspace
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ?", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ? AND deleted_at IS NULL", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			log.Printf("User not found for forgot password request: %s", input.Email)
 		} else {
@@ -1950,7 +1916,7 @@ func (euc *EndUserController) CustomResetPassword(c *gin.Context) {
 
 	// Find the user in the workspace database
 	var user models.User
-	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ?", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
+	if err := tenantDB.Where("workspace_id = ? AND LOWER(email) = ? AND provider IN (?) AND active = ? AND deleted_at IS NULL", workspaceID, input.Email, []string{"custom", "ad_sync", "entra_id", "scim"}, true).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return

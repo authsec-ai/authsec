@@ -1022,8 +1022,10 @@ func (rc *RolesScopedBindingsController) assignRoleScoped(c *gin.Context, db *go
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid User ID format"})
 			return
 		}
+		// Scope to the binding's workspace and exclude soft-deleted users so a
+		// role binding can't be created for a user outside this workspace.
 		var user models.User
-		if err := freshDB.Where("id = ?", userID).First(&user).Error; err != nil {
+		if err := freshDB.Where("id = ? AND workspace_id = ? AND deleted_at IS NULL", userID, workspaceID).First(&user).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
 		}

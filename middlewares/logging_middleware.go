@@ -41,17 +41,18 @@ type ResultInfo struct {
 
 // AuthLogSchema defines the schema for API traffic logs
 type AuthLogSchema struct {
-	TS       string                 `json:"ts"`
-	LogType  string                 `json:"log_type"`
-	Workspace   Workspace                 `json:"workspace"`
-	LogLevel string                 `json:"log_level"`
-	Event    AuthEvent              `json:"event"`
-	Actor    Actor                  `json:"actor"`
-	Client   ClientInfo             `json:"client"`
-	Request  RequestInfo            `json:"request"`
-	Result   ResultInfo             `json:"result"`
-	Message  string                 `json:"message"`
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	TS        string                 `json:"ts"`
+	LogType   string                 `json:"log_type"`
+	RequestID string                 `json:"request_id,omitempty"`
+	Workspace Workspace              `json:"workspace"`
+	LogLevel  string                 `json:"log_level"`
+	Event     AuthEvent              `json:"event"`
+	Actor     Actor                  `json:"actor"`
+	Client    ClientInfo             `json:"client"`
+	Request   RequestInfo            `json:"request"`
+	Result    ResultInfo             `json:"result"`
+	Message   string                 `json:"message"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // AuthEvent represents an authentication/access event
@@ -122,11 +123,12 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		}
 
 		logEntry := AuthLogSchema{
-			TS:       start.UTC().Format(time.RFC3339),
-			LogType:  LogTypeAuth,
-			Workspace:   Workspace{ID: workspaceID},
-			LogLevel: "INFO",
-			Message:  fmt.Sprintf("%s %s request processed by %s", c.Request.Method, c.Request.URL.Path, serviceName),
+			TS:        start.UTC().Format(time.RFC3339),
+			LogType:   LogTypeAuth,
+			RequestID: c.GetString("request_id"), // set by RequestIDMiddleware; enables correlation
+			Workspace: Workspace{ID: workspaceID},
+			LogLevel:  "INFO",
+			Message:   fmt.Sprintf("%s %s request processed by %s", c.Request.Method, c.Request.URL.Path, serviceName),
 
 			Event: AuthEvent{
 				Type:     "api.request",
@@ -162,7 +164,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 type AuditLogSchema struct {
 	TS          string           `json:"ts"`
 	LogType     string           `json:"log_type"` // "audit.trail"
-	Workspace      Workspace           `json:"workspace"`
+	Workspace   Workspace        `json:"workspace"`
 	Event       AuditEvent       `json:"event"`
 	Actor       Actor            `json:"actor"`
 	Object      AuditObject      `json:"object"`
@@ -244,9 +246,9 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	}
 
 	entry := AuditLogSchema{
-		TS:      time.Now().UTC().Format(time.RFC3339),
-		LogType: LogTypeAudit,
-		Workspace:  Workspace{ID: workspaceID},
+		TS:        time.Now().UTC().Format(time.RFC3339),
+		LogType:   LogTypeAudit,
+		Workspace: Workspace{ID: workspaceID},
 
 		Event: AuditEvent{
 			Type:     fmt.Sprintf("%s.%s", objectType, actionType),

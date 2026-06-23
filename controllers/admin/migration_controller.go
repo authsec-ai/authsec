@@ -79,61 +79,15 @@ func (mc *MigrationController) RunTenantMigrations(c *gin.Context) {
 }
 
 // GetTenantMigrationStatus GET /authsec-migration/tenants/:workspace_id/migrations/status
+//
+// Single master DB architecture: there are no per-tenant databases and the
+// `tenants` table no longer exists. Per-tenant DB operations, if ever needed,
+// are owned by the mt-plugin microservice. This endpoint reports unavailable
+// rather than querying the dropped table (which would 500).
 func (mc *MigrationController) GetTenantMigrationStatus(c *gin.Context) {
-	workspaceID := c.Param("workspace_id")
-
-	var tenant migration.TenantInfo
-	if err := config.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
-		return
-	}
-
-	dbName := ""
-	if tenant.WorkspaceDB != nil {
-		dbName = *tenant.WorkspaceDB
-	}
-
-	migStatus := "pending"
-	if tenant.MigrationStatus != nil {
-		migStatus = *tenant.MigrationStatus
-	}
-
-	if dbName == "" {
-		c.JSON(http.StatusOK, gin.H{
-			"workspace_id":        tenant.WorkspaceID.String(),
-			"migration_status": migStatus,
-			"last_migration":   tenant.LastMigration,
-		})
-		return
-	}
-
-	cfg := config.AppConfig
-	tenantDBConn, err := migration.ConnectToWorkspaceDB(cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, dbName)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"workspace_id":        tenant.WorkspaceID.String(),
-			"database_name":    dbName,
-			"migration_status": migStatus,
-			"last_migration":   tenant.LastMigration,
-			"error":            "Unable to connect to tenant database",
-		})
-		return
-	}
-	defer tenantDBConn.Close()
-
-	masterRaw := config.Database.DB
-	runner := migration.NewTenantMigrationRunner(workspaceID, tenantDBConn, mc.tenantMigrationsDir, masterRaw)
-	status, err := runner.GetMigrationStatus()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get migration status"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"workspace_id":        tenant.WorkspaceID.String(),
-		"database_name":    dbName,
-		"migration_status": migStatus,
-		"status":           status,
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error": "Tenant database operations are managed by mt-plugin",
+		"hint":  "Start the mt-plugin microservice and configure MT_PLUGIN_GRPC_ADDR",
 	})
 }
 
@@ -146,33 +100,15 @@ func (mc *MigrationController) MigrateAllTenants(c *gin.Context) {
 }
 
 // ListTenants GET /authsec-migration/tenants
+//
+// Single master DB architecture: the `tenants` table was dropped in the
+// tenant→workspace collapse. Per-tenant DB operations are owned by mt-plugin.
+// Reports unavailable rather than querying the dropped table (which would 500).
 func (mc *MigrationController) ListTenants(c *gin.Context) {
-	var tenants []migration.TenantInfo
-	if err := config.DB.Find(&tenants).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read tenants", "details": err.Error()})
-		return
-	}
-
-	items := make([]migration.TenantListItem, 0, len(tenants))
-	for _, t := range tenants {
-		item := migration.TenantListItem{
-			WorkspaceID:      t.WorkspaceID.String(),
-			Email:         t.Email,
-			WorkspaceDomain:  t.WorkspaceDomain,
-			LastMigration: t.LastMigration,
-		}
-		if t.WorkspaceDB != nil {
-			item.DatabaseName = *t.WorkspaceDB
-		}
-		if t.MigrationStatus != nil {
-			item.MigrationStatus = *t.MigrationStatus
-		} else {
-			item.MigrationStatus = "pending"
-		}
-		items = append(items, item)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"total": len(items), "tenants": items})
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error": "Tenant database operations are managed by mt-plugin",
+		"hint":  "Start the mt-plugin microservice and configure MT_PLUGIN_GRPC_ADDR",
+	})
 }
 
 // CreateTenantFromTemplate POST /authsec/migration/tenants/create-from-template

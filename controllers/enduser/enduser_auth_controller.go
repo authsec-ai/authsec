@@ -88,9 +88,10 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 	tenantDB := config.DB
 
 	// Find user by (workspace_id, LOWER(email)) — provider must start with saml-.
+	// Soft-deleted users (deleted_at set) must never authenticate.
 	var user models.User
 	if err := tenantDB.Where(
-		"workspace_id = ? AND LOWER(email) = LOWER(?) AND provider LIKE 'saml-%'",
+		"workspace_id = ? AND LOWER(email) = LOWER(?) AND provider LIKE 'saml-%' AND deleted_at IS NULL",
 		workspaceID, input.Email,
 	).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

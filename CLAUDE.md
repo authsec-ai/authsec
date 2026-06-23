@@ -139,6 +139,40 @@ match what you're doing to the current phase. Don't freelance ahead of phase.
 
 ---
 
+## Terminology — always follow market standards
+
+AuthSec is a security product. Every name it uses for a concept is implicitly
+compared against AWS, GCP, Okta, and Auth0 by every developer who touches it.
+When AuthSec uses its own jargon where the industry has an established term, it
+creates confusion, breaks documentation assumptions, and signals immaturity.
+
+**Hard rule: before naming any concept (API route, model, UI label, error key,
+log field), check what the dominant security vendors call the same thing. Use
+that name. Deviate only when AuthSec has a concept with no industry precedent.**
+
+### Canonical term map
+
+| Concept | ✅ Market standard | ❌ Do not use |
+|---|---|---|
+| Non-human identity with client_id + secret for M2M | **Service Account** | "Workload" (k8s/SPIFFE term — confuses M2M with pod identity) |
+| OAuth 2.0 registered application | **Client** | "App" at the protocol layer |
+| API that accepts bearer tokens | **Resource Server** | "MCP server" at the auth layer (fine as product name, not as protocol term) |
+| Token scope string | **Scope** | "Permission" at the OAuth layer (Permission is fine at RBAC layer below it) |
+| Short-lived credential for a k8s pod/service | **Workload / SVID** | "Service Account" (that's credential-based M2M) |
+| Organization / tenant | **Workspace** | "Tenant" (removed from AuthSec surface; only `entra_tenant_id` survives as Azure AD concept) |
+| Human logging in via browser | **User** | anything else |
+| Delegated identity token for cross-app access | **ID-JAG** or **identity assertion** | custom names |
+
+### Why this matters for a security company
+
+Security teams evaluate tools by how closely they map to the standards they
+already know (OAuth 2.1, OIDC, SPIFFE, SCIM). A mislabeled concept forces
+every user to maintain a mental translation table. That friction is a sales
+and trust problem, not just a UX annoyance. When in doubt, look up the RFC or
+check how Okta and Auth0 name it in their docs — then use that name exactly.
+
+---
+
 ## Anti-patterns to refuse
 
 - `ALTER TABLE` patch files in `migrations/master/` — edit the CREATE inline

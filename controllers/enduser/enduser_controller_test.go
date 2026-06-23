@@ -404,8 +404,9 @@ func TestEndUserController_ActiveOrDeactiveEndUser(t *testing.T) {
 	ensureNoDatabase(t)
 	controller := &EndUserController{}
 
+	workspaceID := uuid.New().String()
 	payload := map[string]interface{}{
-		"workspace_id": uuid.New().String(),
+		"workspace_id": workspaceID,
 		"user_id":      uuid.New().String(),
 		"active":       false,
 	}
@@ -416,6 +417,9 @@ func TestEndUserController_ActiveOrDeactiveEndUser(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	// Authenticated caller in the same workspace so the request passes the
+	// workspace check and exercises the no-database path under test.
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
 
 	controller.ActiveOrDeactiveEndUser(c)
 

@@ -190,6 +190,11 @@ CREATE TABLE public.audit_events (
     id bigint NOT NULL,
     request_id text,
     workspace_id text,
+    -- actor_realm separates "which login surface" (admin / enduser / service /
+    -- system) from workspace identity. Previously workspace_id was overloaded
+    -- with the literals "admin"/"enduser"; that pollution is gone — workspace_id
+    -- now holds a real workspace UUID or is empty for pre-auth events.
+    actor_realm text,
     user_id text,
     action text,
     resource text,
@@ -397,7 +402,10 @@ CREATE TABLE public.groups (
     description text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    workspace_id uuid,
+    -- Every group is owned by exactly one workspace. There are no platform/global
+    -- groups: group creation always sets workspace_id and the user_groups FK is
+    -- composite on (group_id, workspace_id).
+    workspace_id uuid NOT NULL,
     CONSTRAINT groups_pkey PRIMARY KEY (id),
     CONSTRAINT groups_workspace_id_id_key UNIQUE (workspace_id, id),
     CONSTRAINT uni_groups_workspace_name UNIQUE (workspace_id, name)
@@ -710,7 +718,7 @@ CREATE TABLE public.oidc_user_identities (
     provider_name character varying(50) NOT NULL,
     provider_user_id character varying(255) NOT NULL,
     email character varying(255),
-    profile_data jsonb,
+    profile_data jsonb DEFAULT '{}'::jsonb,
     last_login_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
@@ -938,6 +946,14 @@ CREATE TABLE public.service_accounts (
         CONSTRAINT service_accounts_status_chk CHECK (status IN ('active', 'disabled', 'suspended')),
     oauth_client_id uuid,
     spiffe_id text,
+    -- external_subject: for OIDC-federated workloads (e.g. GitHub Actions), the
+    -- token `sub` (or provider.subject_claim) that maps to this workload.
+    external_subject text,
+    -- owner/contact for triage (plan Journey 3); informational only.
+    owner_email text,
+    owner_team text,
+    -- last time this workload successfully authenticated (any method).
+    last_seen_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT service_accounts_pkey PRIMARY KEY (workspace_id, id)
@@ -946,6 +962,37 @@ CREATE TABLE public.service_accounts (
 CREATE UNIQUE INDEX uq_sa_client ON public.service_accounts (oauth_client_id) WHERE oauth_client_id IS NOT NULL;
 CREATE UNIQUE INDEX uq_sa_spiffe ON public.service_accounts (spiffe_id)       WHERE spiffe_id IS NOT NULL;
 CREATE INDEX idx_sa_workspace_id ON public.service_accounts (workspace_id);
+CREATE INDEX idx_sa_external_subject ON public.service_accounts (external_subject) WHERE external_subject IS NOT NULL;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- workload_identity_providers — registered external token issuers a workload may
+-- authenticate with, replacing the single global SPIFFE_OIDC_ISSUER env:
+--   kind='spiffe' → a SPIRE trust domain (multi-cluster / "already have SPIRE")
+--   kind='oidc'   → a generic OIDC issuer (GitHub Actions / CI federation)
+-- The token validator resolves the provider by the presented token's `iss`,
+-- verifies the signature against its JWKS (discovered or jwks_uri), checks the
+-- audience, then maps the subject to a service_account (spiffe_id for spiffe,
+-- external_subject for oidc). Issuer is unique instance-wide.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE public.workload_identity_providers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    workspace_id uuid NOT NULL,
+    name text NOT NULL,
+    kind text NOT NULL DEFAULT 'spiffe'
+        CONSTRAINT wip_kind_chk CHECK (kind IN ('spiffe', 'oidc')),
+    issuer text NOT NULL,
+    jwks_uri text,
+    trust_domain text,
+    allowed_audiences text[] NOT NULL DEFAULT '{}',
+    subject_claim text NOT NULL DEFAULT 'sub',
+    status text NOT NULL DEFAULT 'active'
+        CONSTRAINT wip_status_chk CHECK (status IN ('active', 'disabled')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT workload_identity_providers_pkey PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX uq_wip_issuer ON public.workload_identity_providers (issuer);
+CREATE INDEX idx_wip_workspace ON public.workload_identity_providers (workspace_id);
 
 CREATE TABLE public.role_bindings (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -965,7 +1012,7 @@ CREATE TABLE public.role_bindings (
     assignment_metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     group_id uuid,
     CONSTRAINT check_principal CHECK ((((((user_id IS NOT NULL))::integer + ((group_id IS NOT NULL))::integer) + ((service_account_id IS NOT NULL))::integer) = 1)),
-    workspace_id uuid,
+    workspace_id uuid NOT NULL,
     CONSTRAINT chk_rb_sa_workspace CHECK (service_account_id IS NULL OR workspace_id IS NOT NULL),
     CONSTRAINT fk_rb_service_account FOREIGN KEY (workspace_id, service_account_id)
         REFERENCES public.service_accounts(workspace_id, id) ON DELETE CASCADE,
@@ -1049,6 +1096,7 @@ CREATE TABLE public.services (
 CREATE TABLE public.spire_audit_logs (
     id bigint NOT NULL,
     request_id text,
+    workspace_id text,
     subject text,
     resource text,
     action text,
@@ -1071,6 +1119,8 @@ CREATE SEQUENCE public.spire_audit_logs_id_seq
     CACHE 1;
 
 ALTER SEQUENCE public.spire_audit_logs_id_seq OWNED BY public.spire_audit_logs.id;
+
+CREATE INDEX idx_spire_audit_logs_workspace ON public.spire_audit_logs(workspace_id);
 
 CREATE TABLE public.spire_oidc_tokens (
     id bigint NOT NULL,
@@ -1708,14 +1758,22 @@ CREATE INDEX idx_scim_events_workspace ON public.scim_events(workspace_id, ts DE
 CREATE TABLE public.application_spiffe_identities (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    application_id uuid NOT NULL REFERENCES public.resource_servers(id) ON DELETE CASCADE,
+    -- Composite FK: the application this SPIFFE identity binds to must live in the
+    -- SAME workspace. Matches resource_servers' UNIQUE (id, workspace_id).
+    application_id uuid NOT NULL,
+    CONSTRAINT fk_app_spiffe_application FOREIGN KEY (application_id, workspace_id)
+        REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE,
     spiffe_id text NOT NULL UNIQUE,
     trust_domain text NOT NULL,
     selectors jsonb NOT NULL DEFAULT '{}'::jsonb,
-    status text NOT NULL DEFAULT 'active',
+    status text NOT NULL DEFAULT 'attestation_pending',
+    last_attested_at timestamptz,
+    last_token_issued_at timestamptz,
+    last_error text,
+    last_error_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     revoked_at timestamptz,
-    CONSTRAINT application_spiffe_identities_status_chk CHECK (status IN ('active', 'revoked', 'disabled'))
+    CONSTRAINT application_spiffe_identities_status_chk CHECK (status IN ('active', 'revoked', 'disabled', 'attestation_pending', 'attested', 'token_issued', 'failed'))
 );
 
 CREATE INDEX idx_app_spiffe_workspace   ON public.application_spiffe_identities(workspace_id);
@@ -1776,6 +1834,7 @@ CREATE TABLE public.native_tokens (
     aud text NOT NULL,                       -- = resource_servers.resource_uri
     scope text NOT NULL,
     source_grant_jti text,                   -- XAA: the redeemed ID-JAG jti
+    source_grant_iss text,                   -- XAA: iss of the redeemed ID-JAG (for issuer bulk-revoke)
     rar_id uuid,                             -- CIBA: server-side RAR reference (RFC 9396)
     issued_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
@@ -1784,8 +1843,9 @@ CREATE TABLE public.native_tokens (
 
 CREATE INDEX idx_native_tokens_expires_at    ON public.native_tokens(expires_at);
 CREATE INDEX idx_native_tokens_workspace_id  ON public.native_tokens(workspace_id);
-CREATE INDEX idx_native_tokens_source_grant  ON public.native_tokens(source_grant_jti) WHERE source_grant_jti IS NOT NULL;
-CREATE INDEX idx_native_tokens_client_id     ON public.native_tokens(client_id);
+CREATE INDEX idx_native_tokens_source_grant      ON public.native_tokens(source_grant_jti) WHERE source_grant_jti IS NOT NULL;
+CREATE INDEX idx_native_tokens_source_grant_iss  ON public.native_tokens(source_grant_iss) WHERE source_grant_iss IS NOT NULL;
+CREATE INDEX idx_native_tokens_client_id         ON public.native_tokens(client_id);
 
 -- jti is unique only PER ISSUER → key on (iss, jti). A redeemed ID-JAG is recorded
 -- here as *seen* (replay guard), never as *revoked*.
@@ -2525,8 +2585,10 @@ ALTER TABLE ONLY public.totp_secrets
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT fk_ug_added_by FOREIGN KEY (added_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
+-- Composite FK so a user can only be added to a group in the SAME workspace.
+-- Matches groups' UNIQUE (workspace_id, id).
 ALTER TABLE ONLY public.user_groups
-    ADD CONSTRAINT fk_ug_group FOREIGN KEY (group_id) REFERENCES public.groups(id) ON DELETE CASCADE;
+    ADD CONSTRAINT fk_ug_group FOREIGN KEY (group_id, workspace_id) REFERENCES public.groups(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.user_groups
     ADD CONSTRAINT fk_ug_user FOREIGN KEY (workspace_id, user_id) REFERENCES public.users(workspace_id, id) ON DELETE CASCADE;
@@ -2546,6 +2608,20 @@ ALTER TABLE ONLY public.mcp_tools
 ALTER TABLE ONLY public.identity_providers
     ADD CONSTRAINT identity_providers_saml_fkey FOREIGN KEY (saml_provider_id, workspace_id) REFERENCES public.saml_providers(id, workspace_id) ON DELETE SET NULL;
 
+-- Workspace-ownership FKs (schema-enforced, not just app convention).
+-- saml_providers.workspace_id is NOT NULL (always workspace-owned).
+ALTER TABLE ONLY public.saml_providers
+    ADD CONSTRAINT saml_providers_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- oidc_providers.workspace_id is nullable (NULL = platform provider shared across
+-- workspaces); MATCH SIMPLE skips the FK when NULL, enforces it otherwise.
+ALTER TABLE ONLY public.oidc_providers
+    ADD CONSTRAINT oidc_providers_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
+-- scope_catalog_entries.workspace_id is NOT NULL (always workspace-owned).
+ALTER TABLE ONLY public.scope_catalog_entries
+    ADD CONSTRAINT scope_catalog_entries_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
+
 ALTER TABLE ONLY public.mcp_oauth_clients
     ADD CONSTRAINT mcp_oauth_clients_home_workspace_fkey FOREIGN KEY (home_workspace_id) REFERENCES public.workspaces(id) ON DELETE SET NULL;
 
@@ -2561,8 +2637,12 @@ ALTER TABLE ONLY public.oauth_scope_permissions
 ALTER TABLE ONLY public.oauth_scopes
     ADD CONSTRAINT oauth_scopes_parent_scope_id_fkey FOREIGN KEY (parent_scope_id) REFERENCES public.oauth_scopes(id) ON DELETE SET NULL;
 
+-- Composite FK so a scope's owning resource server is in the SAME workspace as
+-- the scope. resource_server_id is nullable (workspace-level scopes with no RS);
+-- MATCH SIMPLE skips the check when it is NULL. Matches resource_servers'
+-- UNIQUE (id, workspace_id).
 ALTER TABLE ONLY public.oauth_scopes
-    ADD CONSTRAINT oauth_scopes_resource_server_id_fkey FOREIGN KEY (resource_server_id) REFERENCES public.resource_servers(id) ON DELETE CASCADE;
+    ADD CONSTRAINT oauth_scopes_resource_server_id_fkey FOREIGN KEY (resource_server_id, workspace_id) REFERENCES public.resource_servers(id, workspace_id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_scopes
     ADD CONSTRAINT oauth_scopes_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id);
@@ -2664,9 +2744,12 @@ CREATE TABLE public.trusted_issuers (
     subject_mapping text,
     provider_name   text    NOT NULL,
     jit_provisioning bool   NOT NULL DEFAULT false,
+    status          text    NOT NULL DEFAULT 'active',
+    revoked_at      timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT trusted_issuers_pkey PRIMARY KEY (id)
+    CONSTRAINT trusted_issuers_pkey PRIMARY KEY (id),
+    CONSTRAINT trusted_issuers_status_chk CHECK (status IN ('active', 'revoked'))
 );
 CREATE UNIQUE INDEX uq_trusted_issuers_iss ON public.trusted_issuers (iss);
 CREATE INDEX idx_trusted_issuers_provider_name ON public.trusted_issuers (provider_name);

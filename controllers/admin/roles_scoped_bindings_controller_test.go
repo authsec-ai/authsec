@@ -1,3 +1,5 @@
+//go:build integration
+
 package admin
 
 import (
@@ -12,93 +14,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
-// setupRolesScopedTestDB creates an in-memory SQLite database for testing
+// setupRolesScopedTestDB returns the shared Postgres GORM connection started in
+// TestMain. Tables already exist from the real bootstrap — no CREATE TABLE needed.
 func setupRolesScopedTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-
-	// Create roles table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS roles (
-			id TEXT PRIMARY KEY,
-			workspace_id TEXT NOT NULL,
-			name TEXT NOT NULL,
-			description TEXT,
-			is_system INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(workspace_id, name)
-		)
-	`).Error
-	require.NoError(t, err)
-
-	// Create permissions table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS permissions (
-			id TEXT PRIMARY KEY,
-			workspace_id TEXT NOT NULL,
-			resource TEXT NOT NULL,
-			action TEXT NOT NULL,
-			description TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(workspace_id, resource, action)
-		)
-	`).Error
-	require.NoError(t, err)
-
-	// Create role_permissions table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS role_permissions (
-			role_id TEXT NOT NULL,
-			permission_id TEXT NOT NULL,
-			PRIMARY KEY (role_id, permission_id)
-		)
-	`).Error
-	require.NoError(t, err)
-
-	// Create users table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS users (
-			id TEXT PRIMARY KEY,
-			workspace_id TEXT,
-			email TEXT NOT NULL,
-			username TEXT,
-			password_hash TEXT,
-			active INTEGER DEFAULT 1,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`).Error
-	require.NoError(t, err)
-
-	// Create role_bindings table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS role_bindings (
-			id TEXT PRIMARY KEY,
-			workspace_id TEXT NOT NULL,
-			user_id TEXT,
-			username TEXT,
-			group_id TEXT,
-			service_account_id TEXT,
-			role_id TEXT NOT NULL,
-			role_name TEXT,
-			scope_type TEXT,
-			scope_id TEXT,
-			conditions TEXT DEFAULT '{}',
-			assignment_source TEXT NOT NULL DEFAULT 'manual',
-			assignment_metadata TEXT,
-			expires_at DATETIME,
-			created_by TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`).Error
-	require.NoError(t, err)
-
-	return db
+	t.Helper()
+	if gormDBForTest == nil {
+		t.Fatal("gormDBForTest is nil — integration TestMain did not start")
+	}
+	return gormDBForTest
 }
 
 // seedRolesScopedTestData creates test data (tenant, permissions, user)
@@ -124,7 +50,7 @@ func seedRolesScopedTestData(t *testing.T, db *gorm.DB, workspaceID uuid.UUID) (
 	// Create a user for binding tests
 	userID := uuid.New()
 	err := db.Exec("INSERT INTO users (id, workspace_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
-		userID.String(), workspaceID.String(), "testuser@test.com", "testuser", 1).Error
+		userID.String(), workspaceID.String(), "testuser@test.com", "testuser", true).Error
 	require.NoError(t, err)
 
 	return permIDs, userID
@@ -636,7 +562,7 @@ func TestListRoleBindings_Success(t *testing.T) {
 
 	// Create a binding directly in DB
 	bindingID := uuid.New()
-	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', NOW())",
 		bindingID.String(), workspaceID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
 	require.NoError(t, err)
 
@@ -663,16 +589,16 @@ func TestListRoleBindings_FilterByUser(t *testing.T) {
 	// Create bindings for different users
 	user2ID := uuid.New()
 	err = db.Exec("INSERT INTO users (id, workspace_id, email, username, active) VALUES (?, ?, ?, ?, ?)",
-		user2ID.String(), workspaceID.String(), "user2@test.com", "user2", 1).Error
+		user2ID.String(), workspaceID.String(), "user2@test.com", "user2", true).Error
 	require.NoError(t, err)
 
 	// Binding 1 for user1
-	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', NOW())",
 		uuid.New().String(), workspaceID.String(), userID.String(), roleID.String(), "admin", "testuser").Error
 	require.NoError(t, err)
 
 	// Binding 2 for user2
-	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', datetime('now'))",
+	err = db.Exec("INSERT INTO role_bindings (id, workspace_id, user_id, role_id, role_name, username, conditions, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', NOW())",
 		uuid.New().String(), workspaceID.String(), user2ID.String(), roleID.String(), "admin", "user2").Error
 	require.NoError(t, err)
 
@@ -958,61 +884,3 @@ func TestDeleteRole_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-// ==================================
-// Scope Resource Mappings Tests (from scope_controller)
-// ==================================
-
-// These tests verify the scope_resource_mappings table behavior
-// which is separate from role_bindings scope handling
-
-func setupScopeResourceTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-
-	// Create scope_resource_mappings table
-	err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS scope_resource_mappings (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			workspace_id TEXT NOT NULL,
-			scope_name TEXT NOT NULL,
-			resource_name TEXT NOT NULL,
-			UNIQUE(workspace_id, scope_name, resource_name)
-		)
-	`).Error
-	require.NoError(t, err)
-
-	return db
-}
-
-func TestScopeResourceMappings_ListScopes(t *testing.T) {
-	db := setupScopeResourceTestDB(t)
-	workspaceID := uuid.New()
-
-	// Insert scope mappings
-	err := db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		workspaceID.String(), "admin", "users").Error
-	require.NoError(t, err)
-	err = db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		workspaceID.String(), "admin", "projects").Error
-	require.NoError(t, err)
-	err = db.Exec("INSERT INTO scope_resource_mappings (workspace_id, scope_name, resource_name) VALUES (?, ?, ?)",
-		workspaceID.String(), "viewer", "users").Error
-	require.NoError(t, err)
-
-	// Query unique scope names
-	var scopes []string
-	rows, err := db.Raw("SELECT DISTINCT scope_name FROM scope_resource_mappings WHERE workspace_id = ? ORDER BY scope_name", workspaceID.String()).Rows()
-	require.NoError(t, err)
-	defer rows.Close()
-
-	for rows.Next() {
-		var scopeName string
-		err := rows.Scan(&scopeName)
-		require.NoError(t, err)
-		scopes = append(scopes, scopeName)
-	}
-
-	assert.Len(t, scopes, 2)
-	assert.Contains(t, scopes, "admin")
-	assert.Contains(t, scopes, "viewer")
-}

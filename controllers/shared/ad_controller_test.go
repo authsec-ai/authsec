@@ -564,6 +564,9 @@ func TestADSyncController_fetchADUsers(t *testing.T) {
 }
 
 func TestADSyncController_syncUserToDatabase(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping DB integration test in short mode (requires a bootstrapped Postgres)")
+	}
 	controller := &ADSyncController{}
 
 	tests := []struct {
@@ -647,6 +650,9 @@ func TestADSyncController_syncUserToDatabase(t *testing.T) {
 }
 
 func TestADSyncController_syncAgentUserToDatabase(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping DB integration test in short mode (requires a bootstrapped Postgres)")
+	}
 	controller := &ADSyncController{}
 
 	tests := []struct {

@@ -32,11 +32,13 @@ func (r *TenantDeviceRepository) CreateTenantDeviceToken(token *models.TenantDev
 
 	err := r.db.Create(token).Error
 	if err != nil {
-		if strings.Contains(err.Error(), "fk_tenant_device_tenant") {
-			return errors.New("tenant_not_found")
-		}
-		if strings.Contains(err.Error(), "fk_tenant_device_user") {
+		// workspace_device_tokens FKs (master bootstrap): fk_workspace_device
+		// (workspace_id) and fk_workspace_device_user (user_id, workspace_id).
+		if strings.Contains(err.Error(), "fk_workspace_device_user") {
 			return errors.New("user_not_found")
+		}
+		if strings.Contains(err.Error(), "fk_workspace_device") {
+			return errors.New("tenant_not_found")
 		}
 		return err
 	}
@@ -99,14 +101,17 @@ func (r *TenantDeviceRepository) CreateTenantCIBAAuthRequest(request *models.Ten
 
 	err := r.db.Create(request).Error
 	if err != nil {
-		if strings.Contains(err.Error(), "fk_tenant_ciba_tenant") {
-			return errors.New("tenant_not_found")
-		}
-		if strings.Contains(err.Error(), "fk_tenant_ciba_user") {
+		// workspace_ciba_auth_requests FKs (master bootstrap): fk_workspace_ciba
+		// (workspace_id), fk_workspace_ciba_user (user_id, workspace_id),
+		// fk_workspace_ciba_device (device_token_id, workspace_id).
+		if strings.Contains(err.Error(), "fk_workspace_ciba_user") {
 			return errors.New("user_not_found")
 		}
-		if strings.Contains(err.Error(), "fk_tenant_ciba_device") {
+		if strings.Contains(err.Error(), "fk_workspace_ciba_device") {
 			return errors.New("device_not_found")
+		}
+		if strings.Contains(err.Error(), "fk_workspace_ciba") {
+			return errors.New("tenant_not_found")
 		}
 		return err
 	}

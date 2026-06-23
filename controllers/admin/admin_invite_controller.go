@@ -713,75 +713,64 @@ func (aic *AdminInviteController) ListPendingInvites(c *gin.Context) {
 	})
 }
 
-// createEndUserInWorkspaceDBForInvite creates a corresponding end user account in the tenant database
-// This allows invited admins to also authenticate as end users within their tenant
+// createEndUserInWorkspaceDBForInvite creates a corresponding end-user account
+// for an invited admin so they can also authenticate as an end user in their
+// workspace. Single master DB architecture: this writes to the master `users`
+// table scoped by workspace_id — there are no per-tenant databases.
 func (aic *AdminInviteController) createEndUserInWorkspaceDBForInvite(adminUser *models.AdminUser, workspaceID uuid.UUID, clientID, projectID *uuid.UUID) error {
-	// Get tenant information
-	var tenant models.Tenant
-	if err := config.DB.Where("workspace_id = ?", workspaceID).First(&tenant).Error; err != nil {
-		return fmt.Errorf("failed to get tenant info: %w", err)
+	db := config.DB
+	if db == nil {
+		return fmt.Errorf("database connection not available")
 	}
 
-	// Generate tenant database name
-	tenantDBName := fmt.Sprintf("tenant_%s", strings.ReplaceAll(workspaceID.String(), "-", "_"))
-
-	// Connect to tenant database
-	tenantDSN := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
-		config.AppConfig.DBHost, config.AppConfig.DBUser, config.AppConfig.DBPassword, tenantDBName, config.AppConfig.DBPort)
-
-	tenantDB, err := sql.Open("postgres", tenantDSN)
-	if err != nil {
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-	defer tenantDB.Close()
-
-	// Determine client_id and project_id
-	var effectiveClientID, effectiveProjectID uuid.UUID
+	// Determine client_id and project_id (default to the workspace id).
+	effectiveClientID := workspaceID
 	if clientID != nil {
 		effectiveClientID = *clientID
-	} else {
-		effectiveClientID = workspaceID // Use tenant ID as default
 	}
-
+	effectiveProjectID := workspaceID
 	if projectID != nil {
 		effectiveProjectID = *projectID
 	} else {
-		// Try to get default project for this tenant
 		var defaultProject models.Project
-		if err := config.DB.Where("workspace_id = ? AND active = true", workspaceID).First(&defaultProject).Error; err == nil {
+		if err := db.Where("workspace_id = ? AND active = true", workspaceID).First(&defaultProject).Error; err == nil {
 			effectiveProjectID = defaultProject.ID
-		} else {
-			effectiveProjectID = workspaceID // Use tenant ID as fallback
 		}
 	}
 
-	// Create end user with same credentials as admin
-	endUserInsert := `
-		INSERT INTO users (id, client_id, workspace_id, project_id, email, name, username, 
-			password_hash, workspace_domain, provider, provider_id, active, 
-			created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, NOW(), NOW())
-		ON CONFLICT (email, client_id) DO NOTHING
-	`
-
-	_, err = tenantDB.Exec(endUserInsert,
-		adminUser.ID,           // Use same ID as admin user for consistency
-		effectiveClientID,      // client_id
-		workspaceID,               // workspace_id
-		effectiveProjectID,     // project_id
-		adminUser.Email,        // email
-		adminUser.Name,         // name
-		adminUser.Username,     // username
-		adminUser.PasswordHash, // password_hash (same as admin)
-		adminUser.WorkspaceDomain, // workspace_domain
-		adminUser.Provider,     // provider
-		adminUser.Email,        // provider_id
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to insert end user in tenant database: %w", err)
+	// Idempotent: skip if an end user already exists for this (workspace, email).
+	// The master users table uniqueness is (workspace_id, LOWER(email)) — not
+	// (email, client_id) — so we guard explicitly rather than rely on ON CONFLICT.
+	var existing int64
+	if err := db.Table("users").
+		Where("workspace_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL", workspaceID, adminUser.Email).
+		Count(&existing).Error; err != nil {
+		return fmt.Errorf("failed to check existing end user: %w", err)
+	}
+	if existing > 0 {
+		return nil
 	}
 
-	log.Printf("Created end user account in tenant database for invited admin: email=%s, user_id=%s", adminUser.Email, adminUser.ID.String())
+	if err := db.Exec(`
+		INSERT INTO users (id, client_id, workspace_id, project_id, email, name, username,
+			password_hash, workspace_domain, provider, provider_id, active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, NOW(), NOW())
+	`,
+		adminUser.ID,              // same id as admin for consistency
+		effectiveClientID,         // client_id
+		workspaceID,               // workspace_id
+		effectiveProjectID,        // project_id
+		adminUser.Email,           // email
+		adminUser.Name,            // name
+		adminUser.Username,        // username
+		adminUser.PasswordHash,    // password_hash (same as admin)
+		adminUser.WorkspaceDomain, // workspace_domain
+		adminUser.Provider,        // provider
+		adminUser.Email,           // provider_id
+	).Error; err != nil {
+		return fmt.Errorf("failed to insert end user: %w", err)
+	}
+
+	log.Printf("Created end-user account (master DB) for invited admin: email=%s, user_id=%s", adminUser.Email, adminUser.ID.String())
 	return nil
 }

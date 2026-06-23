@@ -51,6 +51,9 @@ func TestActiveOrDeactiveEndUser_UpdatesStatus(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	// Authenticated caller in the same workspace (handler derives/validates
+	// workspace from the JWT user_info, not from the body).
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -153,6 +156,9 @@ func TestActiveOrDeactiveEndUser_AcceptsStringBoolean(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	// Authenticated caller in the same workspace (handler derives/validates
+	// workspace from the JWT user_info, not from the body).
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -194,6 +200,9 @@ func TestActiveOrDeactiveEndUser_BlocksLastActive(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	// Authenticated caller in the same workspace (handler derives/validates
+	// workspace from the JWT user_info, not from the body).
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID.String()})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -299,4 +308,38 @@ func overrideConfigDB(t *testing.T, replacement *gorm.DB) {
 	t.Cleanup(func() {
 		config.DB = original
 	})
+}
+
+// TestActiveOrDeactiveEndUser_CrossWorkspaceDenied proves the WS1 boundary:
+// a caller authenticated in workspace A cannot toggle a user by passing a
+// different workspace_id in the body. The handler rejects with 403 before any
+// database access, so no DB setup is required.
+func TestActiveOrDeactiveEndUser_CrossWorkspaceDenied(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	controller := &EndUserController{}
+
+	callerWorkspace := uuid.New()
+	targetWorkspace := uuid.New() // different workspace supplied in the body
+
+	active := true
+	payload := map[string]interface{}{
+		"workspace_id": targetWorkspace.String(),
+		"user_id":      uuid.New().String(),
+		"active":       active,
+	}
+	body, _ := json.Marshal(payload)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/uflow/user/enduser/active", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	// Authenticated in callerWorkspace, but the body targets targetWorkspace.
+	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: callerWorkspace.String()})
+
+	controller.ActiveOrDeactiveEndUser(c)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	var response map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &response)
+	assert.Equal(t, "cross-workspace operation is not allowed", response["error"])
 }

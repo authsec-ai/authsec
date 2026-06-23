@@ -28,7 +28,7 @@ import (
 )
 
 type UserController struct {
-	workspaceRepo             *database.WorkspaceRepository
+	workspaceRepo          *database.WorkspaceRepository
 	userRepo               *database.UserRepository
 	otpRepo                *database.OTPRepository
 	pendingRepo            *database.PendingRegistrationRepository
@@ -56,7 +56,7 @@ func NewUserController() (*UserController, error) {
 	icpProvisioningService := services.NewICPProvisioningService(icpClient)
 
 	return &UserController{
-		workspaceRepo:             database.NewWorkspaceRepository(db),
+		workspaceRepo:          database.NewWorkspaceRepository(db),
 		userRepo:               database.NewUserRepository(db),
 		otpRepo:                database.NewOTPRepository(db),
 		pendingRepo:            database.NewPendingRegistrationRepository(db),
@@ -183,10 +183,11 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 	}
 
 	// Single-tenant guard: only one admin/tenant is permitted.
+	// Exclude the system workspace (00000000-...) which is seeded at bootstrap.
 	{
 		db := config.GetDatabase()
 		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active'").Scan(&tenantCount); err == nil && tenantCount > 0 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active' AND id != '00000000-0000-0000-0000-000000000000'").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
@@ -218,14 +219,14 @@ func (uc *UserController) InitiateRegistration(c *gin.Context) {
 
 	// Create pending registration record
 	pendingReg := models.PendingRegistration{
-		Email:        input.Email,
-		PasswordHash: tempUser.PasswordHash, // Use the hashed password
-		FirstName:    input.FirstName,
-		LastName:     input.LastName,
-		WorkspaceID:  workspaceID,
-		ProjectID:    projectID,
-		ClientID:     clientID,
-		ExpiresAt:    time.Now().Add(30 * time.Minute), // Expires in 30 minutes to match OTP
+		Email:           input.Email,
+		PasswordHash:    tempUser.PasswordHash, // Use the hashed password
+		FirstName:       input.FirstName,
+		LastName:        input.LastName,
+		WorkspaceID:     workspaceID,
+		ProjectID:       projectID,
+		ClientID:        clientID,
+		ExpiresAt:       time.Now().Add(30 * time.Minute), // Expires in 30 minutes to match OTP
 		WorkspaceDomain: workspaceDomain,
 	}
 
@@ -353,20 +354,20 @@ func (uc *UserController) VerifyOTPAndCompleteRegistration(c *gin.Context) {
 	username := pendingReg.Email
 	user := models.ExtendedUser{
 		User: sharedmodels.User{
-			ProjectID:    pendingReg.ProjectID,
-			ClientID:     pendingReg.WorkspaceID,
-			WorkspaceID:  pendingReg.WorkspaceID,
-			Email:        pendingReg.Email,
-			Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
-			Username:     &username, // Use email as username
-			PasswordHash: pendingReg.PasswordHash,
+			ProjectID:       pendingReg.ProjectID,
+			ClientID:        pendingReg.WorkspaceID,
+			WorkspaceID:     pendingReg.WorkspaceID,
+			Email:           pendingReg.Email,
+			Name:            fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
+			Username:        &username, // Use email as username
+			PasswordHash:    pendingReg.PasswordHash,
 			WorkspaceDomain: pendingReg.WorkspaceDomain,
-			Provider:     "local",
-			ProviderID:   pendingReg.Email, // Ensure ProviderID is not null
-			Active:       true,
-			MFAEnabled:   false,                // Explicitly set MFAEnabled as required by shared-models v0.5.0
-			MFAMethod:    pq.StringArray{},     // Initialize empty MFA methods array
-			ProviderData: datatypes.JSON("{}"), // Initialize with empty JSON object
+			Provider:        "local",
+			ProviderID:      pendingReg.Email, // Ensure ProviderID is not null
+			Active:          true,
+			MFAEnabled:      false,                // Explicitly set MFAEnabled as required by shared-models v0.5.0
+			MFAMethod:       pq.StringArray{},     // Initialize empty MFA methods array
+			ProviderData:    datatypes.JSON("{}"), // Initialize with empty JSON object
 		},
 	}
 
@@ -679,11 +680,11 @@ func (uc *UserController) Login(c *gin.Context) {
 
 	// Prepare base response
 	response := models.LoginResponse{
-		WorkspaceID:  tenant.WorkspaceID.String(),
+		WorkspaceID:     tenant.WorkspaceID.String(),
 		WorkspaceDomain: tenant.WorkspaceDomain, // Include original domain for WebAuthn RP ID
-		Email:        tenant.Email,
-		FirstLogin:   isFirstLogin,
-		OTPRequired:  false,
+		Email:           tenant.Email,
+		FirstLogin:      isFirstLogin,
+		OTPRequired:     false,
 	}
 
 	// Determine next step based on user status and MFA methods
@@ -1510,7 +1511,7 @@ func (uc *UserController) WebAuthnMFALoginStatus(c *gin.Context) {
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ?", input.Email, workspaceUUID).First(&user).Error; err != nil {
+	if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ? AND deleted_at IS NULL", input.Email, workspaceUUID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return

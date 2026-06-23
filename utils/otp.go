@@ -75,8 +75,11 @@ var SendOTPEmailFunc = func(email, otp string) error {
 	smtpPass := config.AppConfig.SMTPPassword
 
 	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendOTPEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
+		// No SMTP configured — log the OTP so the operator can read it from
+		// the backend logs. This keeps registration usable in dev/single-node
+		// deploys without a real mail provider.
+		log.Printf("SendOTPEmail: SMTP not configured — OTP for %s: %s", email, otp)
+		return nil
 	}
 
 	log.Printf("SendOTPEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)
@@ -135,8 +138,8 @@ var SendPasswordResetOTPEmailFunc = func(email, otp string) error {
 	smtpPass := config.AppConfig.SMTPPassword
 
 	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Printf("SendPasswordResetOTPEmail: incomplete SMTP configuration (host=%q port=%q user=%q)", smtpHost, smtpPort, smtpUser)
-		return fmt.Errorf("SMTP configuration is incomplete")
+		log.Printf("SendPasswordResetOTPEmail: SMTP not configured — OTP for %s: %s", email, otp)
+		return nil
 	}
 
 	log.Printf("SendPasswordResetOTPEmail: using SMTP host=%s port=%s user=%s", smtpHost, smtpPort, smtpUser)

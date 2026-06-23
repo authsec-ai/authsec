@@ -22,18 +22,18 @@ import (
 )
 
 type AdminAuthController struct {
-	adminUserRepo     *database.AdminUserRepository
-	adminWorkspaceRepo   *database.AdminWorkspaceRepository
-	otpRepo           *database.OTPRepository
-	pendingRepo       *database.PendingRegistrationRepository
-	antiReplayService *services.AntiReplayService
+	adminUserRepo      *database.AdminUserRepository
+	adminWorkspaceRepo *database.AdminWorkspaceRepository
+	otpRepo            *database.OTPRepository
+	pendingRepo        *database.PendingRegistrationRepository
+	antiReplayService  *services.AntiReplayService
 }
 
 // RegisterInput represents the input for admin user registration
 type RegisterInput struct {
-	Email        string `json:"email" binding:"required,email"`
-	Password     string `json:"password" binding:"required,min=10"`
-	Name         string `json:"name" binding:"required"`
+	Email           string `json:"email" binding:"required,email"`
+	Password        string `json:"password" binding:"required,min=10"`
+	Name            string `json:"name" binding:"required"`
 	WorkspaceDomain string `json:"workspace_domain" binding:"required"`
 }
 
@@ -59,11 +59,11 @@ func NewAdminAuthController() (*AdminAuthController, error) {
 	}
 
 	return &AdminAuthController{
-		adminUserRepo:     database.NewAdminUserRepository(db),
-		adminWorkspaceRepo:   database.NewAdminWorkspaceRepository(db),
-		otpRepo:           database.NewOTPRepository(db),
-		pendingRepo:       database.NewPendingRegistrationRepository(db),
-		antiReplayService: services.NewAntiReplayService(redisClient),
+		adminUserRepo:      database.NewAdminUserRepository(db),
+		adminWorkspaceRepo: database.NewAdminWorkspaceRepository(db),
+		otpRepo:            database.NewOTPRepository(db),
+		pendingRepo:        database.NewPendingRegistrationRepository(db),
+		antiReplayService:  services.NewAntiReplayService(redisClient),
 	}, nil
 }
 
@@ -78,6 +78,17 @@ func NewAdminAuthController() (*AdminAuthController, error) {
 // @Failure 400 {object} map[string]string "Bad request - invalid input"
 // @Failure 401 {object} map[string]string "Unauthorized - invalid credentials or account disabled"
 // @Failure 500 {object} map[string]string "Internal server error"
+// auditWorkspaceID renders a nullable workspace UUID for audit logging,
+// returning "" when the workspace is unknown (e.g. pre-auth flows). The real
+// workspace UUID — never a realm literal like "admin" — belongs in
+// audit_events.workspace_id.
+func auditWorkspaceID(id *uuid.UUID) string {
+	if id == nil {
+		return ""
+	}
+	return id.String()
+}
+
 // @Router /authsec/uflow/auth/admin/login [post]
 func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	startTime := time.Now()
@@ -89,7 +100,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	if err := c.ShouldBindJSON(&input); err != nil {
 		// Audit: Failed login - invalid input
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", "", "admin_login", clientIP, userAgent, false, "invalid input: "+err.Error())
+			config.AuditLogger.LogAuthentication(requestID, "", "admin", "", "admin_login", clientIP, userAgent, false, "invalid input: "+err.Error())
 		}
 		monitoring.RecordAuthFailure("admin", "invalid_input", "admin")
 
@@ -101,7 +112,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	if input.Email == "" || input.Password == "" {
 		// Audit: Failed login - missing credentials
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", "", "admin_login", clientIP, userAgent, false, "missing email or password")
+			config.AuditLogger.LogAuthentication(requestID, "", "admin", "", "admin_login", clientIP, userAgent, false, "missing email or password")
 		}
 		monitoring.RecordAuthFailure("admin", "missing_credentials", "admin")
 
@@ -115,19 +126,19 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		log.Printf("[AdminLogin][Anti-Replay] Validating request for email: %s, nonce: %s, timestamp: %d", input.Email, input.Nonce, input.Timestamp)
 
 		secureReq := &models.SecureLoginRequest{
-			Email:        input.Email,
-			Password:     input.Password,
+			Email:           input.Email,
+			Password:        input.Password,
 			WorkspaceDomain: input.WorkspaceDomain,
-			Nonce:        input.Nonce,
-			Timestamp:    input.Timestamp,
-			Challenge:    input.Challenge,
-			Signature:    input.Signature,
+			Nonce:           input.Nonce,
+			Timestamp:       input.Timestamp,
+			Challenge:       input.Challenge,
+			Signature:       input.Signature,
 		}
 
 		if err := aac.antiReplayService.ValidateLoginRequest(secureReq); err != nil {
 			log.Printf("[AdminLogin][Anti-Replay] REPLAY ATTACK DETECTED for email %s: %v", input.Email, err)
 			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin", "", "admin_login", clientIP, userAgent, false, "replay attack detected: "+err.Error())
+				config.AuditLogger.LogAuthentication(requestID, "", "admin", "", "admin_login", clientIP, userAgent, false, "replay attack detected: "+err.Error())
 			}
 			monitoring.RecordAuthFailure("admin", "replay_attack", "admin")
 
@@ -162,7 +173,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		// Audit: Failed login - user not found
 		fmt.Printf("[AdminLogin] User NOT FOUND in main database: email=%s, workspace_domain=%s, error=%v\n", input.Email, input.WorkspaceDomain, err)
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", "", "admin_login", clientIP, userAgent, false, "user not found in main database")
+			config.AuditLogger.LogAuthentication(requestID, "", "admin", "", "admin_login", clientIP, userAgent, false, "user not found in main database")
 		}
 		monitoring.RecordAuthFailure("admin", "user_not_found", "admin")
 
@@ -179,7 +190,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		fmt.Printf("[AdminLogin] TENANT ISOLATION VIOLATION: user=%s belongs to domain=%s but tried to login to domain=%s\n",
 			adminUser.Email, adminUser.WorkspaceDomain, input.WorkspaceDomain)
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "tenant domain mismatch")
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "tenant domain mismatch")
 		}
 		monitoring.RecordAuthFailure("admin", "workspace_domain_mismatch", "admin")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials for this tenant"})
@@ -190,7 +201,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	if !adminUser.Active {
 		// Audit: Failed login - account disabled
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account disabled")
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account disabled")
 		}
 		monitoring.RecordAuthFailure("admin", "account_disabled", "admin")
 
@@ -204,7 +215,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		if time.Since(*adminUser.AccountLockedAt) < lockoutDuration {
 			remainingTime := lockoutDuration - time.Since(*adminUser.AccountLockedAt)
 			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
+				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
 			}
 			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
 
@@ -228,7 +239,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	// Check if password reset is required
 	if adminUser.PasswordResetRequired {
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "password reset required")
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "password reset required")
 		}
 		monitoring.RecordAuthFailure("admin", "password_reset_required", "admin")
 
@@ -258,7 +269,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 			}
 
 			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked after 3 failed attempts")
+				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked after 3 failed attempts")
 			}
 			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
 
@@ -275,7 +286,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 		// Audit: Failed login - invalid password
 		if config.AuditLogger != nil {
-			config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "invalid password")
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "invalid password")
 		}
 		monitoring.RecordAuthFailure("admin", "invalid_password", "admin")
 
@@ -308,7 +319,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		if time.Now().After(*adminUser.TemporaryPasswordExpiresAt) {
 			// Audit: Failed login - temporary password expired
 			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "temporary password expired")
+				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "temporary password expired")
 			}
 			monitoring.RecordAuthFailure("admin", "temporary_password_expired", "admin")
 
@@ -404,7 +415,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 	// Build response with MFA information
 	response := gin.H{
 		"workspace_id":      adminUser.WorkspaceID,
-		"workspace_domain":     workspaceDomainToReturn,
+		"workspace_domain":  workspaceDomainToReturn,
 		"email":             adminUser.Email,
 		"first_login":       adminUser.LastLogin == nil,
 		"otp_required":      otpRequired,
@@ -422,7 +433,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		if err != nil {
 			// Audit: Failed login - token generation error
 			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "token generation failed: "+err.Error())
+				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "token generation failed: "+err.Error())
 			}
 			monitoring.RecordAuthFailure("admin", "token_generation_failed", "admin")
 
@@ -441,7 +452,7 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	// Audit: Successful login
 	if config.AuditLogger != nil {
-		config.AuditLogger.LogAuthentication(requestID, "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, true, "")
+		config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, true, "")
 	}
 	monitoring.RecordAuthRequest("admin", "success", "admin")
 
@@ -511,10 +522,11 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 
 	// Single-tenant guard: authsec runs as a single-workspace deployment.
 	// Only one admin/tenant is permitted; reject any subsequent registration.
+	// Exclude the system workspace (00000000-...) which is seeded at bootstrap.
 	{
 		db := config.GetDatabase()
 		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active'").Scan(&tenantCount); err == nil && tenantCount > 0 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active' AND id != '00000000-0000-0000-0000-000000000000'").Scan(&tenantCount); err == nil && tenantCount > 0 {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "Single-tenant deployment: only one admin is allowed.",
 			})
@@ -586,13 +598,13 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	// which reads the first project's id and rejects uuid.Nil. Generate a real
 	// UUID here so the project row inserted at verify-otp time is queryable.
 	pendingReg := &models.PendingRegistration{
-		Email:        input.Email,
-		PasswordHash: hashedPassword,
-		WorkspaceID:  adminUUID,
-		ProjectID:    uuid.New(),
-		ClientID:     adminUUID, // Same as tenant for admin
+		Email:           input.Email,
+		PasswordHash:    hashedPassword,
+		WorkspaceID:     adminUUID,
+		ProjectID:       uuid.New(),
+		ClientID:        adminUUID, // Same as tenant for admin
 		WorkspaceDomain: workspaceDomain,
-		ExpiresAt:    time.Now().Add(24 * time.Hour), // 24 hours for admin registration
+		ExpiresAt:       time.Now().Add(24 * time.Hour), // 24 hours for admin registration
 	}
 
 	if err := aac.pendingRepo.CreatePendingRegistration(pendingReg); err != nil {
@@ -622,7 +634,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create OTP"})
 		return
 	}
-
 
 	// Send OTP via email — fire-and-forget. OTP already persisted.
 	go func(addr, code string) {
@@ -899,6 +910,29 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		return
 	}
 
+	// Auto-verify the workspace's OWN subdomain as a verified workspace_domains
+	// row, but ONLY when it falls under the deployment's configured base domain
+	// (WorkspaceDomainSuffix). The operator owns that wildcard + tunnel, so its
+	// subdomains are one trust boundary — this is safe and removes the manual
+	// "invalid origin" verification step after every fresh bootstrap. Domains
+	// OUTSIDE the base (true custom domains) still go through normal DNS-TXT
+	// verification. Per-subdomain RP-ID isolation is preserved.
+	if suffix := config.AppConfig.WorkspaceDomainSuffix; suffix != "" &&
+		(pendingReg.WorkspaceDomain == suffix || strings.HasSuffix(pendingReg.WorkspaceDomain, "."+suffix)) {
+		if _, derr := tx.Exec(`
+			INSERT INTO workspace_domains
+			  (workspace_id, domain, kind, is_primary, is_verified, verification_token, verification_method, verification_txt_name, verification_txt_value, verified_at, created_at, updated_at)
+			VALUES ($1, $2, 'system', true, true, 'single-node-bootstrap', 'bootstrap', $3, 'single-node-bootstrap', NOW(), NOW(), NOW())
+			ON CONFLICT (domain) DO UPDATE SET is_verified = true, is_primary = true,
+			  verified_at = COALESCE(workspace_domains.verified_at, NOW()), updated_at = NOW()
+		`, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, "_authsec-domain."+pendingReg.WorkspaceDomain); derr != nil {
+			tx.Rollback()
+			log.Printf("Failed to auto-verify workspace domain %s: %v", pendingReg.WorkspaceDomain, derr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify workspace domain"})
+			return
+		}
+	}
+
 	// Phase E: the `projects` table was dropped. Admin signup no longer creates a
 	// project row; user identity is (workspace_id, email). project_id is left unset.
 
@@ -907,18 +941,18 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	username := pendingReg.Email
 	adminUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:           pendingReg.WorkspaceID, // Use tenant ID as user ID for admin
-			Email:        pendingReg.Email,
-			Name:         fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
-			PasswordHash: pendingReg.PasswordHash,
-			ClientID:     pendingReg.ClientID,
-			WorkspaceID:  pendingReg.WorkspaceID,
+			ID:              pendingReg.WorkspaceID, // Use tenant ID as user ID for admin
+			Email:           pendingReg.Email,
+			Name:            fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
+			PasswordHash:    pendingReg.PasswordHash,
+			ClientID:        pendingReg.WorkspaceID, // client_id column removed from pending_registrations; use workspace_id
+			WorkspaceID:     pendingReg.WorkspaceID,
 			WorkspaceDomain: pendingReg.WorkspaceDomain,
-			Provider:     "local",
-			ProviderID:   pendingReg.Email,
-			Username:     &username,
-			ProviderData: datatypes.JSON("{}"),
-			Active:       true,
+			Provider:        "local",
+			ProviderID:      pendingReg.Email,
+			Username:        &username,
+			ProviderData:    datatypes.JSON("{}"),
+			Active:          true,
 		},
 	}
 
@@ -1046,9 +1080,9 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	token, err := config.TokenService.GenerateAdminToken(
 		adminUser.ID,
 		adminUser.Email,
-		adminUser.WorkspaceID,  // Pass actual workspace_id
+		adminUser.WorkspaceID,     // Pass actual workspace_id
 		adminUser.WorkspaceDomain, // Pass workspace_domain
-		roles,                  // Pass admin roles
+		roles,                     // Pass admin roles
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate admin token: %w", err)
@@ -1164,7 +1198,7 @@ func (aac *AdminAuthController) AdminLoginPrecheck(c *gin.Context) {
 	response := models.AdminPrecheckResponse{
 		Exists:             true,
 		DisplayName:        user.Name,
-		WorkspaceDomain:       workspaceDomainToReturn,
+		WorkspaceDomain:    workspaceDomainToReturn,
 		NextStep:           "login",
 		RequiresPassword:   true,
 		AvailableProviders: providers,
@@ -1273,13 +1307,13 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		// Create new pending registration.
 		// ProjectID is generated up-front; see comment in AdminRegister above.
 		pendingReg := &models.PendingRegistration{
-			Email:        input.Email,
-			PasswordHash: hashedPassword,
-			WorkspaceID:  workspaceID,
-			ProjectID:    uuid.New(),
-			ClientID:     clientID,
+			Email:           input.Email,
+			PasswordHash:    hashedPassword,
+			WorkspaceID:     workspaceID,
+			ProjectID:       uuid.New(),
+			ClientID:        clientID,
 			WorkspaceDomain: workspaceDomain,
-			ExpiresAt:    time.Now().Add(24 * time.Hour),
+			ExpiresAt:       time.Now().Add(24 * time.Hour),
 		}
 
 		if err := aac.pendingRepo.CreatePendingRegistration(pendingReg); err != nil {
@@ -1331,9 +1365,9 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, workspaceDomain, otp)
 
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
-		Message:      "Bootstrap initiated. Please check your email for OTP to complete registration.",
-		Status:       "pending_verification",
-		WorkspaceID:  workspaceID.String(),
+		Message:         "Bootstrap initiated. Please check your email for OTP to complete registration.",
+		Status:          "pending_verification",
+		WorkspaceID:     workspaceID.String(),
 		WorkspaceDomain: workspaceDomain,
 	})
 }
