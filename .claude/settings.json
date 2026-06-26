@@ -65,5 +65,38 @@
       "/Users/pc/Desktop/authnull/Authsec-ui",
       "/Users/pc/Desktop/authnull/sdk-authsec/packages/typescript-sdk/src"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\ncmd = d.get('tool_input', {}).get('command', '') or d.get('command', '')\nif 'ALTER TABLE' in cmd.upper():\n    print('\\nBLOCKED: Never ALTER TABLE.\\nEdit CREATE TABLE inline in migrations/master/001_bootstrap.sql, then run /wipe-rebootstrap.\\nSee authsec/docs/primitives/schema.md\\n', file=sys.stderr)\n    sys.exit(2)\n\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os, subprocess\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\nfp = d.get('tool_input', {}).get('file_path', '') or d.get('file_path', '')\nif fp.endswith('.go') and os.path.exists(fp):\n    subprocess.run(['gofmt', '-w', fp], capture_output=True)\n\""
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os, subprocess\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\nfp = d.get('tool_input', {}).get('file_path', '') or d.get('file_path', '')\nif fp.endswith('.go') and os.path.exists(fp):\n    subprocess.run(['gofmt', '-w', fp], capture_output=True)\n\""
+          }
+        ]
+      }
+    ]
   }
 }
