@@ -664,33 +664,8 @@ CREATE TABLE public.oidc_providers (
     CONSTRAINT oidc_providers_pkey PRIMARY KEY (id)
 );
 
--- Platform OIDC providers: available on the AuthSec login page for all admins.
--- Secrets resolved at runtime via env vars (vault_path contains provider name).
-INSERT INTO public.oidc_providers (
-    id, provider_name, display_name, client_id, client_secret_vault_path,
-    authorization_url, token_url, userinfo_url, scopes, is_active, workspace_id
-) VALUES
-(
-    'a0000000-0000-0000-0000-000000000001',
-    'google', 'Google',
-    '239842296073-kl769rs14u18heajst55cl6e1a8qhk5m.apps.googleusercontent.com',
-    'platform/google/client_secret',
-    'https://accounts.google.com/o/oauth2/v2/auth',
-    'https://oauth2.googleapis.com/token',
-    'https://openidconnect.googleapis.com/v1/userinfo',
-    'openid email profile', true, NULL
-),
-(
-    'a0000000-0000-0000-0000-000000000002',
-    'microsoft', 'Microsoft',
-    'b762fc4d-0bb6-46fc-affc-9420fa0f9c7f',
-    'platform/microsoft/client_secret',
-    'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
-    'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-    'https://graph.microsoft.com/oidc/userinfo',
-    'openid email profile', true, NULL
-)
-ON CONFLICT (id) DO NOTHING;
+-- Platform OIDC providers: none seeded by default.
+-- Workspace admins can configure providers via the Authentication page.
 
 CREATE TABLE public.oidc_states (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -946,6 +921,15 @@ CREATE TABLE public.service_accounts (
         CONSTRAINT service_accounts_status_chk CHECK (status IN ('active', 'disabled', 'suspended')),
     oauth_client_id uuid,
     spiffe_id text,
+    -- spiffe_match_type: how the validator matches an incoming SVID `sub` to this
+    -- workload. 'exact' (default) = sub must equal spiffe_id; 'prefix' = sub must
+    -- start with spiffe_id (reserved for federated fleets — exact is shipped today).
+    spiffe_match_type text NOT NULL DEFAULT 'exact'
+        CONSTRAINT service_accounts_spiffe_match_chk CHECK (spiffe_match_type IN ('exact', 'prefix')),
+    -- workload_provider_id: for a FEDERATED (bring-your-own SPIRE) workload, the
+    -- workload_identity_providers row whose trust domain issued this spiffe_id.
+    -- NULL for AuthSec-managed (locally minted) workloads.
+    workload_provider_id uuid,
     -- external_subject: for OIDC-federated workloads (e.g. GitHub Actions), the
     -- token `sub` (or provider.subject_claim) that maps to this workload.
     external_subject text,

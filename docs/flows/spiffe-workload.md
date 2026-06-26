@@ -4,6 +4,26 @@
 > access token. No long-lived secrets — the SVID is the credential.
 > Read `primitives/spire.md` and `primitives/token-engine.md` first.
 
+## Two onboarding modes (trust has two halves)
+
+A workload authenticates only when BOTH halves are registered:
+
+| Half | What | Where registered |
+|---|---|---|
+| **Issuer trust** | "I trust SVIDs signed by issuer X" | `workload_identity_providers` (kind=`spiffe`), or legacy `SPIFFE_OIDC_ISSUER` env |
+| **Subject mapping** | "`spiffe://td/...` → this service account + role" | `service_accounts.spiffe_id` |
+
+- **AuthSec-managed** — AuthSec runs SPIRE and **mints** the SPIFFE ID under its own
+  trust domain. `POST /applications/:id/machine-access/workload` (`CreateWorkloadAccess`).
+  The issuer is AuthSec's own SPIRE; no provider row needed.
+- **Federated (bring-your-own SPIRE)** — the customer's own SPIRE issues the SVID under
+  *their* trust domain. You register (1) the issuer as a `workload_identity_providers`
+  row (kind=`spiffe`, with `trust_domain`), and (2) the **exact external SPIFFE ID** as a
+  service account via `POST /applications/:id/access/federated-workload`
+  (`CreateFederatedWorkloadAccess`). AuthSec never mints — it stores the external ID
+  verbatim. `service_accounts.spiffe_match_type` = `exact` (the column is shaped for a
+  future `prefix`/pattern mode; only `exact` ships today).
+
 ## The path
 
 ```
@@ -49,14 +69,19 @@ Handler: `tokenClientCredentialsGrant` → `AuthenticateClient` (spiffe branch i
 
 `services/client_auth.go` — `authenticateSPIFFESVID(ctx, db, assertion, tokenEndpoint)`:
 
-1. Parse JWT-SVID header (no sig check yet) → get `iss`.
-2. Verify issuer: must be registered as a `workload_identity_providers` entry or match
-   `SPIFFE_OIDC_ISSUER` (the local SPIRE server).
-3. Fetch JWKS from the issuer's OIDC discovery or configured JWKS URI.
-4. Verify signature + `exp` + `aud`.
-5. Extract `sub` (SPIFFE ID).
-6. Look up `service_accounts` by `spiffe_id = sub` to get the service account and its
-   associated `mcp_oauth_clients` row.
+1. Parse JWT-SVID header (no sig check yet) → get `iss` + `sub`.
+2. Verify issuer: must be a registered, active `workload_identity_providers` entry, or
+   match `SPIFFE_OIDC_ISSUER` (legacy single-issuer env). Anything else → `invalid_client:
+   no workload identity provider for this issuer`. **Fail-closed.**
+3. Fetch JWKS via the provider's `jwks_uri` or OIDC discovery (`<iss>/.well-known/
+   openid-configuration` → `jwks_uri`; falls back to `<iss>/.well-known/jwks.json`).
+4. Verify signature + `exp` + `aud` (aud must include the provider's allowed audiences,
+   else the token endpoint).
+5. **Trust-domain binding** — if the matched provider declares a `trust_domain`, the
+   SVID's `sub` trust domain MUST equal it. Stops a token from trusted issuer A asserting
+   a SPIFFE ID under a different domain B.
+6. Look up `service_accounts` by `spiffe_id = sub` (exact match; `spiffe_match_type`),
+   active, with a linked confidential `mcp_oauth_clients` row.
 
 ### 4. Grant continues as M2M
 

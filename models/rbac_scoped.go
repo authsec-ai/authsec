@@ -70,19 +70,21 @@ func (RolePermission) TableName() string {
 // PK is (workspace_id, id) — workspace_id is non-null.
 // Status starts 'disabled' and flips to 'active' once a confidential credential is attached.
 type ServiceAccount struct {
-	ID            uuid.UUID  `json:"id"             gorm:"type:uuid;not null;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID   uuid.UUID  `json:"workspace_id"   gorm:"type:uuid;not null;primaryKey"`
-	Name          string     `json:"name"           gorm:"type:text;not null"`
-	Description   string     `json:"description"    gorm:"type:text"`
-	Status        string     `json:"status"         gorm:"type:text;not null;default:'disabled'"`
-	OAuthClientID   *uuid.UUID `json:"oauth_client_id" gorm:"type:uuid;column:oauth_client_id"`
-	SpiffeID        *string    `json:"spiffe_id"      gorm:"type:text"`
-	ExternalSubject *string    `json:"external_subject,omitempty" gorm:"type:text"`
-	OwnerEmail      *string    `json:"owner_email,omitempty"      gorm:"type:text"`
-	OwnerTeam       *string    `json:"owner_team,omitempty"       gorm:"type:text"`
-	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"             gorm:"type:uuid;not null;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID        uuid.UUID  `json:"workspace_id"   gorm:"type:uuid;not null;primaryKey"`
+	Name               string     `json:"name"           gorm:"type:text;not null"`
+	Description        string     `json:"description"    gorm:"type:text"`
+	Status             string     `json:"status"         gorm:"type:text;not null;default:'disabled'"`
+	OAuthClientID      *uuid.UUID `json:"oauth_client_id" gorm:"type:uuid;column:oauth_client_id"`
+	SpiffeID           *string    `json:"spiffe_id"      gorm:"type:text"`
+	SpiffeMatchType    string     `json:"spiffe_match_type"            gorm:"type:text;not null;default:'exact'"`
+	WorkloadProviderID *uuid.UUID `json:"workload_provider_id,omitempty" gorm:"type:uuid;column:workload_provider_id"`
+	ExternalSubject    *string    `json:"external_subject,omitempty" gorm:"type:text"`
+	OwnerEmail         *string    `json:"owner_email,omitempty"      gorm:"type:text"`
+	OwnerTeam          *string    `json:"owner_team,omitempty"       gorm:"type:text"`
+	LastSeenAt         *time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 func (ServiceAccount) TableName() string { return "service_accounts" }

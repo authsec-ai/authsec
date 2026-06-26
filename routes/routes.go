@@ -439,6 +439,11 @@ func SetupRoutes(
 			// approved registration only — never mints/changes the workload identity).
 			applications.POST("/:id/access/workloads", applicationsController.GrantWorkloadAccess)
 
+			// Register a FEDERATED (bring-your-own SPIRE) workload: an external
+			// SPIFFE ID from a registered workload_identity_provider, mapped to a
+			// confidential spiffe-svid client + rs-scoped role. No identity minting.
+			applications.POST("/:id/access/federated-workload", applicationsController.CreateFederatedWorkloadAccess)
+
 			// Application↔IDP policy (optional whitelist; default-allow when empty).
 			applications.GET("/:id/identity-providers", applicationIDPPoliciesController.List)
 			applications.POST("/:id/identity-providers", applicationIDPPoliciesController.Add)

@@ -1017,6 +1017,234 @@ func (ctrl *ApplicationsController) CreateWorkloadAccess(c *gin.Context) {
 	})
 }
 
+// ── POST /authsec/applications/:id/access/federated-workload ──────────────────
+
+// federatedWorkloadRequest registers a BRING-YOUR-OWN-SPIRE workload: a service
+// account whose SPIFFE ID is issued by a customer's own (federated) trust domain,
+// not minted by AuthSec. The issuer must already be registered as an active
+// workload_identity_provider (kind=spiffe); the external SPIFFE ID is stored
+// verbatim as the SA's spiffe_id so authenticateSPIFFESVID can match it.
+type federatedWorkloadRequest struct {
+	ProviderID         string `json:"provider_id" binding:"required"`        // a registered workload_identity_provider
+	ExternalSpiffeID   string `json:"external_spiffe_id" binding:"required"` // exact spiffe://<trust-domain>/...
+	RoleID             string `json:"role_id" binding:"required"`
+	ServiceAccountID   string `json:"service_account_id"`   // reuse an identity-less SA, OR
+	ServiceAccountName string `json:"service_account_name"` // create a new one
+	Description        string `json:"description"`
+}
+
+// CreateFederatedWorkloadAccess handles
+// POST /authsec/applications/:id/access/federated-workload.
+//
+// Unlike CreateWorkloadAccess (which MINTS an internal authsec.local SPIFFE ID),
+// this registers an EXTERNAL SPIFFE ID from a federated trust domain. The two
+// halves of SPIFFE trust meet here: the issuer (workload_identity_provider) plus
+// the subject (this SA's spiffe_id). It creates the confidential spiffe-svid
+// client, links it, grants the rs-scoped role, and records the workload identity
+// as `active` (federation IS the attestation — there is no embedded-SPIRE attest
+// step for an external trust domain).
+func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	id := c.Param("id")
+	rs, err := ctrl.service.GetByIDAndTenant(id, workspaceID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	var req federatedWorkloadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+
+	// Resolve the workload identity provider (issuer half of trust). Must be an
+	// ACTIVE, spiffe-kind provider in THIS workspace.
+	providerUUID, err := uuid.Parse(req.ProviderID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider_id"})
+		return
+	}
+	var provider models.WorkloadIdentityProvider
+	if err := config.DB.Where("id = ? AND workspace_id = ?", providerUUID, workspaceID).First(&provider).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workload identity provider not found"})
+		return
+	}
+	if provider.Status != "active" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workload identity provider is not active"})
+		return
+	}
+	if provider.Kind != "spiffe" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider must be kind=spiffe for a SPIFFE workload (use the OIDC federation path for CI tokens)"})
+		return
+	}
+
+	// Validate the external SPIFFE ID and bind it to the provider's trust domain.
+	spiffeIDStr := strings.TrimSpace(req.ExternalSpiffeID)
+	if !strings.HasPrefix(spiffeIDStr, "spiffe://") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "external_spiffe_id must be a SPIFFE ID (spiffe://...)"})
+		return
+	}
+	svidTD := strings.TrimPrefix(spiffeIDStr, "spiffe://")
+	if i := strings.IndexByte(svidTD, '/'); i >= 0 {
+		svidTD = svidTD[:i]
+	}
+	if svidTD == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "external_spiffe_id has no trust domain"})
+		return
+	}
+	if provider.TrustDomain != nil && *provider.TrustDomain != "" && svidTD != *provider.TrustDomain {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("external_spiffe_id trust domain %q does not match provider trust domain %q", svidTD, *provider.TrustDomain)})
+		return
+	}
+
+	// Validate role is scoped to this RS.
+	roleUUID, err := uuid.Parse(req.RoleID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role_id"})
+		return
+	}
+	var role models.RBACRole
+	if err := config.DB.Where("id = ? AND workspace_id = ?", roleUUID, workspaceID).First(&role).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "role not found"})
+		return
+	}
+	rsRolePrefix := fmt.Sprintf("rs-%s:", rs.ID.String())
+	if !strings.HasPrefix(role.Name, rsRolePrefix) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "role is not scoped to this MCP server"})
+		return
+	}
+
+	// Reject a duplicate SPIFFE ID up front (the column is globally unique on
+	// application_spiffe_identities; surfacing it here gives a clean 409).
+	var dupCount int64
+	config.DB.Table("application_spiffe_identities").Where("spiffe_id = ?", spiffeIDStr).Count(&dupCount)
+	if dupCount > 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "this SPIFFE ID is already registered"})
+		return
+	}
+
+	saSvc := services.NewServiceAccountService(config.DB)
+
+	// Resolve or create the service account (must not already have an identity).
+	var sa *models.ServiceAccount
+	if req.ServiceAccountID != "" {
+		saUUID, perr := uuid.Parse(req.ServiceAccountID)
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid service_account_id"})
+			return
+		}
+		sa, err = saSvc.GetServiceAccount(workspaceID, saUUID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
+			return
+		}
+		if sa.SpiffeID != nil || sa.OAuthClientID != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "service account already has an identity"})
+			return
+		}
+	} else {
+		if strings.TrimSpace(req.ServiceAccountName) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provide service_account_id or service_account_name"})
+			return
+		}
+		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// Confidential client authenticated by the federated SVID (no secret).
+	clientUUID := uuid.New()
+	clientIDStr := clientUUID.String()
+	now := time.Now().UTC()
+	mcpClient := models.MCPOAuthClient{
+		ID:                              clientUUID,
+		ClientID:                        clientIDStr,
+		HydraClientID:                   clientIDStr,
+		ClientName:                      sa.Name + " (federated workload)",
+		RedirectURIs:                    pq.StringArray{},
+		GrantTypes:                      pq.StringArray{"client_credentials"},
+		ResponseTypes:                   pq.StringArray{},
+		RegistrationType:                "admin",
+		AllowedTokenEndpointAuthMethods: pq.StringArray{"urn:authsec:params:oauth:client-assertion-type:spiffe-svid"},
+		HomeWorkspaceID:                 &workspaceID,
+		IsConfidential:                  true,
+		CreatedAt:                       now,
+		UpdatedAt:                       now,
+	}
+
+	workloadID := uuid.New()
+	spiffeIdentity := models.ApplicationSpiffeIdentity{
+		ID:            workloadID,
+		WorkspaceID:   workspaceID,
+		ApplicationID: rs.ID,
+		SpiffeID:      spiffeIDStr,
+		TrustDomain:   svidTD,
+		Selectors:     json.RawMessage("{}"),
+		Status:        "active", // federated: the external trust domain is the attestation authority
+		CreatedAt:     now,
+	}
+
+	var assignmentID string
+	if txErr := config.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&mcpClient).Error; err != nil {
+			return fmt.Errorf("failed to create OAuth client: %w", err)
+		}
+		if err := tx.Model(&models.ServiceAccount{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, sa.ID).
+			Updates(map[string]interface{}{
+				"oauth_client_id":      clientUUID,
+				"spiffe_id":            spiffeIDStr,
+				"spiffe_match_type":    "exact",
+				"workload_provider_id": provider.ID,
+				"status":               "active",
+				"updated_at":           now,
+			}).Error; err != nil {
+			return fmt.Errorf("failed to link client to SA: %w", err)
+		}
+		if err := tx.Create(&spiffeIdentity).Error; err != nil {
+			return fmt.Errorf("failed to create workload identity: %w", err)
+		}
+		aID, bErr := ensureServiceAccountRSBindingTx(tx, workspaceID, sa.ID, role, rs.ID)
+		if bErr != nil {
+			return fmt.Errorf("failed to assign role: %w", bErr)
+		}
+		assignmentID = aID
+		if _, regErr := ctrl.oauthSvc.EnsureClientRegistrationTx(
+			tx, rs.ID, clientUUID, workspaceID, "admin", models.ClientRegStatusApproved,
+		); regErr != nil {
+			return fmt.Errorf("failed to register client: %w", regErr)
+		}
+		return nil
+	}); txErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": txErr.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, workloadResponse{
+		WorkloadID:         workloadID.String(),
+		SpiffeID:           spiffeIDStr,
+		ServiceAccountID:   sa.ID.String(),
+		ServiceAccountName: sa.Name,
+		ClientID:           clientIDStr,
+		RoleID:             roleUUID.String(),
+		RoleName:           role.Name,
+		AssignmentID:       assignmentID,
+		Status:             "active",
+		Platform:           "federated",
+		Selectors:          map[string]string{},
+		InstallSnippet:     k8sInstallSnippet(spiffeIDStr, config.AppConfig.OAuthBaseURL()+"/oauth/token"),
+		TokenEndpoint:      config.AppConfig.OAuthBaseURL() + "/oauth/token",
+	})
+}
+
 // ── POST /authsec/applications/:id/access/workloads ───────────────────────────
 
 // grantWorkloadRequest grants an EXISTING workload (service account) access to

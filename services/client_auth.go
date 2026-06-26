@@ -218,11 +218,12 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 	// registered workload_identity_provider; fall back to the legacy single
 	// global SPIFFE_OIDC_ISSUER env for spiffe. Anything else is rejected.
 	var (
-		kind         = "spiffe"
-		jwksURL      string
-		allowedAuds  []string
-		subjectClaim = "sub"
-		providerWS   *uuid.UUID
+		kind                = "spiffe"
+		jwksURL             string
+		allowedAuds         []string
+		subjectClaim        = "sub"
+		providerWS          *uuid.UUID
+		providerTrustDomain string
 	)
 	var provider models.WorkloadIdentityProvider
 	perr := db.WithContext(ctx).
@@ -241,6 +242,9 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		}
 		ws := provider.WorkspaceID
 		providerWS = &ws
+		if provider.TrustDomain != nil {
+			providerTrustDomain = *provider.TrustDomain
+		}
 	} else if errors.Is(perr, gorm.ErrRecordNotFound) {
 		expectedIssuer := ""
 		if config.AppConfig != nil {
@@ -262,6 +266,20 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 
 	if kind == "spiffe" && !strings.HasPrefix(sub, "spiffe://") {
 		return nil, fmt.Errorf("invalid_client: SVID sub must be a SPIFFE ID")
+	}
+
+	// Trust-domain binding (fail-closed): if the matched provider declares a trust
+	// domain, the SVID's SPIFFE ID must belong to it. Without this a token from
+	// trusted issuer A could assert a SPIFFE ID under a different trust domain B.
+	if kind == "spiffe" && providerTrustDomain != "" {
+		td := strings.TrimPrefix(sub, "spiffe://")
+		if i := strings.IndexByte(td, '/'); i >= 0 {
+			td = td[:i]
+		}
+		if td != providerTrustDomain {
+			log.Printf("auth.trust_domain_mismatch: SVID sub %q (td=%q) does not match provider trust domain %q", sub, td, providerTrustDomain)
+			return nil, fmt.Errorf("invalid_client: SVID trust domain does not match the registered provider")
+		}
 	}
 
 	// Step 2: fetch the issuer's JWKS and verify the signature.
