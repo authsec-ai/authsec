@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
@@ -124,7 +126,7 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 	parsed, err := jwt.Parse(assertion, func(t *jwt.Token) (interface{}, error) {
 		// Reject none and all HMAC algorithms — per plan §(g).
 		switch t.Method.(type) {
-		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS, *jwt.SigningMethodECDSA:
 			// OK
 		default:
 			return nil, fmt.Errorf("unsupported signing algorithm: %v", t.Header["alg"])
@@ -294,7 +296,7 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 
 	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
 		switch t.Method.(type) {
-		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS, *jwt.SigningMethodECDSA:
 		default:
 			return nil, fmt.Errorf("unsupported token alg: %v", t.Header["alg"])
 		}
@@ -530,7 +532,7 @@ func VerifySVID(svid, tokenEndpoint string) (string, error) {
 
 	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
 		switch t.Method.(type) {
-		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS, *jwt.SigningMethodECDSA:
 		default:
 			return nil, fmt.Errorf("unsupported SVID alg: %v", t.Header["alg"])
 		}
@@ -597,7 +599,8 @@ func fetchURL(u string) ([]byte, error) {
 }
 
 // parseJWKSKeys parses a JWKS JSON string and returns a map kid → public key.
-// Supports RSA (kty=RSA, n+e) and EC (kty=EC) keys used for signing.
+// It accepts RFC 7517 signature keys and SPIFFE JWT-SVID bundle keys, and
+// supports the RSA and EC algorithms accepted by the token validators above.
 func parseJWKSKeys(rawJWKS string) (map[string]interface{}, error) {
 	var doc struct {
 		Keys []json.RawMessage `json:"keys"`
@@ -609,15 +612,22 @@ func parseJWKSKeys(rawJWKS string) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	for i, raw := range doc.Keys {
 		var base struct {
-			Kid string `json:"kid"`
-			Kty string `json:"kty"`
-			Use string `json:"use"`
-			Alg string `json:"alg"`
+			Kid    string   `json:"kid"`
+			Kty    string   `json:"kty"`
+			Use    string   `json:"use"`
+			Alg    string   `json:"alg"`
+			KeyOps []string `json:"key_ops"`
 		}
 		if err := json.Unmarshal(raw, &base); err != nil {
 			continue
 		}
-		if base.Use != "" && base.Use != "sig" {
+		// OIDC JWKS documents normally use "sig". A raw SPIFFE bundle uses
+		// the application-specific "jwt-svid" value required by the JWT-SVID
+		// specification. An absent use is valid under RFC 7517.
+		if base.Use != "" && base.Use != "sig" && base.Use != "jwt-svid" {
+			continue
+		}
+		if len(base.KeyOps) > 0 && !containsString(base.KeyOps, "verify") {
 			continue
 		}
 		kid := base.Kid
@@ -627,11 +637,14 @@ func parseJWKSKeys(rawJWKS string) (map[string]interface{}, error) {
 
 		switch base.Kty {
 		case "RSA":
+			if base.Alg != "" && !containsString([]string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512"}, base.Alg) {
+				continue
+			}
 			var rk struct {
 				N string `json:"n"`
 				E string `json:"e"`
 			}
-			if err := json.Unmarshal(raw, &rk); err != nil || rk.N == "" {
+			if err := json.Unmarshal(raw, &rk); err != nil || rk.N == "" || rk.E == "" {
 				continue
 			}
 			nBytes, err1 := base64.RawURLEncoding.DecodeString(rk.N)
@@ -643,13 +656,66 @@ func parseJWKSKeys(rawJWKS string) (map[string]interface{}, error) {
 			for _, b := range eBytes {
 				e = e<<8 + int(b)
 			}
-			result[kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: e}
+			n := new(big.Int).SetBytes(nBytes)
+			if n.Sign() <= 0 || e < 3 {
+				continue
+			}
+			result[kid] = &rsa.PublicKey{N: n, E: e}
+
+		case "EC":
+			var ek struct {
+				Crv string `json:"crv"`
+				X   string `json:"x"`
+				Y   string `json:"y"`
+			}
+			if err := json.Unmarshal(raw, &ek); err != nil || ek.X == "" || ek.Y == "" {
+				continue
+			}
+
+			var (
+				curve       elliptic.Curve
+				expectedAlg string
+			)
+			switch ek.Crv {
+			case "P-256":
+				curve, expectedAlg = elliptic.P256(), "ES256"
+			case "P-384":
+				curve, expectedAlg = elliptic.P384(), "ES384"
+			case "P-521":
+				curve, expectedAlg = elliptic.P521(), "ES512"
+			default:
+				continue
+			}
+			if base.Alg != "" && base.Alg != expectedAlg {
+				continue
+			}
+
+			xBytes, err1 := base64.RawURLEncoding.DecodeString(ek.X)
+			yBytes, err2 := base64.RawURLEncoding.DecodeString(ek.Y)
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			x := new(big.Int).SetBytes(xBytes)
+			y := new(big.Int).SetBytes(yBytes)
+			if x.Sign() <= 0 || y.Sign() <= 0 || !curve.IsOnCurve(x, y) {
+				continue
+			}
+			result[kid] = &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 		}
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("no usable signing keys found in JWKS")
 	}
 	return result, nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ── claim helpers ─────────────────────────────────────────────────────────────
