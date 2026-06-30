@@ -1,0 +1,74 @@
+# Save as hydra-v2.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hydra
+  namespace: hydra-v2-prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hydra
+  template:
+    metadata:
+      labels:
+        app: hydra
+    spec:
+      containers:
+        - name: hydra
+          image: oryd/hydra:v2.3.0
+          args: ["serve", "all", "--config", "/etc/hydra/hydra.yml"]
+          ports:
+            - name: public
+              containerPort: 4444
+            - name: admin
+              containerPort: 4445
+          envFrom:
+            - secretRef:
+                name: hydra-v2-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hydra
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/alive
+              port: admin
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: hydra-v2-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hydra-public
+  namespace: hydra-v2-prod
+spec:
+  selector:
+    app: hydra
+  ports:
+    - port: 4444
+      targetPort: public
+      name: public
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hydra-admin
+  namespace: hydra-v2-prod
+spec:
+  selector:
+    app: hydra
+  ports:
+    - port: 4445
+      targetPort: admin
+      name: admin

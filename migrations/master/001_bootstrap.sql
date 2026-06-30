@@ -3022,3 +3022,93 @@ BEGIN
       AND p.action = 'create_workspace_from_template'
     ON CONFLICT DO NOTHING;
 END $$;
+
+-- Connectors -------------------------------------------------------------
+-- A workspace-scoped registry of integration connectors (HubSpot, Mixpanel,
+-- Segment, …) modelled on the Descope/Segment shape: provider + non-secret
+-- config + event subscriptions/field-mappings. Secrets (apiKey/writeKey/…)
+-- live in Vault, not here. Runtime consumer is agents over SPIFFE JWT-SVID.
+
+-- connector_providers — fixed catalog of supported integration types.
+-- Seeded below; not created by tenants. config_schema/secret_keys describe
+-- which config fields are allowed and which route to Vault.
+CREATE TABLE public.connector_providers (
+    key            text NOT NULL,
+    display_name   text NOT NULL,
+    component_type text NOT NULL DEFAULT '',
+    config_schema  jsonb NOT NULL DEFAULT '{}'::jsonb,
+    secret_keys    text[] NOT NULL DEFAULT '{}'::text[],
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_providers_pkey PRIMARY KEY (key)
+);
+
+-- connectors — per-workspace configured instances of a catalog provider.
+-- config: non-secret settings (portalId, sampleRate, …).
+-- subscriptions: the [{partnerAction, subscribe, mapping}] array, stored
+--   verbatim as a declarative contract the agent reads (no event engine here).
+-- vault_path: kv/data/secret/tenants/{ws}/connectors/{id} holding the secrets.
+CREATE TABLE public.connectors (
+    id               uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid NOT NULL,
+    provider_key     text NOT NULL,
+    name             text NOT NULL,
+    enabled          boolean NOT NULL DEFAULT true,
+    config           jsonb NOT NULL DEFAULT '{}'::jsonb,
+    subscriptions    jsonb NOT NULL DEFAULT '[]'::jsonb,
+    vault_path       text,
+    agent_accessible boolean NOT NULL DEFAULT false,
+    created_by       text NOT NULL,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connectors_pkey PRIMARY KEY (id),
+    CONSTRAINT connectors_provider_fkey FOREIGN KEY (provider_key)
+        REFERENCES public.connector_providers(key),
+    CONSTRAINT connectors_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT connectors_workspace_name_key UNIQUE (workspace_id, name)
+);
+
+CREATE INDEX idx_connectors_workspace ON public.connectors(workspace_id);
+CREATE INDEX idx_connectors_provider ON public.connectors(provider_key);
+
+-- Seed the provider catalog (derived from the Descope/Segment integration set).
+INSERT INTO public.connector_providers (key, display_name, component_type, secret_keys)
+VALUES
+    ('hubspot-web-actions',   'Hubspot Web (Actions)',        'browser', '{}'::text[]),
+    ('hubspot-cloud-actions', 'Hubspot Cloud Mode (actions)', '',        '{}'::text[]),
+    ('mixpanel-actions',      'Mixpanel (Actions)',           '',        '{apiKey}'::text[]),
+    ('clearbit-enrichment',   'Clearbit Enrichment',          'server',  '{apiKey}'::text[]),
+    ('google-analytics-4',    'Actions Google Analytic 4',    '',        '{apiSecret}'::text[]),
+    ('factorsai',             'FactorsAI',                    'server',  '{apiKey}'::text[]),
+    ('segment-io',            'Segment.io',                   'browser', '{apiKey}'::text[])
+ON CONFLICT (key) DO NOTHING;
+
+-- Connector RBAC permissions (mirrors the resource/action gate used elsewhere).
+DO $$
+DECLARE
+    sys_workspace CONSTANT uuid := '00000000-0000-0000-0000-000000000000';
+BEGIN
+    INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, status, created_at, updated_at)
+    VALUES (sys_workspace, 'System', NULL, sys_workspace, 'team', 'system.authsec.dev', 'system@authsec.local', 'active', NOW(), NOW())
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+    VALUES
+        (gen_random_uuid(), sys_workspace, 'connector', 'create',      'Create a connector',                  'connector:create',      NOW()),
+        (gen_random_uuid(), sys_workspace, 'connector', 'read',        'Read connectors',                     'connector:read',        NOW()),
+        (gen_random_uuid(), sys_workspace, 'connector', 'update',      'Update a connector',                  'connector:update',      NOW()),
+        (gen_random_uuid(), sys_workspace, 'connector', 'delete',      'Delete a connector',                  'connector:delete',      NOW()),
+        (gen_random_uuid(), sys_workspace, 'connector', 'config',      'Read connector config/subscriptions', 'connector:config',      NOW()),
+        (gen_random_uuid(), sys_workspace, 'connector', 'credentials', 'Read connector credentials',          'connector:credentials', NOW())
+    ON CONFLICT ON CONSTRAINT permissions_workspace_resource_action_key DO NOTHING;
+
+    -- Grant all connector permissions to super_admin and admin.
+    INSERT INTO role_permissions (role_id, permission_id)
+    SELECT ro.id, p.id
+    FROM roles ro
+    CROSS JOIN permissions p
+    WHERE ro.name IN ('super_admin', 'admin') AND ro.workspace_id = sys_workspace
+      AND p.workspace_id = sys_workspace AND p.resource = 'connector'
+    ON CONFLICT DO NOTHING;
+END $$;

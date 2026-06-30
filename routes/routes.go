@@ -1324,6 +1324,25 @@ func SetupRoutes(
 			extSvcs.GET("/:id/credentials", middlewares.Require("external-service", "credentials"), extSvcController.GetExternalServiceCredentials)
 		}
 
+		// ────────────────────────────────────────────────────
+		// Connectors — workspace-scoped integration registry.
+		// Admin CRUD + agent-facing config/credentials reads.
+		// Dual-auth: standard auth-manager JWT or SPIFFE JWT-SVID.
+		// ────────────────────────────────────────────────────
+		connectorController := platformCtrl.NewConnectorController(config.DB)
+		connectors := authsec.Group("/connectors")
+		connectors.Use(middlewares.SpiffeAuthMiddleware())
+		{
+			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
+			connectors.POST("", middlewares.Require("connector", "create"), connectorController.CreateConnector)
+			connectors.GET("", middlewares.Require("connector", "read"), connectorController.ListConnectors)
+			connectors.GET("/:id", middlewares.Require("connector", "read"), connectorController.GetConnector)
+			connectors.PUT("/:id", middlewares.Require("connector", "update"), connectorController.UpdateConnector)
+			connectors.DELETE("/:id", middlewares.Require("connector", "delete"), connectorController.DeleteConnector)
+			connectors.GET("/:id/config", middlewares.Require("connector", "config"), connectorController.GetConnectorConfig)
+			connectors.GET("/:id/credentials", middlewares.Require("connector", "credentials"), connectorController.GetConnectorCredentials)
+		}
+
 		// Legacy login/register endpoints
 		uflow.POST("/register/verify", userController.VerifyOTPAndCompleteRegistration)
 		uflow.POST("/login/webauthn-callback", userController.WebAuthnCallback)

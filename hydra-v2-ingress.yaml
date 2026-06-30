@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hydra-v2-ingress
+  namespace: hydra-v2-prod
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: oauth-v2.prod.authsec.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hydra-public
+                port:
+                  number: 4444
+  tls:
+    - hosts:
+        - oauth-v2.prod.authsec.ai
+      secretName: oauth-v2-prod-tls

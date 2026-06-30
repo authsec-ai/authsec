@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Ritam Kumarb Kundu/**)",
+      "Read(//c/Users/Ritam Kumarb Kundu/.claude/**)",
+      "Bash(python -c ' *)",
+      "Bash(gofmt -w models/connector.go repository/connector_repository.go services/connector_service.go controllers/platform/connector_controller.go)",
+      "Bash(go vet *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(gofmt -l models/connector.go repository/connector_repository.go services/connector_service.go controllers/platform/connector_controller.go)"
+    ]
+  }
+}
