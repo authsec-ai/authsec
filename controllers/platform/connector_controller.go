@@ -3,10 +3,10 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
@@ -179,6 +179,12 @@ func (ctl *ConnectorController) CreateConnector(c *gin.Context) {
 		return
 	}
 
+	// Ensure the workspace's Connector Broker Resource Server exists — it is the
+	// audience for all runtime action tokens. Idempotent get-or-create.
+	if _, bErr := services.EnsureBrokerResourceServer(ctl.db, wsID); bErr != nil {
+		log.Printf("CONNECTOR: failed to ensure broker RS for workspace %s: %v", wsID, bErr)
+	}
+
 	auditAdminMutation(c, wsID.String(), "create", "connector", out.ID.String(), http.StatusCreated, nil, out)
 	c.JSON(http.StatusCreated, out)
 }
@@ -210,12 +216,21 @@ func (ctl *ConnectorController) GetConnector(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
 		return
 	}
-	conn, err := ctl.manager(nil).Get(wsID, id)
+	mgr := ctl.manager(nil)
+	conn, err := mgr.Get(wsID, id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "connector not found"})
 		return
 	}
-	c.JSON(http.StatusOK, conn)
+	// P1: surface the connector's credential bindings + lifecycle (no secrets).
+	connections, _ := mgr.Connections(conn.ID)
+	if connections == nil {
+		connections = []models.ConnectorConnection{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"connector":   conn,
+		"connections": connections,
+	})
 }
 
 // UpdateConnector handles PUT /authsec/connectors/:id.
@@ -283,13 +298,157 @@ func (ctl *ConnectorController) DeleteConnector(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// GetConnectorConfig handles GET /authsec/connectors/:id/config — agent-facing.
-// Returns the declarative contract (provider, config, subscriptions/mappings)
-// the agent needs to know how to call the provider. No secrets.
-func (ctl *ConnectorController) GetConnectorConfig(c *gin.Context) {
-	conn, err := ctl.resolveConnectorForAgent(c)
+// StartOAuthConnect handles POST /authsec/connectors/:id/connections/oauth/start.
+// Admin session. Returns a provider authorize_url to redirect the browser to.
+func (ctl *ConnectorController) StartOAuthConnect(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	var req struct {
+		Scopes        []string `json:"scopes"`
+		RedirectAfter string   `json:"redirect_after"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	out, err := svc.Start(wsID, id, principal, req.RedirectAfter, req.Scopes)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "connect_start", "connector", id.String(), http.StatusOK, nil, gin.H{"provider": true})
+	c.JSON(http.StatusOK, out)
+}
+
+// OAuthCallback handles GET /authsec/connectors/oauth/callback. Unauthenticated
+// (validated by the one-shot state); the provider redirects here with code+state.
+func (ctl *ConnectorController) OAuthCallback(c *gin.Context) {
+	code := c.Query("code")
+	state := c.Query("state")
+
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	res, err := svc.HandleCallback(code, state)
+	if err != nil {
+		// Bad/expired state or provider error.
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if res.RedirectAfter != "" {
+		c.Redirect(http.StatusFound, res.RedirectAfter)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "connected", "connector_id": res.ConnectorID})
+}
+
+// GrantAssignment handles POST /authsec/connectors/:id/assignments — grant an
+// agent (client_id) access to this connector, optionally scoped to one action.
+func (ctl *ConnectorController) GrantAssignment(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	var req struct {
+		ClientID  string  `json:"client_id" binding:"required"`
+		ActionKey *string `json:"action_key,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := ctl.manager(nil).GrantAssignment(wsID, id, req.ClientID, req.ActionKey, principal)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "assign", "connector", id.String(), http.StatusCreated, nil, out)
+	c.JSON(http.StatusCreated, out)
+}
+
+// ListAssignments handles GET /authsec/connectors/:id/assignments.
+func (ctl *ConnectorController) ListAssignments(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	list, err := ctl.manager(nil).ListAssignments(wsID, id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"assignments": list})
+}
+
+// RevokeAssignment handles DELETE /authsec/connectors/:id/assignments/:aid.
+func (ctl *ConnectorController) RevokeAssignment(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	aid, err := uuid.Parse(c.Param("aid"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid assignment id"})
+		return
+	}
+	if err := ctl.manager(nil).RevokeAssignment(wsID, aid); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "unassign", "connector", c.Param("id"), http.StatusNoContent, nil, nil)
+	c.Status(http.StatusNoContent)
+}
+
+// GetConnectorConfig handles GET /authsec/connectors/:id/config.
+// Admin/internal non-secret contract: provider, config, subscriptions. Never
+// secrets and never vault_path. A disabled connector fails closed (404).
+func (ctl *ConnectorController) GetConnectorConfig(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	conn, err := ctl.manager(nil).Get(wsID, id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "connector not found"})
+		return
+	}
+	// Fail closed: a disabled connector exposes nothing.
+	if !conn.Enabled {
+		c.JSON(http.StatusNotFound, gin.H{"error": "connector not found"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -300,52 +459,4 @@ func (ctl *ConnectorController) GetConnectorConfig(c *gin.Context) {
 		"config":        conn.Config,
 		"subscriptions": conn.Subscriptions,
 	})
-}
-
-// GetConnectorCredentials handles GET /authsec/connectors/:id/credentials —
-// agent-facing. Returns the Vault-stored secrets for the connector.
-func (ctl *ConnectorController) GetConnectorCredentials(c *gin.Context) {
-	conn, err := ctl.resolveConnectorForAgent(c)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-	vaultClient, err := ctl.getVaultClient()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	secrets, err := ctl.manager(vaultClient).Credentials(conn)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve secrets", "details": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"connector_id": conn.ID,
-		"name":         conn.Name,
-		"provider_key": conn.ProviderKey,
-		"credentials":  secrets,
-		"retrieved_at": time.Now().Format(time.RFC3339),
-	})
-}
-
-// resolveConnectorForAgent loads the connector and, when the caller is a SPIFFE
-// JWT-SVID agent, requires agent_accessible.
-func (ctl *ConnectorController) resolveConnectorForAgent(c *gin.Context) (*models.Connector, error) {
-	wsID, _, err := ctl.resolveWorkspace(c)
-	if err != nil {
-		return nil, err
-	}
-	id, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		return nil, fmt.Errorf("invalid connector id")
-	}
-	conn, err := ctl.manager(nil).Get(wsID, id)
-	if err != nil {
-		return nil, fmt.Errorf("connector not found")
-	}
-	if authMethod, _ := c.Get("auth_method"); authMethod == "spiffe-jwt-svid" && !conn.AgentAccessible {
-		return nil, fmt.Errorf("connector not found")
-	}
-	return conn, nil
 }

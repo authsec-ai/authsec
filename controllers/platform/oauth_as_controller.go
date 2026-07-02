@@ -2416,129 +2416,35 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 // registration gate as the Hydra path and re-resolve live RBAC, normalizing to
 // the identical RS-facing shape (only ext.* varies by family).
 func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid string, rs *models.ResourceServer) {
-	inactive := func(reason string) {
-		log.Printf("[MCP_AUTH] introspectNative: inactive rs=%s: %s", rs.ResourceURI, reason)
-		c.JSON(http.StatusOK, gin.H{"active": false})
-	}
-
-	pub, ok := tokens.NativeKeys().PublicKeyForKID(kid)
-	if !ok {
-		inactive("unknown native kid")
-		return
-	}
-	claims := jwt.MapClaims{}
-	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
-			return nil, fmt.Errorf("unexpected signing method %q", t.Method.Alg())
-		}
-		return pub, nil
-	})
-	if err != nil || parsed == nil || !parsed.Valid {
-		// Bad signature / expired / malformed → active:false. No Hydra fallback.
-		inactive("signature/claims invalid")
-		return
-	}
-
-	jti, _ := claims["jti"].(string)
-	if jti == "" {
-		inactive("no jti")
-		return
-	}
-
 	ctx := c.Request.Context()
-	row, err := tokens.LookupNativeToken(ctx, config.DB, jti)
+
+	// Single shared verifier — same implementation the connector broker uses, so
+	// the native invariants (signature → native_tokens → revocation → audience →
+	// registration → live RBAC) can never drift between callers.
+	authCtx, err := services.VerifyProtectedResourceToken(ctx, config.DB, ctrl.service, ctrl.scopeResolver, token, kid, rs)
 	if err != nil {
-		inactive("native_tokens lookup error")
-		return
-	}
-	if row == nil {
-		inactive("no native_tokens row for jti")
-		return
-	}
-
-	// Revocation source of truth.
-	revoked, err := tokens.IsRevoked(ctx, config.DB, row.Iss, models.RevokedKindAccessToken, jti)
-	if err != nil || revoked {
-		inactive("revoked")
-		return
-	}
-	if time.Now().After(row.ExpiresAt) {
-		inactive("expired (row)")
-		return
-	}
-	if row.Aud != rs.ResourceURI {
-		inactive("audience mismatch")
-		return
-	}
-
-	// Registration gate (parity with the Hydra path): revoking the client's
-	// (resource_server, client) approval must kill still-live native tokens.
-	mcpClient, lookupErr := ctrl.service.GetMCPOAuthClientByClientID(row.ClientID)
-	if lookupErr != nil {
-		inactive("no AuthSec client for client_id")
-		return
-	}
-	reg, regErr := ctrl.service.GetClientRegistration(rs.ID, mcpClient.ID)
-	if regErr != nil || reg.Status != "approved" {
-		inactive("client registration not approved")
-		return
-	}
-
-	// Live scope re-resolution + strict-subset (mirrors the Hydra path).
-	storedScopes := strings.Fields(row.Scope)
-	oidcScopes, rsScopes := services.PartitionScopes(storedScopes)
-	var finalScopes []string
-	if len(rsScopes) > 0 {
-		// Live RBAC re-resolution + strict-subset for BOTH families, via the
-		// Principal dispatcher. A disabled service account or a removed role
-		// binding yields zero effective scopes, so a still-live M2M token flips
-		// to active:false at the next introspection — same revoke-on-introspect
-		// guarantee the user/XAA path already has.
-		principal := tokens.Principal{
-			SubjectType: row.SubjectType,
-			SubjectID:   row.SubjectID,
-			WorkspaceID: row.WorkspaceID,
-		}
-		currentRS, rbacErr := ctrl.scopeResolver.ResolvePrincipalEffectiveScopes(
-			ctx, principal, rs.ID.String(), rsScopes, rs, nil,
-		)
-		if rbacErr != nil || len(currentRS) == 0 {
-			inactive("RBAC revoked all RS scopes")
-			return
-		}
-		if lost := services.ScopesLost(rsScopes, currentRS); len(lost) > 0 {
-			inactive("partial RS scope loss")
-			return
-		}
-		finalScopes = append(oidcScopes, currentRS...)
-	} else {
-		finalScopes = oidcScopes
-	}
-	if len(finalScopes) == 0 {
-		inactive("no scopes after enforcement")
+		log.Printf("[MCP_AUTH] introspectNative: inactive rs=%s: %v", rs.ResourceURI, err)
+		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
 
 	ext := gin.H{
-		"workspace_id":       row.WorkspaceID.String(),
-		"resource_server_id": rs.ID.String(),
-		"token_family":       row.TokenFamily,
+		"workspace_id":       authCtx.Principal.WorkspaceID.String(),
+		"resource_server_id": authCtx.ResourceServerID,
+		"token_family":       authCtx.TokenFamily,
 	}
-	if row.ActorClientID != nil {
-		ext["act"] = gin.H{"client_id": *row.ActorClientID, "spiffe_id": row.ActorSpiffeID}
-	}
-	if row.SourceGrantJTI != nil {
-		ext["id_jag_jti"] = *row.SourceGrantJTI
+	if authCtx.Actor != nil {
+		ext["act"] = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
 	}
 
 	// G9: resolve role_ids for the subject+RS binding.
 	var roleIDs []string
 	roleIDCol := "user_id"
-	if row.SubjectType == "service_account" {
+	if authCtx.Principal.SubjectType == "service_account" {
 		roleIDCol = "service_account_id"
 	}
 	config.DB.WithContext(ctx).
-		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, row.SubjectID).
+		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID).
 		Scan(&roleIDs)
 	if roleIDs == nil {
 		roleIDs = []string{}
@@ -2546,32 +2452,27 @@ func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid strin
 
 	resp := gin.H{
 		"active":       true,
-		"sub":          row.SubjectID.String(),
-		"subject_type": row.SubjectType,
-		"token_family": row.TokenFamily,
-		"workspace_id": row.WorkspaceID.String(),
-		"client_id":    row.ClientID,
-		"aud":          []string{row.Aud},
-		"scope":        strings.Join(finalScopes, " "),
+		"sub":          authCtx.Principal.SubjectID.String(),
+		"subject_type": authCtx.Principal.SubjectType,
+		"token_family": authCtx.TokenFamily,
+		"workspace_id": authCtx.Principal.WorkspaceID.String(),
+		"client_id":    authCtx.ClientID,
+		"aud":          []string{rs.ResourceURI},
+		"scope":        strings.Join(authCtx.Scopes, " "),
 		"role_ids":     roleIDs,
 		"ext":          ext,
+		"exp":          authCtx.ExpiresAt.Unix(),
 	}
 	// G9: typed identity fields for SDK / policy consumers.
-	if row.SubjectType == "service_account" {
-		resp["service_account_id"] = row.SubjectID.String()
+	if authCtx.Principal.SubjectType == "service_account" {
+		resp["service_account_id"] = authCtx.Principal.SubjectID.String()
 		resp["acting_user_id"] = nil
 	} else {
-		resp["acting_user_id"] = row.SubjectID.String()
+		resp["acting_user_id"] = authCtx.Principal.SubjectID.String()
 		resp["service_account_id"] = nil
 	}
-	if exp, ok := claims["exp"].(float64); ok {
-		resp["exp"] = int64(exp)
-	}
-	if iat, ok := claims["iat"].(float64); ok {
-		resp["iat"] = int64(iat)
-	}
 	log.Printf("[MCP_AUTH] introspectNative: active=true family=%s sub=%s rs=%s scopes=%v",
-		row.TokenFamily, row.SubjectID, rs.ResourceURI, finalScopes)
+		authCtx.TokenFamily, authCtx.Principal.SubjectID, rs.ResourceURI, authCtx.Scopes)
 	c.JSON(http.StatusOK, resp)
 }
 

@@ -1,98 +1,131 @@
-# AuthSec backend — agent orientation
+# AuthNull / AuthSec — Agent entrypoint
 
-> See also: workspace root `../AGENTS.md` (product model, flows overview, ownership model, deploy).
-> This file covers authsec-specific conventions, schema rules, and the deep-docs index.
+> **Read this first.** Orientation for any engineer or AI coding assistant working in
+> `~/Desktop/authnull`. This is the workspace map + the rules + the product's mental
+> model. Each repo has its own `AGENTS.md` with specifics (nearest file wins).
+> `AGENTS.md` is the cross-tool standard; `CLAUDE.md` in each repo just points here.
 
-## What this repo is
+## What AuthSec is
 
-Go/Gin backend. One PostgreSQL database (`config.DB`). Fronts ORY Hydra for
-`authorization_code` / `refresh_token` flows; mints native RS256 JWTs for M2M, XAA,
-and CIBA. 90-table schema in `migrations/master/001_bootstrap.sql`.
+An **agent-first identity & authorization layer for AI / MCP**. It fronts ORY Hydra to
+speak OAuth 2.1 / OIDC and sits in front of MCP servers ("applications" / resource
+servers) so every caller — a human **user**, a **service account** (M2M), an **agent**
+(acting on behalf of a user), or a **workload** (k8s pod with a SPIFFE SVID) — gets a
+scoped, auditable token.
 
-**Workspace-centric:** everything is scoped to a `workspace_id`. No `tenant_id` in new
-code (the migration is complete; only `entra_tenant_id` survives as an Azure AD concept).
+## Repos in this workspace
 
-## Schema ownership — hard rules
+| Repo | Role | Stack | Start here |
+|------|------|-------|-----------|
+| `authsec` | **Core backend** — auth/authz, OAuth AS, RBAC, API. Fronts ORY Hydra. One Postgres DB. | Go / Gin | `authsec/AGENTS.md` |
+| `Authsec-ui` | **Production console** (admin UI at mcpauthz.com) | Vite + React + TS + Tailwind v4 + shadcn | `Authsec-ui/AGENTS.md` |
+| `sdk-authsec` | Client **SDKs** (go / python / typescript) + examples — ~3-line MCP/agent integration | Go, Python, TS | `sdk-authsec/AGENTS.md` |
+| `deploy/single-node` | **The live deploy we iterate on** — Docker Compose @ **mcpauthz.com** via Cloudflare Tunnel | Docker Compose | `deploy/single-node/AGENTS.md` |
+| `authsec-charts` | Helm charts for **staging / AKS** | Helm | `authsec-charts/AGENTS.md` |
+| `authsec-doc` | Public **documentation** site | Docusaurus | `authsec-doc/AGENTS.md` |
+| `authsec-agent-shield` | **Separate product** — system-level guard for risky AI tool actions (phone-approve `rm -rf`, `DROP TABLE`) | — | `authsec-agent-shield/AGENTS.md` |
+| `UI` | **LEGACY — do not edit.** Production console is `Authsec-ui`. If grep or file search leads you here, find the equivalent file in `Authsec-ui/` instead. `UI/AGENTS.md` explains the redirect. | — | **Stop. Go to `Authsec-ui/`.** |
+| `claw-auth` | Legacy / secondary. Don't touch unless told. | — | — |
 
-1. **Single-state, forward-only.** The entire schema lives in
-   `migrations/master/001_bootstrap.sql` as hand-curated `CREATE TABLE` statements.
-2. **Never add `ALTER TABLE` patch files.** Edit the `CREATE TABLE` inline, wipe the DB,
-   re-bootstrap.
-3. **`AutoMigrate` is allowed for `migration_logs` only** (`cmd/main.go`). Every other
-   model struct is read-only from GORM's perspective.
-4. **New additive migrations** (adding tables to a live DB that can't be wiped) go in
-   `002_*.sql` alongside `001_bootstrap.sql`.
+## Rules that don't change
 
-> Deep doc: `docs/primitives/schema.md`
+> **Scope:** everything here is **project-scope** — it applies to anyone (human or
+> agent) touching this codebase. An individual's own preferences and tool permissions
+> are **personal-scope** and live in that assistant's private memory, not in this file.
 
-## Code practices
+**Engineering practice**
+- **Keep the codebase clean.** Don't add code that isn't needed — no dead scaffolding, no speculative abstractions, no duplicate helper when one already exists. Reuse before you add; delete what a change makes obsolete.
+- **Fix surgically, never band-aid.** Diagnose the root cause with the whole architecture + product behaviour in mind, then make the minimal correct change. Don't patch the first symptom, and don't stack a workaround on a workaround — if a fix needs a structural change, do the structural change.
+- **Don't add tests** unless explicitly asked; verify with the repo's `tsc` / `vet` / build + a manual smoke.
 
-- **Keep it clean.** No dead scaffolding, no speculative helpers, no duplicate utilities.
-  Reuse before you add; delete what a change makes obsolete.
-- **Surgical fixes only.** Diagnose the root cause with the full architecture in mind.
-  Don't patch the first symptom. If a fix needs a structural change, do the structural change.
-- **No stray `tenant_id`** in new code, JSON, JWT claims, or URL paths.
-- **Error handling**: wrap with context (`fmt.Errorf("op: %w", err)`); don't swallow errors.
-  Return HTTP errors from controllers — don't log-and-continue on meaningful failures.
-- **Audit mutations**: every admin mutation must call `auditAdminMutation(c, wsID, action,
-  resource, resourceID, statusCode, oldValues, newValues)` before returning.
-- **Token issuance**: always goes through `NativeIssuer.Issue` for native tokens, never
-  directly through the key manager's `Sign`. For Hydra-backed flows, proxy through
-  `OAuthASService.ProxyFormToHydraPublicCapture`.
-- **gofmt always**: code must be formatted (`gofmt -w`) before committing.
+**Guardrails**
+- **`git push` is the only action that needs explicit per-command approval.** Everything else (kubectl, docker, edits) is pre-authorized.
+- **Schema is single-state, forward-only:** edit the `CREATE TABLE` in `authsec/migrations/master/001_bootstrap.sql` in place, then wipe + re-bootstrap. Never add `ALTER TABLE` patch files or `AutoMigrate`.
+- **Everything is workspace-scoped** (see *Ownership model*) — new code scopes by `workspace_id`.
+- **UI:** every console page renders through `ConsolePage`; primary `<Button>` is white-on-blue; verify with `npx tsc --noEmit` (+ `eslint`), **not** a dev server (authenticated routes need the backend).
+- Use **market-standard terms** (User / Service Account / Agent / Workload / Application·Resource Server / Scope / Workspace) — see per-repo files.
 
-## Terminology
+## Ownership model
 
-| Concept | Use | Avoid |
-|---|---|---|
-| Non-human M2M identity | **Service Account** | "Workload" |
-| OAuth registered application | **Client** | "App" at protocol layer |
-| API that accepts bearer tokens | **Resource Server** | "MCP server" at auth layer |
-| Scope string | **Scope** | "Permission" at OAuth layer |
-| k8s pod credential | **Workload / SVID** | "Service Account" |
-| Organization unit | **Workspace** | "Tenant" |
-| Cross-app identity assertion | **ID-JAG** | custom names |
+The data model is **workspace-centric**: a Workspace owns everything inside it.
 
-## Adding a new endpoint
+- **User** — belongs to a Workspace through a **WorkspaceMembership**.
+- **Workspace** — owns its **Applications**, **Identity Providers**, **Users / Groups**, **Roles / Permissions / Scopes**, **SCIM Connections**, and **Audit Logs**.
+- **Application** (`resource_servers`, `workspace_id NOT NULL`) — the protected thing. `application_type` ∈ **MCP Server · AI Agent · Clawbot · API Service**. Has **Tools**, **OAuth Scopes**, an **Access Policy**, **OAuth Client Registrations**, and **may have a SPIFFE Identity**.
+- **OAuth Client** (`mcp_oauth_clients`) — belongs to a Workspace (`home_workspace_id`) but is **only a protocol caller**: a `client_id` mapped to a Hydra client. An Application registers one or more. A client whose home is workspace A can still call an Application in workspace B — that's XAA (see Flows).
+- **Identity Provider** — belongs to one Workspace; can be enabled for one or more Applications.
 
-1. Controller method in `controllers/platform/<area>_controller.go`.
-2. Route registration in the router (`router.go`).
-3. Service method in `services/<area>_service.go` — DB logic, no HTTP primitives.
-4. Model in `models/` — struct + `TableName()`. If a new table is needed, edit
-   `001_bootstrap.sql` and wipe+rebootstrap.
-5. Call `auditAdminMutation` for any create/update/delete.
+## Identity model
 
-## Anti-patterns to refuse
+| Identity | What it is | Auth | Lives where |
+|---|---|---|---|
+| **User** | human via browser | OIDC login | a workspace |
+| **Service Account** | machine M2M | client secret or private-key JWT | the **RS's** workspace |
+| **Agent** | acts *on behalf of a user* across apps | XAA / ID-JAG | the user's home workspace |
+| **Workload** | k8s pod, no long-lived secret | SPIFFE SVID | a SPIRE trust domain |
 
-- `ALTER TABLE` patch files — edit CREATE TABLE inline
-- `AutoMigrate` on anything except `migration_logs`
-- Routing a `native:` kid token to Hydra introspect
-- Putting `tenant_id` / `/auth/tenant/` anywhere new
-- Adding tests the user didn't ask for
+## Flows (the mental model) — implemented in `authsec`
 
----
+- **M2M** (`grant_type=client_credentials`) — `client_secret_basic` *or* `private_key_jwt` (RFC 7523). Mints a **native** token (NativeSealer JWT, no Hydra round-trip). The machine client must live in the RS's workspace. → `oauth_as_controller.go` (tokenClientCredentialsGrant), `services/client_auth.go`.
+- **XAA / ID-JAG** (cross-app, agent on behalf of user) — login (`authorization_code`) → **token-exchange (RFC 8693)** → ID-JAG assertion → **`jwt-bearer` (RFC 7523)** → scoped access token at the target RS. **Boundary = requesting client ≠ target RS** (a registered resource server); **workspace equality is NOT the gate** (the old §19 same-domain rejection was removed). First contact → `access_pending` → approve-with-role (atomic binding). → `oauth_as_controller.go` (tokenJWTBearerGrant), `services/xaa_service.go`.
+- **SPIFFE / SVID workloads** — SPIRE issues **X.509-SVID (mTLS)** + **JWT-SVID**; the pod presents its JWT-SVID at `/oauth/token`; SPIRE's OIDC discovery provider federates it (own `jwks.json`). → `internal/spire`, `/authsec/spiresvc/*`, single-node `docker-compose.spire.yml` + `spire/`.
+- **Federation** — **trusted issuers** (external IdP assertions accepted for XAA), **workload identity providers** (multi-cluster SPIFFE + OIDC/CI e.g. GitHub Actions OIDC), **A2A brokering policies** (cross-app permit/deny). → `/authsec/{trusted-issuers,workload-identity-providers,brokering-policies}`, `/authsec/oidc/*`.
+- **MCP discovery & dynamic registration** — RFC 7591 `/oauth/register` + RFC 7592 management; discovery at `/.well-known/oauth-authorization-server` (RFC 8414) + `/.well-known/openid-configuration`; resource-server metadata + `/resource-servers/:id/sdk-policy`.
+- **RBAC & scopes** — roles → scope grants → bindings (user / group / service_account) → `ResolvePrincipalEffectiveScopes`. Approve-with-role is the atomic bind step. → `services/scope_resolver.go`, rolesApi/bindingsApi.
+- **Token engine & discovery** — native NativeSealer JWTs (persisted RSA key, env fallback `NATIVE_RSA_PRIVATE_KEY_B64`) **vs** ORY Hydra; **JWKS union** (native + Hydra + SPIFFE) at `/oauth/jwks`; `/oauth/introspect`, `/oauth/revoke`, `DELETE /tokens/:jti`, agent `revoke-identity` / `revoke-token`. → `internal/tokens`.
 
-## Deep docs index
+## Deploy
 
-Load the relevant doc before working in that area. Each doc is code-verified and
-cites real file paths + function names.
+- **Live = single-node Docker Compose** (`deploy/single-node`), apex **mcpauthz.com** via Cloudflare Tunnel; builds `authsec` + `Authsec-ui` from local source.
+  - UI redeploy: `docker compose build --no-cache ui && docker compose up -d --no-deps ui`
+  - Backend redeploy: `docker compose build backend && docker compose up -d backend`
+  - Admin login OTP appears in the **backend logs**.
+- **Staging = Azure AKS** (cluster `authsec`, ns `authsec-staging`); Jenkins builds on push to the `authsec-staging` branch.
+- **Recovery = wipe + re-bootstrap** (schema is forward-only; wiping is cheap and expected).
 
-| I'm about to… | Read this first |
+## Where knowledge lives (keep it correct)
+
+1. **This file + per-repo `AGENTS.md`** = the versioned source of truth every agent sees. When something becomes permanently true, write it here, not in chat.
+2. **`authsec-doc`** (Docusaurus) = deep, public, rendered docs (concepts/flows/SDK/reference). *Curation + diagrams are a deferred phase — until then, prefer this file for the canonical mental model.*
+3. **AI-assistant memory (`~/.claude/.../memory`)** is private to one user's Claude Code — a fresh agent never sees it. Keep it tiny (user identity, working-style constraints, current deploy/secrets). Never log completed-feature history.
+4. **`~/.claude/plans/`** = scratch, in-flight plans only; not authoritative.
+
+## AI/SDLC tooling — skills, hooks, agents
+
+All cross-repo tooling lives in `.claude/` at the workspace root.
+
+### Slash commands (skills) — `.claude/commands/`
+
+| `/command` | What it does |
 |---|---|
-| Mint / validate / revoke / introspect tokens | [`docs/primitives/token-engine.md`](docs/primitives/token-engine.md) |
-| Touch `/oauth/*` endpoints, grants, discovery, introspect, JWKS | [`docs/primitives/oauth-as.md`](docs/primitives/oauth-as.md) |
-| Touch Hydra client registration, reconciler, auth-code flow | [`docs/primitives/hydra.md`](docs/primitives/hydra.md) |
-| Work with token subjects (user / SA / agent / workload), `sub` claim | [`docs/primitives/identity-principals.md`](docs/primitives/identity-principals.md) |
-| Add/modify scopes, roles, permissions, or role bindings | [`docs/primitives/rbac-scopes.md`](docs/primitives/rbac-scopes.md) |
-| Touch SPIFFE/SVID, SPIRE entries, delegation policies, JWT-SVID | [`docs/primitives/spire.md`](docs/primitives/spire.md) |
-| Add log types, modify audit helper, touch Logs API | [`docs/primitives/logs-audit.md`](docs/primitives/logs-audit.md) |
-| Add a column, table, or understand schema domains | [`docs/primitives/schema.md`](docs/primitives/schema.md) |
-| Implement / debug M2M (client_credentials) flow | [`docs/flows/m2m.md`](docs/flows/m2m.md) *(pending)* |
-| Implement / debug XAA / ID-JAG (cross-app agent) flow | [`docs/flows/xaa-idjag.md`](docs/flows/xaa-idjag.md) *(pending)* |
-| Implement / debug SPIFFE workload token exchange | [`docs/flows/spiffe-workload.md`](docs/flows/spiffe-workload.md) *(pending)* |
-| Implement / debug OIDC login (authorization_code) | [`docs/flows/oidc-login.md`](docs/flows/oidc-login.md) *(pending)* |
-| Implement / debug CIBA | [`docs/flows/ciba.md`](docs/flows/ciba.md) *(pending)* |
-| Implement / debug MCP discovery, DCR (RFC 7591/7592) | [`docs/flows/mcp-discovery.md`](docs/flows/mcp-discovery.md) *(pending)* |
-| Implement / debug federation (trusted issuers, workload IdPs, A2A) | [`docs/flows/federation.md`](docs/flows/federation.md) *(pending)* |
-| Understand the full services/* + controllers/platform/* file map | [`docs/subsystems.md`](docs/subsystems.md) *(pending)* |
-| Follow Go/Gin coding conventions for this repo | [`docs/coding-practices.md`](docs/coding-practices.md) *(pending)* |
+| `/deploy` | Rebuild + restart `backend`, `ui`, or both in single-node |
+| `/wipe-rebootstrap` | `docker compose down -v && up -d` — resets all data |
+| `/schema-change` | Procedure for editing `001_bootstrap.sql` inline + rebootstrap |
+| `/console-page` | Checklist + pattern for adding a new sidebar page |
+| `/flow-test` | curl smoke tests for M2M / XAA / SPIFFE / OIDC / CIBA |
+| `/ship` | Pre-push checklist: `go build/vet/gofmt` + `tsc --noEmit` |
+| `/spec` | Create a feature spec (forces SDK + docs decision before coding) |
+| `/docs` | Update deep docs + public docs after a change |
+
+### Subagent reviewers — `.claude/agents/`
+
+Invoke with the **Agent tool** using `subagent_type: "authsec-reviewer"` etc.
+
+| Agent | When to use |
+|---|---|
+| `authsec-reviewer` | After any Go backend change — checks token engine, schema, workspace scoping, PDP |
+| `ui-reviewer` | After any UI change — checks ConsolePage standard, RTK Query, Button contract |
+| `flow-verifier` | After implementing or debugging a flow — checks end-to-end correctness + token claims |
+
+### Hooks (guardrails)
+
+| Hook | Repo | What it blocks |
+|---|---|---|
+| Block `git push` | workspace root | requires manual push; see `.claude/hooks-manual.md` to wire it |
+| Block `ALTER TABLE` in Bash | `authsec` | enforces single-state schema rule |
+| `gofmt -w` on `*.go` | `authsec` | auto-formats every Go file after Edit/Write |
+| Block `npm run dev` / `npx vite` | `Authsec-ui` | auth routes need backend; use `tsc --noEmit` instead |
+
+### Definition of Done
+
+`.claude/DEFINITION-OF-DONE.md` — per-repo gate table (build/vet/tsc/deploy).
