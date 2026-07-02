@@ -49,6 +49,10 @@ type ResourceServer struct {
 	PRMOverrideExpiresAt *time.Time `json:"prm_override_expires_at,omitempty" gorm:"type:timestamptz"`
 	MetadataStale        bool       `json:"metadata_stale" gorm:"default:false"`
 
+	// Managed marks a system-owned RS (e.g. the per-workspace Connector Broker)
+	// that is not an admin-created Application. The Applications UI filters it out.
+	Managed bool `json:"managed" gorm:"not null;default:false"`
+
 	CreatedAt time.Time `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 
@@ -74,10 +78,11 @@ const (
 )
 
 const (
-	ApplicationTypeMCPServer  = "mcp_server"
-	ApplicationTypeAIAgent    = "ai_agent"
-	ApplicationTypeClawbot    = "clawbot"
-	ApplicationTypeAPIService = "api_service"
+	ApplicationTypeMCPServer       = "mcp_server"
+	ApplicationTypeAIAgent         = "ai_agent"
+	ApplicationTypeClawbot         = "clawbot"
+	ApplicationTypeAPIService      = "api_service"
+	ApplicationTypeConnectorBroker = "connector_broker" // system-managed broker RS
 )
 
 // IsReady returns true when the RS is fully activated and end-user OAuth is allowed.

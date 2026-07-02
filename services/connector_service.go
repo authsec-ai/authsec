@@ -22,7 +22,26 @@ type ConnectorManager interface {
 	List(workspaceID uuid.UUID) ([]models.Connector, error)
 	Update(workspaceID, id uuid.UUID, in ConnectorUpdateInput) (*models.Connector, error)
 	Delete(workspaceID, id uuid.UUID) error
-	Credentials(svc *models.Connector) (map[string]interface{}, error)
+	Connections(connectorID uuid.UUID) ([]models.ConnectorConnection, error)
+
+	// ResolveActionCredential selects the connection to use for a broker action
+	// and reads its secret from Vault. If subjectUserID is non-empty (delegated
+	// call), it prefers the matching user-scope connection; otherwise it uses the
+	// workspace-scope connection. Fails closed on missing/inactive connection.
+	// This is broker-side only — the secret is never returned to a caller.
+	ResolveActionCredential(connectorID uuid.UUID, subjectUserID string) (*ResolvedCredential, error)
+
+	// Assignment management (grant an agent access to a connector + action).
+	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error)
+	ListAssignments(workspaceID, connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
+	RevokeAssignment(workspaceID, assignmentID uuid.UUID) error
+}
+
+// ResolvedCredential is the broker-side result of connection resolution: the
+// secret material for the adapter plus the connection it came from (for audit).
+type ResolvedCredential struct {
+	Connection *models.ConnectorConnection
+	Secret     map[string]interface{}
 }
 
 // ConnectorInput is the validated create payload.
@@ -85,7 +104,7 @@ func (m *connectorManager) Create(workspaceID uuid.UUID, createdBy string, in Co
 	}
 
 	id := uuid.New()
-	vaultPath := fmt.Sprintf("kv/data/secret/tenants/%s/connectors/%s", workspaceID.String(), id.String())
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s", workspaceID.String(), id.String())
 
 	enabled := true
 	if in.Enabled != nil {
@@ -106,7 +125,8 @@ func (m *connectorManager) Create(workspaceID uuid.UUID, createdBy string, in Co
 		UpdatedAt:       time.Now(),
 	}
 
-	if len(in.Secrets) > 0 {
+	hasSecrets := len(in.Secrets) > 0
+	if hasSecrets {
 		if m.vault == nil {
 			return nil, errors.New("vault client not initialized, cannot store secrets")
 		}
@@ -121,6 +141,24 @@ func (m *connectorManager) Create(workspaceID uuid.UUID, createdBy string, in Co
 			m.vault.DeleteSecret(conn.VaultPath) // best-effort rollback
 		}
 		return nil, fmt.Errorf("failed to create connector: %w", err)
+	}
+
+	// P1: a static api_key connector materializes a workspace-scope Connection
+	// holding the credential binding. The Connection reuses the connector's
+	// Vault path so existing secret material is unaffected.
+	if hasSecrets {
+		wsConn := &models.ConnectorConnection{
+			ConnectorID: conn.ID,
+			Scope:       models.ConnectionScopeWorkspace,
+			Status:      models.ConnectionStatusActive,
+			AuthType:    models.ConnectionAuthAPIKey,
+			VaultPath:   conn.VaultPath,
+		}
+		if err := m.repo.CreateConnection(wsConn); err != nil {
+			// Connector is created; surface the binding failure rather than
+			// silently leaving it without a Connection.
+			return nil, fmt.Errorf("connector created but failed to record workspace connection: %w", err)
+		}
 	}
 	return conn, nil
 }
@@ -171,7 +209,7 @@ func (m *connectorManager) Update(workspaceID, id uuid.UUID, in ConnectorUpdateI
 			return nil, errors.New("vault client not configured")
 		}
 		if conn.VaultPath == "" {
-			conn.VaultPath = fmt.Sprintf("kv/data/secret/tenants/%s/connectors/%s", workspaceID.String(), conn.ID.String())
+			conn.VaultPath = fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s", workspaceID.String(), conn.ID.String())
 		}
 		if err := m.vault.WriteSecret(conn.VaultPath, in.Secrets); err != nil {
 			return nil, fmt.Errorf("failed to update credentials in vault: %w", err)
@@ -201,14 +239,93 @@ func (m *connectorManager) Delete(workspaceID, id uuid.UUID) error {
 	return nil
 }
 
-func (m *connectorManager) Credentials(conn *models.Connector) (map[string]interface{}, error) {
+// Connections returns all credential bindings for a connector (workspace + user
+// scope) with their lifecycle metadata. Secret material is never included.
+func (m *connectorManager) Connections(connectorID uuid.UUID) ([]models.ConnectorConnection, error) {
+	return m.repo.ListConnections(connectorID)
+}
+
+// GrantAssignment grants a client (agent) access to a connector, optionally
+// scoped to one action (nil actionKey => all actions). Validates the connector
+// belongs to the workspace and, when an action is named, that it exists for the
+// provider.
+func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error) {
+	if clientID == "" {
+		return nil, errors.New("client_id is required")
+	}
+	conn, err := m.repo.GetByID(workspaceID, connectorID)
+	if err != nil {
+		return nil, errors.New("connector not found")
+	}
+	if actionKey != nil && *actionKey != "" {
+		if _, err := m.repo.GetAction(conn.ProviderKey, *actionKey); err != nil {
+			return nil, fmt.Errorf("unknown action %q for provider %q", *actionKey, conn.ProviderKey)
+		}
+	} else {
+		actionKey = nil // normalize "" → all-actions
+	}
+	a := &models.ConnectorAssignment{
+		WorkspaceID: workspaceID,
+		ConnectorID: connectorID,
+		ClientID:    clientID,
+		ActionKey:   actionKey,
+		CreatedBy:   createdBy,
+	}
+	if err := m.repo.CreateAssignment(a); err != nil {
+		return nil, fmt.Errorf("create assignment: %w", err)
+	}
+	return a, nil
+}
+
+// ListAssignments lists a connector's assignments (workspace-scoped).
+func (m *connectorManager) ListAssignments(workspaceID, connectorID uuid.UUID) ([]models.ConnectorAssignment, error) {
+	if _, err := m.repo.GetByID(workspaceID, connectorID); err != nil {
+		return nil, errors.New("connector not found")
+	}
+	return m.repo.ListAssignments(connectorID)
+}
+
+// RevokeAssignment removes an assignment (workspace-scoped delete).
+func (m *connectorManager) RevokeAssignment(workspaceID, assignmentID uuid.UUID) error {
+	return m.repo.DeleteAssignment(workspaceID, assignmentID)
+}
+
+// ResolveActionCredential is the broker-side internal resolver: it selects the
+// connection for an action and reads its secret from Vault. The secret NEVER
+// leaves the broker — callers use it only to build a provider request. Fails
+// closed: no connection, or a non-active connection, is an error.
+//
+// Delegated call (subjectUserID set): prefer the user-scope connection for that
+// subject; there is no fallback to the workspace connection, because a user
+// acting on their own behalf must use their own grant. Non-delegated (M2M /
+// empty subject): use the workspace-scope connection.
+func (m *connectorManager) ResolveActionCredential(connectorID uuid.UUID, subjectUserID string) (*ResolvedCredential, error) {
+	var (
+		conn *models.ConnectorConnection
+		err  error
+	)
+	if subjectUserID != "" {
+		conn, err = m.repo.GetUserConnection(connectorID, subjectUserID)
+	} else {
+		conn, err = m.repo.GetWorkspaceConnection(connectorID)
+	}
+	if err != nil || conn == nil {
+		return nil, errors.New("no connection for this connector")
+	}
+	if conn.Status != models.ConnectionStatusActive {
+		return nil, fmt.Errorf("connection %s", conn.Status) // expired|error|revoked|disconnected
+	}
 	if conn.VaultPath == "" {
-		return map[string]interface{}{}, nil
+		return nil, errors.New("connection has no credential")
 	}
 	if m.vault == nil {
 		return nil, errors.New("vault client not configured")
 	}
-	return m.vault.ReadSecret(conn.VaultPath)
+	secret, err := m.vault.ReadSecret(conn.VaultPath)
+	if err != nil {
+		return nil, fmt.Errorf("read credential: %w", err)
+	}
+	return &ResolvedCredential{Connection: conn, Secret: secret}, nil
 }
 
 // rejectSecretsInConfig fails if the caller put a provider-declared secret key

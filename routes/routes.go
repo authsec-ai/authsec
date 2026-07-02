@@ -1325,13 +1325,15 @@ func SetupRoutes(
 		}
 
 		// ────────────────────────────────────────────────────
-		// Connectors — workspace-scoped integration registry.
-		// Admin CRUD + agent-facing config/credentials reads.
-		// Dual-auth: standard auth-manager JWT or SPIFFE JWT-SVID.
+		// Connectors — admin control plane (/authsec/connectors/*).
+		// Interactive admin/user session; CRUD + non-secret config only.
+		// NO credential-vending route: AuthSec vends actions + results, not
+		// secrets. Agents execute actions on the broker data plane
+		// (/broker/connectors/*, provisioned in a later P0 step).
 		// ────────────────────────────────────────────────────
 		connectorController := platformCtrl.NewConnectorController(config.DB)
 		connectors := authsec.Group("/connectors")
-		connectors.Use(middlewares.SpiffeAuthMiddleware())
+		connectors.Use(middlewares.AuthMiddleware())
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
 			connectors.POST("", middlewares.Require("connector", "create"), connectorController.CreateConnector)
@@ -1340,7 +1342,40 @@ func SetupRoutes(
 			connectors.PUT("/:id", middlewares.Require("connector", "update"), connectorController.UpdateConnector)
 			connectors.DELETE("/:id", middlewares.Require("connector", "delete"), connectorController.DeleteConnector)
 			connectors.GET("/:id/config", middlewares.Require("connector", "config"), connectorController.GetConnectorConfig)
-			connectors.GET("/:id/credentials", middlewares.Require("connector", "credentials"), connectorController.GetConnectorCredentials)
+			connectors.POST("/:id/connections/oauth/start", middlewares.Require("connector", "update"), connectorController.StartOAuthConnect)
+			connectors.POST("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.GrantAssignment)
+			connectors.GET("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.ListAssignments)
+			connectors.DELETE("/:id/assignments/:aid", middlewares.Require("connector", "assign"), connectorController.RevokeAssignment)
+		}
+		// OAuth callback is provider-redirected and state-validated — it must NOT
+		// sit behind the admin auth middleware (the browser arrives unauthenticated
+		// from the provider). Distinct top-level path to avoid colliding with the
+		// /connectors/:id param route in Gin's tree.
+		authsec.GET("/connector-oauth/callback", connectorController.OAuthCallback)
+
+		// ────────────────────────────────────────────────────
+		// Connector Broker — runtime DATA plane (/broker/connectors/*).
+		// Agents/workloads call here with a native AuthSec access token whose
+		// audience is the workspace Connector Broker RS (RFC 8707). The broker
+		// controller verifies the token itself via the shared
+		// ProtectedResourceVerifier and runs the policy chain — so NO standard
+		// auth middleware here (HMAC authsec-api tokens are rejected by design).
+		// ────────────────────────────────────────────────────
+		connectorBroker := platformCtrl.NewConnectorBrokerController(config.DB)
+		broker := r.Group("/broker/connectors")
+		{
+			broker.GET("", connectorBroker.ListConnectors)
+			broker.GET("/:id/actions", connectorBroker.ListActions)
+			// The client calls .../actions/<actionKey>:execute; the handler trims
+			// the ":execute" suffix from the :key param.
+			broker.POST("/:id/actions/:key", connectorBroker.ExecuteAction)
+		}
+		// MCP tools surface — the "automatic" path: agents list + call connector
+		// actions as MCP tools. Same broker-audience token + policy chain.
+		brokerMCP := r.Group("/broker/mcp")
+		{
+			brokerMCP.GET("/tools", connectorBroker.MCPListTools)
+			brokerMCP.POST("/call", connectorBroker.MCPCallTool)
 		}
 
 		// Legacy login/register endpoints

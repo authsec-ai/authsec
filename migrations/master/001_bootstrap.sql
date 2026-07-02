@@ -858,8 +858,11 @@ CREATE TABLE public.resource_servers (
     prm_source text DEFAULT 'fetched'::text NOT NULL,
     prm_override_expires_at timestamp with time zone,
     metadata_stale boolean DEFAULT false NOT NULL,
+    -- managed: system-owned RS not created by an admin (e.g. the per-workspace
+    -- Connector Broker). The Applications UI lists only managed=false rows.
+    managed boolean DEFAULT false NOT NULL,
     CONSTRAINT resource_servers_prm_source_chk CHECK (prm_source IN ('fetched', 'manual_override')),
-    CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service')),
+    CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service', 'connector_broker')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
     CONSTRAINT resource_servers_id_workspace_uq UNIQUE (id, workspace_id),
     CONSTRAINT resource_servers_workspace_resource_uri_uq UNIQUE (workspace_id, resource_uri)
@@ -3033,13 +3036,21 @@ END $$;
 -- Seeded below; not created by tenants. config_schema/secret_keys describe
 -- which config fields are allowed and which route to Vault.
 CREATE TABLE public.connector_providers (
-    key            text NOT NULL,
-    display_name   text NOT NULL,
-    component_type text NOT NULL DEFAULT '',
-    config_schema  jsonb NOT NULL DEFAULT '{}'::jsonb,
-    secret_keys    text[] NOT NULL DEFAULT '{}'::text[],
-    created_at     timestamptz NOT NULL DEFAULT now(),
-    updated_at     timestamptz NOT NULL DEFAULT now(),
+    key                    text NOT NULL,
+    display_name           text NOT NULL,
+    component_type         text NOT NULL DEFAULT '',
+    config_schema          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    secret_keys            text[] NOT NULL DEFAULT '{}'::text[],
+    -- Which credential methods this provider supports. A provider can support
+    -- more than one (e.g. api_key AND oauth2); the connect flow picks per use.
+    supported_auth_methods text[] NOT NULL DEFAULT '{oauth2}'::text[],
+    -- OAuth 2.0 endpoints + scope catalog (for the connect-once flow, P/B).
+    oauth_authorize_url    text NOT NULL DEFAULT '',
+    oauth_token_url        text NOT NULL DEFAULT '',
+    oauth_scopes_supported text[] NOT NULL DEFAULT '{}'::text[],
+    oauth_default_scopes   text[] NOT NULL DEFAULT '{}'::text[],
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_providers_pkey PRIMARY KEY (key)
 );
 
@@ -3047,7 +3058,7 @@ CREATE TABLE public.connector_providers (
 -- config: non-secret settings (portalId, sampleRate, …).
 -- subscriptions: the [{partnerAction, subscribe, mapping}] array, stored
 --   verbatim as a declarative contract the agent reads (no event engine here).
--- vault_path: kv/data/secret/tenants/{ws}/connectors/{id} holding the secrets.
+-- vault_path: kv/data/secret/workspaces/{ws}/connectors/{id} holding the secrets.
 CREATE TABLE public.connectors (
     id               uuid NOT NULL DEFAULT gen_random_uuid(),
     workspace_id     uuid NOT NULL,
@@ -3066,49 +3077,170 @@ CREATE TABLE public.connectors (
         REFERENCES public.connector_providers(key),
     CONSTRAINT connectors_workspace_fkey FOREIGN KEY (workspace_id)
         REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    CONSTRAINT connectors_workspace_name_key UNIQUE (workspace_id, name)
+    CONSTRAINT connectors_workspace_name_key UNIQUE (workspace_id, name),
+    -- Composite key so child tables (connections, assignments) reference a
+    -- (workspace_id, connector_id) pair and cannot point across workspaces.
+    CONSTRAINT connectors_workspace_id_key UNIQUE (workspace_id, id)
 );
 
 CREATE INDEX idx_connectors_workspace ON public.connectors(workspace_id);
 CREATE INDEX idx_connectors_provider ON public.connectors(provider_key);
 
--- Seed the provider catalog (derived from the Descope/Segment integration set).
-INSERT INTO public.connector_providers (key, display_name, component_type, secret_keys)
+-- connector_connections — a credential binding + its lifecycle state (P1).
+-- One connector holds a single workspace-scope connection and N user-scope
+-- connections, each with independent lifecycle. Secret material (api key /
+-- oauth token) lives in Vault at vault_path; PG holds only metadata.
+--   scope='workspace' → subject_user_id NULL
+--   scope='user'      → keyed by subject_user_id
+CREATE TABLE public.connector_connections (
+    id                    uuid NOT NULL DEFAULT gen_random_uuid(),
+    connector_id          uuid NOT NULL,
+    scope                 text NOT NULL,                  -- 'tenant' | 'user'
+    subject_user_id       text,                           -- NULL for tenant scope
+    status                text NOT NULL DEFAULT 'active', -- active|expired|error|revoked
+    auth_type             text NOT NULL,                  -- 'api_key' | 'oauth2'
+    vault_path            text NOT NULL,
+    scopes_granted        text[] NOT NULL DEFAULT '{}'::text[],
+    access_expires_at     timestamptz,
+    refresh_token_present boolean NOT NULL DEFAULT false,
+    last_refresh_at       timestamptz,
+    last_refresh_error    text,
+    created_at            timestamptz NOT NULL DEFAULT now(),
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_connections_pkey PRIMARY KEY (id),
+    CONSTRAINT connector_connections_connector_fkey FOREIGN KEY (connector_id)
+        REFERENCES public.connectors(id) ON DELETE CASCADE,
+    CONSTRAINT connector_connections_scope_key UNIQUE (connector_id, scope, subject_user_id)
+);
+
+CREATE INDEX idx_connector_connections_connector ON public.connector_connections(connector_id);
+CREATE INDEX idx_connector_connections_subject ON public.connector_connections(subject_user_id);
+
+-- connector_assignments — fine-grained authorization (P0). Controls which OAuth
+-- client (agent) may use which connector + action on the broker data plane.
+-- action_key NULL => all actions on the connector. The composite FK to
+-- (workspace_id, connector_id) prevents cross-workspace assignment.
+CREATE TABLE public.connector_assignments (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    client_id    text NOT NULL,        -- OAuth client / agent permitted
+    action_key   text,                 -- NULL => all actions on this connector
+    created_by   text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_assignments_pkey PRIMARY KEY (id),
+    CONSTRAINT connector_assignments_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.connectors(workspace_id, id) ON DELETE CASCADE
+);
+
+-- Partial unique indexes: Postgres treats NULLs as distinct, so a plain UNIQUE
+-- over (connector_id, client_id, action_key) would allow duplicate all-action
+-- rows. Split the NULL and non-NULL cases.
+CREATE UNIQUE INDEX uq_assign_all    ON public.connector_assignments (connector_id, client_id)             WHERE action_key IS NULL;
+CREATE UNIQUE INDEX uq_assign_action ON public.connector_assignments (connector_id, client_id, action_key) WHERE action_key IS NOT NULL;
+CREATE INDEX idx_connector_assignments_client ON public.connector_assignments(client_id);
+
+-- connector_actions — the typed, invocable units, defined at the PROVIDER level
+-- (every Slack connector exposes the same slack.postMessage). Keyed by
+-- provider_key, not connector_id: with a curated catalog the actions are
+-- intrinsic to the provider and identical across instances, so we avoid
+-- duplicating rows per connector. Each action maps to a provider adapter that
+-- fixes the HTTP method + base path (no caller-supplied URL — SSRF guard).
+CREATE TABLE public.connector_actions (
+    id              uuid NOT NULL DEFAULT gen_random_uuid(),
+    provider_key    text NOT NULL,
+    action_key      text NOT NULL,                    -- 'postMessage', 'createIssue'
+    display_name    text NOT NULL DEFAULT '',
+    adapter_key     text NOT NULL,                    -- adapter that implements it
+    http_method     text NOT NULL,                    -- adapter-fixed; NOT caller-supplied
+    input_schema    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    output_schema   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    required_scopes text[] NOT NULL DEFAULT '{}'::text[],
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_actions_pkey PRIMARY KEY (id),
+    CONSTRAINT connector_actions_provider_fkey FOREIGN KEY (provider_key)
+        REFERENCES public.connector_providers(key) ON DELETE CASCADE,
+    CONSTRAINT connector_actions_provider_action_key UNIQUE (provider_key, action_key)
+);
+
+CREATE INDEX idx_connector_actions_provider ON public.connector_actions(provider_key);
+
+-- connector_oauth_states — short-lived CSRF/PKCE state for the connect-once
+-- OAuth flow (P3). Created at oauth/start, consumed once at oauth/callback,
+-- expires quickly. Binds the returning code to the workspace + connector +
+-- binding scope so the callback can't be replayed against another connector.
+CREATE TABLE public.connector_oauth_states (
+    state           text NOT NULL,
+    workspace_id    uuid NOT NULL,
+    connector_id    uuid NOT NULL,
+    provider_key    text NOT NULL,
+    binding_type    text NOT NULL DEFAULT 'workspace',  -- 'workspace' | 'user'
+    subject_user_id text,                                -- for user-scope connect (P4)
+    code_verifier   text NOT NULL,                       -- PKCE
+    redirect_after  text,                                -- UI return URL
+    created_by      text,
+    expires_at      timestamptz NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_oauth_states_pkey PRIMARY KEY (state)
+);
+
+CREATE INDEX idx_connector_oauth_states_expires ON public.connector_oauth_states(expires_at);
+
+-- Seed the curated OAuth provider catalog. All connect via OAuth 2.0. Slack and
+-- GitHub carry the first typed actions (vertical slice); the rest are catalog
+-- rows their adapters/actions clone the pattern onto.
+INSERT INTO public.connector_providers
+    (key, display_name, supported_auth_methods, oauth_authorize_url, oauth_token_url, oauth_scopes_supported, oauth_default_scopes)
 VALUES
-    ('hubspot-web-actions',   'Hubspot Web (Actions)',        'browser', '{}'::text[]),
-    ('hubspot-cloud-actions', 'Hubspot Cloud Mode (actions)', '',        '{}'::text[]),
-    ('mixpanel-actions',      'Mixpanel (Actions)',           '',        '{apiKey}'::text[]),
-    ('clearbit-enrichment',   'Clearbit Enrichment',          'server',  '{apiKey}'::text[]),
-    ('google-analytics-4',    'Actions Google Analytic 4',    '',        '{apiSecret}'::text[]),
-    ('factorsai',             'FactorsAI',                    'server',  '{apiKey}'::text[]),
-    ('segment-io',            'Segment.io',                   'browser', '{apiKey}'::text[])
+    ('slack',   'Slack',   '{oauth2}'::text[],
+        'https://slack.com/oauth/v2/authorize', 'https://slack.com/api/oauth.v2.access',
+        '{chat:write,channels:read,channels:history}'::text[], '{chat:write}'::text[]),
+    ('github',  'GitHub',  '{oauth2}'::text[],
+        'https://github.com/login/oauth/authorize', 'https://github.com/login/oauth/access_token',
+        '{repo,read:org}'::text[], '{repo}'::text[]),
+    ('google',  'Google',  '{oauth2}'::text[],
+        'https://accounts.google.com/o/oauth2/v2/auth', 'https://oauth2.googleapis.com/token',
+        '{https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/analytics.readonly}'::text[],
+        '{}'::text[]),
+    ('hubspot', 'HubSpot', '{oauth2}'::text[],
+        'https://app.hubspot.com/oauth/authorize', 'https://api.hubapi.com/oauth/v1/token',
+        '{crm.objects.contacts.read,crm.objects.contacts.write,crm.objects.deals.write}'::text[], '{}'::text[]),
+    ('notion',  'Notion',  '{oauth2}'::text[],
+        'https://api.notion.com/v1/oauth/authorize', 'https://api.notion.com/v1/oauth/token',
+        '{}'::text[], '{}'::text[]),
+    ('jira',    'Jira',    '{oauth2}'::text[],
+        'https://auth.atlassian.com/authorize', 'https://auth.atlassian.com/oauth/token',
+        '{read:jira-work,write:jira-work,offline_access}'::text[], '{read:jira-work,write:jira-work}'::text[])
 ON CONFLICT (key) DO NOTHING;
 
--- Connector RBAC permissions (mirrors the resource/action gate used elsewhere).
-DO $$
-DECLARE
-    sys_workspace CONSTANT uuid := '00000000-0000-0000-0000-000000000000';
-BEGIN
-    INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, status, created_at, updated_at)
-    VALUES (sys_workspace, 'System', NULL, sys_workspace, 'team', 'system.authsec.dev', 'system@authsec.local', 'active', NOW(), NOW())
-    ON CONFLICT (id) DO NOTHING;
+-- Seed the first typed actions (vertical slice: Slack + GitHub). Each maps to a
+-- provider adapter with a fixed HTTP method; input_schema is the typed contract
+-- the agent fills. Other providers' actions clone this pattern.
+INSERT INTO public.connector_actions
+    (provider_key, action_key, display_name, adapter_key, http_method, input_schema, required_scopes)
+VALUES
+    ('slack', 'postMessage', 'Post a Slack message', 'slack', 'POST',
+        '{"type":"object","required":["channel","text"],"properties":{"channel":{"type":"string"},"text":{"type":"string"}}}'::jsonb,
+        '{chat:write}'::text[]),
+    ('github', 'createIssue', 'Create a GitHub issue', 'github', 'POST',
+        '{"type":"object","required":["owner","repo","title"],"properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}}}'::jsonb,
+        '{repo}'::text[])
+ON CONFLICT (provider_key, action_key) DO NOTHING;
 
-    INSERT INTO permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
-    VALUES
-        (gen_random_uuid(), sys_workspace, 'connector', 'create',      'Create a connector',                  'connector:create',      NOW()),
-        (gen_random_uuid(), sys_workspace, 'connector', 'read',        'Read connectors',                     'connector:read',        NOW()),
-        (gen_random_uuid(), sys_workspace, 'connector', 'update',      'Update a connector',                  'connector:update',      NOW()),
-        (gen_random_uuid(), sys_workspace, 'connector', 'delete',      'Delete a connector',                  'connector:delete',      NOW()),
-        (gen_random_uuid(), sys_workspace, 'connector', 'config',      'Read connector config/subscriptions', 'connector:config',      NOW()),
-        (gen_random_uuid(), sys_workspace, 'connector', 'credentials', 'Read connector credentials',          'connector:credentials', NOW())
-    ON CONFLICT ON CONSTRAINT permissions_workspace_resource_action_key DO NOTHING;
-
-    -- Grant all connector permissions to super_admin and admin.
-    INSERT INTO role_permissions (role_id, permission_id)
-    SELECT ro.id, p.id
-    FROM roles ro
-    CROSS JOIN permissions p
-    WHERE ro.name IN ('super_admin', 'admin') AND ro.workspace_id = sys_workspace
-      AND p.workspace_id = sys_workspace AND p.resource = 'connector'
-    ON CONFLICT DO NOTHING;
-END $$;
+-- Connector RBAC permissions — GLOBAL (workspace_id IS NULL) so they apply in
+-- every workspace. hasDBPermission / the scope resolver match a permission when
+-- p.workspace_id = caller_workspace OR p.workspace_id IS NULL, so a global
+-- permission is the correct model for a platform-wide capability. Admins grant
+-- the matching role to users per workspace via normal RBAC; a user holding a
+-- role bound to these permissions can use connectors.
+-- ON CONFLICT targets the partial unique index for NULL-workspace rows.
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+    (gen_random_uuid(), NULL, 'connector', 'create',  'Create a connector',                  'connector:create',  NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'read',    'Read connectors',                     'connector:read',    NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'update',  'Update a connector',                  'connector:update',  NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'delete',  'Delete a connector',                  'connector:delete',  NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'config',  'Read connector config (non-secret)',  'connector:config',  NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'assign',  'Manage connector assignments',        'connector:assign',  NOW()),
+    (gen_random_uuid(), NULL, 'connector', 'execute', 'Execute a connector action (broker)', 'connector:execute', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
