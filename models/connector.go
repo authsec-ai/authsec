@@ -19,11 +19,14 @@ type ConnectorProvider struct {
 	SecretKeys    pq.StringArray  `json:"secret_keys" gorm:"type:text[];not null;default:'{}'" swaggertype:"array,string"`
 
 	// Credential + OAuth metadata (connect-once flow).
-	SupportedAuthMethods pq.StringArray `json:"supported_auth_methods" gorm:"type:text[];not null;default:'{oauth2}'" swaggertype:"array,string"`
-	OAuthAuthorizeURL    string         `json:"oauth_authorize_url" gorm:"not null;default:''"`
-	OAuthTokenURL        string         `json:"oauth_token_url" gorm:"not null;default:''"`
-	OAuthScopesSupported pq.StringArray `json:"oauth_scopes_supported" gorm:"type:text[];not null;default:'{}'" swaggertype:"array,string"`
-	OAuthDefaultScopes   pq.StringArray `json:"oauth_default_scopes" gorm:"type:text[];not null;default:'{}'" swaggertype:"array,string"`
+	// NOTE: explicit column names are required — GORM's snake_case strategy maps
+	// `OAuthAuthorizeURL` to `o_auth_authorize_url`, which does NOT match the
+	// migration's `oauth_authorize_url`, so these read back empty without the tag.
+	SupportedAuthMethods pq.StringArray `json:"supported_auth_methods" gorm:"column:supported_auth_methods;type:text[];not null;default:'{oauth2}'" swaggertype:"array,string"`
+	OAuthAuthorizeURL    string         `json:"oauth_authorize_url" gorm:"column:oauth_authorize_url;not null;default:''"`
+	OAuthTokenURL        string         `json:"oauth_token_url" gorm:"column:oauth_token_url;not null;default:''"`
+	OAuthScopesSupported pq.StringArray `json:"oauth_scopes_supported" gorm:"column:oauth_scopes_supported;type:text[];not null;default:'{}'" swaggertype:"array,string"`
+	OAuthDefaultScopes   pq.StringArray `json:"oauth_default_scopes" gorm:"column:oauth_default_scopes;type:text[];not null;default:'{}'" swaggertype:"array,string"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
