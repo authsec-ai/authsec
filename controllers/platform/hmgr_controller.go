@@ -138,12 +138,21 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[CompleteLocalLogin] 400 bind failed: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"error":   "invalid request body",
 		})
 		return
 	}
+
+	// chPrefix is a short, non-sensitive prefix of the login_challenge used purely
+	// to correlate this request across the log lines below.
+	chPrefix := req.LoginChallenge
+	if len(chPrefix) > 12 {
+		chPrefix = chPrefix[:12]
+	}
+	log.Printf("[CompleteLocalLogin] start challenge=%s… len=%d", chPrefix, len(req.LoginChallenge))
 
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
@@ -179,21 +188,26 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 	projectID := claimString(userClaims, "project_id", "")
 
 	if userID == "" || email == "" || workspaceID == "" {
+		log.Printf("[CompleteLocalLogin] 401 missing claims challenge=%s… user_id=%q email=%q workspace_id=%q",
+			chPrefix, userID, email, workspaceID)
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
 			"error":   "user token missing required claims",
 		})
 		return
 	}
+	log.Printf("[CompleteLocalLogin] token ok challenge=%s… token_workspace=%s email=%s", chPrefix, workspaceID, email)
 
 	loginRequest, err := ctrl.service.GetHydraLoginRequest(req.LoginChallenge)
 	if err != nil {
+		log.Printf("[CompleteLocalLogin] 400 BRANCH=hydra_login_request challenge=%s… err=%v", chPrefix, err)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"error":   "failed to load hydra login request",
 		})
 		return
 	}
+	log.Printf("[CompleteLocalLogin] hydra login request loaded challenge=%s… hydra_client=%s", chPrefix, loginRequest.Client.ClientID)
 
 	hydraClientID := loginRequest.Client.ClientID
 	expectedClientID := hydraClientID
@@ -202,6 +216,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	arcCtx, arcErr := ctrl.authzCtx.GetAuthRequestContextByLoginChallenge(req.LoginChallenge)
 	if arcErr != nil {
+		log.Printf("[CompleteLocalLogin] 400 BRANCH=auth_request_context challenge=%s… err=%v", chPrefix, arcErr)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"error":   "failed to resolve MCP auth context",
@@ -209,12 +224,15 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		return
 	}
 	if !strings.EqualFold(arcCtx.WorkspaceID, workspaceID) {
+		log.Printf("[CompleteLocalLogin] 403 BRANCH=tenant_mismatch challenge=%s… arc_workspace=%s token_workspace=%s",
+			chPrefix, arcCtx.WorkspaceID, workspaceID)
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"error":   "user token tenant does not match login challenge tenant",
 		})
 		return
 	}
+	log.Printf("[CompleteLocalLogin] auth context resolved challenge=%s… arc_workspace=%s", chPrefix, arcCtx.WorkspaceID)
 	mcpAuthCtx = arcCtx
 	expectedWorkspaceID = arcCtx.WorkspaceID
 
@@ -226,6 +244,8 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 	var user models.User
 	if err := tenantDB.Where("id = ? AND workspace_id = ?", userID, expectedWorkspaceID).First(&user).Error; err != nil {
 		if err := tenantDB.Where("LOWER(email) = LOWER(?) AND workspace_id = ?", email, expectedWorkspaceID).First(&user).Error; err != nil {
+			log.Printf("[CompleteLocalLogin] 401 BRANCH=user_not_found challenge=%s… user_id=%s email=%s expected_workspace=%s",
+				chPrefix, userID, email, expectedWorkspaceID)
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"success": false,
 				"error":   "authenticated user not found in tenant database",
@@ -262,6 +282,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 
 	acceptResponse, err := ctrl.service.AcceptHydraLoginRequestWithContext(req.LoginChallenge, user.ID.String(), loginContext)
 	if err != nil {
+		log.Printf("[CompleteLocalLogin] 500 BRANCH=accept_login challenge=%s… err=%v", chPrefix, err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"error":   "failed to accept hydra login request",
@@ -269,6 +290,7 @@ func (ctrl *HmgrController) CompleteLocalLoginHandler(c *gin.Context) {
 		})
 		return
 	}
+	log.Printf("[CompleteLocalLogin] 200 OK challenge=%s… user=%s redirect=%s", chPrefix, user.Email, acceptResponse.RedirectTo)
 
 	// Record auth_time on the auth context for OIDC max_age enforcement.
 	if mcpAuthCtx != nil {
@@ -566,10 +588,10 @@ func (ctrl *HmgrController) InitiateAuthHandler(c *gin.Context) {
 	// the browser to whatever URL Hydra returns (typically back to the
 	// OAuth client app's redirect_uri with an authorization code).
 	resp, err := ctrl.oidcSvc.InitiateOIDCFlow(&models.OIDCInitiateInput{
-		Provider:       providerName,
-		WorkspaceDomain:   originDomain,
-		ApplicationID:  appID,
-		LoginChallenge: req.LoginChallenge,
+		Provider:        providerName,
+		WorkspaceDomain: originDomain,
+		ApplicationID:   appID,
+		LoginChallenge:  req.LoginChallenge,
 	}, "hydra_login", &workspaceID)
 	if err != nil {
 		// Workspace gate or Application policy rejected. Surface as 403 so
