@@ -3224,6 +3224,9 @@ VALUES
         '{chat:write}'::text[]),
     ('github', 'createIssue', 'Create a GitHub issue', 'github', 'POST',
         '{"type":"object","required":["owner","repo","title"],"properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}}}'::jsonb,
+        '{repo}'::text[]),
+    ('github', 'listCommits', 'List recent commits', 'github', 'GET',
+        '{"type":"object","required":["owner","repo"],"properties":{"owner":{"type":"string"},"repo":{"type":"string"},"per_page":{"type":"integer","minimum":1,"maximum":50,"description":"defaults to 10"}}}'::jsonb,
         '{repo}'::text[])
 ON CONFLICT (provider_key, action_key) DO NOTHING;
 
