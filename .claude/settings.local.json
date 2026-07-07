@@ -44,7 +44,13 @@
       "Bash(gofmt -l services/connector_oauth_service.go controllers/platform/connector_controller.go models/connector.go routes/routes.go migrations/master/001_bootstrap.sql)",
       "Bash(rm -f /tmp/authsec-routecheck /tmp/rc.log)",
       "Bash(gofmt -w services/connector_service.go controllers/platform/connector_controller.go controllers/platform/connector_broker_controller.go routes/routes.go)",
-      "Bash(gofmt -l controllers/platform/connector_broker_controller.go controllers/platform/connector_controller.go services/connector_service.go services/connector_oauth_service.go routes/routes.go)"
+      "Bash(gofmt -l controllers/platform/connector_broker_controller.go controllers/platform/connector_controller.go services/connector_service.go services/connector_oauth_service.go routes/routes.go)",
+      "Bash(git rev-list *)",
+      "Bash(gofmt -w controllers/platform/connector_broker_controller.go models/connector.go repository/connector_repository.go)",
+      "Bash(gofmt -w controllers/platform/connector_controller.go services/connector_service.go routes/routes.go)",
+      "Bash(gofmt -w services/connector_oauth_service.go controllers/platform/connector_controller.go models/connector.go repository/connector_repository.go routes/routes.go)",
+      "Bash(rm -f /tmp/rtcheck.go /tmp/rtcheck_main.go)",
+      "Bash(gofmt -l controllers/platform/connector_controller.go controllers/platform/connector_broker_controller.go services/connector_service.go services/connector_oauth_service.go repository/connector_repository.go models/connector.go routes/routes.go migrations/master/001_bootstrap.sql)"
     ]
   }
 }

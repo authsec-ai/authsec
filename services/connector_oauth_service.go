@@ -59,7 +59,7 @@ func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, create
 		return nil, fmt.Errorf("provider %q is not OAuth2", provider.Key)
 	}
 
-	clientID, _, redirectURI, cErr := providerOAuthApp(provider.Key)
+	clientID, _, redirectURI, cErr := s.resolveProviderApp(workspaceID, provider.Key)
 	if cErr != nil {
 		return nil, cErr
 	}
@@ -147,7 +147,7 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 	if err != nil {
 		return nil, fmt.Errorf("unknown provider %q", st.ProviderKey)
 	}
-	clientID, clientSecret, redirectURI, cErr := providerOAuthApp(provider.Key)
+	clientID, clientSecret, redirectURI, cErr := s.resolveProviderApp(st.WorkspaceID, provider.Key)
 	if cErr != nil {
 		return nil, cErr
 	}
@@ -251,20 +251,66 @@ func (s *ConnectorOAuthService) exchangeCode(provider *models.ConnectorProvider,
 
 // --- helpers -----------------------------------------------------------------
 
-// providerOAuthApp returns AuthSec's own registered OAuth app credentials for a
-// provider, from env: CONNECTOR_OAUTH_<PROVIDER>_CLIENT_ID / _CLIENT_SECRET /
-// _REDIRECT_URI (provider upper-cased). These are AuthSec's app at the provider,
-// not a tenant secret.
-func providerOAuthApp(providerKey string) (clientID, clientSecret, redirectURI string, err error) {
+// SetProviderApp configures a workspace's own OAuth app for a provider: stores
+// the client_secret in Vault and upserts the client_id/redirect_uri row. This is
+// how a workspace brings its own OAuth app instead of the deployment-wide env one.
+func (s *ConnectorOAuthService) SetProviderApp(workspaceID uuid.UUID, providerKey, clientID, clientSecret, redirectURI, createdBy string) error {
+	if clientID == "" || redirectURI == "" {
+		return errors.New("client_id and redirect_uri are required")
+	}
+	if _, err := s.repo.GetProvider(providerKey); err != nil {
+		return fmt.Errorf("unknown provider %q", providerKey)
+	}
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/%s", workspaceID.String(), providerKey)
+	if clientSecret != "" {
+		if s.vault == nil {
+			return errors.New("vault client not configured")
+		}
+		if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{"client_secret": clientSecret}); err != nil {
+			return fmt.Errorf("store client secret: %w", err)
+		}
+	}
+	return s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
+		WorkspaceID: workspaceID,
+		ProviderKey: providerKey,
+		ClientID:    clientID,
+		RedirectURI: redirectURI,
+		VaultPath:   vaultPath,
+		CreatedBy:   createdBy,
+	})
+}
+
+// resolveProviderApp returns the OAuth app credentials for (workspace, provider):
+// a workspace-specific app (client_id in DB, secret in Vault) takes precedence,
+// else the global env vars CONNECTOR_OAUTH_<P>_CLIENT_ID/_SECRET/_REDIRECT_URI.
+// Lets a workspace bring its own OAuth app while keeping the deployment-wide
+// default working. The secret is read from Vault only for the DB path.
+func (s *ConnectorOAuthService) resolveProviderApp(workspaceID uuid.UUID, providerKey string) (clientID, clientSecret, redirectURI string, err error) {
+	// 1. Workspace-specific app (DB row + Vault secret).
+	if app, e := s.repo.GetProviderApp(workspaceID, providerKey); e == nil && app != nil {
+		secret := ""
+		if s.vault != nil && app.VaultPath != "" {
+			if sec, e2 := s.vault.ReadSecret(app.VaultPath); e2 == nil {
+				if v, ok := sec["client_secret"].(string); ok {
+					secret = v
+				}
+			}
+		}
+		if app.ClientID != "" && app.RedirectURI != "" {
+			return app.ClientID, secret, app.RedirectURI, nil
+		}
+	}
+
+	// 2. Global env fallback.
 	p := strings.ToUpper(providerKey)
 	clientID = os.Getenv("CONNECTOR_OAUTH_" + p + "_CLIENT_ID")
 	clientSecret = os.Getenv("CONNECTOR_OAUTH_" + p + "_CLIENT_SECRET")
 	redirectURI = os.Getenv("CONNECTOR_OAUTH_" + p + "_REDIRECT_URI")
 	if redirectURI == "" {
-		redirectURI = os.Getenv("CONNECTOR_OAUTH_REDIRECT_URI") // shared default
+		redirectURI = os.Getenv("CONNECTOR_OAUTH_REDIRECT_URI")
 	}
 	if clientID == "" || redirectURI == "" {
-		return "", "", "", fmt.Errorf("OAuth app not configured for provider %q (set CONNECTOR_OAUTH_%s_CLIENT_ID / _REDIRECT_URI)", providerKey, p)
+		return "", "", "", fmt.Errorf("OAuth app not configured for provider %q in workspace %s (set a workspace provider app, or CONNECTOR_OAUTH_%s_CLIENT_ID / _REDIRECT_URI)", providerKey, workspaceID, p)
 	}
 	return clientID, clientSecret, redirectURI, nil
 }
@@ -323,11 +369,12 @@ func (s *ConnectorOAuthService) Refresh(conn *models.ConnectorConnection) error 
 	if !conn.RefreshTokenPresent || conn.VaultPath == "" {
 		return errors.New("no refresh token available")
 	}
-	provider, err := s.repo.GetProvider(providerKeyForConnection(s.db, conn))
+	providerKey, workspaceID := connectorContextForConnection(s.db, conn)
+	provider, err := s.repo.GetProvider(providerKey)
 	if err != nil {
 		return err
 	}
-	clientID, clientSecret, _, cErr := providerOAuthApp(provider.Key)
+	clientID, clientSecret, _, cErr := s.resolveProviderApp(workspaceID, provider.Key)
 	if cErr != nil {
 		return cErr
 	}
@@ -400,10 +447,14 @@ func (s *ConnectorOAuthService) markRefreshError(conn *models.ConnectorConnectio
 	s.db.Save(conn)
 }
 
-// providerKeyForConnection resolves the provider key from the connection's
-// connector (the connection row itself doesn't store it).
-func providerKeyForConnection(db *gorm.DB, conn *models.ConnectorConnection) string {
-	var key string
-	db.Table("connectors").Where("id = ?", conn.ConnectorID).Limit(1).Pluck("provider_key", &key)
-	return key
+// connectorContextForConnection resolves the provider key + workspace id from
+// the connection's connector (the connection row stores neither).
+func connectorContextForConnection(db *gorm.DB, conn *models.ConnectorConnection) (providerKey string, workspaceID uuid.UUID) {
+	var row struct {
+		ProviderKey string
+		WorkspaceID uuid.UUID
+	}
+	db.Table("connectors").Select("provider_key, workspace_id").
+		Where("id = ?", conn.ConnectorID).Limit(1).Scan(&row)
+	return row.ProviderKey, row.WorkspaceID
 }

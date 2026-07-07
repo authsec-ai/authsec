@@ -1336,6 +1336,7 @@ func SetupRoutes(
 		connectors.Use(middlewares.AuthMiddleware())
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
+			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
 			connectors.POST("", middlewares.Require("connector", "create"), connectorController.CreateConnector)
 			connectors.GET("", middlewares.Require("connector", "read"), connectorController.ListConnectors)
 			connectors.GET("/:id", middlewares.Require("connector", "read"), connectorController.GetConnector)
@@ -1346,6 +1347,7 @@ func SetupRoutes(
 			connectors.POST("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.GrantAssignment)
 			connectors.GET("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.ListAssignments)
 			connectors.DELETE("/:id/assignments/:aid", middlewares.Require("connector", "assign"), connectorController.RevokeAssignment)
+			connectors.GET("/:id/audit", middlewares.Require("connector", "read"), connectorController.GetConnectorAudit)
 		}
 		// OAuth callback is provider-redirected and state-validated — it must NOT
 		// sit behind the admin auth middleware (the browser arrives unauthenticated

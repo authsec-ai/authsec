@@ -35,6 +35,10 @@ type ConnectorManager interface {
 	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error)
 	ListAssignments(workspaceID, connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
 	RevokeAssignment(workspaceID, assignmentID uuid.UUID) error
+
+	// AuditLog returns recent action-audit records for a connector (who/act/
+	// token/outcome). Workspace-scoped.
+	AuditLog(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error)
 }
 
 // ResolvedCredential is the broker-side result of connection resolution: the
@@ -288,6 +292,15 @@ func (m *connectorManager) ListAssignments(workspaceID, connectorID uuid.UUID) (
 // RevokeAssignment removes an assignment (workspace-scoped delete).
 func (m *connectorManager) RevokeAssignment(workspaceID, assignmentID uuid.UUID) error {
 	return m.repo.DeleteAssignment(workspaceID, assignmentID)
+}
+
+// AuditLog returns recent action-audit records for a connector, after checking
+// the connector belongs to the workspace.
+func (m *connectorManager) AuditLog(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error) {
+	if _, err := m.repo.GetByID(workspaceID, connectorID); err != nil {
+		return nil, errors.New("connector not found")
+	}
+	return m.repo.ListActionAudit(workspaceID, connectorID, limit)
 }
 
 // ResolveActionCredential is the broker-side internal resolver: it selects the

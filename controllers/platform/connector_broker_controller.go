@@ -220,7 +220,7 @@ func (ctl *ConnectorBrokerController) ExecuteAction(c *gin.Context) {
 		c.JSON(status, gin.H{"error": reason})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"result": result})
+	c.JSON(http.StatusOK, gin.H{"result": result, "identity": identityBlock(authCtx)})
 }
 
 // runAction is the heart of the broker, shared by the REST and MCP surfaces. It
@@ -392,7 +392,8 @@ func (ctl *ConnectorBrokerController) MCPCallTool(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"content": []gin.H{{"type": "text", "text": mustJSON(result)}},
+		"content":  []gin.H{{"type": "text", "text": mustJSON(result)}},
+		"identity": identityBlock(authCtx),
 	})
 }
 
@@ -444,6 +445,26 @@ func authContextHasScope(ctx *services.AuthContext, scope string) bool {
 	return false
 }
 
+// identityBlock renders the caller identity for an action response: who the
+// principal is (sub), on whose behalf / which agent acted (act), and which token
+// authorized it (family + jti). This is the "who did what, on whose behalf, with
+// which token" surface — echoed to the caller and mirrored into the audit record.
+func identityBlock(authCtx *services.AuthContext) gin.H {
+	actor := gin.H(nil)
+	if authCtx.Actor != nil {
+		actor = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
+	}
+	return gin.H{
+		"principal": gin.H{
+			"sub":  authCtx.Principal.SubjectID.String(),
+			"type": authCtx.Principal.SubjectType,
+		},
+		"actor":        actor, // nil for direct M2M; set when an agent acts on behalf
+		"token":        gin.H{"family": authCtx.TokenFamily, "jti": authCtx.JTI},
+		"workspace_id": authCtx.Principal.WorkspaceID.String(),
+	}
+}
+
 // firstSecretString returns the first present, non-empty string value among the
 // given keys of the resolved Vault secret. Used to locate the access token /
 // api key regardless of the field name a provider connection stored.
@@ -480,6 +501,9 @@ func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *servi
 	if outcome != "allow" {
 		status = http.StatusForbidden
 	}
+	if authCtx.Actor != nil && authCtx.Actor.SpiffeID != nil {
+		newValues["actor_spiffe_id"] = *authCtx.Actor.SpiffeID
+	}
 	config.AuditLogger.LogAdminAction(
 		c.GetString("request_id"),
 		authCtx.Principal.WorkspaceID.String(),
@@ -497,6 +521,34 @@ func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *servi
 		newValues,
 		reason,
 	)
+
+	// Durable, queryable action-audit record (source of truth for the activity
+	// view): who / on-whose-behalf / which token / outcome. Best-effort.
+	rec := &models.ConnectorActionAudit{
+		WorkspaceID: authCtx.Principal.WorkspaceID,
+		ActionKey:   actionKey,
+		Outcome:     outcome,
+		DenyReason:  reason,
+		SubjectType: authCtx.Principal.SubjectType,
+		TokenFamily: authCtx.TokenFamily,
+		TokenJTI:    authCtx.JTI,
+		HTTPStatus:  status,
+	}
+	if sid := authCtx.Principal.SubjectID; sid != uuid.Nil {
+		rec.SubjectID = &sid
+	}
+	if cid, err := uuid.Parse(connectorID); err == nil {
+		rec.ConnectorID = &cid
+	}
+	if authCtx.Actor != nil {
+		rec.ActorClientID = authCtx.Actor.ClientID
+		if authCtx.Actor.SpiffeID != nil {
+			rec.ActorSpiffeID = *authCtx.Actor.SpiffeID
+		}
+	}
+	if err := ctl.repo().RecordActionAudit(rec); err != nil {
+		log.Printf("BROKER: failed to write action audit: %v", err)
+	}
 }
 
 func bearerToken(c *gin.Context) string {

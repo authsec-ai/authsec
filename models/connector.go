@@ -143,3 +143,45 @@ type ConnectorOAuthState struct {
 }
 
 func (ConnectorOAuthState) TableName() string { return "connector_oauth_states" }
+
+// ConnectorActionAudit is the durable per-action accountability record: who
+// (SubjectID/type), on whose behalf / which agent (ActorClientID/SpiffeID),
+// which token (TokenFamily/JTI), what (Connector+Action), and the outcome. One
+// row per broker action attempt, allow or deny. Never holds secrets.
+type ConnectorActionAudit struct {
+	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID   uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ConnectorID   *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+	ActionKey     string     `json:"action_key" gorm:"not null"`
+	Outcome       string     `json:"outcome" gorm:"not null"` // allow | deny
+	DenyReason    string     `json:"deny_reason,omitempty"`
+	SubjectType   string     `json:"subject_type,omitempty"`
+	SubjectID     *uuid.UUID `json:"subject_id,omitempty" gorm:"type:uuid"`
+	ActorClientID string     `json:"actor_client_id,omitempty"`
+	ActorSpiffeID string     `json:"actor_spiffe_id,omitempty"`
+	TokenFamily   string     `json:"token_family,omitempty"`
+	TokenJTI      string     `json:"token_jti,omitempty"`
+	HTTPStatus    int        `json:"http_status,omitempty"`
+	LatencyMs     int64      `json:"latency_ms,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+func (ConnectorActionAudit) TableName() string { return "connector_action_audit" }
+
+// ConnectorProviderApp is a workspace's own OAuth application credentials for a
+// provider (AuthSec's registered app at the provider). ClientID + RedirectURI
+// are non-secret; the client secret lives in Vault at VaultPath. Resolved before
+// the global env-var fallback in the connect flow. (Bring-your-own OAuth app.)
+type ConnectorProviderApp struct {
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null"`
+	ProviderKey string    `json:"provider_key" gorm:"not null"`
+	ClientID    string    `json:"client_id" gorm:"not null"`
+	RedirectURI string    `json:"redirect_uri" gorm:"not null"`
+	VaultPath   string    `json:"-" gorm:"not null"` // secret location; NEVER serialized
+	CreatedBy   string    `json:"created_by,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func (ConnectorProviderApp) TableName() string { return "connector_provider_apps" }

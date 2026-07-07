@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/authsec-ai/authsec/internal/vault"
@@ -425,6 +426,66 @@ func (ctl *ConnectorController) RevokeAssignment(c *gin.Context) {
 	}
 	auditAdminMutation(c, wsID.String(), "unassign", "connector", c.Param("id"), http.StatusNoContent, nil, nil)
 	c.Status(http.StatusNoContent)
+}
+
+// GetConnectorAudit handles GET /authsec/connectors/:id/audit — the activity
+// log: who ran which action on whose behalf with which token, allow/deny.
+func (ctl *ConnectorController) GetConnectorAudit(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	limit := 100
+	if v := c.Query("limit"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil {
+			limit = n
+		}
+	}
+	rows, err := ctl.manager(nil).AuditLog(wsID, id, limit)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"audit": rows})
+}
+
+// SetProviderApp handles POST /authsec/connectors/providers/:provider/app —
+// configure this workspace's own OAuth app for a provider (client_id + secret +
+// redirect). Secret goes to Vault; only client_id/redirect are stored in PG.
+func (ctl *ConnectorController) SetProviderApp(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	providerKey := c.Param("provider")
+	var req struct {
+		ClientID     string `json:"client_id" binding:"required"`
+		ClientSecret string `json:"client_secret"`
+		RedirectURI  string `json:"redirect_uri" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	if err := svc.SetProviderApp(wsID, providerKey, req.ClientID, req.ClientSecret, req.RedirectURI, principal); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "set_provider_app", "connector_provider", providerKey, http.StatusOK, nil, gin.H{"client_id": req.ClientID})
+	c.JSON(http.StatusOK, gin.H{"status": "configured", "provider": providerKey})
 }
 
 // GetConnectorConfig handles GET /authsec/connectors/:id/config.

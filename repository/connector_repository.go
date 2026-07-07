@@ -32,6 +32,12 @@ type ConnectorRepository interface {
 
 	ListActions(providerKey string) ([]models.ConnectorAction, error)
 	GetAction(providerKey, actionKey string) (*models.ConnectorAction, error)
+
+	RecordActionAudit(a *models.ConnectorActionAudit) error
+	ListActionAudit(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error)
+
+	GetProviderApp(workspaceID uuid.UUID, providerKey string) (*models.ConnectorProviderApp, error)
+	UpsertProviderApp(app *models.ConnectorProviderApp) error
 }
 
 type connectorRepository struct{ db *gorm.DB }
@@ -151,4 +157,39 @@ func (r *connectorRepository) GetAction(providerKey, actionKey string) (*models.
 		return nil, err
 	}
 	return &a, nil
+}
+
+func (r *connectorRepository) RecordActionAudit(a *models.ConnectorActionAudit) error {
+	return r.db.Create(a).Error
+}
+
+func (r *connectorRepository) ListActionAudit(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []models.ConnectorActionAudit
+	err := r.db.Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID).
+		Order("created_at DESC").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+func (r *connectorRepository) GetProviderApp(workspaceID uuid.UUID, providerKey string) (*models.ConnectorProviderApp, error) {
+	var app models.ConnectorProviderApp
+	err := r.db.First(&app, "workspace_id = ? AND provider_key = ?", workspaceID, providerKey).Error
+	if err != nil {
+		return nil, err
+	}
+	return &app, nil
+}
+
+func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp) error {
+	// Upsert on (workspace_id, provider_key): update client_id/redirect/vault_path.
+	return r.db.Where("workspace_id = ? AND provider_key = ?", app.WorkspaceID, app.ProviderKey).
+		Assign(map[string]interface{}{
+			"client_id":    app.ClientID,
+			"redirect_uri": app.RedirectURI,
+			"vault_path":   app.VaultPath,
+			"updated_at":   gorm.Expr("now()"),
+		}).
+		FirstOrCreate(app).Error
 }

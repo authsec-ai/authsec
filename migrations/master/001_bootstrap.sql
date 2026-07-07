@@ -3186,6 +3186,54 @@ CREATE TABLE public.connector_oauth_states (
 
 CREATE INDEX idx_connector_oauth_states_expires ON public.connector_oauth_states(expires_at);
 
+-- connector_action_audit — the durable "who did what, on whose behalf, with
+-- which token" record for every broker action (allow AND deny). This is the
+-- action-outcome accountability a token vault cannot produce: principal (sub),
+-- actor (the agent/on-behalf-of client), token family+jti, connector+action,
+-- outcome, and latency. Never stores secrets or the token itself.
+CREATE TABLE public.connector_action_audit (
+    id              uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid NOT NULL,
+    connector_id    uuid,
+    action_key      text NOT NULL,
+    outcome         text NOT NULL,               -- 'allow' | 'deny'
+    deny_reason     text,
+    subject_type    text,                        -- 'user' | 'service_account'
+    subject_id      uuid,                        -- the principal (sub) — who
+    actor_client_id text,                        -- the acting agent (act) — on behalf of
+    actor_spiffe_id text,
+    token_family    text,                        -- m2m | xaa | ciba — which token
+    token_jti       text,
+    http_status     int,
+    latency_ms      bigint,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_action_audit_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX idx_connector_action_audit_ws ON public.connector_action_audit(workspace_id);
+CREATE INDEX idx_connector_action_audit_connector ON public.connector_action_audit(connector_id, created_at DESC);
+
+-- connector_provider_apps — per-workspace OAuth application credentials for a
+-- provider (AuthSec's registered app AT the provider, e.g. a workspace's own
+-- GitHub OAuth app). client_id + redirect_uri are non-secret and live here; the
+-- client_secret lives in Vault at vault_path. Resolution order in the connect
+-- flow: this row for (workspace, provider) first, else the global env vars
+-- (CONNECTOR_OAUTH_<P>_CLIENT_ID/_SECRET/_REDIRECT_URI). Lets each workspace
+-- bring its own OAuth app instead of a single deployment-wide one.
+CREATE TABLE public.connector_provider_apps (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    provider_key  text NOT NULL,
+    client_id     text NOT NULL,
+    redirect_uri  text NOT NULL,
+    vault_path    text NOT NULL,               -- Vault location of client_secret
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_provider_apps_pkey PRIMARY KEY (id),
+    CONSTRAINT connector_provider_apps_ws_provider_key UNIQUE (workspace_id, provider_key)
+);
+
 -- Seed the curated OAuth provider catalog. All connect via OAuth 2.0. Slack and
 -- GitHub carry the first typed actions (vertical slice); the rest are catalog
 -- rows their adapters/actions clone the pattern onto.
