@@ -50,7 +50,18 @@
       "Bash(gofmt -w controllers/platform/connector_controller.go services/connector_service.go routes/routes.go)",
       "Bash(gofmt -w services/connector_oauth_service.go controllers/platform/connector_controller.go models/connector.go repository/connector_repository.go routes/routes.go)",
       "Bash(rm -f /tmp/rtcheck.go /tmp/rtcheck_main.go)",
-      "Bash(gofmt -l controllers/platform/connector_controller.go controllers/platform/connector_broker_controller.go services/connector_service.go services/connector_oauth_service.go repository/connector_repository.go models/connector.go routes/routes.go migrations/master/001_bootstrap.sql)"
+      "Bash(gofmt -l controllers/platform/connector_controller.go controllers/platform/connector_broker_controller.go services/connector_service.go services/connector_oauth_service.go repository/connector_repository.go models/connector.go routes/routes.go migrations/master/001_bootstrap.sql)",
+      "Bash(gofmt -w repository/connector_repository.go services/connector_service.go)",
+      "Bash(gofmt -w controllers/platform/oauth_as_controller.go controllers/platform/connector_broker_controller.go)",
+      "Bash(gofmt -w controllers/admin/agent_controller.go routes/routes.go)",
+      "Bash(gofmt -l controllers/admin/agent_controller.go controllers/platform/oauth_as_controller.go controllers/platform/connector_broker_controller.go services/connector_service.go repository/connector_repository.go routes/routes.go)",
+      "Bash(grep -qxF 'main.exe' .gitignore)",
+      "Bash(echo 'main.exe')",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gofmt -w services/oauth_as_service.go)",
+      "Bash(gofmt -l services/oauth_as_service.go)"
     ]
   }
 }
