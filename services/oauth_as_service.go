@@ -1565,6 +1565,19 @@ func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string,
 		return "", "", fmt.Errorf("store agent secret: %w", err)
 	}
 
+	// Phase 6 groundwork: back the agent client with a service_account. Broker
+	// authorization binds connector:execute via role_bindings.service_account_id,
+	// so an XAA agent whose actor must hold broker scopes needs an SA to bind to.
+	// Best-effort — a failure here doesn't fail agent registration (the SA can be
+	// linked later); idempotent via the uq_sa_client index on oauth_client_id.
+	if err := s.db.Exec(`
+		INSERT INTO service_accounts (id, workspace_id, name, description, status, oauth_client_id, created_at, updated_at)
+		VALUES (gen_random_uuid(), ?, ?, 'Service account backing agent client', 'active', ?, now(), now())
+		ON CONFLICT (oauth_client_id) WHERE oauth_client_id IS NOT NULL DO NOTHING`,
+		workspaceID, name, mcpClient.ID).Error; err != nil {
+		log.Printf("[RegisterAgentClient] failed to create backing service account for client %s: %v", clientIDStr, err)
+	}
+
 	return clientIDStr, secret, nil
 }
 
