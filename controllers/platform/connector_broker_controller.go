@@ -299,6 +299,11 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 	}
 
 	ctl.auditAction(c, authCtx, connID.String(), actionKey, "allow", "")
+
+	// Best-effort: mark the acting service account as recently seen (Agent 360).
+	if authCtx.Principal.SubjectType == tokens.SubjectTypeServiceAccount && authCtx.Principal.SubjectID != uuid.Nil {
+		ctl.db.Exec(`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, authCtx.Principal.SubjectID)
+	}
 	return result, http.StatusOK, ""
 }
 

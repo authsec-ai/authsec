@@ -268,15 +268,25 @@ func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, c
 	} else {
 		actionKey = nil // normalize "" → all-actions
 	}
-	a := &models.ConnectorAssignment{
-		WorkspaceID: workspaceID,
-		ConnectorID: connectorID,
-		ClientID:    clientID,
-		ActionKey:   actionKey,
-		CreatedBy:   createdBy,
+	// One-transaction grant: assignment + broker-RS registration (approved) +
+	// connector-executor role binding, all-or-nothing. Enabling an agent is now a
+	// single API call instead of 4 authorizations across 4 tables.
+	brokerRSID, permID, err := m.brokerGrantContext(workspaceID)
+	if err != nil {
+		return nil, err
 	}
-	if err := m.repo.CreateAssignment(a); err != nil {
-		return nil, fmt.Errorf("create assignment: %w", err)
+	a, err := m.repo.GrantAssignmentTx(repositories.GrantAssignmentInput{
+		WorkspaceID:     workspaceID,
+		ConnectorID:     connectorID,
+		ClientID:        clientID,
+		ActionKey:       actionKey,
+		CreatedBy:       createdBy,
+		BrokerRSID:      brokerRSID,
+		ExecutePermID:   permID,
+		ExecuteRoleName: "connector-executor",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("grant assignment: %w", err)
 	}
 	return a, nil
 }
@@ -289,9 +299,22 @@ func (m *connectorManager) ListAssignments(workspaceID, connectorID uuid.UUID) (
 	return m.repo.ListAssignments(connectorID)
 }
 
-// RevokeAssignment removes an assignment (workspace-scoped delete).
+// brokerGrantContext resolves the workspace broker RS id + the global
+// connector:execute permission id used when wiring a grant.
+func (m *connectorManager) brokerGrantContext(workspaceID uuid.UUID) (uuid.UUID, uuid.UUID, error) {
+	return m.repo.BrokerGrantContext(workspaceID, BrokerResourceURI(workspaceID))
+}
+
+// RevokeAssignment removes an assignment and, if it was the client's last one in
+// the workspace, tears down the broker registration + executor role binding — the
+// inverse of the one-transaction grant.
 func (m *connectorManager) RevokeAssignment(workspaceID, assignmentID uuid.UUID) error {
-	return m.repo.DeleteAssignment(workspaceID, assignmentID)
+	brokerRSID, _, err := m.brokerGrantContext(workspaceID)
+	if err != nil {
+		// Broker RS gone — fall back to a plain delete so revoke still works.
+		return m.repo.DeleteAssignment(workspaceID, assignmentID)
+	}
+	return m.repo.RevokeAssignmentTx(workspaceID, assignmentID, brokerRSID)
 }
 
 // AuditLog returns recent action-audit records for a connector, after checking

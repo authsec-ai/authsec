@@ -1,6 +1,8 @@
 package repositories
 
 import (
+	"fmt"
+
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -38,6 +40,32 @@ type ConnectorRepository interface {
 
 	GetProviderApp(workspaceID uuid.UUID, providerKey string) (*models.ConnectorProviderApp, error)
 	UpsertProviderApp(app *models.ConnectorProviderApp) error
+
+	// GrantAssignmentTx creates, in ONE transaction: the connector assignment,
+	// the broker-RS client registration (approved), and the connector-executor
+	// role binding for the client's service account. Idempotent per piece.
+	GrantAssignmentTx(in GrantAssignmentInput) (*models.ConnectorAssignment, error)
+	// RevokeAssignmentTx deletes an assignment and, if it was the client's LAST
+	// assignment in the workspace, tears down the registration + role binding.
+	RevokeAssignmentTx(workspaceID, assignmentID uuid.UUID, brokerRSID uuid.UUID) error
+
+	// BrokerGrantContext returns the workspace's broker RS id and the global
+	// connector:execute permission id needed to wire a grant.
+	BrokerGrantContext(workspaceID uuid.UUID, brokerResourceURI string) (brokerRSID, executePermID uuid.UUID, err error)
+}
+
+// GrantAssignmentInput carries everything the one-transaction grant needs. The
+// service resolves brokerRSID (EnsureBrokerResourceServer) and the executor
+// permission id before calling.
+type GrantAssignmentInput struct {
+	WorkspaceID     uuid.UUID
+	ConnectorID     uuid.UUID
+	ClientID        string  // OAuth client_id string of the agent
+	ActionKey       *string // nil => all actions
+	CreatedBy       string
+	BrokerRSID      uuid.UUID
+	ExecutePermID   uuid.UUID // the connector:execute permission to bind
+	ExecuteRoleName string    // e.g. "connector-executor"
 }
 
 type connectorRepository struct{ db *gorm.DB }
@@ -192,4 +220,141 @@ func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp
 			"updated_at":   gorm.Expr("now()"),
 		}).
 		FirstOrCreate(app).Error
+}
+
+// resolveClientPrincipals maps an OAuth client_id string to the mcp_oauth_clients
+// row id (for RS registration) and the owning service_account id (for the role
+// binding — role_bindings.check_principal requires a service_account_id).
+func resolveClientPrincipals(tx *gorm.DB, clientID string) (oauthClientID, serviceAccountID uuid.UUID, err error) {
+	var mc struct{ ID uuid.UUID }
+	if e := tx.Table("mcp_oauth_clients").Select("id").Where("client_id = ?", clientID).First(&mc).Error; e != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("no OAuth client for client_id %q: %w", clientID, e)
+	}
+	var sa struct{ ID uuid.UUID }
+	if e := tx.Table("service_accounts").Select("id").Where("oauth_client_id = ?", mc.ID).First(&sa).Error; e != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("no service account owns client %q: %w", clientID, e)
+	}
+	return mc.ID, sa.ID, nil
+}
+
+func (r *connectorRepository) BrokerGrantContext(workspaceID uuid.UUID, brokerResourceURI string) (uuid.UUID, uuid.UUID, error) {
+	var rs struct{ ID uuid.UUID }
+	if err := r.db.Table("resource_servers").Select("id").
+		Where("workspace_id = ? AND resource_uri = ?", workspaceID, brokerResourceURI).First(&rs).Error; err != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("broker resource server not found (create a connector first): %w", err)
+	}
+	var perm struct{ ID uuid.UUID }
+	if err := r.db.Table("permissions").Select("id").
+		Where("resource = 'connector' AND action = 'execute' AND workspace_id IS NULL").First(&perm).Error; err != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("connector:execute permission not found: %w", err)
+	}
+	return rs.ID, perm.ID, nil
+}
+
+func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*models.ConnectorAssignment, error) {
+	assignment := &models.ConnectorAssignment{
+		WorkspaceID: in.WorkspaceID,
+		ConnectorID: in.ConnectorID,
+		ClientID:    in.ClientID,
+		ActionKey:   in.ActionKey,
+		CreatedBy:   in.CreatedBy,
+	}
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		// 1. The assignment row (connector → agent allowlist).
+		if err := tx.Create(assignment).Error; err != nil {
+			return fmt.Errorf("create assignment: %w", err)
+		}
+
+		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, in.ClientID)
+		if err != nil {
+			return err
+		}
+
+		// 2. Broker-RS registration (approved) — the gateway gate. Idempotent on
+		//    (resource_server_id, oauth_client_id).
+		if err := tx.Exec(`
+			INSERT INTO resource_server_client_registrations
+			  (id, resource_server_id, oauth_client_id, status, registration_type, workspace_id, created_at, updated_at)
+			VALUES (gen_random_uuid(), ?, ?, 'approved', 'prereg', ?, now(), now())
+			ON CONFLICT (resource_server_id, oauth_client_id) DO UPDATE SET status='approved', updated_at=now()`,
+			in.BrokerRSID, oauthClientID, in.WorkspaceID).Error; err != nil {
+			return fmt.Errorf("broker registration: %w", err)
+		}
+
+		// 3. connector-executor role (get-or-create), linked to the execute perm.
+		var roleID uuid.UUID
+		if err := tx.Raw(`
+			INSERT INTO roles (id, name, description, workspace_id, is_system, created_at, updated_at)
+			VALUES (gen_random_uuid(), ?, 'Can execute connector actions', ?, false, now(), now())
+			ON CONFLICT (workspace_id, name) DO UPDATE SET updated_at=now()
+			RETURNING id`, in.ExecuteRoleName, in.WorkspaceID).Scan(&roleID).Error; err != nil {
+			return fmt.Errorf("executor role: %w", err)
+		}
+		if err := tx.Exec(`
+			INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?)
+			ON CONFLICT DO NOTHING`, roleID, in.ExecutePermID).Error; err != nil {
+			return fmt.Errorf("link execute perm: %w", err)
+		}
+
+		// 4. Role binding on the service account, scoped to the broker RS.
+		//    Idempotent: skip if an equivalent binding already exists.
+		if err := tx.Exec(`
+			INSERT INTO role_bindings
+			  (id, service_account_id, role_id, scope_type, scope_id, workspace_id, assignment_source, created_at, updated_at)
+			SELECT gen_random_uuid(), ?, ?, 'resource_server', ?, ?, 'connector', now(), now()
+			WHERE NOT EXISTS (
+			  SELECT 1 FROM role_bindings
+			  WHERE service_account_id=? AND role_id=? AND scope_type='resource_server' AND scope_id=?
+			)`,
+			serviceAccountID, roleID, in.BrokerRSID, in.WorkspaceID,
+			serviceAccountID, roleID, in.BrokerRSID).Error; err != nil {
+			return fmt.Errorf("role binding: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return assignment, nil
+}
+
+func (r *connectorRepository) RevokeAssignmentTx(workspaceID, assignmentID, brokerRSID uuid.UUID) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// Find the assignment (to learn the client_id) before deleting.
+		var a models.ConnectorAssignment
+		if err := tx.First(&a, "id = ? AND workspace_id = ?", assignmentID, workspaceID).Error; err != nil {
+			return nil // already gone — nothing to tear down
+		}
+		if err := tx.Delete(&models.ConnectorAssignment{}, "id = ? AND workspace_id = ?", assignmentID, workspaceID).Error; err != nil {
+			return fmt.Errorf("delete assignment: %w", err)
+		}
+
+		// If the client still has ANY assignment in this workspace, keep its
+		// registration + binding. Only tear down on the last one.
+		var remaining int64
+		if err := tx.Model(&models.ConnectorAssignment{}).
+			Where("workspace_id = ? AND client_id = ?", workspaceID, a.ClientID).
+			Count(&remaining).Error; err != nil {
+			return fmt.Errorf("count remaining: %w", err)
+		}
+		if remaining > 0 {
+			return nil
+		}
+
+		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, a.ClientID)
+		if err != nil {
+			return nil // client/SA already gone; assignment delete stands
+		}
+		// Tear down the broker-RS registration + the executor role binding.
+		if err := tx.Exec(`DELETE FROM resource_server_client_registrations
+			WHERE resource_server_id = ? AND oauth_client_id = ?`, brokerRSID, oauthClientID).Error; err != nil {
+			return fmt.Errorf("delete registration: %w", err)
+		}
+		if err := tx.Exec(`DELETE FROM role_bindings
+			WHERE service_account_id = ? AND scope_type='resource_server' AND scope_id = ?`,
+			serviceAccountID, brokerRSID).Error; err != nil {
+			return fmt.Errorf("delete role binding: %w", err)
+		}
+		return nil
+	})
 }

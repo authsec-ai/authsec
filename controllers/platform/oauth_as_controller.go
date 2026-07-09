@@ -1018,6 +1018,11 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		)
 	}
 
+	// Best-effort: record activity on the service account so Agent 360 can show
+	// "last seen" instead of NULL forever.
+	config.DB.WithContext(ctx).Exec(
+		`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, sa.ID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": tokenStr,
 		"token_type":   "Bearer",

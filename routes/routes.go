@@ -716,6 +716,7 @@ func SetupRoutes(
 			// AI Agent Management
 			adminRBAC.GET("/agents", agentController.ListAgents)
 			adminRBAC.GET("/agents/:id", agentController.GetAgent)
+			adminRBAC.GET("/agents/:id/activity", agentController.GetAgentActivity)
 			adminRBAC.POST("/agents/:id/provision-identity", agentController.ProvisionIdentity)
 			adminRBAC.DELETE("/agents/:id/revoke-identity", agentController.RevokeIdentity)
 			adminRBAC.POST("/agents/:id/delegate-token", agentController.DelegateToken)
