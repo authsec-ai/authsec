@@ -1338,6 +1338,8 @@ func SetupRoutes(
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
 			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
+			connectors.POST("/providers/github/app-github", middlewares.Require("connector", "update"), connectorController.SetGitHubApp)
+			connectors.POST("/:id/connections/github-app", middlewares.Require("connector", "update"), connectorController.ConnectGitHubApp)
 			connectors.POST("", middlewares.Require("connector", "create"), connectorController.CreateConnector)
 			connectors.GET("", middlewares.Require("connector", "read"), connectorController.ListConnectors)
 			connectors.GET("/:id", middlewares.Require("connector", "read"), connectorController.GetConnector)

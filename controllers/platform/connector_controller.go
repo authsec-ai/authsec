@@ -372,14 +372,15 @@ func (ctl *ConnectorController) GrantAssignment(c *gin.Context) {
 		return
 	}
 	var req struct {
-		ClientID  string  `json:"client_id" binding:"required"`
-		ActionKey *string `json:"action_key,omitempty"`
+		ClientID         string          `json:"client_id" binding:"required"`
+		ActionKey        *string         `json:"action_key,omitempty"`
+		InputConstraints json.RawMessage `json:"input_constraints,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	out, err := ctl.manager(nil).GrantAssignment(wsID, id, req.ClientID, req.ActionKey, principal)
+	out, err := ctl.manager(nil).GrantAssignment(wsID, id, req.ClientID, req.ActionKey, req.InputConstraints, principal)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -486,6 +487,73 @@ func (ctl *ConnectorController) SetProviderApp(c *gin.Context) {
 	}
 	auditAdminMutation(c, wsID.String(), "set_provider_app", "connector_provider", providerKey, http.StatusOK, nil, gin.H{"client_id": req.ClientID})
 	c.JSON(http.StatusOK, gin.H{"status": "configured", "provider": providerKey})
+}
+
+// SetGitHubApp handles POST /authsec/connectors/providers/github/app-github —
+// configure this workspace's GitHub App (App id + private key PEM). Distinct
+// from the OAuth-app path: a GitHub App is an org bot identity, not a human
+// OAuth login (F1). Private key → Vault; only the App id is stored in PG.
+func (ctl *ConnectorController) SetGitHubApp(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		AppID      string `json:"app_id" binding:"required"`
+		PrivateKey string `json:"private_key" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	if err := svc.SetGitHubApp(wsID, req.AppID, req.PrivateKey, principal); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "set_github_app", "connector_provider", "github", http.StatusOK, nil, gin.H{"app_id": req.AppID})
+	c.JSON(http.StatusOK, gin.H{"status": "configured", "provider": "github", "app_kind": "github_app"})
+}
+
+// ConnectGitHubApp handles POST /authsec/connectors/:id/connections/github-app —
+// bind a connector to a GitHub App installation (org-scoped bot). No OAuth dance.
+func (ctl *ConnectorController) ConnectGitHubApp(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	var req struct {
+		InstallationID string `json:"installation_id" binding:"required"`
+		OrgName        string `json:"org_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	if err := svc.ConnectGitHubApp(wsID, id, req.InstallationID, req.OrgName, principal); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "connect_github_app", "connector", id.String(), http.StatusOK, nil, gin.H{"installation_id": req.InstallationID})
+	c.JSON(http.StatusOK, gin.H{"status": "connected", "connector_id": id, "installation_id": req.InstallationID})
 }
 
 // GetConnectorConfig handles GET /authsec/connectors/:id/config.

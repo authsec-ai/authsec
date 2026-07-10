@@ -117,8 +117,15 @@ type ConnectorAssignment struct {
 	ConnectorID uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
 	ClientID    string    `json:"client_id" gorm:"not null;index"`
 	ActionKey   *string   `json:"action_key,omitempty"` // nil => all actions
-	CreatedBy   string    `json:"created_by,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	// InputConstraints (F3): an optional per-assignment predicate over action
+	// inputs — a JSON object mapping input field → rule, e.g.
+	//   {"owner":{"equals":"acme-eng"},"repo":{"glob":"release-*"}}
+	// Enforced in the broker chain AFTER input-schema validation and BEFORE the
+	// provider call. Empty/absent = no input restriction. Bounds WHERE an action
+	// runs, complementing the assignment (which bounds WHICH action).
+	InputConstraints json.RawMessage `json:"input_constraints,omitempty" gorm:"type:jsonb"`
+	CreatedBy        string          `json:"created_by,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
 }
 
 func (ConnectorAssignment) TableName() string { return "connector_assignments" }
@@ -205,8 +212,13 @@ type ConnectorProviderApp struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null"`
 	ProviderKey string    `json:"provider_key" gorm:"not null"`
-	ClientID    string    `json:"client_id" gorm:"not null"`
-	RedirectURI string    `json:"redirect_uri" gorm:"not null"`
+	// AppKind: 'oauth2' (code-exchange, ClientID+RedirectURI, secret in Vault) or
+	// 'github_app' (JWT-signed installation tokens, GitHubAppID + private-key PEM
+	// in Vault, no redirect).
+	AppKind     string    `json:"app_kind" gorm:"not null;default:'oauth2'"`
+	ClientID    string    `json:"client_id" gorm:"not null;default:''"`
+	RedirectURI string    `json:"redirect_uri" gorm:"not null;default:''"`
+	GitHubAppID string    `json:"github_app_id" gorm:"not null;default:''"`
 	VaultPath   string    `json:"-" gorm:"not null"` // secret location; NEVER serialized
 	CreatedBy   string    `json:"created_by,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -214,3 +226,11 @@ type ConnectorProviderApp struct {
 }
 
 func (ConnectorProviderApp) TableName() string { return "connector_provider_apps" }
+
+// Provider-app kinds + the github_app connection auth method.
+const (
+	ProviderAppKindOAuth2    = "oauth2"
+	ProviderAppKindGitHubApp = "github_app"
+
+	ConnectionAuthGitHubApp = "github_app"
+)

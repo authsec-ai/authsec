@@ -255,9 +255,10 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 	if !conn.Enabled || !conn.AgentAccessible {
 		return deny(http.StatusNotFound, "connector disabled or not agent-accessible", "not found")
 	}
-	// Gate 2 — assignment allowlist.
-	allowed, aerr := ctl.repo().AssignmentAllows(conn.ID, authCtx.ClientID, actionKey)
-	if aerr != nil || !allowed {
+	// Gate 2 — assignment allowlist (returns the authorizing row so its
+	// input_constraints can be enforced below).
+	assignment, aerr := ctl.repo().MatchingAssignment(conn.ID, authCtx.ClientID, actionKey)
+	if aerr != nil || assignment == nil {
 		return deny(http.StatusForbidden, "no assignment for client/connector/action", "forbidden")
 	}
 	// Resolve typed action + adapter.
@@ -268,6 +269,12 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 	adapter, ok := connectoradapters.Get(action.AdapterKey)
 	if !ok {
 		return deny(http.StatusNotFound, "no adapter for action", "not found")
+	}
+	// Gate 3 — input constraints (F3): the input schema was validated when it was
+	// parsed; now enforce the per-assignment predicate bounding WHERE this action
+	// may run (e.g. repo glob). A violation is a policy deny, not a bad request.
+	if ok, why := evalInputConstraints(assignment.InputConstraints, input); !ok {
+		return deny(http.StatusForbidden, "input constraint: "+why, "forbidden")
 	}
 
 	// Delegated (XAA) → user subject; M2M → workspace connection.
@@ -294,9 +301,22 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 		}
 	}
 
-	cred := connectoradapters.Credential{
-		AccessToken: firstSecretString(resolved.Secret, "access_token", "apiKey", "token"),
-		TokenType:   firstSecretString(resolved.Secret, "token_type"),
+	// Build the credential to inject. For github_app connections there is no
+	// static token in Vault — mint a fresh installation token (F1: org bot
+	// identity, no human attached) from the workspace's GitHub App.
+	var cred connectoradapters.Credential
+	if resolved.Connection != nil && resolved.Connection.AuthMethod == models.ConnectionAuthGitHubApp {
+		oauthSvc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+		instTok, mErr := oauthSvc.MintGitHubAppToken(c.Request.Context(), authCtx.Principal.WorkspaceID, conn.ProviderKey, resolved.Connection)
+		if mErr != nil {
+			return deny(http.StatusFailedDependency, "github app token: "+mErr.Error(), "connection unavailable")
+		}
+		cred = connectoradapters.Credential{AccessToken: instTok, TokenType: "Bearer"}
+	} else {
+		cred = connectoradapters.Credential{
+			AccessToken: firstSecretString(resolved.Secret, "access_token", "apiKey", "token"),
+			TokenType:   firstSecretString(resolved.Secret, "token_type"),
+		}
 	}
 	result, err := adapter.Execute(c.Request.Context(), cred, connectoradapters.Request{ActionKey: actionKey, Input: input})
 	if err != nil {
@@ -625,6 +645,88 @@ func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *servi
 	if err := ctl.repo().RecordActionAudit(rec); err != nil {
 		log.Printf("BROKER: failed to write action audit: %v", err)
 	}
+}
+
+// evalInputConstraints enforces a per-assignment F3 predicate against an
+// action's input. The constraints JSON maps input field → rule, and ALL listed
+// fields must satisfy their rule (AND). Supported per-field rules:
+//
+//	{"equals": "acme-eng"}          field must equal exactly
+//	{"one_of": ["a","b"]}           field must be one of the values
+//	{"glob":  "release-*"}          field must match the glob (* wildcard)
+//
+// Empty/absent constraints = allow. A listed field missing from the input, or a
+// non-string input value where a rule expects one, is a violation (fail closed).
+// Returns (ok, reason-when-not-ok).
+func evalInputConstraints(raw json.RawMessage, input map[string]interface{}) (bool, string) {
+	if len(raw) == 0 || string(raw) == "{}" || string(raw) == "null" {
+		return true, ""
+	}
+	var rules map[string]struct {
+		Equals *string  `json:"equals"`
+		OneOf  []string `json:"one_of"`
+		Glob   *string  `json:"glob"`
+	}
+	if err := json.Unmarshal(raw, &rules); err != nil {
+		// Malformed constraints → fail closed (never silently allow).
+		return false, "malformed input_constraints"
+	}
+	for field, rule := range rules {
+		v, present := input[field]
+		s, isStr := v.(string)
+		if !present || !isStr {
+			return false, "field " + field + " missing or not a string"
+		}
+		switch {
+		case rule.Equals != nil:
+			if s != *rule.Equals {
+				return false, field + " must equal " + *rule.Equals
+			}
+		case rule.OneOf != nil:
+			matched := false
+			for _, allowed := range rule.OneOf {
+				if s == allowed {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false, field + " not in allowed set"
+			}
+		case rule.Glob != nil:
+			if !globMatch(*rule.Glob, s) {
+				return false, field + " does not match " + *rule.Glob
+			}
+		default:
+			return false, "no rule for field " + field
+		}
+	}
+	return true, ""
+}
+
+// globMatch does simple glob matching where '*' matches any run of characters
+// (including empty). No other metacharacters — small, predictable, injection-safe.
+func globMatch(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return s == pattern // no wildcard → exact
+	}
+	// Must start with the first part and end with the last part.
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	if !strings.HasSuffix(s, parts[len(parts)-1]) {
+		return false
+	}
+	pos := len(parts[0])
+	for _, mid := range parts[1 : len(parts)-1] {
+		idx := strings.Index(s[pos:], mid)
+		if idx < 0 {
+			return false
+		}
+		pos += idx + len(mid)
+	}
+	return pos <= len(s)
 }
 
 func bearerToken(c *gin.Context) string {

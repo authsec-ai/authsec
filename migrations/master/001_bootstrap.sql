@@ -3135,7 +3135,7 @@ CREATE TABLE public.connector_connections (
     CONSTRAINT connector_connections_status_chk CHECK (
         status IN ('active', 'expired', 'error', 'revoked', 'disconnected')),
     CONSTRAINT connector_connections_auth_chk CHECK (
-        auth_method IN ('api_key', 'oauth2'))
+        auth_method IN ('api_key', 'oauth2', 'github_app'))
 );
 
 -- NULL-safe uniqueness: exactly one workspace connection per connector, and one
@@ -3158,6 +3158,11 @@ CREATE TABLE public.connector_assignments (
     connector_id uuid NOT NULL,
     client_id    text NOT NULL,        -- OAuth client / agent permitted
     action_key   text,                 -- NULL => all actions on this connector
+    -- input_constraints (F3): optional per-assignment predicate over action
+    -- inputs, e.g. {"owner":{"equals":"acme-eng"},"repo":{"glob":"release-*"}}.
+    -- Enforced after input-schema validation, before the provider call. NULL/
+    -- empty = no input restriction. Bounds WHERE an action runs.
+    input_constraints jsonb,
     created_by   text,
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_assignments_pkey PRIMARY KEY (id),
@@ -3265,9 +3270,14 @@ CREATE TABLE public.connector_provider_apps (
     id            uuid NOT NULL DEFAULT gen_random_uuid(),
     workspace_id  uuid NOT NULL,
     provider_key  text NOT NULL,
-    client_id     text NOT NULL,
-    redirect_uri  text NOT NULL,
-    vault_path    text NOT NULL,               -- Vault location of client_secret
+    -- app_kind distinguishes an OAuth app (code-exchange, has redirect_uri +
+    -- client secret) from a GitHub-App-style bot install (JWT-signed
+    -- installation tokens, has github_app_id + private key, no redirect).
+    app_kind      text NOT NULL DEFAULT 'oauth2',   -- 'oauth2' | 'github_app'
+    client_id     text NOT NULL DEFAULT '',         -- OAuth client_id (oauth2)
+    redirect_uri  text NOT NULL DEFAULT '',         -- OAuth redirect (oauth2)
+    github_app_id text NOT NULL DEFAULT '',         -- numeric App ID (github_app)
+    vault_path    text NOT NULL,                    -- Vault: client_secret (oauth2) OR private key PEM (github_app)
     created_by    text,
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now(),

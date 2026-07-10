@@ -32,7 +32,7 @@ type ConnectorManager interface {
 	ResolveActionCredential(connectorID uuid.UUID, subjectUserID string) (*ResolvedCredential, error)
 
 	// Assignment management (grant an agent access to a connector + action).
-	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error)
+	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, inputConstraints json.RawMessage, createdBy string) (*models.ConnectorAssignment, error)
 	ListAssignments(workspaceID, connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
 	RevokeAssignment(workspaceID, assignmentID uuid.UUID) error
 
@@ -254,7 +254,7 @@ func (m *connectorManager) Connections(connectorID uuid.UUID) ([]models.Connecto
 // scoped to one action (nil actionKey => all actions). Validates the connector
 // belongs to the workspace and, when an action is named, that it exists for the
 // provider.
-func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error) {
+func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, inputConstraints json.RawMessage, createdBy string) (*models.ConnectorAssignment, error) {
 	if clientID == "" {
 		return nil, errors.New("client_id is required")
 	}
@@ -269,6 +269,14 @@ func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, c
 	} else {
 		actionKey = nil // normalize "" → all-actions
 	}
+	// Validate the F3 predicate is well-formed JSON up front (fail at grant time,
+	// not at every action) — empty is fine (no restriction).
+	if len(inputConstraints) > 0 {
+		var probe map[string]interface{}
+		if err := json.Unmarshal(inputConstraints, &probe); err != nil {
+			return nil, fmt.Errorf("input_constraints must be a JSON object: %w", err)
+		}
+	}
 	// One-transaction grant: assignment + broker-RS registration (approved) +
 	// connector-executor role binding, all-or-nothing. Enabling an agent is now a
 	// single API call instead of 4 authorizations across 4 tables.
@@ -277,14 +285,15 @@ func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, c
 		return nil, err
 	}
 	a, err := m.repo.GrantAssignmentTx(repositories.GrantAssignmentInput{
-		WorkspaceID:     workspaceID,
-		ConnectorID:     connectorID,
-		ClientID:        clientID,
-		ActionKey:       actionKey,
-		CreatedBy:       createdBy,
-		BrokerRSID:      brokerRSID,
-		ExecutePermID:   permID,
-		ExecuteRoleName: "connector-executor",
+		WorkspaceID:      workspaceID,
+		ConnectorID:      connectorID,
+		ClientID:         clientID,
+		ActionKey:        actionKey,
+		InputConstraints: inputConstraints,
+		CreatedBy:        createdBy,
+		BrokerRSID:       brokerRSID,
+		ExecutePermID:    permID,
+		ExecuteRoleName:  "connector-executor",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("grant assignment: %w", err)

@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/authsec-ai/authsec/models"
@@ -31,6 +32,9 @@ type ConnectorRepository interface {
 	// AssignmentAllows reports whether client_id may invoke action on connector:
 	// an all-actions row (action_key IS NULL) OR a row matching the action.
 	AssignmentAllows(connectorID uuid.UUID, clientID, actionKey string) (bool, error)
+	// MatchingAssignment returns the assignment authorizing (client, connector,
+	// action) — action-specific preferred over all-actions — or nil.
+	MatchingAssignment(connectorID uuid.UUID, clientID, actionKey string) (*models.ConnectorAssignment, error)
 
 	ListActions(providerKey string) ([]models.ConnectorAction, error)
 	GetAction(providerKey, actionKey string) (*models.ConnectorAction, error)
@@ -58,14 +62,15 @@ type ConnectorRepository interface {
 // service resolves brokerRSID (EnsureBrokerResourceServer) and the executor
 // permission id before calling.
 type GrantAssignmentInput struct {
-	WorkspaceID     uuid.UUID
-	ConnectorID     uuid.UUID
-	ClientID        string  // OAuth client_id string of the agent
-	ActionKey       *string // nil => all actions
-	CreatedBy       string
-	BrokerRSID      uuid.UUID
-	ExecutePermID   uuid.UUID // the connector:execute permission to bind
-	ExecuteRoleName string    // e.g. "connector-executor"
+	WorkspaceID      uuid.UUID
+	ConnectorID      uuid.UUID
+	ClientID         string          // OAuth client_id string of the agent
+	ActionKey        *string         // nil => all actions
+	InputConstraints json.RawMessage // F3: optional per-assignment input predicate
+	CreatedBy        string
+	BrokerRSID       uuid.UUID
+	ExecutePermID    uuid.UUID // the connector:execute permission to bind
+	ExecuteRoleName  string    // e.g. "connector-executor"
 }
 
 type connectorRepository struct{ db *gorm.DB }
@@ -172,6 +177,27 @@ func (r *connectorRepository) AssignmentAllows(connectorID uuid.UUID, clientID, 
 	return count > 0, nil
 }
 
+// MatchingAssignment returns the assignment that authorizes (client, connector,
+// action), or nil if none. An action-specific row (action_key = actionKey) wins
+// over an all-actions row (action_key IS NULL) so its input_constraints apply.
+func (r *connectorRepository) MatchingAssignment(connectorID uuid.UUID, clientID, actionKey string) (*models.ConnectorAssignment, error) {
+	var as []models.ConnectorAssignment
+	if err := r.db.Where("connector_id = ? AND client_id = ? AND (action_key IS NULL OR action_key = ?)",
+		connectorID, clientID, actionKey).Find(&as).Error; err != nil {
+		return nil, err
+	}
+	if len(as) == 0 {
+		return nil, nil
+	}
+	best := &as[0]
+	for i := range as {
+		if as[i].ActionKey != nil && *as[i].ActionKey == actionKey {
+			return &as[i], nil // exact-action match takes precedence
+		}
+	}
+	return best, nil
+}
+
 func (r *connectorRepository) ListActions(providerKey string) ([]models.ConnectorAction, error) {
 	var actions []models.ConnectorAction
 	err := r.db.Where("provider_key = ?", providerKey).Order("action_key").Find(&actions).Error
@@ -211,13 +237,16 @@ func (r *connectorRepository) GetProviderApp(workspaceID uuid.UUID, providerKey 
 }
 
 func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp) error {
-	// Upsert on (workspace_id, provider_key): update client_id/redirect/vault_path.
+	// Upsert on (workspace_id, provider_key): update all mutable fields, incl. the
+	// app kind + GitHub-App id so an oauth2↔github_app reconfigure takes effect.
 	return r.db.Where("workspace_id = ? AND provider_key = ?", app.WorkspaceID, app.ProviderKey).
 		Assign(map[string]interface{}{
-			"client_id":    app.ClientID,
-			"redirect_uri": app.RedirectURI,
-			"vault_path":   app.VaultPath,
-			"updated_at":   gorm.Expr("now()"),
+			"app_kind":      app.AppKind,
+			"client_id":     app.ClientID,
+			"redirect_uri":  app.RedirectURI,
+			"github_app_id": app.GitHubAppID,
+			"vault_path":    app.VaultPath,
+			"updated_at":    gorm.Expr("now()"),
 		}).
 		FirstOrCreate(app).Error
 }
@@ -256,11 +285,12 @@ func (r *connectorRepository) BrokerGrantContext(workspaceID uuid.UUID, brokerRe
 
 func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*models.ConnectorAssignment, error) {
 	assignment := &models.ConnectorAssignment{
-		WorkspaceID: in.WorkspaceID,
-		ConnectorID: in.ConnectorID,
-		ClientID:    in.ClientID,
-		ActionKey:   in.ActionKey,
-		CreatedBy:   in.CreatedBy,
+		WorkspaceID:      in.WorkspaceID,
+		ConnectorID:      in.ConnectorID,
+		ClientID:         in.ClientID,
+		ActionKey:        in.ActionKey,
+		InputConstraints: in.InputConstraints,
+		CreatedBy:        in.CreatedBy,
 	}
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		// 1. The assignment row (connector → agent allowlist).

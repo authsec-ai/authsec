@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/connectoradapters"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -254,6 +256,43 @@ func (s *ConnectorOAuthService) exchangeCode(provider *models.ConnectorProvider,
 
 // --- helpers -----------------------------------------------------------------
 
+// MintGitHubAppToken mints a fresh GitHub-App installation access token for a
+// github_app connection: resolves the workspace's GitHub App (app id + private
+// key PEM in Vault) and the connection's installation id, then signs the App JWT
+// and exchanges it. The token is short-lived and never stored — it's minted per
+// need and injected by the broker. providerKey lets other App-style providers
+// reuse this later; today only 'github' uses it.
+func (s *ConnectorOAuthService) MintGitHubAppToken(ctx context.Context, workspaceID uuid.UUID, providerKey string, conn *models.ConnectorConnection) (string, error) {
+	app, err := s.repo.GetProviderApp(workspaceID, providerKey)
+	if err != nil || app == nil {
+		return "", fmt.Errorf("no GitHub App configured for provider %q in this workspace", providerKey)
+	}
+	if app.AppKind != models.ProviderAppKindGitHubApp || app.GitHubAppID == "" {
+		return "", fmt.Errorf("provider app for %q is not a GitHub App", providerKey)
+	}
+	if s.vault == nil {
+		return "", errors.New("vault client not configured")
+	}
+	secret, err := s.vault.ReadSecret(app.VaultPath)
+	if err != nil {
+		return "", fmt.Errorf("read app private key: %w", err)
+	}
+	privateKey, _ := secret["private_key"].(string)
+	if privateKey == "" {
+		return "", errors.New("GitHub App private key missing in vault")
+	}
+	// The installation id is stored on the connection's external-account id.
+	installationID := conn.ExternalAccountID
+	if installationID == "" {
+		return "", errors.New("connection has no GitHub App installation id")
+	}
+	return connectoradapters.MintGitHubInstallationToken(ctx, connectoradapters.GitHubAppCreds{
+		AppID:          app.GitHubAppID,
+		PrivateKeyPEM:  privateKey,
+		InstallationID: installationID,
+	})
+}
+
 // SetProviderApp configures a workspace's own OAuth app for a provider: stores
 // the client_secret in Vault and upserts the client_id/redirect_uri row. This is
 // how a workspace brings its own OAuth app instead of the deployment-wide env one.
@@ -276,11 +315,71 @@ func (s *ConnectorOAuthService) SetProviderApp(workspaceID uuid.UUID, providerKe
 	return s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
 		WorkspaceID: workspaceID,
 		ProviderKey: providerKey,
+		AppKind:     models.ProviderAppKindOAuth2,
 		ClientID:    clientID,
 		RedirectURI: redirectURI,
 		VaultPath:   vaultPath,
 		CreatedBy:   createdBy,
 	})
+}
+
+// SetGitHubApp configures a workspace's GitHub App for the github provider:
+// stores the App id (DB) + private-key PEM (Vault). Distinct from the OAuth-app
+// path — a GitHub App mints installation tokens, not OAuth code exchanges.
+func (s *ConnectorOAuthService) SetGitHubApp(workspaceID uuid.UUID, appID, privateKeyPEM, createdBy string) error {
+	if appID == "" || privateKeyPEM == "" {
+		return errors.New("app_id and private_key are required")
+	}
+	if s.vault == nil {
+		return errors.New("vault client not configured")
+	}
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/github", workspaceID.String())
+	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{"private_key": privateKeyPEM}); err != nil {
+		return fmt.Errorf("store app private key: %w", err)
+	}
+	return s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
+		WorkspaceID: workspaceID,
+		ProviderKey: "github",
+		AppKind:     models.ProviderAppKindGitHubApp,
+		GitHubAppID: appID,
+		VaultPath:   vaultPath,
+		CreatedBy:   createdBy,
+	})
+}
+
+// ConnectGitHubApp binds a connector to a GitHub App installation: creates (or
+// updates) the connector's workspace-scope github_app connection with the given
+// installation id. No OAuth dance — the installation id + the workspace App are
+// all that's needed; tokens are minted per action.
+func (s *ConnectorOAuthService) ConnectGitHubApp(workspaceID, connectorID uuid.UUID, installationID, orgName, createdBy string) error {
+	if installationID == "" {
+		return errors.New("installation_id is required")
+	}
+	if _, err := s.repo.GetProviderApp(workspaceID, "github"); err != nil {
+		return errors.New("configure the workspace GitHub App first")
+	}
+	// The github_app connection carries no Vault secret of its own (tokens are
+	// minted from the provider-app key); vault_path points at the app key path.
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/github", workspaceID.String())
+	existing, _ := s.repo.GetWorkspaceConnection(connectorID)
+	conn := &models.ConnectorConnection{
+		WorkspaceID:         workspaceID,
+		ConnectorID:         connectorID,
+		BindingType:         models.ConnectionBindingWorkspace,
+		Status:              models.ConnectionStatusActive,
+		AuthMethod:          models.ConnectionAuthGitHubApp,
+		VaultPath:           vaultPath,
+		ExternalAccountID:   installationID, // installation id lives here
+		ExternalOrgName:     orgName,
+		RefreshTokenPresent: false,
+		ConnectedBy:         createdBy,
+	}
+	if existing != nil {
+		conn.ID = existing.ID
+		conn.Version = existing.Version
+		return s.db.Save(conn).Error
+	}
+	return s.repo.CreateConnection(conn)
 }
 
 // resolveProviderApp returns the OAuth app credentials for (workspace, provider):
