@@ -52,13 +52,20 @@ type ProvisionedCredential struct {
 
 // CreateServiceAccount creates a disabled service account. It becomes usable
 // only once a credential is provisioned (status flips to active there).
-func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name, description string) (*models.ServiceAccount, error) {
+func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name, description, ownerEmail, ownerTeam string) (*models.ServiceAccount, error) {
+	if ownerEmail == "" {
+		return nil, fmt.Errorf("owner_email is required: every agent must have an accountable owner")
+	}
 	sa := models.ServiceAccount{
 		ID:          uuid.New(),
 		WorkspaceID: workspaceID,
 		Name:        name,
 		Description: description,
 		Status:      "disabled",
+		OwnerEmail:  &ownerEmail,
+	}
+	if ownerTeam != "" {
+		sa.OwnerTeam = &ownerTeam
 	}
 	if err := s.db.Session(&gorm.Session{NewDB: true}).Create(&sa).Error; err != nil {
 		return nil, fmt.Errorf("failed to create service account: %w", err)

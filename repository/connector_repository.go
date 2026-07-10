@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/authsec-ai/authsec/models"
@@ -24,6 +25,12 @@ type ConnectorRepository interface {
 	ListConnections(connectorID uuid.UUID) ([]models.ConnectorConnection, error)
 	GetWorkspaceConnection(connectorID uuid.UUID) (*models.ConnectorConnection, error)
 	GetUserConnection(connectorID uuid.UUID, subjectUserID string) (*models.ConnectorConnection, error)
+	// ListUserConnectionsBySubject returns all of a user's connections in a
+	// workspace (their own "connected accounts" view). R4.
+	ListUserConnectionsBySubject(workspaceID uuid.UUID, subjectUserID string) ([]models.ConnectorConnection, error)
+	// RevokeUserConnection marks a user's connection revoked (status + revoked_at)
+	// — the user disconnecting their own provider account. Returns rows affected.
+	RevokeUserConnection(workspaceID, connectorID uuid.UUID, subjectUserID string) (int64, error)
 
 	CreateAssignment(a *models.ConnectorAssignment) error
 	ListAssignments(connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
@@ -31,6 +38,12 @@ type ConnectorRepository interface {
 	// AssignmentAllows reports whether client_id may invoke action on connector:
 	// an all-actions row (action_key IS NULL) OR a row matching the action.
 	AssignmentAllows(connectorID uuid.UUID, clientID, actionKey string) (bool, error)
+	// MatchingAssignment returns the assignment authorizing (client, connector,
+	// action) — action-specific preferred over all-actions — or nil.
+	MatchingAssignment(connectorID uuid.UUID, clientID, actionKey string) (*models.ConnectorAssignment, error)
+	// SubjectInAnyGroup reports whether userID is a member of any of groupIDs in
+	// the workspace (F5 subject-group gate).
+	SubjectInAnyGroup(workspaceID uuid.UUID, userID string, groupIDs []string) (bool, error)
 
 	ListActions(providerKey string) ([]models.ConnectorAction, error)
 	GetAction(providerKey, actionKey string) (*models.ConnectorAction, error)
@@ -58,14 +71,15 @@ type ConnectorRepository interface {
 // service resolves brokerRSID (EnsureBrokerResourceServer) and the executor
 // permission id before calling.
 type GrantAssignmentInput struct {
-	WorkspaceID     uuid.UUID
-	ConnectorID     uuid.UUID
-	ClientID        string  // OAuth client_id string of the agent
-	ActionKey       *string // nil => all actions
-	CreatedBy       string
-	BrokerRSID      uuid.UUID
-	ExecutePermID   uuid.UUID // the connector:execute permission to bind
-	ExecuteRoleName string    // e.g. "connector-executor"
+	WorkspaceID      uuid.UUID
+	ConnectorID      uuid.UUID
+	ClientID         string          // OAuth client_id string of the agent
+	ActionKey        *string         // nil => all actions
+	InputConstraints json.RawMessage // F3: optional per-assignment input predicate
+	CreatedBy        string
+	BrokerRSID       uuid.UUID
+	ExecutePermID    uuid.UUID // the connector:execute permission to bind
+	ExecuteRoleName  string    // e.g. "connector-executor"
 }
 
 type connectorRepository struct{ db *gorm.DB }
@@ -129,7 +143,7 @@ func (r *connectorRepository) ListConnections(connectorID uuid.UUID) ([]models.C
 
 func (r *connectorRepository) GetWorkspaceConnection(connectorID uuid.UUID) (*models.ConnectorConnection, error) {
 	var conn models.ConnectorConnection
-	err := r.db.First(&conn, "connector_id = ? AND scope = ?", connectorID, models.ConnectionScopeWorkspace).Error
+	err := r.db.First(&conn, "connector_id = ? AND binding_type = ?", connectorID, models.ConnectionBindingWorkspace).Error
 	if err != nil {
 		return nil, err
 	}
@@ -138,12 +152,28 @@ func (r *connectorRepository) GetWorkspaceConnection(connectorID uuid.UUID) (*mo
 
 func (r *connectorRepository) GetUserConnection(connectorID uuid.UUID, subjectUserID string) (*models.ConnectorConnection, error) {
 	var conn models.ConnectorConnection
-	err := r.db.First(&conn, "connector_id = ? AND scope = ? AND subject_user_id = ?",
-		connectorID, models.ConnectionScopeUser, subjectUserID).Error
+	err := r.db.First(&conn, "connector_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+		connectorID, models.ConnectionBindingUser, subjectUserID).Error
 	if err != nil {
 		return nil, err
 	}
 	return &conn, nil
+}
+
+func (r *connectorRepository) ListUserConnectionsBySubject(workspaceID uuid.UUID, subjectUserID string) ([]models.ConnectorConnection, error) {
+	var conns []models.ConnectorConnection
+	err := r.db.Where("workspace_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+		workspaceID, models.ConnectionBindingUser, subjectUserID).
+		Order("created_at DESC").Find(&conns).Error
+	return conns, err
+}
+
+func (r *connectorRepository) RevokeUserConnection(workspaceID, connectorID uuid.UUID, subjectUserID string) (int64, error) {
+	res := r.db.Model(&models.ConnectorConnection{}).
+		Where("workspace_id = ? AND connector_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+			workspaceID, connectorID, models.ConnectionBindingUser, subjectUserID).
+		Updates(map[string]interface{}{"status": models.ConnectionStatusRevoked, "revoked_at": gorm.Expr("now()")})
+	return res.RowsAffected, res.Error
 }
 
 func (r *connectorRepository) CreateAssignment(a *models.ConnectorAssignment) error {
@@ -165,6 +195,41 @@ func (r *connectorRepository) AssignmentAllows(connectorID uuid.UUID, clientID, 
 	err := r.db.Model(&models.ConnectorAssignment{}).
 		Where("connector_id = ? AND client_id = ? AND (action_key IS NULL OR action_key = ?)",
 			connectorID, clientID, actionKey).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// MatchingAssignment returns the assignment that authorizes (client, connector,
+// action), or nil if none. An action-specific row (action_key = actionKey) wins
+// over an all-actions row (action_key IS NULL) so its input_constraints apply.
+func (r *connectorRepository) MatchingAssignment(connectorID uuid.UUID, clientID, actionKey string) (*models.ConnectorAssignment, error) {
+	var as []models.ConnectorAssignment
+	if err := r.db.Where("connector_id = ? AND client_id = ? AND (action_key IS NULL OR action_key = ?)",
+		connectorID, clientID, actionKey).Find(&as).Error; err != nil {
+		return nil, err
+	}
+	if len(as) == 0 {
+		return nil, nil
+	}
+	best := &as[0]
+	for i := range as {
+		if as[i].ActionKey != nil && *as[i].ActionKey == actionKey {
+			return &as[i], nil // exact-action match takes precedence
+		}
+	}
+	return best, nil
+}
+
+func (r *connectorRepository) SubjectInAnyGroup(workspaceID uuid.UUID, userID string, groupIDs []string) (bool, error) {
+	if len(groupIDs) == 0 {
+		return false, nil
+	}
+	var count int64
+	err := r.db.Table("user_groups").
+		Where("workspace_id = ? AND user_id = ?::uuid AND group_id IN ?", workspaceID, userID, groupIDs).
 		Count(&count).Error
 	if err != nil {
 		return false, err
@@ -211,13 +276,16 @@ func (r *connectorRepository) GetProviderApp(workspaceID uuid.UUID, providerKey 
 }
 
 func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp) error {
-	// Upsert on (workspace_id, provider_key): update client_id/redirect/vault_path.
+	// Upsert on (workspace_id, provider_key): update all mutable fields, incl. the
+	// app kind + GitHub-App id so an oauth2↔github_app reconfigure takes effect.
 	return r.db.Where("workspace_id = ? AND provider_key = ?", app.WorkspaceID, app.ProviderKey).
 		Assign(map[string]interface{}{
-			"client_id":    app.ClientID,
-			"redirect_uri": app.RedirectURI,
-			"vault_path":   app.VaultPath,
-			"updated_at":   gorm.Expr("now()"),
+			"app_kind":      app.AppKind,
+			"client_id":     app.ClientID,
+			"redirect_uri":  app.RedirectURI,
+			"github_app_id": app.GitHubAppID,
+			"vault_path":    app.VaultPath,
+			"updated_at":    gorm.Expr("now()"),
 		}).
 		FirstOrCreate(app).Error
 }
@@ -225,16 +293,19 @@ func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp
 // resolveClientPrincipals maps an OAuth client_id string to the mcp_oauth_clients
 // row id (for RS registration) and the owning service_account id (for the role
 // binding — role_bindings.check_principal requires a service_account_id).
-func resolveClientPrincipals(tx *gorm.DB, clientID string) (oauthClientID, serviceAccountID uuid.UUID, err error) {
+func resolveClientPrincipals(tx *gorm.DB, clientID string) (oauthClientID, serviceAccountID, saWorkspaceID uuid.UUID, err error) {
 	var mc struct{ ID uuid.UUID }
 	if e := tx.Table("mcp_oauth_clients").Select("id").Where("client_id = ?", clientID).First(&mc).Error; e != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("no OAuth client for client_id %q: %w", clientID, e)
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("no OAuth client for client_id %q: %w", clientID, e)
 	}
-	var sa struct{ ID uuid.UUID }
-	if e := tx.Table("service_accounts").Select("id").Where("oauth_client_id = ?", mc.ID).First(&sa).Error; e != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("no service account owns client %q: %w", clientID, e)
+	var sa struct {
+		ID          uuid.UUID
+		WorkspaceID uuid.UUID
 	}
-	return mc.ID, sa.ID, nil
+	if e := tx.Table("service_accounts").Select("id, workspace_id").Where("oauth_client_id = ?", mc.ID).First(&sa).Error; e != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("no service account owns client %q: %w", clientID, e)
+	}
+	return mc.ID, sa.ID, sa.WorkspaceID, nil
 }
 
 func (r *connectorRepository) BrokerGrantContext(workspaceID uuid.UUID, brokerResourceURI string) (uuid.UUID, uuid.UUID, error) {
@@ -253,11 +324,12 @@ func (r *connectorRepository) BrokerGrantContext(workspaceID uuid.UUID, brokerRe
 
 func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*models.ConnectorAssignment, error) {
 	assignment := &models.ConnectorAssignment{
-		WorkspaceID: in.WorkspaceID,
-		ConnectorID: in.ConnectorID,
-		ClientID:    in.ClientID,
-		ActionKey:   in.ActionKey,
-		CreatedBy:   in.CreatedBy,
+		WorkspaceID:      in.WorkspaceID,
+		ConnectorID:      in.ConnectorID,
+		ClientID:         in.ClientID,
+		ActionKey:        in.ActionKey,
+		InputConstraints: in.InputConstraints,
+		CreatedBy:        in.CreatedBy,
 	}
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		// 1. The assignment row (connector → agent allowlist).
@@ -265,9 +337,16 @@ func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*model
 			return fmt.Errorf("create assignment: %w", err)
 		}
 
-		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, in.ClientID)
+		oauthClientID, serviceAccountID, saWorkspaceID, err := resolveClientPrincipals(tx, in.ClientID)
 		if err != nil {
 			return err
+		}
+		// D6 — same-workspace only. A foreign-workspace client_id would bind a
+		// service account into this connector's workspace, which the role-binding
+		// FK forbids; reject it cleanly rather than fail awkwardly. Cross-workspace
+		// grants are the A2A case and will reuse the XAA first-contact machinery.
+		if saWorkspaceID != in.WorkspaceID {
+			return fmt.Errorf("client %q belongs to a different workspace; cross-workspace connector grants are not supported", in.ClientID)
 		}
 
 		// 2. Broker-RS registration (approved) — the gateway gate. Idempotent on
@@ -345,7 +424,7 @@ func (r *connectorRepository) RevokeAssignmentTx(workspaceID, assignmentID, brok
 			return nil
 		}
 
-		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, a.ClientID)
+		oauthClientID, serviceAccountID, _, err := resolveClientPrincipals(tx, a.ClientID)
 		if err != nil {
 			return nil // client/SA already gone; assignment delete stands
 		}
