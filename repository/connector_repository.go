@@ -25,6 +25,12 @@ type ConnectorRepository interface {
 	ListConnections(connectorID uuid.UUID) ([]models.ConnectorConnection, error)
 	GetWorkspaceConnection(connectorID uuid.UUID) (*models.ConnectorConnection, error)
 	GetUserConnection(connectorID uuid.UUID, subjectUserID string) (*models.ConnectorConnection, error)
+	// ListUserConnectionsBySubject returns all of a user's connections in a
+	// workspace (their own "connected accounts" view). R4.
+	ListUserConnectionsBySubject(workspaceID uuid.UUID, subjectUserID string) ([]models.ConnectorConnection, error)
+	// RevokeUserConnection marks a user's connection revoked (status + revoked_at)
+	// — the user disconnecting their own provider account. Returns rows affected.
+	RevokeUserConnection(workspaceID, connectorID uuid.UUID, subjectUserID string) (int64, error)
 
 	CreateAssignment(a *models.ConnectorAssignment) error
 	ListAssignments(connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
@@ -149,6 +155,22 @@ func (r *connectorRepository) GetUserConnection(connectorID uuid.UUID, subjectUs
 		return nil, err
 	}
 	return &conn, nil
+}
+
+func (r *connectorRepository) ListUserConnectionsBySubject(workspaceID uuid.UUID, subjectUserID string) ([]models.ConnectorConnection, error) {
+	var conns []models.ConnectorConnection
+	err := r.db.Where("workspace_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+		workspaceID, models.ConnectionBindingUser, subjectUserID).
+		Order("created_at DESC").Find(&conns).Error
+	return conns, err
+}
+
+func (r *connectorRepository) RevokeUserConnection(workspaceID, connectorID uuid.UUID, subjectUserID string) (int64, error) {
+	res := r.db.Model(&models.ConnectorConnection{}).
+		Where("workspace_id = ? AND connector_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+			workspaceID, connectorID, models.ConnectionBindingUser, subjectUserID).
+		Updates(map[string]interface{}{"status": models.ConnectionStatusRevoked, "revoked_at": gorm.Expr("now()")})
+	return res.RowsAffected, res.Error
 }
 
 func (r *connectorRepository) CreateAssignment(a *models.ConnectorAssignment) error {

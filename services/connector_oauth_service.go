@@ -46,9 +46,48 @@ type StartResult struct {
 	State        string `json:"state"`
 }
 
-// Start builds the provider authorize URL for a workspace-scope connect and
-// persists the CSRF/PKCE state. redirectAfter is the UI page to return to.
+// Start builds the provider authorize URL for a workspace-scope connect (the
+// shared org credential) and persists the CSRF/PKCE state.
 func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, createdBy, redirectAfter string, scopes []string) (*StartResult, error) {
+	return s.startConnect(workspaceID, connectorID, models.ConnectionBindingWorkspace, nil, createdBy, redirectAfter, scopes)
+}
+
+// StartUser builds the authorize URL for a USER-scope connect (R4): an
+// authenticated end-user consents to the provider for their own account. The
+// resulting connection is keyed by subjectUserID and resolved by the broker when
+// a delegated (XAA) token carries sub=this user. subjectUserID is the caller's
+// own local user UUID (from their session) — never a value they supply.
+func (s *ConnectorOAuthService) StartUser(workspaceID, connectorID, subjectUserID uuid.UUID, redirectAfter string, scopes []string) (*StartResult, error) {
+	sid := subjectUserID
+	return s.startConnect(workspaceID, connectorID, models.ConnectionBindingUser, &sid, subjectUserID.String(), redirectAfter, scopes)
+}
+
+// ListUserConnections returns a user's own provider connections in a workspace
+// (their "connected accounts"). R4.
+func (s *ConnectorOAuthService) ListUserConnections(workspaceID, subjectUserID uuid.UUID) ([]models.ConnectorConnection, error) {
+	return s.repo.ListUserConnectionsBySubject(workspaceID, subjectUserID.String())
+}
+
+// RevokeUserConnection lets a user disconnect their own provider account for a
+// connector: marks the connection revoked (broker then fails closed) and best-
+// effort deletes the Vault secret. R4.
+func (s *ConnectorOAuthService) RevokeUserConnection(workspaceID, connectorID, subjectUserID uuid.UUID) error {
+	// Grab the row first so we can clear its Vault secret after revoking.
+	existing, _ := s.repo.GetUserConnection(connectorID, subjectUserID.String())
+	n, err := s.repo.RevokeUserConnection(workspaceID, connectorID, subjectUserID.String())
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("no user connection to revoke")
+	}
+	if existing != nil && s.vault != nil && existing.VaultPath != "" {
+		_ = s.vault.DeleteSecret(existing.VaultPath) // best-effort
+	}
+	return nil
+}
+
+func (s *ConnectorOAuthService) startConnect(workspaceID, connectorID uuid.UUID, bindingType string, subjectUserID *uuid.UUID, createdBy, redirectAfter string, scopes []string) (*StartResult, error) {
 	conn, err := s.repo.GetByID(workspaceID, connectorID)
 	if err != nil {
 		return nil, errors.New("connector not found")
@@ -81,12 +120,18 @@ func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, create
 	}
 	challenge := pkceS256(verifier)
 
+	var subjStr *string
+	if subjectUserID != nil {
+		v := subjectUserID.String()
+		subjStr = &v
+	}
 	st := &models.ConnectorOAuthState{
 		State:         state,
 		WorkspaceID:   workspaceID,
 		ConnectorID:   connectorID,
 		ProviderKey:   provider.Key,
-		BindingType:   models.ConnectionBindingWorkspace,
+		BindingType:   bindingType,
+		SubjectUserID: subjStr,
 		CodeVerifier:  verifier,
 		RedirectAfter: redirectAfter,
 		CreatedBy:     createdBy,
@@ -159,8 +204,13 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}
 
-	// Store secret material in Vault; only metadata in Postgres.
+	// Vault path differs by binding: a user connection is keyed by the subject so
+	// each user's token is stored separately.
+	isUser := st.BindingType == models.ConnectionBindingUser && st.SubjectUserID != nil
 	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s/connection", st.WorkspaceID, st.ConnectorID)
+	if isUser {
+		vaultPath = fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s/users/%s", st.WorkspaceID, st.ConnectorID, *st.SubjectUserID)
+	}
 	secret := map[string]interface{}{"access_token": tok.AccessToken}
 	if tok.RefreshToken != "" {
 		secret["refresh_token"] = tok.RefreshToken
@@ -180,12 +230,11 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 		t := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 		expiresAt = &t
 	}
-	// Upsert the workspace-scope Connection (one per connector).
-	existing, _ := s.repo.GetWorkspaceConnection(st.ConnectorID)
+
 	conn := &models.ConnectorConnection{
 		WorkspaceID:         st.WorkspaceID,
 		ConnectorID:         st.ConnectorID,
-		BindingType:         models.ConnectionBindingWorkspace,
+		BindingType:         st.BindingType,
 		Status:              models.ConnectionStatusActive,
 		AuthMethod:          models.ConnectionAuthOAuth2,
 		VaultPath:           vaultPath,
@@ -193,6 +242,17 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 		AccessExpiresAt:     expiresAt,
 		RefreshTokenPresent: tok.RefreshToken != "",
 		ConnectedBy:         st.CreatedBy,
+	}
+
+	// Upsert the matching connection (one workspace conn per connector; one user
+	// conn per (connector, subject)).
+	var existing *models.ConnectorConnection
+	if isUser {
+		subj, _ := uuid.Parse(*st.SubjectUserID)
+		conn.SubjectUserID = &subj
+		existing, _ = s.repo.GetUserConnection(st.ConnectorID, *st.SubjectUserID)
+	} else {
+		existing, _ = s.repo.GetWorkspaceConnection(st.ConnectorID)
 	}
 	if existing != nil {
 		conn.ID = existing.ID

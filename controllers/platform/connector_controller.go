@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -554,6 +555,113 @@ func (ctl *ConnectorController) ConnectGitHubApp(c *gin.Context) {
 	}
 	auditAdminMutation(c, wsID.String(), "connect_github_app", "connector", id.String(), http.StatusOK, nil, gin.H{"installation_id": req.InstallationID})
 	c.JSON(http.StatusOK, gin.H{"status": "connected", "connector_id": id, "installation_id": req.InstallationID})
+}
+
+// callerUserID resolves the authenticated end-user's local UUID from their
+// session. R4 user-consent endpoints bind to THIS identity — never a supplied
+// user_id — so a user can only connect/list/revoke their own accounts.
+func (ctl *ConnectorController) callerUserID(c *gin.Context) (uuid.UUID, error) {
+	uidStr, err := middlewares.ResolveUserID(c)
+	if err != nil || uidStr == "" {
+		return uuid.Nil, fmt.Errorf("user identity not available")
+	}
+	uid, err := uuid.Parse(uidStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid user id")
+	}
+	return uid, nil
+}
+
+// StartUserConnect handles POST /authsec/connectors/:id/connections/user/oauth/start —
+// R4: the authenticated end-user consents to the provider for their OWN account.
+// Produces a user-scope connection the broker resolves when an XAA token carries
+// sub=this user.
+func (ctl *ConnectorController) StartUserConnect(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	userID, err := ctl.callerUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	var req struct {
+		Scopes        []string `json:"scopes"`
+		RedirectAfter string   `json:"redirect_after"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	out, err := svc.StartUser(wsID, id, userID, req.RedirectAfter, req.Scopes)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListMyConnections handles GET /authsec/connectors/connections/me — the
+// authenticated user's own connected provider accounts. R4.
+func (ctl *ConnectorController) ListMyConnections(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	userID, err := ctl.callerUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	svc := services.NewConnectorOAuthService(ctl.db, nil)
+	conns, err := svc.ListUserConnections(wsID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list connections"})
+		return
+	}
+	if conns == nil {
+		conns = []models.ConnectorConnection{}
+	}
+	c.JSON(http.StatusOK, gin.H{"connections": conns})
+}
+
+// RevokeMyConnection handles DELETE /authsec/connectors/:id/connections/me —
+// the user disconnects their own provider account for a connector. R4.
+func (ctl *ConnectorController) RevokeMyConnection(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	userID, err := ctl.callerUserID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	vaultClient, _ := ctl.getVaultClient()
+	svc := services.NewConnectorOAuthService(ctl.db, vaultClient)
+	if err := svc.RevokeUserConnection(wsID, id, userID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // GetConnectorConfig handles GET /authsec/connectors/:id/config.
