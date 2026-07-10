@@ -3086,33 +3086,65 @@ CREATE TABLE public.connectors (
 CREATE INDEX idx_connectors_workspace ON public.connectors(workspace_id);
 CREATE INDEX idx_connectors_provider ON public.connectors(provider_key);
 
--- connector_connections — a credential binding + its lifecycle state (P1).
--- One connector holds a single workspace-scope connection and N user-scope
--- connections, each with independent lifecycle. Secret material (api key /
--- oauth token) lives in Vault at vault_path; PG holds only metadata.
---   scope='workspace' → subject_user_id NULL
---   scope='user'      → keyed by subject_user_id
+-- connector_connections — a credential binding + its lifecycle state (P1,
+-- hardened). One connector holds a single workspace-scope connection and N
+-- user-scope connections, each with independent lifecycle. Secret material
+-- (api key / oauth token) lives in Vault at vault_path; PG holds only metadata.
+--   binding_type='workspace' → subject_user_id NULL
+--   binding_type='user'      → keyed by subject_user_id (a local user UUID)
+-- Hardening: workspace_id + composite FK (no cross-workspace binding); CHECKs
+-- pin binding_type/subject/status/auth_method consistency; NULL-safe PARTIAL
+-- unique indexes (a plain UNIQUE lets duplicate workspace rows through because
+-- Postgres treats NULLs as distinct); version column for optimistic-CAS on
+-- refresh; external-account + lifecycle columns.
 CREATE TABLE public.connector_connections (
-    id                    uuid NOT NULL DEFAULT gen_random_uuid(),
-    connector_id          uuid NOT NULL,
-    scope                 text NOT NULL,                  -- 'tenant' | 'user'
-    subject_user_id       text,                           -- NULL for tenant scope
-    status                text NOT NULL DEFAULT 'active', -- active|expired|error|revoked
-    auth_type             text NOT NULL,                  -- 'api_key' | 'oauth2'
-    vault_path            text NOT NULL,
-    scopes_granted        text[] NOT NULL DEFAULT '{}'::text[],
-    access_expires_at     timestamptz,
-    refresh_token_present boolean NOT NULL DEFAULT false,
-    last_refresh_at       timestamptz,
-    last_refresh_error    text,
-    created_at            timestamptz NOT NULL DEFAULT now(),
-    updated_at            timestamptz NOT NULL DEFAULT now(),
+    id                     uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id           uuid NOT NULL,
+    connector_id           uuid NOT NULL,
+    binding_type           text NOT NULL,                  -- 'workspace' | 'user'
+    subject_user_id        uuid,                           -- NULL iff workspace-scope
+    status                 text NOT NULL DEFAULT 'active',  -- active|expired|error|revoked|disconnected
+    auth_method            text NOT NULL,                  -- 'api_key' | 'oauth2'
+    vault_path             text NOT NULL,
+    scopes_granted         text[] NOT NULL DEFAULT '{}'::text[],
+    -- Non-secret external-account metadata (populated at OAuth callback) so the
+    -- console can show which provider account/org a connection represents and
+    -- warn on reconnect-with-different-account (F2).
+    external_account_id    text,
+    external_account_name  text,
+    external_org_id        text,
+    external_org_name      text,
+    connected_by           text,
+    -- OAuth lifecycle.
+    access_expires_at      timestamptz,
+    refresh_expires_at     timestamptz,
+    refresh_token_present  boolean NOT NULL DEFAULT false,
+    last_refresh_at        timestamptz,
+    last_refresh_error     text,
+    last_used_at           timestamptz,
+    revoked_at             timestamptz,
+    version                integer NOT NULL DEFAULT 1,      -- optimistic concurrency (refresh CAS)
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_connections_pkey PRIMARY KEY (id),
-    CONSTRAINT connector_connections_connector_fkey FOREIGN KEY (connector_id)
-        REFERENCES public.connectors(id) ON DELETE CASCADE,
-    CONSTRAINT connector_connections_scope_key UNIQUE (connector_id, scope, subject_user_id)
+    CONSTRAINT connector_connections_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.connectors(workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT connector_connections_binding_chk CHECK (
+        (binding_type = 'workspace' AND subject_user_id IS NULL)
+        OR (binding_type = 'user' AND subject_user_id IS NOT NULL)),
+    CONSTRAINT connector_connections_status_chk CHECK (
+        status IN ('active', 'expired', 'error', 'revoked', 'disconnected')),
+    CONSTRAINT connector_connections_auth_chk CHECK (
+        auth_method IN ('api_key', 'oauth2'))
 );
 
+-- NULL-safe uniqueness: exactly one workspace connection per connector, and one
+-- per (connector, user). Plain UNIQUE(connector_id, binding_type, subject_user_id)
+-- would NOT prevent two workspace rows (subject_user_id NULL is distinct).
+CREATE UNIQUE INDEX uq_conn_workspace ON public.connector_connections (connector_id)
+    WHERE binding_type = 'workspace';
+CREATE UNIQUE INDEX uq_conn_user ON public.connector_connections (connector_id, subject_user_id)
+    WHERE binding_type = 'user';
 CREATE INDEX idx_connector_connections_connector ON public.connector_connections(connector_id);
 CREATE INDEX idx_connector_connections_subject ON public.connector_connections(subject_user_id);
 
@@ -3196,15 +3228,24 @@ CREATE TABLE public.connector_action_audit (
     workspace_id    uuid NOT NULL,
     connector_id    uuid,
     action_key      text NOT NULL,
-    outcome         text NOT NULL,               -- 'allow' | 'deny'
+    -- F8 — four orthogonal outcome fields (was one overloaded outcome+status):
+    --  authz_outcome:   did the broker permit the attempt.       allow | deny
+    --  broker_status:   broker-side HTTP (200, or 403/404/424 on deny-before-call).
+    --  provider_status: real upstream HTTP; NULL when the broker denied first.
+    --  action_outcome:  success | provider_error | policy_deny.
+    authz_outcome   text NOT NULL,               -- allow | deny
+    broker_status   int,
+    provider_status int,
+    action_outcome  text,                        -- success | provider_error | policy_deny
     deny_reason     text,
     subject_type    text,                        -- 'user' | 'service_account'
     subject_id      uuid,                        -- the principal (sub) — who
     actor_client_id text,                        -- the acting agent (act) — on behalf of
     actor_spiffe_id text,
+    owner_email     text,                        -- accountable human (D1: owner always)
+    owner_team      text,
     token_family    text,                        -- m2m | xaa | ciba — which token
     token_jti       text,
-    http_status     int,
     latency_ms      bigint,
     created_at      timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_action_audit_pkey PRIMARY KEY (id)

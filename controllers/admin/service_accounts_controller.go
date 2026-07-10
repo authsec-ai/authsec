@@ -27,6 +27,11 @@ func NewServiceAccountsController() *ServiceAccountsController {
 type CreateServiceAccountRequest struct {
 	Name        string `json:"name" binding:"required"`
 	Description string `json:"description"`
+	// OwnerEmail is the accountable human for this agent/service account (D1:
+	// "owner always"). Required — every agent must have an accountable owner so
+	// an autonomous action can never lack a human to attribute it to.
+	OwnerEmail string `json:"owner_email" binding:"required,email"`
+	OwnerTeam  string `json:"owner_team"`
 }
 
 type UpdateServiceAccountRequest struct {
@@ -102,7 +107,7 @@ func (ctrl *ServiceAccountsController) CreateServiceAccount(c *gin.Context) {
 		return
 	}
 
-	sa, err := services.NewServiceAccountService(config.DB).CreateServiceAccount(*workspaceID, req.Name, req.Description)
+	sa, err := services.NewServiceAccountService(config.DB).CreateServiceAccount(*workspaceID, req.Name, req.Description, req.OwnerEmail, req.OwnerTeam)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

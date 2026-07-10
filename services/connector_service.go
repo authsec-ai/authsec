@@ -152,10 +152,11 @@ func (m *connectorManager) Create(workspaceID uuid.UUID, createdBy string, in Co
 	// Vault path so existing secret material is unaffected.
 	if hasSecrets {
 		wsConn := &models.ConnectorConnection{
+			WorkspaceID: workspaceID,
 			ConnectorID: conn.ID,
-			Scope:       models.ConnectionScopeWorkspace,
+			BindingType: models.ConnectionBindingWorkspace,
 			Status:      models.ConnectionStatusActive,
-			AuthType:    models.ConnectionAuthAPIKey,
+			AuthMethod:  models.ConnectionAuthAPIKey,
 			VaultPath:   conn.VaultPath,
 		}
 		if err := m.repo.CreateConnection(wsConn); err != nil {

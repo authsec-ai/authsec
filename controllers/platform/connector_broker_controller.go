@@ -231,7 +231,12 @@ func (ctl *ConnectorBrokerController) ExecuteAction(c *gin.Context) {
 // The credential never leaves the broker.
 func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *services.AuthContext, connID uuid.UUID, actionKey string, input map[string]interface{}) (*connectoradapters.Result, int, string) {
 	deny := func(status int, auditReason, publicMsg string) (*connectoradapters.Result, int, string) {
-		ctl.auditAction(c, authCtx, connID.String(), actionKey, "deny", auditReason)
+		ctl.auditAction(c, authCtx, connID.String(), actionKey, actionAudit{
+			authzOutcome:  "deny",
+			brokerStatus:  status,
+			actionOutcome: models.ActionOutcomePolicyDeny,
+			denyReason:    auditReason,
+		})
 		return nil, status, publicMsg
 	}
 
@@ -295,14 +300,40 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 	}
 	result, err := adapter.Execute(c.Request.Context(), cred, connectoradapters.Request{ActionKey: actionKey, Input: input})
 	if err != nil {
-		return deny(http.StatusBadGateway, "adapter error: "+err.Error(), "provider call failed")
+		// The broker authorized the attempt but the provider call itself errored
+		// (network/adapter). F8: authz=allow, but action_outcome=provider_error.
+		ctl.auditAction(c, authCtx, connID.String(), actionKey, actionAudit{
+			authzOutcome:  "allow",
+			brokerStatus:  http.StatusOK,
+			actionOutcome: models.ActionOutcomeProviderError,
+			denyReason:    "adapter error: " + err.Error(),
+		})
+		return nil, http.StatusBadGateway, "provider call failed"
 	}
 
-	ctl.auditAction(c, authCtx, connID.String(), actionKey, "allow", "")
+	// F8: the broker authorized AND called the provider — record the real upstream
+	// status and whether the provider itself accepted the call. "allow" no longer
+	// hides a provider 4xx/5xx: authz_outcome=allow, provider_status=<real>,
+	// action_outcome=success|provider_error.
+	providerStatus := result.StatusCode
+	outcome := models.ActionOutcomeSuccess
+	if !result.OK {
+		outcome = models.ActionOutcomeProviderError
+	}
+	ctl.auditAction(c, authCtx, connID.String(), actionKey, actionAudit{
+		authzOutcome:   "allow",
+		brokerStatus:   http.StatusOK,
+		providerStatus: &providerStatus,
+		actionOutcome:  outcome,
+	})
 
-	// Best-effort: mark the acting service account as recently seen (Agent 360).
+	// Best-effort lifecycle: mark the SA recently seen (Agent 360) + the
+	// connection last-used.
 	if authCtx.Principal.SubjectType == tokens.SubjectTypeServiceAccount && authCtx.Principal.SubjectID != uuid.Nil {
 		ctl.db.Exec(`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, authCtx.Principal.SubjectID)
+	}
+	if resolved.Connection != nil {
+		ctl.db.Exec(`UPDATE connector_connections SET last_used_at = NOW() WHERE id = ?`, resolved.Connection.ID)
 	}
 	return result, http.StatusOK, ""
 }
@@ -430,7 +461,7 @@ func (e *brokerError) Error() string { return e.msg }
 // near/after expiry and a refresh token is available to renew it. api_key
 // connections and those without expiry/refresh never refresh.
 func connectionNeedsRefresh(conn *models.ConnectorConnection) bool {
-	if conn == nil || conn.AuthType != models.ConnectionAuthOAuth2 {
+	if conn == nil || conn.AuthMethod != models.ConnectionAuthOAuth2 {
 		return false
 	}
 	if !conn.RefreshTokenPresent || conn.AccessExpiresAt == nil {
@@ -455,16 +486,20 @@ func authContextHasScope(ctx *services.AuthContext, scope string) bool {
 // authorized it (family + jti). This is the "who did what, on whose behalf, with
 // which token" surface — echoed to the caller and mirrored into the audit record.
 func identityBlock(authCtx *services.AuthContext) gin.H {
-	actor := gin.H(nil)
+	// Actor always (F7b): the act-claim client for XAA/CIBA, else the
+	// authenticating client for direct M2M.
+	actorClientID := authCtx.ClientID
+	var spiffeID *string
 	if authCtx.Actor != nil {
-		actor = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
+		actorClientID = authCtx.Actor.ClientID
+		spiffeID = authCtx.Actor.SpiffeID
 	}
 	return gin.H{
 		"principal": gin.H{
 			"sub":  authCtx.Principal.SubjectID.String(),
 			"type": authCtx.Principal.SubjectType,
 		},
-		"actor":        actor, // nil for direct M2M; set when an agent acts on behalf
+		"actor":        gin.H{"client_id": actorClientID, "spiffe_id": spiffeID},
 		"token":        gin.H{"family": authCtx.TokenFamily, "jti": authCtx.JTI},
 		"workspace_id": authCtx.Principal.WorkspaceID.String(),
 	}
@@ -484,60 +519,73 @@ func firstSecretString(secret map[string]interface{}, keys ...string) string {
 	return ""
 }
 
-// auditAction writes an action-broker audit event for both allow and deny. It
-// records Principal, Actor (act), the connector + action, and the outcome — the
-// action-level accountability a token vault cannot produce. Never logs secrets.
-func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *services.AuthContext, connectorID, actionKey, outcome, reason string) {
+// actionAudit carries the F8 outcome fields for one broker action attempt.
+type actionAudit struct {
+	authzOutcome   string // allow | deny
+	brokerStatus   int
+	providerStatus *int   // nil if the broker denied before calling the provider
+	actionOutcome  string // success | provider_error | policy_deny
+	denyReason     string
+}
+
+// auditAction writes an action-broker audit event for both allow and deny,
+// recording the F8 outcome triad (authz vs. broker-status vs. provider-status vs.
+// action-outcome) plus Principal, Actor (always), and the accountable Owner.
+// Never logs secrets.
+func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *services.AuthContext, connectorID, actionKey string, a actionAudit) {
 	if config.AuditLogger == nil {
 		return
 	}
 	newValues := map[string]interface{}{
-		"outcome":      outcome,
-		"connector_id": connectorID,
-		"action_key":   actionKey,
-		"client_id":    authCtx.ClientID,
-		"subject_type": authCtx.Principal.SubjectType,
-		"token_family": authCtx.TokenFamily,
+		"authz_outcome":  a.authzOutcome,
+		"action_outcome": a.actionOutcome,
+		"broker_status":  a.brokerStatus,
+		"connector_id":   connectorID,
+		"action_key":     actionKey,
+		"client_id":      authCtx.ClientID,
+		"subject_type":   authCtx.Principal.SubjectType,
+		"token_family":   authCtx.TokenFamily,
+	}
+	if a.providerStatus != nil {
+		newValues["provider_status"] = *a.providerStatus
 	}
 	if authCtx.Actor != nil {
 		newValues["actor_client_id"] = authCtx.Actor.ClientID
-	}
-	status := http.StatusOK
-	if outcome != "allow" {
-		status = http.StatusForbidden
-	}
-	if authCtx.Actor != nil && authCtx.Actor.SpiffeID != nil {
-		newValues["actor_spiffe_id"] = *authCtx.Actor.SpiffeID
+		if authCtx.Actor.SpiffeID != nil {
+			newValues["actor_spiffe_id"] = *authCtx.Actor.SpiffeID
+		}
 	}
 	config.AuditLogger.LogAdminAction(
 		c.GetString("request_id"),
 		authCtx.Principal.WorkspaceID.String(),
 		authCtx.Principal.SubjectID.String(),
-		"connector.action."+outcome,
+		"connector.action."+a.authzOutcome,
 		"connector_action",
 		connectorID+":"+actionKey,
 		c.Request.Method,
 		c.Request.URL.Path,
 		c.ClientIP(),
 		c.GetHeader("User-Agent"),
-		status,
+		a.brokerStatus,
 		0,
 		nil,
 		newValues,
-		reason,
+		a.denyReason,
 	)
 
 	// Durable, queryable action-audit record (source of truth for the activity
-	// view): who / on-whose-behalf / which token / outcome. Best-effort.
+	// view): who / on-whose-behalf / which token / F8 outcome triad. Best-effort.
 	rec := &models.ConnectorActionAudit{
-		WorkspaceID: authCtx.Principal.WorkspaceID,
-		ActionKey:   actionKey,
-		Outcome:     outcome,
-		DenyReason:  reason,
-		SubjectType: authCtx.Principal.SubjectType,
-		TokenFamily: authCtx.TokenFamily,
-		TokenJTI:    authCtx.JTI,
-		HTTPStatus:  status,
+		WorkspaceID:    authCtx.Principal.WorkspaceID,
+		ActionKey:      actionKey,
+		AuthzOutcome:   a.authzOutcome,
+		BrokerStatus:   a.brokerStatus,
+		ProviderStatus: a.providerStatus,
+		ActionOutcome:  a.actionOutcome,
+		DenyReason:     a.denyReason,
+		SubjectType:    authCtx.Principal.SubjectType,
+		TokenFamily:    authCtx.TokenFamily,
+		TokenJTI:       authCtx.JTI,
 	}
 	if sid := authCtx.Principal.SubjectID; sid != uuid.Nil {
 		rec.SubjectID = &sid
@@ -545,10 +593,33 @@ func (ctl *ConnectorBrokerController) auditAction(c *gin.Context, authCtx *servi
 	if cid, err := uuid.Parse(connectorID); err == nil {
 		rec.ConnectorID = &cid
 	}
+	// F7b — "actor always": use the act claim's client when present (XAA/CIBA),
+	// otherwise fall back to the authenticating client (direct M2M). Without this
+	// a direct-M2M action recorded no actor at all.
 	if authCtx.Actor != nil {
 		rec.ActorClientID = authCtx.Actor.ClientID
 		if authCtx.Actor.SpiffeID != nil {
 			rec.ActorSpiffeID = *authCtx.Actor.SpiffeID
+		}
+	} else {
+		rec.ActorClientID = authCtx.ClientID
+	}
+	// F7c — "owner always": stamp the accountable human from the acting service
+	// account into every row, so an autonomous action is never unattributable.
+	if authCtx.Principal.SubjectType == tokens.SubjectTypeServiceAccount && authCtx.Principal.SubjectID != uuid.Nil {
+		var owner struct {
+			OwnerEmail *string
+			OwnerTeam  *string
+		}
+		if e := ctl.db.Table("service_accounts").
+			Select("owner_email, owner_team").
+			Where("id = ?", authCtx.Principal.SubjectID).Scan(&owner).Error; e == nil {
+			if owner.OwnerEmail != nil {
+				rec.OwnerEmail = *owner.OwnerEmail
+			}
+			if owner.OwnerTeam != nil {
+				rec.OwnerTeam = *owner.OwnerTeam
+			}
 		}
 	}
 	if err := ctl.repo().RecordActionAudit(rec); err != nil {

@@ -84,7 +84,7 @@ func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, create
 		WorkspaceID:   workspaceID,
 		ConnectorID:   connectorID,
 		ProviderKey:   provider.Key,
-		BindingType:   models.ConnectionScopeWorkspace,
+		BindingType:   models.ConnectionBindingWorkspace,
 		CodeVerifier:  verifier,
 		RedirectAfter: redirectAfter,
 		CreatedBy:     createdBy,
@@ -181,17 +181,20 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 	// Upsert the workspace-scope Connection (one per connector).
 	existing, _ := s.repo.GetWorkspaceConnection(st.ConnectorID)
 	conn := &models.ConnectorConnection{
+		WorkspaceID:         st.WorkspaceID,
 		ConnectorID:         st.ConnectorID,
-		Scope:               models.ConnectionScopeWorkspace,
+		BindingType:         models.ConnectionBindingWorkspace,
 		Status:              models.ConnectionStatusActive,
-		AuthType:            models.ConnectionAuthOAuth2,
+		AuthMethod:          models.ConnectionAuthOAuth2,
 		VaultPath:           vaultPath,
 		ScopesGranted:       strings.Fields(tok.Scope),
 		AccessExpiresAt:     expiresAt,
 		RefreshTokenPresent: tok.RefreshToken != "",
+		ConnectedBy:         st.CreatedBy,
 	}
 	if existing != nil {
 		conn.ID = existing.ID
+		conn.Version = existing.Version // preserve CAS counter on reconnect
 		if err := s.db.Save(conn).Error; err != nil {
 			return nil, fmt.Errorf("update connection: %w", err)
 		}
@@ -362,12 +365,44 @@ func parseTokenResponse(body []byte) (*tokenResp, error) {
 	}, nil
 }
 
-// Refresh performs an on-demand refresh of a workspace connection's OAuth token
-// using its stored refresh_token, updates the Vault secret + lifecycle metadata.
-// Called before an action when the access token is near/after expiry.
+// Refresh performs an on-demand refresh of a connection's OAuth token, guarded
+// against a thundering herd: N concurrent executes on an expiring token would
+// otherwise all refresh at once and race refresh-token rotation. We take a
+// non-blocking Postgres advisory lock keyed on the connection id; if another
+// worker holds it, we skip (that worker is refreshing) and re-read the row so
+// the caller uses the freshly-rotated token. Inside the lock we re-check via a
+// version CAS so a lock winner that already refreshed isn't refreshed again.
 func (s *ConnectorOAuthService) Refresh(conn *models.ConnectorConnection) error {
 	if !conn.RefreshTokenPresent || conn.VaultPath == "" {
 		return errors.New("no refresh token available")
+	}
+
+	// Advisory lock key derived from the connection UUID (stable per connection).
+	lockKey := int64(conn.ID.ID()) // low 32 bits of the UUID → int; fine for lock keying
+	var got bool
+	if err := s.db.Raw("SELECT pg_try_advisory_lock(?)", lockKey).Scan(&got).Error; err != nil {
+		return fmt.Errorf("acquire refresh lock: %w", err)
+	}
+	if !got {
+		// Someone else is refreshing this connection. Re-read the row so we pick
+		// up their rotated token instead of racing them; don't refresh ourselves.
+		var fresh models.ConnectorConnection
+		if e := s.db.First(&fresh, "id = ?", conn.ID).Error; e == nil {
+			*conn = fresh
+		}
+		return nil
+	}
+	defer s.db.Exec("SELECT pg_advisory_unlock(?)", lockKey)
+
+	// Version CAS: re-read under the lock; if the stored version advanced past
+	// what we hold, another worker already refreshed — adopt their row and stop.
+	var current models.ConnectorConnection
+	if e := s.db.First(&current, "id = ?", conn.ID).Error; e == nil {
+		if current.Version > conn.Version {
+			*conn = current
+			return nil
+		}
+		*conn = current // work from the authoritative row
 	}
 	providerKey, workspaceID := connectorContextForConnection(s.db, conn)
 	provider, err := s.repo.GetProvider(providerKey)
@@ -432,6 +467,7 @@ func (s *ConnectorOAuthService) Refresh(conn *models.ConnectorConnection) error 
 	conn.LastRefreshAt = &now
 	conn.LastRefreshError = ""
 	conn.Status = models.ConnectionStatusActive
+	conn.Version++ // CAS increment — signals other waiters this token is fresh
 	if tok.ExpiresIn > 0 {
 		t := now.Add(time.Duration(tok.ExpiresIn) * time.Second)
 		conn.AccessExpiresAt = &t

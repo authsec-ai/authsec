@@ -124,7 +124,13 @@ func (ctrl *ApplicationsController) CreateAPICredentialAccess(c *gin.Context) {
 			return
 		}
 	} else {
-		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description)
+		// The acting admin is the accountable owner for an implicitly-created SA
+		// (D1/F7: owner always). Falls back to a system marker if unresolved.
+		ownerEmail := c.GetString("email")
+		if ownerEmail == "" {
+			ownerEmail = "system@authsec.local"
+		}
+		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description, ownerEmail, "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -899,7 +905,13 @@ func (ctrl *ApplicationsController) CreateWorkloadAccess(c *gin.Context) {
 			return
 		}
 	} else {
-		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description)
+		// The acting admin is the accountable owner for an implicitly-created SA
+		// (D1/F7: owner always). Falls back to a system marker if unresolved.
+		ownerEmail := c.GetString("email")
+		if ownerEmail == "" {
+			ownerEmail = "system@authsec.local"
+		}
+		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description, ownerEmail, "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1153,7 +1165,13 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 			c.JSON(http.StatusBadRequest, gin.H{"error": "provide service_account_id or service_account_name"})
 			return
 		}
-		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description)
+		// The acting admin is the accountable owner for an implicitly-created SA
+		// (D1/F7: owner always). Falls back to a system marker if unresolved.
+		ownerEmail := c.GetString("email")
+		if ownerEmail == "" {
+			ownerEmail = "system@authsec.local"
+		}
+		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description, ownerEmail, "")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return

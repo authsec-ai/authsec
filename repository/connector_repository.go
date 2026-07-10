@@ -129,7 +129,7 @@ func (r *connectorRepository) ListConnections(connectorID uuid.UUID) ([]models.C
 
 func (r *connectorRepository) GetWorkspaceConnection(connectorID uuid.UUID) (*models.ConnectorConnection, error) {
 	var conn models.ConnectorConnection
-	err := r.db.First(&conn, "connector_id = ? AND scope = ?", connectorID, models.ConnectionScopeWorkspace).Error
+	err := r.db.First(&conn, "connector_id = ? AND binding_type = ?", connectorID, models.ConnectionBindingWorkspace).Error
 	if err != nil {
 		return nil, err
 	}
@@ -138,8 +138,8 @@ func (r *connectorRepository) GetWorkspaceConnection(connectorID uuid.UUID) (*mo
 
 func (r *connectorRepository) GetUserConnection(connectorID uuid.UUID, subjectUserID string) (*models.ConnectorConnection, error) {
 	var conn models.ConnectorConnection
-	err := r.db.First(&conn, "connector_id = ? AND scope = ? AND subject_user_id = ?",
-		connectorID, models.ConnectionScopeUser, subjectUserID).Error
+	err := r.db.First(&conn, "connector_id = ? AND binding_type = ? AND subject_user_id = ?::uuid",
+		connectorID, models.ConnectionBindingUser, subjectUserID).Error
 	if err != nil {
 		return nil, err
 	}
@@ -225,16 +225,19 @@ func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp
 // resolveClientPrincipals maps an OAuth client_id string to the mcp_oauth_clients
 // row id (for RS registration) and the owning service_account id (for the role
 // binding — role_bindings.check_principal requires a service_account_id).
-func resolveClientPrincipals(tx *gorm.DB, clientID string) (oauthClientID, serviceAccountID uuid.UUID, err error) {
+func resolveClientPrincipals(tx *gorm.DB, clientID string) (oauthClientID, serviceAccountID, saWorkspaceID uuid.UUID, err error) {
 	var mc struct{ ID uuid.UUID }
 	if e := tx.Table("mcp_oauth_clients").Select("id").Where("client_id = ?", clientID).First(&mc).Error; e != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("no OAuth client for client_id %q: %w", clientID, e)
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("no OAuth client for client_id %q: %w", clientID, e)
 	}
-	var sa struct{ ID uuid.UUID }
-	if e := tx.Table("service_accounts").Select("id").Where("oauth_client_id = ?", mc.ID).First(&sa).Error; e != nil {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("no service account owns client %q: %w", clientID, e)
+	var sa struct {
+		ID          uuid.UUID
+		WorkspaceID uuid.UUID
 	}
-	return mc.ID, sa.ID, nil
+	if e := tx.Table("service_accounts").Select("id, workspace_id").Where("oauth_client_id = ?", mc.ID).First(&sa).Error; e != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, fmt.Errorf("no service account owns client %q: %w", clientID, e)
+	}
+	return mc.ID, sa.ID, sa.WorkspaceID, nil
 }
 
 func (r *connectorRepository) BrokerGrantContext(workspaceID uuid.UUID, brokerResourceURI string) (uuid.UUID, uuid.UUID, error) {
@@ -265,9 +268,16 @@ func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*model
 			return fmt.Errorf("create assignment: %w", err)
 		}
 
-		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, in.ClientID)
+		oauthClientID, serviceAccountID, saWorkspaceID, err := resolveClientPrincipals(tx, in.ClientID)
 		if err != nil {
 			return err
+		}
+		// D6 — same-workspace only. A foreign-workspace client_id would bind a
+		// service account into this connector's workspace, which the role-binding
+		// FK forbids; reject it cleanly rather than fail awkwardly. Cross-workspace
+		// grants are the A2A case and will reuse the XAA first-contact machinery.
+		if saWorkspaceID != in.WorkspaceID {
+			return fmt.Errorf("client %q belongs to a different workspace; cross-workspace connector grants are not supported", in.ClientID)
 		}
 
 		// 2. Broker-RS registration (approved) — the gateway gate. Idempotent on
@@ -341,7 +351,7 @@ func (r *connectorRepository) RevokeAssignmentTx(workspaceID, assignmentID, brok
 			return nil
 		}
 
-		oauthClientID, serviceAccountID, err := resolveClientPrincipals(tx, a.ClientID)
+		oauthClientID, serviceAccountID, _, err := resolveClientPrincipals(tx, a.ClientID)
 		if err != nil {
 			return nil // client/SA already gone; assignment delete stands
 		}
