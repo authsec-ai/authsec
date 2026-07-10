@@ -664,6 +664,42 @@ func (ctl *ConnectorController) RevokeMyConnection(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// SetSubjectGroups handles PUT /authsec/connectors/:id/subject-groups — set the
+// connector's F5 subject-group policy (which teams an agent may act FOR).
+func (ctl *ConnectorController) SetSubjectGroups(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+	var req struct {
+		GroupIDs []string `json:"group_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Validate each is a UUID (they reference groups in this workspace).
+	for _, g := range req.GroupIDs {
+		if _, e := uuid.Parse(g); e != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "group_ids must be UUIDs"})
+			return
+		}
+	}
+	out, err := ctl.manager(nil).SetAllowedSubjectGroups(wsID, id, req.GroupIDs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "set_subject_groups", "connector", id.String(), http.StatusOK, nil, gin.H{"group_ids": req.GroupIDs})
+	c.JSON(http.StatusOK, gin.H{"connector_id": id, "allowed_subject_groups": out.AllowedSubjectGroups})
+}
+
 // GetConnectorConfig handles GET /authsec/connectors/:id/config.
 // Admin/internal non-secret contract: provider, config, subscriptions. Never
 // secrets and never vault_path. A disabled connector fails closed (404).

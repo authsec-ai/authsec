@@ -11,6 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ConnectorManager holds business logic for connectors: catalog validation,
@@ -39,6 +40,11 @@ type ConnectorManager interface {
 	// AuditLog returns recent action-audit records for a connector (who/act/
 	// token/outcome). Workspace-scoped.
 	AuditLog(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error)
+
+	// SetAllowedSubjectGroups sets the connector's subject-group policy (F5): the
+	// group ids a delegated action's on-behalf-of user must belong to. Empty
+	// clears the restriction. Workspace-scoped.
+	SetAllowedSubjectGroups(workspaceID, connectorID uuid.UUID, groupIDs []string) (*models.Connector, error)
 }
 
 // ResolvedCredential is the broker-side result of connection resolution: the
@@ -334,6 +340,22 @@ func (m *connectorManager) AuditLog(workspaceID, connectorID uuid.UUID, limit in
 		return nil, errors.New("connector not found")
 	}
 	return m.repo.ListActionAudit(workspaceID, connectorID, limit)
+}
+
+// SetAllowedSubjectGroups sets the connector's F5 subject-group policy.
+func (m *connectorManager) SetAllowedSubjectGroups(workspaceID, connectorID uuid.UUID, groupIDs []string) (*models.Connector, error) {
+	conn, err := m.repo.GetByID(workspaceID, connectorID)
+	if err != nil {
+		return nil, errors.New("connector not found")
+	}
+	if groupIDs == nil {
+		groupIDs = []string{}
+	}
+	conn.AllowedSubjectGroups = pq.StringArray(groupIDs)
+	if err := m.repo.Update(conn); err != nil {
+		return nil, fmt.Errorf("update subject groups: %w", err)
+	}
+	return conn, nil
 }
 
 // ResolveActionCredential is the broker-side internal resolver: it selects the

@@ -282,6 +282,21 @@ func (ctl *ConnectorBrokerController) runAction(c *gin.Context, authCtx *service
 	if authCtx.Actor != nil && authCtx.Principal.SubjectType == tokens.SubjectTypeUser {
 		subjectUserID = authCtx.Principal.SubjectID.String()
 	}
+
+	// Gate 4 — subject-group policy (F5): if the connector restricts which teams
+	// an agent may act FOR, the on-behalf-of user must be in an allowed group.
+	// Only applies to delegated (user-subject) calls; an M2M call has no human
+	// subject and is unaffected.
+	if len(conn.AllowedSubjectGroups) > 0 {
+		if subjectUserID == "" {
+			return deny(http.StatusForbidden, "connector requires an on-behalf-of user in an allowed group", "forbidden")
+		}
+		inGroup, gErr := ctl.repo().SubjectInAnyGroup(authCtx.Principal.WorkspaceID, subjectUserID, []string(conn.AllowedSubjectGroups))
+		if gErr != nil || !inGroup {
+			return deny(http.StatusForbidden, "subject not in an allowed group for this connector", "forbidden")
+		}
+	}
+
 	vaultClient, err := ctl.getVaultClient()
 	if err != nil {
 		return deny(http.StatusInternalServerError, "vault unavailable", "internal error")

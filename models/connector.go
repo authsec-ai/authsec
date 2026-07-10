@@ -47,9 +47,12 @@ type Connector struct {
 	Subscriptions   json.RawMessage `json:"subscriptions" gorm:"type:jsonb;not null;default:'[]'"`
 	VaultPath       string          `json:"-"` // secret location; NEVER serialized to any caller
 	AgentAccessible bool            `json:"agent_accessible" gorm:"not null;default:false"`
-	CreatedBy       string          `json:"created_by" gorm:"not null"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	// AllowedSubjectGroups (F5): group ids that may be the on-behalf-of subject of
+	// a delegated action. Empty = no subject-group restriction.
+	AllowedSubjectGroups pq.StringArray `json:"allowed_subject_groups" gorm:"type:uuid[];not null;default:'{}'" swaggertype:"array,string"`
+	CreatedBy            string         `json:"created_by" gorm:"not null"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
 }
 
 func (Connector) TableName() string { return "connectors" }

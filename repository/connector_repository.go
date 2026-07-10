@@ -41,6 +41,9 @@ type ConnectorRepository interface {
 	// MatchingAssignment returns the assignment authorizing (client, connector,
 	// action) — action-specific preferred over all-actions — or nil.
 	MatchingAssignment(connectorID uuid.UUID, clientID, actionKey string) (*models.ConnectorAssignment, error)
+	// SubjectInAnyGroup reports whether userID is a member of any of groupIDs in
+	// the workspace (F5 subject-group gate).
+	SubjectInAnyGroup(workspaceID uuid.UUID, userID string, groupIDs []string) (bool, error)
 
 	ListActions(providerKey string) ([]models.ConnectorAction, error)
 	GetAction(providerKey, actionKey string) (*models.ConnectorAction, error)
@@ -218,6 +221,20 @@ func (r *connectorRepository) MatchingAssignment(connectorID uuid.UUID, clientID
 		}
 	}
 	return best, nil
+}
+
+func (r *connectorRepository) SubjectInAnyGroup(workspaceID uuid.UUID, userID string, groupIDs []string) (bool, error) {
+	if len(groupIDs) == 0 {
+		return false, nil
+	}
+	var count int64
+	err := r.db.Table("user_groups").
+		Where("workspace_id = ? AND user_id = ?::uuid AND group_id IN ?", workspaceID, userID, groupIDs).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (r *connectorRepository) ListActions(providerKey string) ([]models.ConnectorAction, error) {

@@ -3069,6 +3069,12 @@ CREATE TABLE public.connectors (
     subscriptions    jsonb NOT NULL DEFAULT '[]'::jsonb,
     vault_path       text,
     agent_accessible boolean NOT NULL DEFAULT false,
+    -- allowed_subject_groups (F5): if non-empty, a DELEGATED (XAA) action is only
+    -- permitted when the on-behalf-of user is a member of one of these groups
+    -- (group ids in this workspace). Empty = no subject-group restriction. Gates
+    -- WHO an agent may act for at the broker; does not apply to non-delegated M2M
+    -- calls (which have no human subject).
+    allowed_subject_groups uuid[] NOT NULL DEFAULT '{}'::uuid[],
     created_by       text NOT NULL,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),

@@ -1355,6 +1355,7 @@ func SetupRoutes(
 			connectors.GET("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.ListAssignments)
 			connectors.DELETE("/:id/assignments/:aid", middlewares.Require("connector", "assign"), connectorController.RevokeAssignment)
 			connectors.GET("/:id/audit", middlewares.Require("connector", "read"), connectorController.GetConnectorAudit)
+			connectors.PUT("/:id/subject-groups", middlewares.Require("connector", "assign"), connectorController.SetSubjectGroups)
 		}
 		// OAuth callback is provider-redirected and state-validated — it must NOT
 		// sit behind the admin auth middleware (the browser arrives unauthenticated
