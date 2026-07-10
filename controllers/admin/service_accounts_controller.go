@@ -385,6 +385,51 @@ func (ctrl *ServiceAccountsController) CredentialServiceAccount(c *gin.Context) 
 	})
 }
 
+// RotateCredentialServiceAccount handles
+// POST /uflow/admin/service-accounts/:sa_id/credentials/rotate — mints a fresh
+// client secret for the SA's existing credential client and revokes the old
+// one(s). The client_id is unchanged, so assignments/role bindings survive; the
+// new plaintext is returned once. Recovers a lost/leaked/fumbled secret without
+// deleting the service account.
+func (ctrl *ServiceAccountsController) RotateCredentialServiceAccount(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	saID, err := uuid.Parse(c.Param("sa_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sa_id"})
+		return
+	}
+
+	cred, err := services.NewServiceAccountService(config.DB).RotateCredentialSecret(*workspaceID, saID)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrServiceAccountNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrServiceAccountNoSecretCredential):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	middlewares.Audit(c, "service_account", saID.String(), "credential_rotated", &middlewares.AuditChanges{
+		After: map[string]interface{}{
+			"client_id":   cred.ClientID,
+			"auth_method": cred.AuthMethod,
+		},
+	})
+
+	c.JSON(http.StatusOK, CredentialResponse{
+		ClientID:     cred.ClientID,
+		AuthMethod:   cred.AuthMethod,
+		ClientSecret: cred.Secret,
+	})
+}
+
 // ServiceAccountAccessItem is one MCP server a workload can reach, with the
 // role it was granted and the scopes that role currently yields on that server.
 type ServiceAccountAccessItem struct {

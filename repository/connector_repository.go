@@ -282,7 +282,11 @@ func (r *connectorRepository) GrantAssignmentTx(in GrantAssignmentInput) (*model
 		}
 
 		// 3. connector-executor role (get-or-create), linked to the execute perm.
-		var roleID uuid.UUID
+		// Scan RETURNING id into a string, not uuid.UUID: GORM's Raw().Scan into
+		// a [16]byte array type writes the text UUID byte-by-byte and fails
+		// ("converting driver.Value type string to uint8: invalid syntax"). The
+		// string flows fine as a query param below — Postgres casts it to uuid.
+		var roleID string
 		if err := tx.Raw(`
 			INSERT INTO roles (id, name, description, workspace_id, is_system, created_at, updated_at)
 			VALUES (gen_random_uuid(), ?, 'Can execute connector actions', ?, false, now(), now())

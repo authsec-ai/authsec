@@ -201,3 +201,74 @@ func (s *ServiceAccountService) ProvisionCredentialTx(tx *gorm.DB, workspaceID, 
 		Secret:     plainSecret,
 	}, nil
 }
+
+// ErrServiceAccountNoSecretCredential is returned when rotation is attempted on
+// a service account that has no client_secret credential to rotate (either no
+// credential at all, or a private_key_jwt one whose secret isn't ours to spin).
+var ErrServiceAccountNoSecretCredential = errors.New("service account has no client-secret credential to rotate")
+
+// RotateCredentialSecret mints a fresh client secret for the service account's
+// EXISTING credential client and revokes all prior secrets, returning the new
+// plaintext once. The client_id is unchanged — so any assignments/role bindings
+// keyed on it keep working; only the secret changes. Immediate revoke (no grace
+// window): the old secret stops working the instant this returns. The token
+// endpoint already tries every non-revoked secret newest-first
+// (client_auth.go), so this composes cleanly with that verification path.
+func (s *ServiceAccountService) RotateCredentialSecret(workspaceID, saID uuid.UUID) (*ProvisionedCredential, error) {
+	var result *ProvisionedCredential
+	err := s.db.Session(&gorm.Session{NewDB: true}).Transaction(func(tx *gorm.DB) error {
+		var sa models.ServiceAccount
+		if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
+			return ErrServiceAccountNotFound
+		}
+		if sa.OAuthClientID == nil {
+			return ErrServiceAccountNoSecretCredential
+		}
+
+		// Must be a client_secret_basic client — rotating a secret for a
+		// private_key_jwt client is meaningless (there is no secret we hold).
+		var client models.MCPOAuthClient
+		if err := tx.Where("id = ?", *sa.OAuthClientID).First(&client).Error; err != nil {
+			return ErrServiceAccountNoSecretCredential
+		}
+		if !hasMethod(client.AllowedTokenEndpointAuthMethods, "client_secret_basic") {
+			return ErrServiceAccountNoSecretCredential
+		}
+
+		secret, genErr := GenerateClientSecret()
+		if genErr != nil {
+			return genErr
+		}
+		hash, hashErr := HashClientSecret(secret)
+		if hashErr != nil {
+			return hashErr
+		}
+
+		now := time.Now().UTC()
+		// Revoke every currently-active secret for this client.
+		if err := tx.Model(&models.OAuthClientSecret{}).
+			Where("client_id = ? AND revoked_at IS NULL", client.ID).
+			Update("revoked_at", now).Error; err != nil {
+			return fmt.Errorf("revoke prior secrets: %w", err)
+		}
+		// Mint the replacement.
+		if err := tx.Create(&models.OAuthClientSecret{
+			ID:         uuid.New(),
+			ClientID:   client.ID,
+			SecretHash: hash,
+		}).Error; err != nil {
+			return fmt.Errorf("store rotated secret: %w", err)
+		}
+
+		result = &ProvisionedCredential{
+			ClientID:   client.ClientID,
+			AuthMethod: "client_secret_basic",
+			Secret:     &secret,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}

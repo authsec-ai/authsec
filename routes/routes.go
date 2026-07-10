@@ -730,6 +730,7 @@ func SetupRoutes(
 			adminRBAC.PUT("/service-accounts/:sa_id", serviceAccountsController.UpdateServiceAccount)
 			adminRBAC.DELETE("/service-accounts/:sa_id", serviceAccountsController.DeleteServiceAccount)
 			adminRBAC.POST("/service-accounts/:sa_id/credentials", serviceAccountsController.CredentialServiceAccount)
+			adminRBAC.POST("/service-accounts/:sa_id/credentials/rotate", serviceAccountsController.RotateCredentialServiceAccount)
 
 			// Admin self-introspection (delegation UI)
 			adminRBAC.GET("/me/roles-permissions", delegationPolicyController.GetMyRolesAndPermissions)
