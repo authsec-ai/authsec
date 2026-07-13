@@ -25,7 +25,7 @@ func (hc *HealthController) ComprehensiveHealthCheck(c *gin.Context) {
 	healthStatus := map[string]interface{}{
 		"status":    "healthy",
 		"timestamp": startTime.UTC(),
-		"version":   "4.0.0",
+		"version":   "4.1.0-pipeline",
 		"checks":    make(map[string]interface{}),
 	}
 
