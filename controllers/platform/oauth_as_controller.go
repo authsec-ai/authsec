@@ -2863,7 +2863,10 @@ func (ctrl *OAuthASController) validateOAuthPolicy(
 			return nil, &policyError{http.StatusForbidden, "access_denied", "client not authorized for this resource"}
 		}
 	} else if reg.Status != "approved" {
-		return nil, &policyError{http.StatusForbidden, "access_denied", "client not authorized for this resource"}
+		if reg.Status == models.ClientRegStatusRevoked {
+			ctrl.service.RequeueRevokedRegistration(rs.ID, oauthClient.ID)
+		}
+		return nil, &policyError{http.StatusForbidden, "access_denied", "client requires admin approval for this resource"}
 	}
 
 	// 5. Redirect URI resolution and validation
