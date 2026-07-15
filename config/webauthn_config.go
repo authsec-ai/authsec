@@ -49,10 +49,9 @@ func ValidateSubdomainOrigin(origin string) bool {
 	allowedDomains := []string{"app.authsec.dev", "stage.authsec.dev", "dev.authsec.dev", "app.authsec.ai", "stage.authsec.ai", "dev.authsec.ai"}
 
 	// Include the deployment's own base domain (WORKSPACE_DOMAIN_SUFFIX, e.g.
-	// "mcpauthz.com" on the single-node deploy) so its tenant subdomains pass
-	// WebAuthn origin validation — including at SIGNUP time, before any
-	// workspace_domains row exists. The operator owns this wildcard + tunnel,
-	// so its subdomains are one trust boundary.
+	// "app.authsec.ai") so its tenant subdomains pass WebAuthn origin
+	// validation — including at SIGNUP time, before any workspace_domains
+	// row exists.
 	if AppConfig != nil && strings.TrimSpace(AppConfig.WorkspaceDomainSuffix) != "" {
 		allowedDomains = append(allowedDomains, strings.TrimSpace(AppConfig.WorkspaceDomainSuffix))
 	}

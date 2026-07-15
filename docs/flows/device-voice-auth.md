@@ -19,8 +19,8 @@ Returns:
 {
   "device_code": "<opaque>",
   "user_code": "XKCD-4321",
-  "verification_uri": "https://mcpauthz.com/activate",
-  "verification_uri_complete": "https://mcpauthz.com/activate?user_code=XKCD-4321",
+  "verification_uri": "https://app.authsec.ai/activate",
+  "verification_uri_complete": "https://app.authsec.ai/activate?user_code=XKCD-4321",
   "expires_in": 900,
   "interval": 5
 }

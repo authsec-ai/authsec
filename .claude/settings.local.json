@@ -61,7 +61,28 @@
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
       "Bash(gofmt -w services/oauth_as_service.go)",
-      "Bash(gofmt -l services/oauth_as_service.go)"
+      "Bash(gofmt -l services/oauth_as_service.go)",
+      "WebSearch",
+      "WebFetch(domain:auth0.com)",
+      "WebFetch(domain:docs.arcade.dev)",
+      "WebFetch(domain:docs.composio.dev)",
+      "WebFetch(domain:developer.okta.com)",
+      "WebFetch(domain:docs.klavis.ai)",
+      "WebFetch(domain:docs.descope.com)",
+      "WebFetch(domain:www.klavis.ai)",
+      "WebFetch(domain:pipedream.com)",
+      "WebFetch(domain:www.descope.com)",
+      "Bash(wc -l src/App.tsx)",
+      "Bash(ls src/features/)",
+      "Bash(ls src/app/api/)",
+      "Bash(ls src/components/layout/)",
+      "Bash(/usr/bin/curl -s --max-time 8 \"https://app.authsec.ai/.well-known/oauth-authorization-server\")",
+      "Bash(python3 -m json.tool)",
+      "Skill(artifact-design)",
+      "Skill(artifact-design:*)",
+      "Bash(echo \"tsc exit=$?\")",
+      "Bash(npx eslint *)",
+      "Bash(echo \"eslint exit=$?\")"
     ]
   }
 }

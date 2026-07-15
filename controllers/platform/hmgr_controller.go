@@ -998,7 +998,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			// Override the default consent CSP to include the OAuth client's registered
 			// redirect_uri origins. Browsers enforce form-action across the entire
 			// redirect chain, and the final hop after consent goes to the client
-			// redirect_uri (e.g. https://aditya.mcpauthz.com/applications/.../test).
+			// redirect_uri (e.g. https://aditya.app.authsec.ai/applications/.../test).
 			// Without this, the consent form submit is blocked.
 			c.Header("Content-Security-Policy", middlewares.BuildConsentCSP(redirectURIOriginsFromClient(mcpClient)))
 			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, report, scopeMeta)

@@ -10,7 +10,7 @@ new features to work at runtime. Neither is a code change.
 
 ## 1. Edge proxy: forward `/broker/*` to the Go backend  ← BLOCKS agent execute
 
-`api.mcpauthz.com` currently returns an **Express 404** for `/broker/*`
+`app.authsec.ai` currently returns an **Express 404** for `/broker/*`
 (`Cannot POST /broker/connectors/.../actions/...`, header `X-Powered-By: Express`).
 The broker data plane lives in the **Go backend on :7468**, but the edge doesn't
 route `/broker/*` there — so agent action calls never reach it.
@@ -22,10 +22,10 @@ route `/broker/*` there — so agent action calls never reach it.
 **Verify:**
 ```bash
 # inside the backend container — should be a real status (401/403/200), not Express HTML:
-docker exec authsec-single-node-backend-1 curl -s -o /dev/null -w "%{http_code}\n" \
+docker exec authsec-backend curl -s -o /dev/null -w "%{http_code}\n" \
   -X POST http://localhost:7468/broker/connectors/x/actions/y -d '{}'
 # through the edge — should stop returning "Cannot POST" Express HTML:
-curl -s -i https://api.mcpauthz.com/broker/connectors/x/actions/y -X POST -d '{}'
+curl -s -i https://app.authsec.ai/broker/connectors/x/actions/y -X POST -d '{}'
 ```
 
 ## 2. Vault: enable a KV v2 engine at `kv/`  ← BLOCKS token storage
@@ -56,7 +56,7 @@ from current `authsec-staging` AND advance the DB. Most of the connector
 debugging was code/DB drift: the container ran an older binary while the DB was
 at a newer (or older) schema. After deploy, sanity-check:
 ```bash
-docker exec authsec-single-node-backend-1 strings ./main | grep -c "is not OAuth2"  # >=1 = current code
+docker exec authsec-backend strings ./main | grep -c "is not OAuth2"  # >=1 = current code
 ```
 
 Once (1) and (2) are done and the DB is advanced, the full flow runs end to end:
