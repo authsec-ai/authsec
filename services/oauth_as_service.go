@@ -712,10 +712,11 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		// Try pending_approval → approved first (normal DCR approval flow).
+		// Try pending_approval or revoked → approved (covers first-time approval
+		// and re-approval after revocation).
 		result := tx.Model(&models.ResourceServerClientRegistration{}).
-			Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
-				rsUUID, client.ID, models.ClientRegStatusPendingApproval).
+			Where("resource_server_id = ? AND oauth_client_id = ? AND status IN ?",
+				rsUUID, client.ID, []string{models.ClientRegStatusPendingApproval, models.ClientRegStatusRevoked}).
 			Update("status", models.ClientRegStatusApproved)
 		if result.Error != nil {
 			return result.Error
@@ -731,7 +732,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 					rsUUID, client.ID, models.ClientRegStatusApproved).
 				Count(&count)
 			if count == 0 {
-				return fmt.Errorf("no pending registration found for this client")
+				return fmt.Errorf("no pending or revoked registration found for this client")
 			}
 		}
 
@@ -1607,6 +1608,16 @@ func (s *OAuthASService) ListClientsForRS(rsID string) ([]map[string]interface{}
 		})
 	}
 	return result, nil
+}
+
+// RequeueRevokedRegistration flips a revoked registration back to pending_approval
+// so the admin sees it in the Connections page and can re-approve. Called when a
+// revoked agent's client attempts to re-authorize.
+func (s *OAuthASService) RequeueRevokedRegistration(rsID, clientID uuid.UUID) {
+	s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
+			rsID, clientID, models.ClientRegStatusRevoked).
+		Update("status", models.ClientRegStatusPendingApproval)
 }
 
 // RevokeClientRegistration sets a client's join-table status to "revoked" for an RS.
