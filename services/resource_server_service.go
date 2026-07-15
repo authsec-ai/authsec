@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,11 +19,22 @@ import (
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ErrScanInProgress is returned when a rescan is requested while one is already running.
 // Callers should map this to HTTP 409 Conflict.
 var ErrScanInProgress = errors.New("rescan already in progress")
+
+// ErrMCPAuthenticationRequired means the MCP server was reachable and returned
+// a valid bearer challenge, but an explicit inventory refresh could not call
+// tools/list. The admin must retry with a one-shot MCP access token.
+var ErrMCPAuthenticationRequired = errors.New("MCP bearer token required to refresh tool inventory")
+
+// ErrMCPMetadataUnavailable means tools/list completed but RFC 9728 protected
+// resource metadata could not be loaded, so an explicit refresh cannot safely
+// claim that tool and scope policy were reconciled.
+var ErrMCPMetadataUnavailable = errors.New("MCP protected resource metadata unavailable")
 
 type ResourceServerService struct {
 	db *gorm.DB
@@ -390,26 +402,40 @@ func (s *ResourceServerService) GetByIDAndTenant(id, workspaceID string) (*model
 // If public_base_url or protected_base_path change, resource_uri is recomputed.
 func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates map[string]interface{}) (*models.ResourceServer, error) {
 	var rs models.ResourceServer
-	if err := s.db.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
-		return nil, err
-	}
-	if err := s.db.Model(&rs).Updates(updates).Error; err != nil {
-		return nil, err
-	}
-
-	// Recompute resource_uri if either component changed
-	_, urlChanged := updates["public_base_url"]
-	_, pathChanged := updates["protected_base_path"]
-	if urlChanged || pathChanged {
-		// Re-read to get the applied values
-		s.db.Where("id = ?", id).First(&rs)
-		newURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
-		if newURI != rs.ResourceURI {
-			s.db.Model(&rs).Update("resource_uri", newURI)
-			rs.ResourceURI = newURI
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND workspace_id = ?", id, workspaceID).
+			First(&rs).Error; err != nil {
+			return err
 		}
-	}
+		if err := tx.Model(&rs).Updates(updates).Error; err != nil {
+			return err
+		}
 
+		// Keep the OAuth resource identifier and its editable URL components in
+		// one atomic update. Discovery, audience checks, and resource lookup must
+		// all use this exact persisted identifier.
+		_, urlChanged := updates["public_base_url"]
+		_, pathChanged := updates["protected_base_path"]
+		if urlChanged || pathChanged {
+			if err := tx.Where("id = ? AND workspace_id = ?", id, workspaceID).
+				First(&rs).Error; err != nil {
+				return err
+			}
+			newURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
+			if newURI != rs.ResourceURI {
+				if err := tx.Model(&rs).Update("resource_uri", newURI).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		return tx.Where("id = ? AND workspace_id = ?", id, workspaceID).
+			First(&rs).Error
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &rs, nil
 }
 
@@ -503,16 +529,20 @@ type DiscoverySyncResult struct {
 //
 // Always returns a non-nil *DiscoverySyncResult.
 func (s *ResourceServerService) DiscoverAndSync(ctx context.Context, rs *models.ResourceServer) (*DiscoverySyncResult, error) {
-	return s.DiscoverAndSyncWithToken(ctx, rs, "")
+	return s.discoverAndSync(ctx, rs, "", false)
 }
 
-// DiscoverAndSyncWithToken is identical to DiscoverAndSync but lets the caller
-// supply a one-shot bearer token used for the synthetic tools/list call. This
-// is the "authenticated scan" path: when the MCP server requires a token to
-// list tools, an admin pastes one in the wizard and we forward it to the
-// scanner. The token is never persisted — it lives on the mcpclient for the
-// duration of this call only.
+// DiscoverAndSyncWithToken performs an explicit inventory refresh and lets the
+// caller supply a one-shot bearer token for tools/list. Unlike background
+// discovery, an explicit refresh must actually enumerate the live MCP tools:
+// a bearer challenge is returned to the caller as
+// ErrMCPAuthenticationRequired instead of being reported as a successful
+// zero-tool scan. The token is never persisted.
 func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs *models.ResourceServer, mcpBearerToken string) (*DiscoverySyncResult, error) {
+	return s.discoverAndSync(ctx, rs, mcpBearerToken, true)
+}
+
+func (s *ResourceServerService) discoverAndSync(ctx context.Context, rs *models.ResourceServer, mcpBearerToken string, requireToolInventory bool) (*DiscoverySyncResult, error) {
 	syncResult := &DiscoverySyncResult{}
 
 	// ── Stage 1: Claim scan lock ────────────────────────────────────────────
@@ -542,8 +572,9 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 	rs.ScanGeneration = nextGeneration
 
 	// ── Stage 2: MCP Discovery (no DB locks held) ───────────────────────────
-	// Fix: use resourceURI (PublicBaseURL + ProtectedBasePath), not bare PublicBaseURL.
-	resourceURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
+	// resource_uri is the registered OAuth resource identifier. Use it exactly:
+	// reconstructing it here can diverge from token audiences and PRM `resource`.
+	resourceURI := rs.ResourceURI
 	client := mcpclient.NewClient().WithBearerToken(mcpBearerToken)
 	discovered, err := client.Discover(ctx, resourceURI)
 	// protectedServer: RFC 9728 bearer challenge on tools/list. Server is
@@ -555,6 +586,15 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 	protectedServer := false
 	if err != nil {
 		if errors.Is(err, mcpclient.ErrProtectedServer) {
+			if requireToolInventory {
+				reason := ErrMCPAuthenticationRequired.Error()
+				if strings.TrimSpace(mcpBearerToken) != "" {
+					reason = "the MCP server rejected the supplied bearer token; provide a fresh token that can call tools/list"
+				}
+				syncResult.FailureReason = reason
+				s.markExplicitScanFailed(rs, nextGeneration, reason)
+				return syncResult, ErrMCPAuthenticationRequired
+			}
 			protectedServer = true
 			if discovered == nil {
 				discovered = &mcpclient.DiscoveryResult{}
@@ -571,17 +611,44 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 			return syncResult, fmt.Errorf("MCP discovery failed: %w", err)
 		}
 	}
+	if requireToolInventory && discovered.PRM == nil {
+		reason := "tools/list succeeded, but RFC 9728 protected resource metadata could not be loaded; tool and scope policy was not reconciled"
+		syncResult.FailureReason = reason
+		s.markExplicitScanFailed(rs, nextGeneration, reason)
+		return syncResult, ErrMCPMetadataUnavailable
+	}
 
-	// prmFetched distinguishes:
-	//   nil  → PRM fetch failed (non-fatal per spec); partial scan
-	//   non-nil → PRM fetched; may have empty ScopesSupported (legitimately)
+	// Keep metadata availability, scope disclosure, and tools/list completion
+	// separate. RFC 9728 makes scopes_supported optional, and a protected
+	// background probe can fetch valid PRM without being allowed to list tools.
 	prmFetched := discovered.PRM != nil
+	scopesPublished := prmFetched && discovered.PRM.ScopesSupported != nil
+	toolInventoryFetched := !protectedServer
+	fullScan := prmFetched && toolInventoryFetched
 
 	// ── Stage 3: Reconciliation (single atomic transaction) ─────────────────
 	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		// Align lock order with SDK manifest publication: resource server first,
+		// then scopes/tools. Also fail early if this scan no longer owns the
+		// claimed generation.
+		var scanState struct {
+			ScanGeneration           int `gorm:"column:scan_generation"`
+			LastSuccessfulGeneration int `gorm:"column:last_successful_generation"`
+		}
+		if err := tx.Raw(`
+			SELECT scan_generation, last_successful_generation
+			FROM resource_servers
+			WHERE id = ?
+			FOR UPDATE
+		`, rs.ID).Scan(&scanState).Error; err != nil {
+			return fmt.Errorf("lock scan generation: %w", err)
+		}
+		if scanState.ScanGeneration != nextGeneration {
+			return fmt.Errorf("scan generation %d was superseded by a concurrent scan — discarding results", nextGeneration)
+		}
 
 		// ── 3a. Scope reconciliation (full scan only) ─────────────────────
-		if prmFetched {
+		if scopesPublished {
 			appSlug := SlugForApp(rs.Name)
 			legacyScopeCount := len(discovered.PRM.ScopesSupported)
 			currentScopeStrings := CanonicalAuthSecScopes(discovered.PRM.ScopesSupported, appSlug)
@@ -627,6 +694,30 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 			}
 
 			for _, scope := range staleAutoScopes {
+				// A scope can be confirmed by PRM while also remaining in the
+				// current SDK manifest. If PRM later omits it, transfer ownership
+				// back to the manifest instead of deleting the scope and its SDK
+				// suggestion. A later manifest omission can then retire it through
+				// the manifest reconciliation path.
+				var sdkSuggestionCount int64
+				if err := tx.Model(&models.MCPToolScopeMap{}).
+					Where("scope_id = ? AND source = ?", scope.ID, models.ScopeMapSourceSDKSuggested).
+					Count(&sdkSuggestionCount).Error; err != nil {
+					return fmt.Errorf("count SDK suggestions for stale scope %s: %w", scope.ScopeString, err)
+				}
+				if sdkSuggestionCount > 0 {
+					if err := tx.Model(&scope).Updates(map[string]interface{}{
+						"source":             "manifest",
+						"is_auto_discovered": false,
+					}).Error; err != nil {
+						return fmt.Errorf("return stale PRM scope %s to manifest ownership: %w", scope.ScopeString, err)
+					}
+					syncResult.Warnings = append(syncResult.Warnings,
+						fmt.Sprintf("scope %q removed from PRM but remains in the SDK manifest — preserved as a manifest suggestion",
+							scope.ScopeString))
+					continue
+				}
+
 				// Check for manual mappings referencing this scope
 				var manualCount int64
 				tx.Model(&models.MCPToolScopeMap{}).
@@ -658,42 +749,46 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 				return err
 			}
 			rs.ScopesSupported = supportedScopes
-		} else {
+		} else if !prmFetched {
 			syncResult.Warnings = append(syncResult.Warnings,
 				"PRM unavailable — scope registry and scopes_supported not modified")
+		} else {
+			syncResult.Warnings = append(syncResult.Warnings,
+				"PRM omits scopes_supported — existing AuthSec scope registry was preserved")
 		}
 
 		// ── 3b. Tool reconciliation ───────────────────────────────────────
 		var upsertedToolIDs []uuid.UUID
+		var scanMappingToolIDs []uuid.UUID
 
 		for _, tool := range discovered.Tools {
 			existing := models.MCPTool{}
-			// Scope to mcp_scan only: never overwrite sdk_manifest or manual entries.
-			if err := tx.Where("resource_server_id = ? AND name = ? AND inventory_source = ?",
-				rs.ID, tool.Name, models.InventorySourceMCPScan).
+			if err := tx.Where("resource_server_id = ? AND name = ?", rs.ID, tool.Name).
 				First(&existing).Error; err == nil {
-				// Update existing mcp_scan tool, stamp new generation.
+				// A live tools/list response is authoritative for observed MCP metadata.
+				// Preserve the source and manifest suggestions; a scoped token may expose
+				// only part of the server's complete inventory.
+				metadataChanged := existing.Title != tool.Title ||
+					existing.Description != tool.Description ||
+					!bytes.Equal(existing.InputSchema, tool.InputSchema) ||
+					!bytes.Equal(existing.Annotations, tool.Annotations)
 				if err := tx.Model(&existing).Updates(map[string]interface{}{
 					"title":                tool.Title,
 					"description":          tool.Description,
 					"input_schema":         tool.InputSchema,
 					"annotations":          tool.Annotations,
 					"last_scan_generation": nextGeneration,
-					"inventory_source":     models.InventorySourceMCPScan,
 				}).Error; err != nil {
 					return fmt.Errorf("update tool %s: %w", tool.Name, err)
 				}
 				upsertedToolIDs = append(upsertedToolIDs, existing.ID)
-				syncResult.ToolsUpdated++
-			} else {
-				// If a non-mcp_scan tool with this name already exists, skip — don't duplicate.
-				var conflictCount int64
-				tx.Model(&models.MCPTool{}).
-					Where("resource_server_id = ? AND name = ?", rs.ID, tool.Name).
-					Count(&conflictCount)
-				if conflictCount > 0 {
-					continue // sdk_manifest or manual entry wins; track as upserted so we don't delete it
+				if existing.InventorySource == models.InventorySourceMCPScan {
+					scanMappingToolIDs = append(scanMappingToolIDs, existing.ID)
 				}
+				if metadataChanged {
+					syncResult.ToolsUpdated++
+				}
+			} else {
 				newTool := models.MCPTool{
 					WorkspaceID:        rs.WorkspaceID,
 					ResourceServerID:   rs.ID,
@@ -709,18 +804,21 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 					return fmt.Errorf("create tool %s: %w", tool.Name, err)
 				}
 				upsertedToolIDs = append(upsertedToolIDs, newTool.ID)
+				scanMappingToolIDs = append(scanMappingToolIDs, newTool.ID)
 				syncResult.ToolsAdded++
 			}
 		}
 
-		if len(discovered.Tools) == 0 {
+		if toolInventoryFetched && len(discovered.Tools) == 0 {
 			syncResult.Warnings = append(syncResult.Warnings,
 				"MCP server returned empty tools list")
 		}
 
-		// Stale tool deletion — only on full scan, only mcp_scan-sourced tools.
-		// sdk_manifest and manual tools are never deleted by the scanner.
-		if prmFetched {
+		// A successful scan can safely replace only scan-owned inventory. A
+		// protected server may filter tools/list by the supplied token's scopes,
+		// so unseen SDK-manifest tools cannot be assumed stale. SDK-owned deletion
+		// belongs to the authoritative full manifest publish path.
+		if fullScan && strings.TrimSpace(mcpBearerToken) == "" {
 			var staleToolIDs []uuid.UUID
 			staleQ := tx.Model(&models.MCPTool{}).
 				Where("resource_server_id = ? AND last_scan_generation < ? AND inventory_source = ?",
@@ -745,18 +843,30 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 				syncResult.ToolsRemoved = int(result.RowsAffected)
 			}
 		}
+		if fullScan && strings.TrimSpace(mcpBearerToken) != "" {
+			// Authenticated tools/list can be scope-filtered. Carry the prior
+			// serving snapshot forward so tools hidden from this token neither
+			// disappear from policy nor lose their admin mappings.
+			if err := tx.Model(&models.MCPTool{}).
+				Where("resource_server_id = ? AND inventory_source = ? AND last_scan_generation = ?",
+					rs.ID, models.InventorySourceMCPScan, scanState.LastSuccessfulGeneration).
+				Update("last_scan_generation", nextGeneration).Error; err != nil {
+				return fmt.Errorf("carry forward scoped scan inventory: %w", err)
+			}
+		}
 
 		// ── 3c. Auto-matched mapping reconciliation (full scan only) ──────
-		// Full replace: clear then re-apply. This ensures stale convention matches
-		// (e.g., a scope that disappeared from PRM) don't linger on surviving tools.
-		if prmFetched {
+		// Full-replace convention mappings for scan-owned tools. Preserve SDK
+		// manifest suggestions on mixed-source conflicts; that authoritative
+		// publish path owns their replacement lifecycle.
+		if fullScan {
 			currentScopeStrings, err := scopesForResourceServer(tx, rs.WorkspaceID, rs.ID)
 			if err != nil {
 				return err
 			}
 
-			if len(upsertedToolIDs) > 0 {
-				tx.Where("tool_id IN ? AND auto_matched = true", upsertedToolIDs).
+			if len(scanMappingToolIDs) > 0 {
+				tx.Where("tool_id IN ? AND auto_matched = true", scanMappingToolIDs).
 					Delete(&models.MCPToolScopeMap{})
 			}
 
@@ -767,6 +877,9 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 				var tool models.MCPTool
 				if tx.Where("resource_server_id = ? AND name = ?", rs.ID, m.ToolName).
 					First(&tool).Error != nil {
+					continue
+				}
+				if tool.InventorySource != models.InventorySourceMCPScan {
 					continue
 				}
 				var scope models.OAuthScope
@@ -795,20 +908,25 @@ func (s *ResourceServerService) DiscoverAndSyncWithToken(ctx context.Context, rs
 		// it incremented scan_generation. RowsAffected == 0 means this scan
 		// was superseded and its results must be discarded.
 		now := time.Now().UTC()
-		if prmFetched {
+		if fullScan {
 			// Full scan: advance the serving pointer.
-			// state always becomes 'needs_setup' after scan — admin must activate.
-			// Status retains 'ready'/'degraded' for backwards compat with older callers.
+			// A launched server remains ready: newly discovered unmapped tools fail
+			// closed individually and must not take the entire runtime policy offline.
+			// Servers still in onboarding remain needs_setup until activation.
 			finalStatus := "ready"
 			if len(syncResult.Warnings) > 0 {
 				finalStatus = "degraded"
+			}
+			finalState := models.RSStateNeedsSetup
+			if rs.State == models.RSStateReady {
+				finalState = models.RSStateReady
 			}
 			result := tx.Model(rs).
 				Where("id = ? AND scan_generation = ?", rs.ID, nextGeneration).
 				Updates(map[string]interface{}{
 					"last_successful_generation": nextGeneration,
 					"status":                     finalStatus,
-					"state":                      models.RSStateNeedsSetup,
+					"state":                      finalState,
 					"last_scan_status":           "success",
 					"last_scan_error":            nil,
 					"last_scan_completed_at":     &now,
@@ -923,6 +1041,26 @@ func (s *ResourceServerService) markScanFailed(rs *models.ResourceServer, genera
 		Updates(map[string]interface{}{
 			"status":                 "degraded",
 			"last_scan_status":       &scanStatus,
+			"last_scan_error":        &reason,
+			"last_scan_completed_at": &now,
+			"scan_in_progress":       false,
+		})
+}
+
+// markExplicitScanFailed releases an explicit-refresh lock without degrading
+// an otherwise healthy resource server or advancing the serving generation.
+// The previous inventory remains active until the operator fixes the request.
+func (s *ResourceServerService) markExplicitScanFailed(rs *models.ResourceServer, generation int, reason string) {
+	now := time.Now().UTC()
+	previousStatus := rs.Status
+	if previousStatus == "" || previousStatus == "pending_scan" {
+		previousStatus = "degraded"
+	}
+	s.db.Model(rs).
+		Where("id = ? AND scan_generation = ?", rs.ID, generation).
+		Updates(map[string]interface{}{
+			"status":                 previousStatus,
+			"last_scan_status":       "failure",
 			"last_scan_error":        &reason,
 			"last_scan_completed_at": &now,
 			"scan_in_progress":       false,

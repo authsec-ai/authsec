@@ -37,7 +37,7 @@ func (s *ScopeRegistryService) SyncFromPRM(workspaceID, resourceServerID uuid.UU
 		}
 
 		scope := models.OAuthScope{
-			WorkspaceID:         workspaceID,
+			WorkspaceID:      workspaceID,
 			ResourceServerID: &resourceServerID,
 			ScopeString:      scopeStr,
 			DisplayName:      generateDisplayName(scopeStr),
@@ -54,6 +54,19 @@ func (s *ScopeRegistryService) SyncFromPRM(workspaceID, resourceServerID uuid.UU
 
 		if result.Error != nil {
 			return upserted, fmt.Errorf("upsert scope %q: %w", scopeStr, result.Error)
+		}
+		// A scope first introduced as an SDK suggestion can later be confirmed
+		// by the resource server's PRM. Transfer ownership to discovery so a
+		// subsequent manifest omission cannot retire a still-advertised scope.
+		if scope.Source == "manifest" {
+			if err := s.db.Model(&scope).Updates(map[string]interface{}{
+				"source":             "discovered",
+				"is_auto_discovered": true,
+			}).Error; err != nil {
+				return upserted, fmt.Errorf("promote PRM scope %q: %w", scopeStr, err)
+			}
+			scope.Source = "discovered"
+			scope.IsAutoDiscovered = true
 		}
 		upserted = append(upserted, scope)
 	}

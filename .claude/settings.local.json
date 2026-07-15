@@ -82,7 +82,12 @@
       "Skill(artifact-design:*)",
       "Bash(echo \"tsc exit=$?\")",
       "Bash(npx eslint *)",
-      "Bash(echo \"eslint exit=$?\")"
+      "Bash(echo \"eslint exit=$?\")",
+      "Bash(awk -F: '{c[$1]++} END{for\\(f in c\\) print c[f], f}')",
+      "Bash(awk -F: '{split\\($3,a,\" \"\\); print a[1]}')",
+      "Bash(grep -rnoE \"style=\\\\{\\\\{[^}]*\\(#[0-9a-fA-F]{3,6}|rgb\\)[^}]*\\\\}\\\\}\" src/features/ src/components/)",
+      "Bash(grep -rloE \"style=\\\\{\\\\{[^}]*\\(#[0-9a-fA-F]{3,6}|rgb\\)\" src/features/ src/components/)",
+      "Bash(awk 'NR>=327 && NR<=474 && /chart/' src/theme/tokens.css)"
     ]
   }
 }

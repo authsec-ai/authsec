@@ -16,6 +16,7 @@ import (
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -218,11 +219,22 @@ func (ctrl *ScopeMatrixController) Rescan(c *gin.Context) {
 	result, err := ctrl.rsService.DiscoverAndSyncWithToken(ctx, rs, rescanReq.MCPToken)
 	if err != nil {
 		status := http.StatusBadGateway
+		code := "mcp_discovery_failed"
 		if errors.Is(err, services.ErrScanInProgress) {
 			status = http.StatusConflict // 409
+			code = "scan_in_progress"
+		}
+		if errors.Is(err, services.ErrMCPAuthenticationRequired) {
+			status = http.StatusPreconditionRequired // 428
+			code = "mcp_token_required"
+		}
+		if errors.Is(err, services.ErrMCPMetadataUnavailable) {
+			status = http.StatusBadGateway
+			code = "protected_resource_metadata_unavailable"
 		}
 		c.JSON(status, gin.H{
 			"error":          err.Error(),
+			"code":           code,
 			"failure_reason": result.FailureReason,
 		})
 		return
@@ -773,63 +785,112 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid manifest JSON"})
 		return
 	}
-	if len(payload.Tools) == 0 {
-		recordManifestAttempt(rs, models.ManifestAttemptEmptyToolList, "no tools in manifest", 0, payload.ManifestVersion)
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "manifest must contain at least one tool"})
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
+		recordManifestAttempt(rs, models.ManifestAttemptInvalidPayload, "manifest must be a JSON object", 0, "")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "manifest must be a JSON object"})
 		return
+	}
+	rawTools, toolsPresent := rawFields["tools"]
+	if !toolsPresent || strings.TrimSpace(string(rawTools)) == "null" {
+		recordManifestAttempt(rs, models.ManifestAttemptInvalidPayload, "tools field is required", 0, payload.ManifestVersion)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "manifest tools field is required; use an explicit empty array for an empty snapshot"})
+		return
+	}
+	toolNames := make([]string, 0, len(payload.Tools))
+	seenNames := make(map[string]struct{}, len(payload.Tools))
+	for _, tool := range payload.Tools {
+		name := strings.TrimSpace(tool.Name)
+		if name == "" {
+			recordManifestAttempt(rs, models.ManifestAttemptInvalidPayload, "tool name is required", 0, payload.ManifestVersion)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "every manifest tool must have a name"})
+			return
+		}
+		if _, exists := seenNames[name]; exists {
+			recordManifestAttempt(rs, models.ManifestAttemptInvalidPayload, "duplicate tool name: "+name, 0, payload.ManifestVersion)
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "manifest contains duplicate tool name: " + name})
+			return
+		}
+		seenNames[name] = struct{}{}
+		toolNames = append(toolNames, name)
 	}
 
 	toolCount := len(payload.Tools)
 	upsertedCount := 0
+	nextGen := 0
 	appSlug := services.SlugForApp(rs.Name)
-	for _, t := range payload.Tools {
-		canonicalSuggestedScopes := services.CanonicalAuthSecScopes(t.SuggestedScopes, appSlug)
-		existing := models.MCPTool{}
-		if config.DB.Where("resource_server_id = ? AND name = ? AND inventory_source = ?",
-			rs.ID, t.Name, models.InventorySourceSDKManifest).First(&existing).Error == nil {
-			config.DB.Model(&existing).Updates(map[string]interface{}{
-				"title":            t.Title,
-				"description":      t.Description,
-				"input_schema":     t.InputSchema,
-				"annotations":      t.Annotations,
-				"suggested_scopes": canonicalSuggestedScopes,
-			})
-		} else {
-			// Don't overwrite an existing mcp_scan or manual tool — just update suggested_scopes.
-			var conflictCount int64
-			config.DB.Model(&models.MCPTool{}).
-				Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).
-				Count(&conflictCount)
-			if conflictCount > 0 {
-				config.DB.Model(&models.MCPTool{}).
-					Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).
-					Update("suggested_scopes", canonicalSuggestedScopes)
-			} else {
-				newTool := models.MCPTool{
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		var generationState struct {
+			ScanGeneration           int  `gorm:"column:scan_generation"`
+			LastSuccessfulGeneration int  `gorm:"column:last_successful_generation"`
+			ScanInProgress           bool `gorm:"column:scan_in_progress"`
+		}
+		if err := tx.Raw(`
+			SELECT scan_generation, last_successful_generation, scan_in_progress
+			FROM resource_servers
+			WHERE id = ?
+			FOR UPDATE
+		`, rs.ID).Scan(&generationState).Error; err != nil {
+			return fmt.Errorf("lock manifest generation: %w", err)
+		}
+
+		observedToolIDs := make([]uuid.UUID, 0, len(payload.Tools))
+		currentManifestScopes := make(map[string]struct{})
+		for index, manifestTool := range payload.Tools {
+			name := toolNames[index]
+			canonicalSuggestedScopes := services.CanonicalAuthSecScopes(manifestTool.SuggestedScopes, appSlug)
+			for _, scopeString := range canonicalSuggestedScopes {
+				currentManifestScopes[scopeString] = struct{}{}
+			}
+			var tool models.MCPTool
+			findErr := tx.Where("resource_server_id = ? AND name = ?", rs.ID, name).First(&tool).Error
+			switch {
+			case findErr == nil && tool.InventorySource == models.InventorySourceSDKManifest:
+				if err := tx.Model(&tool).Updates(map[string]interface{}{
+					"title":            manifestTool.Title,
+					"description":      manifestTool.Description,
+					"input_schema":     manifestTool.InputSchema,
+					"annotations":      manifestTool.Annotations,
+					"suggested_scopes": canonicalSuggestedScopes,
+				}).Error; err != nil {
+					return fmt.Errorf("update manifest tool %s: %w", name, err)
+				}
+			case findErr == nil:
+				// Preserve an admin-created or live-scan row, but accept the SDK's
+				// advisory scope suggestions for the same unique tool name.
+				if err := tx.Model(&tool).Update("suggested_scopes", canonicalSuggestedScopes).Error; err != nil {
+					return fmt.Errorf("update manifest suggestions for %s: %w", name, err)
+				}
+			case errors.Is(findErr, gorm.ErrRecordNotFound):
+				tool = models.MCPTool{
 					WorkspaceID:      rs.WorkspaceID,
 					ResourceServerID: rs.ID,
-					Name:             t.Name,
-					Title:            t.Title,
-					Description:      t.Description,
-					InputSchema:      t.InputSchema,
-					Annotations:      t.Annotations,
+					Name:             name,
+					Title:            manifestTool.Title,
+					Description:      manifestTool.Description,
+					InputSchema:      manifestTool.InputSchema,
+					Annotations:      manifestTool.Annotations,
 					SuggestedScopes:  canonicalSuggestedScopes,
 					InventorySource:  models.InventorySourceSDKManifest,
 				}
-				config.DB.Create(&newTool)
+				if err := tx.Create(&tool).Error; err != nil {
+					return fmt.Errorf("create manifest tool %s: %w", name, err)
+				}
+			default:
+				return fmt.Errorf("find manifest tool %s: %w", name, findErr)
 			}
-		}
 
-		// Upsert sdk_suggested scope mappings for each canonical AuthSec scope.
-		// Server-defined/legacy suggested scopes are ignored.
-		if len(canonicalSuggestedScopes) > 0 {
-			var tool models.MCPTool
-			config.DB.Where("resource_server_id = ? AND name = ?", rs.ID, t.Name).First(&tool)
+			// A manifest publish is a full replacement of SDK suggestions for
+			// each observed tool. Runtime-effective admin_override mappings stay.
+			if err := tx.Where("tool_id = ? AND source = ?", tool.ID, models.ScopeMapSourceSDKSuggested).
+				Delete(&models.MCPToolScopeMap{}).Error; err != nil {
+				return fmt.Errorf("clear manifest mappings for %s: %w", name, err)
+			}
 			for _, scopeStr := range canonicalSuggestedScopes {
 				var scope models.OAuthScope
-				err := config.DB.Where("(workspace_id = ? OR workspace_id = ?) AND resource_server_id = ? AND scope_string = ?",
-					rs.WorkspaceID, rs.WorkspaceID, rs.ID, scopeStr).First(&scope).Error
-				if err != nil {
+				findScopeErr := tx.Where("workspace_id = ? AND resource_server_id = ? AND scope_string = ?",
+					rs.WorkspaceID, rs.ID, scopeStr).First(&scope).Error
+				if errors.Is(findScopeErr, gorm.ErrRecordNotFound) {
 					scope = models.OAuthScope{
 						WorkspaceID:      rs.WorkspaceID,
 						ResourceServerID: &rs.ID,
@@ -839,36 +900,147 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 						Source:           "manifest",
 						IsAutoDiscovered: false,
 					}
-					if createErr := config.DB.Create(&scope).Error; createErr != nil {
-						// best-effort — keep going
-						continue
+					if err := tx.Create(&scope).Error; err != nil {
+						return fmt.Errorf("create manifest scope %s: %w", scopeStr, err)
 					}
+				} else if findScopeErr != nil {
+					return fmt.Errorf("find manifest scope %s: %w", scopeStr, findScopeErr)
 				}
-				config.DB.Exec(`
+				if err := tx.Exec(`
 					INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
 					VALUES (?, ?, true, 'sdk_suggested')
 					ON CONFLICT (tool_id, scope_id) DO NOTHING
-				`, tool.ID, scope.ID)
+				`, tool.ID, scope.ID).Error; err != nil {
+					return fmt.Errorf("map manifest scope %s to %s: %w", scopeStr, name, err)
+				}
+			}
+			observedToolIDs = append(observedToolIDs, tool.ID)
+			upsertedCount++
+		}
+
+		// suggested_scopes and sdk_suggested mappings are SDK-owned advisory
+		// state even when the unique tool row originated from scan/manual. Clear
+		// omitted suggestions before deleting stale SDK-owned rows.
+		var omittedToolIDs []uuid.UUID
+		omittedQuery := tx.Model(&models.MCPTool{}).Where("resource_server_id = ?", rs.ID)
+		if len(toolNames) > 0 {
+			omittedQuery = omittedQuery.Where("name NOT IN ?", toolNames)
+		}
+		if err := omittedQuery.Pluck("id", &omittedToolIDs).Error; err != nil {
+			return fmt.Errorf("find tools omitted from manifest: %w", err)
+		}
+		if len(omittedToolIDs) > 0 {
+			if err := tx.Where("tool_id IN ? AND source = ?", omittedToolIDs, models.ScopeMapSourceSDKSuggested).
+				Delete(&models.MCPToolScopeMap{}).Error; err != nil {
+				return fmt.Errorf("clear omitted manifest mappings: %w", err)
+			}
+			if err := tx.Model(&models.MCPTool{}).
+				Where("id IN ? AND inventory_source <> ?", omittedToolIDs, models.InventorySourceSDKManifest).
+				Update("suggested_scopes", pq.StringArray{}).Error; err != nil {
+				return fmt.Errorf("clear omitted manifest suggestions: %w", err)
 			}
 		}
-		upsertedCount++
-	}
-	syncScopesSupported(rs.ID, rs.WorkspaceID)
 
-	// Advance the generation pointer on every successful manifest publish so:
-	//   - the /sdk-policy response carries a meaningful, monotonic generation
-	//     for SDK observability (instead of always 0 for manifest-only RSes),
-	//   - any future consumer that filters by last_scan_generation sees the
-	//     manifest-published tools tagged with the current generation.
-	// We do this in a single update so generation and tool tags stay consistent.
-	nextGen := max(rs.LastSuccessfulGeneration, rs.ScanGeneration) + 1
-	config.DB.Model(rs).Updates(map[string]interface{}{
-		"scan_generation":            nextGen,
-		"last_successful_generation": nextGen,
+		// The SDK manifest is a complete snapshot. Delete SDK-owned tools that
+		// disappeared from the new payload; manual and live-scan rows are not
+		// owned by this publish path.
+		staleManifestQuery := tx.Where("resource_server_id = ? AND inventory_source = ?",
+			rs.ID, models.InventorySourceSDKManifest)
+		if len(toolNames) > 0 {
+			staleManifestQuery = staleManifestQuery.Where("name NOT IN ?", toolNames)
+		}
+		if err := staleManifestQuery.Delete(&models.MCPTool{}).Error; err != nil {
+			return fmt.Errorf("delete stale manifest tools: %w", err)
+		}
+
+		// Retire manifest-created scopes that no current SDK suggestion uses.
+		// Preserve scopes that an admin has incorporated into effective RBAC by
+		// promoting them to manual ownership instead of deleting them.
+		var manifestScopes []models.OAuthScope
+		if err := tx.Where("workspace_id = ? AND resource_server_id = ? AND source = ?",
+			rs.WorkspaceID, rs.ID, "manifest").Find(&manifestScopes).Error; err != nil {
+			return fmt.Errorf("list manifest-owned scopes: %w", err)
+		}
+		for _, scope := range manifestScopes {
+			if _, stillSuggested := currentManifestScopes[scope.ScopeString]; stillSuggested {
+				continue
+			}
+			var mappingCount int64
+			if err := tx.Model(&models.MCPToolScopeMap{}).Where("scope_id = ?", scope.ID).
+				Count(&mappingCount).Error; err != nil {
+				return fmt.Errorf("count scope mappings for %s: %w", scope.ScopeString, err)
+			}
+			var permissionCount int64
+			if err := tx.Model(&models.OAuthScopePermission{}).Where("scope_id = ?", scope.ID).
+				Count(&permissionCount).Error; err != nil {
+				return fmt.Errorf("count scope permissions for %s: %w", scope.ScopeString, err)
+			}
+			var childCount int64
+			if err := tx.Model(&models.OAuthScope{}).Where("parent_scope_id = ?", scope.ID).
+				Count(&childCount).Error; err != nil {
+				return fmt.Errorf("count child scopes for %s: %w", scope.ScopeString, err)
+			}
+			if mappingCount+permissionCount+childCount > 0 {
+				if err := tx.Model(&scope).Update("source", "manual").Error; err != nil {
+					return fmt.Errorf("promote manifest scope %s: %w", scope.ScopeString, err)
+				}
+				continue
+			}
+			if err := tx.Delete(&scope).Error; err != nil {
+				return fmt.Errorf("delete stale manifest scope %s: %w", scope.ScopeString, err)
+			}
+		}
+
+		var scopeStrings []string
+		if err := tx.Model(&models.OAuthScope{}).
+			Where("resource_server_id = ? AND workspace_id = ?", rs.ID, rs.WorkspaceID).
+			Order("scope_string ASC").Pluck("scope_string", &scopeStrings).Error; err != nil {
+			return fmt.Errorf("list manifest scopes: %w", err)
+		}
+		if scopeStrings == nil {
+			scopeStrings = []string{}
+		}
+
+		if err := tx.Model(&models.ResourceServer{}).Where("id = ?", rs.ID).
+			Update("scopes_supported", pq.StringArray(scopeStrings)).Error; err != nil {
+			return fmt.Errorf("sync manifest scopes_supported: %w", err)
+		}
+
+		// A live scan owns scan_generation while scan_in_progress is true. Do
+		// not supersede it from the manifest path or the scan's generation guard
+		// would roll back and leave its lock stranded. SDK rows remain eligible
+		// independently of generation; the scan will finish the serving pointer.
+		nextGen = generationState.LastSuccessfulGeneration
+		if !generationState.ScanInProgress {
+			nextGen = max(generationState.ScanGeneration, generationState.LastSuccessfulGeneration) + 1
+			if err := tx.Model(&models.ResourceServer{}).Where("id = ?", rs.ID).Updates(map[string]interface{}{
+				"scan_generation":            nextGen,
+				"last_successful_generation": nextGen,
+			}).Error; err != nil {
+				return fmt.Errorf("advance manifest generation: %w", err)
+			}
+
+			// Carry forward the prior live-scan serving snapshot and stamp every
+			// manifest-observed conflict row. Otherwise advancing the pointer would
+			// hide valid mcp_scan tools from UI/runtime policy.
+			if err := tx.Model(&models.MCPTool{}).
+				Where(`resource_server_id = ? AND (
+					inventory_source = ? OR
+					(inventory_source = ? AND last_scan_generation = ?) OR
+					id IN ?
+				)`, rs.ID, models.InventorySourceSDKManifest, models.InventorySourceMCPScan,
+					generationState.LastSuccessfulGeneration, observedToolIDs).
+				Update("last_scan_generation", nextGen).Error; err != nil {
+				return fmt.Errorf("stamp manifest generation: %w", err)
+			}
+		}
+		return nil
 	})
-	config.DB.Model(&models.MCPTool{}).
-		Where("resource_server_id = ? AND inventory_source = ?", rs.ID, models.InventorySourceSDKManifest).
-		Update("last_scan_generation", nextGen)
+	if err != nil {
+		recordManifestAttempt(rs, models.ManifestAttemptServerError, err.Error(), toolCount, payload.ManifestVersion)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store SDK manifest"})
+		return
+	}
 
 	recordManifestAttemptWithVersion(rs, models.ManifestAttemptSuccess, "", toolCount, payload.ManifestVersion, payload.SDKBuildID)
 

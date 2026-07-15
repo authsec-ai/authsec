@@ -126,12 +126,18 @@ about per-tool authorization. There are two ways this inventory gets populated:
 - **Path A — SDK manifest push.** Your server's AuthSec SDK **publishes a manifest** (the
   list of tools, a manifest version, a build id) to AuthSec. Every push is recorded as a
   *manifest attempt* (success / auth-failed / invalid / empty / error), which powers the
-  "waiting for your first manifest…" polling UI during setup.
+  "waiting for your first manifest…" polling UI during setup. A successful publish is a
+  complete SDK-owned snapshot: tools and SDK suggestions omitted from the new manifest are
+  removed, while admin-effective mappings on surviving tools are preserved.
 - **Path B — Discovery scan.** AuthSec actively connects to your server, runs the MCP
   `initialize` handshake, and calls `tools/list` (paginated) to enumerate tools itself. It
-  also re-fetches PRM. If the server answers the scan with a `401` bearer challenge, AuthSec
-  records that as *"reachable and properly protected"* and commits a zero-tool snapshot
-  rather than treating it as a failure.
+  also re-fetches PRM. The background registration probe treats a `401` bearer challenge as
+  *"reachable and properly protected"*. An operator-triggered **Refresh Tools** must actually
+  enumerate the live inventory, so the console asks for a one-shot MCP bearer token and does
+  not report a successful refresh until `tools/list` completes. That token is never stored.
+  Because a protected server can filter `tools/list` by the token's scopes, authenticated
+  refresh merges the visible result and carries forward unseen scan inventory; only an
+  unfiltered scan or authoritative SDK manifest may remove omitted tools.
 
 Either way, the result is a **tool inventory** tagged by source (SDK manifest, manual, or
 scan), versioned by a **discovery generation number** so a half-finished scan never leaks

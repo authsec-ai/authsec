@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +24,16 @@ import (
 // this as a successful "server is reachable and protected" outcome and commit
 // a zero-tool scan rather than a hard failure.
 var ErrProtectedServer = errors.New("mcp server is protected (401 with bearer challenge)")
+
+// ProtectedServerError carries the RFC 9728 metadata URL advertised by a
+// parsed Bearer challenge. It unwraps to ErrProtectedServer for callers that
+// only need the protected/reachable classification.
+type ProtectedServerError struct {
+	ResourceMetadataURL string
+}
+
+func (e *ProtectedServerError) Error() string { return ErrProtectedServer.Error() }
+func (e *ProtectedServerError) Unwrap() error { return ErrProtectedServer }
 
 const (
 	maxResponseSize    = 5 * 1024 * 1024 // 5MB
@@ -75,9 +87,28 @@ func (c *Client) Discover(ctx context.Context, baseURL string) (*DiscoveryResult
 	} else {
 		result.PRM = prm
 	}
+	if c.bearerToken != "" {
+		// MCP requires clients to prefer resource_metadata from a parsed 401
+		// challenge. Probe without the token only when well-known discovery did
+		// not yield valid metadata; the real tools/list call still uses the
+		// caller's one-shot token below.
+		probe := *c
+		probe.bearerToken = ""
+		_, probeErr := probe.DiscoverTools(ctx, baseURL)
+		var protectedErr *ProtectedServerError
+		if errors.As(probeErr, &protectedErr) && protectedErr.ResourceMetadataURL != "" {
+			// A challenge URL is authoritative over an earlier well-known
+			// document because it can advertise changed metadata.
+			result.PRM = c.prmFromProtectedError(ctx, baseURL, probeErr)
+		}
+	}
 
 	tools, err := c.DiscoverTools(ctx, baseURL)
 	if err != nil {
+		var protectedErr *ProtectedServerError
+		if errors.As(err, &protectedErr) && protectedErr.ResourceMetadataURL != "" {
+			result.PRM = c.prmFromProtectedError(ctx, baseURL, err)
+		}
 		return result, fmt.Errorf("tools/list failed: %w", err)
 	}
 	result.Tools = tools
@@ -93,48 +124,80 @@ func (c *Client) FetchPRM(ctx context.Context, baseURL string) (*ProtectedResour
 	}
 
 	// Try path-specific first, then root
+	resourcePath := parsed.EscapedPath()
+	if resourcePath == "/" {
+		resourcePath = ""
+	}
 	prmURLs := []string{
-		fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource%s", parsed.Scheme, parsed.Host, parsed.Path),
+		fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource%s", parsed.Scheme, parsed.Host, resourcePath),
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
 		prmURLs = append(prmURLs, fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource", parsed.Scheme, parsed.Host))
 	}
 
 	for _, prmURL := range prmURLs {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, prmURL, nil)
-		if err != nil {
-			continue
+		if prm, err := c.fetchPRMURL(ctx, prmURL, baseURL); err == nil {
+			return prm, nil
 		}
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-		if err != nil {
-			continue
-		}
-
-		var prm ProtectedResourceMetadata
-		if err := json.Unmarshal(body, &prm); err != nil {
-			continue
-		}
-		return &prm, nil
 	}
 
 	return nil, fmt.Errorf("PRM not found at any well-known URI for %s", baseURL)
 }
 
+func (c *Client) prmFromProtectedError(ctx context.Context, resourceURI string, discoveryErr error) *ProtectedResourceMetadata {
+	var protectedErr *ProtectedServerError
+	if !errors.As(discoveryErr, &protectedErr) || protectedErr.ResourceMetadataURL == "" {
+		return nil
+	}
+	prm, err := c.fetchPRMURL(ctx, protectedErr.ResourceMetadataURL, resourceURI)
+	if err != nil {
+		return nil
+	}
+	return prm
+}
+
+func (c *Client) fetchPRMURL(ctx context.Context, metadataURL, expectedResource string) (*ProtectedResourceMetadata, error) {
+	parsed, err := url.Parse(metadataURL)
+	if err != nil || parsed == nil {
+		return nil, fmt.Errorf("invalid protected resource metadata URL")
+	}
+	allowLocalHTTP := os.Getenv("MCP_ALLOW_LOOPBACK") == "true" &&
+		parsed.Scheme == "http" &&
+		(parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1")
+	if (parsed.Scheme != "https" && !allowLocalHTTP) || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid protected resource metadata URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("protected resource metadata returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+	if err != nil {
+		return nil, err
+	}
+	var prm ProtectedResourceMetadata
+	if err := json.Unmarshal(body, &prm); err != nil {
+		return nil, err
+	}
+	// RFC 9728 section 3.3 requires an identical resource identifier.
+	if prm.Resource == "" || prm.Resource != expectedResource {
+		return nil, fmt.Errorf("protected resource metadata resource mismatch")
+	}
+	return &prm, nil
+}
+
 // DiscoverTools calls MCP initialize + tools/list via Streamable HTTP.
 func (c *Client) DiscoverTools(ctx context.Context, baseURL string) ([]Tool, error) {
-	mcpEndpoint := strings.TrimRight(baseURL, "/")
+	mcpEndpoint := baseURL
 
 	// Step 1: Initialize
 	sessionID, err := c.mcpInitialize(ctx, mcpEndpoint)
@@ -190,21 +253,24 @@ func (c *Client) mcpInitialize(ctx context.Context, endpoint string) (string, er
 		return "", err
 	}
 
-	// Extract session ID from Mcp-Session header
-	sessionID := resp.Header.Get("Mcp-Session")
+	// MCP Streamable HTTP uses Mcp-Session-Id for stateful sessions.
+	sessionID := resp.Header.Get("Mcp-Session-Id")
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	resp.Body.Close()
+	rpcResp, err := readJSONRPCResponse(resp, 1)
 	if err != nil {
-		return "", fmt.Errorf("read initialize response: %w", err)
-	}
-
-	var rpcResp jsonRPCResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
 		return "", fmt.Errorf("parse initialize response: %w", err)
 	}
 	if rpcResp.Error != nil {
 		return "", fmt.Errorf("initialize error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+	var initializeResult struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(rpcResp.Result, &initializeResult); err != nil {
+		return "", fmt.Errorf("parse initialize protocol version: %w", err)
+	}
+	if initializeResult.ProtocolVersion != mcpProtocolVersion {
+		return "", fmt.Errorf("MCP server negotiated unsupported protocol version %q", initializeResult.ProtocolVersion)
 	}
 
 	// Send initialized notification
@@ -215,9 +281,10 @@ func (c *Client) mcpInitialize(ctx context.Context, endpoint string) (string, er
 	notifBody, _ := json.Marshal(notif)
 	notifReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(notifBody))
 	notifReq.Header.Set("Content-Type", "application/json")
-	notifReq.Header.Set("Accept", "application/json")
+	notifReq.Header.Set("Accept", "application/json, text/event-stream")
+	notifReq.Header.Set("MCP-Protocol-Version", mcpProtocolVersion)
 	if sessionID != "" {
-		notifReq.Header.Set("Mcp-Session", sessionID)
+		notifReq.Header.Set("Mcp-Session-Id", sessionID)
 	}
 	if c.bearerToken != "" {
 		notifReq.Header.Set("Authorization", "Bearer "+c.bearerToken)
@@ -235,22 +302,15 @@ func (c *Client) mcpRequest(ctx context.Context, endpoint, sessionID string, id 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+	rpcResp, err := readJSONRPCResponse(resp, id)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	var rpcResp jsonRPCResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 	if rpcResp.Error != nil {
 		return nil, fmt.Errorf("RPC error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
 	}
 
-	return &rpcResp, nil
+	return rpcResp, nil
 }
 
 func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, id int, method string, params interface{}) (*http.Response, error) {
@@ -271,9 +331,12 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if method != "initialize" {
+		req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion)
+	}
 	if sessionID != "" {
-		req.Header.Set("Mcp-Session", sessionID)
+		req.Header.Set("Mcp-Session-Id", sessionID)
 	}
 	if c.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
@@ -285,13 +348,13 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		wwwAuth := resp.Header.Get("WWW-Authenticate")
+		wwwAuth := resp.Header.Values("WWW-Authenticate")
 		resp.Body.Close()
-		// RFC 9728 bearer challenge: protected server, reachable and well-formed.
-		// Treat as a distinct outcome so the caller can commit a zero-tool scan
-		// rather than mark the RS as failed.
-		if strings.Contains(strings.ToLower(wwwAuth), "bearer") {
-			return nil, ErrProtectedServer
+		// Parse top-level authentication challenges so quoted Basic realms cannot
+		// masquerade as Bearer. MCP prefers resource_metadata from the Bearer
+		// challenge and falls back to well-known discovery when it is absent.
+		if metadataURL, ok := bearerResourceMetadataURL(wwwAuth); ok {
+			return nil, &ProtectedServerError{ResourceMetadataURL: metadataURL}
 		}
 		return nil, fmt.Errorf("HTTP 401 from %s %s", method, endpoint)
 	}
@@ -302,6 +365,158 @@ func (c *Client) mcpRawRequest(ctx context.Context, endpoint, sessionID string, 
 	}
 
 	return resp, nil
+}
+
+func readJSONRPCResponse(resp *http.Response, expectedID int) (*jsonRPCResponse, error) {
+	defer resp.Body.Close()
+	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+		if err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		var rpcResp jsonRPCResponse
+		if err := json.Unmarshal(body, &rpcResp); err != nil {
+			return nil, err
+		}
+		if !isExpectedJSONRPCResponse(&rpcResp, expectedID) {
+			return nil, fmt.Errorf("JSON-RPC response id did not match request %d", expectedID)
+		}
+		return &rpcResp, nil
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), maxResponseSize)
+	dataLines := make([]string, 0, 2)
+	bytesRead := 0
+	flush := func() *jsonRPCResponse {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		var rpcResp jsonRPCResponse
+		if json.Unmarshal([]byte(payload), &rpcResp) != nil {
+			return nil
+		}
+		if !isExpectedJSONRPCResponse(&rpcResp, expectedID) {
+			return nil
+		}
+		return &rpcResp
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		bytesRead += len(line) + 1
+		if bytesRead > maxResponseSize {
+			return nil, fmt.Errorf("SSE response exceeded %d bytes", maxResponseSize)
+		}
+		if line == "" {
+			if rpcResp := flush(); rpcResp != nil {
+				return rpcResp, nil
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if rpcResp := flush(); rpcResp != nil {
+		return rpcResp, nil
+	}
+	return nil, fmt.Errorf("SSE response contained no JSON-RPC result")
+}
+
+func isExpectedJSONRPCResponse(response *jsonRPCResponse, expectedID int) bool {
+	return response.ID != nil &&
+		*response.ID == expectedID &&
+		response.Method == "" &&
+		(response.Result != nil || response.Error != nil)
+}
+
+func bearerResourceMetadataURL(headerValues []string) (string, bool) {
+	sawBearer := false
+	for _, headerValue := range headerValues {
+		currentScheme := ""
+		for _, segment := range splitAuthHeaderSegments(headerValue) {
+			segment = strings.TrimSpace(segment)
+			if segment == "" {
+				continue
+			}
+			parameterText := segment
+			if _, _, isParameter := cutAuthParameter(segment); !isParameter {
+				space := strings.IndexAny(segment, " \t")
+				if space >= 0 {
+					currentScheme = strings.TrimSpace(segment[:space])
+					parameterText = strings.TrimSpace(segment[space+1:])
+				} else {
+					currentScheme = segment
+					parameterText = ""
+				}
+			}
+			if !strings.EqualFold(currentScheme, "Bearer") {
+				continue
+			}
+			sawBearer = true
+			if parameterText == "" {
+				return "", true
+			}
+			name, rawValue, found := cutAuthParameter(parameterText)
+			if !found || !strings.EqualFold(name, "resource_metadata") {
+				continue
+			}
+			value := rawValue
+			if strings.HasPrefix(value, `"`) {
+				unquoted, err := strconv.Unquote(value)
+				if err != nil {
+					return "", false
+				}
+				value = unquoted
+			}
+			return value, true
+		}
+	}
+	return "", sawBearer
+}
+
+func cutAuthParameter(value string) (string, string, bool) {
+	name, rawValue, found := strings.Cut(value, "=")
+	if !found {
+		return "", "", false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || strings.ContainsAny(name, " \t") {
+		return "", "", false
+	}
+	return name, strings.TrimSpace(rawValue), true
+}
+
+func splitAuthHeaderSegments(value string) []string {
+	segments := make([]string, 0, 4)
+	start := 0
+	inQuotes := false
+	escaped := false
+	for index, r := range value {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && inQuotes {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if r == ',' && !inQuotes {
+			segments = append(segments, value[start:index])
+			start = index + 1
+		}
+	}
+	segments = append(segments, value[start:])
+	return segments
 }
 
 // ssrfSafeDialer rejects connections to private/loopback IPs.

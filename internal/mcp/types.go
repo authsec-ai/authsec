@@ -37,7 +37,7 @@ type DiscoveryResult struct {
 
 type jsonRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
+	ID      int         `json:"id,omitempty"`
 	Method  string      `json:"method"`
 	Params  interface{} `json:"params,omitempty"`
 }
@@ -45,6 +45,7 @@ type jsonRPCRequest struct {
 type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      *int            `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *jsonRPCError   `json:"error,omitempty"`
 }
