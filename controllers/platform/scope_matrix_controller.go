@@ -3332,8 +3332,9 @@ func (ctrl *ScopeMatrixController) AccessSimulation(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "scope resolution failed"})
 		return
 	}
-	trace = append(trace, gin.H{"check": "role_grants_scope", "state": boolState(len(report.Grantable) > 0), "detail": report.Diagnostics})
-	if len(report.Grantable) == 0 {
+	hasAccessBearingScope := services.HasAccessBearingScope(report.Grantable)
+	trace = append(trace, gin.H{"check": "role_grants_scope", "state": boolState(hasAccessBearingScope), "detail": report.Diagnostics})
+	if !hasAccessBearingScope {
 		c.JSON(http.StatusOK, simulationDenied(rs, tool, trace, "missing_role_scope", "Assign a role that grants one of the tool's access labels."))
 		return
 	}

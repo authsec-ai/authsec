@@ -266,14 +266,18 @@ func (ctrl *OAuthASController) Authorize(c *gin.Context) {
 
 	// JIT scope binding for DCR clients. RFC 7591 lets clients register with
 	// an empty `scope`; spec-compliant MCP clients (Claude Code, etc.) do
-	// exactly that, expecting resource-bound scopes to be granted at
-	// /authorize. Without this step, Hydra would reject with
-	//   "OAuth 2.0 Client is not allowed to request scope '<rs-scope>'"
+	// exactly that, expecting resource-bound and protocol scopes such as
+	// offline_access to be granted at /authorize. Without this step, Hydra
+	// rejects with "OAuth 2.0 Client is not allowed to request scope '<scope>'".
 	// because the Hydra client was registered with an empty scope set.
-	// See EnsureHydraClientHasRSScopes for the full rationale + safety
+	// See EnsureHydraClientHasAuthorizeScopes for the full rationale + safety
 	// argument (this only widens what the client may REQUEST; consent + RBAC
 	// still gate what's actually granted).
-	if err := ctrl.service.EnsureHydraClientHasRSScopes(oauthClient, rs); err != nil {
+	if err := ctrl.service.EnsureHydraClientHasAuthorizeScopes(
+		oauthClient,
+		rs,
+		strings.Fields(scopeParam),
+	); err != nil {
 		log.Printf("[MCP_AUTH] Authorize: scope-binding update failed client=%s rs=%s: %v",
 			oauthClient.ClientID, rs.ResourceURI, err)
 		// Don't fail the request — Hydra will still reject any requested
@@ -631,7 +635,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 			arcCtx.WorkspaceID, tokenSubject, arcCtx.ResourceServerID,
 			issuedScopes, rs, oauthClient,
 		)
-		if rbacErr != nil || len(currentScopes) == 0 {
+		if rbacErr != nil || !services.HasAccessBearingScope(currentScopes) {
 			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: RBAC full revocation context_id=%s sub=%s err=%v",
 				contextID, tokenSubject, rbacErr)
 			revokeIssuedTokens("RBAC revocation (full loss)")
@@ -837,7 +841,7 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		rs.WorkspaceID.String(), sub, rs.ID.String(),
 		issuedScopes, rs, oauthClient,
 	)
-	if rbacErr != nil || len(currentScopes) == 0 {
+	if rbacErr != nil || !services.HasAccessBearingScope(currentScopes) {
 		log.Printf("[MCP_AUTH] tokenRefreshGrant: RBAC fully revoked sub=%s rs=%s err=%v", sub, resourceParam, rbacErr)
 		revokeRefreshed("full RBAC loss on refresh")
 		c.JSON(http.StatusForbidden, gin.H{
@@ -960,7 +964,7 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
 		return
 	}
-	if len(grantedScopes) == 0 {
+	if !services.HasAccessBearingScope(grantedScopes) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":             "access_denied",
 			"error_description": "no scopes granted to this service account for the requested resource",
@@ -1218,7 +1222,7 @@ func (ctrl *OAuthASController) tokenJWTBearerGrant(c *gin.Context, _ *models.MCP
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
 		return
 	}
-	if len(grantedScopes) == 0 {
+	if !services.HasAccessBearingScope(grantedScopes) {
 		// RBAC resolved to zero scopes — upsert access_request with known subject.
 		scopeStr := strings.Join(requestedScopes, " ")
 		reqID, _ := ctrl.service.UpsertAccessRequest(
@@ -2397,7 +2401,7 @@ func (ctrl *OAuthASController) Introspect(c *gin.Context) {
 		finalScopes = oidcScopes
 	}
 
-	if len(finalScopes) == 0 {
+	if !services.HasAccessBearingScope(finalScopes) {
 		log.Printf("[MCP_AUTH] Introspect: no scopes remain after enforcement sub=%s rs=%s", sub, rs.ResourceURI)
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return

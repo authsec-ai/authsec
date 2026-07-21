@@ -314,11 +314,12 @@ func (s *OAuthASService) GetMCPOAuthClientByClientID(clientID string) (*models.M
 	return s.authzCtx.GetMCPOAuthClientByClientID(clientID)
 }
 
-// EnsureHydraClientHasRSScopes is the lazy-binding fix for DCR'd clients
+// EnsureHydraClientHasAuthorizeScopes is the lazy-binding fix for DCR'd clients
 // whose Hydra `scope` field doesn't yet cover the scopes a Resource Server
-// publishes. Symptom this addresses: Claude Code (and any spec-compliant
-// MCP client) typically calls DCR with `scope=""` (RFC 7591 allows it),
-// expecting the AS to grant resource-bound scopes lazily at /authorize.
+// publishes or the protocol scopes requested later at /authorize. Symptom
+// this addresses: Claude Code (and any spec-compliant MCP client) typically
+// calls DCR with `scope=""` (RFC 7591 allows it), then requests both
+// resource-bound scopes and `offline_access` at /authorize.
 // Without this, Hydra hits the request with
 //
 //	"The OAuth 2.0 Client is not allowed to request scope 'demo_server:admin'"
@@ -326,72 +327,102 @@ func (s *OAuthASService) GetMCPOAuthClientByClientID(clientID string) (*models.M
 // because the client's stored scope set is empty.
 //
 // Behaviour:
-//   - Compute the union of the client's current Hydra `scope` and the RS's
-//     `scopes_supported`.
+//   - Compute the union of the client's current Hydra `scope`, the RS's
+//     `scopes_supported`, and the already-validated authorize request scopes.
 //   - If the union equals the current set → no-op (idempotent, no Hydra call).
 //   - Otherwise PUT the union back to Hydra and persist the new scope on the
 //     MCPOAuthClient row so subsequent reconciler runs see it.
 //
 // Security: this only widens the SET OF SCOPES THE CLIENT MAY REQUEST. The
-// actual grant at /authorize still requires user consent, and AuthSec's
-// scope_resolver still enforces RBAC + per-tool checks at runtime. So we are
-// not silently authorizing anything — we're just making sure the client can
-// _ask_ for any scope its bound RS publishes.
-func (s *OAuthASService) EnsureHydraClientHasRSScopes(client *models.MCPOAuthClient, rs *models.ResourceServer) error {
-	if client == nil || rs == nil || len(rs.ScopesSupported) == 0 {
+// requestedScopes comes from validateOAuthPolicy, so invalid OIDC or
+// application scopes have already failed closed before this method runs. The
+// actual grant still requires consent and AuthSec RBAC at runtime.
+func (s *OAuthASService) EnsureHydraClientHasAuthorizeScopes(
+	client *models.MCPOAuthClient,
+	rs *models.ResourceServer,
+	requestedScopes []string,
+) error {
+	if client == nil || rs == nil {
 		return nil
 	}
 
-	currentScopes := strings.Fields(client.Scope)
-	scopeSet := make(map[string]struct{}, len(currentScopes)+len(rs.ScopesSupported))
-	for _, s := range currentScopes {
-		scopeSet[s] = struct{}{}
-	}
-
-	added := false
-	for _, s := range rs.ScopesSupported {
-		if s == "" {
-			continue
+	// One OAuth client can bind to multiple resource servers. Serialize the
+	// read/merge/write repair by client row so concurrent first authorizations
+	// cannot overwrite each other's scope union across backend instances.
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var locked models.MCPOAuthClient
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&locked, "id = ?", client.ID).Error; err != nil {
+			return fmt.Errorf("ensure authorize scopes: lock client: %w", err)
 		}
-		if _, ok := scopeSet[s]; !ok {
-			scopeSet[s] = struct{}{}
-			added = true
+
+		scopeSet := make(map[string]struct{}, len(strings.Fields(locked.Scope))+len(rs.ScopesSupported)+len(requestedScopes))
+		for _, scope := range strings.Fields(locked.Scope) {
+			scopeSet[scope] = struct{}{}
 		}
-	}
-	if !added {
-		return nil // already a superset; nothing to do
-	}
 
-	// Stable order keeps Hydra-side updates idempotent across reconciler runs.
-	merged := make([]string, 0, len(scopeSet))
-	for s := range scopeSet {
-		merged = append(merged, s)
-	}
-	sort.Strings(merged)
-	mergedScope := strings.Join(merged, " ")
+		scopesToAdd := append([]string{}, rs.ScopesSupported...)
+		if locked.RegistrationType == "dcr" {
+			scopesToAdd = append(scopesToAdd, requestedScopes...)
+		}
+		scopeChanged := false
+		for _, scope := range scopesToAdd {
+			if scope == "" {
+				continue
+			}
+			if _, exists := scopeSet[scope]; !exists {
+				scopeSet[scope] = struct{}{}
+				scopeChanged = true
+			}
+		}
 
-	// Read current Hydra-side client so we preserve every other field
-	// (redirect_uris, grant_types, response_types, token_endpoint_auth_method,
-	// ...). Without the GET-then-PUT pattern, the PUT would wipe them.
-	hc, err := hydraAdminGetClient(client.HydraClientID)
-	if err != nil {
-		return fmt.Errorf("ensure rs scopes: fetch hydra client: %w", err)
-	}
-	hc.Scope = mergedScope
+		wantsRefresh := locked.RegistrationType == "dcr" && containsString(requestedScopes, "offline_access")
+		grantChanged := wantsRefresh && !containsString([]string(locked.GrantTypes), "refresh_token")
+		refreshFlagChanged := wantsRefresh && !locked.SupportsRefreshToken
+		if !scopeChanged && !grantChanged && !refreshFlagChanged {
+			*client = locked
+			return nil
+		}
 
-	if err := hydraAdminUpdateClient(client.HydraClientID, *hc); err != nil {
-		return fmt.Errorf("ensure rs scopes: update hydra client: %w", err)
-	}
+		// Fetch immediately before PUT and merge any Hydra-side scopes as well.
+		// The local Hydra shape preserves every field this service manages; the
+		// row lock protects AuthSec's own concurrent repair operations.
+		hc, err := hydraAdminGetClient(locked.HydraClientID)
+		if err != nil {
+			return fmt.Errorf("ensure authorize scopes: fetch hydra client: %w", err)
+		}
+		for _, scope := range strings.Fields(hc.Scope) {
+			scopeSet[scope] = struct{}{}
+		}
 
-	// Persist the same change locally so the reconciler sees the truth.
-	client.Scope = mergedScope
-	if err := s.authzCtx.UpdateMCPOAuthClient(client); err != nil {
-		// Hydra now diverges from our DB — surface but don't fail the auth
-		// flow; the reconciler will sync drift.
-		log.Printf("[MCP_AUTH] EnsureHydraClientHasRSScopes: hydra updated but db update failed for client=%s rs=%s: %v",
-			client.ClientID, rs.ResourceURI, err)
-	}
-	return nil
+		merged := make([]string, 0, len(scopeSet))
+		for scope := range scopeSet {
+			merged = append(merged, scope)
+		}
+		sort.Strings(merged)
+		mergedScope := strings.Join(merged, " ")
+		hc.Scope = mergedScope
+		if wantsRefresh && !containsString(hc.GrantTypes, "refresh_token") {
+			hc.GrantTypes = append(hc.GrantTypes, "refresh_token")
+		}
+
+		if err := hydraAdminUpdateClient(locked.HydraClientID, *hc); err != nil {
+			return fmt.Errorf("ensure authorize scopes: update hydra client: %w", err)
+		}
+
+		locked.Scope = mergedScope
+		if wantsRefresh {
+			if !containsString([]string(locked.GrantTypes), "refresh_token") {
+				locked.GrantTypes = append(locked.GrantTypes, "refresh_token")
+			}
+			locked.SupportsRefreshToken = true
+		}
+		if err := tx.Save(&locked).Error; err != nil {
+			return fmt.Errorf("ensure authorize scopes: persist client: %w", err)
+		}
+		*client = locked
+		return nil
+	})
 }
 
 // GetClientRegistration checks the join table.
