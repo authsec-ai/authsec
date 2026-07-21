@@ -846,19 +846,21 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 			findErr := tx.Where("resource_server_id = ? AND name = ?", rs.ID, name).First(&tool).Error
 			switch {
 			case findErr == nil && tool.InventorySource == models.InventorySourceSDKManifest:
+				// GORM does not serialize a bare []string as PostgreSQL text[].
+				// Use the driver type on updates just as the model does on create.
 				if err := tx.Model(&tool).Updates(map[string]interface{}{
 					"title":            manifestTool.Title,
 					"description":      manifestTool.Description,
 					"input_schema":     manifestTool.InputSchema,
 					"annotations":      manifestTool.Annotations,
-					"suggested_scopes": canonicalSuggestedScopes,
+					"suggested_scopes": pq.StringArray(canonicalSuggestedScopes),
 				}).Error; err != nil {
 					return fmt.Errorf("update manifest tool %s: %w", name, err)
 				}
 			case findErr == nil:
 				// Preserve an admin-created or live-scan row, but accept the SDK's
 				// advisory scope suggestions for the same unique tool name.
-				if err := tx.Model(&tool).Update("suggested_scopes", canonicalSuggestedScopes).Error; err != nil {
+				if err := tx.Model(&tool).Update("suggested_scopes", pq.StringArray(canonicalSuggestedScopes)).Error; err != nil {
 					return fmt.Errorf("update manifest suggestions for %s: %w", name, err)
 				}
 			case errors.Is(findErr, gorm.ErrRecordNotFound):
