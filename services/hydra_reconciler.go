@@ -92,9 +92,16 @@ func (r *HydraReconciler) runStaleDCRCleanup(ctx context.Context) {
 	cleanup := func() {
 		cutoff := time.Now().AddDate(0, 0, -staleDays)
 		var staleClients []models.MCPOAuthClient
+		// A client is stale only if it was CREATED before the cutoff AND it has
+		// either never issued a token or not issued one since the cutoff. The
+		// created_at gate is essential: without it a freshly-registered DCR
+		// client (last_token_issued_at IS NULL) is reaped the instant the next
+		// cleanup runs — including at every backend boot — even though it's
+		// seconds old. Young clients are never stale, regardless of token history.
 		if err := r.db.WithContext(ctx).Where(
-			"registration_type = 'dcr' AND sync_status = ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)",
+			"registration_type = 'dcr' AND sync_status = ? AND created_at < ? AND (last_token_issued_at IS NULL OR last_token_issued_at < ?)",
 			models.MCPClientSyncActive,
+			cutoff,
 			cutoff,
 		).Find(&staleClients).Error; err != nil {
 			log.Printf("[HydraReconciler] stale DCR query failed: %v", err)

@@ -593,9 +593,9 @@ type registerAgentRequest struct {
 
 // RegisterAgent mints a confidential A2A agent client (authorization_code +
 // token-exchange + a client secret) in the caller's workspace (plan J5). The
-// agent uses it to log a user in (OIDC) and exchange for an ID-JAG to reach
-// other workspaces' MCP servers. Workspace-level: the client is homed here, so
-// its ID-JAG's issuance workspace is this one (cross-workspace by §19).
+// agent uses it to log a user in (OIDC) and exchange for an ID-JAG to reach a
+// distinct Application. The target may be in the same workspace or another
+// workspace; the home workspace is retained for ownership and audit provenance.
 func (ctrl *ApplicationsController) RegisterAgent(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
@@ -634,12 +634,11 @@ type simulateXAARequest struct {
 	ClientID string `json:"client_id" binding:"required"`
 }
 
-// SimulateXAA debugs a CROSS-WORKSPACE (A2A / ID-JAG) call: "why can't this
-// agent from another workspace reach my MCP server?" (plan Journey 8). It runs
-// the redemption-path checks that are computable without an actual ID-JAG:
-// §19 same-domain, registration approval, and the brokering deny gate. These
-// are the failure modes unique to the cross-app flow (the per-scope checks live
-// in the direct debugger). Read-only; mints nothing.
+// SimulateXAA debugs a cross-application (A2A / ID-JAG) call: "why can't this
+// agent reach my MCP server?" (plan Journey 8). It runs the redemption-path
+// checks that are computable without an actual ID-JAG: distinct caller and
+// target, registration approval, and the brokering deny gate. The per-scope
+// checks live in the direct debugger. Read-only; mints nothing.
 func (ctrl *ApplicationsController) SimulateXAA(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {

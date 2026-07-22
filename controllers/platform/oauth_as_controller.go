@@ -1649,7 +1649,7 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	}
 
 	// ── 6. Determine target issuer (audience for the ID-JAG).
-	// Default to this AS's own issuer (cross-workspace same-AS scenario).
+	// Default to this AS's own issuer (same-AS cross-application scenario).
 	targetIssuer := c.PostForm("audience")
 	selfIssuer := config.AppConfig.OAuthBaseURL()
 	if targetIssuer == "" {
@@ -1661,9 +1661,8 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
 	// The issuance_workspace is the CLIENT's home workspace — the workspace
 	// that registered/owns the agent client. This is NOT the user's workspace
-	// or the RS workspace. The §19 same-domain check compares
-	// issuance_workspace vs the target RS workspace; if the client and RS
-	// live in the same workspace, XAA is unnecessary (use direct M2M).
+	// or the RS workspace, and it is carried as ownership/audit provenance rather
+	// than as a same-workspace rejection gate.
 	issuanceWorkspace := subject.WorkspaceID
 	if oauthClient.HomeWorkspaceID != nil {
 		issuanceWorkspace = *oauthClient.HomeWorkspaceID
@@ -1864,8 +1863,8 @@ type RequesterBootstrapPending struct {
 //     workspaces) vs the RS workspace — NOT the mutable home_workspace_id. Caveat:
 //     bootstrap is client-authenticated and does not know which human user will
 //     later arrive on the ID-JAG/browser path, so for XAA this is a hint, not a
-//     per-user determination. The §19 same-domain check at redemption is the
-//     authoritative backstop if the recommendation and the acting user disagree;
+//     per-user determination. Redemption authoritatively enforces the distinct
+//     caller/target boundary, connection approval, brokering, and user access;
 //   - per-target access_status, a top-level pending[] of open access requests,
 //     and a content-hashed metadata_version for drift detection.
 //

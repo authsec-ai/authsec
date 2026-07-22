@@ -110,9 +110,10 @@ func (s *XAAService) ValidateIDJAG(ctx context.Context, assertion, authenticated
 	// Self-issued ID-JAGs (iss == this AS, minted by our own token-exchange) have
 	// no external trusted_issuers row. Per decision #2 we trust them as a reserved
 	// "authsec:id-jag" provider with JIT provisioning, verified against our OWN
-	// native signing keys (no HTTP round-trip to our own JWKS). The issuance_workspace
-	// claim is mapped so §19 same-domain rejection still applies. External issuers
-	// take the trusted_issuers + JWKS path unchanged.
+	// native signing keys (no HTTP round-trip to our own JWKS). The
+	// issuance_workspace claim is retained as ownership and audit provenance; it
+	// does not prohibit a distinct agent and resource server in the same workspace.
+	// External issuers take the trusted_issuers + JWKS path unchanged.
 	var issuer models.TrustedIssuer
 	var keyFunc jwt.Keyfunc
 	var allowedAlgs []string

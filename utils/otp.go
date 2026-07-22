@@ -371,8 +371,8 @@ Your Security Team
 
 // SendNewUserRegistrationNotificationEmail sends a notification to the tenant owner when a new user registers.
 // SendAccessRequestNotificationEmail notifies a workspace admin that a new
-// cross-workspace access request is pending their approval or that an existing
-// pending request is about to expire (indicated by expiryWarning=true).
+// Agent access request is pending their approval or that an existing pending
+// request is about to expire (indicated by expiryWarning=true).
 func SendAccessRequestNotificationEmail(adminEmail, requestID, clientID, rsName, requestedScopes, statusURL string, expiresAt time.Time, expiryWarning bool) error {
 	smtpHost := config.AppConfig.SMTPHost
 	smtpPort := config.AppConfig.SMTPPort
@@ -385,10 +385,10 @@ func SendAccessRequestNotificationEmail(adminEmail, requestID, clientID, rsName,
 
 	var subject, body string
 	if expiryWarning {
-		subject = "Action required: cross-workspace access request expiring soon"
+		subject = "Action required: Agent access request expiring soon"
 		body = fmt.Sprintf(`Hello,
 
-A pending cross-workspace access request for "%s" will expire at %s unless approved.
+A pending Agent access request for "%s" will expire at %s unless approved.
 
 - Request ID:      %s
 - Requesting client: %s
@@ -404,10 +404,10 @@ AuthSec Team
 			requestID, clientID, requestedScopes,
 			expiresAt.UTC().Format(time.RFC1123), statusURL)
 	} else {
-		subject = "New cross-workspace access request pending approval"
+		subject = "New Agent access request pending approval"
 		body = fmt.Sprintf(`Hello,
 
-A new cross-workspace access request requires your approval.
+A new Agent access request requires your approval.
 
 - Request ID:        %s
 - Requesting client: %s
