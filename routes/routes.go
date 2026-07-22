@@ -434,6 +434,7 @@ func SetupRoutes(
 			applications.POST("/:id/machine-access/workload", applicationsController.CreateWorkloadAccess)
 			applications.GET("/:id/workloads", applicationsController.ListWorkloads)
 			applications.DELETE("/:id/workloads/:wid", applicationsController.RevokeWorkload)
+			applications.POST("/:id/workloads/:wid/restore", applicationsController.RestoreWorkload)
 
 			// Grant an EXISTING workload access to this MCP server (role binding +
 			// approved registration only — never mints/changes the workload identity).

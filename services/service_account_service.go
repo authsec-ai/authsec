@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -50,9 +51,32 @@ type ProvisionedCredential struct {
 	Secret *string
 }
 
+// DeletedServiceAccount records the non-secret identifiers removed with a
+// service account. Callers can use it for audit output after the transaction
+// commits without re-querying rows that no longer exist.
+type DeletedServiceAccount struct {
+	ID            uuid.UUID
+	WorkspaceID   uuid.UUID
+	OAuthClientID *uuid.UUID
+	SpiffeID      *string
+}
+
 // CreateServiceAccount creates a disabled service account. It becomes usable
 // only once a credential is provisioned (status flips to active there).
 func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name, description, ownerEmail, ownerTeam string) (*models.ServiceAccount, error) {
+	return s.CreateServiceAccountTx(
+		s.db.Session(&gorm.Session{NewDB: true}), workspaceID, name, description, ownerEmail, ownerTeam,
+	)
+}
+
+// CreateServiceAccountTx is CreateServiceAccount bound to a caller-owned
+// transaction. Composite creation flows use it so the principal cannot be
+// stranded when a later credential, binding, or registration write fails.
+func (s *ServiceAccountService) CreateServiceAccountTx(
+	tx *gorm.DB,
+	workspaceID uuid.UUID,
+	name, description, ownerEmail, ownerTeam string,
+) (*models.ServiceAccount, error) {
 	if ownerEmail == "" {
 		return nil, fmt.Errorf("owner_email is required: every agent must have an accountable owner")
 	}
@@ -67,7 +91,7 @@ func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name
 	if ownerTeam != "" {
 		sa.OwnerTeam = &ownerTeam
 	}
-	if err := s.db.Session(&gorm.Session{NewDB: true}).Create(&sa).Error; err != nil {
+	if err := tx.Create(&sa).Error; err != nil {
 		return nil, fmt.Errorf("failed to create service account: %w", err)
 	}
 	return &sa, nil
@@ -82,6 +106,100 @@ func (s *ServiceAccountService) GetServiceAccount(workspaceID, saID uuid.UUID) (
 		return nil, ErrServiceAccountNotFound
 	}
 	return &sa, nil
+}
+
+// DeleteServiceAccount removes the complete machine-identity lifecycle in one
+// database transaction. A service account owns its OAuth client and SPIFFE
+// binding; leaving either behind creates an unusable client or a unique-key
+// tombstone that prevents the workload from being registered again.
+//
+// The explicit deletes intentionally precede the parent rows even where the
+// current schema has ON DELETE CASCADE. This keeps cleanup correct for older
+// deployed schemas and makes the ownership boundary visible in one place.
+func (s *ServiceAccountService) DeleteServiceAccount(
+	ctx context.Context,
+	workspaceID, saID uuid.UUID,
+) (*DeletedServiceAccount, error) {
+	var deleted *DeletedServiceAccount
+	err := s.db.WithContext(ctx).Session(&gorm.Session{NewDB: true}).Transaction(func(tx *gorm.DB) error {
+		var sa models.ServiceAccount
+		if err := tx.
+			Where("workspace_id = ? AND id = ?", workspaceID, saID).
+			First(&sa).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrServiceAccountNotFound
+			}
+			return fmt.Errorf("load service account for deletion: %w", err)
+		}
+
+		deleted = &DeletedServiceAccount{
+			ID:            sa.ID,
+			WorkspaceID:   sa.WorkspaceID,
+			OAuthClientID: sa.OAuthClientID,
+			SpiffeID:      sa.SpiffeID,
+		}
+
+		// Role bindings are the service account's RBAC assignments. The composite
+		// workspace predicate prevents an identifier collision from crossing a
+		// workspace boundary.
+		if err := tx.Where("workspace_id = ? AND service_account_id = ?", workspaceID, sa.ID).
+			Delete(&models.RoleBinding{}).Error; err != nil {
+			return fmt.Errorf("delete service account assignments: %w", err)
+		}
+
+		if sa.SpiffeID != nil && *sa.SpiffeID != "" {
+			// The Application workload record is the canonical SPIFFE-to-resource
+			// binding and carries the global SPIFFE-ID uniqueness constraint.
+			if err := tx.Where("workspace_id = ? AND spiffe_id = ?", workspaceID, *sa.SpiffeID).
+				Delete(&models.ApplicationSpiffeIdentity{}).Error; err != nil {
+				return fmt.Errorf("delete application SPIFFE binding: %w", err)
+			}
+
+			// Managed-SPIRE compatibility rows may exist for older workloads. They
+			// are database registration material, not audit history.
+			if err := tx.Exec("DELETE FROM spire_workloads WHERE spiffe_id = ?", *sa.SpiffeID).Error; err != nil {
+				return fmt.Errorf("delete legacy SPIRE workload: %w", err)
+			}
+			// Issued-token rows are retained as history but made unusable.
+			if err := tx.Exec(
+				"UPDATE spire_oidc_tokens SET revoked = true WHERE spiffe_id = ?",
+				*sa.SpiffeID,
+			).Error; err != nil {
+				return fmt.Errorf("revoke SPIRE token records: %w", err)
+			}
+		}
+
+		if sa.OAuthClientID != nil {
+			// Registration rows are the client's permission to address individual
+			// resource servers. This OAuth client is unique to this service account,
+			// so every registration it owns must be removed.
+			if err := tx.Where("oauth_client_id = ?", *sa.OAuthClientID).
+				Delete(&models.ResourceServerClientRegistration{}).Error; err != nil {
+				return fmt.Errorf("delete OAuth client registrations: %w", err)
+			}
+		}
+
+		if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, sa.ID).
+			Delete(&models.ServiceAccount{}).Error; err != nil {
+			return fmt.Errorf("delete service account: %w", err)
+		}
+
+		if sa.OAuthClientID != nil {
+			// Deleting the OAuth client cascades its secret/JWKS/consent material.
+			// Service-account clients mint native AuthSec tokens and are never
+			// provisioned in Hydra, so there is no external client to reconcile.
+			if err := tx.Where("id = ?", *sa.OAuthClientID).
+				Delete(&models.MCPOAuthClient{}).Error; err != nil {
+				return fmt.Errorf("delete OAuth client: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // ProvisionCredential creates a confidential M2M OAuth client for the service

@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // machineAccessTokenTTL mirrors the native M2M access-token lifetime minted by
@@ -26,6 +27,11 @@ import (
 // dry-run reports the same value so the wizard doesn't promise a TTL the real
 // mint won't honor. If the grant's TTL changes, change it here too.
 var machineAccessTokenTTL = time.Hour
+
+var (
+	errRevokedIdentityChanged = errors.New("revoked SPIFFE identity changed while it was being re-provisioned")
+	errRevokedIdentityLinked  = errors.New("revoked SPIFFE identity still has a backing service account")
+)
 
 // ── POST /authsec/applications/:id/machine-access/api-credential ──────────────
 
@@ -1131,12 +1137,49 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 		return
 	}
 
-	// Reject a duplicate SPIFFE ID up front (the column is globally unique on
-	// application_spiffe_identities; surfacing it here gives a clean 409).
-	var dupCount int64
-	config.DB.Table("application_spiffe_identities").Where("spiffe_id = ?", spiffeIDStr).Count(&dupCount)
-	if dupCount > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "this SPIFFE ID is already registered"})
+	// A SPIFFE ID is globally unique. Active bindings are always a conflict.
+	// A revoked binding in this same Application is either restored explicitly
+	// (when its backing SA still exists) or safely reclaimed here (when an older
+	// buggy SA deletion left only the revoked tombstone behind).
+	var duplicate models.ApplicationSpiffeIdentity
+	var reclaimRevokedIdentity *models.ApplicationSpiffeIdentity
+	if dupErr := config.DB.Where("spiffe_id = ?", spiffeIDStr).First(&duplicate).Error; dupErr == nil {
+		if duplicate.Status != "revoked" {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":  fmt.Sprintf("this SPIFFE ID is already registered with status %q", duplicate.Status),
+				"code":   "spiffe_identity_active",
+				"status": duplicate.Status,
+			})
+			return
+		}
+
+		sameApplication := duplicate.WorkspaceID == workspaceID && duplicate.ApplicationID == rs.ID
+		var backingCount int64
+		if sameApplication {
+			config.DB.Model(&models.ServiceAccount{}).
+				Where("workspace_id = ? AND spiffe_id = ?", workspaceID, spiffeIDStr).
+				Count(&backingCount)
+		}
+		if sameApplication && backingCount == 0 {
+			reclaimRevokedIdentity = &duplicate
+		} else {
+			payload := gin.H{
+				"error":       "this SPIFFE ID is registered but revoked",
+				"code":        "spiffe_identity_revoked",
+				"status":      duplicate.Status,
+				"restoreable": sameApplication && backingCount > 0,
+			}
+			if sameApplication {
+				payload["workload_id"] = duplicate.ID.String()
+				if backingCount > 0 {
+					payload["error"] = "this SPIFFE ID is revoked; restore the existing Application workload instead of registering it again"
+				}
+			}
+			c.JSON(http.StatusConflict, payload)
+			return
+		}
+	} else if !errors.Is(dupErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check SPIFFE identity"})
 		return
 	}
 
@@ -1144,6 +1187,8 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 
 	// Resolve or create the service account (must not already have an identity).
 	var sa *models.ServiceAccount
+	serviceAccountName := strings.TrimSpace(req.ServiceAccountName)
+	serviceAccountOwnerEmail := ""
 	if req.ServiceAccountID != "" {
 		saUUID, perr := uuid.Parse(req.ServiceAccountID)
 		if perr != nil {
@@ -1159,21 +1204,17 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 			c.JSON(http.StatusConflict, gin.H{"error": "service account already has an identity"})
 			return
 		}
+		serviceAccountName = sa.Name
 	} else {
-		if strings.TrimSpace(req.ServiceAccountName) == "" {
+		if serviceAccountName == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "provide service_account_id or service_account_name"})
 			return
 		}
 		// The acting admin is the accountable owner for an implicitly-created SA
 		// (D1/F7: owner always). Falls back to a system marker if unresolved.
-		ownerEmail := c.GetString("email")
-		if ownerEmail == "" {
-			ownerEmail = "system@authsec.local"
-		}
-		sa, err = saSvc.CreateServiceAccount(workspaceID, strings.TrimSpace(req.ServiceAccountName), req.Description, ownerEmail, "")
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+		serviceAccountOwnerEmail = c.GetString("email")
+		if serviceAccountOwnerEmail == "" {
+			serviceAccountOwnerEmail = "system@authsec.local"
 		}
 	}
 
@@ -1185,7 +1226,7 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 		ID:                              clientUUID,
 		ClientID:                        clientIDStr,
 		HydraClientID:                   clientIDStr,
-		ClientName:                      sa.Name + " (federated workload)",
+		ClientName:                      serviceAccountName + " (federated workload)",
 		RedirectURIs:                    pq.StringArray{},
 		GrantTypes:                      pq.StringArray{"client_credentials"},
 		ResponseTypes:                   pq.StringArray{},
@@ -1198,6 +1239,9 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 	}
 
 	workloadID := uuid.New()
+	if reclaimRevokedIdentity != nil {
+		workloadID = reclaimRevokedIdentity.ID
+	}
 	spiffeIdentity := models.ApplicationSpiffeIdentity{
 		ID:            workloadID,
 		WorkspaceID:   workspaceID,
@@ -1211,6 +1255,35 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 
 	var assignmentID string
 	if txErr := config.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if reclaimRevokedIdentity != nil {
+			// Serialize reclamation of a legacy revoked tombstone. A concurrent
+			// request that already restored/reclaimed it makes this transaction
+			// fail closed before a new OAuth client is created.
+			var locked models.ApplicationSpiffeIdentity
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND workspace_id = ? AND application_id = ?", workloadID, workspaceID, rs.ID).
+				First(&locked).Error; err != nil || locked.Status != "revoked" {
+				return errRevokedIdentityChanged
+			}
+			var linkedCount int64
+			if err := tx.Model(&models.ServiceAccount{}).
+				Where("workspace_id = ? AND spiffe_id = ?", workspaceID, spiffeIDStr).
+				Count(&linkedCount).Error; err != nil {
+				return err
+			}
+			if linkedCount > 0 {
+				return errRevokedIdentityLinked
+			}
+		}
+		if sa == nil {
+			created, err := saSvc.CreateServiceAccountTx(
+				tx, workspaceID, serviceAccountName, req.Description, serviceAccountOwnerEmail, "",
+			)
+			if err != nil {
+				return err
+			}
+			sa = created
+		}
 		if err := tx.Create(&mcpClient).Error; err != nil {
 			return fmt.Errorf("failed to create OAuth client: %w", err)
 		}
@@ -1226,7 +1299,20 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 			}).Error; err != nil {
 			return fmt.Errorf("failed to link client to SA: %w", err)
 		}
-		if err := tx.Create(&spiffeIdentity).Error; err != nil {
+		if reclaimRevokedIdentity != nil {
+			if err := tx.Model(&models.ApplicationSpiffeIdentity{}).
+				Where("id = ? AND workspace_id = ? AND application_id = ? AND status = 'revoked'", workloadID, workspaceID, rs.ID).
+				Updates(map[string]interface{}{
+					"trust_domain":  svidTD,
+					"selectors":     json.RawMessage("{}"),
+					"status":        "active",
+					"revoked_at":    nil,
+					"last_error":    nil,
+					"last_error_at": nil,
+				}).Error; err != nil {
+				return fmt.Errorf("failed to reclaim revoked workload identity: %w", err)
+			}
+		} else if err := tx.Create(&spiffeIdentity).Error; err != nil {
 			return fmt.Errorf("failed to create workload identity: %w", err)
 		}
 		aID, bErr := ensureServiceAccountRSBindingTx(tx, workspaceID, sa.ID, role, rs.ID)
@@ -1241,6 +1327,13 @@ func (ctrl *ApplicationsController) CreateFederatedWorkloadAccess(c *gin.Context
 		}
 		return nil
 	}); txErr != nil {
+		if errors.Is(txErr, errRevokedIdentityChanged) || errors.Is(txErr, errRevokedIdentityLinked) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "the revoked SPIFFE identity changed while it was being registered; refresh workloads and restore the existing record if present",
+				"code":  "spiffe_identity_changed",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": txErr.Error()})
 		return
 	}
@@ -1398,6 +1491,7 @@ type workloadListItem struct {
 	SpiffeID           string      `json:"spiffe_id"`
 	ServiceAccountID   string      `json:"service_account_id,omitempty"`
 	ServiceAccountName string      `json:"service_account_name,omitempty"`
+	ClientID           string      `json:"client_id,omitempty"`
 	Status             string      `json:"status"`
 	Platform           string      `json:"platform"`
 	Selectors          interface{} `json:"selectors"`
@@ -1433,8 +1527,11 @@ func (ctrl *ApplicationsController) ListWorkloads(c *gin.Context) {
 		return
 	}
 
-	// Enrich with SA info.
+	// Enrich with SA and public OAuth client info. client_id is deliberately
+	// returned permanently: it is an identifier, not a secret, and operators
+	// need it to configure and diagnose a workload after the creation wizard.
 	saCache := map[string]*models.ServiceAccount{}
+	clientCache := map[uuid.UUID]string{}
 	items := make([]workloadListItem, 0, len(rows))
 	for _, row := range rows {
 		// Find SA by spiffe_id.
@@ -1467,6 +1564,19 @@ func (ctrl *ApplicationsController) ListWorkloads(c *gin.Context) {
 		if sa != nil {
 			item.ServiceAccountID = sa.ID.String()
 			item.ServiceAccountName = sa.Name
+			if sa.OAuthClientID != nil {
+				if clientID, ok := clientCache[*sa.OAuthClientID]; ok {
+					item.ClientID = clientID
+				} else {
+					var client models.MCPOAuthClient
+					if err := config.DB.WithContext(c.Request.Context()).
+						Where("id = ?", *sa.OAuthClientID).
+						First(&client).Error; err == nil {
+						item.ClientID = client.ClientID
+						clientCache[*sa.OAuthClientID] = client.ClientID
+					}
+				}
+			}
 		}
 		items = append(items, item)
 	}
@@ -1507,16 +1617,164 @@ func (ctrl *ApplicationsController) RevokeWorkload(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
-	config.DB.WithContext(c.Request.Context()).
-		Model(&models.ApplicationSpiffeIdentity{}).
-		Where("id = ?", wid).
-		Updates(map[string]interface{}{"status": "revoked", "revoked_at": now})
+	if txErr := config.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.ApplicationSpiffeIdentity{}).
+			Where("id = ? AND application_id = ? AND workspace_id = ?", wid, rs.ID, workspaceID).
+			Updates(map[string]interface{}{"status": "revoked", "revoked_at": now}).Error; err != nil {
+			return fmt.Errorf("revoke workload identity: %w", err)
+		}
 
-	// Disable the linked service account (if any) so SPIFFE SVID auth fails.
-	config.DB.WithContext(c.Request.Context()).
-		Model(&models.ServiceAccount{}).
-		Where("workspace_id = ? AND spiffe_id = ?", workspaceID, identity.SpiffeID).
-		Updates(map[string]interface{}{"status": "disabled", "updated_at": now})
+		// Disable authentication and revoke this Application registration in the
+		// same transaction. Role assignments stay in place so an explicit Restore
+		// can reactivate the same reviewed access grant.
+		var sa models.ServiceAccount
+		if err := tx.Where("workspace_id = ? AND spiffe_id = ?", workspaceID, identity.SpiffeID).
+			First(&sa).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if err := tx.Model(&models.ServiceAccount{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, sa.ID).
+			Updates(map[string]interface{}{"status": "disabled", "updated_at": now}).Error; err != nil {
+			return fmt.Errorf("disable workload service account: %w", err)
+		}
+		if sa.OAuthClientID != nil {
+			if err := tx.Model(&models.ResourceServerClientRegistration{}).
+				Where("resource_server_id = ? AND workspace_id = ? AND oauth_client_id = ?", rs.ID, workspaceID, *sa.OAuthClientID).
+				Updates(map[string]interface{}{"status": models.ClientRegStatusRevoked, "updated_at": now}).Error; err != nil {
+				return fmt.Errorf("revoke workload client registration: %w", err)
+			}
+		}
+		return nil
+	}); txErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": txErr.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+// RestoreWorkload handles POST /authsec/applications/:id/workloads/:wid/restore.
+// It reactivates a normally-revoked workload without minting a new identity or
+// changing its reviewed role assignments. Legacy orphan tombstones cannot be
+// restored; the create flow safely re-provisions those instead.
+func (ctrl *ApplicationsController) RestoreWorkload(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
+		return
+	}
+
+	rs, err := ctrl.service.GetByIDAndTenant(c.Param("id"), workspaceID.String())
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
+		return
+	}
+
+	wid, err := uuid.Parse(c.Param("wid"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workload id"})
+		return
+	}
+
+	var clientID string
+	var spiffeID string
+	restoreErr := config.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		var identity models.ApplicationSpiffeIdentity
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND application_id = ? AND workspace_id = ?", wid, rs.ID, workspaceID).
+			First(&identity).Error; err != nil {
+			return err
+		}
+		if identity.Status != "revoked" {
+			return fmt.Errorf("workload is not revoked; current status is %s", identity.Status)
+		}
+		spiffeID = identity.SpiffeID
+
+		var sa models.ServiceAccount
+		if err := tx.Where("workspace_id = ? AND spiffe_id = ?", workspaceID, identity.SpiffeID).
+			First(&sa).Error; err != nil || sa.OAuthClientID == nil {
+			return errRevokedIdentityChanged
+		}
+
+		var client models.MCPOAuthClient
+		if err := tx.Where("id = ?", *sa.OAuthClientID).First(&client).Error; err != nil {
+			return errRevokedIdentityChanged
+		}
+		clientID = client.ClientID
+
+		// Restore is allowed only when a reviewed RS-scoped assignment remains.
+		// If an operator deleted the assignment, they must grant a role again.
+		var assignmentCount int64
+		if err := tx.Model(&models.RoleBinding{}).
+			Where("workspace_id = ? AND service_account_id = ?", workspaceID, sa.ID).
+			Where("scope_type = 'resource_server' AND scope_id = ?", rs.ID).
+			Count(&assignmentCount).Error; err != nil {
+			return err
+		}
+		if assignmentCount == 0 {
+			return errRevokedIdentityLinked
+		}
+
+		now := time.Now().UTC()
+		if err := tx.Model(&models.ApplicationSpiffeIdentity{}).
+			Where("id = ? AND status = 'revoked'", identity.ID).
+			Updates(map[string]interface{}{
+				"status":        "active",
+				"revoked_at":    nil,
+				"last_error":    nil,
+				"last_error_at": nil,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.ServiceAccount{}).
+			Where("workspace_id = ? AND id = ?", workspaceID, sa.ID).
+			Updates(map[string]interface{}{"status": "active", "updated_at": now}).Error; err != nil {
+			return err
+		}
+		registration := tx.Model(&models.ResourceServerClientRegistration{}).
+			Where("resource_server_id = ? AND workspace_id = ? AND oauth_client_id = ?", rs.ID, workspaceID, *sa.OAuthClientID).
+			Updates(map[string]interface{}{
+				"status":     models.ClientRegStatusApproved,
+				"updated_at": now,
+			})
+		if registration.Error != nil {
+			return registration.Error
+		}
+		if registration.RowsAffected == 0 {
+			_, err := ctrl.oauthSvc.EnsureClientRegistrationTx(
+				tx, rs.ID, *sa.OAuthClientID, workspaceID, "admin", models.ClientRegStatusApproved,
+			)
+			return err
+		}
+		return nil
+	})
+	if restoreErr != nil {
+		switch {
+		case errors.Is(restoreErr, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "workload not found"})
+		case errors.Is(restoreErr, errRevokedIdentityChanged):
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "this revoked workload no longer has its backing service account and OAuth client; register it again to safely provision a new identity",
+				"code":  "workload_backing_identity_missing",
+			})
+		case errors.Is(restoreErr, errRevokedIdentityLinked):
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "this revoked workload no longer has an access assignment; grant a role before restoring it",
+				"code":  "workload_assignment_missing",
+			})
+		default:
+			c.JSON(http.StatusConflict, gin.H{"error": restoreErr.Error()})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "active",
+		"workload_id": wid.String(),
+		"spiffe_id":   spiffeID,
+		"client_id":   clientID,
+	})
 }

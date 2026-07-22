@@ -281,20 +281,25 @@ func (ctrl *ServiceAccountsController) DeleteServiceAccount(c *gin.Context) {
 		return
 	}
 
-	res := config.DB.Session(&gorm.Session{NewDB: true}).
-		Where("workspace_id = ? AND id = ?", workspaceID, saID).
-		Delete(&models.ServiceAccount{})
-	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete: " + res.Error.Error()})
+	deleted, err := services.NewServiceAccountService(config.DB).DeleteServiceAccount(
+		c.Request.Context(), *workspaceID, saID,
+	)
+	if errors.Is(err, services.ErrServiceAccountNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
 		return
 	}
-	if res.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete: " + err.Error()})
 		return
 	}
 
 	middlewares.Audit(c, "service_account", saID.String(), "delete", &middlewares.AuditChanges{
-		Before: map[string]interface{}{"id": saID.String(), "workspace_id": workspaceID.String()},
+		Before: map[string]interface{}{
+			"id":              saID.String(),
+			"workspace_id":    workspaceID.String(),
+			"oauth_client_id": deleted.OAuthClientID,
+			"spiffe_id":       deleted.SpiffeID,
+		},
 		After:  nil,
 	})
 
