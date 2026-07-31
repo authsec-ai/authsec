@@ -21,7 +21,7 @@ scoped, auditable token.
 | `Authsec-ui` | **Production console** (admin UI at app.authsec.ai) | Vite + React + TS + Tailwind v4 + shadcn | `Authsec-ui/AGENTS.md` |
 | `sdk-authsec` | Client **SDKs** (go / python / typescript) + examples — ~3-line MCP/agent integration | Go, Python, TS | `sdk-authsec/AGENTS.md` |
 | `deploy/single-node` | **DEPRECATED** — old local Docker Compose stack (was mcpauthz.com). Live deploy is now on Hetzner VM via Jenkins CI/CD | Docker Compose | `deploy/single-node/AGENTS.md` |
-| `authsec-charts` | Helm charts for **staging / AKS** | Helm | `authsec-charts/AGENTS.md` |
+| `authsec-charts` | **DEAD — do not use.** Helm charts for a retired Azure AKS staging environment. | — | **Ignore.** |
 | `authsec-doc` | Public **documentation** site | Docusaurus | `authsec-doc/AGENTS.md` |
 | `authsec-agent-shield` | **Separate product** — system-level guard for risky AI tool actions (phone-approve `rm -rf`, `DROP TABLE`) | — | `authsec-agent-shield/AGENTS.md` |
 | `UI` | **LEGACY — do not edit.** Production console is `Authsec-ui`. If grep or file search leads you here, find the equivalent file in `Authsec-ui/` instead. `UI/AGENTS.md` explains the redirect. | — | **Stop. Go to `Authsec-ui/`.** |
@@ -34,13 +34,13 @@ scoped, auditable token.
 > are **personal-scope** and live in that assistant's private memory, not in this file.
 
 **Engineering practice**
-- **Keep the codebase clean.** Don't add code that isn't needed — no dead scaffolding, no speculative abstractions, no duplicate helper when one already exists. Reuse before you add; delete what a change makes obsolete.
+- **Keep the codebase clean.** Don't add code that isn't needed — no dead scaffolding, no speculative abstractions, no duplicate helper when one already exists. Reuse before you add; delete what a change makes obsolete. **Replace, don't accumulate:** when something is superseded, edit the original and delete the old — no parallel file alongside it, no filename describing the retired concept, no "this used to be X" narration, and no SUPERSEDED banner where deletion is the honest answer. This applies to docs and `.claude/commands/*` as much as to code. Keep a pointer only where a stale link would otherwise lead somewhere actively harmful.
 - **Fix surgically, never band-aid.** Diagnose the root cause with the whole architecture + product behaviour in mind, then make the minimal correct change. Don't patch the first symptom, and don't stack a workaround on a workaround — if a fix needs a structural change, do the structural change.
 - **Don't add tests** unless explicitly asked; verify with the repo's `tsc` / `vet` / build + a manual smoke.
 
 **Guardrails**
 - **`git push` is the only action that needs explicit per-command approval.** Everything else (kubectl, docker, edits) is pre-authorized.
-- **Schema is single-state, forward-only:** edit the `CREATE TABLE` in `authsec/migrations/master/001_bootstrap.sql` in place, then wipe + re-bootstrap. Never add `ALTER TABLE` patch files or `AutoMigrate`.
+- **Schema ships as numbered migrations. The production database is never wiped.** Every change is two files: a new `authsec/migrations/master/NNN_name.sql` (what existing databases run) plus `001_bootstrap.sql` updated to the same end state (what a fresh database gets). The runner in `internal/migration/runner.go` applies pending migrations at boot and records them in `migration_logs`, so a migration is applied *by deploying*, not by hand. Never `AutoMigrate` anything but `migration_logs`. See `/schema-change`.
 - **Everything is workspace-scoped** (see *Ownership model*) — new code scopes by `workspace_id`.
 - **UI:** every console page renders through `ConsolePage`; primary `<Button>` is white-on-blue; verify with `npx tsc --noEmit` (+ `eslint`), **not** a dev server (authenticated routes need the backend).
 - Use **market-standard terms** (User / Service Account / Agent / Workload / Application·Resource Server / Scope / Workspace) — see per-repo files.
@@ -82,8 +82,8 @@ The data model is **workspace-centric**: a Workspace owns everything inside it.
   - **Tenant subdomains:** `<workspace>.app.authsec.ai`.
   - Admin login OTP appears in the **backend logs** (`docker logs authsec-backend`).
   - Env config: `/opt/authsec/.env` on the VM (SSH to edit, then `docker compose up -d` to apply).
-- **Staging = Azure AKS** (cluster `authsec`, ns `authsec-staging`); separate Helm-based deploy via `authsec-charts`.
-- **Schema changes:** Tiered approach — see `/schema-change`. Minor = direct SQL. Major = delta migration. Destructive = backup + wipe (last resort).
+- **There is no staging environment.** The former Azure AKS staging is retired and `authsec-charts` is dead. Hetzner is the only deployed environment; the branch named `authsec-staging` deploys straight to it.
+- **Schema changes:** numbered migration + bootstrap update + Go model, in one commit; applied on deploy by the runner. Additive changes migrate *before* the code ships; removals and `NOT NULL` need expand → backfill → contract across releases. Back up first and verify `migration_logs` after. Never wipe a deployed database. See `/schema-change`.
 - **Developer access:** SSH via `ssh -J root@49.12.150.218 ubuntu@192.168.122.252`. DB: `docker exec -it authsec-postgres psql -U authsec -d authsec`. Logs: `docker logs authsec-backend -f`.
 
 ## Where knowledge lives (keep it correct)
@@ -102,8 +102,8 @@ All cross-repo tooling lives in `.claude/` at the workspace root.
 | `/command` | What it does |
 |---|---|
 | `/deploy` | Deploy via Jenkins pipeline (push-to-deploy); emergency manual deploy via SSH |
-| `/wipe-rebootstrap` | Backup + wipe DB + re-bootstrap on the VM (DESTRUCTIVE, last resort) |
-| `/schema-change` | Tiered schema changes: minor (direct SQL), major (delta migration), destructive (wipe) |
+| `/wipe-rebootstrap` | Wipe + re-bootstrap — **local / IGA dev stack only, never Hetzner** |
+| `/schema-change` | Numbered migration applied on deploy; expand/contract sequencing for removals |
 | `/console-page` | Checklist + pattern for adding a new sidebar page |
 | `/flow-test` | curl smoke tests for M2M / XAA / SPIFFE / OIDC / CIBA |
 | `/ship` | Pre-push checklist: `go build/vet/gofmt` + `tsc --noEmit` |
@@ -125,7 +125,7 @@ Invoke with the **Agent tool** using `subagent_type: "authsec-reviewer"` etc.
 | Hook | Repo | What it blocks |
 |---|---|---|
 | Block `git push` | workspace root | requires manual push; see `.claude/hooks-manual.md` to wire it |
-| Block `ALTER TABLE` in Bash | `authsec` | enforces single-state schema rule |
+| Block prod wipe + inline prod DDL | `authsec` | `compose down -v` or `psql -c '<DDL>'` against Hetzner; migration *files* pass |
 | `gofmt -w` on `*.go` | `authsec` | auto-formats every Go file after Edit/Write |
 | Block `npm run dev` / `npx vite` | `Authsec-ui` | auth routes need backend; use `tsc --noEmit` instead |
 
