@@ -2387,6 +2387,10 @@ func stringSlicesEqual(a, b []string) bool {
 
 // WorkspaceClientItem is the DTO returned by GET /authsec/clients.
 type WorkspaceClientItem struct {
+	// ID is mcp_oauth_clients.id — the uuid every FK to a governed identity
+	// points at (e.g. discovered_agents.matched_client_id). ClientID below is
+	// the OAuth protocol string and is NOT interchangeable with it.
+	ID                 string     `json:"id"`
 	ClientID           string     `json:"client_id"`
 	ClientName         string     `json:"client_name"`
 	ClientKind         string     `json:"client_kind"`
@@ -2710,6 +2714,7 @@ func (s *OAuthASService) ListWorkspaceClients(workspaceID uuid.UUID, resourceSer
 		}
 
 		result = append(result, WorkspaceClientItem{
+			ID:                 c.ID.String(),
 			ClientID:           c.ClientID,
 			ClientName:         c.ClientName,
 			ClientKind:         c.ClientKind,
