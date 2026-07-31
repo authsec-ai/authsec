@@ -1366,6 +1366,50 @@ func SetupRoutes(
 		authsec.GET("/connector-oauth/callback", connectorController.OAuthCallback)
 
 		// ────────────────────────────────────────────────────
+		// Agent Discovery (IGA) — /authsec/discovery/*.
+		// A quarantine-first inventory of every AI agent running in the
+		// workspace, including ones nobody registered. A sighting grants
+		// NOTHING: rows land unregistered, so discovery is safe to run against
+		// production before anything is provisioned. A human then either claims
+		// the agent (binding it to a governed identity + an accountable owner)
+		// or quarantines it.
+		//
+		// discovery:report is deliberately separate from the rest so a
+		// connector's service account can push sightings without holding any
+		// authority to claim or quarantine.
+		// ────────────────────────────────────────────────────
+		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
+		discovery := authsec.Group("/discovery")
+		discovery.Use(middlewares.AuthMiddleware())
+		{
+			// Connector registry.
+			discovery.POST("/sources", middlewares.Require("discovery", "admin"), discoveryController.CreateDiscoverySource)
+			discovery.GET("/sources", middlewares.Require("discovery", "read"), discoveryController.ListDiscoverySources)
+			discovery.GET("/sources/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoverySource)
+			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
+			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
+
+			// Connector ingress — the only path that creates an inventory row.
+			// Idempotent on (source, fingerprint): 201 first time, 200 on a bump.
+			discovery.POST("/sightings", middlewares.Require("discovery", "report"), discoveryController.ReportSighting)
+
+			// Inventory. ?status=unregistered is the Unregistered Agents report.
+			// The static /agents/lookup must be registered before /agents/:id.
+			discovery.GET("/agents/lookup", middlewares.Require("discovery", "read"), discoveryController.LookupDiscoveredAgent)
+			discovery.GET("/agents", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveredAgents)
+			discovery.GET("/agents/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoveredAgent)
+			discovery.PUT("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoveredAgent)
+			discovery.DELETE("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoveredAgent)
+
+			// The two governance decisions, each with its own permission.
+			discovery.POST("/agents/:id/claim", middlewares.Require("discovery", "claim"), discoveryController.ClaimAgent)
+			discovery.POST("/agents/:id/quarantine", middlewares.Require("discovery", "quarantine"), discoveryController.QuarantineAgent)
+
+			// Headline KPI: registered / total, segmented by origin.
+			discovery.GET("/coverage", middlewares.Require("discovery", "read"), discoveryController.GetCoverage)
+		}
+
+		// ────────────────────────────────────────────────────
 		// Connector Broker — runtime DATA plane (/broker/connectors/*).
 		// Agents/workloads call here with a native AuthSec access token whose
 		// audience is the workspace Connector Broker RS (RFC 8707). The broker
