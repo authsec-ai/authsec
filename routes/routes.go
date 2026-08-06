@@ -1374,11 +1374,38 @@ func SetupRoutes(
 		// the agent (binding it to a governed identity + an accountable owner)
 		// or quarantines it.
 		//
-		// discovery:report is deliberately separate from the rest so a
-		// connector's service account can push sightings without holding any
-		// authority to claim or quarantine.
 		// ────────────────────────────────────────────────────
 		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
+
+		// Connector ingress is UNAUTHENTICATED by deliberate choice.
+		//
+		// A connector runs inside a customer's cluster and is configured with its
+		// workspace_id at deploy time (a Helm --set on the discovery agent), which it
+		// then asserts in the request body. That removes the token-minting step from
+		// the install flow entirely.
+		//
+		// What this trades away, stated plainly so it is not rediscovered later:
+		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
+		//     any caller who knows a workspace_id can add rows to that workspace's
+		//     inventory
+		//   - there is no rate limit, so inventory growth from this path is unbounded
+		//
+		// What keeps the blast radius to noise rather than privilege: a sighting
+		// grants nothing. Rows land `unregistered`, and only an authenticated,
+		// permission-checked human can claim one into a governed identity. The worst
+		// case is a polluted Unregistered Agents report, not access.
+		//
+		// Registered on its own group so it cannot accidentally inherit
+		// AuthMiddleware from the block below. Same pattern as the connector OAuth
+		// callback above, which is also necessarily unauthenticated.
+		discoveryIngress := authsec.Group("/discovery")
+		{
+			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
+		}
+
+		// Everything else stays authenticated and permission-gated: reading the
+		// inventory exposes hostnames and workload metadata across the workspace, and
+		// claim/quarantine are governance decisions that must be attributable.
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
@@ -1389,9 +1416,9 @@ func SetupRoutes(
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
 
-			// Connector ingress — the only path that creates an inventory row.
-			// Idempotent on (source, fingerprint): 201 first time, 200 on a bump.
-			discovery.POST("/sightings", middlewares.Require("discovery", "report"), discoveryController.ReportSighting)
+			// NOTE: POST /sightings is deliberately NOT here — it is registered
+			// unauthenticated on discoveryIngress above. Re-adding it here would make
+			// Gin panic at startup on the duplicate method+path.
 
 			// Inventory. ?status=unregistered is the Unregistered Agents report.
 			// The static /agents/lookup must be registered before /agents/:id.
