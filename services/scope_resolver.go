@@ -192,6 +192,15 @@ func (r *ScopeResolver) ResolveWithReport(
 		}
 		seen[s] = struct{}{}
 
+		// offline_access is an AS-level refresh capability, not an identity
+		// claim. MCP clients may request it without also being OIDC clients;
+		// ValidateRequestedScopes applies the same rule before authorization.
+		if s == "offline_access" {
+			grantable = append(grantable, s)
+			diagnostics = append(diagnostics, ScopeDiagnostic{Scope: s, Granted: true})
+			continue
+		}
+
 		// OIDC core scopes pass through only when the client is OIDC-capable.
 		if oidcCoreScopes[s] {
 			if isOIDC {
@@ -403,6 +412,23 @@ func RSSpecificScopes(scopes []string) []string {
 		}
 	}
 	return out
+}
+
+// HasAccessBearingScope reports whether a resolved scope set contains anything
+// beyond the offline_access protocol capability. offline_access authorizes the
+// authorization server to issue refresh tokens; by itself it is not an identity
+// claim or a permission to use a protected resource.
+//
+// Keep this check separate from RSSpecificScopes: existing OIDC authorization
+// flows may legitimately carry identity scopes such as openid/profile, while an
+// offline_access-only result must never satisfy an access/RBAC gate.
+func HasAccessBearingScope(scopes []string) bool {
+	for _, scope := range scopes {
+		if scope != "" && scope != "offline_access" {
+			return true
+		}
+	}
+	return false
 }
 
 // PartitionScopes splits a scope list into OIDC core scopes and RS-specific scopes.

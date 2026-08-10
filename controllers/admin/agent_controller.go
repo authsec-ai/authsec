@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
@@ -120,6 +121,63 @@ func (ac *AgentController) GetAgent(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, agent)
+}
+
+// GetAgentActivity returns this agent's connector-action history — the agent
+// lens over connector_action_audit (the audit endpoint on connectors is
+// connector-scoped; Agent 360 needs "what has THIS agent done").
+// GET /uflow/admin/agents/:id/activity
+//
+// An agent is a resource_servers row (application_type='ai_agent'); the audit
+// records the runtime identity that acted (actor_client_id / actor_spiffe_id /
+// subject_id). We match on any identifier associated with the agent: its own id
+// (as subject or client), and its spiffe_id (as actor).
+func (ac *AgentController) GetAgentActivity(c *gin.Context) {
+	workspaceID, err := sharedCtrl.ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	agentID := c.Param("id")
+	if _, err := uuid.Parse(agentID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid agent ID"})
+		return
+	}
+
+	// Confirm the agent exists in this workspace + grab its spiffe_id.
+	var agent struct {
+		ID       string
+		SpiffeID *string
+	}
+	if err := config.DB.Table("resource_servers").
+		Select("id, spiffe_id").
+		Where("id = ? AND workspace_id = ? AND application_type = 'ai_agent'", agentID, workspaceID).
+		First(&agent).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Agent not found"})
+		return
+	}
+
+	limit := 100
+	if v := c.Query("limit"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+
+	spiffe := ""
+	if agent.SpiffeID != nil {
+		spiffe = *agent.SpiffeID
+	}
+	var rows []models.ConnectorActionAudit
+	if err := config.DB.
+		Where("workspace_id = ?", *workspaceID).
+		Where(`actor_client_id = ? OR subject_id::text = ? OR (actor_spiffe_id <> '' AND actor_spiffe_id = ?)`,
+			agentID, agentID, spiffe).
+		Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load activity"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"agent_id": agentID, "activity": rows})
 }
 
 // ProvisionIdentity creates a SPIRE workload entry for an AI agent.

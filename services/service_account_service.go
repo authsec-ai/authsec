@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -50,17 +51,47 @@ type ProvisionedCredential struct {
 	Secret *string
 }
 
+// DeletedServiceAccount records the non-secret identifiers removed with a
+// service account. Callers can use it for audit output after the transaction
+// commits without re-querying rows that no longer exist.
+type DeletedServiceAccount struct {
+	ID            uuid.UUID
+	WorkspaceID   uuid.UUID
+	OAuthClientID *uuid.UUID
+	SpiffeID      *string
+}
+
 // CreateServiceAccount creates a disabled service account. It becomes usable
 // only once a credential is provisioned (status flips to active there).
-func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name, description string) (*models.ServiceAccount, error) {
+func (s *ServiceAccountService) CreateServiceAccount(workspaceID uuid.UUID, name, description, ownerEmail, ownerTeam string) (*models.ServiceAccount, error) {
+	return s.CreateServiceAccountTx(
+		s.db.Session(&gorm.Session{NewDB: true}), workspaceID, name, description, ownerEmail, ownerTeam,
+	)
+}
+
+// CreateServiceAccountTx is CreateServiceAccount bound to a caller-owned
+// transaction. Composite creation flows use it so the principal cannot be
+// stranded when a later credential, binding, or registration write fails.
+func (s *ServiceAccountService) CreateServiceAccountTx(
+	tx *gorm.DB,
+	workspaceID uuid.UUID,
+	name, description, ownerEmail, ownerTeam string,
+) (*models.ServiceAccount, error) {
+	if ownerEmail == "" {
+		return nil, fmt.Errorf("owner_email is required: every agent must have an accountable owner")
+	}
 	sa := models.ServiceAccount{
 		ID:          uuid.New(),
 		WorkspaceID: workspaceID,
 		Name:        name,
 		Description: description,
 		Status:      "disabled",
+		OwnerEmail:  &ownerEmail,
 	}
-	if err := s.db.Session(&gorm.Session{NewDB: true}).Create(&sa).Error; err != nil {
+	if ownerTeam != "" {
+		sa.OwnerTeam = &ownerTeam
+	}
+	if err := tx.Create(&sa).Error; err != nil {
 		return nil, fmt.Errorf("failed to create service account: %w", err)
 	}
 	return &sa, nil
@@ -75,6 +106,100 @@ func (s *ServiceAccountService) GetServiceAccount(workspaceID, saID uuid.UUID) (
 		return nil, ErrServiceAccountNotFound
 	}
 	return &sa, nil
+}
+
+// DeleteServiceAccount removes the complete machine-identity lifecycle in one
+// database transaction. A service account owns its OAuth client and SPIFFE
+// binding; leaving either behind creates an unusable client or a unique-key
+// tombstone that prevents the workload from being registered again.
+//
+// The explicit deletes intentionally precede the parent rows even where the
+// current schema has ON DELETE CASCADE. This keeps cleanup correct for older
+// deployed schemas and makes the ownership boundary visible in one place.
+func (s *ServiceAccountService) DeleteServiceAccount(
+	ctx context.Context,
+	workspaceID, saID uuid.UUID,
+) (*DeletedServiceAccount, error) {
+	var deleted *DeletedServiceAccount
+	err := s.db.WithContext(ctx).Session(&gorm.Session{NewDB: true}).Transaction(func(tx *gorm.DB) error {
+		var sa models.ServiceAccount
+		if err := tx.
+			Where("workspace_id = ? AND id = ?", workspaceID, saID).
+			First(&sa).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrServiceAccountNotFound
+			}
+			return fmt.Errorf("load service account for deletion: %w", err)
+		}
+
+		deleted = &DeletedServiceAccount{
+			ID:            sa.ID,
+			WorkspaceID:   sa.WorkspaceID,
+			OAuthClientID: sa.OAuthClientID,
+			SpiffeID:      sa.SpiffeID,
+		}
+
+		// Role bindings are the service account's RBAC assignments. The composite
+		// workspace predicate prevents an identifier collision from crossing a
+		// workspace boundary.
+		if err := tx.Where("workspace_id = ? AND service_account_id = ?", workspaceID, sa.ID).
+			Delete(&models.RoleBinding{}).Error; err != nil {
+			return fmt.Errorf("delete service account assignments: %w", err)
+		}
+
+		if sa.SpiffeID != nil && *sa.SpiffeID != "" {
+			// The Application workload record is the canonical SPIFFE-to-resource
+			// binding and carries the global SPIFFE-ID uniqueness constraint.
+			if err := tx.Where("workspace_id = ? AND spiffe_id = ?", workspaceID, *sa.SpiffeID).
+				Delete(&models.ApplicationSpiffeIdentity{}).Error; err != nil {
+				return fmt.Errorf("delete application SPIFFE binding: %w", err)
+			}
+
+			// Managed-SPIRE compatibility rows may exist for older workloads. They
+			// are database registration material, not audit history.
+			if err := tx.Exec("DELETE FROM spire_workloads WHERE spiffe_id = ?", *sa.SpiffeID).Error; err != nil {
+				return fmt.Errorf("delete legacy SPIRE workload: %w", err)
+			}
+			// Issued-token rows are retained as history but made unusable.
+			if err := tx.Exec(
+				"UPDATE spire_oidc_tokens SET revoked = true WHERE spiffe_id = ?",
+				*sa.SpiffeID,
+			).Error; err != nil {
+				return fmt.Errorf("revoke SPIRE token records: %w", err)
+			}
+		}
+
+		if sa.OAuthClientID != nil {
+			// Registration rows are the client's permission to address individual
+			// resource servers. This OAuth client is unique to this service account,
+			// so every registration it owns must be removed.
+			if err := tx.Where("oauth_client_id = ?", *sa.OAuthClientID).
+				Delete(&models.ResourceServerClientRegistration{}).Error; err != nil {
+				return fmt.Errorf("delete OAuth client registrations: %w", err)
+			}
+		}
+
+		if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, sa.ID).
+			Delete(&models.ServiceAccount{}).Error; err != nil {
+			return fmt.Errorf("delete service account: %w", err)
+		}
+
+		if sa.OAuthClientID != nil {
+			// Deleting the OAuth client cascades its secret/JWKS/consent material.
+			// Service-account clients mint native AuthSec tokens and are never
+			// provisioned in Hydra, so there is no external client to reconcile.
+			if err := tx.Where("id = ?", *sa.OAuthClientID).
+				Delete(&models.MCPOAuthClient{}).Error; err != nil {
+				return fmt.Errorf("delete OAuth client: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // ProvisionCredential creates a confidential M2M OAuth client for the service
@@ -200,4 +325,75 @@ func (s *ServiceAccountService) ProvisionCredentialTx(tx *gorm.DB, workspaceID, 
 		AuthMethod: authMethod,
 		Secret:     plainSecret,
 	}, nil
+}
+
+// ErrServiceAccountNoSecretCredential is returned when rotation is attempted on
+// a service account that has no client_secret credential to rotate (either no
+// credential at all, or a private_key_jwt one whose secret isn't ours to spin).
+var ErrServiceAccountNoSecretCredential = errors.New("service account has no client-secret credential to rotate")
+
+// RotateCredentialSecret mints a fresh client secret for the service account's
+// EXISTING credential client and revokes all prior secrets, returning the new
+// plaintext once. The client_id is unchanged — so any assignments/role bindings
+// keyed on it keep working; only the secret changes. Immediate revoke (no grace
+// window): the old secret stops working the instant this returns. The token
+// endpoint already tries every non-revoked secret newest-first
+// (client_auth.go), so this composes cleanly with that verification path.
+func (s *ServiceAccountService) RotateCredentialSecret(workspaceID, saID uuid.UUID) (*ProvisionedCredential, error) {
+	var result *ProvisionedCredential
+	err := s.db.Session(&gorm.Session{NewDB: true}).Transaction(func(tx *gorm.DB) error {
+		var sa models.ServiceAccount
+		if err := tx.Where("workspace_id = ? AND id = ?", workspaceID, saID).First(&sa).Error; err != nil {
+			return ErrServiceAccountNotFound
+		}
+		if sa.OAuthClientID == nil {
+			return ErrServiceAccountNoSecretCredential
+		}
+
+		// Must be a client_secret_basic client — rotating a secret for a
+		// private_key_jwt client is meaningless (there is no secret we hold).
+		var client models.MCPOAuthClient
+		if err := tx.Where("id = ?", *sa.OAuthClientID).First(&client).Error; err != nil {
+			return ErrServiceAccountNoSecretCredential
+		}
+		if !hasMethod(client.AllowedTokenEndpointAuthMethods, "client_secret_basic") {
+			return ErrServiceAccountNoSecretCredential
+		}
+
+		secret, genErr := GenerateClientSecret()
+		if genErr != nil {
+			return genErr
+		}
+		hash, hashErr := HashClientSecret(secret)
+		if hashErr != nil {
+			return hashErr
+		}
+
+		now := time.Now().UTC()
+		// Revoke every currently-active secret for this client.
+		if err := tx.Model(&models.OAuthClientSecret{}).
+			Where("client_id = ? AND revoked_at IS NULL", client.ID).
+			Update("revoked_at", now).Error; err != nil {
+			return fmt.Errorf("revoke prior secrets: %w", err)
+		}
+		// Mint the replacement.
+		if err := tx.Create(&models.OAuthClientSecret{
+			ID:         uuid.New(),
+			ClientID:   client.ID,
+			SecretHash: hash,
+		}).Error; err != nil {
+			return fmt.Errorf("store rotated secret: %w", err)
+		}
+
+		result = &ProvisionedCredential{
+			ClientID:   client.ClientID,
+			AuthMethod: "client_secret_basic",
+			Secret:     &secret,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }

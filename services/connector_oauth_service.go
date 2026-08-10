@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/connectoradapters"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -44,9 +46,48 @@ type StartResult struct {
 	State        string `json:"state"`
 }
 
-// Start builds the provider authorize URL for a workspace-scope connect and
-// persists the CSRF/PKCE state. redirectAfter is the UI page to return to.
+// Start builds the provider authorize URL for a workspace-scope connect (the
+// shared org credential) and persists the CSRF/PKCE state.
 func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, createdBy, redirectAfter string, scopes []string) (*StartResult, error) {
+	return s.startConnect(workspaceID, connectorID, models.ConnectionBindingWorkspace, nil, createdBy, redirectAfter, scopes)
+}
+
+// StartUser builds the authorize URL for a USER-scope connect (R4): an
+// authenticated end-user consents to the provider for their own account. The
+// resulting connection is keyed by subjectUserID and resolved by the broker when
+// a delegated (XAA) token carries sub=this user. subjectUserID is the caller's
+// own local user UUID (from their session) — never a value they supply.
+func (s *ConnectorOAuthService) StartUser(workspaceID, connectorID, subjectUserID uuid.UUID, redirectAfter string, scopes []string) (*StartResult, error) {
+	sid := subjectUserID
+	return s.startConnect(workspaceID, connectorID, models.ConnectionBindingUser, &sid, subjectUserID.String(), redirectAfter, scopes)
+}
+
+// ListUserConnections returns a user's own provider connections in a workspace
+// (their "connected accounts"). R4.
+func (s *ConnectorOAuthService) ListUserConnections(workspaceID, subjectUserID uuid.UUID) ([]models.ConnectorConnection, error) {
+	return s.repo.ListUserConnectionsBySubject(workspaceID, subjectUserID.String())
+}
+
+// RevokeUserConnection lets a user disconnect their own provider account for a
+// connector: marks the connection revoked (broker then fails closed) and best-
+// effort deletes the Vault secret. R4.
+func (s *ConnectorOAuthService) RevokeUserConnection(workspaceID, connectorID, subjectUserID uuid.UUID) error {
+	// Grab the row first so we can clear its Vault secret after revoking.
+	existing, _ := s.repo.GetUserConnection(connectorID, subjectUserID.String())
+	n, err := s.repo.RevokeUserConnection(workspaceID, connectorID, subjectUserID.String())
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("no user connection to revoke")
+	}
+	if existing != nil && s.vault != nil && existing.VaultPath != "" {
+		_ = s.vault.DeleteSecret(existing.VaultPath) // best-effort
+	}
+	return nil
+}
+
+func (s *ConnectorOAuthService) startConnect(workspaceID, connectorID uuid.UUID, bindingType string, subjectUserID *uuid.UUID, createdBy, redirectAfter string, scopes []string) (*StartResult, error) {
 	conn, err := s.repo.GetByID(workspaceID, connectorID)
 	if err != nil {
 		return nil, errors.New("connector not found")
@@ -59,7 +100,7 @@ func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, create
 		return nil, fmt.Errorf("provider %q is not OAuth2", provider.Key)
 	}
 
-	clientID, _, redirectURI, cErr := providerOAuthApp(provider.Key)
+	clientID, _, redirectURI, cErr := s.resolveProviderApp(workspaceID, provider.Key)
 	if cErr != nil {
 		return nil, cErr
 	}
@@ -79,12 +120,18 @@ func (s *ConnectorOAuthService) Start(workspaceID, connectorID uuid.UUID, create
 	}
 	challenge := pkceS256(verifier)
 
+	var subjStr *string
+	if subjectUserID != nil {
+		v := subjectUserID.String()
+		subjStr = &v
+	}
 	st := &models.ConnectorOAuthState{
 		State:         state,
 		WorkspaceID:   workspaceID,
 		ConnectorID:   connectorID,
 		ProviderKey:   provider.Key,
-		BindingType:   models.ConnectionScopeWorkspace,
+		BindingType:   bindingType,
+		SubjectUserID: subjStr,
 		CodeVerifier:  verifier,
 		RedirectAfter: redirectAfter,
 		CreatedBy:     createdBy,
@@ -147,7 +194,7 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 	if err != nil {
 		return nil, fmt.Errorf("unknown provider %q", st.ProviderKey)
 	}
-	clientID, clientSecret, redirectURI, cErr := providerOAuthApp(provider.Key)
+	clientID, clientSecret, redirectURI, cErr := s.resolveProviderApp(st.WorkspaceID, provider.Key)
 	if cErr != nil {
 		return nil, cErr
 	}
@@ -157,8 +204,13 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}
 
-	// Store secret material in Vault; only metadata in Postgres.
+	// Vault path differs by binding: a user connection is keyed by the subject so
+	// each user's token is stored separately.
+	isUser := st.BindingType == models.ConnectionBindingUser && st.SubjectUserID != nil
 	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s/connection", st.WorkspaceID, st.ConnectorID)
+	if isUser {
+		vaultPath = fmt.Sprintf("kv/data/secret/workspaces/%s/connectors/%s/users/%s", st.WorkspaceID, st.ConnectorID, *st.SubjectUserID)
+	}
 	secret := map[string]interface{}{"access_token": tok.AccessToken}
 	if tok.RefreshToken != "" {
 		secret["refresh_token"] = tok.RefreshToken
@@ -178,20 +230,33 @@ func (s *ConnectorOAuthService) HandleCallback(code, state string) (*CallbackRes
 		t := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 		expiresAt = &t
 	}
-	// Upsert the workspace-scope Connection (one per connector).
-	existing, _ := s.repo.GetWorkspaceConnection(st.ConnectorID)
+
 	conn := &models.ConnectorConnection{
+		WorkspaceID:         st.WorkspaceID,
 		ConnectorID:         st.ConnectorID,
-		Scope:               models.ConnectionScopeWorkspace,
+		BindingType:         st.BindingType,
 		Status:              models.ConnectionStatusActive,
-		AuthType:            models.ConnectionAuthOAuth2,
+		AuthMethod:          models.ConnectionAuthOAuth2,
 		VaultPath:           vaultPath,
 		ScopesGranted:       strings.Fields(tok.Scope),
 		AccessExpiresAt:     expiresAt,
 		RefreshTokenPresent: tok.RefreshToken != "",
+		ConnectedBy:         st.CreatedBy,
+	}
+
+	// Upsert the matching connection (one workspace conn per connector; one user
+	// conn per (connector, subject)).
+	var existing *models.ConnectorConnection
+	if isUser {
+		subj, _ := uuid.Parse(*st.SubjectUserID)
+		conn.SubjectUserID = &subj
+		existing, _ = s.repo.GetUserConnection(st.ConnectorID, *st.SubjectUserID)
+	} else {
+		existing, _ = s.repo.GetWorkspaceConnection(st.ConnectorID)
 	}
 	if existing != nil {
 		conn.ID = existing.ID
+		conn.Version = existing.Version // preserve CAS counter on reconnect
 		if err := s.db.Save(conn).Error; err != nil {
 			return nil, fmt.Errorf("update connection: %w", err)
 		}
@@ -251,20 +316,163 @@ func (s *ConnectorOAuthService) exchangeCode(provider *models.ConnectorProvider,
 
 // --- helpers -----------------------------------------------------------------
 
-// providerOAuthApp returns AuthSec's own registered OAuth app credentials for a
-// provider, from env: CONNECTOR_OAUTH_<PROVIDER>_CLIENT_ID / _CLIENT_SECRET /
-// _REDIRECT_URI (provider upper-cased). These are AuthSec's app at the provider,
-// not a tenant secret.
-func providerOAuthApp(providerKey string) (clientID, clientSecret, redirectURI string, err error) {
+// MintGitHubAppToken mints a fresh GitHub-App installation access token for a
+// github_app connection: resolves the workspace's GitHub App (app id + private
+// key PEM in Vault) and the connection's installation id, then signs the App JWT
+// and exchanges it. The token is short-lived and never stored — it's minted per
+// need and injected by the broker. providerKey lets other App-style providers
+// reuse this later; today only 'github' uses it.
+func (s *ConnectorOAuthService) MintGitHubAppToken(ctx context.Context, workspaceID uuid.UUID, providerKey string, conn *models.ConnectorConnection) (string, error) {
+	app, err := s.repo.GetProviderApp(workspaceID, providerKey)
+	if err != nil || app == nil {
+		return "", fmt.Errorf("no GitHub App configured for provider %q in this workspace", providerKey)
+	}
+	if app.AppKind != models.ProviderAppKindGitHubApp || app.GitHubAppID == "" {
+		return "", fmt.Errorf("provider app for %q is not a GitHub App", providerKey)
+	}
+	if s.vault == nil {
+		return "", errors.New("vault client not configured")
+	}
+	secret, err := s.vault.ReadSecret(app.VaultPath)
+	if err != nil {
+		return "", fmt.Errorf("read app private key: %w", err)
+	}
+	privateKey, _ := secret["private_key"].(string)
+	if privateKey == "" {
+		return "", errors.New("GitHub App private key missing in vault")
+	}
+	// The installation id is stored on the connection's external-account id.
+	installationID := conn.ExternalAccountID
+	if installationID == "" {
+		return "", errors.New("connection has no GitHub App installation id")
+	}
+	return connectoradapters.MintGitHubInstallationToken(ctx, connectoradapters.GitHubAppCreds{
+		AppID:          app.GitHubAppID,
+		PrivateKeyPEM:  privateKey,
+		InstallationID: installationID,
+	})
+}
+
+// SetProviderApp configures a workspace's own OAuth app for a provider: stores
+// the client_secret in Vault and upserts the client_id/redirect_uri row. This is
+// how a workspace brings its own OAuth app instead of the deployment-wide env one.
+func (s *ConnectorOAuthService) SetProviderApp(workspaceID uuid.UUID, providerKey, clientID, clientSecret, redirectURI, createdBy string) error {
+	if clientID == "" || redirectURI == "" {
+		return errors.New("client_id and redirect_uri are required")
+	}
+	if _, err := s.repo.GetProvider(providerKey); err != nil {
+		return fmt.Errorf("unknown provider %q", providerKey)
+	}
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/%s", workspaceID.String(), providerKey)
+	if clientSecret != "" {
+		if s.vault == nil {
+			return errors.New("vault client not configured")
+		}
+		if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{"client_secret": clientSecret}); err != nil {
+			return fmt.Errorf("store client secret: %w", err)
+		}
+	}
+	return s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
+		WorkspaceID: workspaceID,
+		ProviderKey: providerKey,
+		AppKind:     models.ProviderAppKindOAuth2,
+		ClientID:    clientID,
+		RedirectURI: redirectURI,
+		VaultPath:   vaultPath,
+		CreatedBy:   createdBy,
+	})
+}
+
+// SetGitHubApp configures a workspace's GitHub App for the github provider:
+// stores the App id (DB) + private-key PEM (Vault). Distinct from the OAuth-app
+// path — a GitHub App mints installation tokens, not OAuth code exchanges.
+func (s *ConnectorOAuthService) SetGitHubApp(workspaceID uuid.UUID, appID, privateKeyPEM, createdBy string) error {
+	if appID == "" || privateKeyPEM == "" {
+		return errors.New("app_id and private_key are required")
+	}
+	if s.vault == nil {
+		return errors.New("vault client not configured")
+	}
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/github", workspaceID.String())
+	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{"private_key": privateKeyPEM}); err != nil {
+		return fmt.Errorf("store app private key: %w", err)
+	}
+	return s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
+		WorkspaceID: workspaceID,
+		ProviderKey: "github",
+		AppKind:     models.ProviderAppKindGitHubApp,
+		GitHubAppID: appID,
+		VaultPath:   vaultPath,
+		CreatedBy:   createdBy,
+	})
+}
+
+// ConnectGitHubApp binds a connector to a GitHub App installation: creates (or
+// updates) the connector's workspace-scope github_app connection with the given
+// installation id. No OAuth dance — the installation id + the workspace App are
+// all that's needed; tokens are minted per action.
+func (s *ConnectorOAuthService) ConnectGitHubApp(workspaceID, connectorID uuid.UUID, installationID, orgName, createdBy string) error {
+	if installationID == "" {
+		return errors.New("installation_id is required")
+	}
+	if _, err := s.repo.GetProviderApp(workspaceID, "github"); err != nil {
+		return errors.New("configure the workspace GitHub App first")
+	}
+	// The github_app connection carries no Vault secret of its own (tokens are
+	// minted from the provider-app key); vault_path points at the app key path.
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/github", workspaceID.String())
+	existing, _ := s.repo.GetWorkspaceConnection(connectorID)
+	conn := &models.ConnectorConnection{
+		WorkspaceID:         workspaceID,
+		ConnectorID:         connectorID,
+		BindingType:         models.ConnectionBindingWorkspace,
+		Status:              models.ConnectionStatusActive,
+		AuthMethod:          models.ConnectionAuthGitHubApp,
+		VaultPath:           vaultPath,
+		ExternalAccountID:   installationID, // installation id lives here
+		ExternalOrgName:     orgName,
+		RefreshTokenPresent: false,
+		ConnectedBy:         createdBy,
+	}
+	if existing != nil {
+		conn.ID = existing.ID
+		conn.Version = existing.Version
+		return s.db.Save(conn).Error
+	}
+	return s.repo.CreateConnection(conn)
+}
+
+// resolveProviderApp returns the OAuth app credentials for (workspace, provider):
+// a workspace-specific app (client_id in DB, secret in Vault) takes precedence,
+// else the global env vars CONNECTOR_OAUTH_<P>_CLIENT_ID/_SECRET/_REDIRECT_URI.
+// Lets a workspace bring its own OAuth app while keeping the deployment-wide
+// default working. The secret is read from Vault only for the DB path.
+func (s *ConnectorOAuthService) resolveProviderApp(workspaceID uuid.UUID, providerKey string) (clientID, clientSecret, redirectURI string, err error) {
+	// 1. Workspace-specific app (DB row + Vault secret).
+	if app, e := s.repo.GetProviderApp(workspaceID, providerKey); e == nil && app != nil {
+		secret := ""
+		if s.vault != nil && app.VaultPath != "" {
+			if sec, e2 := s.vault.ReadSecret(app.VaultPath); e2 == nil {
+				if v, ok := sec["client_secret"].(string); ok {
+					secret = v
+				}
+			}
+		}
+		if app.ClientID != "" && app.RedirectURI != "" {
+			return app.ClientID, secret, app.RedirectURI, nil
+		}
+	}
+
+	// 2. Global env fallback.
 	p := strings.ToUpper(providerKey)
 	clientID = os.Getenv("CONNECTOR_OAUTH_" + p + "_CLIENT_ID")
 	clientSecret = os.Getenv("CONNECTOR_OAUTH_" + p + "_CLIENT_SECRET")
 	redirectURI = os.Getenv("CONNECTOR_OAUTH_" + p + "_REDIRECT_URI")
 	if redirectURI == "" {
-		redirectURI = os.Getenv("CONNECTOR_OAUTH_REDIRECT_URI") // shared default
+		redirectURI = os.Getenv("CONNECTOR_OAUTH_REDIRECT_URI")
 	}
 	if clientID == "" || redirectURI == "" {
-		return "", "", "", fmt.Errorf("OAuth app not configured for provider %q (set CONNECTOR_OAUTH_%s_CLIENT_ID / _REDIRECT_URI)", providerKey, p)
+		return "", "", "", fmt.Errorf("OAuth app not configured for provider %q in workspace %s (set a workspace provider app, or CONNECTOR_OAUTH_%s_CLIENT_ID / _REDIRECT_URI)", providerKey, workspaceID, p)
 	}
 	return clientID, clientSecret, redirectURI, nil
 }
@@ -316,18 +524,51 @@ func parseTokenResponse(body []byte) (*tokenResp, error) {
 	}, nil
 }
 
-// Refresh performs an on-demand refresh of a workspace connection's OAuth token
-// using its stored refresh_token, updates the Vault secret + lifecycle metadata.
-// Called before an action when the access token is near/after expiry.
+// Refresh performs an on-demand refresh of a connection's OAuth token, guarded
+// against a thundering herd: N concurrent executes on an expiring token would
+// otherwise all refresh at once and race refresh-token rotation. We take a
+// non-blocking Postgres advisory lock keyed on the connection id; if another
+// worker holds it, we skip (that worker is refreshing) and re-read the row so
+// the caller uses the freshly-rotated token. Inside the lock we re-check via a
+// version CAS so a lock winner that already refreshed isn't refreshed again.
 func (s *ConnectorOAuthService) Refresh(conn *models.ConnectorConnection) error {
 	if !conn.RefreshTokenPresent || conn.VaultPath == "" {
 		return errors.New("no refresh token available")
 	}
-	provider, err := s.repo.GetProvider(providerKeyForConnection(s.db, conn))
+
+	// Advisory lock key derived from the connection UUID (stable per connection).
+	lockKey := int64(conn.ID.ID()) // low 32 bits of the UUID → int; fine for lock keying
+	var got bool
+	if err := s.db.Raw("SELECT pg_try_advisory_lock(?)", lockKey).Scan(&got).Error; err != nil {
+		return fmt.Errorf("acquire refresh lock: %w", err)
+	}
+	if !got {
+		// Someone else is refreshing this connection. Re-read the row so we pick
+		// up their rotated token instead of racing them; don't refresh ourselves.
+		var fresh models.ConnectorConnection
+		if e := s.db.First(&fresh, "id = ?", conn.ID).Error; e == nil {
+			*conn = fresh
+		}
+		return nil
+	}
+	defer s.db.Exec("SELECT pg_advisory_unlock(?)", lockKey)
+
+	// Version CAS: re-read under the lock; if the stored version advanced past
+	// what we hold, another worker already refreshed — adopt their row and stop.
+	var current models.ConnectorConnection
+	if e := s.db.First(&current, "id = ?", conn.ID).Error; e == nil {
+		if current.Version > conn.Version {
+			*conn = current
+			return nil
+		}
+		*conn = current // work from the authoritative row
+	}
+	providerKey, workspaceID := connectorContextForConnection(s.db, conn)
+	provider, err := s.repo.GetProvider(providerKey)
 	if err != nil {
 		return err
 	}
-	clientID, clientSecret, _, cErr := providerOAuthApp(provider.Key)
+	clientID, clientSecret, _, cErr := s.resolveProviderApp(workspaceID, provider.Key)
 	if cErr != nil {
 		return cErr
 	}
@@ -385,6 +626,7 @@ func (s *ConnectorOAuthService) Refresh(conn *models.ConnectorConnection) error 
 	conn.LastRefreshAt = &now
 	conn.LastRefreshError = ""
 	conn.Status = models.ConnectionStatusActive
+	conn.Version++ // CAS increment — signals other waiters this token is fresh
 	if tok.ExpiresIn > 0 {
 		t := now.Add(time.Duration(tok.ExpiresIn) * time.Second)
 		conn.AccessExpiresAt = &t
@@ -400,10 +642,14 @@ func (s *ConnectorOAuthService) markRefreshError(conn *models.ConnectorConnectio
 	s.db.Save(conn)
 }
 
-// providerKeyForConnection resolves the provider key from the connection's
-// connector (the connection row itself doesn't store it).
-func providerKeyForConnection(db *gorm.DB, conn *models.ConnectorConnection) string {
-	var key string
-	db.Table("connectors").Where("id = ?", conn.ConnectorID).Limit(1).Pluck("provider_key", &key)
-	return key
+// connectorContextForConnection resolves the provider key + workspace id from
+// the connection's connector (the connection row stores neither).
+func connectorContextForConnection(db *gorm.DB, conn *models.ConnectorConnection) (providerKey string, workspaceID uuid.UUID) {
+	var row struct {
+		ProviderKey string
+		WorkspaceID uuid.UUID
+	}
+	db.Table("connectors").Select("provider_key, workspace_id").
+		Where("id = ?", conn.ConnectorID).Limit(1).Scan(&row)
+	return row.ProviderKey, row.WorkspaceID
 }

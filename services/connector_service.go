@@ -11,6 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ConnectorManager holds business logic for connectors: catalog validation,
@@ -32,9 +33,18 @@ type ConnectorManager interface {
 	ResolveActionCredential(connectorID uuid.UUID, subjectUserID string) (*ResolvedCredential, error)
 
 	// Assignment management (grant an agent access to a connector + action).
-	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error)
+	GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, inputConstraints json.RawMessage, createdBy string) (*models.ConnectorAssignment, error)
 	ListAssignments(workspaceID, connectorID uuid.UUID) ([]models.ConnectorAssignment, error)
 	RevokeAssignment(workspaceID, assignmentID uuid.UUID) error
+
+	// AuditLog returns recent action-audit records for a connector (who/act/
+	// token/outcome). Workspace-scoped.
+	AuditLog(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error)
+
+	// SetAllowedSubjectGroups sets the connector's subject-group policy (F5): the
+	// group ids a delegated action's on-behalf-of user must belong to. Empty
+	// clears the restriction. Workspace-scoped.
+	SetAllowedSubjectGroups(workspaceID, connectorID uuid.UUID, groupIDs []string) (*models.Connector, error)
 }
 
 // ResolvedCredential is the broker-side result of connection resolution: the
@@ -148,10 +158,11 @@ func (m *connectorManager) Create(workspaceID uuid.UUID, createdBy string, in Co
 	// Vault path so existing secret material is unaffected.
 	if hasSecrets {
 		wsConn := &models.ConnectorConnection{
+			WorkspaceID: workspaceID,
 			ConnectorID: conn.ID,
-			Scope:       models.ConnectionScopeWorkspace,
+			BindingType: models.ConnectionBindingWorkspace,
 			Status:      models.ConnectionStatusActive,
-			AuthType:    models.ConnectionAuthAPIKey,
+			AuthMethod:  models.ConnectionAuthAPIKey,
 			VaultPath:   conn.VaultPath,
 		}
 		if err := m.repo.CreateConnection(wsConn); err != nil {
@@ -249,7 +260,7 @@ func (m *connectorManager) Connections(connectorID uuid.UUID) ([]models.Connecto
 // scoped to one action (nil actionKey => all actions). Validates the connector
 // belongs to the workspace and, when an action is named, that it exists for the
 // provider.
-func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, createdBy string) (*models.ConnectorAssignment, error) {
+func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, clientID string, actionKey *string, inputConstraints json.RawMessage, createdBy string) (*models.ConnectorAssignment, error) {
 	if clientID == "" {
 		return nil, errors.New("client_id is required")
 	}
@@ -264,15 +275,34 @@ func (m *connectorManager) GrantAssignment(workspaceID, connectorID uuid.UUID, c
 	} else {
 		actionKey = nil // normalize "" → all-actions
 	}
-	a := &models.ConnectorAssignment{
-		WorkspaceID: workspaceID,
-		ConnectorID: connectorID,
-		ClientID:    clientID,
-		ActionKey:   actionKey,
-		CreatedBy:   createdBy,
+	// Validate the F3 predicate is well-formed JSON up front (fail at grant time,
+	// not at every action) — empty is fine (no restriction).
+	if len(inputConstraints) > 0 {
+		var probe map[string]interface{}
+		if err := json.Unmarshal(inputConstraints, &probe); err != nil {
+			return nil, fmt.Errorf("input_constraints must be a JSON object: %w", err)
+		}
 	}
-	if err := m.repo.CreateAssignment(a); err != nil {
-		return nil, fmt.Errorf("create assignment: %w", err)
+	// One-transaction grant: assignment + broker-RS registration (approved) +
+	// connector-executor role binding, all-or-nothing. Enabling an agent is now a
+	// single API call instead of 4 authorizations across 4 tables.
+	brokerRSID, permID, err := m.brokerGrantContext(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	a, err := m.repo.GrantAssignmentTx(repositories.GrantAssignmentInput{
+		WorkspaceID:      workspaceID,
+		ConnectorID:      connectorID,
+		ClientID:         clientID,
+		ActionKey:        actionKey,
+		InputConstraints: inputConstraints,
+		CreatedBy:        createdBy,
+		BrokerRSID:       brokerRSID,
+		ExecutePermID:    permID,
+		ExecuteRoleName:  "connector-executor",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("grant assignment: %w", err)
 	}
 	return a, nil
 }
@@ -285,9 +315,47 @@ func (m *connectorManager) ListAssignments(workspaceID, connectorID uuid.UUID) (
 	return m.repo.ListAssignments(connectorID)
 }
 
-// RevokeAssignment removes an assignment (workspace-scoped delete).
+// brokerGrantContext resolves the workspace broker RS id + the global
+// connector:execute permission id used when wiring a grant.
+func (m *connectorManager) brokerGrantContext(workspaceID uuid.UUID) (uuid.UUID, uuid.UUID, error) {
+	return m.repo.BrokerGrantContext(workspaceID, BrokerResourceURI(workspaceID))
+}
+
+// RevokeAssignment removes an assignment and, if it was the client's last one in
+// the workspace, tears down the broker registration + executor role binding — the
+// inverse of the one-transaction grant.
 func (m *connectorManager) RevokeAssignment(workspaceID, assignmentID uuid.UUID) error {
-	return m.repo.DeleteAssignment(workspaceID, assignmentID)
+	brokerRSID, _, err := m.brokerGrantContext(workspaceID)
+	if err != nil {
+		// Broker RS gone — fall back to a plain delete so revoke still works.
+		return m.repo.DeleteAssignment(workspaceID, assignmentID)
+	}
+	return m.repo.RevokeAssignmentTx(workspaceID, assignmentID, brokerRSID)
+}
+
+// AuditLog returns recent action-audit records for a connector, after checking
+// the connector belongs to the workspace.
+func (m *connectorManager) AuditLog(workspaceID, connectorID uuid.UUID, limit int) ([]models.ConnectorActionAudit, error) {
+	if _, err := m.repo.GetByID(workspaceID, connectorID); err != nil {
+		return nil, errors.New("connector not found")
+	}
+	return m.repo.ListActionAudit(workspaceID, connectorID, limit)
+}
+
+// SetAllowedSubjectGroups sets the connector's F5 subject-group policy.
+func (m *connectorManager) SetAllowedSubjectGroups(workspaceID, connectorID uuid.UUID, groupIDs []string) (*models.Connector, error) {
+	conn, err := m.repo.GetByID(workspaceID, connectorID)
+	if err != nil {
+		return nil, errors.New("connector not found")
+	}
+	if groupIDs == nil {
+		groupIDs = []string{}
+	}
+	conn.AllowedSubjectGroups = pq.StringArray(groupIDs)
+	if err := m.repo.Update(conn); err != nil {
+		return nil, fmt.Errorf("update subject groups: %w", err)
+	}
+	return conn, nil
 }
 
 // ResolveActionCredential is the broker-side internal resolver: it selects the

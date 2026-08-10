@@ -434,6 +434,7 @@ func SetupRoutes(
 			applications.POST("/:id/machine-access/workload", applicationsController.CreateWorkloadAccess)
 			applications.GET("/:id/workloads", applicationsController.ListWorkloads)
 			applications.DELETE("/:id/workloads/:wid", applicationsController.RevokeWorkload)
+			applications.POST("/:id/workloads/:wid/restore", applicationsController.RestoreWorkload)
 
 			// Grant an EXISTING workload access to this MCP server (role binding +
 			// approved registration only — never mints/changes the workload identity).
@@ -716,6 +717,7 @@ func SetupRoutes(
 			// AI Agent Management
 			adminRBAC.GET("/agents", agentController.ListAgents)
 			adminRBAC.GET("/agents/:id", agentController.GetAgent)
+			adminRBAC.GET("/agents/:id/activity", agentController.GetAgentActivity)
 			adminRBAC.POST("/agents/:id/provision-identity", agentController.ProvisionIdentity)
 			adminRBAC.DELETE("/agents/:id/revoke-identity", agentController.RevokeIdentity)
 			adminRBAC.POST("/agents/:id/delegate-token", agentController.DelegateToken)
@@ -729,6 +731,7 @@ func SetupRoutes(
 			adminRBAC.PUT("/service-accounts/:sa_id", serviceAccountsController.UpdateServiceAccount)
 			adminRBAC.DELETE("/service-accounts/:sa_id", serviceAccountsController.DeleteServiceAccount)
 			adminRBAC.POST("/service-accounts/:sa_id/credentials", serviceAccountsController.CredentialServiceAccount)
+			adminRBAC.POST("/service-accounts/:sa_id/credentials/rotate", serviceAccountsController.RotateCredentialServiceAccount)
 
 			// Admin self-introspection (delegation UI)
 			adminRBAC.GET("/me/roles-permissions", delegationPolicyController.GetMyRolesAndPermissions)
@@ -1336,6 +1339,13 @@ func SetupRoutes(
 		connectors.Use(middlewares.AuthMiddleware())
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
+			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
+			connectors.POST("/providers/github/app-github", middlewares.Require("connector", "update"), connectorController.SetGitHubApp)
+			connectors.POST("/:id/connections/github-app", middlewares.Require("connector", "update"), connectorController.ConnectGitHubApp)
+			// R4 — end-user self-service consent (bind to the caller's own identity).
+			connectors.POST("/:id/connections/user/oauth/start", middlewares.Require("connector", "read"), connectorController.StartUserConnect)
+			connectors.DELETE("/:id/connections/me", middlewares.Require("connector", "read"), connectorController.RevokeMyConnection)
+			connectors.GET("/connections/me", middlewares.Require("connector", "read"), connectorController.ListMyConnections)
 			connectors.POST("", middlewares.Require("connector", "create"), connectorController.CreateConnector)
 			connectors.GET("", middlewares.Require("connector", "read"), connectorController.ListConnectors)
 			connectors.GET("/:id", middlewares.Require("connector", "read"), connectorController.GetConnector)
@@ -1346,12 +1356,85 @@ func SetupRoutes(
 			connectors.POST("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.GrantAssignment)
 			connectors.GET("/:id/assignments", middlewares.Require("connector", "assign"), connectorController.ListAssignments)
 			connectors.DELETE("/:id/assignments/:aid", middlewares.Require("connector", "assign"), connectorController.RevokeAssignment)
+			connectors.GET("/:id/audit", middlewares.Require("connector", "read"), connectorController.GetConnectorAudit)
+			connectors.PUT("/:id/subject-groups", middlewares.Require("connector", "assign"), connectorController.SetSubjectGroups)
 		}
 		// OAuth callback is provider-redirected and state-validated — it must NOT
 		// sit behind the admin auth middleware (the browser arrives unauthenticated
 		// from the provider). Distinct top-level path to avoid colliding with the
 		// /connectors/:id param route in Gin's tree.
 		authsec.GET("/connector-oauth/callback", connectorController.OAuthCallback)
+
+		// ────────────────────────────────────────────────────
+		// Agent Discovery (IGA) — /authsec/discovery/*.
+		// A quarantine-first inventory of every AI agent running in the
+		// workspace, including ones nobody registered. A sighting grants
+		// NOTHING: rows land unregistered, so discovery is safe to run against
+		// production before anything is provisioned. A human then either claims
+		// the agent (binding it to a governed identity + an accountable owner)
+		// or quarantines it.
+		//
+		// ────────────────────────────────────────────────────
+		discoveryController := platformCtrl.NewDiscoveryController(config.DB)
+
+		// Connector ingress is UNAUTHENTICATED by deliberate choice.
+		//
+		// A connector runs inside a customer's cluster and is configured with its
+		// workspace_id at deploy time (a Helm --set on the discovery agent), which it
+		// then asserts in the request body. That removes the token-minting step from
+		// the install flow entirely.
+		//
+		// What this trades away, stated plainly so it is not rediscovered later:
+		//   - the workspace is CALLER-ASSERTED, not derived from a verified token, so
+		//     any caller who knows a workspace_id can add rows to that workspace's
+		//     inventory
+		//   - there is no rate limit, so inventory growth from this path is unbounded
+		//
+		// What keeps the blast radius to noise rather than privilege: a sighting
+		// grants nothing. Rows land `unregistered`, and only an authenticated,
+		// permission-checked human can claim one into a governed identity. The worst
+		// case is a polluted Unregistered Agents report, not access.
+		//
+		// Registered on its own group so it cannot accidentally inherit
+		// AuthMiddleware from the block below. Same pattern as the connector OAuth
+		// callback above, which is also necessarily unauthenticated.
+		discoveryIngress := authsec.Group("/discovery")
+		{
+			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
+		}
+
+		// Everything else stays authenticated and permission-gated: reading the
+		// inventory exposes hostnames and workload metadata across the workspace, and
+		// claim/quarantine are governance decisions that must be attributable.
+		discovery := authsec.Group("/discovery")
+		discovery.Use(middlewares.AuthMiddleware())
+		{
+			// Connector registry.
+			discovery.POST("/sources", middlewares.Require("discovery", "admin"), discoveryController.CreateDiscoverySource)
+			discovery.GET("/sources", middlewares.Require("discovery", "read"), discoveryController.ListDiscoverySources)
+			discovery.GET("/sources/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoverySource)
+			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
+			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
+
+			// NOTE: POST /sightings is deliberately NOT here — it is registered
+			// unauthenticated on discoveryIngress above. Re-adding it here would make
+			// Gin panic at startup on the duplicate method+path.
+
+			// Inventory. ?status=unregistered is the Unregistered Agents report.
+			// The static /agents/lookup must be registered before /agents/:id.
+			discovery.GET("/agents/lookup", middlewares.Require("discovery", "read"), discoveryController.LookupDiscoveredAgent)
+			discovery.GET("/agents", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveredAgents)
+			discovery.GET("/agents/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoveredAgent)
+			discovery.PUT("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoveredAgent)
+			discovery.DELETE("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoveredAgent)
+
+			// The two governance decisions, each with its own permission.
+			discovery.POST("/agents/:id/claim", middlewares.Require("discovery", "claim"), discoveryController.ClaimAgent)
+			discovery.POST("/agents/:id/quarantine", middlewares.Require("discovery", "quarantine"), discoveryController.QuarantineAgent)
+
+			// Headline KPI: registered / total, segmented by origin.
+			discovery.GET("/coverage", middlewares.Require("discovery", "read"), discoveryController.GetCoverage)
+		}
 
 		// ────────────────────────────────────────────────────
 		// Connector Broker — runtime DATA plane (/broker/connectors/*).

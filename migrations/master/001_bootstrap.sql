@@ -3069,6 +3069,12 @@ CREATE TABLE public.connectors (
     subscriptions    jsonb NOT NULL DEFAULT '[]'::jsonb,
     vault_path       text,
     agent_accessible boolean NOT NULL DEFAULT false,
+    -- allowed_subject_groups (F5): if non-empty, a DELEGATED (XAA) action is only
+    -- permitted when the on-behalf-of user is a member of one of these groups
+    -- (group ids in this workspace). Empty = no subject-group restriction. Gates
+    -- WHO an agent may act for at the broker; does not apply to non-delegated M2M
+    -- calls (which have no human subject).
+    allowed_subject_groups uuid[] NOT NULL DEFAULT '{}'::uuid[],
     created_by       text NOT NULL,
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
@@ -3086,33 +3092,65 @@ CREATE TABLE public.connectors (
 CREATE INDEX idx_connectors_workspace ON public.connectors(workspace_id);
 CREATE INDEX idx_connectors_provider ON public.connectors(provider_key);
 
--- connector_connections — a credential binding + its lifecycle state (P1).
--- One connector holds a single workspace-scope connection and N user-scope
--- connections, each with independent lifecycle. Secret material (api key /
--- oauth token) lives in Vault at vault_path; PG holds only metadata.
---   scope='workspace' → subject_user_id NULL
---   scope='user'      → keyed by subject_user_id
+-- connector_connections — a credential binding + its lifecycle state (P1,
+-- hardened). One connector holds a single workspace-scope connection and N
+-- user-scope connections, each with independent lifecycle. Secret material
+-- (api key / oauth token) lives in Vault at vault_path; PG holds only metadata.
+--   binding_type='workspace' → subject_user_id NULL
+--   binding_type='user'      → keyed by subject_user_id (a local user UUID)
+-- Hardening: workspace_id + composite FK (no cross-workspace binding); CHECKs
+-- pin binding_type/subject/status/auth_method consistency; NULL-safe PARTIAL
+-- unique indexes (a plain UNIQUE lets duplicate workspace rows through because
+-- Postgres treats NULLs as distinct); version column for optimistic-CAS on
+-- refresh; external-account + lifecycle columns.
 CREATE TABLE public.connector_connections (
-    id                    uuid NOT NULL DEFAULT gen_random_uuid(),
-    connector_id          uuid NOT NULL,
-    scope                 text NOT NULL,                  -- 'tenant' | 'user'
-    subject_user_id       text,                           -- NULL for tenant scope
-    status                text NOT NULL DEFAULT 'active', -- active|expired|error|revoked
-    auth_type             text NOT NULL,                  -- 'api_key' | 'oauth2'
-    vault_path            text NOT NULL,
-    scopes_granted        text[] NOT NULL DEFAULT '{}'::text[],
-    access_expires_at     timestamptz,
-    refresh_token_present boolean NOT NULL DEFAULT false,
-    last_refresh_at       timestamptz,
-    last_refresh_error    text,
-    created_at            timestamptz NOT NULL DEFAULT now(),
-    updated_at            timestamptz NOT NULL DEFAULT now(),
+    id                     uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id           uuid NOT NULL,
+    connector_id           uuid NOT NULL,
+    binding_type           text NOT NULL,                  -- 'workspace' | 'user'
+    subject_user_id        uuid,                           -- NULL iff workspace-scope
+    status                 text NOT NULL DEFAULT 'active',  -- active|expired|error|revoked|disconnected
+    auth_method            text NOT NULL,                  -- 'api_key' | 'oauth2'
+    vault_path             text NOT NULL,
+    scopes_granted         text[] NOT NULL DEFAULT '{}'::text[],
+    -- Non-secret external-account metadata (populated at OAuth callback) so the
+    -- console can show which provider account/org a connection represents and
+    -- warn on reconnect-with-different-account (F2).
+    external_account_id    text,
+    external_account_name  text,
+    external_org_id        text,
+    external_org_name      text,
+    connected_by           text,
+    -- OAuth lifecycle.
+    access_expires_at      timestamptz,
+    refresh_expires_at     timestamptz,
+    refresh_token_present  boolean NOT NULL DEFAULT false,
+    last_refresh_at        timestamptz,
+    last_refresh_error     text,
+    last_used_at           timestamptz,
+    revoked_at             timestamptz,
+    version                integer NOT NULL DEFAULT 1,      -- optimistic concurrency (refresh CAS)
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_connections_pkey PRIMARY KEY (id),
-    CONSTRAINT connector_connections_connector_fkey FOREIGN KEY (connector_id)
-        REFERENCES public.connectors(id) ON DELETE CASCADE,
-    CONSTRAINT connector_connections_scope_key UNIQUE (connector_id, scope, subject_user_id)
+    CONSTRAINT connector_connections_connector_fkey FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.connectors(workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT connector_connections_binding_chk CHECK (
+        (binding_type = 'workspace' AND subject_user_id IS NULL)
+        OR (binding_type = 'user' AND subject_user_id IS NOT NULL)),
+    CONSTRAINT connector_connections_status_chk CHECK (
+        status IN ('active', 'expired', 'error', 'revoked', 'disconnected')),
+    CONSTRAINT connector_connections_auth_chk CHECK (
+        auth_method IN ('api_key', 'oauth2', 'github_app'))
 );
 
+-- NULL-safe uniqueness: exactly one workspace connection per connector, and one
+-- per (connector, user). Plain UNIQUE(connector_id, binding_type, subject_user_id)
+-- would NOT prevent two workspace rows (subject_user_id NULL is distinct).
+CREATE UNIQUE INDEX uq_conn_workspace ON public.connector_connections (connector_id)
+    WHERE binding_type = 'workspace';
+CREATE UNIQUE INDEX uq_conn_user ON public.connector_connections (connector_id, subject_user_id)
+    WHERE binding_type = 'user';
 CREATE INDEX idx_connector_connections_connector ON public.connector_connections(connector_id);
 CREATE INDEX idx_connector_connections_subject ON public.connector_connections(subject_user_id);
 
@@ -3126,6 +3164,11 @@ CREATE TABLE public.connector_assignments (
     connector_id uuid NOT NULL,
     client_id    text NOT NULL,        -- OAuth client / agent permitted
     action_key   text,                 -- NULL => all actions on this connector
+    -- input_constraints (F3): optional per-assignment predicate over action
+    -- inputs, e.g. {"owner":{"equals":"acme-eng"},"repo":{"glob":"release-*"}}.
+    -- Enforced after input-schema validation, before the provider call. NULL/
+    -- empty = no input restriction. Bounds WHERE an action runs.
+    input_constraints jsonb,
     created_by   text,
     created_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT connector_assignments_pkey PRIMARY KEY (id),
@@ -3186,6 +3229,68 @@ CREATE TABLE public.connector_oauth_states (
 
 CREATE INDEX idx_connector_oauth_states_expires ON public.connector_oauth_states(expires_at);
 
+-- connector_action_audit — the durable "who did what, on whose behalf, with
+-- which token" record for every broker action (allow AND deny). This is the
+-- action-outcome accountability a token vault cannot produce: principal (sub),
+-- actor (the agent/on-behalf-of client), token family+jti, connector+action,
+-- outcome, and latency. Never stores secrets or the token itself.
+CREATE TABLE public.connector_action_audit (
+    id              uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid NOT NULL,
+    connector_id    uuid,
+    action_key      text NOT NULL,
+    -- F8 — four orthogonal outcome fields (was one overloaded outcome+status):
+    --  authz_outcome:   did the broker permit the attempt.       allow | deny
+    --  broker_status:   broker-side HTTP (200, or 403/404/424 on deny-before-call).
+    --  provider_status: real upstream HTTP; NULL when the broker denied first.
+    --  action_outcome:  success | provider_error | policy_deny.
+    authz_outcome   text NOT NULL,               -- allow | deny
+    broker_status   int,
+    provider_status int,
+    action_outcome  text,                        -- success | provider_error | policy_deny
+    deny_reason     text,
+    subject_type    text,                        -- 'user' | 'service_account'
+    subject_id      uuid,                        -- the principal (sub) — who
+    actor_client_id text,                        -- the acting agent (act) — on behalf of
+    actor_spiffe_id text,
+    owner_email     text,                        -- accountable human (D1: owner always)
+    owner_team      text,
+    token_family    text,                        -- m2m | xaa | ciba — which token
+    token_jti       text,
+    latency_ms      bigint,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_action_audit_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX idx_connector_action_audit_ws ON public.connector_action_audit(workspace_id);
+CREATE INDEX idx_connector_action_audit_connector ON public.connector_action_audit(connector_id, created_at DESC);
+
+-- connector_provider_apps — per-workspace OAuth application credentials for a
+-- provider (AuthSec's registered app AT the provider, e.g. a workspace's own
+-- GitHub OAuth app). client_id + redirect_uri are non-secret and live here; the
+-- client_secret lives in Vault at vault_path. Resolution order in the connect
+-- flow: this row for (workspace, provider) first, else the global env vars
+-- (CONNECTOR_OAUTH_<P>_CLIENT_ID/_SECRET/_REDIRECT_URI). Lets each workspace
+-- bring its own OAuth app instead of a single deployment-wide one.
+CREATE TABLE public.connector_provider_apps (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    provider_key  text NOT NULL,
+    -- app_kind distinguishes an OAuth app (code-exchange, has redirect_uri +
+    -- client secret) from a GitHub-App-style bot install (JWT-signed
+    -- installation tokens, has github_app_id + private key, no redirect).
+    app_kind      text NOT NULL DEFAULT 'oauth2',   -- 'oauth2' | 'github_app'
+    client_id     text NOT NULL DEFAULT '',         -- OAuth client_id (oauth2)
+    redirect_uri  text NOT NULL DEFAULT '',         -- OAuth redirect (oauth2)
+    github_app_id text NOT NULL DEFAULT '',         -- numeric App ID (github_app)
+    vault_path    text NOT NULL,                    -- Vault: client_secret (oauth2) OR private key PEM (github_app)
+    created_by    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT connector_provider_apps_pkey PRIMARY KEY (id),
+    CONSTRAINT connector_provider_apps_ws_provider_key UNIQUE (workspace_id, provider_key)
+);
+
 -- Seed the curated OAuth provider catalog. All connect via OAuth 2.0. Slack and
 -- GitHub carry the first typed actions (vertical slice); the rest are catalog
 -- rows their adapters/actions clone the pattern onto.
@@ -3224,6 +3329,9 @@ VALUES
         '{chat:write}'::text[]),
     ('github', 'createIssue', 'Create a GitHub issue', 'github', 'POST',
         '{"type":"object","required":["owner","repo","title"],"properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}}}'::jsonb,
+        '{repo}'::text[]),
+    ('github', 'listCommits', 'List recent commits', 'github', 'GET',
+        '{"type":"object","required":["owner","repo"],"properties":{"owner":{"type":"string"},"repo":{"type":"string"},"per_page":{"type":"integer","minimum":1,"maximum":50,"description":"defaults to 10"}}}'::jsonb,
         '{repo}'::text[])
 ON CONFLICT (provider_key, action_key) DO NOTHING;
 
@@ -3243,4 +3351,130 @@ VALUES
     (gen_random_uuid(), NULL, 'connector', 'config',  'Read connector config (non-secret)',  'connector:config',  NOW()),
     (gen_random_uuid(), NULL, 'connector', 'assign',  'Manage connector assignments',        'connector:assign',  NOW()),
     (gen_random_uuid(), NULL, 'connector', 'execute', 'Execute a connector action (broker)', 'connector:execute', NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+-- Agent Discovery (IGA) ---------------------------------------------------
+-- A quarantine-first inventory of every AI agent running in a workspace's
+-- estate, including ones nobody registered. A sighting NEVER grants access: it
+-- only makes an agent visible, which is what makes it safe to run discovery
+-- against production before anything is provisioned or enforced. An agent
+-- becomes a governed principal only when a human claims it (linking it to an
+-- mcp_oauth_clients identity and an accountable owner) -- otherwise an admin
+-- quarantines it.
+
+-- discovery_sources -- a configured connector that produces sightings.
+-- kind: k8s_webhook and repo_scan are the active channels; aws/azure/gcp/
+--   vm_sensor are designed but deferred and need no schema change to enable.
+-- config: non-secret connector settings. Secrets belong in Vault, not here.
+CREATE TABLE public.discovery_sources (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    kind         text NOT NULL,
+    display_name text NOT NULL,
+    config       jsonb NOT NULL DEFAULT '{}'::jsonb,
+    enabled      boolean NOT NULL DEFAULT true,
+    last_sync_at timestamptz,
+    last_status  text NOT NULL DEFAULT '',
+    last_error   text NOT NULL DEFAULT '',
+    created_by   text NOT NULL DEFAULT '',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT discovery_sources_pkey PRIMARY KEY (id),
+    CONSTRAINT discovery_sources_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT discovery_sources_kind_chk CHECK (
+        kind IN ('k8s_webhook', 'aws', 'azure', 'gcp', 'vm_sensor', 'repo_scan')),
+    CONSTRAINT discovery_sources_workspace_kind_name_key UNIQUE (workspace_id, kind, display_name)
+);
+
+CREATE INDEX idx_discovery_sources_workspace ON public.discovery_sources(workspace_id);
+
+-- discovered_agents -- one row per distinct agent sighting, keyed by a stable
+-- fingerprint. UNIQUE(workspace_id, source, fingerprint) is what makes a
+-- repeated sighting an upsert (a last_seen_at / sighting_count bump) instead of
+-- a duplicate row -- the connector can re-report freely and idempotently.
+--
+-- status moves forward only (unregistered -> registered | quarantined |
+--   ignored); it never returns to unregistered. 'ignored' is the "keep the row
+--   but stop surfacing it" state, so there is no soft-delete column here.
+-- deployment_origin: a manually run agent (a developer's script with no
+--   pipeline behind it) is the higher-risk, harder-to-attribute case, since its
+--   permissions are typically whatever the developer's own credentials allow --
+--   so the Unregistered Agents report surfaces manual first. It is a heuristic;
+--   an admin correction is audited like any other decision.
+-- archetype: '' until known. Autonomous agents hold their own authority;
+--   user-delegated agents borrow a scoped slice of a user's.
+CREATE TABLE public.discovered_agents (
+    id                  uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid NOT NULL,
+    source              text NOT NULL,
+    discovery_source_id uuid,
+    fingerprint         text NOT NULL,
+    display_name        text NOT NULL DEFAULT '',
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    deployment_origin   text NOT NULL DEFAULT 'unknown',
+    archetype           text NOT NULL DEFAULT '',
+    -- the governed identity this sighting was claimed into
+    matched_client_id   uuid,
+    -- the accountable human; mandatory to register (see registered_chk)
+    owner_user_id       uuid,
+    status              text NOT NULL DEFAULT 'unregistered',
+    claimed_by          uuid,
+    claimed_at          timestamptz,
+    quarantined_by      uuid,
+    quarantined_at      timestamptz,
+    quarantine_reason   text NOT NULL DEFAULT '',
+    first_seen_at       timestamptz NOT NULL DEFAULT now(),
+    last_seen_at        timestamptz NOT NULL DEFAULT now(),
+    sighting_count      integer NOT NULL DEFAULT 1,
+    created_by          text NOT NULL DEFAULT '',
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT discovered_agents_pkey PRIMARY KEY (id),
+    CONSTRAINT discovered_agents_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- A single-column FK (not the composite (workspace_id, id) pattern used by
+    -- connector children) because an agent must OUTLIVE its source: deleting a
+    -- connector nulls the pointer and keeps the inventory row. A composite FK
+    -- cannot ON DELETE SET NULL without nulling the NOT NULL workspace_id. The
+    -- service only ever resolves a source inside the caller's workspace.
+    CONSTRAINT discovered_agents_source_id_fkey FOREIGN KEY (discovery_source_id)
+        REFERENCES public.discovery_sources(id) ON DELETE SET NULL,
+    CONSTRAINT discovered_agents_matched_client_fkey FOREIGN KEY (matched_client_id)
+        REFERENCES public.mcp_oauth_clients(id) ON DELETE SET NULL,
+    CONSTRAINT discovered_agents_owner_fkey FOREIGN KEY (owner_user_id)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT discovered_agents_source_chk CHECK (
+        source IN ('k8s_webhook', 'aws', 'azure', 'gcp', 'vm_sensor', 'repo_scan')),
+    CONSTRAINT discovered_agents_origin_chk CHECK (
+        deployment_origin IN ('manual', 'automated', 'unknown')),
+    CONSTRAINT discovered_agents_status_chk CHECK (
+        status IN ('unregistered', 'registered', 'quarantined', 'ignored')),
+    CONSTRAINT discovered_agents_archetype_chk CHECK (
+        archetype IN ('', 'autonomous', 'user_delegated', 'hybrid')),
+    -- Registered means claimed: a governed principal always has both an identity
+    -- to trace tokens to and an accountable human owner. Enforced in the DB so
+    -- no code path can produce an unowned registered agent.
+    CONSTRAINT discovered_agents_registered_chk CHECK (
+        status <> 'registered'
+        OR (matched_client_id IS NOT NULL AND owner_user_id IS NOT NULL)),
+    CONSTRAINT discovered_agents_fingerprint_key UNIQUE (workspace_id, source, fingerprint)
+);
+
+CREATE INDEX idx_discovered_agents_workspace_status_origin
+    ON public.discovered_agents(workspace_id, status, deployment_origin);
+CREATE INDEX idx_discovered_agents_last_seen ON public.discovered_agents(last_seen_at);
+
+-- Discovery RBAC permissions -- GLOBAL (workspace_id IS NULL) so they apply in
+-- every workspace, exactly like the connector:* permissions above. Admins grant
+-- the matching role per workspace via normal RBAC. discovery:report is split out
+-- from the rest so a connector's service account can report sightings without
+-- holding any authority to claim or quarantine.
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+    (gen_random_uuid(), NULL, 'discovery', 'report',     'Report an agent sighting',            'discovery:report',     NOW()),
+    (gen_random_uuid(), NULL, 'discovery', 'read',       'Read the discovered-agent inventory', 'discovery:read',       NOW()),
+    (gen_random_uuid(), NULL, 'discovery', 'claim',      'Claim an agent into an identity',     'discovery:claim',      NOW()),
+    (gen_random_uuid(), NULL, 'discovery', 'quarantine', 'Quarantine a discovered agent',       'discovery:quarantine', NOW()),
+    (gen_random_uuid(), NULL, 'discovery', 'admin',      'Manage discovery sources',            'discovery:admin',      NOW())
 ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;

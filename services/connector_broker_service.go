@@ -27,6 +27,13 @@ func EnsureBrokerResourceServer(db *gorm.DB, workspaceID uuid.UUID) (*models.Res
 	var rs models.ResourceServer
 	err := db.Where("workspace_id = ? AND resource_uri = ?", workspaceID, resourceURI).First(&rs).Error
 	if err == nil {
+		// Broker RS already exists. Re-assert the connector:execute scope + its
+		// permission link here too (idempotent): a broker RS provisioned before
+		// this wiring existed would otherwise never get the link, and scope
+		// resolution would fail with "no scopes granted" forever.
+		if sErr := ensureBrokerExecuteScope(db, workspaceID, rs.ID); sErr != nil {
+			return &rs, fmt.Errorf("broker RS exists but failed to reassert execute scope: %w", sErr)
+		}
 		return &rs, nil
 	}
 	if err != gorm.ErrRecordNotFound {

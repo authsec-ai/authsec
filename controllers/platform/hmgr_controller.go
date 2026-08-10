@@ -929,8 +929,9 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 		}
 		// report is guaranteed non-nil past this point
 		grantedScopes := report.Grantable
-		if len(grantedScopes) == 0 {
-			// Fail-closed: no grantable scopes → reject consent
+		if !services.HasAccessBearingScope(grantedScopes) {
+			// Fail closed: offline_access only enables refresh tokens. It must
+			// never stand in for an identity or application permission.
 			log.Printf("[MCP_AUTH] ConsentHandler: no grantable scopes for user=%s rs=%s context_id=%s",
 				consentRequest.Subject, rs.ResourceURI, arcCtx.ContextID)
 			_, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge, "insufficient_scope", "user has no authorized scopes for this resource server")
@@ -998,7 +999,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			// Override the default consent CSP to include the OAuth client's registered
 			// redirect_uri origins. Browsers enforce form-action across the entire
 			// redirect chain, and the final hop after consent goes to the client
-			// redirect_uri (e.g. https://aditya.mcpauthz.com/applications/.../test).
+			// redirect_uri (e.g. https://aditya.app.authsec.ai/applications/.../test).
 			// Without this, the consent form submit is blocked.
 			c.Header("Content-Security-Policy", middlewares.BuildConsentCSP(redirectURIOriginsFromClient(mcpClient)))
 			ctrl.renderMCPConsentPage(c, consentChallenge, consentRequest, report, scopeMeta)
@@ -1031,7 +1032,7 @@ func (ctrl *HmgrController) ConsentHandler(c *gin.Context) {
 			}
 		}
 
-		if len(selectedScopes) == 0 {
+		if !services.HasAccessBearingScope(selectedScopes) {
 			rejectResponse, rejectErr := ctrl.service.RejectHydraConsentRequest(consentChallenge, "access_denied", "no scopes approved")
 			if rejectErr != nil {
 				log.Printf("[MCP_AUTH] ConsentHandler: RejectHydraConsentRequest(no scopes) failed consent_challenge=%s: %v", consentChallenge, rejectErr)

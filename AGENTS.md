@@ -18,9 +18,9 @@ scoped, auditable token.
 | Repo | Role | Stack | Start here |
 |------|------|-------|-----------|
 | `authsec` | **Core backend** — auth/authz, OAuth AS, RBAC, API. Fronts ORY Hydra. One Postgres DB. | Go / Gin | `authsec/AGENTS.md` |
-| `Authsec-ui` | **Production console** (admin UI at mcpauthz.com) | Vite + React + TS + Tailwind v4 + shadcn | `Authsec-ui/AGENTS.md` |
+| `Authsec-ui` | **Production console** (admin UI at app.authsec.ai) | Vite + React + TS + Tailwind v4 + shadcn | `Authsec-ui/AGENTS.md` |
 | `sdk-authsec` | Client **SDKs** (go / python / typescript) + examples — ~3-line MCP/agent integration | Go, Python, TS | `sdk-authsec/AGENTS.md` |
-| `deploy/single-node` | **The live deploy we iterate on** — Docker Compose @ **mcpauthz.com** via Cloudflare Tunnel | Docker Compose | `deploy/single-node/AGENTS.md` |
+| `deploy/single-node` | **DEPRECATED** — old local Docker Compose stack (was mcpauthz.com). Live deploy is now on Hetzner VM via Jenkins CI/CD | Docker Compose | `deploy/single-node/AGENTS.md` |
 | `authsec-charts` | Helm charts for **staging / AKS** | Helm | `authsec-charts/AGENTS.md` |
 | `authsec-doc` | Public **documentation** site | Docusaurus | `authsec-doc/AGENTS.md` |
 | `authsec-agent-shield` | **Separate product** — system-level guard for risky AI tool actions (phone-approve `rm -rf`, `DROP TABLE`) | — | `authsec-agent-shield/AGENTS.md` |
@@ -76,12 +76,15 @@ The data model is **workspace-centric**: a Workspace owns everything inside it.
 
 ## Deploy
 
-- **Live = single-node Docker Compose** (`deploy/single-node`), apex **mcpauthz.com** via Cloudflare Tunnel; builds `authsec` + `Authsec-ui` from local source.
-  - UI redeploy: `docker compose build --no-cache ui && docker compose up -d --no-deps ui`
-  - Backend redeploy: `docker compose build backend && docker compose up -d backend`
-  - Admin login OTP appears in the **backend logs**.
-- **Staging = Azure AKS** (cluster `authsec`, ns `authsec-staging`); Jenkins builds on push to the `authsec-staging` branch.
-- **Recovery = wipe + re-bootstrap** (schema is forward-only; wiping is cheap and expected).
+- **Production = `app.authsec.ai`** — Docker Compose on Hetzner VM (`192.168.122.252` behind hypervisor `49.12.150.218`).
+  - **CI/CD:** Push to `authsec-staging` branch → GitHub webhook → **Jenkins** (`jenkins.authsec.ai`) auto-builds Docker image → deploys.
+  - **TLS:** Let's Encrypt wildcard cert (`*.authsec.ai` + `*.app.authsec.ai`) on root VM Nginx.
+  - **Tenant subdomains:** `<workspace>.app.authsec.ai`.
+  - Admin login OTP appears in the **backend logs** (`docker logs authsec-backend`).
+  - Env config: `/opt/authsec/.env` on the VM (SSH to edit, then `docker compose up -d` to apply).
+- **Staging = Azure AKS** (cluster `authsec`, ns `authsec-staging`); separate Helm-based deploy via `authsec-charts`.
+- **Schema changes:** Tiered approach — see `/schema-change`. Minor = direct SQL. Major = delta migration. Destructive = backup + wipe (last resort).
+- **Developer access:** SSH via `ssh -J root@49.12.150.218 ubuntu@192.168.122.252`. DB: `docker exec -it authsec-postgres psql -U authsec -d authsec`. Logs: `docker logs authsec-backend -f`.
 
 ## Where knowledge lives (keep it correct)
 
@@ -98,9 +101,9 @@ All cross-repo tooling lives in `.claude/` at the workspace root.
 
 | `/command` | What it does |
 |---|---|
-| `/deploy` | Rebuild + restart `backend`, `ui`, or both in single-node |
-| `/wipe-rebootstrap` | `docker compose down -v && up -d` — resets all data |
-| `/schema-change` | Procedure for editing `001_bootstrap.sql` inline + rebootstrap |
+| `/deploy` | Deploy via Jenkins pipeline (push-to-deploy); emergency manual deploy via SSH |
+| `/wipe-rebootstrap` | Backup + wipe DB + re-bootstrap on the VM (DESTRUCTIVE, last resort) |
+| `/schema-change` | Tiered schema changes: minor (direct SQL), major (delta migration), destructive (wipe) |
 | `/console-page` | Checklist + pattern for adding a new sidebar page |
 | `/flow-test` | curl smoke tests for M2M / XAA / SPIFFE / OIDC / CIBA |
 | `/ship` | Pre-push checklist: `go build/vet/gofmt` + `tsc --noEmit` |

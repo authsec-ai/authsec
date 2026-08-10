@@ -130,7 +130,7 @@ func VerifyProtectedResourceToken(
 	} else {
 		finalScopes = oidcScopes
 	}
-	if len(finalScopes) == 0 {
+	if !HasAccessBearingScope(finalScopes) {
 		return reject("no scopes after enforcement")
 	}
 

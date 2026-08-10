@@ -27,6 +27,11 @@ func NewServiceAccountsController() *ServiceAccountsController {
 type CreateServiceAccountRequest struct {
 	Name        string `json:"name" binding:"required"`
 	Description string `json:"description"`
+	// OwnerEmail is the accountable human for this agent/service account (D1:
+	// "owner always"). Required — every agent must have an accountable owner so
+	// an autonomous action can never lack a human to attribute it to.
+	OwnerEmail string `json:"owner_email" binding:"required,email"`
+	OwnerTeam  string `json:"owner_team"`
 }
 
 type UpdateServiceAccountRequest struct {
@@ -102,7 +107,7 @@ func (ctrl *ServiceAccountsController) CreateServiceAccount(c *gin.Context) {
 		return
 	}
 
-	sa, err := services.NewServiceAccountService(config.DB).CreateServiceAccount(*workspaceID, req.Name, req.Description)
+	sa, err := services.NewServiceAccountService(config.DB).CreateServiceAccount(*workspaceID, req.Name, req.Description, req.OwnerEmail, req.OwnerTeam)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -276,20 +281,25 @@ func (ctrl *ServiceAccountsController) DeleteServiceAccount(c *gin.Context) {
 		return
 	}
 
-	res := config.DB.Session(&gorm.Session{NewDB: true}).
-		Where("workspace_id = ? AND id = ?", workspaceID, saID).
-		Delete(&models.ServiceAccount{})
-	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete: " + res.Error.Error()})
+	deleted, err := services.NewServiceAccountService(config.DB).DeleteServiceAccount(
+		c.Request.Context(), *workspaceID, saID,
+	)
+	if errors.Is(err, services.ErrServiceAccountNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
 		return
 	}
-	if res.RowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "service account not found"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete: " + err.Error()})
 		return
 	}
 
 	middlewares.Audit(c, "service_account", saID.String(), "delete", &middlewares.AuditChanges{
-		Before: map[string]interface{}{"id": saID.String(), "workspace_id": workspaceID.String()},
+		Before: map[string]interface{}{
+			"id":              saID.String(),
+			"workspace_id":    workspaceID.String(),
+			"oauth_client_id": deleted.OAuthClientID,
+			"spiffe_id":       deleted.SpiffeID,
+		},
 		After:  nil,
 	})
 
@@ -379,6 +389,51 @@ func (ctrl *ServiceAccountsController) CredentialServiceAccount(c *gin.Context) 
 	})
 
 	c.JSON(http.StatusCreated, CredentialResponse{
+		ClientID:     cred.ClientID,
+		AuthMethod:   cred.AuthMethod,
+		ClientSecret: cred.Secret,
+	})
+}
+
+// RotateCredentialServiceAccount handles
+// POST /uflow/admin/service-accounts/:sa_id/credentials/rotate — mints a fresh
+// client secret for the SA's existing credential client and revokes the old
+// one(s). The client_id is unchanged, so assignments/role bindings survive; the
+// new plaintext is returned once. Recovers a lost/leaked/fumbled secret without
+// deleting the service account.
+func (ctrl *ServiceAccountsController) RotateCredentialServiceAccount(c *gin.Context) {
+	workspaceID, err := shared.ResolveWorkspaceIDFromTokenPtr(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	saID, err := uuid.Parse(c.Param("sa_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sa_id"})
+		return
+	}
+
+	cred, err := services.NewServiceAccountService(config.DB).RotateCredentialSecret(*workspaceID, saID)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrServiceAccountNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrServiceAccountNoSecretCredential):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	middlewares.Audit(c, "service_account", saID.String(), "credential_rotated", &middlewares.AuditChanges{
+		After: map[string]interface{}{
+			"client_id":   cred.ClientID,
+			"auth_method": cred.AuthMethod,
+		},
+	})
+
+	c.JSON(http.StatusOK, CredentialResponse{
 		ClientID:     cred.ClientID,
 		AuthMethod:   cred.AuthMethod,
 		ClientSecret: cred.Secret,

@@ -314,11 +314,12 @@ func (s *OAuthASService) GetMCPOAuthClientByClientID(clientID string) (*models.M
 	return s.authzCtx.GetMCPOAuthClientByClientID(clientID)
 }
 
-// EnsureHydraClientHasRSScopes is the lazy-binding fix for DCR'd clients
+// EnsureHydraClientHasAuthorizeScopes is the lazy-binding fix for DCR'd clients
 // whose Hydra `scope` field doesn't yet cover the scopes a Resource Server
-// publishes. Symptom this addresses: Claude Code (and any spec-compliant
-// MCP client) typically calls DCR with `scope=""` (RFC 7591 allows it),
-// expecting the AS to grant resource-bound scopes lazily at /authorize.
+// publishes or the protocol scopes requested later at /authorize. Symptom
+// this addresses: Claude Code (and any spec-compliant MCP client) typically
+// calls DCR with `scope=""` (RFC 7591 allows it), then requests both
+// resource-bound scopes and `offline_access` at /authorize.
 // Without this, Hydra hits the request with
 //
 //	"The OAuth 2.0 Client is not allowed to request scope 'demo_server:admin'"
@@ -326,72 +327,102 @@ func (s *OAuthASService) GetMCPOAuthClientByClientID(clientID string) (*models.M
 // because the client's stored scope set is empty.
 //
 // Behaviour:
-//   - Compute the union of the client's current Hydra `scope` and the RS's
-//     `scopes_supported`.
+//   - Compute the union of the client's current Hydra `scope`, the RS's
+//     `scopes_supported`, and the already-validated authorize request scopes.
 //   - If the union equals the current set → no-op (idempotent, no Hydra call).
 //   - Otherwise PUT the union back to Hydra and persist the new scope on the
 //     MCPOAuthClient row so subsequent reconciler runs see it.
 //
 // Security: this only widens the SET OF SCOPES THE CLIENT MAY REQUEST. The
-// actual grant at /authorize still requires user consent, and AuthSec's
-// scope_resolver still enforces RBAC + per-tool checks at runtime. So we are
-// not silently authorizing anything — we're just making sure the client can
-// _ask_ for any scope its bound RS publishes.
-func (s *OAuthASService) EnsureHydraClientHasRSScopes(client *models.MCPOAuthClient, rs *models.ResourceServer) error {
-	if client == nil || rs == nil || len(rs.ScopesSupported) == 0 {
+// requestedScopes comes from validateOAuthPolicy, so invalid OIDC or
+// application scopes have already failed closed before this method runs. The
+// actual grant still requires consent and AuthSec RBAC at runtime.
+func (s *OAuthASService) EnsureHydraClientHasAuthorizeScopes(
+	client *models.MCPOAuthClient,
+	rs *models.ResourceServer,
+	requestedScopes []string,
+) error {
+	if client == nil || rs == nil {
 		return nil
 	}
 
-	currentScopes := strings.Fields(client.Scope)
-	scopeSet := make(map[string]struct{}, len(currentScopes)+len(rs.ScopesSupported))
-	for _, s := range currentScopes {
-		scopeSet[s] = struct{}{}
-	}
-
-	added := false
-	for _, s := range rs.ScopesSupported {
-		if s == "" {
-			continue
+	// One OAuth client can bind to multiple resource servers. Serialize the
+	// read/merge/write repair by client row so concurrent first authorizations
+	// cannot overwrite each other's scope union across backend instances.
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var locked models.MCPOAuthClient
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&locked, "id = ?", client.ID).Error; err != nil {
+			return fmt.Errorf("ensure authorize scopes: lock client: %w", err)
 		}
-		if _, ok := scopeSet[s]; !ok {
-			scopeSet[s] = struct{}{}
-			added = true
+
+		scopeSet := make(map[string]struct{}, len(strings.Fields(locked.Scope))+len(rs.ScopesSupported)+len(requestedScopes))
+		for _, scope := range strings.Fields(locked.Scope) {
+			scopeSet[scope] = struct{}{}
 		}
-	}
-	if !added {
-		return nil // already a superset; nothing to do
-	}
 
-	// Stable order keeps Hydra-side updates idempotent across reconciler runs.
-	merged := make([]string, 0, len(scopeSet))
-	for s := range scopeSet {
-		merged = append(merged, s)
-	}
-	sort.Strings(merged)
-	mergedScope := strings.Join(merged, " ")
+		scopesToAdd := append([]string{}, rs.ScopesSupported...)
+		if locked.RegistrationType == "dcr" {
+			scopesToAdd = append(scopesToAdd, requestedScopes...)
+		}
+		scopeChanged := false
+		for _, scope := range scopesToAdd {
+			if scope == "" {
+				continue
+			}
+			if _, exists := scopeSet[scope]; !exists {
+				scopeSet[scope] = struct{}{}
+				scopeChanged = true
+			}
+		}
 
-	// Read current Hydra-side client so we preserve every other field
-	// (redirect_uris, grant_types, response_types, token_endpoint_auth_method,
-	// ...). Without the GET-then-PUT pattern, the PUT would wipe them.
-	hc, err := hydraAdminGetClient(client.HydraClientID)
-	if err != nil {
-		return fmt.Errorf("ensure rs scopes: fetch hydra client: %w", err)
-	}
-	hc.Scope = mergedScope
+		wantsRefresh := locked.RegistrationType == "dcr" && containsString(requestedScopes, "offline_access")
+		grantChanged := wantsRefresh && !containsString([]string(locked.GrantTypes), "refresh_token")
+		refreshFlagChanged := wantsRefresh && !locked.SupportsRefreshToken
+		if !scopeChanged && !grantChanged && !refreshFlagChanged {
+			*client = locked
+			return nil
+		}
 
-	if err := hydraAdminUpdateClient(client.HydraClientID, *hc); err != nil {
-		return fmt.Errorf("ensure rs scopes: update hydra client: %w", err)
-	}
+		// Fetch immediately before PUT and merge any Hydra-side scopes as well.
+		// The local Hydra shape preserves every field this service manages; the
+		// row lock protects AuthSec's own concurrent repair operations.
+		hc, err := hydraAdminGetClient(locked.HydraClientID)
+		if err != nil {
+			return fmt.Errorf("ensure authorize scopes: fetch hydra client: %w", err)
+		}
+		for _, scope := range strings.Fields(hc.Scope) {
+			scopeSet[scope] = struct{}{}
+		}
 
-	// Persist the same change locally so the reconciler sees the truth.
-	client.Scope = mergedScope
-	if err := s.authzCtx.UpdateMCPOAuthClient(client); err != nil {
-		// Hydra now diverges from our DB — surface but don't fail the auth
-		// flow; the reconciler will sync drift.
-		log.Printf("[MCP_AUTH] EnsureHydraClientHasRSScopes: hydra updated but db update failed for client=%s rs=%s: %v",
-			client.ClientID, rs.ResourceURI, err)
-	}
-	return nil
+		merged := make([]string, 0, len(scopeSet))
+		for scope := range scopeSet {
+			merged = append(merged, scope)
+		}
+		sort.Strings(merged)
+		mergedScope := strings.Join(merged, " ")
+		hc.Scope = mergedScope
+		if wantsRefresh && !containsString(hc.GrantTypes, "refresh_token") {
+			hc.GrantTypes = append(hc.GrantTypes, "refresh_token")
+		}
+
+		if err := hydraAdminUpdateClient(locked.HydraClientID, *hc); err != nil {
+			return fmt.Errorf("ensure authorize scopes: update hydra client: %w", err)
+		}
+
+		locked.Scope = mergedScope
+		if wantsRefresh {
+			if !containsString([]string(locked.GrantTypes), "refresh_token") {
+				locked.GrantTypes = append(locked.GrantTypes, "refresh_token")
+			}
+			locked.SupportsRefreshToken = true
+		}
+		if err := tx.Save(&locked).Error; err != nil {
+			return fmt.Errorf("ensure authorize scopes: persist client: %w", err)
+		}
+		*client = locked
+		return nil
+	})
 }
 
 // GetClientRegistration checks the join table.
@@ -712,26 +743,27 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		// Try pending_approval → approved first (normal DCR approval flow).
+		// Try pending_approval or revoked → approved (covers first-time approval
+		// and re-approval after revocation).
 		result := tx.Model(&models.ResourceServerClientRegistration{}).
-			Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
-				rsUUID, client.ID, models.ClientRegStatusPendingApproval).
+			Where("resource_server_id = ? AND oauth_client_id = ? AND status IN ?",
+				rsUUID, client.ID, []string{models.ClientRegStatusPendingApproval, models.ClientRegStatusRevoked}).
 			Update("status", models.ClientRegStatusApproved)
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			// The registration may already be approved (e.g. XAA cross-workspace
-			// flow where the client was auto-registered during bootstrap). In that
-			// case the admin is approving the access_request + binding a role, not
-			// the registration itself. Verify the registration exists at all.
+			// The registration may already be approved (for example, a
+			// same-workspace lazy binding or a previously approved connection). In
+			// that case the admin is approving the access_request + binding a role,
+			// not the registration itself. Verify the registration exists at all.
 			var count int64
 			tx.Model(&models.ResourceServerClientRegistration{}).
 				Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
 					rsUUID, client.ID, models.ClientRegStatusApproved).
 				Count(&count)
 			if count == 0 {
-				return fmt.Errorf("no pending registration found for this client")
+				return fmt.Errorf("no pending or revoked registration found for this client")
 			}
 		}
 
@@ -1491,8 +1523,9 @@ func (s *OAuthASService) PreRegisterClient(rs *models.ResourceServer, req DCRReq
 //   - urn:ietf:params:oauth:grant-type:token-exchange: the AuthSec-native ID-JAG
 //     issuance leg, which requires confidential client auth.
 //
-// The client is homed in workspaceID so its ID-JAG carries that issuance
-// workspace (§19 makes the call genuinely cross-workspace). The Hydra client is
+// The client is homed in workspaceID for ownership and audit provenance. It may
+// delegate to a distinct Application in the same workspace or in another
+// workspace; workspace equality is not the XAA boundary. The Hydra client is
 // public/PKCE for the login leg; the secret is used only for the token-exchange
 // leg (checked against oauth_client_secrets by AuthenticateClient). Returns the
 // client_id and the one-time plaintext secret.
@@ -1528,11 +1561,11 @@ func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string,
 		RedirectURIs:  pq.StringArray(redirectURIs),
 		GrantTypes:    pq.StringArray{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"},
 		ResponseTypes: pq.StringArray{"code"},
-		// "dcr" so the agent self-binds to each RS it targets via
-		// adopt-on-first-bind: same-workspace auto-approves; a cross-workspace
-		// RS (the A2A case, §19) parks as pending_approval until that
-		// workspace's owner approves — the first-contact signal. "admin" is the
-		// workspace default-client type and no RS accepts it from a caller.
+		// "dcr" lets the agent bind lazily to each RS it targets:
+		// same-workspace registration auto-approves, while a cross-workspace RS
+		// parks the registration as pending_approval until that workspace's
+		// owner approves it. "admin" is the workspace default-client type and
+		// no RS accepts it from a caller.
 		RegistrationType:                "dcr",
 		ClientKind:                      "agent",
 		SyncStatus:                      "active",
@@ -1565,6 +1598,19 @@ func (s *OAuthASService) RegisterAgentClient(workspaceID uuid.UUID, name string,
 		return "", "", fmt.Errorf("store agent secret: %w", err)
 	}
 
+	// Phase 6 groundwork: back the agent client with a service_account. Broker
+	// authorization binds connector:execute via role_bindings.service_account_id,
+	// so an XAA agent whose actor must hold broker scopes needs an SA to bind to.
+	// Best-effort — a failure here doesn't fail agent registration (the SA can be
+	// linked later); idempotent via the uq_sa_client index on oauth_client_id.
+	if err := s.db.Exec(`
+		INSERT INTO service_accounts (id, workspace_id, name, description, status, oauth_client_id, created_at, updated_at)
+		VALUES (gen_random_uuid(), ?, ?, 'Service account backing agent client', 'active', ?, now(), now())
+		ON CONFLICT (oauth_client_id) WHERE oauth_client_id IS NOT NULL DO NOTHING`,
+		workspaceID, name, mcpClient.ID).Error; err != nil {
+		log.Printf("[RegisterAgentClient] failed to create backing service account for client %s: %v", clientIDStr, err)
+	}
+
 	return clientIDStr, secret, nil
 }
 
@@ -1594,6 +1640,16 @@ func (s *OAuthASService) ListClientsForRS(rsID string) ([]map[string]interface{}
 		})
 	}
 	return result, nil
+}
+
+// RequeueRevokedRegistration flips a revoked registration back to pending_approval
+// so the admin sees it in the Connections page and can re-approve. Called when a
+// revoked agent's client attempts to re-authorize.
+func (s *OAuthASService) RequeueRevokedRegistration(rsID, clientID uuid.UUID) {
+	s.db.Model(&models.ResourceServerClientRegistration{}).
+		Where("resource_server_id = ? AND oauth_client_id = ? AND status = ?",
+			rsID, clientID, models.ClientRegStatusRevoked).
+		Update("status", models.ClientRegStatusPendingApproval)
 }
 
 // RevokeClientRegistration sets a client's join-table status to "revoked" for an RS.
@@ -2379,10 +2435,10 @@ type CrossWorkspaceConnectionEntry struct {
 	IsCrossWorkspace bool `json:"is_cross_workspace"`
 }
 
-// ListCrossWorkspaceConnections returns all cross-workspace client registrations
-// and open access_requests for resource servers owned by workspaceID. This is
-// the data for the Connections governance view — the admin sees who wants/has
-// access from other workspaces and can Approve or Deny.
+// ListCrossWorkspaceConnections returns client registrations and open
+// access_requests for resource servers owned by workspaceID. The Connections
+// governance view includes both same-workspace and cross-workspace callers;
+// the method name is retained for API compatibility.
 func (s *OAuthASService) ListCrossWorkspaceConnections(workspaceID uuid.UUID) ([]CrossWorkspaceConnectionEntry, error) {
 	type rawReg struct {
 		RegID            uuid.UUID

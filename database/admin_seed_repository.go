@@ -53,5 +53,24 @@ func (asr *AdminSeedRepository) ensureAdminRoleAndPermissions(exec sqlExecutor, 
 		return uuid.Nil, fmt.Errorf("ensure admin role: %w", err)
 	}
 
+	// Bind the admin role to every globally-seeded permission (workspace_id
+	// IS NULL). Permissions are defined once in the global catalog; a
+	// workspace's admin role only has access to what it's explicitly bound
+	// to via role_permissions — there is no RBAC bypass for role name
+	// "admin" (see internal/authz/authz.go, "Admin claim bypass removed").
+	// This was previously missing entirely: EnsureAdminRoleAndPermissions
+	// created the role but never granted it any permission, so every new
+	// workspace's admin had zero working access to anything until someone
+	// manually inserted role_permissions rows for it.
+	// Dynamic SELECT (not a hardcoded list) so permissions added to the
+	// global catalog later are picked up for future workspaces automatically.
+	if _, err := exec.Exec(`
+		INSERT INTO role_permissions (role_id, permission_id)
+		SELECT $1, id FROM permissions WHERE workspace_id IS NULL
+		ON CONFLICT (role_id, permission_id) DO NOTHING
+	`, roleID); err != nil {
+		return uuid.Nil, fmt.Errorf("grant admin role permissions: %w", err)
+	}
+
 	return roleID, nil
 }

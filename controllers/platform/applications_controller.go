@@ -785,8 +785,9 @@ func (ctrl *ApplicationsController) DenyConnection(c *gin.Context) {
 }
 
 // ListCrossWorkspaceConnections handles GET /authsec/connections.
-// Returns all cross-workspace client registrations and pending access_requests
-// for resource servers owned by this workspace — the admin governance view.
+// Returns client registrations and pending access_requests for resource servers
+// owned by this workspace — the admin governance view covers both same-workspace
+// and cross-workspace callers despite the legacy method name.
 func (ctrl *ApplicationsController) ListCrossWorkspaceConnections(c *gin.Context) {
 	workspaceID, err := shared.ResolveWorkspaceIDFromToken(c)
 	if err != nil {
