@@ -53,6 +53,15 @@ type DiscoverySourceUpdateRequest struct {
 // SightingRequest is the body for POST /authsec/discovery/sightings — what a
 // connector reports. Idempotent on (source, fingerprint) within the workspace.
 type SightingRequest struct {
+	// WorkspaceID is supplied by the connector, which is configured with it at
+	// deploy time. The sightings route is unauthenticated (see routes.go), so there
+	// is no token to derive the workspace from — the caller asserts it.
+	//
+	// Typed as a string rather than uuid.UUID on purpose: `binding:"required"` on a
+	// uuid.UUID treats the all-zero UUID as absent, and the all-zero UUID is the
+	// real System workspace. A string plus an explicit parse avoids silently
+	// rejecting it and yields a clearer error.
+	WorkspaceID       string                 `json:"workspace_id" binding:"required"`
 	Source            string                 `json:"source" binding:"required"`
 	DiscoverySourceID *uuid.UUID             `json:"discovery_source_id,omitempty"`
 	Fingerprint       string                 `json:"fingerprint" binding:"required"`
@@ -304,16 +313,42 @@ func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 // Returns 201 for a newly seen agent and 200 when an existing row was bumped.
 // Neither is an error: a connector must be able to re-report on every scan.
 func (ctl *DiscoveryController) ReportSighting(c *gin.Context) {
-	wsID, principal, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
 	var req SightingRequest
-	if err = c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// This route is unauthenticated, so the workspace comes from the body rather
+	// than a token claim. See the ingress comment in routes.go for what that trades.
+	wsID, err := uuid.Parse(req.WorkspaceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("workspace_id %q is not a valid uuid", req.WorkspaceID),
+		})
+		return
+	}
+
+	// Confirm the workspace exists. Without this the FK violation surfaces as a raw
+	// Postgres error, which is a miserable thing to debug from inside a cluster —
+	// and a typo'd workspace ID is now a likely mistake, since an operator types it
+	// into a Helm flag by hand. One indexed PK lookup is worth the clarity.
+	var exists int64
+	if err := ctl.db.Table("workspaces").Where("id = ?", wsID).Count(&exists).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify workspace"})
+		return
+	}
+	if exists == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("unknown workspace_id %s", wsID),
+		})
+		return
+	}
+
+	// No authenticated principal on this path. Record an explicitly-marked
+	// attribution rather than something that reads like a verified identity, so a
+	// row's provenance is never overstated when someone reads it later.
+	principal := "unauthenticated:" + req.Source
 
 	agent, created, err := ctl.manager().ReportSighting(wsID, principal, services.SightingInput{
 		Source:            req.Source,
