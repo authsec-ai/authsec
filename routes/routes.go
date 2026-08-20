@@ -260,6 +260,63 @@ func SetupRoutes(
 	}
 
 	// ════════════════════════════════════════════════════════
+	// AGENTIC IGA — /api/iga/v1
+	// ════════════════════════════════════════════════════════
+	// ADDITIVE. This sits alongside the existing /authsec/discovery/* surface
+	// (Kubernetes sightings, claim/quarantine, coverage) and changes none of
+	// it. Different prefix, different tables (iga_*), different permissions
+	// (iga:*), so nothing in the working discovery path can be affected.
+	//
+	// The authenticated workspace is established by AuthMiddleware and is never
+	// read from a body, query parameter or provider identifier.
+	{
+		igaController := platformCtrl.NewIGAController(config.DB)
+
+		// Provider ingress. Unauthenticated at the TOKEN layer only — GitHub
+		// holds no AuthSec token — but authenticated by HMAC signature over the
+		// raw body, with the workspace resolved server-side from the verified
+		// binding. Registered outside the authenticated group so it cannot
+		// inherit AuthMiddleware.
+		r.POST("/api/iga/v1/webhooks/github/:app_registration_id", igaController.ReceiveWebhook)
+
+		iga := r.Group("/api/iga/v1")
+		iga.Use(middlewares.AuthMiddleware())
+		{
+			// Connect and authorize.
+			iga.POST("/integrations", middlewares.Require("iga", "admin"), igaController.CreateIntegration)
+			iga.GET("/integrations", middlewares.Require("iga", "read"), igaController.ListIntegrations)
+			iga.GET("/integrations/:integration_id", middlewares.Require("iga", "read"), igaController.GetIntegration)
+			// Verification turns an untrusted installation id into a trusted
+			// binding; it is an admin action and it is audited.
+			iga.POST("/integrations/:integration_id/verify", middlewares.Require("iga", "admin"), igaController.VerifyIntegration)
+			iga.POST("/integrations/:integration_id/disconnect", middlewares.Require("iga", "admin"), igaController.DisconnectIntegration)
+
+			// Enumerate.
+			iga.POST("/integrations/:integration_id/scans", middlewares.Require("iga", "admin"), igaController.CreateScan)
+			iga.GET("/scan-runs/:scan_id", middlewares.Require("iga", "read"), igaController.GetScanRun)
+
+			// Coverage and source health are separate surfaces on purpose: a
+			// scan failure is an operational issue, not an agent-risk finding.
+			iga.GET("/integrations/:integration_id/coverage", middlewares.Require("iga", "read"), igaController.GetCoverage)
+			iga.GET("/integrations/:integration_id/source-health", middlewares.Require("iga", "read"), igaController.GetSourceHealth)
+
+			// Inventory. Confirmed agents, candidates and identities are
+			// DIFFERENT routes with different counts.
+			iga.GET("/agents", middlewares.Require("iga", "read"), igaController.ListAgents)
+			iga.GET("/agents/:agent_id", middlewares.Require("iga", "read"), igaController.GetAgent)
+			iga.GET("/agents/:agent_id/evidence", middlewares.Require("iga", "read"), igaController.GetAgentEvidence)
+			iga.GET("/agents/:agent_id/access-paths", middlewares.Require("iga", "read"), igaController.GetAgentAccessPaths)
+			iga.GET("/identity-accounts", middlewares.Require("iga", "read"), igaController.ListIdentityAccounts)
+			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
+
+			// Governance decisions. Both require an expected version, so a
+			// stale decision is rejected rather than last-write-wins.
+			iga.POST("/classification-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideCandidate)
+			iga.POST("/ownership-candidates/:candidate_id/decisions", middlewares.Require("iga", "review"), igaController.DecideOwnership)
+		}
+	}
+
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")
@@ -1434,6 +1491,27 @@ func SetupRoutes(
 
 			// Headline KPI: registered / total, segmented by origin.
 			discovery.GET("/coverage", middlewares.Require("discovery", "read"), discoveryController.GetCoverage)
+
+			// GitHub as a discovery channel, alongside the Kubernetes webhook.
+			// ADDITIVE: one new trigger route on a separate controller. The
+			// sightings it reports land in the SAME discovered_agents
+			// inventory and are governed by the claim/quarantine/coverage
+			// endpoints above, unchanged. Gated on discovery:admin because a
+			// scan spends the workspace's GitHub API budget.
+			// The flow is connect -> choose -> scan:
+			//   from-connector   builds the source from an existing GitHub App
+			//                    connection, so no installation id is retyped
+			//   GET  repositories lists what the installation actually exposes
+			//   PUT  repositories records the explicit scan plan
+			//   POST scan          inspects only the selected repositories
+			//
+			// Selection is deliberate: a new source selects nothing, so
+			// connecting an org can never trigger an unbounded scan by itself.
+			discoveryGitHub := platformCtrl.NewDiscoveryGitHubController(config.DB)
+			discovery.POST("/sources/from-connector", middlewares.Require("discovery", "admin"), discoveryGitHub.CreateSourceFromConnector)
+			discovery.GET("/sources/:id/repositories", middlewares.Require("discovery", "read"), discoveryGitHub.ListSourceRepositories)
+			discovery.PUT("/sources/:id/repositories", middlewares.Require("discovery", "admin"), discoveryGitHub.SetSourceRepositories)
+			discovery.POST("/sources/:id/scan", middlewares.Require("discovery", "admin"), discoveryGitHub.ScanGitHubSource)
 		}
 
 		// ────────────────────────────────────────────────────
