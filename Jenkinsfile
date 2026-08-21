@@ -1,16 +1,19 @@
 pipeline {
     agent any
 
+    // ── AuthSec backend — Hetzner single-node deploy ──────────────────────────
+    // Push to authsec-staging → GitHub webhook → this pipeline runs ON the VM
+    // (jenkins.authsec.ai lives on 192.168.122.252). It pulls source into
+    // /opt/authsec/src/authsec, builds the image from the Dockerfile, and
+    // recreates the `backend` service via the /opt/authsec compose stack.
+    // No registry, no Azure/AKS — the VM builds from source every time.
     environment {
-        SERVICE_NAME = 'authsec'  
-        GITHUB_REPO = 'https://github.com/authsec-ai/authsec.git'
-        GITHUB_BRANCH = 'authsec-staging'
-        DOCKER_REGISTRY = 'docker-repo-public.authnull.com'
-        DOCKER_REGISTRY_CREDENTIALS = credentials('docker-repo-public')
-        TAG = 'stage'
-        DOCKER_IMAGE = "docker-repo-public.authnull.com/authsec:${TAG}"
-
-        
+        SERVICE_NAME  = 'authsec'
+        STACK_DIR     = '/opt/authsec'
+        SRC_DIR       = '/opt/authsec/src/authsec'
+        IMAGE         = 'authsec-backend:latest'
+        DEPLOY_BRANCH = 'authsec-staging'
+        HEALTH_URL    = 'https://app.authsec.ai/authsec/uflow/health'
     }
 
     triggers {
@@ -18,55 +21,54 @@ pipeline {
     }
 
     options {
-        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '10', daysToKeepStr: '', numToKeepStr: '10')
+        buildDiscarder logRotator(artifactNumToKeepStr: '10', numToKeepStr: '10')
     }
 
     stages {
-
-        stage('Checkout') {
-            steps {
-                checkout scm
-                script {
-                    env.GIT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-                    env.IMAGE_TAG = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}-${env.GIT_SHA}".replaceAll("[^A-Za-z0-9_.-]", "-")
-                    env.DOCKER_IMAGE_IMMUTABLE = "${env.DOCKER_REGISTRY}/${env.SERVICE_NAME}:${env.IMAGE_TAG}"
-                }
-            }
-        }
-
-        stage('Build Public Image') {
+        stage('Pull source') {
             steps {
                 sh """
-                    echo "Building PUBLIC image: ${DOCKER_IMAGE}"
-                    DOCKER_BUILDKIT=1 docker build -t ${DOCKER_IMAGE} .
+                    cd ${SRC_DIR}
+                    git fetch origin ${DEPLOY_BRANCH}
+                    git reset --hard origin/${DEPLOY_BRANCH}
+                    git log --oneline -1
                 """
             }
         }
 
-        stage('Login to Docker Artifactory') {
-            steps {
-                sh "echo ${DOCKER_REGISTRY_CREDENTIALS_PSW} | docker login ${DOCKER_REGISTRY} -u ${DOCKER_REGISTRY_CREDENTIALS_USR} --password-stdin"
-            }
-        }
-
-        stage('Push Docker Image') {
+        stage('Build image') {
             steps {
                 sh """
-                    docker push ${env.DOCKER_IMAGE}
+                    cd ${STACK_DIR}
+                    DOCKER_BUILDKIT=1 docker compose build backend
                 """
             }
         }
 
-        stage('Logout from Docker Artifactory') {
+        stage('Deploy') {
             steps {
-                sh "docker logout ${env.DOCKER_REGISTRY}"
+                sh """
+                    cd ${STACK_DIR}
+                    docker compose up -d --no-deps --force-recreate backend
+                """
             }
         }
 
-        stage('Remove Docker Image') {
+        stage('Health check') {
             steps {
-                sh "docker rmi ${env.DOCKER_IMAGE} || true"
+                sh "curl -fsS --retry 12 --retry-delay 6 --retry-all-errors ${HEALTH_URL}"
             }
         }
+
+        stage('Prune dangling images') {
+            steps {
+                sh "docker image prune -f || true"
+            }
+        }
+    }
+
+    post {
+        success { echo "Deployed ${SERVICE_NAME} (${IMAGE}) to app.authsec.ai" }
+        failure { echo "Deploy FAILED for ${SERVICE_NAME} — check build/compose logs on the VM (${STACK_DIR})" }
     }
 }
