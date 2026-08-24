@@ -152,7 +152,14 @@ type AgentUpdateRequest struct {
 // Both fields are mandatory: an agent needs an identity for its tokens and a
 // human who is accountable for it.
 type ClaimAgentRequest struct {
-	MatchedClientID uuid.UUID `json:"matched_client_id" binding:"required"`
+	// MatchedClientID is OPTIONAL. Omit it and the platform mints a governed
+	// identity from the sighting, named after the workload. Most discovered agents
+	// are workloads that never authenticate to AuthSec, so requiring an operator to
+	// pick a credential-holder for them was ceremony blocking the only judgement
+	// that needs a human: who is accountable.
+	//
+	// Supply it to bind this sighting to an identity that already exists.
+	MatchedClientID uuid.UUID `json:"matched_client_id,omitempty"`
 	OwnerUserID     uuid.UUID `json:"owner_user_id" binding:"required"`
 	Archetype       string    `json:"archetype,omitempty"`
 }

@@ -110,8 +110,24 @@ func TestProvisionCreatesTheWholeGovernedPrincipal(t *testing.T) {
 	if out.ServiceAccountID == uuid.Nil || !out.ServiceAccountNew {
 		t.Errorf("expected a newly created service-account anchor, got %+v", out)
 	}
-	if out.SpiffeID != "system:serviceaccount:default:research-agent-sa" {
-		t.Errorf("spiffe_id = %q; discovery's identity_anchor must land on the anchor", out.SpiffeID)
+	// The observed Kubernetes identity is deliberately NOT copied onto
+	// service_accounts.spiffe_id. That column has a UNIQUE index because a SPIFFE ID
+	// identifies exactly one workload, whereas a Kubernetes ServiceAccount is shared
+	// by every pod that does not name its own -- so storing one in the other's column
+	// made provisioning the SECOND agent in a namespace fail on a duplicate key.
+	// These agents have no SPIFFE ID, and saying so is the honest answer.
+	if out.SpiffeID != "" {
+		t.Errorf("spiffe_id = %q; a Kubernetes ServiceAccount must not be stored as a "+
+			"SPIFFE ID -- it is shared by many workloads and that column is unique",
+			out.SpiffeID)
+	}
+	// It is recorded where it belongs instead: on the grant's provenance, which is
+	// where a reviewer asks "which workload identity was this bound to".
+	if f.count(t, `SELECT count(*) FROM entitlement_provenance
+	                WHERE workspace_id = $1
+	                  AND entitlement_snapshot->>'identity_anchor'
+	                      = 'system:serviceaccount:default:research-agent-sa'`, f.ws) == 0 {
+		t.Error("the observed identity anchor must survive on the provenance snapshot")
 	}
 	if f.count(t, `SELECT count(*) FROM service_accounts WHERE oauth_client_id = $1 AND status = 'active'`, f.client) != 1 {
 		t.Error("the anchor should be active and paired to the oauth client")

@@ -11,6 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // DiscoveryManager holds the business rules for agent discovery: connector
@@ -784,9 +785,8 @@ func (m *discoveryManager) DeleteAgent(workspaceID, id uuid.UUID) error {
 /* --------------------------- claim / quarantine ------------------------- */
 
 func (m *discoveryManager) ClaimAgent(workspaceID, agentID uuid.UUID, in ClaimInput) (*models.DiscoveredAgent, error) {
-	if in.MatchedClientID == uuid.Nil {
-		return nil, errors.New("matched_client_id is required: every token and action must trace to one principal")
-	}
+	// The owner stays mandatory. It is the one thing a human genuinely knows and the
+	// system cannot infer: who answers for this agent.
 	if in.OwnerUserID == uuid.Nil {
 		return nil, errors.New("owner_user_id is required: an agent must have an accountable human owner")
 	}
@@ -794,10 +794,51 @@ func (m *discoveryManager) ClaimAgent(workspaceID, agentID uuid.UUID, in ClaimIn
 		return nil, fmt.Errorf("unknown archetype %q", in.Archetype)
 	}
 
+	// matched_client_id is NO LONGER required from the caller.
+	//
+	// It is still required by the data model -- service_accounts is keyed on
+	// oauth_client_id, so without a client there is no entitlement anchor to hang a
+	// role binding, a revocation or a certification decision on. But most agents
+	// discovered in a cluster are workloads that never authenticate to AuthSec at
+	// all: no SPIRE agent so no SVID, no mounted secret so no client_secret_basic.
+	// Making an operator hand-pick a credential-holder for a workload that holds no
+	// credential demanded information they did not have, to satisfy a foreign key
+	// the platform can satisfy itself.
+	//
+	// So when no identity is supplied, one is minted from the sighting -- named
+	// after the workload, using the suggested_client_name the connector has always
+	// sent and nothing ever read.
+	clientID := in.MatchedClientID
+	if clientID == uuid.Nil {
+		db := m.repo.DB()
+		if db == nil {
+			return nil, errors.New("cannot mint a governed identity without a database handle; " +
+				"pass matched_client_id explicitly")
+		}
+		agent, err := m.repo.GetAgent(workspaceID, agentID)
+		if err != nil {
+			return nil, err
+		}
+		// One transaction: an agent must never end up claimed against a client that
+		// failed to persist, nor leave an orphan client behind if the claim loses a
+		// race.
+		err = db.Transaction(func(tx *gorm.DB) error {
+			client, mErr := mintGovernedIdentity(tx, workspaceID, agent)
+			if mErr != nil {
+				return mErr
+			}
+			clientID = client.ID
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return m.repo.ClaimAgent(repositories.ClaimAgentInput{
 		WorkspaceID:     workspaceID,
 		AgentID:         agentID,
-		MatchedClientID: in.MatchedClientID,
+		MatchedClientID: clientID,
 		OwnerUserID:     in.OwnerUserID,
 		Archetype:       in.Archetype,
 		ClaimedBy:       in.ClaimedBy,

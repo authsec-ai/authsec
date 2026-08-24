@@ -251,8 +251,14 @@ func (m *provisioningManager) Provision(workspaceID uuid.UUID, in ProvisionInput
 
 		// --- 6. provenance -------------------------------------------------
 		rsName, _ := m.resourceServerName(tx, in.ResourceServerID)
-		anchor := ""
-		if sa.SpiffeID != nil {
+		// Read straight from the sighting rather than via sa.SpiffeID. The observed
+		// Kubernetes identity is no longer copied onto the anchor (spiffe_id is
+		// unique per workload; a ServiceAccount is shared), but the provenance record
+		// still needs it: "which workload identity was this grant bound to" is
+		// exactly what a reviewer asks later, and what verify_uptake checks against.
+		anchor := identityAnchorFrom(agent.Metadata)
+		if anchor == "" && sa.SpiffeID != nil {
+			// A genuine SPIFFE ID, if this anchor has one.
 			anchor = *sa.SpiffeID
 		}
 
@@ -347,19 +353,10 @@ func (m *provisioningManager) ensureAnchor(tx *gorm.DB, workspaceID uuid.UUID,
 	var existing models.ServiceAccount
 	err := tx.Where("workspace_id = ? AND oauth_client_id = ?", workspaceID, client.ID).First(&existing).Error
 	if err == nil {
-		// Backfill the workload identity if discovery has since learned it and the
-		// anchor predates that. Never overwrite a non-empty value — an operator may
-		// have corrected it.
-		if existing.SpiffeID == nil || *existing.SpiffeID == "" {
-			if anchor := identityAnchorFrom(agent.Metadata); anchor != "" {
-				if uerr := tx.Model(&models.ServiceAccount{}).
-					Where("id = ? AND workspace_id = ?", existing.ID, workspaceID).
-					Update("spiffe_id", anchor).Error; uerr != nil {
-					return nil, false, fmt.Errorf("backfill spiffe_id: %w", uerr)
-				}
-				existing.SpiffeID = &anchor
-			}
-		}
+		// No spiffe_id backfill, for the same reason as above: a Kubernetes SA is
+		// shared by many workloads and spiffe_id is unique per workload. Backfilling
+		// it here would fail as soon as a second agent in the namespace was
+		// provisioned under the same ServiceAccount.
 		return &existing, false, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -376,12 +373,20 @@ func (m *provisioningManager) ensureAnchor(tx *gorm.DB, workspaceID uuid.UUID,
 		Status:        "active",
 		OAuthClientID: &client.ID,
 	}
-	// The workload identity discovery already reported. This is the bridge between
-	// "the pod authenticates as system:serviceaccount:ns:sa" and "this principal holds
-	// these entitlements".
-	if anchor := identityAnchorFrom(agent.Metadata); anchor != "" {
-		sa.SpiffeID = &anchor
-	}
+	// The Kubernetes workload identity discovery reported is deliberately NOT written
+	// to sa.SpiffeID.
+	//
+	// spiffe_id carries a UNIQUE index (uq_sa_spiffe) because a SPIFFE ID identifies
+	// exactly one workload. A Kubernetes ServiceAccount does the opposite: it is
+	// shared by every pod that does not name its own, which in practice means most of
+	// them run as "default". Storing one in the other's column made provisioning the
+	// SECOND agent in a namespace fail with a duplicate-key violation -- and sharing
+	// an SA is the normal case, not an edge case.
+	//
+	// The observed identity is not lost: the connector reports it on every sighting
+	// and it lives on discovered_agents.observed_service_account, which is also what
+	// verify_uptake compares against. Duplicating it here bought nothing and broke
+	// uniqueness.
 	if err := tx.Create(&sa).Error; err != nil {
 		return nil, false, fmt.Errorf("create entitlement anchor: %w", err)
 	}
