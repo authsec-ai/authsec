@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -641,6 +642,13 @@ type approveConnectionBody struct {
 	RoleID      string `json:"role_id,omitempty"`
 	SubjectType string `json:"subject_type,omitempty"` // "user" | "service_account"
 	SubjectID   string `json:"subject_id,omitempty"`
+	// Duration time-boxes the grant ("15m", "8h"). Omitting it keeps this endpoint's
+	// historical behaviour — a permanent binding — but the grant is then recorded as an
+	// unjustified standing one so it surfaces in certification.
+	Duration string `json:"duration,omitempty"`
+	// Justification is required to request a permanent grant deliberately.
+	Justification string `json:"justification,omitempty"`
+	IsStanding    bool   `json:"is_standing,omitempty"`
 }
 
 // ApproveConnection handles PUT /authsec/applications/:id/connections/:connection_id/approve.
@@ -668,7 +676,8 @@ func (ctrl *ApplicationsController) ApproveConnection(c *gin.Context) {
 	// empty/absent body.
 	var body approveConnectionBody
 	_ = c.ShouldBindJSON(&body)
-	var binding *services.ApprovalRoleBinding
+	var grantRole *uuid.UUID
+	var grantSubject uuid.UUID
 	if body.RoleID != "" {
 		roleUUID, rErr := uuid.Parse(body.RoleID)
 		subjUUID, sErr := uuid.Parse(body.SubjectID)
@@ -680,20 +689,58 @@ func (ctrl *ApplicationsController) ApproveConnection(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_type must be 'user' or 'service_account' when role_id is supplied"})
 			return
 		}
-		binding = &services.ApprovalRoleBinding{
-			RoleID:      roleUUID,
-			SubjectType: body.SubjectType,
-			SubjectID:   subjUUID,
-		}
+		grantRole = &roleUUID
+		grantSubject = subjUUID
 	}
 
-	if err := ctrl.oauthSvc.ApproveClientRegistrationWithBinding(id, connectionID, binding); err != nil {
+	var expiresAt *time.Time
+	if body.Duration != "" {
+		d, derr := time.ParseDuration(body.Duration)
+		if derr != nil || d <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid duration"})
+			return
+		}
+		t := time.Now().Add(d)
+		expiresAt = &t
+	}
+
+	// Approve + optionally bind + record WHY, in one transaction. This endpoint used to
+	// create a permanent binding with no provenance, so nothing downstream could say who
+	// approved it or on what grounds.
+	rsUUID, err := uuid.Parse(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid application id"})
+		return
+	}
+	actor, actorLabel := ctrl.governanceActor(c)
+	grant, err := services.NewProvisioningManager(config.DB, ctrl.oauthSvc).
+		GrantEntitlement(workspaceID, services.GrantEntitlementInput{
+			ResourceServerID: rsUUID,
+			ClientID:         connectionID,
+			RoleID:           grantRole,
+			SubjectType:      body.SubjectType,
+			SubjectID:        grantSubject,
+			Origin:           models.GrantOriginConnectionApproval,
+			Justification:    body.Justification,
+			ExpiresAt:        expiresAt,
+			IsStanding:       body.IsStanding,
+			ActingUser:       actor,
+			ActingUserLabel:  actorLabel,
+		})
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if grant.LegacyStandingDefault {
+		log.Printf("connection %s on app %s approved as a PERMANENT grant: no duration supplied",
+			connectionID, id)
+	}
 
 	auditAdminMutation(c, workspaceID.String(), "application_connection_approved", "oauth_client",
-		connectionID, http.StatusOK, nil, map[string]interface{}{"application_id": id, "role_bound": binding != nil})
+		connectionID, http.StatusOK, nil, map[string]interface{}{
+			"application_id": id, "role_bound": grantRole != nil,
+			"expires_at": grant.ExpiresAt, "is_standing": grant.IsStanding,
+		})
 
 	// Honesty contract (finding #1): without an atomic role grant, approving a
 	// connection authorizes the client↔RS link only — it does NOT grant scopes.

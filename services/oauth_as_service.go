@@ -695,6 +695,12 @@ type ApprovalRoleBinding struct {
 	RoleID      uuid.UUID
 	SubjectType string // "user" | "service_account"
 	SubjectID   uuid.UUID
+	// ExpiresAt bounds the grant. Nil creates a STANDING binding, which is what this
+	// path did unconditionally before governance existed — every approval was
+	// permanent. Callers that mean "just in time" must set it; the ScopeResolver
+	// already honours it at read time, and the expiry worker closes the remaining
+	// token window.
+	ExpiresAt *time.Time
 }
 
 // ApproveClientRegistration flips a pending_approval registration to approved
@@ -711,6 +717,19 @@ func (s *OAuthASService) ApproveClientRegistration(rsID, clientID string) error 
 // invariant). The role is validated to belong to the RS's workspace first, so an
 // admin cannot graft a foreign-workspace role onto the grant.
 func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID string, binding *ApprovalRoleBinding) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		return s.ApproveClientRegistrationInTx(tx, rsID, clientID, binding)
+	})
+}
+
+// ApproveClientRegistrationInTx is ApproveClientRegistrationWithBinding joined to a
+// caller-supplied transaction.
+//
+// Provisioning needs registration, the role binding, access_requests, provenance, and
+// the agent's governance status to commit together (PG-2). Sequencing two independent
+// transactions would leave a window where an agent has an approved registration but no
+// recorded justification — a state that looks governed and is not.
+func (s *OAuthASService) ApproveClientRegistrationInTx(tx *gorm.DB, rsID, clientID string, binding *ApprovalRoleBinding) error {
 	rsUUID, err := uuid.Parse(rsID)
 	if err != nil {
 		return fmt.Errorf("invalid RS ID: %w", err)
@@ -720,8 +739,8 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		return fmt.Errorf("client not found: %w", err)
 	}
 
-	// When binding, resolve the RS (for workspace) and validate the role lives in
-	// that workspace before opening the transaction.
+	// When binding, resolve the RS (for its workspace) and validate the role lives in
+	// that workspace, so an admin cannot graft a foreign-workspace role onto the grant.
 	var rs models.ResourceServer
 	var roleName string
 	if binding != nil {
@@ -731,10 +750,10 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		if binding.SubjectType != "user" && binding.SubjectType != "service_account" {
 			return fmt.Errorf("role binding subject_type must be 'user' or 'service_account'")
 		}
-		if err := s.db.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
+		if err := tx.Where("id = ?", rsUUID).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found: %w", err)
 		}
-		if err := s.db.Raw(
+		if err := tx.Raw(
 			`SELECT name FROM roles WHERE id = ? AND workspace_id = ? LIMIT 1`,
 			binding.RoleID, rs.WorkspaceID,
 		).Scan(&roleName).Error; err != nil || roleName == "" {
@@ -742,7 +761,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 		}
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	{
 		// Try pending_approval or revoked → approved (covers first-time approval
 		// and re-approval after revocation).
 		result := tx.Model(&models.ResourceServerClientRegistration{}).
@@ -781,6 +800,7 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 				ScopeID:          &rs.ID,
 				AssignmentSource: "connection_approval",
 				Conditions:       []byte("{}"),
+				ExpiresAt:        binding.ExpiresAt,
 				CreatedAt:        time.Now().UTC(),
 			}
 			if binding.SubjectType == "service_account" {
@@ -807,8 +827,8 @@ func (s *OAuthASService) ApproveClientRegistrationWithBinding(rsID, clientID str
 			now, now, rsUUID, clientID).Error; aerr != nil {
 			return fmt.Errorf("flip access_requests: %w", aerr)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // DenyClientRegistration removes a pending_approval registration and flips any
@@ -2638,11 +2658,17 @@ func (s *OAuthASService) RevokeNativeTokenByJTI(workspaceID uuid.UUID, jtiStr st
 	}
 
 	now := time.Now().UTC()
+	// The column is `kind`, and the primary key is (iss, kind, jti). This previously
+	// named a `token_type` column that does not exist, so EVERY call failed with
+	// `column "token_type" of relation "revoked_tokens" does not exist` — meaning the
+	// admin token-revocation path never actually revoked anything. Introspection
+	// treats revoked_tokens as authoritative, so a token an admin believed they had
+	// killed stayed valid for its full remaining lifetime.
 	return s.db.Exec(`
-		INSERT INTO revoked_tokens (iss, token_type, jti, revoked_at, expires_at)
-		VALUES (?, 'access_token', ?, ?, ?)
-		ON CONFLICT (iss, token_type, jti) DO NOTHING`,
-		nt.Iss, jti, now, nt.ExpiresAt,
+		INSERT INTO revoked_tokens (iss, kind, jti, revoked_at, reason, expires_at)
+		VALUES (?, 'access_token', ?, ?, ?, ?)
+		ON CONFLICT (iss, kind, jti) DO NOTHING`,
+		nt.Iss, jti, now, "revoked by admin", nt.ExpiresAt,
 	).Error
 }
 

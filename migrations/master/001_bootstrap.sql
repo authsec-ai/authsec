@@ -455,6 +455,14 @@ CREATE TABLE public.mcp_oauth_clients (
     CONSTRAINT mcp_oauth_clients_sync_status_chk CHECK (sync_status IN ('active', 'sync_error', 'pending_delete')),
     CONSTRAINT mcp_oauth_clients_client_id_key UNIQUE (client_id),
     CONSTRAINT mcp_oauth_clients_hydra_client_id_key UNIQUE (hydra_client_id),
+    -- The accountable human for this agent, and its governance state.
+    -- governance_status is what a HUMAN decided about the agent's authority; it is
+    -- orthogonal to discovered_agents.runtime_status, which is what we OBSERVED
+    -- about its workload. An agent can be governance-active and runtime-gone.
+    owner_user_id uuid,
+    governance_status text NOT NULL DEFAULT 'ungoverned'
+        CONSTRAINT mcp_oauth_clients_governance_status_chk
+        CHECK (governance_status IN ('ungoverned', 'active', 'suspended', 'deprovisioned')),
     CONSTRAINT mcp_oauth_clients_pkey PRIMARY KEY (id)
 );
 
@@ -863,6 +871,13 @@ CREATE TABLE public.resource_servers (
     managed boolean DEFAULT false NOT NULL,
     CONSTRAINT resource_servers_prm_source_chk CHECK (prm_source IN ('fetched', 'manual_override')),
     CONSTRAINT resource_servers_application_type_chk CHECK (application_type IN ('mcp_server', 'ai_agent', 'clawbot', 'api_service', 'connector_broker')),
+    -- governance ownership: certification routes a review to the owner of the thing
+    -- the entitlement grants access to, so without this there is nobody to review.
+    owner_user_id uuid,
+    -- risk_tier drives certification frequency and review ordering.
+    risk_tier text NOT NULL DEFAULT 'medium'
+        CONSTRAINT resource_servers_risk_tier_chk
+        CHECK (risk_tier IN ('low', 'medium', 'high', 'critical')),
     CONSTRAINT resource_servers_pkey PRIMARY KEY (id),
     CONSTRAINT resource_servers_id_workspace_uq UNIQUE (id, workspace_id),
     CONSTRAINT resource_servers_workspace_resource_uri_uq UNIQUE (workspace_id, resource_uri)
@@ -1510,6 +1525,11 @@ CREATE TABLE public.users (
     provider_data jsonb DEFAULT '{}'::jsonb,
     avatar_url text,
     active boolean DEFAULT true,
+    -- Leaver bookkeeping. The JML reconcile is idempotent and needs no cursor; these
+    -- exist so an operator can SEE that a leaver was processed, and when, without
+    -- reading the audit log.
+    access_revoked_at timestamptz,
+    access_revoked_summary text NOT NULL DEFAULT '',
     mfa_enabled boolean DEFAULT false,
     mfa_method text[],
     mfa_default_method character varying(50),
@@ -2786,6 +2806,21 @@ CREATE TABLE public.access_requests (
     expires_at          timestamptz,
     decided_by          uuid,
     decided_at          timestamptz,
+    -- Governance intent on the LIVE request pipeline. Deliberately here and not on
+    -- role_assignment_requests: that table is vestigial (no service or controller
+    -- reads it) and lacks expires_at, requested_scopes, and a usable status enum.
+    justification       text    NOT NULL DEFAULT '',
+    -- What the access is FOR, in the requester's words. Certification compares
+    -- stated purpose against observed usage, which needs it captured up front.
+    purpose             text    NOT NULL DEFAULT '',
+    request_origin      text    NOT NULL DEFAULT 'admin'
+                            CONSTRAINT access_requests_origin_chk
+                            CHECK (request_origin IN ('discovery_claim','self_service',
+                                                      'birthright','admin','escalation')),
+    -- What was ASKED for, as distinct from expires_at, which is what was GRANTED.
+    -- Keeping both makes "we always cut requests down" visible instead of folklore.
+    requested_duration  interval,
+    discovered_agent_id uuid,
     CONSTRAINT access_requests_pkey PRIMARY KEY (id)
 );
 -- §2: at most one open pending row per (subject, rs, client). ON CONFLICT
@@ -3362,10 +3397,26 @@ ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
 -- mcp_oauth_clients identity and an accountable owner) -- otherwise an admin
 -- quarantines it.
 
--- discovery_sources -- a configured connector that produces sightings.
+-- discovery_sources -- a connector that produces sightings, whether an admin
+-- configured it in the console or an agent registered itself.
+--
 -- kind: k8s_webhook and repo_scan are the active channels; aws/azure/gcp/
 --   vm_sensor are designed but deferred and need no schema change to enable.
 -- config: non-secret connector settings. Secrets belong in Vault, not here.
+--
+-- SELF-REGISTRATION. One control plane serves discovery agents in many clusters,
+-- so it needs a first-class record of each one -- otherwise cluster identity
+-- lives only inside sighting metadata and there is no way to list connected
+-- clusters, see their agent versions, or tell a live agent from one that stopped
+-- reporting last week. A self-registering agent upserts its own row here on
+-- startup, heartbeats into last_heartbeat_at, and receives this row's id back so
+-- every sighting it reports carries a real discovery_source_id.
+--
+-- instance_id is the stable key the agent asserts. For the Kubernetes connector
+-- it derives from cluster.name, which is ALREADY part of every agent
+-- fingerprint -- so renaming a cluster re-mints the connector row at exactly the
+-- moment it re-mints the agent rows. Keying on display_name would instead break
+-- the first time an admin renamed the connector in the console.
 CREATE TABLE public.discovery_sources (
     id           uuid NOT NULL DEFAULT gen_random_uuid(),
     workspace_id uuid NOT NULL,
@@ -3376,6 +3427,28 @@ CREATE TABLE public.discovery_sources (
     last_sync_at timestamptz,
     last_status  text NOT NULL DEFAULT '',
     last_error   text NOT NULL DEFAULT '',
+    -- self-registration / liveness ('' for admin-configured connectors)
+    instance_id       text NOT NULL DEFAULT '',
+    cluster_name      text NOT NULL DEFAULT '',
+    -- Corroborating fact, never a key: the kube-system namespace UID, immutable
+    -- per cluster. Lets the control plane spot two DIFFERENT clusters installed
+    -- with the same cluster.name (same instance_id, but the uid changed). Empty
+    -- when the agent lacks RBAC to read it, which is the default.
+    cluster_uid       text NOT NULL DEFAULT '',
+    agent_version     text NOT NULL DEFAULT '',
+    last_heartbeat_at timestamptz,
+    -- Separates a machine-owned row (runtime fields overwritten by every
+    -- heartbeat) from an admin-configured one.
+    self_registered   boolean NOT NULL DEFAULT false,
+    -- Last reported runtime snapshot: pod/node identity, resolved config,
+    -- counters. Observability only -- no decision reads it, so it stays
+    -- schemaless on purpose.
+    runtime           jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Actuation credential. Only a HASH is stored: a leaked backup must not yield a
+    -- working credential. The token identifies WHICH connector is calling, so an agent
+    -- never asserts its own cluster.
+    actuation_token_hash text NOT NULL DEFAULT '',
+    actuation_enabled_at timestamptz,
     created_by   text NOT NULL DEFAULT '',
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
@@ -3389,6 +3462,17 @@ CREATE TABLE public.discovery_sources (
 
 CREATE INDEX idx_discovery_sources_workspace ON public.discovery_sources(workspace_id);
 
+-- The self-registration upsert target. PARTIAL so it constrains only
+-- self-registered rows: admin-created connectors keep instance_id='' and any
+-- number of them may coexist, which a plain UNIQUE would forbid.
+CREATE UNIQUE INDEX discovery_sources_instance_key
+    ON public.discovery_sources(workspace_id, kind, instance_id)
+    WHERE instance_id <> '';
+
+-- Answers "which clusters are reporting right now?" without a full scan.
+CREATE INDEX idx_discovery_sources_heartbeat
+    ON public.discovery_sources(workspace_id, last_heartbeat_at DESC);
+
 -- discovered_agents -- one row per distinct agent sighting, keyed by a stable
 -- fingerprint. UNIQUE(workspace_id, source, fingerprint) is what makes a
 -- repeated sighting an upsert (a last_seen_at / sighting_count bump) instead of
@@ -3397,6 +3481,13 @@ CREATE INDEX idx_discovery_sources_workspace ON public.discovery_sources(workspa
 -- status moves forward only (unregistered -> registered | quarantined |
 --   ignored); it never returns to unregistered. 'ignored' is the "keep the row
 --   but stop surfacing it" state, so there is no soft-delete column here.
+-- runtime_status is a SEPARATE, orthogonal axis and must stay that way. `status`
+--   is what a human DECIDED; runtime_status is what we OBSERVED (running |
+--   stopped | gone | unknown), it is machine-written, and it moves both ways. An
+--   agent that was claimed and later deleted must stay `registered` -- the audit
+--   trail is the entire point -- while its runtime_status becomes `gone`.
+--   Collapsing the two would force a choice between losing the governance
+--   decision and lying about whether the workload is running.
 -- deployment_origin: a manually run agent (a developer's script with no
 --   pipeline behind it) is the higher-risk, harder-to-attribute case, since its
 --   permissions are typically whatever the developer's own credentials allow --
@@ -3427,6 +3518,36 @@ CREATE TABLE public.discovered_agents (
     first_seen_at       timestamptz NOT NULL DEFAULT now(),
     last_seen_at        timestamptz NOT NULL DEFAULT now(),
     sighting_count      integer NOT NULL DEFAULT 1,
+    -- observed runtime lifecycle (see the runtime_status note in the header)
+    runtime_status      text NOT NULL DEFAULT 'unknown',
+    -- Why runtime_status holds its value, in the agent's words ("deleted by
+    -- alice@corp via Deployment DELETE"). Shown verbatim; a reviewer should never
+    -- have to guess how we concluded an agent was gone.
+    runtime_reason      text NOT NULL DEFAULT '',
+    -- Observation time of the event that last set runtime_status -- NOT receive
+    -- time. This is the monotonic guard: a sighting delayed in a retry queue must
+    -- not resurrect an agent deleted after it was enqueued, so a transition
+    -- applies only when its observed_at is at least as recent as this value.
+    runtime_observed_at timestamptz,
+    terminated_at       timestamptz,
+    -- The principal the API SERVER attributed the DELETE to. The answer to "who
+    -- destroyed this agent", and available only from admission: a resync can
+    -- prove absence but can never attribute it.
+    terminated_by       text NOT NULL DEFAULT '',
+    -- Whether the quarantine DECISION has actually been enforced in the cluster. The
+    -- same decision-versus-observation split as status vs runtime_status: an admin needs
+    -- to know "I quarantined it" from "it is actually blocked".
+    quarantine_enforced_at       timestamptz,
+    quarantine_enforcement_error text NOT NULL DEFAULT '',
+    -- When the quarantine was LIFTED. quarantined_at/by/reason deliberately survive a
+    -- release as the record that it happened, so this is what separates a live
+    -- quarantine from a historical one.
+    quarantine_released_at timestamptz,
+    quarantine_released_by uuid,
+    -- The workload identity actually observed running. When it disagrees with the
+    -- provisioned anchor, the entitlement is bound to an identity the workload lacks.
+    observed_service_account text NOT NULL DEFAULT '',
+    identity_verified_at     timestamptz,
     created_by          text NOT NULL DEFAULT '',
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
@@ -3452,6 +3573,8 @@ CREATE TABLE public.discovered_agents (
         status IN ('unregistered', 'registered', 'quarantined', 'ignored')),
     CONSTRAINT discovered_agents_archetype_chk CHECK (
         archetype IN ('', 'autonomous', 'user_delegated', 'hybrid')),
+    CONSTRAINT discovered_agents_runtime_status_chk CHECK (
+        runtime_status IN ('running', 'stopped', 'gone', 'unknown')),
     -- Registered means claimed: a governed principal always has both an identity
     -- to trace tokens to and an accountable human owner. Enforced in the DB so
     -- no code path can produce an unowned registered agent.
@@ -3464,6 +3587,62 @@ CREATE TABLE public.discovered_agents (
 CREATE INDEX idx_discovered_agents_workspace_status_origin
     ON public.discovered_agents(workspace_id, status, deployment_origin);
 CREATE INDEX idx_discovered_agents_last_seen ON public.discovered_agents(last_seen_at);
+-- The "show me agents that vanished" / "show me live agents" reports.
+CREATE INDEX idx_discovered_agents_runtime
+    ON public.discovered_agents(workspace_id, runtime_status);
+
+-- discovered_agent_events -- the lifecycle trail behind runtime_status.
+--
+-- Append-only. The inventory row carries only the CURRENT runtime state; this is
+-- the history, which is what makes "when and how was this agent destroyed"
+-- answerable after the fact rather than merely "it is gone now".
+--
+-- Kept separate from audit_events deliberately: these are MACHINE observations of
+-- third-party workloads, not administrator actions on AuthSec objects. They carry
+-- no acting AuthSec user, they are far higher volume, and they are safe to prune
+-- on a shorter retention -- all of which would be wrong for the admin audit log.
+--
+-- discovered_agent_id is nullable because an event can legitimately arrive for a
+-- fingerprint we hold no sighting for: an agent created and destroyed between two
+-- resyncs, or deleted while the reporting queue was backed up. Dropping such an
+-- event would discard the only evidence that agent ever existed.
+CREATE TABLE public.discovered_agent_events (
+    id                  uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid NOT NULL,
+    discovered_agent_id uuid,
+    discovery_source_id uuid,
+    source              text NOT NULL,
+    fingerprint         text NOT NULL,
+    event               text NOT NULL,
+    -- The runtime_status this event asserted, or '' for a purely informational
+    -- event such as a controller-owned pod being rescheduled.
+    runtime_status      text NOT NULL DEFAULT '',
+    reason              text NOT NULL DEFAULT '',
+    actor               text NOT NULL DEFAULT '',
+    -- 'admission' | 'resync' | 'control_plane'. An admission event carries a
+    -- trustworthy actor; a resync event never can.
+    channel             text NOT NULL DEFAULT '',
+    cluster_name        text NOT NULL DEFAULT '',
+    metadata            jsonb NOT NULL DEFAULT '{}'::jsonb,
+    observed_at         timestamptz NOT NULL DEFAULT now(),
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT discovered_agent_events_pkey PRIMARY KEY (id),
+    CONSTRAINT discovered_agent_events_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT discovered_agent_events_agent_fkey FOREIGN KEY (discovered_agent_id)
+        REFERENCES public.discovered_agents(id) ON DELETE SET NULL,
+    CONSTRAINT discovered_agent_events_source_id_fkey FOREIGN KEY (discovery_source_id)
+        REFERENCES public.discovery_sources(id) ON DELETE SET NULL,
+    CONSTRAINT discovered_agent_events_event_chk CHECK (
+        event IN ('observed', 'deleted', 'pod_terminated', 'absent', 'reappeared')),
+    CONSTRAINT discovered_agent_events_runtime_chk CHECK (
+        runtime_status IN ('', 'running', 'stopped', 'gone', 'unknown'))
+);
+
+CREATE INDEX idx_discovered_agent_events_agent
+    ON public.discovered_agent_events(discovered_agent_id, observed_at DESC);
+CREATE INDEX idx_discovered_agent_events_ws_fp
+    ON public.discovered_agent_events(workspace_id, source, fingerprint, observed_at DESC);
 
 -- Discovery RBAC permissions -- GLOBAL (workspace_id IS NULL) so they apply in
 -- every workspace, exactly like the connector:* permissions above. Admins grant
@@ -4376,3 +4555,798 @@ CREATE TABLE public.iga_idempotency_keys (
     CONSTRAINT iga_idempotency_keys_workspace_fkey FOREIGN KEY (workspace_id)
         REFERENCES public.workspaces(id) ON DELETE CASCADE
 );
+
+-- ============================================================================
+-- GOVERNANCE: entitlement provenance (PROVISIONING-GOVERNANCE-ARCHITECTURE.md §5)
+--
+-- The platform can already answer "what does this subject have?" precisely: the
+-- ScopeResolver walks role_bindings -> roles -> permissions -> oauth_scopes and
+-- honours expires_at at read time. What it cannot answer is "WHY does this subject
+-- have it?" -- who asked, who approved, on what justification, for what purpose,
+-- and whether it was meant to be temporary.
+--
+-- That is the prerequisite for certification. A reviewer asked "should this agent
+-- still have this?" has nothing to review without it, and every answer is a guess.
+-- It is also what keeps a revocation auditable once the grant row itself is gone.
+--
+-- Placed at the end of the file because it references users, workspaces,
+-- role_bindings, access_requests, connector_assignments,
+-- resource_server_client_registrations, and discovered_agents -- all created above.
+-- ============================================================================
+
+-- Deferred FKs for the ownership columns added inline to earlier tables, whose
+-- targets (users, discovered_agents) are created further down the file.
+ALTER TABLE ONLY public.resource_servers
+    ADD CONSTRAINT resource_servers_owner_fkey FOREIGN KEY (owner_user_id)
+    REFERENCES public.users(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.mcp_oauth_clients
+    ADD CONSTRAINT mcp_oauth_clients_owner_fkey FOREIGN KEY (owner_user_id)
+    REFERENCES public.users(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.access_requests
+    ADD CONSTRAINT access_requests_discovered_agent_fkey FOREIGN KEY (discovered_agent_id)
+    REFERENCES public.discovered_agents(id) ON DELETE SET NULL;
+
+CREATE INDEX idx_resource_servers_owner
+    ON public.resource_servers(owner_user_id) WHERE owner_user_id IS NOT NULL;
+CREATE INDEX idx_mcp_oauth_clients_owner
+    ON public.mcp_oauth_clients(owner_user_id) WHERE owner_user_id IS NOT NULL;
+
+-- entitlement_provenance -- one row per grant DECISION.
+--
+-- Rows are OPENED when a grant is made and CLOSED when it is revoked. Nothing is
+-- ever deleted from this table, because it is evidence.
+--
+-- WHY BOTH A POINTER AND A SNAPSHOT
+-- The live pointers (role_binding_id etc.) are ON DELETE SET NULL, because
+-- provenance must OUTLIVE the grant it describes -- an expired binding is deleted,
+-- and that is precisely when the record of it becomes important. entitlement_snapshot
+-- carries a denormalised copy of the essentials and stays readable after the pointer
+-- is nulled. A pointer alone would lose the evidence; a snapshot alone could not be
+-- joined while the grant is live.
+CREATE TABLE public.entitlement_provenance (
+    id                       uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id             uuid NOT NULL,
+
+    -- WHAT was granted
+    entitlement_type         text NOT NULL,
+    role_binding_id          uuid,
+    client_registration_id   uuid,
+    connector_assignment_id  uuid,
+    entitlement_snapshot     jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Human-readable one-liner for a review queue, so a reviewer never has to read
+    -- jsonb to know what they are deciding on.
+    entitlement_label        text NOT NULL DEFAULT '',
+
+    -- WHO holds it. Deliberately not an FK: the subject may be a user, a service
+    -- account, an oauth client, or a group, and one polymorphic FK cannot express
+    -- that. The service resolves and validates the subject before writing.
+    subject_type             text NOT NULL,
+    subject_id               uuid NOT NULL,
+    subject_label            text NOT NULL DEFAULT '',
+
+    -- WHY it was granted
+    origin                   text NOT NULL,
+    justification            text NOT NULL DEFAULT '',
+    purpose                  text NOT NULL DEFAULT '',
+    access_request_id        uuid,
+    discovered_agent_id      uuid,
+
+    -- BY WHOM. granted_by_label is denormalised on purpose: a deactivated user's row
+    -- can be removed, and "granted by <null>" is useless in an audit six months on.
+    granted_by               uuid,
+    granted_by_label         text NOT NULL DEFAULT '',
+    granted_at               timestamptz NOT NULL DEFAULT now(),
+
+    -- FOR HOW LONG. is_standing marks a deliberate permanent grant; those require a
+    -- justification (see the check below) and sort first in every campaign.
+    expires_at               timestamptz,
+    is_standing              boolean NOT NULL DEFAULT false,
+
+    -- CLOSING. revoked_via records which of the five callers invoked the single
+    -- de-provision path.
+    revoked_at               timestamptz,
+    revoked_by               uuid,
+    revoked_reason           text NOT NULL DEFAULT '',
+    revoked_via              text NOT NULL DEFAULT '',
+
+    created_at               timestamptz NOT NULL DEFAULT now(),
+    updated_at               timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT entitlement_provenance_pkey PRIMARY KEY (id),
+    CONSTRAINT entitlement_provenance_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT entitlement_provenance_role_binding_fkey FOREIGN KEY (role_binding_id)
+        REFERENCES public.role_bindings(id) ON DELETE SET NULL,
+    CONSTRAINT entitlement_provenance_client_reg_fkey FOREIGN KEY (client_registration_id)
+        REFERENCES public.resource_server_client_registrations(id) ON DELETE SET NULL,
+    CONSTRAINT entitlement_provenance_connector_assignment_fkey FOREIGN KEY (connector_assignment_id)
+        REFERENCES public.connector_assignments(id) ON DELETE SET NULL,
+    CONSTRAINT entitlement_provenance_access_request_fkey FOREIGN KEY (access_request_id)
+        REFERENCES public.access_requests(id) ON DELETE SET NULL,
+    CONSTRAINT entitlement_provenance_discovered_agent_fkey FOREIGN KEY (discovered_agent_id)
+        REFERENCES public.discovered_agents(id) ON DELETE SET NULL,
+    CONSTRAINT entitlement_provenance_granted_by_fkey FOREIGN KEY (granted_by)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+
+    CONSTRAINT entitlement_provenance_type_chk CHECK (
+        entitlement_type IN ('role_binding', 'client_registration', 'secret_access')),
+    CONSTRAINT entitlement_provenance_subject_chk CHECK (
+        subject_type IN ('user', 'service_account', 'oauth_client', 'group')),
+    CONSTRAINT entitlement_provenance_origin_chk CHECK (
+        origin IN ('discovery_claim', 'self_service', 'birthright', 'admin',
+                   'escalation', 'connection_approval', 'migration')),
+    CONSTRAINT entitlement_provenance_revoked_via_chk CHECK (
+        revoked_via IN ('', 'expiry', 'certification', 'leaver', 'quarantine',
+                        'admin', 'sod_remediation')),
+    -- A standing grant must say why it is standing. This is the mechanism behind
+    -- "ephemeral is the default, permanent is the audited exception" -- without it,
+    -- is_standing is just a boolean nobody has to defend.
+    CONSTRAINT entitlement_provenance_standing_needs_justification_chk CHECK (
+        NOT is_standing OR justification <> ''),
+    -- A closed row must say when and how.
+    CONSTRAINT entitlement_provenance_revocation_complete_chk CHECK (
+        (revoked_at IS NULL AND revoked_via = '')
+        OR (revoked_at IS NOT NULL AND revoked_via <> '')),
+    -- Exactly one live pointer, matching entitlement_type. Stops a row that claims
+    -- to describe a role binding while pointing at a client registration.
+    CONSTRAINT entitlement_provenance_pointer_chk CHECK (
+        (entitlement_type = 'role_binding'
+            AND client_registration_id IS NULL AND connector_assignment_id IS NULL)
+     OR (entitlement_type = 'client_registration'
+            AND role_binding_id IS NULL AND connector_assignment_id IS NULL)
+     OR (entitlement_type = 'secret_access'
+            AND role_binding_id IS NULL AND client_registration_id IS NULL))
+);
+
+-- At most ONE OPEN provenance row per live entitlement. Partial, so the closed
+-- history of a recreated entitlement is unconstrained. Without this a retried
+-- provision would silently double-record, and every "why" query would return two
+-- conflicting answers.
+CREATE UNIQUE INDEX entitlement_provenance_open_role_binding_key
+    ON public.entitlement_provenance(role_binding_id)
+    WHERE role_binding_id IS NOT NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX entitlement_provenance_open_client_reg_key
+    ON public.entitlement_provenance(client_registration_id)
+    WHERE client_registration_id IS NOT NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX entitlement_provenance_open_connector_key
+    ON public.entitlement_provenance(connector_assignment_id)
+    WHERE connector_assignment_id IS NOT NULL AND revoked_at IS NULL;
+
+-- "What does this subject have, and why?" -- the certification and console query.
+CREATE INDEX idx_entitlement_provenance_subject
+    ON public.entitlement_provenance(workspace_id, subject_type, subject_id)
+    WHERE revoked_at IS NULL;
+-- The expiry worker's sweep.
+CREATE INDEX idx_entitlement_provenance_expiring
+    ON public.entitlement_provenance(expires_at)
+    WHERE revoked_at IS NULL AND expires_at IS NOT NULL;
+-- "Show me every standing grant" -- the first page of any campaign.
+CREATE INDEX idx_entitlement_provenance_standing
+    ON public.entitlement_provenance(workspace_id)
+    WHERE revoked_at IS NULL AND is_standing;
+CREATE INDEX idx_entitlement_provenance_agent
+    ON public.entitlement_provenance(discovered_agent_id)
+    WHERE discovered_agent_id IS NOT NULL;
+
+-- Governance RBAC permissions -- GLOBAL (workspace_id IS NULL), like discovery's
+-- above. governance:read is split from governance:admin so a reviewer can work a
+-- campaign without gaining the ability to grant anything.
+INSERT INTO public.permissions (id, workspace_id, resource, action, description, full_permission_string, created_at)
+VALUES
+    (gen_random_uuid(), NULL, 'governance', 'read',    'Read entitlement provenance and governance reports', 'governance:read',    NOW()),
+    (gen_random_uuid(), NULL, 'governance', 'certify', 'Decide certification items',                         'governance:certify', NOW()),
+    (gen_random_uuid(), NULL, 'governance', 'revoke',  'Revoke an entitlement',                              'governance:revoke',  NOW()),
+    (gen_random_uuid(), NULL, 'governance', 'admin',   'Manage governance policy and campaigns',             'governance:admin',   NOW())
+ON CONFLICT (resource, action) WHERE workspace_id IS NULL DO NOTHING;
+
+-- ============================================================================
+-- GOVERNANCE: separation of duties (PROVISIONING-GOVERNANCE-ARCHITECTURE.md §6.4)
+--
+-- TWO RULE SHAPES, because the agentic cases are not all classic SoD:
+--   'conflict'    -- holding capabilities from BOTH sides is the violation.
+--   'prohibition' -- one side only; holding ANY of these is the violation for the
+--                    subjects the rule applies to. This is what expresses "no agent
+--                    principal may hold role-management authority", which is not a
+--                    conflict between two duties but a capability an agent must never
+--                    have. Forcing it into the two-set shape would mean inventing a
+--                    fake second side.
+--
+-- Capabilities are named in the platform's OWN vocabulary (role ids, `resource:action`
+-- permission strings), so a rule means exactly what enforcement means. A parallel
+-- vocabulary is how an SoD engine drifts from the thing it polices, and a drifted
+-- engine gives false assurance -- worse than none.
+-- ============================================================================
+-- sod_rules ----------------------------------------------------------------
+--
+-- Capabilities are named in the platform's OWN vocabulary — role ids and
+-- `resource:action` permission strings — so a rule means exactly what enforcement
+-- means. Expressing rules in a parallel vocabulary is how an SoD engine drifts from
+-- the thing it is supposed to police, and a drifted engine gives false assurance,
+-- which is worse than none.
+--
+-- workspace_id NULL marks a GLOBAL rule, the same convention permissions use. Global
+-- + is_system rules are the seeded controls; the API refuses to edit or delete them.
+CREATE TABLE public.sod_rules (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid,
+    name          text NOT NULL,
+    description   text NOT NULL DEFAULT '',
+    kind          text NOT NULL DEFAULT 'conflict',
+    severity      text NOT NULL DEFAULT 'high',
+    enabled       boolean NOT NULL DEFAULT true,
+    -- A system rule is immutable through the API. The self-modification control has to
+    -- be un-editable, or an attacker who reaches the governance API simply turns it off
+    -- before escalating.
+    is_system     boolean NOT NULL DEFAULT false,
+    -- Which subjects the rule applies to. 'agents' means a service account that is an
+    -- agent's entitlement anchor (service_accounts.oauth_client_id IS NOT NULL) —
+    -- which is precisely the population the self-modification control targets.
+    subject_scope text NOT NULL DEFAULT 'any',
+
+    -- Side A. Always meaningful.
+    left_label       text NOT NULL DEFAULT '',
+    left_roles       text[] NOT NULL DEFAULT '{}',
+    left_permissions text[] NOT NULL DEFAULT '{}',
+
+    -- Side B. Empty for a prohibition.
+    right_label       text NOT NULL DEFAULT '',
+    right_roles       text[] NOT NULL DEFAULT '{}',
+    right_permissions text[] NOT NULL DEFAULT '{}',
+
+    -- 'block' refuses the grant in the preventive check; 'warn' records the violation
+    -- and allows it. Warn exists so a rule can be rolled out in observation mode
+    -- before it starts refusing real requests.
+    enforcement text NOT NULL DEFAULT 'block',
+
+    created_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT sod_rules_pkey PRIMARY KEY (id),
+    CONSTRAINT sod_rules_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT sod_rules_kind_chk CHECK (kind IN ('conflict', 'prohibition')),
+    CONSTRAINT sod_rules_severity_chk CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    CONSTRAINT sod_rules_subject_scope_chk CHECK (subject_scope IN ('any', 'agents', 'humans')),
+    CONSTRAINT sod_rules_enforcement_chk CHECK (enforcement IN ('block', 'warn')),
+    -- Side A must name something, or the rule matches everything.
+    CONSTRAINT sod_rules_left_nonempty_chk CHECK (
+        cardinality(left_roles) > 0 OR cardinality(left_permissions) > 0),
+    -- A conflict needs a second side; a prohibition must not have one, or it is
+    -- silently a conflict wearing the wrong label.
+    CONSTRAINT sod_rules_shape_chk CHECK (
+        (kind = 'conflict'
+            AND (cardinality(right_roles) > 0 OR cardinality(right_permissions) > 0))
+     OR (kind = 'prohibition'
+            AND cardinality(right_roles) = 0 AND cardinality(right_permissions) = 0))
+);
+
+-- One rule name per workspace. Partial-by-coalesce so global rules (workspace_id
+-- NULL) share one namespace rather than every NULL being distinct.
+CREATE UNIQUE INDEX sod_rules_name_key
+    ON public.sod_rules(COALESCE(workspace_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+CREATE INDEX idx_sod_rules_enabled
+    ON public.sod_rules(workspace_id) WHERE enabled;
+
+-- sod_violations -----------------------------------------------------------
+--
+-- Records the CONFLICTING PATHS, not just a flag. A reviewer told "this subject
+-- violates rule X" cannot act; one told "it holds governance:admin via role
+-- platform-admin, bound by binding <id>" can.
+CREATE TABLE public.sod_violations (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    rule_id      uuid NOT NULL,
+    rule_name    text NOT NULL DEFAULT '',
+
+    subject_type  text NOT NULL,
+    subject_id    uuid NOT NULL,
+    subject_label text NOT NULL DEFAULT '',
+
+    -- Which capabilities matched each side, and through which bindings.
+    left_evidence  jsonb NOT NULL DEFAULT '[]'::jsonb,
+    right_evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+
+    status text NOT NULL DEFAULT 'open',
+    -- 'accepted' is a documented risk acceptance, not a fix. It needs a note and an
+    -- owner, because an unexplained acceptance is indistinguishable from neglect.
+    resolution_note text NOT NULL DEFAULT '',
+    resolved_by     uuid,
+    resolved_at     timestamptz,
+
+    detected_at timestamptz NOT NULL DEFAULT now(),
+    -- Refreshed by each scan that still sees it, so an open violation's age is real.
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    -- 'preventive' means a grant was refused; 'detective' means a scan found an
+    -- existing one. Preventive rows are evidence of an attempt, which is worth
+    -- keeping distinct.
+    detected_via text NOT NULL DEFAULT 'detective',
+
+    CONSTRAINT sod_violations_pkey PRIMARY KEY (id),
+    CONSTRAINT sod_violations_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT sod_violations_rule_fkey FOREIGN KEY (rule_id)
+        REFERENCES public.sod_rules(id) ON DELETE CASCADE,
+    CONSTRAINT sod_violations_resolved_by_fkey FOREIGN KEY (resolved_by)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT sod_violations_status_chk CHECK (status IN ('open', 'accepted', 'remediated')),
+    CONSTRAINT sod_violations_detected_via_chk CHECK (detected_via IN ('preventive', 'detective')),
+    CONSTRAINT sod_violations_resolution_chk CHECK (
+        status = 'open' OR (resolved_at IS NOT NULL AND resolution_note <> ''))
+);
+
+-- One OPEN violation per (rule, subject). Re-detecting refreshes last_seen_at rather
+-- than piling up duplicates, so the count means "how many problems" and not "how many
+-- times the scan ran".
+CREATE UNIQUE INDEX sod_violations_open_key
+    ON public.sod_violations(workspace_id, rule_id, subject_type, subject_id)
+    WHERE status = 'open';
+CREATE INDEX idx_sod_violations_open
+    ON public.sod_violations(workspace_id, status, detected_at DESC);
+
+-- The seeded self-modification control -------------------------------------
+--
+-- An agent that can grant itself permissions is not governed, whatever the inventory
+-- says. This is the preventive half of that control; the other half is that the PDP
+-- resolves no scope for a binding an agent does not hold.
+--
+-- GLOBAL and is_system, so it applies in every workspace and cannot be edited or
+-- disabled through the API. 'prohibition' rather than 'conflict' because these are
+-- capabilities an agent must never hold at all, not two duties that must stay apart.
+INSERT INTO public.sod_rules
+    (workspace_id, name, description, kind, severity, is_system, subject_scope,
+     left_label, left_permissions, enforcement, created_by)
+VALUES (
+    NULL,
+    'agent-self-modification',
+    'An agent principal may not hold governance, role-management, or binding-write '
+        || 'authority. An agent that can widen its own access is ungoverned however '
+        || 'complete its inventory record looks.',
+    'prohibition',
+    'critical',
+    true,
+    'agents',
+    'governance and role-management authority',
+    ARRAY[
+        'governance:admin',
+        'governance:revoke',
+        'governance:certify',
+        'roles:create', 'roles:update', 'roles:delete',
+        'role_bindings:create', 'role_bindings:update', 'role_bindings:delete',
+        'permissions:create', 'permissions:update', 'permissions:delete',
+        'discovery:claim', 'discovery:admin'
+    ]::text[],
+    'block',
+    'system'
+)
+ON CONFLICT (COALESCE(workspace_id, '00000000-0000-0000-0000-000000000000'::uuid), name)
+DO NOTHING;
+
+-- verify -------------------------------------------------------------------
+SELECT to_regclass('public.sod_rules')      AS rules_table,
+       to_regclass('public.sod_violations')  AS violations_table,
+       (SELECT count(*) FROM public.sod_rules WHERE is_system) AS system_rules;
+
+-- ============================================================================
+-- GOVERNANCE: access certification (PROVISIONING-GOVERNANCE-ARCHITECTURE.md §6.3)
+--
+-- Periodically the accountable human for each entitlement confirms it is still needed
+-- or revokes it. It exists because access accumulates -- people request, nobody
+-- removes -- and because an auditor wants evidence a NAMED person reviewed.
+--
+-- The queue here is deliberately small. Traditional certification exists because all
+-- access is standing; PG-4 inverted that, so most grants expire rather than needing
+-- review. What genuinely needs certifying is the STANDING grants, which is why
+-- standing_only is the default scope.
+--
+-- ITEMS ARE SNAPSHOTS. Certifying against live data means the thing you approved can
+-- change under you mid-review, and the frozen export would not match what the reviewer
+-- actually saw.
+-- ============================================================================
+-- certification_campaigns --------------------------------------------------
+CREATE TABLE public.certification_campaigns (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    name         text NOT NULL,
+    description  text NOT NULL DEFAULT '',
+
+    -- What to review. Typed in Go (services.CampaignScope) but stored as jsonb, so a
+    -- new filter dimension does not need a migration. Empty means the default:
+    -- standing grants only.
+    scope jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    status text NOT NULL DEFAULT 'draft',
+    -- Reviewers get until this date; past it, items are overdue and escalate to the
+    -- workspace owner. A campaign with no deadline is one nobody finishes.
+    due_at timestamptz,
+
+    -- The frozen export, written at close. This is the artifact an auditor reads, so
+    -- it is stored rather than recomputed: recomputing it later would reflect the
+    -- world as it is now, not as the reviewer found it.
+    export      jsonb,
+    generated_at timestamptz,
+    closed_at    timestamptz,
+    closed_by    uuid,
+
+    -- Denormalised counters, maintained as decisions land, so a campaign list does not
+    -- need an aggregate over every item.
+    items_total    integer NOT NULL DEFAULT 0,
+    items_decided  integer NOT NULL DEFAULT 0,
+    items_kept     integer NOT NULL DEFAULT 0,
+    items_revoked  integer NOT NULL DEFAULT 0,
+
+    created_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT certification_campaigns_pkey PRIMARY KEY (id),
+    CONSTRAINT certification_campaigns_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT certification_campaigns_closed_by_fkey FOREIGN KEY (closed_by)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT certification_campaigns_status_chk CHECK (
+        status IN ('draft', 'active', 'closed')),
+    -- A closed campaign must have its export. Without this, "closed" could mean
+    -- "abandoned" and the audit artifact would be silently absent.
+    CONSTRAINT certification_campaigns_closed_chk CHECK (
+        status <> 'closed' OR (closed_at IS NOT NULL AND export IS NOT NULL)),
+    -- An active campaign must have been generated: an active campaign with no items is
+    -- a review nobody can perform.
+    CONSTRAINT certification_campaigns_active_chk CHECK (
+        status <> 'active' OR generated_at IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX certification_campaigns_name_key
+    ON public.certification_campaigns(workspace_id, name);
+CREATE INDEX idx_certification_campaigns_status
+    ON public.certification_campaigns(workspace_id, status, due_at);
+
+-- certification_items ------------------------------------------------------
+--
+-- One entitlement under review. entitlement_provenance_id is the anchor: provenance is
+-- already the append-only record of WHY a grant exists, so an item points at it rather
+-- than re-deriving the justification.
+CREATE TABLE public.certification_items (
+    id          uuid NOT NULL DEFAULT gen_random_uuid(),
+    campaign_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
+
+    -- ON DELETE SET NULL, not CASCADE: an item must survive its provenance row being
+    -- removed, or closing a campaign could lose the very record it certified.
+    entitlement_provenance_id uuid,
+
+    -- The SNAPSHOT. Everything the reviewer saw, frozen at generation.
+    subject_type  text NOT NULL,
+    subject_id    uuid NOT NULL,
+    subject_label text NOT NULL DEFAULT '',
+    entitlement_label text NOT NULL DEFAULT '',
+    entitlement_type  text NOT NULL DEFAULT '',
+    snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Assembled evidence: why it was granted, whether it has ever been used, whether
+    -- the workload is still running, and any open SoD violation. This is the
+    -- difference between a real review and a rubber stamp.
+    evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Who has to decide, resolved at generation: resource-server owner -> the human who
+    -- granted it -> workspace owner. Frozen, so a later ownership change cannot
+    -- silently move an in-flight review.
+    reviewer_user_id uuid,
+    reviewer_label   text NOT NULL DEFAULT '',
+    reviewer_source  text NOT NULL DEFAULT '',
+
+    decision      text NOT NULL DEFAULT 'pending',
+    decision_note text NOT NULL DEFAULT '',
+    decided_by    uuid,
+    decided_at    timestamptz,
+    -- Set when a 'revoke' decision was actually carried out, so a decision that failed
+    -- to execute is visibly distinct from one that succeeded.
+    revocation_executed_at timestamptz,
+
+    created_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT certification_items_pkey PRIMARY KEY (id),
+    CONSTRAINT certification_items_campaign_fkey FOREIGN KEY (campaign_id)
+        REFERENCES public.certification_campaigns(id) ON DELETE CASCADE,
+    CONSTRAINT certification_items_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT certification_items_provenance_fkey FOREIGN KEY (entitlement_provenance_id)
+        REFERENCES public.entitlement_provenance(id) ON DELETE SET NULL,
+    CONSTRAINT certification_items_reviewer_fkey FOREIGN KEY (reviewer_user_id)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT certification_items_decided_by_fkey FOREIGN KEY (decided_by)
+        REFERENCES public.users(id) ON DELETE SET NULL,
+    CONSTRAINT certification_items_decision_chk CHECK (
+        decision IN ('pending', 'keep', 'revoke', 'delegate')),
+    -- A decision must record who made it and when. An undated decision is not evidence.
+    CONSTRAINT certification_items_decided_chk CHECK (
+        decision = 'pending' OR (decided_at IS NOT NULL)),
+    -- Keeping an entitlement needs a reason as much as revoking one does: "keep"
+    -- without justification is exactly the rubber stamp certification exists to stop.
+    CONSTRAINT certification_items_keep_note_chk CHECK (
+        decision <> 'keep' OR decision_note <> '')
+);
+
+-- One item per entitlement per campaign. Without this, re-running generation would
+-- duplicate the reviewer's work and double-count the campaign totals.
+CREATE UNIQUE INDEX certification_items_unique_key
+    ON public.certification_items(campaign_id, entitlement_provenance_id)
+    WHERE entitlement_provenance_id IS NOT NULL;
+
+-- The reviewer's queue.
+CREATE INDEX idx_certification_items_reviewer
+    ON public.certification_items(workspace_id, reviewer_user_id, decision);
+CREATE INDEX idx_certification_items_campaign
+    ON public.certification_items(campaign_id, decision);
+
+-- verify -------------------------------------------------------------------
+SELECT to_regclass('public.certification_campaigns') AS campaigns_table,
+       to_regclass('public.certification_items')     AS items_table;
+
+-- ============================================================================
+-- GOVERNANCE: in-cluster actuation (PROVISIONING-GOVERNANCE-ARCHITECTURE.md §6.6)
+--
+-- NOT credential delivery. AuthSec's workload identity model is SECRETLESS: a workload
+-- authenticates with a `spiffe-svid` client assertion using an SVID it already holds,
+-- so governance grants access to an identity the workload has rather than shipping one
+-- to it. What genuinely needs in-cluster action is quarantine ENFORCEMENT (a
+-- NetworkPolicy -- `status='quarantined'` was advisory, enforced by nothing) and
+-- verifying that a workload really runs as the ServiceAccount its entitlements are
+-- anchored to.
+--
+-- Pull-based: the control plane cannot reach into a customer's cluster and should not
+-- want to. An inbound connection is a hole in their network; an outbound poll is not.
+-- Leases rather than locks, so a crashed agent's work returns to the queue -- which is
+-- why every instruction kind must be idempotent.
+-- ============================================================================
+-- provisioning_instructions -------------------------------------------------
+--
+-- A pull-based work queue, one row per cluster-side action. Pull rather than push
+-- because the control plane cannot reach into a customer's cluster, and should not want
+-- to: an inbound connection is a hole in their network, an outbound poll is not.
+--
+-- LEASES, NOT LOCKS. An agent claims work with a time-bounded lease. If it crashes
+-- mid-apply the lease expires and the instruction returns to pending, so work is never
+-- silently lost -- at the cost of a possible re-apply, which is why every instruction
+-- kind must be idempotent.
+CREATE TABLE public.provisioning_instructions (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    -- Which cluster is responsible. NOT NULL: an instruction nobody owns is one nobody
+    -- applies, and silently queuing work for a cluster that has no agent is worse than
+    -- refusing to queue it.
+    discovery_source_id uuid NOT NULL,
+
+    kind    text NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- What this instruction is about, for the console and for dedupe.
+    discovered_agent_id uuid,
+    fingerprint         text NOT NULL DEFAULT '',
+
+    -- Collapses a re-issued instruction onto the existing row rather than queuing the
+    -- same action twice. Quarantining an already-quarantined agent should be a no-op,
+    -- not a second NetworkPolicy write.
+    idempotency_key text NOT NULL,
+
+    status   text NOT NULL DEFAULT 'pending',
+    attempts integer NOT NULL DEFAULT 0,
+
+    lease_expires_at timestamptz,
+    leased_by        text NOT NULL DEFAULT '',
+    applied_at       timestamptz,
+    -- What the agent reported. For verify_uptake this is the ANSWER, not just an
+    -- acknowledgement, which is why it is structured rather than a status flag.
+    result jsonb,
+    error  text NOT NULL DEFAULT '',
+
+    created_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT provisioning_instructions_pkey PRIMARY KEY (id),
+    CONSTRAINT provisioning_instructions_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT provisioning_instructions_source_fkey FOREIGN KEY (discovery_source_id)
+        REFERENCES public.discovery_sources(id) ON DELETE CASCADE,
+    CONSTRAINT provisioning_instructions_agent_fkey FOREIGN KEY (discovered_agent_id)
+        REFERENCES public.discovered_agents(id) ON DELETE SET NULL,
+    CONSTRAINT provisioning_instructions_kind_chk CHECK (
+        kind IN ('quarantine', 'unquarantine', 'verify_uptake')),
+    -- 'superseded' is an instruction overtaken by a newer, contradicting decision
+    -- before it was applied — a quarantine released before the cluster agent polled.
+    -- Kept rather than deleted so an operator can see the decision was overtaken
+    -- rather than find a gap where a row used to be. Not "open", so it never blocks a
+    -- later enqueue for the same key.
+    CONSTRAINT provisioning_instructions_status_chk CHECK (
+        status IN ('pending', 'leased', 'applied', 'failed', 'superseded')),
+    -- A terminal instruction must say when it finished. An applied row with no
+    -- timestamp cannot be reasoned about later.
+    CONSTRAINT provisioning_instructions_terminal_chk CHECK (
+        status NOT IN ('applied', 'failed') OR applied_at IS NOT NULL),
+    -- A failure must say why, or the console can only report that something went wrong.
+    CONSTRAINT provisioning_instructions_failure_chk CHECK (
+        status <> 'failed' OR error <> '')
+);
+
+-- One OPEN instruction per idempotency key. Partial, so the history of completed
+-- instructions is unconstrained and an agent can be quarantined, released, and
+-- quarantined again.
+CREATE UNIQUE INDEX provisioning_instructions_open_key
+    ON public.provisioning_instructions(discovery_source_id, idempotency_key)
+    WHERE status IN ('pending', 'leased');
+
+-- The agent's poll: pending work for my cluster, oldest first.
+CREATE INDEX idx_provisioning_instructions_queue
+    ON public.provisioning_instructions(discovery_source_id, status, created_at);
+-- The lease reaper.
+CREATE INDEX idx_provisioning_instructions_leases
+    ON public.provisioning_instructions(lease_expires_at)
+    WHERE status = 'leased';
+CREATE INDEX idx_provisioning_instructions_agent
+    ON public.provisioning_instructions(discovered_agent_id)
+    WHERE discovered_agent_id IS NOT NULL;
+
+
+-- ============================================================================
+-- GOVERNANCE: human lifecycle (joiner / mover / leaver)
+--
+-- RECONCILED, not event-driven. ARCHITECTURE.md §4.5 proposed consuming scim_events;
+-- that table is an HTTP AUDIT LOG (method, path, status_code) with no semantic payload,
+-- so `PATCH /Users/123` could be a rename, a deactivation, or a group edit and the
+-- before/after state is recorded nowhere. JML cannot be derived from it.
+--
+-- Reconciling is strictly better anyway: it catches changes made through ANY path (SCIM,
+-- console, direct SQL), it is idempotent and self-healing, and it needs no cursor --
+-- desired state is computable from birthright policies and actual state is already in
+-- entitlement_provenance (origin='birthright').
+--
+-- NOTE: the authoritative deactivation flag on `users` is `active` (models.User.Active,
+-- and what the SCIM controller writes). `is_active` is a vestigial duplicate with no
+-- model field and no writer -- reading it would make a leaver invisible.
+-- ============================================================================
+-- birthright_policies -------------------------------------------------------
+--
+-- "Everyone in this group gets this role on this Application." The joiner half of JML,
+-- and the thing a mover diff is computed against.
+--
+-- Matching is GROUP-based (or workspace-wide). Deliberately not department- or
+-- title-based: `users` has no such column, and inventing one would mean matching on a
+-- field nothing populates.
+CREATE TABLE public.birthright_policies (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    name         text NOT NULL,
+    description  text NOT NULL DEFAULT '',
+
+    -- WHO it applies to.
+    match_kind     text NOT NULL DEFAULT 'group',
+    match_group_id uuid,
+
+    -- WHAT they get.
+    resource_server_id uuid NOT NULL,
+    role_id            uuid NOT NULL,
+
+    -- FOR HOW LONG. NULL duration means a STANDING grant, which the provenance layer
+    -- requires a justification for -- so the same "ephemeral by default, permanent is
+    -- the audited exception" rule applies to birthrights as to everything else.
+    duration      interval,
+    justification text NOT NULL DEFAULT '',
+
+    -- What to do when a user STOPS matching (the mover case). Default 'flag', because
+    -- auto-revoking on a group change would let a mistyped group membership take
+    -- someone's access away with no human in the loop. Revoking is opt-in per policy.
+    on_unmatch text NOT NULL DEFAULT 'flag',
+
+    enabled    boolean NOT NULL DEFAULT true,
+    created_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT birthright_policies_pkey PRIMARY KEY (id),
+    CONSTRAINT birthright_policies_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT birthright_policies_group_fkey FOREIGN KEY (match_group_id)
+        REFERENCES public.groups(id) ON DELETE CASCADE,
+    CONSTRAINT birthright_policies_rs_fkey FOREIGN KEY (resource_server_id)
+        REFERENCES public.resource_servers(id) ON DELETE CASCADE,
+    CONSTRAINT birthright_policies_role_fkey FOREIGN KEY (role_id)
+        REFERENCES public.roles(id) ON DELETE CASCADE,
+    CONSTRAINT birthright_policies_match_kind_chk CHECK (match_kind IN ('group', 'all')),
+    CONSTRAINT birthright_policies_on_unmatch_chk CHECK (on_unmatch IN ('flag', 'revoke')),
+    -- A group policy must name a group; an 'all' policy must not, or it would look
+    -- scoped while applying to everyone.
+    CONSTRAINT birthright_policies_match_chk CHECK (
+        (match_kind = 'group' AND match_group_id IS NOT NULL)
+     OR (match_kind = 'all'   AND match_group_id IS NULL)),
+    -- A standing birthright must say why it is permanent, mirroring the provenance
+    -- rule. Without this, "no duration" would quietly become the easy default for
+    -- policies that apply to entire groups -- the widest blast radius there is.
+    CONSTRAINT birthright_policies_standing_chk CHECK (
+        duration IS NOT NULL OR justification <> ''),
+    CONSTRAINT birthright_policies_name_key UNIQUE (workspace_id, name)
+);
+
+-- One policy per (match, grant) target. Stops two identically-scoped policies both
+-- granting the same role, which would make the reconcile's "does this grant still have
+-- a matching policy?" question ambiguous.
+CREATE UNIQUE INDEX birthright_policies_target_key
+    ON public.birthright_policies(
+        workspace_id, match_kind,
+        COALESCE(match_group_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        resource_server_id, role_id);
+
+CREATE INDEX idx_birthright_policies_enabled
+    ON public.birthright_policies(workspace_id) WHERE enabled;
+CREATE INDEX idx_birthright_policies_group
+    ON public.birthright_policies(match_group_id) WHERE match_group_id IS NOT NULL;
+
+-- ============================================================================
+-- Bridge: the k8s runtime inventory <-> the correlated IGA estate.
+-- Two agent models coexist and neither subsumes the other: discovered_agents is
+-- what is actually running in a cluster, iga_agents is the logical agent across
+-- every channel. This is the join, and it only ever PROPOSES -- the models share
+-- no identifier, so a weak link needs a recorded human decision (the CHECK below
+-- mirrors iga_correlations_weak_chk).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.discovered_agent_iga_links (
+    id                  uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid NOT NULL,
+    discovered_agent_id uuid NOT NULL,
+    iga_agent_id        uuid NOT NULL,
+
+    -- The evidence. Recorded so a reviewer can see WHY this was proposed rather
+    -- than being asked to trust it: an unexplained proposal is one a reviewer can
+    -- only rubber-stamp.
+    join_key text NOT NULL DEFAULT '',
+    strength text NOT NULL DEFAULT 'weak',
+
+    state      text NOT NULL DEFAULT 'proposed',
+    decided_by uuid,
+    decided_at timestamptz,
+
+    -- Optimistic concurrency, matching the iga_* decision routes: a decision
+    -- carrying a stale version is rejected rather than silently winning.
+    version bigint NOT NULL DEFAULT 1,
+
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT discovered_agent_iga_links_pkey PRIMARY KEY (id),
+    CONSTRAINT discovered_agent_iga_links_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- CASCADE on both sides: if either entity goes, the claim that they are the
+    -- same thing is meaningless. This is what makes an invalid state
+    -- unrepresentable rather than merely unlikely.
+    CONSTRAINT discovered_agent_iga_links_agent_fkey FOREIGN KEY (discovered_agent_id)
+        REFERENCES public.discovered_agents(id) ON DELETE CASCADE,
+    CONSTRAINT discovered_agent_iga_links_iga_fkey FOREIGN KEY (workspace_id, iga_agent_id)
+        REFERENCES public.iga_agents (workspace_id, id) ON DELETE CASCADE,
+
+    CONSTRAINT discovered_agent_iga_links_strength_chk CHECK (strength IN ('strong', 'weak')),
+    CONSTRAINT discovered_agent_iga_links_state_chk CHECK (
+        state IN ('proposed', 'accepted', 'rejected')),
+    -- Mirrors iga_correlations_weak_chk. A weak join that claims accepted status
+    -- without a decision is a bug, not a shortcut.
+    CONSTRAINT discovered_agent_iga_links_weak_chk CHECK (
+        state <> 'accepted' OR strength = 'strong' OR decided_by IS NOT NULL),
+    -- A decision must say when it happened, or it cannot be reasoned about later.
+    CONSTRAINT discovered_agent_iga_links_decided_chk CHECK (
+        state = 'proposed' OR decided_at IS NOT NULL),
+
+    -- One link per discovered agent: a k8s workload is one logical agent, or none.
+    -- Re-proposing therefore updates in place rather than accumulating rows, and
+    -- the repository refuses to overwrite a link that has already been DECIDED --
+    -- so a rejected link stays rejected instead of being re-proposed on every
+    -- sighting.
+    CONSTRAINT discovered_agent_iga_links_agent_key UNIQUE (workspace_id, discovered_agent_id)
+);
+
+-- The reverse join: "which running workloads are believed to be this agent?"
+CREATE INDEX IF NOT EXISTS idx_discovered_agent_iga_links_iga
+    ON public.discovered_agent_iga_links(workspace_id, iga_agent_id);
+
+-- A reviewer's queue: proposals still awaiting a decision.
+CREATE INDEX IF NOT EXISTS idx_discovered_agent_iga_links_proposed
+    ON public.discovered_agent_iga_links(workspace_id) WHERE state = 'proposed';

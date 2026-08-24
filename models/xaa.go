@@ -75,8 +75,16 @@ type AccessRequest struct {
 	CreatedAt            time.Time  `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt            time.Time  `json:"updated_at" gorm:"not null;default:now()"`
 	ExpiresAt            *time.Time `json:"expires_at,omitempty" gorm:"type:timestamptz"`
-	DecidedBy            *uuid.UUID `json:"decided_by,omitempty" gorm:"type:uuid"`
-	DecidedAt            *time.Time `json:"decided_at,omitempty" gorm:"type:timestamptz"`
+	// Governance intent, added with entitlement provenance. Justification and Purpose
+	// are carried into the provenance record on approval; RequestedDuration is what the
+	// requester ASKED for, as distinct from ExpiresAt, which is what they were granted.
+	Justification     string         `json:"justification" gorm:"type:text;not null;default:''"`
+	Purpose           string         `json:"purpose" gorm:"type:text;not null;default:''"`
+	RequestOrigin     string         `json:"request_origin" gorm:"type:text;not null;default:'admin'"`
+	RequestedDuration *time.Duration `json:"requested_duration,omitempty" gorm:"type:interval"`
+	DiscoveredAgentID *uuid.UUID     `json:"discovered_agent_id,omitempty" gorm:"type:uuid"`
+	DecidedBy         *uuid.UUID     `json:"decided_by,omitempty" gorm:"type:uuid"`
+	DecidedAt         *time.Time     `json:"decided_at,omitempty" gorm:"type:timestamptz"`
 }
 
 func (AccessRequest) TableName() string { return "access_requests" }

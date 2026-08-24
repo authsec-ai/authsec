@@ -35,6 +35,11 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 			introspection_secret        TEXT,
 			introspection_secret_hash   TEXT,
 			active                      NUMERIC,
+			-- models.ResourceServer.Managed exists but was never added here, so
+			-- Create() failed on an unknown column. Not a production issue: the
+			-- real schema has it (001_bootstrap.sql), only this hand-rolled
+			-- sqlite fixture was out of date.
+			managed                     NUMERIC NOT NULL DEFAULT 0,
 			state                       TEXT NOT NULL,
 			setup_completed_at          DATETIME,
 			setup_completed_by          TEXT,
