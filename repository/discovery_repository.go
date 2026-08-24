@@ -25,6 +25,7 @@ type DiscoveryRepository interface {
 	CreateSource(s *models.DiscoverySource) error
 	GetSource(workspaceID, id uuid.UUID) (*models.DiscoverySource, error)
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
+	TouchSource(workspaceID, id uuid.UUID, status string) error
 	UpdateSource(s *models.DiscoverySource) error
 	DeleteSource(workspaceID, id uuid.UUID) error
 
@@ -106,8 +107,49 @@ func (r *discoveryRepository) ListSources(workspaceID uuid.UUID, kind string, en
 		q = q.Where("enabled = ?", true)
 	}
 	var sources []models.DiscoverySource
-	err := q.Order("kind, display_name").Find(&sources).Error
-	return sources, err
+	if err := q.Order("kind, display_name").Find(&sources).Error; err != nil {
+		return nil, err
+	}
+	if len(sources) == 0 {
+		return sources, nil
+	}
+
+	// One grouped query for the whole page rather than a count per row.
+	type row struct {
+		DiscoverySourceID uuid.UUID
+		N                 int64
+	}
+	var rows []row
+	if err := r.db.Model(&models.DiscoveredAgent{}).
+		Select("discovery_source_id, count(*) AS n").
+		Where("workspace_id = ? AND discovery_source_id IS NOT NULL", workspaceID).
+		Group("discovery_source_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	counts := make(map[uuid.UUID]int64, len(rows))
+	for _, x := range rows {
+		counts[x.DiscoverySourceID] = x.N
+	}
+	for i := range sources {
+		sources[i].AgentCount = counts[sources[i].ID]
+	}
+	return sources, nil
+}
+
+// TouchSource records that a source just reported. Best-effort: a sighting must
+// never fail because the liveness stamp could not be written, so the caller
+// ignores the error. Without this, last_sync_at is never written by anything and
+// the console shows every integration as "Never run" forever.
+func (r *discoveryRepository) TouchSource(workspaceID, id uuid.UUID, status string) error {
+	return r.db.Model(&models.DiscoverySource{}).
+		Where("workspace_id = ? AND id = ?", workspaceID, id).
+		Updates(map[string]interface{}{
+			"last_sync_at": time.Now(),
+			"last_status":  status,
+			"last_error":   "",
+			"updated_at":   time.Now(),
+		}).Error
 }
 
 func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {

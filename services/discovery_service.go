@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -252,7 +253,20 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 		CreatedBy:         reportedBy,
 	}
 
-	return m.repo.UpsertSighting(agent)
+	stored, created, err := m.repo.UpsertSighting(agent)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Record that this source is alive. Best-effort by design: a failed liveness
+	// stamp must never cost us the sighting itself, which is the actual payload.
+	if in.DiscoverySourceID != nil {
+		if terr := m.repo.TouchSource(workspaceID, *in.DiscoverySourceID, "ok"); terr != nil {
+			log.Printf("[discovery] could not stamp source %s as live: %v",
+				in.DiscoverySourceID, terr)
+		}
+	}
+	return stored, created, nil
 }
 
 /* -------------------------------- agents -------------------------------- */
