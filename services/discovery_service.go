@@ -218,11 +218,16 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	if !containsString(models.ValidDeploymentOrigins(), origin) {
 		return nil, false, fmt.Errorf("unknown deployment origin %q", origin)
 	}
-	// A repo scan needs no inference: anything it finds came from a
-	// version-controlled declaration, so it is automated by construction.
-	if in.Source == models.DiscoverySourceRepoScan {
-		origin = models.DeploymentOriginAutomated
-	}
+	// A repo scan finding is a DECLARATION, not a deployment: the file may
+	// never have run, and nothing in it says how it would be deployed if it
+	// did. This function used to force "automated" here regardless of what
+	// the caller passed, on the reasoning that anything version-controlled is
+	// automated by construction — that reasoning was rejected when the GitHub
+	// scanner was built (services/discovery_github_scanner.go now passes
+	// "unknown" explicitly for exactly this reason), but this second,
+	// independent override sat downstream of it and silently put "automated"
+	// back on every repo_scan row regardless. Removed rather than special-cased
+	// again: origin is the caller's call, this function's job is validation.
 
 	// If the connector names a source, it must be one in this workspace —
 	// otherwise the row would point at another workspace's connector.
