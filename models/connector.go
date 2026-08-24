@@ -218,10 +218,13 @@ type ConnectorProviderApp struct {
 	// AppKind: 'oauth2' (code-exchange, ClientID+RedirectURI, secret in Vault) or
 	// 'github_app' (JWT-signed installation tokens, GitHubAppID + private-key PEM
 	// in Vault, no redirect).
-	AppKind     string    `json:"app_kind" gorm:"not null;default:'oauth2'"`
-	ClientID    string    `json:"client_id" gorm:"not null;default:''"`
-	RedirectURI string    `json:"redirect_uri" gorm:"not null;default:''"`
-	GitHubAppID string    `json:"github_app_id" gorm:"not null;default:''"`
+	AppKind     string `json:"app_kind" gorm:"not null;default:'oauth2'"`
+	ClientID    string `json:"client_id" gorm:"not null;default:''"`
+	RedirectURI string `json:"redirect_uri" gorm:"not null;default:''"`
+	// Explicit column, because GORM's default naming splits "GitHub" into
+	// git_hub and would look for a git_hub_app_id column that does not exist.
+	// Every other acronym field here carries the same tag for the same reason.
+	GitHubAppID string    `json:"github_app_id" gorm:"column:github_app_id;not null;default:''"`
 	VaultPath   string    `json:"-" gorm:"not null"` // secret location; NEVER serialized
 	CreatedBy   string    `json:"created_by,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
