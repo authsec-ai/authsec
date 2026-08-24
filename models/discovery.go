@@ -89,6 +89,11 @@ type DiscoverySource struct {
 	CreatedBy   string          `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
+
+	// AgentCount is how many discovered agents this source has produced. Computed
+	// on read, not stored — a count that can drift from the rows it counts is
+	// worse than no count. gorm:"-" keeps it out of every write.
+	AgentCount int64 `json:"agent_count" gorm:"-"`
 }
 
 func (DiscoverySource) TableName() string { return "discovery_sources" }

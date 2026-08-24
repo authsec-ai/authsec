@@ -3,6 +3,8 @@ package connectoradapters
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,7 +23,11 @@ import (
 
 // GitHubAppCreds is what the broker resolves for a github_app connection: the
 // App's numeric id, its private-key PEM, and the installation id to mint for.
+//
+// WorkspaceID is required and is part of the cache key. It is not used to talk
+// to GitHub — it exists so one tenant's token can never be served to another.
 type GitHubAppCreds struct {
+	WorkspaceID    string
 	AppID          string
 	PrivateKeyPEM  string
 	InstallationID string
@@ -33,9 +39,47 @@ type ghInstallToken struct {
 }
 
 var (
-	ghTokenCache   = map[string]ghInstallToken{} // key: appID + ":" + installationID
+	ghTokenCache   = map[string]ghInstallToken{}
 	ghTokenCacheMu sync.Mutex
 )
+
+// ghCacheKey scopes a cached installation token so that it can only ever be
+// returned to the exact caller that earned it.
+//
+// Both `app_id` and `installation_id` are public values, and both arrive from
+// caller-supplied input on some paths (a request body, and an
+// X-GitHub-Installation-ID header). Keying on those two alone means a caller
+// who names another tenant's app+installation pair receives that tenant's live
+// token straight from the cache — before the private key is ever exercised, so
+// holding a valid key is not required. Two additions close that:
+//
+//   - workspace: a token minted for one workspace is unreachable from another.
+//   - key fingerprint: a caller presenting a wrong or forged private key lands
+//     on a different key entirely, so it cannot hit a legitimate entry and is
+//     forced down the minting path, where GitHub rejects the bad signature.
+//
+// The fingerprint is of the PEM, never logged, and only ever compared.
+func ghCacheKey(creds GitHubAppCreds) string {
+	sum := sha256.Sum256([]byte(creds.PrivateKeyPEM))
+	return strings.Join([]string{
+		creds.WorkspaceID,
+		creds.AppID,
+		creds.InstallationID,
+		hex.EncodeToString(sum[:8]),
+	}, ":")
+}
+
+// evictExpiredLocked drops entries that can no longer be served. Callers hold
+// ghTokenCacheMu. Without this the map only ever grows: every workspace ×
+// installation pair the process has ever seen stays resident for the life of
+// the process.
+func evictExpiredLocked(now time.Time) {
+	for k, v := range ghTokenCache {
+		if !v.expires.After(now) {
+			delete(ghTokenCache, k)
+		}
+	}
+}
 
 // MintGitHubInstallationToken returns a valid installation access token for the
 // given App + installation, minting a fresh one (and caching it) when the cached
@@ -45,13 +89,19 @@ func MintGitHubInstallationToken(ctx context.Context, creds GitHubAppCreds) (str
 	if creds.AppID == "" || creds.PrivateKeyPEM == "" || creds.InstallationID == "" {
 		return "", fmt.Errorf("github app credentials incomplete (need app_id, private key, installation id)")
 	}
-	cacheKey := creds.AppID + ":" + creds.InstallationID
+	// Refused rather than defaulted: a blank workspace would collapse every
+	// tenant onto one cache key, which is the defect this guards against.
+	if creds.WorkspaceID == "" {
+		return "", fmt.Errorf("github app credentials incomplete (workspace is required to scope the token cache)")
+	}
+	cacheKey := ghCacheKey(creds)
 
 	ghTokenCacheMu.Lock()
 	if t, ok := ghTokenCache[cacheKey]; ok && time.Until(t.expires) > 5*time.Minute {
 		ghTokenCacheMu.Unlock()
 		return t.token, nil
 	}
+	evictExpiredLocked(time.Now())
 	ghTokenCacheMu.Unlock()
 
 	appJWT, err := signGitHubAppJWT(creds.AppID, creds.PrivateKeyPEM)

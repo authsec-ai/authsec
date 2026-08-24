@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/authsec-ai/authsec/internal/connectoradapters"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
@@ -58,10 +57,12 @@ func NewGitHubProvider() *GitHubProvider {
 		APIVersion: "2022-11-28",
 		MaxRetries: 4,
 		etags:      map[string]string{},
-		TokenFn: func(ctx context.Context, in ProviderContext) (string, error) {
-			return connectoradapters.MintGitHubInstallationToken(ctx, connectoradapters.GitHubAppCreds{
-				InstallationID: in.InstallationID,
-			})
+		// Default TokenFn: deliberately inert. It holds no App id and no private
+		// key, so it could never mint anything — returning a clear error beats a
+		// call that reads as wired and fails at GitHub. Real tokens come from
+		// NewGitHubProviderFromConnector, which resolves the workspace's App.
+		TokenFn: func(_ context.Context, _ ProviderContext) (string, error) {
+			return "", fmt.Errorf("no GitHub credentials bound: build this provider with NewGitHubProviderFromConnector")
 		},
 	}
 }

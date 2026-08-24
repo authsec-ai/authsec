@@ -347,6 +347,7 @@ func (s *ConnectorOAuthService) MintGitHubAppToken(ctx context.Context, workspac
 		return "", errors.New("connection has no GitHub App installation id")
 	}
 	return connectoradapters.MintGitHubInstallationToken(ctx, connectoradapters.GitHubAppCreds{
+		WorkspaceID:    workspaceID.String(),
 		AppID:          app.GitHubAppID,
 		PrivateKeyPEM:  privateKey,
 		InstallationID: installationID,
@@ -417,6 +418,24 @@ func (s *ConnectorOAuthService) ConnectGitHubApp(workspaceID, connectorID uuid.U
 	}
 	if _, err := s.repo.GetProviderApp(workspaceID, "github"); err != nil {
 		return errors.New("configure the workspace GitHub App first")
+	}
+
+	// Prove the installation is ours before recording it.
+	//
+	// installation_id arrives from caller-supplied input (a request body here, an
+	// X-GitHub-Installation-ID header elsewhere) and is not a secret — it is
+	// visible in GitHub URLs and webhook payloads. Stored unverified, it lets a
+	// workspace bind an installation belonging to somebody else's organisation
+	// and then have this service mint tokens against it.
+	//
+	// Minting is itself the verification: GitHub only issues an installation
+	// token when the App identified by our workspace's own key is actually
+	// installed there. A foreign installation fails, and a successful call warms
+	// the cache legitimately, so this costs nothing on the happy path.
+	if _, err := s.MintGitHubAppToken(context.Background(), workspaceID, "github",
+		&models.ConnectorConnection{ExternalAccountID: installationID}); err != nil {
+		return fmt.Errorf("installation %s is not reachable with this workspace's GitHub App; "+
+			"check that the App is installed on that organisation: %w", installationID, err)
 	}
 	// The github_app connection carries no Vault secret of its own (tokens are
 	// minted from the provider-app key); vault_path points at the app key path.

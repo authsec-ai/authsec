@@ -295,7 +295,10 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 				// Anything found by a repo scan came from a version-controlled
 				// declaration, so it is automated by construction — the scanner
 				// never has to guess at origin.
-				DeploymentOrigin: models.DeploymentOriginAutomated,
+				// A parsed file is a DECLARATION, not a deployment. It may never
+				// have run, and nothing in the file says how it was deployed, so
+				// "automated" would be an assertion we cannot support.
+				DeploymentOrigin: models.DeploymentOriginUnknown,
 			})
 			if err != nil {
 				res.Warnings = append(res.Warnings,
