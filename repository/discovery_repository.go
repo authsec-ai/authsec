@@ -95,6 +95,12 @@ func (r *discoveryRepository) GetSource(workspaceID, id uuid.UUID) (*models.Disc
 	if err := r.db.First(&s, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 		return nil, err
 	}
+	// The same computed-on-read count ListSources produces, so a detail view and
+	// a list view can never disagree about how many agents a source found. Best
+	// effort: a failed count must not turn a readable source into an error.
+	_ = r.db.Model(&models.DiscoveredAgent{}).
+		Where("workspace_id = ? AND discovery_source_id = ?", workspaceID, id).
+		Count(&s.AgentCount).Error
 	return &s, nil
 }
 

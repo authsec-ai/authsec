@@ -202,6 +202,19 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 	if mode == "" {
 		mode = "all"
 	}
+	// Refuse a scan that would inspect nothing.
+	//
+	// A source created from a connector starts with an explicit empty selection,
+	// so this is the state of the very FIRST scan anyone runs. Left unguarded it
+	// excludes every repository, leaves Complete true, and returns
+	// scanned=0 / complete_for_selected_scope=true -- which a UI cannot help but
+	// render as "we looked and your organisation is clean". It is vacuously
+	// true and operationally a lie. An error is the honest answer: the admin has
+	// not chosen anything yet.
+	if mode == "selected" && len(cfg.Repositories.Include) == 0 {
+		return nil, fmt.Errorf("no repositories selected: choose repositories for this source before scanning")
+	}
+
 	res := &GitHubScanResult{
 		SourceID: sourceID, Complete: true, SelectionMode: mode, ScannedAt: time.Now(),
 	}
@@ -209,6 +222,19 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 	scopes, err := s.provider.ListScopes(ctx, pctx)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate repositories: %w", err)
+	}
+
+	repoScopes := 0
+	for _, scope := range scopes {
+		if scope.Kind == "repository" {
+			repoScopes++
+		}
+	}
+	if repoScopes == 0 {
+		// The installation is reachable but grants nothing. "Complete" would be
+		// vacuously true, so say plainly that there was nothing to look at.
+		res.Warnings = append(res.Warnings,
+			"this installation exposes no repositories, so nothing was scanned; grant repository access on GitHub")
 	}
 
 	for _, scope := range scopes {
