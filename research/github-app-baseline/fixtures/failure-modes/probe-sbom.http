@@ -1,0 +1,7 @@
+HTTP/2.0 404 Not Found
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 99
+X-RateLimit-Reset: 1787599375
+X-RateLimit-Used: 1
+X-RateLimit-Resource: dependency_sbom
+X-GitHub-Request-Id: CB18:3ABC49:47DEDF9:4EDA13D:6A8C99D3

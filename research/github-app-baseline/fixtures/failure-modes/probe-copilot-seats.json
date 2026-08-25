@@ -1,0 +1,5 @@
+{
+  "documentation_url": "https://docs.github.com/rest/copilot/copilot-user-management#list-all-copilot-seat-assignments-for-an-organization",
+  "message": "Resource not accessible by integration",
+  "status": "403"
+}

@@ -1,0 +1,8 @@
+HTTP/2.0 200 OK
+X-RateLimit-Limit: 5000
+X-RateLimit-Remaining: 4990
+X-RateLimit-Reset: 1787600883
+X-RateLimit-Used: 10
+X-RateLimit-Resource: core
+ETag: W/"6a3e981c407b2f7bab72b1f3f8074bc3444cfaa688498d512f002fc3c8532871"
+X-GitHub-Request-Id: CB5E:54E7F:484FE6B:4F3CED4:6A8C9235

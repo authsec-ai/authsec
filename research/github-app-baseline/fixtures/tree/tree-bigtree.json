@@ -1,0 +1,806 @@
+{
+  "sha": "4b7daf5d2840437d688e6e236e00d8188f576b0d",
+  "truncated": true,
+  "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/trees/4b7daf5d2840437d688e6e236e00d8188f576b0d",
+  "entry_count_returned": 40269,
+  "note": "raw payload measured 15,715,966 bytes pretty-printed (~7 MB raw) at GitHub truncation boundary",
+  "first_entries": [
+    {
+      "mode": "040000",
+      "path": "deep",
+      "sha": "c845ce573dae0ad4b934b516abc11117fdfa0cc0",
+      "type": "tree",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/trees/c845ce573dae0ad4b934b516abc11117fdfa0cc0"
+    },
+    {
+      "mode": "040000",
+      "path": "deep/nested",
+      "sha": "a5c24963ed6a79a049916805d3ee06220e73ba8c",
+      "type": "tree",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/trees/a5c24963ed6a79a049916805d3ee06220e73ba8c"
+    },
+    {
+      "mode": "040000",
+      "path": "deep/nested/dir000",
+      "sha": "7a6142d30b146e315f19e1f2fd00e32f385277fc",
+      "type": "tree",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/trees/7a6142d30b146e315f19e1f2fd00e32f385277fc"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-00400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-00800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-01200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-01600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-02000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-02400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-02800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-03200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-03600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-04000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-04400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-04800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-05200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-05600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-06000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-06400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-06800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-07200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-07600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-08000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-08400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-08800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-09200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-09600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-10000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-10400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-10800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-11200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-11600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-12000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-12400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-12800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-13200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-13600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-14000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-14400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-14800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-15200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-15600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-16000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-16400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-16800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-17200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-17600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-18000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-18400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-18800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-19200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-19600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-20000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-20400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-20800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-21200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-21600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-22000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-22400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-22800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-23200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-23600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-24000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-24400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-24800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-25200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-25600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-26000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-26400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-26800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-27200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-27600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-28000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-28400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-28800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-29200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-29600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-30000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-30400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-30800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-31200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-31600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-32000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-32400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-32800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-33200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-33600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-34000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-34400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-34800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-35200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-35600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-36000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-36400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-36800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-37200.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-37600.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-38000.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-38400.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    },
+    {
+      "mode": "100644",
+      "path": "deep/nested/dir000/file-with-a-rather-long-name-to-inflate-the-recursive-tree-output-and-exceed-seven-megabytes-38800.txt",
+      "sha": "c1b0730e0133447badcfd47fd144e254807b06e1",
+      "size": 1,
+      "type": "blob",
+      "url": "https://api.github.com/repos/authsec-sandbox/bigtree/git/blobs/c1b0730e0133447badcfd47fd144e254807b06e1"
+    }
+  ]
+}

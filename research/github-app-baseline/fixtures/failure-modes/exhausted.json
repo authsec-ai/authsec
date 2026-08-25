@@ -1,0 +1,5 @@
+{
+  "documentation_url": "https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api#rate-limiting",
+  "message": "API rate limit exceeded for installation ID 156281961. If you reach out to GitHub Support for help, please include the request ID CB26:0BEE:197BBE3:1A94BCB:6A8C9C29 and timestamp 2026-08-24 19:31:53 UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)",
+  "status": "403"
+}

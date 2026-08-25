@@ -1,0 +1,18 @@
+{
+  "_links": {
+    "git": "https://api.github.com/repos/authsec-sandbox/test-repo-1/git/blobs/935a92371eabdd881e94ae4c4838d8869bfd0e68",
+    "html": "https://github.com/authsec-sandbox/test-repo-1/blob/main/CODEOWNERS",
+    "self": "https://api.github.com/repos/authsec-sandbox/test-repo-1/contents/CODEOWNERS?ref=main"
+  },
+  "content": "KiBAYXV0aHNlYy1zYW5kYm94L2FkbWlucwo=\n",
+  "download_url": "https://raw.githubusercontent.com/authsec-sandbox/test-repo-1/main/CODEOWNERS?token=\u003credacted\u003e",
+  "encoding": "base64",
+  "git_url": "https://api.github.com/repos/authsec-sandbox/test-repo-1/git/blobs/935a92371eabdd881e94ae4c4838d8869bfd0e68",
+  "html_url": "https://github.com/authsec-sandbox/test-repo-1/blob/main/CODEOWNERS",
+  "name": "CODEOWNERS",
+  "path": "CODEOWNERS",
+  "sha": "935a92371eabdd881e94ae4c4838d8869bfd0e68",
+  "size": 26,
+  "type": "file",
+  "url": "https://api.github.com/repos/authsec-sandbox/test-repo-1/contents/CODEOWNERS?ref=main"
+}

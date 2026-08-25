@@ -1,0 +1,9 @@
+HTTP/2.0 200 OK
+X-RateLimit-Limit: 5000
+X-RateLimit-Remaining: 4998
+X-RateLimit-Reset: 1787612576
+X-RateLimit-Used: 2
+X-RateLimit-Resource: core
+Link: <https://api.github.com/installation/repositories?per_page=1&page=2>; rel="next", <https://api.github.com/installation/repositories?per_page=1&page=2>; rel="last"
+ETag: W/"4998664a68a80788994e32596975addeb42816b92f9741fabba3c6a3d3010fd9"
+X-GitHub-Request-Id: DCE0:0BEE:8933635:9490715:6A8CBF91

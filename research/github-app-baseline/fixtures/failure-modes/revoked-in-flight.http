@@ -1,0 +1,7 @@
+HTTP/2.0 401 Unauthorized
+X-GitHub-Request-Id: not-captured
+
+# Observed live: token minted for installation 156307174 at 21:31:00 UTC,
+# installation revoked by owner at ~21:31:50 UTC, next poll (5s cadence)
+# returned 401 "Bad credentials". Status line + body are verbatim from the
+# poller; response headers were not captured by the poller.

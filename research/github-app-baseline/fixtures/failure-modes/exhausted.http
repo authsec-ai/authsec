@@ -1,0 +1,7 @@
+HTTP/2.0 403 Forbidden
+X-RateLimit-Limit: 5000
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1787603257
+X-RateLimit-Used: 5000
+X-RateLimit-Resource: core
+X-GitHub-Request-Id: CB26:0BEE:197BBE3:1A94BCB:6A8C9C29

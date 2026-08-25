@@ -1,0 +1,17 @@
+{
+  "total_count": 1,
+  "workflows": [
+    {
+      "badge_url": "https://github.com/authsec-sandbox/test-repo-1/workflows/CI/badge.svg",
+      "created_at": "2026-08-24T18:05:55.000Z",
+      "html_url": "https://github.com/authsec-sandbox/test-repo-1/blob/main/.github/workflows/ci.yml",
+      "id": 341455396,
+      "name": "CI",
+      "node_id": "W_kwDOUC8B3M4UWjIk",
+      "path": ".github/workflows/ci.yml",
+      "state": "active",
+      "updated_at": "2026-08-24T18:05:55.000Z",
+      "url": "https://api.github.com/repos/authsec-sandbox/test-repo-1/actions/workflows/341455396"
+    }
+  ]
+}
