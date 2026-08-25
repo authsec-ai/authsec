@@ -203,7 +203,33 @@ func (ctl *ConnectorController) ListConnectors(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"connectors": list})
+
+	// Which of these actually have a workspace credential bound. Callers need
+	// this to avoid offering a connector that cannot talk to the provider yet:
+	// picking one that was created but never finished setup fails later, at use
+	// time, with an error that does not point back at the real cause.
+	//
+	// Non-secret and derived, so it ships alongside the list rather than forcing
+	// a detail fetch per connector.
+	repo := repositories.NewConnectorRepository(ctl.db)
+	summaries := make([]gin.H, 0, len(list))
+	for i := range list {
+		bound, method, status := false, "", ""
+		if conn, err := repo.GetWorkspaceConnection(list[i].ID); err == nil && conn != nil {
+			bound, method, status = true, conn.AuthMethod, conn.Status
+		}
+		// Id only, not the whole connector: the full objects are already in
+		// `connectors` above and duplicating them would double the payload for
+		// three booleans' worth of information.
+		summaries = append(summaries, gin.H{
+			"connector_id":      list[i].ID,
+			"connected":         bound,
+			"connection_method": method,
+			"connection_status": status,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"connectors": list, "connector_status": summaries})
 }
 
 // GetConnector handles GET /authsec/connectors/:id.
@@ -455,6 +481,45 @@ func (ctl *ConnectorController) GetConnectorAudit(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"audit": rows})
+}
+
+// GetProviderApp handles GET /authsec/connectors/providers/:provider/app —
+// report WHETHER this workspace has configured a provider app, and the
+// non-secret identifiers if so. Never returns secret material: the client
+// secret and the GitHub App private key live only in Vault and are not read
+// here at all.
+//
+// This exists because the console previously had no way to tell a configured
+// workspace from an unconfigured one. Both rendered an identical collapsed
+// "set up" affordance, so a returning admin could not see that registration
+// was already done, and a first-time admin could not see that it was still
+// required — they would attempt the install step first and hit a confusing
+// failure from a missing prerequisite.
+func (ctl *ConnectorController) GetProviderApp(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	providerKey := c.Param("provider")
+
+	app, err := repositories.NewConnectorRepository(ctl.db).GetProviderApp(wsID, providerKey)
+	if err != nil || app == nil {
+		// Not an error: "nothing configured yet" is a normal, expected answer
+		// and the caller needs to distinguish it from a failure.
+		c.JSON(http.StatusOK, gin.H{"configured": false, "provider": providerKey})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"configured":    true,
+		"provider":      providerKey,
+		"app_kind":      app.AppKind,
+		"client_id":     app.ClientID,
+		"redirect_uri":  app.RedirectURI,
+		"github_app_id": app.GitHubAppID,
+		"created_at":    app.CreatedAt,
+	})
 }
 
 // SetProviderApp handles POST /authsec/connectors/providers/:provider/app —

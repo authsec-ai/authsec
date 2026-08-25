@@ -1396,6 +1396,10 @@ func SetupRoutes(
 		connectors.Use(middlewares.AuthMiddleware())
 		{
 			connectors.GET("/providers", middlewares.Require("connector", "read"), connectorController.ListProviders)
+			// Read-only, non-secret: lets the console tell a configured workspace
+			// from an unconfigured one. Requires only `read`, since it exposes no
+			// secret material.
+			connectors.GET("/providers/:provider/app", middlewares.Require("connector", "read"), connectorController.GetProviderApp)
 			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
 			connectors.POST("/providers/github/app-github", middlewares.Require("connector", "update"), connectorController.SetGitHubApp)
 			connectors.POST("/:id/connections/github-app", middlewares.Require("connector", "update"), connectorController.ConnectGitHubApp)
