@@ -19,6 +19,55 @@ fields and `?token=` URL params are scrubbed (`<redacted>`); only whitelisted
 headers are stored (`X-RateLimit-*`, `Link`, `ETag`, `Retry-After`,
 `X-GitHub-Request-Id`).
 
+## Reproducing this baseline
+
+### 1. Prerequisites
+
+- A GitHub org you control — use a **disposable sandbox org, NOT production**.
+- Go installed.
+- A GitHub App registered on that org (see `REGISTRATION.md`) and installed on it.
+
+### 2. Credentials (steps, not values)
+
+- **APP ID** — Org Settings → Developer settings → GitHub Apps → (your app) →
+  Edit; "App ID" is shown near the top. Not secret.
+- **PRIVATE KEY** — same page → "Private keys" → "Generate a private key" → a
+  `.pem` downloads. Keep it **OUTSIDE the repo** (e.g. your home/Downloads dir).
+  **NEVER commit it or paste its contents.** Reference it only by file path via
+  an env var.
+- **INSTALLATION ID** — Org Settings → GitHub Apps → (your app) → Configure; the
+  number at the end of the settings URL (`.../installations/<INSTALL_ID>`) is
+  it. It also appears in `fixtures/meta/installations.json` as `"id"`. Not secret.
+
+### 3. Set env vars and build
+
+```bash
+cd tool && go build -o /tmp/task101-tool .
+export GITHUB_APP_ID=<app id>
+export GITHUB_APP_PRIVATE_KEY_PATH=<absolute path to your .pem>
+export GITHUB_APP_INSTALLATION_ID=<install id>
+```
+
+### 4. Commands reference
+
+| Command | What it does | Fixture group produced |
+|---|---|---|
+| `app` | `GET /app` (App JWT auth) | `fixtures/meta/` (`app.*`) |
+| `installations` | `GET /app/installations` — every installation of the App | `fixtures/meta/` (`installations.*`) |
+| `install-meta <id>` | `GET /app/installations/{id}` — one installation's metadata | `fixtures/meta/` (`install-<id>.*`) |
+| `repos <id>` | `GET /installation/repositories`, follows `Link: rel="next"` pagination | `fixtures/repos/` (`install-<id>-pageN.*`) |
+| `endpoint <auth> <name> <group> <path>` | generic authenticated GET; `auth` = `app` or `install` | `fixtures/<group>/<name>.*` |
+| `scan-sim <o> <r> <branch>` | runs the product's per-repo scan sequence (tree → CODEOWNERS probes → matched blobs), counts calls + wall-clock | stdout only |
+| `burst <auth> <path> <count>` | rapid-fire GETs to measure secondary rate-limit behavior | stdout only |
+| `exhaust <path> <count> [offset]` | cache-busted burn toward the 5000/h ceiling; captures the exhausted 403 | `fixtures/failure-modes/` (`exhausted.*`) |
+
+### 5. Security
+
+The private key is the only real secret. It is never stored in the repo — only
+referenced by path via `GITHUB_APP_PRIVATE_KEY_PATH`. The tool holds it in
+memory (and the App JWTs / installation tokens derived from it) and redacts all
+tokens and Authorization headers before writing any fixture.
+
 ## Fixture map: fixture → endpoint → permission → observed limits
 
 | Fixture (fixtures/) | Endpoint | Auth | Permission | Status | Rate-limit observation |
@@ -48,18 +97,6 @@ headers are stored (`X-RateLimit-*`, `Link`, `ETag`, `Retry-After`,
 | `failure-modes/exhausted.json` | `GET /repos/…/commits` | probe token | — | **403** | **`Remaining: 0`, `Used: 5000`**; exact exhausted body captured |
 | `failure-modes/revoked-in-flight.json` | `GET /installation/repositories` | revoked token | — | **401** | token minted pre-revocation; **401 "Bad credentials" ≤5 s after uninstall** — no grace period |
 | `failure-modes/tree-bigtree-ungranted.json` | bigtree tree after de-grant | main token | granted gone | **404** | removal reflected instantly |
-
-## Reproducing
-
-```bash
-cd tool && go build -o /tmp/task101-tool .
-export GITHUB_APP_ID=<app id> GITHUB_APP_PRIVATE_KEY_PATH=<pem> GITHUB_APP_INSTALLATION_ID=<install id>
-/tmp/task101-tool app | installations | install-meta <id> | repos <id> | endpoint <auth> <name> <group> <path> | scan-sim <o> <r> <branch> | burst | exhaust
-```
-
-The tool mints installation tokens exactly as the product does (RS256 App JWT,
-`iss`=AppID, iat −30s, exp 9m → `POST /app/installations/{id}/access_tokens`);
-tokens are in-memory only.
 
 ## Out of scope (product code — not modified)
 
