@@ -335,6 +335,48 @@ func main() {
 		}
 	}
 
+	// Governance expiry sweep.
+	//
+	// Expiry is already honoured at READ time — the ScopeResolver filters
+	// `expires_at IS NULL OR expires_at > NOW()` — so a lapsed binding grants no new
+	// scope without this. What this closes is the window where a token ALREADY minted
+	// under a now-lapsed grant keeps working for its remaining lifetime (up to an hour
+	// for native M2M tokens), plus recording the lapse and cleaning up the row.
+	//
+	// One minute, because the point of a short JIT grant is defeated if it takes
+	// longer than that to actually stop working. It only ever removes access, so a
+	// failure fails toward less access, never more.
+	if config.DB != nil {
+		expiryWorker := services.NewExpiryWorker(config.DB, time.Minute, 200)
+		expiryWorker.Start()
+		log.Printf("governance expiry worker started (interval=1m)")
+
+		// Detective SoD. Hours, not minutes: the preventive check inside the
+		// provisioning transaction already covers anything new, so this is catching up
+		// on history — conflicts that predate a rule, or arrived through a path that
+		// does not call the check yet. It only ever reports; remediation is a human
+		// decision, because auto-revoking on an SoD hit would let a mistyped rule take
+		// down production access.
+		sodWorker := services.NewSoDScanWorker(config.DB, 6*time.Hour)
+		sodWorker.Start()
+		log.Printf("governance SoD scan worker started (interval=6h)")
+
+		// Actuation lease reaper. An agent evicted mid-apply would otherwise leave its
+		// instruction 'leased' forever, so a quarantine would never be enforced while the
+		// console showed it as merely pending — silence looking identical to progress.
+		reaper := services.NewLeaseReaper(config.DB, time.Minute)
+		reaper.Start()
+		log.Printf("actuation lease reaper started (interval=1m)")
+
+		// Human joiner/mover/leaver. Reconciled rather than event-driven, because
+		// scim_events is an HTTP audit log with no semantic payload — see
+		// LifecycleManager. Five minutes because the leaver half is a security control:
+		// a deactivated user keeping access is the failure it exists to prevent.
+		jmlWorker := services.NewJMLWorker(config.DB, 5*time.Minute)
+		jmlWorker.Start()
+		log.Printf("governance JML reconcile worker started (interval=5m)")
+	}
+
 	// ─────────────────────────────────────────────────────────
 	// Phase 5: start server
 	// ─────────────────────────────────────────────────────────

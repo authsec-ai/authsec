@@ -1,17 +1,38 @@
 package platform
 
 import (
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/controllers/shared"
+	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// governanceActor resolves the human performing an approval, for provenance.
+// Denormalised label alongside the id because a deactivated user's row can be
+// removed, and "approved by <null>" is useless in an audit months later.
+func (ctrl *ApplicationsController) governanceActor(c *gin.Context) (*uuid.UUID, string) {
+	raw, err := middlewares.ResolveUserID(c)
+	if err != nil || raw == "" {
+		return nil, c.GetString("client_id")
+	}
+	parsed, perr := uuid.Parse(raw)
+	if perr != nil || parsed == uuid.Nil {
+		return nil, raw
+	}
+	label := c.GetString("email")
+	if label == "" {
+		label = raw
+	}
+	return &parsed, label
+}
 
 // ── GET /authsec/applications/:id/requests ────────────────────────────────────
 
@@ -231,18 +252,50 @@ func (ctrl *ApplicationsController) ApproveRequest(c *gin.Context) {
 		return
 	}
 
-	binding := &services.ApprovalRoleBinding{
-		RoleID:      roleUUID,
-		SubjectType: "user",
-		SubjectID:   actingUser.ID,
+	// Honour the duration the REQUEST asked for. access_requests.expires_at has always
+	// existed and this path ignored it, so a request for time-boxed access was granted
+	// permanently. requested_duration is the governance-era field and wins when set,
+	// because it is what the requester actually typed.
+	var expiresAt *time.Time
+	if ar.RequestedDuration != nil && *ar.RequestedDuration > 0 {
+		t := time.Now().Add(*ar.RequestedDuration)
+		expiresAt = &t
+	} else if ar.ExpiresAt != nil && ar.ExpiresAt.After(time.Now()) {
+		expiresAt = ar.ExpiresAt
 	}
 
-	// Approve the connection + create role binding + flip access_request atomically.
-	if err := ctrl.oauthSvc.ApproveClientRegistrationWithBinding(
-		rs.ID.String(), ar.RequestedByClient, binding,
-	); err != nil {
+	origin := ar.RequestOrigin
+	if origin == "" {
+		origin = models.GrantOriginSelfService
+	}
+
+	// Approve the connection + bind the role + flip the access_request + record WHY,
+	// atomically. Previously this created a permanent binding and wrote no provenance,
+	// so nothing downstream could say who approved it or on what grounds.
+	actingApprover, approverLabel := ctrl.governanceActor(c)
+	grant, err := services.NewProvisioningManager(config.DB, ctrl.oauthSvc).
+		GrantEntitlement(workspaceID, services.GrantEntitlementInput{
+			ResourceServerID: rs.ID,
+			ClientID:         ar.RequestedByClient,
+			RoleID:           &roleUUID,
+			SubjectType:      "user",
+			SubjectID:        actingUser.ID,
+			SubjectLabel:     actingUser.Email,
+			AccessRequestID:  &ar.ID,
+			Origin:           origin,
+			Justification:    ar.Justification,
+			Purpose:          ar.Purpose,
+			ExpiresAt:        expiresAt,
+			ActingUser:       actingApprover,
+			ActingUserLabel:  approverLabel,
+		})
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if grant.LegacyStandingDefault {
+		log.Printf("access request %s approved as a PERMANENT grant: neither the request nor "+
+			"the approval supplied a duration (role=%s app=%s)", ar.ID, roleUUID, rs.ID)
 	}
 
 	// connection_id is the public client_id — the same identifier the connections

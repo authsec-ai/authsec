@@ -1462,11 +1462,36 @@ func SetupRoutes(
 		discoveryIngress := authsec.Group("/discovery")
 		{
 			discoveryIngress.POST("/sightings", discoveryController.ReportSighting)
+
+			// Connector self-registration + heartbeat. One control plane serves agents
+			// in many clusters, so each announces itself and gets back a
+			// discovery_source_id it stamps on every sighting — which is what makes
+			// "which cluster did this agent come from" a foreign key rather than a
+			// string buried in metadata, and "has this cluster gone quiet" answerable
+			// at all.
+			discoveryIngress.POST("/agent-registration", discoveryController.RegisterAgent)
+
+			// Runtime lifecycle. Sightings only ever said "this exists"; these carry
+			// the other half — deleted, when, and (on the admission channel, where the
+			// API server authenticates the caller) by whom. They write runtime_status
+			// only, never the governance status, so a claimed-then-deleted agent stays
+			// registered while its runtime state becomes gone.
+			discoveryIngress.POST("/lifecycle", discoveryController.ReportLifecycleEvent)
+
+			// Per-sweep manifest of everything a connector observed. The only signal
+			// that catches an agent destroyed while nobody was watching — before
+			// install, or during an outage — since admission sees deletions live or
+			// never. A partial sweep retires nothing.
+			discoveryIngress.POST("/resync-manifest", discoveryController.ReportResyncManifest)
 		}
 
 		// Everything else stays authenticated and permission-gated: reading the
 		// inventory exposes hostnames and workload metadata across the workspace, and
 		// claim/quarantine are governance decisions that must be attributable.
+		// Declared before the discovery group because the IGA-correlation bridge
+		// hangs off /discovery/agents/:id as well as /governance.
+		governanceController := platformCtrl.NewGovernanceController(config.DB)
+
 		discovery := authsec.Group("/discovery")
 		discovery.Use(middlewares.AuthMiddleware())
 		{
@@ -1477,21 +1502,41 @@ func SetupRoutes(
 			discovery.PUT("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoverySource)
 			discovery.DELETE("/sources/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoverySource)
 
-			// NOTE: POST /sightings is deliberately NOT here — it is registered
-			// unauthenticated on discoveryIngress above. Re-adding it here would make
-			// Gin panic at startup on the duplicate method+path.
+			// NOTE: POST /sightings, /agent-registration, /lifecycle and
+			// /resync-manifest are deliberately NOT here — they are registered
+			// unauthenticated on discoveryIngress above. Re-adding any of them here
+			// would make Gin panic at startup on the duplicate method+path.
 
-			// Inventory. ?status=unregistered is the Unregistered Agents report.
+			// Inventory. ?status=unregistered is the Unregistered Agents report;
+			// add &live=true to drop agents already observed to be destroyed.
+			// ?runtime_status= and ?discovery_source_id= filter by observed state and
+			// by reporting cluster.
 			// The static /agents/lookup must be registered before /agents/:id.
 			discovery.GET("/agents/lookup", middlewares.Require("discovery", "read"), discoveryController.LookupDiscoveredAgent)
 			discovery.GET("/agents", middlewares.Require("discovery", "read"), discoveryController.ListDiscoveredAgents)
 			discovery.GET("/agents/:id", middlewares.Require("discovery", "read"), discoveryController.GetDiscoveredAgent)
+			// The lifecycle trail behind an agent's runtime status: when it was
+			// deleted, through which channel, and which principal the API server
+			// attributed it to.
+			discovery.GET("/agents/:id/events", middlewares.Require("discovery", "read"), discoveryController.ListAgentLifecycle)
 			discovery.PUT("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.UpdateDiscoveredAgent)
 			discovery.DELETE("/agents/:id", middlewares.Require("discovery", "admin"), discoveryController.DeleteDiscoveredAgent)
 
 			// The two governance decisions, each with its own permission.
 			discovery.POST("/agents/:id/claim", middlewares.Require("discovery", "claim"), discoveryController.ClaimAgent)
 			discovery.POST("/agents/:id/quarantine", middlewares.Require("discovery", "quarantine"), discoveryController.QuarantineAgent)
+			// Releasing takes the SAME permission as quarantining: whoever can cut an
+			// agent off can restore it. Splitting them would leave an operator able to
+			// contain an incident but not to undo a mistake — which is how a mis-click
+			// becomes an outage nobody on shift can fix.
+			discovery.POST("/agents/:id/unquarantine", middlewares.Require("discovery", "quarantine"), discoveryController.UnquarantineAgent)
+
+			// Which canonical agent in the correlated estate is this workload?
+			// Read is a discovery read; the decision is a correlation decision.
+			discovery.GET("/agents/:id/iga-link",
+				middlewares.Require("discovery", "read"), governanceController.GetAgentIGALink)
+			discovery.POST("/agents/:id/iga-link/decisions",
+				middlewares.Require("iga", "review"), governanceController.DecideAgentIGALink)
 
 			// Headline KPI: registered / total, segmented by origin.
 			discovery.GET("/coverage", middlewares.Require("discovery", "read"), discoveryController.GetCoverage)
@@ -1516,6 +1561,132 @@ func SetupRoutes(
 			discovery.GET("/sources/:id/repositories", middlewares.Require("discovery", "read"), discoveryGitHub.ListSourceRepositories)
 			discovery.PUT("/sources/:id/repositories", middlewares.Require("discovery", "admin"), discoveryGitHub.SetSourceRepositories)
 			discovery.POST("/sources/:id/scan", middlewares.Require("discovery", "admin"), discoveryGitHub.ScanGitHubSource)
+		}
+
+		// ────────────────────────────────────────────────────
+		// Provisioning & Governance — /authsec/provisioning/*, /authsec/governance/*.
+		//
+		// Where discovery answers "what exists?", these answer "should it exist, with
+		// what authority, and is that still true?" — and then make it so.
+		//
+		// ALL of these are authenticated and permission-gated. The reasoning that made
+		// the discovery ingress unauthenticated does NOT transfer: a sighting grants
+		// nothing and lands `unregistered`, whereas provisioning grants real authority
+		// and de-provisioning takes it away.
+		//
+		// Provisioning is one transaction (PG-2) and de-provisioning is the single
+		// revocation path every mechanism funnels through (PG-6), which is why both
+		// live behind one controller rather than being spread across callers.
+		// ────────────────────────────────────────────────────
+
+		provisioning := authsec.Group("/provisioning")
+		provisioning.Use(middlewares.AuthMiddleware())
+		{
+			// Claimed sighting -> governed principal. discovery:claim is the permission
+			// that already means "may bring an agent under management", so provisioning
+			// reuses it rather than inventing a second gate for the same decision.
+			provisioning.POST("/agents/:id/provision",
+				middlewares.Require("discovery", "claim"), governanceController.ProvisionAgent)
+			// Taking authority away is its own permission: an operator who may enrol an
+			// agent is not automatically trusted to revoke a production one.
+			provisioning.POST("/agents/:id/deprovision",
+				middlewares.Require("governance", "revoke"), governanceController.DeprovisionAgent)
+		}
+
+		// The in-cluster agent's ACTUATION surface.
+		//
+		// Deliberately NOT under AuthMiddleware: the caller is a workload in a
+		// customer's cluster, not a console user. It authenticates with the
+		// per-connector actuation token, which also determines WHICH cluster is calling
+		// — so an agent never asserts its own identity.
+		//
+		// Unlike the discovery ingress this is authenticated, because the reasoning
+		// there does not carry over. A sighting grants nothing, but a forged
+		// UNQUARANTINE would lift a network deny, which fails OPEN. (A forged quarantine
+		// fails safe: it denies.)
+		actuation := authsec.Group("/provisioning")
+		{
+			actuation.GET("/instructions", governanceController.LeaseInstructions)
+			actuation.POST("/instructions/:id/result", governanceController.ReportInstruction)
+		}
+
+		governance := authsec.Group("/governance")
+		governance.Use(middlewares.AuthMiddleware())
+		{
+			// "Why does this subject have this?" — the question the platform could not
+			// answer before provenance existed, and the whole basis of certification.
+			governance.GET("/provenance",
+				middlewares.Require("governance", "read"), governanceController.ListProvenance)
+			governance.GET("/provenance/:id",
+				middlewares.Require("governance", "read"), governanceController.GetProvenance)
+
+			// Separation of duties. Reading rules and violations is a read; resolving a
+			// violation is a governance decision somebody has to answer for, so it needs
+			// governance:certify rather than governance:read.
+			governance.GET("/sod/rules",
+				middlewares.Require("governance", "read"), governanceController.ListSoDRules)
+			governance.GET("/sod/violations",
+				middlewares.Require("governance", "read"), governanceController.ListSoDViolations)
+			governance.POST("/sod/violations/:id/resolve",
+				middlewares.Require("governance", "certify"), governanceController.ResolveSoDViolation)
+			// "Would this grant conflict?" — lets a console warn before an operator
+			// submits, instead of surfacing the refusal as an error afterwards.
+			governance.POST("/sod/simulate",
+				middlewares.Require("governance", "read"), governanceController.SimulateSoD)
+			// Trigger a detective pass on demand, for after writing a new rule.
+			governance.POST("/sod/scan",
+				middlewares.Require("governance", "admin"), governanceController.RunSoDScan)
+
+			// Certification. Creating and closing a campaign is administration;
+			// DECIDING an item is the reviewer's act and needs governance:certify —
+			// which is deliberately NOT governance:admin, so a reviewer can work a
+			// campaign without gaining the ability to grant anything (PG-5).
+			governance.POST("/campaigns",
+				middlewares.Require("governance", "admin"), governanceController.CreateCampaign)
+			governance.GET("/campaigns",
+				middlewares.Require("governance", "read"), governanceController.ListCampaigns)
+			governance.GET("/campaigns/:id",
+				middlewares.Require("governance", "read"), governanceController.GetCampaign)
+			governance.POST("/campaigns/:id/generate",
+				middlewares.Require("governance", "admin"), governanceController.GenerateCampaign)
+			governance.GET("/campaigns/:id/items",
+				middlewares.Require("governance", "read"), governanceController.ListCampaignItems)
+			governance.POST("/campaigns/:id/items/:item/decide",
+				middlewares.Require("governance", "certify"), governanceController.DecideItem)
+			governance.POST("/campaigns/:id/close",
+				middlewares.Require("governance", "admin"), governanceController.CloseCampaign)
+
+			// Actuation. Enabling it mints the cluster's credential, so it is admin-only;
+			// the instruction list is a read.
+			governance.POST("/connectors/:id/actuation",
+				middlewares.Require("governance", "admin"), governanceController.EnableActuation)
+			governance.GET("/instructions",
+				middlewares.Require("governance", "read"), governanceController.ListInstructions)
+
+			// Human lifecycle. Birthright policy is administration; the reconcile is
+			// too, because it grants. The reports are reads.
+			governance.POST("/birthrights",
+				middlewares.Require("governance", "admin"), governanceController.CreateBirthright)
+			governance.GET("/birthrights",
+				middlewares.Require("governance", "read"), governanceController.ListBirthrights)
+			governance.DELETE("/birthrights/:id",
+				middlewares.Require("governance", "admin"), governanceController.DeleteBirthright)
+			// The bridge to the correlated IGA estate. Reading a proposal is a
+			// discovery read; DECIDING one is a correlation decision, so it takes
+			// iga:review — the same permission as the classification and ownership
+			// decisions it sits alongside, rather than a governance permission that
+			// would let an entitlement reviewer redefine what an agent IS.
+			governance.GET("/iga-links",
+				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)
+
+			governance.POST("/jml/reconcile",
+				middlewares.Require("governance", "admin"), governanceController.ReconcileJML)
+			// The mover queue: grants whose policy no longer matches the holder.
+			governance.GET("/jml/stale",
+				middlewares.Require("governance", "read"), governanceController.ListStaleBirthrights)
+			// Agents whose accountable owner has been deactivated.
+			governance.GET("/jml/orphans",
+				middlewares.Require("governance", "read"), governanceController.ListOrphanedAgents)
 		}
 
 		// ────────────────────────────────────────────────────
