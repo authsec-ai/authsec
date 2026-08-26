@@ -19,6 +19,51 @@ const (
 	DiscoverySourceRepoScan   = "repo_scan"
 )
 
+// Evidence modes. These are not confidence levels and not a ranking; they are
+// three different KINDS of knowledge, and staleness means the opposite thing in
+// two of them.
+const (
+	// EvidenceObserved -- we saw it exist at runtime.
+	EvidenceObserved = "observed"
+	// EvidenceDeclared -- someone wrote down that it should exist. A repository
+	// declaration. May never have run.
+	EvidenceDeclared = "declared"
+	// EvidenceInferred -- deduced from indirect signal. Lowest trust.
+	EvidenceInferred = "inferred"
+)
+
+func ValidEvidenceModes() []string {
+	return []string{EvidenceObserved, EvidenceDeclared, EvidenceInferred}
+}
+
+// IsStale reports whether evidence older than `window` should be treated as
+// stale, and it BRANCHES ON EVIDENCE MODE because the same elapsed time means
+// opposite things:
+//
+//	a workflow file untouched for six months is STABLE
+//	a pod unseen for six months is GONE
+//
+// Treating them identically makes a stale badge actively misleading on half the
+// inventory -- and the half it misleads on is the half a customer is most
+// likely to act on.
+//
+// So: an observed row goes stale on the freshness window, because absence of a
+// sighting is meaningful. A declared row does not, because nobody was expected
+// to touch the file; only losing the ability to READ it is a staleness signal,
+// which is a coverage state rather than a property of the agent.
+func (a DiscoveredAgent) IsStale(now time.Time, window time.Duration) bool {
+	switch a.EvidenceMode {
+	case EvidenceDeclared:
+		return false
+	case EvidenceInferred, EvidenceObserved:
+		return now.Sub(a.LastSeenAt) > window
+	default:
+		// An unknown mode is treated as observed: failing toward "possibly
+		// gone" is the safer error for something we cannot classify.
+		return now.Sub(a.LastSeenAt) > window
+	}
+}
+
 // Deployment origin. A manually run agent is the higher-risk, harder-to-attribute
 // case — its permissions are typically whatever the developer's own credentials
 // allow — so the Unregistered Agents report surfaces manual first.
@@ -115,21 +160,35 @@ type DiscoveredAgent struct {
 	DisplayName       string          `json:"display_name" gorm:"not null;default:''"`
 	Metadata          json.RawMessage `json:"metadata" gorm:"type:jsonb;not null;default:'{}'"`
 	DeploymentOrigin  string          `json:"deployment_origin" gorm:"not null;default:'unknown'"`
-	Archetype         string          `json:"archetype" gorm:"not null;default:''"`
-	MatchedClientID   *uuid.UUID      `json:"matched_client_id,omitempty" gorm:"type:uuid"`
-	OwnerUserID       *uuid.UUID      `json:"owner_user_id,omitempty" gorm:"type:uuid"`
-	Status            string          `json:"status" gorm:"not null;default:'unregistered'"`
-	ClaimedBy         *uuid.UUID      `json:"claimed_by,omitempty" gorm:"type:uuid"`
-	ClaimedAt         *time.Time      `json:"claimed_at,omitempty"`
-	QuarantinedBy     *uuid.UUID      `json:"quarantined_by,omitempty" gorm:"type:uuid"`
-	QuarantinedAt     *time.Time      `json:"quarantined_at,omitempty"`
-	QuarantineReason  string          `json:"quarantine_reason" gorm:"not null;default:''"`
-	FirstSeenAt       time.Time       `json:"first_seen_at" gorm:"not null;default:now()"`
-	LastSeenAt        time.Time       `json:"last_seen_at" gorm:"not null;default:now()"`
-	SightingCount     int             `json:"sighting_count" gorm:"not null;default:1"`
-	CreatedBy         string          `json:"created_by" gorm:"not null;default:''"`
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
+	// EvidenceMode is HOW we know this agent exists, and it changes what every
+	// other field on the row means.
+	//
+	//	observed  we saw it exist at runtime (cluster admission, sensors)
+	//	declared  someone wrote down that it should exist (a repository file)
+	//	inferred  we deduced it from indirect signal; lowest trust
+	EvidenceMode string `json:"evidence_mode" gorm:"not null;default:'observed'"`
+	// LastObservedRunningAt is when we last saw this agent RUN.
+	//
+	// NULL on a declared row is the CORRECT and permanent answer, not missing
+	// data: reading a file establishes that someone intends to run something,
+	// never that it ran. Anything in a UI implying liveness must read this
+	// column and never LastSeenAt, or a file reads as a live process.
+	LastObservedRunningAt *time.Time `json:"last_observed_running_at"`
+	Archetype             string     `json:"archetype" gorm:"not null;default:''"`
+	MatchedClientID       *uuid.UUID `json:"matched_client_id,omitempty" gorm:"type:uuid"`
+	OwnerUserID           *uuid.UUID `json:"owner_user_id,omitempty" gorm:"type:uuid"`
+	Status                string     `json:"status" gorm:"not null;default:'unregistered'"`
+	ClaimedBy             *uuid.UUID `json:"claimed_by,omitempty" gorm:"type:uuid"`
+	ClaimedAt             *time.Time `json:"claimed_at,omitempty"`
+	QuarantinedBy         *uuid.UUID `json:"quarantined_by,omitempty" gorm:"type:uuid"`
+	QuarantinedAt         *time.Time `json:"quarantined_at,omitempty"`
+	QuarantineReason      string     `json:"quarantine_reason" gorm:"not null;default:''"`
+	FirstSeenAt           time.Time  `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt            time.Time  `json:"last_seen_at" gorm:"not null;default:now()"`
+	SightingCount         int        `json:"sighting_count" gorm:"not null;default:1"`
+	CreatedBy             string     `json:"created_by" gorm:"not null;default:''"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 func (DiscoveredAgent) TableName() string { return "discovered_agents" }

@@ -78,6 +78,13 @@ type SightingInput struct {
 	Metadata          map[string]interface{}
 	DeploymentOrigin  string
 	Archetype         string
+	// EvidenceMode says whether this sighting is a runtime observation or a
+	// declaration. Left empty it is DERIVED from the source, so a caller cannot
+	// accidentally file a declaration as an observation by forgetting a field.
+	EvidenceMode string
+	// ObservedRunningAt is set ONLY by a collector that genuinely saw the agent
+	// run. A declaration must leave it nil, and the database enforces that.
+	ObservedRunningAt *time.Time
 }
 
 // AgentUpdateInput captures the operator-editable fields on an inventory row.
@@ -222,12 +229,49 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	// declared". A repo scan establishes only the latter: a parsed declaration
 	// may never have run, may be dead code, and says nothing about how anything
 	// reached an environment. Stamping it "automated" asserts a deployment we
-	// never observed, so the caller's origin (unknown for a repo scan) is
-	// preserved. Overriding it here is what turns "nightly-audit | automated |
-	// 2 min ago" into a live-looking process that is, in fact, a file.
+	// never observed — the caller's DeploymentOriginUnknown is the honest value
+	// and it is preserved. Overriding it here is what turns
+	// "nightly-audit | automated | 2 min ago" into a live-looking process that
+	// is, in fact, a file.
 
 	// If the connector names a source, it must be one in this workspace —
 	// otherwise the row would point at another workspace's connector.
+	// Evidence mode, derived from the source when the caller does not say.
+	//
+	// Derivation rather than a plain default: a repo scan reads FILES, so
+	// anything it reports is declared by construction, and letting a forgotten
+	// field turn that into "observed" is exactly how a file starts reading as a
+	// running process.
+	evidence := in.EvidenceMode
+	if evidence == "" {
+		if in.Source == models.DiscoverySourceRepoScan {
+			evidence = models.EvidenceDeclared
+		} else {
+			evidence = models.EvidenceObserved
+		}
+	}
+	if !containsString(models.ValidEvidenceModes(), evidence) {
+		return nil, false, fmt.Errorf("unknown evidence mode %q", evidence)
+	}
+
+	// A declaration can never carry a runtime observation. Refused here as well
+	// as in the database, so a caller gets a clear error instead of a
+	// constraint violation.
+	runningAt := in.ObservedRunningAt
+	if evidence == models.EvidenceDeclared && runningAt != nil {
+		return nil, false, fmt.Errorf(
+			"a declared sighting cannot carry a runtime timestamp: reading a file " +
+				"does not establish that anything ran")
+	}
+	// Nor can it assert HOW the thing was deployed. Refused explicitly rather
+	// than silently corrected, so a caller passing it learns their assumption
+	// is wrong instead of having it quietly rewritten.
+	if evidence == models.EvidenceDeclared && origin == models.DeploymentOriginAutomated {
+		return nil, false, fmt.Errorf(
+			"a declared sighting cannot assert an automated deployment origin: a " +
+				"declaration establishes only that someone wrote the agent down")
+	}
+
 	if in.DiscoverySourceID != nil {
 		if _, err := m.repo.GetSource(workspaceID, *in.DiscoverySourceID); err != nil {
 			return nil, false, fmt.Errorf("unknown discovery_source_id for this workspace: %w", err)
@@ -241,18 +285,20 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 
 	// Always built as unregistered: discovery only makes an agent visible.
 	agent := &models.DiscoveredAgent{
-		ID:                uuid.New(),
-		WorkspaceID:       workspaceID,
-		Source:            in.Source,
-		DiscoverySourceID: in.DiscoverySourceID,
-		Fingerprint:       in.Fingerprint,
-		DisplayName:       in.DisplayName,
-		Metadata:          metadataJSON,
-		DeploymentOrigin:  origin,
-		Archetype:         in.Archetype,
-		Status:            models.DiscoveredAgentUnregistered,
-		SightingCount:     1,
-		CreatedBy:         reportedBy,
+		ID:                    uuid.New(),
+		WorkspaceID:           workspaceID,
+		Source:                in.Source,
+		DiscoverySourceID:     in.DiscoverySourceID,
+		Fingerprint:           in.Fingerprint,
+		DisplayName:           in.DisplayName,
+		Metadata:              metadataJSON,
+		DeploymentOrigin:      origin,
+		EvidenceMode:          evidence,
+		LastObservedRunningAt: runningAt,
+		Archetype:             in.Archetype,
+		Status:                models.DiscoveredAgentUnregistered,
+		SightingCount:         1,
+		CreatedBy:             reportedBy,
 	}
 
 	stored, created, err := m.repo.UpsertSighting(agent)
@@ -318,10 +364,21 @@ func (m *discoveryManager) UpdateAgent(workspaceID, id uuid.UUID, in AgentUpdate
 		}
 		fields["metadata"] = metadataJSON
 	}
-	// An admin correcting a misclassified origin is a legitimate, audited edit.
+	// An admin correcting a misclassified origin is a legitimate, audited edit —
+	// but not into a state the evidence cannot support. A DECLARED row was
+	// derived from reading a file, and no amount of admin authority makes that
+	// file a deployment, so this one transition stays closed even to an
+	// operator. Refused here with an explanation rather than left to the
+	// database, which would surface as an opaque constraint violation.
 	if in.DeploymentOrigin != nil {
 		if !containsString(models.ValidDeploymentOrigins(), *in.DeploymentOrigin) {
 			return nil, fmt.Errorf("unknown deployment origin %q", *in.DeploymentOrigin)
+		}
+		if *in.DeploymentOrigin == models.DeploymentOriginAutomated &&
+			current.EvidenceMode == models.EvidenceDeclared {
+			return nil, fmt.Errorf(
+				"cannot set an automated deployment origin on a declared finding: it " +
+					"was read from a file, which does not establish that anything was deployed")
 		}
 		fields["deployment_origin"] = *in.DeploymentOrigin
 	}

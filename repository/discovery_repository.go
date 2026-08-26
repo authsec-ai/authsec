@@ -285,6 +285,18 @@ func (r *discoveryRepository) UpsertSighting(a *models.DiscoveredAgent) (*models
 			"CASE WHEN discovered_agents.status = 'unregistered' THEN excluded.deployment_origin ELSE discovered_agents.deployment_origin END"),
 		"archetype": gorm.Expr(
 			"CASE WHEN discovered_agents.archetype = '' THEN excluded.archetype ELSE discovered_agents.archetype END"),
+		// evidence_mode is a property of HOW we learned about this agent, so the
+		// incoming sighting is authoritative: a declaration later observed
+		// running is a genuine upgrade in what we know.
+		"evidence_mode": gorm.Expr("excluded.evidence_mode"),
+		// The runtime timestamp only ever moves FORWARD, and a declaration
+		// (which sends NULL) must never erase a real runtime observation made
+		// by a collector. Keeping the best fact from either feed is also what
+		// makes the shadow-agent question answerable later: one row can hold
+		// "declared here" and "seen running there" at the same time.
+		"last_observed_running_at": gorm.Expr(
+			"GREATEST(COALESCE(excluded.last_observed_running_at, discovered_agents.last_observed_running_at), " +
+				"COALESCE(discovered_agents.last_observed_running_at, excluded.last_observed_running_at))"),
 	}
 	// Deliberately NOT updated on conflict: status, matched_client_id,
 	// owner_user_id, claimed_*, quarantined_*, first_seen_at. Those are human
