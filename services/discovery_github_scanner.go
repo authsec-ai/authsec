@@ -287,7 +287,7 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 			}
 			res.FilesFetched++
 
-			facts, secretRefs, err := rule.Extract(e.Path, body)
+			facts, secretRefs, err := rule.ExtractRedacted(e.Path, body)
 			if err != nil || facts == nil {
 				// A malformed or uninteresting file is not an agent.
 				continue

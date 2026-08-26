@@ -487,7 +487,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 						report.BlobsFetched++
 
 						// Step 5 — parse, redact, persist facts + hash, discard.
-						facts, secretRefs, err := rule.Extract(e.Path, body)
+						facts, secretRefs, err := rule.ExtractRedacted(e.Path, body)
 						if err != nil {
 							_ = m.repo.RecordIssue(&models.IGAOperationalIssue{
 								ID: uuid.New(), WorkspaceID: workspaceID, IntegrationID: &integ.ID,

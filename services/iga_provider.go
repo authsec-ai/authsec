@@ -185,6 +185,110 @@ func (r IGARule) Matches(p string) bool {
 	return false
 }
 
+// RedactedMarker replaces a sensitive VALUE while preserving the fact that the
+// key was declared. "this tool declares an apiKey" is useful evidence; the key
+// material behind it is not, and storing it turns the inventory into a target.
+const RedactedMarker = "[redacted]"
+
+// baselineSensitiveKeys is the redaction floor applied to EVERY rule.
+//
+// It exists because per-rule SensitiveKeys is author-supplied, and an author
+// who forgets an entry would otherwise silently persist a live credential. A
+// floor means a new rule is safe by default and a forgotten key is a missing
+// nicety rather than a breach. Names still survive redaction: they are
+// harvested separately by collectSecretNames, so "names only, never values"
+// holds without depending on any one Extract implementation.
+var baselineSensitiveKeys = []string{
+	"apikey", "api_key", "apisecret", "api_secret",
+	"token", "auth_token", "access_token", "refresh_token", "id_token",
+	"secret", "client_secret", "password", "passwd", "passphrase",
+	"credential", "credentials", "private_key", "privatekey",
+	"authorization", "auth", "bearer", "session", "cookie",
+	// Values here are routinely credentials, and only the NAMES are evidence.
+	"env", "environment", "env_file", "with", "run", "args", "command",
+	// Prompt bodies carry business logic and sometimes credentials. Presence
+	// and length are the evidence; the text never is.
+	"prompt", "prompts", "instructions", "system_prompt", "systemprompt",
+	"headers", "header",
+}
+
+// sensitiveKeySet builds the effective redaction set for a rule: the baseline
+// floor plus whatever the rule declares, matched case- and separator-
+// insensitively so apiKey, api_key and APIKEY are one key.
+func sensitiveKeySet(extra []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(baselineSensitiveKeys)+len(extra))
+	add := func(k string) {
+		k = strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(k))
+		if k != "" {
+			out[k] = struct{}{}
+		}
+	}
+	for _, k := range baselineSensitiveKeys {
+		add(k)
+	}
+	for _, k := range extra {
+		add(k)
+	}
+	return out
+}
+
+func normalizeKey(k string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(k))
+}
+
+// redactValue walks a fact value to ANY depth and replaces the value of every
+// sensitive key, leaving structure and non-sensitive names intact.
+//
+// Depth is the whole point. The leak this closes was a rule copying a nested
+// structure verbatim — tools:[{name:"db",apiKey:"sk-live-..."}] — where a
+// top-level key check sees only "tools" and waves it through.
+func redactValue(v interface{}, sensitive map[string]struct{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, inner := range t {
+			if _, bad := sensitive[normalizeKey(k)]; bad {
+				out[k] = RedactedMarker
+				continue
+			}
+			out[k] = redactValue(inner, sensitive)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, inner := range t {
+			out[i] = redactValue(inner, sensitive)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// ExtractRedacted is the ONLY extraction entry point a scanner may call.
+//
+// Extract itself is written per rule and cannot be trusted to redact — the
+// catalogue's SensitiveKeys used to be documentation with nothing enforcing it,
+// which is exactly how a nested apiKey reached the database. Funnelling every
+// caller through here makes redaction structural instead of a promise each rule
+// author has to remember to keep.
+func (r IGARule) ExtractRedacted(filePath string, body []byte) (map[string]interface{}, []string, error) {
+	facts, secretRefs, err := r.Extract(filePath, body)
+	if err != nil || facts == nil {
+		return facts, secretRefs, err
+	}
+	sensitive := sensitiveKeySet(r.SensitiveKeys)
+	out := make(map[string]interface{}, len(facts))
+	for k, v := range facts {
+		if _, bad := sensitive[normalizeKey(k)]; bad {
+			out[k] = RedactedMarker
+			continue
+		}
+		out[k] = redactValue(v, sensitive)
+	}
+	return out, secretRefs, nil
+}
+
 // IGARuleCatalog is a versioned set of rules. The version is recorded on every
 // scan run, so a rule change is visible in the evidence trail — and because raw
 // bodies are discarded, a catalogue bump requires a rescan rather than a replay.
