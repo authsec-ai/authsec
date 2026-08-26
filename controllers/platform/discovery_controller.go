@@ -3,10 +3,13 @@ package platform
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -387,8 +390,25 @@ func (ctl *DiscoveryController) UpdateDiscoverySource(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// DeleteDiscoverySource handles DELETE /authsec/discovery/sources/:id. Agents
-// already discovered by this source are kept; their pointer is simply nulled.
+// vaultClient builds a secrets-store client for the one thing this controller
+// needs it for: purging a GitHub App private key whose registration has just
+// been deleted.
+func (ctl *DiscoveryController) vaultClient() (vault.VaultClient, error) {
+	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+	if addr == "" || token == "" {
+		return nil, errors.New("VAULT_ADDR/VAULT_TOKEN not configured")
+	}
+	return vault.NewClient(addr, token)
+}
+
+// DeleteDiscoverySource handles DELETE /authsec/discovery/sources/:id.
+//
+// Delete means delete: the source, the integration binding it owns, and the
+// agents it found all go. When it was the workspace's last GitHub organisation,
+// the GitHub App registration goes with it and its private key is purged from
+// the secrets store, so nothing GitHub-related is left behind with nothing using
+// it. The App itself remains on github.com -- only its owner can remove it
+// there.
 func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 	wsID, _, err := ctl.workspace(c)
 	if err != nil {
@@ -401,13 +421,30 @@ func (ctl *DiscoveryController) DeleteDiscoverySource(c *gin.Context) {
 		return
 	}
 
-	if err := ctl.manager().DeleteSource(wsID, id); err != nil {
+	purgePath, err := ctl.manager().DeleteSource(wsID, id)
+	if err != nil {
 		discoveryError(c, err)
 		return
 	}
 
+	// After the commit, never before: the row's removal has to be real before
+	// the key it points at is destroyed. A failure here is logged and not
+	// returned -- the delete the caller asked for has already succeeded, and a
+	// 500 would tell them it had not.
+	if purgePath != "" {
+		if vc, verr := ctl.vaultClient(); verr == nil {
+			if derr := vc.DeleteSecret(purgePath); derr != nil {
+				log.Printf("[discovery] deleted source %s but could not purge GitHub App key at %s: %v",
+					id, purgePath, derr)
+			}
+		} else {
+			log.Printf("[discovery] deleted source %s but Vault is unreachable, GitHub App key at %s not purged: %v",
+				id, purgePath, verr)
+		}
+	}
+
 	auditAdminMutation(c, wsID.String(), "delete", "discovery_source", id.String(),
-		http.StatusNoContent, nil, nil)
+		http.StatusNoContent, nil, gin.H{"github_app_key_purged": purgePath != ""})
 	c.Status(http.StatusNoContent)
 }
 

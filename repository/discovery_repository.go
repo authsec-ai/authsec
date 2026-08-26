@@ -29,7 +29,10 @@ type DiscoveryRepository interface {
 	ListSources(workspaceID uuid.UUID, kind string, enabledOnly bool) ([]models.DiscoverySource, error)
 	TouchSource(workspaceID, id uuid.UUID, status string) error
 	UpdateSource(s *models.DiscoverySource) error
-	DeleteSource(workspaceID, id uuid.UUID) error
+	// DeleteSource removes a source, its integration, and its findings.
+	// Returns a secrets-store path to purge when this was the workspace's last
+	// GitHub organisation, or "" when there is nothing to purge.
+	DeleteSource(workspaceID, id uuid.UUID) (string, error)
 
 	// UpsertSelfRegistration records a heartbeat from a deployed agent as ONE
 	// atomic statement keyed by (workspace_id, kind, instance_id). Machine-owned
@@ -234,13 +237,20 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 // iga_integrations lives here rather than a layer up, where the two deletes
 // could not share a transaction.
 //
-// What deliberately does NOT go: discovered_agents. Its FK is ON DELETE SET
-// NULL, so findings outlive the scanner that found them. An agent that was
-// running yesterday does not stop existing because the integration that spotted
-// it was removed, and silently dropping those rows would quietly shrink the
-// inventory the customer governs.
-func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) error {
-	return r.db.Transaction(func(tx *gorm.DB) error {
+// The findings go too. discovered_agents.discovery_source_id is ON DELETE SET
+// NULL, so leaving the database to it produces rows with no source at all --
+// sightings the console still lists and counts toward coverage, with nothing
+// left that can rescan, refresh or explain them. There is an argument that a
+// finding should outlive its scanner, and this used to implement it; in practice
+// it made "delete" mean "hide the integration and keep its rows forever", which
+// is not what deleting an integration is for. Deleting is now deleting.
+//
+// Everything that points at discovered_agents (events, access requests,
+// provenance, provisioning instructions, IGA links) is itself ON DELETE SET
+// NULL, so this cannot cascade into an audit trail or fail on a dependent row.
+func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
+	purgePath := ""
+	err := r.db.Transaction(func(tx *gorm.DB) error {
 		var src models.DiscoverySource
 		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 			return err
@@ -253,6 +263,14 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) error {
 			}
 			_ = json.Unmarshal(src.Config, &cfg)
 			integrationID = cfg.IntegrationID
+		}
+
+		// BEFORE the source: once the source row goes, the FK nulls
+		// discovery_source_id and there is no way left to tell which findings
+		// belonged to it.
+		if derr := tx.Delete(&models.DiscoveredAgent{},
+			"workspace_id = ? AND discovery_source_id = ?", workspaceID, id).Error; derr != nil {
+			return derr
 		}
 
 		res := tx.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
@@ -274,8 +292,50 @@ func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) error {
 				}
 			}
 		}
+
+		// Removing the LAST GitHub organisation also forgets the workspace's
+		// GitHub App. Otherwise "delete the integration" leaves a registered App
+		// and a private key behind with nothing using them -- which is where the
+		// App appeared to come from after a delete, since the wizard reads it and
+		// skips its own first step.
+		if src.Kind == models.DiscoverySourceRepoScan {
+			var remaining int64
+			if cerr := tx.Model(&models.DiscoverySource{}).
+				Where("workspace_id = ? AND kind = ?", workspaceID, models.DiscoverySourceRepoScan).
+				Count(&remaining).Error; cerr != nil {
+				return cerr
+			}
+
+			// The App key store is SHARED with the connector action broker, whose
+			// shipped use is an agent calling a provider through it. Deleting the
+			// key while a GitHub connector still exists would break that with an
+			// error naming nothing the operator did. Discovery only gets to
+			// remove the App when it is the last thing using it.
+			var brokerConnectors int64
+			if cerr := tx.Table("connectors").
+				Where("workspace_id = ? AND provider_key = ?", workspaceID, "github").
+				Count(&brokerConnectors).Error; cerr != nil {
+				return cerr
+			}
+
+			if remaining == 0 && brokerConnectors == 0 {
+				var app models.ConnectorProviderApp
+				if ferr := tx.First(&app, "workspace_id = ? AND provider_key = ?",
+					workspaceID, "github").Error; ferr == nil {
+					if derr := tx.Delete(&models.ConnectorProviderApp{},
+						"workspace_id = ? AND provider_key = ?", workspaceID, "github").Error; derr != nil {
+						return derr
+					}
+					// Purged by the caller: the secrets store is not part of this
+					// transaction, so it must happen only after the commit that
+					// makes the row's removal real.
+					purgePath = app.VaultPath
+				}
+			}
+		}
 		return nil
 	})
+	return purgePath, err
 }
 
 /* -------------------------- self-registration --------------------------- */
