@@ -33,9 +33,12 @@
 -- so it behaves the same on a fresh install (where it matches nothing), on a
 -- developer database, and on production.
 
--- Everything runs as one unit: a half-applied cutover is the same orphan by
--- another route.
-BEGIN;
+-- Everything below runs as ONE unit -- a half-applied cutover is the same orphan
+-- by another route -- but there is deliberately no BEGIN/COMMIT here:
+-- internal/migration/runner.go already wraps each migration file in its own
+-- transaction. Opening a second one ends the runner's transaction early, and
+-- the runner's own commit then fails with "unexpected transaction status idle",
+-- which fails the migration and stops the backend from starting at all.
 
 -- ---------------------------------------------------------------------------
 -- 1. Mint an iga_integrations row for every connector-bound repo_scan source.
@@ -136,4 +139,3 @@ WHERE connector_id IN (SELECT id FROM _discovery_connectors);
 DELETE FROM public.connectors
 WHERE id IN (SELECT id FROM _discovery_connectors);
 
-COMMIT;
