@@ -1,69 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git worktree *)",
-      "Bash(ls \"../authsec-prod-readonly\" | head -20 && echo \"---\" && ls \"../authsec-prod-readonly/cmd\" 2>&1 | head -10)",
-      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-prod-readonly/**)",
-      "Read(//c/Users/Ritam Kumarb Kundu/Desktop/Broadcom/authsec/authsec-prod-readonly/cmd/**)",
-      "Bash(Get-ChildItem -Depth 2 -Directory)",
-      "Bash(Select-Object FullName)",
-      "Bash(grep -E \"\\\\.\\(go|sql\\)$\")",
-      "Bash(grep -E \"\\\\.go$\")",
       "Read(//Users/pc/.claude/**)",
-      "Read(//Users/pc/Desktop/**)",
-      "Read(//Users/pc/**)",
-      "WebFetch(domain:mcp-dev.mcpauthz.com)",
-      "WebFetch(domain:dev.api.authsec.dev)",
-      "Bash(git fetch:*)",
-      "Bash(xargs -I{} git show origin/authsec-dev:{})",
-      "WebFetch(domain:blog.modelcontextprotocol.io)",
-      "WebFetch(domain:stytch.com)",
-      "Bash(sed -i '' 's/uni_groups_tenant_name/uni_groups_workspace_name/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/tenant_user_provider_unique/workspace_user_provider_unique/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_tenant_device_token/fk_workspace_device_token/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/uq_tenant_device_id_tenant/uq_workspace_device_id/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/uq_voice_identity_tenant_platform_user/uq_voice_identity_workspace_platform_user/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_agent_action_tenant/fk_agent_action_workspace/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_agent_guard_settings_tenant/fk_agent_guard_settings_workspace/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_backup_tenant/fk_backup_workspace/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_ciba_auth_tenant/fk_ciba_auth_workspace/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/fk_device_token_tenant/fk_device_token_workspace/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' \"s/relation \\\\\"tenants\\\\\" does not exist/relation does not exist \\(legacy comment\\)/g\" migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' 's/the tenants table; the/the workspaces table; the/g' migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' \"s/Create new tenant databases/Create new workspace databases/g\" migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' \"s/tenant DB creation/workspace DB creation/g\" migrations/master/001_bootstrap.sql)",
-      "Bash(sed -i '' \"s/Create tenant databases by cloning/Create workspace databases by cloning/g\" migrations/master/001_bootstrap.sql)",
-      "Bash(echo \"Build exit: $?\")",
-      "Bash(echo \"Vet exit: $?\")",
-      "Bash(awk '{:*)",
-      "Bash(psql --version)",
-      "Bash(pg_isready)",
-      "Read(//Applications/Postgres.app/Contents/Versions/16/bin/**)",
-      "Bash(echo \"---Exit code: $?---\")",
-      "Bash(open -a Postgres)",
-      "Bash(pg_isready -h localhost -p 5432)",
-      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE IF EXISTS authsec_test;\")",
-      "Bash(psql -h localhost -p 5432 -U postgres -c \"CREATE DATABASE authsec_test;\")",
-      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test --set ON_ERROR_STOP=on -f migrations/master/001_bootstrap.sql)",
-      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c ':*)",
-      "Bash(psql -h localhost -p 5432 -U postgres -c \"DROP DATABASE authsec_test;\")",
-      "Bash(echo \"Exit: $?\")",
-      "Bash(kubectl scale:*)",
-      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT provider_name, workspace_id IS NULL AS is_platform FROM oidc_providers;\")",
-      "Bash(psql -h localhost -p 5432 -U postgres -d authsec_test -c \"SELECT column_name FROM information_schema.columns WHERE table_name = 'saml_providers' AND column_name IN \\('sp_entity_id','sp_acs_url','want_assertions_signed'\\);\")",
-      "Bash(echo \"SQL Exit: $?\")",
-      "Bash(kubectl set:*)",
-      "Bash(go version:*)"
+      "Read(//Users/pc/Desktop/authnull/**)"
     ],
+    "deny": [
+      "Bash(git push*)"
+    ],
+    "defaultMode": "bypassPermissions",
     "additionalDirectories": [
-      "/tmp",
-      "/Users/pc/Desktop/authnull/Authsec-ui/src/features/directory-sync",
-      "/Users/pc/Desktop/authnull/Authsec-ui/src/components/layout",
-      "/Users/pc/Desktop/authnull/Authsec-ui/src",
-      "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/src/authsec_sdk/runtime",
-      "/Users/pc/Desktop/authnull/sdk-authsec/packages/python-sdk/examples",
-      "/Users/pc/Desktop/authnull/Authsec-ui",
-      "/Users/pc/Desktop/authnull/sdk-authsec/packages/typescript-sdk/src"
+      "/Users/pc/.claude",
+      "/Users/pc/Desktop/authnull"
     ]
   },
   "hooks": {
@@ -73,23 +20,14 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"\nimport sys, json, re\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\ncmd = d.get('tool_input', {}).get('command', '') or d.get('command', '')\nlow = cmd.lower()\n\n# Production K3s targets: block namespace, database, and persistent-data destruction.\nprod_markers = ('37.27.104.185', 'app.authsec.ai', 'prod.api.authsec.ai', 'authsec-prod', 'database-prod', 'hydra-prod', 'vault-prod')\nprod = any(marker in low for marker in prod_markers)\nkube_delete = ('kubectl' in low) and re.search(r'\\bdelete\\b[^|;\\n]*(namespace|namespaces|ns|pvc|persistentvolumeclaim|persistentvolumeclaims|pv|persistentvolume|persistentvolumes)\\b', low)\nwipe = ('drop database' in low) or ('drop schema' in low) or kube_delete\nif wipe and prod:\n    print('\\nBLOCKED: that can destroy production K3s data.\\nThere are real workspaces, tokens, revocation state, and audit history in this cluster.\\nUse a numbered migration and the K3s release procedure: /schema-change and /deploy\\n', file=sys.stderr)\n    sys.exit(2)\n\n# Ad-hoc DDL against production is forbidden; the startup runner owns migrations.\nddl = re.search(r'(alter table|create table|drop table|create index|drop index)', low)\npsql_prod = ('psql' in low) and prod\ninline = (' -c ' in cmd) or (' --command' in cmd)\nif ddl and psql_prod and inline:\n    print('\\nBLOCKED: inline DDL against production.\\nPut it in authsec/migrations/master/NNN_name.sql so the runner applies and records it,\\nthen deploy through K3s. See /schema-change.\\n', file=sys.stderr)\n    sys.exit(2)\n\""
+            "command": "python3 -c \"\nimport sys, json, re\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\ncmd = d.get('tool_input', {}).get('command', '') or d.get('command', '')\nlow = cmd.lower()\n\nprod_markers = ('37.27.104.185', 'app.authsec.ai', 'prod.api.authsec.ai', 'authsec-prod', 'database-prod', 'hydra-prod', 'vault-prod')\nprod = any(marker in low for marker in prod_markers)\nkube_delete = ('kubectl' in low) and re.search(r'\\bdelete\\b[^|;\\n]*(namespace|namespaces|ns|pvc|persistentvolumeclaim|persistentvolumeclaims|pv|persistentvolume|persistentvolumes)\\b', low)\nwipe = ('drop database' in low) or ('drop schema' in low) or kube_delete\nif wipe and prod:\n    print('\\nBLOCKED: that can destroy production K3s data.\\nUse a numbered migration and the K3s procedures in /schema-change and /deploy.\\n', file=sys.stderr)\n    sys.exit(2)\n\nddl = re.search(r'(alter table|create table|drop table|create index|drop index)', low)\npsql_prod = ('psql' in low) and prod\ninline = (' -c ' in cmd) or (' --command' in cmd)\nif ddl and psql_prod and inline:\n    print('\\nBLOCKED: inline DDL against production.\\nPut it in authsec/migrations/master/NNN_name.sql and deploy through K3s.\\n', file=sys.stderr)\n    sys.exit(2)\n\""
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 -c \"\nimport sys, json, os, subprocess\ntry:\n    d = json.load(sys.stdin)\nexcept Exception:\n    sys.exit(0)\nfp = d.get('tool_input', {}).get('file_path', '') or d.get('file_path', '')\nif fp.endswith('.go') and os.path.exists(fp):\n    subprocess.run(['gofmt', '-w', fp], capture_output=True)\n\""
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
