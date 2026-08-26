@@ -91,13 +91,21 @@ exchange — a workload presents its JWT-SVID and a target resource indicator; A
 validates the SVID, checks delegation policies, and mints a native access token with
 `act.spiffe_id` set to the presenter's SPIFFE ID.
 
-## Single-node compose wiring
+## Production federation contract
 
-In `deploy/single-node`:
-- SPIRE server + agent run from `docker-compose.spire.yml`.
-- SPIRE's OIDC discovery provider URL must match `SPIFFE_OIDC_ISSUER`.
-- Trust bundle federation: SPIRE publishes its own `jwks.json`; AuthSec pulls it for
-  the JWKS union at `/oauth/jwks`.
+The current production K3s cluster does not run an AuthSec-managed SPIRE Server
+or Agent workload. Federated workload identity uses an external SPIFFE/SPIRE
+issuer configured through AuthSec's workload identity provider and trusted issuer
+records.
+
+- The provider issuer and JWKS URL are the source of truth for validating external
+  JWT-SVIDs.
+- `SPIFFE_OIDC_ISSUER` must match the issuer used for AuthSec-signed SPIFFE tokens.
+- The JWKS union at `/oauth/jwks` publishes AuthSec's native, Hydra, and SPIFFE
+  verification keys; an external provider's JWKS is validated through its provider
+  configuration.
+- If AuthSec later operates SPIRE inside production, add it explicitly to the K3s
+  deployment contract and validate its trust bundle, persistence, and rollout.
 
 ## When you're building
 

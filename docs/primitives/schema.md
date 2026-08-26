@@ -74,20 +74,23 @@ is no version of this that is safe as a single step.
 
 ## Before you touch a deployed database
 
+Production PostgreSQL runs in the `database-prod` namespace on the K3s cluster.
+Create and verify the backup on `k3s-master` before deploying any schema-changing
+backend image:
+
 ```bash
-ssh -J root@49.12.150.218 ubuntu@192.168.122.252
-docker exec authsec-postgres pg_dump -U authsec -Fc authsec \
-  > ~/backup_$(date +%Y%m%d-%H%M%S).dump
+mkdir -p /root/backups
+AUTHSEC_BACKUP_PATH=/root/backups/authsec-pre-migration-$(date +%Y%m%dT%H%M%S).dump
+kubectl exec -n database-prod postgresql-primary-0 -- sh -c \
+  'export PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -Fc' \
+  > "$AUTHSEC_BACKUP_PATH"
+test -s "$AUTHSEC_BACKUP_PATH" && sha256sum "$AUTHSEC_BACKUP_PATH"
 ```
 
 A backup you have not restored is a hypothesis. For anything beyond a purely
 additive change, restore it into a scratch database and check the row counts
-before you proceed:
-
-```bash
-docker exec -i authsec-postgres psql -U authsec -c 'CREATE DATABASE restore_check;'
-docker exec -i authsec-postgres pg_restore -U authsec -d restore_check < ~/backup_*.dump
-```
+before you proceed. Do that in an isolated non-production PostgreSQL instance;
+never create a restore-test database inside the production cluster.
 
 ## Table domains
 
@@ -220,11 +223,21 @@ docker exec -i authsec-postgres pg_restore -U authsec -d restore_check < ~/backu
 
 ## How to change the schema
 
-1. Edit the `CREATE TABLE` statement inline in `001_bootstrap.sql`.
-2. Wipe the database: `docker compose down -v` (removes the Postgres volume).
-3. Re-bootstrap: `docker compose up -d` (runs migrations on fresh DB).
-4. If this is a **new** table being added for the first time and no data exists yet, this is all you need.
-5. If the schema is live (production) and you can't wipe, write a `002_<description>.sql` patch file and document it clearly as an additive migration.
+1. Find the highest shipped migration number and add
+   `migrations/master/NNN_description.sql` with the next number.
+2. Update `migrations/master/001_bootstrap.sql` so a fresh database reaches the
+   same final schema.
+3. Test both paths: upgrade an existing database with the numbered migration and
+   initialize a fresh scratch database from bootstrap.
+4. Back up production as described above.
+5. Deploy the immutable backend image through the K3s procedure in
+   `../../../.claude/specs/SPEC-deployment-k3s.md`. The migration runner applies
+   and records the change on startup.
+6. Verify the backend rollout, health endpoint, and the new successful row in
+   `migration_logs` before deploying any dependent UI change.
+
+Production is never reinitialized for a schema change. Do not execute ad-hoc DDL
+against it and do not insert fake success rows into `migration_logs`.
 
 **Never** add `AutoMigrate` calls for non-`migration_logs` tables. GORM will diverge from the hand-curated schema.
 

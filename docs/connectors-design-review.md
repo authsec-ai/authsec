@@ -7,7 +7,7 @@
 | **Status** | Decisions locked (D1–D6) — ready to build · core shipped, enterprise gaps scheduled (Track A) |
 | **Date** | 2026-07-08 |
 | **Scope** | `authsec` (backend) · `Authsec-ui` · `marco` reference agent |
-| **Verified on** | Live single-node deployment |
+| **Verified on** | Production AuthSec runtime; current platform is K3s |
 
 > A self-contained review document. It states the problem the connector subsystem solves, describes what is built and proven today, lays out the enterprise deployment reality (with the industry patterns it's grounded in), names the places the current design is flawed, and proposes a prioritized path to close them. Written for reviewers who were not part of the build.
 
@@ -48,7 +48,7 @@ As an org adds more agents and more tools, this compounds into an unmanaged spra
 
 ## 2. What we built & what it proves
 
-The core broker is shipped, deployed on the single-node environment, and proven end-to-end by a real agent. This is not a prototype claim — here is the evidence.
+The core broker is shipped and has been proven end-to-end by a real agent in the production AuthSec runtime. This is not a prototype claim — here is the evidence.
 
 > **Proof of life (2026-07-08).** A LangChain agent holding only an AuthSec client credential read the last 10 commits of a private repo through the broker. It never held a GitHub token; AuthSec injected it server-side; the action was attributed to the agent's identity in the audit log.
 
@@ -289,4 +289,4 @@ These were the open calls; they are now **decided** and are binding for the buil
 
 ---
 
-*Grounded in: the live single-node deployment (M2M flow proven 2026-07-08, `audit_events` #150–156), `authsec@authsec-staging` code (connector broker controller, oauth service, XAA/ID-JAG token engine, service-account provisioning), provider auth models (GitHub Apps vs OAuth Apps, Slack bot tokens, Google per-user OAuth vs domain delegation), and the 2026 agentic-identity literature (Strata, Entrust, IBM, "Authenticated Delegation and Authorized AI Agents" arXiv 2501.09674, "The Start Button Problem" arXiv 2501.12498). Companion documents: SPEC-connectors.md, connectors-infra-handoff.md.*
+*Grounded in: the production AuthSec runtime (M2M flow proven 2026-07-08, `audit_events` #150–156), `authsec@authsec-staging` code (connector broker controller, oauth service, XAA/ID-JAG token engine, service-account provisioning), provider auth models (GitHub Apps vs OAuth Apps, Slack bot tokens, Google per-user OAuth vs domain delegation), and the 2026 agentic-identity literature (Strata, Entrust, IBM, "Authenticated Delegation and Authorized AI Agents" arXiv 2501.09674, "The Start Button Problem" arXiv 2501.12498). Companion documents: SPEC-connectors.md, connectors-infra-handoff.md.*
