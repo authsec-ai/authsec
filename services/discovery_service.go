@@ -218,11 +218,13 @@ func (m *discoveryManager) ReportSighting(workspaceID uuid.UUID, reportedBy stri
 	if !containsString(models.ValidDeploymentOrigins(), origin) {
 		return nil, false, fmt.Errorf("unknown deployment origin %q", origin)
 	}
-	// A repo scan needs no inference: anything it finds came from a
-	// version-controlled declaration, so it is automated by construction.
-	if in.Source == models.DiscoverySourceRepoScan {
-		origin = models.DeploymentOriginAutomated
-	}
+	// deployment_origin answers "how did this get deployed", NOT "how was this
+	// declared". A repo scan establishes only the latter: a parsed declaration
+	// may never have run, may be dead code, and says nothing about how anything
+	// reached an environment. Stamping it "automated" asserts a deployment we
+	// never observed, so the caller's origin (unknown for a repo scan) is
+	// preserved. Overriding it here is what turns "nightly-audit | automated |
+	// 2 min ago" into a live-looking process that is, in fact, a file.
 
 	// If the connector names a source, it must be one in this workspace —
 	// otherwise the row would point at another workspace's connector.

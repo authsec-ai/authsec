@@ -58,7 +58,9 @@ func TestGitHubScanFeedsExistingInventory(t *testing.T) {
 	}
 	t.Log("PASS: failure and truncation counted separately; scan not marked complete")
 
-	// The rows are in the EXISTING inventory, marked repo_scan and automated.
+	// The rows are in the EXISTING inventory, marked repo_scan with an honest
+	// deployment origin: a parsed declaration establishes only that someone
+	// wrote the agent down, never how (or whether) it was deployed.
 	agents, total, err := disco.ListAgents(ws, repositories.AgentFilter{
 		Source: models.DiscoverySourceRepoScan, Limit: 50,
 	})
@@ -72,12 +74,15 @@ func TestGitHubScanFeedsExistingInventory(t *testing.T) {
 		if a.Status != models.DiscoveredAgentUnregistered {
 			t.Fatalf("a sighting must land unregistered, got %q", a.Status)
 		}
-		if a.DeploymentOrigin != models.DeploymentOriginAutomated {
-			t.Fatalf("a version-controlled declaration is automated by construction, got %q",
+		// A declaration is not a deployment. Stamping these "automated" would
+		// assert a deployment nobody observed, which is what makes a repo
+		// finding read as a live process in the inventory.
+		if a.DeploymentOrigin != models.DeploymentOriginUnknown {
+			t.Fatalf("a declared finding must not assert a deployment origin, got %q",
 				a.DeploymentOrigin)
 		}
 	}
-	t.Logf("PASS: %d GitHub sighting(s) in the existing inventory, all unregistered and automated", total)
+	t.Logf("PASS: %d GitHub sighting(s) in the existing inventory, all unregistered with origin=unknown", total)
 
 	// No secret value or prompt body, only the secret NAME.
 	var leaked, named int64
