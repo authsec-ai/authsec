@@ -67,9 +67,28 @@ type GitHubScanResult struct {
 	ReposFailed  int       `json:"repos_failed"`
 	// Excluded by the plan. Reported separately from failures: choosing not to
 	// scan something is not the same as being unable to.
-	ReposExcluded   int       `json:"repos_excluded"`
-	Excluded        []string  `json:"excluded_repositories,omitempty"`
-	SelectionMode   string    `json:"selection_mode"`
+	// Excluded is every repository the scan did not read by choice or by
+	// missing grant, named. Deliberately a ROLL-UP, so "what did we leave out?"
+	// has one answer. SelectedNotGranted below is the subset that says WHY.
+	ReposExcluded int      `json:"repos_excluded"`
+	Excluded      []string `json:"excluded_repositories,omitempty"`
+	// Selected by the plan but never exposed by the installation. Kept apart
+	// from Excluded because the two demand different actions from different
+	// people: Excluded is "our admin chose not to scan this" (fixed in the
+	// plan), while this is "our admin asked for this and GitHub never granted
+	// it" (fixed only on GitHub). Folding them together hides the second.
+	ReposSelectedNotGranted int      `json:"repos_selected_not_granted"`
+	SelectedNotGranted      []string `json:"selected_not_granted,omitempty"`
+	// Scanned, and archived on GitHub. A subset of ReposScanned, not a skip: an
+	// archived repository is read-only, not empty, and its declarations still
+	// name real secrets. It is inspected and annotated so an admin can discount
+	// findings that can no longer be merged.
+	ReposArchived int      `json:"repos_archived"`
+	Archived      []string `json:"archived_repositories,omitempty"`
+	SelectionMode string   `json:"selection_mode"`
+	// Disclosure is UNCONDITIONAL and travels in the payload rather than in UI
+	// copy, so a client cannot omit it by accident.
+	Disclosure      string    `json:"disclosure"`
 	ReposTruncated  int       `json:"repos_truncated"`
 	FilesFetched    int       `json:"files_fetched"`
 	SightingsNew    int       `json:"sightings_new"`
@@ -78,6 +97,13 @@ type GitHubScanResult struct {
 	Warnings        []string  `json:"warnings,omitempty"`
 	ScannedAt       time.Time `json:"scanned_at"`
 }
+
+// ScanGrantDisclosure is the coverage limit every GitHub scan carries. It
+// states the one thing a reader cannot infer from the counters: the scan saw
+// only what the installation exposed, so a repository's absence from these
+// numbers is not evidence that it holds no agents.
+const ScanGrantDisclosure = "repositories not granted to this installation are not listed or scanned, " +
+	"and their absence from this result is not evidence that they hold no agents"
 
 // githubScannerConfig is the per-source config stored on discovery_sources.
 //
@@ -125,6 +151,9 @@ type RepoChoice struct {
 	FullName      string `json:"full_name"`
 	DefaultBranch string `json:"default_branch"`
 	Selected      bool   `json:"selected"`
+	// Archived is shown at selection time so an admin can judge the cost before
+	// spending API budget: findings here are real but unfixable in place.
+	Archived bool `json:"archived"`
 }
 
 // ListSelectableRepositories returns what the installation can see, so an admin
@@ -158,6 +187,7 @@ func (s *GitHubRepoScanner) ListSelectableRepositories(ctx context.Context, work
 		out = append(out, RepoChoice{
 			NativeID: sc.NativeID, FullName: sc.DisplayName,
 			DefaultBranch: sc.DefaultBranch, Selected: cfg.Repositories.wants(sc.DisplayName),
+			Archived: sc.Archived,
 		})
 	}
 	return out, nil
@@ -216,7 +246,8 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 	}
 
 	res := &GitHubScanResult{
-		SourceID: sourceID, Complete: true, SelectionMode: mode, ScannedAt: time.Now(),
+		SourceID: sourceID, Complete: true, SelectionMode: mode,
+		Disclosure: ScanGrantDisclosure, ScannedAt: time.Now(),
 	}
 
 	scopes, err := s.provider.ListScopes(ctx, pctx)
@@ -230,6 +261,43 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 			repoScopes++
 		}
 	}
+	// The plan may name repositories this installation never exposed: a stale
+	// entry, a repository since deleted or transferred out, or a grant that was
+	// simply never made on GitHub.
+	//
+	// Only a diff against the live grant can surface those. Walking the grant
+	// alone — which is all the scan loop below does — can never mention a
+	// repository that is absent from it, so such an entry would vanish without
+	// a trace while the stored plan still implies it is covered. That is the
+	// difference between "we did not look there" and "there is nothing there",
+	// reported in the admin's own words: the name they typed.
+	if mode == "selected" {
+		granted := make(map[string]struct{}, repoScopes)
+		for _, scope := range scopes {
+			if scope.Kind == "repository" {
+				granted[strings.ToLower(scope.DisplayName)] = struct{}{}
+			}
+		}
+		for _, want := range cfg.Repositories.Include {
+			if _, ok := granted[strings.ToLower(want)]; ok {
+				continue
+			}
+			res.ReposSelectedNotGranted++
+			res.SelectedNotGranted = append(res.SelectedNotGranted, want)
+			// Also reported as excluded, by bare name: Excluded is the roll-up
+			// of everything left out, and a consumer matching on the repository
+			// it asked for needs an exact match, not a string with a reason on it.
+			res.ReposExcluded++
+			res.Excluded = append(res.Excluded, want)
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"%s: selected for scanning but not granted to this installation; "+
+					"it was not inspected — grant it on GitHub or remove it from the plan", want))
+			// Part of the selected scope went uninspected, so the scan cannot
+			// claim to be complete for that scope.
+			res.Complete = false
+		}
+	}
+
 	if repoScopes == 0 {
 		// The installation is reachable but grants nothing. "Complete" would be
 		// vacuously true, so say plainly that there was nothing to look at.
@@ -247,6 +315,12 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 			res.ReposExcluded++
 			res.Excluded = append(res.Excluded, scope.DisplayName)
 			continue
+		}
+		// Counted, then scanned anyway. See ReposArchived: read-only is not
+		// empty, and an archived declaration still names a live secret.
+		if scope.Archived {
+			res.ReposArchived++
+			res.Archived = append(res.Archived, scope.DisplayName)
 		}
 
 		entries, truncated, err := s.provider.ListTree(ctx, pctx, scope)
@@ -301,6 +375,12 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 			}
 			facts["repository"] = scope.DisplayName
 			facts["path"] = e.Path
+			// Set only when true, so its presence is the signal: a reviewer
+			// judging whether a declaration is still live needs to know the
+			// repository can no longer be merged to.
+			if scope.Archived {
+				facts["repository_archived"] = true
+			}
 			facts["rule_id"] = rule.ID
 			facts["rule_version"] = rule.Version
 			facts["evidence_mode"] = rule.EvidenceMode

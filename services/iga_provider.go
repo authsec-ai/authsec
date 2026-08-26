@@ -96,6 +96,10 @@ type ProviderScope struct {
 	NativeID      string // immutable provider id — the recognition key input
 	DisplayName   string // owner/name — a LOCATOR, never identity
 	DefaultBranch string
+	// Archived reports the provider's own read-only flag. It qualifies a
+	// finding rather than suppressing it: declarations in an archived
+	// repository still name real secrets, but nobody can merge a fix.
+	Archived bool
 }
 
 // ProviderObject is one raw thing the provider returned, before any

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/vault"
@@ -154,6 +155,19 @@ func (ctl *DiscoveryGitHubController) CreateSourceFromConnector(c *gin.Context) 
 		c.JSON(http.StatusNotFound, gin.H{"error": "connector not found in this workspace"})
 		return
 	}
+	// The connector must actually be a GitHub App connector. Without this check
+	// any workspace-bound connection carrying an external account id — a Slack
+	// team, a Notion workspace — produced a repo_scan source stamped
+	// provider_host "github.com" with that foreign id as its installation_id,
+	// failing only later at token minting and pointing at the wrong thing.
+	if pk := strings.ToLower(connector.ProviderKey); pk != "github" && pk != "github_app" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "connector " + req.ConnectorID.String() + " is provider " +
+				connector.ProviderKey + "; GitHub repository scanning requires a GitHub App connector",
+		})
+		return
+	}
+
 	conn, err := connRepo.GetWorkspaceConnection(req.ConnectorID)
 	if err != nil || conn == nil || conn.ExternalAccountID == "" {
 		c.JSON(http.StatusConflict, gin.H{
@@ -230,6 +244,10 @@ func (ctl *DiscoveryGitHubController) ListSourceRepositories(c *gin.Context) {
 		"data": repos,
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
+			// Dedicated key carrying the SAME constant the scan result uses, so
+			// a client can locate the mandatory disclosure by key rather than
+			// string-matching prose out of the general-purpose "note" field.
+			"disclosure": services.ScanGrantDisclosure,
 			"note": "this is what the installation exposes; repositories not granted are not listed, " +
 				"and their absence is not evidence that they hold no agents",
 		},

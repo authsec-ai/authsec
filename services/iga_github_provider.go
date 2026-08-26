@@ -254,6 +254,7 @@ type ghRepo struct {
 	NodeID        string `json:"node_id"`
 	FullName      string `json:"full_name"`
 	DefaultBranch string `json:"default_branch"`
+	Archived      bool   `json:"archived"`
 }
 
 func (g *GitHubProvider) ListScopes(ctx context.Context, in ProviderContext) ([]ProviderScope, error) {
@@ -279,6 +280,7 @@ func (g *GitHubProvider) ListScopes(ctx context.Context, in ProviderContext) ([]
 			out = append(out, ProviderScope{
 				Kind: "repository", NativeID: id,
 				DisplayName: r.FullName, DefaultBranch: branch,
+				Archived: r.Archived,
 			})
 		}
 		return nil
