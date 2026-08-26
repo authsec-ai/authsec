@@ -60,9 +60,19 @@ type IGAManager interface {
 // IntegrationInput is the create payload. The installation id is deliberately
 // absent: it arrives from the provider and is untrusted until verified.
 type IntegrationInput struct {
-	Provider             string
-	ProviderHost         string
-	AppRegistrationID    string
+	Provider          string
+	ProviderHost      string
+	AppRegistrationID string
+	// SecretRef points at the approved secrets store entry holding the App
+	// private key. A POINTER only -- no key material reaches this database, and
+	// the field is json:"-" so it never reaches a client either.
+	//
+	// Nothing reads it to mint a token; the credential is resolved from the
+	// workspace's App registration. It is here so a row can SAY where its
+	// credential lives, which is what makes an orphaned or repointed key
+	// traceable later. Leaving it empty on this path while the migration filled
+	// it would put two shapes of the same row in one table.
+	SecretRef            string
 	CapabilityProfile    map[string]interface{}
 	RequestedPermissions map[string]interface{}
 }
@@ -183,6 +193,7 @@ func (m *igaManager) CreateIntegration(workspaceID uuid.UUID, createdBy string, 
 		Provider:             in.Provider,
 		ProviderHost:         in.ProviderHost,
 		AppRegistrationID:    in.AppRegistrationID,
+		SecretRef:            in.SecretRef,
 		CapabilityProfile:    mustJSON(in.CapabilityProfile),
 		RequestedPermissions: mustJSON(in.RequestedPermissions),
 		GrantedPermissions:   json.RawMessage("{}"),

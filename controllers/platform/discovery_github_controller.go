@@ -244,6 +244,7 @@ func (ctl *DiscoveryGitHubController) AddOrganisation(c *gin.Context) {
 		Provider:          "github",
 		ProviderHost:      "github.com",
 		AppRegistrationID: app.GitHubAppID,
+		SecretRef:         app.VaultPath,
 		CapabilityProfile: map[string]interface{}{
 			"repository_selection": match.RepositorySelection,
 			"account_type":         match.AccountType,
