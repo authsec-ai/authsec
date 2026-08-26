@@ -1402,6 +1402,12 @@ func SetupRoutes(
 			connectors.GET("/providers/:provider/app", middlewares.Require("connector", "read"), connectorController.GetProviderApp)
 			connectors.POST("/providers/:provider/app", middlewares.Require("connector", "update"), connectorController.SetProviderApp)
 			connectors.POST("/providers/github/app-github", middlewares.Require("connector", "update"), connectorController.SetGitHubApp)
+			// Self-service reads that let the console stop asking humans for
+			// values GitHub already knows. Both are non-secret and read-only.
+			connectors.GET("/providers/github/app/describe", middlewares.Require("connector", "read"), connectorController.DescribeGitHubApp)
+			connectors.GET("/providers/github/installations", middlewares.Require("connector", "read"), connectorController.ListGitHubInstallations)
+			// Completes GitHub's App-manifest flow; writes the App id + key.
+			connectors.POST("/providers/github/app-manifest/convert", middlewares.Require("connector", "update"), connectorController.ConvertGitHubAppManifest)
 			connectors.POST("/:id/connections/github-app", middlewares.Require("connector", "update"), connectorController.ConnectGitHubApp)
 			// R4 — end-user self-service consent (bind to the caller's own identity).
 			connectors.POST("/:id/connections/user/oauth/start", middlewares.Require("connector", "read"), connectorController.StartUserConnect)

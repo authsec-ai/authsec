@@ -798,3 +798,104 @@ func (ctl *ConnectorController) GetConnectorConfig(c *gin.Context) {
 		"subscriptions": conn.Subscriptions,
 	})
 }
+
+/* ------------------- GitHub App self-service (console reads) ---------------- */
+
+// DescribeGitHubApp handles GET /authsec/connectors/providers/github/app/describe.
+// Confirms what the stored App actually is, straight from GitHub, so the console
+// can show the operator that the right App was registered rather than trusting a
+// number they typed. Also returns the canonical install URL, which lets the UI
+// offer a button instead of telling someone where to click on github.com.
+func (ctl *ConnectorController) DescribeGitHubApp(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		DescribeGitHubApp(c.Request.Context(), wsID)
+	if err != nil {
+		// 502, not 400: the credentials are ours and the failure is almost always
+		// GitHub-side or a credential mismatch, neither of which the caller's
+		// request can fix by being different.
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": info})
+}
+
+// ListGitHubInstallations handles
+// GET /authsec/connectors/providers/github/installations.
+//
+// Returns everywhere this workspace's App is installed so the console can offer
+// a list to pick from. This exists to delete the worst step in onboarding:
+// copying an installation id out of a browser URL, which is easy to confuse with
+// the App id and fails opaquely much later when it is wrong.
+func (ctl *ConnectorController) ListGitHubInstallations(c *gin.Context) {
+	wsID, _, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	list, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		ListGitHubInstallations(c.Request.Context(), wsID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": list,
+		"meta": gin.H{
+			"note": "installations this App can currently see; installing it on another " +
+				"organisation adds a row here",
+		},
+	})
+}
+
+// ConvertGitHubAppManifest handles
+// POST /authsec/connectors/providers/github/app-manifest/convert.
+//
+// Completes GitHub's App-manifest flow: the operator approves one pre-filled
+// screen on github.com, GitHub redirects back with a single-use code, and this
+// exchanges it for the App id and private key. That removes App creation,
+// permission selection, key generation and key upload from the operator
+// entirely — the values never pass through a human's clipboard.
+func (ctl *ConnectorController) ConvertGitHubAppManifest(c *gin.Context) {
+	wsID, principal, err := ctl.resolveWorkspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	vaultClient, err := ctl.getVaultClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := services.NewConnectorOAuthService(ctl.db, vaultClient).
+		ConvertGitHubAppManifest(c.Request.Context(), wsID, req.Code, principal)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	// The app id is not secret; the private key it arrived with is never echoed.
+	auditAdminMutation(c, wsID.String(), "create_github_app_via_manifest", "connector_provider",
+		"github", http.StatusOK, nil, gin.H{"app_id": info.AppID, "slug": info.Slug})
+	c.JSON(http.StatusOK, gin.H{"data": info})
+}

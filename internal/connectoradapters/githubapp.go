@@ -175,3 +175,14 @@ func parseRSAPrivateKey(pem string) (*rsa.PrivateKey, error) {
 		return nil, err
 	}
 }
+
+// AppJWT signs a short-lived GitHub App JWT for App-level (not installation-level)
+// endpoints: GET /app, GET /app/installations, and the manifest conversion.
+//
+// Exported so the connector service can reach App-scoped reads without a second
+// signing implementation. Installation-scoped calls should keep going through
+// MintGitHubInstallationToken, which caches; these App reads are rare and
+// deliberately uncached.
+func AppJWT(appID, privateKeyPEM string) (string, error) {
+	return signGitHubAppJWT(appID, privateKeyPEM)
+}

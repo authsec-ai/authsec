@@ -672,3 +672,216 @@ func connectorContextForConnection(db *gorm.DB, conn *models.ConnectorConnection
 		Where("id = ?", conn.ConnectorID).Limit(1).Scan(&row)
 	return row.ProviderKey, row.WorkspaceID
 }
+
+/* ----------------------- GitHub App self-service reads ---------------------- */
+//
+// These exist so the console can stop asking a human for values GitHub already
+// knows. Copying an App ID off one settings page and an installation ID out of
+// a URL on another is the single most error-prone part of onboarding, and the
+// two numbers are easy to swap -- a mistake that only surfaces much later, as an
+// opaque token-minting failure. Every value below is read from GitHub with the
+// key already in Vault.
+
+// GitHubAppInfo is the App's own description of itself. Non-secret.
+type GitHubAppInfo struct {
+	AppID       string            `json:"app_id"`
+	Name        string            `json:"name"`
+	Slug        string            `json:"slug"`
+	Owner       string            `json:"owner"`
+	Permissions map[string]string `json:"permissions"`
+	// InstallURL is where a human installs this App. Derived from the slug so
+	// the console can offer a button instead of instructions.
+	InstallURL string `json:"install_url"`
+}
+
+// GitHubInstallation is one place this App is installed.
+type GitHubInstallation struct {
+	InstallationID      string `json:"installation_id"`
+	Account             string `json:"account"`
+	AccountType         string `json:"account_type"`
+	RepositorySelection string `json:"repository_selection"`
+}
+
+// appJWTFor loads the workspace's App credentials and signs an App-level JWT.
+func (s *ConnectorOAuthService) appJWTFor(workspaceID uuid.UUID) (jwtStr, appID string, err error) {
+	app, err := s.repo.GetProviderApp(workspaceID, "github")
+	if err != nil || app == nil || app.GitHubAppID == "" {
+		return "", "", errors.New("no GitHub App configured for this workspace")
+	}
+	if s.vault == nil {
+		return "", "", errors.New("vault client not configured")
+	}
+	secret, err := s.vault.ReadSecret(app.VaultPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read app private key: %w", err)
+	}
+	pem, _ := secret["private_key"].(string)
+	if pem == "" {
+		return "", "", errors.New("GitHub App private key missing in vault")
+	}
+	j, err := connectoradapters.AppJWT(app.GitHubAppID, pem)
+	if err != nil {
+		return "", "", err
+	}
+	return j, app.GitHubAppID, nil
+}
+
+// githubAppGet performs an App-JWT-authenticated GET and decodes into out.
+func (s *ConnectorOAuthService) githubAppGet(ctx context.Context, jwtStr, path string, out interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com"+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+jwtStr)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("reach GitHub: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		// 401 here almost always means the stored App ID and private key are not
+		// a matching pair, which is worth saying plainly rather than echoing a
+		// bare status code.
+		if resp.StatusCode == http.StatusUnauthorized {
+			return errors.New("GitHub rejected this App's credentials — the App ID and private key may not belong to the same App")
+		}
+		return fmt.Errorf("github %s returned %d", path, resp.StatusCode)
+	}
+	return json.Unmarshal(body, out)
+}
+
+// DescribeGitHubApp asks GitHub what this App actually is, so the console can
+// confirm the right App was registered instead of trusting a pasted number.
+func (s *ConnectorOAuthService) DescribeGitHubApp(ctx context.Context, workspaceID uuid.UUID) (*GitHubAppInfo, error) {
+	j, appID, err := s.appJWTFor(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Name        string                 `json:"name"`
+		Slug        string                 `json:"slug"`
+		Owner       struct{ Login string } `json:"owner"`
+		Permissions map[string]string      `json:"permissions"`
+	}
+	if err := s.githubAppGet(ctx, j, "/app", &raw); err != nil {
+		return nil, err
+	}
+	return &GitHubAppInfo{
+		AppID:       appID,
+		Name:        raw.Name,
+		Slug:        raw.Slug,
+		Owner:       raw.Owner.Login,
+		Permissions: raw.Permissions,
+		InstallURL:  "https://github.com/apps/" + raw.Slug + "/installations/new",
+	}, nil
+}
+
+// ListGitHubInstallations returns everywhere this App is installed, so the
+// console can offer a list to click instead of asking for an id.
+func (s *ConnectorOAuthService) ListGitHubInstallations(ctx context.Context, workspaceID uuid.UUID) ([]GitHubInstallation, error) {
+	j, _, err := s.appJWTFor(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	var raw []struct {
+		ID                  int64  `json:"id"`
+		RepositorySelection string `json:"repository_selection"`
+		Account             struct {
+			Login string `json:"login"`
+			Type  string `json:"type"`
+		} `json:"account"`
+	}
+	if err := s.githubAppGet(ctx, j, "/app/installations", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]GitHubInstallation, 0, len(raw))
+	for _, i := range raw {
+		out = append(out, GitHubInstallation{
+			InstallationID:      fmt.Sprintf("%d", i.ID),
+			Account:             i.Account.Login,
+			AccountType:         i.Account.Type,
+			RepositorySelection: i.RepositorySelection,
+		})
+	}
+	return out, nil
+}
+
+// ConvertGitHubAppManifest exchanges the temporary code GitHub hands back after
+// a manifest-created App for the App's real credentials, and stores them.
+//
+// This is what removes App creation from the operator's hands entirely: instead
+// of creating an App by hand, choosing permissions, generating a key, and
+// pasting an id, they approve one pre-filled GitHub screen and the id + key
+// arrive here directly. The code is single-use and expires after an hour.
+func (s *ConnectorOAuthService) ConvertGitHubAppManifest(ctx context.Context, workspaceID uuid.UUID, code, createdBy string) (*GitHubAppInfo, error) {
+	if code == "" {
+		return nil, errors.New("manifest code is required")
+	}
+	if s.vault == nil {
+		return nil, errors.New("vault client not configured")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.github.com/app-manifests/"+url.PathEscape(code)+"/conversions", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reach GitHub: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		// The usual cause is a reused or expired code -- say so, because the
+		// remedy (start the create flow again) is not obvious from a 404.
+		return nil, fmt.Errorf("GitHub rejected the manifest code (%d); it is single-use and expires after an hour — start the setup again", resp.StatusCode)
+	}
+
+	var out struct {
+		ID          int64                  `json:"id"`
+		Name        string                 `json:"name"`
+		Slug        string                 `json:"slug"`
+		PEM         string                 `json:"pem"`
+		Owner       struct{ Login string } `json:"owner"`
+		Permissions map[string]string      `json:"permissions"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("parse manifest conversion: %w", err)
+	}
+	if out.ID == 0 || out.PEM == "" {
+		return nil, errors.New("manifest conversion returned no app id or private key")
+	}
+
+	appID := fmt.Sprintf("%d", out.ID)
+	vaultPath := fmt.Sprintf("kv/data/secret/workspaces/%s/provider-apps/github", workspaceID.String())
+	if err := s.vault.WriteSecret(vaultPath, map[string]interface{}{"private_key": out.PEM}); err != nil {
+		return nil, fmt.Errorf("store app private key: %w", err)
+	}
+	if err := s.repo.UpsertProviderApp(&models.ConnectorProviderApp{
+		WorkspaceID: workspaceID,
+		ProviderKey: "github",
+		AppKind:     models.ProviderAppKindGitHubApp,
+		GitHubAppID: appID,
+		VaultPath:   vaultPath,
+		CreatedBy:   createdBy,
+	}); err != nil {
+		return nil, err
+	}
+
+	return &GitHubAppInfo{
+		AppID:       appID,
+		Name:        out.Name,
+		Slug:        out.Slug,
+		Owner:       out.Owner.Login,
+		Permissions: out.Permissions,
+		InstallURL:  "https://github.com/apps/" + out.Slug + "/installations/new",
+	}, nil
+}
