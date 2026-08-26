@@ -560,6 +560,9 @@ func (ctl *DiscoveryGitHubController) SetGitHubApp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if ctl.refuseAppChange(c, workspaceID, req.AppID) {
+		return
+	}
 	oauth, err := ctl.oauthService()
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
@@ -594,6 +597,11 @@ func (ctl *DiscoveryGitHubController) ConvertGitHubAppManifest(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// A manifest conversion always produces a NEW App, so this can never be a
+	// same-App key rotation.
+	if ctl.refuseAppChange(c, workspaceID, "") {
 		return
 	}
 	oauth, err := ctl.oauthService()
@@ -664,6 +672,43 @@ func (ctl *DiscoveryGitHubController) DeleteGitHubApp(c *gin.Context) {
 			"note": "the App itself still exists on GitHub; delete or uninstall it there if you no longer want it",
 		},
 	})
+}
+
+// refuseAppChange blocks swapping the workspace's App while organisations are
+// still bound to the current one.
+//
+// An installation belongs to the App it was created under. Registering a
+// different App leaves every existing organisation pointing at credentials that
+// can no longer mint a token for it, and nothing says so until the next scan
+// fails with an error naming neither the App nor the organisation. Refusing, and
+// naming what to remove first, is the difference between a clear instruction and
+// a silent break.
+//
+// Returns true when it has already written a response.
+func (ctl *DiscoveryGitHubController) refuseAppChange(
+	c *gin.Context, workspaceID uuid.UUID, incomingAppID string,
+) bool {
+	current, err := repositories.NewConnectorRepository(ctl.db).GetProviderApp(workspaceID, "github")
+	// Nothing registered yet, or the same App being re-registered (a key
+	// rotation, which keeps every installation valid): nothing to protect.
+	if err != nil || current == nil || current.GitHubAppID == "" {
+		return false
+	}
+	if incomingAppID != "" && incomingAppID == current.GitHubAppID {
+		return false
+	}
+	blocking := ctl.organisationsUsingApp(workspaceID)
+	if len(blocking) == 0 {
+		return false
+	}
+	c.JSON(http.StatusConflict, gin.H{
+		"error": "remove these GitHub organisations first, then register the new App: " +
+			strings.Join(blocking, ", "),
+		"blocking_organisations": blocking,
+		"reason": "each organisation was installed on App " + current.GitHubAppID +
+			" and cannot be read by a different App",
+	})
+	return true
 }
 
 // organisationsUsingApp names the repo_scan sources still bound to an

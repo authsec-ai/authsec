@@ -701,6 +701,17 @@ type GitHubAppInfo struct {
 	Slug        string            `json:"slug"`
 	Owner       string            `json:"owner"`
 	Permissions map[string]string `json:"permissions"`
+	// OwnerType is "User" or "Organization".
+	//
+	// Together with Public it decides where this App can be installed AT ALL:
+	// GitHub only allows a private App on the account that owns it. A private,
+	// personally-owned App therefore can never be installed on an organisation,
+	// and the console needs to be able to say so -- otherwise the organisation
+	// list is simply empty with no way to find out why.
+	OwnerType string `json:"owner_type"`
+	// Public is GitHub's "any account may install this" flag. False means owner
+	// only.
+	Public bool `json:"public"`
 	// InstallURL is where a human installs this App. Derived from the slug so
 	// the console can offer a button instead of instructions.
 	InstallURL string `json:"install_url"`
@@ -774,10 +785,14 @@ func (s *ConnectorOAuthService) DescribeGitHubApp(ctx context.Context, workspace
 		return nil, err
 	}
 	var raw struct {
-		Name        string                 `json:"name"`
-		Slug        string                 `json:"slug"`
-		Owner       struct{ Login string } `json:"owner"`
-		Permissions map[string]string      `json:"permissions"`
+		Name  string `json:"name"`
+		Slug  string `json:"slug"`
+		Owner struct {
+			Login string `json:"login"`
+			Type  string `json:"type"`
+		} `json:"owner"`
+		Permissions map[string]string `json:"permissions"`
+		Public      bool              `json:"public"`
 	}
 	if err := s.githubAppGet(ctx, j, "/app", &raw); err != nil {
 		return nil, err
@@ -787,6 +802,8 @@ func (s *ConnectorOAuthService) DescribeGitHubApp(ctx context.Context, workspace
 		Name:        raw.Name,
 		Slug:        raw.Slug,
 		Owner:       raw.Owner.Login,
+		OwnerType:   raw.Owner.Type,
+		Public:      raw.Public,
 		Permissions: raw.Permissions,
 		InstallURL:  "https://github.com/apps/" + raw.Slug + "/installations/new",
 	}, nil
