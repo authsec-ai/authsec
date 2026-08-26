@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -548,4 +549,57 @@ func NewGitHubProviderFromConnector(db *gorm.DB, vaultClient vault.VaultClient) 
 			&models.ConnectorConnection{ExternalAccountID: in.InstallationID})
 	}
 	return p
+}
+
+// ListTreeDir lists one directory level via the tree API's "ref:path" form.
+//
+// Recovery after truncation, not a general walker: it asks only for the
+// directories the rule catalogue can name, so the cost is bounded by the
+// catalogue rather than by the size of the repository. An absent or forbidden
+// directory is not an error here — the caller is already in a degraded,
+// partial-coverage path and must not have it escalated to a failure.
+func (g *GitHubProvider) ListTreeDir(ctx context.Context, in ProviderContext, scope ProviderScope, dir string) ([]TreeEntry, error) {
+	ref := scope.DefaultBranch
+	if dir != "" {
+		// GitHub resolves "<ref>:<path>" to that subtree. The path is a repo
+		// path, so its separators must survive escaping.
+		ref += ":" + dir
+	}
+	body, notModified, err := g.get(ctx, in,
+		fmt.Sprintf("%s/repos/%s/git/trees/%s", g.BaseURL, scope.DisplayName, url.PathEscape(ref)))
+	if err != nil {
+		if e, ok := err.(*ghError); ok && (e.IsAbsent() || e.IsPermissionDenied()) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if notModified {
+		return nil, nil
+	}
+	var tree struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			SHA  string `json:"sha"`
+			Size int64  `json:"size"`
+		} `json:"tree"`
+	}
+	if err := json.Unmarshal(body, &tree); err != nil {
+		return nil, err
+	}
+	out := make([]TreeEntry, 0, len(tree.Tree))
+	for _, t := range tree.Tree {
+		if t.Type != "blob" {
+			continue
+		}
+		// A subtree listing returns names relative to the subtree, so rejoin
+		// them: every path leaving this provider is a full repo path, which is
+		// what the catalogue globs and the fingerprints both assume.
+		full := t.Path
+		if dir != "" {
+			full = dir + "/" + t.Path
+		}
+		out = append(out, TreeEntry{Path: full, SHA: t.SHA, Size: t.Size})
+	}
+	return out, nil
 }

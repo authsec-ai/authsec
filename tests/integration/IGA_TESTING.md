@@ -28,7 +28,7 @@ docker exec postgres psql -U authsec -d postgres \
 docker cp migrations/master/001_bootstrap.sql postgres:/tmp/bootstrap.sql
 docker exec postgres psql -U authsec -d iga_test -v ON_ERROR_STOP=1 -q -f /tmp/bootstrap.sql
 
-# expect 24
+# expect 25
 docker exec postgres psql -U authsec -d iga_test -tAc \
   "SELECT count(*) FROM information_schema.tables WHERE table_name LIKE 'iga_%';"
 ```
@@ -240,12 +240,22 @@ SELECT a.id, count(l.id) AS supporting
 - **No live GitHub call anywhere.** The provider is a fixture. Real endpoints,
   per-plan availability, rate-limit behaviour and token minting are Stage-0
   work and cannot be tested without a tenant.
-- **The rule catalogue is a two-rule starter set**, not the Stage-4 catalogue.
-  Real rules need official schema references, positive/negative/malformed
-  fixtures, and measured precision on a labelled corpus before any of them may
-  auto-classify.
+- **The rule catalogue is v1.0.0 with 14 rules and 42 fixtures**
+  (`docs/IGA_RULE_CATALOGUE.md`), but its precision is still UNMEASURED. Every
+  rule has a true-positive, a near-miss and an adversarial fixture, and the
+  documented over-matches and blind spots are asserted so they stay honest —
+  none of which is the same as measured precision on a labelled corpus. Until
+  that exists no rule may auto-classify, and only HIGH confidence may be
+  counted as an agent at all.
 - **No scale or cadence benchmark.** Scan duration, API-call cost and safe
   refresh interval are explicitly must-not-guess and need a measured tenant run.
-- **Tombstoning is not implemented.** The generation columns and the
-  authoritative-scan gate exist, but the sweep that marks absent objects does
-  not, so nothing is ever tombstoned yet.
+- **No live-tenant proof of the recovery path.** `GitHubProvider.ListTreeDir`
+  (the per-directory fallback used when a tree truncates) is exercised only
+  against the fixture provider, so its `<ref>:<path>` URL form is unverified
+  until Stage-0.
+- **Nothing here runs in CI.** Every test in this directory skips unless
+  `IGA_TEST_DSN` is set, and the Jenkinsfile has no test stage — so these
+  assertions currently protect nothing automatically. The catalogue fixtures and
+  the redaction and staleness tests were deliberately written as UNIT tests
+  (`go test ./services/ ./models/`) so that at least the coverage claim and the
+  redaction guarantee are gated by an ordinary `go test ./...`.

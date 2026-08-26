@@ -439,11 +439,26 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 						// gets manufactured out of a big monorepo.
 						c.state = models.CoveragePartial
 						c.reason = "git tree truncated (100k entries / 7MB); unwalked subtrees not inspected"
+
+						// Recover the directories the catalogue can name. Same
+						// helper the repo-scan channel uses, deliberately: two
+						// scanners that recover differently would report
+						// different coverage for the same repository, which
+						// reads to a customer as a product bug.
+						//
+						// Coverage stays PARTIAL either way — recovery narrows
+						// the gap, it never closes it.
+						recovered, dirs := RecoverTruncatedTree(ctx, m.provider, pctx, scope, m.catalog, entries)
+						entries = append(entries, recovered...)
 						_ = m.repo.RecordIssue(&models.IGAOperationalIssue{
 							ID: uuid.New(), WorkspaceID: workspaceID, IntegrationID: &integ.ID,
 							IssueKind: "tree_truncated", Severity: "warning",
 							ObjectClass: models.ClassRepoDeclaration, ScopeRef: scope.DisplayName,
-							Detail:      mustJSON(map[string]interface{}{"entries_seen": len(entries)}),
+							Detail: mustJSON(map[string]interface{}{
+								"entries_seen":         len(entries) - len(recovered),
+								"paths_recovered":      len(recovered),
+								"directories_relisted": dirs,
+							}),
 							FirstSeenAt: now, LastSeenAt: now,
 						})
 						report.Issues = append(report.Issues,
@@ -855,8 +870,34 @@ func (m *igaManager) findPriorHash(workspaceID, integrationID uuid.UUID, recogni
 	return prior.RawHash, nil
 }
 
+// ingest records a PROVIDER-NATIVE object — one GitHub itself handed us, rather
+// than one a detection rule inferred from a file.
+//
+// These still carry a rule identity. There is no catalogue rule behind them, but
+// "every observation records rule id and rule version" has to hold for all of
+// them or the evidence trail has holes: when a rule turns out to be wrong we
+// identify the findings it produced BY that pair, and a row with an empty id
+// can never be retracted precisely — it can only be distrusted along with
+// everything else. So the lane gets a synthetic identity naming the provider as
+// the source of the claim, versioned with the catalogue so a reader can still
+// tell which vintage produced it.
 func (m *igaManager) ingest(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, o ProviderObject, class string, report *ScanReport) {
-	m.ingestWithRule(workspaceID, integ, run, scope, o, class, IGARule{}, "", report)
+	m.ingestWithRule(workspaceID, integ, run, scope, o, class, providerNativeRule(class, m.catalog.Version), "", report)
+}
+
+// providerNativeRule is the synthetic identity for a provider-declared object.
+//
+// The "provider." prefix is deliberate and load-bearing: it says the claim came
+// from GitHub's own schema rather than from anything we inferred, which is a
+// materially stronger basis than any catalogue rule can offer.
+func providerNativeRule(class, catalogVersion string) IGARule {
+	return IGARule{
+		ID:           "provider." + class,
+		Version:      catalogVersion,
+		ObjectClass:  class,
+		EvidenceMode: models.EvidencePlatformDeclared,
+		Confidence:   ConfidenceHigh,
+	}
 }
 
 // touchSourceObject records "seen again, unchanged" for a file whose fetch was

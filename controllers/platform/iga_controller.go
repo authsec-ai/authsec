@@ -120,6 +120,16 @@ func igaError(c *gin.Context, err error) {
 		c.JSON(http.StatusUnauthorized, igaProblem("signature_invalid",
 			"Webhook signature verification failed", http.StatusUnauthorized, c))
 	default:
+		// An unreachable provider is 503, never 400 and never an empty 200.
+		// "We could not look" and "we looked and found nothing" are opposite
+		// facts about a customer's security posture; a 400 invites a client to
+		// render the first as a caller mistake, one step from a false all-clear.
+		var unavailable *services.ProviderUnavailableError
+		if errors.As(err, &unavailable) {
+			c.JSON(http.StatusServiceUnavailable,
+				igaProblem("provider_unavailable", err.Error(), http.StatusServiceUnavailable, c))
+			return
+		}
 		c.JSON(http.StatusBadRequest, igaProblem("invalid_request", err.Error(), http.StatusBadRequest, c))
 	}
 }
