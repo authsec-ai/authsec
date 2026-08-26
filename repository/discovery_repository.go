@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -220,15 +221,61 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 	return r.db.Save(s).Error
 }
 
+// DeleteSource removes a discovery source and the integration binding it owns.
+//
+// The cascade is the point. A repo_scan source is created together with an
+// iga_integrations row that exists only to serve it, and deleting the source
+// alone used to strand that row: it kept reporting itself as an active,
+// verified GitHub binding for an organisation nobody was scanning any more, and
+// nothing in the console could reach it to clear it.
+//
+// Both statements run in one transaction because a half-applied delete is the
+// same stranded row by another route. This is why the reach into
+// iga_integrations lives here rather than a layer up, where the two deletes
+// could not share a transaction.
+//
+// What deliberately does NOT go: discovered_agents. Its FK is ON DELETE SET
+// NULL, so findings outlive the scanner that found them. An agent that was
+// running yesterday does not stop existing because the integration that spotted
+// it was removed, and silently dropping those rows would quietly shrink the
+// inventory the customer governs.
 func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) error {
-	res := r.db.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var src models.DiscoverySource
+		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
+			return err
+		}
+
+		integrationID := ""
+		if len(src.Config) > 0 {
+			var cfg struct {
+				IntegrationID string `json:"integration_id"`
+			}
+			_ = json.Unmarshal(src.Config, &cfg)
+			integrationID = cfg.IntegrationID
+		}
+
+		res := tx.Delete(&models.DiscoverySource{}, "id = ? AND workspace_id = ?", id, workspaceID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+
+		if integrationID != "" {
+			if integID, perr := uuid.Parse(integrationID); perr == nil {
+				// Not checked for RowsAffected: a source whose integration was
+				// already removed is a source we still want deleted, not an
+				// error that leaves it in place.
+				if derr := tx.Delete(&models.IGAIntegration{},
+					"id = ? AND workspace_id = ?", integID, workspaceID).Error; derr != nil {
+					return derr
+				}
+			}
+		}
+		return nil
+	})
 }
 
 /* -------------------------- self-registration --------------------------- */

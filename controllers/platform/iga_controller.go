@@ -57,7 +57,7 @@ func (ctl *IGAController) provider() services.IGAProvider {
 	if os.Getenv("IGA_GITHUB_LIVE") == "1" {
 		vc, err := vault.NewClient(os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"))
 		if err == nil {
-			return services.NewGitHubProviderFromConnector(ctl.db, vc)
+			return services.NewGitHubProviderForWorkspaceApp(ctl.db, vc)
 		}
 		// Vault is unreachable, so no App key can be read and no token minted.
 		// Falling back to fixtures here would be the worst possible outcome: the

@@ -26,9 +26,9 @@ import (
 // not a duplicate.
 //
 // Two pieces are reused rather than rebuilt:
-//   - credentials: the workspace's GitHub App already lives in the connector
-//     broker, with the private key in Vault. A second key store for the same
-//     App would be strictly worse.
+//   - credentials: the workspace's single GitHub App registration, with the
+//     private key in Vault. That key grants access across every installation of
+//     the App, so a second store holding a copy would be strictly worse.
 //   - transport: the pagination, rate-limit and conditional-request handling in
 //     GitHubProvider, which is covered by its own tests.
 type GitHubRepoScanner struct {
@@ -42,7 +42,7 @@ type GitHubRepoScanner struct {
 func NewGitHubRepoScanner(db *gorm.DB, vaultClient vault.VaultClient) *GitHubRepoScanner {
 	return &GitHubRepoScanner{
 		discovery: NewDiscoveryManager(repositories.NewDiscoveryRepository(db)),
-		provider:  NewGitHubProviderFromConnector(db, vaultClient),
+		provider:  NewGitHubProviderForWorkspaceApp(db, vaultClient),
 		catalog:   DefaultRuleCatalog(),
 	}
 }
@@ -90,7 +90,31 @@ type githubScannerConfig struct {
 	AppRegistrationID string        `json:"app_registration_id"`
 	ProviderHost      string        `json:"provider_host"`
 	Repositories      RepoSelection `json:"repositories"`
-	ConnectorID       string        `json:"connector_id,omitempty"`
+	// IntegrationID is the iga_integrations row that holds the verified
+	// installation binding this source scans through. It is the source's link
+	// back to its governance record — verified_at, granted permissions and the
+	// cross-workspace rebinding guard all live there, not here.
+	IntegrationID     string        `json:"integration_id,omitempty"`
+}
+
+// providerContext builds the provider call context for a source.
+//
+// IntegrationID must be the real iga_integrations id. It used to be given the
+// SOURCE id, which meant every provider call and every issue it recorded
+// carried a source uuid in a field named integration_id — traceable only by
+// someone who already knew about the substitution.
+func (c githubScannerConfig) providerContext(workspaceID uuid.UUID) ProviderContext {
+	host := c.ProviderHost
+	if host == "" {
+		host = "github.com"
+	}
+	return ProviderContext{
+		WorkspaceID:       workspaceID,
+		IntegrationID:     c.IntegrationID,
+		AppRegistrationID: c.AppRegistrationID,
+		InstallationID:    c.InstallationID,
+		ProviderHost:      host,
+	}
 }
 
 // RepoSelection is how an admin narrows a scan.
@@ -141,11 +165,7 @@ func (s *GitHubRepoScanner) ListSelectableRepositories(ctx context.Context, work
 	if len(src.Config) > 0 {
 		_ = json.Unmarshal(src.Config, &cfg)
 	}
-	pctx := ProviderContext{
-		WorkspaceID: workspaceID, IntegrationID: sourceID.String(),
-		AppRegistrationID: cfg.AppRegistrationID, InstallationID: cfg.InstallationID,
-		ProviderHost: cfg.ProviderHost,
-	}
+	pctx := cfg.providerContext(workspaceID)
 	scopes, err := s.provider.ListScopes(ctx, pctx)
 	if err != nil {
 		return nil, err
@@ -190,13 +210,7 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 		cfg.ProviderHost = "github.com"
 	}
 
-	pctx := ProviderContext{
-		WorkspaceID:       workspaceID,
-		IntegrationID:     sourceID.String(),
-		AppRegistrationID: cfg.AppRegistrationID,
-		InstallationID:    cfg.InstallationID,
-		ProviderHost:      cfg.ProviderHost,
-	}
+	pctx := cfg.providerContext(workspaceID)
 
 	mode := cfg.Repositories.Mode
 	if mode == "" {
@@ -204,7 +218,7 @@ func (s *GitHubRepoScanner) Scan(ctx context.Context, workspaceID, sourceID uuid
 	}
 	// Refuse a scan that would inspect nothing.
 	//
-	// A source created from a connector starts with an explicit empty selection,
+	// A newly added organisation starts with an explicit empty selection,
 	// so this is the state of the very FIRST scan anyone runs. Left unguarded it
 	// excludes every repository, leaves Complete true, and returns
 	// scanned=0 / complete_for_selected_scope=true -- which a UI cannot help but

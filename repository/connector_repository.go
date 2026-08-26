@@ -53,6 +53,7 @@ type ConnectorRepository interface {
 
 	GetProviderApp(workspaceID uuid.UUID, providerKey string) (*models.ConnectorProviderApp, error)
 	UpsertProviderApp(app *models.ConnectorProviderApp) error
+	DeleteProviderApp(workspaceID uuid.UUID, providerKey string) error
 
 	// GrantAssignmentTx creates, in ONE transaction: the connector assignment,
 	// the broker-RS client registration (approved), and the connector-executor
@@ -273,6 +274,11 @@ func (r *connectorRepository) GetProviderApp(workspaceID uuid.UUID, providerKey 
 		return nil, err
 	}
 	return &app, nil
+}
+
+func (r *connectorRepository) DeleteProviderApp(workspaceID uuid.UUID, providerKey string) error {
+	return r.db.Delete(&models.ConnectorProviderApp{},
+		"workspace_id = ? AND provider_key = ?", workspaceID, providerKey).Error
 }
 
 func (r *connectorRepository) UpsertProviderApp(app *models.ConnectorProviderApp) error {

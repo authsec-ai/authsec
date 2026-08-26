@@ -1553,17 +1553,38 @@ func SetupRoutes(
 			// inventory and are governed by the claim/quarantine/coverage
 			// endpoints above, unchanged. Gated on discovery:admin because a
 			// scan spends the workspace's GitHub API budget.
-			// The flow is connect -> choose -> scan:
-			//   from-connector   builds the source from an existing GitHub App
-			//                    connection, so no installation id is retyped
-			//   GET  repositories lists what the installation actually exposes
-			//   PUT  repositories records the explicit scan plan
-			//   POST scan          inspects only the selected repositories
+			// The flow is: register the App once, add an organisation, choose
+			// repositories, scan.
 			//
-			// Selection is deliberate: a new source selects nothing, so
-			// connecting an org can never trigger an unbounded scan by itself.
+			//   github/app*           the ONE GitHub App this workspace owns.
+			//                         Workspace-level, because one App serves
+			//                         every organisation it is installed on.
+			//   github/installations  where that App is installed, read live
+			//                         from GitHub and annotated with what has
+			//                         already been added here
+			//   github/organisations  adds one: creates the verified
+			//                         iga_integrations binding AND the
+			//                         discovery source, in one call
+			//   GET  repositories     what the installation actually exposes
+			//   PUT  repositories     the explicit scan plan
+			//   POST scan             inspects only the selected repositories
+			//
+			// These live under discovery, not under /connectors. The GitHub App
+			// KEY store is shared with the connector broker on purpose -- one
+			// private key, one place -- but the product surface is not: per
+			// SPEC-connectors, Agentic IGA must not depend on that framework,
+			// and nothing here reads or writes a connector row.
+			//
+			// Selection is deliberate: a new source selects nothing, so adding
+			// an organisation can never trigger an unbounded scan by itself.
 			discoveryGitHub := platformCtrl.NewDiscoveryGitHubController(config.DB)
-			discovery.POST("/sources/from-connector", middlewares.Require("discovery", "admin"), discoveryGitHub.CreateSourceFromConnector)
+			discovery.GET("/github/app", middlewares.Require("discovery", "read"), discoveryGitHub.GetGitHubApp)
+			discovery.GET("/github/app/describe", middlewares.Require("discovery", "read"), discoveryGitHub.DescribeGitHubApp)
+			discovery.POST("/github/app", middlewares.Require("discovery", "admin"), discoveryGitHub.SetGitHubApp)
+			discovery.DELETE("/github/app", middlewares.Require("discovery", "admin"), discoveryGitHub.DeleteGitHubApp)
+			discovery.POST("/github/app/manifest/convert", middlewares.Require("discovery", "admin"), discoveryGitHub.ConvertGitHubAppManifest)
+			discovery.GET("/github/installations", middlewares.Require("discovery", "read"), discoveryGitHub.ListGitHubInstallations)
+			discovery.POST("/github/organisations", middlewares.Require("discovery", "admin"), discoveryGitHub.AddOrganisation)
 			discovery.GET("/sources/:id/repositories", middlewares.Require("discovery", "read"), discoveryGitHub.ListSourceRepositories)
 			discovery.PUT("/sources/:id/repositories", middlewares.Require("discovery", "admin"), discoveryGitHub.SetSourceRepositories)
 			discovery.POST("/sources/:id/scan", middlewares.Require("discovery", "admin"), discoveryGitHub.ScanGitHubSource)

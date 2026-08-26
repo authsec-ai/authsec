@@ -408,6 +408,18 @@ func (s *ConnectorOAuthService) SetGitHubApp(workspaceID uuid.UUID, appID, priva
 	})
 }
 
+// DeleteGitHubAppKey removes an App private key from Vault.
+//
+// Takes the path rather than the workspace because the caller has already
+// resolved and authorised the provider-app row it belongs to; re-deriving the
+// path here would be a second place for the two to drift apart.
+func (s *ConnectorOAuthService) DeleteGitHubAppKey(vaultPath string) error {
+	if s.vault == nil || vaultPath == "" {
+		return nil
+	}
+	return s.vault.DeleteSecret(vaultPath)
+}
+
 // ConnectGitHubApp binds a connector to a GitHub App installation: creates (or
 // updates) the connector's workspace-scope github_app connection with the given
 // installation id. No OAuth dance — the installation id + the workspace App are

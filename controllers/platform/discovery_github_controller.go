@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/vault"
@@ -54,6 +55,24 @@ func (ctl *DiscoveryGitHubController) scanner() (*services.GitHubRepoScanner, er
 		return nil, err
 	}
 	return services.NewGitHubRepoScanner(ctl.db, vc), nil
+}
+
+// oauthService builds the GitHub App credential service.
+//
+// Same store, same key, same JWT signing as the connector broker uses -- a
+// GitHub App private key grants access across every installation of that App,
+// so a second copy of it would be a second thing to leak for no gain. What is
+// NOT shared is any connector row: nothing here reads or writes one.
+func (ctl *DiscoveryGitHubController) oauthService() (*services.ConnectorOAuthService, error) {
+	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+	if addr == "" || token == "" {
+		return nil, errors.New("VAULT_ADDR/VAULT_TOKEN not configured; the GitHub App private key cannot be read")
+	}
+	vc, err := vault.NewClient(addr, token)
+	if err != nil {
+		return nil, err
+	}
+	return services.NewConnectorOAuthService(ctl.db, vc), nil
 }
 
 // ScanGitHubSource handles POST /authsec/discovery/sources/:id/scan.
@@ -115,88 +134,217 @@ func (ctl *DiscoveryGitHubController) ScanGitHubSource(c *gin.Context) {
 	})
 }
 
-// ConnectorSourceRequest asks for a discovery source built from an existing
-// connector connection.
-type ConnectorSourceRequest struct {
-	ConnectorID uuid.UUID `json:"connector_id" binding:"required"`
-	DisplayName string    `json:"display_name,omitempty"`
+// AddOrganisationRequest asks for everything needed to start scanning one
+// GitHub organisation, which is exactly one thing: which installation.
+//
+// Nothing else is accepted from the client. The account name, the App id and
+// the display name are all derived server-side from the installation, because
+// an attacker-supplied account name is precisely what the ownership check below
+// exists to reject.
+type AddOrganisationRequest struct {
+	InstallationID string `json:"installation_id" binding:"required"`
 }
 
-// CreateSourceFromConnector handles
-// POST /authsec/discovery/sources/from-connector.
+// AddOrganisation handles POST /authsec/discovery/github/organisations.
 //
-// This is the missing link between "connect an org" and "scan it". The
-// connector already holds the verified GitHub App installation for this
-// workspace; this reads the installation id off that connection and creates
-// the matching repo_scan discovery source, so an admin never has to copy an
-// installation id by hand, nor mistype one belonging to another org.
+// This is the whole "add a GitHub org" flow in one call: it creates the
+// governance record, proves the installation belongs to this workspace, and
+// creates the discovery source that scans it. One call rather than three
+// because the intermediate states are not useful to anyone — a UI that crashed
+// between them would leave a pending integration with no source, which reads as
+// a broken integration the operator cannot act on.
 //
-// The source starts with NO repositories selected. Scanning is a deliberate
-// act: an admin picks repositories first, so connecting an org can never
-// quietly spend its whole API budget.
-func (ctl *DiscoveryGitHubController) CreateSourceFromConnector(c *gin.Context) {
+// HOW OWNERSHIP IS PROVEN. iga_integrations refuses to verify a binding unless
+// the installation's account matches an authenticated provider account, because
+// an installation id arriving from a provider setup URL is attacker-controlled:
+// anyone who can guess one could otherwise bind someone else's GitHub org into
+// their workspace.
+//
+// This flow has no GitHub-authenticated admin to compare against — the operator
+// is authenticated to AuthSec, not to github.com. So it supplies a different and
+// stronger proof: the installation list is re-enumerated HERE, server-side,
+// signed with this workspace's own App private key. An installation that comes
+// back is by construction an installation of this workspace's App, and the
+// account name is read from GitHub's answer rather than from the request body.
+// An installation id that does not appear is refused outright — including one
+// typed by hand, which is the case the original check was written for.
+func (ctl *DiscoveryGitHubController) AddOrganisation(c *gin.Context) {
 	workspaceID, actor, err := ctl.workspaceAndActor(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	var req ConnectorSourceRequest
+	var req AddOrganisationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	connRepo := repositories.NewConnectorRepository(ctl.db)
-	// Workspace-scoped lookup: a connector id from another workspace resolves
-	// to nothing rather than leaking a binding across tenants.
-	connector, err := connRepo.GetByID(workspaceID, req.ConnectorID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "connector not found in this workspace"})
+	installationID := strings.TrimSpace(req.InstallationID)
+	if installationID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "installation_id is required"})
 		return
 	}
-	conn, err := connRepo.GetWorkspaceConnection(req.ConnectorID)
-	if err != nil || conn == nil || conn.ExternalAccountID == "" {
+
+	oauth, err := ctl.oauthService()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	app, err := repositories.NewConnectorRepository(ctl.db).GetProviderApp(workspaceID, "github")
+	if err != nil || app == nil || app.GitHubAppID == "" {
 		c.JSON(http.StatusConflict, gin.H{
-			"error": "connector has no GitHub App installation; complete the GitHub App connection first",
+			"error": "this workspace has no GitHub App yet; register one before adding an organisation",
 		})
 		return
 	}
 
-	name := req.DisplayName
-	if name == "" {
-		name = connector.Name
+	// The ownership proof. Enumerated with our own App key, so the account name
+	// below is GitHub's answer and not the caller's claim.
+	installs, err := oauth.ListGitHubInstallations(c.Request.Context(), workspaceID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error": "could not confirm the installation with GitHub: " + err.Error(),
+		})
+		return
+	}
+	var match *services.GitHubInstallation
+	for i := range installs {
+		if installs[i].InstallationID == installationID {
+			match = &installs[i]
+			break
+		}
+	}
+	if match == nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "installation " + installationID + " is not an installation of this workspace's GitHub App. " +
+				"Install the App on that organisation first, then try again.",
+		})
+		return
+	}
+
+	// Already added? Return the existing pair rather than creating a second
+	// source for the same organisation. Two sources scanning one installation
+	// would double the API spend and report the same agents twice.
+	if existingSrc, existingInteg, found := ctl.findExisting(workspaceID, installationID); found {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "This organisation is already connected",
+			"success": true,
+			"data": gin.H{
+				"source":          existingSrc,
+				"integration":     existingInteg,
+				"already_existed": true,
+			},
+		})
+		return
+	}
+
+	iga := services.NewIGAManager(repositories.NewIGARepository(ctl.db), nil)
+
+	integ, err := iga.CreateIntegration(workspaceID, actor, services.IntegrationInput{
+		Provider:          "github",
+		ProviderHost:      "github.com",
+		AppRegistrationID: app.GitHubAppID,
+		CapabilityProfile: map[string]interface{}{
+			"repository_selection": match.RepositorySelection,
+			"account_type":         match.AccountType,
+		},
+		RequestedPermissions: map[string]interface{}{"contents": "read", "metadata": "read"},
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Both accounts come from GitHub's own answer above, so the match is not a
+	// formality being satisfied — it is the statement that this installation was
+	// reachable with this workspace's App key.
+	verified, err := iga.VerifyIntegration(workspaceID, integ.ID, services.VerifyInput{
+		InstallationID:         installationID,
+		AccountNativeID:        match.Account,
+		AuthenticatedAccountID: match.Account,
+		GrantedPermissions:     map[string]interface{}{"contents": "read", "metadata": "read"},
+	})
+	if err != nil {
+		// Leave nothing half-built: an unverified integration with no source is
+		// dead weight the operator cannot see or clear.
+		_ = repositories.NewIGARepository(ctl.db).DeleteIntegration(workspaceID, integ.ID)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+		return
 	}
 
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(ctl.db))
 	src, err := disco.CreateSource(workspaceID, actor, services.DiscoverySourceInput{
 		Kind:        models.DiscoverySourceRepoScan,
-		DisplayName: name,
+		DisplayName: match.Account,
 		Config: map[string]interface{}{
-			"installation_id": conn.ExternalAccountID,
-			"connector_id":    req.ConnectorID.String(),
-			"provider_host":   "github.com",
-			// Nothing selected yet: an explicit choice must come first.
+			"installation_id":     installationID,
+			"integration_id":      verified.ID.String(),
+			"app_registration_id": app.GitHubAppID,
+			"provider_host":       "github.com",
+			"account":             match.Account,
+			// Nothing selected yet: an explicit choice must come first, so
+			// connecting an org can never trigger an unbounded scan by itself.
 			"repositories": map[string]interface{}{"mode": "selected", "include": []string{}},
 		},
 	})
 	if err != nil {
+		_ = repositories.NewIGARepository(ctl.db).DeleteIntegration(workspaceID, integ.ID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "create", "discovery_source",
-		src.ID.String(), http.StatusCreated, nil, src)
+		src.ID.String(), http.StatusCreated, nil, gin.H{
+			"integration_id":  verified.ID.String(),
+			"installation_id": installationID,
+			"account":         match.Account,
+		})
 
 	c.JSON(http.StatusCreated, gin.H{
-		"message": "Discovery source created from connector",
+		"message": match.Account + " connected",
 		"success": true,
-		"data":    src,
+		"data": gin.H{
+			"source":      src,
+			"integration": verified,
+		},
 		"meta": gin.H{
-			"next_step": "GET /authsec/discovery/sources/" + src.ID.String() + "/repositories, " +
-				"then PUT the selection, then POST .../scan",
-			"note": "no repositories are selected yet, so a scan would inspect nothing",
+			"next_step": "choose repositories for source " + src.ID.String() + ", then scan",
+			"note":      "no repositories are selected yet, so a scan would inspect nothing",
 		},
 	})
+}
+
+// findExisting locates the source and integration already bound to an
+// installation in this workspace, if any.
+func (ctl *DiscoveryGitHubController) findExisting(
+	workspaceID uuid.UUID, installationID string,
+) (*models.DiscoverySource, *models.IGAIntegration, bool) {
+	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(ctl.db))
+	sources, err := disco.ListSources(workspaceID, string(models.DiscoverySourceRepoScan), false)
+	if err != nil {
+		return nil, nil, false
+	}
+	for i := range sources {
+		if sources[i].Kind != models.DiscoverySourceRepoScan {
+			continue
+		}
+		var cfg struct {
+			InstallationID string `json:"installation_id"`
+			IntegrationID  string `json:"integration_id"`
+		}
+		if len(sources[i].Config) > 0 {
+			_ = json.Unmarshal(sources[i].Config, &cfg)
+		}
+		if cfg.InstallationID != installationID {
+			continue
+		}
+		var integ *models.IGAIntegration
+		if id, perr := uuid.Parse(cfg.IntegrationID); perr == nil {
+			integ, _ = repositories.NewIGARepository(ctl.db).GetIntegration(workspaceID, id)
+		}
+		return &sources[i], integ, true
+	}
+	return nil, nil, false
 }
 
 // ListSourceRepositories handles
@@ -332,4 +480,257 @@ func (ctl *DiscoveryGitHubController) workspaceAndActor(c *gin.Context) (uuid.UU
 		actor = "system"
 	}
 	return id, actor, nil
+}
+
+/* --------------------- the workspace's GitHub App ----------------------- */
+
+// The App is workspace-level, not per-organisation: one App, installed on as
+// many organisations as the customer likes, each installation becoming its own
+// integration. These endpoints exist so discovery never has to call the
+// connector API to reach it — the credential store is shared on purpose, the
+// product surface is not.
+
+// GetGitHubApp handles GET /authsec/discovery/github/app.
+//
+// Answers only "is an App registered, and which one". Never returns key
+// material: the private key lives in Vault and is not read here at all.
+// "Not configured" is a normal answer with a 200, not an error — the caller
+// needs to tell it apart from a failure, because they lead to opposite UI.
+func (ctl *DiscoveryGitHubController) GetGitHubApp(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	app, err := repositories.NewConnectorRepository(ctl.db).GetProviderApp(workspaceID, "github")
+	if err != nil || app == nil || app.GitHubAppID == "" {
+		c.JSON(http.StatusOK, gin.H{"configured": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"configured": true,
+		"app_id":     app.GitHubAppID,
+		"created_at": app.CreatedAt,
+	})
+}
+
+// DescribeGitHubApp handles GET /authsec/discovery/github/app/describe.
+//
+// Asks GitHub what the stored App actually is, so the console can show the
+// operator that the right App is registered instead of echoing back a number
+// they typed. A wrong App id becomes visible here rather than surfacing much
+// later as an opaque token-minting failure.
+func (ctl *DiscoveryGitHubController) DescribeGitHubApp(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	oauth, err := ctl.oauthService()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := oauth.DescribeGitHubApp(c.Request.Context(), workspaceID)
+	if err != nil {
+		// 502, not 400: the credentials are ours. The caller cannot fix this by
+		// sending a different request.
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": info})
+}
+
+// SetGitHubApp handles POST /authsec/discovery/github/app — register an
+// existing App by hand. The manifest flow is the primary path; this is the
+// fallback for an App that already exists, or a customer who wants to create it
+// themselves. Private key straight to Vault; only the App id is stored here.
+func (ctl *DiscoveryGitHubController) SetGitHubApp(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		AppID      string `json:"app_id" binding:"required"`
+		PrivateKey string `json:"private_key" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	oauth, err := ctl.oauthService()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	if err := oauth.SetGitHubApp(workspaceID, req.AppID, req.PrivateKey, actor); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// The App id is not secret. The private key is never echoed anywhere.
+	auditAdminMutation(c, workspaceID.String(), "set_github_app", "discovery_github_app",
+		req.AppID, http.StatusOK, nil, gin.H{"app_id": req.AppID})
+	c.JSON(http.StatusOK, gin.H{"status": "configured", "app_id": req.AppID})
+}
+
+// ConvertGitHubAppManifest handles
+// POST /authsec/discovery/github/app/manifest/convert.
+//
+// Completes GitHub's App-manifest flow: the operator approves one pre-filled
+// screen on github.com, GitHub redirects back with a single-use code, and this
+// exchanges it for the App id and private key. That removes App creation,
+// permission selection, key generation and key upload from the operator
+// entirely — the values never pass through anyone's clipboard.
+func (ctl *DiscoveryGitHubController) ConvertGitHubAppManifest(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	oauth, err := ctl.oauthService()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := oauth.ConvertGitHubAppManifest(c.Request.Context(), workspaceID, req.Code, actor)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, workspaceID.String(), "create_github_app_via_manifest",
+		"discovery_github_app", info.AppID, http.StatusOK, nil,
+		gin.H{"app_id": info.AppID, "slug": info.Slug})
+	c.JSON(http.StatusOK, gin.H{"data": info})
+}
+
+// DeleteGitHubApp handles DELETE /authsec/discovery/github/app.
+//
+// Refused while any integration still uses it. Pulling the credential out from
+// under a live integration is the worse of the two orphan directions: the
+// integration would keep listing itself as connected and fail only at scan time,
+// with an error about a missing key that names nothing the operator recognises.
+// Naming the blocking organisations turns that into one obvious next action.
+//
+// This does not uninstall the App from GitHub. Only the account owner can do
+// that, on github.com, and saying so is the difference between a complete
+// removal and one that appears to have failed when the App is still listed
+// there.
+func (ctl *DiscoveryGitHubController) DeleteGitHubApp(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	connRepo := repositories.NewConnectorRepository(ctl.db)
+	app, err := connRepo.GetProviderApp(workspaceID, "github")
+	if err != nil || app == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no GitHub App is registered for this workspace"})
+		return
+	}
+
+	blocking := ctl.organisationsUsingApp(workspaceID)
+	if len(blocking) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":                  "remove these GitHub organisations first: " + strings.Join(blocking, ", "),
+			"blocking_organisations": blocking,
+		})
+		return
+	}
+
+	if app.VaultPath != "" {
+		if oauth, verr := ctl.oauthService(); verr == nil {
+			_ = oauth.DeleteGitHubAppKey(app.VaultPath)
+		}
+	}
+	if err := connRepo.DeleteProviderApp(workspaceID, "github"); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	auditAdminMutation(c, workspaceID.String(), "delete", "discovery_github_app",
+		app.GitHubAppID, http.StatusOK, gin.H{"app_id": app.GitHubAppID}, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "GitHub App removed from this workspace",
+		"success": true,
+		"meta": gin.H{
+			"note": "the App itself still exists on GitHub; delete or uninstall it there if you no longer want it",
+		},
+	})
+}
+
+// organisationsUsingApp names the repo_scan sources still bound to an
+// installation, for the delete refusal above.
+func (ctl *DiscoveryGitHubController) organisationsUsingApp(workspaceID uuid.UUID) []string {
+	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(ctl.db))
+	sources, err := disco.ListSources(workspaceID, string(models.DiscoverySourceRepoScan), false)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(sources))
+	for i := range sources {
+		out = append(out, sources[i].DisplayName)
+	}
+	return out
+}
+
+// ListGitHubInstallations handles GET /authsec/discovery/github/installations.
+//
+// Everywhere this workspace's App is installed, annotated with whether it has
+// already been added here. The annotation is the point: without it the list
+// shows organisations that are already connected as if they were new, and
+// clicking one either duplicates the source or fails with a uniqueness error
+// that explains nothing.
+//
+// The list is read live from GitHub, never from our tables. That is worth
+// stating in the response, because an organisation appears here whether or not
+// anything exists on our side — which reads as stale data unless it is said
+// plainly.
+func (ctl *DiscoveryGitHubController) ListGitHubInstallations(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	oauth, err := ctl.oauthService()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	list, err := oauth.ListGitHubInstallations(c.Request.Context(), workspaceID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	out := make([]gin.H, 0, len(list))
+	for i := range list {
+		row := gin.H{
+			"installation_id":      list[i].InstallationID,
+			"account":              list[i].Account,
+			"account_type":         list[i].AccountType,
+			"repository_selection": list[i].RepositorySelection,
+			"already_added":        false,
+		}
+		if src, _, found := ctl.findExisting(workspaceID, list[i].InstallationID); found {
+			row["already_added"] = true
+			row["source_id"] = src.ID.String()
+		}
+		out = append(out, row)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": out,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "read live from GitHub, not from AuthSec. An organisation appears here " +
+				"whenever the App is installed on it, whether or not it has been added here",
+		},
+	})
 }

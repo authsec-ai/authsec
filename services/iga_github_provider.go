@@ -60,9 +60,9 @@ func NewGitHubProvider() *GitHubProvider {
 		// Default TokenFn: deliberately inert. It holds no App id and no private
 		// key, so it could never mint anything — returning a clear error beats a
 		// call that reads as wired and fails at GitHub. Real tokens come from
-		// NewGitHubProviderFromConnector, which resolves the workspace's App.
+		// NewGitHubProviderForWorkspaceApp, which resolves the workspace's App.
 		TokenFn: func(_ context.Context, _ ProviderContext) (string, error) {
-			return "", fmt.Errorf("no GitHub credentials bound: build this provider with NewGitHubProviderFromConnector")
+			return "", fmt.Errorf("no GitHub credentials bound: build this provider with NewGitHubProviderForWorkspaceApp")
 		},
 	}
 }
@@ -516,21 +516,22 @@ func (g *GitHubProvider) FetchBlob(ctx context.Context, in ProviderContext, scop
 	return []byte(blob.Content), nil
 }
 
-// NewGitHubProviderFromConnector builds a live provider whose tokens come from
-// the workspace's EXISTING GitHub App registration in the connector broker.
+// NewGitHubProviderForWorkspaceApp builds a live provider whose tokens are
+// minted from the workspace's single registered GitHub App.
 //
-// This is deliberate reuse rather than a second implementation. The connector
-// already stores the App id and keeps the private key in Vault, and
-// MintGitHubAppToken already does the JWT signing and exchange. Standing up a
-// second GitHub App store for IGA would mean two places holding a key that,
-// per the provider's own warning, grants access across every installation of
-// that App — the last thing worth duplicating.
+// One App key per workspace, in one place. A GitHub App private key grants
+// access across EVERY installation of that App, so a second copy of it would be
+// a second thing to leak for no gain — which is why this reuses the existing
+// store and MintGitHubAppToken's JWT signing and exchange rather than standing
+// up a parallel one.
 //
-// What is NOT reused is the connector as the record of governance:
-// iga_integrations remains the binding, because it carries verified_at,
-// requested-versus-granted permissions, the capability profile and the
-// cross-workspace rebinding guard, none of which the connector tables model.
-func NewGitHubProviderFromConnector(db *gorm.DB, vaultClient vault.VaultClient) *GitHubProvider {
+// What it does NOT reuse is the connector as a record of anything. No connector
+// row is read or created here: the ConnectorConnection below is a throwaway
+// struct literal, built solely because MintGitHubAppToken takes one, and it
+// carries nothing but the installation id. Governance lives in
+// iga_integrations, which holds verified_at, requested-versus-granted
+// permissions, the capability profile and the cross-workspace rebinding guard.
+func NewGitHubProviderForWorkspaceApp(db *gorm.DB, vaultClient vault.VaultClient) *GitHubProvider {
 	p := NewGitHubProvider()
 	oauth := NewConnectorOAuthService(db, vaultClient)
 	p.TokenFn = func(ctx context.Context, in ProviderContext) (string, error) {

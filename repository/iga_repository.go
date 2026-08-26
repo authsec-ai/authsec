@@ -31,6 +31,17 @@ type IGARepository interface {
 	// trusted binding. It fails if another workspace already owns it.
 	VerifyIntegration(workspaceID, id uuid.UUID, installationID, accountNativeID string, granted []byte) (*models.IGAIntegration, error)
 	DisconnectIntegration(workspaceID, id uuid.UUID) error
+	// DeleteIntegration removes the binding outright. Distinct from
+	// DisconnectIntegration, which is the governance action on a live
+	// integration and deliberately retains history.
+	//
+	// This is for the two cases where there is no history worth keeping: rolling
+	// back a create that failed before it verified, and removing an integration
+	// whose discovery source is being deleted. Its scan runs, coverage and
+	// source objects cascade with it; discovered agents do not -- they are
+	// ON DELETE SET NULL, because a finding must outlive the scanner that
+	// found it.
+	DeleteIntegration(workspaceID, id uuid.UUID) error
 	// ResolveBinding maps a provider-side (app registration, installation) pair
 	// to a verified integration. This is how a webhook learns its workspace —
 	// never from the payload.
@@ -241,6 +252,17 @@ func (r *igaRepository) DisconnectIntegration(workspaceID, id uuid.UUID) error {
 		Updates(map[string]interface{}{
 			"status": "disconnected", "verified_at": nil, "updated_at": time.Now(),
 		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrIGANotFound
+	}
+	return nil
+}
+
+func (r *igaRepository) DeleteIntegration(workspaceID, id uuid.UUID) error {
+	res := r.db.Delete(&models.IGAIntegration{}, "id = ? AND workspace_id = ?", id, workspaceID)
 	if res.Error != nil {
 		return res.Error
 	}
