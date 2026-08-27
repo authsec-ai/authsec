@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,19 +78,19 @@ func (ctl *DiscoveryGitHubController) oauthService() (*services.ConnectorOAuthSe
 
 // ScanGitHubSource handles POST /authsec/discovery/sources/:id/scan.
 //
-// Returns the coverage-honest result: repositories scanned, failed and
-// truncated are reported separately, and complete_for_selected_scope is only
-// true when every repository was fully inspected. A caller must not read an
-// incomplete scan as "these are all the agents".
+// The scan is QUEUED, not run inline, and the response is 202 with a run id to
+// poll. It used to run inside this request, which failed in two ways that both
+// got worse with estate size: an organisation-wide scan outlived the proxy's
+// idle timeout and died half-finished, and its result existed only in the
+// response body, so refreshing the page lost it for good.
+//
+// Validation that can be done up front still is — a disabled source or an empty
+// selection returns 4xx here rather than becoming a failed run somebody has to
+// go and find.
 func (ctl *DiscoveryGitHubController) ScanGitHubSource(c *gin.Context) {
-	workspaceStr := c.GetString("workspace_id")
-	if workspaceStr == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found in token"})
-		return
-	}
-	workspaceID, err := uuid.Parse(workspaceStr)
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workspace_id"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 	sourceID, err := uuid.Parse(c.Param("id"))
@@ -98,38 +99,134 @@ func (ctl *DiscoveryGitHubController) ScanGitHubSource(c *gin.Context) {
 		return
 	}
 
-	actor := c.GetString("client_id")
-	if actor == "" {
-		if u, uerr := middlewares.ResolveUserID(c); uerr == nil {
-			actor = u
-		}
-	}
-	if actor == "" {
-		actor = "system"
-	}
-
-	sc, err := ctl.scanner()
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+	run, err := services.EnqueueGitHubScan(ctl.db, workspaceID, sourceID, actor)
+	if errors.Is(err, repositories.ErrScanAlreadyActive) {
+		// Not an error the admin needs to fix: point them at the scan already
+		// running rather than starting a second one over the same repositories.
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "a scan is already queued or running for this source",
+			"data":    run,
+			"message": "watch the existing run instead of starting another",
+		})
 		return
 	}
-
-	res, err := sc.Scan(c.Request.Context(), workspaceID, sourceID, actor)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "scan", "discovery_source",
-		sourceID.String(), http.StatusOK, nil, res)
+		sourceID.String(), http.StatusAccepted, nil, run)
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "GitHub scan completed",
+	c.JSON(http.StatusAccepted, gin.H{
+		"message": "GitHub scan queued",
 		"success": true,
-		"data":    res,
+		"data":    run,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(),
-			"note":  "sightings land in the existing discovered_agents inventory as unregistered; claim or quarantine them through the normal endpoints",
+			"as_of":     time.Now().UTC(),
+			"poll":      "/authsec/discovery/scan-runs/" + run.ID.String(),
+			"terminal":  []string{"succeeded", "failed", "cancelled"},
+			"note":      "sightings land in the existing discovered_agents inventory as unregistered; claim or quarantine them through the normal endpoints",
+			"warn_note": "read complete_for_selected_scope on the finished run; a partial scan is not an all-clear",
+		},
+	})
+}
+
+// GetScanRun handles GET /authsec/discovery/scan-runs/:run_id.
+//
+// This is the poll target while a scan is in flight and the permanent report
+// once it finishes. Counters advance between repositories, so a console can
+// show real movement rather than an indefinite spinner.
+func (ctl *DiscoveryGitHubController) GetScanRun(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	runID, err := uuid.Parse(c.Param("run_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid run id"})
+		return
+	}
+	run, err := repositories.NewDiscoveryScanRunRepository(ctl.db).Get(workspaceID, runID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": run,
+		"meta": gin.H{
+			"as_of":    time.Now().UTC(),
+			"terminal": run.Terminal(),
+			"note": "complete_for_selected_scope is only meaningful once status is succeeded; " +
+				"repos_failed and repos_excluded are different answers and neither means clean",
+		},
+	})
+}
+
+// ListScanRuns handles GET /authsec/discovery/sources/:id/scan-runs — the scan
+// history for one source, newest first.
+//
+// History is the point: an admin has to be able to answer "what did the last
+// scan see, and has coverage got better or worse since?" without having been
+// watching at the moment it ran.
+func (ctl *DiscoveryGitHubController) ListScanRuns(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	sourceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source id"})
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	runs, err := repositories.NewDiscoveryScanRunRepository(ctl.db).
+		ListForSource(workspaceID, sourceID, limit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":  runs,
+		"total": len(runs),
+		"meta":  gin.H{"as_of": time.Now().UTC()},
+	})
+}
+
+// CancelScanRun handles POST /authsec/discovery/scan-runs/:run_id/cancel.
+//
+// An organisation-wide scan can be a long and expensive mistake — the wrong
+// selection, or a branch plan nobody meant to enable. Cancelling stops further
+// work; it does NOT retract the sightings already reported, because those were
+// really observed and quietly removing them would be its own kind of lie.
+func (ctl *DiscoveryGitHubController) CancelScanRun(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	runID, err := uuid.Parse(c.Param("run_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid run id"})
+		return
+	}
+	run, err := repositories.NewDiscoveryScanRunRepository(ctl.db).Cancel(workspaceID, runID)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "scan run is not queued or running, so it cannot be cancelled",
+		})
+		return
+	}
+	auditAdminMutation(c, workspaceID.String(), "cancel", "discovery_scan_run",
+		runID.String(), http.StatusOK, nil, run)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Scan cancelled",
+		"success": true,
+		"data":    run,
+		"meta": gin.H{
+			"note": "findings already reported are kept; they were observed",
 		},
 	})
 }
@@ -389,6 +486,14 @@ func (ctl *DiscoveryGitHubController) ListSourceRepositories(c *gin.Context) {
 type SelectRepositoriesRequest struct {
 	Mode    string   `json:"mode" binding:"required"`
 	Include []string `json:"include,omitempty"`
+
+	// BranchMode is "default" (only the branch in effect) or "all". Omitted
+	// means default, so an existing caller that knows nothing about branches
+	// keeps its previous behaviour.
+	BranchMode string `json:"branch_mode,omitempty"`
+	// MaxBranchesPerRepo bounds all-branch scanning. Omitted takes the built-in
+	// cap. Refs beyond it are counted and force the run incomplete.
+	MaxBranchesPerRepo int `json:"max_branches_per_repo,omitempty"`
 }
 
 // SetSourceRepositories handles
@@ -422,6 +527,18 @@ func (ctl *DiscoveryGitHubController) SetSourceRepositories(c *gin.Context) {
 		})
 		return
 	}
+	branchMode := req.BranchMode
+	if branchMode == "" {
+		branchMode = models.BranchModeDefault
+	}
+	if branchMode != models.BranchModeDefault && branchMode != models.BranchModeAll {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "branch_mode must be default or all"})
+		return
+	}
+	maxBranches := req.MaxBranchesPerRepo
+	if maxBranches <= 0 {
+		maxBranches = models.DefaultMaxBranchesPerRepo
+	}
 
 	disco := services.NewDiscoveryManager(repositories.NewDiscoveryRepository(ctl.db))
 	src, err := disco.GetSource(workspaceID, sourceID)
@@ -436,6 +553,9 @@ func (ctl *DiscoveryGitHubController) SetSourceRepositories(c *gin.Context) {
 		_ = json.Unmarshal(src.Config, &cfg)
 	}
 	cfg["repositories"] = map[string]interface{}{"mode": req.Mode, "include": req.Include}
+	cfg["branches"] = map[string]interface{}{
+		"mode": branchMode, "max_per_repo": maxBranches,
+	}
 
 	updated, err := disco.UpdateSource(workspaceID, sourceID, services.DiscoverySourceUpdateInput{
 		Config: cfg,
@@ -453,10 +573,14 @@ func (ctl *DiscoveryGitHubController) SetSourceRepositories(c *gin.Context) {
 		"success": true,
 		"data":    updated,
 		"meta": gin.H{
-			"selection_mode": req.Mode,
-			"selected_count": len(req.Include),
+			"selection_mode":        req.Mode,
+			"selected_count":        len(req.Include),
+			"branch_mode":           branchMode,
+			"max_branches_per_repo": maxBranches,
 			"note": "all means every repository this installation was granted, " +
 				"not every repository in the organization",
+			"branch_note": "branch_mode all also reads non-default refs, where a declaration may be " +
+				"proposed but not merged; such findings are marked is_default_branch=false and are weaker evidence",
 		},
 	})
 }

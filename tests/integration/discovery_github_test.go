@@ -58,7 +58,8 @@ func TestGitHubScanFeedsExistingInventory(t *testing.T) {
 	}
 	t.Log("PASS: failure and truncation counted separately; scan not marked complete")
 
-	// The rows are in the EXISTING inventory, marked repo_scan and automated.
+	// The rows are in the EXISTING inventory, marked repo_scan, unregistered,
+	// and of UNKNOWN deployment origin.
 	agents, total, err := disco.ListAgents(ws, repositories.AgentFilter{
 		Source: models.DiscoverySourceRepoScan, Limit: 50,
 	})
@@ -72,12 +73,18 @@ func TestGitHubScanFeedsExistingInventory(t *testing.T) {
 		if a.Status != models.DiscoveredAgentUnregistered {
 			t.Fatalf("a sighting must land unregistered, got %q", a.Status)
 		}
-		if a.DeploymentOrigin != models.DeploymentOriginAutomated {
-			t.Fatalf("a version-controlled declaration is automated by construction, got %q",
-				a.DeploymentOrigin)
+		// This assertion used to demand "automated", on the reasoning that a
+		// version-controlled declaration is automated by construction. That
+		// reasoning was rejected: parsing a workflow file proves the file
+		// exists, not that anything ever ran it, and nothing in the file says
+		// how — or whether — it was deployed. Claiming "automated" would state
+		// as observed fact something we never observed.
+		if a.DeploymentOrigin != models.DeploymentOriginUnknown {
+			t.Fatalf("a repository declaration is not evidence of a deployment; "+
+				"origin must be unknown, got %q", a.DeploymentOrigin)
 		}
 	}
-	t.Logf("PASS: %d GitHub sighting(s) in the existing inventory, all unregistered and automated", total)
+	t.Logf("PASS: %d GitHub sighting(s) in the existing inventory, all unregistered with unknown origin", total)
 
 	// No secret value or prompt body, only the secret NAME.
 	var leaked, named int64

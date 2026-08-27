@@ -122,6 +122,21 @@ func main() {
 		go reconciler.Run(context.Background())
 	}
 
+	// GitHub discovery scan worker: drains discovery_scan_runs.
+	//
+	// POST .../sources/:id/scan only ENQUEUES; without this loop running
+	// somewhere, a queued scan would sit forever and the console would poll a
+	// run that never starts. Safe to run on every replica — runs are claimed
+	// FOR UPDATE SKIP LOCKED under a lease, so two replicas cannot execute the
+	// same scan, and a replica that dies mid-scan has its run picked up by
+	// another once the lease expires.
+	//
+	// Disabled with AUTHSEC_DISABLE_DISCOVERY_SCAN_WORKER=true for unit-test
+	// boots and for replicas deliberately kept API-only.
+	if os.Getenv("AUTHSEC_DISABLE_DISCOVERY_SCAN_WORKER") != "true" {
+		go services.NewDiscoveryScanWorker(config.DB).Run(context.Background())
+	}
+
 	// Initialise Vault (optional; logs warning if not configured)
 	config.InitVault(cfg)
 
