@@ -5391,6 +5391,10 @@ CREATE TABLE IF NOT EXISTS public.discovery_scan_runs (
     -- there were more refs and we did not read them.
     branches_skipped integer NOT NULL DEFAULT 0,
     files_fetched    integer NOT NULL DEFAULT 0,
+    -- Files the scan could not read. Distinct from repos_failed: a readable
+    -- repository can still hold a file we failed to fetch, and reporting only
+    -- the repository count shows "0 failed" beside a page of file errors.
+    files_failed     integer NOT NULL DEFAULT 0,
     sightings_new    integer NOT NULL DEFAULT 0,
     sightings_bumped integer NOT NULL DEFAULT 0,
 

@@ -74,6 +74,10 @@ type DiscoveryScanRun struct {
 	// MaxBranches cut them off. Non-zero always forces Complete=false.
 	BranchesSkipped int `json:"branches_skipped" gorm:"not null;default:0"`
 	FilesFetched    int `json:"files_fetched" gorm:"not null;default:0"`
+	// FilesFailed counts files that could not be read inside repositories that
+	// opened fine. Separate from ReposFailed so a console never shows "0
+	// failed" next to a list of unreadable files.
+	FilesFailed     int `json:"files_failed" gorm:"not null;default:0"`
 	SightingsNew    int `json:"sightings_new" gorm:"not null;default:0"`
 	SightingsBumped int `json:"sightings_bumped" gorm:"not null;default:0"`
 
