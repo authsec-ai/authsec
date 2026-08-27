@@ -251,6 +251,7 @@ func baseFrom(run *models.DiscoveryScanRun) *GitHubScanResult {
 		ReposFailed:     run.ReposFailed,
 		ReposTruncated:  run.ReposTruncated,
 		FilesFetched:    run.FilesFetched,
+		FilesFailed:     run.FilesFailed,
 		SightingsNew:    run.SightingsNew,
 		SightingsBumped: run.SightingsBumped,
 		// Derived, not read from `complete`: that column stays false until the
@@ -277,6 +278,7 @@ func applyResult(run *models.DiscoveryScanRun, res *GitHubScanResult) {
 	run.ReposTruncated = res.ReposTruncated
 	run.BranchesSkipped = res.BranchesSkipped
 	run.FilesFetched = res.FilesFetched
+	run.FilesFailed = res.FilesFailed
 	run.SightingsNew = res.SightingsNew
 	run.SightingsBumped = res.SightingsBumped
 	run.SelectionMode = res.SelectionMode

@@ -81,6 +81,8 @@ type GitHubScanResult struct {
 	BranchesSkipped int `json:"branches_skipped"`
 
 	FilesFetched    int       `json:"files_fetched"`
+	// FilesFailed counts unreadable files inside repositories that opened fine.
+	FilesFailed     int       `json:"files_failed"`
 	SightingsNew    int       `json:"sightings_new"`
 	SightingsBumped int       `json:"sightings_bumped"`
 	Complete        bool      `json:"complete_for_selected_scope"`
@@ -316,6 +318,7 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 		res.ReposFailed = b.ReposFailed
 		res.ReposTruncated = b.ReposTruncated
 		res.FilesFetched = b.FilesFetched
+		res.FilesFailed = b.FilesFailed
 		res.SightingsNew = b.SightingsNew
 		res.SightingsBumped = b.SightingsBumped
 		res.Warnings = append(res.Warnings, b.Warnings...)
@@ -435,6 +438,11 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 
 				body, ferr := s.provider.FetchBlob(ctx, pctx, refScope, e)
 				if ferr != nil {
+					// A file we could not read is a hole in coverage. Counted
+					// separately from ReposFailed: the repository opened fine, so
+					// reporting only repository failures shows "0 failed" beside
+					// a page of file errors.
+					res.FilesFailed++
 					res.Complete = false
 					res.Warnings = append(res.Warnings,
 						fmt.Sprintf("%s:%s: %v", unit, e.Path, ferr))

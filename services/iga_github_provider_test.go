@@ -18,11 +18,13 @@ import (
 
 func testProvider(base string) *GitHubProvider {
 	return &GitHubProvider{
-		BaseURL:    base,
-		HTTP:       &http.Client{Timeout: 5 * time.Second},
-		APIVersion: "2022-11-28",
-		MaxRetries: 3,
-		etags:      map[string]string{},
+		BaseURL:      base,
+		HTTP:         &http.Client{Timeout: 5 * time.Second},
+		APIVersion:   "2022-11-28",
+		MaxRetries:   3,
+		etags:        map[string]string{},
+		cachedBodies: map[string][]byte{},
+		blobs:        map[string][]byte{},
 		TokenFn: func(context.Context, ProviderContext) (string, error) {
 			return "test-token", nil
 		},
@@ -268,4 +270,101 @@ func TestRateLimitPausePrefersRetryAfter(t *testing.T) {
 		t.Fatalf("expected a 7s pause from Retry-After, got %v (throttled=%v)", d, throttled)
 	}
 	t.Log("PASS: Retry-After takes precedence over x-ratelimit-reset")
+}
+
+// A blob read must never be answered with "unexpected end of JSON input".
+//
+// This is a regression test for a real organisation-wide scan that produced
+// ~130 warnings of exactly that shape against files that were perfectly
+// readable. The cause: the ETag cache stored a validator but not the body, so
+// the SECOND request for a blob URL got a 304 with an empty body, and FetchBlob
+// discarded the not-modified flag and JSON-parsed the empty buffer. Every
+// affected file was reported as unreadable and its agents were never seen.
+//
+// The second request is not exotic. All-branch scanning asks for the same
+// unchanged file once per branch that contains it.
+func TestBlobRefetchDoesNotBecomeAParseError(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		// Behave like GitHub: offer a validator, and honour it.
+		if r.Header.Get("If-None-Match") == `"blob-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"blob-etag"`)
+		fmt.Fprint(w, `{"content":"aGVsbG8gd29ybGQ=","encoding":"base64"}`)
+	}))
+	defer srv.Close()
+
+	p := testProvider(srv.URL)
+	scope := ProviderScope{DisplayName: "acme/one", DefaultBranch: "main"}
+	entry := TreeEntry{Path: "agent.json", SHA: "sha-1"}
+
+	first, err := p.FetchBlob(context.Background(), ProviderContext{}, scope, entry)
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if string(first) != "hello world" {
+		t.Fatalf("first fetch decoded wrong: %q", first)
+	}
+
+	// The same blob on another branch. Before the fix this returned
+	// "unexpected end of JSON input".
+	onBranch := scope
+	onBranch.Ref = "feature/x"
+	second, err := p.FetchBlob(context.Background(), ProviderContext{}, onBranch, entry)
+	if err != nil {
+		t.Fatalf("re-reading the same blob must succeed, got: %v", err)
+	}
+	if string(second) != "hello world" {
+		t.Fatalf("re-read returned different bytes: %q", second)
+	}
+
+	// And it should not have cost a second call at all: a blob SHA IS its
+	// content hash, so the bytes were already held.
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("expected the repeat to be served from cache (1 call), got %d", n)
+	}
+	t.Log("PASS: repeated blob read served from cache, no parse error, no extra API call")
+}
+
+// A 304 on a LISTING must return the body the validator was issued for, not
+// nothing. ListTree previously turned that case into an empty tree — a silent
+// "this branch has no files", which is a false all-clear rather than an error.
+func TestNotModifiedListingReturnsTheCachedBody(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Header.Get("If-None-Match") == `"tree-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"tree-etag"`)
+		fmt.Fprint(w, `{"truncated":false,"tree":[{"path":"agent.json","type":"blob","sha":"s1","size":10}]}`)
+	}))
+	defer srv.Close()
+
+	p := testProvider(srv.URL)
+	scope := ProviderScope{DisplayName: "acme/one", DefaultBranch: "main"}
+
+	if entries, _, err := p.ListTree(context.Background(), ProviderContext{}, scope); err != nil || len(entries) != 1 {
+		t.Fatalf("first listing: %d entries, err=%v", len(entries), err)
+	}
+
+	entries, truncated, err := p.ListTree(context.Background(), ProviderContext{}, scope)
+	if err != nil {
+		t.Fatalf("revalidated listing: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("a 304 must reuse the cached tree, got %d entries — an empty tree here "+
+			"would read as 'this repository has no files'", len(entries))
+	}
+	if truncated {
+		t.Fatal("truncation flag must survive the cache")
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("expected 2 requests (the second revalidating), got %d", n)
+	}
+	t.Log("PASS: 304 on a listing serves the cached body instead of an empty result")
 }

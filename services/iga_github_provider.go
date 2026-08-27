@@ -44,19 +44,52 @@ type GitHubProvider struct {
 	MaxRetries int
 	// etags caches per-URL validators so an unchanged page costs no quota.
 	etags map[string]string
+	// cachedBodies holds the response each validator in etags was issued for.
+	//
+	// A validator without the body it validates is worse than no validator at
+	// all: the server answers 304, the caller has nothing to show for it, and
+	// every caller then invents its own wrong answer — an empty tree, a missing
+	// CODEOWNERS, a JSON parse error on an empty buffer. Storing the body is
+	// what makes a 304 mean "reuse what you have" instead of "here is nothing".
+	cachedBodies map[string][]byte
 	// lastLink holds the Link header of the most recent response, used by
 	// paginate to find the next page.
 	lastLink string
+
+	// blobs caches decoded file contents by git blob SHA for the life of one
+	// scan.
+	//
+	// A git blob SHA IS the hash of the content, so the same SHA can only ever
+	// mean the same bytes — the cache cannot go stale. It exists because
+	// branches share files: scanning twenty refs of one repository asks for the
+	// same unchanged package.json twenty times, and each repeat is a paid API
+	// call for bytes we already hold.
+	blobs map[string][]byte
 }
+
+// maxCachedBlobs bounds the blob cache. Config files are small, but an
+// organisation-wide all-branch scan sees a lot of them, and an unbounded map
+// would grow for the whole run. On overflow the cache simply stops accepting
+// entries and repeats go back to being fetched — slower, never wrong.
+const maxCachedBlobs = 4096
+
+// maxCachedBodyBytes bounds a single cached response. A recursive git tree can
+// reach 7MB; caching a handful of those is fine, caching an organisation's
+// worth is not. A response larger than this is served normally and simply not
+// remembered — which also means no validator is stored for it, so it is
+// re-requested in full rather than 304'd into nothing.
+const maxCachedBodyBytes = 8 << 20
 
 // NewGitHubProvider builds a provider with sane defaults.
 func NewGitHubProvider() *GitHubProvider {
 	return &GitHubProvider{
-		BaseURL:    "https://api.github.com",
-		HTTP:       &http.Client{Timeout: 30 * time.Second},
-		APIVersion: "2022-11-28",
-		MaxRetries: 4,
-		etags:      map[string]string{},
+		BaseURL:      "https://api.github.com",
+		HTTP:         &http.Client{Timeout: 30 * time.Second},
+		APIVersion:   "2022-11-28",
+		MaxRetries:   4,
+		etags:        map[string]string{},
+		cachedBodies: map[string][]byte{},
+		blobs:        map[string][]byte{},
 		// Default TokenFn: deliberately inert. It holds no App id and no private
 		// key, so it could never mint anything — returning a clear error beats a
 		// call that reads as wired and fails at GitHub. Real tokens come from
@@ -123,6 +156,19 @@ func (e *ghError) IsAbsent() bool { return e.Status == http.StatusNotFound }
 // get performs one authenticated request with retries, conditional-request
 // support and rate-limit awareness. Returns (body, notModified, error).
 func (g *GitHubProvider) get(ctx context.Context, in ProviderContext, url string) ([]byte, bool, error) {
+	return g.fetch(ctx, in, url, true)
+}
+
+// fetch performs the request. conditional controls whether a cached validator
+// is sent.
+//
+// Conditional requests are right for LISTINGS, which change and whose 304 the
+// caller can act on. They are wrong for content addressed by hash: a git blob
+// URL names its own content, so it can never change, and a 304 there buys
+// nothing while handing the caller an empty body it has no cached copy to
+// substitute. That combination is what produced "unexpected end of JSON input"
+// on files that were perfectly readable.
+func (g *GitHubProvider) fetch(ctx context.Context, in ProviderContext, url string, conditional bool) ([]byte, bool, error) {
 	token, err := g.TokenFn(ctx, in)
 	if err != nil {
 		return nil, false, fmt.Errorf("mint installation token: %w", err)
@@ -137,8 +183,10 @@ func (g *GitHubProvider) get(ctx context.Context, in ProviderContext, url string
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", g.APIVersion)
 		// Conditional request: an unchanged page returns 304 and costs no quota.
-		if tag, ok := g.etags[url]; ok && tag != "" {
-			req.Header.Set("If-None-Match", tag)
+		if conditional {
+			if tag, ok := g.etags[url]; ok && tag != "" {
+				req.Header.Set("If-None-Match", tag)
+			}
 		}
 
 		resp, err := g.HTTP.Do(req)
@@ -169,13 +217,30 @@ func (g *GitHubProvider) get(ctx context.Context, in ProviderContext, url string
 
 		if resp.StatusCode == http.StatusNotModified {
 			resp.Body.Close()
+			// Serve the body the validator was issued for. Reporting notModified
+			// with an empty body would make every caller invent its own wrong
+			// answer; a cache hit is the whole point of having asked.
+			if cached, ok := g.cachedBodies[url]; ok {
+				return cached, false, nil
+			}
+			// No cached copy — the body was too large to keep, or was evicted.
+			// Say so rather than returning nothing that looks like an empty
+			// result.
 			return nil, true, nil
 		}
 
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 		linkHdr := resp.Header.Get("Link")
-		if tag := resp.Header.Get("ETag"); tag != "" {
+		// Only remember a validator alongside the body it validates. Storing the
+		// tag without the body is what created the 304-with-nothing case.
+		// Nil maps are tolerated: a GitHubProvider built as a struct literal
+		// rather than through the constructor must degrade to "no caching", not
+		// panic on first write.
+		if tag := resp.Header.Get("ETag"); tag != "" && readErr == nil &&
+			resp.StatusCode < 400 && len(body) <= maxCachedBodyBytes &&
+			g.etags != nil && g.cachedBodies != nil {
 			g.etags[url] = tag
+			g.cachedBodies[url] = body
 		}
 		resp.Body.Close()
 		if readErr != nil {
@@ -535,22 +600,55 @@ func (g *GitHubProvider) ListTree(ctx context.Context, in ProviderContext, scope
 }
 
 func (g *GitHubProvider) FetchBlob(ctx context.Context, in ProviderContext, scope ProviderScope, e TreeEntry) ([]byte, error) {
-	body, _, err := g.get(ctx, in,
+	// Content-addressed, so a hit is always correct. Branches share files, and
+	// without this a twenty-branch repository pays twenty times for one
+	// unchanged file.
+	if e.SHA != "" {
+		if cached, ok := g.blobs[e.SHA]; ok {
+			return cached, nil
+		}
+	}
+
+	// Unconditional on purpose: see fetch(). A blob URL names its own content,
+	// so If-None-Match can only ever produce a 304 with an empty body and
+	// nothing to fall back on.
+	body, notModified, err := g.getUnconditional(ctx, in,
 		fmt.Sprintf("%s/repos/%s/git/blobs/%s", g.BaseURL, scope.DisplayName, e.SHA))
 	if err != nil {
 		return nil, err
 	}
+	if notModified {
+		// Should be unreachable now that blob reads are unconditional. Reported
+		// as a real error rather than parsed as an empty body, because the
+		// previous behaviour turned this into "unexpected end of JSON input" —
+		// an unreadable-file warning for a file that was never actually read.
+		return nil, fmt.Errorf("blob %s: server reported not-modified but no cached copy is held", e.SHA)
+	}
+
 	var blob struct {
 		Content  string `json:"content"`
 		Encoding string `json:"encoding"`
 	}
 	if err := json.Unmarshal(body, &blob); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode blob %s: %w", e.SHA, err)
 	}
+
+	out := []byte(blob.Content)
 	if blob.Encoding == "base64" {
-		return base64.StdEncoding.DecodeString(strings.ReplaceAll(blob.Content, "\n", ""))
+		out, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(blob.Content, "\n", ""))
+		if err != nil {
+			return nil, fmt.Errorf("decode blob %s: %w", e.SHA, err)
+		}
 	}
-	return []byte(blob.Content), nil
+	if e.SHA != "" && g.blobs != nil && len(g.blobs) < maxCachedBlobs {
+		g.blobs[e.SHA] = out
+	}
+	return out, nil
+}
+
+// getUnconditional is get without conditional revalidation.
+func (g *GitHubProvider) getUnconditional(ctx context.Context, in ProviderContext, url string) ([]byte, bool, error) {
+	return g.fetch(ctx, in, url, false)
 }
 
 // NewGitHubProviderForWorkspaceApp builds a live provider whose tokens are

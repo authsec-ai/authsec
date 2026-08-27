@@ -236,3 +236,47 @@ func TestInterruptedScanResumesWithoutRegressing(t *testing.T) {
 	t.Logf("PASS: resumed with totals intact (scanned=%d new=%d) and degradation remembered",
 		resumed.ReposScanned, resumed.SightingsNew)
 }
+
+// The counters must agree with the warnings.
+//
+// A real scan reported "0 Failed" beside ~130 warnings naming files it could
+// not read. Both were true — repos_failed counts REPOSITORIES — and together
+// they were unreadable. A file-level failure now has its own counter.
+func TestUnreadableFilesAreCountedNotJustWarned(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-file-fail")
+
+	// repo-1's tree lists agent.json, but no blob is registered for it, so the
+	// fetch fails while the repository itself opens fine.
+	fx := fixtures()
+	delete(fx.Blobs, "repo-1:agent.json")
+
+	srcID := newScanSource(t, db, ws, "acme", map[string]interface{}{
+		"installation_id": "12345",
+		"repositories":    map[string]interface{}{"mode": "selected", "include": []string{"acme/payments"}},
+	})
+	res, err := services.NewGitHubRepoScannerWithProvider(db, fx).
+		Scan(context.Background(), ws, srcID, "admin")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if res.ReposScanned != 1 {
+		t.Fatalf("the repository itself opened fine, expected 1 scanned, got %d", res.ReposScanned)
+	}
+	if res.ReposFailed != 0 {
+		t.Fatalf("a readable repository must not be counted as a failed repository, got %d", res.ReposFailed)
+	}
+	if res.FilesFailed != 1 {
+		t.Fatalf("the unreadable file must be counted, got files_failed=%d", res.FilesFailed)
+	}
+	if len(res.Warnings) != res.FilesFailed {
+		t.Fatalf("counters and warnings disagree: %d warnings, files_failed=%d",
+			len(res.Warnings), res.FilesFailed)
+	}
+	if res.Complete {
+		t.Fatal("a scan that could not read a file is not complete")
+	}
+	t.Logf("PASS: files_failed=%d matches %d warning(s); repos_failed stays 0",
+		res.FilesFailed, len(res.Warnings))
+}
