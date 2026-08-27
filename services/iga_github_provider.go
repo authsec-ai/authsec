@@ -286,6 +286,43 @@ func (g *GitHubProvider) ListScopes(ctx context.Context, in ProviderContext) ([]
 	return out, err
 }
 
+// ListBranches enumerates a repository's refs, newest API page first.
+//
+// Only used when a source opts into all-branch coverage. The default-branch
+// flag is derived from the scope rather than trusted from the branch payload,
+// because /branches does not mark it.
+func (g *GitHubProvider) ListBranches(ctx context.Context, in ProviderContext, scope ProviderScope) ([]ProviderBranch, error) {
+	var out []ProviderBranch
+	err := g.paginate(ctx, in,
+		fmt.Sprintf("%s/repos/%s/branches?per_page=100", g.BaseURL, scope.DisplayName),
+		func(b []byte) error {
+			var page []struct {
+				Name   string `json:"name"`
+				Commit struct {
+					SHA string `json:"sha"`
+				} `json:"commit"`
+			}
+			if err := json.Unmarshal(b, &page); err != nil {
+				return err
+			}
+			for _, br := range page {
+				out = append(out, ProviderBranch{
+					Name:      br.Name,
+					CommitSHA: br.Commit.SHA,
+					IsDefault: br.Name == scope.DefaultBranch,
+				})
+			}
+			return nil
+		})
+	if err != nil {
+		// An unreadable branch list is a coverage gap, not an empty repository.
+		// Returning the error lets the scanner degrade this repository to its
+		// default branch and record why, instead of concluding it has one branch.
+		return nil, err
+	}
+	return out, nil
+}
+
 /* ------------------------------- lane A/C ------------------------------- */
 
 // ListNativeAgents reads the provider's own agent objects. The endpoint is
@@ -381,7 +418,7 @@ func (g *GitHubProvider) ListGrants(ctx context.Context, in ProviderContext, sco
 func (g *GitHubProvider) ListCodeowners(ctx context.Context, in ProviderContext, scope ProviderScope) ([]CodeownerRule, error) {
 	for _, p := range []string{".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"} {
 		body, _, err := g.get(ctx, in,
-			fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", g.BaseURL, scope.DisplayName, p, scope.DefaultBranch))
+			fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", g.BaseURL, scope.DisplayName, p, scope.EffectiveRef()))
 		if err != nil {
 			continue
 		}
@@ -465,7 +502,7 @@ func (g *GitHubProvider) ListSBOM(ctx context.Context, in ProviderContext, scope
 // honestly. A truncated tree must degrade coverage, never shrink the count.
 func (g *GitHubProvider) ListTree(ctx context.Context, in ProviderContext, scope ProviderScope) ([]TreeEntry, bool, error) {
 	body, notModified, err := g.get(ctx, in,
-		fmt.Sprintf("%s/repos/%s/git/trees/%s?recursive=1", g.BaseURL, scope.DisplayName, scope.DefaultBranch))
+		fmt.Sprintf("%s/repos/%s/git/trees/%s?recursive=1", g.BaseURL, scope.DisplayName, scope.EffectiveRef()))
 	if err != nil {
 		if e, ok := err.(*ghError); ok && (e.IsAbsent() || e.IsPermissionDenied()) {
 			return nil, false, nil

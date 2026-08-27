@@ -96,6 +96,49 @@ type ProviderScope struct {
 	NativeID      string // immutable provider id — the recognition key input
 	DisplayName   string // owner/name — a LOCATOR, never identity
 	DefaultBranch string
+	// Ref overrides which git ref content reads resolve against. Empty means
+	// DefaultBranch, which is what every caller wanted before branch coverage
+	// existed — so leaving it unset preserves the previous behaviour exactly.
+	//
+	// It is a separate field rather than an overwrite of DefaultBranch because
+	// a finding has to record BOTH: which ref it was found on, and whether that
+	// ref is the one actually in effect. A declaration on an unmerged branch is
+	// weaker evidence than the same declaration on the default branch, and the
+	// two must never be presented identically.
+	Ref string
+}
+
+// EffectiveRef is the git ref reads should resolve against.
+func (s ProviderScope) EffectiveRef() string {
+	if s.Ref != "" {
+		return s.Ref
+	}
+	return s.DefaultBranch
+}
+
+// ProviderBranch is one ref in a repository.
+//
+// CommitSHA is what makes all-branch scanning affordable: branches that point
+// at the same commit have identical trees, so the scan reads that tree once and
+// attributes the result to every branch sharing it. On a real repository most
+// stale branches share a head with something already walked.
+type ProviderBranch struct {
+	Name      string
+	CommitSHA string
+	IsDefault bool
+}
+
+// BranchLister is an OPTIONAL provider capability: enumerate a repository's
+// refs.
+//
+// It is kept off IGAProvider deliberately. A provider that cannot enumerate
+// branches is still a perfectly good provider — it simply cannot support
+// all-branch coverage, and the scanner degrades to the default branch and says
+// so in the run's warnings. Widening the mandatory interface would instead
+// force every implementation, including test doubles, to grow a method most of
+// them have no meaning for.
+type BranchLister interface {
+	ListBranches(ctx context.Context, in ProviderContext, scope ProviderScope) ([]ProviderBranch, error)
 }
 
 // ProviderObject is one raw thing the provider returned, before any
@@ -624,6 +667,27 @@ type FixtureProvider struct {
 	Codeowners   map[string][]CodeownerRule
 	// FailScopes forces an error for a scope, to exercise partial coverage.
 	FailScopes map[string]error
+
+	// Branches, keyed by scope NativeID. Nil means the fixture does not model
+	// branches, and all-branch scanning degrades to the default branch.
+	Branches map[string][]ProviderBranch
+	// RefTrees holds per-ref trees, keyed "scopeNativeID@ref". A ref with no
+	// entry here falls back to Trees, so existing fixtures keep working
+	// unchanged while a branch-aware test can vary content per ref.
+	RefTrees map[string][]TreeEntry
+	// FailBranches forces ListBranches to error for a scope, to exercise the
+	// "could not enumerate refs" degradation path.
+	FailBranches map[string]error
+}
+
+func (f *FixtureProvider) ListBranches(_ context.Context, _ ProviderContext, s ProviderScope) ([]ProviderBranch, error) {
+	if err := f.FailBranches[s.NativeID]; err != nil {
+		return nil, err
+	}
+	if err := f.FailScopes[s.NativeID]; err != nil {
+		return nil, err
+	}
+	return f.Branches[s.NativeID], nil
 }
 
 func (f *FixtureProvider) ListGrants(_ context.Context, _ ProviderContext, s ProviderScope) ([]ProviderGrant, error) {
@@ -733,6 +797,14 @@ func (f *FixtureProvider) ListSBOM(_ context.Context, _ ProviderContext, s Provi
 func (f *FixtureProvider) ListTree(_ context.Context, _ ProviderContext, s ProviderScope) ([]TreeEntry, bool, error) {
 	if err := f.FailScopes[s.NativeID]; err != nil {
 		return nil, false, err
+	}
+	// A ref-specific tree wins when the fixture defines one; otherwise every ref
+	// sees the same tree, which is the right default for fixtures written before
+	// branch coverage existed.
+	if s.Ref != "" {
+		if entries, ok := f.RefTrees[s.NativeID+"@"+s.Ref]; ok {
+			return entries, f.Truncated[s.NativeID], nil
+		}
 	}
 	return f.Trees[s.NativeID], f.Truncated[s.NativeID], nil
 }

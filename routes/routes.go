@@ -1588,6 +1588,14 @@ func SetupRoutes(
 			discovery.GET("/sources/:id/repositories", middlewares.Require("discovery", "read"), discoveryGitHub.ListSourceRepositories)
 			discovery.PUT("/sources/:id/repositories", middlewares.Require("discovery", "admin"), discoveryGitHub.SetSourceRepositories)
 			discovery.POST("/sources/:id/scan", middlewares.Require("discovery", "admin"), discoveryGitHub.ScanGitHubSource)
+
+			// Scan runs. POST .../scan queues and returns 202 with a run id;
+			// these are how the console follows it and how anyone answers "what
+			// did the last scan actually see?" after the fact. Reading a run is
+			// discovery:read — it reports coverage, it does not change anything.
+			discovery.GET("/sources/:id/scan-runs", middlewares.Require("discovery", "read"), discoveryGitHub.ListScanRuns)
+			discovery.GET("/scan-runs/:run_id", middlewares.Require("discovery", "read"), discoveryGitHub.GetScanRun)
+			discovery.POST("/scan-runs/:run_id/cancel", middlewares.Require("discovery", "admin"), discoveryGitHub.CancelScanRun)
 		}
 
 		// ────────────────────────────────────────────────────
