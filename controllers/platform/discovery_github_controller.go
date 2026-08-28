@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/vault"
-	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
@@ -586,25 +585,11 @@ func (ctl *DiscoveryGitHubController) SetSourceRepositories(c *gin.Context) {
 }
 
 // workspaceAndActor resolves the authenticated workspace and principal.
+//
+// Delegates to the package-level helper so there is exactly one answer to "who
+// is calling, and for which workspace" across the discovery controllers.
 func (ctl *DiscoveryGitHubController) workspaceAndActor(c *gin.Context) (uuid.UUID, string, error) {
-	ws := c.GetString("workspace_id")
-	if ws == "" {
-		return uuid.Nil, "", errors.New("workspace_id not found in token")
-	}
-	id, err := uuid.Parse(ws)
-	if err != nil {
-		return uuid.Nil, "", errors.New("invalid workspace_id")
-	}
-	actor := c.GetString("client_id")
-	if actor == "" {
-		if u, uerr := middlewares.ResolveUserID(c); uerr == nil {
-			actor = u
-		}
-	}
-	if actor == "" {
-		actor = "system"
-	}
-	return id, actor, nil
+	return workspaceAndActorFrom(c)
 }
 
 /* --------------------- the workspace's GitHub App ----------------------- */

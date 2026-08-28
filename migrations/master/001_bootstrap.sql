@@ -5475,3 +5475,35 @@ CREATE INDEX IF NOT EXISTS idx_discovery_scan_runs_claim
 -- The console's history query: newest first for one source.
 CREATE INDEX IF NOT EXISTS idx_discovery_scan_runs_source
     ON public.discovery_scan_runs (workspace_id, source_id, queued_at DESC);
+
+
+-- ===========================================================================
+-- discovery_rule_catalogs — per-workspace detection-pattern overlay.
+-- Mirrors 009_discovery_rule_catalogs.sql so a FRESH bootstrap and an
+-- UPGRADED database end at the same schema. Rationale lives in 009.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.discovery_rule_catalogs (
+    -- One overlay per workspace. The workspace IS the key: a second row would
+    -- mean two answers to "what does this workspace search for".
+    workspace_id uuid PRIMARY KEY,
+
+    -- The overlay: {"vocabularies":{...},"rules":{...},"custom_rules":[...]}.
+    -- Shape and limits are enforced in Go before write; see
+    -- services/iga_rule_catalog_config.go.
+    overlay jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Version of the built-in catalogue this overlay was authored against.
+    -- Kept so that a later built-in change that conflicts with an overlay can be
+    -- reported to the customer instead of quietly resolved.
+    based_on text NOT NULL DEFAULT '',
+
+    -- Content hash of the overlay, recomputed on write. Combined with the
+    -- built-in version it forms the effective catalogue version stamped onto
+    -- every finding.
+    overlay_hash text NOT NULL DEFAULT '',
+
+    updated_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

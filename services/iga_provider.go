@@ -178,8 +178,12 @@ type IGARule struct {
 	EvidenceMode string
 	// SensitiveKeys are redacted before persistence and never leave the parser.
 	SensitiveKeys []string
-	// Extract pulls typed facts out of a matched file. It returns non-secret
-	// facts plus any secret NAMES referenced (names only, never values).
+	// Extractor names the parser in extractorRegistry. It is what configuration
+	// may choose; the parser itself is always code.
+	Extractor string
+	// Extract is Extractor bound to a resolved vocabulary. Populated by
+	// bindCatalog — never set by hand, or a rule would silently match on the
+	// built-in token list while claiming to use the workspace's.
 	Extract func(filePath string, body []byte) (facts map[string]interface{}, secretRefs []string, err error)
 }
 
@@ -278,6 +282,12 @@ var agentActionMarkers = []string{
 	"claude-code", "codex exec", "aider --",
 }
 
+// defaultSecretSuffixes decide which environment-variable NAMES are recorded
+// as credential references. Suffixes, not substrings: "_TOKEN" catches
+// GITHUB_TOKEN without also catching every variable containing the word token.
+// Only the NAME is ever recorded; the value is not read.
+var defaultSecretSuffixes = []string{"_API_KEY", "_TOKEN", "_SECRET"}
+
 // containsAny reports which of `tokens` appear in `text`, lower-cased. Order
 // follows `tokens` so output is stable across runs.
 func containsAny(text string, tokens []string) []string {
@@ -309,7 +319,7 @@ func containsAny(text string, tokens []string) []string {
 // read from a mounted file or fetched at runtime, or anything in a repository
 // the installation was not granted.
 func DefaultRuleCatalog() IGARuleCatalog {
-	return IGARuleCatalog{
+	c := IGARuleCatalog{
 		// Bumping this version schedules a rescan: bodies are discarded after
 		// parse, so a corrected rule cannot be replayed over stored evidence.
 		Version: "0.2.0",
@@ -321,7 +331,7 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				PathGlobs:     []string{".github/workflows/*.yml", ".github/workflows/*.yaml"},
 				EvidenceMode:  models.EvidenceInvocationDeclared,
 				SensitiveKeys: []string{"env", "with", "run"},
-				Extract:       extractWorkflowInvocation,
+				Extractor:     "workflow",
 			},
 			{
 				ID:            "manifest.agent-declaration",
@@ -330,7 +340,7 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				PathGlobs:     []string{"*.agent.json", "agent.json", "agents.json"},
 				EvidenceMode:  models.EvidenceDeploymentDeclared,
 				SensitiveKeys: []string{"apiKey", "api_key", "token", "secret", "password", "prompt", "instructions"},
-				Extract:       extractAgentManifest,
+				Extractor:     "manifest",
 			},
 			{
 				// The highest-value rule here. An MCP config is a literal list
@@ -348,7 +358,7 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				},
 				EvidenceMode:  models.EvidenceToolConfiguration,
 				SensitiveKeys: []string{"env", "headers", "token", "apiKey", "api_key", "password"},
-				Extract:       extractMCPConfig,
+				Extractor:     "mcp",
 			},
 			{
 				ID:          "container.dockerfile",
@@ -359,7 +369,7 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				},
 				EvidenceMode:  models.EvidenceFrameworkDep,
 				SensitiveKeys: []string{"ENV", "ARG"},
-				Extract:       extractDockerfile,
+				Extractor:     "dockerfile",
 			},
 			{
 				ID:          "container.compose",
@@ -372,7 +382,7 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				},
 				EvidenceMode:  models.EvidenceDeploymentDeclared,
 				SensitiveKeys: []string{"environment", "env_file"},
-				Extract:       extractCompose,
+				Extractor:     "compose",
 			},
 			{
 				// Weakest rule in the set, and labelled as such in its own
@@ -390,9 +400,29 @@ func DefaultRuleCatalog() IGARuleCatalog {
 				},
 				EvidenceMode:  models.EvidenceFrameworkDep,
 				SensitiveKeys: []string{},
-				Extract:       extractDependencyManifest,
+				Extractor:     "dependency",
 			},
 		},
+	}
+	bindCatalog(&c, DefaultVocabulary())
+	return c
+}
+
+// DefaultVocabulary is the shipped token set, before any workspace overlay.
+func DefaultVocabulary() EffectiveVocabulary {
+	return EffectiveVocabulary{
+		FrameworkTokens: agentFrameworkTokens,
+		ActionMarkers:   agentActionMarkers,
+		SecretSuffixes:  defaultSecretSuffixes,
+	}
+}
+
+// bindCatalog resolves each rule's named extractor against a vocabulary.
+func bindCatalog(c *IGARuleCatalog, v EffectiveVocabulary) {
+	for i := range c.Rules {
+		if factory, ok := extractorRegistry[c.Rules[i].Extractor]; ok {
+			c.Rules[i].Extract = factory(v)
+		}
 	}
 }
 
@@ -439,14 +469,14 @@ func workflowName(text string) string {
 // extractWorkflowInvocation looks for a workflow step invoking a documented
 // agent runtime. It records WHICH runtime and the step name — never the `run:`
 // body, `env:` values or `with:` arguments, any of which can carry secrets.
-func extractWorkflowInvocation(filePath string, body []byte) (map[string]interface{}, []string, error) {
+func extractWorkflowInvocation(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
 	text := string(body)
-	runtimes := containsAny(text, agentActionMarkers)
+	runtimes := containsAny(text, v.ActionMarkers)
 	if len(runtimes) == 0 {
 		// Fall back to the framework vocabulary: a workflow that pip-installs
 		// langchain and runs it is an agent invocation too, just declared less
 		// explicitly than a named action.
-		if frameworks := containsAny(text, agentFrameworkTokens); len(frameworks) > 0 {
+		if frameworks := containsAny(text, v.FrameworkTokens); len(frameworks) > 0 {
 			facts := map[string]interface{}{
 				"declared_frameworks": frameworks,
 				"workflow_path":       filePath,
@@ -455,7 +485,7 @@ func extractWorkflowInvocation(filePath string, body []byte) (map[string]interfa
 			if n := workflowName(text); n != "" {
 				facts["name"] = n
 			}
-			return facts, collectSecretNames(text), nil
+			return facts, collectSecretNames(v.SecretSuffixes, text), nil
 		}
 		return nil, nil, nil // no fact to record; not an error
 	}
@@ -477,13 +507,13 @@ func extractWorkflowInvocation(filePath string, body []byte) (map[string]interfa
 	if strings.Contains(text, "permissions:") {
 		facts["declares_permissions"] = true
 	}
-	return facts, collectSecretNames(text), nil
+	return facts, collectSecretNames(v.SecretSuffixes, text), nil
 }
 
 // extractMCPConfig records which MCP servers a repository configures and what
 // transport each uses. Server env blocks and headers are where credentials live,
 // so only their KEY names are kept.
-func extractMCPConfig(filePath string, body []byte) (map[string]interface{}, []string, error) {
+func extractMCPConfig(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, nil, fmt.Errorf("malformed MCP config at %s: %w", filePath, err)
@@ -529,15 +559,15 @@ func extractMCPConfig(filePath string, body []byte) (map[string]interface{}, []s
 		// was handed.
 		facts["mcp_env_keys"] = envKeys
 	}
-	return facts, collectSecretNames(string(body)), nil
+	return facts, collectSecretNames(v.SecretSuffixes, string(body)), nil
 }
 
 // extractDockerfile looks for an agent framework installed or invoked at build
 // time. ENV and ARG values are never read — only the names, and only via
 // collectSecretNames.
-func extractDockerfile(filePath string, body []byte) (map[string]interface{}, []string, error) {
+func extractDockerfile(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
 	text := string(body)
-	frameworks := containsAny(text, agentFrameworkTokens)
+	frameworks := containsAny(text, v.FrameworkTokens)
 	if len(frameworks) == 0 {
 		return nil, nil, nil
 	}
@@ -552,21 +582,21 @@ func extractDockerfile(filePath string, body []byte) (map[string]interface{}, []
 			break
 		}
 	}
-	return facts, collectSecretNames(text), nil
+	return facts, collectSecretNames(v.SecretSuffixes, text), nil
 }
 
 // extractCompose records services whose image or command indicates an agent.
 // Environment blocks contribute names only.
-func extractCompose(filePath string, body []byte) (map[string]interface{}, []string, error) {
+func extractCompose(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
 	text := string(body)
-	frameworks := containsAny(text, agentFrameworkTokens)
+	frameworks := containsAny(text, v.FrameworkTokens)
 	if len(frameworks) == 0 {
 		return nil, nil, nil
 	}
 	return map[string]interface{}{
 		"compose_path":        filePath,
 		"declared_frameworks": frameworks,
-	}, collectSecretNames(text), nil
+	}, collectSecretNames(v.SecretSuffixes, text), nil
 }
 
 // extractDependencyManifest records agent frameworks present as dependencies.
@@ -575,8 +605,8 @@ func extractCompose(filePath string, body []byte) (map[string]interface{}, []str
 // carries `requires_corroboration` so nothing downstream can promote it to an
 // agent on its own — a dependency-only match belongs in a candidate list an
 // admin reviews, never in the agent count.
-func extractDependencyManifest(filePath string, body []byte) (map[string]interface{}, []string, error) {
-	frameworks := containsAny(string(body), agentFrameworkTokens)
+func extractDependencyManifest(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
+	frameworks := containsAny(string(body), v.FrameworkTokens)
 	if len(frameworks) == 0 {
 		return nil, nil, nil
 	}
@@ -590,7 +620,7 @@ func extractDependencyManifest(filePath string, body []byte) (map[string]interfa
 
 // extractAgentManifest parses a declared agent manifest, keeping only typed
 // non-secret fields. Prompt bodies and instructions are excluded by default.
-func extractAgentManifest(filePath string, body []byte) (map[string]interface{}, []string, error) {
+func extractAgentManifest(v EffectiveVocabulary, filePath string, body []byte) (map[string]interface{}, []string, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, nil, fmt.Errorf("malformed manifest at %s: %w", filePath, err)
@@ -614,13 +644,13 @@ func extractAgentManifest(filePath string, body []byte) (map[string]interface{},
 		}
 		facts["mcp_servers"] = names
 	}
-	return facts, collectSecretNames(string(body)), nil
+	return facts, collectSecretNames(v.SecretSuffixes, string(body)), nil
 }
 
 // collectSecretNames records secret NAMES referenced by a declaration. A name
 // is redacted evidence and never creates an agent by itself; a value is never
 // read at all.
-func collectSecretNames(text string) []string {
+func collectSecretNames(suffixes []string, text string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, token := range strings.FieldsFunc(text, func(r rune) bool {
@@ -629,10 +659,12 @@ func collectSecretNames(text string) []string {
 		if len(token) < 8 || seen[token] {
 			continue
 		}
-		if strings.HasSuffix(token, "_API_KEY") || strings.HasSuffix(token, "_TOKEN") ||
-			strings.HasSuffix(token, "_SECRET") {
-			seen[token] = true
-			out = append(out, token)
+		for _, suf := range suffixes {
+			if strings.HasSuffix(token, suf) {
+				seen[token] = true
+				out = append(out, token)
+				break
+			}
 		}
 	}
 	return out

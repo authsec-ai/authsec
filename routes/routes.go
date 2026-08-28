@@ -1593,6 +1593,20 @@ func SetupRoutes(
 			// these are how the console follows it and how anyone answers "what
 			// did the last scan actually see?" after the fact. Reading a run is
 			// discovery:read — it reports coverage, it does not change anything.
+			// Detection patterns. What a scan searches for used to be compiled
+			// in; a workspace can now tune the path globs and the token
+			// vocabulary without waiting for a release. The PARSERS stay in
+			// code and are selected by name — config never introduces one.
+			//
+			// Reading is discovery:read (it describes coverage). Writing is
+			// discovery:admin: widening a glob widens what every later scan
+			// downloads, so it is a spending decision as much as a detection one.
+			ruleCatalog := platformCtrl.NewDiscoveryRuleCatalogController(config.DB)
+			discovery.GET("/rule-catalog", middlewares.Require("discovery", "read"), ruleCatalog.GetRuleCatalog)
+			discovery.PUT("/rule-catalog", middlewares.Require("discovery", "admin"), ruleCatalog.SetRuleCatalog)
+			discovery.DELETE("/rule-catalog", middlewares.Require("discovery", "admin"), ruleCatalog.ResetRuleCatalog)
+			discovery.POST("/rule-catalog/test", middlewares.Require("discovery", "read"), ruleCatalog.TestRuleCatalog)
+
 			discovery.GET("/sources/:id/scan-runs", middlewares.Require("discovery", "read"), discoveryGitHub.ListScanRuns)
 			discovery.GET("/scan-runs/:run_id", middlewares.Require("discovery", "read"), discoveryGitHub.GetScanRun)
 			discovery.POST("/scan-runs/:run_id/cancel", middlewares.Require("discovery", "admin"), discoveryGitHub.CancelScanRun)

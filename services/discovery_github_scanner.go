@@ -35,6 +35,13 @@ type GitHubRepoScanner struct {
 	discovery DiscoveryManager
 	provider  IGAProvider
 	catalog   IGARuleCatalog
+	// catalogs resolves the workspace's pattern overlay at scan time. Nil means
+	// "run the built-in catalogue", which is what a fixture-driven test wants.
+	//
+	// Resolved per SCAN rather than at construction: the patterns belong to the
+	// workspace being scanned, and a scanner built once and reused across
+	// workspaces would otherwise apply the first workspace's rules to everyone.
+	catalogs *RuleCatalogService
 }
 
 // NewGitHubRepoScanner wires the scanner to the live GitHub client, taking App
@@ -44,6 +51,7 @@ func NewGitHubRepoScanner(db *gorm.DB, vaultClient vault.VaultClient) *GitHubRep
 		discovery: NewDiscoveryManager(repositories.NewDiscoveryRepository(db)),
 		provider:  NewGitHubProviderForWorkspaceApp(db, vaultClient),
 		catalog:   DefaultRuleCatalog(),
+		catalogs:  NewRuleCatalogService(db),
 	}
 }
 
@@ -54,6 +62,7 @@ func NewGitHubRepoScannerWithProvider(db *gorm.DB, p IGAProvider) *GitHubRepoSca
 		discovery: NewDiscoveryManager(repositories.NewDiscoveryRepository(db)),
 		provider:  p,
 		catalog:   DefaultRuleCatalog(),
+		catalogs:  NewRuleCatalogService(db),
 	}
 }
 
@@ -80,7 +89,7 @@ type GitHubScanResult struct {
 	// because the per-repository cap cut them off. Always forces Complete false.
 	BranchesSkipped int `json:"branches_skipped"`
 
-	FilesFetched    int       `json:"files_fetched"`
+	FilesFetched int `json:"files_fetched"`
 	// FilesFailed counts unreadable files inside repositories that opened fine.
 	FilesFailed     int       `json:"files_failed"`
 	SightingsNew    int       `json:"sightings_new"`
@@ -305,6 +314,19 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 		return nil, fmt.Errorf("no repositories selected: choose repositories for this source before scanning")
 	}
 
+	// The patterns belong to the workspace, so they are resolved here rather
+	// than at construction. A failure is fatal to the scan on purpose: falling
+	// back to the built-in catalogue would scan with rules the customer did not
+	// choose and report the result as though they had.
+	catalog := s.catalog
+	if s.catalogs != nil {
+		resolved, _, cerr := s.catalogs.Resolve(workspaceID)
+		if cerr != nil {
+			return nil, fmt.Errorf("resolve detection patterns: %w", cerr)
+		}
+		catalog = resolved
+	}
+
 	branchMode, maxBranches := cfg.Branches.resolve()
 
 	res := &GitHubScanResult{
@@ -427,7 +449,7 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 			res.BranchesScanned++
 
 			for _, e := range entries {
-				rule, ok := s.catalog.MatchRule(e.Path)
+				rule, ok := catalog.MatchRule(e.Path)
 				if !ok {
 					continue // not a path any rule can interpret; never fetched
 				}
@@ -466,6 +488,13 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 				facts["path"] = e.Path
 				facts["rule_id"] = rule.ID
 				facts["rule_version"] = rule.Version
+				// The catalogue version this finding came from. Patterns are
+				// configurable, so "which ruleset produced this?" is a real
+				// question — and because raw bodies are discarded after parse, a
+				// changed ruleset cannot be replayed over stored evidence. This
+				// is what lets the console mark older findings as stale instead
+				// of presenting them as current.
+				facts["catalog_version"] = catalog.Version
 				facts["evidence_mode"] = rule.EvidenceMode
 				facts["content_sha256"] = HashBody(body)
 				// The blob SHA lets a later scan skip an unchanged file.
