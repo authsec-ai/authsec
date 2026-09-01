@@ -5786,13 +5786,8 @@ CREATE TABLE IF NOT EXISTS public.cloud_assume_edge (
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     row_updated_at timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT cloud_assume_edge_subject_kind_chk CHECK (
-        subject_kind IN ('cloud_service', 'identity', 'k8s_service_account',
-                          'ci_pipeline', 'external_account')
-    ),
-    CONSTRAINT cloud_assume_edge_mechanism_chk CHECK (
-        mechanism IN ('sts_assume_role', 'oidc_federation')
-    ),
+    CONSTRAINT cloud_assume_edge_subject_kind_chk CHECK (subject_kind <> ''),
+    CONSTRAINT cloud_assume_edge_mechanism_chk CHECK (mechanism <> ''),
     CONSTRAINT cloud_assume_edge_subject_chk CHECK (subject <> ''),
     CONSTRAINT cloud_assume_edge_k8s_ref_chk CHECK (
         subject_kind <> 'k8s_service_account' OR k8s_ref IS NOT NULL

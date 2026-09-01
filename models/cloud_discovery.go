@@ -404,11 +404,17 @@ func (c *CloudConnector) SetAWSAttrs(a AWSConnectorAttrs) error {
    Ticket [2]: cloud_assume_edge, cloud_permission, cloud_resource.
    ========================================================================= */
 
-// Who may assume an identity. Five values because the shared cross-cloud note
-// splits "another account" into a SPECIFIC known principal (identity) and an
-// unnamed one (external_account, including a bare account id, an account root
-// ARN, or "*") -- a distinction collapsed by ticket [2]'s own summary text but
-// not by the schema it points at.
+// Who may assume an identity. These are the five values AWS writes today --
+// the shared cross-cloud note splits "another account" into a SPECIFIC known
+// principal (identity) and an unnamed one (external_account, including a bare
+// account id, an account root ARN, or "*"), a distinction collapsed by ticket
+// [2]'s own summary text but not by the schema it points at.
+//
+// NOT a closed set. cloud_assume_edge.subject_kind has no CHECK enumerating
+// these -- see the migration's header -- because GCP and Azure both have
+// federation and impersonation shapes that do not fit AWS's five. These
+// constants exist so AWS's own code never hand-types the string, not to
+// declare every value another connector may write.
 const (
 	AssumeSubjectCloudService = "cloud_service"
 	AssumeSubjectIdentity     = "identity"
@@ -421,13 +427,19 @@ const (
 // static trust-policy principal (sts:AssumeRole), and a Federated principal
 // (sts:AssumeRoleWithWebIdentity) -- which covers BOTH k8s_service_account and
 // ci_pipeline, told apart by subject_kind and issuer rather than by mechanism.
+//
+// Also not a closed set -- see AssumeSubject* above. GCP service-account
+// impersonation, for one, is neither of these two.
 const (
 	AssumeMechanismSTSAssumeRole  = "sts_assume_role"
 	AssumeMechanismOIDCFederation = "oidc_federation"
 )
 
-// ValidAssumeSubjectKinds returns the allowed subject kinds.
-func ValidAssumeSubjectKinds() []string {
+// KnownAWSAssumeSubjectKinds returns the subject kinds AWS's own scanner
+// writes. Not an exhaustive list of legal values -- see the constants' own
+// comment -- useful for a console filter or a validation warning, not for a
+// database constraint.
+func KnownAWSAssumeSubjectKinds() []string {
 	return []string{
 		AssumeSubjectCloudService, AssumeSubjectIdentity, AssumeSubjectK8sSA,
 		AssumeSubjectCIPipeline, AssumeSubjectExternal,

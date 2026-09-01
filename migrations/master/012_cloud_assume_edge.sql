@@ -14,23 +14,23 @@
 -- policy, differing only in which OIDC subject shows up. Modelling them as two
 -- tables would split one relationship in half for no reason.
 --
--- WHY subject_kind HAS FIVE VALUES AND THE TICKET TEXT NAMES FOUR. Ticket [2]'s
--- scope says "AWS service, IRSA Kubernetes subject, GitHub CI subject, or
--- another account". The shared schema note is the more precise source of truth
--- and splits "another account" in two: a Principal.AWS naming a SPECIFIC role
--- or user ARN is `identity` (a known principal, possibly in this account or
--- another), while a bare account id, an account root ARN, or "*" is
--- `external_account` (anyone in that account, or anyone at all). Collapsing
--- them would make "arn:aws:iam::999:role/known-role" and "*" read identically,
--- which is exactly the distinction a reviewer of this table needs.
+-- WHY subject_kind AND mechanism ARE OPEN TEXT, NOT A CLOSED ENUM. This table
+-- is shared with the GCP and Azure connectors, neither built here. AWS
+-- populates five subject kinds today -- cloud_service, identity,
+-- k8s_service_account, ci_pipeline, external_account -- and two mechanisms,
+-- sts_assume_role and oidc_federation (see internal/awsdiscovery/trust_policy.go
+-- for what each one means and when AWS writes it). A closed CHECK enumerating
+-- only those values would reject the first GCP row naming
+-- mechanism='gcp_impersonation' -- service-account impersonation, which is
+-- neither an AssumeRole-shaped trust principal nor an OIDC federation -- or an
+-- Azure federated identity credential that does not fit AWS's vocabulary.
+-- cloud_identity.kind already made this call the same way for the same reason;
+-- this table should not be stricter than its own neighbour.
 --
--- WHY mechanism HAS TWO VALUES, NOT FOUR. It describes HOW the assumption
--- happens, not WHO is assuming. AWS has exactly two: a plain trust-policy
--- principal using sts:AssumeRole (`sts_assume_role` -- covers the cloud_service,
--- identity and external_account subject kinds), and a Federated principal using
--- sts:AssumeRoleWithWebIdentity (`oidc_federation` -- covers BOTH
--- k8s_service_account and ci_pipeline, which are the same AWS mechanism and are
--- told apart by subject_kind and issuer, not by mechanism).
+-- The only subject_kind this migration still checks BY NAME is
+-- 'k8s_service_account', because that value's meaning (and the k8s_ref
+-- invariant below) is fixed by the Kubernetes connector's own join contract,
+-- not by which cloud wrote the row.
 --
 -- Applied at boot by internal/migration/runner.go, which wraps each file in its
 -- own transaction -- so there is deliberately no BEGIN/COMMIT here.
@@ -75,13 +75,8 @@ CREATE TABLE IF NOT EXISTS public.cloud_assume_edge (
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     row_updated_at timestamptz NOT NULL DEFAULT now(),
 
-    CONSTRAINT cloud_assume_edge_subject_kind_chk CHECK (
-        subject_kind IN ('cloud_service', 'identity', 'k8s_service_account',
-                          'ci_pipeline', 'external_account')
-    ),
-    CONSTRAINT cloud_assume_edge_mechanism_chk CHECK (
-        mechanism IN ('sts_assume_role', 'oidc_federation')
-    ),
+    CONSTRAINT cloud_assume_edge_subject_kind_chk CHECK (subject_kind <> ''),
+    CONSTRAINT cloud_assume_edge_mechanism_chk CHECK (mechanism <> ''),
     CONSTRAINT cloud_assume_edge_subject_chk CHECK (subject <> ''),
     -- A k8s_service_account edge without its subject-account-format ref is a
     -- broken join: the whole reason this subject kind exists is so the
