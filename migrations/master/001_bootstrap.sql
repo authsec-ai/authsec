@@ -5507,3 +5507,401 @@ CREATE TABLE IF NOT EXISTS public.discovery_rule_catalogs (
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+
+-- ===========================================================================
+-- cloud_connector — one onboarded cloud account, project or subscription.
+-- Mirrors 010_cloud_discovery_connector.sql so a FRESH bootstrap and an
+-- UPGRADED database end at the same schema. Rationale, and the recorded
+-- deviations from the shared cross-cloud schema note, live in 010.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_connector (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+
+    -- aws | gcp | azure.
+    provider text NOT NULL,
+
+    -- account | project | folder | org | subscription.
+    scope_kind text NOT NULL,
+
+    -- The provider's own identifier for the scope, verbatim. A join key, never
+    -- a display name.
+    scope_id text NOT NULL,
+
+    -- Azure tenant, GCP org. NULL, not '', when there is no parent.
+    parent_scope_id text,
+
+    -- A HANDLE, never key material: for AWS, the secrets-store path holding the
+    -- ExternalId.
+    auth_ref text NOT NULL DEFAULT '',
+
+    -- active | revoked | error.
+    status text NOT NULL DEFAULT 'active',
+
+    -- Bumped once per scan; drives reconciliation against last_seen_generation.
+    scan_generation integer NOT NULL DEFAULT 0,
+
+    -- Per surface (per region x surface for AWS): reached | denied |
+    -- not_configured | throttled. Keeps "could not read" distinguishable from
+    -- "found nothing".
+    coverage jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Provider extras. For AWS: role_arn, regions, caller_arn.
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- When the connection was last PROVEN by assuming the role and reading the
+    -- identity back. NULL means never proven, not broken.
+    verified_at timestamptz,
+    last_error  text NOT NULL DEFAULT '',
+
+    created_by text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_connector_provider_chk CHECK (
+        provider IN ('aws', 'gcp', 'azure')
+    ),
+    CONSTRAINT cloud_connector_scope_kind_chk CHECK (
+        scope_kind IN ('account', 'project', 'folder', 'org', 'subscription')
+    ),
+    CONSTRAINT cloud_connector_status_chk CHECK (
+        status IN ('active', 'revoked', 'error')
+    ),
+    CONSTRAINT cloud_connector_scope_id_chk CHECK (scope_id <> ''),
+    CONSTRAINT cloud_connector_error_chk CHECK (
+        status <> 'error' OR last_error <> ''
+    ),
+    CONSTRAINT cloud_connector_auth_ref_chk CHECK (
+        status <> 'active' OR auth_ref <> ''
+    ),
+    CONSTRAINT cloud_connector_scan_generation_chk CHECK (scan_generation >= 0)
+);
+
+-- One row per onboarded scope; the conflict target for the onboarding upsert.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_connector_scope
+    ON public.cloud_connector (workspace_id, provider, scope_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_connector_workspace
+    ON public.cloud_connector (workspace_id, provider, status);
+
+
+-- ===========================================================================
+-- cloud_identity / cloud_secret — the identity foundation of cloud discovery.
+-- Mirrors 011_cloud_identity_and_secret.sql so a FRESH bootstrap and an
+-- UPGRADED database end at the same schema. Rationale lives in 011, including
+-- why created_at holds the PROVIDER's creation time rather than the row's.
+-- ===========================================================================
+
+-- ===========================================================================
+-- cloud_identity — what code runs as.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_identity (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+
+    -- The connector that most recently saw this identity. ON DELETE CASCADE:
+    -- disconnecting an account removes what that account's connector found.
+    -- There is no orphan state worth keeping — an identity with no way to reach
+    -- it can never be refreshed, re-verified or acted on.
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The real provider object name, never an AuthSec abstraction.
+    --   AWS   iam_role | iam_user   (agentcore_workload_identity to follow)
+    --   GCP   service_account
+    --   AZURE service_principal | managed_identity
+    kind text NOT NULL,
+
+    -- The provider's own id, verbatim. For AWS the role or user ARN. This is
+    -- the cross-connector join key, which is why it is unique per workspace
+    -- rather than per connector: the shared note's rule is "one identity, one
+    -- row — two connectors seeing the same principal update the same row,
+    -- matched on native_id". An ARN already encodes its account, so this cannot
+    -- collide across two legitimately different principals.
+    native_id text NOT NULL,
+
+    name text NOT NULL DEFAULT '',
+
+    -- PROVIDER creation time. See the header. Nullable because a provider may
+    -- not report one.
+    created_at timestamptz,
+
+    -- NULL means UNKNOWN, never "never used". The distinction is load-bearing:
+    -- an unused over-privileged role is a finding, and an unknown one is a gap
+    -- in our coverage. Reporting the second as the first would manufacture
+    -- findings out of our own blind spots.
+    last_used_at timestamptz,
+
+    -- AWS has no disable switch for a role or user, so this is always true
+    -- there. It exists for the providers that do.
+    enabled boolean NOT NULL DEFAULT true,
+
+    -- Small provider extras. For AWS: the unique id (AROA.../AIDA...), path,
+    -- description, tags, max session duration.
+    --
+    -- The unique id lives here rather than replacing native_id as the key: the
+    -- ARN is what every other connector and every policy document refers to, so
+    -- it has to stay the join key. But a role deleted and recreated with the
+    -- same name has the SAME ARN and a DIFFERENT unique id, so keeping the id
+    -- is the only way to notice that the principal is not the one we saw last
+    -- week.
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Reconciliation. Stamped with cloud_connector.scan_generation on every
+    -- scan that sees this row. A row whose generation has fallen behind was not
+    -- seen last time — which is only meaningful if that surface was actually
+    -- reached, hence cloud_connector.coverage.
+    last_seen_generation integer NOT NULL DEFAULT 0,
+
+    -- OUR bookkeeping, deliberately named apart from created_at.
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_identity_kind_chk CHECK (kind <> ''),
+    CONSTRAINT cloud_identity_native_id_chk CHECK (native_id <> ''),
+    CONSTRAINT cloud_identity_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+-- One identity, one row. The conflict target for the scan's upsert, and what
+-- makes a repeat scan an update rather than a duplicate.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_identity_native
+    ON public.cloud_identity (workspace_id, native_id);
+
+-- The scan's own reconciliation query: everything this connector saw, by
+-- generation.
+CREATE INDEX IF NOT EXISTS idx_cloud_identity_connector_generation
+    ON public.cloud_identity (connector_id, last_seen_generation);
+
+-- The console's list query.
+CREATE INDEX IF NOT EXISTS idx_cloud_identity_workspace_kind
+    ON public.cloud_identity (workspace_id, kind);
+
+-- ===========================================================================
+-- cloud_secret — the long-lived secret that proves an identity.
+-- ===========================================================================
+--
+-- METADATA ONLY. There is no column here that accepts a secret value, and that
+-- is a deliberate structural guarantee rather than a convention: a schema with
+-- nowhere to put a value cannot leak one through a careless INSERT, a debug
+-- log of a row, or a database backup. native_id holds a key IDENTIFIER — an
+-- AWS access key id (AKIA...), which is public in the sense that it appears in
+-- CloudTrail and in the credential report.
+
+CREATE TABLE IF NOT EXISTS public.cloud_secret (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The identity this secret proves. NOT NULL: an access key without its user
+    -- is not a finding, it is a fragment.
+    --
+    -- NOTE for the schema owner: AgentCore OAuth2 and API-key credential
+    -- providers are account-scoped rather than owned by one identity, so
+    -- writing them here (planned for ticket [3]) will need this relaxed to
+    -- nullable. Raised in the AWS plan's section 6 and not yet decided; left
+    -- NOT NULL until it is, because loosening a constraint later is an
+    -- expand-only change while tightening one is not.
+    identity_id uuid NOT NULL
+        REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
+
+    -- AWS access_key. GCP sa_json_key. AZURE client_secret | certificate.
+    kind text NOT NULL,
+
+    -- The key IDENTIFIER only. Never material.
+    native_id text NOT NULL,
+
+    -- PROVIDER creation time. "Age is the finding" — this is the column the
+    -- stale-credential report reads.
+    created_at timestamptz,
+
+    -- NULL where the provider has no expiry, which is the case for every AWS
+    -- access key. Not "no expiry recorded" — AWS access keys genuinely do not
+    -- expire, which is itself why their age matters.
+    expires_at timestamptz,
+
+    -- NULL means unknown, never "never used". AWS reports a key that has never
+    -- been used by omitting the date, so the scanner must not turn that into a
+    -- zero timestamp.
+    last_used_at timestamptz,
+
+    -- active | inactive, the provider's own words.
+    status text NOT NULL DEFAULT 'active',
+
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_secret_kind_chk CHECK (kind <> ''),
+    CONSTRAINT cloud_secret_native_id_chk CHECK (native_id <> ''),
+    CONSTRAINT cloud_secret_status_chk CHECK (status IN ('active', 'inactive')),
+    CONSTRAINT cloud_secret_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_secret_native
+    ON public.cloud_secret (workspace_id, native_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_secret_identity
+    ON public.cloud_secret (identity_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_secret_connector_generation
+    ON public.cloud_secret (connector_id, last_seen_generation);
+
+-- Stale-credential reporting: oldest active keys first, which is the whole
+-- point of holding created_at.
+CREATE INDEX IF NOT EXISTS idx_cloud_secret_age
+    ON public.cloud_secret (workspace_id, status, created_at);
+
+-- ===========================================================================
+-- cloud_assume_edge — who may become an identity. Mirrors
+-- 012_cloud_assume_edge.sql so a fresh bootstrap and an existing database that
+-- ran the migration reach the same end state.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_assume_edge (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+    identity_id uuid NOT NULL
+        REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
+
+    subject_kind text NOT NULL,
+    subject text NOT NULL,
+    issuer text,
+    mechanism text NOT NULL,
+    k8s_ref text,
+
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_assume_edge_subject_kind_chk CHECK (
+        subject_kind IN ('cloud_service', 'identity', 'k8s_service_account',
+                          'ci_pipeline', 'external_account')
+    ),
+    CONSTRAINT cloud_assume_edge_mechanism_chk CHECK (
+        mechanism IN ('sts_assume_role', 'oidc_federation')
+    ),
+    CONSTRAINT cloud_assume_edge_subject_chk CHECK (subject <> ''),
+    CONSTRAINT cloud_assume_edge_k8s_ref_chk CHECK (
+        subject_kind <> 'k8s_service_account' OR k8s_ref IS NOT NULL
+    ),
+    CONSTRAINT cloud_assume_edge_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_assume_edge_subject
+    ON public.cloud_assume_edge (identity_id, subject_kind, subject);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_assume_edge_connector_generation
+    ON public.cloud_assume_edge (connector_id, last_seen_generation);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_assume_edge_k8s_ref
+    ON public.cloud_assume_edge (k8s_ref, issuer) WHERE k8s_ref IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_cloud_assume_edge_identity
+    ON public.cloud_assume_edge (identity_id);
+
+-- ===========================================================================
+-- cloud_resource / cloud_permission — what an identity may reach, and what it
+-- is granted to do there. Mirrors 013_cloud_permission_and_resource.sql so a
+-- fresh bootstrap and an existing database that ran the migration reach the
+-- same end state.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_resource (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    kind text NOT NULL,
+    native_id text NOT NULL,
+    name text NOT NULL DEFAULT '',
+    sensitivity text NOT NULL DEFAULT 'low',
+
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_resource_kind_chk CHECK (kind <> ''),
+    CONSTRAINT cloud_resource_native_id_chk CHECK (native_id <> ''),
+    CONSTRAINT cloud_resource_sensitivity_chk CHECK (
+        sensitivity IN ('low', 'med', 'high')
+    ),
+    CONSTRAINT cloud_resource_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_resource_native
+    ON public.cloud_resource (workspace_id, native_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_resource_connector_generation
+    ON public.cloud_resource (connector_id, last_seen_generation);
+
+CREATE TABLE IF NOT EXISTS public.cloud_permission (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+    identity_id uuid NOT NULL
+        REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
+    resource_id uuid
+        REFERENCES public.cloud_resource(id) ON DELETE CASCADE,
+
+    plane text NOT NULL DEFAULT 'cloud',
+    effect text NOT NULL,
+    role_name text,
+    actions text[] NOT NULL,
+    scope_kind text NOT NULL,
+    derivation text NOT NULL DEFAULT 'granted',
+    sensitivity text NOT NULL DEFAULT 'low',
+    last_exercised_at timestamptz,
+    native_id text NOT NULL,
+
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_permission_plane_chk CHECK (plane IN ('cloud', 'api')),
+    CONSTRAINT cloud_permission_effect_chk CHECK (effect IN ('allow', 'deny')),
+    CONSTRAINT cloud_permission_scope_kind_chk CHECK (
+        scope_kind IN ('resource', 'prefix', 'account_wide')
+    ),
+    CONSTRAINT cloud_permission_scope_resource_chk CHECK (
+        (scope_kind = 'resource') = (resource_id IS NOT NULL)
+    ),
+    CONSTRAINT cloud_permission_derivation_chk CHECK (
+        derivation IN ('granted', 'effective')
+    ),
+    CONSTRAINT cloud_permission_sensitivity_chk CHECK (
+        sensitivity IN ('low', 'med', 'high')
+    ),
+    CONSTRAINT cloud_permission_actions_chk CHECK (array_length(actions, 1) > 0),
+    CONSTRAINT cloud_permission_native_id_chk CHECK (native_id <> ''),
+    CONSTRAINT cloud_permission_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_permission_grant
+    ON public.cloud_permission (identity_id, native_id, resource_id)
+    NULLS NOT DISTINCT;
+
+CREATE INDEX IF NOT EXISTS idx_cloud_permission_connector_generation
+    ON public.cloud_permission (connector_id, last_seen_generation);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_permission_identity
+    ON public.cloud_permission (identity_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_permission_resource
+    ON public.cloud_permission (resource_id) WHERE resource_id IS NOT NULL;
