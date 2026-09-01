@@ -49,13 +49,21 @@ type CloudConnectorRepository interface {
 	// thing that distinguishes "broken since this morning" from "never worked".
 	MarkError(workspaceID, id uuid.UUID, reason string) (*models.CloudConnector, error)
 
-	// Delete removes a connector and returns the auth_ref that should now be
-	// purged from the secrets store, or "" when there was nothing stored.
+	// Revoke marks a connector revoked and clears its auth_ref, returning the
+	// PREVIOUS auth_ref so the caller can purge it from the secrets store, or ""
+	// when there was nothing stored.
+	//
+	// Does NOT delete the row, and nothing it points at cascades: cloud_identity,
+	// cloud_secret, cloud_assume_edge, cloud_permission and cloud_resource all
+	// stay exactly as the last successful scan left them. A revoked connection
+	// says "we can no longer read this account", not "what we already found is
+	// gone" -- the same distinction status='error' already makes, and the reason
+	// hydra_reconciler.go revokes rather than deletes elsewhere in this codebase.
 	//
 	// The purge is the CALLER's job, not this method's: the repository has no
 	// secrets client, and doing it here would put a network call inside a
 	// database transaction.
-	Delete(workspaceID, id uuid.UUID) (authRef string, err error)
+	Revoke(workspaceID, id uuid.UUID) (authRef string, err error)
 }
 
 type cloudConnectorRepository struct{ db *gorm.DB }
@@ -196,14 +204,21 @@ func (r *cloudConnectorRepository) MarkError(workspaceID, id uuid.UUID, reason s
 	return r.Get(workspaceID, id)
 }
 
-func (r *cloudConnectorRepository) Delete(workspaceID, id uuid.UUID) (string, error) {
+func (r *cloudConnectorRepository) Revoke(workspaceID, id uuid.UUID) (string, error) {
 	c, err := r.Get(workspaceID, id)
 	if err != nil {
 		return "", err
 	}
-	if err := r.db.Where("workspace_id = ? AND id = ?", workspaceID, id).
-		Delete(&models.CloudConnector{}).Error; err != nil {
+	previousAuthRef := c.AuthRef
+	err = r.db.Model(&models.CloudConnector{}).
+		Where("workspace_id = ? AND id = ?", workspaceID, id).
+		Updates(map[string]interface{}{
+			"status":     models.CloudConnectorRevoked,
+			"auth_ref":   "",
+			"updated_at": time.Now(),
+		}).Error
+	if err != nil {
 		return "", err
 	}
-	return c.AuthRef, nil
+	return previousAuthRef, nil
 }

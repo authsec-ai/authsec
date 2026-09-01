@@ -775,11 +775,14 @@ func TestIAMScanOnUnusableConnectorIsRecordedAsFailed(t *testing.T) {
 	t.Logf("PASS: recorded as failed (%s), generation not advanced", truncate(cov.Error, 60))
 }
 
-// Deleting a connector removes what it found. There is no orphan state worth
-// keeping: an identity with no way to reach it can never be refreshed.
-func TestIAMDeletingConnectorCascadesToIdentitiesAndSecrets(t *testing.T) {
+// Revoking a connector keeps what it found. A revoked connection says "we can
+// no longer read this account", not "what we already found is gone" -- the
+// customer's own audit trail must survive them disconnecting AWS, and
+// re-onboarding the same account later reactivates this same connector rather
+// than starting a second, disconnected history.
+func TestIAMRevokingConnectorKeepsIdentitiesAndSecrets(t *testing.T) {
 	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-iam-cascade")
+	ws := newWorkspace(t, db, "ws-iam-revoke")
 	defer cleanIdentities(t, db, ws)
 
 	svc, _ := newOnboarding(db, okVerifier())
@@ -791,18 +794,26 @@ func TestIAMDeletingConnectorCascadesToIdentitiesAndSecrets(t *testing.T) {
 	if _, err := scanner.Scan(context.Background(), ws, c.ID); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
+	var before int64
+	db.Raw(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ?`, ws).Scan(&before)
+	if before == 0 {
+		t.Fatal("test setup: scan should have written identities")
+	}
 
-	if err := svc.DeleteConnector(ws, c.ID); err != nil {
-		t.Fatalf("delete: %v", err)
+	if err := svc.RevokeConnector(ws, c.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
 	}
 	var identities, secrets int64
 	db.Raw(`SELECT count(*) FROM cloud_identity WHERE workspace_id = ?`, ws).Scan(&identities)
 	db.Raw(`SELECT count(*) FROM cloud_secret WHERE workspace_id = ?`, ws).Scan(&secrets)
-	if identities != 0 || secrets != 0 {
-		t.Fatalf("disconnecting should remove what the connector found, left %d identities and %d secrets",
-			identities, secrets)
+	if identities != before {
+		t.Fatalf("revoking should keep discovered identities for audit, had %d before, %d after",
+			before, identities)
 	}
-	t.Log("PASS: identities and secrets removed with the connector")
+	if secrets == 0 {
+		t.Fatal("revoking should keep discovered secret metadata for audit, found none")
+	}
+	t.Log("PASS: identities and secret metadata kept, unchanged, after revoke")
 }
 
 // No secret value can reach the database, because there is no column for one.

@@ -372,13 +372,15 @@ func (s *AWSOnboardingService) ConfigForConnector(
 	return cfg, c, nil
 }
 
-// DeleteConnector removes a connector and purges its stored ExternalId.
+// RevokeConnector revokes a connector and purges its stored ExternalId. The
+// connector row and everything it discovered stay in place for audit -- see
+// CloudConnectorRepository.Revoke for why this is not a delete.
 //
 // The row goes first. A purge that fails leaves an unreferenced secret, which
-// is untidy; a delete that fails after the purge would leave a connector that
+// is untidy; a revoke that fails after the purge would leave a connector that
 // looks usable and is not, and every scan against it would fail confusingly.
-func (s *AWSOnboardingService) DeleteConnector(workspaceID, id uuid.UUID) error {
-	authRef, err := s.repo.Delete(workspaceID, id)
+func (s *AWSOnboardingService) RevokeConnector(workspaceID, id uuid.UUID) error {
+	authRef, err := s.repo.Revoke(workspaceID, id)
 	if err != nil {
 		return err
 	}
