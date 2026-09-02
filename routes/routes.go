@@ -1658,6 +1658,25 @@ func SetupRoutes(
 			discovery.GET("/aws/assume-edges", middlewares.Require("discovery", "read"), cloudAWS.ListAssumeEdges)
 			discovery.GET("/aws/permissions", middlewares.Require("discovery", "read"), cloudAWS.ListPermissions)
 			discovery.GET("/aws/resources", middlewares.Require("discovery", "read"), cloudAWS.ListResources)
+
+			// GCP as a discovery channel, alongside AWS, Kubernetes and GitHub.
+			//
+			// Same boundary as the AWS block above: these endpoints ONBOARD a GCP
+			// scope (org, folder or project) — an agentless, read-only connection
+			// (Workload Identity Federation preferred, an uploaded service-account
+			// key as fallback) and the cloud_connector row every later GCP surface
+			// resolves against. Nothing here discovers anything yet.
+			//
+			// discovery:read gates the onboarding package for the same reason as
+			// AWS's: a reviewer must be able to see the permissions AuthSec is
+			// asking for before granting them. discovery:admin gates every mutation.
+			cloudGCP := platformCtrl.NewCloudGCPController(config.DB)
+			discovery.GET("/gcp/onboarding", middlewares.Require("discovery", "read"), cloudGCP.GetOnboardingPackage)
+			discovery.POST("/gcp/connectors", middlewares.Require("discovery", "admin"), cloudGCP.CreateConnector)
+			discovery.GET("/gcp/connectors", middlewares.Require("discovery", "read"), cloudGCP.ListConnectors)
+			discovery.GET("/gcp/connectors/:id", middlewares.Require("discovery", "read"), cloudGCP.GetConnector)
+			discovery.POST("/gcp/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudGCP.VerifyConnector)
+			discovery.DELETE("/gcp/connectors/:id", middlewares.Require("discovery", "admin"), cloudGCP.RevokeConnector)
 		}
 
 		// ────────────────────────────────────────────────────
