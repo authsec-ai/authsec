@@ -462,15 +462,24 @@ func TestIAMScanRecordsIdentitiesSecretsAndPolicies(t *testing.T) {
 	t.Log("PASS: trust policy decoded and handed to ticket [2]")
 
 	// Ticket [1]'s scope line: no write path beyond cloud_connector,
-	// cloud_identity and cloud_secret.
-	for _, table := range []string{"cloud_permission", "cloud_resource", "cloud_assume_edge", "cloud_usage"} {
-		var exists int64
-		db.Raw(`SELECT count(*) FROM information_schema.tables WHERE table_name = ?`, table).Scan(&exists)
-		if exists > 0 {
-			t.Fatalf("%s exists already; ticket [1] must not create it", table)
+	// cloud_identity and cloud_secret. cloud_permission, cloud_resource and
+	// cloud_assume_edge are ticket [2]'s tables -- they exist in this schema
+	// (migrations 012/013 ship in the same PR), so the check that matters is
+	// that AWSIAMScanner.Scan wrote no rows into them, not that they are
+	// missing. cloud_usage is a later ticket and genuinely does not exist yet.
+	for _, table := range []string{"cloud_permission", "cloud_resource", "cloud_assume_edge"} {
+		var rows int64
+		db.Raw(fmt.Sprintf(`SELECT count(*) FROM %s WHERE workspace_id = ?`, table), ws).Scan(&rows)
+		if rows > 0 {
+			t.Fatalf("%s has %d rows; ticket [1]'s scan must not write to it", table, rows)
 		}
 	}
-	t.Log("PASS: no out-of-scope table was created")
+	var usageTableExists int64
+	db.Raw(`SELECT count(*) FROM information_schema.tables WHERE table_name = 'cloud_usage'`).Scan(&usageTableExists)
+	if usageTableExists > 0 {
+		t.Fatal("cloud_usage exists already; it is a later ticket, not [1] or [2]")
+	}
+	t.Log("PASS: ticket [1]'s scan wrote nothing outside its own tables")
 }
 
 // A repeat scan must update, not duplicate — the acceptance criterion stated
