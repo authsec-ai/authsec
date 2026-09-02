@@ -1635,7 +1635,10 @@ func SetupRoutes(
 			discovery.GET("/aws/connectors", middlewares.Require("discovery", "read"), cloudAWS.ListConnectors)
 			discovery.GET("/aws/connectors/:id", middlewares.Require("discovery", "read"), cloudAWS.GetConnector)
 			discovery.POST("/aws/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAWS.VerifyConnector)
-			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.DeleteConnector)
+			// DELETE verb, revoke semantics: the connector row and everything it
+			// discovered stay for audit, aligned with GCP's planned behaviour. See
+			// CloudConnectorRepository.Revoke.
+			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
 
 			// IAM identity discovery: the foundation every later AWS surface
 			// resolves against. Writes cloud_identity and cloud_secret and

@@ -11,7 +11,6 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
-	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -420,9 +419,9 @@ func TestAWSFailedVerificationRecordsTheReasonAndKeepsVerifiedAt(t *testing.T) {
 }
 
 // Deleting a connector purges the secret it addressed.
-func TestAWSDeleteConnectorPurgesTheStoredExternalID(t *testing.T) {
+func TestAWSRevokeConnectorPurgesTheStoredExternalIDButKeepsTheRow(t *testing.T) {
 	db := igaDB(t)
-	ws := newWorkspace(t, db, "ws-aws-delete")
+	ws := newWorkspace(t, db, "ws-aws-revoke")
 	defer cleanConnectors(t, db, ws)
 
 	svc, mv := newOnboarding(db, okVerifier())
@@ -432,16 +431,22 @@ func TestAWSDeleteConnectorPurgesTheStoredExternalID(t *testing.T) {
 	}
 	path := c.AuthRef
 
-	if err := svc.DeleteConnector(ws, c.ID); err != nil {
-		t.Fatalf("delete: %v", err)
+	if err := svc.RevokeConnector(ws, c.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
 	}
 	if _, err := mv.ReadSecret(path); err == nil {
-		t.Fatal("the stored external id must be purged on delete")
+		t.Fatal("the stored external id must be purged on revoke")
 	}
-	if _, err := svc.Connector(ws, c.ID); !errors.Is(err, repositories.ErrCloudConnectorNotFound) {
-		t.Fatalf("connector should be gone, got %v", err)
+	// Unlike a delete, the row -- and anything discovered through it -- stays,
+	// for audit. Only its status and auth_ref change.
+	after, err := svc.Connector(ws, c.ID)
+	if err != nil {
+		t.Fatalf("connector should still be readable after revoke, got %v", err)
 	}
-	t.Log("PASS: row removed and stored external id purged")
+	if after.Status != models.CloudConnectorRevoked {
+		t.Fatalf("status = %q, want %q", after.Status, models.CloudConnectorRevoked)
+	}
+	t.Log("PASS: external id purged, connector row and status=revoked kept for audit")
 }
 
 // Input the service must refuse before it ever reaches AWS.

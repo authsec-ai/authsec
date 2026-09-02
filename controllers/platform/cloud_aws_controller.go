@@ -278,8 +278,12 @@ func (ctl *CloudAWSController) VerifyConnector(c *gin.Context) {
 	})
 }
 
-// DeleteConnector handles DELETE /authsec/discovery/aws/connectors/:id.
-func (ctl *CloudAWSController) DeleteConnector(c *gin.Context) {
+// RevokeConnector handles DELETE /authsec/discovery/aws/connectors/:id.
+//
+// Named for what it does, not for the HTTP verb it answers to: this revokes
+// the connection rather than deleting the connector row or anything it
+// discovered. See CloudConnectorRepository.Revoke for why.
+func (ctl *CloudAWSController) RevokeConnector(c *gin.Context) {
 	workspaceID, _, err := ctl.workspaceAndActor(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
@@ -295,20 +299,24 @@ func (ctl *CloudAWSController) DeleteConnector(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	if err := svc.DeleteConnector(workspaceID, id); err != nil {
+	if err := svc.RevokeConnector(workspaceID, id); err != nil {
 		status, body := mapAWSOnboardingError(err)
 		c.JSON(status, body)
 		return
 	}
-	auditAdminMutation(c, workspaceID.String(), "delete", "cloud_connector",
+	auditAdminMutation(c, workspaceID.String(), "revoke", "cloud_connector",
 		id.String(), http.StatusOK, nil, nil)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "AWS connector removed and its stored external id purged",
+		"message": "AWS connector revoked and its stored external id purged",
 		"meta": gin.H{
 			"note": "the read-only role still exists in the customer account; " +
-				"deleting the CloudFormation stack is the customer's step",
+				"deleting the CloudFormation stack is the customer's step. " +
+				"Everything already discovered through this connector (identities, " +
+				"permissions, resources) is kept, unchanged, for audit -- it is not " +
+				"deleted by revoking. Re-onboarding the same account reactivates " +
+				"this same connector rather than creating a second one.",
 		},
 	})
 }
