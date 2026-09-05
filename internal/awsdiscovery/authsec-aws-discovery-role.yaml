@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec cloud discovery - read-only cross-account role for AI agent and
+  non-human identity discovery. Creates one IAM role and nothing else. No
+  software is installed in this account, nothing is ever written or changed by
+  AuthSec, and no secret value can be read through this role.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-09-01'
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Copy these two values from the AuthSec console
+        Parameters:
+          - AuthSecPrincipalArn
+          - ExternalId
+      - Label:
+          default: Optional
+        Parameters:
+          - RoleName
+          - MaxSessionDurationSeconds
+
+Parameters:
+
+  AuthSecPrincipalArn:
+    Type: String
+    Description: >-
+      The AuthSec AWS principal permitted to assume this role. Copy it from the
+      AuthSec console. Do not substitute your own account - doing so creates a
+      role AuthSec cannot use.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(root|user\/.+|role\/.+)$'
+    ConstraintDescription: must be an IAM principal ARN.
+
+  ExternalId:
+    Type: String
+    Description: >-
+      The AuthSec-generated ExternalId for this connection. Copy it from the
+      AuthSec console; do not invent one. It is what proves the connection was
+      started by you, and it is the reason a third party who learns this role's
+      ARN still cannot assume it.
+    MinLength: 32
+    MaxLength: 1224
+    AllowedPattern: '^[\w+=,.@:\/-]+$'
+    NoEcho: true
+    ConstraintDescription: must be the ExternalId shown in the AuthSec console.
+
+  RoleName:
+    Type: String
+    Default: AuthSecCloudDiscovery
+    Description: Name for the role this stack creates.
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+
+  MaxSessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    # AWS's own floor for an IAM role is 3600, not the 900 that applies to an
+    # STS session. Accepting anything lower here would create a stack that
+    # CloudFormation rejects at deploy time with a validation error the customer
+    # has no way to interpret.
+    MinValue: 3600
+    MaxValue: 43200
+    Description: >-
+      How long one assumed session may last, in seconds. A scan of a large
+      account can run for a while; the default of one hour is enough for the
+      current scan surfaces. Minimum 3600, maximum 43200.
+
+Resources:
+
+  AuthSecDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: >-
+        Read-only role assumed by AuthSec cloud discovery. Grants metadata reads
+        only; explicitly denied the ability to read secret values, decrypt, or
+        assume any further role.
+      MaxSessionDuration: !Ref MaxSessionDurationSeconds
+
+      # The ExternalId condition is the whole point of this trust policy. Without
+      # it, any AuthSec customer who learned this role's ARN could ask AuthSec to
+      # assume it - the classic confused-deputy problem this AWS pattern exists
+      # to solve.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthSecAssumeWithExternalId
+            Effect: Allow
+            Principal:
+              AWS: !Ref AuthSecPrincipalArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+
+      # SecurityAudit is the AWS-managed read-only baseline for exactly this kind
+      # of tool. It grants metadata reads across the account and does not grant
+      # the ability to read secret values, SSM parameter values or decryption
+      # keys. !Sub on the partition so the template also works in GovCloud and
+      # China, where the managed policy ARN is not arn:aws:.
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/SecurityAudit'
+
+      Policies:
+
+        # ------------------------------------------------------------------
+        # Additional reads. These cover services newer than SecurityAudit's
+        # coverage, or where that coverage is not confirmed. Every action is a
+        # List, Describe, Get or Generate on metadata. Each is annotated with
+        # the AuthSec ticket that needs it, so an account reviewer can see why
+        # it is here and an operator can see what breaks without it.
+        # ------------------------------------------------------------------
+        - PolicyName: AuthSecCloudDiscoveryAdditionalReads
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # Onboarding. The only call the connector makes to prove the
+              # connection works.
+              - Sid: Onboarding
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+              # IAM bulk reads. GetAccountAuthorizationDetails returns every
+              # role, user, group, instance profile and attached/inline policy
+              # document in one paginated call - the alternative is thousands of
+              # per-identity calls on a large account. The credential report and
+              # service-last-accessed calls are named Generate* but produce
+              # read-only reports; they create no resource and change no state.
+              # Service-last-accessed in particular gives per-service last-used
+              # data without paying for CloudTrail volume.
+              - Sid: IamBulkAndLastUsedReads
+                Effect: Allow
+                Action:
+                  - iam:GetAccountAuthorizationDetails
+                  - iam:GenerateCredentialReport
+                  - iam:GetCredentialReport
+                  - iam:GenerateServiceLastAccessedDetails
+                  - iam:GetServiceLastAccessedDetails
+                  - iam:ListOpenIDConnectProviders
+                Resource: '*'
+
+              # Bedrock Agents - the AWS-native managed agent surface.
+              # ListAgents gives id, name and status; the execution role and
+              # foundation model need the per-agent GetAgent call.
+              - Sid: BedrockAgents
+                Effect: Allow
+                Action:
+                  - bedrock:ListAgents
+                  - bedrock:GetAgent
+                Resource: '*'
+
+              # Bedrock AgentCore. List-only on the credential providers: the
+              # List calls return provider names and ARNs, and there is
+              # deliberately no Get here, because that is where a value would be.
+              - Sid: BedrockAgentCore
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListWorkloadIdentities
+                  - bedrock-agentcore:ListOauth2CredentialProviders
+                  - bedrock-agentcore:ListApiKeyCredentialProviders
+                  - bedrock-agentcore:ListGateways
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: '*'
+
+              # EKS. The AWS side of the Kubernetes identity edge only - which
+              # IAM role a Kubernetes service account may assume. AuthSec does
+              # not discover pods or workloads here; the existing Kubernetes
+              # connector already does that, and repeating it would produce
+              # duplicate inventory. DescribeCluster is needed for the cluster's
+              # OIDC issuer, which is what tells two clusters apart.
+              - Sid: EksIdentityEdge
+                Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:ListPodIdentityAssociations
+                  - eks:DescribePodIdentityAssociation
+                Resource: '*'
+
+              # Activity. Read per-identity API history for liveness and agent
+              # classification.
+              - Sid: CloudTrailActivity
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrailStatus
+                Resource: '*'
+
+        # ------------------------------------------------------------------
+        # Explicit denies. SecurityAudit does not grant any of these, so this
+        # policy changes nothing about what the role can do today. It is here so
+        # that the guarantee survives contact with the future: an explicit Deny
+        # beats any Allow, so if AWS ever widens SecurityAudit, or a later
+        # AuthSec release adds a permission carelessly, these stay impossible.
+        #
+        # This is the "no secret values" rule of the shared schema, enforced by
+        # IAM rather than by our promise to behave.
+        # ------------------------------------------------------------------
+        - PolicyName: AuthSecCloudDiscoveryHardDenies
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Sid: NeverReadSecretValues
+                Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:BatchGetSecretValue
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - ssm:GetParameterHistory
+                Resource: '*'
+
+              - Sid: NeverDecrypt
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:ReEncryptFrom
+                  - kms:ReEncryptTo
+                Resource: '*'
+
+              # No role chaining. The discovery session must be a leaf: it may be
+              # assumed BY AuthSec (that is the trust policy above, which this
+              # does not affect) but it may never assume anything further and
+              # pivot deeper into the account. sts:GetCallerIdentity is
+              # deliberately not in this list.
+              - Sid: NeverChainRoles
+                Effect: Deny
+                Action:
+                  - sts:AssumeRole
+                  - sts:AssumeRoleWithWebIdentity
+                  - sts:AssumeRoleWithSAML
+                Resource: '*'
+
+      Tags:
+        - Key: ManagedBy
+          Value: AuthSec
+        - Key: Purpose
+          Value: cloud-discovery-read-only
+
+Outputs:
+
+  RoleArn:
+    Description: >-
+      Paste this back into the AuthSec console to finish onboarding. This value
+      is not secret; the ExternalId is.
+    Value: !GetAtt AuthSecDiscoveryRole.Arn
+
+  AccountId:
+    Description: The AWS account this connection covers.
+    Value: !Ref 'AWS::AccountId'
+
+  TemplateVersion:
+    Description: >-
+      Report this to AuthSec support if a scan says a permission is missing. It
+      identifies which set of read permissions this stack granted.
+    Value: '2026-09-01'

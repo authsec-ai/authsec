@@ -1610,6 +1610,57 @@ func SetupRoutes(
 			discovery.GET("/sources/:id/scan-runs", middlewares.Require("discovery", "read"), discoveryGitHub.ListScanRuns)
 			discovery.GET("/scan-runs/:run_id", middlewares.Require("discovery", "read"), discoveryGitHub.GetScanRun)
 			discovery.POST("/scan-runs/:run_id/cancel", middlewares.Require("discovery", "admin"), discoveryGitHub.CancelScanRun)
+
+			// AWS as a discovery channel, alongside Kubernetes and GitHub.
+			//
+			// These endpoints ONBOARD an AWS account: they establish an agentless,
+			// read-only cross-account connection and record the cloud_connector row
+			// that every later AWS surface — IAM identities, access keys, policies,
+			// Bedrock, activity — resolves against. Nothing here discovers anything
+			// yet.
+			//
+			// Under /discovery rather than /connectors, the same boundary the GitHub
+			// channel keeps: the connector broker is the action framework, and
+			// Agentic IGA must not depend on it.
+			//
+			// Reading the onboarding package is discovery:read even though it mints
+			// an ExternalId — the id is worthless until a role that trusts it exists,
+			// and gating it on admin would stop a reader from seeing the permissions
+			// AuthSec is asking for, which is exactly the thing a reviewer needs.
+			// Everything that CHANGES a connection is discovery:admin: connecting an
+			// AWS account decides what a scan may read and what it will cost.
+			cloudAWS := platformCtrl.NewCloudAWSController(config.DB)
+			discovery.GET("/aws/onboarding", middlewares.Require("discovery", "read"), cloudAWS.GetOnboardingPackage)
+			discovery.POST("/aws/connectors", middlewares.Require("discovery", "admin"), cloudAWS.CreateConnector)
+			discovery.GET("/aws/connectors", middlewares.Require("discovery", "read"), cloudAWS.ListConnectors)
+			discovery.GET("/aws/connectors/:id", middlewares.Require("discovery", "read"), cloudAWS.GetConnector)
+			discovery.POST("/aws/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudAWS.VerifyConnector)
+			// DELETE verb, revoke semantics: the connector row and everything it
+			// discovered stay for audit, aligned with GCP's planned behaviour. See
+			// CloudConnectorRepository.Revoke.
+			discovery.DELETE("/aws/connectors/:id", middlewares.Require("discovery", "admin"), cloudAWS.RevokeConnector)
+
+			// IAM identity discovery: the foundation every later AWS surface
+			// resolves against. Writes cloud_identity and cloud_secret and
+			// nothing else.
+			//
+			// Starting a scan is discovery:admin because it spends the
+			// customer's API quota and can take minutes on a large account.
+			// Reading the results is discovery:read — and note that an identity
+			// row is a CANDIDATE, not an agent: nothing this endpoint returns
+			// asserts that anything is an AI agent.
+			discovery.POST("/aws/connectors/:id/scan", middlewares.Require("discovery", "admin"), cloudAWS.ScanIAM)
+			discovery.GET("/aws/identities", middlewares.Require("discovery", "read"), cloudAWS.ListIdentities)
+			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
+
+			// Trust relationships and permission/resource extraction: who may
+			// assume each identity, and what each identity may do. No separate
+			// trigger route — this runs chained after the scan above, against
+			// the same generation, so cloud_assume_edge and cloud_permission are
+			// never a scan behind cloud_identity.
+			discovery.GET("/aws/assume-edges", middlewares.Require("discovery", "read"), cloudAWS.ListAssumeEdges)
+			discovery.GET("/aws/permissions", middlewares.Require("discovery", "read"), cloudAWS.ListPermissions)
+			discovery.GET("/aws/resources", middlewares.Require("discovery", "read"), cloudAWS.ListResources)
 		}
 
 		// ────────────────────────────────────────────────────
