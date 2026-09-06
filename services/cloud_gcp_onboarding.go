@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/authsec-ai/authsec/gcp/scripts"
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
@@ -61,6 +61,18 @@ var (
 	// unsupported scope_kind, or a missing scope_id/reader_project_id.
 	// Caught before any GCP or Vault call.
 	ErrInvalidScopeID = errors.New("gcp: scope_kind, scope_id or reader_project_id is invalid")
+
+	// ErrConnectorRevoked means the caller asked to verify a connector whose
+	// status is already 'revoked'. Caught before any credential is loaded or
+	// GCP call is attempted — see GCP-E2E-MANUAL-TEST-GUIDE.md §12 finding
+	// #3 (live-confirmed 2026-09-02): without this guard, VerifyConnector
+	// would run the normal probe, fail (the WIF auth_ref is empty and the
+	// json_key Vault secret was purged by revoke), and MarkError would flip
+	// the row from 'revoked' to 'error' — losing the fact that this
+	// connector was deliberately disconnected, not merely broken. A revoked
+	// connector must stay 'revoked' until it is reconnected (POST
+	// /connectors again), never silently reinterpreted as an error state.
+	ErrConnectorRevoked = errors.New("gcp: this connector has been revoked; reconnect it to verify again")
 )
 
 /* --------------------------------- request ---------------------------------- */
@@ -152,29 +164,40 @@ func (s *GCPOnboardingService) Onboard(
 	// Resolve the credential's ClientOption WITHOUT touching Vault yet (json_key)
 	// and without any network call yet (wif — minting a cloud-onboarding token
 	// is a local signing operation, not a call to GCP). The actual GCP calls
-	// start below, at the connectivity and scope checks.
+	// start below, at the connectivity and scope checks. The same credential
+	// is reused for both clients below — see ResolveWIFCredential's own doc
+	// comment for why the wif path requests every scope both clients need
+	// up front, in this one credential.
 	authOpt, readerSAEmail, err := s.resolveOnboardingCredential(ctx, workspaceID, scopeID, in.Auth)
 	if err != nil {
+		// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation): stage
+		// markers only, no secret material -- remove once root cause is
+		// confirmed.
+		log.Printf("GCP-OAUTH-DEBUG: Onboard failed at resolveOnboardingCredential (method=%s): %v", in.Auth.Method, err)
 		return nil, false, err
 	}
 
 	iamClient, err := newIAMClientFunc(ctx, authOpt)
 	if err != nil {
+		log.Printf("GCP-OAUTH-DEBUG: Onboard failed building iam client: %v", err)
 		return nil, false, err
 	}
 	rmClient, err := newResourceManagerClientFunc(ctx, authOpt)
 	if err != nil {
+		log.Printf("GCP-OAUTH-DEBUG: Onboard failed building resource manager client: %v", err)
 		return nil, false, err
 	}
 
 	// The GCP-03 connectivity primitive: proves the credential resolves to
 	// the reader SA the customer claimed, before trusting it for anything else.
 	if _, err := s.authSvc.ResolveReaderIdentity(ctx, iamClient, readerSAEmail, in.Auth.Method); err != nil {
+		log.Printf("GCP-OAUTH-DEBUG: Onboard failed at ResolveReaderIdentity (readerSAEmail=%s method=%s): %v", readerSAEmail, in.Auth.Method, err)
 		return nil, false, err
 	}
 
 	parentScopeID, err := validateGCPScope(ctx, rmClient, scopeKind, scopeID)
 	if err != nil {
+		log.Printf("GCP-OAUTH-DEBUG: Onboard failed at validateGCPScope (scopeKind=%s scopeID=%s): %v", scopeKind, scopeID, err)
 		return nil, false, err
 	}
 
@@ -223,7 +246,7 @@ func (s *GCPOnboardingService) Onboard(
 		ReaderSAEmail:      readerSAEmail,
 		CAIQuotaProject:    readerProjectID,
 		RoleSetStatus:      gcp.CurrentRoleSetStatus,
-		SetupScriptVersion: scripts.Version,
+		SetupScriptVersion: gcp.Version,
 	}
 	if in.Auth.Method == GCPAuthMethodWIF {
 		attrs.WIFProviderResource = in.Auth.ProviderResource
@@ -252,7 +275,11 @@ func (s *GCPOnboardingService) Onboard(
 // path and returns the reader SA email the credential claims to be — for
 // json_key this is parsed from the uploaded key's own client_email field
 // (the customer never types it separately for this path); for wif it is
-// exactly what the customer pasted back.
+// exactly what the customer pasted back. The single returned credential is
+// reused for every client (IAM, Resource Manager, Cloud Asset) the caller
+// builds — see ResolveWIFCredential's own doc comment for why the wif path
+// requests every scope those clients need up front, in one credential,
+// rather than resolving one per client.
 func (s *GCPOnboardingService) resolveOnboardingCredential(
 	ctx context.Context, workspaceID uuid.UUID, scopeID string, auth GCPAuthInput,
 ) (option.ClientOption, string, error) {
@@ -279,6 +306,11 @@ func (s *GCPOnboardingService) resolveOnboardingCredential(
 		pastedPool, pastedProvider, ok := gcp.ParseProviderResource(auth.ProviderResource)
 		wantPool, wantProvider, _ := gcp.DeriveWIFParams(workspaceID, scopeID)
 		if !ok || pastedPool != wantPool || pastedProvider != wantProvider {
+			// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation):
+			// pool/provider ids are deterministic, non-secret strings --
+			// remove once root cause is confirmed.
+			log.Printf("GCP-OAUTH-DEBUG: provider_resource cross-check failed: pasted=%q ok=%v pastedPool=%q wantPool=%q pastedProvider=%q wantProvider=%q",
+				auth.ProviderResource, ok, pastedPool, wantPool, pastedProvider, wantProvider)
 			return nil, "", fmt.Errorf("%w: the pasted provider_resource does not match what was derived for this workspace and scope", gcp.ErrWIFPoolMissing)
 		}
 
@@ -406,6 +438,9 @@ func (s *GCPOnboardingService) VerifyConnector(
 	}
 	if c.Provider != models.CloudProviderGCP {
 		return nil, fmt.Errorf("connector %s is a %s connector", id, c.Provider)
+	}
+	if c.Status == models.CloudConnectorRevoked {
+		return c, ErrConnectorRevoked
 	}
 	attrs := c.GCPAttrs()
 

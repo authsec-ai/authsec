@@ -75,10 +75,24 @@ func (m *memVault) callCount() int {
 // fakeIssuer is the services-package twin of internal/gcp's fakeTokenIssuer —
 // stands in for internal/tokens.NativeIssuer without a real signing keyset or
 // database.
-type fakeIssuer struct{ token string }
+type fakeIssuer struct {
+	token string
+	// issuerURL, if set, is what IssuerURL() returns. Zero value defaults to
+	// a valid HTTPS placeholder so every existing test in this file (none of
+	// which is testing issuer validation) keeps passing unchanged.
+	issuerURL string
+}
 
 func (f fakeIssuer) IssueCloudOnboardingToken(_ context.Context, _, _ string) (string, error) {
 	return f.token, nil
+}
+
+// IssuerURL satisfies gcp.CloudOnboardingTokenIssuer.
+func (f fakeIssuer) IssuerURL() string {
+	if f.issuerURL != "" {
+		return f.issuerURL
+	}
+	return "https://app.authsec.test"
 }
 
 /* -------------------------------- json_key --------------------------------- */
@@ -227,6 +241,54 @@ func TestClassifyIAMError(t *testing.T) {
 		{"invalid_grant on wif", errors.New("oauth2: cannot fetch token: 400 Bad Request\nResponse: {\"error\":\"invalid_grant\"}"), GCPAuthMethodWIF, gcp.ErrWIFPoolMissing},
 		{"invalid_grant on json_key", errors.New("oauth2: cannot fetch token: 400 Bad Request\nResponse: {\"error\":\"invalid_grant\"}"), GCPAuthMethodJSONKey, gcp.ErrInvalidGrant},
 		{"unrecognized error defaults to invalid_grant", errors.New("some other transport failure"), GCPAuthMethodJSONKey, gcp.ErrInvalidGrant},
+		// Regression for a real live failure (2026-09-02): a customer's
+		// provider_resource passed AuthSec's own pre-flight cross-check
+		// byte-for-byte (proven separately, resolveOnboardingCredential's
+		// own comparison), yet onboarding still failed, because the WIF
+		// provider on GCP's side trusted an issuer hostname (a Cloudflare
+		// quick tunnel) that had gone offline. This EXACT error text is what
+		// google.golang.org/api's IAM client surfaced for that live failure
+		// — must classify as ErrWIFIssuerUnreachable, never ErrWIFPoolMissing
+		// (which would incorrectly tell the customer to re-paste an
+		// already-correct value).
+		{
+			"wif issuer unreachable (live-captured 2026-09-02)",
+			errors.New(`Get "https://iam.googleapis.com/v1/projects/-/serviceAccounts/authsec-reader@codevault-8cc83.iam.gserviceaccount.com?alt=json&prettyPrint=false": credentials: status code 400: {"error":"invalid_grant","error_description":"Error connecting to the given credential's issuer."}`),
+			GCPAuthMethodWIF,
+			gcp.ErrWIFIssuerUnreachable,
+		},
+		// The same GCP error text, but for json_key: this failure mode is
+		// WIF-specific (only WIF depends on AuthSec's own OIDC issuer being
+		// reachable), so json_key must fall through to the ordinary
+		// invalid_grant handling, completely unaffected by this check.
+		{
+			"same error text on json_key falls through unaffected",
+			errors.New(`Get "https://iam.googleapis.com/v1/projects/-/serviceAccounts/authsec-reader@codevault-8cc83.iam.gserviceaccount.com?alt=json&prettyPrint=false": credentials: status code 400: {"error":"invalid_grant","error_description":"Error connecting to the given credential's issuer."}`),
+			GCPAuthMethodJSONKey,
+			gcp.ErrInvalidGrant,
+		},
+		// Regression for GCP-E2E-MANUAL-TEST-GUIDE.md §12 finding #1
+		// (live-confirmed 2026-09-02, §5g): a pool/provider that does not
+		// exist at all makes GCP's STS reject with "invalid_target", not
+		// "invalid_grant" — before this fix that fell through to the
+		// unrecognized-error default (ErrInvalidGrant, fault "gcp") instead
+		// of ErrWIFPoolMissing (fault "customer_account"), which is what a
+		// missing pool/provider actually is.
+		{
+			"invalid_target on wif (missing pool/provider, live-confirmed 2026-09-02)",
+			errors.New(`oauth2: cannot fetch token: 400 Bad Request` + "\n" + `Response: {"error":"invalid_target","error_description":"The workload identity pool or provider is disabled, deleted, or does not exist."}`),
+			GCPAuthMethodWIF,
+			gcp.ErrWIFPoolMissing,
+		},
+		// json_key never exchanges a token against a pool/provider, so this
+		// error text (however unlikely in practice) must not be given any
+		// WIF-specific meaning on that path.
+		{
+			"invalid_target on json_key falls through unaffected",
+			errors.New(`oauth2: cannot fetch token: 400 Bad Request` + "\n" + `Response: {"error":"invalid_target","error_description":"The workload identity pool or provider is disabled, deleted, or does not exist."}`),
+			GCPAuthMethodJSONKey,
+			gcp.ErrInvalidGrant,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

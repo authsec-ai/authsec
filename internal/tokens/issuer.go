@@ -45,6 +45,14 @@ func NewNativeIssuer(db *gorm.DB, keys *NativeKeyManager, issuer string) *Native
 	return &NativeIssuer{db: db, keys: keys, issuer: issuer}
 }
 
+// IssuerURL returns the exact issuer string this instance was constructed
+// with — every token it mints carries this in `iss`. Satisfies
+// internal/gcp.CloudOnboardingTokenIssuer's IssuerURL() method, so GCP's WIF
+// path can check it's HTTPS before minting anything.
+func (i *NativeIssuer) IssuerURL() string {
+	return i.issuer
+}
+
 // IDJAGClaims carries the inputs for IssueIDJAG.
 type IDJAGClaims struct {
 	// WorkspaceID is the minting workspace, carried as the `issuance_workspace`

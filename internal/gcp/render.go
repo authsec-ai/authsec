@@ -1,10 +1,11 @@
-// Package scripts embeds and renders the customer-run GCP reader setup
+// setup-reader.sh embed and render — the customer-run GCP reader setup
 // script. Mirrors internal/awsdiscovery's CloudFormationTemplate embed
-// pattern (the template a customer runs is exactly the one this build
-// expects, no outbound fetch needed to onboard), but lives outside internal/
-// at authsec/gcp/scripts/ per this ticket's own file list — a deliberate
-// difference from AWS's placement, not an oversight.
-package scripts
+// pattern exactly: the template a customer runs is exactly the one this
+// build expects, no outbound fetch needed to onboard, and it lives
+// alongside the rest of the gcp package rather than in its own top-level
+// directory, matching where internal/awsdiscovery keeps
+// authsec-aws-discovery-role.yaml.
+package gcp
 
 import (
 	_ "embed"

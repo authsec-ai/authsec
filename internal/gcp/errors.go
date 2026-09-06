@@ -37,4 +37,35 @@ var (
 	// once resolved, lacks a permission this ticket's connectivity check
 	// needs, or impersonation itself was denied.
 	ErrPermissionDenied = errors.New("gcp: permission denied")
+
+	// ErrWIFIssuerNotHTTPS means this AuthSec deployment's configured WIF
+	// OIDC issuer (see issuer.go's WIFIssuerEnv) is not HTTPS. Google Cloud
+	// unconditionally rejects a non-HTTPS issuer when creating a Workload
+	// Identity Pool provider, so WIF cannot succeed here regardless of
+	// anything the customer does — this is squarely an AuthSec deployment-
+	// configuration problem, never the customer's GCP setup. Caught in
+	// ResolveWIFCredential BEFORE any token is minted or GCP/STS call is
+	// attempted. Maps to fault:"authsec", not fault:"customer_account" or
+	// fault:"gcp" — the deployment-side counterpart to AWS's
+	// ErrNoBaseCredentials.
+	ErrWIFIssuerNotHTTPS = errors.New("gcp: workload identity federation requires a publicly reachable https issuer, which this deployment is not configured with")
+
+	// ErrWIFIssuerUnreachable means Google Cloud could not reach the WIF
+	// provider's configured issuer to complete a credential exchange — GCP's
+	// own error_description for this exact case is "Error connecting to the
+	// given credential's issuer." (live-confirmed 2026-09-02 against a real
+	// GCP project whose WIF provider trusted a Cloudflare quick-tunnel
+	// hostname that had since gone offline).
+	//
+	// This is a live reachability problem with whatever issuer AuthSec (or,
+	// in local dev, a developer's tunnel) is currently serving — never a
+	// paste mismatch. GCP-04's own pre-flight cross-check
+	// (services/cloud_gcp_onboarding.go's resolveOnboardingCredential)
+	// already proves the pasted provider_resource is byte-correct before
+	// this call is ever reached, so classifyIAMError previously conflated
+	// this into ErrWIFPoolMissing (via its broad invalid_grant branch),
+	// which told an operator to re-check a value that was already provably
+	// correct. Maps to fault:"authsec" — the deployment's issuer is the
+	// problem, never the customer's GCP configuration.
+	ErrWIFIssuerUnreachable = errors.New("gcp: google cloud could not reach the configured wif issuer to complete the credential exchange")
 )

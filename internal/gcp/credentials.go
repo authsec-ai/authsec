@@ -129,6 +129,12 @@ func validatePrivateKeyPEM(raw string) error {
 // a real signing keyset or database.
 type CloudOnboardingTokenIssuer interface {
 	IssueCloudOnboardingToken(ctx context.Context, sub, audience string) (string, error)
+	// IssuerURL returns the exact issuer string every minted token's `iss`
+	// claim carries — the same value the customer's setup script must have
+	// configured its WIF provider to trust. ResolveWIFCredential reads this
+	// to fail fast (ErrWIFIssuerNotHTTPS) when it's not HTTPS, before ever
+	// minting a token GCP is guaranteed to reject.
+	IssuerURL() string
 }
 
 // staticSubjectTokenProvider hands the external-account credential the ONE
@@ -179,6 +185,12 @@ func ResolveWIFCredential(
 	providerResource string,
 	readerSAEmail string,
 ) (option.ClientOption, error) {
+	// Checked first, before the provider-resource/reader-SA-email guards
+	// below: those are the CUSTOMER's mistakes to fix, this one is never
+	// theirs to fix at all, regardless of what they pasted.
+	if !IsHTTPSIssuer(issuer.IssuerURL()) {
+		return nil, ErrWIFIssuerNotHTTPS
+	}
 	if providerResource == "" {
 		return nil, fmt.Errorf("%w: no provider resource given", ErrWIFPoolMissing)
 	}
@@ -208,9 +220,33 @@ func ResolveWIFCredential(
 		// in internal/gcp/client.go: option.WithScopes' own documentation says
 		// scope settings from an already-resolved token source (which is what
 		// WithAuthCredentials hands the client) take precedence, so pinning the
-		// read-only scope has to happen on the credential itself for this path
-		// to actually be least-privilege, not just documented as such.
-		Scopes: []string{ReadOnlyScope},
+		// scope has to happen on the credential itself for this path to
+		// actually be least-privilege, not just documented as such.
+		//
+		// BOTH read-only scopes this connector's clients ever need are
+		// requested together, not just one: this credential is reused for the
+		// IAM client (internal/gcp/client.go's NewIAMClient) AND the Resource
+		// Manager / Cloud Asset clients (NewResourceManagerClient /
+		// NewCloudAssetClient), and a WIF credential's scope is fixed at
+		// construction — a client's own option.WithScopes call cannot widen it
+		// afterward. Live-confirmed 2026-09-03: pinning ONLY ReadOnlyScope here
+		// made the IAM Admin API reject iam.serviceAccounts.get with 403
+		// ACCESS_TOKEN_SCOPE_INSUFFICIENT even though the underlying identity
+		// held every IAM role it needed — client.go's own IAMScope doc comment
+		// already recorded that finding for the client-construction side, but
+		// this credential-construction side still hardcoded the single
+		// ReadOnlyScope value, silently overriding NewIAMClient's
+		// option.WithScopes(IAMScope) for every WIF connection.
+		// generateAccessToken (the impersonation call this credential drives)
+		// accepts multiple scopes in one request and returns a token valid for
+		// all of them, so requesting both here — rather than resolving a
+		// separate WIF credential per client — costs nothing in privilege: the
+		// reader SA's IAM roles (never write-capable) are what actually bound
+		// what either scope can do, exactly as before. json_key is unaffected
+		// by any of this — ResolveJSONKeyCredential never pins a scope, so
+		// each client's own option.WithScopes already won for that path,
+		// which is why only WIF ever hit this.
+		Scopes: []string{ReadOnlyScope, IAMScope},
 	})
 	if err != nil {
 		// Everything NewCredentials can fail on here is a shape problem with

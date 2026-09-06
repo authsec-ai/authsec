@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/authsec-ai/authsec/gcp/scripts"
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/internal/vault"
@@ -52,10 +51,14 @@ func (ctl *CloudGCPController) service() *services.GCPOnboardingService {
 			vc = c
 		}
 	}
-	issuerURL := ""
+	appIssuerURL := ""
 	if config.AppConfig != nil {
-		issuerURL = config.AppConfig.OAuthBaseURL()
+		appIssuerURL = config.AppConfig.OAuthBaseURL()
 	}
+	// GCP_WIF_ISSUER_URL, if set, overrides ONLY what this connector mints
+	// tokens as and renders into the setup script — never the app's general
+	// OAuth issuer. See internal/gcp/issuer.go.
+	issuerURL := gcp.ResolveWIFIssuerURL(appIssuerURL)
 	issuer := tokens.NewNativeIssuer(ctl.db, tokens.NativeKeys(), issuerURL)
 	return services.NewGCPOnboardingService(ctl.db, vc, issuer)
 }
@@ -94,12 +97,18 @@ func (ctl *CloudGCPController) GetOnboardingPackage(c *gin.Context) {
 	scopeKind := c.DefaultQuery("scope_kind", models.CloudScopeProject)
 
 	poolID, providerID, wifSubject := gcp.DeriveWIFParams(workspaceID, scopeID)
-	issuerURL := ""
+	appIssuerURL := ""
 	if config.AppConfig != nil {
-		issuerURL = config.AppConfig.OAuthBaseURL()
+		appIssuerURL = config.AppConfig.OAuthBaseURL()
 	}
+	// Same override as ctl.service() — must resolve identically, since this
+	// is the issuer value rendered into the script's --issuer-uri= flag, and
+	// it has to match what ctl.service()'s NativeIssuer actually mints
+	// tokens as, or WIF breaks in a different, worse way (script configures
+	// GCP to trust an issuer AuthSec never signs as).
+	issuerURL := gcp.ResolveWIFIssuerURL(appIssuerURL)
 
-	script, err := scripts.Render(scripts.Data{
+	script, err := gcp.Render(gcp.Data{
 		ReaderProjectID:    readerProjectID,
 		ScopeKind:          scopeKind,
 		ScopeID:            scopeID,
@@ -108,7 +117,7 @@ func (ctl *CloudGCPController) GetOnboardingPackage(c *gin.Context) {
 		WIFSubject:         wifSubject,
 		IssuerURL:          issuerURL,
 		RoleSetStatus:      gcp.CurrentRoleSetStatus,
-		SetupScriptVersion: scripts.Version,
+		SetupScriptVersion: gcp.Version,
 		RoleGrantCommands:  gcp.RoleGrantCommands(scopeKind, scopeID),
 	})
 	if err != nil {
@@ -129,7 +138,7 @@ func (ctl *CloudGCPController) GetOnboardingPackage(c *gin.Context) {
 			"role_set":             gcp.CandidateReaderRoles,
 			"role_set_status":      gcp.CurrentRoleSetStatus,
 			"setup_script":         script,
-			"setup_script_version": scripts.Version,
+			"setup_script_version": gcp.Version,
 			"wif_instructions": "Run Option A in the script, then paste the two printed values " +
 				"(reader SA email, WIF provider resource) into the WIF form below.",
 			"json_key_instructions": "Run Option B in the script, then upload the generated " +
@@ -374,6 +383,13 @@ func mapGCPOnboardingError(err error) (int, gin.H) {
 			"fault": "customer_account",
 		}
 
+	case errors.Is(err, services.ErrConnectorRevoked):
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint":  "reconnect this scope (POST /connectors again with fresh credentials) instead of verifying a revoked connector",
+			"fault": "customer_account",
+		}
+
 	case errors.Is(err, services.ErrScopeNotReadable):
 		return http.StatusBadRequest, gin.H{
 			"error": err.Error(),
@@ -388,6 +404,18 @@ func mapGCPOnboardingError(err error) (int, gin.H) {
 			"hint": "confirm the workload identity pool/provider setup-reader.sh created still exists, " +
 				"and that you pasted the exact provider resource name it printed at the end",
 			"fault": "customer_account",
+		}
+
+	case errors.Is(err, gcp.ErrWIFIssuerUnreachable):
+		// Deliberately distinct from ErrWIFPoolMissing above — the pasted
+		// value already passed AuthSec's own cross-check before this call
+		// was ever attempted; re-pasting it fixes nothing here.
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint": "the Workload Identity Federation issuer this deployment is configured with isn't reachable " +
+				"from Google Cloud right now — if this is a local development tunnel, confirm it's still running " +
+				"and matches what the WIF provider was created with, or use the JSON key method instead",
+			"fault": "authsec",
 		}
 
 	case errors.Is(err, gcp.ErrKeyInvalid):
@@ -409,6 +437,18 @@ func mapGCPOnboardingError(err error) (int, gin.H) {
 			"error": err.Error(),
 			"hint":  "the credential exchange was rejected by GCP; re-run setup-reader.sh and try again",
 			"fault": "gcp",
+		}
+
+	case errors.Is(err, gcp.ErrWIFIssuerNotHTTPS):
+		// Never the customer's fault, never GCP's fault — this deployment's
+		// own WIF issuer configuration. Deliberately does not name the
+		// actual issuer value (may be http://localhost:7001 in dev) in a
+		// customer-facing response; that detail belongs in server logs, not
+		// here.
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint":  "use the JSON key authentication method instead, or contact an administrator about Workload Identity Federation for this deployment",
+			"fault": "authsec",
 		}
 	}
 	// Everything left is caller-supplied input the service refused before any

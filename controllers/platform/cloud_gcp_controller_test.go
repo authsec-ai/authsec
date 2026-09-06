@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -138,5 +139,37 @@ func TestCloudGcpCreateConnector_KeyNeverAppearsInResponse(t *testing.T) {
 
 	if strings.Contains(w.Body.String(), secretMarker) {
 		t.Fatalf("the uploaded key value leaked into the HTTP response: %s", w.Body.String())
+	}
+}
+
+// TestMapGCPOnboardingError_WIFIssuerNotHTTPS proves the real backend error
+// for a non-HTTPS WIF issuer reaches the response body honestly (the actual
+// {error, hint, fault} envelope, never an invented "transient" framing) AND
+// never names the actual issuer value in a customer-facing field — that
+// deployment detail (which may be http://localhost:7001) belongs in server
+// logs, not in what the UI shows a customer.
+func TestMapGCPOnboardingError_WIFIssuerNotHTTPS(t *testing.T) {
+	status, body := mapGCPOnboardingError(gcp.ErrWIFIssuerNotHTTPS)
+
+	if status != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if body["fault"] != "authsec" {
+		t.Errorf(`fault = %v, want "authsec" — never the customer's GCP config, never GCP itself`, body["fault"])
+	}
+	errStr, _ := body["error"].(string)
+	hintStr, _ := body["hint"].(string)
+	if errStr == "" || hintStr == "" {
+		t.Fatalf("expected both error and hint populated, got error=%q hint=%q", errStr, hintStr)
+	}
+	for _, forbidden := range []string{"localhost", "7001", "127.0.0.1"} {
+		if strings.Contains(strings.ToLower(errStr), forbidden) || strings.Contains(strings.ToLower(hintStr), forbidden) {
+			t.Errorf("customer-facing error/hint must never name the deployment's actual issuer host; found %q in error=%q hint=%q", forbidden, errStr, hintStr)
+		}
+	}
+	for _, invented := range []string{"transient", "temporary", "please retry", "try again shortly"} {
+		if strings.Contains(strings.ToLower(errStr), invented) || strings.Contains(strings.ToLower(hintStr), invented) {
+			t.Errorf("must never invent a cause the backend didn't assert; found %q in error=%q hint=%q", invented, errStr, hintStr)
+		}
 	}
 }

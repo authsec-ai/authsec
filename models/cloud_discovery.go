@@ -460,11 +460,29 @@ type GCPConnectorAttrs struct {
 	// against an earlier, still-candidate role set once GCP-01 closes.
 	RoleSetStatus string `json:"role_set_status,omitempty"`
 
-	// SetupScriptVersion is the gcp/scripts.Version the customer's script was
+	// SetupScriptVersion is the internal/gcp.Version the customer's script was
 	// rendered from — the WIF/json_key analog of AWS's TemplateVersion, same
 	// reason: lets an operator find connectors still on an older script once
 	// the role set or binding shape changes.
 	SetupScriptVersion string `json:"setup_script_version,omitempty"`
+
+	// ProvisionedVia and ProvisionedBy are additive provenance metadata for
+	// the Google Authentication onboarding option (services/gcp_oauth_
+	// provision_service.go): they record HOW a WIF connector's GCP-side
+	// resources were configured, never a second auth method — AuthMethod
+	// above still reads "wif" for a connector provisioned this way, and its
+	// persistent credential is still the ordinary ResolveWIFCredential path.
+	// Both fields are omitted (empty string, indistinguishable from a
+	// manually-onboarded connector on every other field) unless a connector
+	// was actually created through that option. ProvisionedBy deliberately
+	// reuses the same AuthSec actor identifier already recorded on
+	// CloudConnector.CreatedBy — never a Google account email or any other
+	// Google identity detail, per this option's minimum-necessary-
+	// persistence design: the transient Google identity used for the
+	// one-time OAuth consent lives only in a short-lived Redis session and
+	// the audit trail, never here.
+	ProvisionedVia string `json:"provisioned_via,omitempty"`
+	ProvisionedBy  string `json:"provisioned_by,omitempty"`
 }
 
 // GCPAttrs decodes Attrs as the GCP shape. A malformed or empty blob decodes

@@ -92,6 +92,19 @@ type fakeTokenIssuer struct {
 	gotSub    string
 	gotAud    string
 	callCount int
+	// issuerURL, if set, is what IssuerURL() returns — lets a test construct
+	// an issuer with a non-HTTPS URL to exercise ErrWIFIssuerNotHTTPS.
+	// Zero value defaults to a valid HTTPS placeholder so every existing
+	// test (none of which cares about this) keeps passing unchanged.
+	issuerURL string
+}
+
+// IssuerURL satisfies gcp.CloudOnboardingTokenIssuer.
+func (f *fakeTokenIssuer) IssuerURL() string {
+	if f.issuerURL != "" {
+		return f.issuerURL
+	}
+	return "https://app.authsec.test"
 }
 
 func (f *fakeTokenIssuer) IssueCloudOnboardingToken(_ context.Context, sub, audience string) (string, error) {
@@ -140,6 +153,43 @@ func TestResolveWIFCredential_DerivesSubjectAndAudienceFromInputs(t *testing.T) 
 	wantAudience := audiencePrefix + providerResource
 	if issuer.gotAud != wantAudience {
 		t.Errorf("issuer was minted for audience=%q, want %q", issuer.gotAud, wantAudience)
+	}
+}
+
+// TestResolveWIFCredential_RejectsNonHTTPSIssuerBeforeAnyCall proves the
+// fail-fast requirement directly: an issuer that isn't HTTPS (e.g. this
+// deployment's own http://localhost:7001) is rejected with
+// ErrWIFIssuerNotHTTPS before the token issuer is ever invoked — no minted
+// token, no GCP/STS call, for a failure GCP is guaranteed to produce anyway.
+func TestResolveWIFCredential_RejectsNonHTTPSIssuerBeforeAnyCall(t *testing.T) {
+	issuer := &fakeTokenIssuer{token: "irrelevant", issuerURL: "http://localhost:7001"}
+
+	_, err := ResolveWIFCredential(context.Background(), issuer, uuid.New(), "scope-1",
+		"projects/1/locations/global/workloadIdentityPools/p/providers/pr", "reader@p.iam.gserviceaccount.com")
+
+	if !errors.Is(err, ErrWIFIssuerNotHTTPS) {
+		t.Errorf("err = %v, want ErrWIFIssuerNotHTTPS", err)
+	}
+	if issuer.callCount != 0 {
+		t.Errorf("issuer.IssueCloudOnboardingToken was called %d times; a non-HTTPS issuer must be rejected before minting anything", issuer.callCount)
+	}
+}
+
+// TestResolveWIFCredential_AcceptsHTTPSIssuer proves the check is not
+// over-broad: a real HTTPS issuer (production, or a local dev tunnel) is
+// not rejected and the function proceeds to mint a token exactly as before
+// this check was added.
+func TestResolveWIFCredential_AcceptsHTTPSIssuer(t *testing.T) {
+	issuer := &fakeTokenIssuer{token: "fake.jwt.token", issuerURL: "https://abc123.trycloudflare.com"}
+
+	_, err := ResolveWIFCredential(context.Background(), issuer, uuid.New(), "scope-1",
+		"projects/1/locations/global/workloadIdentityPools/p/providers/pr", "reader@p.iam.gserviceaccount.com")
+
+	if err != nil {
+		t.Fatalf("ResolveWIFCredential with a valid HTTPS issuer: %v", err)
+	}
+	if issuer.callCount != 1 {
+		t.Errorf("issuer.IssueCloudOnboardingToken called %d times, want 1", issuer.callCount)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -188,12 +189,43 @@ func (s *GCPAuthService) ResolveReaderIdentity(
 // REAL failure mode now that WIF is fully implemented, not a stub-era
 // placeholder.
 func classifyIAMError(err error, authMethod string) error {
+	// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation): the code
+	// below intentionally returns only a static sanitized sentinel from this
+	// point on -- this is the one place the real GCP/STS error code+message
+	// is still visible. googleapi.Error.Code/Message are GCP's own
+	// descriptive text (e.g. "invalid_target", "Error connecting to the
+	// given credential's issuer") -- never a token, key or credential -- so
+	// this is safe to log. Remove once the 400 root cause is confirmed.
 	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		log.Printf("GCP-OAUTH-DEBUG: classifyIAMError authMethod=%s code=%d message=%q", authMethod, gerr.Code, gerr.Message)
+	} else {
+		log.Printf("GCP-OAUTH-DEBUG: classifyIAMError authMethod=%s non-googleapi error=%q", authMethod, err.Error())
+	}
 	if errors.As(err, &gerr) {
 		switch gerr.Code {
 		case http.StatusForbidden, http.StatusNotFound:
 			return gcp.ErrPermissionDenied
 		}
+	}
+	// Checked before the broader invalid_grant branch below, on WIF only:
+	// GCP's own error_description for an unreachable issuer is this exact
+	// string, distinct from a genuine pool/provider/binding mismatch — see
+	// gcp.ErrWIFIssuerUnreachable's doc comment for why conflating the two
+	// was wrong (live-confirmed 2026-09-02).
+	if authMethod == GCPAuthMethodWIF && strings.Contains(err.Error(), "Error connecting to the given credential's issuer") {
+		return gcp.ErrWIFIssuerUnreachable
+	}
+	// A pool or provider that does not exist AT ALL (as opposed to one that
+	// exists but is misconfigured/mismatched) makes GCP's STS reject the
+	// token exchange with "invalid_target", not "invalid_grant" — live-
+	// confirmed 2026-09-02 (see GCP-E2E-MANUAL-TEST-GUIDE.md §5g/§12 finding
+	// #1). Both cases mean the same thing from the customer's side (their
+	// WIF setup does not match what AuthSec derived), so both classify as
+	// ErrWIFPoolMissing on WIF. json_key never performs a token-exchange
+	// against a pool/provider, so this branch is WIF-only by construction.
+	if authMethod == GCPAuthMethodWIF && strings.Contains(err.Error(), "invalid_target") {
+		return gcp.ErrWIFPoolMissing
 	}
 	if strings.Contains(err.Error(), "invalid_grant") {
 		if authMethod == GCPAuthMethodWIF {

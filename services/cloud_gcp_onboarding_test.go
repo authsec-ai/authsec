@@ -180,10 +180,23 @@ func installFakeGCPServer(t *testing.T, f *fakeGCPServer) {
 }
 
 // fakeGCPOnboardIssuer stands in for internal/tokens.NativeIssuer.
-type fakeGCPOnboardIssuer struct{}
+type fakeGCPOnboardIssuer struct {
+	// issuerURL, if set, is what IssuerURL() returns. Zero value defaults to
+	// a valid HTTPS placeholder so every existing WIF test in this file
+	// (none of which is testing issuer validation) keeps passing unchanged.
+	issuerURL string
+}
 
 func (fakeGCPOnboardIssuer) IssueCloudOnboardingToken(_ context.Context, _, _ string) (string, error) {
 	return "fake.jwt.token", nil
+}
+
+// IssuerURL satisfies gcp.CloudOnboardingTokenIssuer.
+func (f fakeGCPOnboardIssuer) IssuerURL() string {
+	if f.issuerURL != "" {
+		return f.issuerURL
+	}
+	return "https://app.authsec.test"
 }
 
 /* ---------------------------------- DB ------------------------------------ */
@@ -194,6 +207,8 @@ func setupGCPOnboardingTestDB(t *testing.T) *gorm.DB {
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping GCP onboarding integration tests")
 	}
+	// Hard stop before the DROP SCHEMA below. See requireThrowawayDatabase.
+	requireThrowawayDatabase(t, dsn)
 
 	raw, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -368,6 +383,28 @@ func TestGcpOnboardLifecycle_JSONKey(t *testing.T) {
 	if _, err := svc.Connector(ws, c.ID); err != nil {
 		t.Fatalf("revoked connector should still be readable (row kept for audit): %v", err)
 	}
+
+	// --- verify-on-revoked must refuse, not flip the row to 'error' ---
+	// Regression for GCP-E2E-MANUAL-TEST-GUIDE.md §12 finding #3
+	// (live-confirmed 2026-09-02): before this guard, VerifyConnector ran
+	// the normal probe against a connector whose Vault secret was already
+	// purged by revoke, failed, and MarkError overwrote status='revoked'
+	// with status='error' -- silently losing the fact that this connector
+	// was deliberately disconnected.
+	afterVerify, verr := svc.VerifyConnector(context.Background(), ws, c.ID)
+	if !errors.Is(verr, ErrConnectorRevoked) {
+		t.Fatalf("verify on a revoked connector: err = %v, want ErrConnectorRevoked", verr)
+	}
+	if afterVerify == nil || afterVerify.Status != models.CloudConnectorRevoked {
+		t.Fatalf("verify on a revoked connector must not change its status; got %+v", afterVerify)
+	}
+	stillRevoked, err := svc.Connector(ws, c.ID)
+	if err != nil {
+		t.Fatalf("get after verify-on-revoked: %v", err)
+	}
+	if stillRevoked.Status != models.CloudConnectorRevoked {
+		t.Fatalf("status after verify-on-revoked = %q, want it to stay %q", stillRevoked.Status, models.CloudConnectorRevoked)
+	}
 }
 
 func TestGcpOnboardLifecycle_WIF_NeverTouchesVault(t *testing.T) {
@@ -454,6 +491,54 @@ func TestGcpOnboard_WIFMismatchedProviderResource_RejectedBeforeAnyNetworkCall(t
 	}
 	if len(rows) != 0 {
 		t.Fatalf("a rejected onboard must leave no row, got %d", len(rows))
+	}
+}
+
+// TestGcpOnboard_NonHTTPSIssuer_RejectsWIFButJSONKeyStillWorks is the
+// service-layer proof that WIF and JSON-key are genuinely separate auth
+// methods, not two branches of one opaque flow: a deployment whose WIF
+// issuer is broken (http://localhost:7001, exactly this local dev
+// backend's own configuration) must reject a WIF onboard fast, with no
+// network call — and must NOT affect JSON-key onboarding against the same
+// service instance at all.
+func TestGcpOnboard_NonHTTPSIssuer_RejectsWIFButJSONKeyStillWorks(t *testing.T) {
+	db := setupGCPOnboardingTestDB(t)
+	mv := newGCPTestVault()
+	svc := NewGCPOnboardingService(db, mv, fakeGCPOnboardIssuer{issuerURL: "http://localhost:7001"})
+
+	fake := newFakeGCPServer()
+	defer fake.Close()
+	fake.saEmail = testSAEmail
+	fake.projectID = "my-scope"
+	installFakeGCPServer(t, fake)
+
+	ws := uuid.New()
+
+	// WIF: must fail fast, before any call to GCP.
+	wifIn := wifInput(ws, models.CloudScopeProject, "my-scope")
+	_, _, err := svc.Onboard(context.Background(), ws, wifIn, "admin")
+	if !errors.Is(err, gcp.ErrWIFIssuerNotHTTPS) {
+		t.Fatalf("wif onboard: err = %v, want it to wrap gcp.ErrWIFIssuerNotHTTPS", err)
+	}
+	if got := fake.callCount(); got != 0 {
+		t.Fatalf("fake GCP server was called %d time(s) for the WIF attempt; want 0", got)
+	}
+	if rows, _ := svc.Connectors(ws); len(rows) != 0 {
+		t.Fatalf("a rejected WIF onboard must leave no row, got %d", len(rows))
+	}
+
+	// JSON key, same workspace, same service instance, same (broken-for-WIF)
+	// issuer: must succeed exactly as if WIF had never been attempted.
+	jsonIn := jsonKeyInput(models.CloudScopeProject, "my-scope")
+	c, created, err := svc.Onboard(context.Background(), ws, jsonIn, "admin")
+	if err != nil {
+		t.Fatalf("json_key onboard on a WIF-broken deployment must still succeed: %v", err)
+	}
+	if !created {
+		t.Fatal("first json_key onboard must report created")
+	}
+	if c.AuthRef == "" || strings.HasPrefix(c.AuthRef, "wif:") {
+		t.Fatalf("json_key connector should have a Vault auth_ref, got %q", c.AuthRef)
 	}
 }
 

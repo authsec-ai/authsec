@@ -14,6 +14,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/google/uuid"
@@ -105,4 +107,76 @@ func hmacSum(key []byte, msg string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(msg))
 	return mac.Sum(nil)
+}
+
+/* ------------------------- provider resource parsing ----------------------- */
+
+// providerResourcePattern matches a bare WIF provider resource name (no
+// "//iam.googleapis.com/" scheme prefix — see credentials.go's audiencePrefix
+// doc comment for why the bare form is what's stored and pasted), capturing
+// the pool id and provider id segments:
+//
+//	projects/<NUM>/locations/global/workloadIdentityPools/<pool_id>/providers/<provider_id>
+var providerResourcePattern = regexp.MustCompile(
+	`^projects/\d+/locations/global/workloadIdentityPools/([^/]+)/providers/([^/]+)$`)
+
+// ParseProviderResource extracts the pool id and provider id segments from a
+// bare WIF provider resource name. ok is false when providerResource does not
+// match the expected shape at all (not this function's job to say why —
+// the caller's cross-check against DeriveWIFParams's own output is what
+// actually validates it; this only splits the string apart).
+func ParseProviderResource(providerResource string) (poolID, providerID string, ok bool) {
+	m := providerResourcePattern.FindStringSubmatch(providerResource)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+/* ------------------------------- wif issuer -------------------------------- */
+
+// WIFIssuerEnv independently configures the OIDC issuer AuthSec presents to
+// Google Cloud for Workload Identity Federation — separate from the general
+// application base URL (BASE_URL / OAUTH_ISSUER_URL, config.Config.OAuthBaseURL).
+// Google requires this specific value to be a real, HTTPS-reachable endpoint
+// whose OIDC discovery document and JWKS resolve there — live-confirmed
+// against a real GCP WIF provider-creation call: a non-HTTPS issuer is
+// rejected outright ("Invalid OIDC issuer URI. The scheme must be https.").
+// That is stricter than what the app's base URL needs to satisfy elsewhere
+// (cookies, general OAuth redirects, etc.), so it gets its own setting
+// rather than forcing the whole app onto HTTPS locally.
+//
+// Local development: leave BASE_URL at http://localhost:7001 for everything
+// else, and set GCP_WIF_ISSUER_URL to a public HTTPS tunnel (e.g. a
+// Cloudflare Tunnel or ngrok host) that forwards to that same local server —
+// so the real WIF flow can be tested without ever making localhost itself a
+// GCP OIDC issuer, and without touching production behavior.
+//
+// Production: leave unset. Falls back to whatever the caller's own
+// OAuthBaseURL() already resolves to — already a real HTTPS URL there, so
+// no new configuration is required in production, and production can never
+// accidentally fall back to a localhost value this way.
+const WIFIssuerEnv = "GCP_WIF_ISSUER_URL"
+
+// ResolveWIFIssuerURL returns the OIDC issuer to use for GCP WIF: the
+// explicit GCP_WIF_ISSUER_URL override if set, else defaultIssuerURL
+// unchanged (trailing slash trimmed either way). Callers pass their own
+// already-resolved app issuer (config.AppConfig.OAuthBaseURL()) as
+// defaultIssuerURL — this function never reads that itself, so it has no
+// opinion about, and cannot regress, anything unrelated to WIF.
+func ResolveWIFIssuerURL(defaultIssuerURL string) string {
+	if v := strings.TrimSpace(os.Getenv(WIFIssuerEnv)); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return strings.TrimRight(strings.TrimSpace(defaultIssuerURL), "/")
+}
+
+// IsHTTPSIssuer reports whether issuerURL is HTTPS — the one thing Google
+// Cloud unconditionally requires of a Workload Identity Federation OIDC
+// issuer. A non-HTTPS issuer can never work for WIF in any environment, so
+// callers check this BEFORE minting a token or handing the customer a setup
+// script GCP is guaranteed to reject, rather than letting the failure
+// surface only after a wasted round trip.
+func IsHTTPSIssuer(issuerURL string) bool {
+	return strings.HasPrefix(issuerURL, "https://")
 }

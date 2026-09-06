@@ -1,4 +1,4 @@
-package scripts
+package gcp
 
 import (
 	"strings"

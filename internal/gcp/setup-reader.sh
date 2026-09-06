@@ -19,6 +19,20 @@ READER_PROJECT_ID="{{.ReaderProjectID}}"
 READER_SA_NAME="authsec-reader"
 READER_SA_EMAIL="${READER_SA_NAME}@${READER_PROJECT_ID}.iam.gserviceaccount.com"
 
+echo "=== Enabling required APIs in ${READER_PROJECT_ID} ==="
+# A fresh GCP project has none of these on by default. Every step below —
+# creating the service account, the WIF pool/provider, the IAM binding, and
+# AuthSec's later token exchange and read-only calls — depends on one of
+# these being enabled, so this runs first and unconditionally.
+gcloud services enable \
+  iam.googleapis.com \
+  iamcredentials.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  sts.googleapis.com \
+  cloudasset.googleapis.com \
+  --project="${READER_PROJECT_ID}"
+
+echo ""
 echo "=== Creating the reader service account in ${READER_PROJECT_ID} ==="
 gcloud iam service-accounts create "${READER_SA_NAME}" \
   --display-name="AuthSec Reader" \
@@ -36,7 +50,7 @@ echo "# Option A (recommended): Workload Identity Federation      #"
 echo "# Keyless. No key file, no secret, ever leaves your account. #"
 echo "############################################################"
 echo ""
-echo "Run this section, then copy the TWO printed values at the end into"
+echo "Run this section, then copy the ONE value it prints at the end into"
 echo "the AuthSec console's WIF form."
 echo ""
 
@@ -65,10 +79,19 @@ PROVIDER_RESOURCE=$(gcloud iam workload-identity-pools providers describe "{{.Pr
   --project="${READER_PROJECT_ID}" --format='value(name)')
 
 echo ""
-echo "=== COPY THESE TWO VALUES INTO THE AUTHSEC CONSOLE ==="
-echo "Reader SA email:        ${READER_SA_EMAIL}"
-echo "WIF provider resource:  ${PROVIDER_RESOURCE}"
-echo "======================================================="
+echo "════════════════════════════════════════════════════════════"
+echo " AuthSec GCP setup completed successfully"
+echo "════════════════════════════════════════════════════════════"
+echo ""
+echo "Copy the value below and paste it into AuthSec's WIF provider field:"
+echo ""
+echo "  ${PROVIDER_RESOURCE}"
+echo ""
+echo "AuthSec derives everything else (reader SA email, pool, audience)"
+echo "from this one value plus the project you entered — nothing else to"
+echo "copy or configure."
+echo "(reader SA, for reference only, not needed by AuthSec: ${READER_SA_EMAIL})"
+echo "════════════════════════════════════════════════════════════"
 echo ""
 echo "############################################################"
 echo "# Option B (fallback): JSON key upload                      #"
