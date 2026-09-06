@@ -16,7 +16,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -75,13 +74,6 @@ var GoogleOAuthScopes = []string{
 	"https://www.googleapis.com/auth/cloudplatformprojects",
 	"https://www.googleapis.com/auth/service.management",
 }
-
-// ErrGoogleOAuthExchangeFailed means Google rejected or could not complete
-// the authorization-code-for-token exchange. Sanitized: never carries the
-// authorization code, the client secret, or any token material -- only this
-// static sentinel and (for operator logs, not customer-facing responses) the
-// bare OAuth "error" field Google returned.
-var ErrGoogleOAuthExchangeFailed = errors.New("gcp: google rejected the authorization code exchange")
 
 // GoogleAuthorizeURL builds the Google OAuth 2.0 Authorization Code + PKCE
 // consent URL. access_type is deliberately "online" and prompt is left

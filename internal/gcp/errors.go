@@ -1,6 +1,10 @@
 package gcp
 
-import "errors"
+import (
+	"errors"
+
+	"google.golang.org/api/googleapi"
+)
 
 // Sentinel errors this package returns. The service layer (and, once GCP-04
 // lands, the controller) maps these to sanitized codes and an HTTP fault
@@ -69,3 +73,30 @@ var (
 	// problem, never the customer's GCP configuration.
 	ErrWIFIssuerUnreachable = errors.New("gcp: google cloud could not reach the configured wif issuer to complete the credential exchange")
 )
+
+/* ----------------------- google authentication errors ---------------------- */
+
+// ErrGoogleOAuthExchangeFailed means Google rejected or could not complete
+// the authorization-code-for-token exchange. Sanitized: never carries the
+// authorization code, the client secret, or any token material -- only this
+// static sentinel and (for operator logs, not customer-facing responses) the
+// bare OAuth "error" field Google returned.
+var ErrGoogleOAuthExchangeFailed = errors.New("gcp: google rejected the authorization code exchange")
+
+// ErrGoogleOAuthProvisioningFailed wraps an unexpected failure from a
+// provisioning write call that isn't one of the sanitized internal/gcp
+// sentinels above (ErrPermissionDenied, etc, reused via errors.Is/As by the
+// caller where applicable).
+var ErrGoogleOAuthProvisioningFailed = errors.New("gcp: google authentication provisioning failed")
+
+/* --------------------------- error classification -------------------------- */
+
+func isNotFound(err error) bool {
+	var gerr *googleapi.Error
+	return errors.As(err, &gerr) && gerr.Code == 404
+}
+
+func isConflict(err error) bool {
+	var gerr *googleapi.Error
+	return errors.As(err, &gerr) && (gerr.Code == 409 || gerr.Code == 400)
+}
