@@ -158,6 +158,18 @@ func (ctl *CloudAWSController) CreateConnector(c *gin.Context) {
 
 	connector, created, err := svc.Onboard(c.Request.Context(), workspaceID, in, actor)
 	if err != nil {
+		// The client went away before the probe finished (browser fetch
+		// timeout, closed tab). Answering 400 here would log a misleading
+		// client error for a request AuthSec failed to finish in time; 499
+		// marks it as aborted. The response is usually undeliverable — this
+		// status exists so the access log tells aborts apart from real 400s.
+		if c.Request.Context().Err() != nil {
+			c.JSON(499, gin.H{
+				"error":   "request aborted by the client before the AWS probe completed",
+				"aborted": true,
+			})
+			return
+		}
 		status, body := mapAWSOnboardingError(err)
 		c.JSON(status, body)
 		return
@@ -260,6 +272,15 @@ func (ctl *CloudAWSController) VerifyConnector(c *gin.Context) {
 
 	connector, verr := svc.VerifyConnector(c.Request.Context(), workspaceID, id)
 	if verr != nil {
+		if c.Request.Context().Err() != nil {
+			// Same abort distinction as CreateConnector: never log a client
+			// going away as a 400 against the connector.
+			c.JSON(499, gin.H{
+				"error":   "request aborted by the client before the AWS probe completed",
+				"aborted": true,
+			})
+			return
+		}
 		status, body := mapAWSOnboardingError(verr)
 		// The row, when we have it, travels with the error: the console needs to
 		// render the connector's new error state, not just a toast.
@@ -620,6 +641,14 @@ func mapAWSOnboardingError(err error) (int, gin.H) {
 			"error": err.Error(),
 			"hint": "start onboarding again from this workspace and use the external id it returns; " +
 				"an external id issued to another workspace cannot be used here",
+		}
+
+	case errors.Is(err, services.ErrAWSProbeTimeout):
+		return http.StatusGatewayTimeout, gin.H{
+			"error": err.Error(),
+			"hint": "AuthSec's assume-role probe got no answer from AWS in time; " +
+				"try again, and if it persists check that this deployment's network path to STS is healthy",
+			"fault": "aws",
 		}
 
 	case errors.Is(err, awsdiscovery.ErrNotAssumable):
