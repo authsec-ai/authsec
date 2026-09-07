@@ -357,6 +357,7 @@ func SetupRoutes(
 			azureAPI.POST("/assign-reader", middlewares.Require("discovery", "admin"), azureOnboard.AssignReader)
 			azureAPI.POST("/validate-graph", middlewares.Require("discovery", "admin"), azureOnboard.ValidateGraph)
 			azureAPI.GET("/subscriptions", middlewares.Require("discovery", "read"), azureOnboard.ListSubscriptions)
+			azureAPI.GET("/config", middlewares.Require("discovery", "read"), azureOnboard.ConfigStatus)
 			azureAPI.GET("/connectors", middlewares.Require("discovery", "read"), azureOnboard.ListConnectors)
 		}
 	}

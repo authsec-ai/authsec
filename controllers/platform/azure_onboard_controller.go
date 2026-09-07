@@ -66,6 +66,74 @@ func (ctl *AzureOnboardController) service() (*services.AzureOnboardService, err
 	return services.NewAzureOnboardService(ctl.db, vc)
 }
 
+// ConfigStatus handles GET /api/azure/config.
+//
+// Reports what this deployment is configured with, so a setup screen can show a
+// live checklist instead of an operator guessing from a 500. Deliberately does
+// NOT go through ctl.service(): that constructor fails when configuration is
+// incomplete, which is exactly the state this endpoint exists to describe.
+//
+// Secret VALUES are never returned -- only whether each one is set. The client
+// id, redirect uri and endpoints are public by design (they appear in every
+// authorize URL), so reporting them lets a setup screen catch the single most
+// common misconfiguration: a redirect uri that does not match the one
+// registered on the Entra application.
+func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
+	if _, _, err := ctl.workspaceAndActor(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+
+	clientID := strings.TrimSpace(os.Getenv("AZURE_CLIENT_ID"))
+	redirectURI := strings.TrimSpace(os.Getenv("AZURE_REDIRECT_URI"))
+	secretSet := strings.TrimSpace(os.Getenv("AZURE_CLIENT_SECRET")) != ""
+	sessionSet := len(strings.TrimSpace(os.Getenv(azureSessionSecretEnv))) >= 32
+	vaultSet := os.Getenv("VAULT_ADDR") != "" && os.Getenv("VAULT_TOKEN") != ""
+
+	missing := []string{}
+	if clientID == "" {
+		missing = append(missing, "AZURE_CLIENT_ID")
+	}
+	if !secretSet {
+		missing = append(missing, "AZURE_CLIENT_SECRET")
+	}
+	if redirectURI == "" {
+		missing = append(missing, "AZURE_REDIRECT_URI")
+	}
+	if !sessionSet {
+		missing = append(missing, "SESSION_SECRET (32+ chars)")
+	}
+	if !vaultSet {
+		missing = append(missing, "VAULT_ADDR/VAULT_TOKEN")
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ready": len(missing) == 0,
+		"data": gin.H{
+			// Public values, echoed so a setup screen can compare them against
+			// the Entra application.
+			"client_id":      clientID,
+			"redirect_uri":   redirectURI,
+			"signin_tenant":  azureonboard.SignInTenant,
+			"authority_host": azureonboard.AuthorityBase,
+			"arm_endpoint":   azureonboard.ARMBase,
+
+			// Presence only. The values are never serialised.
+			"client_secret_set":  secretSet,
+			"session_secret_set": sessionSet,
+			"vault_configured":   vaultSet,
+
+			"missing": missing,
+		},
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "secret values are never returned; only whether they are set. " +
+				"redirect_uri must match a uri registered on the entra application exactly",
+			"required_graph_permissions": azureonboard.RequiredGraphRoles(),
+		},
+	})
+}
+
 /* ---------------------------------- login --------------------------------- */
 
 // Login handles GET /api/azure/login.
