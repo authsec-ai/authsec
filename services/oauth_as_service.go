@@ -1329,9 +1329,33 @@ func (s *OAuthASService) RevokeUserTokensForWorkspace(userID, workspaceID uuid.U
 // additive on this public union only — they are NEVER inserted into the
 // Hydra-only jwksCache used for ID-token/logout verification (§4), so logout and
 // no-kid ID-token fallback are unaffected.
+//
+// Hydra is optional when XAA_NATIVE_SEALER is on: a deployment that mints and
+// verifies only natively-signed tokens (e.g. local dev, or GCP WIF's
+// onboarding token — internal/tokens/issuer.go) has no reason to run Hydra at
+// all. So if the Hydra fetch itself fails, this falls back to native-only
+// keys rather than failing the whole endpoint — a caller that only ever needs
+// the native key (like Google's STS validating a WIF subject token) must not
+// be blocked by an optional, unrelated Hydra instance being unreachable. When
+// XAA_NATIVE_SEALER is off, or there is no native key to fall back to, the
+// original behavior is unchanged: a Hydra fetch failure fails the endpoint.
 func (s *OAuthASService) FetchJWKS() (json.RawMessage, error) {
 	raw, err := s.jwksCache.get()
 	if err != nil {
+		if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
+			if native := tokens.NativeKeys().PublicJWKS(); len(native) > 0 {
+				log.Printf("[MCP_AUTH] FetchJWKS: Hydra unreachable (%v); serving native-only JWKS", err)
+				keys := make([]json.RawMessage, 0, len(native))
+				for _, k := range native {
+					if b, merr := json.Marshal(k); merr == nil {
+						keys = append(keys, b)
+					}
+				}
+				return json.Marshal(struct {
+					Keys []json.RawMessage `json:"keys"`
+				}{Keys: keys})
+			}
+		}
 		return nil, err
 	}
 	if config.AppConfig == nil || !config.AppConfig.XAANativeSealer {
