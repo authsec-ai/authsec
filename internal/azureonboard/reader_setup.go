@@ -1,8 +1,13 @@
 package azureonboard
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
 )
 
 // Assigning ARM Reader is the one step of Azure onboarding that AuthSec cannot
@@ -156,4 +161,117 @@ func BuildReaderSetup(tenantID, principalObjectID, scope string, scopes []string
 			"Review + assign",
 		},
 	}
+}
+
+/* --------------------- checking our own app registration --------------------- */
+
+// Well-known Microsoft Graph identifiers. Constant in every Azure tenant.
+const (
+	GraphResourceAppID = "00000003-0000-0000-c000-000000000000"
+
+	// Graph app-role ids for the permissions this connector requires. Read from
+	// the Graph service principal to confirm, rather than transcribed from
+	// documentation: appRoles[?value=='<name>'].id
+	roleApplicationReadAll    = "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30"
+	roleDirectoryReadAll      = "7ab1d382-f21e-4acd-a863-ba3e13f7da61"
+	roleRoleManagementReadDir = "483bed4a-2ad3-4361-a73b-c83ccdbdc53c"
+	roleAuditLogReadAll       = "b0afded3-3588-46d8-8b3d-9842eff778da"
+)
+
+// RequiredGraphRoleIDs maps each required permission to its Graph app-role id,
+// which is what an application object actually stores in requiredResourceAccess.
+// The names never appear there -- only these ids -- so a check that compares
+// names would have nothing to compare against.
+func RequiredGraphRoleIDs() map[string]string {
+	return map[string]string{
+		"Application.Read.All":          roleApplicationReadAll,
+		"Directory.Read.All":            roleDirectoryReadAll,
+		"RoleManagement.Read.Directory": roleRoleManagementReadDir,
+		"AuditLog.Read.All":             roleAuditLogReadAll,
+	}
+}
+
+// AppRegistration is the subset of our own application object worth asserting on.
+type AppRegistration struct {
+	DisplayName    string `json:"displayName"`
+	AppID          string `json:"appId"`
+	SignInAudience string `json:"signInAudience"`
+	Web            struct {
+		RedirectURIs []string `json:"redirectUris"`
+	} `json:"web"`
+	RequiredResourceAccess []struct {
+		ResourceAppID  string `json:"resourceAppId"`
+		ResourceAccess []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"resourceAccess"`
+	} `json:"requiredResourceAccess"`
+	PasswordCredentials []struct {
+		DisplayName string     `json:"displayName"`
+		EndDateTime *time.Time `json:"endDateTime"`
+	} `json:"passwordCredentials"`
+	KeyCredentials []struct {
+		DisplayName string     `json:"displayName"`
+		EndDateTime *time.Time `json:"endDateTime"`
+	} `json:"keyCredentials"`
+}
+
+// ReadOwnApp reads OUR application object from the home tenant.
+//
+// Needs only Application.Read.All, which this connector already requires for
+// discovery -- so a configuration self-check costs no additional permission and
+// in particular needs no write access. The application object exists ONLY in the
+// home tenant; a customer tenant holds a service principal instead, so this call
+// must use a home-tenant token.
+//
+// This is the one place the package reads /applications, and it reads exactly
+// one: its own. The promise it keeps is not "never call this endpoint" but
+// "never enumerate a customer's directory objects with it".
+func (c *HTTPClient) ReadOwnApp(ctx context.Context, accessToken, appID string) (*AppRegistration, error) {
+	q := url.Values{}
+	q.Set("$filter", "appId eq '"+appID+"'")
+	q.Set("$select", "displayName,appId,signInAudience,web,requiredResourceAccess,"+
+		"passwordCredentials,keyCredentials")
+	endpoint := "https://graph.microsoft.com/v1.0/applications?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build graph request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reach microsoft graph: %v", redactURLError(err))
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	if resp.StatusCode != http.StatusOK {
+		var gErr struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &gErr)
+		return nil, &APIError{
+			Status:      resp.StatusCode,
+			Code:        orDefault(gErr.Error.Code, fmt.Sprintf("http %d", resp.StatusCode)),
+			Description: truncate(firstLine(gErr.Error.Message), maxErrorBody),
+		}
+	}
+
+	var page struct {
+		Value []AppRegistration `json:"value"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("decode graph response: %w", err)
+	}
+	if len(page.Value) == 0 {
+		return nil, fmt.Errorf("application %s not found in this tenant -- "+
+			"is this the home tenant the app registration was created in?", appID)
+	}
+	return &page.Value[0], nil
 }

@@ -134,6 +134,46 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	})
 }
 
+// CheckAppRegistration handles GET /api/azure/app/check.
+//
+// Asserts that the App Registration matches what this code requires. Read-only:
+// it reports and never repairs, so it cannot itself become a way to repoint the
+// product at a different application.
+//
+// Serves BOTH setup paths. Whether the registration was created by hand in the
+// portal or by an automated bootstrap, this is the single assertion that says
+// the end state is right -- and it checks by machine every field the runbook
+// currently asks a human to verify by eye.
+func (ctl *AzureOnboardController) CheckAppRegistration(c *gin.Context) {
+	if _, _, err := ctl.workspaceAndActor(c); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	svc, err := ctl.service()
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
+	res, err := svc.CheckAppRegistration(c.Request.Context())
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   res.OK,
+		"data": res,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "needs only Application.Read.All, which discovery already requires; " +
+				"no write access is used or requested",
+			"severity": "an 'error' finding blocks onboarding; a 'warning' does not",
+		},
+	})
+}
+
 /* ---------------------------------- login --------------------------------- */
 
 // Login handles GET /api/azure/login.

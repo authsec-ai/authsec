@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -912,4 +913,223 @@ func (s *AzureOnboardService) ValidateGraph(
 		_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, tok.PrincipalObjectID)
 	}
 	return result, nil
+}
+
+/* ----------------------- checking our own app registration ----------------------- */
+
+// azureHomeTenantEnv names the tenant the App Registration itself lives in.
+//
+// Needed because an application object exists ONLY in its home tenant -- a
+// customer tenant holds a service principal instead -- so a self-check must use
+// a home-tenant token. Falls back to AZURE_SIGNIN_TENANT when that is a GUID,
+// which it is on any deployment that had to pin sign-in.
+const azureHomeTenantEnv = "AZURE_HOME_TENANT"
+
+// AppCheckFinding is one thing the app registration gets wrong.
+type AppCheckFinding struct {
+	Check    string `json:"check"`
+	Severity string `json:"severity"` // "error" blocks onboarding, "warning" does not
+	Detail   string `json:"detail"`
+	Fix      string `json:"fix"`
+}
+
+// AppCheckResult is the verdict on our own App Registration.
+type AppCheckResult struct {
+	AppID          string `json:"app_id"`
+	DisplayName    string `json:"display_name"`
+	SignInAudience string `json:"sign_in_audience"`
+	HomeTenant     string `json:"home_tenant"`
+
+	RedirectURIs        []string `json:"redirect_uris"`
+	DeclaredPermissions []string `json:"declared_permissions"`
+	MissingPermissions  []string `json:"missing_permissions"`
+
+	SecretCount int        `json:"secret_count"`
+	CertCount   int        `json:"cert_count"`
+	CredExpires *time.Time `json:"credential_expires_at,omitempty"`
+
+	OK       bool              `json:"ok"`
+	Findings []AppCheckFinding `json:"findings"`
+}
+
+// CheckAppRegistration asserts the App Registration matches what this code
+// requires, read-only.
+//
+// WHY THIS EXISTS. Every field it checks is something the runbook currently asks
+// a human to verify by eye in the portal, and one of them -- undeclared
+// application permissions -- produced a consent that succeeded while granting
+// nothing, and read as a code bug for an hour. A machine checks all of them in
+// one call.
+//
+// WHY IT NEEDS NO NEW PERMISSION. Application.Read.All is already required for
+// identity discovery, and reading one application is within it. It needs no
+// WRITE access, which matters: a check that can only report and never repair
+// cannot itself become a way to repoint the product at a different application.
+//
+// It also serves both setup paths. Whether the registration was created by hand
+// in the portal or by an automated bootstrap, this is the single assertion that
+// says the end state is correct.
+func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppCheckResult, error) {
+	home := strings.TrimSpace(os.Getenv(azureHomeTenantEnv))
+	if home == "" && azureonboard.ValidateTenantID(azureonboard.SignInTenant) == nil {
+		home = azureonboard.SignInTenant
+	}
+	if err := azureonboard.ValidateTenantID(home); err != nil {
+		return nil, fmt.Errorf("cannot check the app registration: set %s to the tenant the "+
+			"registration was created in (an application object exists only in its home tenant)",
+			azureHomeTenantEnv)
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	tok, err := s.azure.GraphToken(callCtx, home)
+	if err != nil {
+		return nil, err
+	}
+	app, err := s.azure.ReadOwnApp(callCtx, tok.AccessToken, s.clientID)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &AppCheckResult{
+		AppID:               app.AppID,
+		DisplayName:         app.DisplayName,
+		SignInAudience:      app.SignInAudience,
+		HomeTenant:          home,
+		RedirectURIs:        app.Web.RedirectURIs,
+		DeclaredPermissions: []string{},
+		MissingPermissions:  []string{},
+		Findings:            []AppCheckFinding{},
+	}
+
+	// 1. Multi-tenant, or no customer can ever consent.
+	if app.SignInAudience != "AzureADMultipleOrgs" {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "sign_in_audience",
+			Severity: "error",
+			Detail: fmt.Sprintf("signInAudience is %q; a customer tenant cannot consent to "+
+				"anything but AzureADMultipleOrgs", app.SignInAudience),
+			Fix: "portal -> Authentication -> Supported account types -> " +
+				"Accounts in any organizational directory (Multitenant)",
+		})
+	}
+
+	// 2. The configured redirect URI must be registered, or Microsoft refuses
+	//    with AADSTS50011 before a password is typed.
+	registered := false
+	for _, u := range app.Web.RedirectURIs {
+		if u == s.redirectURI {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "redirect_uri",
+			Severity: "error",
+			Detail: fmt.Sprintf("AZURE_REDIRECT_URI is %q but the registration lists %v",
+				s.redirectURI, app.Web.RedirectURIs),
+			Fix: "add that exact URI under Authentication -> Web. A registration holds a " +
+				"list, so add it alongside the existing entries rather than replacing them",
+		})
+	}
+
+	// 3. Declared application permissions. The application object stores role
+	//    IDs, never names, so the comparison is by ID.
+	declared := map[string]bool{}
+	for _, r := range app.RequiredResourceAccess {
+		if r.ResourceAppID != azureonboard.GraphResourceAppID {
+			continue
+		}
+		for _, a := range r.ResourceAccess {
+			// "Role" is an application permission; "Scope" is delegated, and a
+			// delegated grant never appears in an app-only token's roles claim.
+			if a.Type == "Role" {
+				declared[a.ID] = true
+			}
+		}
+	}
+	for name, id := range azureonboard.RequiredGraphRoleIDs() {
+		if declared[id] {
+			res.DeclaredPermissions = append(res.DeclaredPermissions, name)
+		} else {
+			res.MissingPermissions = append(res.MissingPermissions, name)
+		}
+	}
+	sort.Strings(res.DeclaredPermissions)
+	sort.Strings(res.MissingPermissions)
+
+	if len(res.MissingPermissions) > 0 {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "declared_permissions",
+			Severity: "error",
+			Detail: fmt.Sprintf("not declared as APPLICATION permissions: %s. Admin consent uses "+
+				"scope=.default, which grants only what the application declares, so consent "+
+				"would succeed and grant nothing",
+				strings.Join(res.MissingPermissions, ", ")),
+			Fix: "portal -> API permissions -> Add a permission -> Microsoft Graph -> " +
+				"Application permissions (not Delegated) -> add them -> Grant admin consent",
+		})
+	}
+
+	// 4. Credentials, and how long they have left. A secret nobody is watching
+	//    expires and breaks every consented tenant at once.
+	res.SecretCount = len(app.PasswordCredentials)
+	res.CertCount = len(app.KeyCredentials)
+
+	var soonest *time.Time
+	for _, c := range app.PasswordCredentials {
+		if c.EndDateTime != nil && (soonest == nil || c.EndDateTime.Before(*soonest)) {
+			soonest = c.EndDateTime
+		}
+	}
+	for _, c := range app.KeyCredentials {
+		if c.EndDateTime != nil && (soonest == nil || c.EndDateTime.Before(*soonest)) {
+			soonest = c.EndDateTime
+		}
+	}
+	res.CredExpires = soonest
+
+	switch {
+	case res.SecretCount == 0 && res.CertCount == 0:
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "credentials",
+			Severity: "error",
+			Detail:   "the registration has no client secret and no certificate",
+			Fix:      "portal -> Certificates & secrets -> New client secret, or upload a certificate",
+		})
+	case soonest != nil && time.Until(*soonest) < 30*24*time.Hour:
+		sev := "warning"
+		if time.Until(*soonest) <= 0 {
+			sev = "error"
+		}
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "credential_expiry",
+			Severity: sev,
+			Detail: fmt.Sprintf("the soonest credential expires %s (%d days)",
+				soonest.UTC().Format("2006-01-02"), int(time.Until(*soonest).Hours()/24)),
+			Fix: "issue a new secret or certificate before then. This credential is global: " +
+				"when it lapses, every consented tenant stops working at once",
+		})
+	}
+
+	// A certificate is preferable, but a secret is not a defect.
+	if res.CertCount == 0 && res.SecretCount > 0 {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "credential_type",
+			Severity: "warning",
+			Detail:   "authenticating with a client secret rather than a certificate",
+			Fix: "a certificate signs an assertion instead of sending the credential, so it " +
+				"never crosses the network and can live in an HSM as non-exportable",
+		})
+	}
+
+	res.OK = true
+	for _, f := range res.Findings {
+		if f.Severity == "error" {
+			res.OK = false
+		}
+	}
+	return res, nil
 }

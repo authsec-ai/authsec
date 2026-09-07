@@ -130,6 +130,9 @@ type Client interface {
 
 	// ProbeGraphCapabilities checks what a granted permission can actually reach.
 	ProbeGraphCapabilities(ctx context.Context, accessToken string) []GraphCapability
+
+	// ReadOwnApp reads OUR application object from its home tenant.
+	ReadOwnApp(ctx context.Context, accessToken, appID string) (*AppRegistration, error)
 }
 
 // HTTPClient is the live Client.
