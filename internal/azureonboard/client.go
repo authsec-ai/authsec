@@ -124,6 +124,9 @@ type Client interface {
 
 	// AssignRole creates a role assignment as the signed-in operator.
 	AssignRole(ctx context.Context, userAccessToken, scope, principalObjectID, roleDefinitionID string) AssignmentResult
+
+	// GraphToken acquires an app-only Microsoft Graph token for one tenant.
+	GraphToken(ctx context.Context, tenantID string) (*TokenSet, error)
 }
 
 // HTTPClient is the live Client.
@@ -509,4 +512,113 @@ func (c *HTTPClient) AssignRole(
 		orDefault(armErr.Error.Code, fmt.Sprintf("http %d", resp.StatusCode)),
 		truncate(firstLine(armErr.Error.Message), 300))
 	return out
+}
+
+/* --------------------------- plane 1: graph authorisation --------------------------- */
+
+// RequiredGraphRoles is what Azure discovery needs from Microsoft Graph, as
+// Application permissions. Delegated grants of the same names never appear in
+// an app-only token's roles claim, and mistaking one for the other is the most
+// common way a consent appears to succeed while granting nothing.
+//
+// Deliberately not requested and not listed: anything that reads a secret
+// VALUE. Recording that a credential exists, its age and its last use is the
+// product's claim; reading it is not.
+func RequiredGraphRoles() []string {
+	return []string{
+		// App registrations, service principals, their credentials and app role
+		// assignments -- the non-human identities themselves.
+		"Application.Read.All",
+		// Users, groups, and the OAuth2 permission grants that say which
+		// delegated consents exist.
+		"Directory.Read.All",
+		// Entra directory role assignments: who holds Global Administrator and
+		// the rest. Not covered by Directory.Read.All for the unified role API.
+		"RoleManagement.Read.Directory",
+		// Sign-in activity, which is how an identity's liveness is established
+		// without paying for a log pipeline.
+		"AuditLog.Read.All",
+	}
+}
+
+// GraphAuthorization is what an app-only Graph token reveals about consent.
+type GraphAuthorization struct {
+	// Granted is the token's roles claim, verbatim.
+	Granted []string `json:"granted"`
+	// Missing is RequiredGraphRoles minus Granted.
+	Missing []string `json:"missing"`
+	// OK is true when nothing required is missing.
+	OK bool `json:"ok"`
+}
+
+// GraphToken acquires an app-only Microsoft Graph token for one tenant.
+func (c *HTTPClient) GraphToken(ctx context.Context, tenantID string) (*TokenSet, error) {
+	if err := ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	form := url.Values{}
+	form.Set("client_id", c.clientID)
+	form.Set("client_secret", c.clientSecret)
+	form.Set("grant_type", "client_credentials")
+	form.Set("scope", ScopeGraphDefault)
+
+	tok, err := c.token(ctx, TenantTokenURL(tenantID), form)
+	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) &&
+			(strings.Contains(apiErr.Description, "AADSTS700016") ||
+				strings.Contains(apiErr.Description, "AADSTS7000229") ||
+				apiErr.Code == "unauthorized_client") {
+			return nil, fmt.Errorf("%w: %s", ErrAppNotInTenant, apiErr.Description)
+		}
+		return nil, err
+	}
+	return tok, nil
+}
+
+// AuthorizationFromToken reports which required permissions a Graph token
+// actually carries.
+//
+// The verdict comes from the token's own roles claim rather than from probing a
+// Graph endpoint. That costs no extra call, needs no permission of its own to
+// work even when nothing was granted, and enumerates exactly WHICH permissions
+// landed -- where a probe only proves that one endpoint happened to answer, and
+// tells an operator nothing about the one they are missing.
+func AuthorizationFromToken(accessToken string) GraphAuthorization {
+	granted := rolesFromToken(accessToken)
+	have := make(map[string]bool, len(granted))
+	for _, r := range granted {
+		have[r] = true
+	}
+
+	auth := GraphAuthorization{Granted: granted, Missing: []string{}}
+	for _, want := range RequiredGraphRoles() {
+		if !have[want] {
+			auth.Missing = append(auth.Missing, want)
+		}
+	}
+	auth.OK = len(auth.Missing) == 0
+	return auth
+}
+
+// rolesFromToken reads the roles claim. Same unverified decode as
+// objectIDFromToken, and safe for the same reason: Microsoft issued this token
+// to us over TLS moments ago in answer to our own request, and the value drives
+// a report, never an authorisation decision.
+func rolesFromToken(raw string) []string {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return []string{}
+	}
+	body, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return []string{}
+	}
+	var claims struct {
+		Roles []string `json:"roles"`
+	}
+	if err := json.Unmarshal(body, &claims); err != nil || claims.Roles == nil {
+		return []string{}
+	}
+	return claims.Roles
 }

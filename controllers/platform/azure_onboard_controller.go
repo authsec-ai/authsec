@@ -147,7 +147,7 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 			int(8*time.Hour/time.Second),
 			"/api/azure",
 			"",
-			c.Request.TLS != nil,
+			requestIsHTTPS(c),
 			true,
 		)
 		c.JSON(http.StatusOK, gin.H{"ok": true, "step": "logged_in"})
@@ -399,13 +399,30 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 		return
 	}
 
+	tenantID := strings.TrimSpace(body.TenantID)
 	res, err := svc.AssignReader(c.Request.Context(), workspaceID, sessionID,
-		strings.TrimSpace(body.TenantID), strings.TrimSpace(body.Scope))
+		tenantID, strings.TrimSpace(body.Scope))
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
+		// A refusal is the interesting case: it records that someone attempted
+		// to grant AuthSec access to a customer tenant and Azure said no.
+		auditAdminMutation(c, workspaceID.String(), "azure.reader.assign.failed",
+			"azure_connector", tenantID, status,
+			nil, gin.H{"tenant_id": tenantID, "error": err.Error()})
 		c.JSON(status, errBody)
 		return
 	}
+
+	// This is the only state-changing action this feature performs inside
+	// another organisation's Azure tenant. Without a record there is no answer
+	// to "who granted AuthSec access to this subscription, and when".
+	auditAdminMutation(c, workspaceID.String(), "azure.reader.assign",
+		"azure_connector", tenantID, http.StatusOK,
+		nil, gin.H{
+			"tenant_id": tenantID,
+			"principal": res.Assigned,
+			"all_ok":    res.AllOK,
+		})
 	c.JSON(http.StatusOK, gin.H{
 		"ok":   res.AllOK,
 		"data": res,
@@ -414,6 +431,101 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 			"next":  "POST /api/azure/validate-arm to confirm the application can now read",
 			"note": "granted as the signed-in operator, which requires them to hold Owner or " +
 				"User Access Administrator on the scope; no application can grant itself an azure role",
+		},
+	})
+}
+
+// ValidateGraph handles POST /api/azure/validate-graph.
+//
+// The Entra counterpart to validate-arm. Consent completing is not the same as
+// consent granting anything: an application that declares no permissions is
+// consented successfully and holds none. This asks the token itself which
+// permissions actually landed.
+func (ctl *AzureOnboardController) ValidateGraph(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var body struct {
+		TenantID string `json:"tenantId"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
+		return
+	}
+	svc, err := ctl.service()
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+
+	res, err := svc.ValidateGraph(c.Request.Context(), workspaceID, strings.TrimSpace(body.TenantID))
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   res.GraphOK,
+		"data": res,
+		"meta": gin.H{
+			"as_of":    time.Now().UTC(),
+			"required": azureonboard.RequiredGraphRoles(),
+			"note": "permissions must be declared on the app registration as Application, not " +
+				"Delegated; a delegated grant never appears in an app-only token",
+		},
+	})
+}
+
+// ListSubscriptions handles GET /api/azure/subscriptions?tenantId=...
+//
+// Per-subscription Reader coverage, which is what makes partial coverage
+// visible. A tenant is only fully onboarded when every subscription reads true.
+func (ctl *AzureOnboardController) ListSubscriptions(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	svc, err := ctl.service()
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
+	rows, err := svc.Subscriptions(workspaceID, strings.TrimSpace(c.Query("tenantId")))
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
+	readable := 0
+	for _, r := range rows {
+		if r.ReaderOK {
+			readable++
+		}
+	}
+	coverage := "none"
+	switch {
+	case len(rows) > 0 && readable == len(rows):
+		coverage = "complete"
+	case readable > 0:
+		coverage = "partial"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    rows,
+		"meta": gin.H{
+			"count":    len(rows),
+			"readable": readable,
+			"coverage": coverage,
+			"as_of":    time.Now().UTC(),
+			"note":     "coverage 'partial' is not an all-clear: reader is assigned per scope",
 		},
 	})
 }
@@ -453,6 +565,19 @@ func (ctl *AzureOnboardController) ListConnectors(c *gin.Context) {
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+// requestIsHTTPS reports whether the browser reached us over TLS.
+//
+// Request.TLS alone is wrong behind a terminating proxy, which is the normal
+// deployment: nginx or an ALB speaks TLS to the browser and plain HTTP to us,
+// so the cookie carrying a live Azure sign-in would ship without Secure. Same
+// test middlewares/security.go already uses to decide on HSTS.
+func requestIsHTTPS(c *gin.Context) bool {
+	return c.Request.TLS != nil ||
+		c.GetHeader("X-Forwarded-Proto") == "https" ||
+		os.Getenv("FORCE_HSTS") == "true" ||
+		os.Getenv("ENVIRONMENT") == "production"
+}
 
 func (ctl *AzureOnboardController) workspaceAndActor(c *gin.Context) (uuid.UUID, string, error) {
 	return workspaceAndActorFrom(c)

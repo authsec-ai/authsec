@@ -5968,6 +5968,15 @@ CREATE TABLE IF NOT EXISTS public.azure_connectors (
     -- not work there.
     principal_object_id text,
 
+    -- Plane 1, the Entra side. graph_ok is to admin consent what arm_reader_ok
+    -- is to a role assignment: consent granting nothing is a real, observed
+    -- state, so it is verified rather than assumed. graph_granted_roles keeps
+    -- the roles claim verbatim so a missing permission can be named.
+    graph_ok            boolean NOT NULL DEFAULT false,
+    graph_checked_at    timestamptz,
+    graph_last_error    text,
+    graph_granted_roles text[] NOT NULL DEFAULT '{}',
+
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
 
@@ -6017,3 +6026,53 @@ CREATE TABLE IF NOT EXISTS public.azure_oauth_state (
 
 CREATE INDEX IF NOT EXISTS idx_azure_oauth_state_expires
     ON public.azure_oauth_state (expires_at);
+
+CREATE TABLE IF NOT EXISTS public.azure_subscriptions (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid NOT NULL,
+    tenant_id       text NOT NULL,
+
+    -- Unique within a tenant, and globally unique in practice, but never
+    -- treated as sufficient on its own: the tenant is what says whose
+    -- subscription this is and which credential may read it.
+    subscription_id text NOT NULL,
+
+    display_name    text,
+
+    -- Azure's own word: Enabled, Warned, PastDue, Disabled, Deleted.
+    -- Open text rather than a CHECK enum -- this mirrors a vendor's vocabulary
+    -- and a new value must not fail an insert.
+    state           text,
+
+    -- Per subscription, because Reader is assigned per scope. A tenant is only
+    -- fully covered when every subscription reads true; anything less is
+    -- partial and must not present as an all-clear.
+    reader_ok         boolean NOT NULL DEFAULT false,
+    reader_checked_at timestamptz,
+
+    -- When ARM last returned this subscription. A subscription that stops being
+    -- returned has been removed, renamed out of scope, or lost its role
+    -- assignment -- distinguishable only if the last sighting is recorded.
+    last_seen_at    timestamptz NOT NULL DEFAULT now(),
+
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT azure_subscriptions_uq UNIQUE (workspace_id, tenant_id, subscription_id),
+    CONSTRAINT azure_subscriptions_subscription_id_chk CHECK (subscription_id <> ''),
+
+    -- Composite FK to the connector, not to workspaces: it is what makes the
+    -- tenant relationship structural rather than conventional, and it cascades
+    -- so a revoked tenant does not leave orphaned subscriptions behind.
+    CONSTRAINT azure_subscriptions_connector_fk
+        FOREIGN KEY (workspace_id, tenant_id)
+        REFERENCES public.azure_connectors (workspace_id, tenant_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_tenant
+    ON public.azure_subscriptions (workspace_id, tenant_id);
+
+CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_reader
+    ON public.azure_subscriptions (workspace_id, reader_ok);
+

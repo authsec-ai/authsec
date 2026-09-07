@@ -453,6 +453,14 @@ func (s *AzureOnboardService) ValidateARM(
 	result.Subscriptions = subs
 	result.Count = len(subs)
 
+	// Persist what ARM named, then record coverage per scope. Listing a
+	// subscription and being able to read it are the same fact here -- ARM only
+	// returns subscriptions the caller has a role on -- but they are stored
+	// separately so a later per-scope probe can disagree without losing the row.
+	if err := s.persistSubscriptions(workspaceID, tenantID, subs); err != nil {
+		return nil, err
+	}
+
 	// A 200 alone is NOT the pass condition.
 	//
 	// ARM answers 200 with an empty list when the token is valid but the
@@ -774,6 +782,120 @@ func (s *AzureOnboardService) AssignReader(
 	result.AllOK = allOK
 	if !allOK {
 		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+	}
+	return result, nil
+}
+
+/* ------------------------- subscriptions and plane 1 ------------------------- */
+
+// persistSubscriptions records the subscriptions ARM returned and marks each
+// one readable, since ARM only lists subscriptions the caller holds a role on.
+func (s *AzureOnboardService) persistSubscriptions(
+	workspaceID uuid.UUID, tenantID string, subs []azureonboard.Subscription,
+) error {
+	if len(subs) == 0 {
+		return nil
+	}
+	rows := make([]models.AzureSubscription, 0, len(subs))
+	readable := make(map[string]bool, len(subs))
+	for _, sub := range subs {
+		rows = append(rows, models.AzureSubscription{
+			SubscriptionID: sub.SubscriptionID,
+			DisplayName:    sub.DisplayName,
+			State:          sub.State,
+		})
+		readable[sub.SubscriptionID] = true
+	}
+	if err := s.repo.UpsertSubscriptions(workspaceID, tenantID, rows); err != nil {
+		return err
+	}
+	return s.repo.SetSubscriptionReader(workspaceID, tenantID, readable)
+}
+
+// Subscriptions lists what is known about one tenant's subscriptions.
+func (s *AzureOnboardService) Subscriptions(
+	workspaceID uuid.UUID, tenantID string,
+) ([]models.AzureSubscription, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	return s.repo.ListSubscriptions(workspaceID, tenantID)
+}
+
+// AzureGraphResult is the outcome of a Microsoft Graph authorisation check.
+type AzureGraphResult struct {
+	TenantID string   `json:"tenantId"`
+	GraphOK  bool     `json:"graph_ok"`
+	Granted  []string `json:"granted_roles"`
+	Missing  []string `json:"missing_roles"`
+	Error    string   `json:"error,omitempty"`
+	Hint     string   `json:"hint,omitempty"`
+}
+
+// ValidateGraph proves whether admin consent actually granted anything.
+//
+// The counterpart to ValidateARM, and needed for the same reason: consent and
+// capability are different facts. A tenant can complete admin consent and hold
+// no permission at all -- which is what happens when the application declares
+// none, since .default grants only what is declared. Recording consented_at and
+// moving on reports a success nobody checked.
+//
+// The verdict comes from the roles claim of an app-only Graph token, not from
+// calling Graph. That works even when nothing was granted, costs no extra
+// request, and names the individual permissions that are missing.
+func (s *AzureOnboardService) ValidateGraph(
+	ctx context.Context, workspaceID uuid.UUID, tenantID string,
+) (*AzureGraphResult, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	if _, err := s.repo.Get(workspaceID, tenantID); err != nil {
+		return nil, err
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	result := &AzureGraphResult{TenantID: tenantID, Granted: []string{}, Missing: []string{}}
+
+	tok, err := s.azure.GraphToken(callCtx, tenantID)
+	if err != nil {
+		result.Error = err.Error()
+		result.Missing = azureonboard.RequiredGraphRoles()
+		if errors.Is(err, azureonboard.ErrAppNotInTenant) {
+			result.Hint = "admin consent has not completed in this tenant; run POST /api/azure/consent"
+		}
+		if _, sErr := s.repo.SetGraphResult(workspaceID, tenantID, false, nil, result.Error); sErr != nil {
+			return nil, sErr
+		}
+		return result, nil
+	}
+
+	auth := azureonboard.AuthorizationFromToken(tok.AccessToken)
+	result.GraphOK = auth.OK
+	result.Granted = auth.Granted
+	result.Missing = auth.Missing
+
+	if !auth.OK {
+		if len(auth.Granted) == 0 {
+			// The specific, and by far the most common, failure: consent
+			// succeeded and granted nothing because the app registration
+			// declares no application permissions.
+			result.Error = "admin consent completed but the application holds no permissions in this tenant"
+			result.Hint = "the app registration declares no Microsoft Graph APPLICATION permissions, " +
+				"so .default consent grants nothing; declare them on the registration " +
+				"(Type must be Application, not Delegated) and consent again"
+		} else {
+			result.Error = "some required graph permissions are not granted"
+			result.Hint = "re-run admin consent for this tenant after declaring the missing permissions"
+		}
+	}
+
+	if _, err := s.repo.SetGraphResult(workspaceID, tenantID, auth.OK, auth.Granted, result.Error); err != nil {
+		return nil, err
+	}
+	if tok.PrincipalObjectID != "" {
+		_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, tok.PrincipalObjectID)
 	}
 	return result, nil
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -39,6 +40,22 @@ type AzureConnectorRepository interface {
 	// SetARMResult records the outcome of an ARM Reader check. reason is stored
 	// only when ok is false; a success clears the previous failure.
 	SetARMResult(workspaceID uuid.UUID, tenantID string, ok bool, reason string) (*models.AzureConnector, error)
+
+	// SetGraphResult records the outcome of a Microsoft Graph authorisation
+	// check: whether the required application permissions are actually granted,
+	// and which ones the token carried. Mirrors SetARMResult on the other plane.
+	SetGraphResult(workspaceID uuid.UUID, tenantID string, ok bool, granted []string, reason string) (*models.AzureConnector, error)
+
+	// UpsertSubscriptions records the subscriptions ARM returned for a tenant,
+	// refreshing last_seen_at. Reader status is NOT touched here -- listing a
+	// subscription and being able to read it are different facts, established
+	// by different calls.
+	UpsertSubscriptions(workspaceID uuid.UUID, tenantID string, subs []models.AzureSubscription) error
+
+	// SetSubscriptionReader records per-scope Reader coverage.
+	SetSubscriptionReader(workspaceID uuid.UUID, tenantID string, readable map[string]bool) error
+
+	ListSubscriptions(workspaceID uuid.UUID, tenantID string) ([]models.AzureSubscription, error)
 
 	// SetPrincipalObjectID records the service principal's object id in the
 	// customer's tenant. It comes from the oid claim of an app-only token, so it
@@ -136,6 +153,94 @@ func (r *azureConnectorRepository) SetARMResult(
 		return nil, ErrAzureConnectorNotFound
 	}
 	return r.Get(workspaceID, tenantID)
+}
+
+func (r *azureConnectorRepository) SetGraphResult(
+	workspaceID uuid.UUID, tenantID string, ok bool, granted []string, reason string,
+) (*models.AzureConnector, error) {
+	now := time.Now().UTC()
+	if ok {
+		reason = ""
+	}
+	if granted == nil {
+		granted = []string{}
+	}
+
+	res := r.db.Model(&models.AzureConnector{}).
+		Where("workspace_id = ? AND tenant_id = ?", workspaceID, tenantID).
+		Updates(map[string]interface{}{
+			"graph_ok":            ok,
+			"graph_checked_at":    now,
+			"graph_last_error":    reason,
+			"graph_granted_roles": pq.StringArray(granted),
+			"updated_at":          now,
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, ErrAzureConnectorNotFound
+	}
+	return r.Get(workspaceID, tenantID)
+}
+
+func (r *azureConnectorRepository) UpsertSubscriptions(
+	workspaceID uuid.UUID, tenantID string, subs []models.AzureSubscription,
+) error {
+	if len(subs) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	for i := range subs {
+		subs[i].WorkspaceID = workspaceID
+		subs[i].TenantID = tenantID
+		subs[i].LastSeenAt = now
+	}
+
+	// reader_ok is deliberately absent from the update set: this records that
+	// ARM named the subscription, which is not the same as being able to read
+	// it. Overwriting the verdict here would erase a check with a listing.
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "workspace_id"}, {Name: "tenant_id"}, {Name: "subscription_id"},
+		},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"display_name": gorm.Expr("COALESCE(NULLIF(EXCLUDED.display_name, ''), azure_subscriptions.display_name)"),
+			"state":        gorm.Expr("COALESCE(NULLIF(EXCLUDED.state, ''), azure_subscriptions.state)"),
+			"last_seen_at": now,
+			"updated_at":   now,
+		}),
+	}).Create(&subs).Error
+}
+
+func (r *azureConnectorRepository) SetSubscriptionReader(
+	workspaceID uuid.UUID, tenantID string, readable map[string]bool,
+) error {
+	now := time.Now().UTC()
+	for subID, ok := range readable {
+		if err := r.db.Model(&models.AzureSubscription{}).
+			Where("workspace_id = ? AND tenant_id = ? AND subscription_id = ?",
+				workspaceID, tenantID, subID).
+			Updates(map[string]interface{}{
+				"reader_ok":         ok,
+				"reader_checked_at": now,
+				"updated_at":        now,
+			}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *azureConnectorRepository) ListSubscriptions(
+	workspaceID uuid.UUID, tenantID string,
+) ([]models.AzureSubscription, error) {
+	var rows []models.AzureSubscription
+	err := r.db.
+		Where("workspace_id = ? AND tenant_id = ?", workspaceID, tenantID).
+		Order("display_name, subscription_id").
+		Find(&rows).Error
+	return rows, err
 }
 
 func (r *azureConnectorRepository) SetPrincipalObjectID(
