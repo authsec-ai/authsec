@@ -317,6 +317,48 @@ func SetupRoutes(
 	}
 
 	// ════════════════════════════════════════════════════════
+	// Azure onboarding
+	// ════════════════════════════════════════════════════════
+	//
+	// Consent the AuthSec Entra application into the tenants an operator can
+	// see, and check whether that consent bought ARM Reader. Onboarding only —
+	// no identity scan, no permissions, no access graph.
+	//
+	// WHY /api/azure AND NOT /authsec/discovery/azure. The callback path is
+	// fixed by the redirect URI registered on the Entra application; Microsoft
+	// will not redirect anywhere else. The rest of the flow is grouped with it.
+	//
+	// WHY login AND callback SIT OUTSIDE THE AUTHENTICATED GROUP. Both are
+	// top-level browser navigations — a redirect from Microsoft cannot carry a
+	// bearer token, so AuthMiddleware would reject the callback every time. They
+	// are authorised by the one-shot azure_oauth_state row instead, which is
+	// also the only place the workspace and the consented tenant are read from.
+	// Same reasoning as the GitHub webhook above.
+	{
+		azureOnboard := platformCtrl.NewAzureOnboardController(config.DB)
+
+		// Browser-facing, unauthenticated, rate limited.
+		r.GET("/api/azure/login",
+			middlewares.StrictAuthRateLimitMiddleware(30, time.Minute),
+			azureOnboard.Login)
+		r.GET("/api/azure/callback",
+			middlewares.StrictAuthRateLimitMiddleware(30, time.Minute),
+			azureOnboard.Callback)
+
+		// Console-facing. Ordinary fetch calls, so they authenticate and RBAC
+		// check exactly like the AWS discovery routes.
+		azureAPI := r.Group("/api/azure")
+		azureAPI.Use(middlewares.AuthMiddleware())
+		{
+			azureAPI.GET("/tenants", middlewares.Require("discovery", "read"), azureOnboard.ListTenants)
+			azureAPI.POST("/consent", middlewares.Require("discovery", "admin"), azureOnboard.StartConsent)
+			azureAPI.POST("/validate-arm", middlewares.Require("discovery", "admin"), azureOnboard.ValidateARM)
+			azureAPI.POST("/reader-setup", middlewares.Require("discovery", "read"), azureOnboard.ReaderSetup)
+			azureAPI.POST("/assign-reader", middlewares.Require("discovery", "admin"), azureOnboard.AssignReader)
+			azureAPI.GET("/connectors", middlewares.Require("discovery", "read"), azureOnboard.ListConnectors)
+		}
+	}
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")

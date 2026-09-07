@@ -1,0 +1,779 @@
+package services
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/authsec-ai/authsec/internal/azureonboard"
+	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// Azure onboarding: consent the AuthSec application into the Entra tenants an
+// operator can see, and prove whether that consent bought ARM read access.
+//
+// The shape of the flow, and why it is four steps rather than one:
+//
+//  1. The operator signs in with their own Azure work account. AuthSec keeps the
+//     resulting delegated ARM token, and nothing else about them.
+//  2. AuthSec lists the tenants THAT ACCOUNT can see -- the same list the portal
+//     shows under "Manage tenants". Not every tenant that exists; not a
+//     directory enumeration. The operator's own access is the boundary.
+//  3. For each tenant they choose, an administrator of that tenant grants admin
+//     consent on Microsoft's own consent page. AuthSec never grants it.
+//  4. Someone assigns Reader to the consented application in that tenant's
+//     subscriptions, and AuthSec checks whether that actually happened.
+//
+// Step 4 is separate from step 3 because consent and authorisation are different
+// things in Azure and are performed by different people. An application can be
+// fully consented in a directory and still able to read nothing at all. Recording
+// consent as if it were access is the mistake this split exists to prevent.
+
+const (
+	// Environment. The client secret is read here and nowhere else.
+	azureClientIDEnv     = "AZURE_CLIENT_ID"
+	azureClientSecretEnv = "AZURE_CLIENT_SECRET"
+	azureRedirectURIEnv  = "AZURE_REDIRECT_URI"
+
+	// How long a browser has to complete one redirect. Long enough for an
+	// administrator to read a consent page properly, short enough that an
+	// abandoned tab is not a standing capability.
+	azureStateTTL = 15 * time.Minute
+
+	// How long a delegated sign-in stays usable. Bounded by the refresh token,
+	// which Microsoft may revoke sooner.
+	azureSessionTTL = 8 * time.Hour
+
+	// Bounds one call to Microsoft from inside an HTTP handler.
+	azureCallTimeout = 45 * time.Second
+)
+
+// ErrAzureWorkspaceAmbiguous means /login was reached without a workspace and
+// the deployment has more than one to choose from.
+var ErrAzureWorkspaceAmbiguous = errors.New(
+	"this deployment has more than one workspace; call /api/azure/login?workspace_id=<uuid>")
+
+// AzureOnboardService is the Azure onboarding orchestration.
+type AzureOnboardService struct {
+	db    *gorm.DB
+	repo  repositories.AzureConnectorRepository
+	vault vault.VaultClient
+	azure azureonboard.Client
+
+	clientID    string
+	redirectURI string
+}
+
+// NewAzureOnboardService builds the service against the live Microsoft
+// client. Returns ErrNotConfigured when the deployment has no Entra app.
+func NewAzureOnboardService(db *gorm.DB, vc vault.VaultClient) (*AzureOnboardService, error) {
+	clientID := strings.TrimSpace(os.Getenv(azureClientIDEnv))
+	clientSecret := strings.TrimSpace(os.Getenv(azureClientSecretEnv))
+	redirectURI := strings.TrimSpace(os.Getenv(azureRedirectURIEnv))
+
+	var missing []string
+	if clientID == "" {
+		missing = append(missing, azureClientIDEnv)
+	}
+	if clientSecret == "" {
+		missing = append(missing, azureClientSecretEnv)
+	}
+	if redirectURI == "" {
+		missing = append(missing, azureRedirectURIEnv)
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("%w: set %s", azureonboard.ErrNotConfigured, strings.Join(missing, ", "))
+	}
+
+	return &AzureOnboardService{
+		db:          db,
+		repo:        repositories.NewAzureConnectorRepository(db),
+		vault:       vc,
+		azure:       azureonboard.NewHTTPClient(clientID, clientSecret),
+		clientID:    clientID,
+		redirectURI: redirectURI,
+	}, nil
+}
+
+// WithClient swaps the Microsoft client. Test seam, mirroring the AWS service.
+func (s *AzureOnboardService) WithClient(c azureonboard.Client) *AzureOnboardService {
+	s.azure = c
+	return s
+}
+
+/* --------------------------------- login --------------------------------- */
+
+// StartLogin mints a one-shot state and returns where to send the browser.
+//
+// adminConsent merges tenant-wide consent into the sign-in itself. Opt-in: it
+// requires the signer to be a Global Administrator of the tenant, so forcing it
+// on would lock out every operator who is not one.
+func (s *AzureOnboardService) StartLogin(workspaceID uuid.UUID, actor string, adminConsent bool) (string, error) {
+	state, err := azureonboard.NewLoginState()
+	if err != nil {
+		return "", err
+	}
+	if err := s.repo.CreateState(&models.AzureOAuthState{
+		State:       state,
+		WorkspaceID: workspaceID,
+		Purpose:     models.AzureOAuthPurposeLogin,
+		CreatedBy:   actor,
+		ExpiresAt:   time.Now().Add(azureStateTTL),
+	}); err != nil {
+		return "", err
+	}
+	_ = s.repo.PurgeExpiredStates()
+	return azureonboard.AuthorizeURL(s.clientID, s.redirectURI, state, adminConsent), nil
+}
+
+// ResolveLoginWorkspace decides which workspace a sign-in belongs to.
+//
+// /api/azure/login is reached by a top-level browser navigation, so it cannot
+// carry a bearer token and cannot read the workspace from one. An explicit
+// workspace_id is therefore accepted, and validated against the workspaces
+// table so a typo fails here rather than orphaning a session nothing can read.
+// A single-workspace deployment -- the on-prem default -- needs neither.
+//
+// This decides only where the operator's own token is filed. Nothing is written
+// to azure_connectors on this path: that happens on the consent callback, whose
+// state is minted by an authenticated, RBAC-checked endpoint.
+func (s *AzureOnboardService) ResolveLoginWorkspace(explicit string) (uuid.UUID, error) {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		id, err := uuid.Parse(explicit)
+		if err != nil {
+			return uuid.Nil, errors.New("workspace_id is not a uuid")
+		}
+		var count int64
+		if err := s.db.Model(&models.Workspace{}).Where("id = ?", id).Count(&count).Error; err != nil {
+			return uuid.Nil, err
+		}
+		if count == 0 {
+			return uuid.Nil, errors.New("workspace_id does not exist")
+		}
+		return id, nil
+	}
+
+	var only []models.Workspace
+	if err := s.db.Model(&models.Workspace{}).Limit(2).Find(&only).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(only) != 1 {
+		return uuid.Nil, ErrAzureWorkspaceAmbiguous
+	}
+	return only[0].ID, nil
+}
+
+// AzureCallbackResult is what the callback handler needs to answer with.
+type AzureCallbackResult struct {
+	// Step is "logged_in" or "consented".
+	Step string
+
+	// WorkspaceID the redeemed state was issued for.
+	WorkspaceID uuid.UUID
+
+	// SessionID is set on the login branch. It addresses the stored token and is
+	// the value the browser gets back in a cookie.
+	SessionID string
+
+	// Connector is set on the consent branch.
+	Connector *models.AzureConnector
+	Created   bool
+}
+
+// AzureCallbackInput is the callback's query string, already parsed.
+type AzureCallbackInput struct {
+	Code             string
+	State            string
+	Tenant           string
+	AdminConsent     string
+	Error            string
+	ErrorDescription string
+}
+
+// HandleCallback services both redirects.
+//
+// Everything trusted is read from the redeemed state row. Microsoft's tenant
+// query parameter is compared against it and never used on its own -- a callback
+// is a request an attacker can also make, and the tenant parameter decides which
+// directory gets written into this workspace's inventory.
+func (s *AzureOnboardService) HandleCallback(ctx context.Context, in AzureCallbackInput) (*AzureCallbackResult, error) {
+	if in.State == "" {
+		return nil, repositories.ErrAzureStateInvalid
+	}
+
+	// Shape first: a login state must never be redeemable into the consent
+	// branch, and the shape check runs before the row is spent.
+	purpose, stateTenant, ok := azureonboard.StatePurpose(in.State)
+	if !ok {
+		return nil, repositories.ErrAzureStateInvalid
+	}
+
+	st, err := s.repo.ConsumeState(in.State)
+	if err != nil {
+		return nil, err
+	}
+	if st.Purpose != purpose {
+		return nil, repositories.ErrAzureStateInvalid
+	}
+
+	// Microsoft reports refusals on the redirect itself.
+	if in.Error != "" {
+		if purpose == models.AzureOAuthPurposeConsent {
+			return nil, fmt.Errorf("%w: %s", azureonboard.ErrConsentDenied,
+				strings.TrimSpace(in.Error+" "+in.ErrorDescription))
+		}
+		return nil, fmt.Errorf("azure sign-in failed: %s",
+			strings.TrimSpace(in.Error+" "+in.ErrorDescription))
+	}
+
+	if purpose == models.AzureOAuthPurposeConsent {
+		return s.finishConsent(ctx, st, stateTenant, in)
+	}
+	return s.finishLogin(ctx, st, in)
+}
+
+func (s *AzureOnboardService) finishLogin(
+	ctx context.Context, st *models.AzureOAuthState, in AzureCallbackInput,
+) (*AzureCallbackResult, error) {
+	if in.Code == "" {
+		return nil, errors.New("callback carried no authorization code")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	tok, err := s.azure.ExchangeCode(callCtx, in.Code, s.redirectURI)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionID, err := s.saveSession(st.WorkspaceID, tok)
+	if err != nil {
+		return nil, err
+	}
+	return &AzureCallbackResult{
+		Step:        "logged_in",
+		WorkspaceID: st.WorkspaceID,
+		SessionID:   sessionID,
+	}, nil
+}
+
+func (s *AzureOnboardService) finishConsent(
+	_ context.Context, st *models.AzureOAuthState, stateTenant string, in AzureCallbackInput,
+) (*AzureCallbackResult, error) {
+	// Three independent statements of which tenant this is. All three must
+	// agree: the state row, the tenant encoded in the state string, and what
+	// Microsoft appended. Only the first two are ours.
+	if st.TenantID == "" || st.TenantID != stateTenant {
+		return nil, repositories.ErrAzureStateInvalid
+	}
+	if tenantParam := strings.TrimSpace(in.Tenant); tenantParam != "" &&
+		!strings.EqualFold(tenantParam, st.TenantID) {
+		return nil, azureonboard.ErrTenantMismatch
+	}
+
+	// admin_consent=True is the grant. Anything else -- False, absent, or a
+	// value we do not recognise -- is not consent, and must not write a row that
+	// claims it was.
+	if !strings.EqualFold(strings.TrimSpace(in.AdminConsent), "true") {
+		return nil, azureonboard.ErrConsentDenied
+	}
+
+	// Display fields come from whatever the earlier tenant listing recorded;
+	// the consent callback carries none. COALESCE in the repository keeps an
+	// existing name rather than blanking it.
+	display, domain := "", ""
+	if existing, err := s.repo.Get(st.WorkspaceID, st.TenantID); err == nil {
+		display, domain = existing.DisplayName, existing.Domain
+	}
+
+	stored, created, err := s.repo.UpsertConsent(st.WorkspaceID, st.TenantID, display, domain)
+	if err != nil {
+		return nil, err
+	}
+	return &AzureCallbackResult{
+		Step:        "consented",
+		WorkspaceID: st.WorkspaceID,
+		Connector:   stored,
+		Created:     created,
+	}, nil
+}
+
+/* -------------------------------- tenants -------------------------------- */
+
+// AzureTenantView is one row of the tenant picker.
+type AzureTenantView struct {
+	TenantID         string   `json:"tenantId"`
+	DisplayName      string   `json:"displayName,omitempty"`
+	Domains          []string `json:"domains"`
+	AlreadyConnected bool     `json:"alreadyConnected"`
+	ARMReaderOK      bool     `json:"armReaderOk"`
+}
+
+// ListTenants returns the tenants the signed-in operator can see.
+//
+// This is ARM's tenant list, which is scoped to that person's own access -- the
+// same set the Azure portal shows under "Manage tenants". It is not a directory
+// enumeration and cannot become one: no Graph call is involved.
+func (s *AzureOnboardService) ListTenants(
+	ctx context.Context, workspaceID uuid.UUID, sessionID string,
+) ([]AzureTenantView, error) {
+	tok, err := s.loadSession(ctx, workspaceID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	tenants, err := s.azure.ListTenants(callCtx, tok.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+
+	connected, err := s.repo.ConnectedTenantIDs(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]AzureTenantView, 0, len(tenants))
+	for _, t := range tenants {
+		view := AzureTenantView{
+			TenantID:         t.TenantID,
+			DisplayName:      t.DisplayName,
+			Domains:          t.Domains,
+			AlreadyConnected: connected[t.TenantID],
+		}
+		if view.Domains == nil {
+			view.Domains = []string{}
+		}
+		if view.AlreadyConnected {
+			if row, gErr := s.repo.Get(workspaceID, t.TenantID); gErr == nil {
+				view.ARMReaderOK = row.ARMReaderOK
+			}
+		}
+		out = append(out, view)
+	}
+	return out, nil
+}
+
+/* -------------------------------- consent -------------------------------- */
+
+// StartConsent mints a consent state for one tenant and returns where to send
+// the administrator's browser.
+func (s *AzureOnboardService) StartConsent(
+	workspaceID uuid.UUID, actor, tenantID string,
+) (string, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return "", err
+	}
+	state, err := azureonboard.NewConsentState(tenantID)
+	if err != nil {
+		return "", err
+	}
+	if err := s.repo.CreateState(&models.AzureOAuthState{
+		State:       state,
+		WorkspaceID: workspaceID,
+		Purpose:     models.AzureOAuthPurposeConsent,
+		TenantID:    tenantID,
+		CreatedBy:   actor,
+		ExpiresAt:   time.Now().Add(azureStateTTL),
+	}); err != nil {
+		return "", err
+	}
+	_ = s.repo.PurgeExpiredStates()
+	return azureonboard.AdminConsentURL(s.clientID, s.redirectURI, tenantID, state), nil
+}
+
+/* ------------------------------- arm reader ------------------------------ */
+
+// AzureARMResult is the outcome of an ARM Reader check.
+type AzureARMResult struct {
+	TenantID      string                      `json:"tenantId"`
+	ARMReaderOK   bool                        `json:"arm_reader_ok"`
+	Subscriptions []azureonboard.Subscription `json:"subscriptions,omitempty"`
+	Count         int                         `json:"subscription_count"`
+	Error         string                      `json:"error,omitempty"`
+
+	// ReaderSetup is attached whenever the check did NOT pass, so the caller can
+	// act on the failure without a second round trip.
+	ReaderSetup *azureonboard.ReaderSetup `json:"reader_setup,omitempty"`
+}
+
+// ValidateARM proves whether the consented application can actually read ARM.
+//
+// App-only, not delegated: the question is what AUTHSEC can read in that tenant,
+// and asking with the operator's own token would answer a different question and
+// pass whenever the operator happens to be privileged.
+func (s *AzureOnboardService) ValidateARM(
+	ctx context.Context, workspaceID uuid.UUID, tenantID string,
+) (*AzureARMResult, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	// Must already be consented: a client-credentials grant in a tenant that
+	// never consented cannot succeed, and a row is what the verdict is recorded
+	// against.
+	if _, err := s.repo.Get(workspaceID, tenantID); err != nil {
+		return nil, err
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	result := &AzureARMResult{TenantID: tenantID}
+
+	tok, err := s.azure.ClientCredentials(callCtx, tenantID)
+	if err != nil {
+		result.Error = err.Error()
+		if _, sErr := s.repo.SetARMResult(workspaceID, tenantID, false, result.Error); sErr != nil {
+			return nil, sErr
+		}
+		return result, nil
+	}
+
+	subs, err := s.azure.ListSubscriptions(callCtx, tok.AccessToken)
+	if err != nil {
+		result.Error = err.Error()
+		if _, sErr := s.repo.SetARMResult(workspaceID, tenantID, false, result.Error); sErr != nil {
+			return nil, sErr
+		}
+		return result, nil
+	}
+
+	result.Subscriptions = subs
+	result.Count = len(subs)
+
+	// A 200 alone is NOT the pass condition.
+	//
+	// ARM answers 200 with an empty list when the token is valid but the
+	// application holds no role assignment anywhere -- which is exactly the
+	// state this check exists to detect. Treating that as success reports a
+	// tenant as fully onboarded while the app can read nothing at all, and it
+	// was observed doing so against a real tenant. The verdict is therefore
+	// "ARM returned at least one subscription", not "ARM answered".
+	if len(subs) == 0 {
+		result.Error = "azure accepted the app-only token but returned no subscriptions: " +
+			"the Reader role is not assigned to the AuthSec application in this tenant"
+		result.ReaderSetup = s.readerSetup(tenantID, tok, subs)
+		if _, sErr := s.repo.SetARMResult(workspaceID, tenantID, false, result.Error); sErr != nil {
+			return nil, sErr
+		}
+		return result, nil
+	}
+
+	result.ARMReaderOK = true
+	if _, err := s.repo.SetARMResult(workspaceID, tenantID, true, ""); err != nil {
+		return nil, err
+	}
+	if tok.PrincipalObjectID != "" {
+		_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, tok.PrincipalObjectID)
+	}
+	return result, nil
+}
+
+// readerSetup builds the role-assignment instructions for a tenant, targeting
+// the first subscription ARM will admit to when there is one.
+func (s *AzureOnboardService) readerSetup(
+	tenantID string, tok *azureonboard.TokenSet, subs []azureonboard.Subscription,
+) *azureonboard.ReaderSetup {
+	scope := ""
+	scopes := make([]string, 0, len(subs))
+	for _, sub := range subs {
+		scopes = append(scopes, "/subscriptions/"+sub.SubscriptionID)
+	}
+	if len(scopes) > 0 {
+		scope = scopes[0]
+	}
+	oid := ""
+	if tok != nil {
+		oid = tok.PrincipalObjectID
+	}
+	setup := azureonboard.BuildReaderSetup(tenantID, oid, scope, scopes)
+	return &setup
+}
+
+// ReaderSetup returns the role-assignment instructions for a consented tenant.
+//
+// Separate from ValidateARM because an operator needs it BEFORE the check can
+// pass, not only after it fails. Requires consent to have completed: the
+// service principal object id comes from an app-only token, which a tenant that
+// never consented cannot issue.
+func (s *AzureOnboardService) ReaderSetup(
+	ctx context.Context, workspaceID uuid.UUID, tenantID string,
+) (*azureonboard.ReaderSetup, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	if _, err := s.repo.Get(workspaceID, tenantID); err != nil {
+		return nil, err
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	tok, err := s.azure.ClientCredentials(callCtx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if tok.PrincipalObjectID != "" {
+		_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, tok.PrincipalObjectID)
+	}
+
+	// Best effort: if ARM already answers, the real subscription ids go into the
+	// commands instead of a placeholder.
+	subs, _ := s.azure.ListSubscriptions(callCtx, tok.AccessToken)
+	return s.readerSetup(tenantID, tok, subs), nil
+}
+
+/* ------------------------------- connectors ------------------------------ */
+
+// Connectors lists this workspace's consented tenants.
+func (s *AzureOnboardService) Connectors(workspaceID uuid.UUID) ([]models.AzureConnector, error) {
+	return s.repo.List(workspaceID)
+}
+
+/* --------------------------------- session -------------------------------- */
+
+// The operator's delegated token goes to the secrets store, not to a cookie and
+// not to a process-memory map: a cookie would put a live ARM bearer token in a
+// browser, and a memory map would drop every sign-in on restart and would not
+// exist at all on the other replica.
+func azureSessionPath(workspaceID uuid.UUID, sessionID string) string {
+	return fmt.Sprintf("kv/data/secret/workspaces/%s/cloud-discovery/azure/sessions/%s",
+		workspaceID, sessionID)
+}
+
+func (s *AzureOnboardService) saveSession(
+	workspaceID uuid.UUID, tok *azureonboard.TokenSet,
+) (string, error) {
+	if s.vault == nil {
+		return "", errors.New("vault client not configured; the azure sign-in token cannot be stored")
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate session id: %w", err)
+	}
+	sessionID := base64.RawURLEncoding.EncodeToString(raw)
+
+	if err := s.vault.WriteSecret(azureSessionPath(workspaceID, sessionID), map[string]interface{}{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+		"expires_at":    tok.ExpiresAt.UTC().Format(time.RFC3339),
+		"session_ends":  time.Now().Add(azureSessionTTL).UTC().Format(time.RFC3339),
+	}); err != nil {
+		return "", fmt.Errorf("store azure sign-in: %w", err)
+	}
+	return sessionID, nil
+}
+
+// loadSession returns a usable delegated token, refreshing it when the access
+// token has aged out but the sign-in itself has not.
+func (s *AzureOnboardService) loadSession(
+	ctx context.Context, workspaceID uuid.UUID, sessionID string,
+) (*azureonboard.TokenSet, error) {
+	if sessionID == "" {
+		return nil, azureonboard.ErrNoSession
+	}
+	// The id lands in a secrets-store path. Anything outside the alphabet it was
+	// minted from is rejected rather than escaped.
+	if !isBase64URL(sessionID) || len(sessionID) > 128 {
+		return nil, azureonboard.ErrNoSession
+	}
+	if s.vault == nil {
+		return nil, errors.New("vault client not configured")
+	}
+
+	path := azureSessionPath(workspaceID, sessionID)
+	data, err := s.vault.ReadSecret(path)
+	if err != nil || data == nil {
+		return nil, azureonboard.ErrNoSession
+	}
+
+	if ends, ok := data["session_ends"].(string); ok {
+		if t, pErr := time.Parse(time.RFC3339, ends); pErr == nil && time.Now().After(t) {
+			_ = s.vault.DeleteSecret(path)
+			return nil, azureonboard.ErrNoSession
+		}
+	}
+
+	tok := &azureonboard.TokenSet{}
+	tok.AccessToken, _ = data["access_token"].(string)
+	tok.RefreshToken, _ = data["refresh_token"].(string)
+	if exp, ok := data["expires_at"].(string); ok {
+		if t, pErr := time.Parse(time.RFC3339, exp); pErr == nil {
+			tok.ExpiresAt = t
+		}
+	}
+	if !tok.Expired() {
+		return tok, nil
+	}
+	if tok.RefreshToken == "" {
+		return nil, azureonboard.ErrNoSession
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	refreshed, err := s.azure.Refresh(callCtx, tok.RefreshToken)
+	if err != nil {
+		return nil, azureonboard.ErrNoSession
+	}
+	// Microsoft may or may not rotate the refresh token; keep the old one when
+	// it does not, or the next refresh has nothing to present.
+	if refreshed.RefreshToken == "" {
+		refreshed.RefreshToken = tok.RefreshToken
+	}
+	if wErr := s.vault.WriteSecret(path, map[string]interface{}{
+		"access_token":  refreshed.AccessToken,
+		"refresh_token": refreshed.RefreshToken,
+		"expires_at":    refreshed.ExpiresAt.UTC().Format(time.RFC3339),
+		"session_ends":  orNow(data["session_ends"]),
+	}); wErr != nil {
+		return nil, wErr
+	}
+	return refreshed, nil
+}
+
+// EndSession discards a stored sign-in.
+func (s *AzureOnboardService) EndSession(workspaceID uuid.UUID, sessionID string) {
+	if s.vault == nil || sessionID == "" || !isBase64URL(sessionID) {
+		return
+	}
+	_ = s.vault.DeleteSecret(azureSessionPath(workspaceID, sessionID))
+}
+
+func orNow(v interface{}) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return time.Now().Add(azureSessionTTL).UTC().Format(time.RFC3339)
+}
+
+func isBase64URL(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+/* --------------------------- assigning reader for them -------------------------- */
+
+// AssignReaderResult reports what was granted, and where.
+type AssignReaderResult struct {
+	TenantID string                          `json:"tenantId"`
+	Assigned []azureonboard.AssignmentResult `json:"assigned"`
+	AllOK    bool                            `json:"all_ok"`
+
+	// Fallback is attached when nothing could be granted, so an operator who
+	// lacks the privilege is not left with only an error.
+	Fallback *azureonboard.ReaderSetup `json:"fallback,omitempty"`
+}
+
+// AssignReader grants ARM Reader to the AuthSec application, without the
+// customer running anything.
+//
+// It works by asking ARM on behalf of the SIGNED-IN OPERATOR. The application
+// cannot grant itself a role; a human holding Owner or User Access
+// Administrator can, and this performs exactly the request that human would
+// make through the portal. If they do not hold it, ARM refuses and the manual
+// instructions come back instead -- nothing is half-done.
+//
+// scope is optional. Empty means "every subscription this operator can see in
+// the tenant", which is what makes it one click rather than one per
+// subscription. A root management group scope covers future subscriptions too,
+// but needs privilege at the root that most operators have to grant themselves
+// first, so it is never assumed.
+func (s *AzureOnboardService) AssignReader(
+	ctx context.Context, workspaceID uuid.UUID, sessionID, tenantID, scope string,
+) (*AssignReaderResult, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	if _, err := s.repo.Get(workspaceID, tenantID); err != nil {
+		return nil, err
+	}
+
+	sess, err := s.loadSession(ctx, workspaceID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sess.RefreshToken == "" {
+		return nil, azureonboard.ErrNoSession
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	// An ARM token issued by the sign-in tenant is refused when writing into a
+	// subscription that lives in a different directory, so trade the refresh
+	// token for one this tenant accepts.
+	userTok, err := s.azure.RefreshForTenant(callCtx, sess.RefreshToken, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The principal being granted access is the application's service principal
+	// in this tenant, which only an app-only token can name.
+	appTok, err := s.azure.ClientCredentials(callCtx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	principal := appTok.PrincipalObjectID
+	if principal == "" {
+		return nil, errors.New("could not determine the service principal object id for this tenant")
+	}
+	_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, principal)
+
+	scopes := []string{}
+	if scope = strings.TrimSpace(scope); scope != "" {
+		scopes = append(scopes, scope)
+	} else {
+		// The OPERATOR's token, not the application's: the whole point is that
+		// the operator can already see these and the application cannot yet.
+		subs, sErr := s.azure.ListSubscriptions(callCtx, userTok.AccessToken)
+		if sErr != nil {
+			return nil, sErr
+		}
+		for _, sub := range subs {
+			scopes = append(scopes, "/subscriptions/"+sub.SubscriptionID)
+		}
+	}
+
+	result := &AssignReaderResult{TenantID: tenantID}
+	if len(scopes) == 0 {
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+		return result, nil
+	}
+
+	allOK := true
+	for _, sc := range scopes {
+		r := s.azure.AssignRole(callCtx, userTok.AccessToken, sc, principal,
+			azureonboard.ReaderRoleDefinitionID)
+		result.Assigned = append(result.Assigned, r)
+		if !r.OK {
+			allOK = false
+		}
+	}
+	result.AllOK = allOK
+	if !allOK {
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+	}
+	return result, nil
+}
