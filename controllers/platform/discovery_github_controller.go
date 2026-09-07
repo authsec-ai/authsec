@@ -110,7 +110,7 @@ func (ctl *DiscoveryGitHubController) ScanGitHubSource(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(providerErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
@@ -468,13 +468,20 @@ func (ctl *DiscoveryGitHubController) ListSourceRepositories(c *gin.Context) {
 	}
 	repos, err := sc.ListSelectableRepositories(c.Request.Context(), workspaceID, sourceID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(providerErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"data": repos,
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
+			// A dedicated key, carrying the SAME constant the scan result uses.
+			// "note" is a general-purpose field reused for several unrelated
+			// messages on this controller, so a client cannot locate the
+			// disclosure in it without string-matching prose. The mandatory
+			// disclosure has to be findable by key, and identical wherever it
+			// appears, or a UI will render one surface without it.
+			"disclosure": services.ScanGrantDisclosure,
 			"note": "this is what the installation exposes; repositories not granted are not listed, " +
 				"and their absence is not evidence that they hold no agents",
 		},
@@ -888,4 +895,18 @@ func (ctl *DiscoveryGitHubController) ListGitHubInstallations(c *gin.Context) {
 				"whenever the App is installed on it, whether or not it has been added here",
 		},
 	})
+}
+
+// providerErrorStatus maps a failure to the status its MEANING deserves.
+//
+// A provider we could not reach is 503, never 400 and never an empty 200.
+// "We could not look" and "we looked and found nothing" are opposite facts
+// about a customer's security posture, and a 400 invites a client to render
+// the first as the second.
+func providerErrorStatus(err error) int {
+	var unavail *services.ProviderUnavailableError
+	if errors.As(err, &unavail) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadRequest
 }
