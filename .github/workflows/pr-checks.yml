@@ -12,6 +12,14 @@ env:
 
 jobs:
   # ── Unit tests (always run, no DB required) ─────────────────────────────────
+  migration-hygiene:
+    name: Migration hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: No duplicate or self-transacting migrations
+        run: ./scripts/ci-migration-check.sh
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -42,13 +50,18 @@ jobs:
   merge-gate:
     name: Merge Gate
     runs-on: ubuntu-latest
-    needs: [unit-tests]
+    needs: [unit-tests, migration-hygiene]
     if: always()
     steps:
       - name: Unit tests must pass
         if: needs.unit-tests.result != 'success'
         run: |
           echo "Unit tests failed or were cancelled — merge blocked"
+          exit 1
+      - name: Migration hygiene must pass
+        if: needs.migration-hygiene.result != 'success'
+        run: |
+          echo "Migration hygiene failed — merge blocked"
           exit 1
       - name: All checks passed
         run: echo "All required checks passed"

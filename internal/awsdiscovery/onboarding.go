@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -49,6 +50,18 @@ const TemplateVersion = "2026-09-01"
 // client-side rate limiting whose behaviour is hard to reason about when a
 // scan is already slow for unrelated reasons.
 const maxRetryAttempts = 8
+
+// baseCredentialTimeout bounds resolving AuthSec's OWN AWS identity before an
+// assume-role call is attempted.
+//
+// Base credentials should resolve locally and instantly — environment,
+// shared config file, container endpoint, or EC2 metadata on a real host.
+// Capping the resolution means a deployment with no usable identity fails
+// here, quickly, as ErrNoBaseCredentials (an AuthSec-side 500) instead of
+// grinding through unreachable metadata endpoints until the caller's context
+// dies and surfacing as a misleading 400. Well under the service's 45s probe
+// budget, so the honest failure always arrives before any client timeout.
+const baseCredentialTimeout = 10 * time.Second
 
 // roleARNPattern matches an IAM role ARN and captures the partition and the
 // account. Paths are allowed: a role created inside an OU-managed path has an
@@ -167,6 +180,22 @@ func (v *LiveVerifier) Config(ctx context.Context, req AssumeRequest) (aws.Confi
 		awsconfig.WithRetryMode(aws.RetryModeStandard),
 	)
 	if err != nil {
+		return aws.Config{}, fmt.Errorf("%w: %v", ErrNoBaseCredentials, err)
+	}
+
+	// Prove AuthSec has an AWS identity of its own BEFORE building the
+	// assume-role provider. LoadDefaultConfig never touches the network, so
+	// without this check a credential-less deployment only discovers it has
+	// nothing to sign with deep inside the STS call — after seconds of
+	// metadata-endpoint retries whose error classifies as neither assumable
+	// nor throttled and lands on the generic 400. The resolved chain is
+	// cache-backed, so on a healthy deployment this is one cheap lookup.
+	if base.Credentials == nil {
+		return aws.Config{}, fmt.Errorf("%w: credential chain resolved to nothing", ErrNoBaseCredentials)
+	}
+	credCtx, credCancel := context.WithTimeout(ctx, baseCredentialTimeout)
+	defer credCancel()
+	if _, err := base.Credentials.Retrieve(credCtx); err != nil {
 		return aws.Config{}, fmt.Errorf("%w: %v", ErrNoBaseCredentials, err)
 	}
 

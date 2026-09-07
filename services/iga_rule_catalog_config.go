@@ -138,6 +138,13 @@ var extractorRegistry = map[string]func(EffectiveVocabulary) extractorFn{
 	"compose":    bindVocab(extractCompose),
 	"dependency": bindVocab(extractDependencyManifest),
 	"text":       bindVocab(extractGenericText),
+	// Catalogue v1 (AS-107); parsers live in iga_rules_v1.go.
+	"reusable-workflow":   bindVocab(extractReusableWorkflow),
+	"self-hosted-runner":  bindVocab(extractSelfHostedRunner),
+	"terraform":           bindVocab(extractTerraform),
+	"kubernetes-manifest": bindVocab(extractKubernetesManifest),
+	"helm-values":         bindVocab(extractHelmValues),
+	"secret-reference":    bindVocab(extractSecretReference),
 }
 
 // bindVocab turns a vocabulary-taking extractor into a factory.
@@ -208,12 +215,50 @@ const (
 	maxOverlayBytesOnWire = 256 << 10
 )
 
+// legacyRuleIDs maps rule ids the catalogue used to ship to the ids that
+// replaced them. An overlay is keyed by rule id and stored per workspace, so a
+// rename in code would otherwise make every saved overlay fail validation on
+// its next read — and the scanner treats an unresolvable overlay as fatal.
+//
+// One old id may fan out to several new ones: dependency.manifest was split by
+// ecosystem so the combination rule can count independent signals, and an
+// overlay that tuned the old rule should tune all of its descendants.
+var legacyRuleIDs = map[string][]string{
+	"config.mcp-servers":  {"manifest.mcp-server-config"},
+	"dependency.manifest": {"dependency.python", "dependency.node", "dependency.go"},
+}
+
+// withCurrentRuleIDs returns a copy of the overlay whose rule keys are all
+// current. A legacy key is applied to each of its successors; an explicit
+// entry for a successor wins over the inherited one.
+func (o RuleCatalogOverlay) withCurrentRuleIDs() RuleCatalogOverlay {
+	if len(o.Rules) == 0 {
+		return o
+	}
+	rules := make(map[string]RuleOverlay, len(o.Rules))
+	for id, ru := range o.Rules {
+		if _, legacy := legacyRuleIDs[id]; !legacy {
+			rules[id] = ru
+		}
+	}
+	for id, ru := range o.Rules {
+		for _, cur := range legacyRuleIDs[id] {
+			if _, explicit := rules[cur]; !explicit {
+				rules[cur] = ru
+			}
+		}
+	}
+	o.Rules = rules
+	return o
+}
+
 // Validate rejects an overlay that is malformed, unsafe or unaffordable.
 //
 // Every rejection here is a cost or correctness problem that would otherwise
 // surface as a mysterious scan failure, an exhausted rate limit, or an
 // inventory full of noise.
 func (o *RuleCatalogOverlay) Validate() error {
+	*o = o.withCurrentRuleIDs()
 	base := DefaultRuleCatalog()
 	known := map[string]bool{}
 	for _, r := range base.Rules {
@@ -438,6 +483,7 @@ type EffectiveVocabulary struct {
 // The version becomes "<builtin>+ws:<hash>" so a finding always names the exact
 // ruleset that produced it — built-in version and customisation together.
 func ApplyOverlay(o RuleCatalogOverlay) (IGARuleCatalog, EffectiveVocabulary) {
+	o = o.withCurrentRuleIDs()
 	base := DefaultRuleCatalog()
 	vocab := EffectiveVocabulary{
 		FrameworkTokens: o.Vocabularies.FrameworkTokens.apply(agentFrameworkTokens),

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/policy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
@@ -144,19 +145,102 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 	}
 }
 
+// requestHost reads the effective Host this request arrived on, preferring
+// X-Forwarded-Host (set by the tunnel/proxy in front of local dev, or any
+// production load balancer) over the raw connection Host — the same
+// resolution CanonicalIssuerOnly uses, kept identical on purpose so the two
+// never disagree about what host a request came in on.
+func requestHost(c *gin.Context) string {
+	if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
+		return strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
+	}
+	return c.Request.Host
+}
+
+// issuerBaseForRequest picks which base URL this request's OIDC metadata
+// should be built from: the GCP WIF issuer (internal/gcp.ResolveWIFIssuerURL)
+// if and only if the request actually arrived on that issuer's host, else
+// the app's own canonical OAuthBaseURL() — unchanged default for every
+// other caller (SPIRE, general OIDC discovery, RFC 8414 clients).
+//
+// This exists because the discovery document's own "issuer"/"jwks_uri"
+// fields must exactly match the host a client fetched them from — Google
+// Cloud validates this when creating a WIF OIDC provider. Local dev is the
+// only place these two values can differ (BASE_URL stays localhost,
+// GCP_WIF_ISSUER_URL points at a public HTTPS tunnel); in production, where
+// GCP_WIF_ISSUER_URL is unset, this always resolves to OAuthBaseURL().
+func issuerBaseForRequest(c *gin.Context) string {
+	appBase := config.AppConfig.OAuthBaseURL()
+	wifBase := gcp.ResolveWIFIssuerURL(appBase)
+	if wifBase == appBase {
+		return appBase
+	}
+	wifHost, err := url.Parse(wifBase)
+	if err != nil || wifHost.Host == "" {
+		return appBase
+	}
+	if strings.EqualFold(requestHost(c), wifHost.Host) {
+		return wifBase
+	}
+	return appBase
+}
+
+// CanonicalIssuerOrWIFIssuer is CanonicalIssuerOnly's relaxed sibling, for
+// the two PUBLIC, READ-ONLY OIDC metadata endpoints a Workload Identity
+// Federation provider must be able to fetch directly from whatever host the
+// configured WIF issuer (internal/gcp.ResolveWIFIssuerURL) claims to be —
+// which may legitimately differ from the app's own canonical host in local
+// development (BASE_URL stays localhost while GCP_WIF_ISSUER_URL points at
+// a public HTTPS tunnel).
+//
+// Every OTHER /oauth/* endpoint (authorize, token, register, introspect,
+// revoke, userinfo, ...) keeps the strict, single-host CanonicalIssuerOnly()
+// completely unchanged — those carry real authorization state and must only
+// ever be served under the app's one canonical host, never a WIF-testing
+// tunnel. Only /.well-known/openid-configuration and /oauth/jwks use this.
+func (ctrl *OAuthASController) CanonicalIssuerOrWIFIssuer() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodOptions {
+			c.Next()
+			return
+		}
+
+		host := requestHost(c)
+		appBase := config.AppConfig.OAuthBaseURL()
+
+		if appParsed, err := url.Parse(appBase); err == nil && appParsed.Host != "" &&
+			strings.EqualFold(host, appParsed.Host) {
+			c.Next()
+			return
+		}
+		if wifBase := gcp.ResolveWIFIssuerURL(appBase); wifBase != appBase {
+			if wifParsed, err := url.Parse(wifBase); err == nil && wifParsed.Host != "" &&
+				strings.EqualFold(host, wifParsed.Host) {
+				c.Next()
+				return
+			}
+		}
+
+		// Neither the app's canonical host nor the configured WIF issuer's
+		// host: fall back to CanonicalIssuerOnly's own behavior — redirect
+		// to the canonical app host, never serve under an unrecognized one.
+		target := strings.TrimSuffix(appBase, "/") + c.Request.URL.RequestURI()
+		c.Redirect(http.StatusPermanentRedirect, target)
+		c.Abort()
+	}
+}
+
 // ASMetadata serves RFC 8414 Authorization Server Metadata.
 // GET /.well-known/oauth-authorization-server
 func (ctrl *OAuthASController) ASMetadata(c *gin.Context) {
-	baseURL := config.AppConfig.OAuthBaseURL()
-	c.JSON(http.StatusOK, ctrl.service.ASMetadata(baseURL))
+	c.JSON(http.StatusOK, ctrl.service.ASMetadata(issuerBaseForRequest(c)))
 }
 
 // OIDCDiscovery serves OpenID Connect Discovery 1.0 metadata.
 // GET /.well-known/openid-configuration
 // Returns the same superset document as ASMetadata (OIDC Discovery is a superset of RFC 8414).
 func (ctrl *OAuthASController) OIDCDiscovery(c *gin.Context) {
-	baseURL := config.AppConfig.OAuthBaseURL()
-	c.JSON(http.StatusOK, ctrl.service.ASMetadata(baseURL))
+	c.JSON(http.StatusOK, ctrl.service.ASMetadata(issuerBaseForRequest(c)))
 }
 
 // Authorize handles the OAuth authorization request.

@@ -81,6 +81,33 @@ type GitHubScanResult struct {
 	SelectionMode  string   `json:"selection_mode"`
 	ReposSelected  int      `json:"repos_selected"`
 	ReposTruncated int      `json:"repos_truncated"`
+	// Truncated names the units whose tree cut off, so TRUNCATED is explainable
+	// per repository rather than being a bare count an admin cannot act on.
+	Truncated []string `json:"truncated_repositories,omitempty"`
+	// PathsRecovered counts paths a truncated tree hid that per-directory
+	// listing got back: the measure of how much of a truncated repository was
+	// still worth reading.
+	PathsRecovered int `json:"paths_recovered"`
+	// Failed names the repositories that could not be opened at all.
+	Failed []string `json:"failed_repositories,omitempty"`
+
+	// Selected by the plan but never exposed by the installation. Kept apart
+	// from Excluded because they demand different actions from different
+	// people: Excluded is "our admin chose not to scan this" and is fixed by
+	// editing the plan; this is "our admin asked for this and GitHub never
+	// granted it" and is fixed only on GitHub.
+	ReposSelectedNotGranted int      `json:"repos_selected_not_granted"`
+	SelectedNotGranted      []string `json:"selected_not_granted,omitempty"`
+	// Scanned, and archived on GitHub. A subset of ReposScanned, not a skip:
+	// read-only is not empty, and an archived declaration still names real
+	// secrets and runtimes. Counted so an admin can discount findings that can
+	// no longer be merged.
+	ReposArchived int      `json:"repos_archived"`
+	Archived      []string `json:"archived_repositories,omitempty"`
+	// Disclosure is UNCONDITIONAL and travels in the payload rather than in UI
+	// copy, so a client cannot omit it by accident. A scan can only ever speak
+	// for what the installation was granted.
+	Disclosure string `json:"disclosure"`
 
 	// BranchMode is the ref plan this run actually executed under.
 	BranchMode      string `json:"branch_mode"`
@@ -91,17 +118,54 @@ type GitHubScanResult struct {
 
 	FilesFetched int `json:"files_fetched"`
 	// FilesFailed counts unreadable files inside repositories that opened fine.
-	FilesFailed     int       `json:"files_failed"`
-	SightingsNew    int       `json:"sightings_new"`
-	SightingsBumped int       `json:"sightings_bumped"`
-	Complete        bool      `json:"complete_for_selected_scope"`
-	Warnings        []string  `json:"warnings,omitempty"`
-	ScannedAt       time.Time `json:"scanned_at"`
+	FilesFailed int      `json:"files_failed"`
+	FailedFiles []string `json:"failed_files,omitempty"`
+	// BlobsSkipped counts unchanged files whose blob SHA matched the stored one,
+	// so no fetch was spent: the difference between a cheap refresh and a full
+	// re-read of every declaration in the estate.
+	BlobsSkipped    int `json:"blobs_skipped"`
+	SightingsNew    int `json:"sightings_new"`
+	SightingsBumped int `json:"sightings_bumped"`
+	// AgentsCounted and CandidatesRecorded are reported SEPARATELY and never
+	// summed into one "agents discovered" number. A single weak signal is a
+	// candidate, not an agent; an inventory whose headline count carries junk
+	// gets abandoned, and then every real finding is missed too.
+	AgentsCounted      int       `json:"agents_counted"`
+	CandidatesRecorded int       `json:"candidates_recorded"`
+	Complete           bool      `json:"complete_for_selected_scope"`
+	Warnings           []string  `json:"warnings,omitempty"`
+	ScannedAt          time.Time `json:"scanned_at"`
 
 	// Done lists the units ("owner/name@ref") this run finished, in order. It is
 	// the resume cursor: a retry skips everything already in here.
 	Done []string `json:"-"`
 }
+
+// storedBlobSHA reads the blob SHA a previous scan recorded for a sighting.
+//
+// Metadata is the store of record here rather than a dedicated column, because
+// the SHA is provider-specific evidence about one file and the inventory row is
+// provider-neutral. A missing or unparseable value simply means "no basis to
+// skip", which fails safe toward fetching.
+func storedBlobSHA(a *models.DiscoveredAgent) string {
+	if a == nil || len(a.Metadata) == 0 {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(a.Metadata, &m); err != nil {
+		return ""
+	}
+	sha, _ := m["blob_sha"].(string)
+	return sha
+}
+
+// ScanGrantDisclosure is the coverage limit every GitHub scan carries.
+//
+// It states the one thing a reader cannot infer from the counters: the scan
+// saw only what the installation exposed, so a repository's absence from
+// these numbers is not evidence that it holds no agents.
+const ScanGrantDisclosure = "repositories not granted to this installation are not listed or scanned, " +
+	"and their absence from this result is not evidence that they hold no agents"
 
 // githubScannerConfig is the per-source config stored on discovery_sources.
 //
@@ -200,6 +264,10 @@ type RepoChoice struct {
 	FullName      string `json:"full_name"`
 	DefaultBranch string `json:"default_branch"`
 	Selected      bool   `json:"selected"`
+	// Archived is shown at selection time so an admin can judge the cost
+	// before spending API budget: findings here are real but unfixable in
+	// place, since the repository can no longer be merged to.
+	Archived bool `json:"archived"`
 }
 
 // ListSelectableRepositories returns what the installation can see, so an admin
@@ -219,7 +287,9 @@ func (s *GitHubRepoScanner) ListSelectableRepositories(ctx context.Context, work
 	pctx := cfg.providerContext(workspaceID)
 	scopes, err := s.provider.ListScopes(ctx, pctx)
 	if err != nil {
-		return nil, err
+		// Reaching GitHub failed. Typed, so the handler answers 503 rather
+		// than letting an empty picker imply the installation grants nothing.
+		return nil, unavailable("list repositories", err)
 	}
 	out := make([]RepoChoice, 0, len(scopes))
 	for _, sc := range scopes {
@@ -229,6 +299,7 @@ func (s *GitHubRepoScanner) ListSelectableRepositories(ctx context.Context, work
 		out = append(out, RepoChoice{
 			NativeID: sc.NativeID, FullName: sc.DisplayName,
 			DefaultBranch: sc.DefaultBranch, Selected: cfg.Repositories.wants(sc.DisplayName),
+			Archived: sc.Archived,
 		})
 	}
 	return out, nil
@@ -331,7 +402,7 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 
 	res := &GitHubScanResult{
 		SourceID: sourceID, Complete: true, SelectionMode: mode,
-		BranchMode: branchMode, ScannedAt: time.Now(),
+		BranchMode: branchMode, Disclosure: ScanGrantDisclosure, ScannedAt: time.Now(),
 	}
 	if b := opts.Base; b != nil {
 		// Cumulative work only. A unit skipped as already-done contributes
@@ -343,6 +414,13 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 		res.FilesFailed = b.FilesFailed
 		res.SightingsNew = b.SightingsNew
 		res.SightingsBumped = b.SightingsBumped
+		res.BlobsSkipped = b.BlobsSkipped
+		res.PathsRecovered = b.PathsRecovered
+		res.AgentsCounted = b.AgentsCounted
+		res.CandidatesRecorded = b.CandidatesRecorded
+		res.Failed = append(res.Failed, b.Failed...)
+		res.FailedFiles = append(res.FailedFiles, b.FailedFiles...)
+		res.Truncated = append(res.Truncated, b.Truncated...)
 		res.Warnings = append(res.Warnings, b.Warnings...)
 		// A problem seen by an earlier attempt did not stop being a problem.
 		res.Complete = res.Complete && b.Complete
@@ -350,7 +428,10 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 
 	scopes, err := s.provider.ListScopes(ctx, pctx)
 	if err != nil {
-		return nil, fmt.Errorf("enumerate repositories: %w", err)
+		// Enumeration itself failed, so nothing was inspected at all. This is
+		// the whole-scan failure case and must never surface as a completed
+		// scan that found nothing.
+		return nil, unavailable("enumerate repositories", err)
 	}
 
 	repoScopes := 0
@@ -359,6 +440,37 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 			repoScopes++
 		}
 	}
+	// The plan may name repositories this installation never exposed: a stale
+	// entry, a repository since deleted or transferred out, or a grant that was
+	// simply never made on GitHub. Only a diff against the live grant can
+	// surface those — the scan loop below walks the grant and can never mention
+	// a repository absent from it.
+	if mode == "selected" {
+		granted := make(map[string]struct{}, repoScopes)
+		for _, scope := range scopes {
+			if scope.Kind == "repository" {
+				granted[strings.ToLower(scope.DisplayName)] = struct{}{}
+			}
+		}
+		for _, want := range cfg.Repositories.Include {
+			if _, ok := granted[strings.ToLower(want)]; ok {
+				continue
+			}
+			res.ReposSelectedNotGranted++
+			res.SelectedNotGranted = append(res.SelectedNotGranted, want)
+			// Also in the Excluded roll-up, by bare name, so "what was left
+			// out" has one answer; SelectedNotGranted is the subset with a why.
+			res.ReposExcluded++
+			res.Excluded = append(res.Excluded, want)
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"%s: selected for scanning but not granted to this installation; "+
+					"it was not inspected — grant it on GitHub or remove it from the plan", want))
+			// Part of the selected scope went uninspected, so the scan cannot
+			// claim completeness FOR THAT SCOPE.
+			res.Complete = false
+		}
+	}
+
 	if repoScopes == 0 {
 		// The installation is reachable but grants nothing. "Complete" would be
 		// vacuously true, so say plainly that there was nothing to look at.
@@ -378,6 +490,12 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 			continue
 		}
 		res.ReposSelected++
+		// Counted, then scanned anyway: read-only is not empty, and an archived
+		// declaration still names a live secret.
+		if scope.Archived {
+			res.ReposArchived++
+			res.Archived = append(res.Archived, scope.DisplayName)
+		}
 
 		refs := s.refsFor(ctx, pctx, scope, branchMode, maxBranches, res)
 
@@ -427,6 +545,7 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 				// unreadable side branch does not.
 				if br.IsDefault {
 					res.ReposFailed++
+					res.Failed = append(res.Failed, fmt.Sprintf("%s: %v", unit, terr))
 				}
 				res.Complete = false
 				res.Warnings = append(res.Warnings, fmt.Sprintf("%s: %v", unit, terr))
@@ -435,9 +554,23 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 			if truncated {
 				// The tree cut off, so files beyond the limit were never seen.
 				res.ReposTruncated++
+				res.Truncated = append(res.Truncated, unit)
 				res.Complete = false
-				res.Warnings = append(res.Warnings,
-					fmt.Sprintf("%s: git tree truncated; unwalked subtrees not inspected", unit))
+
+				// Recover what the catalogue can still name by directory. The
+				// cut-off is arbitrary, so a declaration we care about may sit
+				// just past it; asking for the handful of directories the rules
+				// name costs a few calls and turns most of a truncated repository
+				// back into real coverage. Complete stays false regardless: a
+				// bare-basename glob can match at any depth, and those depths
+				// were never walked.
+				recovered, dirs := RecoverTruncatedTree(ctx, s.provider, pctx, refScope, catalog, entries)
+				entries = append(entries, recovered...)
+				res.PathsRecovered += len(recovered)
+				res.Warnings = append(res.Warnings, fmt.Sprintf(
+					"%s: git tree truncated; recovered %d path(s) from %d catalogue director(ies), "+
+						"but paths outside them were never inspected",
+					unit, len(recovered), dirs))
 			}
 			if br.CommitSHA != "" {
 				walkedCommits[br.CommitSHA] = true
@@ -448,13 +581,54 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 			}
 			res.BranchesScanned++
 
+			// Findings are BUFFERED for the whole unit before any is reported,
+			// because the combination rule is a per-repository judgement:
+			// "langchain in requirements.txt" and "OPENAI_API_KEY nearby" are each
+			// too weak to count alone and together are strong. Reporting
+			// file-by-file would decide before the corroborating signal is seen.
+			var pending []pendingFinding
+			var signals []RuleSignal
+
 			for _, e := range entries {
-				rule, ok := catalog.MatchRule(e.Path)
-				if !ok {
+				// EVERY rule claiming this path, not just the first: a workflow
+				// may declare an agent invocation AND run on a self-hosted
+				// runner, and those are different facts about the same file.
+				rules := catalog.MatchRules(e.Path)
+				if len(rules) == 0 {
 					continue // not a path any rule can interpret; never fetched
 				}
 				// Already reported from the default branch, byte for byte.
 				if !br.IsDefault && onDefault[e.Path] == e.SHA && e.SHA != "" {
+					continue
+				}
+				fingerprint := declarationFingerprint(scope.NativeID, br, e.Path)
+
+				// Incremental refresh. GitHub hands over the blob SHA for free in
+				// the tree listing, so an unchanged file costs nothing to skip.
+				// The sighting is still reported, with EMPTY facts: the upsert
+				// keeps stored metadata when it receives none, so this advances
+				// last-seen without re-fetching. Skipping the REPORT as well as
+				// the fetch would let every unchanged agent decay into "possibly
+				// gone" for exactly the agents just confirmed still declared.
+				if prev, perr := s.discovery.GetAgentByFingerprint(
+					workspaceID, models.DiscoverySourceRepoScan, fingerprint,
+				); perr == nil && prev != nil && e.SHA != "" && storedBlobSHA(prev) == e.SHA {
+					if _, _, rerr := s.discovery.ReportSighting(workspaceID, actor, SightingInput{
+						Source:            models.DiscoverySourceRepoScan,
+						DiscoverySourceID: &sourceID,
+						Fingerprint:       fingerprint,
+						DeploymentOrigin:  models.DeploymentOriginUnknown,
+					}); rerr != nil {
+						res.Warnings = append(res.Warnings, fmt.Sprintf(
+							"%s:%s: touch unchanged sighting: %v", unit, e.Path, rerr))
+						res.Complete = false
+						continue
+					}
+					if br.IsDefault {
+						onDefault[e.Path] = e.SHA
+					}
+					res.BlobsSkipped++
+					res.SightingsBumped++
 					continue
 				}
 
@@ -465,6 +639,8 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 					// reporting only repository failures shows "0 failed" beside
 					// a page of file errors.
 					res.FilesFailed++
+					res.FailedFiles = append(res.FailedFiles,
+						fmt.Sprintf("%s:%s: %v", unit, e.Path, ferr))
 					res.Complete = false
 					res.Warnings = append(res.Warnings,
 						fmt.Sprintf("%s:%s: %v", unit, e.Path, ferr))
@@ -472,30 +648,63 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 				}
 				res.FilesFetched++
 
-				facts, secretRefs, xerr := rule.Extract(e.Path, body)
-				if xerr != nil || facts == nil {
-					// A malformed or uninteresting file is not an agent.
+				// Run every claiming rule and merge what fires. A rule that
+				// declines (nil facts) or fails to parse contributes nothing and
+				// must not suppress the others. ExtractRedacted is the only
+				// entry point: values under sensitive keys never reach a row.
+				facts := map[string]interface{}{}
+				var firedRules []IGARule
+				var secretRefs []string
+				for _, rule := range rules {
+					rf, rs, xerr := rule.ExtractRedacted(e.Path, body)
+					if xerr != nil || rf == nil {
+						continue
+					}
+					for k, v := range rf {
+						if _, clash := facts[k]; !clash {
+							facts[k] = v
+						}
+					}
+					secretRefs = append(secretRefs, rs...)
+					firedRules = append(firedRules, rule)
+				}
+				if len(firedRules) == 0 {
+					// Nothing in this file matched any rule's content test.
 					continue
 				}
 				// Names only. A secret value is never read, stored or reported.
 				if len(secretRefs) > 0 {
-					facts["secret_references"] = secretRefs
+					facts["secret_references"] = dedupeStrings(secretRefs)
 				}
 				if owners := MatchCodeowners(coRules, e.Path); len(owners) > 0 {
 					facts["codeowners"] = owners
 				}
 				facts["repository"] = scope.DisplayName
 				facts["path"] = e.Path
-				facts["rule_id"] = rule.ID
-				facts["rule_version"] = rule.Version
+				// Set only when true, so its presence is the signal.
+				if scope.Archived {
+					facts["repository_archived"] = true
+				}
+				// rule_id names the STRONGEST rule that fired, which is what the
+				// row is worth; rule_ids lists every signal, which is what makes
+				// the finding explainable and what a retraction needs when one
+				// rule turns out to be wrong.
+				primary := firedRules[0]
+				var ruleIDs []string
+				for _, r := range firedRules {
+					ruleIDs = append(ruleIDs, r.ID+"@"+r.Version)
+					if r.Confidence == ConfidenceHigh && primary.Confidence != ConfidenceHigh {
+						primary = r
+					}
+				}
+				facts["rule_id"] = primary.ID
+				facts["rule_version"] = primary.Version
+				facts["rule_ids"] = ruleIDs
 				// The catalogue version this finding came from. Patterns are
-				// configurable, so "which ruleset produced this?" is a real
-				// question — and because raw bodies are discarded after parse, a
-				// changed ruleset cannot be replayed over stored evidence. This
-				// is what lets the console mark older findings as stale instead
-				// of presenting them as current.
+				// configurable and raw bodies are discarded after parse, so this
+				// is what lets the console mark older findings as stale.
 				facts["catalog_version"] = catalog.Version
-				facts["evidence_mode"] = rule.EvidenceMode
+				facts["evidence_mode"] = primary.EvidenceMode
 				facts["content_sha256"] = HashBody(body)
 				// The blob SHA lets a later scan skip an unchanged file.
 				facts["blob_sha"] = e.SHA
@@ -504,17 +713,44 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 				// one merely proposed on a branch.
 				facts["branch"] = br.Name
 				facts["is_default_branch"] = br.IsDefault
+				// This file's own strength, before corroboration across the unit.
+				facts["confidence"] = StrongestConfidence(firedRules)
 
+				for _, r := range firedRules {
+					signals = append(signals, RuleSignal{
+						RuleID: r.ID, Confidence: r.Confidence, Path: e.Path,
+					})
+				}
 				if br.IsDefault {
 					onDefault[e.Path] = e.SHA
 				}
+				pending = append(pending, pendingFinding{
+					fingerprint: fingerprint,
+					displayName: declarationName(facts, e.Path),
+					path:        e.Path,
+					facts:       facts,
+				})
+			}
 
+			// The whole unit has been read, so the signals can corroborate each
+			// other. Combined confidence decides only ONE thing: whether a
+			// finding may be counted as an agent or belongs in the candidate
+			// bucket a human reviews. Everything is recorded either way — be
+			// permissive about what you RECORD, strict about what you COUNT.
+			combined := CombineConfidence(signals)
+			countable := CountsAsAgent(combined)
+			for _, pf := range pending {
+				pf.facts["combined_confidence"] = combined
+				pf.facts["counts_as_agent"] = countable
+				if !countable {
+					pf.facts["review_bucket"] = "candidate"
+				}
 				_, created, rerr := s.discovery.ReportSighting(workspaceID, actor, SightingInput{
 					Source:            models.DiscoverySourceRepoScan,
 					DiscoverySourceID: &sourceID,
-					Fingerprint:       declarationFingerprint(scope.NativeID, br, e.Path),
-					DisplayName:       declarationName(facts, e.Path),
-					Metadata:          facts,
+					Fingerprint:       pf.fingerprint,
+					DisplayName:       pf.displayName,
+					Metadata:          pf.facts,
 					// A parsed file is a DECLARATION, not a deployment. It may never
 					// have run, and nothing in the file says how it was deployed, so
 					// "automated" would be an assertion we cannot support.
@@ -522,7 +758,7 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 				})
 				if rerr != nil {
 					res.Warnings = append(res.Warnings,
-						fmt.Sprintf("%s:%s: report sighting: %v", unit, e.Path, rerr))
+						fmt.Sprintf("%s:%s: report sighting: %v", unit, pf.path, rerr))
 					res.Complete = false
 					continue
 				}
@@ -530,6 +766,12 @@ func (s *GitHubRepoScanner) ScanWithOptions(ctx context.Context, workspaceID, so
 					res.SightingsNew++
 				} else {
 					res.SightingsBumped++
+				}
+				// Separate counts, never summed into one "agents discovered".
+				if countable {
+					res.AgentsCounted++
+				} else {
+					res.CandidatesRecorded++
 				}
 			}
 
@@ -633,6 +875,15 @@ func declarationFingerprint(repoNativeID string, br ProviderBranch, path string)
 	return fmt.Sprintf("gh:%s@%s:%s", repoNativeID, br.Name, path)
 }
 
+// pendingFinding is one buffered declaration awaiting its repository's combined
+// confidence. It exists only for the length of one repository's scan.
+type pendingFinding struct {
+	fingerprint string
+	displayName string
+	path        string
+	facts       map[string]interface{}
+}
+
 // declarationName prefers the name the declaration gives itself, falling back
 // to the path so a row is never anonymous.
 func declarationName(facts map[string]interface{}, path string) string {
@@ -640,4 +891,54 @@ func declarationName(facts map[string]interface{}, path string) string {
 		return v
 	}
 	return path
+}
+
+// ProviderUnavailableError marks a failure to REACH GitHub, as distinct from a
+// caller mistake or a genuinely empty result.
+//
+// It exists as a type rather than a convention because the two facts it
+// separates look identical on screen and are opposites in meaning:
+//
+//	zero-because-broken  -> the provider is unreachable, coverage FAILED,
+//	                        and the customer's real posture is unknown
+//	zero-because-clean   -> we looked at everything selected and found nothing
+//
+// A caller that cannot tell them apart will eventually render "0 agents" over a
+// broken connection, which reads as an all-clear. Making it a type means the
+// unavailable case cannot silently serialise as an empty list: a handler must
+// either match it and answer 503, or fail loudly.
+type ProviderUnavailableError struct {
+	Op  string
+	Err error
+}
+
+func (e *ProviderUnavailableError) Error() string {
+	if e.Op == "" {
+		return "github unavailable: " + e.Err.Error()
+	}
+	return e.Op + ": github unavailable: " + e.Err.Error()
+}
+
+func (e *ProviderUnavailableError) Unwrap() error { return e.Err }
+
+// unavailable wraps a provider transport failure so callers can answer 503.
+func unavailable(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ProviderUnavailableError{Op: op, Err: err}
+}
+
+// dedupeStrings keeps first-seen order so evidence is stable across runs.
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range in {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }

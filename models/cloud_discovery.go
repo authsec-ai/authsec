@@ -400,6 +400,114 @@ func (c *CloudConnector) SetAWSAttrs(a AWSConnectorAttrs) error {
 	return nil
 }
 
+// GCPConnectorAttrs is the GCP shape of CloudConnector.Attrs — the WIF analog
+// of AWSConnectorAttrs, per prompt.md's GCP-D9 design. Everything here is
+// non-secret: a project id, a service-account email, a GCP resource name, or
+// AuthSec's own deterministic derivation of one. No column or field anywhere
+// in this struct accepts key material — the json_key path's key bytes never
+// reach this struct, only a reference to where they live in Vault
+// (CloudConnector.AuthRef, not Attrs).
+type GCPConnectorAttrs struct {
+	// DisplayName is the operator's label for the connector. Cosmetic; ScopeID
+	// is the identity.
+	DisplayName string `json:"display_name,omitempty"`
+
+	// AuthMethod is "json_key" or "wif" — see GCPAuthMethodJSONKey/
+	// GCPAuthMethodWIF in services/gcp_auth_service.go. Recorded here (not just
+	// inferable from AuthRef's prefix) so a reader never has to parse AuthRef
+	// to answer "how is this connector authenticated".
+	AuthMethod string `json:"auth_method,omitempty"`
+
+	// ReaderProjectID is the reader service account's home project — distinct
+	// from ScopeID, since a service account always has a home project even
+	// when its IAM grants are at org/folder scope (GCP-D9, point 2).
+	ReaderProjectID string `json:"reader_project_id,omitempty"`
+
+	// ReaderSAEmail is the reader service account's email, as the customer
+	// pasted it back (json_key: parsed from the uploaded key's client_email;
+	// wif: the second of the two values GCP-D9's flow has the customer paste).
+	ReaderSAEmail string `json:"reader_sa_email,omitempty"`
+
+	// WIFProviderResource is the full WIF provider resource name the customer
+	// pasted back. Empty for a json_key connector. The one fact AuthSec cannot
+	// derive itself (it embeds the GCP project NUMBER) — see GCP-D9's naming/
+	// pool-ownership note.
+	WIFProviderResource string `json:"wif_provider_resource,omitempty"`
+
+	// WIFSubject is the deterministic subject internal/gcp.DeriveWIFParams
+	// computed for this (workspace, scope) pair — durable so every later
+	// scan/verify call can re-derive the same value without re-deriving it
+	// from scratch or storing it twice inconsistently.
+	WIFSubject string `json:"wif_subject,omitempty"`
+
+	// PoolID and ProviderID are internal/gcp.DeriveWIFParams's other two
+	// outputs, stored for the same reason as WIFSubject: so a later read never
+	// has to re-derive what was already derived once at CreateConnector time.
+	PoolID     string `json:"pool_id,omitempty"`
+	ProviderID string `json:"provider_id,omitempty"`
+
+	// CAIQuotaProject is the project Cloud Asset Inventory calls bill against.
+	// Per authsec/docs/gcp/feasibility-validation.md's STEP 4 finding, this is
+	// ReaderProjectID by default — recorded explicitly rather than re-derived
+	// by every later scan call, mirroring why WIFSubject/PoolID/ProviderID are
+	// stored rather than recomputed.
+	CAIQuotaProject string `json:"cai_quota_project,omitempty"`
+
+	// RoleSetStatus records which reader role set this connector was set up
+	// against: "confirmed" once GCP-01's feasibility ledger reaches COMPLETE,
+	// "candidate_pending_GCP-01" until then (see internal/gcp.RoleSetStatus).
+	// Recorded per connector so an operator can find connectors set up
+	// against an earlier, still-candidate role set once GCP-01 closes.
+	RoleSetStatus string `json:"role_set_status,omitempty"`
+
+	// SetupScriptVersion is the internal/gcp.Version the customer's script was
+	// rendered from — the WIF/json_key analog of AWS's TemplateVersion, same
+	// reason: lets an operator find connectors still on an older script once
+	// the role set or binding shape changes.
+	SetupScriptVersion string `json:"setup_script_version,omitempty"`
+
+	// ProvisionedVia and ProvisionedBy are additive provenance metadata for
+	// the Google Authentication onboarding option (services/gcp_oauth_
+	// provision_service.go): they record HOW a WIF connector's GCP-side
+	// resources were configured, never a second auth method — AuthMethod
+	// above still reads "wif" for a connector provisioned this way, and its
+	// persistent credential is still the ordinary ResolveWIFCredential path.
+	// Both fields are omitted (empty string, indistinguishable from a
+	// manually-onboarded connector on every other field) unless a connector
+	// was actually created through that option. ProvisionedBy deliberately
+	// reuses the same AuthSec actor identifier already recorded on
+	// CloudConnector.CreatedBy — never a Google account email or any other
+	// Google identity detail, per this option's minimum-necessary-
+	// persistence design: the transient Google identity used for the
+	// one-time OAuth consent lives only in a short-lived Redis session and
+	// the audit trail, never here.
+	ProvisionedVia string `json:"provisioned_via,omitempty"`
+	ProvisionedBy  string `json:"provisioned_by,omitempty"`
+}
+
+// GCPAttrs decodes Attrs as the GCP shape. A malformed or empty blob decodes
+// to a zero struct rather than an error, for the same reason AWSAttrs does:
+// Attrs is provider extras, and a connector must stay listable even if one
+// key is unreadable.
+func (c *CloudConnector) GCPAttrs() GCPConnectorAttrs {
+	var a GCPConnectorAttrs
+	if len(c.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(c.Attrs, &a)
+	return a
+}
+
+// SetGCPAttrs encodes the GCP shape into Attrs.
+func (c *CloudConnector) SetGCPAttrs(a GCPConnectorAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	c.Attrs = raw
+	return nil
+}
+
 /* ============================================================================
    Ticket [2]: cloud_assume_edge, cloud_permission, cloud_resource.
    ========================================================================= */

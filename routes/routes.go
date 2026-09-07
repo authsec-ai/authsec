@@ -212,8 +212,18 @@ func SetupRoutes(
 
 	// RFC 8414 — AS Metadata discovery (must be at root)
 	r.GET("/.well-known/oauth-authorization-server", oauthASController.CanonicalIssuerOnly(), oauthASController.ASMetadata)
-	// OpenID Connect Discovery 1.0 — same superset metadata
-	r.GET("/.well-known/openid-configuration", oauthASController.CanonicalIssuerOnly(), oauthASController.OIDCDiscovery)
+	// OpenID Connect Discovery 1.0 — same superset metadata. Relaxed host
+	// check (not CanonicalIssuerOnly): a GCP Workload Identity Federation
+	// provider must be able to fetch this directly from the configured WIF
+	// issuer's own host (GCP_WIF_ISSUER_URL), which in local development is
+	// a public HTTPS tunnel, not the app's canonical BASE_URL host. See
+	// CanonicalIssuerOrWIFIssuer's doc comment.
+	r.GET("/.well-known/openid-configuration", oauthASController.CanonicalIssuerOrWIFIssuer(), oauthASController.OIDCDiscovery)
+	// JWKS: same relaxed reasoning as discovery above — GCP's STS fetches
+	// this directly from the WIF issuer host too. Deliberately NOT inside
+	// the oauth group below (that group's CanonicalIssuerOnly() is correct
+	// and unchanged for every other OAuth endpoint).
+	r.GET("/oauth/jwks", oauthASController.CanonicalIssuerOrWIFIssuer(), oauthASController.JWKS)
 
 	// Global OAuth + OIDC endpoints (unauthenticated — the OAuth flow itself handles authz)
 	oauth := r.Group("/oauth")
@@ -227,7 +237,6 @@ func SetupRoutes(
 		oauth.PUT("/register/:client_id", oauthASController.RFC7592Put)
 		oauth.DELETE("/register/:client_id", oauthASController.RFC7592Delete)
 		oauth.POST("/introspect", middlewares.StrictAuthRateLimitMiddleware(60, time.Minute), oauthASController.Introspect)
-		oauth.GET("/jwks", oauthASController.JWKS)
 		oauth.POST("/revoke", oauthASController.Revoke)
 		// OIDC endpoints
 		oauth.GET("/userinfo", oauthASController.Userinfo)
@@ -1706,6 +1715,63 @@ func SetupRoutes(
 			discovery.GET("/aws/assume-edges", middlewares.Require("discovery", "read"), cloudAWS.ListAssumeEdges)
 			discovery.GET("/aws/permissions", middlewares.Require("discovery", "read"), cloudAWS.ListPermissions)
 			discovery.GET("/aws/resources", middlewares.Require("discovery", "read"), cloudAWS.ListResources)
+
+			// GCP as a discovery channel, alongside AWS, Kubernetes and GitHub.
+			//
+			// Same boundary as the AWS block above: these endpoints ONBOARD a GCP
+			// scope (org, folder or project) — an agentless, read-only connection
+			// (Workload Identity Federation preferred, an uploaded service-account
+			// key as fallback) and the cloud_connector row every later GCP surface
+			// resolves against. Nothing here discovers anything yet.
+			//
+			// discovery:read gates the onboarding package for the same reason as
+			// AWS's: a reviewer must be able to see the permissions AuthSec is
+			// asking for before granting them. discovery:admin gates every mutation.
+			cloudGCP := platformCtrl.NewCloudGCPController(config.DB)
+			discovery.GET("/gcp/onboarding", middlewares.Require("discovery", "read"), cloudGCP.GetOnboardingPackage)
+			discovery.POST("/gcp/connectors", middlewares.Require("discovery", "admin"), cloudGCP.CreateConnector)
+			discovery.GET("/gcp/connectors", middlewares.Require("discovery", "read"), cloudGCP.ListConnectors)
+			discovery.GET("/gcp/connectors/:id", middlewares.Require("discovery", "read"), cloudGCP.GetConnector)
+			discovery.POST("/gcp/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudGCP.VerifyConnector)
+			discovery.DELETE("/gcp/connectors/:id", middlewares.Require("discovery", "admin"), cloudGCP.RevokeConnector)
+
+			// Google Authentication — an ADDITIVE second onboarding option for
+			// GCP, alongside WIF and JSON key above (neither modified by this
+			// block). A human's one-time Google OAuth consent auto-provisions
+			// the same Workload Identity Federation resources the manual
+			// Cloud-Shell script creates, then hands off to the existing
+			// CreateConnector/Onboard path above — the resulting connector is
+			// an ordinary "wif"-method connector, indistinguishable from one
+			// created by hand. See controllers/platform/cloud_gcp_oauth_controller.go
+			// and services/gcp_oauth_provision_service.go.
+			cloudGCPOAuth := platformCtrl.NewCloudGCPOAuthController(config.DB)
+			discovery.GET("/gcp/google-oauth/status", middlewares.Require("discovery", "read"), cloudGCPOAuth.GoogleOAuthStatus)
+			discovery.POST("/gcp/google-oauth/start", middlewares.Require("discovery", "admin"), cloudGCPOAuth.StartGoogleOAuth)
+			discovery.GET("/gcp/google-oauth/projects", middlewares.Require("discovery", "read"), cloudGCPOAuth.ListGoogleProjects)
+			discovery.POST("/gcp/google-oauth/preflight", middlewares.Require("discovery", "admin"), cloudGCPOAuth.PreflightGoogleOAuth)
+			discovery.POST("/gcp/google-oauth/connectors", middlewares.Require("discovery", "admin"), cloudGCPOAuth.ProvisionGoogleOAuth)
+
+			// Google's OAuth redirect lands here — UNAUTHENTICATED by
+			// necessity, exactly like /connector-oauth/callback elsewhere in
+			// this file, and for the identical reason: the browser arrives
+			// with no AuthSec session, and this route must sit outside
+			// AuthMiddleware and outside this group's own :id-shaped routes
+			// (/gcp/connectors/:id) to avoid a collision in Gin's routing
+			// tree.
+			//
+			// Registered on the ROOT engine `r`, NOT on `authsec` (which
+			// carries its own "/authsec" path prefix even though it has no
+			// AuthMiddleware of its own — a RouterGroup's prefix always
+			// applies regardless of what middleware is or isn't attached to
+			// it). GCP_OAUTH_REDIRECT_URI — the value registered with Google
+			// and configured in this deployment's .env — is the bare
+			// "http://<host>/discovery/gcp/google-oauth/callback", with no
+			// "/authsec" segment, so the path Google actually redirects back
+			// to must match that exactly: registering this on `authsec`
+			// (which would produce "/authsec/discovery/gcp/google-oauth/
+			// callback") is what previously 404'd here. Live-confirmed via a
+			// real Google consent round trip.
+			r.GET("/discovery/gcp/google-oauth/callback", cloudGCPOAuth.GoogleOAuthCallback)
 		}
 
 		// ────────────────────────────────────────────────────

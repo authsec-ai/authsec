@@ -62,6 +62,12 @@ const maxRegionsPerConnector = 32
 // workspace's signature. See mintExternalID for why that check exists.
 var ErrExternalIDNotIssued = errors.New("this external id was not issued to this workspace")
 
+// ErrAWSProbeTimeout means the assume-role probe did not finish inside
+// awsOnboardingTimeout. Distinct from the request context dying (the client
+// went away — the controller answers that itself) and from AWS refusing the
+// assume (ErrNotAssumable): this is "AWS never answered", a 504, not a 400.
+var ErrAWSProbeTimeout = errors.New("the AWS connection probe timed out before AWS answered")
+
 // AWSOnboardingService owns the policy around connecting an AWS account:
 // validation, proving the connection, where the ExternalId is stored, and the
 // connector row. AWS itself is reached only through the Verifier.
@@ -220,6 +226,13 @@ func (s *AWSOnboardingService) Onboard(
 		Region: regions[0], SessionName: sessionName,
 	})
 	if err != nil {
+		// probeCtx derives from the request context, so its own deadline
+		// firing (rather than the client going away) means AWS never
+		// answered in time. Name it explicitly: the controller's generic
+		// 400 fall-through must never claim a timeout was bad input.
+		if probeCtx.Err() == context.DeadlineExceeded {
+			return nil, false, fmt.Errorf("%w: %v", ErrAWSProbeTimeout, err)
+		}
 		return nil, false, err
 	}
 
@@ -318,6 +331,12 @@ func (s *AWSOnboardingService) VerifyConnector(
 
 	identity, verr := s.verifier.Verify(probeCtx, req)
 	if verr != nil {
+		// Same distinction as Onboard: our own probe budget firing is a
+		// timeout to report, not caller input. Recorded on the row as-is,
+		// so the console shows what actually happened.
+		if probeCtx.Err() == context.DeadlineExceeded {
+			verr = fmt.Errorf("%w: %v", ErrAWSProbeTimeout, verr)
+		}
 		updated, uerr := s.repo.MarkError(workspaceID, id, verr.Error())
 		if uerr != nil {
 			return nil, uerr
