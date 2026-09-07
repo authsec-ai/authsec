@@ -127,6 +127,9 @@ type Client interface {
 
 	// GraphToken acquires an app-only Microsoft Graph token for one tenant.
 	GraphToken(ctx context.Context, tenantID string) (*TokenSet, error)
+
+	// ProbeGraphCapabilities checks what a granted permission can actually reach.
+	ProbeGraphCapabilities(ctx context.Context, accessToken string) []GraphCapability
 }
 
 // HTTPClient is the live Client.
@@ -621,4 +624,95 @@ func rolesFromToken(raw string) []string {
 		return []string{}
 	}
 	return claims.Roles
+}
+
+/* ------------------------- granted is not always usable ------------------------- */
+
+// GraphCapability is a permission that is granted and may still not work.
+//
+// A granted permission and an available capability are different facts, and
+// Microsoft gates some data on the tenant's LICENCE rather than on consent.
+// /auditLogs/signIns is the one that matters here: AuditLog.Read.All grants it,
+// and a tenant without Entra ID P1 or P2 still gets 403
+// Authentication_RequestFromNonPremiumTenantOrB2CTenant. Observed against a
+// real free-tier tenant holding the permission.
+//
+// Discovery has to know this up front. Without it, the sign-in-activity reader
+// fails on free-tier tenants in a way that reads as a code bug and is not, and
+// "last used" quietly becomes unknown with nothing saying why.
+type GraphCapability struct {
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+
+	// LicenseGated is true when the permission is held but the tenant's licence
+	// withholds the data -- a customer action (buy P1), not an AuthSec bug and
+	// not a missing consent.
+	LicenseGated bool `json:"license_gated,omitempty"`
+}
+
+// ProbeGraphCapabilities checks the capabilities that consent alone does not
+// settle. Cheap: one page-of-one request each.
+func (c *HTTPClient) ProbeGraphCapabilities(ctx context.Context, accessToken string) []GraphCapability {
+	type probe struct{ name, url string }
+	probes := []probe{
+		// The licence-gated one. Everything else discovery needs was verified
+		// against a real tenant to work on the free tier.
+		{"signin_activity", ARMGraphSignInsURL()},
+	}
+
+	out := make([]GraphCapability, 0, len(probes))
+	for _, pr := range probes {
+		cap := GraphCapability{Name: pr.name, Available: true}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pr.url, nil)
+		if err != nil {
+			cap.Available, cap.Reason = false, err.Error()
+			out = append(out, cap)
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			cap.Available = false
+			cap.Reason = fmt.Sprintf("reach microsoft graph: %v", redactURLError(err))
+			out = append(out, cap)
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			out = append(out, cap)
+			continue
+		}
+
+		var gErr struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &gErr)
+		cap.Available = false
+		cap.Reason = fmt.Sprintf("%s: %s",
+			orDefault(gErr.Error.Code, fmt.Sprintf("http %d", resp.StatusCode)),
+			truncate(firstLine(gErr.Error.Message), 200))
+
+		// Microsoft's own marker for the licence gate.
+		if strings.Contains(gErr.Error.Code, "NonPremiumTenant") ||
+			strings.Contains(gErr.Error.Message, "premium license") {
+			cap.LicenseGated = true
+			cap.Reason = "the tenant has no Entra ID P1/P2 licence, so sign-in logs are " +
+				"withheld even though AuditLog.Read.All is granted"
+		}
+		out = append(out, cap)
+	}
+	return out
+}
+
+// ARMGraphSignInsURL is the sign-in activity endpoint, as one page of one.
+func ARMGraphSignInsURL() string {
+	return "https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=1"
 }

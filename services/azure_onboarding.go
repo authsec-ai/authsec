@@ -830,6 +830,14 @@ type AzureGraphResult struct {
 	Missing  []string `json:"missing_roles"`
 	Error    string   `json:"error,omitempty"`
 	Hint     string   `json:"hint,omitempty"`
+
+	// Capabilities is what the granted permissions can actually reach. A
+	// permission can be granted and still withhold its data -- sign-in logs
+	// need an Entra ID P1/P2 licence regardless of consent -- and a discovery
+	// reader that does not know which is which fails in a way that reads as a
+	// bug. Reported separately from GraphOK because a licence gate is a
+	// customer purchasing decision, not a missing grant.
+	Capabilities []azureonboard.GraphCapability `json:"capabilities,omitempty"`
 }
 
 // ValidateGraph proves whether admin consent actually granted anything.
@@ -875,6 +883,12 @@ func (s *AzureOnboardService) ValidateGraph(
 	result.GraphOK = auth.OK
 	result.Granted = auth.Granted
 	result.Missing = auth.Missing
+
+	// Only worth probing once something was actually granted; with nothing
+	// granted every capability would fail for the obvious reason.
+	if len(auth.Granted) > 0 {
+		result.Capabilities = s.azure.ProbeGraphCapabilities(callCtx, tok.AccessToken)
+	}
 
 	if !auth.OK {
 		if len(auth.Granted) == 0 {
