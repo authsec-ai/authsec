@@ -392,6 +392,7 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 
 	scanner := services.NewAWSIAMScanner(ctl.db, svc)
 	permissionScanner := services.NewAWSPermissionScanner(ctl.db, svc)
+	workloadScanner := services.NewAWSWorkloadScanner(ctl.db, svc)
 
 	// context.Background(), not the request context: the request is about to
 	// return, and cancelling the scan when it does would make every scan die
@@ -413,6 +414,14 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 		if _, err := permissionScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot); err != nil {
 			log.Printf("aws permission scan: connector=%s workspace=%s: %v", id, workspaceID, err)
 		}
+		// Workloads and activity run last, chained on the same snapshot and so
+		// the same generation. Last because they are the most expensive -- one
+		// report job per identity, plus every regional compute surface -- and
+		// the least damaging to lose: an identity with its permissions but no
+		// attributed compute is still a governed identity.
+		if _, err := workloadScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot); err != nil {
+			log.Printf("aws workload scan: connector=%s workspace=%s: %v", id, workspaceID, err)
+		}
 	}()
 
 	auditAdminMutation(c, workspaceID.String(), "scan", "cloud_connector",
@@ -431,6 +440,7 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 			"writes": []string{
 				"cloud_identity", "cloud_secret",
 				"cloud_assume_edge", "cloud_permission", "cloud_resource",
+				"cloud_workload", "cloud_usage",
 			},
 		},
 	})
