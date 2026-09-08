@@ -487,9 +487,26 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 	var body struct {
 		TenantID string `json:"tenantId"`
 		Scope    string `json:"scope"`
+
+		// TenantWide asks for one grant at the root management group instead of
+		// one per subscription, so subscriptions created later are covered too.
+		//
+		// Opt-in, and it must stay opt-in: reaching that scope can require
+		// briefly raising the operator's own privilege to root User Access
+		// Administrator. Nobody should discover that happened by reading the
+		// response.
+		TenantWide bool `json:"tenantWide"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
+		return
+	}
+	if body.TenantWide && strings.TrimSpace(body.Scope) != "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "tenantWide and scope are mutually exclusive",
+			"hint": "tenantWide targets the tenant root management group; " +
+				"pass scope only to target one subscription or management group",
+		})
 		return
 	}
 	sessionID, ok := ctl.sessionFromCookie(c)
@@ -509,7 +526,7 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 
 	tenantID := strings.TrimSpace(body.TenantID)
 	res, err := svc.AssignReader(c.Request.Context(), workspaceID, sessionID,
-		tenantID, strings.TrimSpace(body.Scope))
+		tenantID, strings.TrimSpace(body.Scope), body.TenantWide)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		// A refusal is the interesting case: it records that someone attempted
@@ -524,12 +541,18 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 	// This is the only state-changing action this feature performs inside
 	// another organisation's Azure tenant. Without a record there is no answer
 	// to "who granted AuthSec access to this subscription, and when".
+	// Elevation is recorded separately and unconditionally. A temporary raise to
+	// root User Access Administrator is the single most privileged thing this
+	// feature can do inside a customer tenant, and "was it given back" is the
+	// question an auditor will ask first.
 	auditAdminMutation(c, workspaceID.String(), "azure.reader.assign",
 		"azure_connector", tenantID, http.StatusOK,
 		nil, gin.H{
-			"tenant_id": tenantID,
-			"principal": res.Assigned,
-			"all_ok":    res.AllOK,
+			"tenant_id":   tenantID,
+			"principal":   res.Assigned,
+			"all_ok":      res.AllOK,
+			"tenant_wide": res.TenantWide,
+			"elevation":   res.Elevation,
 		})
 	c.JSON(http.StatusOK, gin.H{
 		"ok":   res.AllOK,

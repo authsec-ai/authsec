@@ -88,6 +88,16 @@ const (
 	// API versions, pinned. An unpinned ARM call silently changes shape.
 	APIVersionTenants       = "2022-12-01"
 	APIVersionSubscriptions = "2020-01-01"
+
+	// Role assignment reads, writes and deletes. The same version throughout, so
+	// that an assignment created here can be found and removed by the same id.
+	APIVersionRoleAssignments = "2022-04-01"
+
+	// elevateAccess is pinned separately and much older. Microsoft documents
+	// 2016-07-01 as the minimum for it and 2015-07-01 on the operation reference;
+	// it is a different operation from role assignments and there is no reason to
+	// assume one version spans both.
+	APIVersionElevateAccess = "2016-07-01"
 )
 
 // Failure modes a caller maps to HTTP status codes.

@@ -120,9 +120,7 @@ func BuildReaderSetup(tenantID, principalObjectID, scope string, scopes []string
 	}
 	raw, _ := json.MarshalIndent(tmpl, "", "  ")
 
-	// A tenant's root management group id IS the tenant id. So the
-	// all-subscriptions scope needs no extra input from anyone.
-	rootMG := "/providers/Microsoft.Management/managementGroups/" + tenantID
+	rootMG := RootManagementGroupScope(tenantID)
 
 	return ReaderSetup{
 		PrincipalObjectID:        principalObjectID,

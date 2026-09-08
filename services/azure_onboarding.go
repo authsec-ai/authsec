@@ -690,9 +690,67 @@ type AssignReaderResult struct {
 	Assigned []azureonboard.AssignmentResult `json:"assigned"`
 	AllOK    bool                            `json:"all_ok"`
 
+	// TenantWide says the grant was made once at the root management group and
+	// therefore covers subscriptions created after it, rather than a snapshot of
+	// the ones that existed at the time.
+	TenantWide bool `json:"tenant_wide"`
+
+	// Elevation is present only when the tenant-wide path had to raise the
+	// operator's own privilege to complete. Always reported, never implied.
+	Elevation *ElevationOutcome `json:"elevation,omitempty"`
+
 	// Fallback is attached when nothing could be granted, so an operator who
 	// lacks the privilege is not left with only an error.
 	Fallback *azureonboard.ReaderSetup `json:"fallback,omitempty"`
+}
+
+// ElevationOutcome is the full account of a temporary root-scope privilege
+// raise: whether it happened, and -- the part that matters -- whether it was
+// given back.
+//
+// Every field is reported to the caller even on success. An operator has to be
+// able to see that AuthSec briefly held the widest role in their tenant and then
+// released it, without going to read an audit log to find out.
+type ElevationOutcome struct {
+	// Attempted is true once the direct assignment has been refused and this
+	// path was entered at all.
+	Attempted bool `json:"attempted"`
+
+	// Elevated is true only when THIS call granted the role.
+	Elevated bool `json:"elevated"`
+
+	// Removed reports the outcome of putting it back. False alongside
+	// Elevated:true is the one state that needs a human -- root User Access
+	// Administrator does not expire on its own.
+	Removed bool `json:"removed"`
+
+	// AlreadyHeld means the operator held root User Access Administrator before
+	// this call. Nothing was granted, and nothing is removed: it was not ours to
+	// take away.
+	AlreadyHeld bool `json:"already_held,omitempty"`
+
+	Error string `json:"error,omitempty"`
+}
+
+const (
+	// The tenant-wide path makes up to five ARM calls and waits out RBAC
+	// propagation between them, so it needs a longer budget than one call.
+	azureElevationTimeout = 3 * time.Minute
+
+	// Removal runs on its own budget, deliberately NOT derived from the request
+	// context. If the browser hangs up or the request deadline passes mid-flight,
+	// the elevation still has to come back down.
+	azureDeElevationTimeout = 45 * time.Second
+)
+
+// armPropagationBackoff paces the retry after elevating.
+//
+// A role assignment is authorised server-side per request, so no new token is
+// needed -- but ARM caches the decision briefly, and a retry issued immediately
+// after elevateAccess intermittently still sees 403. These delays cover the lag
+// observed in practice without turning a failure into a two-minute hang.
+var armPropagationBackoff = []time.Duration{
+	2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second,
 }
 
 // AssignReader grants ARM Reader to the AuthSec application, without the
@@ -706,11 +764,16 @@ type AssignReaderResult struct {
 //
 // scope is optional. Empty means "every subscription this operator can see in
 // the tenant", which is what makes it one click rather than one per
-// subscription. A root management group scope covers future subscriptions too,
-// but needs privilege at the root that most operators have to grant themselves
-// first, so it is never assumed.
+// subscription.
+//
+// tenantWide instead makes ONE assignment at the root management group, which
+// covers subscriptions created after today rather than a snapshot of the ones
+// that exist now. That scope needs User Access Administrator at the root, which
+// nobody holds by default, so this is the only path allowed to raise the
+// operator's own privilege -- briefly, explicitly, and only after the plain
+// assignment has already been refused. See internal/azureonboard/elevate.go.
 func (s *AzureOnboardService) AssignReader(
-	ctx context.Context, workspaceID uuid.UUID, sessionID, tenantID, scope string,
+	ctx context.Context, workspaceID uuid.UUID, sessionID, tenantID, scope string, tenantWide bool,
 ) (*AssignReaderResult, error) {
 	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
 		return nil, err
@@ -727,7 +790,11 @@ func (s *AzureOnboardService) AssignReader(
 		return nil, azureonboard.ErrNoSession
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	budget := azureCallTimeout
+	if tenantWide {
+		budget = azureElevationTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	// An ARM token issued by the sign-in tenant is refused when writing into a
@@ -749,6 +816,10 @@ func (s *AzureOnboardService) AssignReader(
 		return nil, errors.New("could not determine the service principal object id for this tenant")
 	}
 	_ = s.repo.SetPrincipalObjectID(workspaceID, tenantID, principal)
+
+	if tenantWide {
+		return s.assignReaderTenantWide(callCtx, tenantID, userTok, appTok, principal), nil
+	}
 
 	scopes := []string{}
 	if scope = strings.TrimSpace(scope); scope != "" {
@@ -785,6 +856,133 @@ func (s *AzureOnboardService) AssignReader(
 		result.Fallback = s.readerSetup(tenantID, appTok, nil)
 	}
 	return result, nil
+}
+
+// assignReaderTenantWide grants Reader once at the tenant root management group,
+// covering every subscription including ones that do not exist yet.
+//
+// The ordering IS the safety argument, so it is spelled out rather than implied:
+//
+//  1. Try with the privilege the operator already has. Anyone who has done this
+//     before is likely to still hold root User Access Administrator, and those
+//     operators must never be elevated at all.
+//  2. Only after a refusal, look for an EXISTING root elevation. If one is
+//     there it reflects somebody's earlier decision, and removing it afterwards
+//     would revoke standing access AuthSec never granted -- so this reports the
+//     failure instead of touching it.
+//  3. Otherwise elevate, retry, and give the privilege back. Removal runs on a
+//     context of its own so a cancelled request cannot strand it.
+//
+// Returns rather than errors on every failure: the caller gets the fallback
+// instructions, exactly as the per-subscription path does.
+func (s *AzureOnboardService) assignReaderTenantWide(
+	ctx context.Context, tenantID string,
+	userTok, appTok *azureonboard.TokenSet, principal string,
+) *AssignReaderResult {
+	rootMG := azureonboard.RootManagementGroupScope(tenantID)
+	result := &AssignReaderResult{TenantID: tenantID, TenantWide: true}
+
+	assign := func() azureonboard.AssignmentResult {
+		return s.azure.AssignRole(ctx, userTok.AccessToken, rootMG, principal,
+			azureonboard.ReaderRoleDefinitionID)
+	}
+
+	// 1. The operator may already hold enough. Cheapest and least privileged.
+	r := assign()
+	result.Assigned = []azureonboard.AssignmentResult{r}
+	if r.OK {
+		result.AllOK = true
+		return result
+	}
+
+	el := &ElevationOutcome{Attempted: true}
+	result.Elevation = el
+
+	// 2. Do not touch an elevation somebody else put there.
+	existing, err := s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
+	if err != nil {
+		el.Error = "could not check for an existing root elevation, so did not elevate: " + err.Error()
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+		return result
+	}
+	if existing != "" {
+		el.AlreadyHeld = true
+		el.Error = "the operator already holds User Access Administrator at root scope and the " +
+			"assignment was still refused, so elevating would change nothing"
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+		return result
+	}
+
+	// 3. From here on, removal is mandatory on every exit path.
+	if err := s.azure.ElevateAccess(ctx, userTok.AccessToken); err != nil {
+		el.Error = err.Error()
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+		return result
+	}
+	el.Elevated = true
+	defer s.removeElevation(userTok, el)
+
+	for _, wait := range armPropagationBackoff {
+		select {
+		case <-ctx.Done():
+			el.Error = "gave up waiting for the elevated role to take effect: " + ctx.Err().Error()
+			result.Fallback = s.readerSetup(tenantID, appTok, nil)
+			return result
+		case <-time.After(wait):
+		}
+
+		r = assign()
+		result.Assigned = append(result.Assigned, r)
+		if r.OK {
+			result.AllOK = true
+			return result
+		}
+	}
+
+	result.Fallback = s.readerSetup(tenantID, appTok, nil)
+	return result
+}
+
+// removeElevation gives the root-scope role back, and records whether it worked.
+//
+// The context is deliberately NOT derived from the request. A browser that hung
+// up, or a deadline that passed mid-flight, must not be the reason a human is
+// left holding User Access Administrator over an entire tenant -- and that role
+// does not expire on its own.
+//
+// It re-reads the assignment id rather than trusting one captured earlier: the
+// id is minted by ARM at elevation time, and reading it back is also the only
+// honest confirmation that the elevation landed at all.
+func (s *AzureOnboardService) removeElevation(userTok *azureonboard.TokenSet, el *ElevationOutcome) {
+	ctx, cancel := context.WithTimeout(context.Background(), azureDeElevationTimeout)
+	defer cancel()
+
+	id, err := s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
+	if err != nil {
+		el.Error = appendReason(el.Error, "could not locate the elevation to remove: "+err.Error())
+		return
+	}
+	if id == "" {
+		// Nothing there. Either it never landed or something else removed it;
+		// either way the end state is the one this wanted.
+		el.Removed = true
+		return
+	}
+	if err := s.azure.DeleteRoleAssignment(ctx, userTok.AccessToken, id); err != nil {
+		el.Error = appendReason(el.Error,
+			"FAILED to remove root User Access Administrator from the signed-in operator ("+id+
+				"): "+err.Error()+". Remove it by hand: Microsoft Entra ID -> Properties -> "+
+				"Access management for Azure resources -> No")
+		return
+	}
+	el.Removed = true
+}
+
+func appendReason(existing, add string) string {
+	if existing == "" {
+		return add
+	}
+	return existing + "; " + add
 }
 
 /* ------------------------- subscriptions and plane 1 ------------------------- */

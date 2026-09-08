@@ -89,11 +89,19 @@ Three properties fall out of this shape and are worth stating:
 | Sign in with an Azure work account | operator | browser |
 | Choose tenants | operator | console |
 | Accept the consent page | **an admin of the customer tenant** | Microsoft |
-| Assign Reader to the AuthSec app | **the customer** | Azure portal, per subscription or management group |
+| Assign Reader to the AuthSec app | AuthSec, as the operator | `POST /api/azure/assign-reader` |
+| Verify consent granted anything | AuthSec | `POST /api/azure/validate-graph` |
 | Verify Reader actually works | AuthSec | `POST /api/azure/validate-arm` |
 
-The Reader assignment is the one step nothing in this flow can perform. Azure has
-no API by which an application grants itself a role, which is the point.
+**Accepting the consent page is the one step nothing here can perform.** It is a
+human with authority in that directory authorising a foreign identity, which is
+the entire security model; there is no ordering of API calls that removes it.
+
+The Reader assignment is a different case and often confused with it. No
+application can grant itself an Azure role — that has no API by design — but a
+human who holds Owner or User Access Administrator can, and AuthSec sends
+exactly the request that person would have sent. It succeeds precisely when they
+could have done it by hand, and refuses cleanly when they could not.
 
 ---
 
@@ -110,11 +118,18 @@ and cannot be widened from a query string.
 |---|---|
 | `Application.Read.All` | Reading applications and service principals in a later discovery ticket |
 | `Directory.Read.All` | Directory objects those principals resolve against |
+| `RoleManagement.Read.Directory` | Which principals hold which directory roles |
 | `AuditLog.Read.All` | Sign-in activity, for liveness in a later ticket |
 
-**None of these are used by this ticket.** Onboarding calls Graph exactly zero
-times. They are consented now because consent is a human step and asking an
-administrator to repeat it per ticket is how onboarding stalls.
+They are consented up front because consent is a human step, and asking an
+administrator to repeat it per ticket is how onboarding stalls. Onboarding itself
+uses them for two read-only checks only: `validate-graph` reads the `roles` claim
+of an app-only token to prove consent granted something, and `app/check` reads
+AuthSec's own application object. Everything else waits for discovery.
+
+`AuditLog.Read.All` is consented but gated: `/auditLogs/signIns` needs Entra ID
+P1 or P2, so on a free tier the permission is granted and the endpoint still
+403s. `validate-graph` reports that as a licence gate rather than a failure.
 
 ### Delegated
 
@@ -125,16 +140,29 @@ sending the operator back through a browser.
 
 ### Azure RBAC
 
-The built-in **Reader** role, assigned by the customer to the AuthSec service
-principal at subscription or management-group scope. Nothing narrower is
-requested and nothing wider is accepted.
+The built-in **Reader** role, assigned to the AuthSec service principal at
+subscription or root-management-group scope. Nothing narrower is requested and
+nothing wider is accepted.
+
+One exception, opt-in and temporary: `tenantWide` can raise the **operator's
+own** account to User Access Administrator at root scope for the duration of a
+single assignment, and always gives it back. That is a grant to a human who was
+already a Global Administrator, never to the AuthSec application. See step 4.
 
 ### Never called
 
-`GET /applications` and `GET /servicePrincipals` are deliberately never called.
-The application object is AuthSec's own and is managed in the portal; reading it
-back would add a directory-shaped dependency to a flow whose entire claim is that
-it only redirects a human and reads ARM.
+`GET /servicePrincipals` is never called. The service principal object id comes
+from the `oid` claim of an app-only token instead, which is the same value
+without a directory read.
+
+`GET /applications` is called exactly once, for AuthSec's **own** application
+object (`app/check`). The promise this flow keeps is not "never touch that
+endpoint" but "never enumerate a customer's directory objects with it".
+
+Nothing here ever writes to Microsoft Graph. No `POST /applications`, no
+`POST /servicePrincipals`, no `appRoleAssignedTo`. Consent is the customer's to
+give on Microsoft's own screen, and a flow that could grant itself permissions
+would not be able to say that.
 
 ---
 
@@ -170,8 +198,14 @@ redirect anywhere else.
 | `GET` | `/callback` | none | Both redirects land here |
 | `GET` | `/tenants` | `discovery:read` + session cookie | Tenants the operator can see |
 | `POST` | `/consent` | `discovery:admin` | 302 to the admin consent page |
+| `POST` | `/validate-graph` | `discovery:admin` | Plane 1: what consent actually granted |
+| `POST` | `/reader-setup` | `discovery:read` | az / PowerShell / ARM template / portal steps |
+| `POST` | `/assign-reader` | `discovery:admin` + session cookie | Plane 2: AuthSec makes the assignment |
 | `POST` | `/validate-arm` | `discovery:admin` | The Reader probe |
+| `GET` | `/subscriptions` | `discovery:read` | Per-subscription coverage |
 | `GET` | `/connectors` | `discovery:read` | Consented tenants |
+| `GET` | `/config` | `discovery:read` | Is this deployment configured at all |
+| `GET` | `/app/check` | `discovery:read` | Drift check on our own app registration |
 
 **`/login` and `/callback` are unauthenticated because they cannot be anything
 else.** Both are top-level browser navigations; a redirect arriving from
@@ -255,13 +289,75 @@ answers:
 { "ok": true, "step": "consented", "tenant": "f448fd31-..." }
 ```
 
-### 4. Assign Reader — portal checklist
+### 4. Assign Reader
 
-Nothing below can be done by AuthSec.
+AuthSec makes the assignment itself, as the signed-in operator. The application
+cannot grant itself an Azure role — nothing can — but it can send exactly the
+request the operator would have sent by hand.
 
-1. Azure portal → **Subscriptions** → pick the subscription.
-   To cover every subscription at once, use **Management groups** → the root
-   group instead, and assign there.
+```bash
+curl -s -X POST http://localhost:8080/api/azure/assign-reader \
+  -H "Authorization: Bearer $AUTHSEC_TOKEN" \
+  -H 'Content-Type: application/json' -b cookies.txt \
+  -d '{"tenantId":"f448fd31-c240-4c96-8013-acded88b5df6"}'
+```
+
+Default: one assignment per subscription the operator can currently see.
+Needs **Owner** or **User Access Administrator** on each.
+
+#### `"tenantWide": true` — one grant, every subscription
+
+```bash
+  -d '{"tenantId":"f448fd31-...","tenantWide":true}'
+```
+
+One assignment at the tenant **root management group**, which covers
+subscriptions created *after* today rather than a snapshot of the ones that
+exist now. Mutually exclusive with `scope`.
+
+That scope needs User Access Administrator at the root, which nobody holds by
+default — Entra roles and Azure RBAC are separate systems, so administering a
+directory grants nothing over its resources. Microsoft's answer is
+`elevateAccess`: a Global Administrator may assign themselves that role at root
+scope. It is the API behind *Microsoft Entra ID → Properties → Access
+management for Azure resources*, and AuthSec calls it with the delegated token
+it already holds.
+
+Because that is the widest role in Azure RBAC, the order is fixed
+([`internal/azureonboard/elevate.go`](../../internal/azureonboard/elevate.go)):
+
+1. **Try first without elevating.** An operator who already holds the privilege
+   is never elevated.
+2. **On refusal, look for an existing root elevation.** If one is there it
+   reflects somebody's earlier decision; removing it later would revoke standing
+   access AuthSec never granted, so the call reports failure instead of touching
+   it.
+3. **Otherwise elevate, retry, and give it back** — on a context of its own, so
+   a cancelled request cannot strand it. Root User Access Administrator does not
+   expire on its own.
+
+Every part of that is reported back and written to the audit log:
+
+```json
+{ "ok": true,
+  "data": { "tenant_wide": true, "all_ok": true,
+            "elevation": { "attempted": true, "elevated": true, "removed": true } } }
+```
+
+`"elevated": true` with `"removed": false` is the one state that needs a human:
+the error names the manual fix. Microsoft records it independently too — Entra
+audit logs under *Azure RBAC (Elevated Access)*, the Azure activity log under
+`Microsoft.Authorization/elevateAccess/action`, and a standing portal banner
+naming everyone currently elevated.
+
+#### Portal fallback
+
+When the operator holds neither privilege, the response carries `fallback` with
+the az CLI, PowerShell, ARM template and this click path — nothing is
+half-done:
+
+1. Azure portal → **Subscriptions** → pick the subscription, or
+   **Management groups** → the root group to cover all of them.
 2. **Access control (IAM)** → **Add** → **Add role assignment**.
 3. Role: **Reader** (built-in).
 4. *Assign access to*: **User, group, or service principal**.
@@ -269,11 +365,6 @@ Nothing below can be done by AuthSec.
    If nothing is found, admin consent has not completed in this tenant — the
    service principal does not exist yet. Redo step 3.
 6. **Review + assign**.
-7. Repeat per subscription, unless you assigned at the root management group.
-
-Assigning at the root management group requires the assigner to have elevated
-access at that scope, which is itself a deliberate action in the portal
-(*Microsoft Entra ID → Properties → Access management for Azure resources*).
 
 ### 5. Verify Reader
 

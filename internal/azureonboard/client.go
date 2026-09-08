@@ -125,6 +125,18 @@ type Client interface {
 	// AssignRole creates a role assignment as the signed-in operator.
 	AssignRole(ctx context.Context, userAccessToken, scope, principalObjectID, roleDefinitionID string) AssignmentResult
 
+	// ElevateAccess grants the signed-in operator User Access Administrator at
+	// root scope. Global Administrators only; everyone else gets
+	// ErrNotGlobalAdmin.
+	ElevateAccess(ctx context.Context, userAccessToken string) error
+
+	// RootElevation finds a principal's existing root-scope User Access
+	// Administrator assignment, so one AuthSec did not create is never removed.
+	RootElevation(ctx context.Context, userAccessToken, principalObjectID string) (string, error)
+
+	// DeleteRoleAssignment removes one role assignment by its full ARM id.
+	DeleteRoleAssignment(ctx context.Context, userAccessToken, assignmentID string) error
+
 	// GraphToken acquires an app-only Microsoft Graph token for one tenant.
 	GraphToken(ctx context.Context, tenantID string) (*TokenSet, error)
 
@@ -473,7 +485,7 @@ func (c *HTTPClient) AssignRole(
 	}
 
 	endpoint := ARMBase + scope + "/providers/Microsoft.Authorization/roleAssignments/" +
-		name + "?api-version=2022-04-01"
+		name + "?api-version=" + APIVersionRoleAssignments
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, strings.NewReader(string(payload)))
 	if err != nil {
