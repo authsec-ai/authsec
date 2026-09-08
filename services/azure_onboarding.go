@@ -72,6 +72,20 @@ type AzureOnboardService struct {
 
 	clientID    string
 	redirectURI string
+
+	// homeTenant is the directory the App Registration was created in. Empty
+	// means "fall back to the environment"; ForWorkspace fills it from a stored
+	// configuration. An application object exists only in its home tenant, so
+	// checking our own registration cannot be done without it.
+	homeTenant string
+
+	// appCfg is resolved lazily so the zero-value service used by tests needs no
+	// database.
+	appCfg repositories.AzureAppConfigRepository
+
+	// clientFixed marks a Microsoft client injected by WithClient. ForWorkspace
+	// must not replace it, or a test would silently start talking to Azure.
+	clientFixed bool
 }
 
 // NewAzureOnboardService builds the service against the live Microsoft
@@ -81,25 +95,18 @@ func NewAzureOnboardService(db *gorm.DB, vc vault.VaultClient) (*AzureOnboardSer
 	clientSecret := strings.TrimSpace(os.Getenv(azureClientSecretEnv))
 	redirectURI := strings.TrimSpace(os.Getenv(azureRedirectURIEnv))
 
-	var missing []string
-	if clientID == "" {
-		missing = append(missing, azureClientIDEnv)
-	}
-	if clientSecret == "" {
-		missing = append(missing, azureClientSecretEnv)
-	}
-	if redirectURI == "" {
-		missing = append(missing, azureRedirectURIEnv)
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("%w: set %s", azureonboard.ErrNotConfigured, strings.Join(missing, ", "))
-	}
-
+	// Deliberately NOT an error when the environment is empty. A workspace can
+	// now supply its own application through POST /api/azure/config, and that is
+	// the whole point of the setup flow -- refusing to construct would make the
+	// endpoint that fixes the problem unreachable. Ready() reports the state
+	// instead, after the workspace is known and its stored row has been consulted.
 	return &AzureOnboardService{
-		db:          db,
-		repo:        repositories.NewAzureConnectorRepository(db),
-		vault:       vc,
-		azure:       azureonboard.NewHTTPClient(clientID, clientSecret),
+		db:    db,
+		repo:  repositories.NewAzureConnectorRepository(db),
+		vault: vc,
+		// nil when the deployment has no secret. ForWorkspace may still supply
+		// one from a stored configuration; Ready() reports the gap if not.
+		azure:       azureClientOrNil(clientID, clientSecret),
 		clientID:    clientID,
 		redirectURI: redirectURI,
 	}, nil
@@ -108,7 +115,44 @@ func NewAzureOnboardService(db *gorm.DB, vc vault.VaultClient) (*AzureOnboardSer
 // WithClient swaps the Microsoft client. Test seam, mirroring the AWS service.
 func (s *AzureOnboardService) WithClient(c azureonboard.Client) *AzureOnboardService {
 	s.azure = c
+	s.clientFixed = true
 	return s
+}
+
+// Ready reports whether this service has a usable Entra application, naming what
+// is absent when it does not.
+//
+// Called AFTER ForWorkspace, never before: a deployment with no AZURE_* variables
+// at all is perfectly usable by a workspace that submitted its own application,
+// and answering from the environment alone would call that deployment broken.
+func (s *AzureOnboardService) Ready() error {
+	var missing []string
+	if strings.TrimSpace(s.clientID) == "" {
+		missing = append(missing, "client id")
+	}
+	if strings.TrimSpace(s.redirectURI) == "" {
+		missing = append(missing, "redirect uri")
+	}
+	if s.azure == nil {
+		missing = append(missing, "client secret")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing %s. Submit them with POST /api/azure/config, "+
+			"or set %s / %s / %s on the deployment",
+			azureonboard.ErrNotConfigured, strings.Join(missing, ", "),
+			azureClientIDEnv, azureClientSecretEnv, azureRedirectURIEnv)
+	}
+	return nil
+}
+
+// azureClientOrNil avoids handing out a client that would authenticate with an
+// empty secret and fail with a confusing AADSTS7000215 instead of a clear
+// "not configured".
+func azureClientOrNil(clientID, clientSecret string) azureonboard.Client {
+	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
+		return nil
+	}
+	return azureonboard.NewHTTPClient(clientID, clientSecret)
 }
 
 /* --------------------------------- login --------------------------------- */
@@ -118,7 +162,16 @@ func (s *AzureOnboardService) WithClient(c azureonboard.Client) *AzureOnboardSer
 // adminConsent merges tenant-wide consent into the sign-in itself. Opt-in: it
 // requires the signer to be a Global Administrator of the tenant, so forcing it
 // on would lock out every operator who is not one.
-func (s *AzureOnboardService) StartLogin(workspaceID uuid.UUID, actor string, adminConsent bool) (string, error) {
+func (s *AzureOnboardService) StartLogin(
+	workspaceID uuid.UUID, actor string, adminConsent bool, signInTenant string,
+) (string, error) {
+	// Validated here rather than trusted: it lands in the authority URL path.
+	if t := strings.TrimSpace(signInTenant); t != "" {
+		if err := azureonboard.ValidateSignInTenant(t); err != nil {
+			return "", err
+		}
+		signInTenant = t
+	}
 	state, err := azureonboard.NewLoginState()
 	if err != nil {
 		return "", err
@@ -133,7 +186,7 @@ func (s *AzureOnboardService) StartLogin(workspaceID uuid.UUID, actor string, ad
 		return "", err
 	}
 	_ = s.repo.PurgeExpiredStates()
-	return azureonboard.AuthorizeURL(s.clientID, s.redirectURI, state, adminConsent), nil
+	return azureonboard.AuthorizeURL(s.clientID, s.redirectURI, state, adminConsent, signInTenant), nil
 }
 
 // ResolveLoginWorkspace decides which workspace a sign-in belongs to.
@@ -171,6 +224,14 @@ func (s *AzureOnboardService) ResolveLoginWorkspace(explicit string) (uuid.UUID,
 		return uuid.Nil, ErrAzureWorkspaceAmbiguous
 	}
 	return only[0].ID, nil
+}
+
+// PeekCallbackWorkspace says which workspace a pending redirect belongs to,
+// without redeeming it. The callback needs this to bind the same Entra
+// application the redirect was started with, before HandleCallback consumes the
+// state.
+func (s *AzureOnboardService) PeekCallbackWorkspace(state string) (uuid.UUID, error) {
+	return s.repo.PeekStateWorkspace(strings.TrimSpace(state))
 }
 
 // AzureCallbackResult is what the callback handler needs to answer with.
@@ -1194,7 +1255,12 @@ type AppCheckResult struct {
 // in the portal or by an automated bootstrap, this is the single assertion that
 // says the end state is correct.
 func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppCheckResult, error) {
-	home := strings.TrimSpace(os.Getenv(azureHomeTenantEnv))
+	// A submitted configuration wins over the environment: it is the
+	// application this workspace actually asked us to use.
+	home := strings.TrimSpace(s.homeTenant)
+	if home == "" {
+		home = strings.TrimSpace(os.Getenv(azureHomeTenantEnv))
+	}
 	if home == "" && azureonboard.ValidateTenantID(azureonboard.SignInTenant) == nil {
 		home = azureonboard.SignInTenant
 	}
@@ -1227,13 +1293,37 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 		Findings:            []AppCheckFinding{},
 	}
 
-	// 1. Multi-tenant, or no customer can ever consent.
-	if app.SignInAudience != "AzureADMultipleOrgs" {
+	// 1. Multi-tenant, or no customer tenant can ever consent.
+	//
+	// Two values qualify, not one. AzureADandPersonalMicrosoftAccount is
+	// AzureADMultipleOrgs plus consumer accounts, so every customer tenant can
+	// still consent -- treating it as a defect would fail a deployment that
+	// deliberately widened the audience.
+	//
+	// It is reported as a warning because it is not free: Microsoft caps such an
+	// application at TWO client secrets and refuses it in the national clouds
+	// (Gov, 21Vianet) outright. Both are permanent properties of the choice, and
+	// both are easier to discover here than at a rotation or a Gov deployment.
+	switch app.SignInAudience {
+	case "AzureADMultipleOrgs":
+	case "AzureADandPersonalMicrosoftAccount":
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "sign_in_audience",
+			Severity: "warning",
+			Detail: "signInAudience is AzureADandPersonalMicrosoftAccount, so personal Microsoft " +
+				"accounts may sign in. Microsoft caps this audience at two client secrets and " +
+				"does not support it in the national clouds",
+			Fix: "intentional if personal accounts must be supported. Sign in via " +
+				"/api/azure/login?tenant=common; note that a personal account with no Azure " +
+				"subscription lands in the Microsoft Services tenant, which has no directory " +
+				"and therefore nothing to onboard",
+		})
+	default:
 		res.Findings = append(res.Findings, AppCheckFinding{
 			Check:    "sign_in_audience",
 			Severity: "error",
-			Detail: fmt.Sprintf("signInAudience is %q; a customer tenant cannot consent to "+
-				"anything but AzureADMultipleOrgs", app.SignInAudience),
+			Detail: fmt.Sprintf("signInAudience is %q; a customer tenant cannot consent unless it "+
+				"is AzureADMultipleOrgs or AzureADandPersonalMicrosoftAccount", app.SignInAudience),
 			Fix: "portal -> Authentication -> Supported account types -> " +
 				"Accounts in any organizational directory (Multitenant)",
 		})

@@ -150,6 +150,23 @@ func ValidateTenantID(tenantID string) error {
 	return nil
 }
 
+// signInTenantPattern accepts a tenant GUID or a domain. Deliberately strict:
+// this value is interpolated into the authority URL PATH, where a slash would
+// let a caller redirect the sign-in at a host of their choosing.
+var signInTenantPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$`)
+
+// ValidateSignInTenant checks an operator-supplied sign-in authority.
+func ValidateSignInTenant(t string) error {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return nil
+	}
+	if !signInTenantPattern.MatchString(t) {
+		return fmt.Errorf("tenant %q is not a tenant GUID or domain", t)
+	}
+	return nil
+}
+
 /* --------------------------------- state --------------------------------- */
 
 // State prefixes. The callback has no other way to tell which of the two
@@ -230,7 +247,26 @@ func nonce32() (string, error) {
 // any work account can sign in and consent stays a separate per-tenant step,
 // which is the only thing that works when one operator onboards tenants they do
 // not administer.
-func AuthorizeURL(clientID, redirectURI, state string, adminConsent bool) string {
+// signInTenant, when non-empty, replaces the process-wide SignInTenant for this
+// one sign-in. It exists because /organizations cannot always disambiguate an
+// address: Microsoft permits the same address to exist BOTH as a work account in
+// a directory and as a consumer Microsoft account, and when it does,
+// /organizations can resolve to the personal one -- which produces "You can't
+// sign in here with a personal account" with no way forward, since the picker
+// keeps offering the same wrong identity.
+//
+// Naming the directory removes the ambiguity, because only that directory is
+// consulted. It is per-request rather than configuration precisely so that one
+// deployment still serves every customer: pinning it in the environment would
+// make the product single-tenant.
+//
+// Accepts a tenant GUID or a verified domain. The caller validates it; it lands
+// in the URL path.
+func AuthorizeURL(clientID, redirectURI, state string, adminConsent bool, signInTenant string) string {
+	authority := SignInTenant
+	if t := strings.TrimSpace(signInTenant); t != "" {
+		authority = t
+	}
 	q := url.Values{}
 	q.Set("client_id", clientID)
 	q.Set("response_type", "code")
@@ -253,7 +289,7 @@ func AuthorizeURL(clientID, redirectURI, state string, adminConsent bool) string
 		// /organizations correctly refuses. The fix is to let them pick.
 		q.Set("prompt", "select_account")
 	}
-	return AuthorityBase + "/" + SignInTenant + "/oauth2/v2.0/authorize?" + q.Encode()
+	return AuthorityBase + "/" + authority + "/oauth2/v2.0/authorize?" + q.Encode()
 }
 
 // AdminConsentURL is where a tenant administrator is sent to grant the

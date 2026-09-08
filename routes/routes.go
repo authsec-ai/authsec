@@ -367,6 +367,9 @@ func SetupRoutes(
 			azureAPI.POST("/validate-graph", middlewares.Require("discovery", "admin"), azureOnboard.ValidateGraph)
 			azureAPI.GET("/subscriptions", middlewares.Require("discovery", "read"), azureOnboard.ListSubscriptions)
 			azureAPI.GET("/config", middlewares.Require("discovery", "read"), azureOnboard.ConfigStatus)
+			// Submitting the application is a write that changes which Entra
+			// identity this workspace acts as, so it needs admin, not read.
+			azureAPI.POST("/config", middlewares.Require("discovery", "admin"), azureOnboard.SetAppConfig)
 			azureAPI.GET("/app/check", middlewares.Require("discovery", "read"), azureOnboard.CheckAppRegistration)
 			azureAPI.GET("/connectors", middlewares.Require("discovery", "read"), azureOnboard.ListConnectors)
 		}

@@ -76,6 +76,16 @@ type AzureConnectorRepository interface {
 	// not it had expired, so a leaked state cannot be retried.
 	ConsumeState(state string) (*models.AzureOAuthState, error)
 
+	// PeekStateWorkspace reads which workspace a pending state belongs to
+	// WITHOUT redeeming it.
+	//
+	// Needed because the callback must authenticate with the same Entra
+	// application the redirect was started with, and which application that is
+	// depends on the workspace -- which is only recorded in this row. Peeking
+	// grants nothing on its own: the state is still redeemed exactly once,
+	// atomically, by ConsumeState.
+	PeekStateWorkspace(state string) (uuid.UUID, error)
+
 	// PurgeExpiredStates drops abandoned redirects.
 	PurgeExpiredStates() error
 }
@@ -326,6 +336,14 @@ func (r *azureConnectorRepository) ConsumeState(state string) (*models.AzureOAut
 		return nil, ErrAzureStateInvalid
 	}
 	return &st, nil
+}
+
+func (r *azureConnectorRepository) PeekStateWorkspace(state string) (uuid.UUID, error) {
+	var row models.AzureOAuthState
+	if err := r.db.Select("workspace_id").Where("state = ?", state).First(&row).Error; err != nil {
+		return uuid.Nil, ErrAzureStateInvalid
+	}
+	return row.WorkspaceID, nil
 }
 
 func (r *azureConnectorRepository) PurgeExpiredStates() error {

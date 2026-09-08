@@ -12,6 +12,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/azureonboard"
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -66,6 +67,26 @@ func (ctl *AzureOnboardController) service() (*services.AzureOnboardService, err
 	return services.NewAzureOnboardService(ctl.db, vc)
 }
 
+// serviceFor builds the onboarding service bound to one workspace's Entra
+// application: the row it submitted through POST /api/azure/config if there is
+// one, else the deployment-wide AZURE_* variables.
+//
+// Readiness is checked HERE rather than in the constructor. A deployment with no
+// AZURE_* variables at all is perfectly usable by a workspace that supplied its
+// own application, so "is this configured" is only answerable once the workspace
+// is known.
+func (ctl *AzureOnboardController) serviceFor(workspaceID uuid.UUID) (*services.AzureOnboardService, error) {
+	svc, err := ctl.service()
+	if err != nil {
+		return nil, err
+	}
+	bound := svc.ForWorkspace(workspaceID)
+	if err := bound.Ready(); err != nil {
+		return nil, err
+	}
+	return bound, nil
+}
+
 // ConfigStatus handles GET /api/azure/config.
 //
 // Reports what this deployment is configured with, so a setup screen can show a
@@ -79,7 +100,8 @@ func (ctl *AzureOnboardController) service() (*services.AzureOnboardService, err
 // common misconfiguration: a redirect uri that does not match the one
 // registered on the Entra application.
 func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
-	if _, _, err := ctl.workspaceAndActor(c); err != nil {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
@@ -87,18 +109,34 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	clientID := strings.TrimSpace(os.Getenv("AZURE_CLIENT_ID"))
 	redirectURI := strings.TrimSpace(os.Getenv("AZURE_REDIRECT_URI"))
 	secretSet := strings.TrimSpace(os.Getenv("AZURE_CLIENT_SECRET")) != ""
+	homeTenant := strings.TrimSpace(os.Getenv("AZURE_HOME_TENANT"))
+	source := "environment"
+
+	// A workspace that submitted its own application overrides all of the above,
+	// and the checklist must describe what will ACTUALLY be used -- otherwise a
+	// correctly configured workspace reads as broken because the deployment has
+	// no env vars.
+	var stored *models.AzureAppConfig
+	if svc, sErr := ctl.service(); sErr == nil {
+		if cfg, cErr := svc.GetAppConfig(workspaceID); cErr == nil && cfg != nil {
+			stored = cfg
+			clientID, redirectURI, homeTenant = cfg.ClientID, cfg.RedirectURI, cfg.HomeTenant
+			secretSet = true // the row cannot exist without a secret written first
+			source = "workspace"
+		}
+	}
 	sessionSet := len(strings.TrimSpace(os.Getenv(azureSessionSecretEnv))) >= 32
 	vaultSet := os.Getenv("VAULT_ADDR") != "" && os.Getenv("VAULT_TOKEN") != ""
 
 	missing := []string{}
 	if clientID == "" {
-		missing = append(missing, "AZURE_CLIENT_ID")
+		missing = append(missing, "client id")
 	}
 	if !secretSet {
-		missing = append(missing, "AZURE_CLIENT_SECRET")
+		missing = append(missing, "client secret")
 	}
 	if redirectURI == "" {
-		missing = append(missing, "AZURE_REDIRECT_URI")
+		missing = append(missing, "redirect uri")
 	}
 	if !sessionSet {
 		missing = append(missing, "SESSION_SECRET (32+ chars)")
@@ -112,8 +150,21 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 		"data": gin.H{
 			// Public values, echoed so a setup screen can compare them against
 			// the Entra application.
-			"client_id":      clientID,
-			"redirect_uri":   redirectURI,
+			"client_id":    clientID,
+			"redirect_uri": redirectURI,
+			"home_tenant":  homeTenant,
+
+			// Which of the two sources these values came from, so a setup
+			// screen can say "this workspace has its own app" rather than
+			// leaving an operator to guess why editing .env changed nothing.
+			"source":     source,
+			"configured": stored != nil,
+			"checked_at": func() interface{} {
+				if stored != nil && stored.CheckedAt != nil {
+					return stored.CheckedAt
+				}
+				return nil
+			}(),
 			"signin_tenant":  azureonboard.SignInTenant,
 			"authority_host": azureonboard.AuthorityBase,
 			"arm_endpoint":   azureonboard.ARMBase,
@@ -134,6 +185,93 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	})
 }
 
+// SetAppConfig handles POST /api/azure/config.
+//
+// The first step of onboarding: someone creates an App Registration in the Azure
+// portal and hands AuthSec its details. This stores them and, in the same call,
+// asks Microsoft whether that application actually has what onboarding needs --
+// answering the only question that matters before anything else is attempted.
+//
+// It answers 200 even when the registration is wrong, and that is deliberate.
+// "Stored, and here is exactly what is missing and how to grant it" is a
+// different outcome from "rejected", and an operator fixing four permissions in
+// the portal needs the list, not an error. `ok` says whether the application is
+// usable; `check.findings` says what to do about it.
+//
+// The secret is written to Vault and never returned, never logged, and never
+// stored in Postgres -- the row keeps only the path.
+func (ctl *AzureOnboardController) SetAppConfig(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+
+	var in services.AzureAppConfigInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "body must be {\"clientId\", \"clientSecret\", \"homeTenant\", \"redirectUri\"}",
+			"hint": "clientId and homeTenant are the Application (client) ID and Directory " +
+				"(tenant) ID from the app registration Overview page",
+		})
+		return
+	}
+
+	// Unbound: this endpoint SUPPLIES the configuration, so it cannot require it.
+	svc, err := ctl.service()
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
+	res, err := svc.SetAppConfig(c.Request.Context(), workspaceID, actor, in)
+	if err != nil {
+		auditAdminMutation(c, workspaceID.String(), "azure.app.config.failed",
+			"azure_app_config", workspaceID.String(), http.StatusBadRequest,
+			nil, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Recorded because it changes which Entra application this workspace acts
+	// as. The secret is not in the payload and never will be -- only the fact.
+	auditAdminMutation(c, workspaceID.String(), "azure.app.config",
+		"azure_app_config", workspaceID.String(), http.StatusOK,
+		nil, gin.H{"client_id": res.Stored.ClientID, "home_tenant": res.Stored.HomeTenant})
+
+	ok := res.Check != nil && res.Check.OK
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   ok,
+		"data": res,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "the client secret is stored in vault and is never returned by any endpoint. " +
+				"stored=true with ok=false means the application was saved but is not usable yet",
+			"next": nextForAppConfig(res),
+		},
+	})
+}
+
+// nextForAppConfig turns the verdict into the one thing to do next.
+func nextForAppConfig(res *services.AzureAppConfigResult) string {
+	switch {
+	case res.CheckError != "":
+		return "the application could not be read at all: check the client id, the secret, " +
+			"and that homeTenant is the directory the registration was created in"
+	case res.Check == nil:
+		return "stored, but not verified"
+	case len(res.Check.MissingPermissions) > 0:
+		return "grant these as APPLICATION permissions (not delegated) in portal -> API permissions " +
+			"-> Microsoft Graph -> Application permissions, then Grant admin consent: " +
+			strings.Join(res.Check.MissingPermissions, ", ")
+	case !res.Check.OK:
+		return "fix the errors in check.findings, then POST this again or GET /api/azure/app/check"
+	default:
+		return "GET /api/azure/login to sign in and start onboarding tenants"
+	}
+}
+
 // CheckAppRegistration handles GET /api/azure/app/check.
 //
 // Asserts that the App Registration matches what this code requires. Read-only:
@@ -145,11 +283,12 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 // the end state is right -- and it checks by machine every field the runbook
 // currently asks a human to verify by eye.
 func (ctl *AzureOnboardController) CheckAppRegistration(c *gin.Context) {
-	if _, _, err := ctl.workspaceAndActor(c); err != nil {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
@@ -181,6 +320,8 @@ func (ctl *AzureOnboardController) CheckAppRegistration(c *gin.Context) {
 // Redirects the operator to Microsoft to sign in with their own Azure work
 // account. Nothing is stored until they come back.
 func (ctl *AzureOnboardController) Login(c *gin.Context) {
+	// Unbound on purpose: resolving which workspace this sign-in belongs to
+	// needs only the database, and the workspace is not known until it returns.
 	svc, err := ctl.service()
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
@@ -194,12 +335,22 @@ func (ctl *AzureOnboardController) Login(c *gin.Context) {
 		return
 	}
 
+	// Rebind: the authorize URL must carry THIS workspace's client id and
+	// redirect uri, and the code that comes back is redeemable only by the
+	// application that issued it.
+	if svc, err = ctl.serviceFor(workspaceID); err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
 	// admin_consent=true merges tenant-wide consent into this sign-in. Opt-in per
 	// request rather than per deployment: it requires a Global Administrator, so
 	// forcing it on would lock out every other operator on the same instance.
 	adminConsent := strings.EqualFold(strings.TrimSpace(c.Query("admin_consent")), "true")
 
-	authorizeURL, err := svc.StartLogin(workspaceID, "browser", adminConsent)
+	authorizeURL, err := svc.StartLogin(workspaceID, "browser", adminConsent,
+		strings.TrimSpace(c.Query("tenant")))
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
@@ -220,6 +371,18 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
 		return
+	}
+
+	// Bind to the workspace this redirect was started for, BEFORE redeeming the
+	// state. Microsoft will only exchange the code for the application that
+	// issued it, so a callback authenticating with a different workspace's
+	// application fails with an opaque invalid_client. Peeking grants nothing:
+	// the state is still redeemed exactly once, atomically, inside
+	// HandleCallback.
+	if ws, wErr := svc.PeekCallbackWorkspace(c.Query("state")); wErr == nil {
+		if bound, bErr := ctl.serviceFor(ws); bErr == nil {
+			svc = bound
+		}
 	}
 
 	res, err := svc.HandleCallback(c.Request.Context(), services.AzureCallbackInput{
@@ -289,7 +452,7 @@ func (ctl *AzureOnboardController) ListTenants(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
@@ -333,7 +496,7 @@ func (ctl *AzureOnboardController) StartConsent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		c.JSON(status, errBody)
@@ -395,7 +558,7 @@ func (ctl *AzureOnboardController) ValidateARM(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		c.JSON(status, errBody)
@@ -444,7 +607,7 @@ func (ctl *AzureOnboardController) ReaderSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		c.JSON(status, errBody)
@@ -517,7 +680,7 @@ func (ctl *AzureOnboardController) AssignReader(c *gin.Context) {
 		})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		c.JSON(status, errBody)
@@ -585,7 +748,7 @@ func (ctl *AzureOnboardController) ValidateGraph(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {\"tenantId\": \"<guid>\"}"})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, errBody := mapAzureOnboardError(err)
 		c.JSON(status, errBody)
@@ -620,7 +783,7 @@ func (ctl *AzureOnboardController) ListSubscriptions(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
@@ -670,7 +833,7 @@ func (ctl *AzureOnboardController) ListConnectors(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	svc, err := ctl.service()
+	svc, err := ctl.serviceFor(workspaceID)
 	if err != nil {
 		status, body := mapAzureOnboardError(err)
 		c.JSON(status, body)
