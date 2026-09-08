@@ -240,6 +240,18 @@ func AuthorizeURL(clientID, redirectURI, state string, adminConsent bool) string
 	q.Set("state", state)
 	if adminConsent {
 		q.Set("prompt", "admin_consent")
+	} else {
+		// Always show the account picker.
+		//
+		// Without it Microsoft silently reuses whatever account the browser is
+		// already signed in with. When that is a personal account -- outlook.com,
+		// live.com, an Xbox login -- the operator gets "You can't sign in here
+		// with a personal account" and no way to choose a different one, because
+		// nothing ever asked them. That is not a real failure and it is not
+		// something the app registration can accommodate: an Azure directory and
+		// its subscriptions only exist behind a work or school account, so
+		// /organizations correctly refuses. The fix is to let them pick.
+		q.Set("prompt", "select_account")
 	}
 	return AuthorityBase + "/" + SignInTenant + "/oauth2/v2.0/authorize?" + q.Encode()
 }
