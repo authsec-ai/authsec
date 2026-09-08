@@ -168,6 +168,7 @@ func TestTenantWide_AlreadyPrivileged_NeverElevates(t *testing.T) {
 // retry, succeed, and give it back.
 func TestTenantWide_ElevatesRetriesAndRemoves(t *testing.T) {
 	attempt := 0
+	granted := false
 	f := &fakeAzureClient{
 		assign: func(scope string) azureonboard.AssignmentResult {
 			attempt++
@@ -176,17 +177,21 @@ func TestTenantWide_ElevatesRetriesAndRemoves(t *testing.T) {
 			}
 			return ok(scope)
 		},
+		// Absent before elevateAccess, present the moment it returns -- what ARM
+		// does. The second lookup is the id being captured while we still know
+		// for certain that a grant exists.
 		rootElev: func() (string, error) {
-			// Absent before elevating, present afterwards -- what ARM would say.
-			if attempt >= 2 {
+			if granted {
 				return testElevID, nil
 			}
 			return "", nil
 		},
 	}
+	f.elevate = func() error { granted = true; return nil }
+
 	res := run(t, f)
 
-	if got := seq(f); got != "assign,rootElevation,elevate,assign,rootElevation,delete" {
+	if got := seq(f); got != "assign,rootElevation,elevate,rootElevation,assign,delete" {
 		t.Fatalf("wrong call sequence: %q", got)
 	}
 	if !res.AllOK {
@@ -288,6 +293,43 @@ func TestTenantWide_RemovesElevationEvenWhenAssignmentNeverSucceeds(t *testing.T
 	}
 	if res.Fallback == nil {
 		t.Fatal("expected the manual instructions after exhausting retries")
+	}
+}
+
+// Regression. A production-shaped simulation reported removed:true while root
+// User Access Administrator was still assigned: the cleanup re-derived the
+// assignment id from a filter, the filter matched nothing, and "not found" was
+// read as "already gone".
+//
+// Removed:true must mean a DELETE was issued and accepted -- nothing weaker.
+func TestTenantWide_LookupMissDoesNotCountAsRemoved(t *testing.T) {
+	attempt := 0
+	f := &fakeAzureClient{
+		assign: func(scope string) azureonboard.AssignmentResult {
+			attempt++
+			if attempt == 1 {
+				return denied(scope)
+			}
+			return ok(scope)
+		},
+		// Never finds the elevation -- as happens when the lookup filters on the
+		// wrong principal, which is exactly what the simulation did.
+		rootElev: func() (string, error) { return "", nil },
+	}
+	res := run(t, f)
+
+	el := res.Elevation
+	if el == nil || !el.Elevated {
+		t.Fatalf("expected an elevation to have happened, got %+v", el)
+	}
+	if el.Removed {
+		t.Fatal("nothing was deleted, so Removed must be false -- this is the bug")
+	}
+	if len(f.deletedIDs) != 0 {
+		t.Fatalf("nothing could be located, so nothing should be deleted: %v", f.deletedIDs)
+	}
+	if !strings.Contains(el.Error, "no matching assignment could be found") {
+		t.Fatalf("the operator must be told the role may still be assigned, got %q", el.Error)
 	}
 }
 

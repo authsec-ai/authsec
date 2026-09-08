@@ -920,7 +920,20 @@ func (s *AzureOnboardService) assignReaderTenantWide(
 		return result
 	}
 	el.Elevated = true
-	defer s.removeElevation(userTok, el)
+
+	// Capture the assignment id NOW, while we know exactly one thing about the
+	// world: ARM just granted it. Cleanup then addresses a known object instead
+	// of re-deriving it from a filter later.
+	//
+	// This is not defensive tidiness. Deriving it at cleanup time means a lookup
+	// that matches nothing is indistinguishable from "already removed" -- and a
+	// simulation caught exactly that, reporting removed:true while root User
+	// Access Administrator was still assigned.
+	elevationID, idErr := s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
+	if idErr != nil {
+		el.Error = appendReason(el.Error, "elevated, but could not read back the assignment id: "+idErr.Error())
+	}
+	defer s.removeElevation(userTok, el, elevationID)
 
 	for _, wait := range armPropagationBackoff {
 		select {
@@ -950,22 +963,35 @@ func (s *AzureOnboardService) assignReaderTenantWide(
 // left holding User Access Administrator over an entire tenant -- and that role
 // does not expire on its own.
 //
-// It re-reads the assignment id rather than trusting one captured earlier: the
-// id is minted by ARM at elevation time, and reading it back is also the only
-// honest confirmation that the elevation landed at all.
-func (s *AzureOnboardService) removeElevation(userTok *azureonboard.TokenSet, el *ElevationOutcome) {
+// knownID is the assignment captured immediately after elevating. It is
+// preferred over a fresh lookup for one reason: a lookup that matches nothing
+// cannot be told apart from "already removed", and treating that as success
+// reports removed:true while the role is still assigned.
+//
+// So Removed:true here means exactly one thing -- a DELETE was issued and ARM
+// accepted it. Nothing weaker is allowed to set it.
+func (s *AzureOnboardService) removeElevation(
+	userTok *azureonboard.TokenSet, el *ElevationOutcome, knownID string,
+) {
 	ctx, cancel := context.WithTimeout(context.Background(), azureDeElevationTimeout)
 	defer cancel()
 
-	id, err := s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
-	if err != nil {
-		el.Error = appendReason(el.Error, "could not locate the elevation to remove: "+err.Error())
-		return
+	id := knownID
+	if id == "" {
+		var err error
+		id, err = s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
+		if err != nil {
+			el.Error = appendReason(el.Error, "could not locate the elevation to remove: "+err.Error())
+			return
+		}
 	}
 	if id == "" {
-		// Nothing there. Either it never landed or something else removed it;
-		// either way the end state is the one this wanted.
-		el.Removed = true
+		// We know a grant happened -- ARM accepted elevateAccess -- so finding
+		// nothing is a failure to LOCATE it, never evidence it is gone.
+		el.Error = appendReason(el.Error,
+			"root User Access Administrator was granted but no matching assignment could be found "+
+				"to remove it. Check by hand: Microsoft Entra ID -> Properties -> "+
+				"Access management for Azure resources -> No")
 		return
 	}
 	if err := s.azure.DeleteRoleAssignment(ctx, userTok.AccessToken, id); err != nil {

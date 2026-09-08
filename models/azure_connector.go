@@ -44,10 +44,17 @@ type AzureConnector struct {
 	// assignment: consent completing while granting nothing is a real state, so
 	// it is verified rather than assumed. GraphGrantedRoles keeps the token's
 	// roles claim so a missing permission can be named, not just counted.
-	GraphOK           bool           `json:"graph_ok"                     gorm:"column:graph_ok;not null;default:false"`
-	GraphCheckedAt    *time.Time     `json:"graph_checked_at,omitempty"   gorm:"column:graph_checked_at;type:timestamptz"`
-	GraphLastError    string         `json:"graph_last_error,omitempty"   gorm:"column:graph_last_error;type:text"`
-	GraphGrantedRoles pq.StringArray `json:"graph_granted_roles"          gorm:"column:graph_granted_roles;type:text[]"`
+	GraphOK        bool       `json:"graph_ok"                     gorm:"column:graph_ok;not null;default:false"`
+	GraphCheckedAt *time.Time `json:"graph_checked_at,omitempty"   gorm:"column:graph_checked_at;type:timestamptz"`
+	GraphLastError string     `json:"graph_last_error,omitempty"   gorm:"column:graph_last_error;type:text"`
+	// The default tag is load-bearing, not decoration. The column is
+	// text[] NOT NULL DEFAULT '{}', but a nil pq.StringArray is not a Go zero
+	// value GORM knows to skip unless a default is declared -- so without this
+	// every INSERT sent an explicit NULL and the FIRST consent for any tenant
+	// died on the not-null constraint. Existing rows were unaffected, because
+	// the upsert path only touches the display columns, which is why it survived
+	// a real end-to-end run and only surfaced against an empty table.
+	GraphGrantedRoles pq.StringArray `json:"graph_granted_roles"          gorm:"column:graph_granted_roles;type:text[];default:'{}'"`
 
 	CreatedAt time.Time `json:"created_at" gorm:"type:timestamptz;autoCreateTime"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"type:timestamptz;autoUpdateTime"`
