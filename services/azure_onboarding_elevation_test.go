@@ -97,6 +97,9 @@ func (f *fakeAzureClient) ProbeGraphCapabilities(context.Context, string) []azur
 func (f *fakeAzureClient) ReadOwnApp(context.Context, string, string) (*azureonboard.AppRegistration, error) {
 	return nil, errors.New("not used")
 }
+func (f *fakeAzureClient) ResolveSignInName(context.Context, string, string) (*azureonboard.SignInName, error) {
+	return nil, errors.New("not used")
+}
 
 /* -------------------------------- harness -------------------------------- */
 
@@ -111,6 +114,7 @@ const (
 // shrunk so the retries do not cost 29 real seconds.
 func run(t *testing.T, f *fakeAzureClient) *AssignReaderResult {
 	t.Helper()
+	allowRootElevation(t)
 
 	restore := armPropagationBackoff
 	armPropagationBackoff = []time.Duration{time.Millisecond, time.Millisecond}
@@ -374,5 +378,170 @@ func TestTenantWide_FailedRemovalIsReportedLoudly(t *testing.T) {
 	// The grant itself did succeed, and that stays true.
 	if !res.AllOK {
 		t.Fatal("a failed cleanup must not retroactively fail the grant")
+	}
+}
+
+// allowRootElevation turns on the deployment switch that permits raising the
+// operator to root User Access Administrator.
+//
+// It is off in production until the path has been exercised against a real
+// tenant, so every test that drives the elevation has to ask for it. A test
+// that forgets exercises the gate instead of the thing it meant to test, and
+// says so loudly rather than passing for the wrong reason.
+func allowRootElevation(t *testing.T) {
+	t.Helper()
+	t.Setenv(azureAllowRootElevationEnv, "true")
+}
+
+// With the switch OFF -- the shipping default -- a refused assignment must not
+// elevate anything, must say why, and must hand back the manual instructions.
+func TestTenantWide_ElevationIsOffUnlessTheDeploymentAllowsIt(t *testing.T) {
+	t.Setenv(azureAllowRootElevationEnv, "")
+
+	f := &fakeAzureClient{assign: denied}
+	svc := &AzureOnboardService{azure: f}
+	res := svc.assignReaderTenantWide(
+		context.Background(), testTenant,
+		&azureonboard.TokenSet{AccessToken: "user", PrincipalObjectID: testOperator},
+		&azureonboard.TokenSet{AccessToken: "app", PrincipalObjectID: testPrincipal},
+		testPrincipal,
+	)
+
+	// One attempt with the privilege the operator already has, and nothing else.
+	if got := seq(f); got != "assign" {
+		t.Fatalf("calls = %q; with elevation disabled nothing beyond the plain assign may run", got)
+	}
+	if res.Elevation == nil {
+		t.Fatal("the refusal must still be explained")
+	}
+	if res.Elevation.Attempted || res.Elevation.Elevated {
+		t.Fatalf("elevated with the switch off: %+v", res.Elevation)
+	}
+	if !strings.Contains(res.Elevation.Error, azureAllowRootElevationEnv) {
+		t.Errorf("does not name the switch that would enable it: %q", res.Elevation.Error)
+	}
+	// An operator who cannot be elevated still needs a way forward.
+	if res.Fallback == nil {
+		t.Error("no fallback instructions were attached")
+	}
+	if res.AllOK {
+		t.Error("reported success having granted nothing")
+	}
+}
+
+// And with it on, the elevation happens -- so the gate is the only difference.
+func TestTenantWide_ElevationRunsWhenAllowed(t *testing.T) {
+	allowRootElevation(t)
+
+	f := &fakeAzureClient{assign: denied}
+	svc := &AzureOnboardService{azure: f}
+	svc.assignReaderTenantWide(
+		context.Background(), testTenant,
+		&azureonboard.TokenSet{AccessToken: "user", PrincipalObjectID: testOperator},
+		&azureonboard.TokenSet{AccessToken: "app", PrincipalObjectID: testPrincipal},
+		testPrincipal,
+	)
+	if !strings.Contains(seq(f), "elevate") {
+		t.Fatalf("the switch is on and nothing elevated: %q", seq(f))
+	}
+}
+
+// An ElevateAccess error and a failed elevation are not the same thing.
+//
+// The call is a write. A timeout, a reset, or a 5xx after ARM applied it all
+// return an error while leaving the operator holding root User Access
+// Administrator. This path used to return immediately on any error -- before
+// the removal defer was registered -- so nothing ever took it back, and the
+// status said elevated:false while the privilege was live.
+func TestTenantWide_AmbiguousElevationFailureIsStillGivenBack(t *testing.T) {
+	const strayID = "/providers/Microsoft.Authorization/roleAssignments/stray"
+
+	// First lookup (step 2, "does one already exist?") finds nothing, which is
+	// what lets the flow proceed. The second, after the failed elevate, finds
+	// the elevation that applied anyway.
+	lookups := 0
+	f := &fakeAzureClient{
+		assign:  denied,
+		elevate: func() error { return errors.New("Post \"https://management.azure.com/...\": EOF") },
+		rootElev: func() (string, error) {
+			lookups++
+			if lookups == 1 {
+				return "", nil
+			}
+			return strayID, nil
+		},
+	}
+	res := run(t, f)
+
+	if got := seq(f); got != "assign,rootElevation,elevate,rootElevation,delete" {
+		t.Fatalf("the elevation was not looked for or not removed: %q", got)
+	}
+	if len(f.deletedIDs) != 1 || f.deletedIDs[0] != strayID {
+		t.Fatalf("wrong assignment deleted: %v", f.deletedIDs)
+	}
+
+	el := res.Elevation
+	if el == nil {
+		t.Fatal("no elevation outcome reported")
+	}
+	if !el.Elevated {
+		t.Error("reported elevated:false while an elevation had in fact applied -- " +
+			"the exact claim that made this invisible")
+	}
+	if !el.Removed {
+		t.Error("the elevation that applied was not reported as removed")
+	}
+	if !strings.Contains(el.Error, "applied despite the error") {
+		t.Errorf("the outcome does not say what happened: %q", el.Error)
+	}
+}
+
+// ErrNotGlobalAdmin is a clean refusal: ARM applied nothing, so looking is
+// wasted work and deleting would be wrong. Guards against a fix that probes
+// after every failure.
+func TestTenantWide_CleanRefusalIsNotProbedForAStrayElevation(t *testing.T) {
+	lookups := 0
+	f := &fakeAzureClient{
+		assign:   denied,
+		elevate:  func() error { return azureonboard.ErrNotGlobalAdmin },
+		rootElev: func() (string, error) { lookups++; return "", nil },
+	}
+	run(t, f)
+
+	if lookups != 1 {
+		t.Errorf("looked for an elevation %d times after a refusal that provably "+
+			"applied nothing; want 1 (the pre-flight check only)", lookups)
+	}
+	if len(f.deletedIDs) != 0 {
+		t.Errorf("deleted something after a clean refusal: %v", f.deletedIDs)
+	}
+}
+
+// If the read-back itself fails, the operator has to be told to go and look --
+// silently reporting a clean failure would hide a privilege that may be live.
+func TestTenantWide_UnconfirmableElevationSaysToCheckByHand(t *testing.T) {
+	lookups := 0
+	f := &fakeAzureClient{
+		assign:  denied,
+		elevate: func() error { return errors.New("EOF") },
+		rootElev: func() (string, error) {
+			lookups++
+			if lookups == 1 {
+				return "", nil
+			}
+			return "", errors.New("ARM unreachable")
+		},
+	}
+	res := run(t, f)
+
+	el := res.Elevation
+	if el == nil {
+		t.Fatal("no elevation outcome reported")
+	}
+	if !strings.Contains(el.Error, "remove it by hand") {
+		t.Errorf("does not tell the operator to check: %q", el.Error)
+	}
+	if el.Elevated {
+		t.Error("claimed the elevation applied when that could not be established")
 	}
 }

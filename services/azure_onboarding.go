@@ -1,9 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -56,6 +58,11 @@ const (
 
 	// Bounds one call to Microsoft from inside an HTTP handler.
 	azureCallTimeout = 45 * time.Second
+
+	// azureAllowRootElevationEnv opts a deployment into letting AuthSec raise
+	// the operator to root User Access Administrator when a tenant-wide Reader
+	// grant is refused. Off unless set: see assignReaderTenantWide.
+	azureAllowRootElevationEnv = "AZURE_ALLOW_ROOT_ELEVATION"
 )
 
 // ErrAzureWorkspaceAmbiguous means /login was reached without a workspace and
@@ -86,6 +93,31 @@ type AzureOnboardService struct {
 	// clientFixed marks a Microsoft client injected by WithClient. ForWorkspace
 	// must not replace it, or a test would silently start talking to Azure.
 	clientFixed bool
+
+	// credKind is which credential form this service authenticates with, for the
+	// check to report. Never the value.
+	//
+	// It matters because the two questions differ: an application can have a
+	// certificate uploaded AND be configured here with a secret, in which case
+	// the registration looks exemplary while every token request still sends a
+	// password.
+	credKind azureonboard.CredentialKind
+
+	// credThumbprint identifies WHICH uploaded certificate is ours, when the
+	// credential is one. Without it the check can only say whether the
+	// registration has some certificate, which is a different question.
+	credThumbprint string
+
+	// bindProblem is why a STORED application could not be used.
+	//
+	// ForWorkspace falls back to the environment when it cannot bind the row a
+	// workspace submitted, and that fallback used to be silent. The result was
+	// an error naming the wrong thing: with the row present and its secret
+	// unreadable, Ready() reported "missing client id, redirect uri, client
+	// secret" -- three values that were all sitting in the row -- and said
+	// nothing about the secret it had failed to read. Debugging that starts by
+	// checking the three things that are fine.
+	bindProblem string
 }
 
 // NewAzureOnboardService builds the service against the live Microsoft
@@ -109,6 +141,9 @@ func NewAzureOnboardService(db *gorm.DB, vc vault.VaultClient) (*AzureOnboardSer
 		azure:       azureClientOrNil(clientID, clientSecret),
 		clientID:    clientID,
 		redirectURI: redirectURI,
+		// The environment supplies a secret and nothing else. A workspace that
+		// stored a certificate overrides this in ForWorkspace.
+		credKind: azureonboard.CredentialSecret,
 	}, nil
 }
 
@@ -136,6 +171,15 @@ func (s *AzureOnboardService) Ready() error {
 	if s.azure == nil {
 		missing = append(missing, "client secret")
 	}
+	// Checked BEFORE the missing list, and independently of it. A stored
+	// application that could not be bound is a hard stop even when the
+	// deployment has its own AZURE_* variables set, because the alternative is
+	// falling back to a different application than the workspace submitted --
+	// silently, and while reporting itself healthy.
+	if s.bindProblem != "" {
+		return fmt.Errorf("%w: this workspace has a stored application, but it could not "+
+			"be used: %s", azureonboard.ErrNotConfigured, s.bindProblem)
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: missing %s. Submit them with POST /api/azure/config, "+
 			"or set %s / %s / %s on the deployment",
@@ -148,6 +192,13 @@ func (s *AzureOnboardService) Ready() error {
 // azureClientOrNil avoids handing out a client that would authenticate with an
 // empty secret and fail with a confusing AADSTS7000215 instead of a clear
 // "not configured".
+// rootElevationEnabled reports whether this deployment permits the privilege
+// raise. Read per call rather than at startup so it can be turned on without a
+// restart -- and so a test can set it.
+func rootElevationEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv(azureAllowRootElevationEnv)), "true")
+}
+
 func azureClientOrNil(clientID, clientSecret string) azureonboard.Client {
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
 		return nil
@@ -159,11 +210,30 @@ func azureClientOrNil(clientID, clientSecret string) azureonboard.Client {
 
 // StartLogin mints a one-shot state and returns where to send the browser.
 //
-// adminConsent merges tenant-wide consent into the sign-in itself. Opt-in: it
-// requires the signer to be a Global Administrator of the tenant, so forcing it
-// on would lock out every operator who is not one.
+// autoSetup marks the state as the FIRST leg of the automatic setup: when that
+// callback returns, it sends the browser straight on to the tenant's admin
+// consent page rather than answering, and the second callback starts the chain.
+//
+// Two redirects rather than one is not a shortcoming, it is the only thing that
+// works. See AuthorizeURL: v2.0 rejects prompt=admin_consent outright, and one
+// /authorize call carries one resource, so an ARM code and a Graph
+// application-permission grant cannot come from the same screen.
+//
+// autoSetup MUST NOT be reachable from the unauthenticated /login route, and the
+// controller does not read it from a query parameter for exactly that reason.
+// The distinction is not cosmetic: this path writes an azure_connectors row, and
+// /login is a browser navigation with no bearer token -- so honouring a query
+// parameter there would let anyone who can reach the deployment sign in with a
+// tenant of their choosing and file it into a workspace they hold no rights in,
+// bypassing the discovery:admin check that guards every other write. Minting
+// this state stays behind that check.
+// tenantWide is only meaningful with autoSetup, and records which Reader
+// strategy to use when the second callback runs. It is carried in the state
+// rather than remembered here because the decision is made now and acted on two
+// Microsoft round trips later.
 func (s *AzureOnboardService) StartLogin(
-	workspaceID uuid.UUID, actor string, adminConsent bool, signInTenant string,
+	workspaceID uuid.UUID, actor string, autoSetup, tenantWide bool,
+	signInTenant, loginHint string, pickAccount bool,
 ) (string, error) {
 	// Validated here rather than trusted: it lands in the authority URL path.
 	if t := strings.TrimSpace(signInTenant); t != "" {
@@ -172,7 +242,7 @@ func (s *AzureOnboardService) StartLogin(
 		}
 		signInTenant = t
 	}
-	state, err := azureonboard.NewLoginState()
+	state, err := azureonboard.NewLoginState(autoSetup, tenantWide)
 	if err != nil {
 		return "", err
 	}
@@ -186,7 +256,8 @@ func (s *AzureOnboardService) StartLogin(
 		return "", err
 	}
 	_ = s.repo.PurgeExpiredStates()
-	return azureonboard.AuthorizeURL(s.clientID, s.redirectURI, state, adminConsent, signInTenant), nil
+	return azureonboard.AuthorizeURL(s.clientID, s.redirectURI, state,
+		signInTenant, loginHint, pickAccount), nil
 }
 
 // ResolveLoginWorkspace decides which workspace a sign-in belongs to.
@@ -198,8 +269,9 @@ func (s *AzureOnboardService) StartLogin(
 // A single-workspace deployment -- the on-prem default -- needs neither.
 //
 // This decides only where the operator's own token is filed. Nothing is written
-// to azure_connectors on this path: that happens on the consent callback, whose
-// state is minted by an authenticated, RBAC-checked endpoint.
+// to azure_connectors on this path. A connector row is written on the consent
+// callback, and on the merged sign-in-and-consent callback -- and the state for
+// BOTH is minted by an authenticated, RBAC-checked endpoint, never by this one.
 func (s *AzureOnboardService) ResolveLoginWorkspace(explicit string) (uuid.UUID, error) {
 	if explicit = strings.TrimSpace(explicit); explicit != "" {
 		id, err := uuid.Parse(explicit)
@@ -226,6 +298,35 @@ func (s *AzureOnboardService) ResolveLoginWorkspace(explicit string) (uuid.UUID,
 	return only[0].ID, nil
 }
 
+// ResolveSignInName answers "what do I type at the sign-in page for this tenant".
+//
+// An account whose credential lives outside the directory is represented there
+// under a rewritten name -- someone@gmail.com becomes
+// someone_gmail.com#EXT#@tenant.onmicrosoft.com -- and nobody knows their own.
+// Typing the real address hands it to the consumer identity system, where a
+// work-and-school application is not enabled, and Microsoft reports "You can't
+// sign in here with a personal account" with no hint that a different username
+// would work. This is the lookup that removes the guesswork.
+//
+// LIMIT: it needs an app-only Graph token, so the application must already be
+// consented in that tenant. It helps a tenant that is onboarded or part-way
+// through, not one nothing has touched yet.
+func (s *AzureOnboardService) ResolveSignInName(
+	ctx context.Context, tenantID, email string,
+) (*azureonboard.SignInName, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	tok, err := s.azure.GraphToken(callCtx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return s.azure.ResolveSignInName(callCtx, tok.AccessToken, email)
+}
+
 // PeekCallbackWorkspace says which workspace a pending redirect belongs to,
 // without redeeming it. The callback needs this to bind the same Entra
 // application the redirect was started with, before HandleCallback consumes the
@@ -249,6 +350,32 @@ type AzureCallbackResult struct {
 	// Connector is set on the consent branch.
 	Connector *models.AzureConnector
 	Created   bool
+
+	// ConsentRedirect is where to send the browser NEXT, and is set only on the
+	// first leg of an automatic setup. The sign-in succeeded; admin consent is a
+	// second Microsoft screen, and the operator should not have to come back to
+	// the console to ask for it.
+	ConsentRedirect string
+
+	// AutoSetupWide says the operator chose the tenant-wide Reader grant when
+	// they started this. Never inferred: only a state minted by an operator who
+	// asked for it can make this true, because that grant can briefly raise
+	// their own privilege to root User Access Administrator.
+	AutoSetupWide bool
+
+	// AutoSetupWanted says this consent callback belongs to an automatic setup,
+	// so the chain should be started. The service cannot start it itself: the
+	// chain needs the sign-in session id, and only the caller can read the
+	// cookie that carries it.
+	AutoSetupWanted bool
+
+	// AutoSetup reports that this callback started the background setup chain.
+	AutoSetup bool
+
+	// AutoSetupSkipped says why it did not, when the sign-in had asked for it.
+	// Empty when nothing was asked for. An operator who reaches the console and
+	// finds nothing happening deserves the reason rather than silence.
+	AutoSetupSkipped string
 }
 
 // AzureCallbackInput is the callback's query string, already parsed.
@@ -268,6 +395,15 @@ type AzureCallbackInput struct {
 // is a request an attacker can also make, and the tenant parameter decides which
 // directory gets written into this workspace's inventory.
 func (s *AzureOnboardService) HandleCallback(ctx context.Context, in AzureCallbackInput) (*AzureCallbackResult, error) {
+	// Defence in depth. Every other entry point reaches this service through
+	// serviceFor(), which checks Ready() -- but /callback is unauthenticated and
+	// was able to arrive here with a nil Microsoft client, which crashed the
+	// process on the code exchange. A guard at the boundary costs nothing and
+	// does not depend on every future caller remembering.
+	if err := s.Ready(); err != nil {
+		return nil, err
+	}
+
 	if in.State == "" {
 		return nil, repositories.ErrAzureStateInvalid
 	}
@@ -322,11 +458,71 @@ func (s *AzureOnboardService) finishLogin(
 	if err != nil {
 		return nil, err
 	}
-	return &AzureCallbackResult{
+	res := &AzureCallbackResult{
 		Step:        "logged_in",
 		WorkspaceID: st.WorkspaceID,
 		SessionID:   sessionID,
-	}, nil
+	}
+	if !azureonboard.LoginStateAutoSetup(st.State) {
+		return res, nil
+	}
+
+	// First leg of an automatic setup. Reaching here means the state was minted
+	// behind discovery:admin, because that is the only place that can mark a
+	// login state this way.
+	//
+	// NOTHING is recorded about consent yet, because nothing has been consented.
+	// The sign-in proves who the operator is and gets an ARM token; the grant is
+	// the next screen. Writing a connector row here -- which an earlier version
+	// of this did, on the belief that one screen could do both -- would claim a
+	// grant that may never happen.
+	//
+	// Which tenant to consent is not in the callback: /authorize does not name
+	// one the way /adminconsent does. The token does, in tid.
+	tenantID := azureonboard.TenantIDFromToken(tok.AccessToken)
+	if tenantID == "" {
+		res.AutoSetupSkipped = "could not determine which tenant was signed in to"
+		return res, nil
+	}
+
+	consentURL, err := s.startAutoConsent(st.WorkspaceID, st.CreatedBy, tenantID,
+		azureonboard.LoginStateTenantWide(st.State))
+	if err != nil {
+		// The sign-in itself worked and the session is usable, so this is not
+		// fatal -- report it and let the operator finish by hand.
+		res.AutoSetupSkipped = "could not start admin consent: " + err.Error()
+		return res, nil
+	}
+	res.ConsentRedirect = consentURL
+	return res, nil
+}
+
+// startAutoConsent mints the second leg's state and returns where to send the
+// browser for admin consent.
+//
+// Separate from StartConsent because the state is marked, so that callback knows
+// to run the chain rather than stopping at "consented".
+func (s *AzureOnboardService) startAutoConsent(
+	workspaceID uuid.UUID, actor, tenantID string, tenantWide bool,
+) (string, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return "", err
+	}
+	state, err := azureonboard.NewConsentState(tenantID, true, tenantWide)
+	if err != nil {
+		return "", err
+	}
+	if err := s.repo.CreateState(&models.AzureOAuthState{
+		State:       state,
+		WorkspaceID: workspaceID,
+		Purpose:     models.AzureOAuthPurposeConsent,
+		TenantID:    tenantID,
+		CreatedBy:   firstNonEmpty(actor, "auto-setup"),
+		ExpiresAt:   time.Now().Add(azureStateTTL),
+	}); err != nil {
+		return "", err
+	}
+	return azureonboard.AdminConsentURL(s.clientID, s.redirectURI, tenantID, state), nil
 }
 
 func (s *AzureOnboardService) finishConsent(
@@ -367,6 +563,11 @@ func (s *AzureOnboardService) finishConsent(
 		WorkspaceID: st.WorkspaceID,
 		Connector:   stored,
 		Created:     created,
+		// Second leg of an automatic setup. The caller starts the chain, because
+		// it needs the sign-in session id and only the caller can read the
+		// cookie holding it.
+		AutoSetupWanted: azureonboard.ConsentStateAutoSetup(st.State),
+		AutoSetupWide:   azureonboard.ConsentStateTenantWide(st.State),
 	}, nil
 }
 
@@ -438,7 +639,7 @@ func (s *AzureOnboardService) StartConsent(
 	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
 		return "", err
 	}
-	state, err := azureonboard.NewConsentState(tenantID)
+	state, err := azureonboard.NewConsentState(tenantID, false, false)
 	if err != nil {
 		return "", err
 	}
@@ -714,6 +915,49 @@ func (s *AzureOnboardService) loadSession(
 	return refreshed, nil
 }
 
+// keepRotatedRefresh stores the refresh token Entra handed back, replacing the
+// one that was presented.
+//
+// Entra ROTATES a refresh token on redemption: the reply carries a new one, and
+// the token presented is superseded. It keeps working for a short grace period
+// and then stops. Discarding the replacement therefore does not fail
+// immediately -- it fails on the third or fourth use of the same stored token,
+// with an error that names consent rather than the token:
+//
+//	AADSTS65001: The user or administrator has not consented ...
+//
+// Every RefreshForTenant call must land here. It is deliberately best-effort:
+// the caller already holds a usable access token, so a secrets-store hiccup
+// should not fail the operation the operator asked for. The cost of losing the
+// write is one extra sign-in later, which is what happened before this existed.
+//
+// Only the refresh token and the access token change. session_ends is preserved
+// so this cannot extend a session past its original bound.
+func (s *AzureOnboardService) keepRotatedRefresh(
+	workspaceID uuid.UUID, sessionID string, tok *azureonboard.TokenSet,
+) {
+	if s.vault == nil || tok == nil || tok.RefreshToken == "" {
+		return
+	}
+	if sessionID == "" || !isBase64URL(sessionID) {
+		return
+	}
+	path := azureSessionPath(workspaceID, sessionID)
+	existing, err := s.vault.ReadSecret(path)
+	if err != nil || existing == nil {
+		return
+	}
+	if prev, _ := existing["refresh_token"].(string); prev == tok.RefreshToken {
+		return // not rotated; nothing to write
+	}
+	_ = s.vault.WriteSecret(path, map[string]interface{}{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+		"expires_at":    tok.ExpiresAt.UTC().Format(time.RFC3339),
+		"session_ends":  orNow(existing["session_ends"]),
+	})
+}
+
 // EndSession discards a stored sign-in.
 func (s *AzureOnboardService) EndSession(workspaceID uuid.UUID, sessionID string) {
 	if s.vault == nil || sessionID == "" || !isBase64URL(sessionID) {
@@ -865,6 +1109,9 @@ func (s *AzureOnboardService) AssignReader(
 	if err != nil {
 		return nil, err
 	}
+	// Entra rotated the refresh token; keep the replacement or the next call
+	// presents a superseded one. See keepRotatedRefresh.
+	s.keepRotatedRefresh(workspaceID, sessionID, userTok)
 
 	// The principal being granted access is the application's service principal
 	// in this tenant, which only an app-only token can name.
@@ -884,6 +1131,11 @@ func (s *AzureOnboardService) AssignReader(
 
 	scopes := []string{}
 	if scope = strings.TrimSpace(scope); scope != "" {
+		// Validated here for the same reason tenantID is: it is interpolated
+		// into an ARM URL, and an unchecked one relocates the request.
+		if err := azureonboard.ValidateARMScope(scope); err != nil {
+			return nil, err
+		}
 		scopes = append(scopes, scope)
 	} else {
 		// The OPERATOR's token, not the application's: the whole point is that
@@ -959,6 +1211,32 @@ func (s *AzureOnboardService) assignReaderTenantWide(
 	el := &ElevationOutcome{Attempted: true}
 	result.Elevation = el
 
+	// 1b. Everything below RAISES the operator to root User Access Administrator
+	//     and is off unless a deployment turns it on.
+	//
+	//     Not because it is wrong -- it is careful, and thirteen tests hold its
+	//     ordering -- but because it has never executed against Microsoft. Every
+	//     run that reached this code did so with an operator who already held the
+	//     privilege, so the assignment above succeeded and this branch was
+	//     skipped. Code that can grant the widest role in Azure RBAC should not
+	//     meet a customer's tenant for the first time in production.
+	//
+	//     The path that IS proven stays on: an operator holding Owner or User
+	//     Access Administrator gets the tenant-wide grant at step 1, which is
+	//     how it was verified end to end. Without the privilege they now get the
+	//     fallback instructions instead of a silent elevation.
+	//
+	//     Remove this gate once it has been exercised against a real tenant.
+	if !rootElevationEnabled() {
+		el.Attempted = false
+		el.Error = "the assignment was refused and automatic privilege elevation is disabled " +
+			"on this deployment, so nothing was elevated. Either assign Reader at the tenant " +
+			"root yourself, or set " + azureAllowRootElevationEnv + "=true to let AuthSec " +
+			"raise and return the privilege for you"
+		result.Fallback = s.readerSetup(tenantID, appTok, nil)
+		return result
+	}
+
 	// 2. Do not touch an elevation somebody else put there.
 	existing, err := s.azure.RootElevation(ctx, userTok.AccessToken, userTok.PrincipalObjectID)
 	if err != nil {
@@ -977,6 +1255,35 @@ func (s *AzureOnboardService) assignReaderTenantWide(
 	// 3. From here on, removal is mandatory on every exit path.
 	if err := s.azure.ElevateAccess(ctx, userTok.AccessToken); err != nil {
 		el.Error = err.Error()
+
+		// A refusal and a lost answer are not the same thing, and this used to
+		// treat them alike -- returning before the removal defer exists. Some
+		// failures are ambiguous: a timeout, a reset, a 5xx after the write.
+		// ARM may well have applied the elevation, and nothing would ever have
+		// taken it back. The status said elevated:false while the operator held
+		// User Access Administrator at the tenant root, which is the one
+		// outcome this whole dance exists to avoid.
+		//
+		// ErrNotGlobalAdmin is the exception: that one provably applied nothing,
+		// so there is nothing to look for.
+		if !errors.Is(err, azureonboard.ErrNotGlobalAdmin) {
+			stray, lookErr := s.azure.RootElevation(
+				ctx, userTok.AccessToken, userTok.PrincipalObjectID)
+			switch {
+			case lookErr != nil:
+				el.Error = appendReason(el.Error,
+					"and it could not be confirmed whether the elevation applied anyway: "+
+						lookErr.Error()+". Check for a root-scope User Access Administrator "+
+						"assignment on this operator and remove it by hand")
+			case stray != "":
+				// It did apply. Record it honestly and give it back.
+				el.Elevated = true
+				el.Error = appendReason(el.Error,
+					"the elevation applied despite the error, and is being removed")
+				s.removeElevation(userTok, el, stray)
+			}
+		}
+
 		result.Fallback = s.readerSetup(tenantID, appTok, nil)
 		return result
 	}
@@ -1098,6 +1405,51 @@ func (s *AzureOnboardService) persistSubscriptions(
 	return s.repo.SetSubscriptionReader(workspaceID, tenantID, readable)
 }
 
+// AvailableSubscriptions lists the subscriptions the SIGNED-IN OPERATOR can see
+// in one tenant, so a caller can choose which of them to grant Reader on.
+//
+// Distinct from Subscriptions(), and the difference is which token asks:
+//
+//	Subscriptions()           the app's own view, from the database, and only
+//	                          ever populated AFTER Reader was assigned
+//	AvailableSubscriptions()  the operator's view, live from ARM, available
+//	                          BEFORE any Reader exists
+//
+// Without this the choice cannot be offered at all: the only list the product
+// held was one that does not exist until the grant it is meant to scope has
+// already happened.
+//
+// It grants nothing and records nothing. It reports what a person can already
+// see in their own portal.
+func (s *AzureOnboardService) AvailableSubscriptions(
+	ctx context.Context, workspaceID uuid.UUID, sessionID, tenantID string,
+) ([]azureonboard.Subscription, error) {
+	if err := azureonboard.ValidateTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	sess, err := s.loadSession(ctx, workspaceID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sess.RefreshToken == "" {
+		return nil, azureonboard.ErrNoSession
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
+	defer cancel()
+
+	// Per-tenant, like every other ARM call here: a token issued by the sign-in
+	// tenant is refused when reading a subscription in a different directory.
+	userTok, err := s.azure.RefreshForTenant(callCtx, sess.RefreshToken, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	// Entra rotated the refresh token; keep the replacement or the next call
+	// presents a superseded one. See keepRotatedRefresh.
+	s.keepRotatedRefresh(workspaceID, sessionID, userTok)
+	return s.azure.ListSubscriptions(callCtx, userTok.AccessToken)
+}
+
 // Subscriptions lists what is known about one tenant's subscriptions.
 func (s *AzureOnboardService) Subscriptions(
 	workspaceID uuid.UUID, tenantID string,
@@ -1110,12 +1462,23 @@ func (s *AzureOnboardService) Subscriptions(
 
 // AzureGraphResult is the outcome of a Microsoft Graph authorisation check.
 type AzureGraphResult struct {
-	TenantID string   `json:"tenantId"`
-	GraphOK  bool     `json:"graph_ok"`
-	Granted  []string `json:"granted_roles"`
-	Missing  []string `json:"missing_roles"`
-	Error    string   `json:"error,omitempty"`
-	Hint     string   `json:"hint,omitempty"`
+	TenantID string `json:"tenantId"`
+	GraphOK  bool   `json:"graph_ok"`
+
+	// Unreadable means the check could not obtain an app-only token at all, so
+	// nothing is known about the permissions and Missing below is every required
+	// one rather than an observation.
+	//
+	// Without this the two failures are indistinguishable from outside: both
+	// leave Granted empty and Missing full. A caller reporting the missing list
+	// then tells an operator "you granted nothing" when the application could
+	// not authenticate -- and they re-grant four permissions that were never the
+	// problem.
+	Unreadable bool     `json:"unreadable,omitempty"`
+	Granted    []string `json:"granted_roles"`
+	Missing    []string `json:"missing_roles"`
+	Error      string   `json:"error,omitempty"`
+	Hint       string   `json:"hint,omitempty"`
 
 	// Capabilities is what the granted permissions can actually reach. A
 	// permission can be granted and still withhold its data -- sign-in logs
@@ -1155,6 +1518,7 @@ func (s *AzureOnboardService) ValidateGraph(
 	tok, err := s.azure.GraphToken(callCtx, tenantID)
 	if err != nil {
 		result.Error = err.Error()
+		result.Unreadable = true
 		result.Missing = azureonboard.RequiredGraphRoles()
 		if errors.Is(err, azureonboard.ErrAppNotInTenant) {
 			result.Hint = "admin consent has not completed in this tenant; run POST /api/azure/consent"
@@ -1202,14 +1566,6 @@ func (s *AzureOnboardService) ValidateGraph(
 
 /* ----------------------- checking our own app registration ----------------------- */
 
-// azureHomeTenantEnv names the tenant the App Registration itself lives in.
-//
-// Needed because an application object exists ONLY in its home tenant -- a
-// customer tenant holds a service principal instead -- so a self-check must use
-// a home-tenant token. Falls back to AZURE_SIGNIN_TENANT when that is a GUID,
-// which it is on any deployment that had to pin sign-in.
-const azureHomeTenantEnv = "AZURE_HOME_TENANT"
-
 // AppCheckFinding is one thing the app registration gets wrong.
 type AppCheckFinding struct {
 	Check    string `json:"check"`
@@ -1229,9 +1585,24 @@ type AppCheckResult struct {
 	DeclaredPermissions []string `json:"declared_permissions"`
 	MissingPermissions  []string `json:"missing_permissions"`
 
-	SecretCount int        `json:"secret_count"`
-	CertCount   int        `json:"cert_count"`
-	CredExpires *time.Time `json:"credential_expires_at,omitempty"`
+	// MissingARMScopes is the Azure Service Management DELEGATED permissions
+	// that are not declared. A different API and a different permission type
+	// from MissingPermissions, so a different field -- the portal path to fix
+	// them is not the same one.
+	MissingARMScopes []string `json:"missing_arm_scopes"`
+
+	// MissingOptionalPermissions is what discovery would use if granted. Absent
+	// ones do NOT make the check fail -- they narrow what gets collected, and
+	// that is worth saying rather than discovering later from an empty table.
+	MissingOptionalPermissions []string `json:"missing_optional_permissions"`
+
+	SecretCount int `json:"secret_count"`
+
+	// CredentialInUse is which form AuthSec authenticates with -- "secret" or
+	// "certificate" -- as distinct from what the registration happens to hold.
+	CredentialInUse string     `json:"credential_in_use,omitempty"`
+	CertCount       int        `json:"cert_count"`
+	CredExpires     *time.Time `json:"credential_expires_at,omitempty"`
 
 	OK       bool              `json:"ok"`
 	Findings []AppCheckFinding `json:"findings"`
@@ -1255,19 +1626,23 @@ type AppCheckResult struct {
 // in the portal or by an automated bootstrap, this is the single assertion that
 // says the end state is correct.
 func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppCheckResult, error) {
-	// A submitted configuration wins over the environment: it is the
-	// application this workspace actually asked us to use.
+	// The home tenant comes from the submitted configuration and nowhere else.
+	//
+	// It used to also be an environment variable, from before POST
+	// /api/azure/config existed. That was one input too many: it is not a
+	// secret, it is not a deployment property, and it belongs to a specific
+	// application -- so keeping it beside the client id that it describes, in
+	// the same row, is the only place it cannot drift out of step with.
+	//
+	// An application object exists ONLY in the directory it was created in; a
+	// customer tenant holds a service principal instead. So this check has no
+	// meaning without knowing that directory, and refusing is correct.
 	home := strings.TrimSpace(s.homeTenant)
-	if home == "" {
-		home = strings.TrimSpace(os.Getenv(azureHomeTenantEnv))
-	}
-	if home == "" && azureonboard.ValidateTenantID(azureonboard.SignInTenant) == nil {
-		home = azureonboard.SignInTenant
-	}
 	if err := azureonboard.ValidateTenantID(home); err != nil {
-		return nil, fmt.Errorf("cannot check the app registration: set %s to the tenant the "+
-			"registration was created in (an application object exists only in its home tenant)",
-			azureHomeTenantEnv)
+		return nil, fmt.Errorf("%w: this workspace has no Entra application on record, so there "+
+			"is nothing to check. Submit it with POST /api/azure/config, including the "+
+			"Directory (tenant) ID the registration was created in",
+			azureonboard.ErrNotConfigured)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, azureCallTimeout)
@@ -1290,7 +1665,10 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 		RedirectURIs:        app.Web.RedirectURIs,
 		DeclaredPermissions: []string{},
 		MissingPermissions:  []string{},
-		Findings:            []AppCheckFinding{},
+		MissingARMScopes:    []string{},
+
+		MissingOptionalPermissions: []string{},
+		Findings:                   []AppCheckFinding{},
 	}
 
 	// 1. Multi-tenant, or no customer tenant can ever consent.
@@ -1349,41 +1727,132 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 		})
 	}
 
-	// 3. Declared application permissions. The application object stores role
-	//    IDs, never names, so the comparison is by ID.
-	declared := map[string]bool{}
+	// 3. Declared permissions. The application object stores permission IDs,
+	//    never names, so every comparison here is by ID.
+	//
+	//    Two resources, and both matter. Graph APPLICATION permissions are what
+	//    the background discovery reads with. The Azure Service Management
+	//    DELEGATED scope is what lets an operator assign Reader -- and it is the
+	//    one that used to be missed, because sign-in obtains it by incremental
+	//    consent and nothing here looked for it.
+	declaredGraphRoles := map[string]bool{}
+	declaredARMScopes := map[string]bool{}
 	for _, r := range app.RequiredResourceAccess {
-		if r.ResourceAppID != azureonboard.GraphResourceAppID {
-			continue
-		}
-		for _, a := range r.ResourceAccess {
-			// "Role" is an application permission; "Scope" is delegated, and a
-			// delegated grant never appears in an app-only token's roles claim.
-			if a.Type == "Role" {
-				declared[a.ID] = true
+		switch r.ResourceAppID {
+		case azureonboard.GraphResourceAppID:
+			for _, a := range r.ResourceAccess {
+				// "Role" is an application permission; "Scope" is delegated, and
+				// a delegated grant never appears in an app-only token's roles
+				// claim.
+				if a.Type == "Role" {
+					declaredGraphRoles[a.ID] = true
+				}
+			}
+		case azureonboard.ARMResourceAppID:
+			for _, a := range r.ResourceAccess {
+				if a.Type == "Scope" {
+					declaredARMScopes[a.ID] = true
+				}
 			}
 		}
 	}
+
+	var missingGraph, missingARM, missingOptional []string
 	for name, id := range azureonboard.RequiredGraphRoleIDs() {
-		if declared[id] {
+		if declaredGraphRoles[id] {
 			res.DeclaredPermissions = append(res.DeclaredPermissions, name)
 		} else {
-			res.MissingPermissions = append(res.MissingPermissions, name)
+			missingGraph = append(missingGraph, name)
 		}
 	}
+	// Optional ones are reported the same way and judged differently: granted,
+	// they appear alongside the rest; missing, they are a warning rather than an
+	// error, because discovery runs without them and only collects less.
+	for name, id := range azureonboard.OptionalGraphRoleIDs() {
+		if declaredGraphRoles[id] {
+			res.DeclaredPermissions = append(res.DeclaredPermissions, name)
+		} else {
+			missingOptional = append(missingOptional, name)
+		}
+	}
+	for name, id := range azureonboard.RequiredARMScopeIDs() {
+		if declaredARMScopes[id] {
+			res.DeclaredPermissions = append(res.DeclaredPermissions, "Azure Service Management / "+name)
+		} else {
+			missingARM = append(missingARM, name)
+		}
+	}
+	sort.Strings(missingGraph)
+	sort.Strings(missingARM)
+	// Kept separate, and NOT merged into MissingPermissions.
+	//
+	// Every consumer of that field -- the console's "how to grant these" box,
+	// the POST /config next hint -- renders it as "Microsoft Graph -> Application
+	// permissions". Merging a DELEGATED scope on a DIFFERENT API into it made
+	// them all instruct an operator to look for user_impersonation under Graph
+	// application permissions, where it does not exist. Wrong instructions are
+	// worse than none: this whole feature lost an afternoon to an error message
+	// that named the wrong thing.
+	res.MissingPermissions = missingGraph
+	res.MissingARMScopes = missingARM
+	sort.Strings(missingOptional)
+	res.MissingOptionalPermissions = missingOptional
 	sort.Strings(res.DeclaredPermissions)
-	sort.Strings(res.MissingPermissions)
 
-	if len(res.MissingPermissions) > 0 {
+	if len(missingGraph) > 0 {
 		res.Findings = append(res.Findings, AppCheckFinding{
 			Check:    "declared_permissions",
 			Severity: "error",
 			Detail: fmt.Sprintf("not declared as APPLICATION permissions: %s. Admin consent uses "+
 				"scope=.default, which grants only what the application declares, so consent "+
 				"would succeed and grant nothing",
-				strings.Join(res.MissingPermissions, ", ")),
+				strings.Join(missingGraph, ", ")),
 			Fix: "portal -> API permissions -> Add a permission -> Microsoft Graph -> " +
 				"Application permissions (not Delegated) -> add them -> Grant admin consent",
+		})
+	}
+
+	if len(missingOptional) > 0 {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check: "optional_permissions",
+			// Warning, not error: onboarding is complete and discovery works.
+			// Making this an error would tell every customer who does not want
+			// Conditional Access in their access graph that their application
+			// is broken.
+			Severity: "warning",
+			Detail: fmt.Sprintf("not declared, so discovery will not collect what they cover: %s. "+
+				"Everything else still works", strings.Join(missingOptional, ", ")),
+			Fix: "optional. To collect it: portal -> API permissions -> Add a permission -> " +
+				"Microsoft Graph -> Application permissions -> expand Policy -> " +
+				"Policy.Read.All -> Grant admin consent. The narrower " +
+				"Policy.Read.ConditionalAccess does NOT work for this: it is granted, it " +
+				"appears in the token, and the endpoint still answers AccessDenied",
+		})
+	}
+
+	// Its own finding, because the failure it produces looks like something
+	// else entirely and cost a real debugging session.
+	if len(missingARM) > 0 {
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "declared_arm_scope",
+			Severity: "error",
+			Detail: fmt.Sprintf("not declared as a DELEGATED permission on the Azure Service "+
+				"Management API: %s. Sign-in still obtains it by incremental consent, so this "+
+				"looks fine until admin consent runs -- .default then replaces the delegated "+
+				"grants with what the registration declares, deleting it. Reader assignment "+
+				"afterwards fails with AADSTS65001 \"has not consented\", while Graph reports "+
+				"fully consented",
+				strings.Join(missingARM, ", ")),
+			// The name to SEARCH FOR is the service principal's display name in
+			// the directory, which is not what Microsoft's documentation calls
+			// this API. Searching "Azure Service Management" returns No results,
+			// and there is nothing on that screen to suggest why. The app id is
+			// unambiguous and the search box accepts it.
+			Fix: "portal -> API permissions -> Add a permission -> APIs my organization uses -> " +
+				"search 797f4846-ba00-4fd7-ba43-dac1f8f63013 (its display name there is " +
+				"\"Windows Azure Service Management API\", NOT \"Azure Service Management\") -> " +
+				"Delegated permissions -> user_impersonation -> Add permissions -> " +
+				"Grant admin consent",
 		})
 	}
 
@@ -1392,18 +1861,40 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 	res.SecretCount = len(app.PasswordCredentials)
 	res.CertCount = len(app.KeyCredentials)
 
-	var soonest *time.Time
-	for _, c := range app.PasswordCredentials {
-		if c.EndDateTime != nil && (soonest == nil || c.EndDateTime.Before(*soonest)) {
-			soonest = c.EndDateTime
+	// The expiry of the credential IN USE, not the soonest on the registration.
+	//
+	// Those are different numbers whenever a registration carries credentials
+	// AuthSec does not authenticate with -- which is the normal state after
+	// switching from a secret to a certificate, because the old secrets are
+	// still sitting there. Reporting the soonest told an operator "credential
+	// expires 2027-03-07" while the certificate actually in use expired six
+	// months later: they would plan a rotation for a credential nothing uses,
+	// and get no warning for the one that matters.
+	//
+	// Observed exactly that against a real registration: two unused secrets, one
+	// certificate, and the reported date belonged to a secret.
+	var expires *time.Time
+	ourCertUploaded := false
+	switch s.credKind {
+	case azureonboard.CredentialCertificate:
+		for _, c := range app.KeyCredentials {
+			if !sameThumbprint(c.CustomKeyIdentifier, s.credThumbprint) {
+				continue
+			}
+			ourCertUploaded = true
+			expires = c.EndDateTime
+		}
+	default:
+		// A secret cannot be identified from the registration -- Graph returns
+		// no value and no hash -- so the soonest is the honest answer, and it
+		// is the right one when the secret in use is the only one.
+		for _, c := range app.PasswordCredentials {
+			if c.EndDateTime != nil && (expires == nil || c.EndDateTime.Before(*expires)) {
+				expires = c.EndDateTime
+			}
 		}
 	}
-	for _, c := range app.KeyCredentials {
-		if c.EndDateTime != nil && (soonest == nil || c.EndDateTime.Before(*soonest)) {
-			soonest = c.EndDateTime
-		}
-	}
-	res.CredExpires = soonest
+	res.CredExpires = expires
 
 	switch {
 	case res.SecretCount == 0 && res.CertCount == 0:
@@ -1413,29 +1904,73 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 			Detail:   "the registration has no client secret and no certificate",
 			Fix:      "portal -> Certificates & secrets -> New client secret, or upload a certificate",
 		})
-	case soonest != nil && time.Until(*soonest) < 30*24*time.Hour:
+	// The credential IN USE, so the warning fires on the date that matters.
+	// Warning on the soonest credential on the registration meant nagging about
+	// a secret nothing uses while the one being used quietly approached expiry.
+	case expires != nil && time.Until(*expires) < 30*24*time.Hour:
 		sev := "warning"
-		if time.Until(*soonest) <= 0 {
+		if time.Until(*expires) <= 0 {
 			sev = "error"
 		}
 		res.Findings = append(res.Findings, AppCheckFinding{
 			Check:    "credential_expiry",
 			Severity: sev,
-			Detail: fmt.Sprintf("the soonest credential expires %s (%d days)",
-				soonest.UTC().Format("2006-01-02"), int(time.Until(*soonest).Hours()/24)),
-			Fix: "issue a new secret or certificate before then. This credential is global: " +
-				"when it lapses, every consented tenant stops working at once",
+			Detail: fmt.Sprintf("the %s AuthSec authenticates with expires %s (%d days)",
+				firstNonEmpty(string(s.credKind), "credential"),
+				expires.UTC().Format("2006-01-02"), int(time.Until(*expires).Hours()/24)),
+			Fix: "issue a new one before then. This credential is global: when it lapses, " +
+				"every consented tenant stops working at once",
 		})
 	}
 
-	// A certificate is preferable, but a secret is not a defect.
-	if res.CertCount == 0 && res.SecretCount > 0 {
+	// What is IN USE, cross-referenced with what is registered.
+	res.CredentialInUse = string(s.credKind)
+	switch {
+	case s.credKind == azureonboard.CredentialCertificate && !ourCertUploaded:
+		// Configured to sign assertions against a certificate the registration
+		// does not have. Every token request will be rejected, and the error
+		// will be about the assertion rather than the missing upload.
+		detail := "configured with a certificate, but the registration has no certificate " +
+			"uploaded. Microsoft verifies the signed assertion against a public key it " +
+			"holds, and there is none"
+		if res.CertCount > 0 {
+			// Worse than none, and much harder to spot: certificates ARE
+			// uploaded, just not this one. "cert_count > 0" reads like success.
+			detail = fmt.Sprintf("the registration has %d certificate(s) uploaded, but none of "+
+				"them is the one AuthSec holds the key for. Signing will be refused with "+
+				"AADSTS700027", res.CertCount)
+		}
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "credential_type",
+			Severity: "error",
+			Detail:   detail,
+			Fix: "portal -> Certificates & secrets -> Certificates -> Upload certificate, " +
+				"using the public certificate that matches the private key submitted here",
+		})
+
+	case s.credKind == azureonboard.CredentialSecret && res.CertCount > 0:
+		// The registration looks exemplary and the credential still crosses the
+		// network on every call. Worth saying plainly, because nothing else here
+		// would reveal it.
+		res.Findings = append(res.Findings, AppCheckFinding{
+			Check:    "credential_type",
+			Severity: "warning",
+			Detail: "a certificate is uploaded on the registration, but AuthSec is configured " +
+				"with a client secret, so the credential is still sent on every token request",
+			Fix: "re-submit with generateCertificate to switch. Note that AuthSec makes its " +
+				"own key pair, so the certificate already uploaded is not the one it will " +
+				"use -- you will upload the new one and can then remove the old",
+		})
+
+	case s.credKind == azureonboard.CredentialSecret:
+		// The ordinary case. Not a defect.
 		res.Findings = append(res.Findings, AppCheckFinding{
 			Check:    "credential_type",
 			Severity: "warning",
 			Detail:   "authenticating with a client secret rather than a certificate",
 			Fix: "a certificate signs an assertion instead of sending the credential, so it " +
-				"never crosses the network and can live in an HSM as non-exportable",
+				"never crosses the network. Set generateCertificate and AuthSec will make the " +
+				"key pair, keep the private half, and hand you the certificate to upload",
 		})
 	}
 
@@ -1446,4 +1981,40 @@ func (s *AzureOnboardService) CheckAppRegistration(ctx context.Context) (*AppChe
 		}
 	}
 	return res, nil
+}
+
+// sameThumbprint compares a Graph customKeyIdentifier with our x5t.
+//
+// The same twenty bytes, written two ways -- and comparing the strings never
+// matches. The failure that produces is "your certificate is not uploaded" on a
+// registration where it plainly is, which sends an operator to upload it again.
+//
+// HEX is what Graph actually returns for an X509 credential, observed against a
+// real registration:
+//
+//	customKeyIdentifier  C2EC90B404B8213FC5B3FB2A61D2E8E2CDEE9CEB
+//	x5t                  wuyQtAS4IT_Fs_sqYdLo4s3unOs
+//
+// The documentation describes the field as base64, and for other credential
+// types it is, so both are tried rather than assuming either.
+func sameThumbprint(graphKeyID, x5t string) bool {
+	if graphKeyID == "" || x5t == "" {
+		return false
+	}
+	decode := func(v string) []byte {
+		if b, err := hex.DecodeString(v); err == nil && len(b) > 0 {
+			return b
+		}
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding, base64.RawStdEncoding,
+			base64.URLEncoding, base64.RawURLEncoding,
+		} {
+			if b, err := enc.DecodeString(v); err == nil && len(b) > 0 {
+				return b
+			}
+		}
+		return nil
+	}
+	a, b := decode(graphKeyID), decode(x5t)
+	return a != nil && b != nil && bytes.Equal(a, b)
 }

@@ -3,10 +3,12 @@ package azureonboard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -174,7 +176,83 @@ const (
 	roleDirectoryReadAll      = "7ab1d382-f21e-4acd-a863-ba3e13f7da61"
 	roleRoleManagementReadDir = "483bed4a-2ad3-4361-a73b-c83ccdbdc53c"
 	roleAuditLogReadAll       = "b0afded3-3588-46d8-8b3d-9842eff778da"
+
+	// Windows Azure Service Management API, and its one delegated scope.
+	//
+	// This has to be DECLARED on the registration, not merely consented at
+	// sign-in, and the difference is the whole reason it is here.
+	//
+	// A sign-in asking for management.azure.com/user_impersonation gets it by
+	// incremental consent -- Entra records a grant for that ONE user. Admin
+	// consent afterwards uses scope=.default, and .default replaces the
+	// application's delegated grants with exactly what the registration
+	// declares. Declare nothing for this resource and the admin consent DELETES
+	// the grant the sign-in just created, leaving:
+	//
+	//	oauth2PermissionGrants: consentType=AllPrincipals scope="User.Read"
+	//
+	// Every later delegated ARM call then fails with
+	//
+	//	AADSTS65001: The user or administrator has not consented ...
+	//
+	// which names consent and reads like a consent failure -- while the Graph
+	// side reports fully consented, because it is. Observed against a real
+	// tenant: admin consent succeeded, all four application permissions usable,
+	// and Reader could not be assigned anywhere.
+	//
+	// Declared, the same admin consent grants it tenant-wide (AllPrincipals),
+	// which is also strictly better than a per-user grant: any operator in the
+	// tenant can then assign Reader, not only the one who first signed in.
+	ARMResourceAppID = "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+
+	// scopeARMUserImpersonation is oauth2PermissionScopes[?value=='user_impersonation'].id
+	// on that service principal.
+	scopeARMUserImpersonation = "41094075-9dad-400e-a0bd-54e686782033"
 )
+
+// OptionalGraphRoleIDs are permissions discovery USES if granted and does not
+// need to run.
+//
+// Separate from RequiredGraphRoleIDs because the consequence of missing one is
+// different in kind: a missing required permission means discovery cannot do its
+// job, and a missing optional one means it collects less. Reporting both as
+// errors would tell every customer who does not want Conditional Access in their
+// access graph that their application is broken.
+//
+// They are still reported, because silently collecting less is worse than
+// saying so.
+func OptionalGraphRoleIDs() map[string]string {
+	return map[string]string{
+		// Conditional Access policies: which sign-ins require MFA, which
+		// applications are exempt, who is excluded from a control. Useful in an
+		// access graph, and not needed to enumerate identities or resources.
+		//
+		// Policy.Read.All, NOT the narrower Policy.Read.ConditionalAccess.
+		//
+		// The narrow one looks like the least-privilege choice and does not work:
+		// granted and present in the app-only token's roles claim,
+		// /identity/conditionalAccess/policies still answers
+		//
+		//	AccessDenied: required scopes are missing in the token
+		//
+		// Tested against a real tenant rather than assumed. Microsoft documents
+		// Policy.Read.All for that endpoint and means it.
+		"Policy.Read.All": rolePolicyReadAll,
+	}
+}
+
+const rolePolicyReadAll = "246dd0d5-5bd0-4def-940b-0421030a5b68"
+
+// RequiredARMScopeIDs maps each required DELEGATED permission on the Azure
+// Service Management API to its scope id.
+//
+// Delegated, not application: the role assignment this buys is made AS THE
+// OPERATOR, because an application cannot grant itself an Azure RBAC role.
+func RequiredARMScopeIDs() map[string]string {
+	return map[string]string{
+		"user_impersonation": scopeARMUserImpersonation,
+	}
+}
 
 // RequiredGraphRoleIDs maps each required permission to its Graph app-role id,
 // which is what an application object actually stores in requiredResourceAccess.
@@ -211,6 +289,13 @@ type AppRegistration struct {
 	KeyCredentials []struct {
 		DisplayName string     `json:"displayName"`
 		EndDateTime *time.Time `json:"endDateTime"`
+
+		// CustomKeyIdentifier is the certificate's SHA-1 thumbprint, base64.
+		// It is what makes "is OUR certificate uploaded, and when does IT
+		// expire" answerable -- as opposed to "does this registration have
+		// some certificate", which is a different and much less useful
+		// question.
+		CustomKeyIdentifier string `json:"customKeyIdentifier"`
 	} `json:"keyCredentials"`
 }
 
@@ -230,7 +315,7 @@ func (c *HTTPClient) ReadOwnApp(ctx context.Context, accessToken, appID string) 
 	q.Set("$filter", "appId eq '"+appID+"'")
 	q.Set("$select", "displayName,appId,signInAudience,web,requiredResourceAccess,"+
 		"passwordCredentials,keyCredentials")
-	endpoint := "https://graph.microsoft.com/v1.0/applications?" + q.Encode()
+	endpoint := GraphBase + "/v1.0/applications?" + q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -272,4 +357,122 @@ func (c *HTTPClient) ReadOwnApp(ctx context.Context, accessToken, appID string) 
 			"is this the home tenant the app registration was created in?", appID)
 	}
 	return &page.Value[0], nil
+}
+
+/* ------------------------- resolving a sign-in name ------------------------- */
+
+// SignInName is what a person must actually type at a tenant's sign-in page.
+type SignInName struct {
+	// Email is what they gave us -- their real address.
+	Email string `json:"email"`
+
+	// UserPrincipalName is what Entra knows them as INSIDE the tenant, which is
+	// what the sign-in page resolves. For an externally-backed account these are
+	// different strings and nobody can guess the second one.
+	UserPrincipalName string `json:"user_principal_name"`
+
+	// Mangled records that the two differ, so a caller can explain why.
+	Mangled bool `json:"mangled"`
+}
+
+// ResolveSignInName finds what an email address is called inside one tenant.
+//
+// WHY THIS EXISTS. An account whose credential lives outside the directory --
+// a Gmail or Outlook address that signed up for Azure, or a guest invited from
+// another company -- is represented in that directory under a rewritten name:
+//
+//	amankumarsingh@gmail.com
+//	  becomes  amankumarsingh_gmail.com#EXT#@<tenant>.onmicrosoft.com
+//
+// The rewrite happens because a directory cannot issue names in a domain it
+// does not own. Typing the REAL address at that tenant's sign-in page fails:
+// gmail.com is not a verified domain there, so Entra hands the address to the
+// consumer identity system instead, where a work-and-school-only application is
+// not enabled -- and the operator is told "You can't sign in here with a
+// personal account", with no hint that a different username would work.
+//
+// Nobody knows their own #EXT# name. It is not shown at sign-up, not in any
+// email, and not in the portal unless you go looking at the user object. So the
+// product looks it up: the real address is kept on the user as otherMails, and
+// Directory.Read.All -- already required for discovery -- can read it.
+//
+// LIMIT, stated plainly: this needs an app-only Graph token, which needs the
+// application to be consented in that tenant already. It resolves a sign-in for
+// a tenant that is onboarded or mid-onboarding, not for one nothing has touched.
+func (c *HTTPClient) ResolveSignInName(
+	ctx context.Context, graphToken, email string,
+) (*SignInName, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil, errors.New("email is required")
+	}
+	// Single quotes terminate an OData string literal; doubling them is the
+	// escape. Rejecting instead would refuse addresses that are legal.
+	safe := strings.ReplaceAll(email, "'", "''")
+
+	// otherMails carries the real address for an externally-backed account, and
+	// filtering on a collection needs the advanced query flags. mail and
+	// userPrincipalName cover an ordinary member, whose name needs no rewrite.
+	queries := []struct {
+		filter   string
+		advanced bool
+	}{
+		{"otherMails/any(m:m eq '" + safe + "')", true},
+		{"mail eq '" + safe + "' or userPrincipalName eq '" + safe + "'", false},
+	}
+
+	for _, q := range queries {
+		v := url.Values{}
+		v.Set("$filter", q.filter)
+		v.Set("$select", "userPrincipalName,mail,otherMails")
+		v.Set("$top", "2")
+		if q.advanced {
+			v.Set("$count", "true")
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			GraphBase+"/v1.0/users?"+v.Encode(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("build graph request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+graphToken)
+		req.Header.Set("Accept", "application/json")
+		if q.advanced {
+			req.Header.Set("ConsistencyLevel", "eventual")
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("reach microsoft graph: %v", redactURLError(err))
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			// A filter this tenant rejects is not fatal while another remains.
+			continue
+		}
+		var page struct {
+			Value []struct {
+				UserPrincipalName string `json:"userPrincipalName"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil || len(page.Value) == 0 {
+			continue
+		}
+		// More than one match means the address is ambiguous in this directory.
+		// Guessing which is meant would send someone to the wrong identity.
+		if len(page.Value) > 1 {
+			return nil, fmt.Errorf("%q matches more than one account in this tenant; "+
+				"sign in with the exact user principal name", email)
+		}
+		upn := page.Value[0].UserPrincipalName
+		return &SignInName{
+			Email:             email,
+			UserPrincipalName: upn,
+			Mangled:           !strings.EqualFold(upn, email),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("no account in this tenant has the address %q", email)
 }
