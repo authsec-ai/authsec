@@ -1091,3 +1091,217 @@ func (ctl *GovernanceController) DecideAgentIGALink(c *gin.Context) {
 		id.String(), http.StatusOK, nil, out)
 	c.JSON(http.StatusOK, out)
 }
+
+/* ----------------------------- agent policies ----------------------------- */
+
+// The declarative layer above enforcement (ENFORCEMENT-ARCHITECTURE.md §3A). An
+// operator attaches a policy to a claimed agent, or to a selector matching many, and
+// a reconciler works toward it.
+//
+// PHASE 1: reconciliation is dry-run only. These endpoints let a policy be authored,
+// expanded and previewed; nothing acts on a cluster yet.
+
+func (ctl *GovernanceController) agentPolicies() services.AgentPolicyManager {
+	return services.NewAgentPolicyManager(ctl.db)
+}
+
+// CreateAgentPolicyRequest is the body for POST /authsec/governance/agent-policies.
+type CreateAgentPolicyRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description,omitempty"`
+
+	// Exactly one target.
+	DiscoveredAgentID *uuid.UUID                  `json:"discovered_agent_id,omitempty"`
+	Selector          *models.AgentPolicySelector `json:"selector,omitempty"`
+
+	// Entitlement arm — a ceiling, never a grant.
+	ScopeCeiling  []string   `json:"scope_ceiling,omitempty"`
+	RoleCeilingID *uuid.UUID `json:"role_ceiling_id,omitempty"`
+
+	// Cluster arm.
+	DesiredState string `json:"desired_state,omitempty"` // active | quarantined
+
+	Duration  string     `json:"duration,omitempty"` // XOR expires_at
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	OnExpiry  string     `json:"on_expiry,omitempty"` // revoke (default) | quarantine | evict
+
+	// Required when on_expiry is destructive. ConfirmAgentIDs binds the confirmation
+	// to a concrete expansion so one confirmation cannot authorize deleting workloads
+	// nobody enumerated.
+	Reason          string      `json:"reason,omitempty"`
+	ConfirmAgentIDs []uuid.UUID `json:"confirm_agent_ids,omitempty"`
+}
+
+// CreateAgentPolicy handles POST /authsec/governance/agent-policies.
+func (ctl *GovernanceController) CreateAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req CreateAgentPolicyRequest
+	if err = c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	actor, actorLabel := ctl.actingUser(c)
+	out, err := ctl.agentPolicies().Create(wsID, actorLabel, services.AgentPolicyInput{
+		Name:              req.Name,
+		Description:       req.Description,
+		DiscoveredAgentID: req.DiscoveredAgentID,
+		Selector:          req.Selector,
+		ScopeCeiling:      req.ScopeCeiling,
+		RoleCeilingID:     req.RoleCeilingID,
+		DesiredState:      req.DesiredState,
+		Duration:          req.Duration,
+		ExpiresAt:         req.ExpiresAt,
+		OnExpiry:          req.OnExpiry,
+		Reason:            req.Reason,
+		ConfirmedBy:       actor,
+		ConfirmAgentIDs:   req.ConfirmAgentIDs,
+	})
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	auditAdminMutation(c, wsID.String(), "create", "agent_policy", out.ID.String(),
+		http.StatusCreated, nil, out)
+	c.JSON(http.StatusCreated, out)
+}
+
+// ListAgentPolicies handles GET /authsec/governance/agent-policies.
+func (ctl *GovernanceController) ListAgentPolicies(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := ctl.agentPolicies().List(wsID, c.Query("enabled") == "true")
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"policies": out, "total": len(out)})
+}
+
+// GetAgentPolicy handles GET /authsec/governance/agent-policies/:id, including the
+// agents its selector currently expands to — a policy is only as clear as the set it
+// actually covers.
+func (ctl *GovernanceController) GetAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	mgr := ctl.agentPolicies()
+	p, err := mgr.Get(wsID, id)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	agents, _ := mgr.Expand(wsID, p)
+	c.JSON(http.StatusOK, gin.H{"policy": p, "expands_to": agents})
+}
+
+// DeleteAgentPolicy handles DELETE /authsec/governance/agent-policies/:id.
+func (ctl *GovernanceController) DeleteAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := ctl.agentPolicies().Delete(wsID, id); err != nil {
+		governanceError(c, err)
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "delete", "agent_policy", id.String(),
+		http.StatusOK, nil, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"deleted": true,
+		"note": "already-applied effects are NOT undone; the actions this policy took " +
+			"remain in agent_policy_actions",
+	})
+}
+
+// GetAgentPolicyEffective handles GET /authsec/discovery/agents/:id/effective-policy —
+// what every matching policy adds up to for one agent, and which policies caused it.
+func (ctl *GovernanceController) GetAgentPolicyEffective(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := ctl.agentPolicies().Effective(wsID, id)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ReconcileAgentPolicies handles POST /authsec/governance/agent-policies/reconcile.
+//
+// dry_run defaults to TRUE and a live run is currently refused — the plan has to be
+// provable against real data before anything acts on it.
+func (ctl *GovernanceController) ReconcileAgentPolicies(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	dryRun := c.Query("dry_run") != "false"
+	out, err := ctl.agentPolicies().Reconcile(wsID, dryRun)
+	if err != nil {
+		// A refused live run is a 501, not a 400: the request was valid, the
+		// capability is not built.
+		if !dryRun {
+			c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
+			return
+		}
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListUpcomingPolicyActions handles GET /authsec/governance/policies/upcoming?days=7 —
+// the lookahead. What will this system do to the cluster this week.
+func (ctl *GovernanceController) ListUpcomingPolicyActions(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	days, _ := strconv.Atoi(c.Query("days"))
+	out, err := ctl.agentPolicies().Upcoming(wsID, days)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	destructive := 0
+	for _, a := range out {
+		if a.Destructive {
+			destructive++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"upcoming": out, "total": len(out), "destructive": destructive,
+	})
+}

@@ -1548,6 +1548,11 @@ func SetupRoutes(
 
 			// Which canonical agent in the correlated estate is this workload?
 			// Read is a discovery read; the decision is a correlation decision.
+			// What every matching policy adds up to for this agent, and which
+			// policies caused it — a state without an explanation is unreviewable.
+			discovery.GET("/agents/:id/effective-policy",
+				middlewares.Require("discovery", "read"), governanceController.GetAgentPolicyEffective)
+
 			discovery.GET("/agents/:id/iga-link",
 				middlewares.Require("discovery", "read"), governanceController.GetAgentIGALink)
 			discovery.POST("/agents/:id/iga-link/decisions",
@@ -1848,6 +1853,26 @@ func SetupRoutes(
 			// iga:review — the same permission as the classification and ownership
 			// decisions it sits alongside, rather than a governance permission that
 			// would let an entitlement reviewer redefine what an agent IS.
+			// Agent policies — the declarative layer above enforcement.
+			// Authoring is governance:admin; a destructive on_expiry additionally
+			// needs an attributable confirmation, checked in the service.
+			governance.POST("/agent-policies",
+				middlewares.Require("governance", "admin"), governanceController.CreateAgentPolicy)
+			governance.GET("/agent-policies",
+				middlewares.Require("governance", "read"), governanceController.ListAgentPolicies)
+			governance.GET("/agent-policies/:id",
+				middlewares.Require("governance", "read"), governanceController.GetAgentPolicy)
+			governance.DELETE("/agent-policies/:id",
+				middlewares.Require("governance", "admin"), governanceController.DeleteAgentPolicy)
+			// Dry-run by default; a live run is refused until the phase order allows it.
+			governance.POST("/agent-policies/reconcile",
+				middlewares.Require("governance", "admin"), governanceController.ReconcileAgentPolicies)
+			// The lookahead: what this system will do to the cluster this week. Read
+			// permission on purpose — anyone who can see governance state should be
+			// able to see what is about to happen because of it.
+			governance.GET("/policies/upcoming",
+				middlewares.Require("governance", "read"), governanceController.ListUpcomingPolicyActions)
+
 			governance.GET("/iga-links",
 				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)
 
