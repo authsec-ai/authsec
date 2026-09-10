@@ -6076,3 +6076,41 @@ CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_tenant
 CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_reader
     ON public.azure_subscriptions (workspace_id, reader_ok);
 
+-- Mirrored from 017_azure_app_config.sql. Every other azure_* table is here,
+-- and this one being absent means a deployment built from the bootstrap has no
+-- azure_app_config at all -- so POST /api/azure/config, the first step of
+-- onboarding, fails on a fresh install while working everywhere it was
+-- migrated. See 017 for why the secret is a Vault path rather than a column.
+CREATE TABLE IF NOT EXISTS public.azure_app_config (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL REFERENCES public.workspaces (id) ON DELETE CASCADE,
+
+    -- Application (client) id. Not a secret: it appears in every authorize URL.
+    client_id     text NOT NULL,
+
+    -- The directory the registration was created in. An application object
+    -- exists only there, so reading it back is possible only there.
+    home_tenant   text NOT NULL,
+
+    -- Must match a redirect URI registered on the application EXACTLY, or
+    -- Microsoft refuses with AADSTS50011 before a password is typed.
+    redirect_uri  text NOT NULL,
+
+    -- Vault path holding {"client_secret": "..."}. A path, never a value.
+    auth_ref      text NOT NULL,
+
+    created_by    text,
+    checked_at    timestamptz,
+
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+
+    -- One application per workspace. Replacing it is an UPDATE, not a second
+    -- row, so there is never an ambiguous "which app is this workspace using".
+    CONSTRAINT azure_app_config_workspace_uq UNIQUE (workspace_id),
+    CONSTRAINT azure_app_config_client_id_chk    CHECK (client_id <> ''),
+    CONSTRAINT azure_app_config_home_tenant_chk  CHECK (home_tenant <> ''),
+    CONSTRAINT azure_app_config_redirect_uri_chk CHECK (redirect_uri <> ''),
+    CONSTRAINT azure_app_config_auth_ref_chk     CHECK (auth_ref <> '')
+);
+
