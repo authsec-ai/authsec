@@ -8,8 +8,8 @@
 // design and hardcodes access_type=offline&prompt=consent for its
 // provider.Key=="google" catalog entry -- the opposite of what a one-time,
 // discard-after-use bootstrap needs. Nothing in this file is used by, or
-// changes the behaviour of, wif.go/wif_parse.go/roles.go/credentials.go/
-// issuer.go or setup-reader.sh.
+// changes the behaviour of, auth.go, setup.go, scope.go
+// or setup-reader.sh.
 package gcp
 
 import (
@@ -23,7 +23,7 @@ import (
 )
 
 // GoogleOAuthAuthorizeURL is Google's own OAuth 2.0 authorization endpoint --
-// distinct from AuthSec's own OIDC issuer (issuer.go) and from the Hydra
+// distinct from AuthSec's own OIDC issuer (auth.go's ResolveWIFIssuerURL) and from the Hydra
 // instance services/connector_oauth_service.go's provider catalog points at.
 const GoogleOAuthAuthorizeURL = "https://accounts.google.com/o/oauth2/v2/auth"
 
@@ -57,7 +57,7 @@ func SetGoogleOAuthTokenURLForTesting(url string) string {
 //   - "iam": Workload Identity Pool/Provider create, service-account create,
 //     and IAM-policy binding on IAM API resources (the IAM Admin API's
 //     documented scope set is exactly {cloud-platform, iam} -- see
-//     internal/gcp/client.go's IAMScope doc comment, live-confirmed there
+//     auth.go's IAMScope doc comment, live-confirmed there
 //     already for the WIF path's own IAM calls).
 //   - "cloudplatformprojects": Cloud Resource Manager's projects.setIamPolicy
 //     and projects.testIamPermissions (and, by the same API surface,

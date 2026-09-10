@@ -294,116 +294,58 @@ func wifInput(workspaceID uuid.UUID, scopeKind, scopeID string) GCPOnboardInput 
 
 /* ---------------------------------- tests ---------------------------------- */
 
-func TestGcpOnboardLifecycle_JSONKey(t *testing.T) {
-	db := setupGCPOnboardingTestDB(t)
+// TestGcpOnboard_KeyedMethodIsRefusedBeforeAnything replaces the old json_key
+// lifecycle test, because that lifecycle no longer exists.
+//
+// The console stopped offering the keyed path some time ago, but the service
+// still accepted auth.method "json_key", so a keyed connector could be created
+// through the API and handed to discovery -- quietly defeating the guarantee
+// that no scan depends on stored key material. The refusal is the guarantee.
+//
+// Deliberately needs no database: the check runs before validation, before
+// Vault and before any GCP call, and asserting that is most of the point. A
+// refusal that happened later could still leave a secret or a row behind.
+func TestGcpOnboard_KeyedMethodIsRefusedBeforeAnything(t *testing.T) {
 	mv := newGCPTestVault()
-	svc := NewGCPOnboardingService(db, mv, fakeGCPOnboardIssuer{})
+	svc := NewGCPOnboardingService(nil, mv, fakeGCPOnboardIssuer{})
 
 	fake := newFakeGCPServer()
 	defer fake.Close()
 	fake.saEmail = testSAEmail
 	fake.projectID = "my-scope"
-	fake.projectParent = "organizations/999"
 	installFakeGCPServer(t, fake)
 
-	ws := uuid.New()
 	in := jsonKeyInput(models.CloudScopeProject, "my-scope")
+	_, created, err := svc.Onboard(context.Background(), uuid.New(), in, "admin")
 
-	// --- create ---
-	c, created, err := svc.Onboard(context.Background(), ws, in, "admin")
-	if err != nil {
-		t.Fatalf("onboard: %v", err)
+	if !errors.Is(err, ErrKeyedOnboardingClosed) {
+		t.Fatalf("err = %v, want it to wrap ErrKeyedOnboardingClosed", err)
 	}
-	if !created {
-		t.Fatal("first onboard must report created")
+	if created {
+		t.Error("a refused onboard must not report the connector as created")
 	}
-	if c.Status != models.CloudConnectorActive || c.VerifiedAt == nil {
-		t.Fatalf("expected active+verified, got status=%s verified=%v", c.Status, c.VerifiedAt)
+	if got := fake.callCount(); got != 0 {
+		t.Errorf("GCP was called %d time(s) for a method we refuse outright; want 0", got)
 	}
-	if c.ParentScopeID == nil || *c.ParentScopeID != "999" {
-		t.Fatalf("parent_scope_id = %v, want \"999\" (bare id from organizations/999)", c.ParentScopeID)
+	if mv.writes != 0 {
+		t.Errorf("Vault was written %d time(s) for a refused keyed onboard; want 0", mv.writes)
 	}
-	if !strings.HasPrefix(c.AuthRef, "kv/data/secret/workspaces/") {
-		t.Fatalf("json_key auth_ref should be a Vault path, got %q", c.AuthRef)
-	}
-	if mv.writes != 1 {
-		t.Fatalf("expected exactly one Vault write, got %d", mv.writes)
-	}
+}
 
-	// --- key value never appears anywhere on the row ---
-	raw, _ := json.Marshal(c)
-	if strings.Contains(string(raw), testRSAPrivateKeyPEM) {
-		t.Fatal("the private key value must never appear in the connector row's JSON encoding")
-	}
-	if strings.Contains(string(c.Attrs), "private_key") || strings.Contains(string(c.Attrs), testRSAPrivateKeyPEM) {
-		t.Fatal("the private key value must never appear in attrs")
-	}
+// TestGcpOnboard_KeyedRefusalDoesNotDependOnAnythingElseBeingValid: the
+// refusal must not be reachable only for otherwise-well-formed requests, or a
+// caller could get a keyed connector past it by getting something else wrong
+// first and retrying.
+func TestGcpOnboard_KeyedRefusalDoesNotDependOnAnythingElseBeingValid(t *testing.T) {
+	svc := NewGCPOnboardingService(nil, newGCPTestVault(), fakeGCPOnboardIssuer{})
 
-	// --- verify ---
-	verified, err := svc.VerifyConnector(context.Background(), ws, c.ID)
-	if err != nil {
-		t.Fatalf("verify: %v", err)
+	in := GCPOnboardInput{
+		ScopeKind: "not-a-scope-kind",
+		ScopeID:   "",
+		Auth:      GCPAuthInput{Method: GCPAuthMethodJSONKey},
 	}
-	if verified.Status != models.CloudConnectorActive {
-		t.Fatalf("expected active after verify, got %s", verified.Status)
-	}
-
-	// --- read ---
-	got, err := svc.Connector(ws, c.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.ID != c.ID {
-		t.Fatalf("wrong connector returned")
-	}
-	list, err := svc.Connectors(ws)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(list) != 1 {
-		t.Fatalf("expected exactly one connector, got %d", len(list))
-	}
-
-	// --- revoke ---
-	if err := svc.RevokeConnector(ws, c.ID); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if mv.deletes != 1 {
-		t.Fatalf("expected exactly one Vault delete on revoke, got %d", mv.deletes)
-	}
-	revoked, err := svc.Connector(ws, c.ID)
-	if err != nil {
-		t.Fatalf("get after revoke: %v", err)
-	}
-	if revoked.Status != models.CloudConnectorRevoked {
-		t.Fatalf("status after revoke = %q, want %q", revoked.Status, models.CloudConnectorRevoked)
-	}
-	// The row is KEPT, per plan section 9 -- this is the deliberate AWS
-	// divergence (AWS hard-deletes on DELETE).
-	if _, err := svc.Connector(ws, c.ID); err != nil {
-		t.Fatalf("revoked connector should still be readable (row kept for audit): %v", err)
-	}
-
-	// --- verify-on-revoked must refuse, not flip the row to 'error' ---
-	// Regression for GCP-E2E-MANUAL-TEST-GUIDE.md §12 finding #3
-	// (live-confirmed 2026-09-02): before this guard, VerifyConnector ran
-	// the normal probe against a connector whose Vault secret was already
-	// purged by revoke, failed, and MarkError overwrote status='revoked'
-	// with status='error' -- silently losing the fact that this connector
-	// was deliberately disconnected.
-	afterVerify, verr := svc.VerifyConnector(context.Background(), ws, c.ID)
-	if !errors.Is(verr, ErrConnectorRevoked) {
-		t.Fatalf("verify on a revoked connector: err = %v, want ErrConnectorRevoked", verr)
-	}
-	if afterVerify == nil || afterVerify.Status != models.CloudConnectorRevoked {
-		t.Fatalf("verify on a revoked connector must not change its status; got %+v", afterVerify)
-	}
-	stillRevoked, err := svc.Connector(ws, c.ID)
-	if err != nil {
-		t.Fatalf("get after verify-on-revoked: %v", err)
-	}
-	if stillRevoked.Status != models.CloudConnectorRevoked {
-		t.Fatalf("status after verify-on-revoked = %q, want it to stay %q", stillRevoked.Status, models.CloudConnectorRevoked)
+	if _, _, err := svc.Onboard(context.Background(), uuid.New(), in, "admin"); !errors.Is(err, ErrKeyedOnboardingClosed) {
+		t.Fatalf("err = %v, want the keyed refusal to win over every other validation error", err)
 	}
 }
 
@@ -501,7 +443,7 @@ func TestGcpOnboard_WIFMismatchedProviderResource_RejectedBeforeAnyNetworkCall(t
 // backend's own configuration) must reject a WIF onboard fast, with no
 // network call — and must NOT affect JSON-key onboarding against the same
 // service instance at all.
-func TestGcpOnboard_NonHTTPSIssuer_RejectsWIFButJSONKeyStillWorks(t *testing.T) {
+func TestGcpOnboard_NonHTTPSIssuer_RejectsWIFBeforeAnyNetworkCall(t *testing.T) {
 	db := setupGCPOnboardingTestDB(t)
 	mv := newGCPTestVault()
 	svc := NewGCPOnboardingService(db, mv, fakeGCPOnboardIssuer{issuerURL: "http://localhost:7001"})
@@ -527,23 +469,17 @@ func TestGcpOnboard_NonHTTPSIssuer_RejectsWIFButJSONKeyStillWorks(t *testing.T) 
 		t.Fatalf("a rejected WIF onboard must leave no row, got %d", len(rows))
 	}
 
-	// JSON key, same workspace, same service instance, same (broken-for-WIF)
-	// issuer: must succeed exactly as if WIF had never been attempted.
-	jsonIn := jsonKeyInput(models.CloudScopeProject, "my-scope")
-	c, created, err := svc.Onboard(context.Background(), ws, jsonIn, "admin")
-	if err != nil {
-		t.Fatalf("json_key onboard on a WIF-broken deployment must still succeed: %v", err)
-	}
-	if !created {
-		t.Fatal("first json_key onboard must report created")
-	}
-	if c.AuthRef == "" || strings.HasPrefix(c.AuthRef, "wif:") {
-		t.Fatalf("json_key connector should have a Vault auth_ref, got %q", c.AuthRef)
-	}
+	// This test used to go on to prove the JSON-key path still worked on the
+	// same broken-for-WIF deployment. It no longer can: a keyed onboard is
+	// refused outright, so there is no fallback on a deployment whose issuer
+	// Google cannot reach. That is the intended trade -- the deployment has to
+	// be fixed rather than worked around with a stored key.
 }
 
 func TestGcpOnboard_ScopeValidationFailure_LeavesNoRow(t *testing.T) {
-	for _, method := range []string{GCPAuthMethodJSONKey, GCPAuthMethodWIF} {
+	// WIF only: the keyed path is refused before it could ever reach scope
+	// validation, and is covered by its own refusal test above.
+	for _, method := range []string{GCPAuthMethodWIF} {
 		t.Run(method, func(t *testing.T) {
 			db := setupGCPOnboardingTestDB(t)
 			mv := newGCPTestVault()
@@ -557,12 +493,7 @@ func TestGcpOnboard_ScopeValidationFailure_LeavesNoRow(t *testing.T) {
 			installFakeGCPServer(t, fake)
 
 			ws := uuid.New()
-			var in GCPOnboardInput
-			if method == GCPAuthMethodJSONKey {
-				in = jsonKeyInput(models.CloudScopeProject, "denied-scope")
-			} else {
-				in = wifInput(ws, models.CloudScopeProject, "denied-scope")
-			}
+			in := wifInput(ws, models.CloudScopeProject, "denied-scope")
 
 			_, _, err := svc.Onboard(context.Background(), ws, in, "admin")
 			if !errors.Is(err, ErrScopeNotReadable) {
@@ -576,8 +507,8 @@ func TestGcpOnboard_ScopeValidationFailure_LeavesNoRow(t *testing.T) {
 			if len(rows) != 0 {
 				t.Fatalf("a scope-validation failure must leave no row, got %d", len(rows))
 			}
-			if method == GCPAuthMethodJSONKey && mv.writes != 0 {
-				t.Fatalf("json_key: Vault write count = %d, want 0 -- validation must happen before any write", mv.writes)
+			if mv.writes != 0 {
+				t.Fatalf("Vault write count = %d, want 0 -- the wif path never writes a secret at all", mv.writes)
 			}
 		})
 	}
@@ -595,7 +526,7 @@ func TestGcpOnboard_RepeatCreate_UpdatesInPlace_NeverTouchesScanGenerationOrCove
 	installFakeGCPServer(t, fake)
 
 	ws := uuid.New()
-	in := jsonKeyInput(models.CloudScopeProject, "repeat-scope")
+	in := wifInput(ws, models.CloudScopeProject, "repeat-scope")
 
 	first, created, err := svc.Onboard(context.Background(), ws, in, "admin")
 	if err != nil || !created {
@@ -673,3 +604,61 @@ KBovz2ahtEB8EWqRDEYGeCpfAGH0cD4iTgljlr+ucRJ/F+pRpgCaw2Wmh4rzN9EH
 u0k36Zck1UXzsm/ZiTiVMYzAo3r8ruJEBWlQTmwFjI9JUk6331Fcg9n5vCPYPsf7
 phURV/5siSVQnI6k1NXjHg==
 -----END PRIVATE KEY-----`
+
+/* --------------------------- capability limits (ONB-5) ----------------------- */
+
+// TestSetLimit_ClearsWhenTheConditionIsFixed is the half that is easy to get
+// wrong. A limit is a claim about the present, so a customer who grants the
+// missing permission must see it disappear on the next verify. A set that only
+// ever grew would leave every repaired connector permanently marked broken.
+func TestSetLimit_ClearsWhenTheConditionIsFixed(t *testing.T) {
+	limits := setGCPCapabilityLimit(nil, models.GCPLimitQuotaProjectUnusable, true)
+	if len(limits) != 1 || limits[0] != models.GCPLimitQuotaProjectUnusable {
+		t.Fatalf("limits = %v, want the quota limit set", limits)
+	}
+
+	limits = setGCPCapabilityLimit(limits, models.GCPLimitQuotaProjectUnusable, false)
+	if len(limits) != 0 {
+		t.Errorf("limits = %v, want empty once the condition is resolved", limits)
+	}
+}
+
+// TestSetLimit_LeavesOtherLimitsAlone: each limit is owned by the code path
+// that evaluates it. Rewriting the whole set would let one path silently drop
+// another path's finding.
+func TestSetLimit_LeavesOtherLimitsAlone(t *testing.T) {
+	start := []string{models.GCPLimitOAuthProjectScopeOnly, models.GCPLimitKeyedCredential}
+
+	got := setGCPCapabilityLimit(start, models.GCPLimitQuotaProjectUnusable, true)
+	if len(got) != 3 {
+		t.Fatalf("limits = %v, want all three", got)
+	}
+
+	got = setGCPCapabilityLimit(got, models.GCPLimitQuotaProjectUnusable, false)
+	if len(got) != 2 {
+		t.Fatalf("limits = %v, want the other two preserved", got)
+	}
+	for _, want := range start {
+		var found bool
+		for _, l := range got {
+			if l == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s was dropped by an unrelated limit update", want)
+		}
+	}
+}
+
+// TestSetLimit_IsIdempotent stops the same limit accumulating across repeated
+// verifies, which would make the row grow without bound.
+func TestSetLimit_IsIdempotent(t *testing.T) {
+	var limits []string
+	for i := 0; i < 3; i++ {
+		limits = setGCPCapabilityLimit(limits, models.GCPLimitQuotaProjectUnusable, true)
+	}
+	if len(limits) != 1 {
+		t.Errorf("limits = %v, want exactly one entry after repeated sets", limits)
+	}
+}

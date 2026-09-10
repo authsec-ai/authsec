@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 // cloud_gcp_onboarding_test.go (same package, so it can reassign an
 // unexported var) can point them at a fake server instead — no live GCP call
 // in that test tier, per this ticket's own instruction. Production code
-// never reassigns these; internal/gcp/client.go itself is not touched, since
+// never reassigns these; auth.go itself is not touched, since
 // both factories' real signatures are reused unchanged.
 var (
 	newIAMClientFunc             = gcp.NewIAMClient
@@ -61,6 +62,21 @@ var (
 	// unsupported scope_kind, or a missing scope_id/reader_project_id.
 	// Caught before any GCP or Vault call.
 	ErrInvalidScopeID = errors.New("gcp: scope_kind, scope_id or reader_project_id is invalid")
+
+	// ErrKeyedOnboardingClosed means a caller asked to create a connector with
+	// auth.method "json_key". No new GCP connector may authenticate with a
+	// stored service-account key.
+	//
+	// The console stopped offering the keyed path some time ago, but the HTTP
+	// surface still accepted it, so a keyed connector could be created through
+	// the API and handed to discovery — which quietly defeated the guarantee
+	// that no scan depends on stored key material. Closing it at the door is
+	// the only place the guarantee actually holds.
+	//
+	// Existing keyed connectors keep working: they still verify, and they
+	// still revoke cleanly with their Vault secret purged. What is refused is
+	// creating another one.
+	ErrKeyedOnboardingClosed = errors.New("gcp: connecting with a service account key is no longer supported; use workload identity federation")
 
 	// ErrConnectorRevoked means the caller asked to verify a connector whose
 	// status is already 'revoked'. Caught before any credential is loaded or
@@ -104,6 +120,12 @@ type GCPOnboardInput struct {
 	ReaderProjectID string       `json:"reader_project_id"`
 	Auth            GCPAuthInput `json:"auth"`
 	DisplayName     string       `json:"display_name"`
+
+	// Hints are optional customer-declared context no GCP API reports —
+	// environment, naming convention, owning team. Onboarding is the only
+	// point in the lifecycle where someone who knows the answer is present, so
+	// it is asked here even though nothing in onboarding uses it.
+	Hints *models.GCPOnboardingHints `json:"hints,omitempty"`
 }
 
 /* --------------------------------- service ----------------------------------- */
@@ -111,7 +133,7 @@ type GCPOnboardInput struct {
 // GCPOnboardingService owns the policy around connecting a GCP scope:
 // validation, proving the connection and the scope, where credential
 // material lives, and the connector row. GCP itself is reached only through
-// the typed clients internal/gcp/client.go builds.
+// the typed clients internal/gcp/auth.go builds.
 type GCPOnboardingService struct {
 	db      *gorm.DB
 	repo    repositories.CloudConnectorRepository
@@ -151,6 +173,11 @@ func (s *GCPOnboardingService) Onboard(
 	scopeKind := strings.TrimSpace(in.ScopeKind)
 	scopeID := strings.TrimSpace(in.ScopeID)
 	readerProjectID := strings.TrimSpace(in.ReaderProjectID)
+	// Refused before validation, before Vault, before any GCP call: there is
+	// no state worth building for a connector that will not be created.
+	if in.Auth.Method == GCPAuthMethodJSONKey {
+		return nil, false, ErrKeyedOnboardingClosed
+	}
 	if !isSupportedGCPScopeKind(scopeKind) {
 		return nil, false, fmt.Errorf("%w: scope_kind must be org, folder or project", ErrInvalidScopeID)
 	}
@@ -180,56 +207,35 @@ func (s *GCPOnboardingService) Onboard(
 	// up front, in this one credential.
 	authOpt, readerSAEmail, err := s.resolveOnboardingCredential(ctx, workspaceID, scopeID, in.Auth)
 	if err != nil {
-		// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation): stage
-		// markers only, no secret material -- remove once root cause is
-		// confirmed.
-		log.Printf("[gcp] Onboard failed at resolveOnboardingCredential (method=%s): %v", in.Auth.Method, err)
 		return nil, false, err
 	}
 
 	iamClient, err := newIAMClientFunc(ctx, authOpt)
 	if err != nil {
-		log.Printf("[gcp] Onboard failed building iam client: %v", err)
 		return nil, false, err
 	}
 	rmClient, err := newResourceManagerClientFunc(ctx, authOpt)
 	if err != nil {
-		log.Printf("[gcp] Onboard failed building resource manager client: %v", err)
 		return nil, false, err
 	}
 
 	// The GCP-03 connectivity primitive: proves the credential resolves to
 	// the reader SA the customer claimed, before trusting it for anything else.
 	if _, err := s.authSvc.ResolveReaderIdentity(ctx, iamClient, readerSAEmail, in.Auth.Method); err != nil {
-		log.Printf("[gcp] Onboard failed at ResolveReaderIdentity (readerSAEmail=%s method=%s): %v", readerSAEmail, in.Auth.Method, err)
 		return nil, false, err
 	}
 
 	parentScopeID, err := validateGCPScope(ctx, rmClient, scopeKind, scopeID)
 	if err != nil {
-		log.Printf("[gcp] Onboard failed at validateGCPScope (scopeKind=%s scopeID=%s): %v", scopeKind, scopeID, err)
 		return nil, false, err
 	}
 
-	// Existing-or-new decided BEFORE any write, exactly like AWS's Onboard:
-	// after the upsert there is no way to tell.
-	existing, err := s.repo.GetByScope(workspaceID, models.CloudProviderGCP, scopeID)
-	if err != nil && !errors.Is(err, repositories.ErrCloudConnectorNotFound) {
-		return nil, false, err
-	}
-	isNewConnector := existing == nil
-
-	var authRef string
-	switch in.Auth.Method {
-	case GCPAuthMethodJSONKey:
-		authRef, err = s.authSvc.StoreKey(workspaceID, scopeID, in.Auth.KeyJSON)
-		if err != nil {
-			return nil, false, err
-		}
-	case GCPAuthMethodWIF:
-		// No Vault write at all for this path, by design (GCP-D9).
-		authRef = "wif:" + in.Auth.ProviderResource
-	}
+	// No Vault write anywhere in this function: the only auth method that
+	// reaches here is wif, whose auth_ref is a non-secret GCP resource name.
+	// The rollback this used to need — delete the stored key if the upsert
+	// fails on a new connector — went with the keyed path, because there is
+	// no longer anything to roll back.
+	authRef := "wif:" + in.Auth.ProviderResource
 
 	now := time.Now()
 	connector := &models.CloudConnector{
@@ -242,10 +248,11 @@ func (s *GCPOnboardingService) Onboard(
 		Status:        models.CloudConnectorActive,
 		VerifiedAt:    &now,
 		CreatedBy:     actor,
-		// Set explicitly for the same reason AWS's Onboard does: a NOT NULL
-		// jsonb column is the wrong place to rely on GORM's zero-value-omits-
-		// default inference.
-		Coverage: json.RawMessage("{}"),
+		// Every surface, pre-created and explicitly unknown, rather than the
+		// empty object this used to write. A surface missing from coverage is
+		// indistinguishable from one a scan reached and found empty, so the
+		// first scan must UPDATE this list rather than invent one.
+		Coverage: NewGCPCoverageSkeleton(),
 	}
 
 	poolID, providerID, wifSubject := gcp.DeriveWIFParams(workspaceID, scopeID)
@@ -256,8 +263,15 @@ func (s *GCPOnboardingService) Onboard(
 		ReaderSAEmail:      readerSAEmail,
 		CAIQuotaProject:    readerProjectID,
 		RoleSetStatus:      gcp.CurrentRoleSetStatus,
+		RoleSetVersion:     gcp.ReaderRoleSetVersion,
 		SetupScriptVersion: gcp.Version,
+		Hints:              in.Hints,
 	}
+	// Provenance is empty here on every path: the Google Authentication route
+	// stamps ProvisionedVia AFTER Onboard returns, so at this point a connector
+	// it created is indistinguishable from a manual one and correctly reads as
+	// manual_wif. That route corrects the value when it stamps.
+	attrs.OnboardingPath = gcpOnboardingPath(in.Auth.Method, attrs.ProvisionedVia)
 	if in.Auth.Method == GCPAuthMethodWIF {
 		attrs.WIFProviderResource = in.Auth.ProviderResource
 		attrs.WIFSubject = wifSubject
@@ -270,15 +284,113 @@ func (s *GCPOnboardingService) Onboard(
 
 	stored, created, err := s.repo.Upsert(connector)
 	if err != nil {
-		// Roll the secret back only when this scope was not already connected —
-		// same reasoning as AWS's Onboard: deleting it on a re-onboard would
-		// strand a working connector with a dangling auth_ref.
-		if isNewConnector && in.Auth.Method == GCPAuthMethodJSONKey {
-			_ = s.authSvc.DeleteCredential(authRef)
-		}
 		return nil, false, fmt.Errorf("failed to record the connector: %w", err)
 	}
+
+	// Probe AFTER the upsert, and never fail the onboarding on it. The
+	// connection is already proven at this point; what the probe adds is a
+	// description of what that connection can reach. A connector that
+	// connects but cannot be profiled is a connector with an empty capability
+	// profile — which reads as "not yet probed" and is honest — whereas
+	// refusing to record it at all would throw away a working connection over
+	// a report.
+	s.refreshCapabilityProfile(ctx, stored, authOpt)
+
 	return stored, created, nil
+}
+
+// refreshCapabilityProfile runs the live permission probe and merges the
+// result into the connector's attrs. Best-effort by design: every failure
+// path leaves the existing profile untouched rather than half-overwriting it,
+// because a stale-but-complete profile is more useful than a fresh empty one.
+//
+// It takes the already-resolved credential rather than rebuilding one, so the
+// probe describes exactly the principal the caller just proved.
+func (s *GCPOnboardingService) refreshCapabilityProfile(
+	ctx context.Context, c *models.CloudConnector, authOpt option.ClientOption,
+) {
+	rmClient, err := newResourceManagerClientFunc(ctx, authOpt)
+	if err != nil {
+		return
+	}
+
+	result, err := gcp.ProbeReaderCapabilities(ctx, rmClient, c.ScopeKind, c.ScopeID)
+	if err != nil {
+		return
+	}
+
+	attrs := c.GCPAttrs()
+	attrs.CapabilityProfile = result.Surfaces
+	attrs.ProbedPermissions = result.Held
+	attrs.WritePermissionsHeld = result.WriteHeld
+	probedAt := result.ProbedAt
+	attrs.ProbedAt = &probedAt
+	attrs.RoleSetVersion = gcp.ReaderRoleSetVersion
+
+	// Enablement is read against the QUOTA project, not the scanned scope.
+	// Cloud Asset Inventory bills every call to the caller's quota project, so
+	// that is the project whose APIs have to be on for the spine to work at
+	// all — a scanned project with cloudasset enabled and a quota project
+	// without it fails on the first call, with an error that names neither.
+	quotaProject := attrs.CAIQuotaProject
+	if quotaProject == "" {
+		quotaProject = attrs.ReaderProjectID
+	}
+	if quotaProject != "" {
+		if suClient, err := newServiceUsageClientFunc(ctx, authOpt); err == nil {
+			attrs.APIEnablement = gcp.ReadAPIEnablement(ctx, suClient, quotaProject)
+		}
+		// A failure to build the client leaves APIEnablement as it was.
+		// Overwriting it with an all-unknown map would discard a good reading
+		// from a previous verify in exchange for nothing.
+	}
+
+	// The quota project is probed on its own, because it is allowed to sit
+	// OUTSIDE the onboarded scope -- and when it does, the reader roles bound
+	// at the scope grant nothing on it. That connector reads its scope
+	// perfectly and fails every Cloud Asset call, which is the single failure
+	// most likely to be misread as "the estate is empty".
+	usable, known := gcp.QuotaProjectUsable(ctx, rmClient, quotaProject)
+	attrs.CapabilityLimits = setGCPCapabilityLimit(attrs.CapabilityLimits, models.GCPLimitQuotaProjectUnusable, known && !usable)
+
+	// A connector still authenticating with a stored key. No new one can be
+	// created this way; this marks the ones that predate the change, so
+	// discovery can apply its own policy to them rather than having to infer
+	// the credential kind from an auth_ref prefix.
+	attrs.CapabilityLimits = setGCPCapabilityLimit(attrs.CapabilityLimits,
+		models.GCPLimitKeyedCredential, attrs.AuthMethod == GCPAuthMethodJSONKey)
+
+	// Whether the reader can walk below the top scope. Recorded rather than
+	// acted on: onboarding does not build the tree, it establishes that
+	// building one is possible, so a later empty result can be told apart
+	// from an impossible one.
+	if enum, err := json.Marshal(gcp.ProbeScopeEnumeration(ctx, rmClient, c.ScopeKind, c.ScopeID)); err == nil {
+		attrs.ScopeEnumeration = enum
+	}
+
+	if !result.Clean() {
+		// Loud, because this is the one thing in the probe that is a finding
+		// rather than a measurement. The permissions are non-secret identifiers
+		// and naming them is the point — an operator cannot act on "something
+		// is writable".
+		log.Printf("[gcp] ZERO-WRITE ASSERTION FAILED connector=%s scope=%s/%s write_permissions_held=%v write_check_unknown=%v",
+			c.ID, c.ScopeKind, c.ScopeID, result.WriteHeld, result.WriteCheckUnknown)
+	}
+
+	// Derived last, from everything written above, so the verdict and the
+	// evidence behind it are always the same age. Recomputed rather than
+	// incrementally maintained — a stored judgement drifts from its inputs and
+	// then the console and the scheduler disagree about the same connector.
+	attrs.DiscoveryReadiness, attrs.DiscoveryReadinessReasons = DeriveGCPReadiness(attrs, c.Status)
+
+	if err := c.SetGCPAttrs(attrs); err != nil {
+		return
+	}
+	if err := s.db.Model(&models.CloudConnector{}).
+		Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
+		Update("attrs", c.Attrs).Error; err != nil {
+		log.Printf("[gcp] could not persist capability profile for connector=%s: %v", c.ID, err)
+	}
 }
 
 // resolveOnboardingCredential builds the option.ClientOption for either auth
@@ -294,17 +406,6 @@ func (s *GCPOnboardingService) resolveOnboardingCredential(
 	ctx context.Context, workspaceID uuid.UUID, scopeID string, auth GCPAuthInput,
 ) (option.ClientOption, string, error) {
 	switch auth.Method {
-	case GCPAuthMethodJSONKey:
-		email, err := parseServiceAccountEmail(auth.KeyJSON)
-		if err != nil {
-			return nil, "", err
-		}
-		opt, err := gcp.ResolveJSONKeyCredential(auth.KeyJSON)
-		if err != nil {
-			return nil, "", err
-		}
-		return opt, email, nil
-
 	case GCPAuthMethodWIF:
 		if auth.ReaderSAEmail == "" {
 			return nil, "", fmt.Errorf("%w: reader_sa_email is required for the wif auth method", ErrInvalidScopeID)
@@ -316,11 +417,9 @@ func (s *GCPOnboardingService) resolveOnboardingCredential(
 		pastedPool, pastedProvider, ok := gcp.ParseProviderResource(auth.ProviderResource)
 		wantPool, wantProvider, _ := gcp.DeriveWIFParams(workspaceID, scopeID)
 		if !ok || pastedPool != wantPool || pastedProvider != wantProvider {
-			// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation):
-			// pool/provider ids are deterministic, non-secret strings --
-			// remove once root cause is confirmed.
-			log.Printf("[gcp] provider_resource cross-check failed: pasted=%q ok=%v pastedPool=%q wantPool=%q pastedProvider=%q wantProvider=%q",
-				auth.ProviderResource, ok, pastedPool, wantPool, pastedProvider, wantProvider)
+			// The mismatch itself is the whole message. Logging what was
+			// pasted against what was derived was for one investigation, now
+			// closed, and the caller already gets told which value is wrong.
 			return nil, "", fmt.Errorf("%w: the pasted provider_resource does not match what was derived for this workspace and scope", gcp.ErrWIFPoolMissing)
 		}
 
@@ -331,27 +430,8 @@ func (s *GCPOnboardingService) resolveOnboardingCredential(
 		return opt, auth.ReaderSAEmail, nil
 
 	default:
-		return nil, "", fmt.Errorf("%w: auth.method must be \"json_key\" or \"wif\"", ErrInvalidScopeID)
+		return nil, "", fmt.Errorf("%w: auth.method must be \"wif\"", ErrInvalidScopeID)
 	}
-}
-
-// serviceAccountKeyEmail is the one field this file needs out of an uploaded
-// json_key's JSON — NOT a re-implementation of internal/gcp's structural
-// validation (ResolveJSONKeyCredential, called separately above, still owns
-// that). This exists only because the caller needs to know which email to
-// pass to ResolveReaderIdentity before it can build the connectivity check,
-// and internal/gcp's own key-shape struct is unexported by design (GCP-03's
-// file, not edited here).
-type serviceAccountKeyEmail struct {
-	ClientEmail string `json:"client_email"`
-}
-
-func parseServiceAccountEmail(keyJSON []byte) (string, error) {
-	var shape serviceAccountKeyEmail
-	if err := json.Unmarshal(keyJSON, &shape); err != nil || shape.ClientEmail == "" {
-		return "", fmt.Errorf("%w: could not read client_email from the uploaded key", gcp.ErrKeyInvalid)
-	}
-	return shape.ClientEmail, nil
 }
 
 // isSupportedGCPScopeKind rejects "account"/"subscription" (AWS/Azure scope
@@ -417,6 +497,13 @@ func parentIDOf(parent string) *string {
 }
 
 func classifyScopeError(err error) error {
+	// A scope refused by a perimeter or an org policy is not an unreadable
+	// scope in the sense this function's other answer means. The reader may be
+	// perfectly configured; something else said no, and the customer needs to
+	// hear which. Checked first, since both arrive as a 403.
+	if constrained := gcp.ClassifyConstraint(err); constrained != nil {
+		return constrained
+	}
 	var gerr *googleapi.Error
 	if errors.As(err, &gerr) {
 		switch gerr.Code {
@@ -475,11 +562,12 @@ func (s *GCPOnboardingService) VerifyConnector(
 	if err == nil {
 		_, err = s.authSvc.ResolveReaderIdentity(ctx, iamClient, attrs.ReaderSAEmail, attrs.AuthMethod)
 	}
+	var freshParent *string
 	if err == nil {
 		var rmClient *cloudresourcemanager.Service
 		rmClient, err = newResourceManagerClientFunc(ctx, authOpt)
 		if err == nil {
-			_, err = validateGCPScope(ctx, rmClient, c.ScopeKind, c.ScopeID)
+			freshParent, err = validateGCPScope(ctx, rmClient, c.ScopeKind, c.ScopeID)
 		}
 	}
 	if err != nil {
@@ -490,9 +578,27 @@ func (s *GCPOnboardingService) VerifyConnector(
 		return updated, err
 	}
 
-	// Nothing new to record in attrs on a bare verify — pass nil so
-	// MarkVerified leaves the existing blob (reader project, WIF params, role
-	// set status) untouched, exactly as its own doc comment describes.
+	// Re-probe on every successful verify. This is what makes the role set
+	// extensible without a re-onboard: a customer who grants a later phase's
+	// roles out of band gets them picked up by hitting verify, with no new
+	// endpoint and nothing to re-run on their side.
+	//
+	// It sits here, after the revoked short-circuit above and after the
+	// credential and scope have both been re-proven, so a revoked or broken
+	// connector is never probed — there would be nothing to learn, and the
+	// calls would fail anyway.
+	s.refreshCapabilityProfile(ctx, c, authOpt)
+
+	// Re-record the parent. A project or folder can be MOVED in the hierarchy
+	// after onboarding, and a stale parent silently misplaces the connector in
+	// every inheritance-aware calculation built on top of it. The check costs
+	// nothing -- validateGCPScope already read it above and the value was
+	// previously thrown away.
+	s.refreshParentScope(ctx, c, freshParent)
+
+	// MarkVerified is passed nil so it leaves the attrs blob alone: the probe
+	// above already wrote the only attrs this call changes, and handing
+	// MarkVerified a second copy would race it against itself.
 	return s.repo.MarkVerified(workspaceID, id, nil)
 }
 
@@ -556,4 +662,61 @@ func (s *GCPOnboardingService) Connector(workspaceID, id uuid.UUID) (*models.Clo
 		return nil, repositories.ErrCloudConnectorNotFound
 	}
 	return c, nil
+}
+
+/* --------------------------- capability limits ------------------------------ */
+
+// setGCPCapabilityLimit adds or removes one capability limit, returning the
+// updated set. Named with the GCP prefix because it lives in the shared
+// services package alongside 77 other files -- a bare setLimit there is a
+// collision waiting for whoever writes the Azure connector.
+//
+// Removal matters as much as addition: a limit is a claim about the present,
+// and a customer who fixes a missing grant must see it clear on the next
+// verify. A set that only ever grows would leave every repaired connector
+// permanently marked broken.
+//
+// Only ever called with a limit this code path actually evaluated, so a limit
+// owned by some other path is never silently dropped.
+func setGCPCapabilityLimit(limits []string, limit string, present bool) []string {
+	out := make([]string, 0, len(limits)+1)
+	for _, l := range limits {
+		if l != limit {
+			out = append(out, l)
+		}
+	}
+	if present {
+		out = append(out, limit)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// refreshParentScope writes parent_scope_id when the provider now reports a
+// different parent from the one on the row.
+//
+// Best-effort and write-only-on-change: a verify that cannot update the parent
+// is still a successful verify, and rewriting an unchanged value on every
+// verify would churn updated_at for no reason.
+func (s *GCPOnboardingService) refreshParentScope(ctx context.Context, c *models.CloudConnector, fresh *string) {
+	if sameGCPParentScope(c.ParentScopeID, fresh) {
+		return
+	}
+	if err := s.db.WithContext(ctx).Model(&models.CloudConnector{}).
+		Where("workspace_id = ? AND id = ?", c.WorkspaceID, c.ID).
+		Update("parent_scope_id", fresh).Error; err != nil {
+		log.Printf("[gcp] could not refresh parent_scope_id for connector=%s: %v", c.ID, err)
+		return
+	}
+	c.ParentScopeID = fresh
+}
+
+// sameGCPParentScope compares two nullable strings by VALUE. The schema treats
+// NULL as "no parent / not applicable", so nil and a pointer to "" are not
+// interchangeable and must not compare equal.
+func sameGCPParentScope(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }

@@ -24,7 +24,7 @@ var rawTemplate string
 // recorded on the connector (GCPConnectorAttrs.SetupScriptVersion) so an
 // operator can find connectors still on an older script once the role set or
 // binding shape changes.
-const Version = "2026-09-02"
+const Version = "2026-09-09"
 
 var tmpl = template.Must(template.New("setup-reader.sh").Parse(rawTemplate))
 
@@ -53,6 +53,15 @@ type Data struct {
 	// template, so the template has no per-scope-kind branching logic to get
 	// wrong.
 	RoleGrantCommands []string
+	// CoreServices and DiscoveryServices are internal/gcp's two API lists,
+	// rendered into the script separately because the script treats them
+	// differently: core is fatal, discovery is best-effort. Passed through
+	// rather than hardcoded in the template so the script a customer runs and
+	// the list the Google Authentication path enables cannot diverge -- they
+	// were two separate literals before, exactly the kind of pair that drifts
+	// silently the first time one of them is extended.
+	CoreServices      []string
+	DiscoveryServices []string
 }
 
 // Render fills the embedded template with data and returns the complete
@@ -77,37 +86,81 @@ const (
 	RoleSetStatusCandidate = "candidate_pending_GCP-01"
 )
 
-// CandidateReaderRoles is the reader role set GCP-04's setup script grants,
-// bound at whichever scope_kind the customer picked (org, folder, or
-// project) — never project-only, per the scoping finding below.
+// ReaderRoleSetVersion labels the role set below. It is a stable, explicit
+// string bumped BY HAND whenever ReaderRolesFor's output changes -- not a hash
+// or anything derived. Recorded per connector so an operator can find
+// connectors still onboarded against an earlier, narrower set once a later
+// phase adds roles.
 //
-// This is authsec/docs/gcp/feasibility-validation.md's "Final candidate
-// reader role list" as of this writing, NOT gcp-test-environment-setup.md
-// Phase 2's original four-role baseline. That baseline is NOT used here even
-// though the ledger's overall status is PARTIAL (not COMPLETE) — the literal
-// GCP-04 ticket text says to fall back to it when the ledger isn't COMPLETE,
-// but Phase 2's own baseline names `roles/resourcemanager.projectViewer`,
-// which GCP-01 proved does not exist as a real GCP role (live-tested:
-// `gcloud iam roles describe roles/resourcemanager.projectViewer` returns
-// "not found"). Shipping a known-nonexistent role name in a customer-facing
-// script would make the script fail every time it runs, which is a strictly
-// worse outcome than using the ledger's own corrected list a session early.
-// The two live-access gaps that keep the ledger's overall status at PARTIAL
-// (GKE Workload Identity untested — billing unavailable; the WIF mechanism's
-// full success round-trip untested — no reachable issuer) are both unrelated
-// to the role list itself, which the ledger recorded as fully live-verified.
+// v1 was the four-role set that shipped with GCP onboarding
+// (serviceAccountViewer, roleViewer, cloudasset.viewer, browser). v2 completes
+// the discovery plan's P1 set by adding iam.securityReviewer and by using the
+// org-level role viewer where the scope is an organization.
+const ReaderRoleSetVersion = "gcp-reader-p1-v2"
+
+// baseReaderRoles are granted at every scope kind. The role-viewer role is NOT
+// here: which one is correct depends on the scope kind, so ReaderRolesFor adds
+// it.
 //
-// RoleSetStatusCandidate is still used below (not RoleSetStatusConfirmed) —
-// this deviation is about not shipping a role that doesn't exist, not a claim
-// that GCP-01 has reached COMPLETE. Re-evaluate both the constant list and
-// RoleSetStatus together once GCP-01's ledger status line actually reads
-// COMPLETE.
-var CandidateReaderRoles = []string{
+// roles/iam.securityReviewer is what makes org-wide allow-policy reads and
+// getIamPolicy across resource types possible, and it is also how auditConfigs
+// become readable. It is broad by design; if a customer objects, the fallback
+// is a custom role, which is a conversation to have rather than a silent
+// narrowing here.
+var baseReaderRoles = []string{
 	"roles/iam.serviceAccountViewer",
-	"roles/iam.roleViewer",
+	"roles/iam.securityReviewer",
 	"roles/cloudasset.viewer",
 	"roles/browser",
 }
+
+// RoleViewerFor returns the role that lets the reader read role DEFINITIONS --
+// iam.roles.get/.list -- at scopeKind.
+//
+// The two are not interchangeable. roles/iam.organizationRoleViewer is what
+// grants org-wide visibility of custom role definitions, which is what
+// expanding a binding found by searchAllIamPolicies actually needs; but it is
+// an organization-level role, so binding it at a folder or project is not a
+// narrower version of the same thing. roles/iam.roleViewer is the right role
+// there.
+//
+// LIVE-CHECK OWED: whether GCP accepts organizationRoleViewer only at
+// organizations, or at folders too, has not been confirmed against a real
+// organization. This split is the conservative reading. If the live API
+// disagrees, the API wins -- record what it does and change this, do not code
+// around it.
+func RoleViewerFor(scopeKind string) string {
+	if scopeKind == models.CloudScopeOrg {
+		return "roles/iam.organizationRoleViewer"
+	}
+	return "roles/iam.roleViewer"
+}
+
+// ReaderRolesFor is the reader role set to grant at scopeKind, bound at
+// whichever scope the customer picked (org, folder or project) -- never
+// project-only.
+//
+// This is the discovery plan's P1 set and nothing beyond it. The P2 roles
+// (deny, Principal Access Boundary), P5 (workload hosts, Vertex, Agent
+// Registry) and P7 (private logs, activity analysis) are deliberately NOT
+// granted here: two of them carry unresolved decisions -- roles/aiplatform.viewer
+// also permits invoking an agent, and no read-only predefined role exists for
+// iam.policybindings -- and granting them quietly ahead of that review would
+// be exactly the silent scope creep this set exists to prevent. The permission
+// probe reports those surfaces as unreachable instead, so the gap is visible
+// rather than assumed.
+func ReaderRolesFor(scopeKind string) []string {
+	roles := make([]string, 0, len(baseReaderRoles)+1)
+	roles = append(roles, baseReaderRoles...)
+	return append(roles, RoleViewerFor(scopeKind))
+}
+
+// CandidateReaderRoles is the project-scope reader set, retained as the
+// scope-kind-free answer for callers that only need "roughly what do we grant"
+// (the onboarding package's informational role_set field). Anything that
+// actually grants must use ReaderRolesFor, so an org connector gets the
+// org-level role viewer.
+var CandidateReaderRoles = ReaderRolesFor(models.CloudScopeProject)
 
 // CurrentRoleSetStatus is which of the two RoleSetStatus* values
 // CandidateReaderRoles currently corresponds to. A single source of truth so
@@ -144,8 +197,9 @@ func RoleGrantCommands(scopeKind, scopeID string) []string {
 		target = "projects"
 	}
 
-	cmds := make([]string, 0, len(CandidateReaderRoles))
-	for _, role := range CandidateReaderRoles {
+	roles := ReaderRolesFor(scopeKind)
+	cmds := make([]string, 0, len(roles))
+	for _, role := range roles {
 		// --condition=None is required, not cosmetic: gcloud refuses to add an
 		// unconditional binding non-interactively to any policy that already
 		// carries a conditional binding ("Adding a binding without specifying
@@ -156,9 +210,22 @@ func RoleGrantCommands(scopeKind, scopeID string) []string {
 		// clean scope. Every reader-role grant here is meant to be
 		// unconditional, so this is the correct binding in both cases, not a
 		// workaround that changes behavior on a clean scope.
+		// The trailing `|| echo` is not cosmetic. The script runs under
+		// `set -e`, so a grant the operator is not permitted to make would
+		// otherwise abort it here — before the workload identity pool,
+		// provider and binding below are created. The customer would then have
+		// nothing to paste back, and the credential exchange would fail later
+		// with an error nowhere near the actual cause.
+		//
+		// A role that could not be granted is a capability limit, not a failed
+		// onboarding: the permission probe measures what was actually granted,
+		// so a connector that comes up short says so rather than claiming
+		// access it does not have.
 		cmds = append(cmds, fmt.Sprintf(
-			"gcloud %s add-iam-policy-binding %s \\\n  --member=\"serviceAccount:%s\" --role=%s --condition=None",
-			target, scopeID, readerSAEmailVar, role,
+			"gcloud %s add-iam-policy-binding %s \\\n"+
+				"  --member=\"serviceAccount:%s\" --role=%s --condition=None \\\n"+
+				"  || echo \"  WARNING: could not grant %s — AuthSec will report the surfaces it covers as unavailable\"",
+			target, scopeID, readerSAEmailVar, role, role,
 		))
 	}
 	return cmds

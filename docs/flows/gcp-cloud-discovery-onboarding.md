@@ -230,11 +230,40 @@ Two consequences worth stating plainly:
   For a federated connector there is no AuthSec-held secret that could outlive
   it.
 
+### Token lifetimes and refresh
+
+Nothing here is cached between calls, and nothing needs an operator present.
+A scan that pages for hours refreshes transparently.
+
+| Token | Lives | Who mints it | Refreshed by |
+|---|---|---|---|
+| Subject assertion (AuthSec-signed) | 5 minutes | AuthSec's native signer | Minted fresh on **every** exchange, including every refresh |
+| Federated token (STS) | ~1 hour | Google STS | A new subject assertion is exchanged for a new one |
+| Impersonated access token | ~1 hour | IAM Credentials | A new federated token is used to impersonate again |
+
+The subject assertion is deliberately short-lived, so it is minted on demand
+rather than held. When the impersonated access token expires mid-scan, the
+credential re-runs the whole chain by itself — mint, exchange, impersonate —
+and the page loop continues. A long scan does not die at the one-hour mark,
+and no part of this path re-reads a stored secret, because there is none.
+
+If AuthSec's own signing path is broken, that surfaces at onboarding rather
+than hours into a scan: the connection attempt mints once up front purely to
+fail fast, and discards the result.
+
 ### Legacy JSON-key authentication
 
-A service-account key path exists internally and is retained for compatibility,
-but **it is not offered in the console**. Where it is used, only the Vault
-*handle* is recorded against the connector — never the key itself.
+**No new connector can be created with a service-account key.** The method is
+refused at the API, not merely hidden in the console — it used to be hidden
+there while the HTTP surface still accepted it, which meant a keyed connector
+could be created through the API and handed to discovery.
+
+Connectors created before that change keep working. They still verify, so an
+operator can see whether one is healthy before migrating it, and they still
+revoke cleanly with the stored key purged from Vault. Only the key *handle* was
+ever recorded against the connector, never the key itself, and such a
+connector now carries a `keyed_credential` capability limit so discovery can
+apply its own policy to it.
 
 Many organizations set `constraints/iam.disableServiceAccountKeyCreation`, which
 blocks key creation outright. Federation is unaffected by that policy, which is
@@ -251,17 +280,31 @@ Granted at the scope AuthSec reads:
 | Role | Why |
 |---|---|
 | `roles/iam.serviceAccountViewer` | Enumerate service accounts — the candidate identities |
-| `roles/iam.roleViewer` | Read role definitions, to expand a binding into the actions it permits |
+| `roles/iam.securityReviewer` | Read allow policies across the scope, and the audit configuration attached to them |
 | `roles/cloudasset.viewer` | Read IAM policy across the scope in one paginated call |
 | `roles/browser` | Resolve the project, folder and organization hierarchy |
+| `roles/iam.organizationRoleViewer` **or** `roles/iam.roleViewer` | Read role definitions, to expand a binding into the actions it permits |
 
-All four are read-only. AuthSec never requests write, delete or impersonation
-permission on customer resources beyond the single binding that lets it act as
-the reader service account it created.
+The last row depends on the scope. An organization gets
+`organizationRoleViewer`, which is what gives org-wide sight of custom role
+definitions; a folder or project gets `roleViewer`. They are not
+interchangeable, and the second is not a narrower version of the first.
 
-> This set is still marked as a **candidate**: it is what onboarding grants
-> today, and is expected to be confirmed or narrowed once discovery is
-> implemented and its real permission needs are known.
+All of them are read-only. AuthSec never requests write, delete or
+impersonation permission on customer resources beyond the single binding that
+lets it act as the reader service account it created.
+
+The set is versioned, and the version is recorded on the connector, so an
+operator can tell which roles a given connector actually holds rather than
+inferring it from when it was onboarded.
+
+> Roles that later discovery phases will need — deny policies, Principal
+> Access Boundary, workload hosts, Vertex, Agent Registry, private logs — are
+> deliberately **not** granted here. Two of them carry open questions:
+> `roles/aiplatform.viewer` also permits *invoking* an agent, and no read-only
+> predefined role exists for reading IAM policy bindings. Granting them ahead
+> of that review would be exactly the silent scope creep this set exists to
+> prevent.
 
 ### Permissions the operator needs to connect
 
@@ -306,7 +349,13 @@ flowchart LR
 | CSRF state, PKCE verifier | Redis | 10 min, consumed once |
 | Google access token | Redis | 15 min, deleted on successful connect |
 | Scope, status, federation resource name, reader service account | PostgreSQL | Life of the connector |
-| Legacy key handle | Vault | Only for the legacy path |
+| Capability profile, API enablement, scope enumerability, readiness | PostgreSQL | Refreshed on every verify |
+| Customer-declared hints (environment, naming, owning team) | PostgreSQL | Life of the connector |
+| Legacy key handle | Vault | Only for connectors created before the keyed path closed |
+
+Everything in the two middle rows is an *observation* — permission names, API
+names, states, timestamps. None of it is a credential, and none of it names
+anything inside the customer's estate beyond the scope they told us about.
 
 **Never stored anywhere:** the Google refresh token (none is ever issued — the
 consent is online-only), the operator's Google password, or any service-account
@@ -355,8 +404,16 @@ Every failure is classified so the console can say who needs to act:
 | Fault | Means |
 |---|---|
 | `customer_account` | Something in the customer's Google Cloud — missing permission, unreadable scope, federation not configured as expected |
+| `constrained` | A VPC Service Controls perimeter or an organization policy refused the request by design |
 | `gcp` | Google rejected the exchange or the request |
 | `authsec` | An AuthSec-side deployment problem, such as a sign-in service Google cannot reach |
+
+`constrained` exists because the other three all imply somebody made a mistake,
+and this one means somebody made a decision. Both a perimeter violation and a
+missing role arrive as a 403; telling a customer to grant a role when a
+perimeter is blocking the call sends them to make a change that cannot work.
+The remedy is an access level, an ingress rule, or a policy exception, from
+whoever owns the constraint.
 
 Error messages are sanitized — they never carry a token, a key, or an
 authorization code.
@@ -371,16 +428,31 @@ Stated plainly so nothing here is mistaken for a promise.
 
 - Google Authentication onboarding, including automatic federation provisioning
 - Manual Workload Identity Federation onboarding
-- Federated authentication with service-account impersonation
+- Federated authentication with service-account impersonation, refreshing
+  transparently across a long scan
 - Connector create, verify, reconnect and revoke
 - Preflight permission checks before anything is created
 - One `cloud_connector` row per scope, with fault-classified errors
+- **A live per-surface permission probe**, run at onboarding and on every
+  verify. The row records what the reader was *proved* to reach, not what the
+  setup script was supposed to grant.
+- **A zero-write assertion** asked of GCP directly, rather than inferred from
+  the fact that the granted roles are all named "viewer"
+- **API enablement state** per API, and enablement repair on the path that
+  holds a credential able to do it
+- **Quota-project verification**, including the case where the reader project
+  sits outside the onboarded scope
+- **Scope enumerability**, probed by both routes independently
+- **A pre-created coverage skeleton**, so the first scan updates rather than
+  invents
+- **A discovery-readiness verdict** — ready, partial or blocked — derived from
+  the evidence above with the reasons attached
 
 ### Partially implemented
 
-- **Scan coverage and generation tracking** — the columns exist and are
-  initialised, but nothing advances them, because no scan exists.
-- **Legacy JSON-key path** — functional internally, not offered in the console.
+- **Scan generation tracking** — the column exists and is initialised to zero,
+  but nothing advances it, because no scan exists. Coverage is now pre-created
+  rather than empty, but every surface reads `unknown` until something scans.
 
 ### Planned — not built
 
@@ -396,12 +468,39 @@ GCP discovery is not implemented, so **GCP writes only `cloud_connector`
 today** — no `cloud_identity`, `cloud_permission`, `cloud_resource` or
 `cloud_secret` row originates from GCP.
 
+### Deliberately not done
+
+These are decisions, not omissions, and each has a reason:
+
+- **Later-phase reader roles** — deny policies, Principal Access Boundary,
+  workload hosts, Vertex, Agent Registry, private logs. Two carry open
+  questions: `roles/aiplatform.viewer` also permits *invoking* an agent, and no
+  read-only predefined role exists for reading IAM policy bindings. The probe
+  reports these surfaces as unreachable so the gap is visible rather than
+  assumed away.
+- **Audit-log configuration, org-policy enumeration and log-sink detection** —
+  signals discovery needs, but reads discovery should perform. Onboarding
+  reports whether the *permissions* for them exist and stops there.
+- **Scope selection state** — deselecting a scope without tombstoning it needs
+  somewhere to persist the selection, which is a schema decision this work did
+  not take.
+- **Persisting the scope tree** — onboarding proves the tree can be walked;
+  walking it is a scan's job, bounded by the documented ten-level and
+  300-per-parent limits.
+
 ### Unverified
 
-- Whether the candidate reader-role set is sufficient once discovery is built
-- Organization- and folder-scoped onboarding end to end against a real
-  organization
-- Behaviour under organization policies that restrict federation or key creation
+Everything below needs a real organization to settle, and none of it is
+settled by the tests:
+
+- Whether the reader role set is sufficient in practice, and whether
+  `roles/iam.organizationRoleViewer` binds anywhere below an organization —
+  the code takes the conservative reading and says so
+- Organization- and folder-scoped onboarding end to end
+- Behaviour under organization policies that restrict federation
+- Whether the org-policy half of the constrained-vs-denied classification
+  matches what Google actually returns; the VPC Service Controls half is
+  documented, that one is inferred from the constraint id alone
 
 ---
 

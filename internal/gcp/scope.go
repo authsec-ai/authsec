@@ -54,33 +54,48 @@ func setScopeIamPolicy(ctx context.Context, rm *cloudresourcemanager.Service, sc
 	return err
 }
 
-func testMissingPermissions(ctx context.Context, rm *cloudresourcemanager.Service, scopeKind, scopeID string, want []string) ([]string, error) {
+// testAllowedPermissions returns the subset of want the CALLER holds at
+// (scopeKind, scopeID). Raw: the provider error is returned unwrapped so a
+// caller that needs to tell an unsupported permission (400) from a denial
+// (403) still can -- testMissingPermissions below wraps it for callers that
+// do not care.
+//
+// want must be at most testIamPermissionsBatchSize long; callers probing more
+// than that are responsible for chunking (see chunkPermissions).
+func testAllowedPermissions(ctx context.Context, rm *cloudresourcemanager.Service, scopeKind, scopeID string, want []string) ([]string, error) {
 	resource, err := scopeResourceName(scopeKind, scopeID)
 	if err != nil {
 		return nil, err
 	}
 	req := &cloudresourcemanager.TestIamPermissionsRequest{Permissions: want}
 
-	var allowed []string
 	switch scopeKind {
 	case models.CloudScopeOrg:
 		resp, err := rm.Organizations.TestIamPermissions(resource, req).Context(ctx).Do()
 		if err != nil {
-			return nil, fmt.Errorf("%w: testIamPermissions at %s: %v", ErrGoogleOAuthProvisioningFailed, resource, err)
+			return nil, err
 		}
-		allowed = resp.Permissions
+		return resp.Permissions, nil
 	case models.CloudScopeFolder:
 		resp, err := rm.Folders.TestIamPermissions(resource, req).Context(ctx).Do()
 		if err != nil {
-			return nil, fmt.Errorf("%w: testIamPermissions at %s: %v", ErrGoogleOAuthProvisioningFailed, resource, err)
+			return nil, err
 		}
-		allowed = resp.Permissions
+		return resp.Permissions, nil
 	default:
 		resp, err := rm.Projects.TestIamPermissions(resource, req).Context(ctx).Do()
 		if err != nil {
-			return nil, fmt.Errorf("%w: testIamPermissions at %s: %v", ErrGoogleOAuthProvisioningFailed, resource, err)
+			return nil, err
 		}
-		allowed = resp.Permissions
+		return resp.Permissions, nil
+	}
+}
+
+func testMissingPermissions(ctx context.Context, rm *cloudresourcemanager.Service, scopeKind, scopeID string, want []string) ([]string, error) {
+	allowed, err := testAllowedPermissions(ctx, rm, scopeKind, scopeID, want)
+	if err != nil {
+		resource, _ := scopeResourceName(scopeKind, scopeID)
+		return nil, fmt.Errorf("%w: testIamPermissions at %s: %v", ErrGoogleOAuthProvisioningFailed, resource, err)
 	}
 
 	missing := make([]string, 0, len(want))
@@ -107,3 +122,19 @@ func ProvisioningScopePermission(scopeKind string) string {
 		return "resourcemanager.projects.setIamPolicy"
 	}
 }
+
+/* ------------------------- hierarchy limits (ONB-6) ------------------------- */
+
+// Documented Google Cloud resource-hierarchy limits. Named here so a
+// hierarchy walk imports a guard rather than rediscovering one at runtime
+// against a customer's estate.
+//
+// These are ceilings to recurse defensively against, not values to assume: a
+// walk that hits either has found something worth reporting, not a reason to
+// silently stop.
+const (
+	// MaxFolderDepth is the deepest folder nesting under an organization.
+	MaxFolderDepth = 10
+	// MaxFoldersPerParent is the most folders one parent may directly contain.
+	MaxFoldersPerParent = 300
+)

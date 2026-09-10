@@ -37,6 +37,17 @@ type fakeProvisionServer struct {
 	scopePolicy *cloudresourcemanager.Policy
 
 	deniedPermissions map[string]bool
+	// rejectedPermissions makes the WHOLE testIamPermissions call fail with
+	// 400, the way GCP does when a permission name is not applicable to the
+	// resource type being tested. Distinct from deniedPermissions, which the
+	// call simply omits from its answer -- the difference between "you do not
+	// have this" and "that is not a question about this resource", which the
+	// probe has to keep apart.
+	rejectedPermissions map[string]bool
+	// failBatchEnable makes Service Usage refuse, so a test can prove that the
+	// core APIs failing is fatal while an individual discovery API failing is
+	// not.
+	failBatchEnable bool
 
 	createPoolCalls, undeletePoolCalls          int
 	createProviderCalls                         int
@@ -49,9 +60,10 @@ type fakeProvisionServer struct {
 
 func newFakeProvisionServer() *fakeProvisionServer {
 	f := &fakeProvisionServer{
-		saPolicy:          &iam.Policy{Etag: "etag-sa-1"},
-		scopePolicy:       &cloudresourcemanager.Policy{Etag: "etag-scope-1"},
-		deniedPermissions: map[string]bool{},
+		saPolicy:            &iam.Policy{Etag: "etag-sa-1"},
+		scopePolicy:         &cloudresourcemanager.Policy{Etag: "etag-scope-1"},
+		deniedPermissions:   map[string]bool{},
+		rejectedPermissions: map[string]bool{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
@@ -63,6 +75,16 @@ func (f *fakeProvisionServer) record(method, path string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, method+" "+path)
+}
+
+// recorded returns a copy of the calls seen so far, so a test can assert
+// WHICH resource a call targeted rather than only how many there were.
+func (f *fakeProvisionServer) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
 }
 
 func (f *fakeProvisionServer) callCount() int {
@@ -168,6 +190,12 @@ func (f *fakeProvisionServer) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && strings.HasSuffix(path, ":testIamPermissions"):
 		var req cloudresourcemanager.TestIamPermissionsRequest
 		_ = json.Unmarshal(body, &req)
+		for _, p := range req.Permissions {
+			if f.rejectedPermissions[p] {
+				http.Error(w, `{"error":{"code":400,"message":"permission not applicable"}}`, http.StatusBadRequest)
+				return
+			}
+		}
 		var allowed []string
 		for _, p := range req.Permissions {
 			if !f.deniedPermissions[p] {
@@ -180,7 +208,12 @@ func (f *fakeProvisionServer) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && strings.HasSuffix(path, ":batchEnable"):
 		f.mu.Lock()
 		f.enableCalls++
+		shouldFail := f.failBatchEnable
 		f.mu.Unlock()
+		if shouldFail {
+			http.Error(w, `{"error":{"code":403,"message":"denied"}}`, http.StatusForbidden)
+			return
+		}
 		writeJSON(w, http.StatusOK, &serviceusage.Operation{Done: true})
 
 	default:
@@ -460,14 +493,114 @@ func TestTestScopePermission_SelectsCorrectAPIByScopeKind(t *testing.T) {
 
 /* -------------------------------- misc ------------------------------------ */
 
-func TestEnableServices_CallsBatchEnable(t *testing.T) {
+// TestEnableServices_CoreIsOneBatchAndDiscoveryIsOneAtATime pins the split
+// that a live WIF setup failure forced.
+//
+// A single BatchEnable naming all twenty-one APIs is all-or-nothing, so one
+// unavailable API (agentregistry is Beta) takes the other twenty down with it.
+// In the setup script, running under `set -e`, that aborted before the pool
+// and provider were created, and surfaced much later as a failed credential
+// exchange pointing at a pool that had never existed. Core goes in one batch
+// because nothing works without it; everything else goes one at a time so it
+// can fail alone.
+func TestEnableServices_CoreIsOneBatchAndDiscoveryIsOneAtATime(t *testing.T) {
 	f := newFakeProvisionServer()
 	defer f.Close()
 	if err := EnableServices(context.Background(), f.suClient(t), "p1"); err != nil {
 		t.Fatalf("EnableServices: %v", err)
 	}
-	if f.enableCalls != 1 {
-		t.Fatalf("enableCalls = %d, want 1", f.enableCalls)
+	want := 1 + len(DiscoveryServices)
+	if f.enableCalls != want {
+		t.Fatalf("enableCalls = %d, want %d (1 core batch + %d individual)",
+			f.enableCalls, want, len(DiscoveryServices))
+	}
+}
+
+// TestEnableServices_CoreFitsInOneBatch guards the assumption above: core is
+// sent unchunked, so it must stay under BatchEnable's documented ceiling.
+func TestEnableServices_CoreFitsInOneBatch(t *testing.T) {
+	if len(CoreServices) > batchEnableMaxServices {
+		t.Fatalf("CoreServices has %d entries, over the %d-per-call ceiling; it is sent as one batch",
+			len(CoreServices), batchEnableMaxServices)
+	}
+}
+
+// TestEnableServices_CoreFailureIsFatal: without these, the service account,
+// the federation resources and every later read are impossible, so continuing
+// would only build a connector guaranteed not to work.
+func TestEnableServices_CoreFailureIsFatal(t *testing.T) {
+	f := newFakeProvisionServer()
+	defer f.Close()
+	f.failBatchEnable = true
+
+	if err := EnableServices(context.Background(), f.suClient(t), "p1"); err == nil {
+		t.Fatal("expected an error when the core APIs cannot be enabled")
+	}
+}
+
+// TestCoreAndDiscoveryPartitionRequiredServices stops a service being added to
+// one list and quietly dropped from the other, which would leave it enabled
+// but never reported, or reported but never enabled.
+func TestCoreAndDiscoveryPartitionRequiredServices(t *testing.T) {
+	if len(RequiredServices) != len(CoreServices)+len(DiscoveryServices) {
+		t.Fatalf("RequiredServices has %d entries, want %d core + %d discovery",
+			len(RequiredServices), len(CoreServices), len(DiscoveryServices))
+	}
+	seen := map[string]bool{}
+	for _, s := range RequiredServices {
+		if seen[s] {
+			t.Errorf("%s appears in both lists", s)
+		}
+		seen[s] = true
+	}
+}
+
+// TestRequiredServices_CoversEveryAPIDiscoveryReads is the E3.1 guard. The
+// list is the contract with discovery; a surface whose API is missing here
+// fails at scan time with "not enabled", which is a support ticket rather
+// than a sentence in the setup output.
+func TestRequiredServices_CoversEveryAPIDiscoveryReads(t *testing.T) {
+	want := []string{
+		"cloudresourcemanager.googleapis.com", "iam.googleapis.com",
+		"iamcredentials.googleapis.com", "sts.googleapis.com",
+		"cloudasset.googleapis.com", "serviceusage.googleapis.com",
+		"logging.googleapis.com", "policyanalyzer.googleapis.com",
+		"recommender.googleapis.com", "run.googleapis.com",
+		"cloudfunctions.googleapis.com", "compute.googleapis.com",
+		"container.googleapis.com", "aiplatform.googleapis.com",
+		"agentregistry.googleapis.com", "secretmanager.googleapis.com",
+		"bigquery.googleapis.com", "storage.googleapis.com",
+		"pubsub.googleapis.com", "cloudkms.googleapis.com",
+		"sqladmin.googleapis.com",
+	}
+	have := map[string]bool{}
+	for _, s := range RequiredServices {
+		have[s] = true
+	}
+	for _, w := range want {
+		if !have[w] {
+			t.Errorf("RequiredServices is missing %s", w)
+		}
+	}
+}
+
+// TestReadAPIEnablement_UnreadableIsUnknownNotDisabled is the coverage-honesty
+// rule applied to enablement. A reader that cannot list services has learned
+// nothing; recording that as "not_enabled" would be indistinguishable from the
+// truth while being invented.
+func TestReadAPIEnablement_UnreadableIsUnknownNotDisabled(t *testing.T) {
+	f := newFakeProvisionServer()
+	defer f.Close()
+	// The fake has no services.list handler, so the listing fails.
+	state := ReadAPIEnablement(context.Background(), f.suClient(t), "p1")
+
+	if len(state) != len(RequiredServices) {
+		t.Fatalf("state has %d entries, want one per required service (%d)", len(state), len(RequiredServices))
+	}
+	for svc, v := range state {
+		if v != APIStateUnknown {
+			t.Errorf("%s = %q, want %q when enablement could not be read", svc, v, APIStateUnknown)
+		}
 	}
 }
 

@@ -390,7 +390,7 @@ func TestProvision_WorkspaceMismatch_ZeroGCPCalls(t *testing.T) {
 	attackerWorkspace := uuid.New()
 	sessionID := startAndCallback(t, svc, ownerWorkspace, "actor", "tok-1", "")
 
-	_, _, err := svc.Provision(context.Background(), sessionID, attackerWorkspace, testScope, "", "attacker-actor")
+	_, _, err := svc.Provision(context.Background(), sessionID, attackerWorkspace, testScope, "", nil, "attacker-actor")
 	if err == nil || !strings.Contains(err.Error(), "does not belong to your workspace") {
 		t.Fatalf("Provision from a different workspace = %v, want ErrGoogleOAuthWorkspaceMismatch", err)
 	}
@@ -410,7 +410,7 @@ func TestProvision_MissingPermissions_ZeroGCPWritesAndSessionPreserved(t *testin
 	workspaceID := uuid.New()
 	sessionID := startAndCallback(t, svc, workspaceID, "actor", "tok-1", "")
 
-	_, _, err := svc.Provision(context.Background(), sessionID, workspaceID, testScope, "", "actor")
+	_, _, err := svc.Provision(context.Background(), sessionID, workspaceID, testScope, "", nil, "actor")
 	if err == nil || !strings.Contains(err.Error(), "does not have the permissions") {
 		t.Fatalf("Provision with a missing permission = %v, want ErrGoogleOAuthPermissionsMissing", err)
 	}
@@ -445,7 +445,7 @@ func TestProvision_FullFlow_EquivalentToManualWIF_Idempotent_TokenNotPersisted(t
 
 	sessionID := startAndCallback(t, oauthSvc, workspaceID, "human@example.com", secretAccessToken, "")
 
-	connector, created, err := oauthSvc.Provision(context.Background(), sessionID, workspaceID, scope, "My GCP (OAuth)", "human@example.com")
+	connector, created, err := oauthSvc.Provision(context.Background(), sessionID, workspaceID, scope, "My GCP (OAuth)", nil, "human@example.com")
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -512,7 +512,7 @@ func TestProvision_FullFlow_EquivalentToManualWIF_Idempotent_TokenNotPersisted(t
 
 	// --- idempotency: re-provisioning the SAME scope updates, not duplicates ---
 	sessionID2 := startAndCallback(t, oauthSvc, workspaceID, "human@example.com", "second-access-token", "")
-	_, created2, err := oauthSvc.Provision(context.Background(), sessionID2, workspaceID, scope, "My GCP (OAuth)", "human@example.com")
+	_, created2, err := oauthSvc.Provision(context.Background(), sessionID2, workspaceID, scope, "My GCP (OAuth)", nil, "human@example.com")
 	if err != nil {
 		t.Fatalf("second Provision: %v", err)
 	}

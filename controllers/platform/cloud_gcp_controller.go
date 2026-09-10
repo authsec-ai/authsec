@@ -134,6 +134,8 @@ func (ctl *CloudGCPController) GetOnboardingPackage(c *gin.Context) {
 		RoleSetStatus:      gcp.CurrentRoleSetStatus,
 		SetupScriptVersion: gcp.Version,
 		RoleGrantCommands:  gcp.RoleGrantCommands(scopeKind, scopeID),
+		CoreServices:       gcp.CoreServices,
+		DiscoveryServices:  gcp.DiscoveryServices,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -150,14 +152,13 @@ func (ctl *CloudGCPController) GetOnboardingPackage(c *gin.Context) {
 			"provider_id":          providerID,
 			"wif_subject":          wifSubject,
 			"issuer_url":           issuerURL,
-			"role_set":             gcp.CandidateReaderRoles,
+			"role_set":             gcp.ReaderRolesFor(scopeKind),
+			"role_set_version":     gcp.ReaderRoleSetVersion,
 			"role_set_status":      gcp.CurrentRoleSetStatus,
 			"setup_script":         script,
 			"setup_script_version": gcp.Version,
-			"wif_instructions": "Run Option A in the script, then paste the two printed values " +
-				"(reader SA email, WIF provider resource) into the WIF form below.",
-			"json_key_instructions": "Run Option B in the script, then upload the generated " +
-				"reader-key.json file below. Delete the local copy once uploaded.",
+			"wif_instructions": "Run the script, then paste the provider resource it prints at the end " +
+				"into the WIF form below.",
 		},
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
@@ -186,6 +187,12 @@ type gcpCreateConnectorRequest struct {
 		ProviderResource string `json:"provider_resource,omitempty"`
 		ReaderSAEmail    string `json:"reader_sa_email,omitempty"`
 	} `json:"auth"`
+
+	// Hints is optional customer-declared context no GCP API reports.
+	// Non-secret by construction — an environment name, a naming convention, a
+	// team — and never a credential, so it is safe on a row that is returned
+	// to the console.
+	Hints *models.GCPOnboardingHints `json:"hints,omitempty"`
 }
 
 // CreateConnector handles POST /authsec/discovery/gcp/connectors.
@@ -213,6 +220,7 @@ func (ctl *CloudGCPController) CreateConnector(c *gin.Context) {
 		ScopeID:         req.ScopeID,
 		ReaderProjectID: req.ReaderProjectID,
 		DisplayName:     req.DisplayName,
+		Hints:           req.Hints,
 		Auth: services.GCPAuthInput{
 			Method:           req.Auth.Method,
 			KeyJSON:          []byte(req.Auth.KeyJSON),
@@ -398,11 +406,42 @@ func mapGCPOnboardingError(err error) (int, gin.H) {
 			"fault": "customer_account",
 		}
 
+	case errors.Is(err, services.ErrKeyedOnboardingClosed):
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint": "use auth.method \"wif\" — fetch GET /discovery/gcp/onboarding for the setup script, " +
+				"or connect with Google Authentication to have it configured for you",
+			"fault": "customer_account",
+		}
+
 	case errors.Is(err, services.ErrConnectorRevoked):
 		return http.StatusBadRequest, gin.H{
 			"error": err.Error(),
 			"hint":  "reconnect this scope (POST /connectors again with fresh credentials) instead of verifying a revoked connector",
 			"fault": "customer_account",
+		}
+
+	// A fourth fault class alongside customer_account / gcp / authsec. The
+	// three existing ones all imply somebody made a mistake; these two mean
+	// somebody made a DECISION, and the console has to say so — telling a
+	// customer to grant a role when a perimeter is blocking the call wastes
+	// their time on a change that cannot work.
+	case errors.Is(err, gcp.ErrVPCServiceControls):
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint": "a VPC Service Controls perimeter is blocking this read. The reader may already hold every " +
+				"permission it needs — whoever owns the perimeter has to allow AuthSec through it, via an " +
+				"access level or an ingress rule. Granting more IAM roles will not change this.",
+			"fault": "constrained",
+		}
+
+	case errors.Is(err, gcp.ErrOrgPolicyConstrained):
+		return http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"hint": "an organization policy constraint is blocking this. This is a deliberate setting in the " +
+				"customer's organization, not a missing permission — it has to be relaxed for this scope, or " +
+				"the scope onboarded differently.",
+			"fault": "constrained",
 		}
 
 	case errors.Is(err, services.ErrScopeNotReadable):
@@ -429,7 +468,7 @@ func mapGCPOnboardingError(err error) (int, gin.H) {
 			"error": err.Error(),
 			"hint": "the Workload Identity Federation issuer this deployment is configured with isn't reachable " +
 				"from Google Cloud right now — if this is a local development tunnel, confirm it's still running " +
-				"and matches what the WIF provider was created with, or use the JSON key method instead",
+				"and matches what the WIF provider was created with",
 			"fault": "authsec",
 		}
 
