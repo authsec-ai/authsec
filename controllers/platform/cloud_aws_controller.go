@@ -606,6 +606,97 @@ func (ctl *CloudAWSController) ListResources(c *gin.Context) {
 	})
 }
 
+// ListWorkloads handles GET /authsec/discovery/aws/workloads.
+//
+// The compute that runs as a discovered identity. Filterable by identity so a
+// console can answer "what actually runs as this role", which is the question
+// that makes a role's permissions actionable.
+func (ctl *CloudAWSController) ListWorkloads(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	identityID, err := parseOptionalUUID(c.Query("identity_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
+		return
+	}
+	rows, err := repositories.NewCloudWorkloadRepository(ctl.db).ListWorkloads(workspaceID, identityID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Unattributed compute is the finding a console should surface, so it is
+	// counted here rather than left for the caller to derive.
+	unattributed := 0
+	byKind := map[string]int{}
+	for _, w := range rows {
+		byKind[w.RuntimeKind]++
+		if w.IdentityID == nil {
+			unattributed++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(), "count": len(rows),
+			"by_runtime_kind": byKind,
+			"unattributed":    unattributed,
+			"note": "a workload is compute that RUNS AS an identity, not an identity itself. " +
+				"identity_id null means the role it names was not discovered -- compute " +
+				"nobody can attribute, which is a finding rather than missing data. " +
+				"Whether a workload is an agent is a separate judgement this table does not make",
+		},
+	})
+}
+
+// ListUsage handles GET /authsec/discovery/aws/usage.
+//
+// Whether an identity actually exercised a service, as opposed to merely being
+// permitted to.
+func (ctl *CloudAWSController) ListUsage(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	identityID, err := parseOptionalUUID(c.Query("identity_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
+		return
+	}
+	rows, err := repositories.NewCloudWorkloadRepository(ctl.db).ListUsage(workspaceID, identityID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// A null last_used_at is the actionable row -- the service this identity is
+	// permitted to use and never has.
+	neverUsed := 0
+	for _, u := range rows {
+		if u.LastUsedAt == nil {
+			neverUsed++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(), "count": len(rows),
+			"never_accessed": neverUsed,
+			"note": "the grain is one row per (identity, service) because that is the grain " +
+				"AWS reports -- it can say 'never touched S3', not 'used GetObject but " +
+				"never PutObject'. last_used_at null means AWS reports the service was " +
+				"never accessed in its tracking window; a service that could not be read " +
+				"produces no row at all",
+		},
+	})
+}
+
 func parseOptionalUUID(raw string) (*uuid.UUID, error) {
 	if raw == "" {
 		return nil, nil

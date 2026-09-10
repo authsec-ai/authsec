@@ -1671,6 +1671,12 @@ func SetupRoutes(
 			discovery.GET("/aws/permissions", middlewares.Require("discovery", "read"), cloudAWS.ListPermissions)
 			discovery.GET("/aws/resources", middlewares.Require("discovery", "read"), cloudAWS.ListResources)
 
+			// The compute that runs as a discovered identity, and whether an
+			// identity has actually exercised a service. Read-only, same
+			// permission as every other discovery read.
+			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
+			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
+
 			// GCP as a discovery channel, alongside AWS, Kubernetes and GitHub.
 			//
 			// Same boundary as the AWS block above: these endpoints ONBOARD a GCP
