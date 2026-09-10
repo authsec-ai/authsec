@@ -1,10 +1,12 @@
 package platform
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -109,7 +111,10 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	clientID := strings.TrimSpace(os.Getenv("AZURE_CLIENT_ID"))
 	redirectURI := strings.TrimSpace(os.Getenv("AZURE_REDIRECT_URI"))
 	secretSet := strings.TrimSpace(os.Getenv("AZURE_CLIENT_SECRET")) != ""
-	homeTenant := strings.TrimSpace(os.Getenv("AZURE_HOME_TENANT"))
+	// No environment fallback for the home tenant: it belongs to a specific
+	// application, so it lives beside the client id it describes, in the stored
+	// row, where the two cannot drift apart.
+	homeTenant := ""
 	source := "environment"
 
 	// A workspace that submitted its own application overrides all of the above,
@@ -117,12 +122,41 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	// correctly configured workspace reads as broken because the deployment has
 	// no env vars.
 	var stored *models.AzureAppConfig
+	problem, certPEM, certThumb := "", "", ""
+	// Set when the row itself could not be read. Distinct from "there is no
+	// row": this used to discard the error and answer with the environment
+	// checklist, telling an operator to set AZURE_* variables because Postgres
+	// was unreachable.
+	readError := ""
 	if svc, sErr := ctl.service(); sErr == nil {
-		if cfg, cErr := svc.GetAppConfig(workspaceID); cErr == nil && cfg != nil {
+		cfg, cErr := svc.GetAppConfig(workspaceID)
+		if cErr != nil {
+			readError = cErr.Error()
+		}
+		if cErr == nil && cfg != nil {
 			stored = cfg
 			clientID, redirectURI, homeTenant = cfg.ClientID, cfg.RedirectURI, cfg.HomeTenant
-			secretSet = true // the row cannot exist without a secret written first
 			source = "workspace"
+
+			// Whether the secret is READABLE, not whether a row exists.
+			//
+			// This used to assume the two were the same -- "the row cannot exist
+			// without a secret written first" -- which is true when the row is
+			// written and false ever after. A secrets store restored from an
+			// older backup than the database, or a development store that keeps
+			// nothing across a restart, leaves the row pointing at a path that
+			// holds nothing. Reporting "configured, secret set" then sends an
+			// operator looking at everything except the one thing that is wrong.
+			if rErr := svc.ForWorkspace(workspaceID).Ready(); rErr != nil {
+				problem = rErr.Error()
+			} else {
+				secretSet = true
+			}
+			// The PUBLIC certificate, so the console can always offer it.
+			// Offering it only once left an operator who closed the page with
+			// no way back except generating again -- which replaces the key and
+			// orphans whatever they had already uploaded.
+			certPEM, certThumb = svc.CurrentCertificatePEM(workspaceID)
 		}
 	}
 	sessionSet := len(strings.TrimSpace(os.Getenv(azureSessionSecretEnv))) >= 32
@@ -146,7 +180,9 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"ready": len(missing) == 0,
+		// A row that could not be read is not a ready workspace, whatever the
+		// environment happens to hold.
+		"ready": len(missing) == 0 && readError == "",
 		"data": gin.H{
 			// Public values, echoed so a setup screen can compare them against
 			// the Entra application.
@@ -175,6 +211,30 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 			"vault_configured":   vaultSet,
 
 			"missing": missing,
+
+			// Set only when a STORED application exists and cannot be used, so
+			// a setup screen can say what is actually wrong instead of listing
+			// environment variables this workspace was never meant to set.
+			//
+			// Named credential_problem, not problem: an error body's "problem"
+			// is a Diagnosis object, and one key holding two shapes is how a
+			// client ends up rendering "[object Object]".
+			"credential_problem": problem,
+
+			// Set only when the stored application could not be READ. Without
+			// it an unreachable database is indistinguishable from a workspace
+			// that never configured anything.
+			"config_read_error": readError,
+
+			// The certificate in use, when there is one. Public: it verifies a
+			// signature and cannot make one. Empty for a client secret, and
+			// there is no equivalent for one -- a secret cannot be handed back.
+			"certificate_pem": certPEM,
+
+			// Uppercase hex, the form the portal shows and AADSTS700027 quotes.
+			// With both on screen the mismatch that error describes is one
+			// glance to confirm.
+			"certificate_thumbprint": certThumb,
 		},
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
@@ -210,9 +270,12 @@ func (ctl *AzureOnboardController) SetAppConfig(c *gin.Context) {
 	var in services.AzureAppConfigInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "body must be {\"clientId\", \"clientSecret\", \"homeTenant\", \"redirectUri\"}",
+			"error": "body must be {\"clientId\", \"homeTenant\", \"redirectUri\"} plus EITHER " +
+				"\"generateCertificate\": true OR \"clientSecret\"",
 			"hint": "clientId and homeTenant are the Application (client) ID and Directory " +
-				"(tenant) ID from the app registration Overview page",
+				"(tenant) ID from the app registration Overview page. generateCertificate is " +
+				"preferred: AuthSec makes the key pair, keeps the private key, and returns the " +
+				"certificate for you to upload -- so the key is never sent anywhere",
 		})
 		return
 	}
@@ -246,8 +309,10 @@ func (ctl *AzureOnboardController) SetAppConfig(c *gin.Context) {
 		"data": res,
 		"meta": gin.H{
 			"as_of": time.Now().UTC(),
-			"note": "the client secret is stored in vault and is never returned by any endpoint. " +
-				"stored=true with ok=false means the application was saved but is not usable yet",
+			"note": "the credential -- secret or private key -- is stored in vault and is never " +
+				"returned by any endpoint. certificate_pem, when present, is the PUBLIC " +
+				"certificate to upload to Microsoft. stored=true with ok=false means the " +
+				"application was saved but is not usable yet",
 			"next": nextForAppConfig(res),
 		},
 	})
@@ -257,14 +322,36 @@ func (ctl *AzureOnboardController) SetAppConfig(c *gin.Context) {
 func nextForAppConfig(res *services.AzureAppConfigResult) string {
 	switch {
 	case res.CheckError != "":
-		return "the application could not be read at all: check the client id, the secret, " +
+		// The diagnosis when there is one -- "check the client id and the
+		// secret" is actively wrong for a 403, where both are correct and the
+		// missing thing is admin consent.
+		if res.CheckProblem != nil {
+			return res.CheckProblem.Fix
+		}
+		return "the application could not be read at all: check the client id, the credential, " +
 			"and that homeTenant is the directory the registration was created in"
+	case res.CertificatePEM != "":
+		// The key pair exists and Microsoft has not seen the public half yet, so
+		// every check below would fail for that one reason. Say the one thing
+		// that unblocks it.
+		return "download certificate_pem and upload it: portal -> your app -> " +
+			"Certificates & secrets -> Certificates -> Upload certificate. Then " +
+			"GET /api/azure/app/check. Until then the application cannot authenticate, " +
+			"because Microsoft has no public key to verify its signature against"
 	case res.Check == nil:
 		return "stored, but not verified"
 	case len(res.Check.MissingPermissions) > 0:
 		return "grant these as APPLICATION permissions (not delegated) in portal -> API permissions " +
 			"-> Microsoft Graph -> Application permissions, then Grant admin consent: " +
 			strings.Join(res.Check.MissingPermissions, ", ")
+	case len(res.Check.MissingARMScopes) > 0:
+		// A different API and a different permission type, so a different path.
+		// Sending someone to Microsoft Graph for these is what the merged field
+		// used to do, and user_impersonation is not there to be found.
+		return "declare these as DELEGATED permissions in portal -> API permissions -> " +
+			"Add a permission -> APIs my organization uses -> Azure Service Management -> " +
+			"Delegated permissions, then Grant admin consent: " +
+			strings.Join(res.Check.MissingARMScopes, ", ")
 	case !res.Check.OK:
 		return "fix the errors in check.findings, then POST this again or GET /api/azure/app/check"
 	default:
@@ -313,6 +400,60 @@ func (ctl *AzureOnboardController) CheckAppRegistration(c *gin.Context) {
 	})
 }
 
+// ResolveSignInName handles POST /api/azure/signin-name.
+//
+// Turns "my email is X" into "type Y at the sign-in page", which for an
+// externally backed account are different strings. Read-only, and it returns a
+// username -- not a credential, not a token, nothing that grants anything.
+//
+// It exists because the alternative is a dead end. Microsoft rejects the real
+// address at a directory sign-in, says only "use your work or school account",
+// and there is no way for the person to discover the rewritten name it would
+// have accepted. It is not shown at sign-up, not in any mail, and not anywhere
+// they would look.
+func (ctl *AzureOnboardController) ResolveSignInName(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var body struct {
+		TenantID string `json:"tenantId"`
+		Email    string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "body must be {\"tenantId\": \"<guid>\", \"email\": \"you@example.com\"}"})
+		return
+	}
+	svc, err := ctl.serviceFor(workspaceID)
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+
+	res, err := svc.ResolveSignInName(c.Request.Context(),
+		strings.TrimSpace(body.TenantID), strings.TrimSpace(body.Email))
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   true,
+		"data": res,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "sign in at /api/azure/login?tenant=<tenantId>&login_hint=<user_principal_name>. " +
+				"mangled=true means the address differs from the directory name, which is why " +
+				"typing the address itself fails",
+			"limit": "needs the application to be consented in this tenant already, because the " +
+				"lookup uses an app-only Graph token",
+		},
+	})
+}
+
 /* ---------------------------------- login --------------------------------- */
 
 // Login handles GET /api/azure/login.
@@ -324,7 +465,7 @@ func (ctl *AzureOnboardController) Login(c *gin.Context) {
 	// needs only the database, and the workspace is not known until it returns.
 	svc, err := ctl.service()
 	if err != nil {
-		status, body := mapAzureOnboardError(err)
+		status, body := mapAzureOnboardErrorPublic(c, err)
 		c.JSON(status, body)
 		return
 	}
@@ -339,20 +480,37 @@ func (ctl *AzureOnboardController) Login(c *gin.Context) {
 	// redirect uri, and the code that comes back is redeemable only by the
 	// application that issued it.
 	if svc, err = ctl.serviceFor(workspaceID); err != nil {
-		status, body := mapAzureOnboardError(err)
+		status, body := mapAzureOnboardErrorPublic(c, err)
 		c.JSON(status, body)
 		return
 	}
 
-	// admin_consent=true merges tenant-wide consent into this sign-in. Opt-in per
-	// request rather than per deployment: it requires a Global Administrator, so
-	// forcing it on would lock out every other operator on the same instance.
-	adminConsent := strings.EqualFold(strings.TrimSpace(c.Query("admin_consent")), "true")
-
-	authorizeURL, err := svc.StartLogin(workspaceID, "browser", adminConsent,
-		strings.TrimSpace(c.Query("tenant")))
+	// There is no admin_consent parameter, and there never usefully was one.
+	//
+	// It used to set prompt=admin_consent on the authorize URL, and Microsoft
+	// rejects that value on the v2.0 endpoint outright -- AADSTS901001, before a
+	// password is typed. Admin consent is a separate Microsoft screen; POST
+	// /api/azure/auto-setup chains the two for the operator, and POST
+	// /api/azure/consent does one tenant on its own.
+	//
+	// login_hint decides which identity Entra resolves before anyone types.
+	// pick_account forces the picker -- opt-in, because forcing it replaces
+	// working single sign-on with a blank username box, and for an externally
+	// backed account the name that box needs is one nobody knows.
+	//
+	// The autoSetup argument is hard-coded false and there is no query parameter
+	// for it. This route is a browser navigation with no bearer token, and the
+	// auto-setup path WRITES an azure_connectors row -- so a query parameter
+	// here would let anyone who can reach this deployment sign in with a tenant
+	// of their choosing and file it into a workspace they have no rights to.
+	// POST /api/azure/auto-setup mints that state instead, behind
+	// discovery:admin.
+	authorizeURL, err := svc.StartLogin(workspaceID, "browser", false, false,
+		strings.TrimSpace(c.Query("tenant")),
+		strings.TrimSpace(c.Query("login_hint")),
+		strings.EqualFold(strings.TrimSpace(c.Query("pick_account")), "true"))
 	if err != nil {
-		status, body := mapAzureOnboardError(err)
+		status, body := mapAzureOnboardErrorPublic(c, err)
 		c.JSON(status, body)
 		return
 	}
@@ -368,7 +526,7 @@ func (ctl *AzureOnboardController) Login(c *gin.Context) {
 func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 	svc, err := ctl.service()
 	if err != nil {
-		status, body := mapAzureOnboardError(err)
+		status, body := mapAzureOnboardErrorPublic(c, err)
 		c.JSON(status, body)
 		return
 	}
@@ -379,11 +537,26 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 	// application fails with an opaque invalid_client. Peeking grants nothing:
 	// the state is still redeemed exactly once, atomically, inside
 	// HandleCallback.
-	if ws, wErr := svc.PeekCallbackWorkspace(c.Query("state")); wErr == nil {
-		if bound, bErr := ctl.serviceFor(ws); bErr == nil {
-			svc = bound
-		}
+	//
+	// FAILING TO BIND IS FATAL HERE, and must not fall through to the unbound
+	// service. That fallback crashed the process: with no AZURE_* variables --
+	// now a supported deployment, because the application arrives through
+	// POST /api/azure/config -- the unbound service holds a nil Microsoft client,
+	// and the code exchange dereferenced it. This route is unauthenticated by
+	// necessity, so a nil dereference here is a remote unauthenticated crash.
+	ws, wErr := svc.PeekCallbackWorkspace(c.Query("state"))
+	if wErr != nil {
+		status, body := mapAzureOnboardErrorPublic(c, wErr)
+		c.JSON(status, body)
+		return
 	}
+	bound, bErr := ctl.serviceFor(ws)
+	if bErr != nil {
+		status, body := mapAzureOnboardErrorPublic(c, bErr)
+		c.JSON(status, body)
+		return
+	}
+	svc = bound
 
 	res, err := svc.HandleCallback(c.Request.Context(), services.AzureCallbackInput{
 		Code:             c.Query("code"),
@@ -394,7 +567,7 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 		ErrorDescription: c.Query("error_description"),
 	})
 	if err != nil {
-		status, body := mapAzureOnboardError(err)
+		status, body := mapAzureOnboardErrorPublic(c, err)
 		c.JSON(status, body)
 		return
 	}
@@ -421,11 +594,35 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 			requestIsHTTPS(c),
 			true,
 		)
-		c.JSON(http.StatusOK, gin.H{"ok": true, "step": "logged_in"})
+		// First leg of an automatic setup: send the browser straight on to the
+		// consent screen. The cookie is already set above, which matters -- the
+		// second callback needs it to find the session the chain will run with.
+		//
+		// A redirect rather than an answer because there is nothing useful to
+		// answer yet: the operator asked for the whole thing, and stopping here
+		// to make them click again in the console would be the manual flow with
+		// extra steps.
+		if res.ConsentRedirect != "" {
+			c.Redirect(http.StatusFound, res.ConsentRedirect)
+			return
+		}
+
+		out := gin.H{"ok": true, "step": "logged_in"}
+		if res.AutoSetupSkipped != "" {
+			// The sign-in asked for the whole chain and did not get it. Saying
+			// why here is the difference between a console that explains itself
+			// and one that appears to have done nothing.
+			out["setup"] = "skipped"
+			out["reason"] = res.AutoSetupSkipped
+			out["meta"] = gin.H{
+				"next": "continue manually: GET /api/azure/tenants, then POST /api/azure/consent",
+			}
+		}
+		c.JSON(http.StatusOK, out)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	out := gin.H{
 		"ok":     true,
 		"step":   "consented",
 		"tenant": res.Connector.TenantID,
@@ -437,7 +634,35 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 			"note": "consent is not access: the application can be fully consented here and still " +
 				"read nothing until a Reader role assignment exists",
 		},
-	})
+	}
+
+	// Second leg of an automatic setup. Started here rather than in the service
+	// because the chain needs the sign-in session id, and the cookie carrying it
+	// is only readable from a request.
+	if res.AutoSetupWanted {
+		switch sessionID, ok := ctl.sessionFromCookie(c); {
+		case !ok:
+			out["setup"] = "skipped"
+			out["reason"] = "the sign-in session cookie did not come back with this redirect"
+		case svc.StartAutoSetup(res.WorkspaceID, sessionID, res.Connector.TenantID, res.AutoSetupWide):
+			out["setup"] = "running"
+			meta := gin.H{
+				"next": "poll GET /api/azure/setup-status until state is done or failed",
+			}
+			if res.AutoSetupWide {
+				meta["reader_scope"] = "the tenant root management group, which covers " +
+					"subscriptions created later"
+				meta["note"] = "reaching that scope can briefly raise your own account to root " +
+					"User Access Administrator. It is given back in the same run; the setup " +
+					"status reports whether that succeeded, because it does not expire on its own"
+			}
+			out["meta"] = meta
+		default:
+			out["setup"] = "skipped"
+			out["reason"] = "a setup run is already in progress for this session"
+		}
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 /* --------------------------------- tenants -------------------------------- */
@@ -773,6 +998,59 @@ func (ctl *AzureOnboardController) ValidateGraph(c *gin.Context) {
 	})
 }
 
+// AvailableSubscriptions handles GET /api/azure/available-subscriptions.
+//
+// The subscriptions the signed-in OPERATOR can see, so a console can offer the
+// choice of which to grant Reader on. Needs the session cookie: this is the
+// operator's view of ARM, not the application's.
+//
+// It exists because the only subscription list the product held was the one in
+// azure_subscriptions -- which is populated by validate-arm, which needs Reader,
+// which is the very thing the choice is meant to scope. The choice could not be
+// offered before the grant it applies to.
+//
+// read, not admin. It grants nothing and writes nothing; it reports what the
+// person can already see in their own portal.
+func (ctl *AzureOnboardController) AvailableSubscriptions(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	sessionID, ok := ctl.sessionFromCookie(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": azureonboard.ErrNoSession.Error(),
+			"hint":  "this is the operator's own view of ARM; sign in at /api/azure/login first",
+		})
+		return
+	}
+	svc, err := ctl.serviceFor(workspaceID)
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+
+	subs, err := svc.AvailableSubscriptions(c.Request.Context(), workspaceID, sessionID,
+		strings.TrimSpace(c.Query("tenantId")))
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   true,
+		"data": subs,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"note": "what the SIGNED-IN OPERATOR can see, live from ARM. Pass one as " +
+				"scope=/subscriptions/<id> to POST /api/azure/assign-reader to grant Reader " +
+				"on just that one",
+		},
+	})
+}
+
 // ListSubscriptions handles GET /api/azure/subscriptions?tenantId=...
 //
 // Per-subscription Reader coverage, which is what makes partial coverage
@@ -918,6 +1196,29 @@ func verifyAzureSession(raw string, secret []byte) (string, bool) {
 // mapAzureOnboardError turns a service error into a status and a body that says
 // whose problem it is. Distinct from the cloud discovery connector's mapper:
 // these are different failure modes with different operator actions.
+// mapAzureOnboardErrorPublic is mapAzureOnboardError for the two routes that
+// have no bearer token: /api/azure/login and /api/azure/callback.
+//
+// The configuration errors are deliberately detailed -- they name the vault
+// path and carry the secrets-store error verbatim, because that is what makes
+// a broken workspace debuggable from the console. None of it belongs in a
+// response anyone on the network can ask for. The detail goes to the log; the
+// caller gets the fact.
+func mapAzureOnboardErrorPublic(c *gin.Context, err error) (int, gin.H) {
+	status, body := mapAzureOnboardError(err)
+	if errors.Is(err, azureonboard.ErrNotConfigured) {
+		log.Printf("azure: unauthenticated request to %s could not be served: %v",
+			c.Request.URL.Path, err)
+		return status, gin.H{
+			"error": "azure onboarding is not configured for this workspace",
+			"hint": "an administrator can see what is wrong at GET /api/azure/config, " +
+				"which requires a bearer token",
+			"fault": "authsec",
+		}
+	}
+	return status, body
+}
+
 func mapAzureOnboardError(err error) (int, gin.H) {
 	switch {
 	case errors.Is(err, azureonboard.ErrNotConfigured):
@@ -967,10 +1268,11 @@ func mapAzureOnboardError(err error) (int, gin.H) {
 
 	case errors.Is(err, azureonboard.ErrARMForbidden):
 		return http.StatusOK, gin.H{
-			"ok":    false,
-			"error": err.Error(),
-			"hint":  "assign the built-in Reader role to the AuthSec application in this tenant",
-			"fault": "customer_tenant",
+			"ok":      false,
+			"error":   err.Error(),
+			"hint":    "assign the built-in Reader role to the AuthSec application in this tenant",
+			"fault":   "customer_tenant",
+			"problem": azureonboard.DiagnoseARMForbidden(),
 		}
 
 	case errors.Is(err, repositories.ErrAzureConnectorNotFound):
@@ -983,17 +1285,232 @@ func mapAzureOnboardError(err error) (int, gin.H) {
 		return http.StatusBadRequest, gin.H{"error": err.Error()}
 	}
 
+	// Named where it can be. A 401 and a 403 from Microsoft read almost alike
+	// and are fixed in different blades of the portal, so handing back the raw
+	// string alone is how an operator ends up regenerating a credential that
+	// was working.
+	diag := azureonboard.Diagnose(err)
+
 	var apiErr *azureonboard.APIError
 	if errors.As(err, &apiErr) {
 		status := http.StatusBadGateway
 		if apiErr.Status == http.StatusTooManyRequests {
 			status = http.StatusTooManyRequests
 		}
-		return status, gin.H{
+		body := gin.H{
 			"error": apiErr.Error(),
 			"fault": "azure",
 		}
+		if diag != nil {
+			body["problem"] = diag
+			body["hint"] = diag.Fix
+			// Whose problem it is, when the diagnosis knows better than
+			// "azure" -- a missing consent is not Microsoft misbehaving.
+			body["fault"] = diag.Fault
+		}
+		return status, body
 	}
 
-	return http.StatusBadRequest, gin.H{"error": err.Error()}
+	body := gin.H{"error": err.Error()}
+	if diag != nil {
+		body["problem"] = diag
+		body["hint"] = diag.Fix
+		body["fault"] = diag.Fault
+		return http.StatusBadRequest, body
+	}
+
+	// An unclassified error is not automatically the caller's fault, and
+	// answering every one of them 400 said it was. A Postgres outage, a Vault
+	// that will not answer, a certificate that no longer parses -- all reported
+	// as "bad request", which sends whoever is on call to look at the client.
+	// Nothing here is retryable by changing the request.
+	if isInfrastructureFailure(err) {
+		body["fault"] = "authsec"
+		body["hint"] = "this is a failure inside the deployment, not in the request; " +
+			"check the database and the secrets store"
+		return http.StatusInternalServerError, body
+	}
+	return http.StatusBadRequest, body
+}
+
+// isInfrastructureFailure reports whether an error is the deployment's own.
+//
+// Matched on the sentinel where there is one and on the driver's text where
+// there is not -- gorm and the vault client do not export errors for most of
+// what goes wrong, and a wrong status code is worse than an imperfect match.
+func isInfrastructureFailure(err error) bool {
+	if errors.Is(err, gorm.ErrInvalidDB) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"connection refused", "connection reset", "no such host", "i/o timeout",
+		"broken pipe", "server closed the connection", "driver: bad connection",
+		"vault", "secrets store", "sql:", "pq:", "dial tcp",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+/* ------------------------------- auto setup ------------------------------- */
+
+// StartAutoSetup handles POST /api/azure/auto-setup.
+//
+// Returns the one sign-in URL that does everything: the administrator signs in,
+// grants admin consent on the same Microsoft screen, and the callback then reads
+// the tenant, assigns Reader across its subscriptions and verifies both planes
+// in the background.
+//
+// It exists as an authenticated endpoint rather than a flag on /login because
+// completing it writes an azure_connectors row. Every other write in this
+// controller is behind discovery:admin, and this one is no different -- see the
+// note in Login.
+//
+// It is not a replacement for the step-by-step routes. This path assumes ONE
+// person holds both privileges the flow needs -- Global Administrator to
+// consent, Owner or User Access Administrator to assign Reader -- in the tenant
+// they are signing in to. That is the on-prem case. When those are different
+// people, or the operator is onboarding a tenant they do not administer, the
+// separate endpoints are the only thing that works.
+func (ctl *AzureOnboardController) StartAutoSetup(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	// All optional. tenant pins the sign-in authority, which is what an
+	// externally backed account needs; login_hint decides which identity Entra
+	// resolves before anyone types.
+	var body struct {
+		Tenant      string `json:"tenant"`
+		LoginHint   string `json:"login_hint"`
+		PickAccount bool   `json:"pick_account"`
+
+		// TenantWide asks for ONE Reader grant at the tenant root management
+		// group instead of one per subscription, so subscriptions created later
+		// are covered without anyone coming back.
+		//
+		// Opt-in, and it must stay opt-in: reaching that scope can require
+		// briefly raising the operator's own privilege to root User Access
+		// Administrator. That is a reasonable thing to do when a person asks for
+		// it and an indefensible thing to infer. The raise is reported in the
+		// setup status whether or not it happened.
+		TenantWide bool `json:"tenant_wide"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	svc, err := ctl.serviceFor(workspaceID)
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+
+	loginURL, err := svc.StartLogin(workspaceID, actor, true, body.TenantWide,
+		strings.TrimSpace(body.Tenant), strings.TrimSpace(body.LoginHint), body.PickAccount)
+	if err != nil {
+		status, errBody := mapAzureOnboardError(err)
+		c.JSON(status, errBody)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":        true,
+		"login_url": loginURL,
+		"meta": gin.H{
+			"next": "navigate the top-level window to login_url, then poll " +
+				"GET /api/azure/setup-status",
+			"requires": "the signer must be a Global Administrator of the tenant " +
+				"(to consent) and Owner or User Access Administrator (to assign Reader)",
+			"expires_in_seconds": 900,
+		},
+	})
+}
+
+// SetupStatus handles GET /api/azure/setup-status.
+//
+// Progress of the background chain for the caller's own sign-in session.
+//
+// 404 means this process has no run for that session: it finished long enough
+// ago to be swept, the sign-in never asked for one, or -- behind more than one
+// replica -- the poll landed on an instance that did not run it. In all three
+// cases GET /api/azure/connectors is the durable answer, and the response says
+// so rather than leaving a console to guess.
+func (ctl *AzureOnboardController) SetupStatus(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	svc, err := ctl.serviceFor(workspaceID)
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+	sessionID, ok := ctl.sessionFromCookie(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": azureonboard.ErrNoSession.Error(),
+			"hint":  "complete the Microsoft sign-in first",
+		})
+		return
+	}
+
+	status, found := svc.SetupStatus(sessionID)
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "no setup run is recorded for this session",
+			"hint":  "read GET /api/azure/connectors for the stored result",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, status)
+}
+
+// DeleteAppConfig handles DELETE /api/azure/config.
+//
+// Removes the workspace's stored Entra application and the client secret it
+// points at. Without this there is no way to take an application back out: POST
+// replaces one, so a workspace that submitted the wrong registration -- or is
+// being offboarded -- is stuck with it.
+//
+// The secret goes first, in the service, because a row without its secret is
+// recoverable (re-submit) and a secret without its row is an orphan nobody will
+// ever clean up.
+//
+// It does NOT touch azure_connectors. Those record that customer tenants granted
+// consent, which remains true whichever application this workspace uses next,
+// and deleting them here would quietly discard the record of a grant that still
+// exists in Microsoft.
+func (ctl *AzureOnboardController) DeleteAppConfig(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	// ctl.service(), not serviceFor(): serviceFor checks Ready(), and a
+	// configuration broken enough to fail that check is exactly the one an
+	// operator most needs to be able to delete.
+	svc, err := ctl.service()
+	if err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+	if err := svc.DeleteAppConfig(workspaceID); err != nil {
+		status, body := mapAzureOnboardError(err)
+		c.JSON(status, body)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok": true,
+		"meta": gin.H{
+			"note": "the stored application and its credential are gone. This workspace now falls " +
+				"back to the deployment-wide AZURE_* variables, if any are set",
+			"next": "POST /api/azure/config to submit a different application",
+		},
+	})
 }

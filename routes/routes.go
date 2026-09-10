@@ -366,10 +366,23 @@ func SetupRoutes(
 			azureAPI.POST("/assign-reader", middlewares.Require("discovery", "admin"), azureOnboard.AssignReader)
 			azureAPI.POST("/validate-graph", middlewares.Require("discovery", "admin"), azureOnboard.ValidateGraph)
 			azureAPI.GET("/subscriptions", middlewares.Require("discovery", "read"), azureOnboard.ListSubscriptions)
+			// The operator's own ARM view, so a console can offer WHICH
+			// subscriptions to grant Reader on. Reports, never grants.
+			azureAPI.GET("/available-subscriptions", middlewares.Require("discovery", "read"), azureOnboard.AvailableSubscriptions)
 			azureAPI.GET("/config", middlewares.Require("discovery", "read"), azureOnboard.ConfigStatus)
 			// Submitting the application is a write that changes which Entra
 			// identity this workspace acts as, so it needs admin, not read.
 			azureAPI.POST("/config", middlewares.Require("discovery", "admin"), azureOnboard.SetAppConfig)
+			// Taking the application back out. admin, like submitting it.
+			azureAPI.DELETE("/config", middlewares.Require("discovery", "admin"), azureOnboard.DeleteAppConfig)
+			// Returns a username, never a credential. read is the right scope.
+			azureAPI.POST("/signin-name", middlewares.Require("discovery", "read"), azureOnboard.ResolveSignInName)
+			// One sign-in that consents AND assigns Reader. admin, because
+			// completing it writes a connector row -- which is also why this
+			// state cannot be minted from the unauthenticated /login route.
+			azureAPI.POST("/auto-setup", middlewares.Require("discovery", "admin"), azureOnboard.StartAutoSetup)
+			// Progress of that background run. Reports only.
+			azureAPI.GET("/setup-status", middlewares.Require("discovery", "read"), azureOnboard.SetupStatus)
 			azureAPI.GET("/app/check", middlewares.Require("discovery", "read"), azureOnboard.CheckAppRegistration)
 			azureAPI.GET("/connectors", middlewares.Require("discovery", "read"), azureOnboard.ListConnectors)
 		}
