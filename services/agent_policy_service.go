@@ -991,5 +991,40 @@ func (m *agentPolicyManager) appliedFor(workspaceID uuid.UUID, p *models.AgentPo
 		WorkspaceID: workspaceID, PolicyID: &p.ID, DiscoveredAgentID: &agent.ID,
 		Action: action, Arm: arm, Reason: p.Reason, DryRun: false,
 		Outcome: models.PolicyOutcomeApplied, Detail: detail,
+		WarningDelivered: m.warningDelivered(workspaceID, p, agent),
 	})
+}
+
+// warningDelivered answers "was anybody told before this happened".
+//
+// NULL for a non-destructive action -- there is nothing to warn about when an
+// entitlement lapses and can be re-provisioned. For a destructive one, false is a
+// GOVERNANCE EXCEPTION the console surfaces: the action still executed, because
+// blocking on a notification would let an SMTP outage silently no-op every
+// destructive policy (§3A.9), but the fact that nobody was told is an auditable
+// finding rather than a swallowed error.
+func (m *agentPolicyManager) warningDelivered(workspaceID uuid.UUID,
+	p *models.AgentPolicy, agent *models.DiscoveredAgent) *bool {
+
+	if p == nil || !models.OnExpiryIsDestructive(p.OnExpiry) || p.EffectiveExpiry == nil {
+		return nil
+	}
+	var n int64
+	// Any channel counts. The question is whether a human COULD have known, not
+	// which pipe carried it. Matched on a window rather than an exact timestamp,
+	// because a second's drift in how the deadline is recomputed must not read as
+	// "never warned".
+	err := m.db.Model(&models.AgentPolicyWarning{}).
+		Where(`workspace_id = ? AND discovered_agent_id = ? AND state = ?
+		       AND deadline BETWEEN ? AND ?`,
+			workspaceID, agent.ID, models.WarningSent,
+			p.EffectiveExpiry.Add(-time.Minute), p.EffectiveExpiry.Add(time.Minute)).
+		Count(&n).Error
+	if err != nil {
+		// Unknown is not evidence of absence. Recording false here would
+		// manufacture a governance exception out of a failed query.
+		return nil
+	}
+	delivered := n > 0
+	return &delivered
 }

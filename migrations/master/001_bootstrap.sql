@@ -5813,6 +5813,133 @@ CREATE INDEX IF NOT EXISTS idx_enforcement_plans_workspace
 
 
 -- ===========================================================================
+-- governance_notification_settings + agent_policy_warnings
+--
+-- §3A.4 requires that a destructive deadline is warned about BEFORE it fires.
+-- This is the durable side of that: a row per (policy, agent, deadline, channel,
+-- recipient), scheduled at deadline-minus-lead, retried on failure, and sent once
+-- across replicas.
+--
+-- A FAILED WARNING NEVER BLOCKS THE ACTION. Blocking would mean an SMTP outage
+-- silently turns every destructive policy into a no-op -- exactly the
+-- silent-non-execution failure §3A.4 exists to prevent. The failure is recorded
+-- instead: a destructive action that ran without a delivered warning is a
+-- governance exception (agent_policy_actions.warning_delivered = false), which is
+-- an auditable finding rather than a swallowed error.
+--
+-- The LOOKAHEAD (GET /governance/policies/upcoming) remains the system of record.
+-- It is a pull, so it has no delivery to fail. Everything here is escalation on
+-- top of it.
+--
+-- WHY NOT iga_durable_jobs, WHICH ALREADY LOOKS LIKE THIS QUEUE
+-- Two structural reasons. Its integration_id is NOT NULL with an FK to
+-- iga_integrations, and a policy warning belongs to a policy rather than to a
+-- connected IGA system -- so every row would need a synthetic integration, and
+-- removing an unrelated integration would cascade warnings away. And nothing
+-- drains it: IGAManager.RunWorkerOnce is called from no running process. This
+-- reuses the pattern (available_at, a dedupe key, attempt_count, FOR UPDATE SKIP
+-- LOCKED) without borrowing a table that cannot hold the row.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.governance_notification_settings (
+    workspace_id uuid PRIMARY KEY,
+
+    -- How far ahead of a destructive deadline to warn. Seven days: long enough to
+    -- act on during a normal working week, including a weekend.
+    warning_lead interval NOT NULL DEFAULT '7 days',
+
+    -- OPTIONAL second channel, so customers reach Slack or PagerDuty without us
+    -- integrating each one. OUTBOUND, so it costs nothing against EN-0: the control
+    -- plane calling a customer's Slack is not the control plane calling into a
+    -- customer's cluster.
+    webhook_url    text NOT NULL DEFAULT '',
+    webhook_secret text NOT NULL DEFAULT '',
+    email_enabled  boolean NOT NULL DEFAULT true,
+
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT gov_notif_settings_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- A lead of zero would "warn" at the instant of destruction, which is not a
+    -- warning. The upper bound stops a typo scheduling one years out, where it
+    -- would sit pending and look like the system had gone quiet.
+    CONSTRAINT gov_notif_settings_lead_chk CHECK (
+        warning_lead >= interval '1 hour' AND warning_lead <= interval '90 days'),
+    -- https only. A warning naming which workload is about to be deleted is a map
+    -- of what to attack during the window in which nobody is watching it.
+    CONSTRAINT gov_notif_settings_webhook_chk CHECK (
+        webhook_url = '' OR webhook_url LIKE 'https://%')
+);
+
+CREATE TABLE IF NOT EXISTS public.agent_policy_warnings (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    policy_id    uuid NOT NULL,
+
+    -- A warning names ONE agent, not a policy: "three of your agents will be
+    -- deleted" is a summary, and the person who has to act needs to know which one
+    -- is theirs.
+    discovered_agent_id uuid NOT NULL,
+
+    -- The deadline being warned about, and part of the dedupe key -- so moving a
+    -- policy's expiry schedules a FRESH warning instead of reusing a sent one.
+    -- Keyed on policy alone, an operator who pushed a deletion out by a month would
+    -- never be warned again, because a warning had already gone out for a deadline
+    -- that no longer exists.
+    deadline timestamptz NOT NULL,
+    -- Snapshotted, not read from the policy at send time: the warning has to
+    -- describe what was scheduled when it was scheduled.
+    on_expiry text NOT NULL,
+
+    channel   text NOT NULL,
+    -- The address actually used, so "who was told" is answerable later. In the
+    -- dedupe key, so adding a recipient warns THEM without re-warning everyone who
+    -- already knew.
+    recipient      text NOT NULL,
+    recipient_role text NOT NULL DEFAULT '',
+
+    available_at  timestamptz NOT NULL,
+    state         text NOT NULL DEFAULT 'pending',
+    attempt_count integer NOT NULL DEFAULT 0,
+    last_error    text NOT NULL DEFAULT '',
+    sent_at       timestamptz,
+
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT agent_policy_warnings_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_policy_warnings_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT agent_policy_warnings_policy_fkey FOREIGN KEY (policy_id)
+        REFERENCES public.agent_policies(id) ON DELETE CASCADE,
+    CONSTRAINT agent_policy_warnings_agent_fkey FOREIGN KEY (discovered_agent_id)
+        REFERENCES public.discovered_agents(id) ON DELETE CASCADE,
+    CONSTRAINT agent_policy_warnings_channel_chk CHECK (channel IN ('email', 'webhook')),
+    CONSTRAINT agent_policy_warnings_state_chk CHECK (
+        state IN ('pending', 'sent', 'failed', 'dead')),
+    -- 'sent' must carry its timestamp, or "was this warned about" degrades to a
+    -- boolean with no time attached and cannot be compared against the deadline.
+    CONSTRAINT agent_policy_warnings_sent_chk CHECK (
+        (state = 'sent') = (sent_at IS NOT NULL)),
+    -- Fires ONCE. Two replicas scheduling in the same tick collide here rather than
+    -- double-mailing an operator about the deletion of their workload.
+    CONSTRAINT agent_policy_warnings_dedupe_key UNIQUE (
+        policy_id, discovered_agent_id, deadline, channel, recipient)
+);
+
+-- The delivery worker's claim path: due, not yet sent, oldest first.
+CREATE INDEX IF NOT EXISTS idx_agent_policy_warnings_due
+    ON public.agent_policy_warnings(available_at)
+    WHERE state IN ('pending', 'failed');
+
+-- "Was this action warned about?" -- read by the reconciler when it records a
+-- destructive action, and by the console when it lists governance exceptions.
+CREATE INDEX IF NOT EXISTS idx_agent_policy_warnings_lookup
+    ON public.agent_policy_warnings(workspace_id, discovered_agent_id, deadline);
+
+
+-- ===========================================================================
 -- discovery_rule_catalogs — per-workspace detection-pattern overlay.
 -- Mirrors 009_discovery_rule_catalogs.sql so a FRESH bootstrap and an
 -- UPGRADED database end at the same schema. Rationale lives in 009.

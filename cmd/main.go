@@ -390,6 +390,31 @@ func main() {
 		jmlWorker := services.NewJMLWorker(config.DB, 5*time.Minute)
 		jmlWorker.Start()
 		log.Printf("governance JML reconcile worker started (interval=5m)")
+
+		// Agent policy, on a timer. Until this existed, everything the policy
+		// reconciler does — narrowing a role, lapsing a grant at its expiry,
+		// planning a containment — happened only when somebody POSTed to the
+		// reconcile endpoint. A policy is a standing instruction, and a standing
+		// instruction that needs a button pressed is a reminder.
+		//
+		// Five minutes: the same cadence as JML, and the actions are the same
+		// shape. It only ever narrows or removes (PG-5), so a failure fails toward
+		// less access.
+		policyWorker := services.NewPolicyReconcileWorker(config.DB, 5*time.Minute)
+		policyWorker.Start()
+		log.Printf("agent policy reconcile worker started (interval=5m)")
+
+		// Pre-deadline warnings, scheduled on a lead of days and delivered here.
+		// Runs at five minutes rather than hourly because the DELIVERY half also
+		// retries: an SMTP blip should cost minutes, not a whole warning.
+		//
+		// A failed warning NEVER blocks the action it warns about — blocking would
+		// let an SMTP outage quietly turn every destructive policy into a no-op,
+		// which is the failure this exists to prevent. It is recorded instead, and
+		// the action executes as a governance exception.
+		warningWorker := services.NewPolicyWarningWorker(config.DB, 5*time.Minute, 50)
+		warningWorker.Start()
+		log.Printf("policy pre-deadline warning worker started (interval=5m)")
 	}
 
 	// ─────────────────────────────────────────────────────────

@@ -296,6 +296,26 @@ func k8sCoordinates(raw json.RawMessage) (namespace, kind, name, container strin
 		md.Kubernetes.WorkloadName, md.Kubernetes.ContainerName
 }
 
+// clusterOf reads the cluster name a sighting reported.
+//
+// Lives beside k8sCoordinates because both answer "where is this agent" from the
+// same blob, and a warning that names a workload without naming its cluster is
+// ambiguous for anyone running more than one.
+func clusterOf(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var md struct {
+		Cluster struct {
+			Name string `json:"name"`
+		} `json:"cluster"`
+	}
+	if err := json.Unmarshal(raw, &md); err != nil {
+		return ""
+	}
+	return md.Cluster.Name
+}
+
 /* ------------------------------ agent report ----------------------------- */
 
 func (m *enforcementPlanManager) RecordReport(sourceID uuid.UUID,

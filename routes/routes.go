@@ -1889,6 +1889,26 @@ func SetupRoutes(
 			governance.GET("/connectors/:id/enforcement-plans",
 				middlewares.Require("governance", "read"), governanceController.ListEnforcementPlans)
 
+			// Pre-deadline warnings. The LOOKAHEAD above is the system of record —
+			// a pull, with no delivery to fail. These configure and inspect the
+			// escalation layered on top of it.
+			//
+			// Reading which warnings failed is governance:read on purpose: an
+			// undelivered warning is the thing standing between an operator and an
+			// unannounced deletion, so anyone who can see governance state should
+			// see it. CHANGING where warnings go is admin — redirecting them is
+			// indistinguishable from silencing them.
+			governance.GET("/notification-settings",
+				middlewares.Require("governance", "read"), governanceController.GetNotificationSettings)
+			governance.PUT("/notification-settings",
+				middlewares.Require("governance", "admin"), governanceController.UpdateNotificationSettings)
+			governance.GET("/policy-warnings",
+				middlewares.Require("governance", "read"), governanceController.ListPolicyWarnings)
+			// Schedule and send now rather than on the worker's tick, so "did my
+			// policy actually warn anyone" is answerable while setting one up.
+			governance.POST("/policy-warnings/run",
+				middlewares.Require("governance", "admin"), governanceController.RunPolicyWarnings)
+
 			governance.GET("/iga-links",
 				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)
 

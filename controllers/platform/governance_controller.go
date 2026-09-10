@@ -809,6 +809,166 @@ func (ctl *GovernanceController) ReportInstruction(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
+/* --------------------------- pre-deadline warnings ----------------------- */
+
+func (ctl *GovernanceController) warnings() services.PolicyWarningManager {
+	return services.NewPolicyWarningManager(ctl.db)
+}
+
+// GetNotificationSettings handles GET /authsec/governance/notification-settings.
+//
+// Always answers, even for a workspace that has never configured anything: the
+// defaults are what it will actually get, and returning 404 would suggest warnings
+// are off when they are on.
+func (ctl *GovernanceController) GetNotificationSettings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	s, err := ctl.warnings().Settings(wsID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id":         s.WorkspaceID,
+		"warning_lead_seconds": int64(s.Lead().Seconds()),
+		"webhook_url":          s.WebhookURL,
+		// Never the secret itself, only whether one is set. Same reasoning as the
+		// actuation token: a console read must not be able to exfiltrate a
+		// credential somebody typed once.
+		"webhook_secret_set": s.WebhookSecret != "",
+		"email_enabled":      s.EmailEnabled,
+	})
+}
+
+// UpdateNotificationSettingsRequest is the console's update body.
+type UpdateNotificationSettingsRequest struct {
+	// WarningLead is a Go duration ("168h"). Between 1h and 90 days.
+	WarningLead   *string `json:"warning_lead,omitempty"`
+	WebhookURL    *string `json:"webhook_url,omitempty"`
+	WebhookSecret *string `json:"webhook_secret,omitempty"`
+	EmailEnabled  *bool   `json:"email_enabled,omitempty"`
+}
+
+// UpdateNotificationSettings handles PUT /authsec/governance/notification-settings.
+func (ctl *GovernanceController) UpdateNotificationSettings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req UpdateNotificationSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	in := services.NotificationSettingsInput{
+		WebhookURL: req.WebhookURL, WebhookSecret: req.WebhookSecret,
+		EmailEnabled: req.EmailEnabled,
+	}
+	if req.WarningLead != nil {
+		d, derr := time.ParseDuration(*req.WarningLead)
+		if derr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "invalid warning_lead (use a Go duration, e.g. 168h)"})
+			return
+		}
+		in.WarningLead = &d
+	}
+
+	out, err := ctl.warnings().SaveSettings(wsID, in)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id":         out.WorkspaceID,
+		"warning_lead_seconds": int64(out.Lead().Seconds()),
+		"webhook_url":          out.WebhookURL,
+		"webhook_secret_set":   out.WebhookSecret != "",
+		"email_enabled":        out.EmailEnabled,
+	})
+}
+
+// ListPolicyWarnings handles GET /authsec/governance/policy-warnings.
+//
+// The delivery record behind the lookahead: which warnings were scheduled, which
+// were sent, and which failed. Read permission, because a warning that never
+// arrived is something anyone watching governance needs to be able to see.
+func (ctl *GovernanceController) ListPolicyWarnings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var policyID *uuid.UUID
+	if raw := c.Query("policy_id"); raw != "" {
+		id, perr := uuid.Parse(raw)
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy_id"})
+			return
+		}
+		policyID = &id
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+
+	rows, err := ctl.warnings().List(wsID, policyID, limit)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// Undelivered warnings are counted separately rather than left for the console
+	// to filter: a warning stuck in 'failed' or exhausted at 'dead' is the thing
+	// standing between an operator and an unannounced deletion.
+	var undelivered int
+	for i := range rows {
+		if rows[i].State != models.WarningSent {
+			undelivered++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"warnings":    rows,
+		"undelivered": undelivered,
+	})
+}
+
+// RunPolicyWarnings handles POST /authsec/governance/policy-warnings/run.
+//
+// Schedules and delivers immediately instead of waiting for the worker's tick.
+// Exists because "did my policy actually warn anyone" is a question an operator
+// asks while setting one up, and a five-minute wait to find out is the difference
+// between trusting the feature and not.
+func (ctl *GovernanceController) RunPolicyWarnings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	mgr := ctl.warnings()
+	scheduled, err := mgr.Schedule(wsID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	out, err := mgr.Deliver(50)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"scheduled": scheduled,
+		"attempted": out.Attempted,
+		"sent":      out.Sent,
+		"failed":    out.Failed,
+		"dead":      out.Dead,
+		"errors":    out.Errors,
+	})
+}
+
 /* ---------------------------- the enforcement plan ----------------------- */
 
 func (ctl *GovernanceController) enforcementPlans() services.EnforcementPlanManager {
