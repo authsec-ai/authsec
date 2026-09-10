@@ -1785,6 +1785,16 @@ func SetupRoutes(
 		{
 			actuation.GET("/instructions", governanceController.LeaseInstructions)
 			actuation.POST("/instructions/:id/result", governanceController.ReportInstruction)
+			// The enforcement plan: the WHOLE list of fingerprints this cluster
+			// should be containing, re-fetched on every actuation tick. Whole and
+			// not a delta, because a missed delta silently un-enforces while a
+			// whole plan is self-correcting on the next poll.
+			//
+			// The agent's self-report (mode, the version it is enforcing, its
+			// would-deny count) rides on this fetch as query parameters rather than
+			// on an endpoint of its own — one authenticated round trip that both
+			// reports and refreshes.
+			actuation.GET("/enforcement-plan", governanceController.GetEnforcementPlan)
 		}
 
 		governance := authsec.Group("/governance")
@@ -1872,6 +1882,12 @@ func SetupRoutes(
 			// able to see what is about to happen because of it.
 			governance.GET("/policies/upcoming",
 				middlewares.Require("governance", "read"), governanceController.ListUpcomingPolicyActions)
+
+			// What a cluster has actually been told to contain, and whether it says
+			// it is enforcing it. The gap between the published version and the
+			// reported one is the difference between a decision and its effect.
+			governance.GET("/connectors/:id/enforcement-plans",
+				middlewares.Require("governance", "read"), governanceController.ListEnforcementPlans)
 
 			governance.GET("/iga-links",
 				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)

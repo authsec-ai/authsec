@@ -3449,6 +3449,18 @@ CREATE TABLE public.discovery_sources (
     -- never asserts its own cluster.
     actuation_token_hash text NOT NULL DEFAULT '',
     actuation_enabled_at timestamptz,
+    -- What this cluster reports it is ENFORCING. Observations, not configuration:
+    -- the control plane cannot push a mode (EN-0, it never calls in), so these are
+    -- what the agent said on its last plan poll. '' means it has never reported --
+    -- distinct from 'observe', which is a live agent deliberately enforcing nothing.
+    enforcement_mode          text NOT NULL DEFAULT '',
+    -- The plan version actually in force in the cluster. The gap between this and
+    -- the latest row in enforcement_plans IS the enforcement gap.
+    enforced_plan_version     bigint,
+    enforced_plan_at          timestamptz,
+    -- Cumulative since the agent PROCESS started, so it resets on restart. A rate
+    -- and a liveness signal, never an all-time total.
+    enforcement_denials_total bigint NOT NULL DEFAULT 0,
     created_by   text NOT NULL DEFAULT '',
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
@@ -3457,6 +3469,8 @@ CREATE TABLE public.discovery_sources (
         REFERENCES public.workspaces(id) ON DELETE CASCADE,
     CONSTRAINT discovery_sources_kind_chk CHECK (
         kind IN ('k8s_webhook', 'aws', 'azure', 'gcp', 'vm_sensor', 'repo_scan')),
+    CONSTRAINT discovery_sources_enf_mode_chk CHECK (
+        enforcement_mode IN ('', 'observe', 'evict', 'deny')),
     CONSTRAINT discovery_sources_workspace_kind_name_key UNIQUE (workspace_id, kind, display_name)
 );
 
@@ -3468,6 +3482,13 @@ CREATE INDEX idx_discovery_sources_workspace ON public.discovery_sources(workspa
 CREATE UNIQUE INDEX discovery_sources_instance_key
     ON public.discovery_sources(workspace_id, kind, instance_id)
     WHERE instance_id <> '';
+
+-- The console's "which clusters are behind?" query. Partial: a connector that has
+-- never reported is a different problem with a different answer, and does not
+-- belong in the same scan as one that is enforcing a stale plan.
+CREATE INDEX idx_discovery_sources_enforcing
+    ON public.discovery_sources(workspace_id, enforced_plan_at DESC)
+    WHERE enforcement_mode <> '';
 
 -- Answers "which clusters are reporting right now?" without a full scan.
 CREATE INDEX idx_discovery_sources_heartbeat
@@ -5728,6 +5749,67 @@ CREATE INDEX IF NOT EXISTS idx_agent_policy_actions_policy
 CREATE INDEX IF NOT EXISTS idx_agent_policy_actions_unwarned
     ON public.agent_policy_actions(workspace_id, acted_at DESC)
     WHERE warning_delivered IS FALSE;
+
+
+-- ===========================================================================
+-- enforcement_plans -- the document the in-cluster agent polls.
+--
+-- The control plane originates no connection into a customer cluster (EN-0), so a
+-- quarantine decision reaches the cluster exactly one way: the agent asks on its
+-- actuation interval and is handed a WHOLE plan. Whole, not a delta -- a missed
+-- delta silently un-enforces, whereas a whole plan is self-correcting on the next
+-- poll. The list is an explicit set of fingerprints (EN-3), never a predicate, so a
+-- detection bug can lengthen the list but can never widen what the agent evaluates.
+--
+-- Persisted rather than computed and discarded because the question asked after a
+-- workload was blocked is "what were we enforcing at the time", which today's state
+-- cannot answer.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.enforcement_plans (
+    id           uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+
+    -- WHICH CLUSTER. Per-connector, so one cluster's plan can never contain
+    -- another's fingerprints -- what bounds a leaked actuation token to the cluster
+    -- it was minted for.
+    discovery_source_id uuid NOT NULL,
+
+    -- Monotonic per connector. The agent reports the version it is enforcing; the
+    -- difference between that and this IS the enforcement gap.
+    version bigint NOT NULL,
+
+    -- The document that was served. jsonb rather than json so it stays QUERYABLE
+    -- -- "which clusters were ever told to contain this fingerprint" is one scan
+    -- -- at the cost of normalised key order, which no reader depends on.
+    plan jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Content hash over the deny list. A poll that finds the plan unchanged mints
+    -- NO row: version is bumped by content, not by traffic, or a 30-second poll
+    -- would write 2,880 identical rows a day and the version number would stop
+    -- meaning "something changed".
+    content_hash text NOT NULL DEFAULT '',
+
+    generated_at timestamptz NOT NULL DEFAULT now(),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT enforcement_plans_pkey PRIMARY KEY (id),
+    CONSTRAINT enforcement_plans_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT enforcement_plans_source_fkey FOREIGN KEY (discovery_source_id)
+        REFERENCES public.discovery_sources(id) ON DELETE CASCADE,
+    -- Monotonicity is enforced HERE, not in application code. Two agent replicas
+    -- polling in the same instant both compute version N+1; one insert wins and the
+    -- loser re-reads. Without this the two would publish divergent plans under one
+    -- version number, and the version would stop identifying a document.
+    CONSTRAINT enforcement_plans_version_key UNIQUE (discovery_source_id, version),
+    CONSTRAINT enforcement_plans_version_chk CHECK (version > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_enforcement_plans_latest
+    ON public.enforcement_plans(discovery_source_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_enforcement_plans_workspace
+    ON public.enforcement_plans(workspace_id, generated_at DESC);
 
 
 -- ===========================================================================

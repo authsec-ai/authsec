@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -806,6 +807,125 @@ func (ctl *GovernanceController) ReportInstruction(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+/* ---------------------------- the enforcement plan ----------------------- */
+
+func (ctl *GovernanceController) enforcementPlans() services.EnforcementPlanManager {
+	return services.NewEnforcementPlanManager(ctl.db)
+}
+
+// GetEnforcementPlan handles GET /authsec/provisioning/enforcement-plan — the
+// agent's poll for what it should be containing.
+//
+// Authenticated by the actuation token like the instruction lease, and for the same
+// reason: the caller is a workload in a customer cluster, not a console user, and
+// the token is what says WHICH cluster is asking. An agent never names its own
+// cluster, so it can never be handed another one's plan.
+//
+// THE REPORT RIDES ON THE FETCH. The agent states the version it is currently
+// enforcing, its mode, and its would-deny count as query parameters, and this
+// handler folds them into the connector row before answering. One authenticated
+// round trip both reports and refreshes: "what version is this cluster enforcing"
+// is then exactly as fresh as "when did it last poll", and neither fact can exist
+// without the other. The alternative — a second endpoint the agent POSTs to —
+// doubles the request rate and adds a state where one arrived and the other did not.
+//
+// A mutation on a GET, deliberately, matching LeaseInstructions: the agent polls
+// this on a timer, and the poll is the mechanism rather than the intent.
+func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
+	src, ok := ctl.agentSource(c)
+	if !ok {
+		return
+	}
+
+	rep := models.EnforcementReport{Mode: strings.TrimSpace(c.Query("mode"))}
+	if v := c.Query("enforcing"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			rep.Version = &n
+		}
+	}
+	if v := c.Query("denials"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			rep.DenialsTotal = &n
+		}
+	}
+	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
+		// Never fatal to the fetch. Refusing to serve a plan because the agent's
+		// self-report was unparseable would take enforcement away over telemetry.
+		log.Printf("ENFORCEMENT: connector %s sent an unusable self-report (%v); "+
+			"serving the plan anyway", src.ID, err)
+	}
+
+	plan, _, err := ctl.enforcementPlans().Publish(src.WorkspaceID, src.ID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// An ETag over the CONTENT hash, not the version: an agent that reconnects to a
+	// plan it already holds gets a 304 and does not re-index. Weak, because the
+	// bytes may differ in generated_at while the decisions do not.
+	etag := `W/"` + plan.ContentHash + `"`
+	c.Header("ETag", etag)
+	c.Header("Cache-Control", "no-store")
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json; charset=utf-8", plan.Plan)
+}
+
+// ListEnforcementPlans handles GET /authsec/governance/connectors/:id/enforcement-plans
+// — the console's audit view of what a cluster has been told to contain.
+//
+// Read permission on purpose: anyone who can see a governance decision should be
+// able to see whether it actually reached the cluster it was about.
+func (ctl *GovernanceController) ListEnforcementPlans(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	sourceID, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var src models.DiscoverySource
+	if err := ctl.db.First(&src, "id = ? AND workspace_id = ?", sourceID, wsID).Error; err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	rows, err := ctl.enforcementPlans().History(wsID, sourceID, limit)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// The gap is the whole reason this view exists, so it is computed here rather
+	// than left for the console to derive: "decided at v43, enforcing v42" is the
+	// difference between a decision and its effect, and an operator must not have to
+	// subtract two numbers to notice it.
+	var latest int64
+	if len(rows) > 0 {
+		latest = rows[0].Version
+	}
+	behind := latest > 0 && (src.EnforcedPlanVersion == nil || *src.EnforcedPlanVersion < latest)
+
+	c.JSON(http.StatusOK, gin.H{
+		"plans":                     rows,
+		"published_version":         latest,
+		"enforcement_mode":          src.EnforcementMode,
+		"enforced_plan_version":     src.EnforcedPlanVersion,
+		"enforced_plan_at":          src.EnforcedPlanAt,
+		"enforcement_denials_total": src.EnforcementDenialsTotal,
+		"behind":                    behind,
+	})
 }
 
 /* ------------------------------ human lifecycle -------------------------- */

@@ -236,6 +236,25 @@ type DiscoverySource struct {
 	ActuationTokenHash string     `json:"-" gorm:"not null;default:''"`
 	ActuationEnabledAt *time.Time `json:"actuation_enabled_at,omitempty"`
 
+	// --- what the cluster reports it is ENFORCING -------------------------
+	// Observations, not configuration. The control plane cannot push a mode
+	// (EN-0: it never calls in), so these are what the agent last said about
+	// itself on a plan poll. A stored intent the cluster had not adopted would
+	// read in the console exactly like one it had, which is the failure this
+	// avoids.
+	//
+	// EnforcementMode is "" until an agent reports — distinct from "observe",
+	// which is a live agent deliberately enforcing nothing.
+	EnforcementMode string `json:"enforcement_mode" gorm:"not null;default:''"`
+	// EnforcedPlanVersion is the version actually in force in the cluster. Read
+	// against the latest published plan, the difference IS the enforcement gap:
+	// "decided at v43, enforcing v42".
+	EnforcedPlanVersion *int64     `json:"enforced_plan_version,omitempty"`
+	EnforcedPlanAt      *time.Time `json:"enforced_plan_at,omitempty"`
+	// EnforcementDenialsTotal is cumulative since the agent PROCESS started, so
+	// it resets on restart. A rate and a liveness signal, never an all-time total.
+	EnforcementDenialsTotal int64 `json:"enforcement_denials_total" gorm:"not null;default:0"`
+
 	CreatedBy string    `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
