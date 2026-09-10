@@ -3551,6 +3551,9 @@ CREATE TABLE public.discovered_agents (
     created_by          text NOT NULL DEFAULT '',
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
+    evidence_mode            text NOT NULL DEFAULT 'observed',
+    last_observed_running_at timestamptz,
+
     CONSTRAINT discovered_agents_pkey PRIMARY KEY (id),
     CONSTRAINT discovered_agents_workspace_fkey FOREIGN KEY (workspace_id)
         REFERENCES public.workspaces(id) ON DELETE CASCADE,
@@ -3581,6 +3584,23 @@ CREATE TABLE public.discovered_agents (
     CONSTRAINT discovered_agents_registered_chk CHECK (
         status <> 'registered'
         OR (matched_client_id IS NOT NULL AND owner_user_id IS NOT NULL)),
+    -- Evidence semantics (mirrors 014_discovery_evidence_semantics.sql).
+    --
+    -- HOW we know an agent exists, kept separate from WHETHER we saw it run. A
+    -- GitHub workflow file is a DECLARATION: it might run tonight, or be dead code
+    -- from eighteen months ago. Writing it into a table that means "running",
+    -- stamped with a last_seen of two minutes ago, makes the product assert
+    -- something it cannot support.
+    --
+    -- last_observed_running_at is NULL for a declared row, and that NULL is the
+    -- correct permanent answer rather than missing data. Any UI implying liveness
+    -- must read it and never last_seen_at.
+    CONSTRAINT discovered_agents_evidence_mode_check CHECK (
+        evidence_mode IN ('observed', 'declared', 'inferred')),
+    CONSTRAINT discovered_agents_declared_never_running_check CHECK (
+        evidence_mode <> 'declared' OR last_observed_running_at IS NULL),
+    CONSTRAINT discovered_agents_declared_never_automated_check CHECK (
+        evidence_mode <> 'declared' OR deployment_origin <> 'automated'),
     CONSTRAINT discovered_agents_fingerprint_key UNIQUE (workspace_id, source, fingerprint)
 );
 
@@ -5344,6 +5364,17 @@ CREATE TABLE IF NOT EXISTS public.discovered_agent_iga_links (
 );
 
 -- The reverse join: "which running workloads are believed to be this agent?"
+-- Staleness branches on evidence mode -- a workflow file untouched for six months
+-- is STABLE, a pod unseen for six months is GONE -- so every staleness query
+-- filters on mode before it filters on time.
+CREATE INDEX IF NOT EXISTS idx_discovered_agents_evidence_mode
+    ON public.discovered_agents(workspace_id, evidence_mode, last_seen_at);
+
+-- Partial: declared rows are permanently NULL here, so indexing them is waste.
+CREATE INDEX IF NOT EXISTS idx_discovered_agents_observed_running
+    ON public.discovered_agents(workspace_id, last_observed_running_at)
+ WHERE last_observed_running_at IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_discovered_agent_iga_links_iga
     ON public.discovered_agent_iga_links(workspace_id, iga_agent_id);
 
