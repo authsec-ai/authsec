@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -612,4 +613,174 @@ func supersedeOpenInstruction(db *gorm.DB, workspaceID, sourceID uuid.UUID, key 
 		return 0
 	}
 	return res.RowsAffected
+}
+
+/* --------------------------- force-delete escalation --------------------- */
+
+// ForceEvictInput is an explicit human decision to override a disruption budget.
+type ForceEvictInput struct {
+	// Actor is who is answerable for this. Required — the schema refuses an
+	// unattributed force-delete outright.
+	Actor string
+	// Reason is why the budget is being overruled. Required for the same reason.
+	Reason string
+}
+
+// ForceEvictResult reports what was queued.
+type ForceEvictResult struct {
+	InstructionID uuid.UUID `json:"instruction_id"`
+	BlockedPods   []string  `json:"blocked_pods"`
+	Queued        bool      `json:"queued"`
+}
+
+// ForceEvict queues the override for an eviction a PodDisruptionBudget refused.
+//
+// THE MOST DANGEROUS OPERATION IN THIS SYSTEM, and the only one that deliberately
+// overrules something the cluster owner declared. Eviction uses the Eviction API
+// precisely so budgets are honoured (EN-6); this bypasses that, by deleting the pod
+// with a zero grace period.
+//
+// So it is fenced on four sides, and none of them is a convention:
+//
+//  1. NEVER AUTOMATIC. Nothing calls this but an explicit endpoint. No reconciler,
+//     no policy expiry, no retry path can reach it.
+//  2. ATTRIBUTED AND JUSTIFIED, enforced by a database CHECK rather than by
+//     whichever code path remembered.
+//  3. ONLY AS AN ESCALATION. There must be a PDB-blocked eviction on record for
+//     this agent. You cannot force-delete something that was never refused —
+//     that would make it a first resort, and a first resort is not an escalation.
+//  4. ONLY WHERE THE CLUSTER PERMITS IT. The agent reports the capability
+//     separately from deletion, because permitting a workload to be deleted is not
+//     the same as permitting a budget to be overruled.
+func ForceEvict(db *gorm.DB, workspaceID uuid.UUID, agent *models.DiscoveredAgent,
+	in ForceEvictInput) (*ForceEvictResult, error) {
+
+	if agent == nil {
+		return nil, errors.New("no agent")
+	}
+	if strings.TrimSpace(in.Actor) == "" {
+		return nil, errors.New("a force-delete must name who authorised it")
+	}
+	if strings.TrimSpace(in.Reason) == "" {
+		return nil, errors.New("a force-delete must say why a PodDisruptionBudget is " +
+			"being overruled: the cluster owner declared that budget, and overriding it " +
+			"without a recorded reason is exactly the boundary violation this system " +
+			"exists to prevent elsewhere")
+	}
+	if agent.DiscoverySourceID == nil {
+		return nil, errors.New("this agent is not attributed to a cluster connector")
+	}
+
+	var src models.DiscoverySource
+	if err := db.First(&src, "id = ? AND workspace_id = ?",
+		*agent.DiscoverySourceID, workspaceID).Error; err != nil {
+		return nil, fmt.Errorf("unknown connector: %w", err)
+	}
+	if !src.EnforcementForceEvict {
+		return nil, errors.New("this cluster's agent does not permit overriding a " +
+			"PodDisruptionBudget (--set enforcement.forceEvict=true). Permitting a " +
+			"workload to be deleted is not the same as permitting a budget to be " +
+			"overruled, so the two are separate switches")
+	}
+
+	// THE ESCALATION PRECONDITION. Read from what the agent actually reported, not
+	// from an operator's assertion that something is stuck.
+	blocked, err := pdbBlockedPods(db, workspaceID, agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(blocked) == 0 {
+		return nil, errors.New("no eviction for this agent has been refused by a " +
+			"PodDisruptionBudget. Force-delete is an escalation of a blocked eviction, " +
+			"not a way to skip one — quarantine the agent first and let the ordinary " +
+			"eviction run")
+	}
+
+	ns, kind, name, _ := k8sCoordinatesForActuation(agent.Metadata)
+	if ns == "" || name == "" {
+		return nil, errors.New("the sighting carries no workload coordinate")
+	}
+
+	agentID := agent.ID
+	inst, created, err := NewActuationManager(db).Enqueue(workspaceID, EnqueueInstructionInput{
+		DiscoverySourceID: *agent.DiscoverySourceID,
+		Kind:              models.InstructionForceDeletePods,
+		DiscoveredAgentID: &agentID,
+		Fingerprint:       agent.Fingerprint,
+		Payload: map[string]interface{}{
+			"namespace":     ns,
+			"workload_kind": kind,
+			"workload_name": name,
+			"reason":        in.Reason,
+			// The pods the agent itself reported as blocked. Naming them bounds
+			// the override to what was actually refused, rather than handing the
+			// agent a licence to delete whatever it finds under that workload now.
+			"pods": blocked,
+		},
+		// Time-keyed, so a second override after a second refusal is a second
+		// decision with its own record rather than a silent no-op.
+		IdempotencyKey: models.InstructionForceDeletePods + ":" + agent.Fingerprint +
+			":" + time.Now().UTC().Format(time.RFC3339),
+		CreatedBy: in.Actor,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ForceEvictResult{InstructionID: inst.ID, BlockedPods: blocked, Queued: created}, nil
+}
+
+// pdbBlockedPods reads the pods a PodDisruptionBudget refused, from the results the
+// agent reported on its own eviction instructions.
+//
+// The agent's report is the evidence. An operator saying "it is stuck" is not: the
+// point of the precondition is that the cluster refused, and only the cluster can
+// say that.
+func pdbBlockedPods(db *gorm.DB, workspaceID, agentID uuid.UUID) ([]string, error) {
+	var rows []models.ProvisioningInstruction
+	err := db.Where(`workspace_id = ? AND discovered_agent_id = ? AND kind = ?
+	                 AND status = ?`,
+		workspaceID, agentID, models.InstructionEvictPods, models.InstructionApplied).
+		Order("applied_at DESC").Limit(5).Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		var res struct {
+			PDBBlocked     int      `json:"pdb_blocked"`
+			PDBBlockedPods []string `json:"pdb_blocked_pods"`
+		}
+		if len(rows[i].Result) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(rows[i].Result, &res); err != nil {
+			continue
+		}
+		if res.PDBBlocked > 0 && len(res.PDBBlockedPods) > 0 {
+			// The most recent refusal only. An older one may name pods that have
+			// since been replaced, and force-deleting a pod by a stale name is at
+			// best a no-op and at worst the wrong pod.
+			return res.PDBBlockedPods, nil
+		}
+	}
+	return nil, nil
+}
+
+// k8sCoordinatesForActuation reads the workload coordinate from sighting metadata.
+func k8sCoordinatesForActuation(raw json.RawMessage) (namespace, kind, name, container string) {
+	if len(raw) == 0 {
+		return
+	}
+	var md struct {
+		Kubernetes struct {
+			Namespace     string `json:"namespace"`
+			WorkloadKind  string `json:"workload_kind"`
+			WorkloadName  string `json:"workload_name"`
+			ContainerName string `json:"container_name"`
+		} `json:"kubernetes"`
+	}
+	if err := json.Unmarshal(raw, &md); err != nil {
+		return
+	}
+	return md.Kubernetes.Namespace, md.Kubernetes.WorkloadKind,
+		md.Kubernetes.WorkloadName, md.Kubernetes.ContainerName
 }

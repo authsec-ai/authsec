@@ -1909,6 +1909,16 @@ func SetupRoutes(
 			governance.POST("/policy-warnings/run",
 				middlewares.Require("governance", "admin"), governanceController.RunPolicyWarnings)
 
+			// The force-delete escalation: override a PodDisruptionBudget that
+			// refused an eviction. THE ONLY WAY TO REACH ONE — no reconciler,
+			// policy expiry or retry path can, deliberately.
+			//
+			// governance:admin, not certify: this is not a review, it is
+			// destruction that overrides an availability guarantee somebody else
+			// set. The reason is required here, and again by a database CHECK.
+			governance.POST("/agents/:id/force-evict",
+				middlewares.Require("governance", "admin"), governanceController.ForceEvictAgent)
+
 			governance.GET("/iga-links",
 				middlewares.Require("discovery", "read"), governanceController.ListIGALinkProposals)
 

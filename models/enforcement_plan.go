@@ -171,4 +171,9 @@ type EnforcementReport struct {
 	// false, because silently clearing the capability of an agent that simply
 	// predates the field would stop its evictions with no visible cause.
 	Evict *bool
+	// Delete is whether the agent may destroy a workload. nil when unreported,
+	// for the same reason as Evict.
+	Delete *bool
+	// ForceEvict is whether the agent may override a PodDisruptionBudget.
+	ForceEvict *bool
 }

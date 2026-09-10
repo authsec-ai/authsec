@@ -809,6 +809,72 @@ func (ctl *GovernanceController) ReportInstruction(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
+/* -------------------------- force-delete escalation ---------------------- */
+
+// ForceEvictRequest is the body for POST /authsec/governance/agents/:id/force-evict.
+type ForceEvictRequest struct {
+	// Reason is required. Overriding a PodDisruptionBudget without a recorded
+	// justification is the boundary violation this system exists to prevent
+	// elsewhere, so it is refused here and again by a database CHECK.
+	Reason string `json:"reason" binding:"required"`
+}
+
+// ForceEvictAgent handles POST /authsec/governance/agents/:id/force-evict.
+//
+// THE ONLY WAY TO REACH A FORCE-DELETE. It is deliberately an endpoint and not a
+// reconciler branch, a retry, or an escalation the system performs on its own: a
+// disruption budget is something the cluster owner declared, and overruling it has
+// to be a person's decision with their name on it.
+//
+// governance:admin, not governance:certify — this is not a review, it is
+// destruction that overrides an availability guarantee somebody else set.
+func (ctl *GovernanceController) ForceEvictAgent(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	agentID, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req ForceEvictRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "a reason is required: overriding a PodDisruptionBudget is a " +
+				"decision somebody has to answer for"})
+		return
+	}
+
+	var agent models.DiscoveredAgent
+	if err := ctl.db.First(&agent, "id = ? AND workspace_id = ?", agentID, wsID).Error; err != nil {
+		governanceError(c, err)
+		return
+	}
+	// Containment first. Force-deleting the pods of an agent nobody quarantined
+	// would be destruction with no governance decision behind it at all.
+	if agent.Status != models.DiscoveredAgentQuarantined {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "this agent is not quarantined. A force-delete overrides a " +
+				"disruption budget to complete a containment; there is no containment here"})
+		return
+	}
+
+	_, actorLabel := ctl.actingUser(c)
+	out, err := services.ForceEvict(ctl.db, wsID, &agent, services.ForceEvictInput{
+		Actor:  actorLabel,
+		Reason: req.Reason,
+	})
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	log.Printf("FORCE-DELETE authorised by %s for agent %s (%s): %s",
+		actorLabel, agent.ID, agent.DisplayName, req.Reason)
+	c.JSON(http.StatusOK, out)
+}
+
 /* --------------------------- pre-deadline warnings ----------------------- */
 
 func (ctl *GovernanceController) warnings() services.PolicyWarningManager {
@@ -1016,6 +1082,14 @@ func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
 	if v := c.Query("evict"); v != "" {
 		b := v == "true" || v == "1"
 		rep.Evict = &b
+	}
+	if v := c.Query("delete"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Delete = &b
+	}
+	if v := c.Query("force_evict"); v != "" {
+		b := v == "true" || v == "1"
+		rep.ForceEvict = &b
 	}
 	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
 		// Never fatal to the fetch. Refusing to serve a plan because the agent's

@@ -3470,6 +3470,14 @@ CREATE TABLE public.discovery_sources (
     -- connector that said it can carry one out, so an install without the switch
     -- never accumulates instructions nobody will execute.
     enforcement_evict boolean NOT NULL DEFAULT false,
+    -- And whether it can DELETE a workload outright. Separate from evict for the
+    -- same reason evict is separate from deny: destroying what a customer created
+    -- is categorically larger than stopping it, and no switch should imply another.
+    enforcement_delete boolean NOT NULL DEFAULT false,
+    -- And whether it may OVERRIDE a PodDisruptionBudget. Separate from delete on
+    -- purpose: an operator may well permit deleting a workload while never
+    -- permitting a budget the cluster owner declared to be overruled.
+    enforcement_force_evict boolean NOT NULL DEFAULT false,
     created_by   text NOT NULL DEFAULT '',
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
@@ -5204,11 +5212,22 @@ CREATE TABLE public.provisioning_instructions (
     -- evict_pods stops a contained agent RUNNING, through the Eviction API so that
     -- PodDisruptionBudgets are honoured (EN-6). Quarantine cuts the network and
     -- leaves the process alive; this is the half that stops it.
-    -- evict_pods stops a contained agent RUNNING, through the Eviction API so that
-    -- PodDisruptionBudgets are honoured (EN-6). Quarantine cuts the network and
-    -- leaves the process alive; this is the half that stops it.
+    -- delete_workload removes the owning controller. Categorically larger than
+    -- containing an agent (EN-9), with its own agent switch, namespace list and
+    -- RBAC — and it does not survive a GitOps reconciler, which the outcome says
+    -- plainly rather than implying a permanence that is not there.
+    -- force_delete_pods overrides a PodDisruptionBudget. Never automatic: no
+    -- reconciler, policy expiry or retry path can reach it, and the CHECK below
+    -- makes its attribution structural rather than conventional.
     CONSTRAINT provisioning_instructions_kind_chk CHECK (
-        kind IN ('quarantine', 'unquarantine', 'verify_uptake', 'evict_pods')),
+        kind IN ('quarantine', 'unquarantine', 'verify_uptake',
+                 'evict_pods', 'delete_workload', 'force_delete_pods')),
+    -- Overriding a disruption budget is a decision a person answers for, so an
+    -- unattributed or unjustified one is rejected by the DATABASE rather than by
+    -- whichever code path happened to remember to check.
+    CONSTRAINT provisioning_instructions_force_chk CHECK (
+        kind <> 'force_delete_pods'
+        OR (created_by <> '' AND coalesce(payload->>'reason', '') <> '')),
     -- 'superseded' is an instruction overtaken by a newer, contradicting decision
     -- before it was applied — a quarantine released before the cluster agent polled.
     -- Kept rather than deleted so an operator can see the decision was overtaken

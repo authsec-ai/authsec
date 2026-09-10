@@ -703,8 +703,43 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 					continue
 				}
 				res.WouldEvict++
-				m.plannedFor(workspaceID, p, a, models.PolicyActionEvicted,
-					models.PolicyArmCluster, "policy expired: "+p.Reason)
+				if dryRun {
+					m.plannedFor(workspaceID, p, a, models.PolicyActionEvicted,
+						models.PolicyArmCluster, "policy expired: "+p.Reason)
+					continue
+				}
+				// LIVE. Everything protecting this point has already happened: the
+				// policy carries a reason and a confirmation, the confirmation
+				// names THIS agent, and a warning was scheduled a lead-time ago.
+				// What is left is to queue it for the cluster.
+				//
+				// Entitlements go first. If the deletion is queued and the grants
+				// are not, a workload recreated by a GitOps reconciler comes back
+				// holding the access the policy was expiring — the exact opposite
+				// of what expiry means.
+				if _, aerr := m.applyEntitlementArm(workspaceID, a, nil,
+					[]*models.AgentPolicy{p}); aerr != nil {
+					res.Errors = append(res.Errors,
+						fmt.Sprintf("agent %s: revoke before evict: %v", a.ID, aerr))
+					continue
+				}
+				detail, derr := m.enqueueDestruction(workspaceID, p, a)
+				if derr != nil {
+					res.Errors = append(res.Errors,
+						fmt.Sprintf("agent %s: %v", a.ID, derr))
+					m.record(&models.AgentPolicyAction{
+						WorkspaceID: workspaceID, PolicyID: &p.ID,
+						DiscoveredAgentID: &a.ID,
+						Action:            models.PolicyActionEvicted,
+						Arm:               models.PolicyArmCluster,
+						Reason:            p.Reason, DryRun: false,
+						Outcome: models.PolicyOutcomeFailed,
+						Detail:  derr.Error(),
+					})
+					continue
+				}
+				m.appliedFor(workspaceID, p, a, models.PolicyActionEvicted,
+					models.PolicyArmCluster, detail)
 			}
 		}
 	}
@@ -1027,4 +1062,117 @@ func (m *agentPolicyManager) warningDelivered(workspaceID uuid.UUID,
 	}
 	delivered := n > 0
 	return &delivered
+}
+
+// enqueueDestruction queues the cluster work for an expired destructive policy.
+//
+// WHAT IT QUEUES DEPENDS ON WHAT THE CLUSTER SAID IT CAN DO. An agent reports its
+// eviction and deletion capabilities on every plan poll, and queuing work a cluster
+// cannot carry out would fill the console with enforcement errors that are really a
+// configuration choice.
+//
+// Both, when both are available, and in that order: evicting stops the process now,
+// deleting removes the controller that would otherwise reschedule it. With only
+// eviction available the agent is stopped but comes back, and the returned detail
+// says so — an operator reading "evicted" must not conclude the workload is gone.
+func (m *agentPolicyManager) enqueueDestruction(workspaceID uuid.UUID,
+	p *models.AgentPolicy, agent *models.DiscoveredAgent) (string, error) {
+
+	if agent.DiscoverySourceID == nil {
+		return "", errors.New("this agent is not attributed to a cluster connector, " +
+			"so there is nowhere to carry out the deletion")
+	}
+	var src models.DiscoverySource
+	if err := m.db.First(&src, "id = ? AND workspace_id = ?",
+		*agent.DiscoverySourceID, workspaceID).Error; err != nil {
+		return "", fmt.Errorf("unknown connector: %w", err)
+	}
+
+	ns, kind, name, _ := k8sCoordinates(agent.Metadata)
+	if ns == "" || name == "" {
+		return "", errors.New("the sighting carries no workload coordinate, so there is " +
+			"nothing the cluster agent could act on")
+	}
+	labels := k8sLabels(agent.Metadata)
+
+	act := NewActuationManager(m.db)
+	agentID := agent.ID
+	base := map[string]interface{}{
+		"namespace":     ns,
+		"workload_kind": kind,
+		"workload_name": name,
+		"labels":        labels,
+		"reason":        "policy expired: " + p.Reason,
+	}
+	// The policy id is part of the key, so two policies expiring on the same agent
+	// each get their own instruction and each records its own outcome.
+	suffix := ":" + agent.Fingerprint + ":" + p.ID.String()
+
+	var queued []string
+	if src.EnforcementEvict {
+		if _, _, err := act.Enqueue(workspaceID, EnqueueInstructionInput{
+			DiscoverySourceID: *agent.DiscoverySourceID,
+			Kind:              models.InstructionEvictPods,
+			DiscoveredAgentID: &agentID, Fingerprint: agent.Fingerprint,
+			Payload:        base,
+			IdempotencyKey: models.InstructionEvictPods + suffix,
+			CreatedBy:      "policy:" + p.ID.String(),
+		}); err != nil {
+			return "", fmt.Errorf("queue eviction: %w", err)
+		}
+		queued = append(queued, "evict_pods")
+	}
+	if src.EnforcementDelete {
+		if _, _, err := act.Enqueue(workspaceID, EnqueueInstructionInput{
+			DiscoverySourceID: *agent.DiscoverySourceID,
+			Kind:              models.InstructionDeleteWorkload,
+			DiscoveredAgentID: &agentID, Fingerprint: agent.Fingerprint,
+			Payload:        base,
+			IdempotencyKey: models.InstructionDeleteWorkload + suffix,
+			CreatedBy:      "policy:" + p.ID.String(),
+		}); err != nil {
+			return "", fmt.Errorf("queue deletion: %w", err)
+		}
+		queued = append(queued, "delete_workload")
+	}
+
+	switch {
+	case len(queued) == 0:
+		// Refused rather than silently recorded as done. A policy that says
+		// "delete this at the deadline" and quietly does nothing is worse than one
+		// that fails loudly, because the operator believes it was handled.
+		return "", errors.New("this cluster's agent reports neither eviction nor " +
+			"workload deletion enabled (--set enforcement.evict=true / " +
+			"--set enforcement.deleteWorkloads=true), so the expiry cannot be carried out")
+	case !src.EnforcementDelete:
+		return "queued " + strings.Join(queued, " + ") +
+			"; the workload's CONTROLLER was not deleted (deletion is not enabled on " +
+			"this cluster), so the pods will be rescheduled", nil
+	case gitOpsManaged(agent.Metadata):
+		// EN-9, said plainly at the moment it matters. A workload that reappears
+		// looks like failed enforcement when it is the reconciler doing its job.
+		return "queued " + strings.Join(queued, " + ") +
+			"; this workload appears to be GitOps-managed, so the reconciler will " +
+			"recreate it — pair this with enforcement.mode=deny, or remove it from " +
+			"the source repository", nil
+	default:
+		return "queued " + strings.Join(queued, " + "), nil
+	}
+}
+
+// k8sLabels reads the pod-template labels a sighting captured, which is what the
+// cluster agent turns into a selector.
+func k8sLabels(raw json.RawMessage) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var md struct {
+		Kubernetes struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"kubernetes"`
+	}
+	if err := json.Unmarshal(raw, &md); err != nil {
+		return nil
+	}
+	return md.Kubernetes.Labels
 }
