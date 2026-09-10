@@ -254,6 +254,15 @@ type DiscoverySource struct {
 	// EnforcementDenialsTotal is cumulative since the agent PROCESS started, so
 	// it resets on restart. A rate and a liveness signal, never an all-time total.
 	EnforcementDenialsTotal int64 `json:"enforcement_denials_total" gorm:"not null;default:0"`
+	// EnforcementEvict is whether this cluster's agent says it can EVICT — a
+	// separate switch from the mode (EN-5), because deny without evict leaves the
+	// agent running while evict without deny recreates it in seconds, and the two
+	// carry different risk.
+	//
+	// Reported, never pushed. The control plane queues an eviction only for a
+	// connector that said it can carry one out, so an install without the switch
+	// never accumulates instructions nobody will execute.
+	EnforcementEvict bool `json:"enforcement_evict" gorm:"not null;default:false"`
 
 	CreatedBy string    `json:"created_by" gorm:"not null;default:''"`
 	CreatedAt time.Time `json:"created_at"`

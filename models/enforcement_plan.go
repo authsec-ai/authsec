@@ -166,4 +166,9 @@ type EnforcementReport struct {
 	// DenialsTotal is cumulative since the agent process started, so it resets on
 	// restart. A rate and a liveness signal, never an all-time total.
 	DenialsTotal *int64
+	// Evict is whether the agent can carry out an eviction. nil when the agent did
+	// not say -- an older build -- which is left as-is rather than defaulted to
+	// false, because silently clearing the capability of an agent that simply
+	// predates the field would stop its evictions with no visible cause.
+	Evict *bool
 }

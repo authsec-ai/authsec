@@ -509,10 +509,81 @@ func EnforceQuarantine(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discove
 	if err != nil {
 		return false, err.Error()
 	}
+
+	// EVICTION: the half that stops the process.
+	//
+	// A NetworkPolicy cuts an agent's network and leaves it running. For a
+	// quarantine to mean what an operator thinks it means, the pods have to stop
+	// too — so a quarantine also queues an eviction, and a release does not (there
+	// is nothing to un-evict; the controller has already rescheduled).
+	//
+	// Gated on what the CLUSTER said it can do (EN-5). Queuing an eviction for a
+	// connector whose agent has the switch off would accumulate instructions that
+	// fail on every attempt and fill the console with enforcement errors that are
+	// really a configuration choice.
+	if !release {
+		enqueueEviction(db, workspaceID, agent, meta.Kubernetes.Namespace,
+			meta.Kubernetes.WorkloadKind, meta.Kubernetes.WorkloadName,
+			meta.Kubernetes.Labels, actor)
+	}
+
 	if !created {
 		return true, "already queued"
 	}
 	return true, ""
+}
+
+// enqueueEviction queues the stop-the-process half of a quarantine.
+//
+// Best-effort and deliberately non-fatal: the NetworkPolicy is the containment that
+// must not be lost, and failing the whole quarantine because the eviction could not
+// be queued would trade a working half for nothing.
+func enqueueEviction(db *gorm.DB, workspaceID uuid.UUID, agent *models.DiscoveredAgent,
+	namespace, workloadKind, workloadName string, labels map[string]string, actor string) {
+
+	if agent == nil || agent.DiscoverySourceID == nil {
+		return
+	}
+	var src models.DiscoverySource
+	if err := db.First(&src, "id = ?", *agent.DiscoverySourceID).Error; err != nil {
+		return
+	}
+	if !src.EnforcementEvict {
+		// The cluster has not enabled eviction. Not an error and not silent: the
+		// console shows enforcement_evict=false on the connector, which is the
+		// honest answer to "why is the pod still running".
+		return
+	}
+
+	agentID := agent.ID
+	_, _, _ = NewActuationManager(db).Enqueue(workspaceID, EnqueueInstructionInput{
+		DiscoverySourceID: *agent.DiscoverySourceID,
+		Kind:              models.InstructionEvictPods,
+		DiscoveredAgentID: &agentID,
+		Fingerprint:       agent.Fingerprint,
+		Payload: map[string]interface{}{
+			"namespace":     namespace,
+			"workload_kind": workloadKind,
+			"workload_name": workloadName,
+			"labels":        labels,
+			"reason":        agent.QuarantineReason,
+		},
+		// Keyed on the QUARANTINE DECISION, not just the fingerprint: re-quarantining
+		// an agent that was released must evict again, and sharing a key with the
+		// first quarantine would collapse the second onto a row already applied.
+		IdempotencyKey: models.InstructionEvictPods + ":" + agent.Fingerprint + ":" +
+			quarantineEpoch(agent),
+		CreatedBy: actor,
+	})
+}
+
+// quarantineEpoch identifies WHICH quarantine this is, so a re-quarantine after a
+// release is a distinct instruction rather than a duplicate of the first.
+func quarantineEpoch(agent *models.DiscoveredAgent) string {
+	if agent.QuarantinedAt != nil {
+		return agent.QuarantinedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return "0"
 }
 
 // supersedeOpenInstruction retires a PENDING instruction that a newer, contradicting

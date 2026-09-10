@@ -1010,6 +1010,13 @@ func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
 			rep.DenialsTotal = &n
 		}
 	}
+	// Absent means "this agent did not say", which is left alone rather than read
+	// as false: an older build that never sends the parameter must not have its
+	// eviction capability silently cleared on its next poll.
+	if v := c.Query("evict"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Evict = &b
+	}
 	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
 		// Never fatal to the fetch. Refusing to serve a plan because the agent's
 		// self-report was unparseable would take enforcement away over telemetry.

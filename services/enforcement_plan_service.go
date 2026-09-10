@@ -341,6 +341,9 @@ func (m *enforcementPlanManager) RecordReport(sourceID uuid.UUID,
 	if rep.Version != nil {
 		updates["enforced_plan_version"] = *rep.Version
 	}
+	if rep.Evict != nil {
+		updates["enforcement_evict"] = *rep.Evict
+	}
 	if rep.DenialsTotal != nil {
 		// Stored as reported, INCLUDING a decrease. The counter resets when the
 		// agent process restarts, and rewriting a smaller value as a larger one

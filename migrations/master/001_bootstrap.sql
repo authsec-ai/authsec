@@ -3461,6 +3461,15 @@ CREATE TABLE public.discovery_sources (
     -- Cumulative since the agent PROCESS started, so it resets on restart. A rate
     -- and a liveness signal, never an all-time total.
     enforcement_denials_total bigint NOT NULL DEFAULT 0,
+    -- Whether this cluster's agent says it can EVICT. A separate switch from the
+    -- mode above (EN-5): deny without evict leaves the agent running, evict without
+    -- deny recreates it in seconds, and they carry different risk, so an operator
+    -- can run eviction for a week before anything sits in the request path.
+    --
+    -- Reported, never pushed. The control plane only queues an eviction for a
+    -- connector that said it can carry one out, so an install without the switch
+    -- never accumulates instructions nobody will execute.
+    enforcement_evict boolean NOT NULL DEFAULT false,
     created_by   text NOT NULL DEFAULT '',
     created_at   timestamptz NOT NULL DEFAULT now(),
     updated_at   timestamptz NOT NULL DEFAULT now(),
@@ -5192,8 +5201,14 @@ CREATE TABLE public.provisioning_instructions (
         REFERENCES public.discovery_sources(id) ON DELETE CASCADE,
     CONSTRAINT provisioning_instructions_agent_fkey FOREIGN KEY (discovered_agent_id)
         REFERENCES public.discovered_agents(id) ON DELETE SET NULL,
+    -- evict_pods stops a contained agent RUNNING, through the Eviction API so that
+    -- PodDisruptionBudgets are honoured (EN-6). Quarantine cuts the network and
+    -- leaves the process alive; this is the half that stops it.
+    -- evict_pods stops a contained agent RUNNING, through the Eviction API so that
+    -- PodDisruptionBudgets are honoured (EN-6). Quarantine cuts the network and
+    -- leaves the process alive; this is the half that stops it.
     CONSTRAINT provisioning_instructions_kind_chk CHECK (
-        kind IN ('quarantine', 'unquarantine', 'verify_uptake')),
+        kind IN ('quarantine', 'unquarantine', 'verify_uptake', 'evict_pods')),
     -- 'superseded' is an instruction overtaken by a newer, contradicting decision
     -- before it was applied — a quarantine released before the cluster agent polled.
     -- Kept rather than deleted so an operator can see the decision was overtaken
