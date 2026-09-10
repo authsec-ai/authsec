@@ -1258,8 +1258,12 @@ func (ctl *GovernanceController) GetAgentPolicyEffective(c *gin.Context) {
 
 // ReconcileAgentPolicies handles POST /authsec/governance/agent-policies/reconcile.
 //
-// dry_run defaults to TRUE and a live run is currently refused — the plan has to be
-// provable against real data before anything acts on it.
+// dry_run defaults to TRUE — a live run must be asked for explicitly.
+//
+// A live run executes the ENTITLEMENT arm only: role narrowing and revoke-on-expiry.
+// Those are control-plane effects, reversible by editing the policy, and invisible to
+// the cluster. The CLUSTER arm is still computed and recorded as refused, so a live
+// reconcile can never look like it quarantined something it did not.
 func (ctl *GovernanceController) ReconcileAgentPolicies(c *gin.Context) {
 	wsID, err := ctl.workspace(c)
 	if err != nil {
@@ -1269,14 +1273,12 @@ func (ctl *GovernanceController) ReconcileAgentPolicies(c *gin.Context) {
 	dryRun := c.Query("dry_run") != "false"
 	out, err := ctl.agentPolicies().Reconcile(wsID, dryRun)
 	if err != nil {
-		// A refused live run is a 501, not a 400: the request was valid, the
-		// capability is not built.
-		if !dryRun {
-			c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
-			return
-		}
 		governanceError(c, err)
 		return
+	}
+	if !dryRun {
+		auditAdminMutation(c, wsID.String(), "reconcile", "agent_policy", "",
+			http.StatusOK, nil, out)
 	}
 	c.JSON(http.StatusOK, out)
 }

@@ -77,6 +77,13 @@ type EffectivePolicy struct {
 	// ScopeCeiling is the INTERSECTION of every ceiling that applies. nil means no
 	// policy constrains scope.
 	ScopeCeiling []string `json:"scope_ceiling,omitempty"`
+	// RoleCeilingID is the NARROWEST role any matching policy names — the one
+	// granting the fewest permissions. nil means no policy caps the role.
+	RoleCeilingID *uuid.UUID `json:"role_ceiling_id,omitempty"`
+	// Ambiguous is set when two policies name role ceilings that are INCOMPARABLE
+	// (neither grants a subset of the other). Applying an arbitrary one would be a
+	// coin flip on somebody's access, so nothing is applied and this says why.
+	Ambiguous string `json:"ambiguous,omitempty"`
 	// Policies that contributed, for explainability -- a reviewer must be able to see
 	// which policy caused a state, not just the state.
 	PolicyIDs []uuid.UUID `json:"policy_ids"`
@@ -84,16 +91,19 @@ type EffectivePolicy struct {
 
 // PolicyReconcileResult reports what a pass did, or would do.
 type PolicyReconcileResult struct {
-	DryRun          bool     `json:"dry_run"`
-	PoliciesActive  int      `json:"policies_active"`
-	AgentsCovered   int      `json:"agents_covered"`
-	WouldNarrow     int      `json:"would_narrow"`
-	WouldQuarantine int      `json:"would_quarantine"`
-	WouldRelease    int      `json:"would_release"`
-	WouldRevoke     int      `json:"would_revoke"`
-	WouldEvict      int      `json:"would_evict"`
-	Refused         int      `json:"refused"`
-	Errors          []string `json:"errors,omitempty"`
+	DryRun          bool `json:"dry_run"`
+	PoliciesActive  int  `json:"policies_active"`
+	AgentsCovered   int  `json:"agents_covered"`
+	WouldNarrow     int  `json:"would_narrow"`
+	WouldQuarantine int  `json:"would_quarantine"`
+	WouldRelease    int  `json:"would_release"`
+	WouldRevoke     int  `json:"would_revoke"`
+	WouldEvict      int  `json:"would_evict"`
+	Refused         int  `json:"refused"`
+	// Applied counts, non-zero only on a live run.
+	BindingsNarrowed int      `json:"bindings_narrowed"`
+	GrantsLapsed     int64    `json:"grants_lapsed"`
+	Errors           []string `json:"errors,omitempty"`
 }
 
 // UpcomingAction is one scheduled effect, for the lookahead.
@@ -413,6 +423,7 @@ func (m *agentPolicyManager) Effective(workspaceID, agentID uuid.UUID) (*Effecti
 		PolicyIDs:    []uuid.UUID{},
 	}
 	var ceilings [][]string
+	var roleCeilings []uuid.UUID
 
 	for i := range policies {
 		p := &policies[i]
@@ -437,6 +448,24 @@ func (m *agentPolicyManager) Effective(workspaceID, agentID uuid.UUID) (*Effecti
 		}
 		if len(p.ScopeCeiling) > 0 {
 			ceilings = append(ceilings, []string(p.ScopeCeiling))
+		}
+		if p.RoleCeilingID != nil {
+			roleCeilings = append(roleCeilings, *p.RoleCeilingID)
+		}
+	}
+
+	// Narrowest role ceiling wins, by permission-set containment. Two ceilings that
+	// are incomparable are NOT silently resolved: picking one would decide somebody's
+	// access by evaluation order.
+	if len(roleCeilings) > 0 {
+		winner, amb, err := m.narrowestRole(roleCeilings)
+		if err != nil {
+			return nil, err
+		}
+		if amb != "" {
+			eff.Ambiguous = amb
+		} else {
+			eff.RoleCeilingID = &winner
 		}
 	}
 
@@ -482,17 +511,18 @@ func intersectScopes(sets [][]string) []string {
 func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 	dryRun bool) (*PolicyReconcileResult, error) {
 
-	if !dryRun {
-		return nil, errors.New("live reconciliation is not implemented yet: this build " +
-			"computes plans only (ENFORCEMENT-ARCHITECTURE.md §7, phase 1). Call with " +
-			"dry_run=true")
-	}
+	// PHASE 2: a live run executes the ENTITLEMENT arm only — scope/role narrowing
+	// and revoke-on-expiry. Those are control-plane effects: nothing is written to a
+	// cluster, no reconciler can undo them, and editing the policy reverses them.
+	//
+	// The CLUSTER arm still only plans. Quarantine, eviction and deletion arrive in
+	// phases 5-7, on machinery this phase is proving first.
 
 	policies, err := m.List(workspaceID, true)
 	if err != nil {
 		return nil, err
 	}
-	res := &PolicyReconcileResult{DryRun: true, PoliciesActive: len(policies)}
+	res := &PolicyReconcileResult{DryRun: dryRun, PoliciesActive: len(policies)}
 
 	// Every agent any policy touches, so an agent covered by two policies is counted
 	// and resolved once rather than twice.
@@ -527,8 +557,8 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 		case eff.DesiredState == models.AgentPolicyStateQuarantined &&
 			agent.Status != models.DiscoveredAgentQuarantined:
 			res.WouldQuarantine++
-			m.planned(workspaceID, eff, &agent, models.PolicyActionQuarantined,
-				models.PolicyArmCluster, "policy asks for quarantined; agent is "+agent.Status)
+			m.clusterPlanned(workspaceID, eff, &agent, dryRun, models.PolicyActionQuarantined,
+				"policy asks for quarantined; agent is "+agent.Status)
 
 		case eff.DesiredState == models.AgentPolicyStateActive &&
 			agent.Status == models.DiscoveredAgentQuarantined:
@@ -536,16 +566,75 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 			// no policy asks for it. Reconciliation is symmetric by design -- it
 			// converges, it does not only tighten.
 			res.WouldRelease++
-			m.planned(workspaceID, eff, &agent, models.PolicyActionReleased,
-				models.PolicyArmCluster, "no active policy asks for quarantine")
+			m.clusterPlanned(workspaceID, eff, &agent, dryRun, models.PolicyActionReleased,
+				"no active policy asks for quarantine")
 		}
 
-		// --- the entitlement arm: scope ceiling ---
+		// --- the entitlement arm ---
+		//
+		// An ambiguous role ceiling applies NOTHING. Two policies naming incomparable
+		// ceilings is a question for a human, not a coin flip on someone's access.
+		if eff.Ambiguous != "" {
+			res.Refused++
+			m.record(&models.AgentPolicyAction{
+				WorkspaceID: workspaceID, DiscoveredAgentID: &agent.ID,
+				Action: models.PolicyActionNoop, Arm: models.PolicyArmEntitlement,
+				DryRun: dryRun, Outcome: models.PolicyOutcomeRefused,
+				Detail: "REFUSED: " + eff.Ambiguous,
+			})
+			continue
+		}
+
+		// A scope ceiling is EVALUATED, never applied: scopes derive from a role's
+		// permissions, so honouring an arbitrary one would mean synthesising a role,
+		// which is a widen arrived at from the other direction. Report the excess.
 		if len(eff.ScopeCeiling) > 0 {
-			res.WouldNarrow++
-			m.planned(workspaceID, eff, &agent, models.PolicyActionNarrowed,
-				models.PolicyArmEntitlement,
-				"ceiling: "+strings.Join(eff.ScopeCeiling, ","))
+			over, serr := m.evaluateScopeCeiling(workspaceID, &agent, eff.ScopeCeiling)
+			if serr != nil {
+				res.Errors = append(res.Errors, serr.Error())
+			} else if len(over) > 0 {
+				res.Refused++
+				m.record(&models.AgentPolicyAction{
+					WorkspaceID: workspaceID, DiscoveredAgentID: &agent.ID,
+					Action: models.PolicyActionNoop, Arm: models.PolicyArmEntitlement,
+					DryRun: dryRun, Outcome: models.PolicyOutcomeRefused,
+					Detail: "scopes held beyond the ceiling: " + strings.Join(over, ",") +
+						" — bind a narrower role (role_ceiling_id) or revoke; a scope " +
+						"ceiling alone cannot narrow a role",
+				})
+			}
+		}
+
+		if eff.RoleCeilingID != nil {
+			if dryRun {
+				res.WouldNarrow++
+				m.clusterOrEntitlementPlanned(workspaceID, eff, &agent,
+					models.PolicyActionNarrowed, models.PolicyArmEntitlement,
+					"would bind to ceiling role "+eff.RoleCeilingID.String())
+			} else {
+				out, aerr := m.applyEntitlementArm(workspaceID, &agent, eff, nil)
+				if aerr != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("agent %s: %v", agent.ID, aerr))
+				} else {
+					res.BindingsNarrowed += out.Narrowed
+					if out.Narrowed > 0 {
+						res.WouldNarrow++
+						m.applied(workspaceID, eff, &agent, models.PolicyActionNarrowed,
+							models.PolicyArmEntitlement,
+							fmt.Sprintf("bound %d binding(s) to ceiling role %s",
+								out.Narrowed, eff.RoleCeilingID))
+					}
+					if out.Refusal != "" {
+						res.Refused++
+						m.record(&models.AgentPolicyAction{
+							WorkspaceID: workspaceID, DiscoveredAgentID: &agent.ID,
+							Action: models.PolicyActionNoop, Arm: models.PolicyArmEntitlement,
+							DryRun: false, Outcome: models.PolicyOutcomeRefused,
+							Detail: "REFUSED: " + out.Refusal,
+						})
+					}
+				}
+			}
 		}
 	}
 
@@ -568,8 +657,29 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 			switch p.OnExpiry {
 			case models.OnExpiryRevoke:
 				res.WouldRevoke++
-				m.plannedFor(workspaceID, p, a, models.PolicyActionRevoked,
-					models.PolicyArmEntitlement, "policy expired")
+				if dryRun {
+					m.plannedFor(workspaceID, p, a, models.PolicyActionRevoked,
+						models.PolicyArmEntitlement, "policy expired")
+					continue
+				}
+				// Live: make the grants lapse. The EXPIRY WORKER does the actual
+				// revocation on its next pass (1m) -- closing provenance, killing
+				// live tokens, deleting the binding, in one transaction.
+				//
+				// That indirection is PG-6, not laziness: revocation has exactly one
+				// implementation, and a second one here would be two places that
+				// must stay in step forever.
+				out, aerr := m.applyEntitlementArm(workspaceID, a, nil,
+					[]*models.AgentPolicy{p})
+				if aerr != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("agent %s: %v", a.ID, aerr))
+					continue
+				}
+				res.GrantsLapsed += out.Lapsed
+				m.appliedFor(workspaceID, p, a, models.PolicyActionRevoked,
+					models.PolicyArmEntitlement,
+					fmt.Sprintf("%d grant(s) lapsed; the expiry worker revokes them on "+
+						"its next pass", out.Lapsed))
 			case models.OnExpiryQuarantine:
 				res.WouldQuarantine++
 				m.plannedFor(workspaceID, p, a, models.PolicyActionQuarantined,
@@ -614,6 +724,60 @@ func (m *agentPolicyManager) confirmationCovers(workspaceID, policyID, agentID u
 		return false, fmt.Errorf("check confirmation for policy %s: %w", policyID, err)
 	}
 	return n > 0, nil
+}
+
+// clusterPlanned records a cluster-arm action that was computed but not executed.
+//
+// On a LIVE run this is 'refused', not 'planned', and the distinction is the honest
+// one: the plan was correct and the capability does not exist yet. Recording it as
+// planned would let an operator read a live reconcile as having done something.
+func (m *agentPolicyManager) clusterPlanned(workspaceID uuid.UUID, eff *EffectivePolicy,
+	agent *models.DiscoveredAgent, dryRun bool, action, detail string) {
+
+	outcome, prefix := models.PolicyOutcomePlanned, ""
+	if !dryRun {
+		outcome = models.PolicyOutcomeRefused
+		prefix = "cluster arm not implemented until phase 5: "
+	}
+	var policyID *uuid.UUID
+	if len(eff.PolicyIDs) > 0 {
+		policyID = &eff.PolicyIDs[0]
+	}
+	m.record(&models.AgentPolicyAction{
+		WorkspaceID: workspaceID, PolicyID: policyID, DiscoveredAgentID: &agent.ID,
+		Action: action, Arm: models.PolicyArmCluster, DryRun: dryRun,
+		Outcome: outcome, Detail: prefix + detail,
+	})
+}
+
+// clusterOrEntitlementPlanned records a dry-run intent on either arm.
+func (m *agentPolicyManager) clusterOrEntitlementPlanned(workspaceID uuid.UUID,
+	eff *EffectivePolicy, agent *models.DiscoveredAgent, action, arm, detail string) {
+
+	var policyID *uuid.UUID
+	if len(eff.PolicyIDs) > 0 {
+		policyID = &eff.PolicyIDs[0]
+	}
+	m.record(&models.AgentPolicyAction{
+		WorkspaceID: workspaceID, PolicyID: policyID, DiscoveredAgentID: &agent.ID,
+		Action: action, Arm: arm, DryRun: true,
+		Outcome: models.PolicyOutcomePlanned, Detail: detail,
+	})
+}
+
+// applied records an entitlement-arm change that actually happened.
+func (m *agentPolicyManager) applied(workspaceID uuid.UUID, eff *EffectivePolicy,
+	agent *models.DiscoveredAgent, action, arm, detail string) {
+
+	var policyID *uuid.UUID
+	if len(eff.PolicyIDs) > 0 {
+		policyID = &eff.PolicyIDs[0]
+	}
+	m.record(&models.AgentPolicyAction{
+		WorkspaceID: workspaceID, PolicyID: policyID, DiscoveredAgentID: &agent.ID,
+		Action: action, Arm: arm, DryRun: false,
+		Outcome: models.PolicyOutcomeApplied, Detail: detail,
+	})
 }
 
 // planned records an intended action from a resolved effective policy.
@@ -775,4 +939,57 @@ func gitOpsManaged(metadata json.RawMessage) bool {
 		}
 	}
 	return false
+}
+
+// narrowestRole picks the role granting the fewest permissions among the ceilings a
+// set of policies names, and reports ambiguity rather than guessing.
+//
+// "Narrowest" is containment, not cardinality: role A beats role B only if A's
+// permissions are a strict subset of B's. Two roles that merely differ in size are
+// incomparable — a 3-permission role granting deletes is not narrower than a
+// 5-permission read-only one — and resolving that by count would quietly pick the
+// more dangerous role about as often as not.
+func (m *agentPolicyManager) narrowestRole(ids []uuid.UUID) (uuid.UUID, string, error) {
+	perms := map[uuid.UUID]map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if _, seen := perms[id]; seen {
+			continue
+		}
+		p, err := rolePermissionIDs(m.db, id)
+		if err != nil {
+			return uuid.Nil, "", err
+		}
+		perms[id] = p
+	}
+
+	best := ids[0]
+	for _, id := range ids {
+		if id == best {
+			continue
+		}
+		switch {
+		case len(notSubset(perms[id], perms[best])) == 0:
+			// id grants nothing beyond best -> id is narrower (or equal).
+			best = id
+		case len(notSubset(perms[best], perms[id])) == 0:
+			// best is already the narrower one.
+		default:
+			return uuid.Nil, fmt.Sprintf(
+				"role ceilings %s and %s are incomparable — neither grants a subset of "+
+					"the other, so no ceiling was applied. Resolve the overlap before "+
+					"either can take effect", best, id), nil
+		}
+	}
+	return best, "", nil
+}
+
+// appliedFor records an executed action attributed to one specific policy.
+func (m *agentPolicyManager) appliedFor(workspaceID uuid.UUID, p *models.AgentPolicy,
+	agent *models.DiscoveredAgent, action, arm, detail string) {
+
+	m.record(&models.AgentPolicyAction{
+		WorkspaceID: workspaceID, PolicyID: &p.ID, DiscoveredAgentID: &agent.ID,
+		Action: action, Arm: arm, Reason: p.Reason, DryRun: false,
+		Outcome: models.PolicyOutcomeApplied, Detail: detail,
+	})
 }

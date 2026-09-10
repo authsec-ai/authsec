@@ -303,12 +303,39 @@ func TestNoPolicyMeansActiveAndUnconstrained(t *testing.T) {
 
 /* ------------------------------ reconciliation --------------------------- */
 
-// Phase 1 is dry-run only, and a live run must be refused rather than silently
-// doing nothing.
-func TestLiveReconcileIsRefused(t *testing.T) {
+// Phase 2 opened live runs for the ENTITLEMENT arm. A live run must therefore
+// succeed — and must still leave the cluster untouched, which
+// TestLiveRunStillRefusesTheClusterArm covers in detail.
+//
+// This test previously asserted the opposite (phase 1 refused every live run). It is
+// updated rather than deleted, because "a live run is accepted and does nothing to
+// the cluster" is the property that replaced it.
+func TestLiveReconcileIsAcceptedAndTouchesNoCluster(t *testing.T) {
 	f := newProvFixture(t)
-	if _, err := policyMgr(t, f).Reconcile(f.ws, false); err == nil {
-		t.Fatal("a live reconcile must be refused in this build, not silently no-op")
+	m := policyMgr(t, f)
+	agent := claimedAgent(t, f, "a1", "iga-demo", "crewai", "automated")
+
+	if _, err := m.Create(f.ws, "u", services.AgentPolicyInput{
+		Name: "quarantine-it", DiscoveredAgentID: &agent,
+		DesiredState: models.AgentPolicyStateQuarantined,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	res, err := m.Reconcile(f.ws, false)
+	if err != nil {
+		t.Fatalf("a live reconcile must be accepted in phase 2: %v", err)
+	}
+	if res.DryRun {
+		t.Error("a live run must not report itself as a dry run")
+	}
+	var status string
+	if err := f.raw.QueryRow(`SELECT status FROM discovered_agents WHERE id=$1`,
+		agent).Scan(&status); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if status == models.DiscoveredAgentQuarantined {
+		t.Error("the cluster arm must remain inert until phase 5")
 	}
 }
 
@@ -329,8 +356,11 @@ func TestDryRunReconcilePlansButChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if !res.DryRun || res.WouldQuarantine != 1 || res.WouldNarrow != 1 {
-		t.Errorf("expected 1 quarantine + 1 narrow planned, got %+v", res)
+	// WouldNarrow counts ROLE ceilings only. A scope ceiling is evaluated and
+	// reported rather than applied (phase 2), because scopes derive from a role's
+	// permissions and honouring one would mean synthesising a role.
+	if !res.DryRun || res.WouldQuarantine != 1 {
+		t.Errorf("expected 1 quarantine planned, got %+v", res)
 	}
 
 	// Nothing changed.
