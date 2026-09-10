@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -100,6 +101,28 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("azure returned %d (%s)", e.Status, e.Code)
 }
 
+// sameHostAsARM refuses a URL that a scope has moved off the ARM endpoint.
+//
+// "https://management.azure.com" + "@10.0.0.7" parses to host 10.0.0.7 with the
+// real ARM host demoted to userinfo, so a string that reads like ARM is not one.
+// Comparing the parsed host is the only check that sees that.
+func sameHostAsARM(endpoint string) error {
+	base, err := url.Parse(ARMBase)
+	if err != nil {
+		return fmt.Errorf("ARM endpoint %q is not a url: %w", ARMBase, err)
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("refusing to send: %w", err)
+	}
+	if u.Scheme != base.Scheme || u.Host != base.Host || u.User != nil {
+		return fmt.Errorf(
+			"refusing to send an ARM request to %q: the scope moved it off %s",
+			u.Scheme+"://"+u.Host, ARMBase)
+	}
+	return nil
+}
+
 // Client is everything this package needs from Microsoft. An interface so the
 // service layer can be driven by a fake, the same way awsdiscovery.IAMAPI works.
 type Client interface {
@@ -145,30 +168,43 @@ type Client interface {
 
 	// ReadOwnApp reads OUR application object from its home tenant.
 	ReadOwnApp(ctx context.Context, accessToken, appID string) (*AppRegistration, error)
+
+	// ResolveSignInName finds what an email address is called inside one tenant.
+	ResolveSignInName(ctx context.Context, graphToken, email string) (*SignInName, error)
 }
 
 // HTTPClient is the live Client.
 type HTTPClient struct {
-	clientID     string
-	clientSecret string
-	http         *http.Client
+	clientID string
+	cred     Credential
+	http     *http.Client
 }
 
-// NewHTTPClient builds the live client. The secret never leaves this struct.
+// NewHTTPClient builds the live client from a client secret. The secret never
+// leaves this struct.
 func NewHTTPClient(clientID, clientSecret string) *HTTPClient {
+	return NewHTTPClientWithCredential(clientID, SecretCredential(clientSecret))
+}
+
+// NewHTTPClientWithCredential builds it from either credential form. The
+// private key, like the secret, never leaves this struct.
+func NewHTTPClientWithCredential(clientID string, cred Credential) *HTTPClient {
 	return &HTTPClient{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		http:         &http.Client{Timeout: requestTimeout},
+		clientID: clientID,
+		cred:     cred,
+		http:     newRetryClient(),
 	}
 }
+
+// Credential reports which form this client authenticates with, for the check
+// to report. Never the value.
+func (c *HTTPClient) Credential() Credential { return c.cred }
 
 var _ Client = (*HTTPClient)(nil)
 
 func (c *HTTPClient) ExchangeCode(ctx context.Context, code, redirectURI string) (*TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", c.clientID)
-	form.Set("client_secret", c.clientSecret)
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", redirectURI)
@@ -179,7 +215,6 @@ func (c *HTTPClient) ExchangeCode(ctx context.Context, code, redirectURI string)
 func (c *HTTPClient) Refresh(ctx context.Context, refreshToken string) (*TokenSet, error) {
 	form := url.Values{}
 	form.Set("client_id", c.clientID)
-	form.Set("client_secret", c.clientSecret)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("scope", ScopeARMDelegated)
@@ -192,7 +227,6 @@ func (c *HTTPClient) ClientCredentials(ctx context.Context, tenantID string) (*T
 	}
 	form := url.Values{}
 	form.Set("client_id", c.clientID)
-	form.Set("client_secret", c.clientSecret)
 	form.Set("grant_type", "client_credentials")
 	form.Set("scope", ScopeARMDefault)
 
@@ -218,6 +252,13 @@ func (c *HTTPClient) ClientCredentials(ctx context.Context, tenantID string) (*T
 // The form is never logged and never returned: it carries the client secret on
 // every call and an authorization code on one of them.
 func (c *HTTPClient) token(ctx context.Context, endpoint string, form url.Values) (*TokenSet, error) {
+	// Applied here rather than at the five call sites, because a certificate
+	// assertion has to name the endpoint it may be redeemed at -- and this is
+	// the only place that knows it. Building it earlier would produce one
+	// assertion reused across tenant endpoints, which Entra rejects.
+	if err := c.cred.apply(form, c.clientID, endpoint); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("build token request: %w", err)
@@ -299,6 +340,41 @@ func objectIDFromToken(raw string) string {
 		return ""
 	}
 	return claims.OID
+}
+
+// TenantIDFromToken reads the tid claim out of an access token.
+//
+// Needed because a sign-in that merges admin consent (prompt=admin_consent)
+// comes back on the LOGIN callback, where Microsoft does not name the tenant the
+// way the dedicated /adminconsent endpoint does. The token it produces does: tid
+// is the directory the person actually authenticated against, which is the
+// directory their consent applied to.
+//
+// The signature is not verified, for the same reason objectIDFromToken does not
+// verify it: Microsoft issued this token to us over TLS moments ago in answer to
+// our own request. The value is used to address a row we are about to write, and
+// it is checked against the tenant listing before anything depends on it. It is
+// never an authorisation decision. Returns "" rather than failing on anything
+// unexpected.
+func TenantIDFromToken(raw string) string {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	body, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		TID string `json:"tid"`
+	}
+	if err := json.Unmarshal(body, &claims); err != nil {
+		return ""
+	}
+	if err := ValidateTenantID(claims.TID); err != nil {
+		return ""
+	}
+	return claims.TID
 }
 
 func (c *HTTPClient) ListTenants(ctx context.Context, accessToken string) ([]Tenant, error) {
@@ -430,7 +506,6 @@ func (c *HTTPClient) RefreshForTenant(ctx context.Context, refreshToken, tenantI
 	}
 	form := url.Values{}
 	form.Set("client_id", c.clientID)
-	form.Set("client_secret", c.clientSecret)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("scope", ScopeARMDelegated)
@@ -487,6 +562,16 @@ func (c *HTTPClient) AssignRole(
 	endpoint := ARMBase + scope + "/providers/Microsoft.Authorization/roleAssignments/" +
 		name + "?api-version=" + APIVersionRoleAssignments
 
+	// The caller validates the scope; this refuses to send if the result is
+	// nevertheless pointed somewhere other than ARM. Two checks rather than
+	// one because the request carries the operator's bearer token, and the
+	// cost of a future caller forgetting the first check is that token being
+	// handed to whatever host the scope named.
+	if err := sameHostAsARM(endpoint); err != nil {
+		out.Error = err.Error()
+		return out
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, strings.NewReader(string(payload)))
 	if err != nil {
 		out.Error = err.Error()
@@ -542,21 +627,29 @@ func (c *HTTPClient) AssignRole(
 // Deliberately not requested and not listed: anything that reads a secret
 // VALUE. Recording that a credential exists, its age and its last use is the
 // product's claim; reading it is not.
+// Why each one, since the names alone do not say:
+//   - Application.Read.All          app registrations, service principals,
+//     their credentials and app role assignments: the non-human identities.
+//   - Directory.Read.All            users, groups, and the OAuth2 permission
+//     grants that say which delegated consents exist.
+//   - RoleManagement.Read.Directory Entra directory role assignments -- who
+//     holds Global Administrator. Directory.Read.All does not cover the
+//     unified role API.
+//   - AuditLog.Read.All             sign-in activity, which is how an
+//     identity's liveness is established without a log pipeline.
+//
+// Derived from RequiredGraphRoleIDs rather than written out again. The two
+// lists were maintained separately, which is a set that drifts: adding a
+// permission in one place and not the other means the check asks for something
+// the consent guidance never mentions, or the reverse.
 func RequiredGraphRoles() []string {
-	return []string{
-		// App registrations, service principals, their credentials and app role
-		// assignments -- the non-human identities themselves.
-		"Application.Read.All",
-		// Users, groups, and the OAuth2 permission grants that say which
-		// delegated consents exist.
-		"Directory.Read.All",
-		// Entra directory role assignments: who holds Global Administrator and
-		// the rest. Not covered by Directory.Read.All for the unified role API.
-		"RoleManagement.Read.Directory",
-		// Sign-in activity, which is how an identity's liveness is established
-		// without paying for a log pipeline.
-		"AuditLog.Read.All",
+	ids := RequiredGraphRoleIDs()
+	names := make([]string, 0, len(ids))
+	for name := range ids {
+		names = append(names, name)
 	}
+	sort.Strings(names)
+	return names
 }
 
 // GraphAuthorization is what an app-only Graph token reveals about consent.
@@ -576,7 +669,6 @@ func (c *HTTPClient) GraphToken(ctx context.Context, tenantID string) (*TokenSet
 	}
 	form := url.Values{}
 	form.Set("client_id", c.clientID)
-	form.Set("client_secret", c.clientSecret)
 	form.Set("grant_type", "client_credentials")
 	form.Set("scope", ScopeGraphDefault)
 
@@ -729,5 +821,5 @@ func (c *HTTPClient) ProbeGraphCapabilities(ctx context.Context, accessToken str
 
 // ARMGraphSignInsURL is the sign-in activity endpoint, as one page of one.
 func ARMGraphSignInsURL() string {
-	return "https://graph.microsoft.com/v1.0/auditLogs/signIns?$top=1"
+	return GraphBase + "/v1.0/auditLogs/signIns?$top=1"
 }
