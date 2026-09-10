@@ -25,6 +25,11 @@ const (
 
 	MechanismSTSAssumeRole  = "sts_assume_role"
 	MechanismOIDCFederation = "oidc_federation"
+	// MechanismEKSPodIdentity is not produced by this file: no trust policy
+	// mentions the service account in a Pod Identity binding. It is declared
+	// here so all three mechanism values live together, and is written by the
+	// EKS surface in eks.go.
+	MechanismEKSPodIdentity = "eks_pod_identity"
 )
 
 // TrustPrincipal is one principal from a trust policy, classified.

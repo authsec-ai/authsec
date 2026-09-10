@@ -734,16 +734,23 @@ const (
 	AssumeSubjectExternal     = "external_account"
 )
 
-// How the assumption happens, not who is assuming. AWS has exactly two: a
-// static trust-policy principal (sts:AssumeRole), and a Federated principal
+// How the assumption happens, not who is assuming. Two come from a trust
+// policy: a static principal (sts:AssumeRole), and a Federated principal
 // (sts:AssumeRoleWithWebIdentity) -- which covers BOTH k8s_service_account and
 // ci_pipeline, told apart by subject_kind and issuer rather than by mechanism.
 //
+// The third is not in any trust policy. EKS Pod Identity binds a service
+// account to a role through an EKS association resource, and the role's trust
+// policy names only the pods.eks.amazonaws.com service principal -- so the
+// service account is invisible to a trust-policy read and the mechanism has to
+// be recorded distinctly. See internal/awsdiscovery/eks.go.
+//
 // Also not a closed set -- see AssumeSubject* above. GCP service-account
-// impersonation, for one, is neither of these two.
+// impersonation, for one, is none of these three.
 const (
 	AssumeMechanismSTSAssumeRole  = "sts_assume_role"
 	AssumeMechanismOIDCFederation = "oidc_federation"
+	AssumeMechanismEKSPodIdentity = "eks_pod_identity"
 )
 
 // KnownAWSAssumeSubjectKinds returns the subject kinds AWS's own scanner
@@ -888,3 +895,172 @@ type CloudPermission struct {
 }
 
 func (CloudPermission) TableName() string { return "cloud_permission" }
+
+/* ------------------------------ cloud_workload ---------------------------- */
+
+// Runtime kinds AWS discovery writes. Text in the schema, not an enum -- see
+// migration 015's header on why a new AWS compute service must not need a
+// migration.
+const (
+	WorkloadLambdaFunction     = "lambda_function"
+	WorkloadECSTaskDefinition  = "ecs_task_definition"
+	WorkloadEC2Instance        = "ec2_instance"
+	WorkloadBedrockAgent       = "bedrock_agent"
+	WorkloadBedrockAgentCoreRT = "bedrock_agentcore_runtime"
+)
+
+// CloudWorkload is compute that RUNS AS a cloud identity: a Lambda function, an
+// ECS task definition, an EC2 instance, a Bedrock agent.
+//
+// It is not an identity and not an agent. It is the observation that this
+// compute exists and runs as this role; whether it constitutes an agent is a
+// later judgement, and migration 015's header explains why that judgement is
+// deliberately not encoded here.
+type CloudWorkload struct {
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ConnectorID uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
+
+	// IdentityID is the role this compute runs as, nil when the workload could
+	// not be attributed to a role this scan discovered. Nil is a finding --
+	// compute nobody can tie to an identity -- not a broken row.
+	IdentityID *uuid.UUID `json:"identity_id,omitempty" gorm:"type:uuid"`
+
+	RuntimeKind string `json:"runtime_kind" gorm:"not null"`
+	NativeID    string `json:"native_id" gorm:"not null"`
+	Name        string `json:"name" gorm:"not null;default:''"`
+	// Region matters here in a way it never did for IAM: every service in this
+	// table is regional, and one name can be two workloads in two regions.
+	Region string          `json:"region" gorm:"not null;default:''"`
+	Attrs  json.RawMessage `json:"attrs" gorm:"type:jsonb;not null;default:'{}'"`
+
+	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
+	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt         time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+	RowUpdatedAt       time.Time `json:"row_updated_at" gorm:"not null;default:now()"`
+}
+
+func (CloudWorkload) TableName() string { return "cloud_workload" }
+
+// AWSWorkloadAttrs is the AWS shape of CloudWorkload.Attrs.
+//
+// Never holds a secret value. EnvVarNames exists because AWS returns Lambda
+// environment variable VALUES with the function and offers no way to ask for
+// names only -- the values are dropped at parse time and only the names reach
+// this struct.
+type AWSWorkloadAttrs struct {
+	// ExecutionRoleARN is ECS's executionRoleArn or a Lambda's role as reported
+	// by the service. For ECS this is deliberately NOT the identity: the task
+	// role is what the application acts as, and attributing container
+	// permissions to the execution role would report the wrong permissions.
+	ExecutionRoleARN string `json:"execution_role_arn,omitempty"`
+	// InstanceProfileARN is EC2 only. EC2 names an instance profile, a thin
+	// wrapper holding exactly one role, so resolving it costs an extra call.
+	InstanceProfileARN string `json:"instance_profile_arn,omitempty"`
+	// EnvVarNames are Lambda environment variable names. NEVER values.
+	EnvVarNames []string `json:"env_var_names,omitempty"`
+	// FoundationModel is the Bedrock agent's model id.
+	FoundationModel string `json:"foundation_model,omitempty"`
+	// Status is the provider's own lifecycle string, verbatim.
+	Status string `json:"status,omitempty"`
+	// UnresolvedRoleARN records a role the workload names that this scan could
+	// not find in inventory, so an unattributed row still says which role it
+	// was looking for.
+	UnresolvedRoleARN string `json:"unresolved_role_arn,omitempty"`
+}
+
+// AWSAttrs decodes the AWS attrs, returning the zero value on anything
+// unparseable rather than failing a read.
+func (w *CloudWorkload) AWSAttrs() AWSWorkloadAttrs {
+	var a AWSWorkloadAttrs
+	if len(w.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(w.Attrs, &a)
+	return a
+}
+
+// SetAWSAttrs encodes the AWS attrs.
+func (w *CloudWorkload) SetAWSAttrs(a AWSWorkloadAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	w.Attrs = raw
+	return nil
+}
+
+/* -------------------------------- cloud_usage ----------------------------- */
+
+// Where a usage row's evidence came from. The two support different claims:
+// service-last-accessed is per service, CloudTrail is per call.
+const (
+	UsageSourceServiceLastAccessed = "service_last_accessed"
+	UsageSourceCloudTrail          = "cloudtrail"
+)
+
+// CloudUsage is evidence that an identity actually exercised a service, as
+// opposed to merely being permitted to.
+//
+// The grain is (identity, service, source) because that is the grain AWS
+// reports -- see migration 016's header on why a per-action grain would be
+// invented precision.
+type CloudUsage struct {
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ConnectorID uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
+	IdentityID  uuid.UUID `json:"identity_id" gorm:"type:uuid;not null"`
+
+	// Service is the AWS namespace as AWS reports it: "s3", "dynamodb".
+	Service string `json:"service" gorm:"not null"`
+	// LastUsedAt nil means AWS reports the service was NEVER accessed in the
+	// tracking window. That is the most actionable row in the table, not
+	// missing data -- a service that could not be read produces no row at all.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Source     string     `json:"source" gorm:"not null;default:'service_last_accessed'"`
+	// GeneratedAt is when AWS produced the report, which can be materially
+	// older than the scan that stored it.
+	GeneratedAt *time.Time      `json:"generated_at,omitempty"`
+	Attrs       json.RawMessage `json:"attrs" gorm:"type:jsonb;not null;default:'{}'"`
+
+	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
+	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt         time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+	RowUpdatedAt       time.Time `json:"row_updated_at" gorm:"not null;default:now()"`
+}
+
+func (CloudUsage) TableName() string { return "cloud_usage" }
+
+/* --------------------------- cloud_scan_checkpoint ------------------------ */
+
+// Resumable scan phases. Free text in the schema -- see migration 017's header
+// on why an unrecognised phase must be inert rather than an error.
+const (
+	// ScanPhaseIdentityPolicies is the per-identity policy fetch: the phase
+	// that costs roughly seven calls per identity and dominates a large scan.
+	ScanPhaseIdentityPolicies = "identity_policies"
+	// ScanPhaseActivity is the per-identity service-last-accessed report job.
+	ScanPhaseActivity = "activity"
+)
+
+// ScanPhaseWorkloads names the per-region workload phase for one region.
+func ScanPhaseWorkloads(region string) string { return "workloads:" + region }
+
+// CloudScanCheckpoint records how far one phase of one scan attempt got, so an
+// interrupted scan resumes instead of repeating thousands of AWS calls.
+//
+// Cursor is the last item the phase finished, in that phase's deterministic
+// sort order. Resuming skips everything at or before it -- safe because those
+// items' rows were already written and stamped with this same generation.
+type CloudScanCheckpoint struct {
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;primaryKey"`
+	ConnectorID uuid.UUID `json:"connector_id" gorm:"type:uuid;primaryKey"`
+	Generation  int       `json:"generation" gorm:"primaryKey"`
+	Phase       string    `json:"phase" gorm:"primaryKey"`
+
+	Cursor    string    `json:"cursor" gorm:"not null;default:''"`
+	DoneCount int       `json:"done_count" gorm:"not null;default:0"`
+	UpdatedAt time.Time `json:"updated_at" gorm:"not null;default:now()"`
+}
+
+func (CloudScanCheckpoint) TableName() string { return "cloud_scan_checkpoint" }

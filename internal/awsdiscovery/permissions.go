@@ -69,6 +69,25 @@ func AdditionalPermissions() []Permission {
 			Redundant: true,
 		},
 		{
+			Surface: "workloads",
+			Actions: []string{
+				"lambda:ListFunctions",
+				"ecs:ListTaskDefinitions",
+				"ecs:DescribeTaskDefinition",
+				"ec2:DescribeInstances",
+				"iam:GetInstanceProfile",
+			},
+			Why: "Discovers the compute that runs as each role -- Lambda " +
+				"functions, ECS task definitions and EC2 instances -- so a " +
+				"role's permissions can be attributed to something that " +
+				"actually runs. iam:GetInstanceProfile resolves the wrapper " +
+				"EC2 names instead of a role. Lambda environment variable " +
+				"NAMES are recorded and values are discarded at parse time; " +
+				"no IAM action grants the names alone, so that one is " +
+				"enforced in code.",
+			Redundant: true,
+		},
+		{
 			Surface: "bedrock-agents",
 			Actions: []string{"bedrock:ListAgents", "bedrock:GetAgent"},
 			Why: "Discovers AWS-native managed agents and the execution role each " +
