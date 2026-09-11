@@ -295,22 +295,26 @@ func (IGADurableJob) TableName() string { return "iga_durable_jobs" }
 // built from immutable identifiers. Locator (owner/name/path) is descriptive:
 // a rename changes the locator and must NOT create a new object.
 type IGASourceObject struct {
-	ID                uuid.UUID       `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID       uuid.UUID       `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	IntegrationID     uuid.UUID       `json:"integration_id" gorm:"type:uuid;not null"`
-	ObjectType        string          `json:"object_type" gorm:"not null"`
-	RecognitionKey    string          `json:"recognition_key" gorm:"not null"`
-	NativeID          string          `json:"native_id" gorm:"not null;default:''"`
-	Locator           json.RawMessage `json:"locator" gorm:"type:jsonb;not null;default:'{}'"`
-	NormalizedPayload json.RawMessage `json:"normalized_payload" gorm:"type:jsonb;not null;default:'{}'"`
-	RawHash           string          `json:"raw_hash" gorm:"not null;default:''"`
-	SourceVersion     string          `json:"source_version" gorm:"not null;default:''"`
-	SourceSubjectKey  string          `json:"source_subject_key" gorm:"not null;default:''"`
-	ScanGeneration    *int64          `json:"scan_generation,omitempty"`
-	Lifecycle         string          `json:"lifecycle" gorm:"not null;default:'active'"`
-	FirstSeenAt       time.Time       `json:"first_seen_at"`
-	LastSeenAt        time.Time       `json:"last_seen_at"`
-	TombstonedAt      *time.Time      `json:"tombstoned_at,omitempty"`
+	ID            uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID   uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	IntegrationID uuid.UUID `json:"integration_id" gorm:"type:uuid;not null"`
+	// IntegrationScopeID is where this object was observed. NULL on rows written
+	// before migration 018, which makes them permanently ineligible for the
+	// absence sweep rather than sweepable on a guess.
+	IntegrationScopeID *uuid.UUID      `json:"integration_scope_id,omitempty" gorm:"type:uuid"`
+	ObjectType         string          `json:"object_type" gorm:"not null"`
+	RecognitionKey     string          `json:"recognition_key" gorm:"not null"`
+	NativeID           string          `json:"native_id" gorm:"not null;default:''"`
+	Locator            json.RawMessage `json:"locator" gorm:"type:jsonb;not null;default:'{}'"`
+	NormalizedPayload  json.RawMessage `json:"normalized_payload" gorm:"type:jsonb;not null;default:'{}'"`
+	RawHash            string          `json:"raw_hash" gorm:"not null;default:''"`
+	SourceVersion      string          `json:"source_version" gorm:"not null;default:''"`
+	SourceSubjectKey   string          `json:"source_subject_key" gorm:"not null;default:''"`
+	ScanGeneration     *int64          `json:"scan_generation,omitempty"`
+	Lifecycle          string          `json:"lifecycle" gorm:"not null;default:'active'"`
+	FirstSeenAt        time.Time       `json:"first_seen_at"`
+	LastSeenAt         time.Time       `json:"last_seen_at"`
+	TombstonedAt       *time.Time      `json:"tombstoned_at,omitempty"`
 }
 
 func (IGASourceObject) TableName() string { return "iga_source_objects" }

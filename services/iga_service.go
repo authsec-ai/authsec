@@ -195,6 +195,16 @@ func NewIGAManager(repo repositories.IGARepository, provider IGAProvider, instal
 	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog(), installs: installs}
 }
 
+// scopeIDPtr keeps a zero uuid out of the column: an unset scope must read as
+// NULL (and therefore stay unsweepable) rather than as a scope that does not
+// exist.
+func scopeIDPtr(id uuid.UUID) *uuid.UUID {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &id
+}
+
 const normalizerVersion = "0.1.0"
 
 func mustJSON(v interface{}) json.RawMessage {
@@ -440,7 +450,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 				m.degrade(workspaceID, integ.ID, mark(models.ClassAgentProfile), scope, "agent_profile", err, report)
 			} else {
 				for _, o := range objs {
-					m.ingest(workspaceID, integ, run, scope, o, models.ClassAgentProfile, report)
+					m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassAgentProfile, report)
 					mark(models.ClassAgentProfile).inspected++
 				}
 			}
@@ -452,7 +462,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 			m.degrade(workspaceID, integ.ID, mark(models.ClassAppInstallation), scope, "app_installation", err, report)
 		} else {
 			for _, o := range objs {
-				m.ingest(workspaceID, integ, run, scope, o, models.ClassAppInstallation, report)
+				m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassAppInstallation, report)
 				mark(models.ClassAppInstallation).inspected++
 			}
 		}
@@ -493,7 +503,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 					m.degrade(workspaceID, integ.ID, mark(models.ClassSBOMComponent), scope, "sbom_component", err, report)
 				} else {
 					for _, o := range sbom {
-						m.ingest(workspaceID, integ, run, scope, o, models.ClassSBOMComponent, report)
+						m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassSBOMComponent, report)
 						mark(models.ClassSBOMComponent).inspected++
 					}
 				}
@@ -618,7 +628,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 						}
 						// raw_hash = the provider blob SHA, so the next scan can
 						// diff the tree listing against it without fetching.
-						m.ingestWithRule(workspaceID, integ, run, scope, obj,
+						m.ingestWithRule(workspaceID, integ, run, scopeID, scope, obj,
 							models.ClassRepoDeclaration, rule, e.SHA, report)
 						c.inspected++
 					}
@@ -680,14 +690,30 @@ func maxDisappearanceRatio() float64 {
 	return defaultMaxDisappearanceRatio
 }
 
-// sweepAbsent tombstones objects that a complete, authoritative enumeration did
-// not see. Objects in partial or failed scopes are left alone — "we could not
-// look" is not "it is gone".
+// sweepAbsent retires objects that a complete, authoritative enumeration did
+// not see — and only within the scopes that were actually complete.
+//
+// THE DEFECT THIS REPLACES. Completeness was collected into a set keyed by
+// object CLASS alone, so one scope reporting complete marked the whole class
+// complete, and the sweep then ran integration-wide. A repository returning 403
+// had its objects tombstoned on the strength of a different repository's
+// successful read. The mass-disappearance guard did not catch it: a quarter of
+// the inventory vanishing stays under the threshold, so the inventory shrank
+// silently.
+//
+// Completeness is a property of a (scope, class) pair, because that is the unit
+// a provider actually succeeds or fails at. "We could not look" must never
+// become "it is gone", and that only holds if the thing we could not look at is
+// the thing we decline to delete.
 func (m *igaManager) sweepAbsent(workspaceID, integrationID uuid.UUID, generation int64, coverage []models.IGACoverageState) (int, error) {
-	complete := map[string]bool{}
+	type scopeClass struct {
+		scopeID uuid.UUID
+		class   string
+	}
+	complete := map[scopeClass]bool{}
 	for _, c := range coverage {
-		if c.State == models.CoverageComplete {
-			complete[c.ObjectClass] = true
+		if c.State == models.CoverageComplete && c.IntegrationScopeID != uuid.Nil {
+			complete[scopeClass{c.IntegrationScopeID, c.ObjectClass}] = true
 		}
 	}
 	if len(complete) == 0 {
@@ -695,31 +721,37 @@ func (m *igaManager) sweepAbsent(workspaceID, integrationID uuid.UUID, generatio
 	}
 
 	total := 0
-	for class := range complete {
-		alive, missing, err := m.repo.CountGenerationDrift(workspaceID, integrationID, class, generation)
+	for sc := range complete {
+		alive, missing, err := m.repo.CountGenerationDrift(
+			workspaceID, integrationID, sc.scopeID, sc.class, generation)
 		if err != nil {
 			return total, err
 		}
 		if missing == 0 {
 			continue
 		}
+		// The guard now compares populations from the SAME scope, which is the
+		// only comparison that means anything: a scope losing most of its
+		// objects is a signal, a scope losing most of the integration's objects
+		// is arithmetic about unrelated things.
 		if alive+missing > 0 {
 			ratio := float64(missing) / float64(alive+missing)
 			if ratio > maxDisappearanceRatio() {
 				now := time.Now()
 				_ = m.repo.RecordIssue(&models.IGAOperationalIssue{
 					ID: uuid.New(), WorkspaceID: workspaceID, IntegrationID: &integrationID,
-					IssueKind: "api_failure", Severity: "critical", ObjectClass: class,
+					IssueKind: "api_failure", Severity: "critical", ObjectClass: sc.class,
+					ScopeRef: sc.scopeID.String(),
 					Detail: mustJSON(map[string]interface{}{
-						"reason":  "mass disappearance guard tripped; nothing tombstoned",
-						"missing": missing, "alive": alive,
+						"reason":  "mass disappearance guard tripped; nothing tombstoned in this scope",
+						"missing": missing, "alive": alive, "scope_id": sc.scopeID,
 					}),
 					FirstSeenAt: now, LastSeenAt: now,
 				})
 				continue
 			}
 		}
-		n, err := m.repo.TombstoneAbsent(workspaceID, integrationID, class, generation)
+		n, err := m.repo.TombstoneAbsent(workspaceID, integrationID, sc.scopeID, sc.class, generation)
 		if err != nil {
 			return total, err
 		}
@@ -959,8 +991,8 @@ func (m *igaManager) findPriorHash(workspaceID, integrationID uuid.UUID, recogni
 // everything else. So the lane gets a synthetic identity naming the provider as
 // the source of the claim, versioned with the catalogue so a reader can still
 // tell which vintage produced it.
-func (m *igaManager) ingest(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, o ProviderObject, class string, report *ScanReport) {
-	m.ingestWithRule(workspaceID, integ, run, scope, o, class, providerNativeRule(class, m.catalog.Version), "", report)
+func (m *igaManager) ingest(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scopeID uuid.UUID, scope ProviderScope, o ProviderObject, class string, report *ScanReport) {
+	m.ingestWithRule(workspaceID, integ, run, scopeID, scope, o, class, providerNativeRule(class, m.catalog.Version), "", report)
 }
 
 // providerNativeRule is the synthetic identity for a provider-declared object.
@@ -990,7 +1022,7 @@ func (m *igaManager) touchSourceObject(workspaceID uuid.UUID, integ *models.IGAI
 // ingestWithRule writes source object -> observation -> (maybe) candidate.
 // Order is deliberate and is the projection rule: evidence lands first, and
 // only then may anything be proposed or promoted.
-func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, o ProviderObject, class string, rule IGARule, rawHash string, report *ScanReport) {
+func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scopeID uuid.UUID, scope ProviderScope, o ProviderObject, class string, rule IGARule, rawHash string, report *ScanReport) {
 	now := time.Now()
 	recognition := o.NativeID
 	if recognition == "" {
@@ -998,12 +1030,16 @@ func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAInte
 	}
 
 	src := &models.IGASourceObject{
-		ID:             uuid.New(),
-		WorkspaceID:    workspaceID,
-		IntegrationID:  integ.ID,
-		ObjectType:     class,
-		RecognitionKey: recognition,
-		NativeID:       o.NativeID,
+		// The scope this object was seen in. Without it the absence sweep cannot
+		// tell which objects belonged to the scope it actually read, and one
+		// scope's success licenses deleting another scope's inventory.
+		IntegrationScopeID: scopeIDPtr(scopeID),
+		ID:                 uuid.New(),
+		WorkspaceID:        workspaceID,
+		IntegrationID:      integ.ID,
+		ObjectType:         class,
+		RecognitionKey:     recognition,
+		NativeID:           o.NativeID,
 		// Locator is descriptive: a rename changes this, never the identity.
 		Locator:           mustJSON(map[string]interface{}{"scope": scope.DisplayName, "name": o.DisplayName}),
 		NormalizedPayload: mustJSON(o.Payload),

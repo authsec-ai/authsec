@@ -124,8 +124,8 @@ type IGARepository interface {
 	// Deletion safety. CountGenerationDrift reports how many objects the latest
 	// authoritative generation saw versus missed, so the caller can refuse to
 	// tombstone when too many vanish at once.
-	CountGenerationDrift(workspaceID, integrationID uuid.UUID, objectType string, generation int64) (alive, missing int64, err error)
-	TombstoneAbsent(workspaceID, integrationID uuid.UUID, objectType string, generation int64) (int, error)
+	CountGenerationDrift(workspaceID, integrationID, scopeID uuid.UUID, objectType string, generation int64) (alive, missing int64, err error)
+	TombstoneAbsent(workspaceID, integrationID, scopeID uuid.UUID, objectType string, generation int64) (int, error)
 
 	// Attribute survivorship.
 	GetSurvivingAttribute(workspaceID uuid.UUID, entityKind string, entityID uuid.UUID, attribute string) (*models.IGAAttributeValue, error)
@@ -788,11 +788,19 @@ func (r *igaRepository) ListIssues(workspaceID uuid.UUID, integrationID *uuid.UU
 
 /* --------------------------- deletion safety --------------------------- */
 
-func (r *igaRepository) CountGenerationDrift(workspaceID, integrationID uuid.UUID, objectType string, generation int64) (int64, int64, error) {
+// CountGenerationDrift counts, WITHIN ONE SCOPE, what the current generation
+// saw and what it did not.
+//
+// The scope is required. Counting across the whole integration is what let one
+// scope's successful read supply the denominator for another scope's untouched
+// objects, so the mass-disappearance guard compared the wrong populations and
+// waved a deletion through.
+func (r *igaRepository) CountGenerationDrift(workspaceID, integrationID, scopeID uuid.UUID, objectType string, generation int64) (int64, int64, error) {
 	var alive, missing int64
 	base := r.db.Model(&models.IGASourceObject{}).
-		Where("workspace_id = ? AND integration_id = ? AND object_type = ? AND lifecycle = ?",
-			workspaceID, integrationID, objectType, models.LifecycleActive)
+		Where(`workspace_id = ? AND integration_id = ? AND integration_scope_id = ?
+		       AND object_type = ? AND lifecycle = ?`,
+			workspaceID, integrationID, scopeID, objectType, models.LifecycleActive)
 	if err := base.Session(&gorm.Session{}).
 		Where("scan_generation = ?", generation).Count(&alive).Error; err != nil {
 		return 0, 0, err
@@ -804,12 +812,22 @@ func (r *igaRepository) CountGenerationDrift(workspaceID, integrationID uuid.UUI
 	return alive, missing, nil
 }
 
-func (r *igaRepository) TombstoneAbsent(workspaceID, integrationID uuid.UUID, objectType string, generation int64) (int, error) {
+// TombstoneAbsent retires objects a complete enumeration OF THIS SCOPE did not
+// see.
+//
+// Scoped, and deliberately unable to match a NULL scope. A row with no recorded
+// scope predates migration 018 and cannot be shown to belong to the scope that
+// was just read, so it is never swept here; it becomes eligible once a scan
+// re-observes it and records where it lives. SQL equality with NULL is never
+// true, which gives that behaviour for free — but it is load-bearing, not
+// incidental, so it is stated here.
+func (r *igaRepository) TombstoneAbsent(workspaceID, integrationID, scopeID uuid.UUID, objectType string, generation int64) (int, error) {
 	now := time.Now()
 	res := r.db.Model(&models.IGASourceObject{}).
-		Where(`workspace_id = ? AND integration_id = ? AND object_type = ? AND lifecycle = ?
+		Where(`workspace_id = ? AND integration_id = ? AND integration_scope_id = ?
+		       AND object_type = ? AND lifecycle = ?
 		       AND (scan_generation IS NULL OR scan_generation < ?)`,
-			workspaceID, integrationID, objectType, models.LifecycleActive, generation).
+			workspaceID, integrationID, scopeID, objectType, models.LifecycleActive, generation).
 		Updates(map[string]interface{}{
 			"lifecycle": models.LifecycleTombstoned, "tombstoned_at": now,
 		})

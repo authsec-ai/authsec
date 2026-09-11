@@ -206,7 +206,7 @@ func ownedInstall(ids ...string) fakeInstalls {
 func suiteInstalls() fakeInstalls {
 	return ownedInstall(
 		"inst-1", "inst-scan", "inst-decide", "inst-hook",
-		"inst-access", "inst-delete", "inst-ckpt", "inst-page",
+		"inst-access", "inst-delete", "inst-ckpt", "inst-page", "inst-denied",
 	)
 }
 
