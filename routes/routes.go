@@ -326,6 +326,68 @@ func SetupRoutes(
 	}
 
 	// ════════════════════════════════════════════════════════
+	// Azure onboarding
+	// ════════════════════════════════════════════════════════
+	//
+	// Consent the AuthSec Entra application into the tenants an operator can
+	// see, and check whether that consent bought ARM Reader. Onboarding only —
+	// no identity scan, no permissions, no access graph.
+	//
+	// WHY /api/azure AND NOT /authsec/discovery/azure. The callback path is
+	// fixed by the redirect URI registered on the Entra application; Microsoft
+	// will not redirect anywhere else. The rest of the flow is grouped with it.
+	//
+	// WHY login AND callback SIT OUTSIDE THE AUTHENTICATED GROUP. Both are
+	// top-level browser navigations — a redirect from Microsoft cannot carry a
+	// bearer token, so AuthMiddleware would reject the callback every time. They
+	// are authorised by the one-shot azure_oauth_state row instead, which is
+	// also the only place the workspace and the consented tenant are read from.
+	// Same reasoning as the GitHub webhook above.
+	{
+		azureOnboard := platformCtrl.NewAzureOnboardController(config.DB)
+
+		// Browser-facing, unauthenticated, rate limited.
+		r.GET("/api/azure/login",
+			middlewares.StrictAuthRateLimitMiddleware(30, time.Minute),
+			azureOnboard.Login)
+		r.GET("/api/azure/callback",
+			middlewares.StrictAuthRateLimitMiddleware(30, time.Minute),
+			azureOnboard.Callback)
+
+		// Console-facing. Ordinary fetch calls, so they authenticate and RBAC
+		// check exactly like the AWS discovery routes.
+		azureAPI := r.Group("/api/azure")
+		azureAPI.Use(middlewares.AuthMiddleware())
+		{
+			azureAPI.GET("/tenants", middlewares.Require("discovery", "read"), azureOnboard.ListTenants)
+			azureAPI.POST("/consent", middlewares.Require("discovery", "admin"), azureOnboard.StartConsent)
+			azureAPI.POST("/validate-arm", middlewares.Require("discovery", "admin"), azureOnboard.ValidateARM)
+			azureAPI.POST("/reader-setup", middlewares.Require("discovery", "read"), azureOnboard.ReaderSetup)
+			azureAPI.POST("/assign-reader", middlewares.Require("discovery", "admin"), azureOnboard.AssignReader)
+			azureAPI.POST("/validate-graph", middlewares.Require("discovery", "admin"), azureOnboard.ValidateGraph)
+			azureAPI.GET("/subscriptions", middlewares.Require("discovery", "read"), azureOnboard.ListSubscriptions)
+			// The operator's own ARM view, so a console can offer WHICH
+			// subscriptions to grant Reader on. Reports, never grants.
+			azureAPI.GET("/available-subscriptions", middlewares.Require("discovery", "read"), azureOnboard.AvailableSubscriptions)
+			azureAPI.GET("/config", middlewares.Require("discovery", "read"), azureOnboard.ConfigStatus)
+			// Submitting the application is a write that changes which Entra
+			// identity this workspace acts as, so it needs admin, not read.
+			azureAPI.POST("/config", middlewares.Require("discovery", "admin"), azureOnboard.SetAppConfig)
+			// Taking the application back out. admin, like submitting it.
+			azureAPI.DELETE("/config", middlewares.Require("discovery", "admin"), azureOnboard.DeleteAppConfig)
+			// Returns a username, never a credential. read is the right scope.
+			azureAPI.POST("/signin-name", middlewares.Require("discovery", "read"), azureOnboard.ResolveSignInName)
+			// One sign-in that consents AND assigns Reader. admin, because
+			// completing it writes a connector row -- which is also why this
+			// state cannot be minted from the unauthenticated /login route.
+			azureAPI.POST("/auto-setup", middlewares.Require("discovery", "admin"), azureOnboard.StartAutoSetup)
+			// Progress of that background run. Reports only.
+			azureAPI.GET("/setup-status", middlewares.Require("discovery", "read"), azureOnboard.SetupStatus)
+			azureAPI.GET("/app/check", middlewares.Require("discovery", "read"), azureOnboard.CheckAppRegistration)
+			azureAPI.GET("/connectors", middlewares.Require("discovery", "read"), azureOnboard.ListConnectors)
+		}
+	}
+	// ════════════════════════════════════════════════════════
 	// ALL ROUTES UNDER /authsec
 	// ════════════════════════════════════════════════════════
 	authsec := r.Group("/authsec")

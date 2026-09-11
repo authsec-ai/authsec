@@ -5900,3 +5900,217 @@ CREATE INDEX IF NOT EXISTS idx_cloud_permission_identity
 
 CREATE INDEX IF NOT EXISTS idx_cloud_permission_resource
     ON public.cloud_permission (resource_id) WHERE resource_id IS NOT NULL;
+
+
+-- ==========================================================================
+-- Azure onboarding (see 015_azure_connectors.sql for the full rationale)
+-- ==========================================================================
+--
+-- Azure onboarding: which Entra tenants this workspace has admin-consented the
+-- AuthSec application into, and whether that consent actually bought ARM read
+-- access.
+--
+-- WHY THIS IS NOT cloud_connector. cloud_connector records a proven read-only
+-- connection to one cloud scope and is the row every AWS scan resolves against.
+-- Azure onboarding is a step earlier and a different shape: an operator signs in
+-- with their own Azure work account, AuthSec lists the tenants THAT PERSON can
+-- see, and each selected tenant is admin-consented separately. Until ARM Reader
+-- is assigned there is nothing to scan, so writing a cloud_connector row here
+-- would claim a working connection that does not exist yet. This table is the
+-- consent ledger; promoting a tenant to a cloud_connector is a later ticket.
+--
+-- WHY workspace_id, WHEN THE SPEC SAID tenant_id UNIQUE. Every data operation in
+-- this codebase is workspace-scoped unless the object is platform-global, and an
+-- Entra tenant is emphatically not platform-global -- two workspaces in the same
+-- deployment onboarding the same tenant must not see each other's rows. The
+-- uniqueness the spec asked for is preserved as UNIQUE (workspace_id,
+-- tenant_id), the same shape cloud_connector uses for (workspace_id, provider,
+-- scope_id).
+--
+-- WHY arm_reader_ok STARTS false. Consent alone never means access, so a tenant
+-- is not usable the moment it is consented -- it is usable when an ARM Reader
+-- check has actually passed. Starting at false makes "complete" a single
+-- condition: a row exists AND arm_reader_ok is true. The "never checked" case is
+-- not lost; arm_checked_at IS NULL still says it, and arm_last_error says why a
+-- check failed.
+
+CREATE TABLE IF NOT EXISTS public.azure_connectors (
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id   uuid NOT NULL REFERENCES public.workspaces (id) ON DELETE CASCADE,
+
+    -- The Entra tenant (directory) id. From the ARM tenant list or the verified
+    -- admin-consent callback state, never from a caller-supplied body.
+    tenant_id      text NOT NULL,
+
+    -- Both come from the ARM tenant list and are display sugar. Nullable because
+    -- ARM omits them for tenants the signed-in account can see but has no
+    -- directory read on.
+    display_name   text,
+    domain         text,
+
+    -- When admin consent last completed for this tenant. Refreshed on re-consent.
+    consented_at   timestamptz,
+
+    -- false until an ARM Reader check actually succeeds. Onboarding is complete
+    -- only when a row exists AND this is true.
+    arm_reader_ok  boolean NOT NULL DEFAULT false,
+
+    -- NULL here is what still distinguishes "never checked" from "checked and
+    -- refused", now that arm_reader_ok itself no longer carries that.
+    arm_checked_at timestamptz,
+    arm_last_error text,
+
+    -- Object id of the AuthSec service principal INSIDE the customer's tenant.
+    -- Created by admin consent, so unknown until then, and read from the oid
+    -- claim of an app-only token rather than from Graph -- which keeps the
+    -- promise that this flow never calls /servicePrincipals. It is what an
+    -- Azure RBAC role assignment must name; the application (client) id does
+    -- not work there.
+    principal_object_id text,
+
+    -- Plane 1, the Entra side. graph_ok is to admin consent what arm_reader_ok
+    -- is to a role assignment: consent granting nothing is a real, observed
+    -- state, so it is verified rather than assumed. graph_granted_roles keeps
+    -- the roles claim verbatim so a missing permission can be named.
+    graph_ok            boolean NOT NULL DEFAULT false,
+    graph_checked_at    timestamptz,
+    graph_last_error    text,
+    graph_granted_roles text[] NOT NULL DEFAULT '{}',
+
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT azure_connectors_tenant_uq UNIQUE (workspace_id, tenant_id),
+    CONSTRAINT azure_connectors_tenant_id_chk CHECK (tenant_id <> '')
+);
+
+CREATE INDEX IF NOT EXISTS idx_azure_connectors_workspace
+    ON public.azure_connectors (workspace_id);
+
+-- One-shot OAuth state for the two browser redirects this flow performs.
+--
+-- WHY A TABLE AND NOT A LITERAL STRING. The state parameter is the only thing
+-- standing between this flow and a forged callback: the browser arrives at
+-- /api/azure/callback from Microsoft with query parameters an attacker can also
+-- produce. A fixed literal like state=login is not validatable -- anyone can
+-- send it. A row here makes the state unguessable, single-use (deleted on
+-- redemption), expiring, and -- the part that matters most -- the ONLY place the
+-- workspace and the consented tenant are read from. The tenant query parameter
+-- Microsoft appends is compared against this row and never trusted alone.
+--
+-- Mirrors connector_oauth_state, which does the same job for the connector
+-- broker's OAuth providers.
+CREATE TABLE IF NOT EXISTS public.azure_oauth_state (
+    state        text PRIMARY KEY,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces (id) ON DELETE CASCADE,
+
+    -- 'login'   -- delegated sign-in, returns an ARM token for the tenant list.
+    -- 'consent' -- admin consent for one tenant, named in tenant_id.
+    purpose      text NOT NULL,
+    tenant_id    text,
+
+    created_by   text,
+    expires_at   timestamptz NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT azure_oauth_state_purpose_chk CHECK (purpose IN ('login', 'consent')),
+
+    -- A consent redirect must name a tenant; a login redirect must not. Written
+    -- against emptiness rather than NULL because the Go model types tenant_id as
+    -- a plain string: GORM sends '' for a login state, not NULL, so a bare
+    -- IS NOT NULL test would reject every sign-in.
+    CONSTRAINT azure_oauth_state_consent_tenant_chk CHECK (
+        (purpose = 'consent') = (tenant_id IS NOT NULL AND tenant_id <> '')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_azure_oauth_state_expires
+    ON public.azure_oauth_state (expires_at);
+
+CREATE TABLE IF NOT EXISTS public.azure_subscriptions (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    uuid NOT NULL,
+    tenant_id       text NOT NULL,
+
+    -- Unique within a tenant, and globally unique in practice, but never
+    -- treated as sufficient on its own: the tenant is what says whose
+    -- subscription this is and which credential may read it.
+    subscription_id text NOT NULL,
+
+    display_name    text,
+
+    -- Azure's own word: Enabled, Warned, PastDue, Disabled, Deleted.
+    -- Open text rather than a CHECK enum -- this mirrors a vendor's vocabulary
+    -- and a new value must not fail an insert.
+    state           text,
+
+    -- Per subscription, because Reader is assigned per scope. A tenant is only
+    -- fully covered when every subscription reads true; anything less is
+    -- partial and must not present as an all-clear.
+    reader_ok         boolean NOT NULL DEFAULT false,
+    reader_checked_at timestamptz,
+
+    -- When ARM last returned this subscription. A subscription that stops being
+    -- returned has been removed, renamed out of scope, or lost its role
+    -- assignment -- distinguishable only if the last sighting is recorded.
+    last_seen_at    timestamptz NOT NULL DEFAULT now(),
+
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT azure_subscriptions_uq UNIQUE (workspace_id, tenant_id, subscription_id),
+    CONSTRAINT azure_subscriptions_subscription_id_chk CHECK (subscription_id <> ''),
+
+    -- Composite FK to the connector, not to workspaces: it is what makes the
+    -- tenant relationship structural rather than conventional, and it cascades
+    -- so a revoked tenant does not leave orphaned subscriptions behind.
+    CONSTRAINT azure_subscriptions_connector_fk
+        FOREIGN KEY (workspace_id, tenant_id)
+        REFERENCES public.azure_connectors (workspace_id, tenant_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_tenant
+    ON public.azure_subscriptions (workspace_id, tenant_id);
+
+CREATE INDEX IF NOT EXISTS idx_azure_subscriptions_reader
+    ON public.azure_subscriptions (workspace_id, reader_ok);
+
+-- Mirrored from 017_azure_app_config.sql. Every other azure_* table is here,
+-- and this one being absent means a deployment built from the bootstrap has no
+-- azure_app_config at all -- so POST /api/azure/config, the first step of
+-- onboarding, fails on a fresh install while working everywhere it was
+-- migrated. See 017 for why the secret is a Vault path rather than a column.
+CREATE TABLE IF NOT EXISTS public.azure_app_config (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL REFERENCES public.workspaces (id) ON DELETE CASCADE,
+
+    -- Application (client) id. Not a secret: it appears in every authorize URL.
+    client_id     text NOT NULL,
+
+    -- The directory the registration was created in. An application object
+    -- exists only there, so reading it back is possible only there.
+    home_tenant   text NOT NULL,
+
+    -- Must match a redirect URI registered on the application EXACTLY, or
+    -- Microsoft refuses with AADSTS50011 before a password is typed.
+    redirect_uri  text NOT NULL,
+
+    -- Vault path holding {"client_secret": "..."}. A path, never a value.
+    auth_ref      text NOT NULL,
+
+    created_by    text,
+    checked_at    timestamptz,
+
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+
+    -- One application per workspace. Replacing it is an UPDATE, not a second
+    -- row, so there is never an ambiguous "which app is this workspace using".
+    CONSTRAINT azure_app_config_workspace_uq UNIQUE (workspace_id),
+    CONSTRAINT azure_app_config_client_id_chk    CHECK (client_id <> ''),
+    CONSTRAINT azure_app_config_home_tenant_chk  CHECK (home_tenant <> ''),
+    CONSTRAINT azure_app_config_redirect_uri_chk CHECK (redirect_uri <> ''),
+    CONSTRAINT azure_app_config_auth_ref_chk     CHECK (auth_ref <> '')
+);
+
