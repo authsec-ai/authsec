@@ -52,7 +52,45 @@ func NewAzureOnboardController(db *gorm.DB) *AzureOnboardController {
 // navigation that must carry it.
 const azureSessionCookie = "authsec_azure_session"
 
+// SESSION_SECRET is an OPTIONAL override. Left unset -- which is the normal
+// case -- the cookie key is derived from JWT_SECRET, which every deployment
+// already has.
 const azureSessionSecretEnv = "SESSION_SECRET"
+
+// azureSessionKeyPurpose separates this key from every other use of
+// JWT_SECRET. Two keys derived with different labels cannot be substituted for
+// one another, so a signature valid for one is meaningless to the other -- the
+// cookie key cannot mint a JWT, and the JWT key cannot forge a cookie.
+const azureSessionKeyPurpose = "authsec/azure-session-cookie/v1"
+
+// azureSessionKey is the key the Azure sign-in cookie is signed with.
+//
+// It used to be SESSION_SECRET alone, a variable this feature introduced and
+// nothing else in the codebase reads. That made a new deployment secret to
+// generate, distribute and rotate for one cookie in one feature -- and an
+// operator who had done every part of the Azure setup correctly still stopped
+// at the end on a variable they had never been asked for.
+//
+// So it is derived from JWT_SECRET instead, which is already required and
+// already the deployment's signing secret. HMAC with a purpose label gives a
+// key that is independent of the JWT key rather than the same bytes used
+// twice. SESSION_SECRET still wins when set, for deployments that already
+// configured one and for anyone who wants the two blast radii separate.
+func azureSessionKey() []byte {
+	if s := strings.TrimSpace(os.Getenv(azureSessionSecretEnv)); len(s) >= 32 {
+		return []byte(s)
+	}
+	root := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+	if root == "" {
+		// Nothing to derive from. Returning a key built from an empty secret
+		// would sign cookies anyone could forge, so return none and let the
+		// caller refuse to issue one.
+		return nil
+	}
+	mac := hmac.New(sha256.New, []byte(root))
+	mac.Write([]byte(azureSessionKeyPurpose))
+	return mac.Sum(nil)
+}
 
 // service builds the onboarding service, or explains why it cannot.
 func (ctl *AzureOnboardController) service() (*services.AzureOnboardService, error) {
@@ -159,7 +197,7 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 			certPEM, certThumb = svc.CurrentCertificatePEM(workspaceID)
 		}
 	}
-	sessionSet := len(strings.TrimSpace(os.Getenv(azureSessionSecretEnv))) >= 32
+	sessionSet := len(azureSessionKey()) > 0
 	vaultSet := os.Getenv("VAULT_ADDR") != "" && os.Getenv("VAULT_TOKEN") != ""
 
 	missing := []string{}
@@ -173,7 +211,7 @@ func (ctl *AzureOnboardController) ConfigStatus(c *gin.Context) {
 		missing = append(missing, "redirect uri")
 	}
 	if !sessionSet {
-		missing = append(missing, "SESSION_SECRET (32+ chars)")
+		missing = append(missing, "JWT_SECRET (or SESSION_SECRET, 32+ chars)")
 	}
 	if !vaultSet {
 		missing = append(missing, "VAULT_ADDR/VAULT_TOKEN")
@@ -573,14 +611,15 @@ func (ctl *AzureOnboardController) Callback(c *gin.Context) {
 	}
 
 	if res.Step == "logged_in" {
-		secret := []byte(os.Getenv(azureSessionSecretEnv))
+		secret := azureSessionKey()
 		if len(secret) == 0 {
 			// The token is already stored; without a way to hand the operator a
 			// tamper-evident handle it cannot be used, so say so rather than
 			// issuing an unprotected cookie.
 			svc.EndSession(res.WorkspaceID, res.SessionID)
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "SESSION_SECRET is not configured on this deployment",
+				"error": "neither JWT_SECRET nor SESSION_SECRET is configured on this " +
+					"deployment, so the sign-in cookie cannot be signed",
 			})
 			return
 		}
@@ -1161,7 +1200,7 @@ func (ctl *AzureOnboardController) sessionFromCookie(c *gin.Context) (string, bo
 	if err != nil || raw == "" {
 		return "", false
 	}
-	secret := []byte(os.Getenv(azureSessionSecretEnv))
+	secret := azureSessionKey()
 	if len(secret) == 0 {
 		return "", false
 	}
