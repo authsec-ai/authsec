@@ -15,7 +15,7 @@ import (
 func TestIGAAccessGraph(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-access")
 	integ := verifiedIntegration(t, mgr, ws, "inst-access")
@@ -140,7 +140,7 @@ func TestIGADeletionSafety(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
 	fx := fixtures()
-	mgr := services.NewIGAManager(repo, fx)
+	mgr := services.NewIGAManager(repo, fx, suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-delete")
 	integ := verifiedIntegration(t, mgr, ws, "inst-delete")
@@ -187,7 +187,7 @@ func TestIGADeletionSafety(t *testing.T) {
 func TestIGACheckpointsAndSurvivorship(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-ckpt")
 	integ := verifiedIntegration(t, mgr, ws, "inst-ckpt")
@@ -232,7 +232,7 @@ func TestIGACheckpointsAndSurvivorship(t *testing.T) {
 func TestIGACursorPagination(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-page")
 	integ := verifiedIntegration(t, mgr, ws, "inst-page")

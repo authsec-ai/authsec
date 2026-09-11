@@ -334,7 +334,9 @@ func (ctl *DiscoveryGitHubController) AddOrganisation(c *gin.Context) {
 		return
 	}
 
-	iga := services.NewIGAManager(repositories.NewIGARepository(ctl.db), nil)
+	// The same oauth service that just proved ownership above is handed to the
+	// manager, so its independent re-check uses this workspace's App key too.
+	iga := services.NewIGAManager(repositories.NewIGARepository(ctl.db), nil, oauth)
 
 	integ, err := iga.CreateIntegration(workspaceID, actor, services.IntegrationInput{
 		Provider:          "github",
@@ -352,14 +354,14 @@ func (ctl *DiscoveryGitHubController) AddOrganisation(c *gin.Context) {
 		return
 	}
 
-	// Both accounts come from GitHub's own answer above, so the match is not a
-	// formality being satisfied — it is the statement that this installation was
-	// reachable with this workspace's App key.
+	// The account passed here came from GitHub's own answer above, so it is a
+	// claim we already believe. VerifyIntegration re-confirms it against the
+	// provider independently rather than trusting this call site: binding must
+	// be safe no matter which caller reaches it, and this path is no longer the
+	// only one that enumerates.
 	verified, err := iga.VerifyIntegration(workspaceID, integ.ID, services.VerifyInput{
-		InstallationID:         installationID,
-		AccountNativeID:        match.Account,
-		AuthenticatedAccountID: match.Account,
-		GrantedPermissions:     map[string]interface{}{"contents": "read", "metadata": "read"},
+		InstallationID:  installationID,
+		AccountNativeID: match.Account,
 	})
 	if err != nil {
 		// Leave nothing half-built: an unverified integration with no source is

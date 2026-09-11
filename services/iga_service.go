@@ -81,10 +81,29 @@ type IntegrationInput struct {
 // account of the GitHub admin who actually authorized — it must match the
 // installation's account, or the binding is refused.
 type VerifyInput struct {
-	InstallationID         string
-	AccountNativeID        string
-	AuthenticatedAccountID string
-	GrantedPermissions     map[string]interface{}
+	InstallationID string
+
+	// AccountNativeID is what the CALLER believes the installation belongs to.
+	// It is a claim to check against the provider, never the proof itself, and
+	// the value stored is always the provider's answer.
+	AccountNativeID string
+}
+
+// igaVerifyTimeout bounds the provider round trip during binding. Short on
+// purpose: a caller is waiting, and a slow provider must surface as an explicit
+// refusal to bind rather than a hung request.
+const igaVerifyTimeout = 20 * time.Second
+
+// InstallationVerifier proves against the provider that an installation is
+// genuinely an installation of THIS workspace's App.
+//
+// It exists so binding cannot be established from the request body. The
+// implementation enumerates with the workspace's own App credentials, so an
+// installation that comes back is by construction one this workspace's App was
+// installed on -- which is the same proof the discovery source path already
+// requires (controllers/platform/discovery_github_controller.go).
+type InstallationVerifier interface {
+	ListGitHubInstallations(ctx context.Context, workspaceID uuid.UUID) ([]GitHubInstallation, error)
 }
 
 // ScanReport is the human-readable outcome of one enumeration.
@@ -159,13 +178,21 @@ type igaManager struct {
 	repo     repositories.IGARepository
 	provider IGAProvider
 	catalog  IGARuleCatalog
+	// installs proves installation ownership with the provider. Nil means
+	// binding is refused rather than silently trusted: a deployment that cannot
+	// reach the provider must not be able to bind an integration at all.
+	installs InstallationVerifier
 }
 
 // NewIGAManager constructs an IGAManager. The provider is injected so the
 // pipeline can run against recorded fixtures until the Stage-0 spike produces
 // a verified real client.
-func NewIGAManager(repo repositories.IGARepository, provider IGAProvider) IGAManager {
-	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog()}
+// installs is required for VerifyIntegration and is deliberately a positional
+// argument rather than an option: binding an integration is a security
+// decision, so every construction site has to state where its ownership proof
+// comes from. Passing nil is allowed and makes binding fail closed.
+func NewIGAManager(repo repositories.IGARepository, provider IGAProvider, installs InstallationVerifier) IGAManager {
+	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog(), installs: installs}
 }
 
 const normalizerVersion = "0.1.0"
@@ -208,24 +235,64 @@ func (m *igaManager) CreateIntegration(workspaceID uuid.UUID, createdBy string, 
 
 // VerifyIntegration turns an untrusted installation id into a trusted binding.
 //
-// The check that matters: a setup-URL installation_id is attacker-supplied, so
-// it is only accepted when the installation's account matches the account of
-// the admin who actually authenticated. Without this, anyone who can guess an
-// installation id could bind someone else's GitHub org to their workspace.
+// WHAT THIS USED TO DO, AND WHY IT WAS NOT A CHECK. It compared two fields that
+// both arrived in the same request body -- account_native_id against
+// authenticated_account_id -- and bound the integration when they matched.
+// Sending the same invented account twice satisfied it. The route requires
+// iga:admin, but permission to administer AuthSec is not authority over a
+// GitHub installation, and an App credential can reach every installation of
+// that App, so the flaw reached across estates.
+//
+// The binding is now established from the PROVIDER's answer. We enumerate the
+// installations of this workspace's own App and refuse anything that does not
+// appear. An installation that comes back is by construction one this
+// workspace's App was installed on; the account and the granted permissions are
+// then read from GitHub's reply rather than from the caller's claim.
+//
+// A caller-supplied account is still accepted, but only as a claim to check:
+// when it disagrees with the provider the binding is refused rather than
+// quietly corrected, because a disagreement means the console and the provider
+// disagree about what is being connected.
 func (m *igaManager) VerifyIntegration(workspaceID, id uuid.UUID, in VerifyInput) (*models.IGAIntegration, error) {
 	if in.InstallationID == "" {
 		return nil, errors.New("installation_id is required")
 	}
-	if in.AuthenticatedAccountID == "" {
-		return nil, fmt.Errorf("%w: no authenticated provider account to match against",
+	if m.installs == nil {
+		return nil, fmt.Errorf("%w: no provider verifier configured; refusing to bind on caller-supplied values",
 			repositories.ErrIGABindingFailed)
 	}
-	if in.AccountNativeID != in.AuthenticatedAccountID {
-		return nil, fmt.Errorf("%w: installation account %q does not match authenticated account %q",
-			repositories.ErrIGABindingFailed, in.AccountNativeID, in.AuthenticatedAccountID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), igaVerifyTimeout)
+	defer cancel()
+	installs, err := m.installs.ListGitHubInstallations(ctx, workspaceID)
+	if err != nil {
+		// Unreachable provider is NOT "unverified but probably fine". Refuse.
+		return nil, fmt.Errorf("%w: could not confirm the installation with the provider: %v",
+			repositories.ErrIGABindingFailed, err)
 	}
-	return m.repo.VerifyIntegration(workspaceID, id, in.InstallationID, in.AccountNativeID,
-		mustJSON(in.GrantedPermissions))
+
+	var match *GitHubInstallation
+	for i := range installs {
+		if installs[i].InstallationID == in.InstallationID {
+			match = &installs[i]
+			break
+		}
+	}
+	if match == nil {
+		return nil, fmt.Errorf("%w: installation %q is not an installation of this workspace's App",
+			repositories.ErrIGABindingFailed, in.InstallationID)
+	}
+	if in.AccountNativeID != "" && in.AccountNativeID != match.Account {
+		return nil, fmt.Errorf("%w: installation %q belongs to %q, not the claimed %q",
+			repositories.ErrIGABindingFailed, in.InstallationID, match.Account, in.AccountNativeID)
+	}
+
+	granted := map[string]interface{}{}
+	for k, v := range match.Permissions {
+		granted[k] = v
+	}
+	return m.repo.VerifyIntegration(workspaceID, id, in.InstallationID, match.Account,
+		mustJSON(granted))
 }
 
 func (m *igaManager) GetIntegration(workspaceID, id uuid.UUID) (*models.IGAIntegration, error) {
