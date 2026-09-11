@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"gorm.io/gorm"
@@ -87,6 +88,18 @@ type EffectivePolicy struct {
 	// Policies that contributed, for explainability -- a reviewer must be able to see
 	// which policy caused a state, not just the state.
 	PolicyIDs []uuid.UUID `json:"policy_ids"`
+}
+
+// PolicyLabel names the policies behind an effective state, for a reason string a
+// human will read on the contained agent and on the blocked pod.
+func (e *EffectivePolicy) PolicyLabel() string {
+	if e == nil || len(e.PolicyIDs) == 0 {
+		return "an agent policy"
+	}
+	if len(e.PolicyIDs) == 1 {
+		return e.PolicyIDs[0].String()
+	}
+	return fmt.Sprintf("%s (+%d more)", e.PolicyIDs[0], len(e.PolicyIDs)-1)
 }
 
 // PolicyReconcileResult reports what a pass did, or would do.
@@ -511,12 +524,24 @@ func intersectScopes(sets [][]string) []string {
 func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 	dryRun bool) (*PolicyReconcileResult, error) {
 
-	// PHASE 2: a live run executes the ENTITLEMENT arm only — scope/role narrowing
-	// and revoke-on-expiry. Those are control-plane effects: nothing is written to a
-	// cluster, no reconciler can undo them, and editing the policy reverses them.
+	// WHAT A LIVE RUN DOES, AND THE ONE THING IT DELIBERATELY WILL NOT.
 	//
-	// The CLUSTER arm still only plans. Quarantine, eviction and deletion arrive in
-	// phases 5-7, on machinery this phase is proving first.
+	// ENTITLEMENT ARM: role narrowing and revoke-on-expiry. Control-plane effects —
+	// nothing is written to a cluster, no reconciler can undo them, and editing the
+	// policy reverses them.
+	//
+	// CLUSTER ARM: containment, and destruction at a destructive expiry. Both reach
+	// the cluster through the ordinary instruction queue, so a policy-driven action
+	// and a human-driven one produce identical state and identical history (PG-6).
+	//
+	// WHAT IT WILL NOT DO IS RELEASE. Quarantining narrows and releasing widens, so
+	// the sweep converges in one direction only. A symmetric reconciler would lift
+	// the containment of any agent no policy asks to contain — including one a human
+	// quarantined by hand during an incident, for reasons no policy knows. That is
+	// the single direction in which a bug here would grant access rather than remove
+	// it, which is why it is the one thing left for a person to do (PG-5).
+	//
+	// A DRY RUN CHANGES NOTHING, in either arm.
 
 	policies, err := m.List(workspaceID, true)
 	if err != nil {
@@ -553,21 +578,44 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 		}
 
 		// --- the cluster arm: containment state ---
+		//
+		// ASYMMETRIC, AND DELIBERATELY SO. Quarantining NARROWS, so the reconciler
+		// does it. Releasing WIDENS, so the reconciler only ever reports it.
+		//
+		// That asymmetry is PG-5 applied to convergence. A symmetric reconciler
+		// would auto-release any agent no policy asks to contain -- including one a
+		// human quarantined by hand during an incident, for reasons no policy
+		// knows. Undoing a containment nobody asked to undo is the one direction
+		// where a bug here would grant access rather than remove it.
 		switch {
 		case eff.DesiredState == models.AgentPolicyStateQuarantined &&
 			agent.Status != models.DiscoveredAgentQuarantined:
 			res.WouldQuarantine++
-			m.clusterPlanned(workspaceID, eff, &agent, dryRun, models.PolicyActionQuarantined,
-				"policy asks for quarantined; agent is "+agent.Status)
+			if dryRun {
+				m.clusterPlanned(workspaceID, eff, &agent, true,
+					models.PolicyActionQuarantined,
+					"policy asks for quarantined; agent is "+agent.Status)
+				break
+			}
+			detail, qerr := m.applyQuarantine(workspaceID, &agent,
+				"agent policy: "+eff.PolicyLabel())
+			if qerr != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("agent %s: %v", agent.ID, qerr))
+				m.clusterOutcome(workspaceID, eff, &agent, models.PolicyActionQuarantined,
+					models.PolicyOutcomeFailed, qerr.Error())
+				break
+			}
+			m.clusterOutcome(workspaceID, eff, &agent, models.PolicyActionQuarantined,
+				models.PolicyOutcomeApplied, detail)
 
 		case eff.DesiredState == models.AgentPolicyStateActive &&
 			agent.Status == models.DiscoveredAgentQuarantined:
-			// Drift the other way: something quarantined this agent out of band and
-			// no policy asks for it. Reconciliation is symmetric by design -- it
-			// converges, it does not only tighten.
+			// Reported, never applied. See the note above: this is the widen.
 			res.WouldRelease++
-			m.clusterPlanned(workspaceID, eff, &agent, dryRun, models.PolicyActionReleased,
-				"no active policy asks for quarantine")
+			m.clusterPlanned(workspaceID, eff, &agent, true, models.PolicyActionReleased,
+				"no active policy asks for quarantine; releasing is NOT automatic, "+
+					"because a reconciler that lifts containment could undo a decision "+
+					"a human took for reasons no policy knows. Release it in the console")
 		}
 
 		// --- the entitlement arm ---
@@ -682,8 +730,25 @@ func (m *agentPolicyManager) Reconcile(workspaceID uuid.UUID,
 						"its next pass", out.Lapsed))
 			case models.OnExpiryQuarantine:
 				res.WouldQuarantine++
-				m.plannedFor(workspaceID, p, a, models.PolicyActionQuarantined,
-					models.PolicyArmCluster, "policy expired")
+				if dryRun || a.Status == models.DiscoveredAgentQuarantined {
+					m.plannedFor(workspaceID, p, a, models.PolicyActionQuarantined,
+						models.PolicyArmCluster, "policy expired")
+					continue
+				}
+				detail, qerr := m.applyQuarantine(workspaceID, a,
+					"agent policy "+p.Name+" expired: "+p.Reason)
+				if qerr != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("agent %s: %v", a.ID, qerr))
+					m.record(&models.AgentPolicyAction{
+						WorkspaceID: workspaceID, PolicyID: &p.ID, DiscoveredAgentID: &a.ID,
+						Action: models.PolicyActionQuarantined, Arm: models.PolicyArmCluster,
+						Reason: p.Reason, DryRun: false,
+						Outcome: models.PolicyOutcomeFailed, Detail: qerr.Error(),
+					})
+					continue
+				}
+				m.appliedFor(workspaceID, p, a, models.PolicyActionQuarantined,
+					models.PolicyArmCluster, detail)
 			case models.OnExpiryEvict:
 				// A destructive action is REFUSED for any agent the confirmation
 				// does not name. This is the rule that stops an agent which started
@@ -769,19 +834,20 @@ func (m *agentPolicyManager) confirmationCovers(workspaceID, policyID, agentID u
 func (m *agentPolicyManager) clusterPlanned(workspaceID uuid.UUID, eff *EffectivePolicy,
 	agent *models.DiscoveredAgent, dryRun bool, action, detail string) {
 
-	outcome, prefix := models.PolicyOutcomePlanned, ""
-	if !dryRun {
-		outcome = models.PolicyOutcomeRefused
-		prefix = "cluster arm not implemented until phase 5: "
-	}
+	// Always a PLAN. Since the containment arm went live, the only live cluster
+	// action that routes through here is the release, which is reported and never
+	// applied — so a caller passing dryRun=false would be asserting an effect that
+	// did not happen.
+	_ = dryRun
+	outcome := models.PolicyOutcomePlanned
 	var policyID *uuid.UUID
 	if len(eff.PolicyIDs) > 0 {
 		policyID = &eff.PolicyIDs[0]
 	}
 	m.record(&models.AgentPolicyAction{
 		WorkspaceID: workspaceID, PolicyID: policyID, DiscoveredAgentID: &agent.ID,
-		Action: action, Arm: models.PolicyArmCluster, DryRun: dryRun,
-		Outcome: outcome, Detail: prefix + detail,
+		Action: action, Arm: models.PolicyArmCluster, DryRun: true,
+		Outcome: outcome, Detail: detail,
 	})
 }
 
@@ -1109,7 +1175,14 @@ func (m *agentPolicyManager) enqueueDestruction(workspaceID uuid.UUID,
 	suffix := ":" + agent.Fingerprint + ":" + p.ID.String()
 
 	var queued []string
-	if src.EnforcementEvict {
+	// The containment arm may already have queued an eviction for this agent in
+	// this same pass — a policy that says `quarantined` AND `on_expiry: evict`
+	// reaches both. They are the same action ("the pods of this agent should not be
+	// running"), so a second one is duplicated work and, worse, two rows in the
+	// console an operator cannot tell apart.
+	if src.EnforcementEvict && openEvictionExists(m.db, workspaceID, agent.ID) {
+		queued = append(queued, "evict_pods (already queued by the containment arm)")
+	} else if src.EnforcementEvict {
 		if _, _, err := act.Enqueue(workspaceID, EnqueueInstructionInput{
 			DiscoverySourceID: *agent.DiscoverySourceID,
 			Kind:              models.InstructionEvictPods,
@@ -1175,4 +1248,81 @@ func k8sLabels(raw json.RawMessage) map[string]string {
 		return nil
 	}
 	return md.Kubernetes.Labels
+}
+
+// applyQuarantine contains an agent because a policy says so.
+//
+// PG-6 IN THE SAME SHAPE AS REVOCATION: quarantine has exactly one
+// implementation, and this is not a second one. It calls the same DiscoveryManager
+// path the console button calls, so a policy-driven containment and a
+// human-driven one produce identical state, identical instructions, and identical
+// history. A separate implementation here would be two things that must stay in
+// step forever, and they would not.
+//
+// The reason string is what an operator sees on the agent, and — through the
+// enforcement plan — what a developer sees on the blocked pod. So it names the
+// policy rather than saying "automated".
+func (m *agentPolicyManager) applyQuarantine(workspaceID uuid.UUID,
+	agent *models.DiscoveredAgent, reason string) (string, error) {
+
+	dm := NewDiscoveryManager(repositories.NewDiscoveryRepository(m.db))
+	// by=nil: no human took this decision, the policy did. Recording a user id
+	// here would attribute it to whoever last touched the policy, which is not the
+	// same thing and would read as a person clicking a button they never clicked.
+	out, err := dm.QuarantineAgent(workspaceID, agent.ID, reason, nil)
+	if err != nil {
+		return "", fmt.Errorf("quarantine: %w", err)
+	}
+	// Reflect the new state back, so a later branch in the same sweep does not act
+	// on a status it has just changed.
+	agent.Status = out.Status
+	agent.QuarantinedAt = out.QuarantinedAt
+	agent.QuarantineReason = out.QuarantineReason
+
+	detail := "quarantined; enforcement queued for the cluster"
+	if agent.DiscoverySourceID == nil {
+		// The decision stands, but nothing will apply it. Said plainly, because a
+		// quarantine nobody can enforce looks identical to one that is working.
+		detail = "quarantined, but this agent is not attributed to a cluster " +
+			"connector, so nothing will enforce it"
+	}
+	return detail, nil
+}
+
+// clusterOutcome records what the cluster arm actually did.
+func (m *agentPolicyManager) clusterOutcome(workspaceID uuid.UUID, eff *EffectivePolicy,
+	agent *models.DiscoveredAgent, action, outcome, detail string) {
+
+	var policyID *uuid.UUID
+	if eff != nil && len(eff.PolicyIDs) > 0 {
+		policyID = &eff.PolicyIDs[0]
+	}
+	m.record(&models.AgentPolicyAction{
+		WorkspaceID: workspaceID, PolicyID: policyID, DiscoveredAgentID: &agent.ID,
+		Action: action, Arm: models.PolicyArmCluster, DryRun: false,
+		Outcome: outcome, Detail: detail,
+	})
+}
+
+// openEvictionExists reports whether an eviction for this agent is already queued
+// or in an agent's hands.
+//
+// Only 'pending' and 'leased' count. An APPLIED eviction is history: the pods it
+// stopped have long since been rescheduled, so a later decision must be free to
+// queue a fresh one rather than being told the work is already done.
+func openEvictionExists(db *gorm.DB, workspaceID, agentID uuid.UUID) bool {
+	var n int64
+	err := db.Model(&models.ProvisioningInstruction{}).
+		Where(`workspace_id = ? AND discovered_agent_id = ? AND kind = ?
+		       AND status IN ?`,
+			workspaceID, agentID, models.InstructionEvictPods,
+			[]string{models.InstructionPending, models.InstructionLeased}).
+		Count(&n).Error
+	if err != nil {
+		// Unknown is not evidence of absence, but queuing a duplicate is the
+		// cheaper mistake than skipping a real one: a second eviction of already
+		// stopped pods is a no-op, whereas a skipped one leaves an agent running.
+		return false
+	}
+	return n > 0
 }

@@ -283,7 +283,7 @@ func TestRevokeClearsStandingSoTheGrantCanBeSwept(t *testing.T) {
 
 // A live run must still refuse the cluster arm, and record WHY — not quietly
 // report success for something it did not do.
-func TestLiveRunStillRefusesTheClusterArm(t *testing.T) {
+func TestLiveRunContainsTheAgentAndRecordsItAsApplied(t *testing.T) {
 	f := newProvFixture(t)
 	m := policyMgr(t, f)
 	role := seedRole(t, f, "reader", "read")
@@ -301,21 +301,32 @@ func TestLiveRunStillRefusesTheClusterArm(t *testing.T) {
 		t.Fatalf("a live run must not error: %v", err)
 	}
 	if res.WouldQuarantine != 1 {
-		t.Errorf("the quarantine should still be COMPUTED, got %d", res.WouldQuarantine)
+		t.Errorf("the quarantine should be counted, got %d", res.WouldQuarantine)
 	}
+
+	// Was: "the cluster arm must not act until phase 5". It acts now — that was
+	// the whole point of the containment arm, and a policy that states an end
+	// state and never reaches it is a note rather than a policy.
 	var status string
 	if err := f.raw.QueryRow(`SELECT status FROM discovered_agents WHERE id=$1`,
 		f.agent).Scan(&status); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if status == models.DiscoveredAgentQuarantined {
-		t.Fatal("the cluster arm must not act until phase 5")
+	if status != models.DiscoveredAgentQuarantined {
+		t.Fatalf("a live run must CONTAIN the agent, got status %q", status)
+	}
+
+	// And it must say so honestly: applied, not planned. An action recorded as
+	// planned after it happened reads as though nothing did.
+	if f.count(t, `SELECT count(*) FROM agent_policy_actions
+	                WHERE workspace_id=$1 AND arm='cluster' AND action='quarantined'
+	                  AND outcome='applied' AND dry_run = false`, f.ws) != 1 {
+		t.Error("a live containment must be recorded as applied on the cluster arm")
 	}
 	if f.count(t, `SELECT count(*) FROM agent_policy_actions
-	                WHERE workspace_id=$1 AND arm='cluster' AND outcome='refused'
-	                  AND detail LIKE '%not implemented until phase 5%'`, f.ws) != 1 {
-		t.Error("a live run must record the cluster arm as REFUSED with the reason, " +
-			"not as planned — otherwise it reads as having done something")
+	                WHERE workspace_id=$1 AND outcome='refused'
+	                  AND detail LIKE '%not implemented%'`, f.ws) != 0 {
+		t.Error("no action may still claim the cluster arm is unimplemented")
 	}
 }
 

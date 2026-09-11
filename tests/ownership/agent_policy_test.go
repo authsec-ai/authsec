@@ -310,7 +310,7 @@ func TestNoPolicyMeansActiveAndUnconstrained(t *testing.T) {
 // This test previously asserted the opposite (phase 1 refused every live run). It is
 // updated rather than deleted, because "a live run is accepted and does nothing to
 // the cluster" is the property that replaced it.
-func TestLiveReconcileIsAcceptedAndTouchesNoCluster(t *testing.T) {
+func TestLiveReconcileContainsAndDoesNotReportItselfAsADryRun(t *testing.T) {
 	f := newProvFixture(t)
 	m := policyMgr(t, f)
 	agent := claimedAgent(t, f, "a1", "iga-demo", "crewai", "automated")
@@ -324,18 +324,24 @@ func TestLiveReconcileIsAcceptedAndTouchesNoCluster(t *testing.T) {
 
 	res, err := m.Reconcile(f.ws, false)
 	if err != nil {
-		t.Fatalf("a live reconcile must be accepted in phase 2: %v", err)
+		t.Fatalf("a live reconcile must be accepted: %v", err)
 	}
 	if res.DryRun {
 		t.Error("a live run must not report itself as a dry run")
 	}
+
+	// Was: "the cluster arm must remain inert until phase 5". The containment arm
+	// is live, so the decision must actually land — even here, where the agent has
+	// no connector and nothing will enforce it. The DECISION is a governance fact;
+	// whether a cluster can act on it is a separate one, and conflating them would
+	// make an unenforceable quarantine indistinguishable from no quarantine.
 	var status string
 	if err := f.raw.QueryRow(`SELECT status FROM discovered_agents WHERE id=$1`,
 		agent).Scan(&status); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if status == models.DiscoveredAgentQuarantined {
-		t.Error("the cluster arm must remain inert until phase 5")
+	if status != models.DiscoveredAgentQuarantined {
+		t.Errorf("a live reconcile must contain the agent, got %q", status)
 	}
 }
 
