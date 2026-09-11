@@ -41,7 +41,7 @@ var CloudFormationTemplate string
 // Bumped by ticket [2], which adds iam:ListOpenIDConnectProviders.
 //
 // Must match the TemplateVersion output in the YAML.
-const TemplateVersion = "2026-09-01"
+const TemplateVersion = "2026-09-08"
 
 // maxRetryAttempts bounds the SDK's built-in backoff. Above the SDK default of
 // 3 because IAM and CloudTrail throttle readily on a large account and a scan

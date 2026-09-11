@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
@@ -43,10 +45,11 @@ var ErrScanNotPermitted = errors.New("connector is not in a usable state")
 
 // AWSIAMScanner reads the IAM identity foundation of one connector.
 type AWSIAMScanner struct {
-	db         *gorm.DB
-	connectors repositories.CloudConnectorRepository
-	identities repositories.CloudIdentityRepository
-	onboarding *AWSOnboardingService
+	db          *gorm.DB
+	connectors  repositories.CloudConnectorRepository
+	identities  repositories.CloudIdentityRepository
+	checkpoints repositories.CloudScanCheckpointRepository
+	onboarding  *AWSOnboardingService
 
 	// api, when set, replaces the real IAM client. The seam that lets the whole
 	// scan be exercised without an AWS account.
@@ -56,10 +59,11 @@ type AWSIAMScanner struct {
 // NewAWSIAMScanner constructs the scanner.
 func NewAWSIAMScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWSIAMScanner {
 	return &AWSIAMScanner{
-		db:         db,
-		connectors: repositories.NewCloudConnectorRepository(db),
-		identities: repositories.NewCloudIdentityRepository(db),
-		onboarding: onboarding,
+		db:          db,
+		connectors:  repositories.NewCloudConnectorRepository(db),
+		identities:  repositories.NewCloudIdentityRepository(db),
+		checkpoints: repositories.NewCloudScanCheckpointRepository(db),
+		onboarding:  onboarding,
 	}
 }
 
@@ -129,7 +133,17 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	ctx, cancel := context.WithTimeout(ctx, iamScanTimeout)
 	defer cancel()
 
+	// The generation an interrupted attempt was using is the same number this
+	// one computes: commitScan only advances scan_generation on success, so a
+	// scan that died left it untouched. Checkpoints at this generation
+	// therefore mean "the previous attempt was interrupted part-way", and this
+	// run continues it rather than repeating its work.
 	generation := connector.ScanGeneration + 1
+	resuming, err := s.checkpoints.HasAny(workspaceID, connectorID, generation)
+	if err != nil {
+		return nil, err
+	}
+
 	started := time.Now()
 	coverage := models.ScanCoverage{
 		Generation: generation,
@@ -190,9 +204,30 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	coverage.Surfaces[models.SurfaceIAMAccessKeys] = surfaceResult(keyCount, keysErr)
 
 	// ---- policy documents, for ticket [2] ----------------------------------
-	policyCount, policiesErr := s.readPolicies(ctx, reader, roles, users, snapshot)
+	//
+	// The expensive phase: roughly seven calls per identity, so this is what
+	// dominates a scan of a large account and what resume exists for. On a
+	// resumed attempt the identities whose permissions were already written are
+	// skipped entirely -- no AWS call at all for them.
+	policyCursor := ""
+	if resuming {
+		cursor, _, err := s.checkpoints.Cursor(
+			workspaceID, connectorID, generation, models.ScanPhaseIdentityPolicies)
+		if err != nil {
+			return nil, err
+		}
+		policyCursor = cursor
+	}
+
+	policyCount, skippedIdentities, policiesErr := s.readPolicies(
+		ctx, reader, roles, users, snapshot, policyCursor)
 	coverage.Surfaces[models.SurfaceIAMPolicies] = surfaceResult(policyCount, policiesErr)
 	coverage.Counters["policies_fetched"] = policyCount
+	if skippedIdentities > 0 {
+		coverage.Counters["identities_resumed_past"] = skippedIdentities
+		log.Printf("aws iam scan: connector=%s resuming generation %d, skipped %d identities already done",
+			connectorID, generation, skippedIdentities)
+	}
 
 	// ---- reconcile, but only if we were allowed to look everywhere ----------
 	if coverage.Complete() {
@@ -204,6 +239,15 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 		coverage.Counters["identities_removed"] = int(removedIdentities)
 		coverage.Counters["secrets_removed"] = int(removedSecrets)
 		coverage.Status = models.ScanStatusComplete
+
+		// The attempt finished, so its checkpoints have served their purpose.
+		// Clearing them is what makes the NEXT scan a fresh attempt rather than
+		// a resume that skips everything -- and commitScan is about to advance
+		// the generation past them anyway, so this is hygiene rather than
+		// correctness.
+		if err := s.checkpoints.Clear(workspaceID, connectorID, generation); err != nil {
+			log.Printf("aws iam scan: clearing checkpoints for generation %d: %v", generation, err)
+		}
 	} else {
 		// The rule the whole schema is built around: unreached is not missing.
 		// A denied ListRoles and an account with no roles look identical from
@@ -235,41 +279,67 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 // alternative — abandoning the surface on the first denied GetRolePolicy —
 // would throw away every document already fetched because of one role the
 // audit role happens not to cover.
+// resumeCursor is exceeded when an identity sorts after the last one a previous
+// attempt finished. Everything at or before the cursor already has its
+// permissions written and stamped with this generation.
+//
+// Identities are walked in sorted ARN order rather than the order AWS returned
+// them, because a cursor over an unstable order would silently skip work AWS
+// happened to list earlier the second time.
 func (s *AWSIAMScanner) readPolicies(
 	ctx context.Context, reader *awsdiscovery.IAMReader,
 	roles []awsdiscovery.IAMRole, users []awsdiscovery.IAMUser, snapshot *IAMSnapshot,
-) (int, error) {
+	resumeCursor string,
+) (fetched int, skipped int, err error) {
 
-	count := 0
-	var firstErr error
-
+	// One list of (arn, name, isRole) so the sort order spans roles and users
+	// together -- the cursor is a single position through every identity, not
+	// one per kind.
+	type target struct {
+		arn    string
+		name   string
+		isRole bool
+	}
+	targets := make([]target, 0, len(roles)+len(users))
 	for _, role := range roles {
-		policies, err := reader.RolePolicies(ctx, role.ARN, role.Name)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if len(policies.Attached) > 0 || len(policies.Inline) > 0 {
-			snapshot.Policies[role.ARN] = policies
-			count += len(policies.Attached) + len(policies.Inline)
-		}
+		targets = append(targets, target{arn: role.ARN, name: role.Name, isRole: true})
 	}
 	for _, user := range users {
-		policies, err := reader.UserPolicies(ctx, user.ARN, user.Name)
-		if err != nil {
+		targets = append(targets, target{arn: user.ARN, name: user.Name})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].arn < targets[j].arn })
+
+	count := 0
+	skippedCount := 0
+	var firstErr error
+
+	for _, t := range targets {
+		// The saving resume exists for: no AWS call at all for an identity a
+		// previous attempt already finished.
+		if resumeCursor != "" && t.arn <= resumeCursor {
+			skippedCount++
+			continue
+		}
+
+		var policies awsdiscovery.IdentityPolicies
+		var perr error
+		if t.isRole {
+			policies, perr = reader.RolePolicies(ctx, t.arn, t.name)
+		} else {
+			policies, perr = reader.UserPolicies(ctx, t.arn, t.name)
+		}
+		if perr != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = perr
 			}
 			continue
 		}
 		if len(policies.Attached) > 0 || len(policies.Inline) > 0 {
-			snapshot.Policies[user.ARN] = policies
+			snapshot.Policies[t.arn] = policies
 			count += len(policies.Attached) + len(policies.Inline)
 		}
 	}
-	return count, firstErr
+	return count, skippedCount, firstErr
 }
 
 /* -------------------------------- upserts --------------------------------- */

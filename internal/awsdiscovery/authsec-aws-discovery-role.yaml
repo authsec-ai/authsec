@@ -8,7 +8,7 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-09-01'
+    TemplateVersion: '2026-09-08'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -143,6 +143,33 @@ Resources:
                   - iam:ListOpenIDConnectProviders
                 Resource: '*'
 
+              # Workloads: the compute that RUNS AS a discovered role. This is
+              # what makes a role's permissions actionable - a dangerous role
+              # with no compute attached is a different finding from the same
+              # role backing a production function.
+              #
+              # iam:GetInstanceProfile is here because EC2 does not name a
+              # role: it names an instance profile, a thin wrapper holding
+              # exactly one role, and resolving it needs this second call. EC2
+              # is the only workload with that hop.
+              #
+              # These may already be covered by SecurityAudit - they are
+              # Describe/List reads of exactly the kind it exists to grant -
+              # but that has never been confirmed against a live policy
+              # document, and a surface that silently returns nothing because
+              # of a missing permission is worse than an over-grant a customer
+              # can see. Marked possibly-redundant in permissions.go for the
+              # same reason as the IAM block.
+              - Sid: WorkloadReads
+                Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - ecs:ListTaskDefinitions
+                  - ecs:DescribeTaskDefinition
+                  - ec2:DescribeInstances
+                  - iam:GetInstanceProfile
+                Resource: '*'
+
               # Bedrock Agents - the AWS-native managed agent surface.
               # ListAgents gives id, name and status; the execution role and
               # foundation model need the per-agent GetAgent call.
@@ -265,4 +292,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-09-01'
+    Value: '2026-09-08'
