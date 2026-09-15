@@ -285,7 +285,7 @@ func TestWorkloadScanAttributesComputeToTheRightRole(t *testing.T) {
 	t.Logf("PASS: %d workloads written %v", out.WorkloadsWritten, out.ByKind)
 
 	repo := repositories.NewCloudWorkloadRepository(db)
-	workloads, err := repo.ListWorkloads(ws, nil)
+	workloads, _, err := repo.ListWorkloads(ws, repositories.CloudWorkloadFilter{})
 	if err != nil {
 		t.Fatalf("list workloads: %v", err)
 	}
@@ -372,7 +372,7 @@ func TestWorkloadWithUnknownRoleIsRecordedUnattributed(t *testing.T) {
 		t.Fatalf("expected 1 unattributed workload, got %d", out.Unattributed)
 	}
 
-	workloads, _ := repositories.NewCloudWorkloadRepository(db).ListWorkloads(ws, nil)
+	workloads, _, _ := repositories.NewCloudWorkloadRepository(db).ListWorkloads(ws, repositories.CloudWorkloadFilter{})
 	if len(workloads) != 1 {
 		t.Fatalf("the workload must still be recorded, got %d rows", len(workloads))
 	}
@@ -434,7 +434,7 @@ func TestBedrockAgentsAndRuntimesBecomeWorkloads(t *testing.T) {
 		t.Fatalf("expected one agent and one runtime, got %v", out.ByKind)
 	}
 
-	workloads, _ := repositories.NewCloudWorkloadRepository(db).ListWorkloads(ws, nil)
+	workloads, _, _ := repositories.NewCloudWorkloadRepository(db).ListWorkloads(ws, repositories.CloudWorkloadFilter{})
 	for _, w := range workloads {
 		if w.IdentityID == nil {
 			t.Fatalf("%s (%s) should have resolved to a role", w.RuntimeKind, w.Name)
@@ -504,7 +504,7 @@ func TestActivityScanPollsAndPreservesNeverAccessedAsNull(t *testing.T) {
 	}
 	t.Logf("PASS: %d usage rows across %d polls", out.UsageWritten, activity.polls)
 
-	usage, err := repositories.NewCloudWorkloadRepository(db).ListUsage(ws, nil)
+	usage, _, err := repositories.NewCloudWorkloadRepository(db).ListUsage(ws, repositories.CloudWorkloadFilter{})
 	if err != nil {
 		t.Fatalf("list usage: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestWorkloadDeniedSurfaceBlocksReconciliation(t *testing.T) {
 		t.Fatalf("baseline scan: %v", err)
 	}
 	repo := repositories.NewCloudWorkloadRepository(db)
-	before, _ := repo.ListWorkloads(ws, nil)
+	before, _, _ := repo.ListWorkloads(ws, repositories.CloudWorkloadFilter{})
 	if len(before) == 0 {
 		t.Fatal("test setup: baseline should have written workloads")
 	}
@@ -566,7 +566,7 @@ func TestWorkloadDeniedSurfaceBlocksReconciliation(t *testing.T) {
 	if out.Complete {
 		t.Fatalf("a scan with a denied surface must not report complete: %v", out.Errors)
 	}
-	after, _ := repo.ListWorkloads(ws, nil)
+	after, _, _ := repo.ListWorkloads(ws, repositories.CloudWorkloadFilter{})
 	if len(after) != len(before) {
 		t.Fatalf("a denied read deleted workloads: %d -> %d", len(before), len(after))
 	}

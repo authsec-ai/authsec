@@ -29,7 +29,6 @@ type CloudIdentityRepository interface {
 	GetIdentity(workspaceID, id uuid.UUID) (*models.CloudIdentity, error)
 	GetIdentityByNativeID(workspaceID uuid.UUID, nativeID string) (*models.CloudIdentity, error)
 	ListIdentities(workspaceID uuid.UUID, f CloudIdentityFilter) ([]models.CloudIdentity, int64, error)
-	ListSecrets(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudSecret, error)
 
 	// CountsForConnector reports how many identities and secrets a connector
 	// currently holds, for the scan report.
@@ -42,6 +41,18 @@ type CloudIdentityRepository interface {
 	// reached. There is no guard inside a DELETE that can know whether the scan
 	// was allowed to look — see the comment on the implementation.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (identitiesRemoved, secretsRemoved int64, err error)
+
+	ListSecrets(workspaceID uuid.UUID, f CloudSecretFilter) ([]models.CloudSecret, int64, error)
+}
+
+// CloudSecretFilter narrows a secret listing. ConnectorID scopes to one
+// connected AWS account, the same gap CloudPermissionFilter closes for
+// assume-edges/permissions/resources.
+type CloudSecretFilter struct {
+	IdentityID  *uuid.UUID
+	ConnectorID *uuid.UUID
+	Limit       int
+	Offset      int
 }
 
 // CloudIdentityFilter narrows an identity listing.
@@ -197,28 +208,42 @@ func (r *cloudIdentityRepository) ListIdentities(workspaceID uuid.UUID, f CloudI
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
-	limit := f.Limit
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
 	var out []models.CloudIdentity
-	if err := q.Order("kind, name").Limit(limit).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
 }
 
-func (r *cloudIdentityRepository) ListSecrets(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudSecret, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if identityID != nil {
-		q = q.Where("identity_id = ?", *identityID)
+// clampLimit applies the one paging rule every cloud_* list endpoint shares:
+// an unset or out-of-range limit falls back to 100, and nothing above 500 is
+// ever handed to a single query. Shared here rather than duplicated per
+// repository so the actual number lives in exactly one place.
+func clampLimit(limit int) int {
+	if limit <= 0 || limit > 500 {
+		return 100
+	}
+	return limit
+}
+
+func (r *cloudIdentityRepository) ListSecrets(workspaceID uuid.UUID, f CloudSecretFilter) ([]models.CloudSecret, int64, error) {
+	q := r.db.Model(&models.CloudSecret{}).Where("workspace_id = ?", workspaceID)
+	if f.IdentityID != nil {
+		q = q.Where("identity_id = ?", *f.IdentityID)
+	}
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudSecret
 	// Oldest first: age is the finding.
-	if err := q.Order("created_at NULLS LAST").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("created_at NULLS LAST").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
 func (r *cloudIdentityRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, error) {

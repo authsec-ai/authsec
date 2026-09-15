@@ -31,9 +31,14 @@ type CloudPermissionRepository interface {
 	// (identity_id, native_id, resource_id).
 	UpsertPermission(p *models.CloudPermission) (stored *models.CloudPermission, created bool, err error)
 
-	ListAssumeEdges(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudAssumeEdge, error)
-	ListPermissions(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudPermission, error)
-	ListResources(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]models.CloudResource, error)
+	ListAssumeEdges(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudAssumeEdge, int64, error)
+	ListPermissions(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudPermission, int64, error)
+	// ListResources honors f.ConnectorID and pagination; f.IdentityID is not
+	// applicable here (a resource is reached through cloud_permission, not
+	// owned by one identity) and is ignored rather than rejected, so a caller
+	// that reuses the same filter value across these three calls does not need
+	// a special case for this one.
+	ListResources(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudResource, int64, error)
 
 	// CountsForConnector reports how many rows of each kind a connector
 	// currently holds, for the scan report.
@@ -44,6 +49,18 @@ type CloudPermissionRepository interface {
 	// the caller must only invoke this after a scan in which every surface this
 	// table depends on was reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
+}
+
+// CloudPermissionFilter narrows an assume-edge, permission, or resource
+// listing. ConnectorID scopes to one connected AWS account; without it a
+// workspace with several connectors gets every account's rows mixed together,
+// which is the gap this filter exists to close. Limit/Offset follow
+// CloudIdentityFilter's own convention: <=0 or >500 falls back to 100.
+type CloudPermissionFilter struct {
+	IdentityID  *uuid.UUID
+	ConnectorID *uuid.UUID
+	Limit       int
+	Offset      int
 }
 
 type cloudPermissionRepository struct{ db *gorm.DB }
@@ -175,40 +192,58 @@ func (r *cloudPermissionRepository) UpsertPermission(p *models.CloudPermission) 
 	return p, p.ID == proposed, nil
 }
 
-func (r *cloudPermissionRepository) ListAssumeEdges(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudAssumeEdge, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if identityID != nil {
-		q = q.Where("identity_id = ?", *identityID)
+func (r *cloudPermissionRepository) ListAssumeEdges(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudAssumeEdge, int64, error) {
+	q := r.db.Model(&models.CloudAssumeEdge{}).Where("workspace_id = ?", workspaceID)
+	if f.IdentityID != nil {
+		q = q.Where("identity_id = ?", *f.IdentityID)
+	}
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudAssumeEdge
-	if err := q.Order("subject_kind, subject").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("subject_kind, subject").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
-func (r *cloudPermissionRepository) ListPermissions(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudPermission, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if identityID != nil {
-		q = q.Where("identity_id = ?", *identityID)
+func (r *cloudPermissionRepository) ListPermissions(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudPermission, int64, error) {
+	q := r.db.Model(&models.CloudPermission{}).Where("workspace_id = ?", workspaceID)
+	if f.IdentityID != nil {
+		q = q.Where("identity_id = ?", *f.IdentityID)
+	}
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudPermission
-	if err := q.Order("native_id").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("native_id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
-func (r *cloudPermissionRepository) ListResources(workspaceID uuid.UUID, connectorID *uuid.UUID) ([]models.CloudResource, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if connectorID != nil {
-		q = q.Where("connector_id = ?", *connectorID)
+func (r *cloudPermissionRepository) ListResources(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudResource, int64, error) {
+	q := r.db.Model(&models.CloudResource{}).Where("workspace_id = ?", workspaceID)
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudResource
-	if err := q.Order("kind, name").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
 func (r *cloudPermissionRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, int64, error) {
