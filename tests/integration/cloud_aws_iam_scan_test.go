@@ -400,7 +400,7 @@ func TestIAMScanRecordsIdentitiesSecretsAndPolicies(t *testing.T) {
 	t.Log("PASS: never-used role has last_used_at NULL, not a zero time")
 
 	// Access keys.
-	secrets, err := repo.ListSecrets(ws, nil)
+	secrets, _, err := repo.ListSecrets(ws, repositories.CloudSecretFilter{})
 	if err != nil {
 		t.Fatalf("list secrets: %v", err)
 	}

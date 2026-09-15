@@ -91,6 +91,11 @@ type PermissionSnapshot struct {
 	// more complete than the data ticket [1] handed it, and OIDC providers
 	// being unreadable also marks it incomplete.
 	Complete bool
+	// Surfaces reports this scan's own two independently-callable surfaces
+	// (OIDC providers, EKS Pod Identity), for the caller to fold into the
+	// connector's overall coverage report. Trust-policy and policy-document
+	// parsing are not surfaces here — see the comment on the Surface constants.
+	Surfaces map[string]models.SurfaceCoverage
 	// Skipped counts trust policies or policy documents whose identity could
 	// not be found by native id. Should be zero in practice -- ticket [1] wrote
 	// every identity these ARNs came from moments earlier -- and is surfaced
@@ -146,6 +151,10 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// that was denied would let this scan conclude that every Pod Identity
 	// binding it could not see had been removed.
 	out.Complete = snapshot.Coverage.Complete() && oidcErr == nil && eksErr == nil
+	out.Surfaces = map[string]models.SurfaceCoverage{
+		models.SurfaceOIDCProviders:  surfaceResult(len(providers), oidcErr),
+		models.SurfaceEKSPodIdentity: surfaceResult(out.PodIdentityEdges, eksErr),
+	}
 
 	if out.Complete {
 		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
