@@ -88,7 +88,7 @@ func TestPermissionScanTypesConcreteResourceARNs(t *testing.T) {
 	t.Logf("PASS: %d concrete resources typed and written", permSnap.ResourcesWritten)
 
 	grants := repositories.NewCloudPermissionRepository(db)
-	resources, err := grants.ListResources(ws, nil)
+	resources, _, err := grants.ListResources(ws, repositories.CloudPermissionFilter{})
 	if err != nil {
 		t.Fatalf("list resources: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestPermissionScanTypesConcreteResourceARNs(t *testing.T) {
 	// Every cloud_permission row from this statement must carry the resource it
 	// was typed from -- ClassifyResourceScope returning a concrete resource is
 	// the one case where resource_id must NOT be nil.
-	perms, err := grants.ListPermissions(ws, nil)
+	perms, _, err := grants.ListPermissions(ws, repositories.CloudPermissionFilter{})
 	if err != nil {
 		t.Fatalf("list permissions: %v", err)
 	}

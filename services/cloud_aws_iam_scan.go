@@ -508,6 +508,70 @@ func (s *AWSIAMScanner) persistCoverage(workspaceID, connectorID uuid.UUID, cove
 		}).Error
 }
 
+// FinalizeCoverage folds the permission- and workload-scan results into the
+// connector's coverage report and recomputes the overall status.
+//
+// WHY THIS EXISTS
+// Scan() commits a coverage report based on its own four surfaces the moment
+// it returns -- necessarily, since it has no way to know whether the
+// permission and workload scans that come after it will succeed. Without this
+// call, that premature report is the one that stays: a customer whose Bedrock
+// or EKS read was denied would see coverage.status = "complete" simply
+// because IAM itself was fully readable, with the actual gap visible only in
+// a server log. This call replaces that report with the true, cumulative one
+// once every surface this scan touches has actually been attempted.
+//
+// It never moves the generation. Scan() already advanced it; this only
+// corrects what is filed under that same generation.
+func (s *AWSIAMScanner) FinalizeCoverage(
+	workspaceID, connectorID uuid.UUID, iamCoverage models.ScanCoverage,
+	permErr error, permSurfaces map[string]models.SurfaceCoverage,
+	workloadErr error, workloadSurfaces map[string]models.SurfaceCoverage,
+) {
+	merged := models.ScanCoverage{
+		Generation: iamCoverage.Generation,
+		StartedAt:  iamCoverage.StartedAt,
+		FinishedAt: iamCoverage.FinishedAt,
+		Counters:   iamCoverage.Counters,
+		Surfaces:   map[string]models.SurfaceCoverage{},
+	}
+	for k, v := range iamCoverage.Surfaces {
+		merged.Surfaces[k] = v
+	}
+
+	// A scanner that returned an error before producing a snapshot at all
+	// (could not assume the role, connector vanished mid-scan, …) gets one
+	// surface entry standing in for the surfaces it never got to attempt --
+	// the same reasoning as workload_scan.go's own "compute:region" entry.
+	if permErr != nil && permSurfaces == nil {
+		merged.Surfaces["permission_scan"] = models.SurfaceCoverage{
+			State: models.CloudCoverageDenied, Error: permErr.Error(),
+		}
+	}
+	for k, v := range permSurfaces {
+		merged.Surfaces[k] = v
+	}
+	if workloadErr != nil && workloadSurfaces == nil {
+		merged.Surfaces["workload_scan"] = models.SurfaceCoverage{
+			State: models.CloudCoverageDenied, Error: workloadErr.Error(),
+		}
+	}
+	for k, v := range workloadSurfaces {
+		merged.Surfaces[k] = v
+	}
+
+	if merged.Complete() {
+		merged.Status = models.ScanStatusComplete
+	} else {
+		merged.Status = models.ScanStatusPartial
+	}
+	// iamCoverage.Status is already "failed" or "running" only in paths that
+	// never reach this call (Scan returns an error and the controller never
+	// calls FinalizeCoverage); every path that does call this has a
+	// commitScan-produced complete/partial status to refine, never failed.
+	s.persistCoverage(workspaceID, connectorID, merged)
+}
+
 // surfaceResult turns a read's outcome into a coverage entry.
 //
 // The count is reported even on failure, where it is a FLOOR rather than a

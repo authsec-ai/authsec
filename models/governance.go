@@ -456,6 +456,20 @@ const (
 	InstructionQuarantine   = "quarantine"
 	InstructionUnquarantine = "unquarantine"
 	InstructionVerifyUptake = "verify_uptake"
+	// InstructionEvictPods stops a contained agent RUNNING, through the Eviction
+	// API so PodDisruptionBudgets are honoured (EN-6). Quarantine cuts the network
+	// and leaves the process alive; this is the half that stops it.
+	InstructionEvictPods = "evict_pods"
+	// InstructionDeleteWorkload removes the owning controller. The largest cluster
+	// action this system can take, and the only one a customer cannot undo by
+	// releasing the agent — hence its own switch, its own namespace list and its
+	// own RBAC (EN-9).
+	InstructionDeleteWorkload = "delete_workload"
+	// InstructionForceDeletePods overrides a PodDisruptionBudget that refused an
+	// eviction. NEVER automatic: no reconciler, policy expiry or retry path may
+	// produce one. It exists only behind an explicit human action, and the schema
+	// refuses to store one that does not name who asked and why.
+	InstructionForceDeletePods = "force_delete_pods"
 )
 
 // Instruction lifecycle. 'leased' is time-bounded, so a crashed agent's work returns to
@@ -482,7 +496,9 @@ func InstructionOpen(status string) bool {
 
 // ValidInstructionKinds returns the allowed instruction kinds.
 func ValidInstructionKinds() []string {
-	return []string{InstructionQuarantine, InstructionUnquarantine, InstructionVerifyUptake}
+	return []string{InstructionQuarantine, InstructionUnquarantine,
+		InstructionVerifyUptake, InstructionEvictPods, InstructionDeleteWorkload,
+		InstructionForceDeletePods}
 }
 
 // ProvisioningInstruction is one unit of cluster-side work.

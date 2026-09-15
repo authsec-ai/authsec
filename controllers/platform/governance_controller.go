@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -808,6 +809,366 @@ func (ctl *GovernanceController) ReportInstruction(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
+/* -------------------------- force-delete escalation ---------------------- */
+
+// ForceEvictRequest is the body for POST /authsec/governance/agents/:id/force-evict.
+type ForceEvictRequest struct {
+	// Reason is required. Overriding a PodDisruptionBudget without a recorded
+	// justification is the boundary violation this system exists to prevent
+	// elsewhere, so it is refused here and again by a database CHECK.
+	Reason string `json:"reason" binding:"required"`
+}
+
+// ForceEvictAgent handles POST /authsec/governance/agents/:id/force-evict.
+//
+// THE ONLY WAY TO REACH A FORCE-DELETE. It is deliberately an endpoint and not a
+// reconciler branch, a retry, or an escalation the system performs on its own: a
+// disruption budget is something the cluster owner declared, and overruling it has
+// to be a person's decision with their name on it.
+//
+// governance:admin, not governance:certify — this is not a review, it is
+// destruction that overrides an availability guarantee somebody else set.
+func (ctl *GovernanceController) ForceEvictAgent(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	agentID, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req ForceEvictRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "a reason is required: overriding a PodDisruptionBudget is a " +
+				"decision somebody has to answer for"})
+		return
+	}
+
+	var agent models.DiscoveredAgent
+	if err := ctl.db.First(&agent, "id = ? AND workspace_id = ?", agentID, wsID).Error; err != nil {
+		governanceError(c, err)
+		return
+	}
+	// Containment first. Force-deleting the pods of an agent nobody quarantined
+	// would be destruction with no governance decision behind it at all.
+	if agent.Status != models.DiscoveredAgentQuarantined {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "this agent is not quarantined. A force-delete overrides a " +
+				"disruption budget to complete a containment; there is no containment here"})
+		return
+	}
+
+	_, actorLabel := ctl.actingUser(c)
+	out, err := services.ForceEvict(ctl.db, wsID, &agent, services.ForceEvictInput{
+		Actor:  actorLabel,
+		Reason: req.Reason,
+	})
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	log.Printf("FORCE-DELETE authorised by %s for agent %s (%s): %s",
+		actorLabel, agent.ID, agent.DisplayName, req.Reason)
+	c.JSON(http.StatusOK, out)
+}
+
+/* --------------------------- pre-deadline warnings ----------------------- */
+
+func (ctl *GovernanceController) warnings() services.PolicyWarningManager {
+	return services.NewPolicyWarningManager(ctl.db)
+}
+
+// GetNotificationSettings handles GET /authsec/governance/notification-settings.
+//
+// Always answers, even for a workspace that has never configured anything: the
+// defaults are what it will actually get, and returning 404 would suggest warnings
+// are off when they are on.
+func (ctl *GovernanceController) GetNotificationSettings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	s, err := ctl.warnings().Settings(wsID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id":         s.WorkspaceID,
+		"warning_lead_seconds": int64(s.Lead().Seconds()),
+		"webhook_url":          s.WebhookURL,
+		// Never the secret itself, only whether one is set. Same reasoning as the
+		// actuation token: a console read must not be able to exfiltrate a
+		// credential somebody typed once.
+		"webhook_secret_set": s.WebhookSecret != "",
+		"email_enabled":      s.EmailEnabled,
+	})
+}
+
+// UpdateNotificationSettingsRequest is the console's update body.
+type UpdateNotificationSettingsRequest struct {
+	// WarningLead is a Go duration ("168h"). Between 1h and 90 days.
+	WarningLead   *string `json:"warning_lead,omitempty"`
+	WebhookURL    *string `json:"webhook_url,omitempty"`
+	WebhookSecret *string `json:"webhook_secret,omitempty"`
+	EmailEnabled  *bool   `json:"email_enabled,omitempty"`
+}
+
+// UpdateNotificationSettings handles PUT /authsec/governance/notification-settings.
+func (ctl *GovernanceController) UpdateNotificationSettings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req UpdateNotificationSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	in := services.NotificationSettingsInput{
+		WebhookURL: req.WebhookURL, WebhookSecret: req.WebhookSecret,
+		EmailEnabled: req.EmailEnabled,
+	}
+	if req.WarningLead != nil {
+		d, derr := time.ParseDuration(*req.WarningLead)
+		if derr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "invalid warning_lead (use a Go duration, e.g. 168h)"})
+			return
+		}
+		in.WarningLead = &d
+	}
+
+	out, err := ctl.warnings().SaveSettings(wsID, in)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"workspace_id":         out.WorkspaceID,
+		"warning_lead_seconds": int64(out.Lead().Seconds()),
+		"webhook_url":          out.WebhookURL,
+		"webhook_secret_set":   out.WebhookSecret != "",
+		"email_enabled":        out.EmailEnabled,
+	})
+}
+
+// ListPolicyWarnings handles GET /authsec/governance/policy-warnings.
+//
+// The delivery record behind the lookahead: which warnings were scheduled, which
+// were sent, and which failed. Read permission, because a warning that never
+// arrived is something anyone watching governance needs to be able to see.
+func (ctl *GovernanceController) ListPolicyWarnings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var policyID *uuid.UUID
+	if raw := c.Query("policy_id"); raw != "" {
+		id, perr := uuid.Parse(raw)
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy_id"})
+			return
+		}
+		policyID = &id
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+
+	rows, err := ctl.warnings().List(wsID, policyID, limit)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// Undelivered warnings are counted separately rather than left for the console
+	// to filter: a warning stuck in 'failed' or exhausted at 'dead' is the thing
+	// standing between an operator and an unannounced deletion.
+	var undelivered int
+	for i := range rows {
+		if rows[i].State != models.WarningSent {
+			undelivered++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"warnings":    rows,
+		"undelivered": undelivered,
+	})
+}
+
+// RunPolicyWarnings handles POST /authsec/governance/policy-warnings/run.
+//
+// Schedules and delivers immediately instead of waiting for the worker's tick.
+// Exists because "did my policy actually warn anyone" is a question an operator
+// asks while setting one up, and a five-minute wait to find out is the difference
+// between trusting the feature and not.
+func (ctl *GovernanceController) RunPolicyWarnings(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	mgr := ctl.warnings()
+	scheduled, err := mgr.Schedule(wsID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	out, err := mgr.Deliver(50)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"scheduled": scheduled,
+		"attempted": out.Attempted,
+		"sent":      out.Sent,
+		"failed":    out.Failed,
+		"dead":      out.Dead,
+		"errors":    out.Errors,
+	})
+}
+
+/* ---------------------------- the enforcement plan ----------------------- */
+
+func (ctl *GovernanceController) enforcementPlans() services.EnforcementPlanManager {
+	return services.NewEnforcementPlanManager(ctl.db)
+}
+
+// GetEnforcementPlan handles GET /authsec/provisioning/enforcement-plan — the
+// agent's poll for what it should be containing.
+//
+// Authenticated by the actuation token like the instruction lease, and for the same
+// reason: the caller is a workload in a customer cluster, not a console user, and
+// the token is what says WHICH cluster is asking. An agent never names its own
+// cluster, so it can never be handed another one's plan.
+//
+// THE REPORT RIDES ON THE FETCH. The agent states the version it is currently
+// enforcing, its mode, and its would-deny count as query parameters, and this
+// handler folds them into the connector row before answering. One authenticated
+// round trip both reports and refreshes: "what version is this cluster enforcing"
+// is then exactly as fresh as "when did it last poll", and neither fact can exist
+// without the other. The alternative — a second endpoint the agent POSTs to —
+// doubles the request rate and adds a state where one arrived and the other did not.
+//
+// A mutation on a GET, deliberately, matching LeaseInstructions: the agent polls
+// this on a timer, and the poll is the mechanism rather than the intent.
+func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
+	src, ok := ctl.agentSource(c)
+	if !ok {
+		return
+	}
+
+	rep := models.EnforcementReport{Mode: strings.TrimSpace(c.Query("mode"))}
+	if v := c.Query("enforcing"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			rep.Version = &n
+		}
+	}
+	if v := c.Query("denials"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			rep.DenialsTotal = &n
+		}
+	}
+	// Absent means "this agent did not say", which is left alone rather than read
+	// as false: an older build that never sends the parameter must not have its
+	// eviction capability silently cleared on its next poll.
+	if v := c.Query("evict"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Evict = &b
+	}
+	if v := c.Query("delete"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Delete = &b
+	}
+	if v := c.Query("force_evict"); v != "" {
+		b := v == "true" || v == "1"
+		rep.ForceEvict = &b
+	}
+	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
+		// Never fatal to the fetch. Refusing to serve a plan because the agent's
+		// self-report was unparseable would take enforcement away over telemetry.
+		log.Printf("ENFORCEMENT: connector %s sent an unusable self-report (%v); "+
+			"serving the plan anyway", src.ID, err)
+	}
+
+	plan, _, err := ctl.enforcementPlans().Publish(src.WorkspaceID, src.ID)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// An ETag over the CONTENT hash, not the version: an agent that reconnects to a
+	// plan it already holds gets a 304 and does not re-index. Weak, because the
+	// bytes may differ in generated_at while the decisions do not.
+	etag := `W/"` + plan.ContentHash + `"`
+	c.Header("ETag", etag)
+	c.Header("Cache-Control", "no-store")
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json; charset=utf-8", plan.Plan)
+}
+
+// ListEnforcementPlans handles GET /authsec/governance/connectors/:id/enforcement-plans
+// — the console's audit view of what a cluster has been told to contain.
+//
+// Read permission on purpose: anyone who can see a governance decision should be
+// able to see whether it actually reached the cluster it was about.
+func (ctl *GovernanceController) ListEnforcementPlans(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	sourceID, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var src models.DiscoverySource
+	if err := ctl.db.First(&src, "id = ? AND workspace_id = ?", sourceID, wsID).Error; err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	rows, err := ctl.enforcementPlans().History(wsID, sourceID, limit)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	// The gap is the whole reason this view exists, so it is computed here rather
+	// than left for the console to derive: "decided at v43, enforcing v42" is the
+	// difference between a decision and its effect, and an operator must not have to
+	// subtract two numbers to notice it.
+	var latest int64
+	if len(rows) > 0 {
+		latest = rows[0].Version
+	}
+	behind := latest > 0 && (src.EnforcedPlanVersion == nil || *src.EnforcedPlanVersion < latest)
+
+	c.JSON(http.StatusOK, gin.H{
+		"plans":                     rows,
+		"published_version":         latest,
+		"enforcement_mode":          src.EnforcementMode,
+		"enforced_plan_version":     src.EnforcedPlanVersion,
+		"enforced_plan_at":          src.EnforcedPlanAt,
+		"enforcement_denials_total": src.EnforcementDenialsTotal,
+		"behind":                    behind,
+	})
+}
+
 /* ------------------------------ human lifecycle -------------------------- */
 
 func (ctl *GovernanceController) lifecycle() services.LifecycleManager {
@@ -1090,4 +1451,220 @@ func (ctl *GovernanceController) DecideAgentIGALink(c *gin.Context) {
 	auditAdminMutation(c, wsID.String(), "decide", "discovered_agent_iga_link",
 		id.String(), http.StatusOK, nil, out)
 	c.JSON(http.StatusOK, out)
+}
+
+/* ----------------------------- agent policies ----------------------------- */
+
+// The declarative layer above enforcement (ENFORCEMENT-ARCHITECTURE.md §3A). An
+// operator attaches a policy to a claimed agent, or to a selector matching many, and
+// a reconciler works toward it.
+//
+// PHASE 1: reconciliation is dry-run only. These endpoints let a policy be authored,
+// expanded and previewed; nothing acts on a cluster yet.
+
+func (ctl *GovernanceController) agentPolicies() services.AgentPolicyManager {
+	return services.NewAgentPolicyManager(ctl.db)
+}
+
+// CreateAgentPolicyRequest is the body for POST /authsec/governance/agent-policies.
+type CreateAgentPolicyRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description,omitempty"`
+
+	// Exactly one target.
+	DiscoveredAgentID *uuid.UUID                  `json:"discovered_agent_id,omitempty"`
+	Selector          *models.AgentPolicySelector `json:"selector,omitempty"`
+
+	// Entitlement arm — a ceiling, never a grant.
+	ScopeCeiling  []string   `json:"scope_ceiling,omitempty"`
+	RoleCeilingID *uuid.UUID `json:"role_ceiling_id,omitempty"`
+
+	// Cluster arm.
+	DesiredState string `json:"desired_state,omitempty"` // active | quarantined
+
+	Duration  string     `json:"duration,omitempty"` // XOR expires_at
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	OnExpiry  string     `json:"on_expiry,omitempty"` // revoke (default) | quarantine | evict
+
+	// Required when on_expiry is destructive. ConfirmAgentIDs binds the confirmation
+	// to a concrete expansion so one confirmation cannot authorize deleting workloads
+	// nobody enumerated.
+	Reason          string      `json:"reason,omitempty"`
+	ConfirmAgentIDs []uuid.UUID `json:"confirm_agent_ids,omitempty"`
+}
+
+// CreateAgentPolicy handles POST /authsec/governance/agent-policies.
+func (ctl *GovernanceController) CreateAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	var req CreateAgentPolicyRequest
+	if err = c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	actor, actorLabel := ctl.actingUser(c)
+	out, err := ctl.agentPolicies().Create(wsID, actorLabel, services.AgentPolicyInput{
+		Name:              req.Name,
+		Description:       req.Description,
+		DiscoveredAgentID: req.DiscoveredAgentID,
+		Selector:          req.Selector,
+		ScopeCeiling:      req.ScopeCeiling,
+		RoleCeilingID:     req.RoleCeilingID,
+		DesiredState:      req.DesiredState,
+		Duration:          req.Duration,
+		ExpiresAt:         req.ExpiresAt,
+		OnExpiry:          req.OnExpiry,
+		Reason:            req.Reason,
+		ConfirmedBy:       actor,
+		ConfirmAgentIDs:   req.ConfirmAgentIDs,
+	})
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+
+	auditAdminMutation(c, wsID.String(), "create", "agent_policy", out.ID.String(),
+		http.StatusCreated, nil, out)
+	c.JSON(http.StatusCreated, out)
+}
+
+// ListAgentPolicies handles GET /authsec/governance/agent-policies.
+func (ctl *GovernanceController) ListAgentPolicies(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := ctl.agentPolicies().List(wsID, c.Query("enabled") == "true")
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"policies": out, "total": len(out)})
+}
+
+// GetAgentPolicy handles GET /authsec/governance/agent-policies/:id, including the
+// agents its selector currently expands to — a policy is only as clear as the set it
+// actually covers.
+func (ctl *GovernanceController) GetAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	mgr := ctl.agentPolicies()
+	p, err := mgr.Get(wsID, id)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	agents, _ := mgr.Expand(wsID, p)
+	c.JSON(http.StatusOK, gin.H{"policy": p, "expands_to": agents})
+}
+
+// DeleteAgentPolicy handles DELETE /authsec/governance/agent-policies/:id.
+func (ctl *GovernanceController) DeleteAgentPolicy(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := ctl.agentPolicies().Delete(wsID, id); err != nil {
+		governanceError(c, err)
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "delete", "agent_policy", id.String(),
+		http.StatusOK, nil, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"deleted": true,
+		"note": "already-applied effects are NOT undone; the actions this policy took " +
+			"remain in agent_policy_actions",
+	})
+}
+
+// GetAgentPolicyEffective handles GET /authsec/discovery/agents/:id/effective-policy —
+// what every matching policy adds up to for one agent, and which policies caused it.
+func (ctl *GovernanceController) GetAgentPolicyEffective(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	out, err := ctl.agentPolicies().Effective(wsID, id)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ReconcileAgentPolicies handles POST /authsec/governance/agent-policies/reconcile.
+//
+// dry_run defaults to TRUE — a live run must be asked for explicitly.
+//
+// A live run executes the ENTITLEMENT arm only: role narrowing and revoke-on-expiry.
+// Those are control-plane effects, reversible by editing the policy, and invisible to
+// the cluster. The CLUSTER arm is still computed and recorded as refused, so a live
+// reconcile can never look like it quarantined something it did not.
+func (ctl *GovernanceController) ReconcileAgentPolicies(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	dryRun := c.Query("dry_run") != "false"
+	out, err := ctl.agentPolicies().Reconcile(wsID, dryRun)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	if !dryRun {
+		auditAdminMutation(c, wsID.String(), "reconcile", "agent_policy", "",
+			http.StatusOK, nil, out)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListUpcomingPolicyActions handles GET /authsec/governance/policies/upcoming?days=7 —
+// the lookahead. What will this system do to the cluster this week.
+func (ctl *GovernanceController) ListUpcomingPolicyActions(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	days, _ := strconv.Atoi(c.Query("days"))
+	out, err := ctl.agentPolicies().Upcoming(wsID, days)
+	if err != nil {
+		governanceError(c, err)
+		return
+	}
+	destructive := 0
+	for _, a := range out {
+		if a.Destructive {
+			destructive++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"upcoming": out, "total": len(out), "destructive": destructive,
+	})
 }

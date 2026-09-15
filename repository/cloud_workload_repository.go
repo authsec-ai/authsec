@@ -26,8 +26,8 @@ type CloudWorkloadRepository interface {
 	// (identity_id, service, source).
 	UpsertUsage(u *models.CloudUsage) (stored *models.CloudUsage, created bool, err error)
 
-	ListWorkloads(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudWorkload, error)
-	ListUsage(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudUsage, error)
+	ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error)
+	ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error)
 
 	// CountsForConnector reports how many rows of each kind a connector holds,
 	// for the scan report.
@@ -38,6 +38,16 @@ type CloudWorkloadRepository interface {
 	// caller must only invoke it after a scan in which every surface the table
 	// depends on was actually reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (workloadsRemoved, usageRemoved int64, err error)
+}
+
+// CloudWorkloadFilter narrows a workload or usage listing. ConnectorID scopes
+// to one connected AWS account -- without it a workspace with several
+// connectors returns every account's workloads and usage mixed together.
+type CloudWorkloadFilter struct {
+	IdentityID  *uuid.UUID
+	ConnectorID *uuid.UUID
+	Limit       int
+	Offset      int
 }
 
 type cloudWorkloadRepository struct{ db *gorm.DB }
@@ -133,30 +143,44 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	return u, u.ID == proposed, nil
 }
 
-func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudWorkload, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if identityID != nil {
-		q = q.Where("identity_id = ?", *identityID)
+func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudWorkload, int64, error) {
+	q := r.db.Model(&models.CloudWorkload{}).Where("workspace_id = ?", workspaceID)
+	if f.IdentityID != nil {
+		q = q.Where("identity_id = ?", *f.IdentityID)
+	}
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudWorkload
-	if err := q.Order("runtime_kind, name").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("runtime_kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
-func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, identityID *uuid.UUID) ([]models.CloudUsage, error) {
-	q := r.db.Where("workspace_id = ?", workspaceID)
-	if identityID != nil {
-		q = q.Where("identity_id = ?", *identityID)
+func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorkloadFilter) ([]models.CloudUsage, int64, error) {
+	q := r.db.Model(&models.CloudUsage{}).Where("workspace_id = ?", workspaceID)
+	if f.IdentityID != nil {
+		q = q.Where("identity_id = ?", *f.IdentityID)
+	}
+	if f.ConnectorID != nil {
+		q = q.Where("connector_id = ?", *f.ConnectorID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
 	var out []models.CloudUsage
 	// Never-accessed first: a NULL last_used_at is the row worth acting on, and
 	// NULLS FIRST states that rather than leaving it to the default.
-	if err := q.Order("last_used_at ASC NULLS FIRST, service").Find(&out).Error; err != nil {
-		return nil, err
+	if err := q.Order("last_used_at ASC NULLS FIRST, service").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	return out, total, nil
 }
 
 func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uuid.UUID) (int64, int64, error) {

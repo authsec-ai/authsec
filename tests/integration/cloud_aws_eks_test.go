@@ -188,7 +188,7 @@ func TestEKSPodIdentityAssociationBecomesAnAssumeEdge(t *testing.T) {
 	t.Logf("PASS: %d pod identity edge written", out.PodIdentityEdges)
 
 	grants := repositories.NewCloudPermissionRepository(db)
-	edges, err := grants.ListAssumeEdges(ws, nil)
+	edges, _, err := grants.ListAssumeEdges(ws, repositories.CloudPermissionFilter{})
 	if err != nil {
 		t.Fatalf("list assume edges: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestEKSDeniedReadBlocksReconciliation(t *testing.T) {
 		t.Fatalf("baseline scan: %v", err)
 	}
 	grants := repositories.NewCloudPermissionRepository(db)
-	before, _ := grants.ListAssumeEdges(ws, nil)
+	before, _, _ := grants.ListAssumeEdges(ws, repositories.CloudPermissionFilter{})
 	if len(before) == 0 {
 		t.Fatal("test setup: baseline should have written edges")
 	}
@@ -298,7 +298,7 @@ func TestEKSDeniedReadBlocksReconciliation(t *testing.T) {
 	}
 	t.Log("PASS: denied EKS read reported the scan as incomplete")
 
-	after, _ := grants.ListAssumeEdges(ws, nil)
+	after, _, _ := grants.ListAssumeEdges(ws, repositories.CloudPermissionFilter{})
 	if len(after) != len(before) {
 		t.Fatalf("a denied EKS read deleted edges: %d -> %d", len(before), len(after))
 	}

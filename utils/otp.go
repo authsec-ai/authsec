@@ -491,3 +491,140 @@ AuthSec Team
 
 	return err
 }
+
+// PolicyExpiryWarning is everything the pre-deadline warning email renders.
+//
+// A struct rather than a dozen positional arguments: the closest precedent,
+// SendAccessRequestNotificationEmail, already takes eight and adding four more
+// would make the call site unreadable and the argument order a hazard.
+type PolicyExpiryWarning struct {
+	To            string
+	RecipientRole string
+	PolicyName    string
+	AgentLabel    string
+	Namespace     string
+	Cluster       string
+	// Action is what will happen: evict, quarantine, revoke.
+	Action   string
+	Deadline time.Time
+	Reason   string
+	// Confirmed false means the action will be REFUSED for this agent rather than
+	// executed — a materially different message, and the reader acts differently.
+	Confirmed bool
+	// GitOpsManaged true means deleting the workload will not stick; a reconciler
+	// recreates it. Worth saying while there is still time to change the policy.
+	GitOpsManaged bool
+	PolicyID      string
+	AgentID       string
+}
+
+// SendPolicyExpiryWarningEmail warns one recipient before a governance policy does
+// something destructive to their agent.
+//
+// This mail is the ESCALATION, not the guarantee. The lookahead
+// (GET /authsec/governance/policies/upcoming) is the system of record and is
+// correct whether or not this ever arrives, which is why a failure here is
+// recorded and surfaced rather than allowed to block the action: an SMTP outage
+// must not quietly turn every destructive policy into a no-op.
+func SendPolicyExpiryWarningEmail(w PolicyExpiryWarning) error {
+	smtpHost := config.AppConfig.SMTPHost
+	smtpPort := config.AppConfig.SMTPPort
+	smtpUser := config.AppConfig.SMTPUser
+	smtpPass := config.AppConfig.SMTPPassword
+	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
+		log.Printf("SendPolicyExpiryWarningEmail: SMTP not configured")
+		return fmt.Errorf("SMTP configuration is incomplete")
+	}
+
+	where := w.AgentLabel
+	if w.Namespace != "" {
+		where = fmt.Sprintf("%s (namespace %s)", where, w.Namespace)
+	}
+	if w.Cluster != "" {
+		where = fmt.Sprintf("%s in cluster %s", where, w.Cluster)
+	}
+
+	// The subject has to survive being read on a phone lock screen, so the verb and
+	// the deadline come first and the policy name last.
+	var subject string
+	switch {
+	case w.Action == "evict" && !w.Confirmed:
+		subject = "AuthSec: scheduled deletion of " + w.AgentLabel + " will be REFUSED"
+	case w.Action == "evict":
+		subject = "Action required: " + w.AgentLabel + " will be DELETED on " +
+			w.Deadline.UTC().Format("2 Jan 15:04 MST")
+	case w.Action == "quarantine":
+		subject = "AuthSec: " + w.AgentLabel + " will be quarantined on " +
+			w.Deadline.UTC().Format("2 Jan 15:04 MST")
+	default:
+		subject = "AuthSec: access for " + w.AgentLabel + " expires on " +
+			w.Deadline.UTC().Format("2 Jan 15:04 MST")
+	}
+
+	whyYou := map[string]string{
+		"owner":           "You are the accountable owner of this agent.",
+		"author":          "You created the policy that schedules this.",
+		"confirmer":       "You confirmed the destructive expiry on this policy.",
+		"workspace_admin": "You are an administrator of this workspace.",
+	}[w.RecipientRole]
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Hello,\n\nA governance policy is scheduled to act on an AI agent.\n\n")
+	fmt.Fprintf(&sb, "- Agent:     %s\n", where)
+	fmt.Fprintf(&sb, "- Action:    %s\n", strings.ToUpper(w.Action))
+	fmt.Fprintf(&sb, "- When:      %s\n", w.Deadline.UTC().Format(time.RFC1123))
+	fmt.Fprintf(&sb, "- Policy:    %s\n", w.PolicyName)
+	if w.Reason != "" {
+		fmt.Fprintf(&sb, "- Reason:    %s\n", w.Reason)
+	}
+	if whyYou != "" {
+		fmt.Fprintf(&sb, "\n%s\n", whyYou)
+	}
+
+	if w.Action == "evict" {
+		if !w.Confirmed {
+			// The most important sentence in the message when it applies: the
+			// recipient must not spend the week bracing for a deletion that will
+			// not happen, nor assume it is handled when it is not.
+			sb.WriteString("\nNOTE: this agent is NOT covered by the confirmation on that policy, " +
+				"so the deletion will be REFUSED rather than carried out. It was authorised " +
+				"against a different set of agents. If you intend it to be deleted, confirm " +
+				"the policy again against the current set.\n")
+		} else {
+			sb.WriteString("\nThis will DELETE the workload from the cluster. If that is not " +
+				"what you want, edit or disable the policy before the deadline.\n")
+		}
+		if w.GitOpsManaged {
+			sb.WriteString("\nNOTE: this workload appears to be managed by GitOps. Deleting it " +
+				"will not stick — the reconciler will recreate it. Remove it from the source " +
+				"repository as well, or the deletion will be undone within minutes.\n")
+		}
+	}
+
+	// The lookahead link is the most useful thing in the message: it is the system
+	// of record, it shows everything else about to happen, and it is correct even
+	// if this mail arrived late. Omitted rather than rendered broken when no base
+	// URL is configured — a dead link reads as a broken product.
+	if base := strings.TrimRight(strings.TrimSpace(config.AppConfig.BaseURL), "/"); base != "" {
+		if !strings.HasPrefix(strings.ToLower(base), "http") {
+			base = "https://" + base
+		}
+		fmt.Fprintf(&sb, "\nSee everything scheduled for the coming week at:\n"+
+			"  %s/governance/policies/upcoming\n", base)
+	}
+	fmt.Fprintf(&sb, "\nPolicy ID: %s\nAgent ID:  %s\n", w.PolicyID, w.AgentID)
+	sb.WriteString("\nRegards,\nAuthSec Team\n")
+
+	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+	err := smtp.SendMail(
+		fmt.Sprintf("%s:%s", smtpHost, smtpPort),
+		auth, smtpUser, []string{w.To},
+		buildEmailMessage(w.To, subject, sb.String()),
+	)
+	if err != nil {
+		log.Printf("SendPolicyExpiryWarningEmail: failed to warn %s about %s on %s: %v",
+			w.To, w.Action, w.AgentLabel, err)
+		return err
+	}
+	return nil
+}
