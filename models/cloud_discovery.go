@@ -223,11 +223,21 @@ func DecodeScanCoverage(raw json.RawMessage) ScanCoverage {
 const (
 	CloudIdentityIAMRole = "iam_role"
 	CloudIdentityIAMUser = "iam_user"
+
+	// GCP. A service account is the only identity kind GCP discovery writes
+	// today; workload-identity and federated principals arrive with the
+	// impersonation and WIF edges, which are a later surface.
+	CloudIdentityGCPServiceAccount = "gcp_service_account"
 )
 
 // Secret kinds.
 const (
 	CloudSecretAccessKey = "access_key"
+
+	// GCP. A service-account key, keyed by its key id. Only user-managed keys
+	// are recorded: a google-managed key is rotated by Google, never handled by
+	// the customer, and is not a credential anyone can leak.
+	CloudSecretGCPServiceAccountKey = "gcp_service_account_key"
 )
 
 // Secret status, in the provider's own words.
@@ -708,6 +718,130 @@ func (c *CloudConnector) SetGCPAttrs(a GCPConnectorAttrs) error {
 		return err
 	}
 	c.Attrs = raw
+	return nil
+}
+
+/* ---------------------- GCP row attrs: identity, secret --------------------
+
+   The same discipline AWSIdentityAttrs establishes: a fixed set of cross-cloud
+   columns on the shared table, plus one typed provider struct serialized into
+   the existing attrs jsonb. No GCP-specific column is added to any shared
+   table, and no migration is needed for either of these. */
+
+// GCPIdentityAttrs is the GCP shape of CloudIdentity.Attrs.
+type GCPIdentityAttrs struct {
+	// UniqueID is GCP's own immutable numeric id for the service account, and
+	// it is the RECOGNITION KEY -- cloud_identity.native_id is built from it.
+	//
+	// Not the email. An email is an address: delete a service account and
+	// create another at the same address and GCP gives it a new unique id,
+	// while every "who is this" question asked by email would silently answer
+	// with the old one's history. The email is a locator and lives below.
+	UniqueID string `json:"unique_id,omitempty"`
+	// Email is how every IAM binding, every workload attachment and every human
+	// refers to this identity. Kept because it is the join key for policy data
+	// and the only form anyone recognises -- but never the identity itself.
+	Email string `json:"email,omitempty"`
+	// ProjectID is the human-readable container id; ProjectNumber is the
+	// immutable one. Both are kept for the same reason as Email and UniqueID: a
+	// project id string can be reused after deletion, the number cannot.
+	ProjectID     string `json:"project_id,omitempty"`
+	ProjectNumber string `json:"project_number,omitempty"`
+	// Description is the service account's own description field.
+	Description string `json:"description,omitempty"`
+	// OAuth2ClientID is the client id GCP assigns a service account, and is
+	// what a Workspace domain-wide-delegation grant is keyed on. Recorded now
+	// so the Workspace surface can join against it later without a re-scan.
+	OAuth2ClientID string `json:"oauth2_client_id,omitempty"`
+	// Disabled mirrors the provider's own disabled flag. CloudIdentity.Enabled
+	// carries the same fact in the shared column; this keeps the provider's
+	// word for it beside the rest of its evidence.
+	Disabled bool `json:"disabled,omitempty"`
+	// IdentityKind discriminates within GCP. Always "service_account" today.
+	IdentityKind string `json:"identity_kind,omitempty"`
+}
+
+// GCPAttrs decodes Attrs as the GCP shape. Malformed or empty decodes to a zero
+// struct rather than erroring, matching AWSAttrs.
+func (i *CloudIdentity) GCPAttrs() GCPIdentityAttrs {
+	var a GCPIdentityAttrs
+	if len(i.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(i.Attrs, &a)
+	return a
+}
+
+// SetGCPAttrs encodes the GCP shape into Attrs.
+func (i *CloudIdentity) SetGCPAttrs(a GCPIdentityAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	i.Attrs = raw
+	return nil
+}
+
+// Service-account key TYPE, in GCP's own spelling: who manages rotation.
+//
+// This is the distinction that decides whether a key is worth recording at all.
+// A user-managed key is a credential a human created and can leak; a
+// system-managed one is rotated by Google every few days and never leaves it.
+// Only the first is a finding, and only the first is collected.
+const (
+	GCPKeyTypeUserManaged   = "USER_MANAGED"
+	GCPKeyTypeSystemManaged = "SYSTEM_MANAGED"
+)
+
+// Service-account key ORIGIN, in GCP's own spelling: who generated the private
+// key material.
+//
+// A SEPARATE FIELD from key type, and confirmed separate against the live API:
+// a key can be USER_MANAGED (the customer's to rotate) and GOOGLE_PROVIDED
+// (Google generated the material and handed it over) at the same time, which is
+// what the console's "create key" flow produces. USER_PROVIDED means the
+// customer uploaded their own public key and Google never held the private half.
+// The two have different exposure stories, so they are recorded separately
+// rather than collapsed.
+const (
+	GCPKeyOriginGoogleProvided = "GOOGLE_PROVIDED"
+	GCPKeyOriginUserProvided   = "USER_PROVIDED"
+)
+
+// GCPSecretAttrs is the GCP shape of CloudSecret.Attrs.
+type GCPSecretAttrs struct {
+	// KeyOrigin is user_managed or google_managed, in GCP's own terms.
+	KeyOrigin string `json:"key_origin,omitempty"`
+	// KeyAlgorithm is e.g. "KEY_ALG_RSA_2048".
+	KeyAlgorithm string `json:"key_algorithm,omitempty"`
+	// KeyType is GCP's keyType field, e.g. "USER_MANAGED".
+	KeyType string `json:"key_type,omitempty"`
+	// DisableReason is GCP's own words for why a key is disabled, where it
+	// gives any.
+	DisableReason string `json:"disable_reason,omitempty"`
+	// ServiceAccountEmail is the address the key belongs to. The row's
+	// identity_id is the authoritative link; this is here so a key is
+	// intelligible on its own in an export.
+	ServiceAccountEmail string `json:"service_account_email,omitempty"`
+}
+
+// GCPAttrs decodes Attrs as the GCP shape.
+func (s *CloudSecret) GCPAttrs() GCPSecretAttrs {
+	var a GCPSecretAttrs
+	if len(s.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(s.Attrs, &a)
+	return a
+}
+
+// SetGCPAttrs encodes the GCP shape into Attrs.
+func (s *CloudSecret) SetGCPAttrs(a GCPSecretAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	s.Attrs = raw
 	return nil
 }
 

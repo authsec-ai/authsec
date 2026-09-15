@@ -1,7 +1,9 @@
 package platform
 
 import (
+	"context"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -376,6 +378,112 @@ func (ctl *CloudGCPController) RevokeConnector(c *gin.Context) {
 		"meta": gin.H{
 			"note": "the reader service account, its role grants and (for WIF) the workload identity " +
 				"pool/provider still exist in your project; removing them is your step",
+		},
+	})
+}
+
+/* --------------------------------- scanning -------------------------------- */
+
+// scanner builds the discovery scanner. Same Vault-optional reasoning as
+// service(): a WIF connector needs no Vault at all, and a deployment without
+// one must still be able to scan.
+func (ctl *CloudGCPController) scanner() *services.GCPScanner {
+	var vc vault.VaultClient
+	if addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN"); addr != "" && token != "" {
+		if c, err := vault.NewClient(addr, token); err == nil {
+			vc = c
+		}
+	}
+	appIssuerURL := ""
+	if config.AppConfig != nil {
+		appIssuerURL = config.AppConfig.OAuthBaseURL()
+	}
+	issuerURL := gcp.ResolveWIFIssuerURL(appIssuerURL)
+	issuer := tokens.NewNativeIssuer(ctl.db, tokens.NativeKeys(), issuerURL)
+	return services.NewGCPScanner(ctl.db, services.NewGCPAuthService(vc, issuer))
+}
+
+// ScanConnector handles POST /authsec/discovery/gcp/connectors/:id/scan.
+//
+// Mirrors cloudAWS.ScanIAM's contract: the scan runs in the background, this
+// returns 202, and the durable record is the connector's own coverage blob, so
+// polling is a GET of the connector and the report survives a page refresh.
+//
+// The `note` in the response is not decoration. A 202 plus a coverage status of
+// `partial` is NOT an all-clear, and saying so only inside the coverage blob
+// puts the warning somewhere the caller of this endpoint may never look. AWS's
+// handler makes the same admission in its own success body; this is the same
+// discipline, not a copied string.
+func (ctl *CloudGCPController) ScanConnector(c *gin.Context) {
+	workspaceID, actor, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector id"})
+		return
+	}
+
+	// Validate what can be validated up front, so an unusable connector is a
+	// 4xx here rather than a failed scan someone has to go and find. The
+	// scanner re-checks all of this: it runs in a goroutine that outlives this
+	// request, and state can change in between.
+	connector, err := ctl.service().Connector(workspaceID, id)
+	if err != nil {
+		status, body := mapGCPOnboardingError(err)
+		c.JSON(status, body)
+		return
+	}
+	if connector.Status == models.CloudConnectorRevoked {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "this connection was revoked; reconnect the scope before scanning",
+			"fault": "customer_account",
+		})
+		return
+	}
+	if attrs := connector.GCPAttrs(); attrs.DiscoveryReadiness == models.GCPReadinessBlocked {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "this connector is not ready for discovery",
+			"reasons": attrs.DiscoveryReadinessReasons,
+			"hint":    "re-run verify after fixing the reasons above",
+			"fault":   "customer_account",
+		})
+		return
+	}
+
+	scanner := ctl.scanner()
+
+	// context.Background(), not the request context: the request is about to
+	// return, and cancelling the scan when it does would kill every scan
+	// immediately. The scanner applies its own scan-wide and per-phase
+	// deadlines, so this is bounded despite not being tied to the request.
+	go func() {
+		if _, err := scanner.Scan(context.Background(), workspaceID, id); err != nil {
+			log.Printf("gcp scan: connector=%s workspace=%s: %v", id, workspaceID, err)
+		}
+	}()
+
+	auditAdminMutation(c, workspaceID.String(), "scan", "cloud_connector",
+		id.String(), http.StatusAccepted, nil, gin.H{"surface": "identities", "actor": actor})
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"success": true,
+		"message": "GCP service account and key discovery started",
+		"meta": gin.H{
+			"as_of": time.Now().UTC(),
+			"poll":  "/authsec/discovery/gcp/connectors/" + id.String(),
+			"writes": []string{
+				"cloud_identity", "cloud_secret",
+			},
+			"surfaces": []string{gcp.SurfaceIdentities, gcp.SurfaceKeys},
+			"note": "watch coverage.status on the connector; 'partial' means at least one " +
+				"project was denied, throttled or refused by policy and the inventory is " +
+				"NOT an all-clear. Only a 'complete' scan is allowed to remove anything, so " +
+				"a partial result leaves the previous inventory in place rather than " +
+				"reporting it as deleted. IAM bindings, resources and workloads are later " +
+				"surfaces and are not read by this scan.",
 		},
 	})
 }

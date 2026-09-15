@@ -1696,6 +1696,17 @@ func SetupRoutes(
 			discovery.POST("/gcp/connectors/:id/verify", middlewares.Require("discovery", "admin"), cloudGCP.VerifyConnector)
 			discovery.DELETE("/gcp/connectors/:id", middlewares.Require("discovery", "admin"), cloudGCP.RevokeConnector)
 
+			// Service account and key discovery, mirroring the AWS scan
+			// endpoint above: fire-and-forget, 202, and the connector row is
+			// the durable report you poll.
+			//
+			// Phase 1 reads two surfaces — identities and keys — and writes
+			// only cloud_identity and cloud_secret. IAM bindings, resources and
+			// workloads are later surfaces with their own phases; there is
+			// deliberately no separate trigger route for them, for the same
+			// reason AWS has none.
+			discovery.POST("/gcp/connectors/:id/scan", middlewares.Require("discovery", "admin"), cloudGCP.ScanConnector)
+
 			// Google Authentication — an ADDITIVE second onboarding option for
 			// GCP, alongside WIF and JSON key above (neither modified by this
 			// block). A human's one-time Google OAuth consent auto-provisions
