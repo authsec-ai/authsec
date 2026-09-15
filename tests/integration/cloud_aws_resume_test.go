@@ -156,7 +156,7 @@ func TestScanResumesPastIdentitiesAlreadyDone(t *testing.T) {
 
 	// Every identity ends up with its permissions, across the two attempts --
 	// the point of the whole exercise.
-	perms, err := repositories.NewCloudPermissionRepository(db).ListPermissions(ws, nil)
+	perms, _, err := repositories.NewCloudPermissionRepository(db).ListPermissions(ws, repositories.CloudPermissionFilter{})
 	if err != nil {
 		t.Fatalf("list permissions: %v", err)
 	}

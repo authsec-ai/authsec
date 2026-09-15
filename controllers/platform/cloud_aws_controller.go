@@ -513,17 +513,24 @@ func (ctl *CloudAWSController) ListSecrets(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	var identityID *uuid.UUID
-	if raw := c.Query("identity_id"); raw != "" {
-		iid, err := uuid.Parse(raw)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
-			return
-		}
-		identityID = &iid
+	identityID, err := parseOptionalUUID(c.Query("identity_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
+		return
+	}
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	filter := repositories.CloudSecretFilter{
+		IdentityID:  identityID,
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
 	}
 
-	rows, err := repositories.NewCloudIdentityRepository(ctl.db).ListSecrets(workspaceID, identityID)
+	rows, total, err := repositories.NewCloudIdentityRepository(ctl.db).ListSecrets(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -531,7 +538,8 @@ func (ctl *CloudAWSController) ListSecrets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"ordering": "oldest first — age is the finding",
 			"note":     "key identifiers and dates only; no secret value is read or stored",
 		},
@@ -555,7 +563,18 @@ func (ctl *CloudAWSController) ListAssumeEdges(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
 		return
 	}
-	rows, err := repositories.NewCloudPermissionRepository(ctl.db).ListAssumeEdges(workspaceID, identityID)
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	filter := repositories.CloudPermissionFilter{
+		IdentityID:  identityID,
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudPermissionRepository(ctl.db).ListAssumeEdges(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -563,7 +582,8 @@ func (ctl *CloudAWSController) ListAssumeEdges(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"note": "who may assume this identity, and how. subject_kind=identity or " +
 				"external_account means this role can be assumed from outside AuthSec's own view",
 		},
@@ -582,7 +602,18 @@ func (ctl *CloudAWSController) ListPermissions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
 		return
 	}
-	rows, err := repositories.NewCloudPermissionRepository(ctl.db).ListPermissions(workspaceID, identityID)
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	filter := repositories.CloudPermissionFilter{
+		IdentityID:  identityID,
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudPermissionRepository(ctl.db).ListPermissions(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -590,7 +621,8 @@ func (ctl *CloudAWSController) ListPermissions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"note": "derivation=granted only -- these are policy statements, not computed " +
 				"effective access. scope_kind=account_wide or prefix means resource_id is " +
 				"deliberately null, not missing",
@@ -610,7 +642,12 @@ func (ctl *CloudAWSController) ListResources(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
 		return
 	}
-	rows, err := repositories.NewCloudPermissionRepository(ctl.db).ListResources(workspaceID, connectorID)
+	filter := repositories.CloudPermissionFilter{
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudPermissionRepository(ctl.db).ListResources(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -618,7 +655,8 @@ func (ctl *CloudAWSController) ListResources(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"note": "a resource exists here only because a permission statement named it; " +
 				"this is not an inventory of everything in the account",
 		},
@@ -641,14 +679,28 @@ func (ctl *CloudAWSController) ListWorkloads(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
 		return
 	}
-	rows, err := repositories.NewCloudWorkloadRepository(ctl.db).ListWorkloads(workspaceID, identityID)
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	filter := repositories.CloudWorkloadFilter{
+		IdentityID:  identityID,
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudWorkloadRepository(ctl.db).ListWorkloads(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// Unattributed compute is the finding a console should surface, so it is
-	// counted here rather than left for the caller to derive.
+	// counted here rather than left for the caller to derive. Counted over
+	// THIS page only -- with total now paginated, a caller wanting the
+	// unattributed count across every workload must page through and sum, the
+	// same as any other cross-page aggregate.
 	unattributed := 0
 	byKind := map[string]int{}
 	for _, w := range rows {
@@ -661,13 +713,15 @@ func (ctl *CloudAWSController) ListWorkloads(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"by_runtime_kind": byKind,
 			"unattributed":    unattributed,
 			"note": "a workload is compute that RUNS AS an identity, not an identity itself. " +
 				"identity_id null means the role it names was not discovered -- compute " +
 				"nobody can attribute, which is a finding rather than missing data. " +
-				"Whether a workload is an agent is a separate judgement this table does not make",
+				"Whether a workload is an agent is a separate judgement this table does not make. " +
+				"by_runtime_kind and unattributed are counted over this page only, not the total.",
 		},
 	})
 }
@@ -687,14 +741,26 @@ func (ctl *CloudAWSController) ListUsage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
 		return
 	}
-	rows, err := repositories.NewCloudWorkloadRepository(ctl.db).ListUsage(workspaceID, identityID)
+	connectorID, err := parseOptionalUUID(c.Query("connector_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+		return
+	}
+	filter := repositories.CloudWorkloadFilter{
+		IdentityID:  identityID,
+		ConnectorID: connectorID,
+		Limit:       atoiDefault(c.Query("limit"), 100),
+		Offset:      atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudWorkloadRepository(ctl.db).ListUsage(workspaceID, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// A null last_used_at is the actionable row -- the service this identity is
-	// permitted to use and never has.
+	// permitted to use and never has. Counted over this page only, same
+	// caveat as ListWorkloads' unattributed count.
 	neverUsed := 0
 	for _, u := range rows {
 		if u.LastUsedAt == nil {
@@ -705,7 +771,8 @@ func (ctl *CloudAWSController) ListUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": rows,
 		"meta": gin.H{
-			"as_of": time.Now().UTC(), "count": len(rows),
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
 			"never_accessed": neverUsed,
 			"note": "the grain is one row per (identity, service) because that is the grain " +
 				"AWS reports -- it can say 'never touched S3', not 'used GetObject but " +
