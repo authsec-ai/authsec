@@ -144,6 +144,19 @@ const (
 	SurfaceIAMPolicies   = "iam_policies"
 )
 
+// The two AWS surfaces ticket [2]'s permission scan reads independently of the
+// IAM snapshot it is handed (trust-policy and policy-document parsing are pure
+// local work over data ticket [1] already fetched, so they carry no surface of
+// their own — a denied GetRolePolicy shows up as SurfaceIAMPolicies, not here).
+// Both are global per connector, not per region: OIDCProviders is an
+// account-wide list, and EKS clusters are enumerated per region internally but
+// reported as one surface because a customer who runs no EKS at all must not
+// see a per-region wall of denials for a service they never touched.
+const (
+	SurfaceOIDCProviders  = "oidc_providers"
+	SurfaceEKSPodIdentity = "eks_pod_identity"
+)
+
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`

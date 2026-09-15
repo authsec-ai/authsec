@@ -110,6 +110,11 @@ type WorkloadSnapshot struct {
 	Complete bool
 	// Errors carries what went wrong per surface, for the coverage report.
 	Errors map[string]string
+	// Surfaces is the same information as Errors, but in the connector-level
+	// coverage shape (state + count, not just an error string), so the caller
+	// can fold it into the overall report instead of dropping it. Keyed
+	// "<surface>:<region>" per compute surface, plus "activity" globally.
+	Surfaces map[string]models.SurfaceCoverage
 }
 
 // ScanFromSnapshot reads workloads and activity for the identities a
@@ -127,6 +132,7 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 		Generation:  snapshot.Generation,
 		ByKind:      map[string]int{},
 		Errors:      map[string]string{},
+		Surfaces:    map[string]models.SurfaceCoverage{},
 	}
 
 	connector, err := s.connector(workspaceID, snapshot.ConnectorID)
@@ -142,6 +148,15 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 
 	// ---- activity, which is global because IAM is -------------------------
 	s.scanActivity(ctx, workspaceID, snapshot, out)
+	if activityErr, failed := out.Errors["activity"]; failed {
+		out.Surfaces["activity"] = models.SurfaceCoverage{
+			State: models.CloudCoverageDenied, Count: out.UsageWritten, Error: activityErr,
+		}
+	} else {
+		out.Surfaces["activity"] = models.SurfaceCoverage{
+			State: models.CloudCoverageReached, Count: out.UsageWritten,
+		}
+	}
 
 	out.Complete = len(out.Errors) == 0 && snapshot.Coverage.Complete()
 
@@ -188,6 +203,12 @@ func (s *AWSWorkloadScanner) scanRegion(
 	l, e, c, p, b, ac, err := cfgFor()
 	if err != nil {
 		out.Errors["compute:"+region] = err.Error()
+		// Nothing in this region was even attempted -- one surface entry
+		// stands in for the five that never ran, so Complete() correctly sees
+		// this region as unreached instead of silently passing it.
+		out.Surfaces["compute:"+region] = models.SurfaceCoverage{
+			State: models.CloudCoverageDenied, Error: err.Error(),
+		}
 		return
 	}
 
@@ -206,18 +227,21 @@ func (s *AWSWorkloadScanner) scanRegion(
 	}
 
 	for _, surface := range surfaces {
+		key := surface.name + ":" + region
 		found, err := surface.read(ctx)
 		if err != nil {
-			out.Errors[surface.name+":"+region] = err.Error()
+			out.Errors[key] = err.Error()
 			// Whatever was read before the failure is still real and still
 			// worth recording -- the surface is marked unread either way.
 		}
 		for _, w := range found {
-			if err := s.recordWorkload(workspaceID, snapshot, region, w, out); err != nil {
-				out.Errors[surface.name+":"+region] = err.Error()
+			if werr := s.recordWorkload(workspaceID, snapshot, region, w, out); werr != nil {
+				out.Errors[key] = werr.Error()
+				err = werr
 				break
 			}
 		}
+		out.Surfaces[key] = surfaceResult(len(found), err)
 	}
 }
 

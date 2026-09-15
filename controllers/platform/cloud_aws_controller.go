@@ -411,17 +411,35 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 			log.Printf("aws iam scan: connector=%s workspace=%s: %v", id, workspaceID, err)
 			return
 		}
-		if _, err := permissionScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot); err != nil {
-			log.Printf("aws permission scan: connector=%s workspace=%s: %v", id, workspaceID, err)
+		permSnapshot, permErr := permissionScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot)
+		if permErr != nil {
+			log.Printf("aws permission scan: connector=%s workspace=%s: %v", id, workspaceID, permErr)
 		}
 		// Workloads and activity run last, chained on the same snapshot and so
 		// the same generation. Last because they are the most expensive -- one
 		// report job per identity, plus every regional compute surface -- and
 		// the least damaging to lose: an identity with its permissions but no
 		// attributed compute is still a governed identity.
-		if _, err := workloadScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot); err != nil {
-			log.Printf("aws workload scan: connector=%s workspace=%s: %v", id, workspaceID, err)
+		workloadSnapshot, workloadErr := workloadScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot)
+		if workloadErr != nil {
+			log.Printf("aws workload scan: connector=%s workspace=%s: %v", id, workspaceID, workloadErr)
 		}
+
+		// scanner.Scan already committed a coverage report based on its own
+		// four surfaces -- necessarily premature, since it returned before
+		// either scan below had run. This replaces it with the true,
+		// cumulative report now that every surface has actually been
+		// attempted, so coverage.status = "complete" never hides a denied
+		// permission or workload surface behind a fully-readable IAM scan.
+		var permSurfaces, workloadSurfaces map[string]models.SurfaceCoverage
+		if permSnapshot != nil {
+			permSurfaces = permSnapshot.Surfaces
+		}
+		if workloadSnapshot != nil {
+			workloadSurfaces = workloadSnapshot.Surfaces
+		}
+		scanner.FinalizeCoverage(workspaceID, id, snapshot.Coverage,
+			permErr, permSurfaces, workloadErr, workloadSurfaces)
 	}()
 
 	auditAdminMutation(c, workspaceID.String(), "scan", "cloud_connector",
@@ -434,9 +452,10 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 			"as_of": time.Now().UTC(),
 			"poll":  "/authsec/discovery/aws/connectors/" + id.String(),
 			"note": "watch coverage.status on the connector; 'partial' means at least one " +
-				"surface was denied or throttled and the inventory is not an all-clear. " +
-				"Trust-policy and permission parsing runs immediately after and is not " +
-				"reflected in this coverage blob -- see ListAssumeEdges/ListPermissions.",
+				"surface -- IAM, permissions, or workloads/activity -- was denied or " +
+				"throttled and the inventory is not an all-clear. The report updates " +
+				"again once permission and workload scanning finish, so poll until " +
+				"coverage.finished_at stops moving, not just until status first appears.",
 			"writes": []string{
 				"cloud_identity", "cloud_secret",
 				"cloud_assume_edge", "cloud_permission", "cloud_resource",
