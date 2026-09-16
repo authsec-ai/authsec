@@ -12,6 +12,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/internal/vault"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -255,6 +256,8 @@ type provisionGoogleOAuthRequest struct {
 	ScopeID         string `json:"scope_id"`
 	ReaderProjectID string `json:"reader_project_id"`
 	DisplayName     string `json:"display_name"`
+	// Hints is optional customer-declared context no GCP API reports.
+	Hints *models.GCPOnboardingHints `json:"hints,omitempty"`
 }
 
 // ProvisionGoogleOAuth handles POST /authsec/discovery/gcp/google-oauth/connectors.
@@ -288,7 +291,7 @@ func (ctl *CloudGCPOAuthController) ProvisionGoogleOAuth(c *gin.Context) {
 		ScopeKind:       req.ScopeKind,
 		ScopeID:         req.ScopeID,
 		ReaderProjectID: req.ReaderProjectID,
-	}, req.DisplayName, actor)
+	}, req.DisplayName, req.Hints, actor)
 	if perr != nil {
 		status, body := mapGoogleOAuthError(perr)
 		c.JSON(status, body)
@@ -369,7 +372,7 @@ func mapGoogleOAuthError(err error) (int, gin.H) {
 		// flow, only the hint is reworded for this option.
 		return http.StatusBadRequest, gin.H{
 			"error": err.Error(),
-			"hint": "automatic setup could not verify the connection yet -- Google Cloud can take a minute to apply the new trust relationship, so try connecting again; if it keeps failing, use the Workload Identity Federation option instead",
+			"hint":  "automatic setup could not verify the connection yet -- Google Cloud can take a minute to apply the new trust relationship, so try connecting again; if it keeps failing, use the Workload Identity Federation option instead",
 			"fault": "customer_account",
 		}
 	case errors.Is(err, gcp.ErrInvalidGrant):

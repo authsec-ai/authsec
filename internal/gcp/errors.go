@@ -2,6 +2,7 @@ package gcp
 
 import (
 	"errors"
+	"strings"
 
 	"google.golang.org/api/googleapi"
 )
@@ -43,7 +44,7 @@ var (
 	ErrPermissionDenied = errors.New("gcp: permission denied")
 
 	// ErrWIFIssuerNotHTTPS means this AuthSec deployment's configured WIF
-	// OIDC issuer (see issuer.go's WIFIssuerEnv) is not HTTPS. Google Cloud
+	// OIDC issuer (see auth.go's WIFIssuerEnv) is not HTTPS. Google Cloud
 	// unconditionally rejects a non-HTTPS issuer when creating a Workload
 	// Identity Pool provider, so WIF cannot succeed here regardless of
 	// anything the customer does — this is squarely an AuthSec deployment-
@@ -53,6 +54,22 @@ var (
 	// fault:"gcp" — the deployment-side counterpart to AWS's
 	// ErrNoBaseCredentials.
 	ErrWIFIssuerNotHTTPS = errors.New("gcp: workload identity federation requires a publicly reachable https issuer, which this deployment is not configured with")
+
+	// ErrVPCServiceControls means a VPC Service Controls perimeter refused the
+	// request. The reader may hold every permission it needs; the perimeter
+	// blocks the call regardless.
+	//
+	// Distinct from ErrPermissionDenied because the remedy is completely
+	// different. A denial is fixed by granting a role. A perimeter violation
+	// is fixed by an access-level or egress-rule change, made by whoever owns
+	// the perimeter — and telling that customer to "grant the reader a role"
+	// sends them to do something that will not work.
+	ErrVPCServiceControls = errors.New("gcp: a vpc service controls perimeter refused this request")
+
+	// ErrOrgPolicyConstrained means an organization policy constraint refused
+	// the request. Same shape of problem as the above: a deliberate decision
+	// somebody made, not a missing grant.
+	ErrOrgPolicyConstrained = errors.New("gcp: an organization policy constraint refused this request")
 
 	// ErrWIFIssuerUnreachable means Google Cloud could not reach the WIF
 	// provider's configured issuer to complete a credential exchange — GCP's
@@ -90,6 +107,69 @@ var ErrGoogleOAuthExchangeFailed = errors.New("gcp: google rejected the authoriz
 var ErrGoogleOAuthProvisioningFailed = errors.New("gcp: google authentication provisioning failed")
 
 /* --------------------------- error classification -------------------------- */
+
+// ClassifyConstraint reports whether a provider error was a refusal BY DESIGN
+// — a VPC Service Controls perimeter or an organization policy — rather than a
+// missing permission. Returns nil when it was not.
+//
+// Both arrive as a 403, which is why they need separating deliberately: a
+// perimeter violation and an unbound role are indistinguishable by status
+// code, and collapsing them sends a customer to grant a role that will change
+// nothing.
+//
+// WHAT THIS MATCHES, AND HOW CONFIDENT IT IS. VPC-SC is the reliable half:
+// Google documents the violation reason and it appears verbatim in the error
+// details. Organization-policy refusals are thinner — the constraint id
+// appears in the message, but the surrounding wording is not contractual — so
+// that branch matches on the constraint prefix Google does use consistently
+// and nothing more.
+//
+// Anything unmatched falls through to nil and is treated as an ordinary
+// denial. That is the safe direction: mislabelling a real permission problem
+// as "policy" would tell a customer to go argue with their platform team
+// about a role they simply have not been granted.
+func ClassifyConstraint(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+
+	// Matched first: a perimeter violation can also mention a constraint, and
+	// the perimeter is the more specific and more actionable answer.
+	for _, marker := range []string{
+		"VPC_SERVICE_CONTROLS",
+		"SECURITY_POLICY_VIOLATED",
+		"vpcServiceControlsUniqueIdentifier",
+		"Request is prohibited by organization's policy", // VPC-SC's own wording
+	} {
+		if strings.Contains(msg, marker) {
+			return ErrVPCServiceControls
+		}
+	}
+
+	// Org policy constraints are always named "constraints/<something>".
+	if strings.Contains(msg, "constraints/") {
+		return ErrOrgPolicyConstrained
+	}
+	return nil
+}
+
+// ConstraintReasonCode returns the short, non-secret label to record on
+// coverage for a constrained read. Empty when the error was not a constraint.
+//
+// A code rather than the provider's message: the message can carry resource
+// names and identifiers from the customer's estate, and coverage is read in
+// contexts where that does not belong.
+func ConstraintReasonCode(err error) string {
+	switch {
+	case errors.Is(err, ErrVPCServiceControls):
+		return "vpc_service_controls"
+	case errors.Is(err, ErrOrgPolicyConstrained):
+		return "org_policy_constraint"
+	default:
+		return ""
+	}
+}
 
 func isNotFound(err error) bool {
 	var gerr *googleapi.Error

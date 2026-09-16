@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/auth/credentials/externalaccount"
 	"github.com/google/uuid"
@@ -255,7 +258,7 @@ func TestExternalAccountCredential_MockSTSExchange(t *testing.T) {
 	creds, err := newExternalAccountCredentials(&externalaccount.Options{
 		Audience:                       "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/authsec-abc123/providers/authsec-provider",
 		SubjectTokenType:               wifSubjectTokenType,
-		SubjectTokenProvider:           staticSubjectTokenProvider{token: wantSubjectToken},
+		SubjectTokenProvider:           mintingSubjectTokenProvider{issuer: &fakeTokenIssuer{token: wantSubjectToken}, subject: "authsec:subject", audience: "//iam.googleapis.com/whatever"},
 		TokenURL:                       srv.URL + "/token",
 		ServiceAccountImpersonationURL: srv.URL + "/generateAccessToken",
 		Scopes:                         []string{ReadOnlyScope},
@@ -276,5 +279,172 @@ func TestExternalAccountCredential_MockSTSExchange(t *testing.T) {
 	}
 	if !impersonateCalled {
 		t.Error("mock /generateAccessToken endpoint was never called -- impersonation did not happen")
+	}
+}
+
+/* ------------------------- subject-token refresh (ONB-1) --------------------- */
+
+// countingIssuer mints a DIFFERENT token on every call, so a test can tell one
+// mint apart from the next. fakeTokenIssuer deliberately returns a fixed
+// string (several tests assert on its exact value), which cannot distinguish
+// "minted twice" from "handed back the same token twice" -- the precise
+// confusion this file's ONB-1 tests exist to rule out.
+type countingIssuer struct {
+	mu     sync.Mutex
+	issued []string
+}
+
+func (c *countingIssuer) IssuerURL() string { return "https://app.authsec.test" }
+
+func (c *countingIssuer) IssueCloudOnboardingToken(_ context.Context, _, _ string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tok := fmt.Sprintf("minted-subject-token-%d", len(c.issued)+1)
+	c.issued = append(c.issued, tok)
+	return tok, nil
+}
+
+// TestMintingSubjectTokenProvider_MintsFreshEveryCall is the direct unit test
+// for the ONB-1 fix: the provider must mint per call, never memoise.
+//
+// The predecessor (staticSubjectTokenProvider) captured one 5-minute token at
+// construction. Since the impersonated access token it feeds lives about an
+// hour, the library's first refresh re-invoked the provider and got back an
+// assertion that had expired ~55 minutes earlier -- so a credential worked for
+// exactly one refresh interval. That is survivable for onboarding's single
+// verify call and fatal for a scan that pages for hours.
+func TestMintingSubjectTokenProvider_MintsFreshEveryCall(t *testing.T) {
+	issuer := &countingIssuer{}
+	p := mintingSubjectTokenProvider{issuer: issuer, subject: "authsec:abc", audience: "//iam.googleapis.com/aud"}
+
+	first, err := p.SubjectToken(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("first SubjectToken: %v", err)
+	}
+	second, err := p.SubjectToken(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("second SubjectToken: %v", err)
+	}
+
+	if first == second {
+		t.Fatalf("both calls returned %q -- the provider memoised instead of minting; a long scan would present an expired assertion at its first refresh", first)
+	}
+	if len(issuer.issued) != 2 {
+		t.Errorf("issuer minted %d times, want 2", len(issuer.issued))
+	}
+}
+
+// TestMintingSubjectTokenProvider_PassesDerivedSubjectAndAudience proves the
+// provider forwards exactly what ResolveWIFCredential derived, rather than
+// re-deriving anything of its own on the refresh path.
+func TestMintingSubjectTokenProvider_PassesDerivedSubjectAndAudience(t *testing.T) {
+	issuer := &fakeTokenIssuer{token: "t"}
+	p := mintingSubjectTokenProvider{issuer: issuer, subject: "authsec:deadbeef", audience: "//iam.googleapis.com/projects/1/x"}
+
+	if _, err := p.SubjectToken(context.Background(), nil); err != nil {
+		t.Fatalf("SubjectToken: %v", err)
+	}
+	if issuer.gotSub != "authsec:deadbeef" {
+		t.Errorf("sub = %q, want the derived wif_subject", issuer.gotSub)
+	}
+	if issuer.gotAud != "//iam.googleapis.com/projects/1/x" {
+		t.Errorf("aud = %q, want the provider-resource audience", issuer.gotAud)
+	}
+}
+
+// TestExternalAccountCredential_RefreshMintsANewSubjectToken is the
+// integration half: it drives the real externalaccount credential through TWO
+// token acquisitions against the mock STS and asserts the second exchange
+// carried a DIFFERENT subject token than the first.
+//
+// The impersonation response deliberately expires immediately, which is what
+// makes the library re-run the whole exchange on the second Token() call
+// rather than serving a cached access token. Against the old static provider
+// this test would see the same subject_token twice -- and in production, an
+// expired one.
+func TestExternalAccountCredential_RefreshMintsANewSubjectToken(t *testing.T) {
+	issuer := &countingIssuer{}
+
+	var mu sync.Mutex
+	var seenSubjectTokens []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		seenSubjectTokens = append(seenSubjectTokens, r.FormValue("subject_token"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token":      "federated-token",
+			"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+			"token_type":        "Bearer",
+			// One second, which the auth library's own refresh margin already
+			// treats as stale. The federated STS token is cached SEPARATELY
+			// from the impersonated one, so leaving this at 3600 would let the
+			// second Token() call re-impersonate off a cached exchange and
+			// never re-invoke the subject-token provider at all.
+			"expires_in": 1,
+		})
+	})
+	mux.HandleFunc("/generateAccessToken", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Already expired, so the next Token() call cannot serve this from
+		// cache and must repeat the exchange -- which is the only way to
+		// observe what the provider hands over on a refresh.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"accessToken": "impersonated-access-token",
+			"expireTime":  time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	creds, err := newExternalAccountCredentials(&externalaccount.Options{
+		Audience:                       "//iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/authsec-abc123/providers/authsec-provider",
+		SubjectTokenType:               wifSubjectTokenType,
+		SubjectTokenProvider:           mintingSubjectTokenProvider{issuer: issuer, subject: "authsec:abc", audience: "//iam.googleapis.com/aud"},
+		TokenURL:                       srv.URL + "/token",
+		ServiceAccountImpersonationURL: srv.URL + "/generateAccessToken",
+		Scopes:                         []string{ReadOnlyScope},
+	})
+	if err != nil {
+		t.Fatalf("newExternalAccountCredentials: %v", err)
+	}
+
+	ctx := context.Background()
+	if _, err := creds.Token(ctx); err != nil {
+		t.Fatalf("first Token: %v", err)
+	}
+
+	// Wait past the federated token's one-second lifetime before asking again.
+	//
+	// The impersonated token and the federated STS token are cached at
+	// SEPARATE layers. The already-expired impersonation response forces a
+	// re-impersonation on every call, but that alone reuses the cached
+	// exchange and never re-invokes the subject-token provider -- so simply
+	// calling twice in a row observes only one exchange and so fails for the
+	// wrong reason -- never reaching the refresh path at all. Sleeping past
+	// the STS token's own expiry is what makes the second exchange certain:
+	// the library's refresh margin can only make a token expire sooner than
+	// its stated lifetime, never later.
+	time.Sleep(1200 * time.Millisecond)
+
+	if _, err := creds.Token(ctx); err != nil {
+		t.Fatalf("second Token (the refresh this test exists for): %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenSubjectTokens) < 2 {
+		t.Fatalf("STS saw %d exchange(s), want at least 2 -- the credential served a cached token and the refresh path was never exercised", len(seenSubjectTokens))
+	}
+	if seenSubjectTokens[0] == seenSubjectTokens[1] {
+		t.Errorf("both exchanges presented the same subject token %q -- on a real refresh that assertion would be long expired", seenSubjectTokens[0])
 	}
 }

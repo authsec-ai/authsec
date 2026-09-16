@@ -16,42 +16,27 @@ import (
 	"google.golang.org/api/option"
 )
 
-// GCP credential-resolution service: both onboarding auth paths (json_key,
-// wif), converging on the same typed-client construction
-// (internal/gcp/client.go) and the same connectivity proof
-// (ResolveReaderIdentity), exactly as internal/awsdiscovery/onboarding.go and
-// services/cloud_aws_onboarding.go split adapter from policy for AWS.
+// GCP credential resolution, converging on the same typed-client construction
+// and the same connectivity proof (ResolveReaderIdentity), exactly as
+// internal/awsdiscovery/onboarding.go and services/cloud_aws_onboarding.go
+// split adapter from policy for AWS.
 //
-// json_key: the uploaded key is a real secret and lives in Vault, under a
-// path shaped identically to AWS's ExternalId path
-// (services/cloud_aws_onboarding.go's awsExternalIDPath), keyed by scope
-// rather than by connector id for the same reason AWS's is keyed by account —
-// re-onboarding the same scope overwrites its stored key instead of leaving
-// an orphaned entry behind.
+// wif is the only path a NEW connector can take, and there is no secret
+// anywhere in it: the credential is rebuilt fresh on every call from a token
+// internal/tokens.NativeIssuer mints on demand, so there is nothing to store,
+// nothing to read back, and nothing that can outlive the customer removing
+// their own binding.
 //
-// wif: there is no secret anywhere in this path. The credential is rebuilt
-// fresh, every time, from a token internal/tokens.NativeIssuer mints on
-// demand — see gcp.ResolveWIFCredential's doc comment for why that token
-// never needs caching or persistence.
+// json_key survives in read-and-delete form only, for connectors created
+// before the keyed path was closed. See the block above LoadCredential.
 
-// GCP connector auth methods. Mirror the JSON `auth.method` values
-// prompt.md's GCP-D9 design and GCP-04's request shape use
-// (auth:{method:"wif"|"json_key", ...}).
+// GCP connector auth methods. These mirror the JSON `auth.method` values, and
+// json_key remains a legal value on an EXISTING row even though Onboard now
+// refuses it on a new one.
 const (
 	GCPAuthMethodJSONKey = "json_key"
 	GCPAuthMethodWIF     = "wif"
 )
-
-// gcpKeyPath is where a workspace's uploaded GCP service-account key for one
-// scope lives. Shape mirrors awsExternalIDPath exactly (see
-// services/cloud_aws_onboarding.go), substituting "gcp" for "aws" — the same
-// kv/data/secret/workspaces/<workspace_id>/cloud-discovery/<provider>/<scope>
-// convention prompt.md's FACT list already confirms the landed
-// internal/vault interface and path convention support without any change.
-func gcpKeyPath(workspaceID uuid.UUID, scopeID string) string {
-	return fmt.Sprintf("kv/data/secret/workspaces/%s/cloud-discovery/gcp/%s",
-		workspaceID.String(), scopeID)
-}
 
 // GCPAuthService owns credential resolution for both GCP onboarding auth
 // paths. GCP-04 builds the connector lifecycle (the row, the onboarding
@@ -62,48 +47,36 @@ type GCPAuthService struct {
 	vault vault.VaultClient
 	// issuer is narrowed to gcp.CloudOnboardingTokenIssuer (satisfied by
 	// *internal/tokens.NativeIssuer) rather than depending on internal/tokens
-	// directly, for the same reason internal/gcp/credentials.go does: this
+	// directly, for the same reason internal/gcp/auth.go does: this
 	// service can be exercised in tests against a fake that mints a token
 	// without a real signing keyset or database.
 	issuer gcp.CloudOnboardingTokenIssuer
 }
 
-// NewGCPAuthService constructs the service. vault is required for the
-// json_key path (StoreKey/LoadCredential/DeleteCredential fail explicitly,
-// not silently, when it is nil — see AWSOnboardingService's own NewAWS...
-// comment for the identical reasoning); issuer is required for the wif path.
-// A deployment missing either can still onboard GCP connectors through
-// whichever path it does have configured.
+// NewGCPAuthService constructs the service. vault is needed only to read or
+// purge a legacy keyed connector (LoadCredential/DeleteCredential fail
+// explicitly, not silently, when it is nil); issuer is required for wif, which
+// is the only path new connectors take. A deployment with no Vault can still
+// onboard.
 func NewGCPAuthService(vc vault.VaultClient, issuer gcp.CloudOnboardingTokenIssuer) *GCPAuthService {
 	return &GCPAuthService{vault: vc, issuer: issuer}
 }
 
 /* -------------------------------- json_key --------------------------------- */
 
-// StoreKey validates an uploaded service-account key's shape (never its
-// content beyond structural checks — internal/gcp.ResolveJSONKeyCredential
-// owns that) and writes it to Vault ONLY if valid. Returns the auth_ref to
-// persist on the connector row.
+// What remains of the json_key path, and why.
 //
-// Ordering matters: validation happens before any Vault write, mirroring the
-// plan's own rule that a credential AuthSec cannot use must leave nothing
-// behind — a malformed key must never even reach the secrets store.
-func (s *GCPAuthService) StoreKey(workspaceID uuid.UUID, scopeID string, keyJSON []byte) (string, error) {
-	if _, err := gcp.ResolveJSONKeyCredential(keyJSON); err != nil {
-		return "", err
-	}
-	if s.vault == nil {
-		return "", errors.New("secrets store not configured; the service account key cannot be stored")
-	}
-
-	path := gcpKeyPath(workspaceID, scopeID)
-	if err := s.vault.WriteSecret(path, map[string]interface{}{
-		"key_json": string(keyJSON),
-	}); err != nil {
-		return "", fmt.Errorf("failed to store the service account key: %w", err)
-	}
-	return path, nil
-}
+// No new connector can be created with a service-account key — Onboard refuses
+// the method outright (ErrKeyedOnboardingClosed). The write side is therefore
+// gone: there is no StoreKey, and nothing in this package can put key material
+// into Vault any more.
+//
+// The read and delete sides stay, for connectors that already exist. A keyed
+// connector must still be able to verify, so an operator can see whether it
+// works before migrating it, and must still revoke cleanly with its secret
+// purged. Removing these would strand exactly the connectors we most want
+// people to retire, and would leave their key material in Vault with no code
+// left to delete it.
 
 // LoadCredential reads a json_key connector's stored key back from Vault and
 // resolves it to the option.ClientOption that authenticates a client with it.
@@ -172,9 +145,12 @@ func (s *GCPAuthService) ResolveReaderIdentity(
 }
 
 // classifyIAMError maps a raw error from the IAM call above to one of the
-// four sanitized codes this ticket specifies, WITHOUT ever returning or
-// logging the raw GCP/STS error text or any token material — only the
-// static sentinel is ever propagated.
+// sanitized sentinels. Only the sentinel is ever RETURNED — no provider text
+// reaches a response or the connector row.
+//
+// It does log the provider's own code and message, to an operator log, and
+// only there. That is a deliberate exception to the "nothing raw escapes"
+// rule and the reason is in the comment on the log line itself.
 //
 // authMethod disambiguates one genuinely ambiguous case: an "invalid_grant"
 // response can come from either path's underlying OAuth2 token acquisition
@@ -189,18 +165,32 @@ func (s *GCPAuthService) ResolveReaderIdentity(
 // REAL failure mode now that WIF is fully implemented, not a stub-era
 // placeholder.
 func classifyIAMError(err error, authMethod string) error {
-	// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation): the code
-	// below intentionally returns only a static sanitized sentinel from this
-	// point on -- this is the one place the real GCP/STS error code+message
-	// is still visible. googleapi.Error.Code/Message are GCP's own
-	// descriptive text (e.g. "invalid_target", "Error connecting to the
-	// given credential's issuer") -- never a token, key or credential -- so
-	// this is safe to log. Remove once the 400 root cause is confirmed.
+	// Every branch below collapses the failure into a static sentinel, which
+	// is right for the customer-facing response and useless for working out
+	// WHY a token exchange was refused. This log line is the one place the
+	// real answer survives.
+	//
+	// It was removed once, on the assumption its investigation was closed, and
+	// had to come back the first time a federation setup failed in a way none
+	// of the specific branches matched — leaving nothing anywhere to say what
+	// Google had actually objected to. googleapi.Error's Code and Message are
+	// GCP's own descriptive text ("invalid_target", "Error connecting to the
+	// given credential's issuer"), never a token, key or assertion: the
+	// credential is not in the error, it is in the request that produced it.
 	var gerr *googleapi.Error
 	if errors.As(err, &gerr) {
-		log.Printf("[gcp] classifyIAMError authMethod=%s code=%d message=%q", authMethod, gerr.Code, gerr.Message)
+		log.Printf("[gcp] credential exchange refused: authMethod=%s code=%d message=%q", authMethod, gerr.Code, gerr.Message)
 	} else {
-		log.Printf("[gcp] classifyIAMError authMethod=%s non-googleapi error=%q", authMethod, err.Error())
+		log.Printf("[gcp] credential exchange refused: authMethod=%s error=%q", authMethod, err.Error())
+	}
+
+	// Checked BEFORE the generic 403 below. A VPC Service Controls perimeter
+	// and an organization policy both refuse with 403, and reporting either as
+	// "permission denied" sends the customer to grant a role that will change
+	// nothing — the fix is an access-level or policy change made by whoever
+	// owns the constraint.
+	if constrained := gcp.ClassifyConstraint(err); constrained != nil {
+		return constrained
 	}
 	if errors.As(err, &gerr) {
 		switch gerr.Code {

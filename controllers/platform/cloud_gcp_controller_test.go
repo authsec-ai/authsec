@@ -46,7 +46,7 @@ func TestCloudGcpRoutes_ReadOnlyScope_DeniedOnMutation(t *testing.T) {
 	r := gcpTestRouter(NewCloudGCPController(nil))
 
 	req := httptest.NewRequest(http.MethodPost, "/authsec/discovery/gcp/connectors",
-		bytes.NewReader([]byte(`{"scope_kind":"project","scope_id":"x","reader_project_id":"y","auth":{"method":"json_key","key_json":"{}"}}`)))
+		bytes.NewReader([]byte(`{"scope_kind":"project","scope_id":"x","reader_project_id":"y","auth":{"method":"wif"}}`)))
 	req.Header.Set("X-Test-Scope", "discovery:read")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -118,12 +118,16 @@ func TestCloudGcpRoutes_AdminScope_AllowedOnMutation(t *testing.T) {
 	}
 }
 
-// TestCloudGcpCreateConnector_KeyNeverAppearsInResponse proves that even an
-// uploaded key that makes it all the way to a validation failure never has
-// its bytes echoed back in the HTTP response body -- the response is built
-// from mapGCPOnboardingError(err) and, on success, the stored connector
+// TestCloudGcpCreateConnector_KeyNeverAppearsInResponse proves that a key sent
+// in the request body never has its bytes echoed back in the HTTP response.
+//
+// Onboarding now refuses auth.method "json_key" outright, so this request is
+// rejected rather than processed -- which makes the property MORE important to
+// pin, not less. A rejection path is exactly where a handler is tempted to
+// echo the offending input back to explain itself. The response is built from
+// mapGCPOnboardingError(err) and, on success, from the stored connector
 // (models.GCPConnectorAttrs, which structurally has no field for key
-// material), never from the request struct.
+// material) -- never from the request struct.
 func TestCloudGcpCreateConnector_KeyNeverAppearsInResponse(t *testing.T) {
 	r := gcpTestRouter(NewCloudGCPController(nil))
 
@@ -171,5 +175,40 @@ func TestMapGCPOnboardingError_WIFIssuerNotHTTPS(t *testing.T) {
 		if strings.Contains(strings.ToLower(errStr), invented) || strings.Contains(strings.ToLower(hintStr), invented) {
 			t.Errorf("must never invent a cause the backend didn't assert; found %q in error=%q hint=%q", invented, errStr, hintStr)
 		}
+	}
+}
+
+// TestCloudGcpCreateConnector_KeyedMethodRejected proves the closed keyed path
+// reaches the caller as a clear 400 naming what to do instead, rather than as
+// a generic validation error they would waste time debugging.
+//
+// The console has not offered this method for a while, but the HTTP surface
+// still accepted it, so a keyed connector could be created through the API and
+// handed to discovery. The API is where the guarantee has to hold.
+func TestCloudGcpCreateConnector_KeyedMethodRejected(t *testing.T) {
+	r := gcpTestRouter(NewCloudGCPController(nil))
+
+	body := `{"scope_kind":"project","scope_id":"my-project","reader_project_id":"reader-proj",` +
+		`"auth":{"method":"json_key","key_json":"{}"}}`
+	req := httptest.NewRequest(http.MethodPost, "/authsec/discovery/gcp/connectors", bytes.NewReader([]byte(body)))
+	req.Header.Set("X-Test-Scope", "discovery:admin")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a closed auth method: %s", w.Code, w.Body.String())
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if fault, _ := got["fault"].(string); fault != "customer_account" {
+		t.Errorf("fault = %q, want customer_account -- the caller chose the method", fault)
+	}
+	hint, _ := got["hint"].(string)
+	if !strings.Contains(hint, "wif") {
+		t.Errorf("hint = %q, want it to name the method to use instead", hint)
 	}
 }

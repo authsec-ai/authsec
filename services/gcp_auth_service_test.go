@@ -125,28 +125,34 @@ func validServiceAccountKeyJSON(t *testing.T) []byte {
 	return b
 }
 
-func TestGCPAuthService_StoreKey_RoundTripsThroughVault(t *testing.T) {
+// TestGCPAuthService_LegacyKeyedConnectorStillReadsAndPurges covers what is
+// left of the json_key path after onboarding stopped accepting it.
+//
+// There is no StoreKey any more -- nothing in the service can put key material
+// into Vault. What must keep working is the other half: a connector created
+// before the change still resolves its credential, so an operator can verify
+// it before migrating, and still purges cleanly on revoke. Dropping these
+// would strand exactly the connectors we want retired, and would leave their
+// key material in Vault with no code left to delete it.
+func TestGCPAuthService_LegacyKeyedConnectorStillReadsAndPurges(t *testing.T) {
 	mv := newMemVault()
 	svc := NewGCPAuthService(mv, fakeIssuer{token: "unused"})
 
-	ws := uuid.New()
-	keyJSON := validServiceAccountKeyJSON(t)
-
-	authRef, err := svc.StoreKey(ws, "test-project", keyJSON)
-	if err != nil {
-		t.Fatalf("StoreKey: %v", err)
-	}
-	wantPath := gcpKeyPath(ws, "test-project")
-	if authRef != wantPath {
-		t.Errorf("authRef = %q, want %q", authRef, wantPath)
+	// Seeded directly, the way a connector onboarded before the change would
+	// already have it stored.
+	authRef := "kv/data/secret/workspaces/" + uuid.New().String() + "/cloud-discovery/gcp/test-project"
+	if err := mv.WriteSecret(authRef, map[string]interface{}{
+		"key_json": string(validServiceAccountKeyJSON(t)),
+	}); err != nil {
+		t.Fatalf("seed vault: %v", err)
 	}
 
 	opt, err := svc.LoadCredential(authRef)
 	if err != nil {
-		t.Fatalf("LoadCredential: %v", err)
+		t.Fatalf("LoadCredential on a legacy keyed connector: %v", err)
 	}
 	if opt == nil {
-		t.Fatal("LoadCredential returned a nil ClientOption for a round-tripped key")
+		t.Fatal("LoadCredential returned a nil ClientOption for a stored key")
 	}
 
 	if err := svc.DeleteCredential(authRef); err != nil {
@@ -154,19 +160,6 @@ func TestGCPAuthService_StoreKey_RoundTripsThroughVault(t *testing.T) {
 	}
 	if _, err := svc.LoadCredential(authRef); err == nil {
 		t.Fatal("LoadCredential succeeded after DeleteCredential; the secret should be gone")
-	}
-}
-
-func TestGCPAuthService_StoreKey_MalformedRejectedBeforeVaultWrite(t *testing.T) {
-	mv := newMemVault()
-	svc := NewGCPAuthService(mv, fakeIssuer{token: "unused"})
-
-	_, err := svc.StoreKey(uuid.New(), "test-project", []byte(`{"type":"service_account"}`))
-	if !errors.Is(err, gcp.ErrKeyInvalid) {
-		t.Fatalf("err = %v, want it to wrap gcp.ErrKeyInvalid", err)
-	}
-	if got := mv.callCount(); got != 0 {
-		t.Fatalf("Vault.WriteSecret was called %d time(s) for a malformed key; want 0", got)
 	}
 }
 
@@ -213,10 +206,13 @@ func TestGCPAuthService_RevokeCredential_JSONKeyDeletesFromVault(t *testing.T) {
 	mv := newMemVault()
 	svc := NewGCPAuthService(mv, fakeIssuer{token: "unused"})
 
-	ws := uuid.New()
-	authRef, err := svc.StoreKey(ws, "test-project", validServiceAccountKeyJSON(t))
-	if err != nil {
-		t.Fatalf("StoreKey: %v", err)
+	// Seeded directly: onboarding can no longer write a key, so the only way
+	// a connector reaches this state now is by predating that change.
+	authRef := "kv/data/secret/workspaces/" + uuid.New().String() + "/cloud-discovery/gcp/test-project"
+	if err := mv.WriteSecret(authRef, map[string]interface{}{
+		"key_json": string(validServiceAccountKeyJSON(t)),
+	}); err != nil {
+		t.Fatalf("seed vault: %v", err)
 	}
 
 	if err := svc.RevokeCredential(GCPAuthMethodJSONKey, authRef); err != nil {

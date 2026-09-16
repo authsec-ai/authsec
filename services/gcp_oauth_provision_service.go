@@ -439,7 +439,7 @@ func containsMissing(list []string, target string) bool {
 // newIAMClientFunc/newResourceManagerClientFunc's own convention in
 // services/cloud_gcp_onboarding.go, same package) so tests can point it at a
 // fake server. There is no internal/gcp factory for this client -- adding
-// one to internal/gcp/client.go was deliberately avoided to keep that file,
+// one to internal/gcp/auth.go was deliberately avoided to keep that file,
 // which the WIF path also uses, completely untouched.
 var newServiceUsageClientFunc = func(ctx context.Context, authOpt option.ClientOption) (*serviceusage.Service, error) {
 	return serviceusage.NewService(ctx, authOpt)
@@ -478,7 +478,7 @@ var newServiceUsageClientFunc = func(ctx context.Context, authOpt option.ClientO
 //     connector's existing free-form Attrs jsonb. Best-effort: a failure
 //     here does not fail the onboarding, since the connector is already
 //     fully connected and correct without it.
-func (s *GCPOAuthProvisionService) Provision(ctx context.Context, sessionID string, callerWorkspaceID uuid.UUID, scope GoogleScope, displayName, actor string) (*models.CloudConnector, bool, error) {
+func (s *GCPOAuthProvisionService) Provision(ctx context.Context, sessionID string, callerWorkspaceID uuid.UUID, scope GoogleScope, displayName string, hints *models.GCPOnboardingHints, actor string) (*models.CloudConnector, bool, error) {
 	sess, err := s.loadSession(ctx, sessionID, callerWorkspaceID)
 	if err != nil {
 		return nil, false, err
@@ -537,46 +537,53 @@ func (s *GCPOAuthProvisionService) Provision(ctx context.Context, sessionID stri
 		return nil, false, fmt.Errorf("%w: building service usage client: %v", gcp.ErrGoogleOAuthProvisioningFailed, err)
 	}
 
-	// TEMPORARY DIAGNOSTIC LOGGING (GCP-OAuth 400 investigation): stage
-	// markers only -- project ids/emails/pool ids are non-secret. Remove
-	// once root cause is confirmed.
+	// Each step below logs only the STEP NAME on failure, through
+	// provisionStepFailed. The per-step diagnostics that used to live here
+	// printed the reader project, pool id, provider id, issuer URL and service
+	// account email on every failure, plus the raw provider error, which for
+	// this path wraps Google's own message. Knowing which step failed is the
+	// operationally useful part; the identifiers were only ever there for one
+	// investigation, which is closed.
+	//
+	// This path holds a write credential, so it repairs missing enablement
+	// rather than only reporting it (stamped as APIEnablementRepaired below).
 	if err := gcp.EnableServices(ctx, suClient, norm.ReaderProjectID); err != nil {
-		log.Printf("[gcp] Provision failed at EnableServices (readerProject=%s): %v", norm.ReaderProjectID, err)
+		provisionStepFailed("EnableServices")
 		return nil, false, err
 	}
 
 	readerSAEmail, err := gcp.EnsureReaderServiceAccount(ctx, iamClient, norm.ReaderProjectID)
 	if err != nil {
-		log.Printf("[gcp] Provision failed at EnsureReaderServiceAccount (readerProject=%s): %v", norm.ReaderProjectID, err)
+		provisionStepFailed("EnsureReaderServiceAccount")
 		return nil, false, err
 	}
 
 	poolID, providerID, wifSubject := gcp.DeriveWIFParams(callerWorkspaceID, norm.ScopeID)
 
 	if err := gcp.EnsureWIFPool(ctx, iamClient, norm.ReaderProjectID, poolID); err != nil {
-		log.Printf("[gcp] Provision failed at EnsureWIFPool (readerProject=%s poolID=%s): %v", norm.ReaderProjectID, poolID, err)
+		provisionStepFailed("EnsureWIFPool")
 		return nil, false, err
 	}
 
 	issuerURL := gcp.ResolveWIFIssuerURL(s.issuerURL)
 	if err := gcp.EnsureWIFProvider(ctx, iamClient, norm.ReaderProjectID, poolID, providerID, issuerURL); err != nil {
-		log.Printf("[gcp] Provision failed at EnsureWIFProvider (readerProject=%s poolID=%s providerID=%s issuerURL=%s): %v", norm.ReaderProjectID, poolID, providerID, issuerURL, err)
+		provisionStepFailed("EnsureWIFProvider")
 		return nil, false, err
 	}
 
 	projectNumber, err := gcp.ProjectNumber(ctx, rmClient, norm.ReaderProjectID)
 	if err != nil {
-		log.Printf("[gcp] Provision failed at ProjectNumber (readerProject=%s): %v", norm.ReaderProjectID, err)
+		provisionStepFailed("ProjectNumber")
 		return nil, false, err
 	}
 
 	if err := gcp.EnsureWorkloadIdentityBinding(ctx, iamClient, norm.ReaderProjectID, readerSAEmail, projectNumber, poolID, wifSubject); err != nil {
-		log.Printf("[gcp] Provision failed at EnsureWorkloadIdentityBinding (readerSAEmail=%s poolID=%s): %v", readerSAEmail, poolID, err)
+		provisionStepFailed("EnsureWorkloadIdentityBinding")
 		return nil, false, err
 	}
 
-	if err := gcp.EnsureReaderRoles(ctx, rmClient, norm.ScopeKind, norm.ScopeID, readerSAEmail, gcp.CandidateReaderRoles); err != nil {
-		log.Printf("[gcp] Provision failed at EnsureReaderRoles (scopeKind=%s scopeID=%s readerSAEmail=%s): %v", norm.ScopeKind, norm.ScopeID, readerSAEmail, err)
+	if err := gcp.EnsureReaderRoles(ctx, rmClient, norm.ScopeKind, norm.ScopeID, readerSAEmail, gcp.ReaderRolesFor(norm.ScopeKind)); err != nil {
+		provisionStepFailed("EnsureReaderRoles")
 		return nil, false, err
 	}
 
@@ -585,14 +592,12 @@ func (s *GCPOAuthProvisionService) Provision(ctx context.Context, sessionID stri
 		projectNumber, poolID, providerID,
 	)
 
-	log.Printf("[gcp] Provision GCP-side resources ready, handing off to Onboard (providerResource=%s readerSAEmail=%s scopeKind=%s scopeID=%s)",
-		providerResource, readerSAEmail, norm.ScopeKind, norm.ScopeID)
-
 	connector, created, err := s.onboardWithVerificationRetry(ctx, callerWorkspaceID, GCPOnboardInput{
 		ScopeKind:       norm.ScopeKind,
 		ScopeID:         norm.ScopeID,
 		ReaderProjectID: norm.ReaderProjectID,
 		DisplayName:     displayName,
+		Hints:           hints,
 		Auth: GCPAuthInput{
 			Method:           GCPAuthMethodWIF,
 			ProviderResource: providerResource,
@@ -730,8 +735,22 @@ func (s *GCPOAuthProvisionService) stampProvenance(workspaceID, id uuid.UUID, ac
 		return err
 	}
 	attrs := c.GCPAttrs()
-	attrs.ProvisionedVia = "google_oauth"
+	attrs.ProvisionedVia = gcpProvisionedViaGoogleOAuth
 	attrs.ProvisionedBy = actor
+	// Onboard ran before this stamp and could only see an empty ProvisionedVia,
+	// so it recorded manual_wif. Correct it now that the provenance is known.
+	attrs.OnboardingPath = gcpOnboardingPath(attrs.AuthMethod, attrs.ProvisionedVia)
+	// This path can only offer projects: Google's project search returns
+	// projects, never organizations or folders. Recorded as a permanent
+	// boundary so discovery reports "nothing above this project was ever in
+	// scope" rather than "this organization has no bindings".
+	attrs.CapabilityLimits = setGCPCapabilityLimit(attrs.CapabilityLimits,
+		models.GCPLimitOAuthProjectScopeOnly, c.ScopeKind == models.CloudScopeProject)
+	// Only this path can enable a missing API: the manual federation route has
+	// no credential that can write to the customer's project. Recorded so an
+	// operator reading a connector with APIs off can tell "we could not repair
+	// this" from "nothing needed repairing".
+	attrs.APIEnablementRepaired = true
 	if err := c.SetGCPAttrs(attrs); err != nil {
 		return err
 	}
@@ -751,4 +770,17 @@ func reloadAttrsOrKeep(db *gorm.DB, workspaceID, id uuid.UUID, fallback []byte) 
 		return fallback
 	}
 	return c.Attrs
+}
+
+// provisionStepFailed records WHICH provisioning step failed, and nothing
+// else.
+//
+// Deliberately no identifiers and no error text. The provisioning errors on
+// this path wrap Google's own message, which can name resources in the
+// customer's project, and the reader project, pool id, provider id and service
+// account email add nothing a caller cannot already see on the connector. The
+// step name is the part that is hard to reconstruct afterwards, and it is not
+// sensitive.
+func provisionStepFailed(step string) {
+	log.Printf("[gcp] provisioning failed at step %s", step)
 }

@@ -9,7 +9,7 @@
 // authenticated GCP client for AuthSec's own persistent use, never reads
 // this workspace's connector for ongoing access, and knows nothing about
 // cloud_connector rows. Persistent authentication remains exactly
-// ResolveWIFCredential (credentials.go, untouched): once this file finishes
+// ResolveWIFCredential (auth.go, untouched): once this file finishes
 // creating GCP-side resources, the caller (services/gcp_oauth_provision_service.go)
 // hands off to the existing, unmodified onboarding path, which re-derives
 // and re-proves everything the normal way. Nothing here is a second
@@ -46,15 +46,85 @@ const ReaderServiceAccountID = "authsec-reader"
 // --display-name="AuthSec Reader".
 const ReaderServiceAccountDisplayName = "AuthSec Reader"
 
-// RequiredServices mirrors setup-reader.sh's own `gcloud services enable`
-// list verbatim.
-var RequiredServices = []string{
+// RequiredServices is every API discovery reads, plus the ones onboarding
+// itself needs. Mirrored verbatim by setup-reader.sh's own
+// `gcloud services enable` list, which renders from this same slice.
+//
+// WHY THE WHOLE LIST, AND NOT JUST WHAT ONBOARDING USES. "Not enabled" and
+// "denied" are different customer conversations, and only one of them is
+// anybody's fault. Discovering at scan time that a project never had
+// aiplatform enabled produces a support ticket; discovering it at onboarding
+// produces a sentence in the setup output. Enabling an API a customer never
+// uses costs them nothing -- Google bills usage, not enablement.
+//
+// The list is split into CoreServices and DiscoveryServices below, because
+// the two are treated very differently on failure. RequiredServices is their
+// concatenation, and is what the enablement READ reports on.
+var RequiredServices = append(append([]string{}, CoreServices...), DiscoveryServices...)
+
+// CoreServices are the APIs onboarding ITSELF cannot proceed without. Failing
+// to enable one of these is fatal in both the Go path and the setup script:
+// without them the service account, the federation resources, the token
+// exchange and every later read are impossible, so continuing would only
+// produce a connector that cannot work.
+var CoreServices = []string{
 	"iam.googleapis.com",
 	"iamcredentials.googleapis.com",
 	"cloudresourcemanager.googleapis.com",
 	"sts.googleapis.com",
 	"cloudasset.googleapis.com",
+	"serviceusage.googleapis.com",
 }
+
+// DiscoveryServices are the read surfaces discovery depends on. Failing to
+// enable one of these is NOT fatal.
+//
+// This split is load-bearing, and was learned the hard way. The setup script
+// runs under `set -euo pipefail`, so a single `gcloud services enable` naming
+// all twenty-one APIs aborts the entire script the moment ONE of them is
+// unavailable — before the service account, the pool, the provider or the
+// binding are created. agentregistry is Beta and is not enableable in every
+// project; recommender and policyanalyzer are not universally available
+// either. The result was a customer whose script died at the first step and
+// whose later credential exchange then failed, because the pool it referred
+// to had never been created.
+//
+// An unavailable surface is a capability limit, not a failed onboarding. The
+// probe reports it, ReadAPIEnablement records it, and the connector still
+// works for everything else.
+var DiscoveryServices = []string{
+	"logging.googleapis.com",
+	"policyanalyzer.googleapis.com",
+	"recommender.googleapis.com",
+	"run.googleapis.com",
+	"cloudfunctions.googleapis.com",
+	"compute.googleapis.com",
+	"container.googleapis.com",
+	"aiplatform.googleapis.com",
+	"agentregistry.googleapis.com",
+	"secretmanager.googleapis.com",
+	"bigquery.googleapis.com",
+	"storage.googleapis.com",
+	"pubsub.googleapis.com",
+	"cloudkms.googleapis.com",
+	"sqladmin.googleapis.com",
+}
+
+// batchEnableMaxServices is the documented ceiling on how many service ids one
+// BatchEnable call accepts. Only CoreServices is sent as a single batch, and a
+// test asserts it stays under this.
+const batchEnableMaxServices = 20
+
+// API enablement states recorded per service on the connector.
+//
+// APIStateUnknown is not a placeholder to be tidied away later: it is the
+// correct answer whenever the reader could not read enablement state, and
+// rendering it as "not enabled" would invent a fact. Unknown is never zero.
+const (
+	APIStateEnabled    = "enabled"
+	APIStateNotEnabled = "not_enabled"
+	APIStateUnknown    = "unknown"
+)
 
 // WorkloadIdentityUserRole is the fixed role setup-reader.sh binds the WIF
 // principal to on the reader service account.
@@ -77,17 +147,98 @@ var ProvisioningReaderProjectPermissions = []string{
 /* ---------------------------- service enablement -------------------------- */
 
 // EnableServices enables RequiredServices on projectID. Idempotent: Service
-// Usage's BatchEnable is itself a documented no-op success for an
-// already-enabled service, so this can always be called unconditionally,
-// including on a retry.
+// Usage's BatchEnable is a documented no-op success for an already-enabled
+// service, so this can always be called unconditionally, including on a retry.
+//
+// Core is fatal, discovery is not. BatchEnable is all-or-nothing, so a single
+// unavailable API in a batch takes every other API in that batch down with it
+// -- and some of these are Beta (agentregistry) or not universally available
+// (recommender, policyanalyzer). An org that cannot enable one of them must
+// still get every other one enabled and still finish onboarding; what it
+// loses is that surface, which the enablement read records honestly.
 func EnableServices(ctx context.Context, su *serviceusage.Service, projectID string) error {
-	_, err := su.Services.BatchEnable("projects/"+projectID, &serviceusage.BatchEnableServicesRequest{
-		ServiceIds: RequiredServices,
-	}).Context(ctx).Do()
-	if err != nil {
+	// Core first, and fatal. Nothing downstream can be created without these,
+	// so continuing would only build a connector guaranteed not to work.
+	if _, err := su.Services.BatchEnable("projects/"+projectID, &serviceusage.BatchEnableServicesRequest{
+		ServiceIds: CoreServices,
+	}).Context(ctx).Do(); err != nil {
 		return fmt.Errorf("%w: enabling required APIs: %v", ErrGoogleOAuthProvisioningFailed, err)
 	}
+
+	// Discovery surfaces, one service at a time and never fatal.
+	//
+	// One at a time rather than batched, because BatchEnable is all-or-nothing:
+	// a single unavailable API in a batch of fifteen would take the other
+	// fourteen down with it, and Beta or regionally-unavailable APIs are
+	// exactly the ones this list contains. A surface that cannot be enabled is
+	// a capability limit the probe and ReadAPIEnablement will record, not a
+	// failed onboarding.
+	for _, svc := range DiscoveryServices {
+		_, _ = su.Services.BatchEnable("projects/"+projectID, &serviceusage.BatchEnableServicesRequest{
+			ServiceIds: []string{svc},
+		}).Context(ctx).Do()
+	}
 	return nil
+}
+
+// ReadAPIEnablement reports the state of every RequiredServices entry on
+// projectID, as one map the connector row can carry.
+//
+// This is the half that makes "not enabled" a fact discovery can read before
+// its first call, instead of an inference from an empty result afterwards. It
+// is a pure read and is the only enablement path available on the manual
+// onboarding route, which holds no credential that could enable anything.
+//
+// Every failure resolves to unknown, never to not_enabled. A reader without
+// serviceusage.services.list learns nothing about enablement, and recording
+// that as "the API is off" would be a fabrication that reads identically to
+// the truth.
+func ReadAPIEnablement(ctx context.Context, su *serviceusage.Service, projectID string) map[string]string {
+	state := make(map[string]string, len(RequiredServices))
+	for _, svc := range RequiredServices {
+		state[svc] = APIStateUnknown
+	}
+
+	parent := "projects/" + projectID
+	err := su.Services.List(parent).Filter("state:ENABLED").Pages(ctx,
+		func(page *serviceusage.ListServicesResponse) error {
+			for _, svc := range page.Services {
+				// svc.Name is "projects/<num>/services/<api>"; the config
+				// name is the bare API host, which is what RequiredServices
+				// holds. Config is a pointer and the API may omit it, so this
+				// falls back to the tail of the resource name rather than
+				// skipping a service that is genuinely enabled.
+				name := ""
+				if svc.Config != nil {
+					name = svc.Config.Name
+				}
+				if name == "" {
+					if i := strings.LastIndex(svc.Name, "/"); i >= 0 {
+						name = svc.Name[i+1:]
+					}
+				}
+				if name == "" {
+					continue
+				}
+				if _, wanted := state[name]; wanted {
+					state[name] = APIStateEnabled
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		// Everything stays unknown. Deliberately not partial: a listing that
+		// died halfway would otherwise mark the services it had not reached
+		// yet as not_enabled purely because of where the page boundary fell.
+		return state
+	}
+
+	for svc, v := range state {
+		if v == APIStateUnknown {
+			state[svc] = APIStateNotEnabled
+		}
+	}
+	return state
 }
 
 /* ------------------------------ service account ---------------------------- */
@@ -166,7 +317,7 @@ func EnsureWIFPool(ctx context.Context, iamSvc *iam.Service, projectID, poolID s
 // poolID, if it does not already exist. The AttributeMapping and IssuerUri
 // below MUST stay byte-identical to setup-reader.sh's own
 // --attribute-mapping="google.subject=assertion.sub" and --issuer-uri flags:
-// ResolveWIFCredential (credentials.go, untouched) authenticates against
+// ResolveWIFCredential (auth.go, untouched) authenticates against
 // whatever provider actually exists in GCP, not against what this function
 // thinks it configured, so any drift here would silently break WIF token
 // exchange for connectors provisioned this way.
@@ -253,7 +404,7 @@ func ensureWIFProviderMatches(ctx context.Context, iamSvc *iam.Service, name str
 /* ------------------------------ project number ----------------------------- */
 
 // ProjectNumber resolves the numeric project number ParseProviderResource /
-// the provider_resource string format require (wif_parse.go: "projects/<NUM>/
+// the provider_resource string format require (auth.go's ParseProviderResource: "projects/<NUM>/
 // locations/..."), from the reader project's own ID.
 func ProjectNumber(ctx context.Context, rm *cloudresourcemanager.Service, projectID string) (string, error) {
 	p, err := rm.Projects.Get("projects/" + projectID).Context(ctx).Do()
@@ -324,7 +475,7 @@ func EnsureWorkloadIdentityBinding(ctx context.Context, iamSvc *iam.Service, pro
 
 // EnsureReaderRoles grants every role in roles to readerSAEmail at whichever
 // GCP resource scopeKind/scopeID names (org, folder or project) -- the API
-// equivalent of internal/gcp/roles.go's RoleGrantCommands, reading that same
+// equivalent of internal/gcp/setup.go's RoleGrantCommands, reading that same
 // exported role list rather than duplicating it. One read-merge-write cycle
 // covers all roles at once (read the policy once, append every missing
 // member, write once), rather than one read-modify-write per role, both for

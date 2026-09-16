@@ -25,12 +25,21 @@ echo "=== Enabling required APIs in ${READER_PROJECT_ID} ==="
 # AuthSec's later token exchange and read-only calls — depends on one of
 # these being enabled, so this runs first and unconditionally.
 gcloud services enable \
-  iam.googleapis.com \
-  iamcredentials.googleapis.com \
-  cloudresourcemanager.googleapis.com \
-  sts.googleapis.com \
-  cloudasset.googleapis.com \
-  --project="${READER_PROJECT_ID}"
+{{range .CoreServices}}  {{.}} \
+{{end}}  --project="${READER_PROJECT_ID}"
+
+# The rest are read surfaces discovery uses. Enabled ONE AT A TIME and
+# never fatally: some of these are Beta or are not available in every
+# project, and a single unavailable API must not abort a script running
+# under `set -e` before the federation resources below are created.
+# A surface that cannot be enabled is reported by AuthSec as unavailable;
+# everything else still works.
+for _svc in \
+{{range .DiscoveryServices}}  {{.}} \
+{{end}}  ; do
+  gcloud services enable "${_svc}" --project="${READER_PROJECT_ID}" 2>/dev/null \
+    || echo "  (skipped ${_svc} - not available in this project)"
+done
 
 echo ""
 echo "=== Creating the reader service account in ${READER_PROJECT_ID} ==="
@@ -46,11 +55,11 @@ echo "=== Granting read-only roles at {{.ScopeKind}} scope {{.ScopeID}} ==="
 
 echo ""
 echo "############################################################"
-echo "# Option A (recommended): Workload Identity Federation      #"
+echo "# Workload Identity Federation                              #"
 echo "# Keyless. No key file, no secret, ever leaves your account. #"
 echo "############################################################"
 echo ""
-echo "Run this section, then copy the ONE value it prints at the end into"
+echo "Copy the ONE value this prints at the end into"
 echo "the AuthSec console's WIF form."
 echo ""
 
@@ -78,6 +87,12 @@ PROVIDER_RESOURCE=$(gcloud iam workload-identity-pools providers describe "{{.Pr
   --location=global --workload-identity-pool="{{.PoolID}}" \
   --project="${READER_PROJECT_ID}" --format='value(name)')
 
+if [ -z "${PROVIDER_RESOURCE}" ]; then
+  echo "ERROR: the workload identity provider was not created, so there is"
+  echo "nothing to paste back. Scroll up for the step that failed."
+  exit 1
+fi
+
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo " AuthSec GCP setup completed successfully"
@@ -93,15 +108,3 @@ echo "copy or configure."
 echo "(reader SA, for reference only, not needed by AuthSec: ${READER_SA_EMAIL})"
 echo "════════════════════════════════════════════════════════════"
 echo ""
-echo "############################################################"
-echo "# Option B (fallback): JSON key upload                      #"
-echo "# Only run this if you are NOT using Option A above.         #"
-echo "############################################################"
-echo ""
-echo "This creates a downloadable key file. Upload it once through the"
-echo "AuthSec console, then delete the local copy."
-echo ""
-echo "  gcloud iam service-accounts keys create reader-key.json \\"
-echo "    --iam-account=\"${READER_SA_EMAIL}\""
-echo ""
-echo "Reader SA email (if using Option B): ${READER_SA_EMAIL}"

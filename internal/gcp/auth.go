@@ -1,7 +1,7 @@
 // Package gcp is the GCP adapter for cloud discovery onboarding: it knows
 // about Google's IAM, Cloud Asset and Resource Manager APIs and about GCP's
 // workload identity federation mechanism, and nothing about AuthSec beyond
-// the one narrow seam (CloudOnboardingTokenIssuer, in credentials.go) it needs
+// the one narrow seam (CloudOnboardingTokenIssuer, in this file) it needs
 // to mint the bearer it presents to GCP's own token exchange.
 //
 // Mirrors the internal/awsdiscovery split: policy (what to persist, when to
@@ -68,15 +68,29 @@ func NewIAMClient(ctx context.Context, authOpt option.ClientOption) (*iam.Servic
 }
 
 // NewCloudAssetClient builds the Cloud Asset Inventory client
-// (searchAllIamPolicies — GCP-01's §5 "IAM allow policies" / "Resources"
-// surfaces). Every call this client makes bills against a quota project; per
-// authsec/docs/gcp/feasibility-validation.md's STEP 4 finding, the caller
-// should pass the connector's own reader_project_id as that quota project —
-// this factory does not set one, because the quota project is a per-call
-// concern (X-Goog-User-Project / the API's own QuotaProject field), not a
-// per-client one.
-func NewCloudAssetClient(ctx context.Context, authOpt option.ClientOption) (*cloudasset.Service, error) {
-	svc, err := cloudasset.NewService(ctx, authOpt, option.WithScopes(ReadOnlyScope))
+// (searchAllIamPolicies, searchAllResources — the allow-policy and resource
+// surfaces).
+//
+// quotaProject is REQUIRED, and is the reason this factory exists rather than
+// callers constructing the client themselves. Every Cloud Asset call bills
+// against the caller's quota project and the caller must hold
+// serviceusage.services.use on it; a federated credential carries no default
+// project of its own, so without this every call fails with a message that
+// names neither the quota project nor the missing permission. It was
+// previously left to callers as a per-call concern and, as a result, was never
+// set by anyone.
+//
+// An empty quotaProject is refused outright. Building a client that is
+// guaranteed to fail on first use, and failing then instead of here, would
+// turn a configuration mistake into a mid-scan error.
+func NewCloudAssetClient(ctx context.Context, authOpt option.ClientOption, quotaProject string) (*cloudasset.Service, error) {
+	if quotaProject == "" {
+		return nil, fmt.Errorf("gcp: build cloud asset client: no quota project; every Cloud Asset call bills against one")
+	}
+	svc, err := cloudasset.NewService(ctx, authOpt,
+		option.WithScopes(ReadOnlyScope),
+		option.WithQuotaProject(quotaProject),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("gcp: build cloud asset client: %w", err)
 	}
@@ -221,24 +235,54 @@ type CloudOnboardingTokenIssuer interface {
 	IssuerURL() string
 }
 
-// staticSubjectTokenProvider hands the external-account credential the ONE
-// token IssueCloudOnboardingToken already minted. It is deliberately not a
-// provider that mints on demand: a cloud-onboarding token is 5-minute-lived
-// and single-use by design (see internal/tokens.IssueCloudOnboardingToken's
-// doc comment), so there is nothing to refresh within the lifetime of one
-// BuildWIFCredential call, and the external-account library's own contract
-// ("the provider does not cache the returned subject token") is satisfied
-// trivially by a provider with nothing to cache.
-type staticSubjectTokenProvider struct{ token string }
+// mintingSubjectTokenProvider mints a FRESH cloud-onboarding token on every
+// call, rather than handing back one minted once at construction.
+//
+// WHY THIS IS NOT A STATIC TOKEN. A cloud-onboarding token lives 5 minutes
+// (internal/tokens.CloudOnboardingTTL); the impersonated access token the
+// external-account credential ultimately hands a client lives about an hour.
+// When that access token expires, the library re-runs the whole exchange —
+// and re-invokes this provider to get the subject assertion for it. A
+// provider that returned a token captured at construction would hand back an
+// assertion that expired ~55 minutes earlier, and Google's STS would reject
+// it. A credential built that way works exactly once, for one refresh
+// interval: fine for onboarding's single verify call, fatal for a scan that
+// pages for hours. Minting per call is what makes refresh transparent to a
+// long, resumable scan.
+//
+// This also satisfies the library's own contract ("the provider does not
+// cache the returned subject token") the way it was meant to be satisfied —
+// by minting, not by having nothing to cache.
+//
+// Minting is cheap and has no side effects: IssueCloudOnboardingToken is a
+// pure signing operation over the active native key, writes no database row,
+// and allocates a fresh jti per call, so nothing is reused across refreshes.
+type mintingSubjectTokenProvider struct {
+	issuer   CloudOnboardingTokenIssuer
+	subject  string
+	audience string
+}
 
-func (p staticSubjectTokenProvider) SubjectToken(_ context.Context, _ *externalaccount.RequestOptions) (string, error) {
-	return p.token, nil
+func (p mintingSubjectTokenProvider) SubjectToken(ctx context.Context, _ *externalaccount.RequestOptions) (string, error) {
+	token, err := p.issuer.IssueCloudOnboardingToken(ctx, p.subject, p.audience)
+	if err != nil {
+		// Wrapped, not swallowed: the library surfaces this as the cause of a
+		// failed refresh, and the issuer is AuthSec's own signing path — never
+		// the customer's GCP configuration. See ResolveWIFCredential's own
+		// handling of the same failure at construction time.
+		return "", fmt.Errorf("mint cloud onboarding token: %w", err)
+	}
+	return token, nil
 }
 
 // ResolveWIFCredential derives the deterministic wif_subject for
-// (workspaceID, scopeID), mints a cloud-onboarding token via issuer, and
-// builds the option.ClientOption for a GCP external-account credential that
-// exchanges that token via STS and impersonates readerSAEmail.
+// (workspaceID, scopeID) and builds the option.ClientOption for a GCP
+// external-account credential that exchanges an AuthSec-signed cloud-
+// onboarding token via STS and impersonates readerSAEmail.
+//
+// The subject token is minted ON DEMAND by mintingSubjectTokenProvider, once
+// per exchange, rather than once here — see that type for why a credential
+// built around a single captured token cannot outlive its first refresh.
 //
 // providerResource is the BARE resource name the customer pasted back
 // (no "//iam.googleapis.com/" prefix — see audiencePrefix's doc comment); the
@@ -285,23 +329,31 @@ func ResolveWIFCredential(
 	_, _, subject := DeriveWIFParams(workspaceID, scopeID)
 	audience := audiencePrefix + providerResource
 
-	token, err := issuer.IssueCloudOnboardingToken(ctx, subject, audience)
-	if err != nil {
+	provider := mintingSubjectTokenProvider{issuer: issuer, subject: subject, audience: audience}
+
+	// One eager mint, whose result is deliberately discarded. The credential
+	// itself mints on demand (see mintingSubjectTokenProvider), so this is not
+	// how the subject token is obtained — it exists purely so a broken signing
+	// path fails HERE, at onboarding, with a clear error, instead of surfacing
+	// much later as an opaque refresh failure inside somebody's scan. Keeping
+	// this check is what preserves the fail-fast behaviour callers already
+	// depend on.
+	if _, err := provider.SubjectToken(ctx, nil); err != nil {
 		// The issuer is AuthSec's own signing path; a failure here is never the
 		// customer's GCP configuration, so it is not wrapped as one of the four
 		// sanitized GCP-facing codes. The caller maps this generically (authsec
 		// fault), consistent with how services/cloud_aws_onboarding.go treats a
 		// failure in its own ExternalId path versus a failure from AWS itself.
-		return nil, fmt.Errorf("mint cloud onboarding token: %w", err)
+		return nil, err
 	}
 
 	creds, err := newExternalAccountCredentials(&externalaccount.Options{
 		Audience:                       audience,
 		SubjectTokenType:               wifSubjectTokenType,
-		SubjectTokenProvider:           staticSubjectTokenProvider{token: token},
+		SubjectTokenProvider:           provider,
 		ServiceAccountImpersonationURL: impersonationURL(readerSAEmail),
 		// Scopes is set explicitly here, not left to the ClientOption ordering
-		// in internal/gcp/client.go: option.WithScopes' own documentation says
+		// in auth.go's client factories: option.WithScopes' own documentation says
 		// scope settings from an already-resolved token source (which is what
 		// WithAuthCredentials hands the client) take precedence, so pinning the
 		// scope has to happen on the credential itself for this path to
@@ -309,14 +361,14 @@ func ResolveWIFCredential(
 		//
 		// BOTH read-only scopes this connector's clients ever need are
 		// requested together, not just one: this credential is reused for the
-		// IAM client (internal/gcp/client.go's NewIAMClient) AND the Resource
+		// IAM client (auth.go's NewIAMClient) AND the Resource
 		// Manager / Cloud Asset clients (NewResourceManagerClient /
 		// NewCloudAssetClient), and a WIF credential's scope is fixed at
 		// construction — a client's own option.WithScopes call cannot widen it
 		// afterward. Live-confirmed 2026-09-03: pinning ONLY ReadOnlyScope here
 		// made the IAM Admin API reject iam.serviceAccounts.get with 403
 		// ACCESS_TOKEN_SCOPE_INSUFFICIENT even though the underlying identity
-		// held every IAM role it needed — client.go's own IAMScope doc comment
+		// held every IAM role it needed — IAMScope's own doc comment
 		// already recorded that finding for the client-construction side, but
 		// this credential-construction side still hardcoded the single
 		// ReadOnlyScope value, silently overriding NewIAMClient's
@@ -372,8 +424,8 @@ func impersonationURL(readerSAEmail string) string {
 	)
 }
 
-// staticSubjectTokenProvider must satisfy externalaccount.SubjectTokenProvider.
-var _ externalaccount.SubjectTokenProvider = staticSubjectTokenProvider{}
+// mintingSubjectTokenProvider must satisfy externalaccount.SubjectTokenProvider.
+var _ externalaccount.SubjectTokenProvider = mintingSubjectTokenProvider{}
 
 /* ========================= wif derivation and issuer ======================== */
 
@@ -468,7 +520,7 @@ func hmacSum(key []byte, msg string) []byte {
 /* ------------------------- provider resource parsing ----------------------- */
 
 // providerResourcePattern matches a bare WIF provider resource name (no
-// "//iam.googleapis.com/" scheme prefix — see credentials.go's audiencePrefix
+// "//iam.googleapis.com/" scheme prefix — see audiencePrefix
 // doc comment for why the bare form is what's stored and pasted), capturing
 // the pool id and provider id segments:
 //

@@ -119,6 +119,25 @@ const (
 	CloudCoverageDenied        = "denied"
 	CloudCoverageThrottled     = "throttled"
 	CloudCoverageNotConfigured = "not_configured"
+
+	// CloudCoverageUnknown is the state a surface starts in, before any scan
+	// has touched it. It exists so onboarding can pre-create the full surface
+	// list rather than leaving coverage empty: an absent surface and a surface
+	// that returned nothing look identical to a reader, and only one of them
+	// means the estate is clean.
+	CloudCoverageUnknown = "unknown"
+
+	// CloudCoverageConstrained is a read that failed BY DESIGN -- an org
+	// policy or a VPC Service Controls perimeter refused it. Distinct from
+	// denied, which is a missing grant: denied is fixed by granting a role,
+	// constrained is a deliberate decision by the customer and asking them to
+	// grant something would be the wrong conversation.
+	CloudCoverageConstrained = "constrained"
+
+	// CloudCoverageStale is data carried over from an earlier generation
+	// because this scan could not refresh it. Present so a partial scan can
+	// keep prior findings visible without claiming it re-confirmed them.
+	CloudCoverageStale = "stale"
 )
 
 // Overall scan outcome.
@@ -217,11 +236,21 @@ func DecodeScanCoverage(raw json.RawMessage) ScanCoverage {
 const (
 	CloudIdentityIAMRole = "iam_role"
 	CloudIdentityIAMUser = "iam_user"
+
+	// GCP. A service account is the only identity kind GCP discovery writes
+	// today; workload-identity and federated principals arrive with the
+	// impersonation and WIF edges, which are a later surface.
+	CloudIdentityGCPServiceAccount = "gcp_service_account"
 )
 
 // Secret kinds.
 const (
 	CloudSecretAccessKey = "access_key"
+
+	// GCP. A service-account key, keyed by its key id. Only user-managed keys
+	// are recorded: a google-managed key is rotated by Google, never handled by
+	// the customer, and is not a credential anyone can leak.
+	CloudSecretGCPServiceAccountKey = "gcp_service_account_key"
 )
 
 // Secret status, in the provider's own words.
@@ -413,6 +442,104 @@ func (c *CloudConnector) SetAWSAttrs(a AWSConnectorAttrs) error {
 	return nil
 }
 
+// Capability limits recorded on a GCP connector: things this connector will
+// never be able to do, as opposed to things that merely failed once.
+//
+// They exist so discovery reports a shortfall as a KNOWN BOUNDARY rather than
+// as an absence of data. Without GCPLimitOAuthProjectScopeOnly, a
+// project-scoped connector that reports no organization bindings is
+// indistinguishable from an organization that genuinely has none.
+const (
+	// GCPLimitOAuthProjectScopeOnly: onboarded through Google Authentication,
+	// which can only offer projects because Google’s project search returns
+	// projects and not organizations or folders. Nothing above this project
+	// was ever in scope.
+	GCPLimitOAuthProjectScopeOnly = "oauth_project_scope_only"
+
+	// GCPLimitKeyedCredential: authenticates with a stored service-account
+	// key rather than federation. No new connector can be created this way;
+	// the flag marks the ones that already exist.
+	GCPLimitKeyedCredential = "keyed_credential"
+
+	// GCPLimitQuotaProjectUnusable: the reader cannot use the quota project
+	// every Cloud Asset call bills against, so the CAI-backed surfaces will
+	// fail regardless of how readable the scope itself is.
+	GCPLimitQuotaProjectUnusable = "quota_project_unusable"
+)
+
+// How a GCP connector was onboarded. Recorded explicitly rather than inferred
+// from auth method and provisioning provenance, which between them could
+// express manual_wif only as "neither of the other two" — an absence rather
+// than a value, and one that reads identically to a field nobody set.
+const (
+	GCPOnboardingPathOAuthDefault = "oauth_default"
+	GCPOnboardingPathManualWIF    = "manual_wif"
+	GCPOnboardingPathManualKey    = "manual_key"
+)
+
+// Whether this connector is ready for discovery to scan it.
+const (
+	// GCPReadinessReady: every P1 surface probed reachable, the P1 APIs are
+	// on, and the quota project is usable.
+	GCPReadinessReady = "ready"
+	// GCPReadinessPartial: it will scan, but some surfaces are closed. Which
+	// ones is in the reasons and in the capability profile.
+	GCPReadinessPartial = "partial"
+	// GCPReadinessBlocked: nothing can scan. The credential does not resolve,
+	// the scope is unreadable, or the quota project every Cloud Asset call
+	// bills against is unusable.
+	GCPReadinessBlocked = "blocked"
+)
+
+// GCPOnboardingHints is customer-declared context no GCP API returns.
+//
+// Every field is optional and none of it affects what gets scanned. It matters
+// afterwards: ownership resolution has to attribute a finding to a team, and a
+// naming convention is often the only signal left when labels are absent.
+// Captured at onboarding because that is the one moment somebody who knows the
+// answer is present — asking later means guessing.
+type GCPOnboardingHints struct {
+	// Environment is the customer's own word for this scope: prod, staging,
+	// sandbox. Their vocabulary rather than a fixed enum — an estate that
+	// calls it "live" should not be made to say "prod".
+	Environment string `json:"environment,omitempty"`
+	// EnvironmentLabels are the resource label KEYS that carry the
+	// environment, so ownership resolution knows which label to read instead
+	// of guessing between "env", "environment" and "stage".
+	EnvironmentLabels []string `json:"environment_labels,omitempty"`
+	// NamingConvention is free text describing how they name things.
+	NamingConvention string `json:"naming_convention,omitempty"`
+	// OwningTeam is the team accountable for this scope, as the fallback when
+	// nothing more specific resolves.
+	OwningTeam string `json:"owning_team,omitempty"`
+	// OwnerContact is how to reach them — a group address or a channel.
+	OwnerContact string `json:"owner_contact,omitempty"`
+}
+
+// GCPSurfaceCapability is what a live permission probe found for ONE
+// discovery surface, recorded on the connector so a scan knows before it
+// starts which surfaces it can read.
+//
+// Can and Unknown are deliberately separate booleans rather than a single
+// tri-state string, because the difference is load-bearing: Can=false means
+// the probe ran and the reader provably lacks a permission, while
+// Unknown=true means the probe could not answer at all. Collapsing the second
+// into the first would render "we could not check" as "there is nothing
+// there", which is the exact failure the coverage rules exist to prevent.
+type GCPSurfaceCapability struct {
+	// Can is true only when every permission the surface needs was held.
+	Can bool `json:"can"`
+	// Missing lists the permissions the reader did NOT hold. Meaningful only
+	// when Unknown is false.
+	Missing []string `json:"missing,omitempty"`
+	// Unknown is set when the probe itself could not answer — the API refused
+	// the check, or rejected a permission name it does not recognise at this
+	// resource type. Never treat this as "no access".
+	Unknown bool `json:"unknown,omitempty"`
+	// Reason is a short, sanitized explanation when Unknown is set.
+	Reason string `json:"reason,omitempty"`
+}
+
 // GCPConnectorAttrs is the GCP shape of CloudConnector.Attrs — the WIF analog
 // of AWSConnectorAttrs, per prompt.md's GCP-D9 design. Everything here is
 // non-secret: a project id, a service-account email, a GCP resource name, or
@@ -473,6 +600,92 @@ type GCPConnectorAttrs struct {
 	// against an earlier, still-candidate role set once GCP-01 closes.
 	RoleSetStatus string `json:"role_set_status,omitempty"`
 
+	// RoleSetVersion is the internal/gcp.ReaderRoleSetVersion this connector's
+	// reader roles were granted from -- a stable hand-bumped label, not a
+	// derived value. Distinct from RoleSetStatus, which says how confident we
+	// are in the set, and from SetupScriptVersion, which versions the script
+	// rather than the roles: two connectors can share a script version and
+	// hold different roles if the script was re-rendered for a different scope
+	// kind. This is the field that answers "which roles does this connector
+	// actually have", which is what decides whether a discovery phase can run.
+	RoleSetVersion string `json:"role_set_version,omitempty"`
+
+	// CapabilityProfile is the per-surface result of the last live permission
+	// probe, keyed by surface name. This is what E4.1/E4.2 ask for: what the
+	// reader was PROVED to reach, rather than what the setup script was
+	// supposed to grant. Empty means never probed — not "reaches nothing".
+	CapabilityProfile map[string]GCPSurfaceCapability `json:"capability_profile,omitempty"`
+
+	// ProbedPermissions is every permission the last probe found the reader
+	// actually holds, flattened across surfaces. Kept alongside the profile
+	// because the profile answers "can this phase run" while this answers
+	// "what exactly is granted", and an operator investigating a surprise
+	// needs the second.
+	ProbedPermissions []string `json:"probed_permissions,omitempty"`
+
+	// WritePermissionsHeld is the zero-write assurance, inverted: it must be
+	// empty. Anything here means the reader identity holds a permission that
+	// can change customer state, which is a finding, not a configuration
+	// detail. Recorded rather than merely logged so it is auditable after the
+	// fact.
+	WritePermissionsHeld []string `json:"write_permissions_held,omitempty"`
+
+	// APIEnablement is the state of every API discovery reads, keyed by API
+	// host name: "enabled", "not_enabled" or "unknown". Recorded so coverage
+	// accounting can start before the first call, and so "the API is off" is
+	// distinguishable from "we were denied" — two different conversations to
+	// have with a customer, only one of which is anybody's fault.
+	//
+	// "unknown" is a real value, not a gap to be tidied up: a reader without
+	// serviceusage.services.list cannot tell, and recording that as
+	// "not_enabled" would read identically to the truth while being invented.
+	APIEnablement map[string]string `json:"api_enablement,omitempty"`
+
+	// APIEnablementRepaired records whether this onboarding path was able to
+	// ENABLE what was missing, or could only report it. The manual federation
+	// path holds no credential that can write, so it always reports; the
+	// Google Authentication path repairs. Without this, an operator cannot
+	// tell "nothing needed fixing" from "we could not fix anything".
+	APIEnablementRepaired bool `json:"api_enablement_repaired,omitempty"`
+
+	// CapabilityLimits are the GCPLimit* constants that apply to this
+	// connector — permanent boundaries, not transient failures. Discovery
+	// reads these to describe a shortfall honestly instead of reporting an
+	// empty result as an empty estate.
+	CapabilityLimits []string `json:"capability_limits,omitempty"`
+
+	// ScopeEnumeration is whether, and how, the reader can walk the tree
+	// below the onboarded scope. Load-bearing for an org or folder connector:
+	// one whose reader cannot enumerate can read exactly one resource, and a
+	// scan on it would report a nearly empty estate with nothing actually
+	// wrong. Shaped as internal/gcp.ScopeEnumeration.
+	ScopeEnumeration json.RawMessage `json:"scope_enumeration,omitempty"`
+
+	// OnboardingPath is one of the GCPOnboardingPath* constants. Reporting has
+	// to tell the three apart: they differ in what they were able to
+	// configure, and therefore in what a shortfall on this connector means.
+	OnboardingPath string `json:"onboarding_path,omitempty"`
+
+	// Hints are what the customer told us at onboarding that no API reports.
+	Hints *GCPOnboardingHints `json:"hints,omitempty"`
+
+	// DiscoveryReadiness is one of the GCPReadiness* constants, DERIVED from
+	// the probe evidence above rather than maintained independently. It exists
+	// so a scheduler can skip a blocked connector by reading one field, rather
+	// than re-deriving the judgement from four others and possibly disagreeing
+	// with the console about what it found.
+	DiscoveryReadiness string `json:"discovery_readiness,omitempty"`
+
+	// DiscoveryReadinessReasons names what pushed readiness below ready, and
+	// is empty when ready. Without it the value is a verdict with no argument
+	// attached, which gives an operator nothing to act on.
+	DiscoveryReadinessReasons []string `json:"discovery_readiness_reasons,omitempty"`
+
+	// ProbedAt is when the capability profile was last refreshed. Nil means
+	// never probed. Distinct from VerifiedAt on the row, which says the
+	// credential worked, not what it can reach.
+	ProbedAt *time.Time `json:"probed_at,omitempty"`
+
 	// SetupScriptVersion is the internal/gcp.Version the customer's script was
 	// rendered from — the WIF/json_key analog of AWS's TemplateVersion, same
 	// reason: lets an operator find connectors still on an older script once
@@ -518,6 +731,130 @@ func (c *CloudConnector) SetGCPAttrs(a GCPConnectorAttrs) error {
 		return err
 	}
 	c.Attrs = raw
+	return nil
+}
+
+/* ---------------------- GCP row attrs: identity, secret --------------------
+
+   The same discipline AWSIdentityAttrs establishes: a fixed set of cross-cloud
+   columns on the shared table, plus one typed provider struct serialized into
+   the existing attrs jsonb. No GCP-specific column is added to any shared
+   table, and no migration is needed for either of these. */
+
+// GCPIdentityAttrs is the GCP shape of CloudIdentity.Attrs.
+type GCPIdentityAttrs struct {
+	// UniqueID is GCP's own immutable numeric id for the service account, and
+	// it is the RECOGNITION KEY -- cloud_identity.native_id is built from it.
+	//
+	// Not the email. An email is an address: delete a service account and
+	// create another at the same address and GCP gives it a new unique id,
+	// while every "who is this" question asked by email would silently answer
+	// with the old one's history. The email is a locator and lives below.
+	UniqueID string `json:"unique_id,omitempty"`
+	// Email is how every IAM binding, every workload attachment and every human
+	// refers to this identity. Kept because it is the join key for policy data
+	// and the only form anyone recognises -- but never the identity itself.
+	Email string `json:"email,omitempty"`
+	// ProjectID is the human-readable container id; ProjectNumber is the
+	// immutable one. Both are kept for the same reason as Email and UniqueID: a
+	// project id string can be reused after deletion, the number cannot.
+	ProjectID     string `json:"project_id,omitempty"`
+	ProjectNumber string `json:"project_number,omitempty"`
+	// Description is the service account's own description field.
+	Description string `json:"description,omitempty"`
+	// OAuth2ClientID is the client id GCP assigns a service account, and is
+	// what a Workspace domain-wide-delegation grant is keyed on. Recorded now
+	// so the Workspace surface can join against it later without a re-scan.
+	OAuth2ClientID string `json:"oauth2_client_id,omitempty"`
+	// Disabled mirrors the provider's own disabled flag. CloudIdentity.Enabled
+	// carries the same fact in the shared column; this keeps the provider's
+	// word for it beside the rest of its evidence.
+	Disabled bool `json:"disabled,omitempty"`
+	// IdentityKind discriminates within GCP. Always "service_account" today.
+	IdentityKind string `json:"identity_kind,omitempty"`
+}
+
+// GCPAttrs decodes Attrs as the GCP shape. Malformed or empty decodes to a zero
+// struct rather than erroring, matching AWSAttrs.
+func (i *CloudIdentity) GCPAttrs() GCPIdentityAttrs {
+	var a GCPIdentityAttrs
+	if len(i.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(i.Attrs, &a)
+	return a
+}
+
+// SetGCPAttrs encodes the GCP shape into Attrs.
+func (i *CloudIdentity) SetGCPAttrs(a GCPIdentityAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	i.Attrs = raw
+	return nil
+}
+
+// Service-account key TYPE, in GCP's own spelling: who manages rotation.
+//
+// This is the distinction that decides whether a key is worth recording at all.
+// A user-managed key is a credential a human created and can leak; a
+// system-managed one is rotated by Google every few days and never leaves it.
+// Only the first is a finding, and only the first is collected.
+const (
+	GCPKeyTypeUserManaged   = "USER_MANAGED"
+	GCPKeyTypeSystemManaged = "SYSTEM_MANAGED"
+)
+
+// Service-account key ORIGIN, in GCP's own spelling: who generated the private
+// key material.
+//
+// A SEPARATE FIELD from key type, and confirmed separate against the live API:
+// a key can be USER_MANAGED (the customer's to rotate) and GOOGLE_PROVIDED
+// (Google generated the material and handed it over) at the same time, which is
+// what the console's "create key" flow produces. USER_PROVIDED means the
+// customer uploaded their own public key and Google never held the private half.
+// The two have different exposure stories, so they are recorded separately
+// rather than collapsed.
+const (
+	GCPKeyOriginGoogleProvided = "GOOGLE_PROVIDED"
+	GCPKeyOriginUserProvided   = "USER_PROVIDED"
+)
+
+// GCPSecretAttrs is the GCP shape of CloudSecret.Attrs.
+type GCPSecretAttrs struct {
+	// KeyOrigin is user_managed or google_managed, in GCP's own terms.
+	KeyOrigin string `json:"key_origin,omitempty"`
+	// KeyAlgorithm is e.g. "KEY_ALG_RSA_2048".
+	KeyAlgorithm string `json:"key_algorithm,omitempty"`
+	// KeyType is GCP's keyType field, e.g. "USER_MANAGED".
+	KeyType string `json:"key_type,omitempty"`
+	// DisableReason is GCP's own words for why a key is disabled, where it
+	// gives any.
+	DisableReason string `json:"disable_reason,omitempty"`
+	// ServiceAccountEmail is the address the key belongs to. The row's
+	// identity_id is the authoritative link; this is here so a key is
+	// intelligible on its own in an export.
+	ServiceAccountEmail string `json:"service_account_email,omitempty"`
+}
+
+// GCPAttrs decodes Attrs as the GCP shape.
+func (s *CloudSecret) GCPAttrs() GCPSecretAttrs {
+	var a GCPSecretAttrs
+	if len(s.Attrs) == 0 {
+		return a
+	}
+	_ = json.Unmarshal(s.Attrs, &a)
+	return a
+}
+
+// SetGCPAttrs encodes the GCP shape into Attrs.
+func (s *CloudSecret) SetGCPAttrs(a GCPSecretAttrs) error {
+	raw, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	s.Attrs = raw
 	return nil
 }
 
