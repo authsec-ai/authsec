@@ -156,7 +156,7 @@ func (r *cloudWorkloadRepository) ListWorkloads(workspaceID uuid.UUID, f CloudWo
 		return nil, 0, err
 	}
 	var out []models.CloudWorkload
-	if err := q.Order("runtime_kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("runtime_kind, name, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
@@ -177,7 +177,7 @@ func (r *cloudWorkloadRepository) ListUsage(workspaceID uuid.UUID, f CloudWorklo
 	var out []models.CloudUsage
 	// Never-accessed first: a NULL last_used_at is the row worth acting on, and
 	// NULLS FIRST states that rather than leaving it to the default.
-	if err := q.Order("last_used_at ASC NULLS FIRST, service").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("last_used_at ASC NULLS FIRST, service, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil

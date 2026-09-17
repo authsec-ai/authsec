@@ -209,12 +209,22 @@ func (r *cloudIdentityRepository) ListIdentities(workspaceID uuid.UUID, f CloudI
 		return nil, 0, err
 	}
 	var out []models.CloudIdentity
-	if err := q.Order("kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("kind, name, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
 }
 
+// Every cloud_* list ORDER BY ends in `id`.
+//
+// Offset paging is only coherent over a TOTAL order. "ORDER BY last_used_at,
+// service" is not one -- two identities can share both values, and PostgreSQL
+// is free to return equal rows in a different order on each call, so page two
+// can repeat a row page one already gave and omit one it never did.
+// Deduplicating ids on the client hides the repeat and cannot recover the
+// omission. The primary key is unique, so appending it makes the order total
+// and the traversal exact.
+//
 // clampLimit applies the one paging rule every cloud_* list endpoint shares:
 // an unset or out-of-range limit falls back to 100, and nothing above 500 is
 // ever handed to a single query. Shared here rather than duplicated per
@@ -240,7 +250,7 @@ func (r *cloudIdentityRepository) ListSecrets(workspaceID uuid.UUID, f CloudSecr
 	}
 	var out []models.CloudSecret
 	// Oldest first: age is the finding.
-	if err := q.Order("created_at NULLS LAST").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("created_at NULLS LAST, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil

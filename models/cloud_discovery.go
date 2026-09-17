@@ -119,6 +119,7 @@ const (
 	CloudCoverageDenied        = "denied"
 	CloudCoverageThrottled     = "throttled"
 	CloudCoverageNotConfigured = "not_configured"
+
 	// CloudCoveragePartial: the surface was reached, but some of what it
 	// returned could not be read -- a detail call that failed, a document that
 	// would not parse. The rows we have are real; the set is not known to be
@@ -128,6 +129,25 @@ const (
 	// half-succeeded must not authorise reconciliation to remove what this run
 	// failed to see.
 	CloudCoveragePartial = "partial"
+
+	// CloudCoverageUnknown is a surface no scan has touched yet. It exists so
+	// onboarding can pre-create the full surface list rather than leaving
+	// coverage empty: an absent surface and a surface that returned nothing
+	// look identical to a reader, and only one of them means the estate is
+	// clean.
+	CloudCoverageUnknown = "unknown"
+
+	// CloudCoverageConstrained is a read that failed BY DESIGN -- an org policy
+	// or a VPC Service Controls perimeter refused it. Distinct from denied,
+	// which is a missing grant: denied is fixed by granting a role, constrained
+	// is a deliberate decision by the customer, and asking them to grant
+	// something would be the wrong conversation.
+	CloudCoverageConstrained = "constrained"
+
+	// CloudCoverageStale is data carried over from an earlier generation
+	// because this scan could not refresh it. Present so a partial scan can
+	// keep prior findings visible without claiming it re-confirmed them.
+	CloudCoverageStale = "stale"
 )
 
 // Overall scan outcome.

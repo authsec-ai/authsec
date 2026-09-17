@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,19 +32,49 @@ import (
 //
 // Skips when IGA_TEST_DSN is unset so ordinary `go test ./...` stays green.
 
+var (
+	sharedDBOnce sync.Once
+	sharedDB     *gorm.DB
+	sharedDBErr  error
+)
+
+// igaDB returns the ONE connection pool this package uses.
+//
+// It used to open a fresh gorm pool per call. Each pool keeps its own idle
+// connections and nothing closed them, so a full run exhausted PostgreSQL's
+// default 100 and later tests died with "sorry, too many clients already" —
+// failures that looked like product defects and were not. A shared pool with a
+// small cap keeps the whole suite inside one server's budget.
 func igaDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("IGA_TEST_DSN")
 	if dsn == "" {
 		t.Skip("IGA_TEST_DSN not set; skipping IGA integration test")
 	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+	sharedDBOnce.Do(func() {
+		db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		if err != nil {
+			sharedDBErr = err
+			return
+		}
+		sql, err := db.DB()
+		if err != nil {
+			sharedDBErr = err
+			return
+		}
+		// Small on purpose: the suite is sequential, and a large idle pool is
+		// exactly what starved the server before.
+		sql.SetMaxOpenConns(8)
+		sql.SetMaxIdleConns(4)
+		sql.SetConnMaxLifetime(5 * time.Minute)
+		sharedDB = db
 	})
-	if err != nil {
-		t.Fatalf("connect: %v", err)
+	if sharedDBErr != nil {
+		t.Fatalf("connect: %v", sharedDBErr)
 	}
-	return db
+	return sharedDB
 }
 
 // newWorkspace creates an isolated workspace so tests never collide.

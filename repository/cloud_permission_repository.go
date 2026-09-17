@@ -227,7 +227,7 @@ func (r *cloudPermissionRepository) ListAssumeEdges(workspaceID uuid.UUID, f Clo
 		return nil, 0, err
 	}
 	var out []models.CloudAssumeEdge
-	if err := q.Order("subject_kind, subject").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("subject_kind, subject, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
@@ -246,7 +246,7 @@ func (r *cloudPermissionRepository) ListPermissions(workspaceID uuid.UUID, f Clo
 		return nil, 0, err
 	}
 	var out []models.CloudPermission
-	if err := q.Order("native_id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("native_id, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
@@ -262,7 +262,7 @@ func (r *cloudPermissionRepository) ListResources(workspaceID uuid.UUID, f Cloud
 		return nil, 0, err
 	}
 	var out []models.CloudResource
-	if err := q.Order("kind, name").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
+	if err := q.Order("kind, name, id").Limit(clampLimit(f.Limit)).Offset(f.Offset).Find(&out).Error; err != nil {
 		return nil, 0, err
 	}
 	return out, total, nil
