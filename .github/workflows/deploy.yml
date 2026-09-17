@@ -34,12 +34,19 @@ on:
         description: 'Type DEPLOY to confirm'
         required: true
 
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 env:
   REGISTRY: docker-repo-public.authnull.com
   IMAGE: authsec
   NAMESPACE: authsec-prod
   DEPLOYMENT: prod-authsec
-  CONTAINER: authsec
+  CONTAINER: prod-authsec
   API: https://prod.api.authsec.ai
 
 jobs:
@@ -141,25 +148,30 @@ jobs:
       # schema, which is not what a rollback needs.
       - name: Back up the database before migrating
         run: |
-          STAMP=$(date -u +%Y%m%d-%H%M%S)
           kubectl exec -n database-prod postgresql-primary-0 -- \
-            sh -c 'PGPASSWORD=$(cat /opt/bitnami/postgresql/secrets/password) \
-                   pg_dump -U authprod -d authprod -Fc' \
-            > "authprod-$STAMP.dump"
-          ls -lh "authprod-$STAMP.dump"
-
-      - name: Keep the backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: db-backup-${{ needs.build.outputs.sha }}
-          path: authprod-*.dump
-          retention-days: 14
+            env AUTHSEC_RELEASE="${{ needs.build.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" \
+            sh -ec '
+              umask 077
+              backup_dir=/bitnami/postgresql/authsec-release-backups
+              mkdir -p "$backup_dir"
+              backup="$backup_dir/authprod-$AUTHSEC_RELEASE.dump"
+              export PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"
+              pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DATABASE" -Fc > "$backup"
+              test -s "$backup"
+              pg_restore --list "$backup" > /dev/null
+              sha256sum "$backup"
+            '
+          # This directory is on the verified PostgreSQL PVC. Customer data
+          # stays in the cluster; never upload this dump to Actions artifacts.
+          # This pre-release copy is not a substitute for off-cluster backups.
 
       - name: Point the deployment at this commit
+        id: rollout
         run: |
           kubectl set image -n "$NAMESPACE" \
             "deploy/$DEPLOYMENT" \
             "$CONTAINER=$REGISTRY/$IMAGE:${{ needs.build.outputs.sha }}"
+          echo "image_updated=true" >> "$GITHUB_OUTPUT"
           kubectl annotate -n "$NAMESPACE" "deploy/$DEPLOYMENT" \
             kubernetes.io/change-cause="deploy ${{ needs.build.outputs.sha }} by ${{ github.actor }}" \
             --overwrite
@@ -170,9 +182,9 @@ jobs:
         run: API="$API" ./scripts/check-deployed-version.sh "${{ needs.build.outputs.sha }}"
 
       - name: Roll back if verification failed
-        if: failure()
+        if: failure() && steps.rollout.outputs.image_updated == 'true'
         run: |
           echo "Verification failed — rolling back."
           kubectl rollout undo -n "$NAMESPACE" "deploy/$DEPLOYMENT"
           kubectl rollout status -n "$NAMESPACE" "deploy/$DEPLOYMENT" --timeout=5m
-          echo "Rolled back. The database backup is attached to this run."
+          echo "Rolled back. The database backup remains on the PostgreSQL PVC."
