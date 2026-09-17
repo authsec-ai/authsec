@@ -1,0 +1,178 @@
+name: Deploy
+
+# Build, push, deploy and VERIFY.
+#
+# Before this existed a push deployed nothing, and that was not a broken
+# pipeline -- there was no pipeline. go-ci and mirror fire only on `main`,
+# pr-checks fires only on a pull_request, and nothing in the cluster watches a
+# registry. Code could sit pushed and untested for days while production served
+# a month-old binary.
+#
+# Two rules this workflow exists to enforce, both learned from how the previous
+# setup failed silently:
+#
+#   1. IMAGES ARE TAGGED WITH THE COMMIT. Deployments referenced a floating
+#      `:production` tag, so the tag identified no commit AND a rollout to the
+#      same tag was a no-op -- Kubernetes sees no diff and keeps the cached
+#      image. You could build, push, "deploy", and still be running yesterday's
+#      binary.
+#   2. THE DEPLOY IS NOT DONE UNTIL IT IS VERIFIED. The last step asks the
+#      running service which commit it is, and fails the job if the answer is
+#      not this one. A green deploy job that deployed nothing is worse than a
+#      red one.
+
+on:
+  push:
+    branches:
+      - authsec-staging
+  # Deliberately available by hand as well: a re-deploy of an unchanged commit
+  # (a rolled-back node, a restored database) is a normal thing to need, and
+  # pushing an empty commit to get it is a bad habit to force.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm'
+        required: true
+
+env:
+  REGISTRY: docker-repo-public.authnull.com
+  IMAGE: authsec
+  NAMESPACE: authsec-prod
+  DEPLOYMENT: prod-authsec
+  CONTAINER: authsec
+  API: https://prod.api.authsec.ai
+
+jobs:
+  # ── Gate: never deploy a red build ─────────────────────────────────────────
+  #
+  # pr-checks only runs on pull requests, so a direct push to this branch has
+  # had nothing run against it. Re-running the cheap checks here is the
+  # difference between "deploys on push" and "deploys whatever was pushed".
+  verify-source:
+    name: Tests and hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.GH_PAT }}
+        run: git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - run: go mod download
+      - run: go vet ./...
+      - name: Migration hygiene
+        run: ./scripts/ci-migration-check.sh
+      - name: IGA isolation
+        run: ./scripts/ci-iga-isolation-check.sh
+      - name: Unit tests
+        run: go test -short ./tests/unit/ ./internal/... ./models/...
+
+  build:
+    name: Build and push image
+    needs: verify-source
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.inputs.confirm == 'DEPLOY'
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: meta
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # BOTH tags. The SHA tag is what the deployment is pointed at, so the
+          # rollout actually rolls and the running commit is identifiable.
+          # `:production` is kept only because other things may still reference
+          # it -- nothing should be DEPLOYED from it.
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:production
+          build-args: |
+            GIT_COMMIT=${{ steps.meta.outputs.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            BUILT_AT=${{ steps.meta.outputs.built_at }}
+
+  deploy:
+    name: Deploy and verify
+    needs: build
+    runs-on: ubuntu-latest
+    # A GitHub Environment, so a required reviewer can be attached in repo
+    # settings WITHOUT editing this file. There is one cluster and it serves
+    # customers; whether a push should reach it unattended is a decision for a
+    # person, and this is where that decision is expressed.
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up cluster access
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl version --client
+
+      # Migrations run on boot, against a database with customers in it. A
+      # backup taken AFTER the new pods start is a backup of the migrated
+      # schema, which is not what a rollback needs.
+      - name: Back up the database before migrating
+        run: |
+          STAMP=$(date -u +%Y%m%d-%H%M%S)
+          kubectl exec -n database-prod postgresql-primary-0 -- \
+            sh -c 'PGPASSWORD=$(cat /opt/bitnami/postgresql/secrets/password) \
+                   pg_dump -U authprod -d authprod -Fc' \
+            > "authprod-$STAMP.dump"
+          ls -lh "authprod-$STAMP.dump"
+
+      - name: Keep the backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-${{ needs.build.outputs.sha }}
+          path: authprod-*.dump
+          retention-days: 14
+
+      - name: Point the deployment at this commit
+        run: |
+          kubectl set image -n "$NAMESPACE" \
+            "deploy/$DEPLOYMENT" \
+            "$CONTAINER=$REGISTRY/$IMAGE:${{ needs.build.outputs.sha }}"
+          kubectl annotate -n "$NAMESPACE" "deploy/$DEPLOYMENT" \
+            kubernetes.io/change-cause="deploy ${{ needs.build.outputs.sha }} by ${{ github.actor }}" \
+            --overwrite
+          kubectl rollout status -n "$NAMESPACE" "deploy/$DEPLOYMENT" --timeout=5m
+
+      # The step that makes this a deploy rather than a hope.
+      - name: Verify the running commit
+        run: API="$API" ./scripts/check-deployed-version.sh "${{ needs.build.outputs.sha }}"
+
+      - name: Roll back if verification failed
+        if: failure()
+        run: |
+          echo "Verification failed — rolling back."
+          kubectl rollout undo -n "$NAMESPACE" "deploy/$DEPLOYMENT"
+          kubectl rollout status -n "$NAMESPACE" "deploy/$DEPLOYMENT" --timeout=5m
+          echo "Rolled back. The database backup is attached to this run."

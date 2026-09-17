@@ -40,6 +40,7 @@ import (
 	platformCtrl "github.com/authsec-ai/authsec/controllers/platform"
 	sharedCtrl "github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/handlers"
+	"github.com/authsec-ai/authsec/internal/buildinfo"
 	"github.com/authsec-ai/authsec/internal/spire"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/gin-gonic/gin"
@@ -1288,6 +1289,22 @@ func SetupRoutes(
 			health.GET("/tenant/:workspace_id", healthController.CheckTenantDatabase)
 			health.GET("/tenants", healthController.CheckAllTenantDatabases)
 		}
+
+		// Which commit is actually serving.
+		//
+		// Unauthenticated on purpose, and it is the same exposure as the health
+		// endpoint beside it: a commit SHA is already public in the repo, and a
+		// deploy check that needs a token is a deploy check nobody runs. It
+		// returns build identity only -- no configuration, no dependency
+		// versions, nothing about the environment.
+		//
+		// This exists because the deployed image tag stopped being a commit
+		// SHA, so "is my push live?" had no answer short of probing for a route
+		// that only new code serves. That trick works once per release and
+		// tells you nothing about WHICH build is running.
+		uflow.GET("/version", func(c *gin.Context) {
+			c.JSON(http.StatusOK, buildinfo.Current())
+		})
 
 		// ────────────────────────────────────────────────────
 		// Hydra Manager (formerly hydra-service)
