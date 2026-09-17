@@ -2,6 +2,7 @@ package awsdiscovery
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -87,18 +88,44 @@ type principalBlock struct {
 // {"StringEquals": {"token.actions.githubusercontent.com:sub": "repo:org/repo:*"}}.
 type conditionBlock map[string]map[string]stringOrSlice
 
-// subClaim returns the first condition value keyed on anything ending ":sub",
-// across every operator. IAM does not care which comparison operator names the
-// sub condition, and a trust policy uses exactly one in practice.
-func (c conditionBlock) subClaim() string {
-	for _, kv := range c {
+// negatedOperator reports whether an IAM condition operator states what must
+// NOT match. "StringNotEquals" and "StringNotLike" exclude their values; the
+// "IfExists" suffix and "ForAnyValue:"/"ForAllValues:" prefixes do not change
+// that, so the test is on the operator body.
+func negatedOperator(op string) bool {
+	if i := strings.LastIndex(op, ":"); i >= 0 {
+		op = op[i+1:]
+	}
+	op = strings.TrimSuffix(op, "IfExists")
+	return strings.Contains(op, "Not")
+}
+
+// subClaim returns the subject a trust policy REQUIRES, and whether any
+// negative sub condition was present.
+//
+// The operator is load-bearing. Reading the value under StringNotEquals as
+// though it were StringEquals asserts a trust relationship the policy exists to
+// forbid -- "anyone except repo:acme/deploy" would be recorded as
+// "repo:acme/deploy", naming the one principal that cannot assume the role.
+//
+// A negative condition therefore yields no subject and sets negated, so the
+// caller records an unscoped federation rather than a confident wrong one.
+func (c conditionBlock) subClaim() (sub string, negated bool) {
+	for op, kv := range c {
 		for key, values := range kv {
-			if strings.HasSuffix(key, ":sub") && len(values) > 0 {
-				return values[0]
+			if !strings.HasSuffix(key, ":sub") || len(values) == 0 {
+				continue
+			}
+			if negatedOperator(op) {
+				negated = true
+				continue
+			}
+			if sub == "" {
+				sub = values[0]
 			}
 		}
 	}
-	return ""
+	return sub, negated
 }
 
 type trustStatement struct {
@@ -141,13 +168,17 @@ type trustPolicyDocument struct {
 // A statement that fails to parse is skipped rather than failing the whole
 // document: one malformed statement must not hide every principal AWS
 // otherwise makes clear.
-func ParseTrustPolicy(doc string) []TrustPrincipal {
+func ParseTrustPolicy(doc string) ([]TrustPrincipal, error) {
 	if strings.TrimSpace(doc) == "" {
-		return nil
+		return nil, nil
 	}
 	var parsed trustPolicyDocument
 	if err := json.Unmarshal([]byte(doc), &parsed); err != nil {
-		return nil
+		// Same rule as ParsePolicyDocument: a document we cannot read is a
+		// coverage failure, not a role that trusts nobody. Returning nil made a
+		// broken trust policy look like an unreachable role, which is the
+		// opposite of a finding worth surfacing.
+		return nil, fmt.Errorf("%w: %v", ErrMalformedPolicy, err)
 	}
 
 	var out []TrustPrincipal
@@ -158,7 +189,7 @@ func ParseTrustPolicy(doc string) []TrustPrincipal {
 		webIdentity := actionsInclude(stmt.Action, "sts:assumerolewithwebidentity")
 		out = append(out, principalsFor(stmt, webIdentity)...)
 	}
-	return out
+	return out, nil
 }
 
 func actionsInclude(actions []string, wantLower string) bool {
@@ -226,7 +257,7 @@ func classifyAWSPrincipal(principal string) string {
 // the provider by type.
 func federatedPrincipal(providerARN string, cond conditionBlock, webIdentity bool) TrustPrincipal {
 	issuer := oidcIssuerFromARN(providerARN)
-	sub := cond.subClaim()
+	sub, negatedSub := cond.subClaim()
 
 	p := TrustPrincipal{Subject: providerARN, Issuer: issuer, Mechanism: MechanismSTSAssumeRole}
 	if webIdentity {
@@ -235,9 +266,13 @@ func federatedPrincipal(providerARN string, cond conditionBlock, webIdentity boo
 
 	switch {
 	case sub == "":
-		// No sub condition: the federation is not scoped to one principal.
-		// Recorded as ci_pipeline rather than dropped -- an unscoped federation
-		// trust is a finding worth surfacing, not a reason to go silent.
+		// No usable sub condition -- either none was present, or the only ones
+		// present were negative and name principals that may NOT assume the
+		// role. Either way the federation is not scoped to one principal we can
+		// name. Recorded as ci_pipeline rather than dropped: an unscoped
+		// federation trust is a finding worth surfacing, not a reason to go
+		// silent. negatedSub is what stops a NotEquals being read as an Equals.
+		_ = negatedSub
 		p.SubjectKind = SubjectKindCIPipeline
 	case k8sSubjectPattern.MatchString(sub):
 		p.SubjectKind = SubjectKindK8sSA

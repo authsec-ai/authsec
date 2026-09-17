@@ -723,6 +723,11 @@ type GitHubInstallation struct {
 	Account             string `json:"account"`
 	AccountType         string `json:"account_type"`
 	RepositorySelection string `json:"repository_selection"`
+	// Permissions as GITHUB reports them for this installation. Recorded so a
+	// binding can store what the provider actually granted rather than what a
+	// caller claimed it granted -- the two are not the same statement, and only
+	// the first is evidence.
+	Permissions map[string]string `json:"permissions,omitempty"`
 }
 
 // appJWTFor loads the workspace's App credentials and signs an App-level JWT.
@@ -817,8 +822,9 @@ func (s *ConnectorOAuthService) ListGitHubInstallations(ctx context.Context, wor
 		return nil, err
 	}
 	var raw []struct {
-		ID                  int64  `json:"id"`
-		RepositorySelection string `json:"repository_selection"`
+		ID                  int64             `json:"id"`
+		RepositorySelection string            `json:"repository_selection"`
+		Permissions         map[string]string `json:"permissions"`
 		Account             struct {
 			Login string `json:"login"`
 			Type  string `json:"type"`
@@ -834,6 +840,7 @@ func (s *ConnectorOAuthService) ListGitHubInstallations(ctx context.Context, wor
 			Account:             i.Account.Login,
 			AccountType:         i.Account.Type,
 			RepositorySelection: i.RepositorySelection,
+			Permissions:         i.Permissions,
 		})
 	}
 	return out, nil

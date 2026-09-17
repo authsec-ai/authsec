@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 func TestIGAAccessGraph(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-access")
 	integ := verifiedIntegration(t, mgr, ws, "inst-access")
@@ -140,7 +141,7 @@ func TestIGADeletionSafety(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
 	fx := fixtures()
-	mgr := services.NewIGAManager(repo, fx)
+	mgr := services.NewIGAManager(repo, fx, suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-delete")
 	integ := verifiedIntegration(t, mgr, ws, "inst-delete")
@@ -183,11 +184,101 @@ func TestIGADeletionSafety(t *testing.T) {
 	t.Logf("PASS: guard preserved %d object(s) and raised %d critical issue(s)", before, guard)
 }
 
+// TestIGADeniedScopeIsNotEmptiedByAnotherScopesSuccess reproduces the defect
+// migration 018 exists for.
+//
+// THE DEFECT. Completeness was recorded per object CLASS, dropping which scope
+// it belonged to, and the sweep then ran integration-wide. So a repository that
+// answered 403 had its objects tombstoned on the strength of a DIFFERENT
+// repository's successful read. The mass-disappearance guard never fired,
+// because losing one repository's share of the inventory stays under the
+// threshold — the inventory just quietly shrank.
+//
+// Scan one reads both repositories. Scan two denies repo-2 and leaves repo-1
+// readable and unchanged. Nothing belonging to repo-2 may be retired.
+func TestIGADeniedScopeIsNotEmptiedByAnotherScopesSuccess(t *testing.T) {
+	db := igaDB(t)
+	repo := repositories.NewIGARepository(db)
+	fx := fixtures()
+
+	// Both repositories carry a declaration, so both have something to lose.
+	decl := []byte(`{"name":"nightly-audit","model":"claude-sonnet-5"}`)
+	fx.Scopes = []services.ProviderScope{
+		{Kind: "repository", NativeID: "repo-1", DisplayName: "acme/payments", DefaultBranch: "main"},
+		{Kind: "repository", NativeID: "repo-2", DisplayName: "acme/monorepo", DefaultBranch: "main"},
+	}
+	// Three declarations in repo-1 and one in repo-2, so that losing repo-2
+	// entirely is a 25% drop — under the mass-disappearance threshold. That is
+	// the whole point: the guard cannot see this, so only per-scope
+	// completeness stands between a denied read and a deleted inventory.
+	fx.Trees = map[string][]services.TreeEntry{
+		"repo-1": {
+			{Path: "agent.json", SHA: "sha-a1"},
+			{Path: "agents.json", SHA: "sha-a2"},
+			{Path: "deploy/agent.json", SHA: "sha-a3"},
+		},
+		"repo-2": {{Path: "agent.json", SHA: "sha-b"}},
+	}
+	fx.Blobs = map[string][]byte{
+		"repo-1:agent.json":        decl,
+		"repo-1:agents.json":       decl,
+		"repo-1:deploy/agent.json": decl,
+		"repo-2:agent.json":        decl,
+	}
+	fx.NativeAgents = map[string][]services.ProviderObject{}
+	fx.Identities = map[string][]services.ProviderObject{}
+	fx.SBOM = map[string][]services.ProviderObject{}
+	fx.FailScopes = map[string]error{}
+
+	mgr := services.NewIGAManager(repo, fx, suiteInstalls())
+	ws := newWorkspace(t, db, "ws-denied-scope")
+	integ := verifiedIntegration(t, mgr, ws, "inst-denied")
+
+	run, _ := mgr.StartScan(ws, integ.ID, models.ScanModeFull, "tester")
+	if _, err := mgr.RunScan(context.Background(), ws, run.ID); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	before := countRows(db,
+		`SELECT count(*) FROM iga_source_objects WHERE workspace_id=? AND lifecycle='active'`, ws)
+	if before < 4 {
+		t.Fatalf("expected three objects in repo-1 and one in repo-2, got %d", before)
+	}
+
+	// repo-2 goes dark. repo-1 is untouched and still returns its declaration,
+	// so its scope legitimately completes — which is exactly the success the
+	// old code borrowed to delete repo-2's inventory.
+	fx.FailScopes = map[string]error{"repo-2": errors.New("403 permission denied for repository")}
+
+	run2, _ := mgr.StartScan(ws, integ.ID, models.ScanModeFull, "tester")
+	rep2, err := mgr.RunScan(context.Background(), ws, run2.ID)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+
+	after := countRows(db,
+		`SELECT count(*) FROM iga_source_objects WHERE workspace_id=? AND lifecycle='active'`, ws)
+	if after != before {
+		t.Fatalf("a denied scope was emptied by another scope's success: active %d -> %d (tombstoned %d)",
+			before, after, rep2.Tombstoned)
+	}
+
+	// And state the property directly: nothing from the denied scope is retired.
+	var tombstoned int64
+	db.Raw(`SELECT count(*) FROM iga_source_objects o
+	        JOIN iga_integration_scopes s ON s.id = o.integration_scope_id
+	        WHERE o.workspace_id=? AND s.native_scope_id='repo-2' AND o.lifecycle='tombstoned'`, ws).
+		Scan(&tombstoned)
+	if tombstoned != 0 {
+		t.Fatalf("%d object(s) in the denied scope were tombstoned", tombstoned)
+	}
+	t.Logf("PASS: repo-2 denied, %d object(s) preserved across both scopes", after)
+}
+
 // TestIGACheckpointsAndSurvivorship covers resumability and contradiction.
 func TestIGACheckpointsAndSurvivorship(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-ckpt")
 	integ := verifiedIntegration(t, mgr, ws, "inst-ckpt")
@@ -232,7 +323,7 @@ func TestIGACheckpointsAndSurvivorship(t *testing.T) {
 func TestIGACursorPagination(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-page")
 	integ := verifiedIntegration(t, mgr, ws, "inst-page")

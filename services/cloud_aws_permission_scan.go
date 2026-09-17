@@ -77,6 +77,13 @@ type PermissionSnapshot struct {
 	EdgesWritten       int
 	PermissionsWritten int
 	ResourcesWritten   int
+	// ParseFailures counts policy documents that could not be read at all.
+	// Non-zero means this identity's permissions are INCOMPLETE, and coverage
+	// must say so rather than reporting the statements that happened to parse.
+	ParseFailures int
+	// StatementsSkipped counts statements dropped for having no Effect, or
+	// neither Action nor NotAction. Surfaced so a silent skip is countable.
+	StatementsSkipped int
 	// OIDCProviders is the account's registered providers. Returned rather than
 	// only persisted so a caller resolving a cluster by issuer is not forced to
 	// make this same call again for data this scan already read.
@@ -150,10 +157,33 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// reconciliation below deletes edges from older generations, so an EKS read
 	// that was denied would let this scan conclude that every Pod Identity
 	// binding it could not see had been removed.
-	out.Complete = snapshot.Coverage.Complete() && oidcErr == nil && eksErr == nil
+	// A document this run could not parse is a document this run did not read.
+	// Reconciliation below deletes rows from older generations, so letting a
+	// parse failure pass as complete would delete the trust edges and grants we
+	// merely failed to understand today -- turning a transient malformed
+	// document into permanent data loss. This is the same rule the coverage
+	// states encode: could-not-look is never the same as gone.
+	// A statement we could not use is a statement we did not read, exactly like
+	// a document we could not parse. Both leave a row from the previous
+	// generation unrefreshed, and reconciliation below deletes exactly those.
+	//
+	// So a statement that loses its Effect in AWS -- or any other shape this
+	// parser cannot represent -- must not be able to delete the permission it
+	// previously produced. Skipped and failed are counted separately because
+	// they say different things to an operator, but either one makes this run
+	// non-authoritative.
+	out.Complete = snapshot.Coverage.Complete() &&
+		oidcErr == nil && eksErr == nil &&
+		out.ParseFailures == 0 && out.StatementsSkipped == 0
 	out.Surfaces = map[string]models.SurfaceCoverage{
 		models.SurfaceOIDCProviders:  surfaceResult(len(providers), oidcErr),
 		models.SurfaceEKSPodIdentity: surfaceResult(out.PodIdentityEdges, eksErr),
+	}
+	if out.ParseFailures > 0 || out.StatementsSkipped > 0 {
+		out.Surfaces[models.SurfacePolicyDocuments] = surfacePartial(
+			out.PermissionsWritten+out.EdgesWritten,
+			out.ParseFailures+out.StatementsSkipped,
+			"policy or trust documents could not be fully read")
 	}
 
 	if out.Complete {
@@ -183,7 +213,15 @@ func (s *AWSPermissionScanner) writeAssumeEdges(
 			return err
 		}
 
-		for _, p := range awsdiscovery.ParseTrustPolicy(doc) {
+		principals, perr := awsdiscovery.ParseTrustPolicy(doc)
+		if perr != nil {
+			// The role exists and trusts something we could not read. Count it
+			// and move on: one unreadable trust policy must not end the scan,
+			// and it must not read as a role nobody can assume.
+			out.ParseFailures++
+			continue
+		}
+		for _, p := range principals {
 			edge := &models.CloudAssumeEdge{
 				WorkspaceID:        workspaceID,
 				ConnectorID:        snapshot.ConnectorID,
@@ -340,14 +378,34 @@ func (s *AWSPermissionScanner) writePermissions(
 			return err
 		}
 
+		// Every statement this identity owns is read in the light of its
+		// boundary: the statement text looks unconstrained, the identity is not.
+		attrs := identity.AWSAttrs()
+		state := boundaryNone
+		switch {
+		case attrs.DetailIncomplete:
+			state = boundaryUnknown
+		case attrs.PermissionsBoundaryARN != "":
+			state = boundaryPresent
+		}
+		grants := grantOptions(state)
+
 		for _, p := range policies.Attached {
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, p.ARN, p.Document, out); err != nil {
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, p.ARN, p.Document, out, grants); err != nil {
 				return err
 			}
 		}
 		for _, p := range policies.Inline {
 			source := "inline:" + p.Name
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, source, p.Document, out); err != nil {
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, source, p.Document, out, grants); err != nil {
+				return err
+			}
+		}
+		// The boundary's own statements, recorded as a ceiling. Written with a
+		// distinct derivation so nothing counts them as access granted.
+		if b := policies.Boundary; b != nil {
+			source := "boundary:" + b.ARN
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, source, b.Document, out, boundaryOptions()); err != nil {
 				return err
 			}
 		}
@@ -370,6 +428,78 @@ func (s *AWSPermissionScanner) writePermissions(
 	return nil
 }
 
+// policyWriteOptions carries the facts about the OWNING identity that change
+// how its statements must be read, rather than facts about the statement.
+type policyWriteOptions struct {
+	// boundary is what we know about the owning identity's permissions
+	// boundary: that it has one, that it has none, or that we could not find
+	// out. The third case must not collapse into the second.
+	boundary boundaryState
+	// derivation separates a grant from a ceiling. A boundary document's
+	// statements are written with PermissionDerivationBoundary so no query can
+	// count them as access.
+	derivation string
+}
+
+// boundaryState is what a scan knows about an identity's permissions boundary.
+type boundaryState int
+
+const (
+	// boundaryNone: the identity was read completely and carries no boundary.
+	boundaryNone boundaryState = iota
+	// boundaryPresent: the identity carries one.
+	boundaryPresent
+	// boundaryUnknown: the detail read failed, so we do not know.
+	//
+	// Treating this as boundaryNone is the over-claim that matters: a role
+	// whose boundary we could not read would have its grants recorded as
+	// unconstrained, which is precisely the ceiling the boundary imposes being
+	// erased by a failed API call.
+	boundaryUnknown
+)
+
+func grantOptions(b boundaryState) policyWriteOptions {
+	return policyWriteOptions{boundary: b, derivation: models.PermissionDerivationGranted}
+}
+
+func boundaryOptions() policyWriteOptions {
+	// A boundary's own statements are not capped by the boundary -- they ARE
+	// the boundary, so the state is none here.
+	return policyWriteOptions{boundary: boundaryNone, derivation: models.PermissionDerivationBoundary}
+}
+
+// nullableJSON turns the parser's "" for an absent Condition into a NULL the
+// jsonb column accepts. An empty string is not valid JSON.
+func nullableJSON(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// constraintState decides how far a recorded permission may be trusted as a
+// statement of access.
+//
+// Ordered most- to least-specific: a conditional grant is the narrowest claim,
+// then a negated one, then merely bounded. Only a statement with none of these
+// may be rendered as plain access.
+func constraintState(stmt awsdiscovery.PolicyStatement, b boundaryState) string {
+	switch {
+	case stmt.Condition != "":
+		return models.ConstraintConditional
+	case len(stmt.NotActions) > 0 || len(stmt.NotResources) > 0:
+		return models.ConstraintNegated
+	case b == boundaryPresent:
+		return models.ConstraintBounded
+	case b == boundaryUnknown:
+		// We could not read the identity's detail. Unconstrained would assert
+		// a ceiling we never checked for.
+		return models.ConstraintUnknown
+	default:
+		return models.ConstraintUnconstrained
+	}
+}
+
 // writePolicyDocument parses one policy document and writes one cloud_permission
 // row per (statement, named resource) pair -- or one unresourced row for a
 // statement naming no concrete resource.
@@ -383,14 +513,31 @@ func (s *AWSPermissionScanner) writePermissions(
 // distinct in the first place.
 func (s *AWSPermissionScanner) writePolicyDocument(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, identityID uuid.UUID,
-	source, document string, out *PermissionSnapshot,
+	source, document string, out *PermissionSnapshot, opts policyWriteOptions,
 ) error {
-	for i, stmt := range awsdiscovery.ParsePolicyDocument(document) {
-		nativeID := fmt.Sprintf("%s#s%d", source, i)
+	statements, skipped, err := awsdiscovery.ParsePolicyDocument(document)
+	if err != nil {
+		// A document we cannot read is a coverage failure, not an identity with
+		// no permissions. Returning nil here is what used to make a malformed
+		// managed policy look like an empty one.
+		out.ParseFailures++
+		return fmt.Errorf("parse policy %s: %w", source, err)
+	}
+	out.StatementsSkipped += skipped
+
+	for _, stmt := range statements {
+		// The statement's position in the ORIGINAL document, not in the parsed
+		// slice. Numbering the compacted slice meant one unusable statement
+		// renumbered every statement after it, silently changing what existing
+		// permission rows referred to.
+		nativeID := fmt.Sprintf("%s#s%d", source, stmt.Index)
 		resources := stmt.Resources
 		if len(resources) == 0 {
-			// No concrete Resource field (NotResource, or an empty list) --
-			// one unresourced row, broad by construction.
+			// Either a genuinely unresourced statement or one written with
+			// NotResource. Both produce a single resource-less row, but they
+			// are NOT the same fact: the NotResource text is carried on the row
+			// and constraint_state marks it negated, so a bounded exclusion is
+			// never read as an account-wide grant.
 			resources = []string{"*"}
 		}
 
@@ -432,8 +579,12 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 				Plane:              models.PermissionPlaneCloud,
 				Effect:             stmt.Effect,
 				Actions:            stmt.Actions,
+				NotActions:         stmt.NotActions,
+				NotResources:       stmt.NotResources,
+				Condition:          nullableJSON(stmt.Condition),
+				ConstraintState:    constraintState(stmt, opts.boundary),
 				ScopeKind:          scopeKind,
-				Derivation:         models.PermissionDerivationGranted,
+				Derivation:         opts.derivation,
 				Sensitivity:        sensitivity,
 				NativeID:           nativeID,
 				LastSeenGeneration: snapshot.Generation,

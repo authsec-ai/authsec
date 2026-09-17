@@ -40,7 +40,26 @@ func NewIGAController(db *gorm.DB) *IGAController { return &IGAController{db: db
 // default — it exercises the whole pipeline without pretending to have
 // verified GitHub behaviour that nobody has measured yet.
 func (ctl *IGAController) manager() services.IGAManager {
-	return services.NewIGAManager(repositories.NewIGARepository(ctl.db), ctl.provider())
+	return services.NewIGAManager(repositories.NewIGARepository(ctl.db), ctl.provider(),
+		ctl.installationVerifier())
+}
+
+// installationVerifier supplies the provider-side ownership proof binding needs.
+//
+// Nil when Vault is unconfigured, which makes VerifyIntegration refuse rather
+// than fall back to trusting the request body. That is the intended behaviour:
+// a deployment that cannot read its own App key cannot prove anything about an
+// installation, and binding on an unprovable claim is the defect this replaced.
+func (ctl *IGAController) installationVerifier() services.InstallationVerifier {
+	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+	if addr == "" || token == "" {
+		return nil
+	}
+	vc, err := vault.NewClient(addr, token)
+	if err != nil {
+		return nil
+	}
+	return services.NewConnectorOAuthService(ctl.db, vc)
 }
 
 // provider chooses the discovery source.
@@ -233,14 +252,21 @@ type IGAIntegrationCreateRequest struct {
 	RequestedPermissions map[string]interface{} `json:"requested_permissions,omitempty"`
 }
 
-// IGAVerifyRequest completes the callback. authenticated_account_id is the
-// account of the admin who actually authorized; the binding is refused unless
-// it matches the installation's account.
+// IGAVerifyRequest completes the callback.
+//
+// It deliberately no longer accepts authenticated_account_id or
+// granted_permissions. Both were caller-supplied and both were treated as
+// proof: the handler compared account_native_id against
+// authenticated_account_id, two fields from the same body, so sending one
+// invented account twice bound the integration. Ownership and granted
+// permissions are now read from the provider during verification.
+//
+// account_native_id is still accepted and is now optional: it is the console's
+// claim about what it thinks is being connected, checked against the provider's
+// answer so a disagreement is refused rather than silently resolved.
 type IGAVerifyRequest struct {
-	InstallationID         string                 `json:"installation_id" binding:"required"`
-	AccountNativeID        string                 `json:"account_native_id" binding:"required"`
-	AuthenticatedAccountID string                 `json:"authenticated_account_id" binding:"required"`
-	GrantedPermissions     map[string]interface{} `json:"granted_permissions,omitempty"`
+	InstallationID  string `json:"installation_id" binding:"required"`
+	AccountNativeID string `json:"account_native_id,omitempty"`
 }
 
 func (ctl *IGAController) CreateIntegration(c *gin.Context) {
@@ -286,10 +312,8 @@ func (ctl *IGAController) VerifyIntegration(c *gin.Context) {
 		return
 	}
 	out, err := ctl.manager().VerifyIntegration(ws, id, services.VerifyInput{
-		InstallationID:         req.InstallationID,
-		AccountNativeID:        req.AccountNativeID,
-		AuthenticatedAccountID: req.AuthenticatedAccountID,
-		GrantedPermissions:     req.GrantedPermissions,
+		InstallationID:  req.InstallationID,
+		AccountNativeID: req.AccountNativeID,
 	})
 	if err != nil {
 		igaError(c, err)

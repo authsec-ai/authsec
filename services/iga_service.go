@@ -81,10 +81,29 @@ type IntegrationInput struct {
 // account of the GitHub admin who actually authorized — it must match the
 // installation's account, or the binding is refused.
 type VerifyInput struct {
-	InstallationID         string
-	AccountNativeID        string
-	AuthenticatedAccountID string
-	GrantedPermissions     map[string]interface{}
+	InstallationID string
+
+	// AccountNativeID is what the CALLER believes the installation belongs to.
+	// It is a claim to check against the provider, never the proof itself, and
+	// the value stored is always the provider's answer.
+	AccountNativeID string
+}
+
+// igaVerifyTimeout bounds the provider round trip during binding. Short on
+// purpose: a caller is waiting, and a slow provider must surface as an explicit
+// refusal to bind rather than a hung request.
+const igaVerifyTimeout = 20 * time.Second
+
+// InstallationVerifier proves against the provider that an installation is
+// genuinely an installation of THIS workspace's App.
+//
+// It exists so binding cannot be established from the request body. The
+// implementation enumerates with the workspace's own App credentials, so an
+// installation that comes back is by construction one this workspace's App was
+// installed on -- which is the same proof the discovery source path already
+// requires (controllers/platform/discovery_github_controller.go).
+type InstallationVerifier interface {
+	ListGitHubInstallations(ctx context.Context, workspaceID uuid.UUID) ([]GitHubInstallation, error)
 }
 
 // ScanReport is the human-readable outcome of one enumeration.
@@ -159,13 +178,31 @@ type igaManager struct {
 	repo     repositories.IGARepository
 	provider IGAProvider
 	catalog  IGARuleCatalog
+	// installs proves installation ownership with the provider. Nil means
+	// binding is refused rather than silently trusted: a deployment that cannot
+	// reach the provider must not be able to bind an integration at all.
+	installs InstallationVerifier
 }
 
 // NewIGAManager constructs an IGAManager. The provider is injected so the
 // pipeline can run against recorded fixtures until the Stage-0 spike produces
 // a verified real client.
-func NewIGAManager(repo repositories.IGARepository, provider IGAProvider) IGAManager {
-	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog()}
+// installs is required for VerifyIntegration and is deliberately a positional
+// argument rather than an option: binding an integration is a security
+// decision, so every construction site has to state where its ownership proof
+// comes from. Passing nil is allowed and makes binding fail closed.
+func NewIGAManager(repo repositories.IGARepository, provider IGAProvider, installs InstallationVerifier) IGAManager {
+	return &igaManager{repo: repo, provider: provider, catalog: DefaultRuleCatalog(), installs: installs}
+}
+
+// scopeIDPtr keeps a zero uuid out of the column: an unset scope must read as
+// NULL (and therefore stay unsweepable) rather than as a scope that does not
+// exist.
+func scopeIDPtr(id uuid.UUID) *uuid.UUID {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &id
 }
 
 const normalizerVersion = "0.1.0"
@@ -208,24 +245,64 @@ func (m *igaManager) CreateIntegration(workspaceID uuid.UUID, createdBy string, 
 
 // VerifyIntegration turns an untrusted installation id into a trusted binding.
 //
-// The check that matters: a setup-URL installation_id is attacker-supplied, so
-// it is only accepted when the installation's account matches the account of
-// the admin who actually authenticated. Without this, anyone who can guess an
-// installation id could bind someone else's GitHub org to their workspace.
+// WHAT THIS USED TO DO, AND WHY IT WAS NOT A CHECK. It compared two fields that
+// both arrived in the same request body -- account_native_id against
+// authenticated_account_id -- and bound the integration when they matched.
+// Sending the same invented account twice satisfied it. The route requires
+// iga:admin, but permission to administer AuthSec is not authority over a
+// GitHub installation, and an App credential can reach every installation of
+// that App, so the flaw reached across estates.
+//
+// The binding is now established from the PROVIDER's answer. We enumerate the
+// installations of this workspace's own App and refuse anything that does not
+// appear. An installation that comes back is by construction one this
+// workspace's App was installed on; the account and the granted permissions are
+// then read from GitHub's reply rather than from the caller's claim.
+//
+// A caller-supplied account is still accepted, but only as a claim to check:
+// when it disagrees with the provider the binding is refused rather than
+// quietly corrected, because a disagreement means the console and the provider
+// disagree about what is being connected.
 func (m *igaManager) VerifyIntegration(workspaceID, id uuid.UUID, in VerifyInput) (*models.IGAIntegration, error) {
 	if in.InstallationID == "" {
 		return nil, errors.New("installation_id is required")
 	}
-	if in.AuthenticatedAccountID == "" {
-		return nil, fmt.Errorf("%w: no authenticated provider account to match against",
+	if m.installs == nil {
+		return nil, fmt.Errorf("%w: no provider verifier configured; refusing to bind on caller-supplied values",
 			repositories.ErrIGABindingFailed)
 	}
-	if in.AccountNativeID != in.AuthenticatedAccountID {
-		return nil, fmt.Errorf("%w: installation account %q does not match authenticated account %q",
-			repositories.ErrIGABindingFailed, in.AccountNativeID, in.AuthenticatedAccountID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), igaVerifyTimeout)
+	defer cancel()
+	installs, err := m.installs.ListGitHubInstallations(ctx, workspaceID)
+	if err != nil {
+		// Unreachable provider is NOT "unverified but probably fine". Refuse.
+		return nil, fmt.Errorf("%w: could not confirm the installation with the provider: %v",
+			repositories.ErrIGABindingFailed, err)
 	}
-	return m.repo.VerifyIntegration(workspaceID, id, in.InstallationID, in.AccountNativeID,
-		mustJSON(in.GrantedPermissions))
+
+	var match *GitHubInstallation
+	for i := range installs {
+		if installs[i].InstallationID == in.InstallationID {
+			match = &installs[i]
+			break
+		}
+	}
+	if match == nil {
+		return nil, fmt.Errorf("%w: installation %q is not an installation of this workspace's App",
+			repositories.ErrIGABindingFailed, in.InstallationID)
+	}
+	if in.AccountNativeID != "" && in.AccountNativeID != match.Account {
+		return nil, fmt.Errorf("%w: installation %q belongs to %q, not the claimed %q",
+			repositories.ErrIGABindingFailed, in.InstallationID, match.Account, in.AccountNativeID)
+	}
+
+	granted := map[string]interface{}{}
+	for k, v := range match.Permissions {
+		granted[k] = v
+	}
+	return m.repo.VerifyIntegration(workspaceID, id, in.InstallationID, match.Account,
+		mustJSON(granted))
 }
 
 func (m *igaManager) GetIntegration(workspaceID, id uuid.UUID) (*models.IGAIntegration, error) {
@@ -373,7 +450,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 				m.degrade(workspaceID, integ.ID, mark(models.ClassAgentProfile), scope, "agent_profile", err, report)
 			} else {
 				for _, o := range objs {
-					m.ingest(workspaceID, integ, run, scope, o, models.ClassAgentProfile, report)
+					m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassAgentProfile, report)
 					mark(models.ClassAgentProfile).inspected++
 				}
 			}
@@ -385,7 +462,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 			m.degrade(workspaceID, integ.ID, mark(models.ClassAppInstallation), scope, "app_installation", err, report)
 		} else {
 			for _, o := range objs {
-				m.ingest(workspaceID, integ, run, scope, o, models.ClassAppInstallation, report)
+				m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassAppInstallation, report)
 				mark(models.ClassAppInstallation).inspected++
 			}
 		}
@@ -426,7 +503,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 					m.degrade(workspaceID, integ.ID, mark(models.ClassSBOMComponent), scope, "sbom_component", err, report)
 				} else {
 					for _, o := range sbom {
-						m.ingest(workspaceID, integ, run, scope, o, models.ClassSBOMComponent, report)
+						m.ingest(workspaceID, integ, run, scopeID, scope, o, models.ClassSBOMComponent, report)
 						mark(models.ClassSBOMComponent).inspected++
 					}
 				}
@@ -551,7 +628,7 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 						}
 						// raw_hash = the provider blob SHA, so the next scan can
 						// diff the tree listing against it without fetching.
-						m.ingestWithRule(workspaceID, integ, run, scope, obj,
+						m.ingestWithRule(workspaceID, integ, run, scopeID, scope, obj,
 							models.ClassRepoDeclaration, rule, e.SHA, report)
 						c.inspected++
 					}
@@ -613,14 +690,30 @@ func maxDisappearanceRatio() float64 {
 	return defaultMaxDisappearanceRatio
 }
 
-// sweepAbsent tombstones objects that a complete, authoritative enumeration did
-// not see. Objects in partial or failed scopes are left alone — "we could not
-// look" is not "it is gone".
+// sweepAbsent retires objects that a complete, authoritative enumeration did
+// not see — and only within the scopes that were actually complete.
+//
+// THE DEFECT THIS REPLACES. Completeness was collected into a set keyed by
+// object CLASS alone, so one scope reporting complete marked the whole class
+// complete, and the sweep then ran integration-wide. A repository returning 403
+// had its objects tombstoned on the strength of a different repository's
+// successful read. The mass-disappearance guard did not catch it: a quarter of
+// the inventory vanishing stays under the threshold, so the inventory shrank
+// silently.
+//
+// Completeness is a property of a (scope, class) pair, because that is the unit
+// a provider actually succeeds or fails at. "We could not look" must never
+// become "it is gone", and that only holds if the thing we could not look at is
+// the thing we decline to delete.
 func (m *igaManager) sweepAbsent(workspaceID, integrationID uuid.UUID, generation int64, coverage []models.IGACoverageState) (int, error) {
-	complete := map[string]bool{}
+	type scopeClass struct {
+		scopeID uuid.UUID
+		class   string
+	}
+	complete := map[scopeClass]bool{}
 	for _, c := range coverage {
-		if c.State == models.CoverageComplete {
-			complete[c.ObjectClass] = true
+		if c.State == models.CoverageComplete && c.IntegrationScopeID != uuid.Nil {
+			complete[scopeClass{c.IntegrationScopeID, c.ObjectClass}] = true
 		}
 	}
 	if len(complete) == 0 {
@@ -628,31 +721,37 @@ func (m *igaManager) sweepAbsent(workspaceID, integrationID uuid.UUID, generatio
 	}
 
 	total := 0
-	for class := range complete {
-		alive, missing, err := m.repo.CountGenerationDrift(workspaceID, integrationID, class, generation)
+	for sc := range complete {
+		alive, missing, err := m.repo.CountGenerationDrift(
+			workspaceID, integrationID, sc.scopeID, sc.class, generation)
 		if err != nil {
 			return total, err
 		}
 		if missing == 0 {
 			continue
 		}
+		// The guard now compares populations from the SAME scope, which is the
+		// only comparison that means anything: a scope losing most of its
+		// objects is a signal, a scope losing most of the integration's objects
+		// is arithmetic about unrelated things.
 		if alive+missing > 0 {
 			ratio := float64(missing) / float64(alive+missing)
 			if ratio > maxDisappearanceRatio() {
 				now := time.Now()
 				_ = m.repo.RecordIssue(&models.IGAOperationalIssue{
 					ID: uuid.New(), WorkspaceID: workspaceID, IntegrationID: &integrationID,
-					IssueKind: "api_failure", Severity: "critical", ObjectClass: class,
+					IssueKind: "api_failure", Severity: "critical", ObjectClass: sc.class,
+					ScopeRef: sc.scopeID.String(),
 					Detail: mustJSON(map[string]interface{}{
-						"reason":  "mass disappearance guard tripped; nothing tombstoned",
-						"missing": missing, "alive": alive,
+						"reason":  "mass disappearance guard tripped; nothing tombstoned in this scope",
+						"missing": missing, "alive": alive, "scope_id": sc.scopeID,
 					}),
 					FirstSeenAt: now, LastSeenAt: now,
 				})
 				continue
 			}
 		}
-		n, err := m.repo.TombstoneAbsent(workspaceID, integrationID, class, generation)
+		n, err := m.repo.TombstoneAbsent(workspaceID, integrationID, sc.scopeID, sc.class, generation)
 		if err != nil {
 			return total, err
 		}
@@ -892,8 +991,8 @@ func (m *igaManager) findPriorHash(workspaceID, integrationID uuid.UUID, recogni
 // everything else. So the lane gets a synthetic identity naming the provider as
 // the source of the claim, versioned with the catalogue so a reader can still
 // tell which vintage produced it.
-func (m *igaManager) ingest(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, o ProviderObject, class string, report *ScanReport) {
-	m.ingestWithRule(workspaceID, integ, run, scope, o, class, providerNativeRule(class, m.catalog.Version), "", report)
+func (m *igaManager) ingest(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scopeID uuid.UUID, scope ProviderScope, o ProviderObject, class string, report *ScanReport) {
+	m.ingestWithRule(workspaceID, integ, run, scopeID, scope, o, class, providerNativeRule(class, m.catalog.Version), "", report)
 }
 
 // providerNativeRule is the synthetic identity for a provider-declared object.
@@ -923,7 +1022,7 @@ func (m *igaManager) touchSourceObject(workspaceID uuid.UUID, integ *models.IGAI
 // ingestWithRule writes source object -> observation -> (maybe) candidate.
 // Order is deliberate and is the projection rule: evidence lands first, and
 // only then may anything be proposed or promoted.
-func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, o ProviderObject, class string, rule IGARule, rawHash string, report *ScanReport) {
+func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scopeID uuid.UUID, scope ProviderScope, o ProviderObject, class string, rule IGARule, rawHash string, report *ScanReport) {
 	now := time.Now()
 	recognition := o.NativeID
 	if recognition == "" {
@@ -931,12 +1030,16 @@ func (m *igaManager) ingestWithRule(workspaceID uuid.UUID, integ *models.IGAInte
 	}
 
 	src := &models.IGASourceObject{
-		ID:             uuid.New(),
-		WorkspaceID:    workspaceID,
-		IntegrationID:  integ.ID,
-		ObjectType:     class,
-		RecognitionKey: recognition,
-		NativeID:       o.NativeID,
+		// The scope this object was seen in. Without it the absence sweep cannot
+		// tell which objects belonged to the scope it actually read, and one
+		// scope's success licenses deleting another scope's inventory.
+		IntegrationScopeID: scopeIDPtr(scopeID),
+		ID:                 uuid.New(),
+		WorkspaceID:        workspaceID,
+		IntegrationID:      integ.ID,
+		ObjectType:         class,
+		RecognitionKey:     recognition,
+		NativeID:           o.NativeID,
 		// Locator is descriptive: a rename changes this, never the identity.
 		Locator:           mustJSON(map[string]interface{}{"scope": scope.DisplayName, "name": o.DisplayName}),
 		NormalizedPayload: mustJSON(o.Payload),

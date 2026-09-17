@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,6 +166,50 @@ func fixtures() *services.FixtureProvider {
 
 var farFuture = time.Now().Add(1000 * 24 * time.Hour)
 
+/* ------------------------ installation ownership fake --------------------- */
+
+// fakeInstalls stands in for the provider during binding.
+//
+// It exists because binding must be proved AGAINST the provider: the manager
+// enumerates this workspace's App installations and refuses anything absent.
+// A test that wants a successful bind has to say which installations the App
+// actually has, which is the same thing the real code demands of production.
+type fakeInstalls struct {
+	installs []services.GitHubInstallation
+	err      error
+}
+
+func (f fakeInstalls) ListGitHubInstallations(_ context.Context, _ uuid.UUID) ([]services.GitHubInstallation, error) {
+	return f.installs, f.err
+}
+
+// ownedInstall declares which installations this workspace's App is installed
+// on. Every id a test binds has to appear here, which is the point: a test
+// cannot bind an installation without first saying the App owns it, exactly as
+// production cannot.
+func ownedInstall(ids ...string) fakeInstalls {
+	f := fakeInstalls{}
+	for _, id := range ids {
+		f.installs = append(f.installs, services.GitHubInstallation{
+			InstallationID: id,
+			Account:        "acct",
+			AccountType:    "Organization",
+			Permissions:    map[string]string{"contents": "read", "metadata": "read"},
+		})
+	}
+	return f
+}
+
+// suiteInstalls covers the installations the pipeline tests bind. Those tests
+// are not about binding, so they declare ownership once here rather than
+// restating it; the binding-specific assertions live in TestIGABindingSecurity.
+func suiteInstalls() fakeInstalls {
+	return ownedInstall(
+		"inst-1", "inst-scan", "inst-decide", "inst-hook",
+		"inst-access", "inst-delete", "inst-ckpt", "inst-page", "inst-denied",
+	)
+}
+
 func verifiedIntegration(t *testing.T, mgr services.IGAManager, ws uuid.UUID, installID string) *models.IGAIntegration {
 	t.Helper()
 	integ, err := mgr.CreateIntegration(ws, "tester", services.IntegrationInput{
@@ -175,8 +220,7 @@ func verifiedIntegration(t *testing.T, mgr services.IGAManager, ws uuid.UUID, in
 		t.Fatalf("create integration: %v", err)
 	}
 	out, err := mgr.VerifyIntegration(ws, integ.ID, services.VerifyInput{
-		InstallationID: installID, AccountNativeID: "acct-1", AuthenticatedAccountID: "acct-1",
-		GrantedPermissions: map[string]interface{}{"contents": "read"},
+		InstallationID: installID, AccountNativeID: "acct",
 	})
 	if err != nil {
 		t.Fatalf("verify integration: %v", err)
@@ -184,54 +228,105 @@ func verifiedIntegration(t *testing.T, mgr services.IGAManager, ws uuid.UUID, in
 	return out
 }
 
-// TestIGABindingSecurity covers the two ways an installation could be bound to
-// the wrong tenant: a spoofed setup-URL id, and silent cross-workspace rebinding.
+// TestIGABindingSecurity proves binding cannot be established from the request
+// body.
+//
+// THE DEFECT THIS REPLACES. VerifyIntegration used to compare account_native_id
+// against authenticated_account_id. Both arrived in the same JSON body, so
+// sending one invented account twice satisfied the check and bound the
+// integration. The previous version of this test only ever sent them UNEQUAL,
+// which is why it passed for as long as the defect existed: it demonstrated
+// that the comparison ran, not that the comparison meant anything.
+//
+// Ownership is now proved by enumerating this workspace's own App
+// installations, so the attacker's two matching strings have nothing to act on.
 func TestIGABindingSecurity(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
 
 	wsA := newWorkspace(t, db, "ws-a")
 	wsB := newWorkspace(t, db, "ws-b")
 
-	integ, err := mgr.CreateIntegration(wsA, "tester", services.IntegrationInput{
-		Provider: "github", ProviderHost: "github.com", AppRegistrationID: "app-sec",
-	})
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	// This workspace's App is installed on exactly one installation.
+	mgr := services.NewIGAManager(repo, fixtures(), ownedInstall("inst-sec"))
+
+	newInteg := func(ws uuid.UUID, app string) *models.IGAIntegration {
+		t.Helper()
+		integ, err := mgr.CreateIntegration(ws, "tester", services.IntegrationInput{
+			Provider: "github", ProviderHost: "github.com", AppRegistrationID: app,
+		})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return integ
 	}
 
-	// A spoofed installation id: the installation's account does not match the
-	// account that actually authenticated. Must be refused.
-	_, err = mgr.VerifyIntegration(wsA, integ.ID, services.VerifyInput{
-		InstallationID: "inst-sec", AccountNativeID: "victim-org", AuthenticatedAccountID: "attacker",
+	// 1. A REAL installation the caller does not control. This is the case the
+	//    old check could never catch, because the attacker controls both fields
+	//    it compared. "inst-victim" exists in the world; it is simply not an
+	//    installation of this workspace's App.
+	integ := newInteg(wsA, "app-sec")
+	_, err := mgr.VerifyIntegration(wsA, integ.ID, services.VerifyInput{
+		InstallationID: "inst-victim", AccountNativeID: "victim-org",
 	})
 	if !errors.Is(err, repositories.ErrIGABindingFailed) {
-		t.Fatalf("expected binding refusal for mismatched account, got %v", err)
+		t.Fatalf("binding an installation this App is not installed on must be refused, got %v", err)
 	}
 
-	// The honest case succeeds.
+	// 2. A claimed account that disagrees with the provider is refused rather
+	//    than silently corrected: the console and the provider disagreeing about
+	//    what is being connected is itself the problem.
 	if _, err := mgr.VerifyIntegration(wsA, integ.ID, services.VerifyInput{
-		InstallationID: "inst-sec", AccountNativeID: "acct", AuthenticatedAccountID: "acct",
-	}); err != nil {
-		t.Fatalf("legitimate verify failed: %v", err)
+		InstallationID: "inst-sec", AccountNativeID: "victim-org",
+	}); !errors.Is(err, repositories.ErrIGABindingFailed) {
+		t.Fatalf("a mismatched account claim must be refused, got %v", err)
 	}
 
-	// Workspace B now tries to claim the SAME installation. The unique index
-	// that excludes workspace_id must stop it.
-	integB, err := mgr.CreateIntegration(wsB, "tester", services.IntegrationInput{
-		Provider: "github", ProviderHost: "github.com", AppRegistrationID: "app-sec",
+	// 3. The honest case succeeds, and the stored account and permissions come
+	//    from the PROVIDER, not from anything the caller sent.
+	out, err := mgr.VerifyIntegration(wsA, integ.ID, services.VerifyInput{
+		InstallationID: "inst-sec",
 	})
 	if err != nil {
-		t.Fatalf("create B: %v", err)
+		t.Fatalf("legitimate verify failed: %v", err)
 	}
-	_, err = mgr.VerifyIntegration(wsB, integB.ID, services.VerifyInput{
-		InstallationID: "inst-sec", AccountNativeID: "acct", AuthenticatedAccountID: "acct",
-	})
-	if err == nil {
+	if out.AccountNativeID == nil || *out.AccountNativeID != "acct" {
+		t.Fatalf("account must come from the provider, got %v", out.AccountNativeID)
+	}
+	if !strings.Contains(string(out.GrantedPermissions), "contents") {
+		t.Fatalf("granted permissions must come from the provider, got %s", out.GrantedPermissions)
+	}
+
+	// 4. An unreachable provider fails CLOSED. "Could not check" is not "fine".
+	broken := services.NewIGAManager(repo, fixtures(),
+		fakeInstalls{err: errors.New("provider unreachable")})
+	integBroken := newInteg(wsA, "app-broken")
+	if _, err := broken.VerifyIntegration(wsA, integBroken.ID, services.VerifyInput{
+		InstallationID: "inst-sec",
+	}); !errors.Is(err, repositories.ErrIGABindingFailed) {
+		t.Fatalf("an unreachable provider must refuse to bind, got %v", err)
+	}
+
+	// 5. No verifier configured at all also fails closed, rather than falling
+	//    back to trusting the caller.
+	unconfigured := services.NewIGAManager(repo, fixtures(), nil)
+	integUnconf := newInteg(wsA, "app-unconf")
+	if _, err := unconfigured.VerifyIntegration(wsA, integUnconf.ID, services.VerifyInput{
+		InstallationID: "inst-sec",
+	}); !errors.Is(err, repositories.ErrIGABindingFailed) {
+		t.Fatalf("a manager with no verifier must refuse to bind, got %v", err)
+	}
+
+	// 6. Workspace B cannot claim the same installation, even though its own
+	//    App enumeration would return it. Provider proof and tenant uniqueness
+	//    are separate controls and both must hold.
+	integB := newInteg(wsB, "app-sec")
+	if _, err := mgr.VerifyIntegration(wsB, integB.ID, services.VerifyInput{
+		InstallationID: "inst-sec",
+	}); err == nil {
 		t.Fatal("cross-workspace rebinding was allowed")
 	}
-	t.Logf("PASS: cross-workspace rebinding refused (%v)", err)
+	t.Log("PASS: binding requires provider-confirmed ownership and fails closed")
 }
 
 // TestIGAScanPipeline is the main flow: enumerate, classify, project, cover.
@@ -239,7 +334,7 @@ func TestIGAScanPipeline(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
 	fx := fixtures()
-	mgr := services.NewIGAManager(repo, fx)
+	mgr := services.NewIGAManager(repo, fx, suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-scan")
 	integ := verifiedIntegration(t, mgr, ws, "inst-scan")
@@ -401,7 +496,7 @@ func TestIGAScanPipeline(t *testing.T) {
 func TestIGACandidateDecisionConcurrency(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-decide")
 	integ := verifiedIntegration(t, mgr, ws, "inst-decide")
@@ -462,7 +557,7 @@ func TestIGACandidateDecisionConcurrency(t *testing.T) {
 func TestIGAWebhookIngress(t *testing.T) {
 	db := igaDB(t)
 	repo := repositories.NewIGARepository(db)
-	mgr := services.NewIGAManager(repo, fixtures())
+	mgr := services.NewIGAManager(repo, fixtures(), suiteInstalls())
 
 	ws := newWorkspace(t, db, "ws-hook")
 	integ := verifiedIntegration(t, mgr, ws, "inst-hook")

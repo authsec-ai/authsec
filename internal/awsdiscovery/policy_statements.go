@@ -1,7 +1,10 @@
 package awsdiscovery
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -12,22 +15,65 @@ import (
 // trust_policy.go.
 
 // PolicyStatement is one statement from a policy document, normalised.
+//
+// Every field AWS uses to decide whether a request is allowed is kept, because
+// a statement stripped of its negations and conditions reads as broader than it
+// is. Nothing here is evaluated: this layer records what the document says.
 type PolicyStatement struct {
 	// Effect is lowercased ("allow" | "deny") to match the cloud_permission
 	// schema's enum directly.
-	Effect  string
+	Effect string
+	// Actions is the Action element. Empty when the statement used NotAction.
 	Actions []string
-	// Resources is nil for a statement written with NotResource: AWS defines
-	// that as "every resource except these", which is inherently broad and has
-	// no finite list to report -- treated as unresourced rather than guessed.
+	// NotActions is the NotAction element: "every action except these". A
+	// statement carrying it is NOT dropped -- dropping it loses a Deny
+	// entirely, which is the most dangerous possible parse failure.
+	NotActions []string
+	// Resources is the Resource element. Empty when the statement used
+	// NotResource, or named no resource at all.
 	Resources []string
+	// NotResources is the NotResource element: "every resource except these".
+	// Kept verbatim. It must never be widened to "*" -- that turns a bounded
+	// exclusion into an unbounded grant, and a reviewer cannot tell the
+	// difference afterwards.
+	NotResources []string
+	// Condition is the Condition block as it appeared, compact JSON, or "" when
+	// the statement had none.
+	//
+	// Stored, never evaluated. A conditional grant rendered as unconditional
+	// over-reports access: "GetObject on reports/*" and "GetObject on reports/*
+	// when PrincipalTag/Team is operations" are different facts.
+	Condition string
+	// Index is this statement's position in the ORIGINAL document, counting
+	// every statement including ones that could not be used.
+	//
+	// Callers key stored rows on it, so it must not shift when an unusable
+	// statement is skipped: renumbering would silently repoint an existing row
+	// at a different statement.
+	Index int
+	// Sid is the statement id where the author set one. Useful for pointing a
+	// customer at the exact statement; not an identity, since it is optional
+	// and not unique across documents.
+	Sid string
+}
+
+// Unbounded reports whether the statement names no concrete resource at all --
+// no Resource and no NotResource. That is genuinely account-wide.
+//
+// A statement with NotResource is NOT unbounded: it excludes something, and
+// callers must not collapse the two.
+func (s PolicyStatement) Unbounded() bool {
+	return len(s.Resources) == 0 && len(s.NotResources) == 0
 }
 
 type permissionStatement struct {
+	Sid         string          `json:"Sid"`
 	Effect      string          `json:"Effect"`
 	Action      stringOrSlice   `json:"Action"`
+	NotAction   stringOrSlice   `json:"NotAction"`
 	Resource    json.RawMessage `json:"Resource"`
 	NotResource json.RawMessage `json:"NotResource"`
+	Condition   json.RawMessage `json:"Condition"`
 }
 
 type permissionStatementList []permissionStatement
@@ -50,38 +96,71 @@ type permissionPolicyDocument struct {
 	Statement permissionStatementList `json:"Statement"`
 }
 
+// ErrMalformedPolicy is returned when a document cannot be parsed at all.
+//
+// It exists so a broken policy is a coverage failure rather than an empty
+// result: "this policy grants nothing" and "we could not read this policy" are
+// different answers, and silently returning zero statements makes the second
+// one look like the first.
+var ErrMalformedPolicy = errors.New("awsdiscovery: malformed policy document")
+
 // ParsePolicyDocument reads every statement in a decoded policy document.
 //
-// A statement missing an Effect, or a document that fails to parse, yields no
-// statements rather than an error: one malformed managed policy must not abort
-// the scan of every other policy attached to the identity.
-func ParsePolicyDocument(doc string) []PolicyStatement {
+// A document that will not parse returns ErrMalformedPolicy. Individual
+// statements that carry no Effect, or neither Action nor NotAction, are skipped
+// and counted in the returned skip count -- one unusable statement must not
+// discard the rest of the document, but the caller still needs to know it
+// happened.
+func ParsePolicyDocument(doc string) (statements []PolicyStatement, skipped int, err error) {
 	if strings.TrimSpace(doc) == "" {
-		return nil
+		return nil, 0, nil
 	}
 	var parsed permissionPolicyDocument
-	if err := json.Unmarshal([]byte(doc), &parsed); err != nil {
-		return nil
+	if uerr := json.Unmarshal([]byte(doc), &parsed); uerr != nil {
+		return nil, 0, fmt.Errorf("%w: %v", ErrMalformedPolicy, uerr)
 	}
 
 	out := make([]PolicyStatement, 0, len(parsed.Statement))
-	for _, stmt := range parsed.Statement {
-		if stmt.Effect == "" || len(stmt.Action) == 0 {
+	for i, stmt := range parsed.Statement {
+		// A statement needs an Effect, and needs to say which actions it is
+		// about -- through Action or NotAction. A Deny written with NotAction
+		// used to vanish here, taking the denial with it.
+		if stmt.Effect == "" || (len(stmt.Action) == 0 && len(stmt.NotAction) == 0) {
+			skipped++
 			continue
 		}
 		out = append(out, PolicyStatement{
-			Effect:    strings.ToLower(stmt.Effect),
-			Actions:   stmt.Action,
-			Resources: decodeResourceField(stmt.Resource, stmt.NotResource),
+			Index:        i,
+			Sid:          stmt.Sid,
+			Effect:       strings.ToLower(stmt.Effect),
+			Actions:      stmt.Action,
+			NotActions:   stmt.NotAction,
+			Resources:    decodeResourceField(stmt.Resource),
+			NotResources: decodeResourceField(stmt.NotResource),
+			Condition:    compactJSON(stmt.Condition),
 		})
 	}
-	return out
+	return out, skipped, nil
 }
 
-func decodeResourceField(resource, notResource json.RawMessage) []string {
-	if len(notResource) > 0 {
-		return nil
+// compactJSON returns the raw message with insignificant whitespace removed, so
+// the same condition block from two APIs stores identically. Invalid JSON is
+// returned as-is rather than dropped: the caller asked to preserve what AWS
+// said, and an unparseable condition is still evidence that a condition exists.
+func compactJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
 	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return string(raw)
+	}
+	return buf.String()
+}
+
+// decodeResourceField reads a Resource or NotResource element, which AWS allows
+// to be either a single string or an array of them.
+func decodeResourceField(resource json.RawMessage) []string {
 	if len(resource) == 0 {
 		return nil
 	}

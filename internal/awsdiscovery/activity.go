@@ -143,7 +143,7 @@ func (r *ActivityReader) ServiceActivityFor(ctx context.Context, principalARN st
 
 		switch out.JobStatus {
 		case iamtypes.JobStatusTypeCompleted:
-			return activityFromReport(out), nil
+			return r.drainReport(ctx, jobID, out)
 
 		case iamtypes.JobStatusTypeFailed:
 			// AWS's own reason, when it gave one, so an operator is not left
@@ -172,12 +172,42 @@ func (r *ActivityReader) ServiceActivityFor(ctx context.Context, principalARN st
 	}
 }
 
-// activityFromReport normalises a completed report.
+// drainReport reads every page of a completed report.
 //
-// IsTruncated and Marker are deliberately not followed. The report is one page
-// of at most a few hundred service namespaces -- AWS has fewer than that in
-// total -- so a second page does not occur in practice, and pretending to
-// handle one would be untested code guarding an impossible case.
+// GetServiceLastAccessedDetails returns at most MaxItems entries -- default
+// 100 -- and sets IsTruncated with a Marker when more remain. A role granted
+// broad access (anything approaching "*" on "*") lists far more service
+// namespaces than that, so a single page silently omits activity while the scan
+// reports success. Stopping at page one understates usage, and understated
+// usage is what an "unused access" finding is built on.
+func (r *ActivityReader) drainReport(
+	ctx context.Context, jobID string, first *iam.GetServiceLastAccessedDetailsOutput,
+) ([]ServiceActivity, error) {
+	activity := activityFromReport(first)
+
+	out := first
+	for page := 1; out.IsTruncated && out.Marker != nil; page++ {
+		if page >= maxPages {
+			return activity, fmt.Errorf("%w: service last accessed report", errTooManyPages)
+		}
+		next, err := r.api.GetServiceLastAccessedDetails(ctx,
+			&iam.GetServiceLastAccessedDetailsInput{
+				JobId:  aws.String(jobID),
+				Marker: out.Marker,
+			})
+		if err != nil {
+			// Partial activity with an error is better than silently returning
+			// page one as though it were everything: the caller records the
+			// surface as incomplete rather than complete-and-wrong.
+			return activity, classify(err)
+		}
+		activity = append(activity, activityFromReport(next)...)
+		out = next
+	}
+	return activity, nil
+}
+
+// activityFromReport normalises one page of a completed report.
 func activityFromReport(out *iam.GetServiceLastAccessedDetailsOutput) []ServiceActivity {
 	generated := out.JobCompletionDate
 	if generated == nil {

@@ -6354,6 +6354,16 @@ CREATE TABLE IF NOT EXISTS public.cloud_permission (
     effect text NOT NULL,
     role_name text,
     actions text[] NOT NULL,
+    -- NotAction / NotResource: the negated halves of a statement. Kept because
+    -- a statement stripped of them reads as broader than it is; see 019.
+    not_actions text[],
+    not_resources text[],
+    -- The Condition block verbatim. Stored, never evaluated.
+    condition jsonb,
+    -- unknown | unconstrained | conditional | negated | bounded. Only
+    -- 'unconstrained' may be rendered as plain access; 'unknown' means nobody
+    -- has looked yet, which is why it is the default.
+    constraint_state text NOT NULL DEFAULT 'unknown',
     scope_kind text NOT NULL,
     derivation text NOT NULL DEFAULT 'granted',
     sensitivity text NOT NULL DEFAULT 'low',
@@ -6373,13 +6383,27 @@ CREATE TABLE IF NOT EXISTS public.cloud_permission (
     CONSTRAINT cloud_permission_scope_resource_chk CHECK (
         (scope_kind = 'resource') = (resource_id IS NOT NULL)
     ),
-    CONSTRAINT cloud_permission_derivation_chk CHECK (
-        derivation IN ('granted', 'effective')
+    CONSTRAINT cloud_permission_derivation_v2_chk CHECK (
+        derivation IN ('granted', 'effective', 'boundary')
+    ),
+    CONSTRAINT cloud_permission_constraint_state_chk CHECK (
+        constraint_state IN ('unknown', 'unconstrained', 'conditional', 'negated', 'bounded')
+    ),
+    CONSTRAINT cloud_permission_condition_state_chk CHECK (
+        condition IS NULL OR constraint_state <> 'unconstrained'
+    ),
+    CONSTRAINT cloud_permission_negation_state_chk CHECK (
+        (COALESCE(array_length(not_actions, 1), 0) = 0
+         AND COALESCE(array_length(not_resources, 1), 0) = 0)
+        OR constraint_state <> 'unconstrained'
     ),
     CONSTRAINT cloud_permission_sensitivity_chk CHECK (
         sensitivity IN ('low', 'med', 'high')
     ),
-    CONSTRAINT cloud_permission_actions_chk CHECK (array_length(actions, 1) > 0),
+    CONSTRAINT cloud_permission_actions_present_chk CHECK (
+        COALESCE(array_length(actions, 1), 0) > 0
+        OR COALESCE(array_length(not_actions, 1), 0) > 0
+    ),
     CONSTRAINT cloud_permission_native_id_chk CHECK (native_id <> ''),
     CONSTRAINT cloud_permission_generation_chk CHECK (last_seen_generation >= 0)
 );
@@ -6396,3 +6420,328 @@ CREATE INDEX IF NOT EXISTS idx_cloud_permission_identity
 
 CREATE INDEX IF NOT EXISTS idx_cloud_permission_resource
     ON public.cloud_permission (resource_id) WHERE resource_id IS NOT NULL;
+
+-- ===========================================================================
+-- cloud_workload / cloud_usage / cloud_scan_checkpoint — mirrors migrations
+-- 015, 016 and 017. A fresh database built from this file was missing all
+-- three, so bootstrap and migrated schemas disagreed: scans failed on a new
+-- install with "relation cloud_scan_checkpoint does not exist" while an
+-- upgraded database worked. Keep these in step with those migrations.
+-- ===========================================================================
+
+-- ---- from 015_cloud_workload.sql ----
+-- 015_cloud_workload.sql
+--
+-- The compute that RUNS as a cloud identity: a Lambda function, an ECS task
+-- definition, an EC2 instance, a Bedrock agent, a Bedrock AgentCore runtime.
+--
+-- WHY A NEW TABLE AND NOT iga_agent_instances. iga_agent_instances is the
+-- canonical home for a workload once something has decided it belongs to an
+-- agent: its agent_id is NOT NULL with a foreign key to iga_agents, so a row
+-- cannot exist before that decision is made. Discovery does not make that
+-- decision. A scan of an AWS account finds hundreds of Lambda functions, most
+-- of which are not agents, and inserting an iga_agents row for each one to
+-- satisfy the foreign key would assert agent-ness the scan never established --
+-- and would duplicate the agents the Kubernetes connector already writes for
+-- the same workloads.
+--
+-- So this table records the OBSERVATION ("this compute exists and runs as this
+-- role") and stops there. Whether a given workload is an agent, and which
+-- agent, is a separate judgement a later ticket makes -- at which point this
+-- table is the input to it, not a thing to be migrated away. correlated_agent_id
+-- is deliberately absent for the same reason: adding it would invite this table
+-- to answer a question it cannot.
+--
+-- WHY IT IS NOT cloud_identity. A workload is not an identity. It HAS one: the
+-- role it runs as, which cloud_identity already holds because ticket [1]
+-- discovered it independently from IAM. identity_id is that role, and it is
+-- nullable because the link is the thing most likely to be missing -- a Lambda
+-- with no execution role attached, a task definition naming a role in another
+-- account, or an IAM read that was denied while the Lambda read succeeded.
+-- A workload with a NULL identity_id is a real finding (compute nobody can
+-- attribute), not a broken row.
+--
+-- WHY runtime_kind IS TEXT. Same argument as cloud_resource.kind: AWS ships new
+-- compute services, and an enum would need a migration for each. The values AWS
+-- discovery writes today are lambda_function, ecs_task_definition, ec2_instance,
+-- bedrock_agent and bedrock_agentcore_runtime; GCP and Azure will add their own
+-- without touching this file.
+--
+-- WHY THE ECS ROLE DISTINCTION IS RECORDED IN attrs, NOT A COLUMN. An ECS task
+-- definition names two roles: taskRoleArn, which the application acts as, and
+-- executionRoleArn, which ECS itself uses to pull images and write logs.
+-- identity_id is always the TASK role -- attributing a container's permissions
+-- to the execution role would report the wrong permissions entirely. The
+-- execution role is kept in attrs for the reader who needs it, because it is an
+-- ECS-only concept and does not belong in a cross-cloud column.
+--
+-- NO SECRET VALUES. Lambda returns environment variable VALUES with the
+-- function, and there is no IAM action that returns the names alone. Only names
+-- are recorded here, in attrs; values are discarded at parse time. That is a
+-- code obligation (see internal/awsdiscovery/workloads.go) because IAM cannot
+-- enforce it, and this table has no column a value could be written to.
+--
+-- Applied at boot by internal/migration/runner.go, which wraps each file in its
+-- own transaction. This file must not open one of its own.
+
+CREATE TABLE IF NOT EXISTS public.cloud_workload (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The role this compute runs as. NULL means unattributed, which is a
+    -- finding, not a defect -- see the header. ON DELETE SET NULL rather than
+    -- CASCADE: if the role is deleted the workload still exists and still
+    -- matters; losing the row would hide compute that just became
+    -- unattributable.
+    identity_id uuid
+        REFERENCES public.cloud_identity(id) ON DELETE SET NULL,
+
+    -- lambda_function | ecs_task_definition | ec2_instance | bedrock_agent |
+    -- bedrock_agentcore_runtime. Text, not an enum -- see the header.
+    runtime_kind text NOT NULL,
+
+    -- The provider's own identifier, verbatim: a function ARN, a task
+    -- definition ARN, an instance id, an agent id. The cross-scan join key.
+    native_id text NOT NULL,
+
+    name text NOT NULL DEFAULT '',
+
+    -- The region the workload was found in. Unlike IAM, every service in this
+    -- table is regional, and the same name can exist in two regions as two
+    -- different workloads.
+    region text NOT NULL DEFAULT '',
+
+    -- Provider-specific detail: the ECS execution role, a Lambda's environment
+    -- variable NAMES (never values), an EC2 instance profile ARN, a Bedrock
+    -- foundation model. Never a secret value.
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Reconciliation, identical in shape to cloud_identity, cloud_secret and
+    -- cloud_assume_edge, and driven by the same connector generation.
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_workload_runtime_kind_chk CHECK (runtime_kind <> ''),
+    CONSTRAINT cloud_workload_native_id_chk CHECK (native_id <> ''),
+    CONSTRAINT cloud_workload_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+-- One row per workload per workspace. native_id is an ARN or an instance id,
+-- already unique per account and region, so a re-scan updates rather than
+-- duplicating. Scoped by workspace, not connector: re-onboarding an account
+-- produces the same connector row, and two workspaces may legitimately watch
+-- the same account.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_workload_native
+    ON public.cloud_workload (workspace_id, native_id);
+
+-- The scan's own reconciliation query.
+CREATE INDEX IF NOT EXISTS idx_cloud_workload_connector_generation
+    ON public.cloud_workload (connector_id, last_seen_generation);
+
+-- "What runs as this role" -- the question this table exists to answer, and the
+-- join a later classification ticket walks to decide whether a role's compute
+-- makes it an agent.
+CREATE INDEX IF NOT EXISTS idx_cloud_workload_identity
+    ON public.cloud_workload (identity_id)
+    WHERE identity_id IS NOT NULL;
+
+-- "Show me every unattributed workload" -- compute nobody can tie to a role.
+CREATE INDEX IF NOT EXISTS idx_cloud_workload_unattributed
+    ON public.cloud_workload (workspace_id, runtime_kind)
+    WHERE identity_id IS NULL;
+
+-- ---- from 016_cloud_usage.sql ----
+-- 016_cloud_usage.sql
+--
+-- Whether a permission was ever actually EXERCISED, as opposed to merely
+-- granted. The difference between "this role can read every bucket" and "this
+-- role has not touched S3 in 400 days" is the whole basis of a least-privilege
+-- recommendation, and nothing in tickets [1] or [2] could tell them apart.
+--
+-- WHY THE GRAIN IS (identity, service) AND NOT (identity, action). Because that
+-- is the grain AWS gives us. iam:GetServiceLastAccessedDetails reports per
+-- SERVICE -- "s3, last accessed 400 days ago" -- and not per action, so it can
+-- support "never touched S3" but never "used GetObject and never PutObject".
+-- Recording a finer grain than the source supports would invent precision:
+-- every action row would carry the same date, and a reader would reasonably
+-- conclude we had per-action evidence. CloudTrail does give per-call detail and
+-- would justify a finer grain, but it is rate-capped at roughly two requests a
+-- second, so it is an opt-in upgrade rather than the default path -- which is
+-- why source is a column and not an assumption.
+--
+-- WHY last_used_at IS NULLABLE AND WHAT NULL MEANS. NULL is "AWS reports this
+-- service was never accessed in the tracking window", which is a positive
+-- finding and the most actionable row in the table. It is NOT missing data: a
+-- service AuthSec could not read produces no row at all, not a row with a NULL
+-- date. The same rule the rest of this schema follows -- unreached is not
+-- missing -- applies here, and keeping the two distinguishable is why an absent
+-- row and a NULL date have to mean different things.
+--
+-- WHY THIS TABLE DOES NOT POINT AT cloud_permission. It would be the obvious
+-- join, and it is wrong: service-last-accessed data is reported against a
+-- PRINCIPAL, not against a policy statement. One identity's S3 access may come
+-- from four statements across three policies, and AWS gives no signal about
+-- which of them was the one exercised. Attaching a date to a specific statement
+-- would be a guess. Aggregating from here up to cloud_permission.
+-- last_exercised_at is a decision for the ticket that computes it, with its own
+-- documented rule for how a service-level date maps onto statement-level rows.
+--
+-- WHY THE READ IS ASYNCHRONOUS, AND WHY THAT SHOWS UP IN THE SCHEMA.
+-- iam:GenerateServiceLastAccessedDetails returns a JobId; the caller then polls
+-- iam:GetServiceLastAccessedDetails until the job reports COMPLETED. Every
+-- other AWS read in this schema is a synchronous request inside a loop. That is
+-- why generated_at is recorded separately from last_seen_at: the report AWS
+-- produced has its own as-of time, which can be meaningfully older than the
+-- scan that stored it, and treating the two as one would date the evidence to
+-- when we happened to write it down.
+--
+-- Applied at boot by internal/migration/runner.go, which wraps each file in its
+-- own transaction. This file must not open one of its own.
+
+CREATE TABLE IF NOT EXISTS public.cloud_usage (
+    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The principal the report is about. CASCADE rather than SET NULL: a usage
+    -- row describes one identity's behaviour and means nothing detached from
+    -- it, unlike a workload, which still exists once its role is gone.
+    identity_id uuid NOT NULL
+        REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
+
+    -- The AWS service namespace as AWS reports it: "s3", "dynamodb",
+    -- "secretsmanager". Not an action, and not an ARN -- see the header on why
+    -- the grain stops here.
+    service text NOT NULL,
+
+    -- NULL means AWS reports the service was never accessed in the tracking
+    -- window. That is a finding, not missing data -- see the header.
+    last_used_at timestamptz,
+
+    -- Where the evidence came from, because the two sources support different
+    -- claims and a reader must be able to tell which one produced a row.
+    -- service_last_accessed | cloudtrail
+    source text NOT NULL DEFAULT 'service_last_accessed',
+
+    -- When AWS generated the report, as distinct from when this scan stored it.
+    -- The report can be materially older than the scan that read it.
+    generated_at timestamptz,
+
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    last_seen_generation integer NOT NULL DEFAULT 0,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    row_updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_usage_service_chk CHECK (service <> ''),
+    CONSTRAINT cloud_usage_source_chk CHECK (
+        source IN ('service_last_accessed', 'cloudtrail')
+    ),
+    CONSTRAINT cloud_usage_generation_chk CHECK (last_seen_generation >= 0)
+);
+
+-- One row per identity per service per source. Keeping source in the key means
+-- a later CloudTrail-backed row can sit alongside the service-last-accessed one
+-- for the same pair rather than silently overwriting evidence gathered a
+-- different way.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_usage_identity_service
+    ON public.cloud_usage (identity_id, service, source);
+
+-- The scan's own reconciliation query.
+CREATE INDEX IF NOT EXISTS idx_cloud_usage_connector_generation
+    ON public.cloud_usage (connector_id, last_seen_generation);
+
+-- "Which of this identity's services are dormant" -- the least-privilege
+-- question this table exists to answer. Partial, because a never-accessed
+-- service is the row worth finding and it is the minority.
+CREATE INDEX IF NOT EXISTS idx_cloud_usage_never_accessed
+    ON public.cloud_usage (workspace_id, identity_id)
+    WHERE last_used_at IS NULL;
+
+-- ---- from 017_cloud_scan_checkpoint.sql ----
+-- 017_cloud_scan_checkpoint.sql
+--
+-- How far a scan got, so a scan that dies part-way resumes instead of starting
+-- over.
+--
+-- WHY THIS IS NEEDED NOW AND WAS NOT BEFORE. Identity discovery alone is two
+-- calls per role. Adding per-identity policies makes it roughly seven, and
+-- adding activity makes it a submit-plus-poll report job per identity on top.
+-- On five hundred roles that is thousands of calls, and the probability that
+-- nothing interrupts a run that long is not one. Without a checkpoint every
+-- interruption throws away the whole run's work and the next attempt is exactly
+-- as likely to be interrupted, so a large account can fail to ever complete a
+-- scan.
+--
+-- WHY NOT iga_scan_checkpoints. That table is the same idea for the GitHub
+-- pipeline, and it has a NOT NULL foreign key to iga_scan_runs. The AWS
+-- connector does not create iga_scan_runs rows -- it tracks a scan in
+-- cloud_connector.scan_generation and .coverage -- so reusing it would mean
+-- making AWS write into the canonical iga_* pipeline, which is an open
+-- architecture question and not something a resume feature should decide.
+--
+-- WHY THE KEY INCLUDES generation. A checkpoint belongs to one scan attempt.
+-- The generation is that attempt's identity, and it is already how every other
+-- cloud_* table decides what is current, so a stale checkpoint from an older
+-- generation is inert rather than actively wrong -- it simply never matches.
+--
+-- WHY A CURSOR AND NOT A SET OF COMPLETED ITEMS. Storing which of five hundred
+-- identities were finished would mean five hundred rows or one enormous array.
+-- Instead each resumable phase walks its items in a deterministic order --
+-- sorted by ARN, not the order AWS happened to return -- and records the last
+-- one it finished. Resuming skips everything at or before that value. Sorting
+-- is what makes this sound: AWS makes no promise that two calls return items in
+-- the same order, and a cursor over an unstable order would silently skip work.
+--
+-- WHAT MAKES SKIPPING SAFE. Every skipped item's rows were already written and
+-- stamped with THIS generation by the interrupted attempt, so reconciliation --
+-- which only removes rows older than the current generation, and only when the
+-- scan completed -- cannot mistake them for gone. That property is why resume
+-- can be a cursor rather than a re-verification.
+--
+-- Applied at boot by internal/migration/runner.go, which wraps each file in its
+-- own transaction. This file must not open one of its own.
+
+CREATE TABLE IF NOT EXISTS public.cloud_scan_checkpoint (
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The scan attempt this checkpoint belongs to.
+    generation integer NOT NULL,
+
+    -- Which resumable phase. Free text because the phase list grows with the
+    -- surfaces: 'identity_policies', 'activity', 'workloads:<region>'. A phase
+    -- nobody recognises is ignored, which is the right failure mode for a
+    -- resume hint.
+    phase text NOT NULL,
+
+    -- The last item this phase finished, in the phase's own sort order. An
+    -- identity ARN for the per-identity phases, a region for the regional ones.
+    -- Empty means the phase started and finished nothing.
+    cursor text NOT NULL DEFAULT '',
+
+    -- How many items the phase has finished, for the scan report. Advisory:
+    -- the cursor is what resume actually uses.
+    done_count integer NOT NULL DEFAULT 0,
+
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_scan_checkpoint_pkey
+        PRIMARY KEY (workspace_id, connector_id, generation, phase),
+    CONSTRAINT cloud_scan_checkpoint_phase_chk CHECK (phase <> ''),
+    CONSTRAINT cloud_scan_checkpoint_generation_chk CHECK (generation >= 0),
+    CONSTRAINT cloud_scan_checkpoint_done_count_chk CHECK (done_count >= 0)
+);
+
+-- "Is there an unfinished scan for this connector, and at which generation" --
+-- the question asked once at the start of every scan.
+CREATE INDEX IF NOT EXISTS idx_cloud_scan_checkpoint_connector
+    ON public.cloud_scan_checkpoint (connector_id, generation);
+
