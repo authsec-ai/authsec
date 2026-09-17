@@ -6,6 +6,7 @@ import (
 
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -151,11 +152,24 @@ func (r *cloudPermissionRepository) UpsertPermission(p *models.CloudPermission) 
 	if p.WorkspaceID == uuid.Nil || p.ConnectorID == uuid.Nil || p.IdentityID == uuid.Nil {
 		return nil, false, errors.New("workspace_id, connector_id and identity_id are required")
 	}
-	if p.NativeID == "" || p.Effect == "" || p.ScopeKind == "" || len(p.Actions) == 0 {
-		return nil, false, errors.New("native_id, effect, scope_kind and actions are required")
+	if p.NativeID == "" || p.Effect == "" || p.ScopeKind == "" {
+		return nil, false, errors.New("native_id, effect and scope_kind are required")
+	}
+	// A statement must say which actions it is about -- through Action or
+	// NotAction. Requiring Actions alone rejected every NotAction statement,
+	// which is how a Deny written that way was lost between the parser and the
+	// database even after the parser learned to keep it.
+	if len(p.Actions) == 0 && len(p.NotActions) == 0 {
+		return nil, false, errors.New("one of actions or not_actions is required")
 	}
 	if p.ID == uuid.Nil {
 		p.ID = uuid.New()
+	}
+	// actions is NOT NULL, and a nil slice writes NULL rather than '{}'. A
+	// NotAction statement legitimately has no actions, so normalise here: the
+	// empty array is the honest value and satisfies the column.
+	if p.Actions == nil {
+		p.Actions = pq.StringArray{}
 	}
 	proposed := p.ID
 	now := time.Now()
@@ -175,6 +189,14 @@ func (r *cloudPermissionRepository) UpsertPermission(p *models.CloudPermission) 
 				"actions":      p.Actions,
 				"scope_kind":   p.ScopeKind,
 				"derivation":   p.Derivation,
+				// The constraint columns MUST refresh on conflict. A statement
+				// that gains a Condition in AWS between two scans would
+				// otherwise keep its old unconditional row, and the console
+				// would keep showing access that is now gated.
+				"not_actions":      p.NotActions,
+				"not_resources":    p.NotResources,
+				"condition":        p.Condition,
+				"constraint_state": p.ConstraintState,
 				// sensitivity is NOT refreshed on conflict. It starts as the
 				// rule-based default this scan computed, but a reviewer may have
 				// since raised it by hand (once that exists), and a re-scan of

@@ -172,7 +172,17 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 			snapshot.TrustPolicies[role.ARN] = role.TrustPolicy
 		}
 	}
-	coverage.Surfaces[models.SurfaceIAMRoles] = surfaceResult(len(roles), rolesErr)
+	// A role whose GetRole failed is listed but not understood: its tags,
+	// last-used date and permissions boundary are unknown. Reporting the
+	// surface as reached would let reconciliation delete on the strength of an
+	// inventory we only half-read, and would present an unknown boundary as no
+	// boundary.
+	if incomplete := coverage.Counters["roles_detail_incomplete"]; incomplete > 0 && rolesErr == nil {
+		coverage.Surfaces[models.SurfaceIAMRoles] = surfacePartial(
+			len(roles), incomplete, "roles could not be read in detail")
+	} else {
+		coverage.Surfaces[models.SurfaceIAMRoles] = surfaceResult(len(roles), rolesErr)
+	}
 
 	// ---- users and their access keys ---------------------------------------
 	users, usersErr := reader.ListUsers(ctx)
@@ -299,10 +309,16 @@ func (s *AWSIAMScanner) readPolicies(
 		arn    string
 		name   string
 		isRole bool
+		// boundaryARN is set for roles that carry a permissions boundary, so
+		// the policy pass can read the capping document alongside the grants.
+		boundaryARN string
 	}
 	targets := make([]target, 0, len(roles)+len(users))
 	for _, role := range roles {
-		targets = append(targets, target{arn: role.ARN, name: role.Name, isRole: true})
+		targets = append(targets, target{
+			arn: role.ARN, name: role.Name, isRole: true,
+			boundaryARN: role.PermissionsBoundaryARN,
+		})
 	}
 	for _, user := range users {
 		targets = append(targets, target{arn: user.ARN, name: user.Name})
@@ -334,7 +350,24 @@ func (s *AWSIAMScanner) readPolicies(
 			}
 			continue
 		}
-		if len(policies.Attached) > 0 || len(policies.Inline) > 0 {
+
+		// The boundary caps everything the policies above allow, so it is read
+		// in the same pass. A failure to read it degrades this identity rather
+		// than the scan: the grants are still worth recording, and the identity
+		// keeps constraint_state 'bounded' from the ARN alone, so a missing
+		// boundary document never renders as unconstrained access.
+		if t.isRole && t.boundaryARN != "" {
+			boundary, berr := reader.BoundaryPolicy(ctx, t.boundaryARN)
+			if berr != nil {
+				if firstErr == nil {
+					firstErr = berr
+				}
+			} else {
+				policies.Boundary = &boundary
+			}
+		}
+
+		if len(policies.Attached) > 0 || len(policies.Inline) > 0 || policies.Boundary != nil {
 			snapshot.Policies[t.arn] = policies
 			count += len(policies.Attached) + len(policies.Inline)
 		}
@@ -360,14 +393,24 @@ func (s *AWSIAMScanner) upsertRole(
 		LastSeenGeneration: generation,
 	}
 	if err := identity.SetAWSAttrs(models.AWSIdentityAttrs{
-		UniqueID:           role.UniqueID,
-		Path:               role.Path,
-		Description:        role.Description,
-		MaxSessionDuration: role.MaxSessionDuration,
-		Tags:               role.Tags,
-		HasTrustPolicy:     role.TrustPolicy != "",
+		UniqueID:               role.UniqueID,
+		Path:                   role.Path,
+		Description:            role.Description,
+		MaxSessionDuration:     role.MaxSessionDuration,
+		Tags:                   role.Tags,
+		HasTrustPolicy:         role.TrustPolicy != "",
+		PermissionsBoundaryARN: role.PermissionsBoundaryARN,
+		DetailIncomplete:       !role.DetailComplete,
 	}); err != nil {
 		return err
+	}
+	if !role.DetailComplete {
+		// GetRole failed. The role exists -- ListRoles named it -- but its
+		// tags, last-used date and permissions boundary are unknown. Count it
+		// so the surface reports partial rather than complete: a role whose
+		// boundary we could not read must not be presented as a role with no
+		// boundary.
+		counters["roles_detail_incomplete"]++
 	}
 	return s.recordIdentity(identity, counters)
 }
@@ -577,6 +620,21 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 // The count is reported even on failure, where it is a FLOOR rather than a
 // total — we read this many before we were stopped. The state is what tells a
 // reader which of the two it is.
+// surfacePartial reports a surface that was listed successfully but whose
+// contents are not fully known -- for example roles listed by ListRoles whose
+// GetRole detail failed.
+//
+// Kept distinct from an error: the list call worked, so the rows are real and
+// worth keeping. What must not happen is reconciliation treating this run as an
+// authoritative inventory and deleting what it could not read.
+func surfacePartial(count int, incomplete int, reason string) models.SurfaceCoverage {
+	return models.SurfaceCoverage{
+		State: models.CloudCoveragePartial,
+		Count: count,
+		Error: fmt.Sprintf("%d of %d %s", incomplete, count, reason),
+	}
+}
+
 func surfaceResult(count int, err error) models.SurfaceCoverage {
 	switch {
 	case err == nil:

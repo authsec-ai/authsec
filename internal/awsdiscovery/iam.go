@@ -86,6 +86,22 @@ type IAMRole struct {
 	LastUsedAt         *time.Time
 	MaxSessionDuration int32
 	Tags               map[string]string
+	// PermissionsBoundaryARN is the managed policy that caps this role's
+	// effective permissions, or "" when none is attached.
+	//
+	// A boundary does not grant anything; it is a ceiling. A role whose
+	// policies allow dynamodb:PutItem but whose boundary denies it cannot do
+	// it, so reporting the grant without the boundary over-states access. The
+	// field is already in the GetRole response -- it was simply discarded.
+	PermissionsBoundaryARN string
+	// DetailComplete records whether GetRole succeeded for this role.
+	//
+	// False means only the ListRoles summary was available: last-used, tags and
+	// the permissions boundary are UNKNOWN, not absent. A writer must not treat
+	// a partial role as authoritative and overwrite metadata an earlier
+	// complete read established -- that turns a transient throttle into
+	// permanent data loss, and hides a missing boundary.
+	DetailComplete bool
 	// TrustPolicy is the decoded AssumeRolePolicyDocument. Retrieved here but
 	// NOT parsed and NOT persisted by ticket [1] — it is the input ticket [2]
 	// turns into cloud_assume_edge rows.
@@ -139,6 +155,10 @@ type IdentityPolicies struct {
 	IdentityName string
 	Attached     []AttachedPolicy
 	Inline       []InlinePolicy
+	// Boundary is the permissions-boundary policy document, when the identity
+	// has one. It is NOT an attached policy and must never be merged into
+	// Attached: those grant, this one caps. Nil when no boundary is set.
+	Boundary *AttachedPolicy
 }
 
 // OIDCProvider is one OIDC identity provider registered in the account -- a
@@ -226,6 +246,8 @@ func (r *IAMReader) roleDetail(ctx context.Context, role iamtypes.Role) IAMRole 
 
 	detail, err := r.api.GetRole(ctx, &iam.GetRoleInput{RoleName: role.RoleName})
 	if err != nil || detail.Role == nil {
+		// DetailComplete stays false: the caller must record this role as
+		// partially collected rather than writing its gaps as facts.
 		return built
 	}
 	d := detail.Role
@@ -242,6 +264,10 @@ func (r *IAMReader) roleDetail(ctx context.Context, role iamtypes.Role) IAMRole 
 		built.MaxSessionDuration = *d.MaxSessionDuration
 	}
 	built.Tags = tagMap(d.Tags)
+	if d.PermissionsBoundary != nil {
+		built.PermissionsBoundaryARN = aws.ToString(d.PermissionsBoundary.PermissionsBoundaryArn)
+	}
+	built.DetailComplete = true
 	return built
 }
 
@@ -348,6 +374,24 @@ func (r *IAMReader) ListAccessKeys(ctx context.Context, userName string) ([]IAMA
 		}
 		marker = resp.Marker
 	}
+}
+
+// BoundaryPolicy reads the document of a permissions-boundary policy.
+//
+// A boundary is an ordinary managed policy used in a non-granting position, so
+// the read is the same two calls; what differs is how the caller must record
+// the result.
+func (r *IAMReader) BoundaryPolicy(ctx context.Context, boundaryARN string) (AttachedPolicy, error) {
+	return r.managedPolicy(ctx, boundaryARN, boundaryPolicyName(boundaryARN))
+}
+
+// boundaryPolicyName recovers the policy name from its ARN. The boundary is
+// reported as an ARN only, and managedPolicy wants a name for its error text.
+func boundaryPolicyName(arn string) string {
+	if i := strings.LastIndex(arn, "/"); i >= 0 && i+1 < len(arn) {
+		return arn[i+1:]
+	}
+	return arn
 }
 
 // RolePolicies reads the managed and inline policies attached to a role.

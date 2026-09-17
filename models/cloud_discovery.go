@@ -119,6 +119,15 @@ const (
 	CloudCoverageDenied        = "denied"
 	CloudCoverageThrottled     = "throttled"
 	CloudCoverageNotConfigured = "not_configured"
+	// CloudCoveragePartial: the surface was reached, but some of what it
+	// returned could not be read -- a detail call that failed, a document that
+	// would not parse. The rows we have are real; the set is not known to be
+	// whole.
+	//
+	// It exists because "reached" is what licenses deletion. A surface that
+	// half-succeeded must not authorise reconciliation to remove what this run
+	// failed to see.
+	CloudCoveragePartial = "partial"
 )
 
 // Overall scan outcome.
@@ -142,6 +151,10 @@ const (
 	SurfaceIAMUsers      = "iam_users"
 	SurfaceIAMAccessKeys = "iam_access_keys"
 	SurfaceIAMPolicies   = "iam_policies"
+	// SurfacePolicyDocuments covers parsing what those APIs returned, as
+	// opposed to fetching it. A document can be fetched successfully and still
+	// be unreadable.
+	SurfacePolicyDocuments = "policy_documents"
 )
 
 // The two AWS surfaces ticket [2]'s permission scan reads independently of the
@@ -290,6 +303,16 @@ type AWSIdentityAttrs struct {
 	// environment variable, an IAM tag is metadata by construction — it is what
 	// the ownership question in the AWS plan's section 10 reads.
 	Tags map[string]string `json:"tags,omitempty"`
+	// PermissionsBoundaryARN is the managed policy capping this identity's
+	// effective permissions, or "" when none. Presence alone changes how a
+	// grant must be read: the statements are what the policies allow, and the
+	// boundary is the ceiling those allowances are clipped to.
+	PermissionsBoundaryARN string `json:"permissions_boundary_arn,omitempty"`
+	// DetailIncomplete marks an identity whose detail read failed, so tags,
+	// last-used and the permissions boundary here are UNKNOWN rather than
+	// absent. Readers must not present a missing boundary on such a row as
+	// evidence that no boundary exists.
+	DetailIncomplete bool `json:"detail_incomplete,omitempty"`
 	// HasTrustPolicy records that a role carried an AssumeRolePolicyDocument.
 	// The document itself is parsed in the next ticket into cloud_assume_edge;
 	// this is only the flag that says there is something to parse.
@@ -654,12 +677,44 @@ const (
 	PermissionPlaneCloud        = "cloud"
 	PermissionPlaneAPI          = "api"
 	PermissionDerivationGranted = "granted"
+	// PermissionDerivationBoundary is a statement read from a permissions
+	// BOUNDARY, not from a grant. It never adds access; it caps it. Kept as a
+	// separate derivation so no query can mistake a ceiling for a grant.
+	PermissionDerivationBoundary = "boundary"
 	// PermissionDerivationEffective is not written by ticket [2]. Computing
 	// effective access needs service control policies, permission boundaries
 	// and session policies evaluated together, which the AWS plan's section 2
 	// puts out of scope. The value exists so a later ticket can add effective
 	// rows without a schema change.
 	PermissionDerivationEffective = "effective"
+)
+
+// How constrained a recorded permission is. Discovery records constraints; it
+// does not evaluate them, so every state below except "unconstrained" means the
+// grant must not be rendered as plain access.
+const (
+	// ConstraintUnconstrained: no Condition, no NotAction, no NotResource, and
+	// the identity carries no permissions boundary. What the statement says is
+	// what it grants.
+	ConstraintUnconstrained = "unconstrained"
+	// ConstraintConditional: the statement carries a Condition we stored and
+	// did not evaluate.
+	ConstraintConditional = "conditional"
+	// ConstraintNegated: the statement is written with NotAction or
+	// NotResource. Its true extent depends on what else exists in the account.
+	ConstraintNegated = "negated"
+	// ConstraintBounded: the identity has a permissions boundary, so this grant
+	// is capped by a separate document.
+	ConstraintBounded = "bounded"
+	// ConstraintUnknown: this row was collected before constraints were
+	// recorded, so we do not know whether it was conditional or negated.
+	//
+	// It is the DEFAULT for a reason. "We never looked" must not be stored as
+	// "we looked and found nothing" -- that is the same over-claim the
+	// constraint columns exist to prevent, just moved into a backfill. A row
+	// leaves this state when a scan that actually parses constraints rewrites
+	// it.
+	ConstraintUnknown = "unknown"
 )
 
 // CloudPermission is one grant: an identity may take these actions against
@@ -683,10 +738,29 @@ type CloudPermission struct {
 	// RoleName is always nil for AWS. The shared schema names the column for
 	// Azure's RBAC role assignments, which have one; an IAM policy statement
 	// does not.
-	RoleName   *string        `json:"role_name,omitempty"`
-	Actions    pq.StringArray `json:"actions" gorm:"type:text[];not null"`
-	ScopeKind  string         `json:"scope_kind" gorm:"not null"`
-	Derivation string         `json:"derivation" gorm:"not null;default:'granted'"`
+	RoleName *string        `json:"role_name,omitempty"`
+	Actions  pq.StringArray `json:"actions" gorm:"type:text[];not null"`
+	// NotActions is the statement's NotAction element: "every action except
+	// these". Empty for an ordinary statement. A row with NotActions and no
+	// Actions is not an empty grant -- it is a very broad one.
+	NotActions pq.StringArray `json:"not_actions,omitempty" gorm:"type:text[]"`
+	// NotResources is the statement's NotResource element, kept verbatim so a
+	// bounded exclusion is never rendered as an unbounded "*".
+	NotResources pq.StringArray `json:"not_resources,omitempty" gorm:"type:text[]"`
+	// Condition is the statement's Condition block as AWS returned it, or nil
+	// when the statement was unconditional. Stored, never evaluated -- see
+	// ConstraintState.
+	//
+	// A pointer because the column is jsonb: an empty string is not valid JSON,
+	// so "no condition" has to be NULL rather than ''.
+	Condition *string `json:"condition,omitempty" gorm:"type:jsonb"`
+	// ConstraintState says how far this row can be trusted as a statement of
+	// access. It is the difference between "this identity has this permission"
+	// and "this identity has this permission under conditions we recorded but
+	// did not evaluate".
+	ConstraintState string `json:"constraint_state" gorm:"not null;default:'unconstrained'"`
+	ScopeKind       string `json:"scope_kind" gorm:"not null"`
+	Derivation      string `json:"derivation" gorm:"not null;default:'granted'"`
 
 	Sensitivity string `json:"sensitivity" gorm:"not null;default:'low'"`
 	// LastExercisedAt is aggregated from cloud_usage by a later ticket. Always
