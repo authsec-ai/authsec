@@ -216,3 +216,63 @@ func TestNegatedOperatorRecognisesQualifiedForms(t *testing.T) {
 		}
 	}
 }
+
+// --- resource identity: what a row IS, and whose account it is in ----------
+
+func TestS3ObjectIsNotABucket(t *testing.T) {
+	// The key used to be stripped to derive a name while native_id kept the
+	// full object ARN and kind said "s3_bucket". Two objects in one bucket then
+	// produced two rows both claiming to be that bucket.
+	got := TypeResourceARN("arn:aws:s3:::acme-iga-attachments-491056652413/sandbox/probe.txt")
+	if got.Kind != "s3_object" {
+		t.Errorf("Kind = %q, want s3_object", got.Kind)
+	}
+	if got.ObjectKey != "sandbox/probe.txt" {
+		t.Errorf("ObjectKey = %q, want sandbox/probe.txt", got.ObjectKey)
+	}
+	if got.BucketName != "acme-iga-attachments-491056652413" {
+		t.Errorf("BucketName = %q", got.BucketName)
+	}
+	if got.NativeID != "arn:aws:s3:::acme-iga-attachments-491056652413/sandbox/probe.txt" {
+		t.Errorf("NativeID must stay the full object ARN, got %q", got.NativeID)
+	}
+}
+
+func TestS3BucketStaysABucket(t *testing.T) {
+	got := TypeResourceARN("arn:aws:s3:::acme-iga-attachments-491056652413")
+	if got.Kind != "s3_bucket" {
+		t.Errorf("Kind = %q, want s3_bucket", got.Kind)
+	}
+	if got.ObjectKey != "" {
+		t.Errorf("a bucket has no object key, got %q", got.ObjectKey)
+	}
+	// S3 bucket ARNs carry no account segment. Empty is the honest answer;
+	// filling it with the scanned account is the bug this guards.
+	if got.Account != "" {
+		t.Errorf("Account = %q, want empty for an S3 bucket ARN", got.Account)
+	}
+}
+
+func TestAResourcesAccountComesFromItsOwnARN(t *testing.T) {
+	// The screenshot showed arn:aws:iam::429418377036:role/RefundWriterRole
+	// rendered against account 491056652413 -- the account being scanned. A
+	// policy may legitimately name a resource in another account, and reporting
+	// the observer's account turns that into an apparent local resource.
+	got := TypeResourceARN("arn:aws:iam::429418377036:role/RefundWriterRole")
+	if got.Account != "429418377036" {
+		t.Errorf("Account = %q, want 429418377036", got.Account)
+	}
+	if got.Kind != "iam_role" {
+		t.Errorf("Kind = %q, want iam_role", got.Kind)
+	}
+}
+
+func TestDynamoTableCarriesItsAccount(t *testing.T) {
+	got := TypeResourceARN("arn:aws:dynamodb:us-east-1:491056652413:table/acme-refunds")
+	if got.Kind != "dynamodb_table" || got.Name != "acme-refunds" {
+		t.Errorf("got kind=%q name=%q", got.Kind, got.Name)
+	}
+	if got.Account != "491056652413" {
+		t.Errorf("Account = %q", got.Account)
+	}
+}

@@ -186,6 +186,24 @@ type TypedResource struct {
 	// kept alongside Kind so a caller can classify sensitivity by service
 	// without re-parsing the ARN or the Kind string it derived.
 	Service string
+	// Account is the ARN's own account segment, empty for the services whose
+	// ARNs omit it (S3 buckets, notably).
+	//
+	// This is the RESOURCE's account, which is not necessarily the account
+	// being scanned: a policy may legitimately name a resource in another one.
+	// Reporting the scanned account for every row turned a cross-account grant
+	// into an apparent local resource.
+	Account string
+	// BucketName is the bucket an s3_object lives in, empty otherwise. Kept so
+	// a reader can group objects by bucket without re-parsing the ARN.
+	BucketName string
+	// ObjectKey is the key of an S3 object, empty for a bucket.
+	//
+	// A bucket and an object inside it are different grant targets with
+	// different blast radius -- s3:DeleteObject on one key is not the same
+	// permission as on the bucket -- so the key is preserved rather than
+	// truncated away.
+	ObjectKey string
 }
 
 // ClassifyResourceScope reports what one Resource entry from a statement means
@@ -237,46 +255,58 @@ func TypeResourceARN(arn string) *TypedResource {
 		return &TypedResource{Kind: "unknown", NativeID: arn}
 	}
 	service := parts[2]
+	account := parts[4]
 	resource := parts[5]
 
 	switch service {
 	case "s3":
 		// arn:aws:s3:::bucket, or arn:aws:s3:::bucket/key. No resourcetype
 		// segment -- S3 is the one AWS service whose ARN omits it.
-		bucket := resource
-		if i := strings.Index(bucket, "/"); i >= 0 {
-			bucket = bucket[:i]
+		//
+		// The key used to be stripped to derive a name while native_id kept the
+		// full object ARN and kind said "s3_bucket". Two objects in one bucket
+		// then produced two rows both claiming to be that bucket, and a type
+		// count of "3 S3 buckets" included objects.
+		if bucket, key, ok := strings.Cut(resource, "/"); ok && key != "" {
+			return &TypedResource{
+				Kind: "s3_object", Name: key, NativeID: arn,
+				Service: service, Account: account, ObjectKey: key,
+				BucketName: bucket,
+			}
 		}
-		return &TypedResource{Kind: "s3_bucket", Name: bucket, NativeID: arn, Service: service}
+		return &TypedResource{
+			Kind: "s3_bucket", Name: resource, NativeID: arn,
+			Service: service, Account: account,
+		}
 
 	case "sqs":
 		// arn:aws:sqs:region:account:queue-name. No resourcetype segment.
-		return &TypedResource{Kind: "sqs_queue", Name: resource, NativeID: arn, Service: service}
+		return &TypedResource{Kind: "sqs_queue", Name: resource, NativeID: arn, Service: service, Account: account}
 
 	case "dynamodb":
 		if name, ok := afterSeparator(resource, "table/"); ok {
-			return &TypedResource{Kind: "dynamodb_table", Name: name, NativeID: arn, Service: service}
+			return &TypedResource{Kind: "dynamodb_table", Name: name, NativeID: arn, Service: service, Account: account}
 		}
 
 	case "rds":
 		// arn:aws:rds:region:account:db:instance-id -- colon-separated, and the
 		// resourcetype "db" reads better to an operator as "instance".
 		if name, ok := afterSeparator(resource, "db:"); ok {
-			return &TypedResource{Kind: "rds_instance", Name: name, NativeID: arn, Service: service}
+			return &TypedResource{Kind: "rds_instance", Name: name, NativeID: arn, Service: service, Account: account}
 		}
 
 	case "secretsmanager":
 		if name, ok := afterSeparator(resource, "secret:"); ok {
-			return &TypedResource{Kind: "secretsmanager_secret", Name: name, NativeID: arn, Service: service}
+			return &TypedResource{Kind: "secretsmanager_secret", Name: name, NativeID: arn, Service: service, Account: account}
 		}
 	}
 
 	// Generic fallback: split on the first "/" or ":" inside the resource part,
 	// whichever appears. Most AWS services use one of the two.
 	if rtype, name, ok := splitResourceType(resource); ok {
-		return &TypedResource{Kind: service + "_" + rtype, Name: name, NativeID: arn, Service: service}
+		return &TypedResource{Kind: service + "_" + rtype, Name: name, NativeID: arn, Service: service, Account: account}
 	}
-	return &TypedResource{Kind: service, Name: resource, NativeID: arn, Service: service}
+	return &TypedResource{Kind: service, Name: resource, NativeID: arn, Service: service, Account: account}
 }
 
 func afterSeparator(resource, prefix string) (string, bool) {

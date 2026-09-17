@@ -29,6 +29,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire"
 	spirevault "github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 	"github.com/authsec-ai/authsec/internal/tokens"
+	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
@@ -135,6 +136,34 @@ func main() {
 	// boots and for replicas deliberately kept API-only.
 	if os.Getenv("AUTHSEC_DISABLE_DISCOVERY_SCAN_WORKER") != "true" {
 		go services.NewDiscoveryScanWorker(config.DB).Run(context.Background())
+	}
+
+	// AWS discovery scan worker: drains cloud_scan_run.
+	//
+	// Same contract as the GitHub worker above, and for the same reason: POST
+	// .../aws/connectors/:id/scan only ENQUEUES. It used to run the scan in a
+	// goroutine off the request, which lost the work on restart, let two
+	// requests walk one account, and let a superseded worker publish stale
+	// results over fresher ones.
+	//
+	// Safe on every replica: runs are claimed FOR UPDATE SKIP LOCKED under a
+	// lease, and publication is fenced on the lease version, so a replica that
+	// stalls past its lease is refused rather than trusted.
+	//
+	// Needs Vault, because a scan assumes the customer's role with the
+	// ExternalId stored there. Without it the worker would claim runs it cannot
+	// execute and fail them, which is worse than not starting: say so once and
+	// leave the runs queued for a replica that is configured.
+	if os.Getenv("AUTHSEC_DISABLE_AWS_SCAN_WORKER") != "true" {
+		vaultAddr, vaultToken := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
+		if vaultAddr == "" || vaultToken == "" {
+			log.Printf("AWS scan worker not started: VAULT_ADDR/VAULT_TOKEN not configured")
+		} else if vc, verr := vault.NewClient(vaultAddr, vaultToken); verr != nil {
+			log.Printf("AWS scan worker not started: %v", verr)
+		} else {
+			awsSvc := services.NewAWSOnboardingService(config.DB, vc)
+			go services.NewAWSScanWorker(config.DB, awsSvc).Run(context.Background())
+		}
 	}
 
 	// Initialise Vault (optional; logs warning if not configured)

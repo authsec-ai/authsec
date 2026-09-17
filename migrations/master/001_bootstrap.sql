@@ -6319,13 +6319,37 @@ CREATE TABLE IF NOT EXISTS public.cloud_resource (
     kind text NOT NULL,
     native_id text NOT NULL,
     name text NOT NULL DEFAULT '',
+
+    -- The account from the resource's OWN arn, not the connector that observed
+    -- it. A policy may name a resource in another account; reporting the
+    -- scanned account for every row made that look local. See 021.
+    resource_account text NOT NULL DEFAULT '',
+    is_external boolean NOT NULL DEFAULT false,
+    -- An S3 object's key. A bucket and an object inside it are different grant
+    -- targets with different blast radius.
+    object_key text NOT NULL DEFAULT '',
+
     sensitivity text NOT NULL DEFAULT 'low',
+    -- Where the rating came from, so "High" is inspectable rather than taken
+    -- on trust. Today AuthSec only writes heuristic_service.
+    sensitivity_source text NOT NULL DEFAULT 'heuristic_service',
+    sensitivity_reason text NOT NULL DEFAULT '',
 
     last_seen_generation integer NOT NULL DEFAULT 0,
     first_seen_at timestamptz NOT NULL DEFAULT now(),
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     row_updated_at timestamptz NOT NULL DEFAULT now(),
 
+    CONSTRAINT cloud_resource_sensitivity_source_chk CHECK (
+        sensitivity_source IN ('heuristic_service', 'provider_metadata',
+                               'customer_classification', 'unknown')
+    ),
+    CONSTRAINT cloud_resource_external_chk CHECK (
+        NOT is_external OR resource_account <> ''
+    ),
+    CONSTRAINT cloud_resource_object_key_chk CHECK (
+        object_key = '' OR kind = 's3_object'
+    ),
     CONSTRAINT cloud_resource_kind_chk CHECK (kind <> ''),
     CONSTRAINT cloud_resource_native_id_chk CHECK (native_id <> ''),
     CONSTRAINT cloud_resource_sensitivity_chk CHECK (
@@ -6745,3 +6769,196 @@ CREATE TABLE IF NOT EXISTS public.cloud_scan_checkpoint (
 CREATE INDEX IF NOT EXISTS idx_cloud_scan_checkpoint_connector
     ON public.cloud_scan_checkpoint (connector_id, generation);
 
+-- ===========================================================================
+-- cloud_scan_run / cloud_observation — mirrors migrations 020 and 022.
+--
+-- A scan's durable identity and the evidence it produced. Kept in bootstrap so
+-- a fresh install and a migrated database agree; the three cloud tables that
+-- were missing before (015-017) failed a new install at scan time, which is the
+-- failure this section exists to avoid repeating.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS public.cloud_scan_run (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The generation this run stamps its rows with. Assigned when the run is
+    -- claimed, not when it is queued: a run that never starts must not burn a
+    -- generation, because reconciliation reads generations as evidence of a
+    -- completed pass.
+    generation integer NOT NULL DEFAULT 0,
+
+    -- queued    -- waiting for a worker
+    -- running   -- a worker holds the lease
+    -- published -- finished and reconciled; the only authoritative end state
+    -- failed    -- finished without publishing, reason in last_error
+    -- abandoned -- lease expired and another run superseded it
+    status text NOT NULL DEFAULT 'queued',
+
+    trigger text NOT NULL DEFAULT 'manual',
+
+    -- Lease. Empty owner means nobody holds it.
+    lease_owner text NOT NULL DEFAULT '',
+    lease_expires_at timestamptz,
+    -- Bumped on every claim. This is the fence token; see the header.
+    lease_version bigint NOT NULL DEFAULT 0,
+
+    attempts integer NOT NULL DEFAULT 0,
+    last_error text NOT NULL DEFAULT '',
+
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    published_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT cloud_scan_run_status_chk CHECK (
+        status IN ('queued', 'running', 'published', 'failed', 'abandoned')),
+
+    -- A published run must say when, and only a published run may.
+    -- Reconciliation reads published_at as proof the pass finished.
+    CONSTRAINT cloud_scan_run_published_chk CHECK (
+        (status = 'published') = (published_at IS NOT NULL)),
+
+    -- A running run must name its holder and its expiry, or it cannot be
+    -- fenced and cannot be reclaimed.
+    CONSTRAINT cloud_scan_run_lease_chk CHECK (
+        status <> 'running'
+        OR (lease_owner <> '' AND lease_expires_at IS NOT NULL)),
+
+    -- A run that reached a worker has a generation; a queued one does not yet.
+    CONSTRAINT cloud_scan_run_generation_chk CHECK (
+        status IN ('queued', 'abandoned') OR generation > 0),
+
+    CONSTRAINT cloud_scan_run_attempts_chk CHECK (attempts >= 0)
+);
+
+-- AT MOST ONE LIVE RUN PER CONNECTOR.
+--
+-- This is the overlapping-scan protection, and it is a database constraint
+-- rather than a check in the handler because the handler runs in more than one
+-- process. Two concurrent POSTs both see "no run in flight" and both insert;
+-- only a unique index can refuse the second.
+--
+-- Partial, so finished runs accumulate as history without blocking the next.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_scan_run_live
+    ON public.cloud_scan_run (connector_id)
+    WHERE status IN ('queued', 'running');
+
+-- The worker's claim query: the oldest queued run, or a running one whose lease
+-- has expired.
+CREATE INDEX IF NOT EXISTS idx_cloud_scan_run_claimable
+    ON public.cloud_scan_run (status, lease_expires_at, requested_at)
+    WHERE status IN ('queued', 'running');
+
+-- "What happened to this connector's scans?" -- newest first.
+CREATE INDEX IF NOT EXISTS idx_cloud_scan_run_history
+    ON public.cloud_scan_run (workspace_id, connector_id, requested_at DESC);
+
+COMMENT ON TABLE public.cloud_scan_run IS
+    'One AWS scan attempt, with the lease that makes it resumable and fenced. '
+    'Publication requires the holder to still own the lease version it claimed.';
+COMMENT ON COLUMN public.cloud_scan_run.lease_version IS
+    'Fence token. A worker records this at claim time and publication demands '
+    'the row still carries it, so a worker that paused past its expiry is '
+    'refused without relying on clock agreement.';
+COMMENT ON COLUMN public.cloud_scan_run.generation IS
+    'Assigned at claim, not at enqueue: a run that never starts must not burn a '
+    'generation, because reconciliation reads generations as evidence of a pass.';
+
+CREATE TABLE IF NOT EXISTS public.cloud_observation (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id uuid NOT NULL,
+    connector_id uuid NOT NULL
+        REFERENCES public.cloud_connector(id) ON DELETE CASCADE,
+
+    -- The run that produced this fact. RESTRICT, not CASCADE: evidence must not
+    -- disappear because someone pruned a scan. Retention is a deliberate policy
+    -- with an auditable outcome, never a side effect of housekeeping.
+    scan_run_id uuid NOT NULL
+        REFERENCES public.cloud_scan_run(id) ON DELETE RESTRICT,
+    generation integer NOT NULL,
+
+    -- Exactly one subject. See the header on why these are typed columns.
+    identity_id uuid REFERENCES public.cloud_identity(id) ON DELETE CASCADE,
+    permission_id uuid REFERENCES public.cloud_permission(id) ON DELETE CASCADE,
+    resource_id uuid REFERENCES public.cloud_resource(id) ON DELETE CASCADE,
+    workload_id uuid REFERENCES public.cloud_workload(id) ON DELETE CASCADE,
+
+    -- The AWS call this came from, e.g. "iam:GetRole", "lambda:ListFunctions".
+    -- Named as the API, not as our surface, so a reader can go and make the
+    -- same call.
+    source_api text NOT NULL,
+
+    -- The surface this read belonged to and what its coverage said AT THE TIME.
+    -- A fact collected during a partial scan stays readable as such a year
+    -- later; without it, yesterday's degraded read is indistinguishable from
+    -- today's clean one.
+    surface text NOT NULL DEFAULT '',
+    surface_state text NOT NULL DEFAULT '',
+
+    -- When the PROVIDER's data was true, versus when we stored it. Conflating
+    -- them makes a delayed scan look like a change in the account.
+    observed_at timestamptz NOT NULL,
+    ingested_at timestamptz NOT NULL DEFAULT now(),
+
+    -- What AWS said, after redaction. Never a raw response.
+    sanitized_facts jsonb NOT NULL DEFAULT '{}'::jsonb,
+    -- Hash of sanitized_facts, so an unchanged re-read writes nothing.
+    content_hash text NOT NULL,
+
+    CONSTRAINT cloud_observation_subject_chk CHECK (
+        (identity_id IS NOT NULL)::int
+      + (permission_id IS NOT NULL)::int
+      + (resource_id IS NOT NULL)::int
+      + (workload_id IS NOT NULL)::int = 1
+    ),
+    CONSTRAINT cloud_observation_source_api_chk CHECK (source_api <> ''),
+    CONSTRAINT cloud_observation_hash_chk CHECK (content_hash <> ''),
+    CONSTRAINT cloud_observation_generation_chk CHECK (generation > 0)
+);
+
+-- Re-reading unchanged data must not grow the table.
+--
+-- Keyed on the subject columns rather than a single subject id because that is
+-- what exists; COALESCE gives one comparable value without reintroducing a
+-- polymorphic column.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloud_observation_dedupe
+    ON public.cloud_observation (
+        workspace_id,
+        COALESCE(identity_id, permission_id, resource_id, workload_id),
+        source_api,
+        content_hash
+    );
+
+-- "Why do you believe this?" -- newest evidence for one row, which is the
+-- question the evidence drawer asks.
+CREATE INDEX IF NOT EXISTS idx_cloud_observation_identity
+    ON public.cloud_observation (workspace_id, identity_id, observed_at DESC)
+    WHERE identity_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cloud_observation_permission
+    ON public.cloud_observation (workspace_id, permission_id, observed_at DESC)
+    WHERE permission_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cloud_observation_workload
+    ON public.cloud_observation (workspace_id, workload_id, observed_at DESC)
+    WHERE workload_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cloud_observation_resource
+    ON public.cloud_observation (workspace_id, resource_id, observed_at DESC)
+    WHERE resource_id IS NOT NULL;
+
+-- "What did this run see?" -- for a scan report.
+CREATE INDEX IF NOT EXISTS idx_cloud_observation_run
+    ON public.cloud_observation (workspace_id, scan_run_id);
+
+COMMENT ON TABLE public.cloud_observation IS
+    'Why a cloud_* row exists: which AWS call returned it, when the provider '
+    'considered it true, and what coverage the read had. Anchored on '
+    'cloud_scan_run, not iga_scan_runs -- the AWS path has its own run table.';
+COMMENT ON COLUMN public.cloud_observation.content_hash IS
+    'Hash of sanitized_facts, computed AFTER redaction. Hashing the raw '
+    'response would retain a deterministic derivative of material we refused '
+    'to store.';
+COMMENT ON COLUMN public.cloud_observation.surface_state IS
+    'The surface coverage state when this was collected, so a fact read during '
+    'a partial scan stays readable as such later.';

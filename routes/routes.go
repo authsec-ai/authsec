@@ -1664,6 +1664,10 @@ func SetupRoutes(
 			// row is a CANDIDATE, not an agent: nothing this endpoint returns
 			// asserts that anything is an AI agent.
 			discovery.POST("/aws/connectors/:id/scan", middlewares.Require("discovery", "admin"), cloudAWS.ScanIAM)
+			// The scan is queued, not performed, by the POST above. This is
+			// where a caller learns whether it finished -- coverage on the
+			// connector is written after publication and so lags the run.
+			discovery.GET("/aws/scan-runs/:id", middlewares.Require("discovery", "read"), cloudAWS.GetScanRun)
 			discovery.GET("/aws/identities", middlewares.Require("discovery", "read"), cloudAWS.ListIdentities)
 			discovery.GET("/aws/secrets", middlewares.Require("discovery", "read"), cloudAWS.ListSecrets)
 

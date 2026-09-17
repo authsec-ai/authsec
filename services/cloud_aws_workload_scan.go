@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
@@ -40,6 +41,8 @@ type AWSWorkloadScanner struct {
 
 	// Test seams. Each is optional and, when set, replaces the real client for
 	// every region.
+	evidence *ObservationWriter
+
 	lambdaAPI    awsdiscovery.LambdaAPI
 	ecsAPI       awsdiscovery.ECSAPI
 	ec2API       awsdiscovery.EC2API
@@ -146,6 +149,29 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 		s.scanRegion(ctx, workspaceID, snapshot, region, out)
 	}
 
+	// Regions the operator did NOT select are recorded, not omitted.
+	//
+	// An absent surface and a surface that returned nothing look identical to a
+	// reader, and only one of them means the estate is clean. "Nobody looked,
+	// and nobody was meant to" is a different answer from both, and it is the
+	// honest one for an unselected region.
+	for _, region := range unselectedRegions(regions) {
+		out.Surfaces["compute:"+region] = models.SurfaceCoverage{
+			State: models.CloudCoverageNotSelected,
+			Error: "region not in the connector's selected scope",
+		}
+	}
+
+	// Surfaces the role is granted but no collector reads. Naming them here is
+	// what stops a gap in AuthSec reading as a gap in the customer's account --
+	// the CloudFormation template asks for CloudTrail and nothing calls it.
+	for _, surface := range uncollectedSurfaces() {
+		out.Surfaces[surface.name] = models.SurfaceCoverage{
+			State: models.CloudCoverageUnsupported,
+			Error: surface.why,
+		}
+	}
+
 	// ---- activity, which is global because IAM is -------------------------
 	s.scanActivity(ctx, workspaceID, snapshot, out)
 	if activityErr, failed := out.Errors["activity"]; failed {
@@ -170,6 +196,55 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 		_ = usageRemoved
 	}
 	return out, nil
+}
+
+// awsRegionsWithCompute is every region AuthSec can read compute in. Kept here
+// rather than fetched: ec2:DescribeRegions is not in the discovery grant, and
+// asking for it to populate a "not selected" list would be a permission bought
+// to report an absence.
+var awsRegionsWithCompute = []string{
+	"us-east-1", "us-east-2", "us-west-1", "us-west-2",
+	"eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+	"ap-south-1", "ap-southeast-1", "ap-southeast-2",
+	"ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+	"ca-central-1", "sa-east-1",
+}
+
+func unselectedRegions(selected []string) []string {
+	chosen := make(map[string]bool, len(selected))
+	for _, r := range selected {
+		chosen[r] = true
+	}
+	var out []string
+	for _, r := range awsRegionsWithCompute {
+		if !chosen[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// uncollectedSurfaces names what the discovery role is granted and no collector
+// calls. Each entry is a promise the product is not keeping, stated where a
+// customer can see it rather than left to a reader of the template.
+func uncollectedSurfaces() []struct{ name, why string } {
+	return []struct{ name, why string }{
+		{"cloudtrail_events",
+			"granted in the role template; no collector calls it. Activity is " +
+				"Access-Advisor attempts, which include denied ones."},
+		{"agentcore_gateways",
+			"ListGateways and ListGatewayTargets are granted; no collector " +
+				"calls them, so the agent tool-path segment is absent."},
+		{"agentcore_workload_identities",
+			"ListWorkloadIdentities is granted; no collector calls it."},
+		{"iam_credential_report",
+			"GenerateCredentialReport and GetCredentialReport are granted; no " +
+				"collector calls them."},
+		{"resource_policies",
+			"bucket and key policies are not read at all, so a resource policy " +
+				"denying an action is invisible and a grant it blocks still " +
+				"reads as access."},
+	}
 }
 
 // scanRegion reads every compute surface in one region.
@@ -291,12 +366,61 @@ func (s *AWSWorkloadScanner) recordWorkload(
 	if err := workload.SetAWSAttrs(attrs); err != nil {
 		return err
 	}
-	if _, _, err := s.workloads.UpsertWorkload(workload); err != nil {
+	stored, _, err := s.workloads.UpsertWorkload(workload)
+	if err != nil {
 		return fmt.Errorf("record workload %s: %w", w.NativeID, err)
 	}
 	out.WorkloadsWritten++
+
+	// Evidence for "this compute runs as that identity" -- the single most
+	// consequential edge the inventory draws, and the one a reviewer is most
+	// likely to challenge. `identity_native_id` is recorded even when the
+	// identity was not found, because "names a role we never discovered" is
+	// itself the finding for an unattributed workload.
+	if s.evidence != nil && stored != nil {
+		if err := s.evidence.Record(
+			WorkloadSubject(stored.ID),
+			workloadSourceAPI(w.RuntimeKind), "compute:"+region, "",
+			time.Now(),
+			map[string]any{
+				"runtime_kind":       w.RuntimeKind,
+				"native_id":          w.NativeID,
+				"name":               w.Name,
+				"region":             region,
+				"identity_native_id": w.RoleARN,
+				"attributed":         workload.IdentityID != nil,
+			},
+		); err != nil {
+			log.Printf("aws workload scan: evidence for %s: %v", w.NativeID, err)
+		}
+	}
 	out.ByKind[w.RuntimeKind]++
 	return nil
+}
+
+// WithEvidence attaches an observation writer for this run.
+func (s *AWSWorkloadScanner) WithEvidence(w *ObservationWriter) *AWSWorkloadScanner {
+	s.evidence = w
+	return s
+}
+
+// workloadSourceAPI names the call each runtime came from, so evidence points
+// at something a reader can re-issue themselves.
+func workloadSourceAPI(runtimeKind string) string {
+	switch runtimeKind {
+	case models.WorkloadLambdaFunction:
+		return "lambda:ListFunctions"
+	case models.WorkloadECSTaskDefinition:
+		return "ecs:DescribeTaskDefinition"
+	case models.WorkloadEC2Instance:
+		return "ec2:DescribeInstances"
+	case models.WorkloadBedrockAgent:
+		return "bedrock:GetAgent"
+	case models.WorkloadBedrockAgentCoreRT:
+		return "bedrock-agentcore:GetAgentRuntime"
+	default:
+		return "aws:unknown"
+	}
 }
 
 // scanActivity reads service-last-accessed for every discovered identity.

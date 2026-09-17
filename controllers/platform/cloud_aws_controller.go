@@ -1,9 +1,7 @@
 package platform
 
 import (
-	"context"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -390,72 +388,56 @@ func (ctl *CloudAWSController) ScanIAM(c *gin.Context) {
 		return
 	}
 
-	scanner := services.NewAWSIAMScanner(ctl.db, svc)
-	permissionScanner := services.NewAWSPermissionScanner(ctl.db, svc)
-	workloadScanner := services.NewAWSWorkloadScanner(ctl.db, svc)
-
-	// context.Background(), not the request context: the request is about to
-	// return, and cancelling the scan when it does would make every scan die
-	// immediately. Each scanner applies its own timeout.
+	// ENQUEUE, do not execute.
 	//
-	// The permission scan runs INSIDE this same goroutine, chained after the
-	// identity scan succeeds, rather than behind its own endpoint. Ticket [2]'s
-	// cloud_assume_edge and cloud_permission rows must be stamped with the same
-	// generation as the cloud_identity rows they point at; the only place that
-	// generation number exists is the IAMSnapshot this call already produces, so
-	// splitting the two into separate requests would mean inventing a way to
-	// hand a generation across an HTTP boundary for no benefit.
-	go func() {
-		snapshot, err := scanner.Scan(context.Background(), workspaceID, id)
-		if err != nil {
-			log.Printf("aws iam scan: connector=%s workspace=%s: %v", id, workspaceID, err)
+	// This used to start a `go func()` and return 202. Three things followed,
+	// all customer-visible: a backend restart lost the run with nothing
+	// recording it had been in flight; two requests raced and whichever
+	// finished last reconciled away the other's rows; and a worker everyone had
+	// given up on could still publish results older than the run replacing it.
+	//
+	// A row in cloud_scan_run fixes all three, because it gives the scan an
+	// owner, a lease and a fence token. The worker picks it up.
+	run, err := repositories.NewCloudScanRunRepository(ctl.db).
+		Enqueue(workspaceID, id, "manual")
+	if err != nil {
+		if errors.Is(err, repositories.ErrScanAlreadyLive) {
+			// Not an error the operator caused, and not something a retry
+			// improves: report the run already in flight so the console can
+			// follow it instead of queueing a duplicate.
+			live, _ := repositories.NewCloudScanRunRepository(ctl.db).Latest(workspaceID, id)
+			body := gin.H{
+				"error": "a scan is already queued or running for this connection",
+			}
+			if live != nil {
+				body["meta"] = gin.H{"run_id": live.ID, "status": live.Status,
+					"requested_at": live.RequestedAt}
+			}
+			c.JSON(http.StatusConflict, body)
 			return
 		}
-		permSnapshot, permErr := permissionScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot)
-		if permErr != nil {
-			log.Printf("aws permission scan: connector=%s workspace=%s: %v", id, workspaceID, permErr)
-		}
-		// Workloads and activity run last, chained on the same snapshot and so
-		// the same generation. Last because they are the most expensive -- one
-		// report job per identity, plus every regional compute surface -- and
-		// the least damaging to lose: an identity with its permissions but no
-		// attributed compute is still a governed identity.
-		workloadSnapshot, workloadErr := workloadScanner.ScanFromSnapshot(context.Background(), workspaceID, snapshot)
-		if workloadErr != nil {
-			log.Printf("aws workload scan: connector=%s workspace=%s: %v", id, workspaceID, workloadErr)
-		}
-
-		// scanner.Scan already committed a coverage report based on its own
-		// four surfaces -- necessarily premature, since it returned before
-		// either scan below had run. This replaces it with the true,
-		// cumulative report now that every surface has actually been
-		// attempted, so coverage.status = "complete" never hides a denied
-		// permission or workload surface behind a fully-readable IAM scan.
-		var permSurfaces, workloadSurfaces map[string]models.SurfaceCoverage
-		if permSnapshot != nil {
-			permSurfaces = permSnapshot.Surfaces
-		}
-		if workloadSnapshot != nil {
-			workloadSurfaces = workloadSnapshot.Surfaces
-		}
-		scanner.FinalizeCoverage(workspaceID, id, snapshot.Coverage,
-			permErr, permSurfaces, workloadErr, workloadSurfaces)
-	}()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	auditAdminMutation(c, workspaceID.String(), "scan", "cloud_connector",
 		id.String(), http.StatusAccepted, nil, gin.H{"surface": "iam", "actor": actor})
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"success": true,
-		"message": "IAM identity and permission scan started",
+		"message": "scan queued",
 		"meta": gin.H{
-			"as_of": time.Now().UTC(),
-			"poll":  "/authsec/discovery/aws/connectors/" + id.String(),
-			"note": "watch coverage.status on the connector; 'partial' means at least one " +
-				"surface -- IAM, permissions, or workloads/activity -- was denied or " +
-				"throttled and the inventory is not an all-clear. The report updates " +
-				"again once permission and workload scanning finish, so poll until " +
-				"coverage.finished_at stops moving, not just until status first appears.",
+			"as_of":  time.Now().UTC(),
+			"run_id": run.ID,
+			"status": run.Status,
+			"poll":   "/authsec/discovery/aws/scan-runs/" + run.ID.String(),
+			"note": "the scan is QUEUED, not finished. Poll the run and wait for " +
+				"status 'published' -- that is the only state in which the " +
+				"inventory reflects this pass. A connector whose coverage.status " +
+				"stops saying 'running' has not necessarily finished: coverage is " +
+				"written after publication. 'partial' coverage means at least one " +
+				"surface was denied or throttled and the inventory is not an " +
+				"all-clear.",
 			"writes": []string{
 				"cloud_identity", "cloud_secret",
 				"cloud_assume_edge", "cloud_permission", "cloud_resource",
@@ -866,4 +848,54 @@ func mapAWSOnboardingError(err error) (int, gin.H) {
 	// role ARN, an unknown region, an empty region list. 400 with the message as
 	// written: those messages already name the field.
 	return http.StatusBadRequest, gin.H{"error": err.Error()}
+}
+
+// GetScanRun handles GET /authsec/discovery/aws/scan-runs/:id.
+//
+// The console needs one authoritative answer to "is my scan finished?", and the
+// connector's coverage is not it: coverage is written AFTER publication, so a
+// reader watching coverage sees the previous pass until the moment the new one
+// lands. Worse, the old handler returned 202 and the UI treated that as the
+// work being underway, then stopped watching when coverage stopped saying
+// "running" -- which the premature IAM commit made happen early.
+//
+// This endpoint reports the run itself. `status = published` is the only state
+// in which the inventory reflects the pass.
+func (ctl *CloudAWSController) GetScanRun(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	runID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "run id must be a uuid"})
+		return
+	}
+
+	run, err := repositories.NewCloudScanRunRepository(ctl.db).Get(runID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+		return
+	}
+	// The workspace comes from the authenticated context, never the URL: a run
+	// id from another workspace must read as absent, not as forbidden, so the
+	// endpoint cannot be used to test whether an id exists.
+	if run.WorkspaceID != workspaceID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    run,
+		"meta": gin.H{
+			"as_of":    time.Now().UTC(),
+			"terminal": run.Terminal(),
+			"note": "status 'published' is the only state in which the inventory " +
+				"reflects this pass. 'failed' and 'abandoned' are finished too, but " +
+				"the inventory still shows the previous pass. Refresh inventory " +
+				"views on 'published', not on the 202 that queued the scan.",
+		},
+	})
 }

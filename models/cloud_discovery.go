@@ -148,7 +148,50 @@ const (
 	// because this scan could not refresh it. Present so a partial scan can
 	// keep prior findings visible without claiming it re-confirmed them.
 	CloudCoverageStale = "stale"
+
+	// CloudCoverageUnsupported is a surface AuthSec has built no collector for.
+	//
+	// Distinct from denied and from not_configured, and the distinction is the
+	// whole point: denied is the customer's to fix by granting a permission,
+	// not_configured is their deliberate choice, and unsupported is OURS to
+	// build. Collapsing them lets a gap in our product read as a gap in their
+	// estate. CloudTrail is the live example -- the role template grants it and
+	// no collector calls it.
+	CloudCoverageUnsupported = "unsupported"
+
+	// CloudCoverageNotSelected is a surface excluded from the scan's selected
+	// scope -- a region the customer did not choose, for instance.
+	//
+	// Nobody looked, and nobody was meant to. It must never read as "looked and
+	// found nothing", which is what an absent surface does.
+	CloudCoverageNotSelected = "not_selected"
 )
+
+// SurfaceStates is every value CloudCoverage* may take, for validation and for
+// the console's total Record. Ordered as a reader meets them: reached first,
+// then the ways a read can fall short, then the two that mean nobody looked.
+var SurfaceStates = []string{
+	CloudCoverageReached,
+	CloudCoveragePartial,
+	CloudCoverageDenied,
+	CloudCoverageThrottled,
+	CloudCoverageConstrained,
+	CloudCoverageStale,
+	CloudCoverageNotConfigured,
+	CloudCoverageNotSelected,
+	CloudCoverageUnsupported,
+	CloudCoverageUnknown,
+}
+
+// Authoritative reports whether a surface's state licenses reconciliation --
+// that is, whether a row this scan did not see may be concluded to be gone.
+//
+// Only a complete read does. Everything else means the absence of a row is
+// unexplained, and deleting on an unexplained absence is how a permissions
+// outage becomes a cleanup.
+func (s SurfaceCoverage) Authoritative() bool {
+	return s.State == CloudCoverageReached
+}
 
 // Overall scan outcome.
 //
@@ -166,6 +209,21 @@ const (
 
 // The AWS surfaces ticket [1] reads. Named per (region, surface) elsewhere;
 // IAM is global, so these carry no region.
+// Where a sensitivity rating came from. The console must be able to show this:
+// "High" with nothing behind it is an assertion a reader has to take on trust.
+const (
+	// SensitivityFromHeuristic is an AuthSec rule keyed on the ARN's service
+	// segment. A guess, and labelled as one.
+	SensitivityFromHeuristic = "heuristic_service"
+	// SensitivityFromProvider is a fact the provider reported.
+	SensitivityFromProvider = "provider_metadata"
+	// SensitivityFromCustomer is the customer's own classification, which
+	// outranks both.
+	SensitivityFromCustomer = "customer_classification"
+	// SensitivityUnknown is a row collected before sources were recorded.
+	SensitivityUnknown = "unknown"
+)
+
 const (
 	SurfaceIAMRoles      = "iam_roles"
 	SurfaceIAMUsers      = "iam_users"
@@ -221,16 +279,56 @@ type ScanCoverage struct {
 // Complete reports whether every surface was reached. Reconciliation is gated
 // on this: a scan that could not look everywhere has not earned the right to
 // conclude that anything is gone.
+// Complete reports whether every surface this scan INTENDED to read was read.
+//
+// Two states are not failures to read something we meant to read, and must not
+// block reconciliation:
+//
+//   - not_selected -- the operator excluded it. Nobody looked and nobody was
+//     meant to.
+//   - unsupported  -- AuthSec has no collector. A gap in our product, recorded
+//     so it is visible, but not evidence about the customer's account.
+//
+// Without this exemption, recording those states at all would make every scan
+// incomplete forever and silently switch reconciliation off. Everything else --
+// denied, throttled, partial, constrained, stale, unknown -- means a read we
+// intended did not fully happen, and those do block.
 func (c ScanCoverage) Complete() bool {
 	if len(c.Surfaces) == 0 {
 		return false
 	}
+	attempted := 0
 	for _, s := range c.Surfaces {
-		if s.State != CloudCoverageReached {
+		switch s.State {
+		case CloudCoverageNotSelected, CloudCoverageUnsupported:
+			continue // never attempted, by design
+		case CloudCoverageReached:
+			attempted++
+		default:
 			return false
 		}
 	}
-	return true
+	// A "scan" whose every surface was skipped has established nothing, and
+	// must not license deleting what an earlier, real scan found.
+	return attempted > 0
+}
+
+// IntendedIncomplete lists the surfaces a scan meant to read and did not, with
+// the provider's reason. Empty when Complete is true.
+//
+// Exists so a caller can say WHICH read fell short rather than only that one
+// did -- "denied eu-west-1" is actionable, "incomplete" is not.
+func (c ScanCoverage) IntendedIncomplete() map[string]SurfaceCoverage {
+	out := map[string]SurfaceCoverage{}
+	for name, s := range c.Surfaces {
+		switch s.State {
+		case CloudCoverageNotSelected, CloudCoverageUnsupported, CloudCoverageReached:
+			continue
+		default:
+			out[name] = s
+		}
+	}
+	return out
 }
 
 // DecodeScanCoverage reads a connector's coverage blob. A malformed or absent
@@ -990,10 +1088,33 @@ type CloudResource struct {
 	// Kind is typed by service, e.g. "s3_bucket", "dynamodb_table". Text, not an
 	// enum -- a schema-wide enum of every AWS resource type would need a
 	// migration for every new service AWS ships.
-	Kind        string `json:"kind" gorm:"not null"`
-	NativeID    string `json:"native_id" gorm:"not null"`
-	Name        string `json:"name" gorm:"not null;default:''"`
+	Kind     string `json:"kind" gorm:"not null"`
+	NativeID string `json:"native_id" gorm:"not null"`
+	Name     string `json:"name" gorm:"not null;default:''"`
+
+	// ResourceAccount is the account from the resource's OWN arn -- not the
+	// connector that observed it. Empty where the ARN carries no account
+	// segment, which is the normal case for an S3 bucket.
+	ResourceAccount string `json:"resource_account" gorm:"not null;default:''"`
+	// IsExternal marks a resource in some account other than the one scanned.
+	//
+	// A policy naming a cross-account ARN is a legitimate grant, and reporting
+	// the scanned account for it made an external reference look local. Its
+	// existence stays UNVERIFIED either way: a selector naming an ARN has never
+	// been proof the thing is there.
+	IsExternal bool `json:"is_external" gorm:"not null;default:false"`
+	// ObjectKey is an S3 object's key, empty for a bucket and every other
+	// service. A bucket and an object inside it are different grant targets.
+	ObjectKey string `json:"object_key" gorm:"not null;default:''"`
+
 	Sensitivity string `json:"sensitivity" gorm:"not null;default:'low'"`
+	// SensitivitySource says where the rating came from, so a reader can weigh
+	// it. Today everything AuthSec writes is heuristic_service; a customer
+	// classification or a provider fact would be a different claim.
+	SensitivitySource string `json:"sensitivity_source" gorm:"not null;default:'heuristic_service'"`
+	// SensitivityReason is the rule in words, e.g. "kms is on the
+	// high-sensitivity service list". Empty for low.
+	SensitivityReason string `json:"sensitivity_reason" gorm:"not null;default:''"`
 
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`

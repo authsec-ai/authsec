@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
@@ -44,6 +45,16 @@ type AWSPermissionScanner struct {
 	// regional and the live path builds one client per selected region; a test
 	// double stands in for all of them.
 	eksAPI awsdiscovery.EKSAPI
+
+	// evidence records why each permission and resource row exists. Nil writes
+	// nothing.
+	evidence *ObservationWriter
+}
+
+// WithEvidence attaches an observation writer for this run.
+func (s *AWSPermissionScanner) WithEvidence(w *ObservationWriter) *AWSPermissionScanner {
+	s.evidence = w
+	return s
 }
 
 // NewAWSPermissionScanner constructs the scanner.
@@ -477,6 +488,20 @@ func nullableJSON(s string) *string {
 	return &s
 }
 
+// policySourceAPI names the AWS call a statement came from, so evidence points
+// at something a reader can re-issue. An inline policy came from GetRolePolicy;
+// anything else is a managed policy read through GetPolicyVersion.
+func policySourceAPI(source string) string {
+	switch {
+	case strings.HasPrefix(source, "inline:"):
+		return "iam:GetRolePolicy"
+	case strings.HasPrefix(source, "boundary:"):
+		return "iam:GetPolicyVersion (permissions boundary)"
+	default:
+		return "iam:GetPolicyVersion"
+	}
+}
+
 // constraintState decides how far a recorded permission may be trusted as a
 // statement of access.
 //
@@ -589,10 +614,39 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 				NativeID:           nativeID,
 				LastSeenGeneration: snapshot.Generation,
 			}
-			if _, _, err := s.grants.UpsertPermission(perm); err != nil {
+			stored, _, err := s.grants.UpsertPermission(perm)
+			if err != nil {
 				return fmt.Errorf("record permission %s: %w", nativeID, err)
 			}
 			out.PermissionsWritten++
+
+			// Evidence for the grant. The statement is recorded as parsed --
+			// including the halves that NARROW it -- because a reviewer shown
+			// "allow s3:GetObject" needs to see the condition that was attached
+			// to it, and evidence that omits the narrowing repeats the very
+			// over-claim the constraint columns exist to prevent.
+			if s.evidence != nil && stored != nil {
+				if err := s.evidence.Record(
+					PermissionSubject(stored.ID),
+					policySourceAPI(source), models.SurfaceIAMPolicies, "",
+					time.Now(),
+					map[string]any{
+						"source":           source,
+						"statement_index":  stmt.Index,
+						"sid":              stmt.Sid,
+						"effect":           stmt.Effect,
+						"actions":          stmt.Actions,
+						"not_actions":      stmt.NotActions,
+						"resources":        stmt.Resources,
+						"not_resources":    stmt.NotResources,
+						"condition":        stmt.Condition,
+						"constraint_state": perm.ConstraintState,
+						"derivation":       perm.Derivation,
+					},
+				); err != nil {
+					log.Printf("aws permission scan: evidence for %s: %v", nativeID, err)
+				}
+			}
 		}
 	}
 	return nil
@@ -601,13 +655,27 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 func (s *AWSPermissionScanner) getOrCreateResource(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, typed *awsdiscovery.TypedResource, out *PermissionSnapshot,
 ) (uuid.UUID, error) {
+	sensitivity, reason := resourceSensitivityWithReason(typed.Service)
+
+	// External means "in some account other than the one we scanned", and it is
+	// only knowable when the ARN carries an account at all -- S3 bucket ARNs do
+	// not. Reporting the scanned account for every resource is what made a
+	// cross-account grant render as a local resource.
+	external := typed.Account != "" && snapshot.AccountID != "" &&
+		typed.Account != snapshot.AccountID
+
 	resource := &models.CloudResource{
 		WorkspaceID:        workspaceID,
 		ConnectorID:        snapshot.ConnectorID,
 		Kind:               typed.Kind,
 		NativeID:           typed.NativeID,
 		Name:               typed.Name,
-		Sensitivity:        resourceSensitivity(typed.Service),
+		ResourceAccount:    typed.Account,
+		IsExternal:         external,
+		ObjectKey:          typed.ObjectKey,
+		Sensitivity:        sensitivity,
+		SensitivitySource:  models.SensitivityFromHeuristic,
+		SensitivityReason:  reason,
 		LastSeenGeneration: snapshot.Generation,
 	}
 	stored, created, err := s.grants.UpsertResource(resource)
@@ -630,10 +698,22 @@ var highSensitivityServices = map[string]bool{
 }
 
 func resourceSensitivity(service string) string {
-	if highSensitivityServices[strings.ToLower(service)] {
-		return models.SensitivityHigh
+	v, _ := resourceSensitivityWithReason(service)
+	return v
+}
+
+// resourceSensitivityWithReason returns the rating AND the rule behind it.
+//
+// The console showed "High" with nothing to inspect, so a reader could not tell
+// an AuthSec guess from a customer classification or a provider fact. The rating
+// is worth little; the reason is what lets someone decide whether to believe it.
+func resourceSensitivityWithReason(service string) (string, string) {
+	svc := strings.ToLower(service)
+	if highSensitivityServices[svc] {
+		return models.SensitivityHigh,
+			fmt.Sprintf("AuthSec rule: %q is on the high-sensitivity service list", svc)
 	}
-	return models.SensitivityLow
+	return models.SensitivityLow, ""
 }
 
 // actionsSensitivity classifies by the ACTIONS a statement grants, independent

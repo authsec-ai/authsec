@@ -54,6 +54,26 @@ type AWSIAMScanner struct {
 	// api, when set, replaces the real IAM client. The seam that lets the whole
 	// scan be exercised without an AWS account.
 	api awsdiscovery.IAMAPI
+
+	// lastCoverage is the coverage report as far as this scan has built it.
+	//
+	// A surface's state is only known once its loop finishes, so evidence
+	// written DURING that loop -- every identity row, for instance -- records an
+	// empty state. Empty means "not yet established", which the observation's
+	// own comment says, and is better than stamping "reached" on a read that
+	// had not finished.
+	lastCoverage models.ScanCoverage
+
+	// evidence records why each row exists. Nil is valid and writes nothing --
+	// a caller with no durable run to anchor evidence to (a test, a legacy
+	// path) degrades to no evidence rather than failing.
+	evidence *ObservationWriter
+}
+
+// WithEvidence attaches an observation writer for this run.
+func (s *AWSIAMScanner) WithEvidence(w *ObservationWriter) *AWSIAMScanner {
+	s.evidence = w
+	return s
 }
 
 // NewAWSIAMScanner constructs the scanner.
@@ -447,7 +467,7 @@ func (s *AWSIAMScanner) upsertUser(
 }
 
 func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters map[string]int) error {
-	_, created, err := s.identities.UpsertIdentity(identity)
+	stored, created, err := s.identities.UpsertIdentity(identity)
 	if err != nil {
 		return fmt.Errorf("record identity %s: %w", identity.NativeID, err)
 	}
@@ -456,7 +476,65 @@ func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters 
 	} else {
 		counters["identities_updated"]++
 	}
+
+	// The evidence for this row. Recorded from the identity we just wrote
+	// rather than from the raw SDK struct: what is stored is what a reviewer
+	// will be shown, and evidence for a different shape than the one on screen
+	// explains nothing.
+	//
+	// A failure here does NOT fail the scan. Losing the explanation for a row
+	// is bad; losing the row is worse, and an inventory that refuses to record
+	// an identity because its evidence write failed is the wrong trade.
+	if err := s.recordIdentityEvidence(stored, identity); err != nil {
+		log.Printf("aws iam scan: evidence for %s: %v", identity.NativeID, err)
+	}
 	return nil
+}
+
+func (s *AWSIAMScanner) recordIdentityEvidence(
+	stored *models.CloudIdentity, identity *models.CloudIdentity,
+) error {
+	if s.evidence == nil || stored == nil {
+		return nil
+	}
+	attrs := identity.AWSAttrs()
+	api := "iam:GetRole"
+	surface := models.SurfaceIAMRoles
+	if identity.Kind == models.CloudIdentityIAMUser {
+		api, surface = "iam:ListUsers", models.SurfaceIAMUsers
+	}
+	// observed_at is the provider's own creation time where AWS gave one. It is
+	// not "now": conflating them makes a delayed scan look like a change.
+	observed := time.Now()
+	if identity.ProviderCreatedAt != nil {
+		observed = *identity.ProviderCreatedAt
+	}
+	return s.evidence.Record(
+		IdentitySubject(stored.ID), api, surface, s.evidenceSurfaceState(surface),
+		observed,
+		map[string]any{
+			"kind":                     identity.Kind,
+			"native_id":                identity.NativeID,
+			"name":                     identity.Name,
+			"unique_id":                attrs.UniqueID,
+			"path":                     attrs.Path,
+			"max_session_duration":     attrs.MaxSessionDuration,
+			"tags":                     attrs.Tags,
+			"has_trust_policy":         attrs.HasTrustPolicy,
+			"permissions_boundary_arn": attrs.PermissionsBoundaryARN,
+			"detail_incomplete":        attrs.DetailIncomplete,
+		},
+	)
+}
+
+// evidenceSurfaceState reports what coverage said about a surface at the moment
+// evidence under it was written, so a fact collected during a degraded read
+// stays readable as such.
+func (s *AWSIAMScanner) evidenceSurfaceState(surface string) string {
+	if s.lastCoverage.Surfaces == nil {
+		return ""
+	}
+	return SurfaceStateOf(s.lastCoverage, surface)
 }
 
 func (s *AWSIAMScanner) upsertAccessKey(
