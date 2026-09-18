@@ -138,10 +138,18 @@ jobs:
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
+          if [ -z "${KUBECONFIG_B64:-}" ]; then
+            echo "::error::KUBECONFIG_B64 is not set. Mint it with scripts/make-deployer-kubeconfig.sh"
+            exit 1
+          fi
           mkdir -p "$HOME/.kube"
           echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          kubectl version --client
+          # `kubectl version --client` passes with NO kubeconfig at all, so it
+          # proves nothing -- an empty secret sailed through this step and the
+          # job died later, in the database backup, looking like a backup bug.
+          # Reach the API and assert the one permission this job needs.
+          kubectl auth can-i patch deployments -n "$NAMESPACE"
 
       # Migrations run on boot, against a database with customers in it. A
       # backup taken AFTER the new pods start is a backup of the migrated
