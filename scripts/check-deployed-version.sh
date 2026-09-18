@@ -43,11 +43,62 @@ if [ -z "$WANT" ]; then
 fi
 
 URL="$API$VERSION_PATH"
-BODY="$(curl -fsS --max-time 15 "$URL" 2>/dev/null || true)"
 
-if [ -z "$BODY" ]; then
+# WHY THIS RETRIES.
+#
+# `kubectl rollout status` returns when pods report Ready, which is earlier than
+# when the service actually answers: the readiness gate can pass before the
+# process serves, and during a rollout the ingress may still route to the old
+# pod. A single request therefore races the rollout and loses -- the first run of
+# this pipeline failed here 3 seconds before the new process came up, rolled
+# back, and reported a broken deploy that had in fact succeeded.
+#
+# So poll until the answer settles. Every non-match is retried, including a
+# mismatch, because mid-rollout the old pod answering is expected rather than
+# final. Only the state that survives the whole budget is reported.
+ATTEMPTS="${ATTEMPTS:-20}"
+INTERVAL="${INTERVAL:-6}"
+
+field() { printf '%s' "$1" | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin).get('$2',''))
+except Exception: print('')
+"; }
+
+GOT=""; INJECTED=""; BUILT=""; BRANCH=""; UPTIME=""; REASON=""
+attempt=0
+while [ "$attempt" -lt "$ATTEMPTS" ]; do
+  attempt=$((attempt + 1))
+  BODY="$(curl -fsS --max-time 10 "$URL" 2>/dev/null || true)"
+
+  if [ -z "$BODY" ]; then
+    REASON="unreachable"
+  else
+    GOT="$(field "$BODY" commit)"
+    INJECTED="$(field "$BODY" injected)"
+    BUILT="$(field "$BODY" built_at)"
+    BRANCH="$(field "$BODY" branch)"
+    UPTIME="$(field "$BODY" uptime_seconds)"
+
+    if [ "$INJECTED" != "True" ] && [ "$INJECTED" != "true" ]; then
+      REASON="not_injected"
+    elif [ "$GOT" = "$WANT" ]; then
+      REASON="match"
+      break
+    else
+      REASON="mismatch"
+    fi
+  fi
+
+  if [ "$attempt" -lt "$ATTEMPTS" ]; then
+    printf 'waiting for %s (attempt %d/%d: %s)\n' "$SERVICE" "$attempt" "$ATTEMPTS" "$REASON"
+    sleep "$INTERVAL"
+  fi
+done
+
+if [ "$REASON" = "unreachable" ]; then
   cat >&2 <<MSG
-UNKNOWN: $URL returned nothing.
+UNKNOWN: $URL returned nothing after $((ATTEMPTS * INTERVAL))s.
 
 Either the endpoint is not deployed yet -- which is itself the answer, since it
 ships with the code you are checking for -- or the host is unreachable. Probe a
@@ -58,19 +109,7 @@ MSG
   exit 2
 fi
 
-field() { printf '%s' "$BODY" | python3 -c "
-import json,sys
-try: print(json.load(sys.stdin).get('$1',''))
-except Exception: print('')
-"; }
-
-GOT="$(field commit)"
-INJECTED="$(field injected)"
-BUILT="$(field built_at)"
-BRANCH="$(field branch)"
-UPTIME="$(field uptime_seconds)"
-
-if [ "$INJECTED" != "True" ] && [ "$INJECTED" != "true" ]; then
+if [ "$REASON" = "not_injected" ]; then
   cat >&2 <<MSG
 UNKNOWN: the running binary was built without build arguments.
 
@@ -89,6 +128,7 @@ echo "got    $GOT"
 echo "branch $BRANCH"
 echo "built  $BUILT"
 echo "uptime ${UPTIME}s"
+echo "checks $attempt of $ATTEMPTS"
 echo
 
 if [ "$GOT" = "$WANT" ]; then
@@ -97,15 +137,15 @@ if [ "$GOT" = "$WANT" ]; then
 fi
 
 cat <<MSG
-MISMATCH: the deployed binary is NOT that commit.
+MISMATCH: after $((ATTEMPTS * INTERVAL))s the deployed binary is NOT that commit.
 
-A push does not deploy anything here: the workflows build, test and mirror, and
-nothing in the cluster watches a registry. If you expected this to be live,
-the image was not built, not pushed, or not rolled.
+This is not a timing artifact -- the whole retry budget was spent and the answer
+never changed. Something rolled, and it rolled to the wrong thing.
 
-Note a rollout that reuses the same tag does nothing -- Kubernetes sees no diff.
-A deploy needs a new tag, or an explicit:
+Most likely: the image was built from a different commit than the one being
+checked, or the deployment is pinned to a floating tag. A rollout that reuses
+the SAME tag does nothing at all, because Kubernetes sees no diff in the spec.
 
-  kubectl rollout restart deploy/$( [ "$SERVICE" = ui ] && echo prod-ui || echo prod-authsec ) -n authsec-prod
+  kubectl describe deploy/$( [ "$SERVICE" = ui ] && echo prod-ui || echo prod-authsec ) -n authsec-prod | grep -i image
 MSG
 exit 1
