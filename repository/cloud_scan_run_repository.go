@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -47,6 +48,14 @@ type CloudScanRunRepository interface {
 
 	// Fail marks a run finished without publishing, under the same fence.
 	Fail(runID uuid.UUID, owner string, version int64, reason string) error
+
+	// SetCoverage stamps this run's own final coverage report. Not fenced by
+	// lease version: Publish already cleared lease_owner on success, so the
+	// caller has nothing left to fence with by the time it knows the final
+	// coverage. Guarded instead by status = published -- coverage may only ever
+	// attach to a run that is already the authoritative one, never to a run
+	// still in flight or one that lost the race.
+	SetCoverage(runID uuid.UUID, coverage models.ScanCoverage) error
 
 	Get(runID uuid.UUID) (*models.CloudScanRun, error)
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
@@ -191,6 +200,26 @@ func (r *cloudScanRunRepository) fenced(
 	}
 	if res.RowsAffected == 0 {
 		return fmt.Errorf("%w: run=%s owner=%s version=%d", ErrLeaseLost, runID, owner, version)
+	}
+	return nil
+}
+
+func (r *cloudScanRunRepository) SetCoverage(runID uuid.UUID, coverage models.ScanCoverage) error {
+	raw, err := json.Marshal(coverage)
+	if err != nil {
+		return err
+	}
+	res := r.db.Model(&models.CloudScanRun{}).
+		Where("id = ? AND status = ?", runID, models.CloudScanRunPublished).
+		Updates(map[string]any{
+			"coverage":   raw,
+			"updated_at": time.Now(),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("%w: run=%s is not published", ErrCloudScanRunNotFound, runID)
 	}
 	return nil
 }

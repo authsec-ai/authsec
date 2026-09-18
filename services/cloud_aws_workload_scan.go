@@ -381,7 +381,7 @@ func (s *AWSWorkloadScanner) recordWorkload(
 		if err := s.evidence.Record(
 			WorkloadSubject(stored.ID),
 			workloadSourceAPI(w.RuntimeKind), "compute:"+region, "",
-			time.Now(),
+			time.Now(), w.NativeID,
 			map[string]any{
 				"runtime_kind":       w.RuntimeKind,
 				"native_id":          w.NativeID,

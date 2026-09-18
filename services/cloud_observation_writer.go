@@ -167,12 +167,19 @@ func NewObservationWriter(
 
 // Record writes one observation, deduplicating on unchanged content.
 //
-// An unchanged re-read produces no row: the unique index on (workspace,
-// subject, source_api, content_hash) absorbs it. That is what stops evidence
-// growing linearly with scan count for an account nobody is changing.
+// An unchanged re-read writes no NEW row -- the unique index on (workspace,
+// subject, source_api, content_hash) absorbs it -- but it does update
+// last_confirmed_run_id/at and bump confirmation_count on the existing row.
+// Storage stays flat for an account nobody is changing, while reconciliation
+// still gets an answer to "did this run see this fact", which a plain
+// DO NOTHING would have thrown away silently.
+//
+// subjectNativeID is the AWS-native id (ARN, role name, ...) of the subject,
+// stored on the row itself so it stays legible as "evidence for X" even after
+// reconciliation deletes the subject and SETs NULL the FK that used to say so.
 func (w *ObservationWriter) Record(
 	subject ObservationSubject, sourceAPI, surface, surfaceState string,
-	observedAt time.Time, facts any,
+	observedAt time.Time, subjectNativeID string, facts any,
 ) error {
 	if w == nil {
 		return nil
@@ -187,32 +194,70 @@ func (w *ObservationWriter) Record(
 		// fallback and is distinguishable because ingested_at equals it.
 		observedAt = time.Now()
 	}
+	now := time.Now()
 
 	obs := &models.CloudObservation{
-		WorkspaceID:    w.workspaceID,
-		ConnectorID:    w.connectorID,
-		ScanRunID:      w.runID,
-		Generation:     w.generation,
-		IdentityID:     subject.IdentityID,
-		PermissionID:   subject.PermissionID,
-		ResourceID:     subject.ResourceID,
-		WorkloadID:     subject.WorkloadID,
-		SourceAPI:      sourceAPI,
-		Surface:        surface,
-		SurfaceState:   surfaceState,
-		ObservedAt:     observedAt,
-		SanitizedFacts: payload,
-		ContentHash:    hash,
+		WorkspaceID:        w.workspaceID,
+		ConnectorID:        w.connectorID,
+		ScanRunID:          w.runID,
+		Generation:         w.generation,
+		IdentityID:         subject.IdentityID,
+		PermissionID:       subject.PermissionID,
+		ResourceID:         subject.ResourceID,
+		WorkloadID:         subject.WorkloadID,
+		SourceAPI:          sourceAPI,
+		Surface:            surface,
+		SurfaceState:       surfaceState,
+		ObservedAt:         observedAt,
+		SanitizedFacts:     payload,
+		ContentHash:        hash,
+		SubjectNativeID:    subjectNativeID,
+		LastConfirmedRunID: &w.runID,
+		LastConfirmedAt:    &now,
+		ConfirmationCount:  1,
 	}
 
-	res := w.db.Clauses(clause.OnConflict{DoNothing: true}).Create(obs)
+	// The conflict target repeats uq_cloud_observation_dedupe's own definition
+	// (022) rather than naming it: that index is on an EXPRESSION --
+	// COALESCE(identity_id, permission_id, resource_id, workload_id) -- and
+	// Postgres cannot convert an expression index into a named UNIQUE
+	// constraint, so ON CONFLICT ON CONSTRAINT is not available here. The
+	// COALESCE entry sets Raw: true so GORM emits it verbatim; without that it
+	// quotes every Column.Name as a plain identifier, which would turn the
+	// expression into a single invalid, literally-quoted column name instead
+	// of the function call Postgres needs to match the index.
+	//
+	// Insert vs. confirm-only is told apart the same way UpsertWorkload and
+	// friends already do it elsewhere in this package: propose an id, ask for
+	// it back with Returning, and compare. On conflict, Postgres returns the
+	// EXISTING row -- whose id is not the one we proposed -- so a mismatch
+	// means this call confirmed a fact it did not create.
+	proposed := uuid.New()
+	obs.ID = proposed
+
+	res := w.db.Clauses(
+		clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "workspace_id"},
+				{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id)", Raw: true},
+				{Name: "source_api"},
+				{Name: "content_hash"},
+			},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"last_confirmed_run_id": w.runID,
+				"last_confirmed_at":     now,
+				"confirmation_count":    gorm.Expr("cloud_observation.confirmation_count + 1"),
+			}),
+		},
+		clause.Returning{},
+	).Create(obs)
 	if res.Error != nil {
 		return fmt.Errorf("record observation (%s): %w", sourceAPI, res.Error)
 	}
-	if res.RowsAffected == 0 {
-		w.skipped++
-	} else {
+	if obs.ID == proposed {
 		w.written++
+	} else {
+		w.skipped++
 	}
 	return nil
 }

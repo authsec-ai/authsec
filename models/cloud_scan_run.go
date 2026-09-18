@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +59,14 @@ type CloudScanRun struct {
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	PublishedAt *time.Time `json:"published_at,omitempty"`
 	UpdatedAt   time.Time  `json:"updated_at" gorm:"not null;default:now()"`
+
+	// Coverage is THIS run's own final ScanCoverage report (see
+	// models.DecodeScanCoverage), stamped once at publish time. Authoritative
+	// for this run regardless of what a later run writes to
+	// CloudConnector.Coverage -- a reader asking "was this specific run
+	// complete" must read this column, never the connector's, which is
+	// overwritten by every scan and so can only ever answer for the newest one.
+	Coverage json.RawMessage `json:"coverage" gorm:"type:jsonb;not null;default:'{}'"`
 }
 
 func (CloudScanRun) TableName() string { return "cloud_scan_run" }
