@@ -1,7 +1,7 @@
 # AWS IGA lab — Exercise A
 
 Creates a synthetic, single-account estate in `us-east-1` and `us-west-2` for
-the [AWS lab brief](../../../.claude/specs/AuthSec-AWS-Discovery-Lab-Team-Brief.md).
+the [AWS lab brief](../../.claude/specs/AuthSec-AWS-Discovery-Lab-Team-Brief.md).
 This is a deployment kit, not proof that AuthSec discovers its contents correctly.
 Local Python compilation and CloudFormation linting have passed. Deployment and
 runtime probes have **not** been verified in a real AWS account yet.

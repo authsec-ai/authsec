@@ -6,7 +6,7 @@ namespace `authsec-prod`. This document contains only the current K3s runtime
 checks. It does not describe a second deployment path.
 
 Canonical release procedure:
-[`../../../.claude/specs/SPEC-deployment-k3s.md`](../../../.claude/specs/SPEC-deployment-k3s.md).
+[`../../.claude/specs/SPEC-deployment-k3s.md`](../../.claude/specs/SPEC-deployment-k3s.md).
 
 ## 1. Ingress must route broker traffic to the backend
 

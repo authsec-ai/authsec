@@ -7,3 +7,6 @@
 .DS_Store
 
 main.exe
+
+# Credentials live only in the untracked local spec.
+.claude/specs/*.local.md

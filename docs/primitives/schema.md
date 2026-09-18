@@ -231,7 +231,7 @@ never create a restore-test database inside the production cluster.
    initialize a fresh scratch database from bootstrap.
 4. Back up production as described above.
 5. Deploy the immutable backend image through the K3s procedure in
-   `../../../.claude/specs/SPEC-deployment-k3s.md`. The migration runner applies
+   `../../.claude/specs/SPEC-deployment-k3s.md`. The migration runner applies
    and records the change on startup.
 6. Verify the backend rollout, health endpoint, and the new successful row in
    `migration_logs` before deploying any dependent UI change.

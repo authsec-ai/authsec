@@ -39,7 +39,7 @@ issuance, and the ORY Hydra boundary.
 ## Production deployment
 
 The only active release path is the K3s procedure in
-[`../.claude/specs/SPEC-deployment-k3s.md`](../.claude/specs/SPEC-deployment-k3s.md).
+[`.claude/specs/SPEC-deployment-k3s.md`](.claude/specs/SPEC-deployment-k3s.md).
 
 - Production Deployment/container: `authsec-prod/prod-authsec` / `prod-authsec`.
 - Build the local working tree as an immutable `linux/amd64` image.
