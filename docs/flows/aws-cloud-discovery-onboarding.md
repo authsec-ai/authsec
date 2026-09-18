@@ -112,12 +112,13 @@ Granted as an inline policy on top of the baseline. Every action is a `List`,
 | `iam:GenerateServiceLastAccessedDetails`, `iam:GetServiceLastAccessedDetails` | Per-service last-used per principal, without paying for CloudTrail volume | [5], [6] |
 | `bedrock:ListAgents`, `bedrock:GetAgent` | Bedrock Agents; the execution role and foundation model come from the detail call | [3] |
 | `bedrock-agentcore:ListAgentRuntimes`, `GetAgentRuntime` | AgentCore runtimes and the identity each runs as | [3] |
-| `bedrock-agentcore:ListWorkloadIdentities` | AgentCore workload identities, written as `cloud_identity` rows | [3] |
-| `bedrock-agentcore:ListOauth2CredentialProviders`, `ListApiKeyCredentialProviders` | AgentCore credential providers, written as `cloud_secret` rows. **List only** — there is deliberately no `Get`, because that is where a value would be | [3] |
+| `bedrock-agentcore:ListWorkloadIdentities` | AgentCore workload identities, written as subject-less `cloud_observation` evidence, not `cloud_identity` — AgentCore's own principal is not an IAM identity and has no reconciled table of its own | [3] |
+| `bedrock-agentcore:ListOauth2CredentialProviders`, `ListApiKeyCredentialProviders` | AgentCore credential providers, written as subject-less `cloud_observation` evidence, same reasoning as workload identities. **List only** — there is deliberately no `Get`, because that is where a value would be | [3] |
 | `bedrock-agentcore:ListGateways`, `ListGatewayTargets` | What an AgentCore agent can reach | [3] |
 | `eks:ListClusters`, `eks:DescribeCluster` | The cluster OIDC issuer, which is what tells two clusters apart in a multi-cluster estate | [5] |
 | `eks:ListPodIdentityAssociations`, `DescribePodIdentityAssociation` | Which IAM role a Kubernetes service account may assume. Pods and workloads are **not** read here — the Kubernetes connector already discovers those | [5] |
-| `cloudtrail:LookupEvents`, `DescribeTrails`, `GetTrailStatus` | Per-identity API history for liveness and classification | [5] |
+| `cloudtrail:LookupEvents` | Per-identity API history for liveness and classification, matched best-effort against a known identity name | [5] |
+| `cloudtrail:DescribeTrails`, `GetTrailStatus` | Each trail's configuration and whether it is actually logging, written as `cloud_observation` evidence — this is what tells `LookupEvents` finding nothing apart from a blind account | [5] |
 
 The `Generate*` IAM calls are named like writes but produce read-only reports:
 they create no resource and change no state. A customer's security reviewer

@@ -148,6 +148,9 @@ type fakeAgentCore struct {
 	gatewayRoleByID    map[string]string
 	targetsByGateway   map[string][]agentcoretypes.TargetSummary
 	workloadIdentities []agentcoretypes.WorkloadIdentityType
+
+	oauth2Providers []agentcoretypes.Oauth2CredentialProviderItem
+	apiKeyProviders []agentcoretypes.ApiKeyCredentialProviderItem
 }
 
 func (f *fakeAgentCore) ListAgentRuntimes(_ context.Context, _ *bedrockagentcorecontrol.ListAgentRuntimesInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListAgentRuntimesOutput, error) {
@@ -188,6 +191,14 @@ func (f *fakeAgentCore) ListGatewayTargets(_ context.Context, in *bedrockagentco
 
 func (f *fakeAgentCore) ListWorkloadIdentities(_ context.Context, _ *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error) {
 	return &bedrockagentcorecontrol.ListWorkloadIdentitiesOutput{WorkloadIdentities: f.workloadIdentities}, nil
+}
+
+func (f *fakeAgentCore) ListOauth2CredentialProviders(_ context.Context, _ *bedrockagentcorecontrol.ListOauth2CredentialProvidersInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput{CredentialProviders: f.oauth2Providers}, nil
+}
+
+func (f *fakeAgentCore) ListApiKeyCredentialProviders(_ context.Context, _ *bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput{CredentialProviders: f.apiKeyProviders}, nil
 }
 
 // fakeActivity models the asynchronous job: the first poll reports IN_PROGRESS

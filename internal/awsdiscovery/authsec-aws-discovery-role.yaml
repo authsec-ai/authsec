@@ -8,7 +8,7 @@ Description: >-
 
 Metadata:
   AuthSec:
-    TemplateVersion: '2026-09-08'
+    TemplateVersion: '2026-09-18'
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -220,6 +220,24 @@ Resources:
                   - cloudtrail:GetTrailStatus
                 Resource: '*'
 
+              # Resource-based policies. Read-only on the policy DOCUMENT, never
+              # on the resource's data or its key material -- GetBucketPolicy
+              # and GetKeyPolicy both return only the JSON policy text, and
+              # NeverDecrypt below still refuses everything that would touch
+              # what the key protects. Explicit here rather than assumed
+              # covered by the SecurityAudit baseline: this file's own header
+              # says a mismatch between what this template grants and what the
+              # scanner calls shows up as AccessDenied on an account the
+              # console told the customer was sufficient, and that is exactly
+              # the failure mode an unverified "SecurityAudit probably already
+              # covers it" would risk.
+              - Sid: ResourcePolicies
+                Effect: Allow
+                Action:
+                  - s3:GetBucketPolicy
+                  - kms:GetKeyPolicy
+                Resource: '*'
+
         # ------------------------------------------------------------------
         # Explicit denies. SecurityAudit does not grant any of these, so this
         # policy changes nothing about what the role can do today. It is here so
@@ -292,4 +310,4 @@ Outputs:
     Description: >-
       Report this to AuthSec support if a scan says a permission is missing. It
       identifies which set of read permissions this stack granted.
-    Value: '2026-09-08'
+    Value: '2026-09-18'

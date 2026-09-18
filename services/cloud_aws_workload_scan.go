@@ -297,7 +297,9 @@ func (s *AWSWorkloadScanner) scanRegion(
 
 	s.scanGateways(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanWorkloadIdentities(ctx, workspaceID, snapshot, region, bedrock, out)
+	s.scanCredentialProviders(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
+	s.scanTrailStatus(ctx, workspaceID, snapshot, region, trail, out)
 }
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are
@@ -376,13 +378,11 @@ func (s *AWSWorkloadScanner) scanWorkloadIdentities(
 			// check to allow, used here deliberately rather than as the
 			// after-the-fact result of a subject being reconciled away.
 			//
-			// The dedupe index is keyed on COALESCE(subject columns), and
-			// Postgres never treats two NULLs as equal for uniqueness -- so
-			// every subject-less row here is a fresh insert every scan rather
-			// than a confirmed re-read. Accepted for now: the account-wide
-			// count of these is small, and giving subject-less evidence its
-			// own dedupe key is a real design question this fix does not
-			// have to answer to make the surface collected.
+			// Deduped by migration 025's partial index
+			// (uq_cloud_observation_dedupe_no_subject), scoped to exactly the
+			// rows that fall through migration 022's COALESCE-based one: an
+			// unchanged re-read confirms the existing row instead of growing
+			// the table.
 			if rerr := s.evidence.Record(
 				ObservationSubject{}, "bedrock-agentcore:ListWorkloadIdentities",
 				key, "", time.Now(), wi.NativeID,
@@ -393,6 +393,37 @@ func (s *AWSWorkloadScanner) scanWorkloadIdentities(
 		}
 	}
 	out.Surfaces[key] = surfaceResult(len(identities), err)
+}
+
+// scanCredentialProviders reads AgentCore's OAuth2 and API-key credential
+// providers and records each as subject-less evidence, same reasoning and
+// same dedupe key as scanWorkloadIdentities just above: a credential
+// provider is not an IAM identity, permission, resource or workload, has no
+// reconciled table of its own, and must not gate Lambda/ECS/EC2's own
+// otherwise-complete reconciliation.
+func (s *AWSWorkloadScanner) scanCredentialProviders(
+	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
+) {
+	key := "agentcore-credential-providers:" + region
+	providers, err := bedrock.CredentialProviders(ctx)
+	if s.evidence != nil {
+		for _, p := range providers {
+			if p.NativeID == "" {
+				continue
+			}
+			facts := map[string]any{"name": p.Name, "arn": p.NativeID, "kind": p.Kind}
+			if p.Vendor != "" {
+				facts["vendor"] = p.Vendor
+			}
+			if rerr := s.evidence.Record(
+				ObservationSubject{}, p.SourceAPI, key, "", time.Now(), p.NativeID, facts,
+			); rerr != nil {
+				log.Printf("aws workload scan: credential provider evidence for %s: %v", p.NativeID, rerr)
+			}
+		}
+	}
+	out.Surfaces[key] = surfaceResult(len(providers), err)
 }
 
 // scanCloudTrail reads recent management events and records each as evidence
@@ -454,6 +485,58 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 		}
 	}
 	out.Surfaces[key] = surfaceResult(len(events), err)
+}
+
+// scanTrailStatus reads each trail's configuration and whether it is
+// actually logging, and records both as subject-less evidence. This is what
+// tells scanCloudTrail's own silence apart from a blind account: RecentEvents
+// finding nothing is unremarkable for a quiet identity but alarming for an
+// account with no trail logging at all, and only this surface can say which
+// one happened.
+//
+// Recorded under two source APIs, matching the two AWS calls Trails makes:
+// DescribeTrails for the configuration, GetTrailStatus for whether it is
+// live. Same reasoning as scanCredentialProviders for why this is bonus
+// evidence with no reconciled table, not written to out.Errors.
+func (s *AWSWorkloadScanner) scanTrailStatus(
+	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
+) {
+	key := "cloudtrail-status:" + region
+	trails, err := trail.Trails(ctx)
+	if s.evidence != nil {
+		for _, t := range trails {
+			if t.NativeID == "" {
+				continue
+			}
+			if rerr := s.evidence.Record(
+				ObservationSubject{}, "cloudtrail:DescribeTrails", key, "", time.Now(), t.NativeID,
+				map[string]any{
+					"name":                          t.Name,
+					"arn":                           t.NativeID,
+					"home_region":                   t.HomeRegion,
+					"is_multi_region_trail":         t.IsMultiRegionTrail,
+					"is_organization_trail":         t.IsOrganizationTrail,
+					"include_global_service_events": t.IncludeGlobalServiceEvents,
+					"log_file_validation_enabled":   t.LogFileValidationEnabled,
+				},
+			); rerr != nil {
+				log.Printf("aws workload scan: trail config evidence for %s: %v", t.NativeID, rerr)
+			}
+			if t.IsLogging == nil {
+				// GetTrailStatus failed for this trail -- unknown, not "not
+				// logging". Nothing worth recording under this source API.
+				continue
+			}
+			if rerr := s.evidence.Record(
+				ObservationSubject{}, "cloudtrail:GetTrailStatus", key, "", time.Now(), t.NativeID,
+				map[string]any{"arn": t.NativeID, "is_logging": *t.IsLogging},
+			); rerr != nil {
+				log.Printf("aws workload scan: trail status evidence for %s: %v", t.NativeID, rerr)
+			}
+		}
+	}
+	out.Surfaces[key] = surfaceResult(len(trails), err)
 }
 
 // recordWorkload writes one workload, attributing it to a discovered identity

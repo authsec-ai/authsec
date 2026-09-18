@@ -1250,6 +1250,7 @@ const (
 	WorkloadEC2Instance        = "ec2_instance"
 	WorkloadBedrockAgent       = "bedrock_agent"
 	WorkloadBedrockAgentCoreRT = "bedrock_agentcore_runtime"
+	WorkloadBedrockAgentCoreGW = "bedrock_agentcore_gateway"
 )
 
 // CloudWorkload is compute that RUNS AS a cloud identity: a Lambda function, an
