@@ -143,6 +143,11 @@ func (f *fakeBedrock) GetAgent(_ context.Context, in *bedrockagent.GetAgentInput
 type fakeAgentCore struct {
 	runtimes []agentcoretypes.AgentRuntime
 	roleByID map[string]string
+
+	gateways           []agentcoretypes.GatewaySummary
+	gatewayRoleByID    map[string]string
+	targetsByGateway   map[string][]agentcoretypes.TargetSummary
+	workloadIdentities []agentcoretypes.WorkloadIdentityType
 }
 
 func (f *fakeAgentCore) ListAgentRuntimes(_ context.Context, _ *bedrockagentcorecontrol.ListAgentRuntimesInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListAgentRuntimesOutput, error) {
@@ -155,6 +160,34 @@ func (f *fakeAgentCore) GetAgentRuntime(_ context.Context, in *bedrockagentcorec
 		return nil, denied("bedrock-agentcore:GetAgentRuntime")
 	}
 	return &bedrockagentcorecontrol.GetAgentRuntimeOutput{RoleArn: aws.String(role)}, nil
+}
+
+// Gateways and workload identities: empty by default. Fixture-specific tests
+// that need one set fields on fakeAgentCore for it, per the pattern
+// runtimes/roleByID already establish.
+func (f *fakeAgentCore) ListGateways(_ context.Context, _ *bedrockagentcorecontrol.ListGatewaysInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewaysOutput, error) {
+	return &bedrockagentcorecontrol.ListGatewaysOutput{Items: f.gateways}, nil
+}
+
+func (f *fakeAgentCore) GetGateway(_ context.Context, in *bedrockagentcorecontrol.GetGatewayInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.GetGatewayOutput, error) {
+	role, ok := f.gatewayRoleByID[aws.ToString(in.GatewayIdentifier)]
+	if !ok {
+		return nil, denied("bedrock-agentcore:GetGateway")
+	}
+	return &bedrockagentcorecontrol.GetGatewayOutput{
+		GatewayArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:491056652413:gateway/" + aws.ToString(in.GatewayIdentifier)),
+		RoleArn:    aws.String(role),
+	}, nil
+}
+
+func (f *fakeAgentCore) ListGatewayTargets(_ context.Context, in *bedrockagentcorecontrol.ListGatewayTargetsInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewayTargetsOutput, error) {
+	return &bedrockagentcorecontrol.ListGatewayTargetsOutput{
+		Items: f.targetsByGateway[aws.ToString(in.GatewayIdentifier)],
+	}, nil
+}
+
+func (f *fakeAgentCore) ListWorkloadIdentities(_ context.Context, _ *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error) {
+	return &bedrockagentcorecontrol.ListWorkloadIdentitiesOutput{WorkloadIdentities: f.workloadIdentities}, nil
 }
 
 // fakeActivity models the asynchronous job: the first poll reports IN_PROGRESS

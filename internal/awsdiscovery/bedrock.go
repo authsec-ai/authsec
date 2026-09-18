@@ -39,6 +39,24 @@ type BedrockAgentAPI interface {
 type AgentCoreAPI interface {
 	ListAgentRuntimes(ctx context.Context, in *bedrockagentcorecontrol.ListAgentRuntimesInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListAgentRuntimesOutput, error)
 	GetAgentRuntime(ctx context.Context, in *bedrockagentcorecontrol.GetAgentRuntimeInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.GetAgentRuntimeOutput, error)
+
+	// ListGateways/GetGateway/ListGatewayTargets are the agent tool-path
+	// segment: a Gateway is what turns a Lambda (or another backend) into an
+	// MCP tool an agent can call, and a Target is one such exposed backend.
+	// Granted in the role template from the start; this file is the first
+	// caller.
+	ListGateways(ctx context.Context, in *bedrockagentcorecontrol.ListGatewaysInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewaysOutput, error)
+	GetGateway(ctx context.Context, in *bedrockagentcorecontrol.GetGatewayInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.GetGatewayOutput, error)
+	ListGatewayTargets(ctx context.Context, in *bedrockagentcorecontrol.ListGatewayTargetsInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewayTargetsOutput, error)
+
+	// ListWorkloadIdentities: AgentCore's own principal for a runtime or tool,
+	// separate from IAM. Recorded as evidence only (see
+	// AWSWorkloadScanner.scanRegion) rather than as a reconciled cloud_identity
+	// row -- it is discovered by the workload scanner, which runs after IAM
+	// scanning has already reconciled cloud_identity for this generation, and
+	// writing into that table from here would have every workload identity
+	// deleted and recreated on every single scan.
+	ListWorkloadIdentities(ctx context.Context, in *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error)
 }
 
 // NewBedrockAgentClient builds a real Bedrock Agent client.
@@ -184,4 +202,128 @@ func (r *BedrockReader) runtimeRole(ctx context.Context, runtimeID string) (stri
 		return "", false
 	}
 	return aws.ToString(detail.RoleArn), true
+}
+
+// GatewayTarget is one backend a Gateway exposes as an MCP tool. Recorded as
+// evidence under the gateway's workload row rather than as its own inventory
+// row: a target has no identity of its own to attribute it to, and no
+// reconciled table it would belong in without inventing one for a single
+// evidence fact.
+type GatewayTarget struct {
+	GatewayNativeID string
+	TargetID        string
+	Name            string
+	Status          string
+}
+
+// Gateways lists every AgentCore Gateway in the region, resolves each one's
+// execution role, and lists its targets.
+//
+// Same two-call shape as Agents/AgentRuntimes: ListGateways omits the role,
+// which is the entire reason to discover a gateway at all.
+func (r *BedrockReader) Gateways(ctx context.Context) ([]Workload, []GatewayTarget, error) {
+	if r.agentCore == nil {
+		return nil, nil, nil
+	}
+	var workloads []Workload
+	var targets []GatewayTarget
+	var next *string
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return workloads, targets, fmt.Errorf("%w: agentcore gateways", errTooManyPages)
+		}
+		resp, err := r.agentCore.ListGateways(ctx, &bedrockagentcorecontrol.ListGatewaysInput{NextToken: next})
+		if err != nil {
+			return workloads, targets, classify(err)
+		}
+		for _, summary := range resp.Items {
+			id := aws.ToString(summary.GatewayId)
+			w := Workload{
+				RuntimeKind: "bedrock_agentcore_gateway",
+				NativeID:    id,
+				Name:        aws.ToString(summary.Name),
+				Status:      string(summary.Status),
+			}
+			if detail, err := r.agentCore.GetGateway(ctx,
+				&bedrockagentcorecontrol.GetGatewayInput{GatewayIdentifier: summary.GatewayId}); err == nil {
+				if arn := aws.ToString(detail.GatewayArn); arn != "" {
+					w.NativeID = arn
+				}
+				w.RoleARN = aws.ToString(detail.RoleArn)
+			}
+			workloads = append(workloads, w)
+			targets = append(targets, r.gatewayTargets(ctx, id, w.NativeID)...)
+		}
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			return workloads, targets, nil
+		}
+		next = resp.NextToken
+	}
+}
+
+// gatewayTargets lists one gateway's targets. A failure here costs only this
+// gateway's targets, never the gateway row itself or any other gateway's --
+// the same per-surface isolation scanRegion already applies across services.
+func (r *BedrockReader) gatewayTargets(ctx context.Context, gatewayID, gatewayNativeID string) []GatewayTarget {
+	var out []GatewayTarget
+	var next *string
+	for page := 0; page < maxPages; page++ {
+		resp, err := r.agentCore.ListGatewayTargets(ctx, &bedrockagentcorecontrol.ListGatewayTargetsInput{
+			GatewayIdentifier: aws.String(gatewayID), NextToken: next,
+		})
+		if err != nil {
+			return out
+		}
+		for _, t := range resp.Items {
+			out = append(out, GatewayTarget{
+				GatewayNativeID: gatewayNativeID,
+				TargetID:        aws.ToString(t.TargetId),
+				Name:            aws.ToString(t.Name),
+				Status:          string(t.Status),
+			})
+		}
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			return out
+		}
+		next = resp.NextToken
+	}
+	return out
+}
+
+// WorkloadIdentity is AgentCore's own principal for a runtime or tool --
+// distinct from an IAM role, and carrying no role of its own to resolve. See
+// the AgentCoreAPI.ListWorkloadIdentities comment for why this is recorded as
+// evidence rather than a cloud_identity row.
+type WorkloadIdentity struct {
+	NativeID string
+	Name     string
+}
+
+// WorkloadIdentities lists every AgentCore workload identity in the region.
+func (r *BedrockReader) WorkloadIdentities(ctx context.Context) ([]WorkloadIdentity, error) {
+	if r.agentCore == nil {
+		return nil, nil
+	}
+	var out []WorkloadIdentity
+	var next *string
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return out, fmt.Errorf("%w: agentcore workload identities", errTooManyPages)
+		}
+		resp, err := r.agentCore.ListWorkloadIdentities(ctx,
+			&bedrockagentcorecontrol.ListWorkloadIdentitiesInput{NextToken: next})
+		if err != nil {
+			return out, classify(err)
+		}
+		for _, wi := range resp.WorkloadIdentities {
+			out = append(out, WorkloadIdentity{
+				NativeID: aws.ToString(wi.WorkloadIdentityArn),
+				Name:     aws.ToString(wi.Name),
+			})
+		}
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			return out, nil
+		}
+		next = resp.NextToken
+	}
 }

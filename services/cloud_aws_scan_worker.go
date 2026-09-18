@@ -186,7 +186,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 		return fmt.Errorf("publish: %w", err)
 	}
 	merged := scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
-		permErr, permSurfaces, workloadErr, workloadSurfaces)
+		snapshot.CredentialReportSurface, permErr, permSurfaces, workloadErr, workloadSurfaces)
 
 	// Stamped onto this run specifically, not only the connector: the
 	// connector's coverage column is overwritten by whatever scan runs next,

@@ -55,6 +55,11 @@ type AWSIAMScanner struct {
 	// scan be exercised without an AWS account.
 	api awsdiscovery.IAMAPI
 
+	// credentialAPI, when set, replaces the real credential-report client.
+	credentialAPI awsdiscovery.CredentialReportAPI
+	// credentialSleep replaces the report's poll delay, so a test does not wait.
+	credentialSleep func(context.Context, time.Duration) error
+
 	// lastCoverage is the coverage report as far as this scan has built it.
 	//
 	// A surface's state is only known once its loop finishes, so evidence
@@ -93,6 +98,17 @@ func (s *AWSIAMScanner) WithIAMAPI(api awsdiscovery.IAMAPI) *AWSIAMScanner {
 	return s
 }
 
+// WithCredentialReportAPI installs a credential-report client, bypassing
+// assume-role, and optionally a sleep function so a test does not wait on the
+// report's poll loop.
+func (s *AWSIAMScanner) WithCredentialReportAPI(
+	api awsdiscovery.CredentialReportAPI, sleep func(context.Context, time.Duration) error,
+) *AWSIAMScanner {
+	s.credentialAPI = api
+	s.credentialSleep = sleep
+	return s
+}
+
 // IAMSnapshot is what one scan read. The persisted half is already in the
 // database by the time this is returned; the policy documents are the handover
 // to ticket [2].
@@ -110,6 +126,11 @@ type IAMSnapshot struct {
 	// TrustPolicies is the decoded AssumeRolePolicyDocument per role ARN, the
 	// input for cloud_assume_edge in ticket [2].
 	TrustPolicies map[string]string
+
+	// CredentialReportSurface is bonus evidence about users this scan already
+	// wrote, kept OUT of Coverage on purpose -- see the comment where this is
+	// set, in Scan.
+	CredentialReportSurface models.SurfaceCoverage
 }
 
 // Scan reads roles, users, access keys and policy documents for one connector.
@@ -287,6 +308,22 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 		coverage.Counters["secrets_removed"] = 0
 		coverage.Status = models.ScanStatusPartial
 	}
+
+	// ---- credential report --------------------------------------------------
+	//
+	// Deliberately kept OUT of coverage.Surfaces, which is what the reconcile
+	// gate above just consulted -- and, downstream, what the permission and
+	// workload scanners' OWN gates consult too, since both check
+	// snapshot.Coverage.Complete() as their "did ticket [1] succeed" baseline.
+	// Adding a new denial-prone surface there would make every scanner's
+	// reconciliation depend on a permission bonus evidence has nothing to do
+	// with -- exactly the coupling FinalizeCoverage (see cloud_aws_iam_scan.go)
+	// already exists to avoid for the permission and workload scans' own
+	// surfaces. snapshot.CredentialReportSurface carries this one the same
+	// way, merged only at FinalizeCoverage, after every scanner's local gate
+	// has already fired against the unpolluted coverage.
+	reportCount, reportErr := s.scanCredentialReport(ctx, workspaceID, connectorID, users)
+	snapshot.CredentialReportSurface = surfaceResult(reportCount, reportErr)
 
 	finished := time.Now()
 	coverage.FinishedAt = &finished
@@ -593,6 +630,81 @@ func (s *AWSIAMScanner) readerFor(
 	return awsdiscovery.NewIAMReader(awsdiscovery.NewIAMClient(cfg)), nil
 }
 
+// scanCredentialReport reads the account credential report and records one
+// observation per user this same scan already wrote, matched by ARN. A user
+// the report mentions but this scan's ListUsers did not (a timing gap between
+// two calls that are not transactional with each other) is skipped rather
+// than guessed at.
+func (s *AWSIAMScanner) scanCredentialReport(
+	ctx context.Context, workspaceID, connectorID uuid.UUID, users []awsdiscovery.IAMUser,
+) (int, error) {
+	reader, err := s.credentialReportReaderFor(ctx, workspaceID, connectorID)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := reader.Report(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if s.evidence == nil {
+		return len(rows), nil
+	}
+	byARN := make(map[string]awsdiscovery.IAMUser, len(users))
+	for _, u := range users {
+		byARN[u.ARN] = u
+	}
+	for _, row := range rows {
+		if _, known := byARN[row.UserARN]; !known {
+			continue
+		}
+		identity, ierr := s.identities.GetIdentityByNativeID(workspaceID, row.UserARN)
+		if ierr != nil {
+			continue
+		}
+		if rerr := s.evidence.Record(
+			IdentitySubject(identity.ID), "iam:GetCredentialReport",
+			"iam_credential_report", "", time.Now(), row.UserARN,
+			map[string]any{
+				"password_enabled":        row.PasswordEnabled,
+				"password_last_used":      row.PasswordLastUsed,
+				"mfa_active":              row.MFAActive,
+				"access_key_1_active":     row.AccessKey1Active,
+				"access_key_1_rotated_at": row.AccessKey1LastRotated,
+				"access_key_1_last_used":  row.AccessKey1LastUsedAt,
+				"access_key_2_active":     row.AccessKey2Active,
+				"access_key_2_rotated_at": row.AccessKey2LastRotated,
+				"access_key_2_last_used":  row.AccessKey2LastUsedAt,
+			},
+		); rerr != nil {
+			log.Printf("aws iam scan: credential report evidence for %s: %v", row.UserARN, rerr)
+		}
+	}
+	return len(rows), nil
+}
+
+// credentialReportReaderFor mirrors readerFor: an injected client wins, for
+// tests; otherwise a real one is built from the same assumed-role config the
+// IAM reader itself would use.
+func (s *AWSIAMScanner) credentialReportReaderFor(
+	ctx context.Context, workspaceID, connectorID uuid.UUID,
+) (*awsdiscovery.CredentialReportReader, error) {
+	if s.credentialAPI != nil {
+		r := awsdiscovery.NewCredentialReportReader(s.credentialAPI)
+		if s.credentialSleep != nil {
+			r = r.WithSleep(s.credentialSleep)
+		}
+		return r, nil
+	}
+	if s.onboarding == nil {
+		return nil, errors.New("no credential report client and no onboarding service to assume a role with")
+	}
+	cfg, _, err := s.onboarding.ConfigForConnector(ctx, workspaceID, connectorID, "")
+	if err != nil {
+		return nil, err
+	}
+	return awsdiscovery.NewCredentialReportReader(awsdiscovery.NewCredentialReportClient(cfg)), nil
+}
+
 // commitScan advances the connector's generation and stores the final coverage
 // in one statement, so a reader can never see a bumped generation with the
 // previous scan's report beside it.
@@ -652,6 +764,7 @@ func (s *AWSIAMScanner) persistCoverage(workspaceID, connectorID uuid.UUID, cove
 // overwritten by whatever scan runs next and answers only for the newest one.
 func (s *AWSIAMScanner) FinalizeCoverage(
 	workspaceID, connectorID uuid.UUID, iamCoverage models.ScanCoverage,
+	credentialReportSurface models.SurfaceCoverage,
 	permErr error, permSurfaces map[string]models.SurfaceCoverage,
 	workloadErr error, workloadSurfaces map[string]models.SurfaceCoverage,
 ) models.ScanCoverage {
@@ -664,6 +777,14 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	}
 	for k, v := range iamCoverage.Surfaces {
 		merged.Surfaces[k] = v
+	}
+	// Merged here, for connector-level display only -- never part of
+	// iamCoverage itself, so it never reached the reconcile gate inside Scan,
+	// nor the permission/workload scanners' own snapshot.Coverage.Complete()
+	// checks. A denied credential report is honest to show as "partial"
+	// overall; it must never be a reason to refuse deleting a stale identity.
+	if credentialReportSurface.State != "" {
+		merged.Surfaces["iam_credential_report"] = credentialReportSurface
 	}
 
 	// A scanner that returned an error before producing a snapshot at all
