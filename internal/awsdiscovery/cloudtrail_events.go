@@ -41,6 +41,15 @@ import (
 // CloudTrailAPI is the slice of CloudTrail this package uses.
 type CloudTrailAPI interface {
 	LookupEvents(ctx context.Context, in *cloudtrail.LookupEventsInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error)
+
+	// DescribeTrails/GetTrailStatus answer a different question than
+	// LookupEvents: not "what happened", but "is anything capturing what
+	// happens at all". RecentEvents returning nothing is ambiguous between a
+	// quiet account and a blind one -- these two calls are what tells the two
+	// apart. Granted in the role template from the start; this file is the
+	// first caller.
+	DescribeTrails(ctx context.Context, in *cloudtrail.DescribeTrailsInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.DescribeTrailsOutput, error)
+	GetTrailStatus(ctx context.Context, in *cloudtrail.GetTrailStatusInput, opts ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error)
 }
 
 // NewCloudTrailClient builds a real CloudTrail client.
@@ -152,4 +161,65 @@ func errorCodeFromRawEvent(raw string) string {
 		return ""
 	}
 	return rest[:j]
+}
+
+// TrailStatus is one trail's configuration plus whether it is actually
+// logging right now. IsLogging is nil when GetTrailStatus itself failed for
+// a trail DescribeTrails could see -- a trail we cannot get the status of is
+// still worth recording as evidence, and nil keeps that failure from being
+// misread as a confirmed "not logging".
+type TrailStatus struct {
+	NativeID                   string // trail ARN
+	Name                       string
+	HomeRegion                 string
+	IsMultiRegionTrail         bool
+	IsOrganizationTrail        bool
+	IncludeGlobalServiceEvents bool
+	LogFileValidationEnabled   bool
+	IsLogging                  *bool
+}
+
+// Trails describes every trail visible in this region and whether each is
+// actually logging.
+//
+// IncludeShadowTrails is set false: a shadow trail is the same trail's
+// config replicated into every other Region, and this reader already runs
+// once per Region as part of the wider scan -- including shadow trails would
+// report the same organization trail's logging state once per Region on top
+// of the one Region call that already reports it for real.
+func (r *CloudTrailReader) Trails(ctx context.Context) ([]TrailStatus, error) {
+	if r.api == nil {
+		return nil, nil
+	}
+	resp, err := r.api.DescribeTrails(ctx,
+		&cloudtrail.DescribeTrailsInput{IncludeShadowTrails: aws.Bool(false)})
+	if err != nil {
+		return nil, classify(err)
+	}
+	out := make([]TrailStatus, 0, len(resp.TrailList))
+	for _, t := range resp.TrailList {
+		ts := TrailStatus{
+			NativeID:                   aws.ToString(t.TrailARN),
+			Name:                       aws.ToString(t.Name),
+			HomeRegion:                 aws.ToString(t.HomeRegion),
+			IsMultiRegionTrail:         aws.ToBool(t.IsMultiRegionTrail),
+			IsOrganizationTrail:        aws.ToBool(t.IsOrganizationTrail),
+			IncludeGlobalServiceEvents: aws.ToBool(t.IncludeGlobalServiceEvents),
+			LogFileValidationEnabled:   aws.ToBool(t.LogFileValidationEnabled),
+		}
+		// GetTrailStatus takes a name OR an arn; the ARN always resolves, a
+		// bare name does not for an organization trail replicated from
+		// another account, so the ARN is preferred whenever DescribeTrails
+		// returned one.
+		id := ts.Name
+		if ts.NativeID != "" {
+			id = ts.NativeID
+		}
+		if statusResp, serr := r.api.GetTrailStatus(ctx, &cloudtrail.GetTrailStatusInput{Name: aws.String(id)}); serr == nil {
+			logging := aws.ToBool(statusResp.IsLogging)
+			ts.IsLogging = &logging
+		}
+		out = append(out, ts)
+	}
+	return out, nil
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
+	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol"
@@ -81,6 +82,12 @@ func (f *fakeGatewayAgentCore) ListGatewayTargets(_ context.Context, in *bedrock
 func (f *fakeGatewayAgentCore) ListWorkloadIdentities(context.Context, *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error) {
 	return &bedrockagentcorecontrol.ListWorkloadIdentitiesOutput{}, nil
 }
+func (f *fakeGatewayAgentCore) ListOauth2CredentialProviders(context.Context, *bedrockagentcorecontrol.ListOauth2CredentialProvidersInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput{}, nil
+}
+func (f *fakeGatewayAgentCore) ListApiKeyCredentialProviders(context.Context, *bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput{}, nil
+}
 
 // A gateway is written to cloud_workload through the same path as Lambda/ECS,
 // and its target is recorded as evidence under that workload -- proving the
@@ -117,8 +124,8 @@ func TestAgentCoreGatewaysAreCollected(t *testing.T) {
 	}
 
 	var count int64
-	if err := db.Raw(`SELECT count(*) FROM cloud_workload WHERE workspace_id = ? AND runtime_kind = 'bedrock_agentcore_gateway'`,
-		ws).Scan(&count).Error; err != nil || count != 1 {
+	if err := db.Raw(`SELECT count(*) FROM cloud_workload WHERE workspace_id = ? AND runtime_kind = ?`,
+		ws, models.WorkloadBedrockAgentCoreGW).Scan(&count).Error; err != nil || count != 1 {
 		t.Fatalf("gateway workload not written: count=%d err=%v", count, err)
 	}
 	var obsCount int64
@@ -219,10 +226,97 @@ func TestAgentCoreWorkloadIdentityIsRecordedAsEvidence(t *testing.T) {
 	}
 }
 
+// Before uq_cloud_observation_dedupe_no_subject (025), a subject-less
+// observation's dedupe key was COALESCE(identity_id, permission_id,
+// resource_id, workload_id) -- NULL for every workload identity, and
+// Postgres never treats two NULLs as equal for uniqueness. Every re-scan of
+// an unchanged account inserted a fresh row. This proves the fix: the same
+// fact, scanned twice, is one row with confirmation_count = 2, not two rows.
+func TestWorkloadIdentityEvidenceDedupesAcrossScans(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-agentcore-workload-identity-dedupe")
+	defer cleanWorkloadTables(t, db, ws)
+
+	svc, connID, run1 := onboardWithRun(t, db, ws)
+	evidence1 := services.NewObservationWriter(db, ws, connID, run1.ID, run1.Generation)
+	iamFake := populatedIAM()
+	snap1, err := services.NewAWSIAMScanner(db, svc).WithIAMAPI(iamFake).WithEvidence(evidence1).
+		Scan(context.Background(), ws, connID)
+	if err != nil {
+		t.Fatalf("iam scan: %v", err)
+	}
+
+	agentCore := &fakeWorkloadIdentityAgentCore{identities: []agentcoretypes.WorkloadIdentityType{{
+		Name:                aws.String("support-agent-identity"),
+		WorkloadIdentityArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:491056652413:workload-identity-directory/default/workload-identity/support-agent-identity"),
+	}}}
+	l, e, c, p := populatedWorkloads()
+	scanner1 := services.NewAWSWorkloadScanner(db, svc).
+		WithWorkloadAPIs(l, e, c, p).WithBedrockAPIs(nil, agentCore).WithEvidence(evidence1)
+	if _, err := scanner1.ScanFromSnapshot(context.Background(), ws, snap1); err != nil {
+		t.Fatalf("first workload scan: %v", err)
+	}
+
+	// A second, unrelated run re-reads the exact same account. Deliberately
+	// NOT scanRuns(t, db) again -- that helper clears cloud_observation as a
+	// side effect (a clean table for the NEXT test to start from), and calling
+	// it mid-test here would wipe the very evidence this test exists to check
+	// accumulates rather than resets.
+	runs := repositories.NewCloudScanRunRepository(db)
+	// run1 is still "running" -- Scan()/ScanFromSnapshot() know nothing about
+	// the lease lifecycle, only the worker does (see cloud_aws_scan_worker.go).
+	// The live-run unique index would refuse a second Enqueue otherwise.
+	if err := runs.Publish(run1.ID, "test-worker", run1.LeaseVersion); err != nil {
+		t.Fatalf("publish first run: %v", err)
+	}
+	if _, err := runs.Enqueue(ws, connID, "manual"); err != nil {
+		t.Fatalf("enqueue second run: %v", err)
+	}
+	run2, err := runs.Claim("test-worker-2", time.Minute, time.Now())
+	if err != nil || run2 == nil {
+		t.Fatalf("claim second run: %v %v", run2, err)
+	}
+	evidence2 := services.NewObservationWriter(db, ws, connID, run2.ID, run2.Generation)
+	iamFake2 := populatedIAM()
+	snap2, err := services.NewAWSIAMScanner(db, svc).WithIAMAPI(iamFake2).WithEvidence(evidence2).
+		Scan(context.Background(), ws, connID)
+	if err != nil {
+		t.Fatalf("second iam scan: %v", err)
+	}
+	l2, e2, c2, p2 := populatedWorkloads()
+	scanner2 := services.NewAWSWorkloadScanner(db, svc).
+		WithWorkloadAPIs(l2, e2, c2, p2).WithBedrockAPIs(nil, agentCore).WithEvidence(evidence2)
+	if _, err := scanner2.ScanFromSnapshot(context.Background(), ws, snap2); err != nil {
+		t.Fatalf("second workload scan: %v", err)
+	}
+
+	var rowCount int64
+	if err := db.Raw(`SELECT count(*) FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'bedrock-agentcore:ListWorkloadIdentities'`, ws).
+		Scan(&rowCount).Error; err != nil {
+		t.Fatalf("count evidence rows: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("two identical scans produced %d rows, want 1 -- the no-subject dedupe key is not firing", rowCount)
+	}
+
+	var confirmations int
+	if err := db.Raw(`SELECT confirmation_count FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'bedrock-agentcore:ListWorkloadIdentities'`, ws).
+		Scan(&confirmations).Error; err != nil {
+		t.Fatalf("read confirmation_count: %v", err)
+	}
+	if confirmations != 2 {
+		t.Fatalf("confirmation_count = %d, want 2 after two scans of the same fact", confirmations)
+	}
+}
+
 // fakeWorkloadIdentityAgentCore returns a fixed list of workload identities
 // and empty/no-op for every other AgentCore surface.
 type fakeWorkloadIdentityAgentCore struct {
-	identities []agentcoretypes.WorkloadIdentityType
+	identities      []agentcoretypes.WorkloadIdentityType
+	oauth2Providers []agentcoretypes.Oauth2CredentialProviderItem
+	apiKeyProviders []agentcoretypes.ApiKeyCredentialProviderItem
 }
 
 func (f *fakeWorkloadIdentityAgentCore) ListAgentRuntimes(context.Context, *bedrockagentcorecontrol.ListAgentRuntimesInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListAgentRuntimesOutput, error) {
@@ -243,15 +337,30 @@ func (f *fakeWorkloadIdentityAgentCore) ListGatewayTargets(context.Context, *bed
 func (f *fakeWorkloadIdentityAgentCore) ListWorkloadIdentities(context.Context, *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error) {
 	return &bedrockagentcorecontrol.ListWorkloadIdentitiesOutput{WorkloadIdentities: f.identities}, nil
 }
+func (f *fakeWorkloadIdentityAgentCore) ListOauth2CredentialProviders(context.Context, *bedrockagentcorecontrol.ListOauth2CredentialProvidersInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput{CredentialProviders: f.oauth2Providers}, nil
+}
+func (f *fakeWorkloadIdentityAgentCore) ListApiKeyCredentialProviders(context.Context, *bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput, ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput, error) {
+	return &bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput{CredentialProviders: f.apiKeyProviders}, nil
+}
 
 // --- CloudTrail --------------------------------------------------------------
 
 type fakeCloudTrail struct {
 	events []cttypes.Event
+	trails []cttypes.Trail
 }
 
 func (f *fakeCloudTrail) LookupEvents(context.Context, *cloudtrail.LookupEventsInput, ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error) {
 	return &cloudtrail.LookupEventsOutput{Events: f.events}, nil
+}
+
+func (f *fakeCloudTrail) DescribeTrails(context.Context, *cloudtrail.DescribeTrailsInput, ...func(*cloudtrail.Options)) (*cloudtrail.DescribeTrailsOutput, error) {
+	return &cloudtrail.DescribeTrailsOutput{TrailList: f.trails}, nil
+}
+
+func (f *fakeCloudTrail) GetTrailStatus(_ context.Context, in *cloudtrail.GetTrailStatusInput, _ ...func(*cloudtrail.Options)) (*cloudtrail.GetTrailStatusOutput, error) {
+	return &cloudtrail.GetTrailStatusOutput{IsLogging: aws.Bool(true)}, nil
 }
 
 // A direct IAM-user call is matched by name -- the one case CloudTrail's
@@ -296,6 +405,127 @@ func TestCloudTrailEventsMatchAKnownUserAndPreserveDenials(t *testing.T) {
 	}
 	if !denied || errorCode != "AccessDenied" {
 		t.Fatalf("denied=%v errorCode=%q, want a preserved denial", denied, errorCode)
+	}
+}
+
+// --- AgentCore credential providers ------------------------------------------
+
+// Granted in the role template from the start (see permissions.go's
+// "bedrock-agentcore" surface) but never called until this test: an OAuth2
+// and an API-key credential provider each land as their own subject-less
+// observation, named by the AWS action that produced them, and neither
+// blocks Lambda/ECS/EC2 reconciliation when denied.
+func TestAgentCoreCredentialProvidersAreCollectedAsEvidence(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-agentcore-credential-providers")
+	defer cleanWorkloadTables(t, db, ws)
+
+	svc, connID, run := onboardWithRun(t, db, ws)
+	evidence := services.NewObservationWriter(db, ws, connID, run.ID, run.Generation)
+	iamFake := populatedIAM()
+	snap, err := services.NewAWSIAMScanner(db, svc).WithIAMAPI(iamFake).WithEvidence(evidence).
+		Scan(context.Background(), ws, connID)
+	if err != nil {
+		t.Fatalf("iam scan: %v", err)
+	}
+
+	agentCore := &fakeWorkloadIdentityAgentCore{
+		oauth2Providers: []agentcoretypes.Oauth2CredentialProviderItem{{
+			Name:                     aws.String("google-oauth"),
+			CredentialProviderArn:    aws.String("arn:aws:bedrock-agentcore:us-east-1:491056652413:token-vault/default/oauth2credentialprovider/google-oauth"),
+			CredentialProviderVendor: agentcoretypes.CredentialProviderVendorTypeGoogleOauth2,
+		}},
+		apiKeyProviders: []agentcoretypes.ApiKeyCredentialProviderItem{{
+			Name:                  aws.String("weather-api-key"),
+			CredentialProviderArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:491056652413:token-vault/default/apikeycredentialprovider/weather-api-key"),
+		}},
+	}
+	l, e, c, p := populatedWorkloads()
+	noSleep := func(context.Context, time.Duration) error { return nil }
+	scanner := services.NewAWSWorkloadScanner(db, svc).
+		WithWorkloadAPIs(l, e, c, p).WithBedrockAPIs(nil, agentCore).
+		WithActivityAPI(&fakeActivity{}, noSleep).WithEvidence(evidence)
+	snapshot, err := scanner.ScanFromSnapshot(context.Background(), ws, snap)
+	if err != nil {
+		t.Fatalf("workload scan: %v", err)
+	}
+	if !snapshot.Complete {
+		t.Fatalf("bonus credential-provider evidence must not block reconciliation, got Complete=false errors=%v", snapshot.Errors)
+	}
+
+	var oauthName, oauthVendor string
+	if err := db.Raw(`SELECT sanitized_facts->>'name', sanitized_facts->>'vendor' FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'bedrock-agentcore:ListOauth2CredentialProviders'`, ws).
+		Row().Scan(&oauthName, &oauthVendor); err != nil {
+		t.Fatalf("oauth2 credential provider evidence not written: %v", err)
+	}
+	if oauthName != "google-oauth" || oauthVendor != "GoogleOauth2" {
+		t.Fatalf("oauth2 provider facts = name=%q vendor=%q, want google-oauth/GoogleOauth2", oauthName, oauthVendor)
+	}
+
+	var apiKeyName string
+	if err := db.Raw(`SELECT sanitized_facts->>'name' FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'bedrock-agentcore:ListApiKeyCredentialProviders'`, ws).
+		Row().Scan(&apiKeyName); err != nil {
+		t.Fatalf("api key credential provider evidence not written: %v", err)
+	}
+	if apiKeyName != "weather-api-key" {
+		t.Fatalf("api key provider facts name = %q, want weather-api-key", apiKeyName)
+	}
+}
+
+// --- CloudTrail trail status --------------------------------------------------
+
+// DescribeTrails/GetTrailStatus tell RecentEvents' silence apart from a blind
+// account. A trail visible in the region gets its config recorded under
+// cloudtrail:DescribeTrails and, separately, whether it is actually logging
+// under cloudtrail:GetTrailStatus.
+func TestCloudTrailStatusIsRecordedAsEvidence(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "ws-cloudtrail-status")
+	defer cleanWorkloadTables(t, db, ws)
+
+	svc, connID, run := onboardWithRun(t, db, ws)
+	evidence := services.NewObservationWriter(db, ws, connID, run.ID, run.Generation)
+	iamFake := populatedIAM()
+	snap, err := services.NewAWSIAMScanner(db, svc).WithIAMAPI(iamFake).WithEvidence(evidence).
+		Scan(context.Background(), ws, connID)
+	if err != nil {
+		t.Fatalf("iam scan: %v", err)
+	}
+
+	trail := &fakeCloudTrail{trails: []cttypes.Trail{{
+		Name:                       aws.String("management-events"),
+		TrailARN:                   aws.String("arn:aws:cloudtrail:us-east-1:491056652413:trail/management-events"),
+		HomeRegion:                 aws.String("us-east-1"),
+		IsMultiRegionTrail:         aws.Bool(true),
+		IncludeGlobalServiceEvents: aws.Bool(true),
+	}}}
+	l, e, c, p := populatedWorkloads()
+	scanner := services.NewAWSWorkloadScanner(db, svc).
+		WithWorkloadAPIs(l, e, c, p).WithCloudTrailAPI(trail).WithEvidence(evidence)
+	if _, err := scanner.ScanFromSnapshot(context.Background(), ws, snap); err != nil {
+		t.Fatalf("workload scan: %v", err)
+	}
+
+	var multiRegion bool
+	if err := db.Raw(`SELECT (sanitized_facts->>'is_multi_region_trail')::boolean FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'cloudtrail:DescribeTrails'`, ws).
+		Row().Scan(&multiRegion); err != nil {
+		t.Fatalf("trail config evidence not written: %v", err)
+	}
+	if !multiRegion {
+		t.Fatal("expected is_multi_region_trail=true recorded from the fake trail")
+	}
+
+	var logging bool
+	if err := db.Raw(`SELECT (sanitized_facts->>'is_logging')::boolean FROM cloud_observation
+	                    WHERE workspace_id = ? AND source_api = 'cloudtrail:GetTrailStatus'`, ws).
+		Row().Scan(&logging); err != nil {
+		t.Fatalf("trail status evidence not written: %v", err)
+	}
+	if !logging {
+		t.Fatal("expected is_logging=true recorded from the fake trail status")
 	}
 }
 

@@ -57,6 +57,16 @@ type AgentCoreAPI interface {
 	// writing into that table from here would have every workload identity
 	// deleted and recreated on every single scan.
 	ListWorkloadIdentities(ctx context.Context, in *bedrockagentcorecontrol.ListWorkloadIdentitiesInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListWorkloadIdentitiesOutput, error)
+
+	// ListOauth2CredentialProviders/ListApiKeyCredentialProviders: the
+	// credential providers an agent uses to call OUT to a third-party API --
+	// Google, Slack, an arbitrary OAuth2 vendor, or a bare API key. List-only,
+	// same as ListWorkloadIdentities: only a name, an ARN and a vendor come
+	// back, never a secret value, never the credential a provider holds.
+	// Granted in the role template from the start; this file is the first
+	// caller.
+	ListOauth2CredentialProviders(ctx context.Context, in *bedrockagentcorecontrol.ListOauth2CredentialProvidersInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListOauth2CredentialProvidersOutput, error)
+	ListApiKeyCredentialProviders(ctx context.Context, in *bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput, opts ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListApiKeyCredentialProvidersOutput, error)
 }
 
 // NewBedrockAgentClient builds a real Bedrock Agent client.
@@ -326,4 +336,89 @@ func (r *BedrockReader) WorkloadIdentities(ctx context.Context) ([]WorkloadIdent
 		}
 		next = resp.NextToken
 	}
+}
+
+// CredentialProvider is one credential provider an agent can use to call OUT
+// to a third-party API -- never a value, only enough to say the provider
+// exists and what it is for. Kind is "oauth2" or "api_key", matching which
+// of the two list calls found it; there is no reconciled table for either,
+// so like WorkloadIdentity this is recorded as evidence only.
+type CredentialProvider struct {
+	Kind      string
+	SourceAPI string
+	NativeID  string
+	Name      string
+	Vendor    string
+}
+
+// CredentialProviders lists every OAuth2 and API-key credential provider in
+// the region. A failure on one kind does not withhold the other -- they come
+// from two independent AWS calls, so an account with no OAuth2 providers
+// configured (a common, unremarkable state) must not suppress API-key
+// evidence that read just fine, and vice versa.
+func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialProvider, error) {
+	if r.agentCore == nil {
+		return nil, nil
+	}
+	var out []CredentialProvider
+	var firstErr error
+
+	var oauthNext *string
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			firstErr = fmt.Errorf("%w: oauth2 credential providers", errTooManyPages)
+			break
+		}
+		resp, err := r.agentCore.ListOauth2CredentialProviders(ctx,
+			&bedrockagentcorecontrol.ListOauth2CredentialProvidersInput{NextToken: oauthNext})
+		if err != nil {
+			firstErr = classify(err)
+			break
+		}
+		for _, p := range resp.CredentialProviders {
+			out = append(out, CredentialProvider{
+				Kind:      "oauth2",
+				SourceAPI: "bedrock-agentcore:ListOauth2CredentialProviders",
+				NativeID:  aws.ToString(p.CredentialProviderArn),
+				Name:      aws.ToString(p.Name),
+				Vendor:    string(p.CredentialProviderVendor),
+			})
+		}
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			break
+		}
+		oauthNext = resp.NextToken
+	}
+
+	var apiKeyNext *string
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w: api key credential providers", errTooManyPages)
+			}
+			break
+		}
+		resp, err := r.agentCore.ListApiKeyCredentialProviders(ctx,
+			&bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput{NextToken: apiKeyNext})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = classify(err)
+			}
+			break
+		}
+		for _, p := range resp.CredentialProviders {
+			out = append(out, CredentialProvider{
+				Kind:      "api_key",
+				SourceAPI: "bedrock-agentcore:ListApiKeyCredentialProviders",
+				NativeID:  aws.ToString(p.CredentialProviderArn),
+				Name:      aws.ToString(p.Name),
+			})
+		}
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			break
+		}
+		apiKeyNext = resp.NextToken
+	}
+
+	return out, firstErr
 }

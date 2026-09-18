@@ -1703,6 +1703,12 @@ func SetupRoutes(
 			discovery.GET("/aws/workloads", middlewares.Require("discovery", "read"), cloudAWS.ListWorkloads)
 			discovery.GET("/aws/usage", middlewares.Require("discovery", "read"), cloudAWS.ListUsage)
 
+			// Evidence: why a cloud_* row exists, or -- for a subject-less fact
+			// like an AgentCore Workload Identity -- what was observed even
+			// though nothing in inventory names it. Same read permission as
+			// every other discovery listing.
+			discovery.GET("/aws/observations", middlewares.Require("discovery", "read"), cloudAWS.ListObservations)
+
 			// GCP as a discovery channel, alongside AWS, Kubernetes and GitHub.
 			//
 			// Same boundary as the AWS block above: these endpoints ONBOARD a GCP
