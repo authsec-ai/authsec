@@ -26,8 +26,17 @@ NAMESPACE="${NAMESPACE:-authsec-prod}"
 SA="${SA:-github-deployer}"
 SECRET="${SECRET:-github-deployer-token}"
 
+# Point this at a wrapper if kubectl is not on PATH, e.g.
+#   KUBECTL=~/.claude/authsec-k3s/kubectl ./scripts/make-deployer-kubeconfig.sh
+#
+# Use this rather than adding the wrapper's directory to PATH. That directory
+# can hold a script named `ssh`, and putting it on PATH makes the wrapper
+# resolve `ssh` to ITSELF -- it recurses, appending its own arguments each
+# time, and hangs having built a multi-megabyte command line.
+KUBECTL="${KUBECTL:-kubectl}"
+
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
-need kubectl
+command -v "$KUBECTL" >/dev/null || { echo "missing: $KUBECTL" >&2; exit 1; }
 need base64
 
 # Read the Secret as YAML and pick the fields out locally.
@@ -36,7 +45,7 @@ need base64
 # as `kubectl $*`, which loses the quoting around '{.data.token}' and lets the
 # REMOTE shell brace-expand it. That fails confusingly or hangs. YAML has no
 # characters a shell wants to touch.
-secret_yaml="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o yaml)"
+secret_yaml="$("$KUBECTL" get secret "$SECRET" -n "$NAMESPACE" -o yaml)"
 field() { printf '%s\n' "$secret_yaml" | awk -v k="$1:" '$1 == k { print $2; exit }'; }
 
 token="$(field token | base64 -d)"
@@ -49,7 +58,7 @@ fi
 
 # Fail loudly rather than emitting a kubeconfig that cannot deploy. A silently
 # under-privileged credential turns into a red workflow at the worst moment.
-if ! kubectl auth can-i patch deployments \
+if ! "$KUBECTL" auth can-i patch deployments \
         -n "$NAMESPACE" \
         --as="system:serviceaccount:${NAMESPACE}:${SA}" >/dev/null; then
     echo "$SA cannot patch deployments in $NAMESPACE -- check the RoleBinding" >&2
