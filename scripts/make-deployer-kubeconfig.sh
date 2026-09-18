@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Mint the KUBECONFIG_B64 secret for .github/workflows/deploy.yml.
+#
+# Run this on a machine with cluster-admin, AFTER:
+#   kubectl apply -f deploy/github-deployer-rbac.yaml
+#
+# It prints ONE base64 line. Pipe it straight into `gh secret set` -- do not
+# paste it into a chat, a file, or a commit:
+#
+#   ./scripts/make-deployer-kubeconfig.sh | gh secret set KUBECONFIG_B64 \
+#       --repo authsec-ai/authsec
+#
+# The UI repo's deploy workflow needs the same secret:
+#
+#   ./scripts/make-deployer-kubeconfig.sh | gh secret set KUBECONFIG_B64 \
+#       --repo authsec-ai/Authsec-ui
+#
+# WHY NOT /etc/rancher/k3s/k3s.yaml: that file is cluster-admin and its server
+# is 127.0.0.1, so it is both over-privileged for CI and unusable from outside
+# the node. This produces a credential scoped to replacing an image on one
+# Deployment, pointed at the API's reachable address.
+set -euo pipefail
+
+SERVER="${SERVER:-https://37.27.104.185:6443}"
+NAMESPACE="${NAMESPACE:-authsec-prod}"
+SA="${SA:-github-deployer}"
+SECRET="${SECRET:-github-deployer-token}"
+
+need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
+need kubectl
+need base64
+
+token="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)"
+ca="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o jsonpath='{.data.ca\.crt}')"
+
+if [ -z "$token" ] || [ -z "$ca" ]; then
+    echo "token or CA empty -- has deploy/github-deployer-rbac.yaml been applied?" >&2
+    exit 1
+fi
+
+# Fail loudly rather than emitting a kubeconfig that cannot deploy. A silently
+# under-privileged credential turns into a red workflow at the worst moment.
+if ! kubectl auth can-i patch deployments \
+        -n "$NAMESPACE" \
+        --as="system:serviceaccount:${NAMESPACE}:${SA}" >/dev/null; then
+    echo "$SA cannot patch deployments in $NAMESPACE -- check the RoleBinding" >&2
+    exit 1
+fi
+
+cat <<YAML | base64 | tr -d '\n'
+apiVersion: v1
+kind: Config
+clusters:
+  - name: authsec
+    cluster:
+      server: ${SERVER}
+      certificate-authority-data: ${ca}
+contexts:
+  - name: deployer
+    context:
+      cluster: authsec
+      namespace: ${NAMESPACE}
+      user: ${SA}
+current-context: deployer
+users:
+  - name: ${SA}
+    user:
+      token: ${token}
+YAML
+echo
