@@ -46,6 +46,10 @@ type AWSPermissionScanner struct {
 	// double stands in for all of them.
 	eksAPI awsdiscovery.EKSAPI
 
+	// s3API/kmsAPI, when set, replace the real resource-policy clients.
+	s3API  awsdiscovery.S3PolicyAPI
+	kmsAPI awsdiscovery.KMSPolicyAPI
+
 	// evidence records why each permission and resource row exists. Nil writes
 	// nothing.
 	evidence *ObservationWriter
@@ -78,6 +82,15 @@ func (s *AWSPermissionScanner) WithIAMAPI(api awsdiscovery.IAMAPI) *AWSPermissio
 // assume-role.
 func (s *AWSPermissionScanner) WithEKSAPI(api awsdiscovery.EKSAPI) *AWSPermissionScanner {
 	s.eksAPI = api
+	return s
+}
+
+// WithResourcePolicyAPIs installs the S3 and KMS clients used to read
+// resource-based policies, bypassing assume-role. Either may be nil.
+func (s *AWSPermissionScanner) WithResourcePolicyAPIs(
+	s3api awsdiscovery.S3PolicyAPI, kmsapi awsdiscovery.KMSPolicyAPI,
+) *AWSPermissionScanner {
+	s.s3API, s.kmsAPI = s3api, kmsapi
 	return s
 }
 
@@ -119,6 +132,26 @@ type PermissionSnapshot struct {
 	// every identity these ARNs came from moments earlier -- and is surfaced
 	// rather than silently dropped in case it is ever not.
 	Skipped int
+
+	// resourcePolicyCandidates is every S3 bucket / KMS key this scan named,
+	// collected while writing permissions and checked afterward in
+	// scanResourcePolicies. Deferred rather than checked inline in
+	// getOrCreateResource: that call has no context to make an AWS request
+	// with, and threading one through four call sites just for this is a
+	// larger change than a second pass over a short, already-deduplicated list.
+	resourcePolicyCandidates []resourcePolicyCandidate
+}
+
+// resourcePolicyCandidate is one resource discovered while writing
+// permissions, worth checking for a resource-based policy afterward.
+type resourcePolicyCandidate struct {
+	ResourceID uuid.UUID
+	Kind       string
+	NativeID   string
+	// Name is the bucket name for an s3_bucket candidate -- GetBucketPolicy
+	// takes a bucket name, not the ARN NativeID carries. Unused for kms_key,
+	// where GetKeyPolicy accepts the ARN directly.
+	Name string
 }
 
 // ScanFromSnapshot parses the trust policies and policy documents an
@@ -196,6 +229,17 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 			out.ParseFailures+out.StatementsSkipped,
 			"policy or trust documents could not be fully read")
 	}
+
+	// Resource-based policies for the S3 buckets and KMS keys writePermissions
+	// named above. Placed after out.Complete is already decided, and reported
+	// through out.Surfaces rather than any of the named booleans that formula
+	// checks -- see resourcePolicyCandidates' doc comment: this is bonus
+	// evidence about resources this scan already wrote, with no reconciled
+	// table of its own, and a customer whose deployed role predates
+	// s3:GetBucketPolicy/kms:GetKeyPolicy must not have an otherwise-complete
+	// permission scan refuse to reconcile edges and grants over it.
+	resourcePolicyCount, resourcePolicyErr := s.scanResourcePolicies(ctx, workspaceID, snapshot.ConnectorID, out)
+	out.Surfaces["resource_policies"] = surfaceResult(resourcePolicyCount, resourcePolicyErr)
 
 	if out.Complete {
 		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
@@ -685,6 +729,11 @@ func (s *AWSPermissionScanner) getOrCreateResource(
 	if created {
 		out.ResourcesWritten++
 	}
+	if typed.Kind == "s3_bucket" || typed.Kind == "kms_key" {
+		out.resourcePolicyCandidates = append(out.resourcePolicyCandidates, resourcePolicyCandidate{
+			ResourceID: stored.ID, Kind: typed.Kind, NativeID: typed.NativeID, Name: typed.Name,
+		})
+	}
 	return stored.ID, nil
 }
 
@@ -771,6 +820,102 @@ func (s *AWSPermissionScanner) eksReaderFor(
 		return nil, err
 	}
 	return awsdiscovery.NewEKSReader(awsdiscovery.NewEKSClient(cfg)), nil
+}
+
+// resourcePolicyReaderFor mirrors eksReaderFor: an injected client wins, for
+// tests; otherwise real S3/KMS clients are built from the connector's own
+// assumed-role config. Not region-bound the way EKS is -- GetBucketPolicy and
+// GetKeyPolicy both resolve against the resource's own ARN regardless of
+// which region the client itself is signing for.
+func (s *AWSPermissionScanner) resourcePolicyReaderFor(
+	ctx context.Context, workspaceID, connectorID uuid.UUID,
+) (*awsdiscovery.ResourcePolicyReader, error) {
+	if s.s3API != nil || s.kmsAPI != nil {
+		return awsdiscovery.NewResourcePolicyReader(s.s3API, s.kmsAPI), nil
+	}
+	if s.onboarding == nil {
+		return nil, errors.New("no resource-policy client and no onboarding service to assume a role with")
+	}
+	cfg, _, err := s.onboarding.ConfigForConnector(ctx, workspaceID, connectorID, "")
+	if err != nil {
+		return nil, err
+	}
+	return awsdiscovery.NewResourcePolicyReader(
+		awsdiscovery.NewS3PolicyClient(cfg), awsdiscovery.NewKMSPolicyClient(cfg)), nil
+}
+
+// scanResourcePolicies checks every S3 bucket / KMS key writePermissions
+// named, deduplicated by native id so a bucket referenced by ten statements
+// is read once. Records each resource's policy as evidence; does not alter
+// any cloud_permission row's ConstraintState -- cross-referencing a resource
+// policy's explicit deny back into the identity-based grant it narrows is a
+// real next step this does not take, see the file header on ResourcePolicy.
+func (s *AWSPermissionScanner) scanResourcePolicies(
+	ctx context.Context, workspaceID, connectorID uuid.UUID, out *PermissionSnapshot,
+) (int, error) {
+	if len(out.resourcePolicyCandidates) == 0 {
+		return 0, nil
+	}
+	reader, err := s.resourcePolicyReaderFor(ctx, workspaceID, connectorID)
+	if err != nil {
+		return 0, err
+	}
+
+	seen := make(map[string]bool, len(out.resourcePolicyCandidates))
+	checked := 0
+	for _, c := range out.resourcePolicyCandidates {
+		if seen[c.NativeID] {
+			continue
+		}
+		seen[c.NativeID] = true
+
+		var (
+			policy awsdiscovery.ResourcePolicy
+			rerr   error
+		)
+		switch c.Kind {
+		case "s3_bucket":
+			policy, rerr = reader.BucketPolicy(ctx, c.Name)
+		case "kms_key":
+			policy, rerr = reader.KeyPolicy(ctx, c.NativeID)
+		default:
+			continue
+		}
+		if rerr != nil {
+			log.Printf("aws permission scan: resource policy for %s: %v", c.NativeID, rerr)
+			continue
+		}
+		checked++
+		if s.evidence == nil || policy.Document == "" {
+			continue
+		}
+		if werr := s.evidence.Record(
+			ResourceSubject(c.ResourceID), resourcePolicySourceAPI(c.Kind),
+			"resource_policies", "", time.Now(), c.NativeID,
+			map[string]any{
+				"kind":         c.Kind,
+				"has_deny":     policy.HasDeny,
+				"parse_failed": policy.ParseFailed,
+				"statements":   len(policy.Statements),
+			},
+		); werr != nil {
+			log.Printf("aws permission scan: resource policy evidence for %s: %v", c.NativeID, werr)
+		}
+	}
+	return checked, nil
+}
+
+// resourcePolicySourceAPI names the call each resource kind's policy came
+// from, so evidence points at something a reader can re-issue themselves.
+func resourcePolicySourceAPI(kind string) string {
+	switch kind {
+	case "s3_bucket":
+		return "s3:GetBucketPolicy"
+	case "kms_key":
+		return "kms:GetKeyPolicy"
+	default:
+		return "resource:GetPolicy"
+	}
 }
 
 // readerFor builds an IAM reader for a connector, assuming its role unless a

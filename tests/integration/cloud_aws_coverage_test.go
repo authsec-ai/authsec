@@ -92,7 +92,7 @@ func TestCoverageStatusReflectsPermissionAndWorkloadDenialsNotJustIAM(t *testing
 		t.Fatal("workload scan must not report complete with Lambda denied")
 	}
 
-	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage,
+	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage, models.SurfaceCoverage{},
 		nil, permSnap.Surfaces, nil, workloadSnap.Surfaces)
 
 	final := connectorCoverage(t, db, ws, connID)
@@ -154,7 +154,7 @@ func TestCoverageStatusCompleteWhenAllThreeScansSucceed(t *testing.T) {
 		t.Fatalf("test setup: workload scan should be complete: %+v", workloadSnap)
 	}
 
-	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage,
+	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage, models.SurfaceCoverage{},
 		nil, permSnap.Surfaces, nil, workloadSnap.Surfaces)
 
 	final := connectorCoverage(t, db, ws, connID)
@@ -213,7 +213,7 @@ func TestCoverageRecordsWhollyFailedSubScan(t *testing.T) {
 	}
 
 	// Must not panic on a nil Surfaces map from the failed permission scan.
-	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage,
+	iamScanner.FinalizeCoverage(ws, connID, snap.Coverage, models.SurfaceCoverage{},
 		permErr, nil, nil, workloadSnap.Surfaces)
 
 	final := connectorCoverage(t, db, ws, connID)

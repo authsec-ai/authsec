@@ -43,13 +43,14 @@ type AWSWorkloadScanner struct {
 	// every region.
 	evidence *ObservationWriter
 
-	lambdaAPI    awsdiscovery.LambdaAPI
-	ecsAPI       awsdiscovery.ECSAPI
-	ec2API       awsdiscovery.EC2API
-	profileAPI   awsdiscovery.InstanceProfileAPI
-	bedrockAPI   awsdiscovery.BedrockAgentAPI
-	agentCoreAPI awsdiscovery.AgentCoreAPI
-	activityAPI  awsdiscovery.ServiceLastAccessedAPI
+	lambdaAPI     awsdiscovery.LambdaAPI
+	ecsAPI        awsdiscovery.ECSAPI
+	ec2API        awsdiscovery.EC2API
+	profileAPI    awsdiscovery.InstanceProfileAPI
+	bedrockAPI    awsdiscovery.BedrockAgentAPI
+	agentCoreAPI  awsdiscovery.AgentCoreAPI
+	cloudTrailAPI awsdiscovery.CloudTrailAPI
+	activityAPI   awsdiscovery.ServiceLastAccessedAPI
 	// activitySleep replaces the polling delay, so a test does not wait.
 	activitySleep func(context.Context, time.Duration) error
 }
@@ -79,6 +80,12 @@ func (s *AWSWorkloadScanner) WithBedrockAPIs(
 	b awsdiscovery.BedrockAgentAPI, c awsdiscovery.AgentCoreAPI,
 ) *AWSWorkloadScanner {
 	s.bedrockAPI, s.agentCoreAPI = b, c
+	return s
+}
+
+// WithCloudTrailAPI installs the CloudTrail client for every region.
+func (s *AWSWorkloadScanner) WithCloudTrailAPI(c awsdiscovery.CloudTrailAPI) *AWSWorkloadScanner {
+	s.cloudTrailAPI = c
 	return s
 }
 
@@ -162,16 +169,6 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 		}
 	}
 
-	// Surfaces the role is granted but no collector reads. Naming them here is
-	// what stops a gap in AuthSec reading as a gap in the customer's account --
-	// the CloudFormation template asks for CloudTrail and nothing calls it.
-	for _, surface := range uncollectedSurfaces() {
-		out.Surfaces[surface.name] = models.SurfaceCoverage{
-			State: models.CloudCoverageUnsupported,
-			Error: surface.why,
-		}
-	}
-
 	// ---- activity, which is global because IAM is -------------------------
 	s.scanActivity(ctx, workspaceID, snapshot, out)
 	if activityErr, failed := out.Errors["activity"]; failed {
@@ -224,29 +221,6 @@ func unselectedRegions(selected []string) []string {
 	return out
 }
 
-// uncollectedSurfaces names what the discovery role is granted and no collector
-// calls. Each entry is a promise the product is not keeping, stated where a
-// customer can see it rather than left to a reader of the template.
-func uncollectedSurfaces() []struct{ name, why string } {
-	return []struct{ name, why string }{
-		{"cloudtrail_events",
-			"granted in the role template; no collector calls it. Activity is " +
-				"Access-Advisor attempts, which include denied ones."},
-		{"agentcore_gateways",
-			"ListGateways and ListGatewayTargets are granted; no collector " +
-				"calls them, so the agent tool-path segment is absent."},
-		{"agentcore_workload_identities",
-			"ListWorkloadIdentities is granted; no collector calls it."},
-		{"iam_credential_report",
-			"GenerateCredentialReport and GetCredentialReport are granted; no " +
-				"collector calls them."},
-		{"resource_policies",
-			"bucket and key policies are not read at all, so a resource policy " +
-				"denying an action is invisible and a grant it blocks still " +
-				"reads as access."},
-	}
-}
-
 // scanRegion reads every compute surface in one region.
 //
 // Each surface is independent: a denied ECS read must not cost the Lambda
@@ -256,26 +230,27 @@ func (s *AWSWorkloadScanner) scanRegion(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, out *WorkloadSnapshot,
 ) {
-	cfgFor := func() (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI, awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI, awsdiscovery.AgentCoreAPI, error) {
+	cfgFor := func() (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI, awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI, awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI, error) {
 		// Injected clients win, and stand in for every region.
 		if s.lambdaAPI != nil || s.ecsAPI != nil || s.ec2API != nil ||
-			s.bedrockAPI != nil || s.agentCoreAPI != nil {
-			return s.lambdaAPI, s.ecsAPI, s.ec2API, s.profileAPI, s.bedrockAPI, s.agentCoreAPI, nil
+			s.bedrockAPI != nil || s.agentCoreAPI != nil || s.cloudTrailAPI != nil {
+			return s.lambdaAPI, s.ecsAPI, s.ec2API, s.profileAPI, s.bedrockAPI, s.agentCoreAPI, s.cloudTrailAPI, nil
 		}
 		if s.onboarding == nil {
-			return nil, nil, nil, nil, nil, nil,
+			return nil, nil, nil, nil, nil, nil, nil,
 				errors.New("no compute clients and no onboarding service to assume a role with")
 		}
 		cfg, _, err := s.onboarding.ConfigForConnector(ctx, workspaceID, snapshot.ConnectorID, region)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		return awsdiscovery.NewLambdaClient(cfg), awsdiscovery.NewECSClient(cfg),
 			awsdiscovery.NewEC2Client(cfg), awsdiscovery.NewInstanceProfileClient(cfg),
-			awsdiscovery.NewBedrockAgentClient(cfg), awsdiscovery.NewAgentCoreClient(cfg), nil
+			awsdiscovery.NewBedrockAgentClient(cfg), awsdiscovery.NewAgentCoreClient(cfg),
+			awsdiscovery.NewCloudTrailClient(cfg), nil
 	}
 
-	l, e, c, p, b, ac, err := cfgFor()
+	l, e, c, p, b, ac, ct, err := cfgFor()
 	if err != nil {
 		out.Errors["compute:"+region] = err.Error()
 		// Nothing in this region was even attempted -- one surface entry
@@ -289,6 +264,7 @@ func (s *AWSWorkloadScanner) scanRegion(
 
 	compute := awsdiscovery.NewWorkloadReader(l, e, c, p)
 	bedrock := awsdiscovery.NewBedrockReader(b, ac)
+	trail := awsdiscovery.NewCloudTrailReader(ct)
 
 	surfaces := []struct {
 		name string
@@ -310,7 +286,7 @@ func (s *AWSWorkloadScanner) scanRegion(
 			// worth recording -- the surface is marked unread either way.
 		}
 		for _, w := range found {
-			if werr := s.recordWorkload(workspaceID, snapshot, region, w, out); werr != nil {
+			if _, werr := s.recordWorkload(workspaceID, snapshot, region, w, out); werr != nil {
 				out.Errors[key] = werr.Error()
 				err = werr
 				break
@@ -318,14 +294,176 @@ func (s *AWSWorkloadScanner) scanRegion(
 		}
 		out.Surfaces[key] = surfaceResult(len(found), err)
 	}
+
+	s.scanGateways(ctx, workspaceID, snapshot, region, bedrock, out)
+	s.scanWorkloadIdentities(ctx, workspaceID, snapshot, region, bedrock, out)
+	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
+}
+
+// scanGateways reads AgentCore Gateways and their targets. Gateways are
+// written to cloud_workload through the same recordWorkload path as Lambda,
+// ECS, EC2 and the other managed-agent surfaces; targets have no identity or
+// reconciled table of their own (see the GatewayTarget doc comment), so they
+// are recorded as evidence under the gateway's own workload row instead.
+func (s *AWSWorkloadScanner) scanGateways(
+	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
+) {
+	key := "agentcore-gateways:" + region
+	workloads, targets, err := bedrock.Gateways(ctx)
+	if err != nil {
+		out.Errors[key] = err.Error()
+	}
+
+	targetsByGateway := make(map[string][]awsdiscovery.GatewayTarget, len(targets))
+	for _, t := range targets {
+		targetsByGateway[t.GatewayNativeID] = append(targetsByGateway[t.GatewayNativeID], t)
+	}
+
+	for _, w := range workloads {
+		stored, werr := s.recordWorkload(workspaceID, snapshot, region, w, out)
+		if werr != nil {
+			out.Errors[key] = werr.Error()
+			err = werr
+			continue
+		}
+		if s.evidence == nil || stored == nil {
+			continue
+		}
+		for _, t := range targetsByGateway[w.NativeID] {
+			if rerr := s.evidence.Record(
+				WorkloadSubject(stored.ID), "bedrock-agentcore:ListGatewayTargets",
+				key, "", time.Now(), t.TargetID,
+				map[string]any{
+					"gateway_native_id": t.GatewayNativeID,
+					"target_id":         t.TargetID,
+					"name":              t.Name,
+					"status":            t.Status,
+				},
+			); rerr != nil {
+				log.Printf("aws workload scan: gateway target evidence for %s: %v", t.TargetID, rerr)
+			}
+		}
+	}
+	out.Surfaces[key] = surfaceResult(len(workloads), err)
+}
+
+// scanWorkloadIdentities reads AgentCore's own workload identities and
+// records each as evidence, not as a cloud_identity row -- see
+// AgentCoreAPI.ListWorkloadIdentities for why writing into that table from
+// here would fight IAM scanning's own reconciliation of it.
+func (s *AWSWorkloadScanner) scanWorkloadIdentities(
+	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
+) {
+	// Deliberately not written to out.Errors, which gates out.Complete below
+	// and therefore ReconcileGeneration for cloud_workload/cloud_usage: this
+	// surface is bonus evidence with no reconciled table of its own, and a
+	// customer whose deployed role predates this permission must not have
+	// their otherwise-complete Lambda/ECS/EC2 scan refuse to age out stale
+	// rows over a surface those rows have nothing to do with.
+	key := "agentcore-workload-identities:" + region
+	identities, err := bedrock.WorkloadIdentities(ctx)
+	if s.evidence != nil {
+		for _, wi := range identities {
+			if wi.NativeID == "" {
+				continue
+			}
+			// No ObservationSubject constructor fits: a workload identity is
+			// not an IAM identity, permission, resource or workload row.
+			// ObservationSubject's zero value -- every field nil -- is exactly
+			// the "at most one, possibly none" shape D3 relaxed the subject
+			// check to allow, used here deliberately rather than as the
+			// after-the-fact result of a subject being reconciled away.
+			//
+			// The dedupe index is keyed on COALESCE(subject columns), and
+			// Postgres never treats two NULLs as equal for uniqueness -- so
+			// every subject-less row here is a fresh insert every scan rather
+			// than a confirmed re-read. Accepted for now: the account-wide
+			// count of these is small, and giving subject-less evidence its
+			// own dedupe key is a real design question this fix does not
+			// have to answer to make the surface collected.
+			if rerr := s.evidence.Record(
+				ObservationSubject{}, "bedrock-agentcore:ListWorkloadIdentities",
+				key, "", time.Now(), wi.NativeID,
+				map[string]any{"name": wi.Name, "arn": wi.NativeID},
+			); rerr != nil {
+				log.Printf("aws workload scan: workload identity evidence for %s: %v", wi.NativeID, rerr)
+			}
+		}
+	}
+	out.Surfaces[key] = surfaceResult(len(identities), err)
+}
+
+// scanCloudTrail reads recent management events and records each as evidence
+// against the identity it best-effort matches, per the caveats on
+// CloudTrailReader.RecentEvents. Events that match nothing recorded are
+// still counted in the surface's total -- the read succeeded even where the
+// match did not -- but are not written as evidence with no subject, since
+// evidence with nothing to be evidence FOR is not useful evidence.
+func (s *AWSWorkloadScanner) scanCloudTrail(
+	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
+) {
+	// Not written to out.Errors -- same reasoning as scanWorkloadIdentities
+	// just above: bonus evidence, no reconciled table, must not block
+	// Lambda/ECS/EC2's own otherwise-complete reconciliation.
+	key := "cloudtrail-events:" + region
+	events, err := trail.RecentEvents(ctx)
+	if s.evidence != nil && len(events) > 0 {
+		// Matched by NAME, not NativeID: CloudTrail's Username is the IAM
+		// user's bare name for a direct IAM-user call, never the identity's
+		// ARN -- matching against NativeID, as every other reader in this
+		// package keys identities, would never hit even the one case this
+		// CAN confidently resolve. It still will not match an assumed-role
+		// call, where Username is a session name -- see the file header.
+		//
+		// Bounded to 500 identities (clampLimit's own ceiling): matching
+		// against every identity a large account has is this function's job,
+		// not a reason to add pagination to a best-effort join.
+		byName := make(map[string]models.CloudIdentity)
+		if identities, _, ierr := s.identities.ListIdentities(workspaceID,
+			repositories.CloudIdentityFilter{ConnectorID: &snapshot.ConnectorID, Limit: 500}); ierr == nil {
+			for _, id := range identities {
+				if id.Name != "" {
+					byName[id.Name] = id
+				}
+			}
+		}
+		for _, e := range events {
+			identity, matched := byName[e.Username]
+			if !matched {
+				// No confident match. Recorded in the surface's count above,
+				// not as an orphaned observation -- see the function comment.
+				continue
+			}
+			if rerr := s.evidence.Record(
+				IdentitySubject(identity.ID), "cloudtrail:LookupEvents",
+				key, "", e.EventTime, identity.NativeID,
+				map[string]any{
+					"event_id":     e.EventID,
+					"event_name":   e.EventName,
+					"event_source": e.EventSource,
+					"username":     e.Username,
+					"denied":       e.Denied,
+					"error_code":   e.ErrorCode,
+				},
+			); rerr != nil {
+				log.Printf("aws workload scan: cloudtrail evidence for %s: %v", e.EventID, rerr)
+			}
+		}
+	}
+	out.Surfaces[key] = surfaceResult(len(events), err)
 }
 
 // recordWorkload writes one workload, attributing it to a discovered identity
-// where possible.
+// where possible. Returns the stored row so a caller with more evidence to
+// attach under the same subject -- a gateway's targets, say -- does not have
+// to re-fetch it.
 func (s *AWSWorkloadScanner) recordWorkload(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, region string,
 	w awsdiscovery.Workload, out *WorkloadSnapshot,
-) error {
+) (*models.CloudWorkload, error) {
 
 	workload := &models.CloudWorkload{
 		WorkspaceID:        workspaceID,
@@ -357,18 +495,18 @@ func (s *AWSWorkloadScanner) recordWorkload(
 			attrs.UnresolvedRoleARN = w.RoleARN
 			out.Unattributed++
 		default:
-			return err
+			return nil, err
 		}
 	} else {
 		out.Unattributed++
 	}
 
 	if err := workload.SetAWSAttrs(attrs); err != nil {
-		return err
+		return nil, err
 	}
 	stored, _, err := s.workloads.UpsertWorkload(workload)
 	if err != nil {
-		return fmt.Errorf("record workload %s: %w", w.NativeID, err)
+		return nil, fmt.Errorf("record workload %s: %w", w.NativeID, err)
 	}
 	out.WorkloadsWritten++
 
@@ -395,7 +533,7 @@ func (s *AWSWorkloadScanner) recordWorkload(
 		}
 	}
 	out.ByKind[w.RuntimeKind]++
-	return nil
+	return stored, nil
 }
 
 // WithEvidence attaches an observation writer for this run.
