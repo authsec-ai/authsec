@@ -29,10 +29,21 @@ type CloudObservation struct {
 	ScanRunID  uuid.UUID `json:"scan_run_id" gorm:"type:uuid;not null"`
 	Generation int       `json:"generation" gorm:"not null"`
 
+	// These four are SET NULL, not CASCADE: reconciliation hard-deletes stale
+	// inventory by generation, and this evidence must outlive that delete
+	// rather than vanish with it. At most one is set -- never exactly one --
+	// because a legitimately reconciled-away subject leaves all four null.
 	IdentityID   *uuid.UUID `json:"identity_id,omitempty" gorm:"type:uuid"`
 	PermissionID *uuid.UUID `json:"permission_id,omitempty" gorm:"type:uuid"`
 	ResourceID   *uuid.UUID `json:"resource_id,omitempty" gorm:"type:uuid"`
 	WorkloadID   *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
+
+	// SubjectNativeID is the AWS-native id (ARN, role name, ...) captured at
+	// write time. It is what keeps this row legible as "evidence for X" after
+	// the subject FK above is SET NULL by a later reconciliation delete --
+	// without it, an orphaned observation would say nothing at all about what
+	// it once was evidence for.
+	SubjectNativeID string `json:"subject_native_id" gorm:"not null"`
 
 	// SourceAPI is the AWS call, e.g. "iam:GetRole". Named as the API rather
 	// than as our own surface so a reader can go and make the same call.
@@ -55,6 +66,19 @@ type CloudObservation struct {
 	// ContentHash is of SanitizedFacts, computed AFTER redaction — see
 	// services.HashObservation for why the order matters.
 	ContentHash string `json:"content_hash" gorm:"not null"`
+
+	// LastConfirmedRunID/At record the most recent run that re-read this exact
+	// fact without it changing. The dedupe index (022) means a re-read like
+	// that writes no new row, which used to mean it left no trace at all --
+	// reconciliation could not tell "confirmed again today" from "not looked
+	// at since it was first written". ObservationWriter.Record updates these on
+	// the conflict path instead of doing nothing.
+	LastConfirmedRunID *uuid.UUID `json:"last_confirmed_run_id,omitempty" gorm:"type:uuid"`
+	LastConfirmedAt    *time.Time `json:"last_confirmed_at,omitempty"`
+	// ConfirmationCount is a floor on how many runs have seen this fact, not a
+	// full history -- the history is ScanRunID plus every run that later
+	// touched LastConfirmedRunID, which this table does not enumerate.
+	ConfirmationCount int `json:"confirmation_count" gorm:"not null;default:1"`
 }
 
 func (CloudObservation) TableName() string { return "cloud_observation" }

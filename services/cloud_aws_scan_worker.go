@@ -185,8 +185,19 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 	if err := w.runs.Publish(run.ID, w.owner, run.LeaseVersion); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
-	scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
+	merged := scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
 		permErr, permSurfaces, workloadErr, workloadSurfaces)
+
+	// Stamped onto this run specifically, not only the connector: the
+	// connector's coverage column is overwritten by whatever scan runs next,
+	// so it can only ever answer for the newest one. A reader asking whether
+	// THIS run licensed reconciliation must be able to read this run's own
+	// report regardless of what has scanned since. Best effort, like
+	// persistCoverage above it -- losing this write must not undo a
+	// publication that already succeeded.
+	if err := w.runs.SetCoverage(run.ID, merged); err != nil {
+		log.Printf("aws scan run %s: could not stamp per-run coverage: %v", run.ID, err)
+	}
 
 	written, skipped := evidence.Counts()
 	log.Printf("aws scan run %s published: evidence %d new, %d unchanged",

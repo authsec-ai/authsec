@@ -511,7 +511,7 @@ func (s *AWSIAMScanner) recordIdentityEvidence(
 	}
 	return s.evidence.Record(
 		IdentitySubject(stored.ID), api, surface, s.evidenceSurfaceState(surface),
-		observed,
+		observed, stored.NativeID,
 		map[string]any{
 			"kind":                     identity.Kind,
 			"native_id":                identity.NativeID,
@@ -644,11 +644,17 @@ func (s *AWSIAMScanner) persistCoverage(workspaceID, connectorID uuid.UUID, cove
 //
 // It never moves the generation. Scan() already advanced it; this only
 // corrects what is filed under that same generation.
+//
+// Returns the merged report so the caller can also stamp it onto the specific
+// cloud_scan_run that produced it (CloudScanRunRepository.SetCoverage). That
+// per-run copy, not this method's write to the connector, is what a reader
+// must consult to ask "was THIS run complete" -- the connector's copy is
+// overwritten by whatever scan runs next and answers only for the newest one.
 func (s *AWSIAMScanner) FinalizeCoverage(
 	workspaceID, connectorID uuid.UUID, iamCoverage models.ScanCoverage,
 	permErr error, permSurfaces map[string]models.SurfaceCoverage,
 	workloadErr error, workloadSurfaces map[string]models.SurfaceCoverage,
-) {
+) models.ScanCoverage {
 	merged := models.ScanCoverage{
 		Generation: iamCoverage.Generation,
 		StartedAt:  iamCoverage.StartedAt,
@@ -691,6 +697,7 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	// calls FinalizeCoverage); every path that does call this has a
 	// commitScan-produced complete/partial status to refine, never failed.
 	s.persistCoverage(workspaceID, connectorID, merged)
+	return merged
 }
 
 // surfaceResult turns a read's outcome into a coverage entry.

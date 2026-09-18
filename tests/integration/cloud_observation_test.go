@@ -102,9 +102,10 @@ func TestAnUnchangedRereadWritesNoNewEvidence(t *testing.T) {
 	w := services.NewObservationWriter(db, ws, conn, run.ID, run.Generation)
 	facts := map[string]any{"kind": "iam_role", "name": "SharedToolRole"}
 
+	nativeID := "arn:aws:iam::491056652413:role/SharedToolRole-" + identityID.String()[:8]
 	for i := 0; i < 3; i++ {
 		if err := w.Record(services.IdentitySubject(identityID), "iam:GetRole",
-			models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(), facts); err != nil {
+			models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(), nativeID, facts); err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
 	}
@@ -142,13 +143,14 @@ func TestChangedFactsProduceNewEvidence(t *testing.T) {
 	}
 
 	w := services.NewObservationWriter(db, ws, conn, run.ID, run.Generation)
+	nativeID := "arn:aws:iam::491056652413:role/R-" + identityID.String()[:8]
 	_ = w.Record(services.IdentitySubject(identityID), "iam:GetRole",
-		models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(),
+		models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(), nativeID,
 		map[string]any{"permissions_boundary_arn": ""})
 	// The customer attaches a boundary. That is a different fact and must be
 	// recorded, not absorbed as a duplicate.
 	_ = w.Record(services.IdentitySubject(identityID), "iam:GetRole",
-		models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(),
+		models.SurfaceIAMRoles, models.CloudCoverageReached, time.Now(), nativeID,
 		map[string]any{"permissions_boundary_arn": "arn:aws:iam::491056652413:policy/B01"})
 
 	var count int64
@@ -168,7 +170,7 @@ func TestEvidenceWithoutARunIsNotWritten(t *testing.T) {
 	if w != nil {
 		t.Fatal("a writer with no run should be nil")
 	}
-	if err := w.Record(services.IdentitySubject(uuid.New()), "iam:GetRole", "", "", time.Now(), nil); err != nil {
+	if err := w.Record(services.IdentitySubject(uuid.New()), "iam:GetRole", "", "", time.Now(), "", nil); err != nil {
 		t.Fatalf("a nil writer must be safe to call: %v", err)
 	}
 }

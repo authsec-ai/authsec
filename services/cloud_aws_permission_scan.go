@@ -629,7 +629,7 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 				if err := s.evidence.Record(
 					PermissionSubject(stored.ID),
 					policySourceAPI(source), models.SurfaceIAMPolicies, "",
-					time.Now(),
+					time.Now(), nativeID,
 					map[string]any{
 						"source":           source,
 						"statement_index":  stmt.Index,
