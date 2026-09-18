@@ -34,7 +34,23 @@ issuance, and the ORY Hydra boundary.
 - Migrations run at backend startup and are verified through `migration_logs`.
 - Use expand → backfill → contract for removals, renames, type changes, and new
   `NOT NULL` constraints.
+- Rehearse against a **production schema dump**, never a fresh bootstrap. A green
+  run on a fresh bootstrap proves nothing about production — migration `023`
+  exists only because that rehearsal caught columns added to `001_bootstrap.sql`
+  with no numbered migration.
 - Follow [`../.claude/commands/schema-change.md`](../.claude/commands/schema-change.md).
+
+## Agentic IGA
+
+- Migration head is **`024`**; the next Phase 2 migration is `025`.
+- Phase 2 status, and the corrections to the spec that reality has outrun, are in
+  [`docs/iga-phase2-verified-state.md`](docs/iga-phase2-verified-state.md).
+  Read it before trusting any Phase 2 document's present tense.
+- Invariants that are not style preferences: coverage is a state, never a
+  percentage; `stale` is not `ended`; a configured path is not proven access;
+  conditions are recorded, never evaluated; redact before hashing;
+  `(kind, uuid)` is not a foreign key; leases fence on a version, never a clock;
+  no secrets, ever; the discovery role never writes.
 
 ## Production deployment
 
