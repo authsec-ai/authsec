@@ -30,8 +30,17 @@ need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need kubectl
 need base64
 
-token="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)"
-ca="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o jsonpath='{.data.ca\.crt}')"
+# Read the Secret as YAML and pick the fields out locally.
+#
+# NOT jsonpath: this may be driven through a wrapper that shells out over ssh
+# as `kubectl $*`, which loses the quoting around '{.data.token}' and lets the
+# REMOTE shell brace-expand it. That fails confusingly or hangs. YAML has no
+# characters a shell wants to touch.
+secret_yaml="$(kubectl get secret "$SECRET" -n "$NAMESPACE" -o yaml)"
+field() { printf '%s\n' "$secret_yaml" | awk -v k="$1:" '$1 == k { print $2; exit }'; }
+
+token="$(field token | base64 -d)"
+ca="$(field ca.crt)"
 
 if [ -z "$token" ] || [ -z "$ca" ]; then
     echo "token or CA empty -- has deploy/github-deployer-rbac.yaml been applied?" >&2
