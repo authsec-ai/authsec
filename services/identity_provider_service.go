@@ -111,6 +111,16 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 
 	vaultPath := config.WorkspaceIDPSecretPath(req.WorkspaceID.String(), models.IdentityProviderOIDC, providerName)
 
+	// Store the secret BEFORE creating the rows. A provider row whose secret
+	// never landed is not a usable provider — it authenticates nobody and the
+	// failure only surfaces later, at a user's login. Fail the request instead.
+	if err := config.SaveWorkspaceIDPSecret(req.WorkspaceID.String(), models.IdentityProviderOIDC, providerName,
+		map[string]interface{}{"client_secret": req.ClientSecret}); err != nil {
+		log.Printf("ERROR: Vault secret write failed for IDP %s/%s (provider NOT created): %v",
+			req.WorkspaceID, providerName, err)
+		return nil, fmt.Errorf("failed to store client secret in Vault: %w", err)
+	}
+
 	var idp models.IdentityProvider
 	txErr := s.db.Transaction(func(tx *gorm.DB) error {
 		wsID := req.WorkspaceID
@@ -148,16 +158,6 @@ func (s *IdentityProviderService) CreateOIDC(req CreateOIDCIDPRequest) (*models.
 	})
 	if txErr != nil {
 		return nil, txErr
-	}
-
-	// Vault write — best-effort. Known platform providers (google, microsoft)
-	// fall back to env vars via getClientSecret(), so Vault is not mandatory
-	// for them. Custom providers will log a warning and the admin can retry
-	// by updating the provider once Vault is available.
-	if err := config.SaveWorkspaceIDPSecret(req.WorkspaceID.String(), models.IdentityProviderOIDC, providerName,
-		map[string]interface{}{"client_secret": req.ClientSecret}); err != nil {
-		log.Printf("WARN: Vault secret write failed for IDP %s/%s (provider created, secret may use env fallback): %v",
-			req.WorkspaceID, providerName, err)
 	}
 
 	return &idp, nil

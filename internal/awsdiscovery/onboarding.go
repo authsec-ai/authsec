@@ -38,10 +38,11 @@ var CloudFormationTemplate string
 // find the accounts still running an older stack instead of debugging a
 // mysterious AccessDenied.
 //
-// Bumped by ticket [2], which adds iam:ListOpenIDConnectProviders.
+// Bumped by ticket [2], which adds iam:ListOpenIDConnectProviders. Bumped
+// again to add s3:GetBucketPolicy/kms:GetKeyPolicy for resource-policy reads.
 //
 // Must match the TemplateVersion output in the YAML.
-const TemplateVersion = "2026-09-08"
+const TemplateVersion = "2026-09-18"
 
 // maxRetryAttempts bounds the SDK's built-in backoff. Above the SDK default of
 // 3 because IAM and CloudTrail throttle readily on a large account and a scan

@@ -217,16 +217,53 @@ func (w *ObservationWriter) Record(
 		ConfirmationCount:  1,
 	}
 
-	// The conflict target repeats uq_cloud_observation_dedupe's own definition
-	// (022) rather than naming it: that index is on an EXPRESSION --
-	// COALESCE(identity_id, permission_id, resource_id, workload_id) -- and
-	// Postgres cannot convert an expression index into a named UNIQUE
-	// constraint, so ON CONFLICT ON CONSTRAINT is not available here. The
-	// COALESCE entry sets Raw: true so GORM emits it verbatim; without that it
-	// quotes every Column.Name as a plain identifier, which would turn the
-	// expression into a single invalid, literally-quoted column name instead
-	// of the function call Postgres needs to match the index.
+	// Two different unique indexes back this dedupe, and the row being written
+	// decides which one applies. uq_cloud_observation_dedupe (022) is keyed on
+	// COALESCE(identity_id, permission_id, resource_id, workload_id) -- correct
+	// for the four ordinary subjects, but COALESCE over four NULLs is NULL, and
+	// Postgres never treats two NULLs as equal for uniqueness. A subject-less
+	// row (AgentCore Workload Identities today -- see the ObservationSubject
+	// caller in scanWorkloadIdentities) would insert a fresh row every scan
+	// under that index regardless of content. uq_cloud_observation_dedupe_no_subject
+	// (025) is the fix: a partial index scoped to exactly the rows the first
+	// one cannot dedupe.
 	//
+	// Neither is named ON CONSTRAINT: the first is on an EXPRESSION
+	// (COALESCE(...)), which Postgres cannot convert into a named UNIQUE
+	// constraint, so both targets are repeated by column list instead, same as
+	// each other for consistency. The COALESCE entry sets Raw: true so GORM
+	// emits it verbatim; without that it quotes every Column.Name as a plain
+	// identifier, turning the expression into a single invalid, literally-quoted
+	// column name instead of the function call Postgres needs to match the index.
+	hasSubject := subject.IdentityID != nil || subject.PermissionID != nil ||
+		subject.ResourceID != nil || subject.WorkloadID != nil
+
+	conflict := clause.OnConflict{
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"last_confirmed_run_id": w.runID,
+			"last_confirmed_at":     now,
+			"confirmation_count":    gorm.Expr("cloud_observation.confirmation_count + 1"),
+		}),
+	}
+	if hasSubject {
+		conflict.Columns = []clause.Column{
+			{Name: "workspace_id"},
+			{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id)", Raw: true},
+			{Name: "source_api"},
+			{Name: "content_hash"},
+		}
+	} else {
+		conflict.Columns = []clause.Column{
+			{Name: "workspace_id"}, {Name: "source_api"}, {Name: "content_hash"},
+		}
+		// Matching a PARTIAL index requires the inference clause to repeat its
+		// predicate -- Postgres will not infer a partial index from the column
+		// list alone.
+		conflict.TargetWhere = clause.Where{Exprs: []clause.Expression{clause.Expr{
+			SQL: "identity_id IS NULL AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL",
+		}}}
+	}
+
 	// Insert vs. confirm-only is told apart the same way UpsertWorkload and
 	// friends already do it elsewhere in this package: propose an id, ask for
 	// it back with Returning, and compare. On conflict, Postgres returns the
@@ -235,22 +272,7 @@ func (w *ObservationWriter) Record(
 	proposed := uuid.New()
 	obs.ID = proposed
 
-	res := w.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "workspace_id"},
-				{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id)", Raw: true},
-				{Name: "source_api"},
-				{Name: "content_hash"},
-			},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"last_confirmed_run_id": w.runID,
-				"last_confirmed_at":     now,
-				"confirmation_count":    gorm.Expr("cloud_observation.confirmation_count + 1"),
-			}),
-		},
-		clause.Returning{},
-	).Create(obs)
+	res := w.db.Clauses(conflict, clause.Returning{}).Create(obs)
 	if res.Error != nil {
 		return fmt.Errorf("record observation (%s): %w", sourceAPI, res.Error)
 	}

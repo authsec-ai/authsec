@@ -765,6 +765,74 @@ func (ctl *CloudAWSController) ListUsage(c *gin.Context) {
 	})
 }
 
+// ListObservations handles GET /authsec/discovery/aws/observations.
+//
+// The read path for evidence: why a cloud_* row exists, or -- for a
+// subject-less fact like an AgentCore Workload Identity -- what was observed
+// even though nothing in inventory names it. Filterable by exactly one
+// subject (identity_id, permission_id, resource_id or workload_id) and by
+// source_api, which is how CloudTrail activity, credential-report facts and
+// resource-policy denies are told apart from each other and from everything
+// else a scan recorded against the same subject.
+//
+// No connector_id filter: an observation already carries connector_id, but a
+// caller asking "why do I believe this identity/resource/workload" has
+// already picked the row and therefore already knows which connector it
+// came from. Adding the filter would duplicate what the subject filter
+// already narrows to.
+func (ctl *CloudAWSController) ListObservations(c *gin.Context) {
+	workspaceID, _, err := ctl.workspaceAndActor(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	identityID, err := parseOptionalUUID(c.Query("identity_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid identity_id"})
+		return
+	}
+	permissionID, err := parseOptionalUUID(c.Query("permission_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid permission_id"})
+		return
+	}
+	resourceID, err := parseOptionalUUID(c.Query("resource_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource_id"})
+		return
+	}
+	workloadID, err := parseOptionalUUID(c.Query("workload_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workload_id"})
+		return
+	}
+	filter := repositories.CloudObservationFilter{
+		IdentityID:   identityID,
+		PermissionID: permissionID,
+		ResourceID:   resourceID,
+		WorkloadID:   workloadID,
+		SourceAPI:    c.Query("source_api"),
+		Limit:        atoiDefault(c.Query("limit"), 100),
+		Offset:       atoiDefault(c.Query("offset"), 0),
+	}
+	rows, total, err := repositories.NewCloudObservationRepository(ctl.db).ListObservations(workspaceID, filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows,
+		"meta": gin.H{
+			"as_of": time.Now().UTC(), "total": total,
+			"limit": filter.Limit, "offset": filter.Offset,
+			"note": "sanitized_facts is what AWS said, after redaction -- never a raw " +
+				"response, and never a secret value. A row with every subject column " +
+				"null is not an error: it is evidence with no inventory row to attach " +
+				"to, such as an AgentCore Workload Identity.",
+		},
+	})
+}
+
 func parseOptionalUUID(raw string) (*uuid.UUID, error) {
 	if raw == "" {
 		return nil, nil

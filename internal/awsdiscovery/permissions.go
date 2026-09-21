@@ -133,6 +133,18 @@ func AdditionalPermissions() []Permission {
 			Why: "Reads per-identity API history for liveness and agent " +
 				"classification.",
 		},
+		{
+			Surface: "resource-policies",
+			Actions: []string{
+				"s3:GetBucketPolicy",
+				"kms:GetKeyPolicy",
+			},
+			Why: "Reads the policy DOCUMENT a bucket or key carries, never its " +
+				"data or key material. Needed because an identity-based Allow " +
+				"can be overridden by a resource-based Deny that this scanner " +
+				"would otherwise never see -- reporting access as granted when " +
+				"the resource itself blocks it.",
+		},
 	}
 }
 
