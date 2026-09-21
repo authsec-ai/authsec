@@ -10,7 +10,7 @@ the specs in the order given in §2. Do not skip to the phase documents — they
 assume the invariants in §4, and code that violates those is worse than no code.
 
 Everything below is current as of **2026-09-18**: backend `eedabaa`, UI
-`6814925`, migrations `001`–`024` applied in production. Re-verify before
+`efb67b2`, migrations `001`–`025` applied in production. Re-verify before
 trusting any line number here — this drifts.
 
 ## 1. What you are building

@@ -24,9 +24,18 @@
 | UI | `https://app.authsec.ai` and `https://*.app.authsec.ai` |
 | API and OAuth issuer | `https://prod.api.authsec.ai` |
 
-Credentials and the verified SSH host-key fingerprint are stored only in
-[`SPEC-deployment-k3s.local.md`](SPEC-deployment-k3s.local.md). That companion is
-git-ignored and must remain mode `0600`.
+Credentials and the verified SSH host-key fingerprint live only in
+`SPEC-deployment-k3s.local.md`, which is **not in this repository** and is not
+linked from it — a link would 404 for everyone who clones.
+
+It is a local, operator-held file at
+`~/Desktop/authnull/.claude/specs/SPEC-deployment-k3s.local.md`, mode `0600`.
+`.gitignore:12` also covers `.claude/specs/*.local.md` here, so a copy placed
+alongside these specs stays untracked.
+
+If you do not have it, ask the operator — do not reconstruct it from the
+cluster, and never paste its contents into a spec, a commit, an issue or a
+chat message.
 
 ## Sources that deploy
 
