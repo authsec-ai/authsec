@@ -22,9 +22,14 @@ import (
 // short enough that a crashed worker's account is rescannable within the
 // quarter-hour.
 const (
-	scanLeaseDuration  = 5 * time.Minute
-	scanLeaseHeartbeat = 1 * time.Minute
-	scanPollInterval   = 10 * time.Second
+	scanLeaseDuration = 5 * time.Minute
+	// projectionPipelineLease is how long the workspace barrier is held once
+	// publication hands it to the projector. Longer than the scan lease
+	// because a projection that overruns must not have its workspace stolen
+	// mid-transaction; the expiry sweep is the backstop, not the normal path.
+	projectionPipelineLease = 15 * time.Minute
+	scanLeaseHeartbeat      = 1 * time.Minute
+	scanPollInterval        = 10 * time.Second
 	// A run that has failed this many times stops being retried. Without this a
 	// permanently broken connector is retried forever and starves the queue.
 	scanMaxAttempts = 3
@@ -47,18 +52,31 @@ type AWSScanWorker struct {
 	lease   time.Duration
 	poll    time.Duration
 	nowFunc func() time.Time
+
+	// The Phase 2 pipeline (§2.10A). jobs enqueues the projection work inside
+	// the publish transaction; pipeline is the workspace-wide barrier that
+	// stops a second connector's scan rewriting inventory a projection is
+	// about to read.
+	jobs     repositories.IGAProjectionJobRepository
+	pipeline repositories.IGAPipelineLeaseRepository
+	// pipelineVersion is the fence this worker claimed for the workspace. It
+	// is demanded by every later transition, so a worker that slept past its
+	// expiry is refused because the version moved on.
+	pipelineVersion int64
 }
 
 func NewAWSScanWorker(db *gorm.DB, svc *AWSOnboardingService) *AWSScanWorker {
 	host, _ := os.Hostname()
 	return &AWSScanWorker{
-		db:      db,
-		runs:    repositories.NewCloudScanRunRepository(db),
-		svc:     svc,
-		owner:   fmt.Sprintf("%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8]),
-		lease:   scanLeaseDuration,
-		poll:    scanPollInterval,
-		nowFunc: time.Now,
+		db:       db,
+		runs:     repositories.NewCloudScanRunRepository(db),
+		jobs:     repositories.NewIGAProjectionJobRepository(db),
+		pipeline: repositories.NewIGAPipelineLeaseRepository(db),
+		svc:      svc,
+		owner:    fmt.Sprintf("%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8]),
+		lease:    scanLeaseDuration,
+		poll:     scanPollInterval,
+		nowFunc:  time.Now,
 	}
 }
 
@@ -118,7 +136,33 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	// THE WORKSPACE BARRIER (§2.10A). Claimed before any inventory is written
+	// and released only after projection finishes, so a published run's
+	// inventory cannot change while its projection reads it.
+	//
+	// Refusal is not an error: another connector in this workspace is
+	// collecting or projecting. The run goes back to the queue and is claimed
+	// again once the workspace is free. THIS IS THE THROUGHPUT CEILING the
+	// spec states plainly -- a customer with five AWS accounts scans them one
+	// at a time, and nothing narrower is sound because the shared-resource
+	// writer crosses connectors.
+	version, perr := w.pipeline.ClaimForCollection(
+		run.WorkspaceID, w.owner, run.ID, projectionPipelineLease, w.nowFunc())
+	if perr != nil {
+		if rerr := w.runs.Requeue(run.ID, w.owner, run.LeaseVersion); rerr != nil {
+			log.Printf("aws scan worker %s: could not requeue run %s: %v", w.owner, run.ID, rerr)
+		}
+		return true, nil
+	}
+	w.pipelineVersion = version
+
 	if err := w.execute(ctx, run); err != nil {
+		// Hand the workspace back: publication never happened, so nothing is
+		// waiting to be projected and holding the barrier would block every
+		// other connector until the sweep.
+		if rerr := w.pipeline.Release(run.WorkspaceID, w.pipelineVersion); rerr != nil {
+			log.Printf("aws scan worker %s: could not release pipeline: %v", w.owner, rerr)
+		}
 		// Fail is fenced too. If it returns ErrLeaseLost the run was already
 		// taken by someone else, and recording our failure on it would overwrite
 		// their result with ours.
@@ -174,29 +218,47 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 		workloadSurfaces = workloadSnapshot.Surfaces
 	}
 
-	// PUBLISH BEFORE COVERAGE, and refuse to write coverage if publication is
-	// refused.
+	// COVERAGE FIRST, THEN PUBLICATION AND THE PROJECTION JOB -- ALL IN ONE
+	// TRANSACTION, under the existing lease fence (§2.8).
 	//
-	// Publication is the fence check. A worker whose lease was taken has stale
-	// results, and coverage is the customer-visible claim "this is what your
-	// account looks like" -- so it must not be written by a worker that has
-	// already been superseded. Doing coverage first would let the loser
-	// overwrite the winner's report.
-	if err := w.runs.Publish(run.ID, w.owner, run.LeaseVersion); err != nil {
-		return fmt.Errorf("publish: %w", err)
-	}
+	// FinalizeCoverage performs no writes, so computing it before publication
+	// costs nothing. The previous sequence published first and stamped
+	// coverage best-effort afterwards, on the argument that a superseded
+	// worker must not overwrite the winner's report -- but the FENCE already
+	// guarantees that, and inside one transaction the ordering of the two
+	// writes is not observable.
+	//
+	// What the old sequence could not guarantee: a crash between publication
+	// and coverage made the loss PERMANENT. The projection job would then read
+	// absent coverage, canEnd would refuse every partition, and the graph would
+	// silently never close anything -- an outage that looks like caution.
 	merged := scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
 		snapshot.CredentialReportSurface, permErr, permSurfaces, workloadErr, workloadSurfaces)
 
-	// Stamped onto this run specifically, not only the connector: the
-	// connector's coverage column is overwritten by whatever scan runs next,
-	// so it can only ever answer for the newest one. A reader asking whether
-	// THIS run licensed reconciliation must be able to read this run's own
-	// report regardless of what has scanned since. Best effort, like
-	// persistCoverage above it -- losing this write must not undo a
-	// publication that already succeeded.
-	if err := w.runs.SetCoverage(run.ID, merged); err != nil {
-		log.Printf("aws scan run %s: could not stamp per-run coverage: %v", run.ID, err)
+	if err := w.runs.PublishWithCoverage(run.ID, w.owner, run.LeaseVersion, merged,
+		func(tx *gorm.DB, published *models.CloudScanRun) error {
+			// A published run ALWAYS has a job. A crash between the two is
+			// impossible rather than recovered.
+			if err := w.jobs.EnqueueTx(tx, &models.IGAProjectionJob{
+				WorkspaceID: published.WorkspaceID,
+				ScanRunID:   published.ID,
+				ConnectorID: published.ConnectorID,
+				Generation:  published.Generation,
+				Status:      models.ProjectionQueued,
+			}); err != nil {
+				return fmt.Errorf("enqueue projection job: %w", err)
+			}
+			// Hand the workspace barrier from collecting to projecting in the
+			// SAME transaction, so it is never released in between -- that gap
+			// is where a second connector's scan would overwrite a shared
+			// resource row the projection is about to read (§2.10A).
+			if _, err := w.pipeline.ToProjectingTx(tx, published.WorkspaceID,
+				w.owner, w.pipelineVersion, projectionPipelineLease); err != nil {
+				return fmt.Errorf("pipeline to projecting: %w", err)
+			}
+			return nil
+		}); err != nil {
+		return fmt.Errorf("publish: %w", err)
 	}
 
 	written, skipped := evidence.Counts()

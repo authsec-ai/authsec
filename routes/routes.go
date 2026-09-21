@@ -317,6 +317,14 @@ func SetupRoutes(
 			iga.GET("/agents/:agent_id/evidence", middlewares.Require("iga", "read"), igaController.GetAgentEvidence)
 			iga.GET("/agents/:agent_id/access-paths", middlewares.Require("iga", "read"), igaController.GetAgentAccessPaths)
 			iga.GET("/identity-accounts", middlewares.Require("iga", "read"), igaController.ListIdentityAccounts)
+
+			// P2-11: the first read path over the Phase 2 identity graph.
+			// One workload -> its executes_as identity -> that identity's
+			// grants, each with basis, state, last-confirmed time and the
+			// evidence behind it, plus every surface whose coverage was not
+			// reached. Read-only; the workspace comes from the authenticated
+			// context and a foreign workload id returns 404.
+			iga.GET("/workloads/:workload_id/access-path", middlewares.Require("iga", "read"), igaController.GetWorkloadAccessPath)
 			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 			// Governance decisions. Both require an expected version, so a

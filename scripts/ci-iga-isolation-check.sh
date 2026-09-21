@@ -47,6 +47,16 @@ ALLOWED_NON_IGA=(
   # The bridge itself. It is the sanctioned seam between the runtime channel
   # and the correlated estate, with its own state machine and decision record.
   "discovered_agent_iga_links"
+
+  # The evidence store. Phase 2 FKs iga_access_edge_evidence.observation_id and
+  # iga_relationship_evidence.observation_id straight to cloud_observation (031)
+  # -- evidence IS stored there by construction, so the read path joins it to
+  # show each grant's provenance (the API call, the surface, and the coverage
+  # that surface had at collection time). This is a designed seam, the same
+  # shape as discovered_agent_iga_links, and it is READ-ONLY: writes to cloud_*
+  # from graph code are forbidden by the separate one-way check below, which is
+  # what actually protects the projection's rebuildable guarantee.
+  "cloud_observation"
 )
 
 echo "== IGA isolation =="
@@ -102,15 +112,112 @@ if [ "$found" -eq 0 ]; then
   echo "    (allowlist: ${ALLOWED_NON_IGA[*]})"
 fi
 
+# ---------------------------------------------------------------------------
+# P2-1 -- THE PROJECTION IS ONE-WAY.
+#
+# cloud_* is the authoritative collected model; iga_* is a projection of it,
+# rebuildable at any time by deleting every iga_* row and re-projecting. That
+# guarantee holds only while NOTHING writes cloud_* from the graph side: a
+# single write back makes the two mutually dependent, and "rebuildable from
+# evidence" stops being true the moment a rebuild would lose something.
+#
+# Kept a grep on purpose. A database privilege cannot tell a designed join from
+# a careless one -- the same reasoning recorded in roadmap section 2.1 and in
+# this file's own header.
+echo
+echo "== projection is one-way =="
+
+GRAPH_FILES=""
+while IFS= read -r f; do
+  GRAPH_FILES="${GRAPH_FILES}${f}
+"
+done < <(
+  { find internal/igagraph -type f -name '*.go' 2>/dev/null
+    find . -type f -name '*projector*.go' -not -path './.git/*' 2>/dev/null | sed 's|^\./||'
+  } | grep -v '_test\.go$' | sort -u
+)
+GRAPH_COUNT=$(printf '%s' "$GRAPH_FILES" | grep -c . || true)
+echo "scanning ${GRAPH_COUNT} projection source files"
+
+ONEWAY="$(mktemp)"
+printf '%s' "$GRAPH_FILES" | while IFS= read -r f; do
+  [ -n "$f" ] || continue
+
+  # Raw SQL writing a cloud_* table.
+  sed -e 's://.*::' "$f" \
+    | grep -nE '(INSERT[[:space:]]+INTO|UPDATE|DELETE[[:space:]]+FROM)[[:space:]]+(public\.)?cloud_[a-z0-9_]*' \
+    | sed "s|^|FAIL: $f writes cloud_* in SQL: line |"
+
+  # GORM writing a Cloud* model. Create/Save/Updates/Update/Delete on a
+  # models.Cloud... value is the same write in a different costume.
+  sed -e 's://.*::' "$f" \
+    | grep -nE '\.(Create|Save|Updates|Update|Delete)\([^)]*models\.Cloud' \
+    | sed "s|^|FAIL: $f writes a Cloud model via GORM: line |"
+done > "$ONEWAY"
+
+if [ -s "$ONEWAY" ]; then
+  fail=1
+  cat "$ONEWAY"
+else
+  echo "ok: no projection file writes cloud_*"
+fi
+rm -f "$ONEWAY"
+
+# ---------------------------------------------------------------------------
+# P2-1 -- NO NEW WRITERS TO iga_observation_links.
+#
+# That table keeps a polymorphic target_kind/target_id pair, which is the A3
+# defect this phase exists to close. It survives ONLY because the GitHub
+# ingestion path already writes it. Every new evidence link goes to
+# iga_access_edge_evidence or iga_relationship_evidence, both of which have
+# typed, workspace-qualified endpoints on both ends.
+echo
+echo "== no new iga_observation_links writers =="
+
+# The one path allowed to write it, and the repository method it goes through.
+OBS_LINK_ALLOWED="services/iga_service.go repository/iga_repository.go"
+
+LINKS="$(mktemp)"
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case " $OBS_LINK_ALLOWED " in *" $f "*) continue ;; esac
+  sed -e 's://.*::' "$f" \
+    | grep -nE '(INSERT[[:space:]]+INTO[[:space:]]+(public\.)?iga_observation_links|\.(Create|Save|Updates)\([^)]*IGAObservationLink)' \
+    | sed "s|^|FAIL: $f writes iga_observation_links: line |"
+done < <(
+  find . -type f -name '*.go' -not -path './.git/*' 2>/dev/null \
+    | sed 's|^\./||' | grep -v '_test\.go$' | sort
+) > "$LINKS"
+
+if [ -s "$LINKS" ]; then
+  fail=1
+  cat "$LINKS"
+else
+  echo "ok: only the GitHub path writes iga_observation_links"
+  echo "    (allowed: ${OBS_LINK_ALLOWED})"
+fi
+rm -f "$LINKS"
+
 echo
 if [ "$fail" -ne 0 ]; then
   cat <<'MSG'
 IGA isolation FAILED.
 
-A legacy table named directly from IGA code is coupling nobody declared. If the
-join is genuinely required, route it through a bridge table that records its own
-state and evidence, as discovered_agent_iga_links does -- then add that bridge
-to ALLOWED_NON_IGA with a sentence saying why.
+One of three rules was broken:
+
+  1. A legacy table named directly from IGA code is coupling nobody declared.
+     If the join is genuinely required, route it through a bridge table that
+     records its own state and evidence, as discovered_agent_iga_links does --
+     then add that bridge to ALLOWED_NON_IGA with a sentence saying why.
+
+  2. A projection file writes cloud_*. The projection is ONE-WAY: cloud_* is
+     authoritative, iga_* is rebuildable from it. A write back makes the two
+     mutually dependent and the rebuild guarantee false.
+
+  3. A new writer to iga_observation_links. That table keeps a polymorphic
+     target pair and survives only for the GitHub path. New evidence links go
+     to iga_access_edge_evidence or iga_relationship_evidence, which are typed
+     and workspace-qualified on both ends.
 MSG
   exit 1
 fi

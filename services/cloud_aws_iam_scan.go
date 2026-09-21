@@ -792,7 +792,7 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	// surface entry standing in for the surfaces it never got to attempt --
 	// the same reasoning as workload_scan.go's own "compute:region" entry.
 	if permErr != nil && permSurfaces == nil {
-		merged.Surfaces["permission_scan"] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfacePermissionScan] = models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: permErr.Error(),
 		}
 	}
@@ -800,7 +800,7 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 		merged.Surfaces[k] = v
 	}
 	if workloadErr != nil && workloadSurfaces == nil {
-		merged.Surfaces["workload_scan"] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfaceWorkloadScan] = models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: workloadErr.Error(),
 		}
 	}

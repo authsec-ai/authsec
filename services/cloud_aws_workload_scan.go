@@ -163,7 +163,7 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	// and nobody was meant to" is a different answer from both, and it is the
 	// honest one for an unselected region.
 	for _, region := range unselectedRegions(regions) {
-		out.Surfaces["compute:"+region] = models.SurfaceCoverage{
+		out.Surfaces[models.SurfaceCompute(region)] = models.SurfaceCoverage{
 			State: models.CloudCoverageNotSelected,
 			Error: "region not in the connector's selected scope",
 		}
@@ -252,11 +252,11 @@ func (s *AWSWorkloadScanner) scanRegion(
 
 	l, e, c, p, b, ac, ct, err := cfgFor()
 	if err != nil {
-		out.Errors["compute:"+region] = err.Error()
+		out.Errors[models.SurfaceCompute(region)] = err.Error()
 		// Nothing in this region was even attempted -- one surface entry
 		// stands in for the five that never ran, so Complete() correctly sees
 		// this region as unreached instead of silently passing it.
-		out.Surfaces["compute:"+region] = models.SurfaceCoverage{
+		out.Surfaces[models.SurfaceCompute(region)] = models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: err.Error(),
 		}
 		return
@@ -601,7 +601,13 @@ func (s *AWSWorkloadScanner) recordWorkload(
 	if s.evidence != nil && stored != nil {
 		if err := s.evidence.Record(
 			WorkloadSubject(stored.ID),
-			workloadSourceAPI(w.RuntimeKind), "compute:"+region, "",
+			// NOTE: this labels the evidence with the per-region compute
+			// stand-in rather than the per-service surface the row actually
+			// came from (lambda:<region>, ecs:<region>, ...). Left as-is --
+			// changing what Phase 1 stamps on existing observations is out of
+			// Phase 2's scope -- but the evidence drawer (§2.14 D) wants the
+			// per-service name, so this is worth correcting deliberately.
+			workloadSourceAPI(w.RuntimeKind), models.SurfaceCompute(region), "",
 			time.Now(), w.NativeID,
 			map[string]any{
 				"runtime_kind":       w.RuntimeKind,
