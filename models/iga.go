@@ -389,9 +389,12 @@ func (IGACorrelation) TableName() string { return "iga_correlations" }
 // IGAEstateScope is containment only. Containment confers NO access
 // inheritance; an access path must be evidenced.
 type IGAEstateScope struct {
-	ID            uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID   uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	ScopeKind     string     `json:"scope_kind" gorm:"not null"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ScopeKind   string    `json:"scope_kind" gorm:"not null"`
+	// SourceKey is the scope's recognition key (027). For AWS this is the
+	// connected account; nothing else in the tree writes this table.
+	SourceKey     string     `json:"source_key" gorm:"not null;default:''"`
 	DisplayName   string     `json:"display_name" gorm:"not null;default:''"`
 	ParentScopeID *uuid.UUID `json:"parent_scope_id,omitempty" gorm:"type:uuid"`
 	Stage         string     `json:"stage" gorm:"not null;default:'unknown'"`
@@ -414,8 +417,27 @@ type IGAAgent struct {
 	RollupState    string     `json:"rollup_state" gorm:"not null;default:'unknown'"`
 	Lifecycle      string     `json:"lifecycle" gorm:"not null;default:'active'"`
 	Version        int64      `json:"version" gorm:"not null;default:1"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+
+	// Origin is the exit gate's "a registered agent is distinguished from
+	// native discovery". A discovered object a human later registers KEEPS ITS
+	// ID and flips this; the projector must never overwrite 'registered'.
+	Origin string `json:"origin" gorm:"not null;default:'discovered'"`
+
+	// Recognition and continuity (027). source_key is namespaced and built
+	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
+	// makes delete-and-recreate expressible against the partial unique index.
+	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
+	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
+	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
+	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+
+	// FirstSeenAt is never advanced by an upsert. It is the honest age of the
+	// object and the exit gate tests it directly.
+	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (IGAAgent) TableName() string { return "iga_agents" }
@@ -431,8 +453,16 @@ type IGAAgentInstance struct {
 	RuntimeKind      string     `json:"runtime_kind" gorm:"not null;default:''"`
 	Stage            string     `json:"stage" gorm:"not null;default:'unknown'"`
 	Lifecycle        string     `json:"lifecycle" gorm:"not null;default:'active'"`
-	FirstSeenAt      time.Time  `json:"first_seen_at"`
-	LastSeenAt       time.Time  `json:"last_seen_at"`
+
+	// WorkloadID is the typed link to the runtime that realizes this instance
+	// (032). Nil where the instance is not compute we hold.
+	WorkloadID    *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
+	SourceKey     string     `json:"source_key" gorm:"not null;default:''"`
+	Origin        string     `json:"origin" gorm:"not null;default:'discovered'"`
+	RetiredReason string     `json:"retired_reason" gorm:"not null;default:''"`
+
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
 }
 
 func (IGAAgentInstance) TableName() string { return "iga_agent_instances" }
@@ -448,8 +478,22 @@ type IGAIdentityAccount struct {
 	IdentityBacking string     `json:"identity_backing" gorm:"not null;default:'unknown'"`
 	Lifecycle       string     `json:"lifecycle" gorm:"not null;default:'active'"`
 	RollupState     string     `json:"rollup_state" gorm:"not null;default:'unknown'"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+
+	// Recognition and continuity (027). source_key is namespaced and built
+	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
+	// makes delete-and-recreate expressible against the partial unique index.
+	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
+	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
+	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
+	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+
+	// FirstSeenAt is never advanced by an upsert. It is the honest age of the
+	// object and the exit gate tests it directly.
+	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (IGAIdentityAccount) TableName() string { return "iga_identity_accounts" }
@@ -469,8 +513,22 @@ type IGACredential struct {
 	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
 	RotationPosture   string     `json:"rotation_posture" gorm:"not null;default:'unknown'"`
 	Lifecycle         string     `json:"lifecycle" gorm:"not null;default:'active'"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+
+	// Recognition and continuity (027). source_key is namespaced and built
+	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
+	// makes delete-and-recreate expressible against the partial unique index.
+	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
+	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
+	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
+	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+
+	// FirstSeenAt is never advanced by an upsert. It is the honest age of the
+	// object and the exit gate tests it directly.
+	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (IGACredential) TableName() string { return "iga_credentials" }
@@ -484,8 +542,22 @@ type IGAResource struct {
 	DisplayName   string     `json:"display_name" gorm:"not null;default:''"`
 	Stage         string     `json:"stage" gorm:"not null;default:'unknown'"`
 	Lifecycle     string     `json:"lifecycle" gorm:"not null;default:'active'"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+
+	// Recognition and continuity (027). source_key is namespaced and built
+	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
+	// makes delete-and-recreate expressible against the partial unique index.
+	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
+	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
+	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
+	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+
+	// FirstSeenAt is never advanced by an upsert. It is the honest age of the
+	// object and the exit gate tests it directly.
+	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (IGAResource) TableName() string { return "iga_resources" }
@@ -502,8 +574,27 @@ type IGAEntitlement struct {
 	NormalizedRights json.RawMessage `json:"normalized_rights" gorm:"type:jsonb;not null;default:'{}'"`
 	NativeScope      string          `json:"native_scope" gorm:"not null;default:''"`
 	Remediable       bool            `json:"remediable" gorm:"not null;default:false"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+
+	// Lifecycle did not exist on this table before 027. Added so entitlements
+	// retire the same way every other node does, rather than needing a second
+	// retire path of their own.
+	Lifecycle string `json:"lifecycle" gorm:"not null;default:'active'"`
+
+	// Recognition and continuity (027). source_key is namespaced and built
+	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
+	// makes delete-and-recreate expressible against the partial unique index.
+	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
+	Continuity    string `json:"continuity" gorm:"not null;default:'recognition_only'"`
+	ImmutableKey  string `json:"immutable_key" gorm:"not null;default:''"`
+	RetiredReason string `json:"retired_reason" gorm:"not null;default:''"`
+
+	// FirstSeenAt is never advanced by an upsert. It is the honest age of the
+	// object and the exit gate tests it directly.
+	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
+	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (IGAEntitlement) TableName() string { return "iga_entitlements" }
@@ -512,23 +603,77 @@ func (IGAEntitlement) TableName() string { return "iga_entitlements" }
 // load-bearing column: a source grant is not automatically effective access,
 // and the database refuses a decided conclusion on incomplete evidence.
 type IGAAccessEdge struct {
-	ID                  uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID         uuid.UUID  `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	SubjectKind         string     `json:"subject_kind" gorm:"not null"`
-	SubjectID           uuid.UUID  `json:"subject_id" gorm:"type:uuid;not null"`
-	EntitlementID       *uuid.UUID `json:"entitlement_id,omitempty" gorm:"type:uuid"`
-	ResourceID          *uuid.UUID `json:"resource_id,omitempty" gorm:"type:uuid"`
-	Direction           string     `json:"direction" gorm:"not null"`
-	PathKind            string     `json:"path_kind" gorm:"not null;default:''"`
-	CalculationState    string     `json:"calculation_state" gorm:"not null;default:'unknown'"`
-	EffectiveConclusion string     `json:"effective_conclusion" gorm:"not null;default:'unknown'"`
-	NativeScope         string     `json:"native_scope" gorm:"not null;default:''"`
-	ObservedAt          *time.Time `json:"observed_at,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+
+	// TYPED SUBJECT (029). Exactly one is set, enforced by
+	// iga_access_edges_subject_chk2, and each is composite-FK'd to
+	// (workspace_id, id). This replaces subject_kind + subject_id, which had
+	// NO foreign key of any kind -- defect A3.
+	//
+	// There is deliberately no SubjectWorkloadID: a workload does not hold an
+	// entitlement, it executes AS an identity that does. That path is
+	// IGARelationship(executes_as) then this edge, and keeping it two hops is
+	// the point -- an inbound permission never implies an outbound one.
+	SubjectIdentityAccountID *uuid.UUID `json:"subject_identity_account_id,omitempty" gorm:"type:uuid"`
+	SubjectAgentID           *uuid.UUID `json:"subject_agent_id,omitempty" gorm:"type:uuid"`
+	SubjectAgentInstanceID   *uuid.UUID `json:"subject_agent_instance_id,omitempty" gorm:"type:uuid"`
+
+	// EntitlementID is NOT NULL since 029: an access edge that grants nothing
+	// is not a fact about access.
+	EntitlementID uuid.UUID `json:"entitlement_id" gorm:"type:uuid;not null"`
+	// ResourceID is denormalized from the entitlement for the reverse query.
+	ResourceID *uuid.UUID `json:"resource_id,omitempty" gorm:"type:uuid"`
+
+	Direction string `json:"direction" gorm:"not null"`
+	PathKind  string `json:"path_kind" gorm:"not null;default:''"`
+
+	// CalculationState and EffectiveConclusion carry the honesty rule
+	// iga_access_edges_honesty_chk enforces: a decided conclusion requires a
+	// complete calculation. PHASE 2 RUNS NO EVALUATOR, so these are always
+	// partial/unknown -- conditions are recorded, never evaluated.
+	CalculationState    string `json:"calculation_state" gorm:"not null;default:'unknown'"`
+	EffectiveConclusion string `json:"effective_conclusion" gorm:"not null;default:'unknown'"`
+	NativeScope         string `json:"native_scope" gorm:"not null;default:''"`
+
+	// Lifecycle (029), identical in meaning to IGARelationship's.
+	Basis           string     `json:"basis" gorm:"not null;default:'declared'"`
+	DerivationRule  string     `json:"derivation_rule" gorm:"not null;default:''"`
+	State           string     `json:"state" gorm:"not null;default:'current'"`
+	ValidFrom       time.Time  `json:"valid_from" gorm:"not null;default:now()"`
+	ValidTo         *time.Time `json:"valid_to,omitempty"`
+	LastConfirmedAt time.Time  `json:"last_confirmed_at" gorm:"not null;default:now()"`
+	LastConfirmedBy *uuid.UUID `json:"last_confirmed_by,omitempty" gorm:"type:uuid"`
+	EndedReason     string     `json:"ended_reason" gorm:"not null;default:''"`
+	SourceKey       string     `json:"source_key" gorm:"not null;default:''"`
+
+	// Partition membership. An edge written without these is invisible to
+	// reconciliation and never ends.
+	PartitionKey string     `json:"partition_key" gorm:"not null;default:''"`
+	ConnectorID  *uuid.UUID `json:"connector_id,omitempty" gorm:"type:uuid"`
+
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 func (IGAAccessEdge) TableName() string { return "iga_access_edges" }
+
+// Subject returns the one subject endpoint that is set, as (kind, id).
+//
+// Keeps the multi-column awkwardness out of READ call sites. Writes name the
+// column directly -- a setter here would make it possible to set two.
+func (e IGAAccessEdge) Subject() (string, uuid.UUID) {
+	switch {
+	case e.SubjectIdentityAccountID != nil:
+		return "identity_account", *e.SubjectIdentityAccountID
+	case e.SubjectAgentID != nil:
+		return "agent", *e.SubjectAgentID
+	case e.SubjectAgentInstanceID != nil:
+		return "agent_instance", *e.SubjectAgentInstanceID
+	}
+	return "", uuid.Nil
+}
 
 // IGAAttributeValue is survivorship. When sources disagree, both values are
 // kept with their authority rank; the winner is a decision, not an accident.

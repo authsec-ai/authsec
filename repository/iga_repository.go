@@ -100,7 +100,7 @@ type IGARepository interface {
 	UpsertResource(r *models.IGAResource) error
 	UpsertEntitlement(e *models.IGAEntitlement) error
 	UpsertAccessEdge(e *models.IGAAccessEdge) error
-	ListAccessEdges(workspaceID uuid.UUID, subjectID uuid.UUID) ([]models.IGAAccessEdge, error)
+	ListAccessEdges(workspaceID uuid.UUID, subjectKind string, subjectID uuid.UUID) ([]models.IGAAccessEdge, error)
 	LinkObservation(l *models.IGAObservationLink) error
 	ListObservationLinks(workspaceID uuid.UUID, targetKind string, targetID uuid.UUID) ([]models.IGAObservationLink, error)
 	CreateCorrelation(c *models.IGACorrelation) error
@@ -286,7 +286,7 @@ func (r *igaRepository) ResolveBinding(appRegistrationID, installationID string)
 /* -------------------------- scopes and coverage ------------------------ */
 
 func (r *igaRepository) UpsertScope(s *models.IGAIntegrationScope) error {
-	return r.db.Clauses(clause.OnConflict{
+	return r.db.Clauses(returningID, clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"}, {Name: "integration_id"},
 			{Name: "native_scope_kind"}, {Name: "native_scope_id"},
@@ -305,7 +305,7 @@ func (r *igaRepository) ListScopes(workspaceID, integrationID uuid.UUID) ([]mode
 }
 
 func (r *igaRepository) UpsertCoverage(c *models.IGACoverageState) error {
-	return r.db.Clauses(clause.OnConflict{
+	return r.db.Clauses(returningID, clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"}, {Name: "integration_id"},
 			{Name: "integration_scope_id"}, {Name: "object_class"},
@@ -354,7 +354,7 @@ func (r *igaRepository) NextGeneration(workspaceID, integrationID uuid.UUID) (in
 
 func (r *igaRepository) SaveCheckpoint(cp *models.IGAScanCheckpoint) error {
 	cp.UpdatedAt = time.Now()
-	return r.db.Clauses(clause.OnConflict{
+	return r.db.Clauses(returningID, clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"}, {Name: "scan_run_id"},
 			{Name: "object_class"}, {Name: "partition_key"},
@@ -613,31 +613,153 @@ func (r *igaRepository) ListAgents(workspaceID uuid.UUID, rollup string, limit, 
 	return out, total, err
 }
 
-func (r *igaRepository) UpsertIdentityAccount(a *models.IGAIdentityAccount) error {
-	return r.db.Create(a).Error
-}
-func (r *igaRepository) UpsertCredential(c *models.IGACredential) error {
-	return r.db.Create(c).Error
-}
-func (r *igaRepository) UpsertResource(res *models.IGAResource) error {
-	return r.db.Create(res).Error
-}
-func (r *igaRepository) UpsertEntitlement(e *models.IGAEntitlement) error {
-	return r.db.Create(e).Error
-}
-func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
-	return r.db.Create(e).Error
+/* ---------------------------- canonical upserts --------------------------- */
+//
+// P2-4. All five of these were named Upsert* and every one of them was a bare
+// db.Create -- so a rescan inserted a duplicate row with a fresh uuid, and
+// "repeat scan keeps IDs" was not merely broken but inexpressible: before 027
+// there was no column to match on.
+//
+// TWO TRAPS, both of which must stay covered by a test against REAL POSTGRES.
+//
+// 1. THE CONFLICT TARGET IS A PARTIAL INDEX, AND GORM'S `Where` IS THE WRONG
+//    FIELD. clause.OnConflict{Where: ...} emits the `DO UPDATE ... WHERE`
+//    condition, which is a different clause entirely. Index inference against
+//    a partial unique index needs the INDEX PREDICATE, which is `TargetWhere`,
+//    and it must match the index's predicate exactly or Postgres cannot infer
+//    the index and the statement errors.
+//
+// 2. `a.ID` AFTER A CONFLICT IS THE ID GORM GENERATED, NOT THE SURVIVING
+//    ROW'S. Without Returning, every rescan silently points new edges at ids
+//    that do not exist. Each method below reads the id back.
+//
+// SQLite accepts all of this and enforces none of it, so a suite that passes
+// on SQLite proves nothing here.
+//
+// DoUpdates NAMES ITS COLUMNS, NEVER UpdateAll. UpdateAll would reset
+// first_seen_at and clobber human-owned state -- ownership, review status,
+// classification, and origin once it reads 'registered' -- which is precisely
+// what the exit gate tests for.
+
+// identityConflict is the conflict target shared by every identity upsert. It
+// must match uq_iga_identity_accounts_source_key's predicate exactly.
+func identityConflict(update []string) clause.OnConflict {
+	return clause.OnConflict{
+		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "source_key <> '' AND lifecycle <> 'retired'"},
+		}},
+		DoUpdates: clause.AssignmentColumns(update),
+	}
 }
 
-func (r *igaRepository) ListAccessEdges(workspaceID uuid.UUID, subjectID uuid.UUID) ([]models.IGAAccessEdge, error) {
+// returningID reads the SURVIVING row's id back.
+//
+// GORM otherwise leaves the struct holding the id IT generated, which on a
+// conflict is a value no row has -- so every rescan would point new edges at
+// ids that do not exist. It is a separate clause from OnConflict in this GORM
+// version, not a field on it.
+var returningID = clause.Returning{Columns: []clause.Column{{Name: "id"}}}
+
+func (r *igaRepository) UpsertIdentityAccount(a *models.IGAIdentityAccount) error {
+	return r.db.Clauses(returningID, identityConflict([]string{
+		"display_name", "account_kind", "identity_backing",
+		"last_seen_at", "updated_at",
+	})).Create(a).Error
+}
+
+// UpsertCredential keys on the credential's own identifier namespaced by its
+// identity (§2.5).
+//
+// The predicate differs from the node tables' deliberately: a credential's
+// lifecycle vocabulary is active|expired|revoked|rotated, so "gone" is
+// revoked/expired rather than 'retired'. A revoked key keeps its row forever --
+// never deleted -- and a NEW key with the same identifier would be a new row.
+func (r *igaRepository) UpsertCredential(c *models.IGACredential) error {
+	return r.db.Clauses(returningID, clause.OnConflict{
+		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "source_key <> '' AND lifecycle NOT IN ('revoked', 'expired')"},
+		}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"credential_type", "issuer", "key_identifier", "expires_at",
+			"last_used_at", "rotation_posture", "last_seen_at", "updated_at",
+		}),
+	}).Create(c).Error
+}
+
+func (r *igaRepository) UpsertResource(res *models.IGAResource) error {
+	return r.db.Clauses(returningID, identityConflict([]string{
+		"display_name", "resource_kind", "stage", "last_seen_at", "updated_at",
+	})).Create(res).Error
+}
+
+func (r *igaRepository) UpsertEntitlement(e *models.IGAEntitlement) error {
+	return r.db.Clauses(returningID, identityConflict([]string{
+		"native_grant_kind", "native_rights", "normalized_rights",
+		"native_scope", "remediable", "resource_id", "last_seen_at", "updated_at",
+	})).Create(e).Error
+}
+
+// UpsertAccessEdge conflicts on the LIVE edge only. uq_iga_access_edges_live
+// is partial on state <> 'ended', so history accumulates while exactly one
+// edge per grant is live -- re-granting access that was previously ended
+// creates a NEW row rather than resurrecting the old one, and both are
+// readable.
+func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
+	return r.db.Clauses(returningID, clause.OnConflict{
+		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "source_key <> '' AND state <> 'ended'"},
+		}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"entitlement_id", "resource_id", "direction", "path_kind",
+			"calculation_state", "effective_conclusion", "native_scope",
+			"last_confirmed_at", "last_confirmed_by", "observed_at",
+			"partition_key", "connector_id", "updated_at",
+		}),
+	}).Create(e).Error
+}
+
+// subjectColumn maps a subject kind to the typed column that holds it.
+//
+// 029 replaced subject_kind + subject_id with three nullable typed columns, so
+// a read has to name the column rather than compare a discriminator. Returns
+// "" for an unknown kind, which callers treat as "no such subject" rather than
+// silently querying every edge in the workspace.
+func subjectColumn(subjectKind string) string {
+	switch subjectKind {
+	case "identity_account":
+		return "subject_identity_account_id"
+	case "agent":
+		return "subject_agent_id"
+	case "agent_instance":
+		return "subject_agent_instance_id"
+	}
+	return ""
+}
+
+// ListAccessEdges returns one subject's access edges.
+//
+// Takes a TYPED subject since 029: the old (workspace_id, subject_id) filter
+// named a column that no longer exists, and a uuid alone cannot say which of
+// the three subject kinds it is.
+//
+// Ended edges are included -- history is the point (§2.13) -- and callers that
+// want only live access filter on State.
+func (r *igaRepository) ListAccessEdges(workspaceID uuid.UUID, subjectKind string, subjectID uuid.UUID) ([]models.IGAAccessEdge, error) {
+	col := subjectColumn(subjectKind)
+	if col == "" {
+		return nil, fmt.Errorf("unknown access edge subject kind %q", subjectKind)
+	}
 	var out []models.IGAAccessEdge
-	err := r.db.Where("workspace_id = ? AND subject_id = ?", workspaceID, subjectID).
+	err := r.db.Where("workspace_id = ? AND "+col+" = ?", workspaceID, subjectID).
 		Order("direction, created_at").Find(&out).Error
 	return out, err
 }
 
 func (r *igaRepository) LinkObservation(l *models.IGAObservationLink) error {
-	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(l).Error
+	return r.db.Clauses(returningID, clause.OnConflict{DoNothing: true}).Create(l).Error
 }
 
 func (r *igaRepository) ListObservationLinks(workspaceID uuid.UUID, targetKind string, targetID uuid.UUID) ([]models.IGAObservationLink, error) {
@@ -722,7 +844,7 @@ func (r *igaRepository) AcceptDelivery(d *models.IGAWebhookDelivery, job *models
 }
 
 func (r *igaRepository) RecordRejectedDelivery(d *models.IGAWebhookDelivery) error {
-	return r.db.Clauses(clause.OnConflict{
+	return r.db.Clauses(returningID, clause.OnConflict{
 		Columns:   []clause.Column{{Name: "app_registration_id"}, {Name: "delivery_id"}},
 		DoNothing: true,
 	}).Create(d).Error
@@ -925,18 +1047,26 @@ func (r *igaRepository) CountCandidates(workspaceID uuid.UUID, state string) (in
 
 /* ------------------------------ access paths ---------------------------- */
 
+// ListAccessPaths resolves one subject's edges together with the entitlement
+// and resource each points at.
+//
+// The subject kind is 'agent' here because every caller passes an agent id;
+// identity-account paths go through ListAccessEdges directly.
 func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UUID) ([]AccessPath, error) {
-	edges, err := r.ListAccessEdges(workspaceID, subjectID)
+	edges, err := r.ListAccessEdges(workspaceID, "agent", subjectID)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]AccessPath, 0, len(edges))
 	for i := range edges {
 		p := AccessPath{Edge: edges[i]}
-		if edges[i].EntitlementID != nil {
+		// entitlement_id is NOT NULL since 029 -- an access edge that grants
+		// nothing is not a fact about access -- so there is no nil case left
+		// to guard, only a lookup that may not resolve.
+		{
 			var e models.IGAEntitlement
 			if err := r.db.First(&e, "id = ? AND workspace_id = ?",
-				*edges[i].EntitlementID, workspaceID).Error; err == nil {
+				edges[i].EntitlementID, workspaceID).Error; err == nil {
 				p.Entitlement = &e
 			}
 		}
@@ -980,5 +1110,5 @@ func (r *igaRepository) GetIdempotent(workspaceID uuid.UUID, key string) (*Idemp
 func (r *igaRepository) PutIdempotent(rec *IdempotencyRecord) error {
 	// DoNothing so a concurrent duplicate does not error; the first writer wins
 	// and the second reads back the stored response.
-	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(rec).Error
+	return r.db.Clauses(returningID, clause.OnConflict{DoNothing: true}).Create(rec).Error
 }

@@ -248,6 +248,32 @@ const (
 	SurfaceEKSPodIdentity = "eks_pod_identity"
 )
 
+// SCANNER-LEVEL FAILURE MARKERS. These are not surfaces a scan reads; they are
+// written by FinalizeCoverage ONLY when a scanner returned an error before
+// producing a snapshot at all, standing in for every surface it never got to
+// attempt.
+//
+// Their PRESENCE is therefore proof of failure, and their ABSENCE proves
+// nothing -- which is the opposite of an ordinary surface, where absence means
+// "did not look". Reconciliation keeps them in a separate veto list
+// (Partition.RequiredScanners) for exactly that reason.
+//
+// Promoted from string literals in FinalizeCoverage and in the workload
+// scanner so the partition table and the writer cannot drift by a typo.
+const (
+	SurfacePermissionScan = "permission_scan"
+	SurfaceWorkloadScan   = "workload_scan"
+	// SurfaceComputePrefix + region is the stand-in written when a region's
+	// client config fails or the region was never selected. It is NOT a
+	// success key: a clean regional read reports lambda:<region> and friends,
+	// never this. Treating it as a required surface would mean no partition
+	// could ever close.
+	SurfaceComputePrefix = "compute:"
+)
+
+// SurfaceCompute names the per-region compute stand-in surface.
+func SurfaceCompute(region string) string { return SurfaceComputePrefix + region }
+
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`

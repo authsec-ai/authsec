@@ -46,8 +46,43 @@ type CloudScanRunRepository interface {
 	// still holds the fence token it claimed.
 	Publish(runID uuid.UUID, owner string, version int64) error
 
+	// PublishWithCoverage persists this run's coverage, publishes it, and runs
+	// `after` -- ALL IN ONE TRANSACTION, under the caller's fence.
+	//
+	// This reverses the previous ordering deliberately. The old sequence was
+	// Publish -> FinalizeCoverage -> SetCoverage (best effort), and the comment
+	// there argued publication must come first so a superseded worker could not
+	// overwrite the winner's coverage. THE FENCE ALREADY GUARANTEES THAT, and
+	// inside one transaction the ordering of the two writes is not observable.
+	//
+	// What the old sequence could not guarantee is that a published run always
+	// has its coverage. A crash in the gap made the loss permanent -- and the
+	// projection job would then read absent coverage, canEnd would refuse every
+	// partition, and the graph would silently never close anything.
+	//
+	// `after` is where the projection job is enqueued and the pipeline flips to
+	// projecting. Both must be atomic with publication: a published run that
+	// never got a job is work that silently never happens.
+	//
+	// COVERAGE STOPS BEING BEST-EFFORT: a scan whose coverage cannot be stored
+	// has not published.
+	PublishWithCoverage(
+		runID uuid.UUID, owner string, version int64,
+		coverage models.ScanCoverage,
+		after func(tx *gorm.DB, run *models.CloudScanRun) error,
+	) error
+
 	// Fail marks a run finished without publishing, under the same fence.
 	Fail(runID uuid.UUID, owner string, version int64, reason string) error
+
+	// Requeue returns a claimed run to the queue WITHOUT counting it as a
+	// failure.
+	//
+	// Used when the workspace pipeline barrier (§2.10A) is held by another
+	// connector: nothing went wrong with this run, it simply cannot start yet.
+	// Marking it failed would burn an attempt and eventually give up on a scan
+	// that was only ever waiting its turn.
+	Requeue(runID uuid.UUID, owner string, version int64) error
 
 	// SetCoverage stamps this run's own final coverage report. Not fenced by
 	// lease version: Publish already cleared lease_owner on success, so the
@@ -128,8 +163,24 @@ func (r *cloudScanRunRepository) Claim(
 			updated_at       = ?
 		WHERE id = (
 			SELECT id FROM cloud_scan_run
-			 WHERE status = ?
-			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			 WHERE (status = ?
+			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			   -- A connector whose previous run is still being projected is not
+			   -- claimable (SPEC §4.5). The projection reads that run's
+			   -- inventory, and a new scan would rewrite it underneath.
+			   --
+			   -- TWO CONSEQUENCES, ACCEPTED DELIBERATELY:
+			   --   * a WEDGED PROJECTION BLOCKS SCANNING for that connector.
+			   --     That is why iga_projection_job has an attempts ceiling and
+			   --     terminal failed/abandoned states: a job must always reach a
+			   --     terminal state or it becomes an outage. ALERT ON
+			   --     queued/running JOBS OLDER THAN ONE LEASE.
+			   --   * scan throughput is bounded by projection. Acceptable at one
+			   --     connector per customer and a projection measured in seconds.
+			   AND NOT EXISTS (
+			       SELECT 1 FROM iga_projection_job j
+			        WHERE j.connector_id = cloud_scan_run.connector_id
+			          AND j.status IN (?, ?))
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED
 			 LIMIT 1
@@ -139,6 +190,7 @@ func (r *cloudScanRunRepository) Claim(
 		now,
 		models.CloudScanRunQueued,
 		models.CloudScanRunRunning, now,
+		models.ProjectionQueued, models.ProjectionRunning,
 	).Scan(&out).Error
 	if err != nil {
 		return nil, err
@@ -169,6 +221,49 @@ func (r *cloudScanRunRepository) Publish(runID uuid.UUID, owner string, version 
 	})
 }
 
+func (r *cloudScanRunRepository) PublishWithCoverage(
+	runID uuid.UUID, owner string, version int64,
+	coverage models.ScanCoverage,
+	after func(tx *gorm.DB, run *models.CloudScanRun) error,
+) error {
+	raw, err := json.Marshal(coverage)
+	if err != nil {
+		return fmt.Errorf("encode coverage: %w", err)
+	}
+	now := time.Now()
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// One fenced UPDATE doing both writes. RowsAffected == 0 means the
+		// lease moved on, and the whole transaction rolls back -- so a
+		// superseded worker writes neither coverage nor publication.
+		res := tx.Model(&models.CloudScanRun{}).
+			Where("id = ? AND lease_owner = ? AND lease_version = ?", runID, owner, version).
+			Updates(map[string]any{
+				"coverage":         raw,
+				"status":           models.CloudScanRunPublished,
+				"published_at":     now,
+				"lease_owner":      "",
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("%w: run=%s owner=%s version=%d", ErrLeaseLost, runID, owner, version)
+		}
+
+		if after == nil {
+			return nil
+		}
+		var run models.CloudScanRun
+		if err := tx.First(&run, "id = ?", runID).Error; err != nil {
+			return err
+		}
+		return after(tx, &run)
+	})
+}
+
 func (r *cloudScanRunRepository) Fail(
 	runID uuid.UUID, owner string, version int64, reason string,
 ) error {
@@ -189,6 +284,19 @@ func (r *cloudScanRunRepository) Fail(
 // that slept past its expiry is refused because the version moved on, not
 // because we compared timestamps and decided it was late. Clock skew between
 // two hosts therefore cannot let a superseded worker publish.
+func (r *cloudScanRunRepository) Requeue(runID uuid.UUID, owner string, version int64) error {
+	now := time.Now()
+	// attempts is decremented back: Claim incremented it, and a run that never
+	// got to start must not be charged an attempt against scanMaxAttempts.
+	return r.fenced(runID, owner, version, map[string]any{
+		"status":           models.CloudScanRunQueued,
+		"lease_owner":      "",
+		"lease_expires_at": nil,
+		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"updated_at":       now,
+	})
+}
+
 func (r *cloudScanRunRepository) fenced(
 	runID uuid.UUID, owner string, version int64, updates map[string]any,
 ) error {
