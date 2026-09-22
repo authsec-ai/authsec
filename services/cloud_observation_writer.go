@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -243,6 +244,26 @@ func (w *ObservationWriter) Record(
 			"last_confirmed_run_id": w.runID,
 			"last_confirmed_at":     now,
 			"confirmation_count":    gorm.Expr("cloud_observation.confirmation_count + 1"),
+			// P2-2, the dedupe-path half of the qualified-subject change
+			// (SPEC §4.8). Changing what the permission scanner SUPPLIES is not
+			// enough on its own: an unchanged rescan of stable IAM writes no new
+			// row and takes this DO UPDATE branch, so without upgrading the key
+			// here the pre-change unqualified subject_native_id would survive
+			// indefinitely -- and igagraph.indexObservations skips every
+			// unqualified permission key, so those edges would never get
+			// evidence.
+			//
+			// Guarded so it can ONLY EVER ADD qualification: it upgrades a
+			// stored key that lacks the unit separator to the new one, never
+			// the reverse, and never writes a placeholder over a real value.
+			// For identity/resource/workload subjects the new key is the bare
+			// ARN the row already holds, so this is a self-assignment and a
+			// no-op for them.
+			"subject_native_id": gorm.Expr(
+				`CASE WHEN cloud_observation.subject_native_id NOT LIKE '%' || ? || '%'
+				           AND ? <> '(unknown)'
+				      THEN ? ELSE cloud_observation.subject_native_id END`,
+				igagraph.Sep, subjectNativeID, subjectNativeID),
 		}),
 	}
 	if hasSubject {

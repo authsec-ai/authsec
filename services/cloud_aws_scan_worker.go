@@ -177,8 +177,23 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 
 // execute performs the three scans and publishes, holding the lease throughout.
 func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) error {
-	stop := w.heartbeat(ctx, run)
+	// CANCELLATION FOR PROMPTNESS (§2.10A, part 3). If this worker loses its
+	// lease mid-scan, the heartbeat cancels execCtx so context-aware work stops
+	// as soon as possible. That is NECESSARY but NOT SUFFICIENT: an in-flight
+	// write can already be past its ctx check, so promptness alone cannot
+	// guarantee a superseded worker writes nothing.
+	execCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := w.heartbeat(execCtx, run, cancel)
 	defer stop()
+
+	// THE FENCE FOR CORRECTNESS (§2.10A, part 3). Every inventory upsert this
+	// run makes validates, in the same transaction as the write, that this
+	// worker still owns the run -- against the row Claim bumps on reclaim. A
+	// superseded worker's writes are refused, whatever its context did.
+	fence := repositories.ScanFence{
+		RunID: run.ID, Owner: w.owner, LeaseVersion: run.LeaseVersion,
+	}
 
 	// Evidence is anchored on THIS run. That anchor is why the observation
 	// table could exist at all: before cloud_scan_run there was nothing durable
@@ -188,11 +203,11 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 	evidence := NewObservationWriter(
 		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation)
 
-	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence)
-	permissionScanner := NewAWSPermissionScanner(w.db, w.svc).WithEvidence(evidence)
-	workloadScanner := NewAWSWorkloadScanner(w.db, w.svc).WithEvidence(evidence)
+	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
+	permissionScanner := NewAWSPermissionScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
+	workloadScanner := NewAWSWorkloadScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
 
-	snapshot, err := scanner.Scan(ctx, run.WorkspaceID, run.ConnectorID)
+	snapshot, err := scanner.Scan(execCtx, run.WorkspaceID, run.ConnectorID)
 	if err != nil {
 		return fmt.Errorf("iam scan: %w", err)
 	}
@@ -201,11 +216,11 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 	// every row they write carries one generation. Their errors do NOT abort
 	// the run: a denied surface is a coverage fact, not a failure, and the
 	// identities already written are worth keeping.
-	permSnapshot, permErr := permissionScanner.ScanFromSnapshot(ctx, run.WorkspaceID, snapshot)
+	permSnapshot, permErr := permissionScanner.ScanFromSnapshot(execCtx, run.WorkspaceID, snapshot)
 	if permErr != nil {
 		log.Printf("aws permission scan: run=%s: %v", run.ID, permErr)
 	}
-	workloadSnapshot, workloadErr := workloadScanner.ScanFromSnapshot(ctx, run.WorkspaceID, snapshot)
+	workloadSnapshot, workloadErr := workloadScanner.ScanFromSnapshot(execCtx, run.WorkspaceID, snapshot)
 	if workloadErr != nil {
 		log.Printf("aws workload scan: run=%s: %v", run.ID, workloadErr)
 	}
@@ -271,7 +286,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 //
 // Without it a scan longer than the lease would have its run claimed by another
 // worker mid-flight, and both would then be walking the same account.
-func (w *AWSScanWorker) heartbeat(ctx context.Context, run *models.CloudScanRun) func() {
+func (w *AWSScanWorker) heartbeat(ctx context.Context, run *models.CloudScanRun, onLost context.CancelFunc) func() {
 	done := make(chan struct{})
 	go func() {
 		t := time.NewTicker(scanLeaseHeartbeat)
@@ -287,7 +302,15 @@ func (w *AWSScanWorker) heartbeat(ctx context.Context, run *models.CloudScanRun)
 					// Losing the lease mid-scan is not recoverable by renewing
 					// harder. The run belongs to someone else now; this worker's
 					// publication will be refused, which is the correct outcome.
+					//
+					// Cancel the scan context so in-flight collection stops
+					// promptly rather than racing on -- the promptness half of
+					// §2.10A part 3. The fence on every inventory write is what
+					// makes it CORRECT even for a write already past its ctx
+					// check: that write's transaction re-checks ownership and is
+					// refused.
 					log.Printf("aws scan worker %s: lease lost on run %s: %v", w.owner, run.ID, err)
+					onLost()
 					return
 				}
 			}

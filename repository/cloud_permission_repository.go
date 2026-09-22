@@ -50,6 +50,10 @@ type CloudPermissionRepository interface {
 	// the caller must only invoke this after a scan in which every surface this
 	// table depends on was reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
+
+	// Fenced returns a view whose mutations refuse to commit unless the
+	// given run is still owned by the caller (§2.10A). Reads are unaffected.
+	Fenced(f ScanFence) CloudPermissionRepository
 }
 
 // CloudPermissionFilter narrows an assume-edge, permission, or resource
@@ -64,11 +68,20 @@ type CloudPermissionFilter struct {
 	Offset      int
 }
 
-type cloudPermissionRepository struct{ db *gorm.DB }
+type cloudPermissionRepository struct {
+	db    *gorm.DB
+	fence *ScanFence
+}
 
 // NewCloudPermissionRepository constructs the repository.
 func NewCloudPermissionRepository(db *gorm.DB) CloudPermissionRepository {
 	return &cloudPermissionRepository{db: db}
+}
+
+func (r *cloudPermissionRepository) Fenced(f ScanFence) CloudPermissionRepository {
+	copy := *r
+	copy.fence = &f
+	return &copy
 }
 
 func (r *cloudPermissionRepository) UpsertAssumeEdge(e *models.CloudAssumeEdge) (*models.CloudAssumeEdge, bool, error) {
@@ -85,23 +98,25 @@ func (r *cloudPermissionRepository) UpsertAssumeEdge(e *models.CloudAssumeEdge) 
 	proposed := e.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id":         e.ConnectorID,
-				"issuer":               e.Issuer,
-				"mechanism":            e.Mechanism,
-				"k8s_ref":              e.K8sRef,
-				"attrs":                e.Attrs,
-				"last_seen_generation": e.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-			DoNothing: false,
-		},
-		clause.Returning{},
-	).Create(e).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{{Name: "identity_id"}, {Name: "subject_kind"}, {Name: "subject"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id":         e.ConnectorID,
+					"issuer":               e.Issuer,
+					"mechanism":            e.Mechanism,
+					"k8s_ref":              e.K8sRef,
+					"attrs":                e.Attrs,
+					"last_seen_generation": e.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+				DoNothing: false,
+			},
+			clause.Returning{},
+		).Create(e).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,27 +136,29 @@ func (r *cloudPermissionRepository) UpsertResource(res *models.CloudResource) (*
 	proposed := res.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": res.ConnectorID,
-				"kind":         res.Kind,
-				// name IS refreshed: a resource renamed in place (e.g. an S3
-				// bucket's ARN never changes, but the plan may later type a
-				// service where it can) should not keep showing a stale label.
-				"name": res.Name,
-				// sensitivity is NOT refreshed here deliberately -- see
-				// UpsertPermission's identical note. A later ticket may raise it
-				// from tags or activity, and this scan must not stamp it back
-				// down to the rule-based default on every repeat run.
-				"last_seen_generation": res.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(res).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": res.ConnectorID,
+					"kind":         res.Kind,
+					// name IS refreshed: a resource renamed in place (e.g. an S3
+					// bucket's ARN never changes, but the plan may later type a
+					// service where it can) should not keep showing a stale label.
+					"name": res.Name,
+					// sensitivity is NOT refreshed here deliberately -- see
+					// UpsertPermission's identical note. A later ticket may raise it
+					// from tags or activity, and this scan must not stamp it back
+					// down to the rule-based default on every repeat run.
+					"last_seen_generation": res.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+			},
+			clause.Returning{},
+		).Create(res).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -174,40 +191,42 @@ func (r *cloudPermissionRepository) UpsertPermission(p *models.CloudPermission) 
 	proposed := p.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			// Matches uq_cloud_permission_grant, whose NULLS NOT DISTINCT is
-			// what lets two account_wide/prefix grants from the same statement
-			// (both resource_id NULL) collide as one conflict target instead of
-			// duplicating on every scan.
-			Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": p.ConnectorID,
-				"plane":        p.Plane,
-				"effect":       p.Effect,
-				"role_name":    p.RoleName,
-				"actions":      p.Actions,
-				"scope_kind":   p.ScopeKind,
-				"derivation":   p.Derivation,
-				// The constraint columns MUST refresh on conflict. A statement
-				// that gains a Condition in AWS between two scans would
-				// otherwise keep its old unconditional row, and the console
-				// would keep showing access that is now gated.
-				"not_actions":      p.NotActions,
-				"not_resources":    p.NotResources,
-				"condition":        p.Condition,
-				"constraint_state": p.ConstraintState,
-				// sensitivity is NOT refreshed on conflict. It starts as the
-				// rule-based default this scan computed, but a reviewer may have
-				// since raised it by hand (once that exists), and a re-scan of
-				// an unchanged statement must not silently revert that call.
-				"last_seen_generation": p.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(p).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				// Matches uq_cloud_permission_grant, whose NULLS NOT DISTINCT is
+				// what lets two account_wide/prefix grants from the same statement
+				// (both resource_id NULL) collide as one conflict target instead of
+				// duplicating on every scan.
+				Columns: []clause.Column{{Name: "identity_id"}, {Name: "native_id"}, {Name: "resource_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": p.ConnectorID,
+					"plane":        p.Plane,
+					"effect":       p.Effect,
+					"role_name":    p.RoleName,
+					"actions":      p.Actions,
+					"scope_kind":   p.ScopeKind,
+					"derivation":   p.Derivation,
+					// The constraint columns MUST refresh on conflict. A statement
+					// that gains a Condition in AWS between two scans would
+					// otherwise keep its old unconditional row, and the console
+					// would keep showing access that is now gated.
+					"not_actions":      p.NotActions,
+					"not_resources":    p.NotResources,
+					"condition":        p.Condition,
+					"constraint_state": p.ConstraintState,
+					// sensitivity is NOT refreshed on conflict. It starts as the
+					// rule-based default this scan computed, but a reviewer may have
+					// since raised it by hand (once that exists), and a re-scan of
+					// an unchanged statement must not silently revert that call.
+					"last_seen_generation": p.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+			},
+			clause.Returning{},
+		).Create(p).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}

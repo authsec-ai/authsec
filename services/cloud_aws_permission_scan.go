@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -58,6 +59,13 @@ type AWSPermissionScanner struct {
 // WithEvidence attaches an observation writer for this run.
 func (s *AWSPermissionScanner) WithEvidence(w *ObservationWriter) *AWSPermissionScanner {
 	s.evidence = w
+	return s
+}
+
+// WithFence fences the grant writes (assume edges, resources, permissions)
+// so a superseded worker cannot land them (§2.10A, part 3).
+func (s *AWSPermissionScanner) WithFence(f repositories.ScanFence) *AWSPermissionScanner {
+	s.grants = s.grants.Fenced(f)
 	return s
 }
 
@@ -446,13 +454,13 @@ func (s *AWSPermissionScanner) writePermissions(
 		grants := grantOptions(state)
 
 		for _, p := range policies.Attached {
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, p.ARN, p.Document, out, grants); err != nil {
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, p.ARN, p.Document, out, grants); err != nil {
 				return err
 			}
 		}
 		for _, p := range policies.Inline {
 			source := "inline:" + p.Name
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, source, p.Document, out, grants); err != nil {
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, source, p.Document, out, grants); err != nil {
 				return err
 			}
 		}
@@ -460,7 +468,7 @@ func (s *AWSPermissionScanner) writePermissions(
 		// distinct derivation so nothing counts them as access granted.
 		if b := policies.Boundary; b != nil {
 			source := "boundary:" + b.ARN
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, source, b.Document, out, boundaryOptions()); err != nil {
+			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, source, b.Document, out, boundaryOptions()); err != nil {
 				return err
 			}
 		}
@@ -582,7 +590,7 @@ func constraintState(stmt awsdiscovery.PolicyStatement, b boundaryState) string 
 // distinct in the first place.
 func (s *AWSPermissionScanner) writePolicyDocument(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, identityID uuid.UUID,
-	source, document string, out *PermissionSnapshot, opts policyWriteOptions,
+	holderNativeID, source, document string, out *PermissionSnapshot, opts policyWriteOptions,
 ) error {
 	statements, skipped, err := awsdiscovery.ParsePolicyDocument(document)
 	if err != nil {
@@ -670,10 +678,27 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 			// to it, and evidence that omits the narrowing repeats the very
 			// over-claim the constraint columns exist to prevent.
 			if s.evidence != nil && stored != nil {
+				// P2-2 / SPEC §4.8: the observation's subject_native_id is the
+				// FULLY-QUALIFYING key, not the bare nativeID. One statement
+				// produces one cloud_permission row per resource, and two
+				// holders of one managed policy share a statement id, so the
+				// bare id is ambiguous -- and once 024 SETs NULL the subject FK
+				// on reconciliation, subject_native_id is all that survives to
+				// tie the evidence to its grant.
+				//
+				// Built with the SAME helper the projector's evidence pass
+				// looks up by (igagraph.PermissionSubjectKey), so the key
+				// written and the key read cannot drift. A resourceless or
+				// wildcard statement passes "" and the helper substitutes "*".
+				resourceNativeID := ""
+				if typed != nil {
+					resourceNativeID = typed.NativeID
+				}
+				subjectKey := igagraph.PermissionSubjectKey(*stored, holderNativeID, resourceNativeID)
 				if err := s.evidence.Record(
 					PermissionSubject(stored.ID),
 					policySourceAPI(source), models.SurfaceIAMPolicies, "",
-					time.Now(), nativeID,
+					time.Now(), subjectKey,
 					map[string]any{
 						"source":           source,
 						"statement_index":  stmt.Index,
