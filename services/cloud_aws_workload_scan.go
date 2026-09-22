@@ -631,6 +631,13 @@ func (s *AWSWorkloadScanner) WithEvidence(w *ObservationWriter) *AWSWorkloadScan
 	return s
 }
 
+// WithFence fences the workload and usage writes so a superseded worker
+// cannot land them (§2.10A, part 3).
+func (s *AWSWorkloadScanner) WithFence(f repositories.ScanFence) *AWSWorkloadScanner {
+	s.workloads = s.workloads.Fenced(f)
+	return s
+}
+
 // workloadSourceAPI names the call each runtime came from, so evidence points
 // at something a reader can re-issue themselves.
 func workloadSourceAPI(runtimeKind string) string {

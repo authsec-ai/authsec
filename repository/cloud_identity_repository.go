@@ -43,6 +43,11 @@ type CloudIdentityRepository interface {
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (identitiesRemoved, secretsRemoved int64, err error)
 
 	ListSecrets(workspaceID uuid.UUID, f CloudSecretFilter) ([]models.CloudSecret, int64, error)
+
+	// Fenced returns a view of this repository whose mutations refuse to
+	// commit unless the given run is still owned by the caller (§2.10A). Reads
+	// are unaffected.
+	Fenced(f ScanFence) CloudIdentityRepository
 }
 
 // CloudSecretFilter narrows a secret listing. ConnectorID scopes to one
@@ -63,11 +68,20 @@ type CloudIdentityFilter struct {
 	Offset      int
 }
 
-type cloudIdentityRepository struct{ db *gorm.DB }
+type cloudIdentityRepository struct {
+	db    *gorm.DB
+	fence *ScanFence
+}
 
 // NewCloudIdentityRepository constructs the repository.
 func NewCloudIdentityRepository(db *gorm.DB) CloudIdentityRepository {
 	return &cloudIdentityRepository{db: db}
+}
+
+func (r *cloudIdentityRepository) Fenced(f ScanFence) CloudIdentityRepository {
+	copy := *r
+	copy.fence = &f
+	return &copy
 }
 
 func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*models.CloudIdentity, bool, error) {
@@ -113,13 +127,15 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*mode
 			      THEN excluded.last_used_at ELSE cloud_identity.last_used_at END`)
 	}
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(assignments),
-		},
-		clause.Returning{},
-	).Create(i).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(assignments),
+			},
+			clause.Returning{},
+		).Create(i).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -159,13 +175,15 @@ func (r *cloudIdentityRepository) UpsertSecret(s *models.CloudSecret) (*models.C
 			      THEN excluded.last_used_at ELSE cloud_secret.last_used_at END`)
 	}
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(assignments),
-		},
-		clause.Returning{},
-	).Create(s).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(assignments),
+			},
+			clause.Returning{},
+		).Create(s).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}

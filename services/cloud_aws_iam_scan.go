@@ -81,6 +81,14 @@ func (s *AWSIAMScanner) WithEvidence(w *ObservationWriter) *AWSIAMScanner {
 	return s
 }
 
+// WithFence makes every inventory write refuse to commit once this worker
+// has lost the run (§2.10A, part 3). Applied to the identity repo, which
+// carries this scanner's UpsertIdentity and UpsertSecret writes.
+func (s *AWSIAMScanner) WithFence(f repositories.ScanFence) *AWSIAMScanner {
+	s.identities = s.identities.Fenced(f)
+	return s
+}
+
 // NewAWSIAMScanner constructs the scanner.
 func NewAWSIAMScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWSIAMScanner {
 	return &AWSIAMScanner{

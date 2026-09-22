@@ -38,6 +38,10 @@ type CloudWorkloadRepository interface {
 	// caller must only invoke it after a scan in which every surface the table
 	// depends on was actually reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (workloadsRemoved, usageRemoved int64, err error)
+
+	// Fenced returns a view whose mutations refuse to commit unless the
+	// given run is still owned by the caller (§2.10A). Reads are unaffected.
+	Fenced(f ScanFence) CloudWorkloadRepository
 }
 
 // CloudWorkloadFilter narrows a workload or usage listing. ConnectorID scopes
@@ -50,11 +54,20 @@ type CloudWorkloadFilter struct {
 	Offset      int
 }
 
-type cloudWorkloadRepository struct{ db *gorm.DB }
+type cloudWorkloadRepository struct {
+	db    *gorm.DB
+	fence *ScanFence
+}
 
 // NewCloudWorkloadRepository constructs the repository.
 func NewCloudWorkloadRepository(db *gorm.DB) CloudWorkloadRepository {
 	return &cloudWorkloadRepository{db: db}
+}
+
+func (r *cloudWorkloadRepository) Fenced(f ScanFence) CloudWorkloadRepository {
+	copy := *r
+	copy.fence = &f
+	return &copy
 }
 
 func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*models.CloudWorkload, bool, error) {
@@ -71,27 +84,29 @@ func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*mode
 	proposed := w.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": w.ConnectorID,
-				// identity_id IS refreshed: a Lambda's execution role can be
-				// changed in place, and a workload that became unattributed
-				// (role deleted, or IAM denied this run) must stop claiming the
-				// old one.
-				"identity_id":          w.IdentityID,
-				"runtime_kind":         w.RuntimeKind,
-				"name":                 w.Name,
-				"region":               w.Region,
-				"attrs":                w.Attrs,
-				"last_seen_generation": w.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(w).Error
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{{Name: "workspace_id"}, {Name: "native_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": w.ConnectorID,
+					// identity_id IS refreshed: a Lambda's execution role can be
+					// changed in place, and a workload that became unattributed
+					// (role deleted, or IAM denied this run) must stop claiming the
+					// old one.
+					"identity_id":          w.IdentityID,
+					"runtime_kind":         w.RuntimeKind,
+					"name":                 w.Name,
+					"region":               w.Region,
+					"attrs":                w.Attrs,
+					"last_seen_generation": w.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
+			},
+			clause.Returning{},
+		).Create(w).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -115,28 +130,30 @@ func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.Clo
 	proposed := u.ID
 	now := time.Now()
 
-	err := r.db.Clauses(
-		clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "identity_id"}, {Name: "service"}, {Name: "source"},
+	err := runFenced(r.db, r.fence, func(tx *gorm.DB) error {
+		return tx.Clauses(
+			clause.OnConflict{
+				Columns: []clause.Column{
+					{Name: "identity_id"}, {Name: "service"}, {Name: "source"},
+				},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"connector_id": u.ConnectorID,
+					// last_used_at IS refreshed, including back to NULL. AWS's
+					// tracking window rolls, so a service that ages out of it
+					// genuinely becomes "never accessed in the window" again, and
+					// pinning the old date would report activity AWS no longer
+					// claims.
+					"last_used_at":         u.LastUsedAt,
+					"generated_at":         u.GeneratedAt,
+					"attrs":                u.Attrs,
+					"last_seen_generation": u.LastSeenGeneration,
+					"last_seen_at":         now,
+					"row_updated_at":       now,
+				}),
 			},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"connector_id": u.ConnectorID,
-				// last_used_at IS refreshed, including back to NULL. AWS's
-				// tracking window rolls, so a service that ages out of it
-				// genuinely becomes "never accessed in the window" again, and
-				// pinning the old date would report activity AWS no longer
-				// claims.
-				"last_used_at":         u.LastUsedAt,
-				"generated_at":         u.GeneratedAt,
-				"attrs":                u.Attrs,
-				"last_seen_generation": u.LastSeenGeneration,
-				"last_seen_at":         now,
-				"row_updated_at":       now,
-			}),
-		},
-		clause.Returning{},
-	).Create(u).Error
+			clause.Returning{},
+		).Create(u).Error
+	})
 	if err != nil {
 		return nil, false, err
 	}
