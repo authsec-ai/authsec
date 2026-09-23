@@ -31,6 +31,10 @@ type IGAGraphReadController struct {
 
 	readerOnce sync.Once
 	reader     *igaread.Reader
+
+	// classifier is the classification decision service a test installed
+	// (WithClassificationService); nil builds one over db() per request.
+	classifier *services.ClassificationService
 }
 
 // NewIGAGraphReadController reads the process-wide projection gate on every
