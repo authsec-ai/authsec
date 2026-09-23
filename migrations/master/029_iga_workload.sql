@@ -87,6 +87,35 @@ COMMENT ON COLUMN public.iga_workload.continuity IS
     'continues as ONE object -- and the console says recognition_only rather '
     'than implying we checked.';
 
+-- Unresolved execution role (§4.7) --------------------------------------------
+--
+-- What we know about the role a workload acts as, WHEN THERE IS NO
+-- executes_as EDGE to say it. A bare "ARN or empty" cannot distinguish the
+-- four cases the Identities view has to word differently, and collapsing them
+-- made a configured role silently vanish from the customer's view: both
+-- "no role configured" and "role configured but its identity was not in this
+-- scan" rendered as nothing at all.
+ALTER TABLE public.iga_workload
+    ADD COLUMN IF NOT EXISTS execution_role_state text NOT NULL DEFAULT 'none',
+    ADD COLUMN IF NOT EXISTS execution_role_arn   text NOT NULL DEFAULT '';
+
+ALTER TABLE public.iga_workload
+    ADD CONSTRAINT iga_workload_exec_role_state_chk CHECK (execution_role_state IN
+        ('resolved',          -- an executes_as edge exists; the ARN is on the edge
+         'not_in_scan',       -- configured and known; its identity absent from this run
+         'not_in_inventory',  -- configured; matches no identity we hold
+         'none')),            -- no role configured
+    -- The ARN is present EXACTLY when it is the only place the role is
+    -- recorded. resolved keeps it on the edge; none has none to keep.
+    ADD CONSTRAINT iga_workload_exec_role_arn_chk CHECK (
+        (execution_role_state IN ('not_in_scan','not_in_inventory')) = (execution_role_arn <> ''));
+
+COMMENT ON COLUMN public.iga_workload.execution_role_state IS
+    'Read this, never the absence of an executes_as edge: none = no role '
+    'configured (a real finding); not_in_inventory = runs as <arn>, matches no '
+    'identity we hold; not_in_scan = runs as <arn>, not read in the latest '
+    'scan; resolved = the edge carries it.';
+
 -- verify ---------------------------------------------------------------------
 SELECT count(*) AS iga_workload_created
   FROM information_schema.tables

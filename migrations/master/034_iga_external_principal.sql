@@ -31,10 +31,24 @@ CREATE TABLE IF NOT EXISTS public.iga_external_principal (
     -- Filled when the far provider connects AND the claim resolves to exactly
     -- one object. Nullable forever otherwise, which is an HONEST state, not a
     -- gap to be filled with a guess.
-    resolved_object_type text NOT NULL DEFAULT '',
-    resolved_object_id   uuid,
+    --
+    -- TYPED, for the same reason iga_object_support is: a text kind beside a
+    -- bare uuid would let a principal in workspace A "resolve" to workspace
+    -- B's identity, or to an id that no longer exists. A trust policy names an
+    -- identity or a workload -- nothing else can be assumed -- so two typed
+    -- columns cover the domain.
+    resolved_identity_account_id uuid,
+    resolved_workload_id         uuid,
     resolution_basis     text NOT NULL DEFAULT '',   -- derived | asserted
     resolution_rule      text NOT NULL DEFAULT '',
+    -- Who asserted it, when basis = 'asserted'. A resolution a human made must
+    -- be explicable and reversible.
+    resolved_by          text NOT NULL DEFAULT '',
+    -- Whether the resolution currently APPLIES, separate from whether it
+    -- EXISTS. A human's decision is preserved when its target is retired, but
+    -- it stops being in force until someone reconfirms it -- and it never
+    -- returns to active automatically.
+    resolution_state     text NOT NULL DEFAULT 'active',
 
     first_seen_at timestamptz NOT NULL DEFAULT now(),
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
@@ -49,15 +63,37 @@ CREATE TABLE IF NOT EXISTS public.iga_external_principal (
     -- with its rule recorded, anything wildcarded stays unresolved and is SHOWN
     -- as unresolved, and a human confirming it is 'asserted' with the deciding
     -- authority stored.
+    CONSTRAINT iga_ep_resolved_identity_fkey
+        FOREIGN KEY (workspace_id, resolved_identity_account_id)
+        REFERENCES public.iga_identity_accounts (workspace_id, id)
+        ON DELETE SET NULL (resolved_identity_account_id),
+    CONSTRAINT iga_ep_resolved_workload_fkey
+        FOREIGN KEY (workspace_id, resolved_workload_id)
+        REFERENCES public.iga_workload (workspace_id, id)
+        ON DELETE SET NULL (resolved_workload_id),
+
+    -- At most one target, and a basis exactly when there is a target.
     CONSTRAINT iga_external_principal_resolution_chk CHECK (
-        (resolved_object_id IS NULL) = (resolution_basis = '')),
+        (resolved_identity_account_id IS NOT NULL)::int
+      + (resolved_workload_id         IS NOT NULL)::int <= 1
+        AND ((resolved_identity_account_id IS NULL AND resolved_workload_id IS NULL)
+             = (resolution_basis = ''))),
     CONSTRAINT iga_external_principal_basis_chk CHECK (
         resolution_basis IN ('', 'derived', 'asserted')),
+    CONSTRAINT iga_external_principal_asserted_chk CHECK (
+        resolution_basis <> 'asserted' OR resolved_by <> ''),
+    CONSTRAINT iga_external_principal_state_chk CHECK (
+        resolution_state IN ('active', 'suspended', 'pending_reconfirmation')),
     CONSTRAINT iga_external_principal_derived_chk CHECK (
         resolution_basis <> 'derived' OR resolution_rule <> ''),
     CONSTRAINT iga_external_principal_source_key_chk CHECK (source_key <> '')
 );
 
+-- Deleting a resolved target cannot leave "resolved" with no target: SET NULL
+-- would violate the resolution CHECK. So a target is never hard-deleted while
+-- resolved -- nodes are RETIRED, not deleted (§2.7). Retirement does not clear
+-- the resolution: it SUSPENDS it, keeping the FK pointed at the retired row so
+-- the decision stays explicable. The FK is the backstop, not the mechanism.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_external_principal_key
     ON public.iga_external_principal (workspace_id, source_key);
 

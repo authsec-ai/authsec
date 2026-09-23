@@ -52,10 +52,14 @@ type GraphWriter interface {
 	UpsertRelationship(tx *gorm.DB, r *models.IGARelationship) (uuid.UUID, error)
 	UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error
 	UpsertProjectionState(tx *gorm.DB, s *models.IGAProjectionState) error
+	SetExecutionRoleState(tx *gorm.DB, ws, workloadID uuid.UUID, state, arn string) error
 	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) (int64, error)
 	LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error
 	LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
+	RestoreIdentity(tx *gorm.DB, ws, id uuid.UUID, immutableKey string, desc *models.IGAIdentityAccount, now time.Time) (uuid.UUID, error)
+	SuspendAssertions(tx *gorm.DB, ws, identityID uuid.UUID, reason string) error
+	MarkAssertionsPendingReconfirm(tx *gorm.DB, ws, identityID uuid.UUID) error
 	RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error
 	EndEdgesOnSubject(tx *gorm.DB, ws, identityID uuid.UUID, reason string, now time.Time, runID uuid.UUID) error
 }
@@ -330,30 +334,11 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 		// Map lookup, not a query. The workspace's live objects were loaded
 		// once before the transaction; a SELECT per identity here is one round
 		// trip per row, inside a transaction holding locks.
-		prev := r.existing.identity[key]
+		live := r.existing.identity[key]
 
-		// DELETE-AND-RECREATE. Same recognition key, different creation
-		// boundary => a different principal wearing the old name. Carrying the
-		// old row forward would carry last quarter's review decisions onto a
-		// stranger.
-		//
-		// BOTH immutable keys must be non-empty: one empty side means we could
-		// not tell, and "could not tell" is NEVER "recreated".
-		if prev != nil && cont == ContinuityImmutable &&
-			imm != "" && prev.ImmutableKey != "" && prev.ImmutableKey != imm {
-
-			if err := p.repo.RetireIdentity(tx, snap.Run.WorkspaceID, prev.ID,
-				models.RetiredRecreated, now); err != nil {
-				return err
-			}
-			if err := p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID, prev.ID,
-				models.EndedSubjectRecreate, now, snap.Run.ID); err != nil {
-				return err
-			}
-			prev = nil // fall through to INSERT, with a fresh first_seen_at
-		}
-
-		row := &models.IGAIdentityAccount{
+		// Descriptive fields, applied on every path below: insert, update and
+		// restore all refresh them from what this run read.
+		desc := &models.IGAIdentityAccount{
 			WorkspaceID:     snap.Run.WorkspaceID,
 			EstateScopeID:   &snap.ScopeID,
 			SourceKey:       key,
@@ -366,18 +351,70 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 			RollupState:     models.RollupConfirmed,
 			LastSeenAt:      now,
 		}
-		if prev == nil {
+
+		var id uuid.UUID
+		var err error
+		switch {
+		// (a) RECREATION. Same recognition key, different non-empty creation
+		//     boundary: a different principal wearing the old name. Carrying
+		//     the old row forward would carry last quarter's review decisions
+		//     onto a stranger.
+		case live != nil && cont == ContinuityImmutable &&
+			imm != "" && live.ImmutableKey != "" && live.ImmutableKey != imm:
+
+			if err = p.repo.RetireIdentity(tx, snap.Run.WorkspaceID, live.ID,
+				models.RetiredRecreated, now); err != nil {
+				return fmt.Errorf("retire recreated %s: %w", key, err)
+			}
+			if err = p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID, live.ID,
+				models.EndedSubjectRecreate, now, snap.Run.ID); err != nil {
+				return fmt.Errorf("end edges of recreated %s: %w", key, err)
+			}
+			// §2.12: a human's decision about X never transfers to Y.
+			if err = p.repo.SuspendAssertions(tx, snap.Run.WorkspaceID, live.ID, "recreated"); err != nil {
+				return err
+			}
+			row := *desc
 			row.FirstSeenAt = now
-		} else {
-			// Carried, not advanced. DoUpdates never names first_seen_at, but
-			// sending the old value keeps an INSERT-that-conflicts honest too.
-			row.FirstSeenAt = prev.FirstSeenAt
+			if id, err = p.repo.UpsertIdentity(tx, &row); err != nil {
+				return fmt.Errorf("insert recreated %s: %w", key, err)
+			}
+
+		// (b) CONTINUING. Live; refresh descriptive fields only. first_seen_at,
+		//     lifecycle and human-owned columns are untouched.
+		case live != nil:
+			desc.FirstSeenAt = live.FirstSeenAt
+			if id, err = p.repo.UpsertIdentity(tx, desc); err != nil {
+				return fmt.Errorf("upsert %s: %w", key, err)
+			}
+
+		// (c) RESTORATION. No live row, but the same provider identity was
+		//     retired as UNSUPPORTED. Same id, same first_seen_at -- a
+		//     returning object must not lose its history to a new uuid.
+		//     Requires a non-empty, equal immutable key: a recognition_only
+		//     object is never restored, because without a creation boundary we
+		//     cannot prove the returning one is the one that left.
+		case imm != "" && r.existing.retiredIdentity[retiredKey(key, imm)] != nil:
+			prev := r.existing.retiredIdentity[retiredKey(key, imm)]
+			if id, err = p.repo.RestoreIdentity(tx, snap.Run.WorkspaceID,
+				prev.ID, imm, desc, now); err != nil {
+				return fmt.Errorf("restore %s: %w", key, err)
+			}
+			// Restoring the RECORD does not reactivate a human's decision about
+			// it. Asserted associations come back as pending reconfirmation.
+			if err = p.repo.MarkAssertionsPendingReconfirm(tx, snap.Run.WorkspaceID, id); err != nil {
+				return err
+			}
+
+		// (d) NEW.
+		default:
+			row := *desc
+			row.FirstSeenAt = now
+			if id, err = p.repo.UpsertIdentity(tx, &row); err != nil {
+				return fmt.Errorf("insert %s: %w", key, err)
+			}
 		}
 
-		id, err := p.repo.UpsertIdentity(tx, row)
-		if err != nil {
-			return fmt.Errorf("upsert identity %s: %w", key, err)
-		}
 		r.identity[ci.ID] = id
 		r.identityKey[id] = key
 		r.identityImmutable[id] = imm
@@ -782,18 +819,48 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 
 	// workload --executes_as--> identity
 	for _, w := range snap.Workloads {
-		if w.IdentityID == nil {
-			continue // no configured execution identity; not an edge we can claim
-		}
 		src, ok := r.workload[w.ID]
 		if !ok {
-			continue
+			continue // the workload itself was not projected; nothing to annotate
 		}
-		dst, ok := r.identity[*w.IdentityID]
-		if !ok {
-			// The identity was not in this run's snapshot -- a partial scan.
-			// Skipping is right: an edge whose endpoint we did not read this
-			// run must not be written as `current`.
+
+		// DETERMINE THE ENDPOINT FIRST, then record what we know. Clearing a
+		// warning before the edge is known to exist is how a configured role
+		// silently disappears from the customer's view.
+		//
+		// Four outcomes, each a different sentence on the Identities view. The
+		// ARN is the role the workload ACTS AS -- never attrs.ExecutionRoleARN,
+		// which for ECS is the image-pull role ECS itself uses, not the task's.
+		var dst uuid.UUID
+		state, arn := models.ExecRoleNone, ""
+		switch {
+		case w.IdentityID != nil:
+			if id, ok := r.identity[*w.IdentityID]; ok {
+				dst, state = id, models.ExecRoleResolved
+			} else {
+				// The collector resolved the role against an inventory row,
+				// but that row is not in THIS run's snapshot -- a partial IAM
+				// read, or a row still at an older generation. The role is
+				// configured and known; we just cannot draw the edge now.
+				state, arn = models.ExecRoleNotInScan, snap.IdentityNativeID(*w.IdentityID)
+			}
+		case w.AWSAttrs().UnresolvedRoleARN != "":
+			// A role is configured but matches nothing in inventory -- another
+			// account, or iam_roles never read.
+			state, arn = models.ExecRoleNotInInventory, w.AWSAttrs().UnresolvedRoleARN
+		}
+
+		// Written on EVERY pass, for every projected workload, so a state from
+		// an earlier run cannot survive: resolved clears the ARN, the others
+		// set it, none clears both.
+		if err := p.repo.SetExecutionRoleState(tx, snap.Run.WorkspaceID, src, state, arn); err != nil {
+			return err
+		}
+		if state != models.ExecRoleResolved {
+			// No edge: there is no projected endpoint to point one at. A
+			// PRIOR edge is left alone -- reconciliation decides whether it is
+			// stale or ended. Deleting it here would lose history and would
+			// make a partial scan indistinguishable from a removed role.
 			continue
 		}
 		part := snap.EdgePartitionFor(models.RelTypeExecutesAs, w.RuntimeKind, w.Region)

@@ -262,7 +262,21 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	// Retiring a node ends its incident relationships, in the same
 	// transaction. An edge pointing at a retired object and reading `current`
 	// is a lie the read path would repeat.
-	return rc.endEdgesOnRetiredIdentities(tx, snap)
+	if err := rc.endEdgesOnRetiredIdentities(tx, snap); err != nil {
+		return err
+	}
+
+	// And it settles the resolutions pointing at what just retired -- IN THIS
+	// SAME TRANSACTION. Deferring it to the next pass would leave a resolution
+	// in force, pointing at a retired row, for a full scan cycle.
+	//
+	// The two bases settle differently, and that asymmetry is the point:
+	//   * DERIVED is recomputed from evidence every pass, so it is simply
+	//     cleared -- the next pass re-derives it, or leaves it unresolved.
+	//   * ASSERTED is a person's decision. It is PRESERVED, still pointing at
+	//     the retired row so it stays explicable, but SUSPENDED so it is no
+	//     longer in force. It never returns to active on its own.
+	return rc.settleResolutionsOnRetired(tx, snap)
 }
 
 func (rc *Reconciler) endEdgesOnRetiredIdentities(tx *gorm.DB, snap *Snapshot) error {
@@ -293,6 +307,42 @@ func (rc *Reconciler) endEdgesOnRetiredIdentities(tx *gorm.DB, snap *Snapshot) e
 		                   AND w.id IN (r.source_workload_id, r.target_workload_id)
 		                   AND w.lifecycle = 'retired'))`,
 		now, models.EndedSubjectRetired, now, snap.Run.WorkspaceID).Error
+}
+
+// settleResolutionsOnRetired suspends asserted resolutions and clears derived
+// ones whose target has just retired.
+func (rc *Reconciler) settleResolutionsOnRetired(tx *gorm.DB, snap *Snapshot) error {
+	// Asserted: preserved and suspended, target intact.
+	if err := tx.Exec(`
+		UPDATE iga_external_principal ep
+		   SET resolution_state = ?
+		 WHERE ep.workspace_id = ?
+		   AND ep.resolution_basis = ?
+		   AND ep.resolution_state = ?
+		   AND EXISTS (SELECT 1 FROM iga_identity_accounts a
+		                WHERE a.workspace_id = ep.workspace_id
+		                  AND a.id = ep.resolved_identity_account_id
+		                  AND a.lifecycle = 'retired')`,
+		models.ResolutionSuspended, snap.Run.WorkspaceID,
+		models.BasisAsserted, models.ResolutionActive).Error; err != nil {
+		return fmt.Errorf("suspend asserted resolutions: %w", err)
+	}
+
+	// Derived: cleared, so the next pass re-derives from evidence rather than
+	// leaving a computed answer standing over a retired object. The CHECK
+	// requires basis and target to go together, so both clear at once.
+	return tx.Exec(`
+		UPDATE iga_external_principal ep
+		   SET resolved_identity_account_id = NULL,
+		       resolution_basis = '',
+		       resolution_rule  = ''
+		 WHERE ep.workspace_id = ?
+		   AND ep.resolution_basis = ?
+		   AND EXISTS (SELECT 1 FROM iga_identity_accounts a
+		                WHERE a.workspace_id = ep.workspace_id
+		                  AND a.id = ep.resolved_identity_account_id
+		                  AND a.lifecycle = 'retired')`,
+		snap.Run.WorkspaceID, models.BasisDerived).Error
 }
 
 // markReconciled flips every partition's watermark, in the same transaction

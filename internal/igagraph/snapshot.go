@@ -48,6 +48,11 @@ type Snapshot struct {
 	// Subject -- which is a STRING naming a principal that may not exist.
 	identityByKey map[string]uuid.UUID
 
+	// identityNativeByID names any cloud_identity a workload references,
+	// REGARDLESS OF GENERATION. It is how not_in_scan still names the role:
+	// the identity row exists but is not in this run's snapshot.
+	identityNativeByID map[uuid.UUID]string
+
 	// partitions is the list every row's partition is LOOKED UP from, built
 	// once. Rows must never construct a partition separately: a constructed
 	// one can silently disagree with the reconciled set, and then the row is
@@ -75,6 +80,12 @@ type SubjectRef struct {
 func (s *Snapshot) IdentityIDByKey(key string) (uuid.UUID, bool) {
 	id, ok := s.identityByKey[key]
 	return id, ok
+}
+
+// IdentityNativeID returns the native id of a cloud_identity a workload
+// references, whatever generation it sits at. Empty when unknown.
+func (s *Snapshot) IdentityNativeID(id uuid.UUID) string {
+	return s.identityNativeByID[id]
 }
 
 // RegionsAttempted derives the regions this run tried, from the coverage

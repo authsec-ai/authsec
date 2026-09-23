@@ -56,6 +56,25 @@ type IGAGraphRepository interface {
 	// workspace.
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) (int64, error)
 
+	// SetExecutionRoleState records what we know about a workload's execution
+	// role. Written on EVERY pass so a state from an earlier run cannot
+	// survive a change.
+	SetExecutionRoleState(tx *gorm.DB, ws, workloadID uuid.UUID, state, arn string) error
+
+	// RestoreIdentity flips a row retired as UNSUPPORTED back to active,
+	// keeping its id and first_seen_at. Zero rows is ErrNotRestorable, never a
+	// fallback insert.
+	RestoreIdentity(tx *gorm.DB, ws, id uuid.UUID, immutableKey string, desc *models.IGAIdentityAccount, now time.Time) (uuid.UUID, error)
+
+	// SuspendAssertions parks a human's resolution pointing at an object that
+	// has just retired or been recreated: preserved, explicable, not in force.
+	SuspendAssertions(tx *gorm.DB, ws, identityID uuid.UUID, reason string) error
+
+	// MarkAssertionsPendingReconfirm is what a RESTORED object gets. Never
+	// straight back to active: the same UniqueID returning is a reason to ask,
+	// not to assume.
+	MarkAssertionsPendingReconfirm(tx *gorm.DB, ws, identityID uuid.UUID) error
+
 	RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error
 	EndEdgesOnSubject(tx *gorm.DB, ws, identityID uuid.UUID, reason string, now time.Time, runID uuid.UUID) error
 }
@@ -330,6 +349,77 @@ func (r *igaGraphRepository) InsertPublication(
 		return 0, err
 	}
 	return p.Rev, nil
+}
+
+func (r *igaGraphRepository) SetExecutionRoleState(
+	tx *gorm.DB, ws, workloadID uuid.UUID, state, arn string,
+) error {
+	return tx.Model(&models.IGAWorkload{}).
+		Where("workspace_id = ? AND id = ?", ws, workloadID).
+		Updates(map[string]any{
+			"execution_role_state": state,
+			"execution_role_arn":   arn,
+			"updated_at":           time.Now(),
+		}).Error
+}
+
+// ErrNotRestorable means the guarded restore matched no row -- a concurrent
+// restore, or a row that is no longer retired-as-unsupported. The pass fails
+// rather than silently inserting a duplicate object.
+var ErrNotRestorable = errors.New("identity is not restorable")
+
+func (r *igaGraphRepository) RestoreIdentity(
+	tx *gorm.DB, ws, id uuid.UUID, immutableKey string,
+	desc *models.IGAIdentityAccount, now time.Time,
+) (uuid.UUID, error) {
+	// GUARDED: only a row still retired as 'unsupported' carrying THIS
+	// immutable key. Never touches first_seen_at or human-owned state.
+	res := tx.Model(&models.IGAIdentityAccount{}).
+		Where(`workspace_id = ? AND id = ? AND lifecycle = 'retired'
+		       AND retired_reason = ? AND immutable_key = ?`,
+			ws, id, models.RetiredUnsupported, immutableKey).
+		Updates(map[string]any{
+			"lifecycle":        models.IGALifecycleActive,
+			"retired_reason":   "",
+			"display_name":     desc.DisplayName,
+			"account_kind":     desc.AccountKind,
+			"identity_backing": desc.IdentityBacking,
+			"continuity":       desc.Continuity,
+			"last_seen_at":     desc.LastSeenAt,
+			"updated_at":       now,
+		})
+	if res.Error != nil {
+		return uuid.Nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return uuid.Nil, fmt.Errorf("%w: id=%s", ErrNotRestorable, id)
+	}
+	return id, nil
+}
+
+func (r *igaGraphRepository) SuspendAssertions(
+	tx *gorm.DB, ws, identityID uuid.UUID, reason string,
+) error {
+	// Only ASSERTED resolutions. A derived one is recomputed every pass and
+	// needs no lifecycle; suspending it would freeze a stale answer.
+	return tx.Model(&models.IGAExternalPrincipal{}).
+		Where(`workspace_id = ? AND resolved_identity_account_id = ?
+		       AND resolution_basis = ? AND resolution_state = ?`,
+			ws, identityID, models.BasisAsserted, models.ResolutionActive).
+		Updates(map[string]any{
+			"resolution_state": models.ResolutionSuspended,
+			"resolution_rule":  reason,
+		}).Error
+}
+
+func (r *igaGraphRepository) MarkAssertionsPendingReconfirm(
+	tx *gorm.DB, ws, identityID uuid.UUID,
+) error {
+	return tx.Model(&models.IGAExternalPrincipal{}).
+		Where(`workspace_id = ? AND resolved_identity_account_id = ?
+		       AND resolution_basis = ? AND resolution_state = ?`,
+			ws, identityID, models.BasisAsserted, models.ResolutionSuspended).
+		Update("resolution_state", models.ResolutionPendingReconfirmation).Error
 }
 
 func (r *igaGraphRepository) RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error {

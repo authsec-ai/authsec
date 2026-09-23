@@ -92,8 +92,35 @@ func Load(ctx context.Context, db *gorm.DB, jobRunID uuid.UUID) (*Snapshot, erro
 
 	// Index identities by source key, for cloud_assume_edge.Subject.
 	snap.identityByKey = make(map[string]uuid.UUID, len(snap.Identities))
+	snap.identityNativeByID = make(map[uuid.UUID]string, len(snap.Identities))
 	for _, ci := range snap.Identities {
 		snap.identityByKey[IdentityKey(ci)] = ci.ID
+		snap.identityNativeByID[ci.ID] = ci.NativeID
+	}
+
+	// Native ids for the identities this run's WORKLOADS reference, REGARDLESS
+	// OF GENERATION. A workload whose role sits at an older generation is not
+	// in snap.Identities, and without this the not_in_scan state could not
+	// name the role -- which is the whole point of distinguishing it from
+	// "no role configured".
+	var refs []uuid.UUID
+	for _, w := range snap.Workloads {
+		if w.IdentityID != nil {
+			if _, known := snap.identityNativeByID[*w.IdentityID]; !known {
+				refs = append(refs, *w.IdentityID)
+			}
+		}
+	}
+	if len(refs) > 0 {
+		var rows []models.CloudIdentity
+		if err := tx.Select("id", "native_id").
+			Where("workspace_id = ? AND id IN ?", run.WorkspaceID, refs).
+			Find(&rows).Error; err != nil {
+			return nil, fmt.Errorf("load referenced identities: %w", err)
+		}
+		for _, ci := range rows {
+			snap.identityNativeByID[ci.ID] = ci.NativeID
+		}
 	}
 
 	// A DEFENCE IN DEPTH, NOT THE GUARANTEE.
@@ -169,6 +196,18 @@ type existing struct {
 	entitlement map[string]*models.IGAEntitlement
 	credential  map[string]*models.IGACredential
 	agent       map[string]*models.IGAAgent
+
+	// retiredIdentity holds rows retired as UNSUPPORTED, keyed by
+	// (source_key, immutable_key). Both, because the recognition key alone
+	// would "restore" a RECREATED object -- a different principal wearing the
+	// old name -- which is the one thing restoration must never do.
+	retiredIdentity map[string]*models.IGAIdentityAccount
+}
+
+// retiredKey is the restoration lookup. Both halves, deliberately: see
+// existing.retiredIdentity.
+func retiredKey(sourceKey, immutableKey string) string {
+	return sourceKey + Sep + immutableKey
 }
 
 // LoadExisting reads the workspace's live objects ONCE, before the projection
@@ -181,12 +220,13 @@ type existing struct {
 // comparison needs.
 func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, error) {
 	ex := &existing{
-		identity:    map[string]*models.IGAIdentityAccount{},
-		workload:    map[string]*models.IGAWorkload{},
-		resource:    map[string]*models.IGAResource{},
-		entitlement: map[string]*models.IGAEntitlement{},
-		credential:  map[string]*models.IGACredential{},
-		agent:       map[string]*models.IGAAgent{},
+		identity:        map[string]*models.IGAIdentityAccount{},
+		workload:        map[string]*models.IGAWorkload{},
+		resource:        map[string]*models.IGAResource{},
+		entitlement:     map[string]*models.IGAEntitlement{},
+		credential:      map[string]*models.IGACredential{},
+		agent:           map[string]*models.IGAAgent{},
+		retiredIdentity: map[string]*models.IGAIdentityAccount{},
 	}
 	live := func(dst any) error {
 		return db.WithContext(ctx).
@@ -245,6 +285,21 @@ func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, er
 	}
 	for i := range creds {
 		ex.credential[creds[i].SourceKey] = &creds[i]
+	}
+
+	// Retired identities, for RESTORATION. Only those retired as
+	// 'unsupported': a row retired as 'recreated' is a different principal and
+	// must never come back under the returning object's id.
+	var retired []models.IGAIdentityAccount
+	if err := db.WithContext(ctx).
+		Where(`workspace_id = ? AND lifecycle = 'retired' AND retired_reason = ?
+		       AND source_key <> '' AND immutable_key <> ''`,
+			ws, models.RetiredUnsupported).
+		Find(&retired).Error; err != nil {
+		return nil, err
+	}
+	for i := range retired {
+		ex.retiredIdentity[retiredKey(retired[i].SourceKey, retired[i].ImmutableKey)] = &retired[i]
 	}
 	return ex, nil
 }

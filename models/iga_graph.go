@@ -98,6 +98,29 @@ const (
 	EndedSubjectRecreate = "subject_recreated"
 )
 
+// Execution-role state (§4.7). Read INSTEAD of inferring from the absence of
+// an executes_as edge -- the absence cannot tell "no role configured" from
+// "configured, but its identity was not in this scan", and those are opposite
+// findings.
+const (
+	ExecRoleResolved       = "resolved"
+	ExecRoleNotInScan      = "not_in_scan"
+	ExecRoleNotInInventory = "not_in_inventory"
+	ExecRoleNone           = "none"
+)
+
+// External-principal resolution lifecycle (§2.12).
+//
+// A DERIVED resolution is re-derived every pass, so it needs no lifecycle. An
+// ASSERTED one is a person's decision: it is preserved when its target retires
+// but stops being in force, and NEVER returns to active automatically -- the
+// same UniqueID coming back is a reason to ask, not to assume.
+const (
+	ResolutionActive                = "active"
+	ResolutionSuspended             = "suspended"
+	ResolutionPendingReconfirmation = "pending_reconfirmation"
+)
+
 // Agent origin (§3, 033). The exit gate's "a registered agent is distinguished
 // from native discovery": the two get different review treatment and must
 // never silently merge.
@@ -158,6 +181,12 @@ type IGAWorkload struct {
 	SourceKey    string `json:"source_key" gorm:"not null"`
 	Continuity   string `json:"continuity" gorm:"not null;default:'recognition_only'"`
 	ImmutableKey string `json:"immutable_key" gorm:"not null;default:''"`
+
+	// ExecutionRoleState says what we know about the role this workload acts
+	// as when no executes_as edge records it. ExecutionRoleARN is set exactly
+	// for the two middle states, where it is the only place the role is named.
+	ExecutionRoleState string `json:"execution_role_state" gorm:"not null;default:'none'"`
+	ExecutionRoleARN   string `json:"execution_role_arn" gorm:"not null;default:''"`
 
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
@@ -256,10 +285,17 @@ type IGAExternalPrincipal struct {
 
 	// Nullable forever when the claim is wildcarded or the far provider is not
 	// connected. That is an honest state, not a gap to fill with a guess.
-	ResolvedObjectType string     `json:"resolved_object_type" gorm:"not null;default:''"`
-	ResolvedObjectID   *uuid.UUID `json:"resolved_object_id,omitempty" gorm:"type:uuid"`
-	ResolutionBasis    string     `json:"resolution_basis" gorm:"not null;default:''"`
-	ResolutionRule     string     `json:"resolution_rule" gorm:"not null;default:''"`
+	// TYPED: a text kind beside a bare uuid is not a foreign key.
+	ResolvedIdentityAccountID *uuid.UUID `json:"resolved_identity_account_id,omitempty" gorm:"type:uuid"`
+	ResolvedWorkloadID        *uuid.UUID `json:"resolved_workload_id,omitempty" gorm:"type:uuid"`
+	ResolutionBasis           string     `json:"resolution_basis" gorm:"not null;default:''"`
+	ResolutionRule            string     `json:"resolution_rule" gorm:"not null;default:''"`
+	// ResolvedBy is required when the basis is asserted: a human's resolution
+	// must be explicable and reversible.
+	ResolvedBy string `json:"resolved_by" gorm:"not null;default:''"`
+	// ResolutionState is whether the resolution currently APPLIES, separate
+	// from whether it exists.
+	ResolutionState string `json:"resolution_state" gorm:"not null;default:'active'"`
 
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
