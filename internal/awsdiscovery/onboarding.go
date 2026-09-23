@@ -40,9 +40,16 @@ var CloudFormationTemplate string
 //
 // Bumped by ticket [2], which adds iam:ListOpenIDConnectProviders. Bumped
 // again to add s3:GetBucketPolicy/kms:GetKeyPolicy for resource-policy reads.
+// Bumped for IGA Phase 2 (T2.4, D-54) to add bedrock-agentcore:GetGateway --
+// the gateway's ARN and execution role, which ListGateways does not return --
+// and ec2:DescribeRegions, which GET .../connectors/:id/regions calls to list
+// the regions enabled in the account. Both granted explicitly, in one bump,
+// rather than assumed covered by SecurityAudit (see the template's header).
 //
-// Must match the TemplateVersion output in the YAML.
-const TemplateVersion = "2026-09-18"
+// Must match BOTH the Metadata.AuthSec.TemplateVersion and the TemplateVersion
+// output in the YAML; TestS2TemplateVersionDeclaredConsistently checks all
+// three.
+const TemplateVersion = "2026-09-23"
 
 // maxRetryAttempts bounds the SDK's built-in backoff. Above the SDK default of
 // 3 because IAM and CloudTrail throttle readily on a large account and a scan
@@ -287,6 +294,10 @@ func ValidateRegion(region string) error {
 // the customer must correct in their own account; a throttle means try later;
 // anything else is ours to investigate. Collapsing all three into "AWS error"
 // sends every case to the same unhelpful place.
+//
+// The SDK error stays in the chain (classifiedError): the message is exactly
+// what it always was, but FailedCall can still read the operation and the
+// error code AWS returned, which coverage reports as api and error_code.
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -296,11 +307,20 @@ func classify(err error) error {
 		switch apiErr.ErrorCode() {
 		case "AccessDenied", "AccessDeniedException", "InvalidClientTokenId",
 			"SignatureDoesNotMatch", "ExpiredToken", "MalformedPolicyDocument":
-			return fmt.Errorf("%w: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode())
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+				sentinel: ErrNotAssumable, cause: err,
+			}
 		case "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException":
-			return fmt.Errorf("%w: %s", ErrThrottled, apiErr.ErrorMessage())
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s", ErrThrottled, apiErr.ErrorMessage()),
+				sentinel: ErrThrottled, cause: err,
+			}
 		}
-		return fmt.Errorf("aws %s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage())
+		return &classifiedError{
+			msg:   fmt.Sprintf("aws %s: %s", apiErr.ErrorCode(), apiErr.ErrorMessage()),
+			cause: err,
+		}
 	}
 	return err
 }

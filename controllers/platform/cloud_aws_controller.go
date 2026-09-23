@@ -2,13 +2,16 @@ package platform
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/internal/vault"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
@@ -31,11 +34,28 @@ import (
 // Bedrock, activity and classification all resolve against.
 type CloudAWSController struct {
 	db *gorm.DB
+
+	// svc, when set, is the onboarding service every handler uses instead of
+	// one built from VAULT_ADDR/VAULT_TOKEN -- the seam that lets the routes be
+	// driven through gin with fake AWS and a memory vault.
+	svc *services.AWSOnboardingService
+
+	// cursors signs the run-history cursor (IGA_CURSOR_SECRET, as the graph
+	// lists do), built on first use.
+	cursorsOnce sync.Once
+	cursors     *igaread.Reader
 }
 
 // NewCloudAWSController constructs the controller.
 func NewCloudAWSController(db *gorm.DB) *CloudAWSController {
 	return &CloudAWSController{db: db}
+}
+
+// WithOnboardingService makes every handler use svc. Tests use it; production
+// builds the service per request from the environment.
+func (ctl *CloudAWSController) WithOnboardingService(svc *services.AWSOnboardingService) *CloudAWSController {
+	ctl.svc = svc
+	return ctl
 }
 
 // authsecPrincipalEnv names the AuthSec AWS principal a customer's trust policy
@@ -45,6 +65,9 @@ const authsecPrincipalEnv = "AUTHSEC_AWS_DISCOVERY_PRINCIPAL_ARN"
 
 // service builds the onboarding service, or explains why it cannot.
 func (ctl *CloudAWSController) service() (*services.AWSOnboardingService, error) {
+	if ctl.svc != nil {
+		return ctl.svc, nil
+	}
 	addr, token := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 	if addr == "" || token == "" {
 		// The ExternalId is a shared secret with the customer's trust policy.
@@ -954,9 +977,22 @@ func (ctl *CloudAWSController) GetScanRun(c *gin.Context) {
 		return
 	}
 
+	// The run gains projection: {status, rev} (§5.3): what became of its
+	// projection job, and the revision it published -- null when the run has no
+	// job (the switch was off, or it never published).
+	projection, err := repositories.NewCloudScanRunRepository(ctl.db).Projection(workspaceID, runID)
+	if err != nil {
+		log.Printf("[discovery] scan run %s projection: %v", runID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read the run's projection"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    run,
+		"data": scanRunWithProjection{
+			CloudScanRun: *run,
+			Projection:   projectionView(projection),
+		},
 		"meta": gin.H{
 			"as_of":    time.Now().UTC(),
 			"terminal": run.Terminal(),

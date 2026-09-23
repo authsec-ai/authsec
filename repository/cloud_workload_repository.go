@@ -33,6 +33,12 @@ type CloudWorkloadRepository interface {
 	// for the scan report.
 	CountsForConnector(workspaceID, connectorID uuid.UUID) (workloads, usage int64, err error)
 
+	// RegionsForConnector lists the regions this connector holds workloads in
+	// -- the regions an earlier scan read compute from. A region deselected
+	// since must still get its not_selected stand-in, or its results are never
+	// marked stale (§2.14.13).
+	RegionsForConnector(workspaceID, connectorID uuid.UUID) ([]string, error)
+
 	// ReconcileGeneration removes rows this connector did NOT see in the given
 	// generation. Same contract as every other ReconcileGeneration here: the
 	// caller must only invoke it after a scan in which every surface the table
@@ -213,6 +219,14 @@ func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uu
 		return 0, 0, err
 	}
 	return workloads, usage, nil
+}
+
+func (r *cloudWorkloadRepository) RegionsForConnector(workspaceID, connectorID uuid.UUID) ([]string, error) {
+	var regions []string
+	err := r.db.Model(&models.CloudWorkload{}).
+		Where("workspace_id = ? AND connector_id = ? AND region <> ''", workspaceID, connectorID).
+		Distinct().Order("region").Pluck("region", &regions).Error
+	return regions, err
 }
 
 // ReconcileGeneration removes what this connector did not see. Usage before

@@ -1,10 +1,89 @@
 package platform
 
-import "github.com/gin-gonic/gin"
+import (
+	"github.com/gin-gonic/gin"
 
-// Pipeline and coverage (§5.3 Integration, scan and pipeline, T2.3).
+	"github.com/authsec-ai/authsec/internal/igaread"
+)
+
+// Pipeline and coverage (§5.3 Integration, scan and pipeline; §2.14.7,
+// §2.14.13; T2.3).
 //
-// STUB: every handler answers 501 until its task lands. Replace this file whole.
+// Both run behind serve(): 503 graph_unavailable while IGA_GRAPH_PROJECTION is
+// off or misconfigured (D-10, D-11) -- with the switch off there is no barrier,
+// no job and no publication, so every account would sit in "first publication
+// pending" forever, which is a lie the Unavailable state does not tell. Both
+// read inside ONE §5.1 snapshot, so the barrier, the runs and the revision they
+// report are one moment of the pipeline.
 
-func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) { ctl.notYet(c) }
-func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) { ctl.notYet(c) }
+// GetPipeline handles GET /api/iga/v1/pipeline: the barrier, each AWS
+// account's latest run, its projection and the revision that last published
+// it, and the current revision.
+//
+// Not revision-pinned: the pipeline is the live state around the graph, not a
+// read of it, and a queued scan must be visible the moment it is queued
+// (§2.15 step 1) whatever revision the client holds.
+func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
+	ctl.serve(c, func(g graphCall) (any, error) {
+		var body igaread.Envelope
+		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{}, func(q *igaread.Query) error {
+			view, err := q.Pipeline()
+			if err != nil {
+				return err
+			}
+			body = igaread.Envelope{Data: view, Meta: igaread.NewDetailMeta(q)}
+			return nil
+		})
+		return body, err
+	})
+}
+
+// GetCoverage handles GET /api/iga/v1/coverage[?account=<id>][&rev=N]: per
+// account and surface, from the runs the current revision was built from --
+// state, count, error_code, api, since, prevents and run (§5.3). A rev that is
+// no longer current is 409 revision_stale; nothing published is 200 with empty
+// data and graph_state not_published (§5.1).
+func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) {
+	ctl.serve(c, func(g graphCall) (any, error) {
+		vals := c.Request.URL.Query()
+		rev, perr := igaread.ParseRev(vals)
+		if perr != nil {
+			return nil, perr
+		}
+		accounts, perr := coverageAccounts(vals["account"])
+		if perr != nil {
+			return nil, perr
+		}
+		var body igaread.Envelope
+		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
+			data, err := q.Coverage(accounts)
+			if err != nil {
+				return err
+			}
+			body = igaread.Envelope{Data: data, Meta: igaread.NewDetailMeta(q)}
+			return nil
+		})
+		return body, err
+	})
+}
+
+// coverageAccounts validates ?account= (repeatable, §5.2). Coverage is always
+// of a connected account's read, so "unknown" names nothing here and is 400
+// like any other value that is not a 12-digit account id.
+func coverageAccounts(raw []string) ([]string, *igaread.Error) {
+	var out []string
+	for _, a := range raw {
+		if a == "" {
+			continue
+		}
+		ok := len(a) == 12
+		for _, r := range a {
+			ok = ok && r >= '0' && r <= '9'
+		}
+		if !ok {
+			return nil, igaread.InvalidParameter("account", "account must be a 12-digit AWS account id")
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}

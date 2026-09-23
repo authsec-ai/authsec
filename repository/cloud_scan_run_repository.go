@@ -106,6 +106,40 @@ type CloudScanRunRepository interface {
 
 	Get(runID uuid.UUID) (*models.CloudScanRun, error)
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
+
+	// History lists one connector's runs, newest first, keyset-paged on
+	// (requested_at, id) -- every run however it ended, each with what became
+	// of its projection (GET .../connectors/:id/scan-runs, §5.3).
+	History(workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int) ([]ScanRunRecord, error)
+
+	// Projection reports what became of one run's projection: nil when the run
+	// has no projection job (the switch was off, or it never published).
+	Projection(workspaceID, runID uuid.UUID) (*RunProjection, error)
+}
+
+// ScanRunPosition is where a history page ended: the last row's sort key.
+type ScanRunPosition struct {
+	RequestedAt time.Time
+	ID          uuid.UUID
+}
+
+// RunProjection is a run's projection job and the publication it produced.
+// 033 makes both at most one per run: iga_projection_job_run_key UNIQUE
+// (scan_run_id), iga_publication_run_key UNIQUE (workspace_id, scan_run_id).
+type RunProjection struct {
+	JobStatus string
+	Attempts  int
+	LastError string
+	// Rev is the revision this run's projection published, nil until then --
+	// and nil for good when the job was abandoned or superseded.
+	Rev         *int64
+	PublishedAt *time.Time
+}
+
+// ScanRunRecord is one row of a connector's run history.
+type ScanRunRecord struct {
+	Run        models.CloudScanRun
+	Projection *RunProjection
 }
 
 type cloudScanRunRepository struct{ db *gorm.DB }
@@ -354,11 +388,22 @@ func (r *cloudScanRunRepository) Requeue(runID uuid.UUID, owner string, version 
 	// requested_at stayed the oldest row and was re-claimed in a tight loop --
 	// starving every other workspace's scans, and with the attempt refund
 	// above, never tripping the retry ceiling either.
+	//
+	// started_at IS CLEARED when the refused claim is what set it (D-55).
+	// Claim stamps started_at = COALESCE(started_at, now) before the barrier
+	// is asked, so a refused run otherwise carried a start time for a scan
+	// that never began -- /pipeline and the run history then showed a queued
+	// run as started, and "started 4 min ago" was when it was first refused.
+	// attempts is read BEFORE this statement's refund (every SET expression
+	// sees the old row): attempts <= 1 means no earlier claim ever collected,
+	// so the start is this refusal's. A run reclaimed after a crash
+	// (attempts > 1) really did start, and keeps that time.
 	return r.fenced(runID, owner, version, map[string]any{
 		"status":           models.CloudScanRunQueued,
 		"lease_owner":      "",
 		"lease_expires_at": nil,
 		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"started_at":       gorm.Expr("CASE WHEN attempts <= 1 THEN NULL ELSE started_at END"),
 		"requested_at":     now,
 		"updated_at":       now,
 	})
@@ -424,6 +469,89 @@ func (r *cloudScanRunRepository) Latest(
 		return nil, err
 	}
 	return &run, nil
+}
+
+// scanRunHistoryRow is one history row as the join returns it.
+type scanRunHistoryRow struct {
+	models.CloudScanRun
+	JobStatus    *string
+	JobAttempts  *int
+	JobLastError *string
+	PubRev       *int64
+	PubAt        *time.Time
+}
+
+func (row scanRunHistoryRow) projection() *RunProjection {
+	if row.JobStatus == nil {
+		// No job: a publication cannot exist either (one is only ever written
+		// by a job's projection).
+		return nil
+	}
+	p := &RunProjection{JobStatus: *row.JobStatus, Rev: row.PubRev, PublishedAt: row.PubAt}
+	if row.JobAttempts != nil {
+		p.Attempts = *row.JobAttempts
+	}
+	if row.JobLastError != nil {
+		p.LastError = *row.JobLastError
+	}
+	return p
+}
+
+// historySelect joins a run to its projection job and its publication. Both
+// joins are workspace-qualified (§2.9), and at most one row each (033).
+//
+// It names iga_projection_job and iga_publication, so it is NOT part of the
+// Phase 1 scan path (whose claim names no Phase 2 table): it serves read
+// routes of a binary that migrates to 036 before it serves anything, where
+// both tables exist whatever IGA_GRAPH_PROJECTION says -- and runs projected
+// before a switch-off stay visible with their revision.
+const historySelect = `
+	SELECT r.*, j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,
+	       p.rev AS pub_rev, p.published_at AS pub_at
+	  FROM cloud_scan_run r
+	  LEFT JOIN iga_projection_job j ON j.workspace_id = r.workspace_id AND j.scan_run_id = r.id
+	  LEFT JOIN iga_publication p ON p.workspace_id = r.workspace_id AND p.scan_run_id = r.id`
+
+func (r *cloudScanRunRepository) History(
+	workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int,
+) ([]ScanRunRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// ORDER BY (requested_at DESC, id DESC) walks idx_cloud_scan_run_history
+	// (workspace_id, connector_id, requested_at DESC); the id tiebreak makes
+	// the keyset total, so no row is skipped or repeated across pages (§5.2).
+	q := historySelect + `
+	 WHERE r.workspace_id = ? AND r.connector_id = ?`
+	args := []any{workspaceID, connectorID}
+	if after != nil {
+		q += ` AND (r.requested_at, r.id) < (?, ?)`
+		args = append(args, after.RequestedAt, after.ID)
+	}
+	q += ` ORDER BY r.requested_at DESC, r.id DESC LIMIT ?`
+	args = append(args, limit)
+
+	var rows []scanRunHistoryRow
+	if err := r.db.Raw(q, args...).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]ScanRunRecord, len(rows))
+	for i, row := range rows {
+		out[i] = ScanRunRecord{Run: row.CloudScanRun, Projection: row.projection()}
+	}
+	return out, nil
+}
+
+func (r *cloudScanRunRepository) Projection(workspaceID, runID uuid.UUID) (*RunProjection, error) {
+	var rows []scanRunHistoryRow
+	if err := r.db.Raw(historySelect+`
+	 WHERE r.workspace_id = ? AND r.id = ?`, workspaceID, runID).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, ErrCloudScanRunNotFound
+	}
+	return rows[0].projection(), nil
 }
 
 // truncateError keeps a provider's message without letting a pathological one

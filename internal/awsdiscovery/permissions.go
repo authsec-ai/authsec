@@ -75,16 +75,19 @@ func AdditionalPermissions() []Permission {
 				"ecs:ListTaskDefinitions",
 				"ecs:DescribeTaskDefinition",
 				"ec2:DescribeInstances",
+				"ec2:DescribeRegions",
 				"iam:GetInstanceProfile",
 			},
 			Why: "Discovers the compute that runs as each role -- Lambda " +
 				"functions, ECS task definitions and EC2 instances -- so a " +
 				"role's permissions can be attributed to something that " +
 				"actually runs. iam:GetInstanceProfile resolves the wrapper " +
-				"EC2 names instead of a role. Lambda environment variable " +
-				"NAMES are recorded and values are discarded at parse time; " +
-				"no IAM action grants the names alone, so that one is " +
-				"enforced in code.",
+				"EC2 names instead of a role. ec2:DescribeRegions lists the " +
+				"regions enabled in the account (names and opt-in status " +
+				"only), so a region selection can be checked against them. " +
+				"Lambda environment variable NAMES are recorded and values " +
+				"are discarded at parse time; no IAM action grants the names " +
+				"alone, so that one is enforced in code.",
 			Redundant: true,
 		},
 		{
@@ -103,11 +106,14 @@ func AdditionalPermissions() []Permission {
 				"bedrock-agentcore:ListOauth2CredentialProviders",
 				"bedrock-agentcore:ListApiKeyCredentialProviders",
 				"bedrock-agentcore:ListGateways",
+				"bedrock-agentcore:GetGateway",
 				"bedrock-agentcore:ListGatewayTargets",
 			},
 			Why: "Discovers AgentCore runtimes, the workload identities they run " +
-				"as, and what they can reach. List-only on credential providers: " +
-				"names and ARNs, never a value.",
+				"as, and what they can reach. GetGateway resolves a gateway's " +
+				"ARN and the execution role it runs as, which ListGateways " +
+				"does not return; a gateway holds no credential value. " +
+				"List-only on credential providers: names and ARNs, never a value.",
 			Redundant: true,
 		},
 		{

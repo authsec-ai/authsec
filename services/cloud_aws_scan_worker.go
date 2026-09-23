@@ -273,15 +273,28 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	evidence := NewObservationWriter(
 		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation)
 
+	// THE RUN'S SCOPE, READ ONCE (§5.3 PATCH .../connectors/:id, D-54): a
+	// region change applies from the NEXT scan. Every scanner below reads the
+	// connector through this pinned service, so a PATCH landing mid-run cannot
+	// give the EKS pass one region list and the compute pass another.
+	svc := w.svc
+	if svc != nil {
+		pinned, perr := svc.ForRun(run.WorkspaceID, run.ConnectorID)
+		if perr != nil {
+			return fmt.Errorf("read connector: %w", perr)
+		}
+		svc = pinned
+	}
+
 	// ONE GENERATION PER RUN (§1.3, T1.5). The run's generation was assigned at
 	// its first claim and survives a reclaim; the scanner stamps every row with
 	// it and never recomputes scan_generation + 1 from the connector, which on
 	// a reclaimed run named a DIFFERENT generation from the one its evidence
 	// and its projection job carry.
-	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence).
+	scanner := NewAWSIAMScanner(w.db, svc).WithEvidence(evidence).WithFence(fence).
 		WithGeneration(run.Generation)
-	permissionScanner := NewAWSPermissionScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
-	workloadScanner := NewAWSWorkloadScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
+	permissionScanner := NewAWSPermissionScanner(w.db, svc).WithEvidence(evidence).WithFence(fence)
+	workloadScanner := NewAWSWorkloadScanner(w.db, svc).WithEvidence(evidence).WithFence(fence)
 	if w.scannerHook != nil {
 		w.scannerHook(scanner, permissionScanner, workloadScanner)
 	}

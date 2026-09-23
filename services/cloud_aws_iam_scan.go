@@ -958,10 +958,18 @@ func surfaceResult(count int, err error) models.SurfaceCoverage {
 	case err == nil:
 		return models.SurfaceCoverage{State: models.CloudCoverageReached, Count: count}
 	case errors.Is(err, awsdiscovery.ErrThrottled):
-		return models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
+		return withFailedCall(models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}, err)
 	default:
-		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
+		return withFailedCall(models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}, err)
 	}
+}
+
+// withFailedCall records the call and the AWS error code the failure carried,
+// as the SDK stated them (§5.3 /coverage error_code, api) -- and nothing when
+// it carried neither.
+func withFailedCall(s models.SurfaceCoverage, err error) models.SurfaceCoverage {
+	s.API, s.ErrorCode = awsdiscovery.FailedCall(err)
+	return s
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }

@@ -115,6 +115,8 @@ Granted as an inline policy on top of the baseline. Every action is a `List`,
 | `bedrock-agentcore:ListWorkloadIdentities` | AgentCore workload identities, written as subject-less `cloud_observation` evidence, not `cloud_identity` — AgentCore's own principal is not an IAM identity and has no reconciled table of its own | [3] |
 | `bedrock-agentcore:ListOauth2CredentialProviders`, `ListApiKeyCredentialProviders` | AgentCore credential providers, written as subject-less `cloud_observation` evidence, same reasoning as workload identities. **List only** — there is deliberately no `Get`, because that is where a value would be | [3] |
 | `bedrock-agentcore:ListGateways`, `ListGatewayTargets` | What an AgentCore agent can reach | [3] |
+| `bedrock-agentcore:GetGateway` | A gateway's ARN and the execution role it runs as; `ListGateways` returns neither. A gateway holds no credential value (template `2026-09-23`) | IGA P2 T2.4 |
+| `ec2:DescribeRegions` | The regions enabled in the account, for `GET …/connectors/:id/regions` and for validating a region change (`PATCH …/connectors/:id`). Region names and opt-in status only (template `2026-09-23`) | IGA P2 T2.1 |
 | `eks:ListClusters`, `eks:DescribeCluster` | The cluster OIDC issuer, which is what tells two clusters apart in a multi-cluster estate | [5] |
 | `eks:ListPodIdentityAssociations`, `DescribePodIdentityAssociation` | Which IAM role a Kubernetes service account may assume. Pods and workloads are **not** read here — the Kubernetes connector already discovers those | [5] |
 | `cloudtrail:LookupEvents` | Per-identity API history for liveness and classification, matched best-effort against a known identity name | [5] |

@@ -287,6 +287,13 @@ type SurfaceCoverage struct {
 	Count int `json:"count"`
 	// Error is the provider's own words when State is not reached.
 	Error string `json:"error,omitempty"`
+	// ErrorCode and API are the AWS error code and the call that failed
+	// (iam:GetAccountAuthorizationDetails), exactly as the SDK reported them
+	// (awsdiscovery.FailedCall) -- empty when the failure carried neither.
+	// GET /coverage returns them as error_code and api (§5.3): the call is
+	// named, a missing permission never guessed (§2.14.13).
+	ErrorCode string `json:"error_code,omitempty"`
+	API       string `json:"api,omitempty"`
 }
 
 // ScanCoverage is the typed shape of CloudConnector.Coverage: the durable

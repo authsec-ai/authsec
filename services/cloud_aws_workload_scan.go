@@ -177,7 +177,17 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	// reader, and only one of them means the estate is clean. "Nobody looked,
 	// and nobody was meant to" is a different answer from both, and it is the
 	// honest one for an unselected region.
-	for _, region := range unselectedRegions(regions) {
+	//
+	// That includes every region this connector holds workloads in: a region
+	// can be selected (PATCH .../connectors/:id accepts any ENABLED region,
+	// not only awsRegionsWithCompute) and later deselected, and without its
+	// stand-in its earlier results would stay "current" forever instead of
+	// kept and marked stale (§2.14.13).
+	previously, err := s.workloads.RegionsForConnector(workspaceID, snapshot.ConnectorID)
+	if err != nil {
+		return nil, err
+	}
+	for _, region := range unselectedRegions(regions, previously...) {
 		out.Surfaces[models.SurfaceCompute(region)] = models.SurfaceCoverage{
 			State: models.CloudCoverageNotSelected,
 			Error: "region not in the connector's selected scope",
@@ -210,10 +220,10 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	return out, nil
 }
 
-// awsRegionsWithCompute is every region AuthSec can read compute in. Kept here
-// rather than fetched: ec2:DescribeRegions is not in the discovery grant, and
-// asking for it to populate a "not selected" list would be a permission bought
-// to report an absence.
+// awsRegionsWithCompute is every region AuthSec can read compute in, as a
+// default "not selected" list. Kept here rather than fetched per scan: the
+// template grants ec2:DescribeRegions (2026-09-23) for region SELECTION, but a
+// scan must not fail -- or cost a call per run -- to report an absence.
 var awsRegionsWithCompute = []string{
 	"us-east-1", "us-east-2", "us-west-1", "us-west-2",
 	"eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
@@ -222,14 +232,15 @@ var awsRegionsWithCompute = []string{
 	"ca-central-1", "sa-east-1",
 }
 
-func unselectedRegions(selected []string) []string {
+func unselectedRegions(selected []string, alsoKnown ...string) []string {
 	chosen := make(map[string]bool, len(selected))
 	for _, r := range selected {
 		chosen[r] = true
 	}
 	var out []string
-	for _, r := range awsRegionsWithCompute {
+	for _, r := range append(append([]string{}, awsRegionsWithCompute...), alsoKnown...) {
 		if !chosen[r] {
+			chosen[r] = true // each region once
 			out = append(out, r)
 		}
 	}
