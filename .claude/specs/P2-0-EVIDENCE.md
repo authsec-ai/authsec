@@ -110,6 +110,23 @@ Stated plainly, because a gate that overclaims is worse than one with holes.
    needs a `pg_dump --schema-only` of production restored into a scratch
    database, with `027`–`034` applied on top. That requires production access
    and has not been done.
-3. **`can_assume`, credentials, agent instances and the read path** are
-   implemented and covered by the graph suite, but are out of P2-0's slice and
-   have no dedicated scenario row here.
+3. **`can_assume`, credentials and agent instances have a WRITE path only.**
+   The projector emits `can_assume` edges, `iga_credentials` rows and
+   `iga_agent_instances` with their `realizes` edge. None of that is the same as
+   the work item being done, and an earlier revision of this report wrongly said
+   it was:
+   - **P2-9's gate is not executed.** Two active keys, one disabled under
+     complete coverage ⇒ `revoked`, then a rescan under **denied** coverage ⇒
+     nothing changes. The four-condition revocation rule is unproven.
+   - **P2-10's read side does not exist.** `services/iga_service.go:1375` still
+     returns `Instances: []models.IGAAgentInstance{}` unconditionally with
+     `InstanceCoverage = unknown`. So the projector now writes instance rows
+     that `AgentDetail` hides — a worse state than the honest emptiness it
+     replaced, and the one line P2-10 names as the thing to change.
+4. **P2-11, the read-only path-and-evidence view, is not started.** No endpoint
+   exists. `GetAgentAccessPaths` (`iga_controller.go:727`) is the Phase 1
+   GitHub-era endpoint and is not it.
+
+Items 3 and 4 are out of P2-0's declared slice, so they are not overdue. P2-10
+being half-built is not covered by that: it is an inconsistency this work
+introduced.
