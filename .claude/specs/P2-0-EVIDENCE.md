@@ -1,6 +1,6 @@
 # P2-0 evidence report
 
-**Commit:** `0eef56d` on `graph` (parent `4504426`, rebased onto `0e75ad7`)
+**Commit:** `a0ad22c` on `graph` (parent `bf2e68b`; the branch is rebased onto `0e75ad7`)
 **Date run:** 2026-09-23
 **Database:** PostgreSQL 16, `postgres:16` container, migrations `001`–`034`
 applied in order unless a row says otherwise.
