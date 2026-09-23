@@ -42,7 +42,7 @@ issuance, and the ORY Hydra boundary.
 
 ## Agentic IGA
 
-- Migration head is **`025`**; the next Phase 2 migration is `026`.
+- Migration head is **`026`** (governance schema parity); Phase 2 migrations start at `027`.
 - Phase 2 status, and the corrections to the spec that reality has outrun, are in
   [`docs/iga-phase2-verified-state.md`](docs/iga-phase2-verified-state.md).
   Read it before trusting any Phase 2 document's present tense.
