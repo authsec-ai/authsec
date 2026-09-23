@@ -63,13 +63,18 @@ func TestP2TwoPoliciesOneDetached(t *testing.T) {
 	l := newP2Lab(t, "p2-two-policies", true)
 	a := l.account(accountA)
 	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	// TicketRead is ALSO held by another role, so detaching it here does not
+	// retire the policy: only the ASSIGNMENT partition can end this grant, which
+	// is the mechanism under test (a retired policy would cascade instead).
+	a.role("OtherRole", "AROAOTHERROLEOTHERRO")
 	ticket := a.managed("TicketRead", docTicketRead)
 	a.attach("SharedToolRole", ticket)
+	a.attach("OtherRole", ticket)
 	a.attach("SharedToolRole", a.managed("ToolboxRead", docToolboxRead))
 	l.scanAndProject(a)
 
 	g := l.grants()
-	if len(grantsOf(g, "TicketRead")) != 1 || len(grantsOf(g, "ToolboxRead")) != 1 {
+	if len(grantsOf(g, "TicketRead")) != 2 || len(grantsOf(g, "ToolboxRead")) != 1 {
 		t.Fatalf("grants before detach = %+v, want one per policy (merged grants?)", g)
 	}
 
@@ -78,14 +83,29 @@ func TestP2TwoPoliciesOneDetached(t *testing.T) {
 
 	g = l.grants()
 	tr, tb := grantsOf(g, "TicketRead"), grantsOf(g, "ToolboxRead")
-	if len(tr) != 1 || tr[0].State != models.RelEnded || tr[0].ValidTo == nil {
-		t.Errorf("TicketRead grant = %+v, want one, ended with valid_to", tr)
+	ended, current := 0, 0
+	for _, r := range tr {
+		switch {
+		case r.State == models.RelEnded && r.ValidTo != nil && r.EndedReason == models.EndedNotSeen:
+			ended++
+		case r.State == models.RelCurrent:
+			current++
+		}
+	}
+	if ended != 1 || current != 1 {
+		t.Errorf("TicketRead grants = %+v, want the detached role's ended not_seen and the other role's current", tr)
 	}
 	if len(tb) != 1 || tb[0].State != models.RelCurrent {
 		t.Errorf("ToolboxRead grant = %+v, want one, current: the path must remain", tb)
 	}
-	if asg := l.assignments("TicketRead"); len(asg) != 1 || asg[0].State != models.RelEnded {
-		t.Errorf("TicketRead assignment = %+v, want ended", asg)
+	var detached []assignmentRow
+	for _, r := range l.assignments("TicketRead") {
+		if r.State == models.RelEnded {
+			detached = append(detached, r)
+		}
+	}
+	if len(detached) != 1 || detached[0].EndedReason != models.EndedNotSeen {
+		t.Errorf("TicketRead assignments ended = %+v, want exactly the detached one, not_seen", detached)
 	}
 }
 
@@ -164,22 +184,37 @@ func TestP2AttachDetachReattach(t *testing.T) {
 	l := newP2Lab(t, "p2-reattach", true)
 	a := l.account(accountA)
 	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	// A second holder keeps the policy alive, so the period can only end
+	// through the assignment partition (not a policy-retirement cascade).
+	a.role("OtherRole", "AROAOTHERROLEOTHERRO")
 	ticket := a.managed("TicketRead", docTicketRead)
 	a.attach("SharedToolRole", ticket)
+	a.attach("OtherRole", ticket)
 	l.scanAndProject(a)
+	holder := func() []assignmentRow {
+		var out []assignmentRow
+		l.db.Raw(`SELECT a.id, p.display_name AS policy, a.state, a.valid_to, a.ended_reason
+		            FROM iga_policy_assignment a
+		            JOIN iga_policy p ON p.id = a.policy_id
+		            JOIN iga_identity_accounts i ON i.id = a.holder_identity_account_id
+		           WHERE a.workspace_id = ? AND p.display_name = 'TicketRead' AND i.display_name = 'SharedToolRole'
+		           ORDER BY a.valid_from, a.id`, l.ws).Scan(&out)
+		return out
+	}
 
 	a.detach("SharedToolRole", ticket)
 	l.scanAndProject(a)
-	first := l.assignments("TicketRead")
-	if len(first) != 1 || first[0].State != models.RelEnded || first[0].ValidTo == nil {
-		t.Fatalf("after detach: %+v, want one ended period", first)
+	first := holder()
+	if len(first) != 1 || first[0].State != models.RelEnded || first[0].ValidTo == nil ||
+		first[0].EndedReason != models.EndedNotSeen {
+		t.Fatalf("after detach: %+v, want one period, ended not_seen", first)
 	}
 	endedAt := *first[0].ValidTo
 
 	a.attach("SharedToolRole", ticket)
 	l.scanAndProject(a)
 
-	periods := l.assignments("TicketRead")
+	periods := holder()
 	if len(periods) != 2 {
 		t.Fatalf("assignment periods = %d, want 2 (reattach is a NEW row): %+v", len(periods), periods)
 	}
@@ -190,7 +225,12 @@ func TestP2AttachDetachReattach(t *testing.T) {
 	if periods[1].State != models.RelCurrent || periods[1].ID == first[0].ID {
 		t.Errorf("the reattach period = %+v, want a new current row", periods[1])
 	}
-	g := grantsOf(l.grants(), "TicketRead")
+	var g []grantRow
+	for _, r := range l.grants() {
+		if r.Assignment == periods[0].ID || r.Assignment == periods[1].ID {
+			g = append(g, r)
+		}
+	}
 	if len(g) != 2 || g[0].State != models.RelEnded || g[1].State != models.RelCurrent ||
 		g[0].Assignment != periods[0].ID || g[1].Assignment != periods[1].ID {
 		t.Errorf("grants = %+v, want one per period, each through its own assignment", g)
@@ -328,34 +368,47 @@ func TestP2DenyIsNeverAGrant(t *testing.T) {
 // Scenario 9. One region denied, another clean: per-region partitions are
 // independent. The clean region ends what it no longer sees; the denied one
 // keeps its edge stale.
+//
+// The clean region's Lambda STAYS and switches role, so its old edge can end
+// only through ITS REGION'S executes_as partition -- not through a workload
+// retirement cascade, which would pass this test without exercising the
+// partition at all.
 func TestP2RegionPartitionsIndependent(t *testing.T) {
 	l := newP2Lab(t, "p2-regions", true)
 	a := l.account(accountA, "us-east-1", "eu-west-1")
-	role := a.role("refund-lambda-role", "AROA5XK7QEXAMPLE")
-	a.lambda("us-east-1", "east-fn", role)
-	a.lambda("eu-west-1", "west-fn", role)
+	roleA := a.role("RoleA", "AROAROLEAAAAAAAAAAAA")
+	roleB := a.role("RoleB", "AROAROLEBBBBBBBBBBBB")
+	a.lambda("us-east-1", "east-fn", roleA)
+	a.lambda("eu-west-1", "west-fn", roleA)
 	l.scanAndProject(a)
 
-	a.lambda("us-east-1", "east-fn", "")                         // genuinely gone, clean read
+	a.lambda("us-east-1", "east-fn", roleB)                      // clean read, role changed
 	a.lambdas["eu-west-1"].fail = denied("lambda:ListFunctions") // could not look
 	l.scanAndProject(a)
 
 	var rows []struct {
 		Workload string
+		Target   string
 		State    string
 	}
-	l.db.Raw(`SELECT w.display_name AS workload, r.state FROM iga_relationship r
+	l.db.Raw(`SELECT w.display_name AS workload, i.display_name AS target, r.state FROM iga_relationship r
 	            JOIN iga_workload w ON w.id = r.source_workload_id
+	            JOIN iga_identity_accounts i ON i.id = r.target_identity_account_id
 	           WHERE r.workspace_id = ? AND r.relationship_type = 'executes_as'`, l.ws).Scan(&rows)
 	got := map[string]string{}
 	for _, r := range rows {
-		got[r.Workload] = r.State
+		got[r.Workload+"->"+r.Target] = r.State
 	}
-	if got["east-fn"] != models.RelEnded {
-		t.Errorf("clean region's edge = %q, want ended", got["east-fn"])
+	if got["east-fn->RoleA"] != models.RelEnded || got["east-fn->RoleB"] != models.RelCurrent {
+		t.Errorf("clean region edges = %v, want east-fn->RoleA ended and ->RoleB current", got)
 	}
-	if got["west-fn"] != models.RelStale {
-		t.Errorf("denied region's edge = %q, want stale -- a denied region must not close anything", got["west-fn"])
+	if got["west-fn->RoleA"] != models.RelStale {
+		t.Errorf("denied region's edge = %q, want stale -- a denied region must not close anything", got["west-fn->RoleA"])
+	}
+	var westLife string
+	l.db.Raw(`SELECT lifecycle FROM iga_workload WHERE workspace_id = ? AND display_name = 'west-fn'`, l.ws).Scan(&westLife)
+	if westLife != models.IGALifecycleActive {
+		t.Errorf("denied region's workload = %q, want active", westLife)
 	}
 }
 
@@ -694,4 +747,33 @@ func closedGorm(t *testing.T) *gorm.DB {
 	}
 	_ = sqlDB.Close()
 	return db
+}
+
+// E16 / T4.8. AWS rows share the canonical tables with GitHub's, and must never
+// appear in GitHub's lists: every GitHub reader filters provider = 'github'.
+func TestP2AWSRowsAbsentFromGitHubReaders(t *testing.T) {
+	l := newP2Lab(t, "p2-github-isolation", true)
+	a := oneLambda(l)
+	l.scanAndProject(a)
+	if n := l.count(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND provider = 'aws'`, l.ws); n == 0 {
+		t.Fatal("setup: no AWS identity was projected")
+	}
+	// A GitHub identity, written by the GitHub writer.
+	repo := repositories.NewIGARepository(l.db)
+	gh := &models.IGAIdentityAccount{WorkspaceID: l.ws, DisplayName: "octo-bot", AccountKind: "github_app"}
+	if err := repo.UpsertIdentityAccount(gh); err != nil {
+		t.Fatalf("github writer: %v", err)
+	}
+	t.Cleanup(func() { l.db.Exec(`DELETE FROM iga_identity_accounts WHERE id = ?`, gh.ID) })
+	if gh.Provider != models.ProviderGitHub {
+		t.Errorf("the GitHub writer stamped provider %q, want github", gh.Provider)
+	}
+
+	listed, err := repo.ListIdentityAccounts(l.ws, nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != gh.ID {
+		t.Errorf("GET /identity-accounts would return %d rows %+v; want only the GitHub identity", len(listed), listed)
+	}
 }
