@@ -147,8 +147,12 @@ func TestP2UnreadableAndDetachedInOneRun(t *testing.T) {
 	// the listing partial, §1.4).
 	surfaces := models.DecodeScanCoverage(run.Coverage).Surfaces
 	cov := surfaces[models.SurfacePolicyDocuments]
+	// In AWS's words, never classify()'s "the role could not be assumed": the
+	// role WAS assumed, and one read was refused (§2.14.13, E9 "coverage names
+	// the call").
 	if cov.State != models.CloudCoveragePartial || !strings.Contains(cov.Error, "TicketRead") ||
-		!strings.Contains(cov.Error, "iam:GetPolicyVersion") || !strings.Contains(cov.Error, "AccessDenied") {
+		!strings.Contains(cov.Error, "AWS returned AccessDenied for iam:GetPolicyVersion") ||
+		strings.Contains(cov.Error, "could not be assumed") {
 		t.Errorf("policy_documents = %+v, want partial naming TicketRead, the call and the error code", cov)
 	}
 	if s := surfaces[models.SurfaceIAMPolicies].State; s != models.CloudCoverageReached {

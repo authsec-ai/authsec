@@ -395,9 +395,18 @@ func TestP2S3aUserInGroupWithBoundary(t *testing.T) {
 	if priyaOwn != 1 {
 		t.Errorf("grants = %+v, want priya holding exactly her own PriyaOwn, current", grants)
 	}
-	// Every edge this adds has evidence (§4.8): member_of from priya's own
-	// observation (it lists the group), the boundary assignment from hers and
-	// the policy version's.
+	// member_of's evidence is priya's own observation, which LISTS the group
+	// (§4.8); the boundary assignment's is hers too (it lists the boundary)
+	// beside the policy version's. The link is by subject, so the facts
+	// themselves are what prove the observation says so.
+	userFacts := s3aFacts(l, `SELECT o.sanitized_facts FROM cloud_observation o JOIN cloud_identity i ON i.id = o.identity_id
+	           WHERE o.workspace_id = ? AND i.native_id = ? AND o.surface = ? AND o.last_confirmed_run_id = ?`,
+		l.ws, priyaARN, models.SurfaceIAMUsers, run.ID)
+	if len(userFacts) != 1 || fmt.Sprint(userFacts[0]["groups"]) != "[ops]" ||
+		userFacts[0]["permissions_boundary_arn"] != boundary {
+		t.Errorf("priya's observation this run = %v, want one listing her group ops and her boundary", userFacts)
+	}
+	// Every edge this adds has evidence (§4.8).
 	if n := l.count(`SELECT count(*) FROM iga_relationship r WHERE r.workspace_id = ?
 	                  AND NOT EXISTS (SELECT 1 FROM iga_relationship_evidence e WHERE e.relationship_id = r.id)`,
 		l.ws); n != 0 {
@@ -503,8 +512,9 @@ func TestP2S3aOneUnreadableDocumentIsolated(t *testing.T) {
 		t.Errorf("permission_scan = %+v: the permission scan aborted over one document", cov[models.SurfacePermissionScan])
 	}
 	pols := s3aCloudPolicies(l, a.conn, run.Generation)
-	if b := pols["AAABlockedAccess"]; b.HasDocument || !strings.HasPrefix(b.DocumentError, "fetch: ") ||
-		!strings.Contains(b.DocumentError, "iam:GetPolicyVersion") || !strings.Contains(b.DocumentError, "AccessDenied") {
+	if b := pols["AAABlockedAccess"]; b.HasDocument ||
+		!strings.HasPrefix(b.DocumentError, "fetch: AWS returned AccessDenied for iam:GetPolicyVersion: ") ||
+		strings.Contains(b.DocumentError, "could not be assumed") {
 		t.Errorf("unreadable row = %+v, want no document and a fetch error naming the call and code", b)
 	}
 	// D-71: the same document as a structured item, carrying exactly the
