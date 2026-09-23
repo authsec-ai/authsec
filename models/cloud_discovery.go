@@ -353,10 +353,14 @@ type SurfaceCoverage struct {
 	// <code>". Never a guessed missing permission (§2.14.13).
 	Error string `json:"error,omitempty"`
 	// ErrorCode and API are the AWS error code and the call that failed
-	// (iam:GetAccountAuthorizationDetails), exactly as the SDK reported them
-	// (awsdiscovery.FailedCall) -- empty when the failure carried neither.
-	// GET /coverage returns them as error_code and api (§5.3): the call is
-	// named, a missing permission never guessed (§2.14.13).
+	// (bedrock:ListAgents), stamped at collection (D-71) from the reader's
+	// named error (awsdiscovery.AWSErrorCode, awsdiscovery.CallName) -- the
+	// code exactly as the SDK reported it, never a label of ours, and either
+	// one empty when the failure carried none (a surface whose reader does not
+	// name its calls yet, or an endpoint that does not resolve, which has no
+	// AWS code). For partial, the FIRST failing call. GET /coverage returns
+	// them as error_code and api: the call is named, a missing permission
+	// never guessed (§2.14.13).
 	ErrorCode string `json:"error_code,omitempty"`
 	API       string `json:"api,omitempty"`
 }
