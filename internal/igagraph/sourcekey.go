@@ -8,110 +8,229 @@
 package igagraph
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 )
 
 // Sep is the unit separator that joins the segments of a source key.
 //
 // It cannot occur in an ARN, a policy name, or a Kubernetes reference, so no
-// join is ambiguous and no segment needs escaping. Exported because the
-// observation writer builds the qualified permission subject key with the same
-// separator -- see PermissionSubjectKey -- and two spellings of that separator
-// would silently stop evidence matching its edge.
+// join is ambiguous and no segment needs escaping.
 const Sep = "\x1f"
 
 // Continuity values. Mirrors the CHECK added by migration 028.
 const (
 	// ContinuityImmutable means the provider gives a creation-boundary id, so
 	// a delete-and-recreate under the same name is detectable.
-	ContinuityImmutable = "immutable"
+	ContinuityImmutable = models.ContinuityImmutable
 	// ContinuityRecognitionOnly means the name is the strongest claim
 	// available. Stored rather than implied so the console can say so instead
 	// of suggesting a continuity we never verified.
-	ContinuityRecognitionOnly = "recognition_only"
+	ContinuityRecognitionOnly = models.ContinuityRecognitionOnly
 )
 
-// Key builds a namespaced source key.
+// Key builds a namespaced source key: provider ␟ part ␟ part ...
 //
-// A bare native id is never unique: two AWS accounts, two providers and two
-// regions can all produce the same string. The stored form is
-//
-//	provider | partition | account-or-project | region-if-regional | native-id
-//
-// An ARN already carries partition, account and (where regional) region, so
-// for AWS the provider prefix plus the ARN satisfies that shape on its own.
-// The generalised form exists so GitHub and Kubernetes keys cannot collide
-// with AWS or with each other.
-//
-// This is the ONLY place a source key is formatted. Never build one inline:
-// two spellings of the key is the same duplication bug in a new costume.
+// THIS IS THE ONLY PLACE A SOURCE KEY IS FORMATTED. Never build one inline:
+// two spellings of the key is the duplication bug in a new costume.
 func Key(provider string, parts ...string) string {
 	return provider + Sep + strings.Join(parts, Sep)
 }
 
-// IdentityKey is the recognition key of an IAM role or user: its ARN.
+// IdentityKey is the recognition key of an IAM role, user or group: its ARN.
 func IdentityKey(i models.CloudIdentity) string { return Key("aws", i.NativeID) }
 
-// WorkloadKey is the recognition key of a runtime: its function, task
-// definition or instance ARN.
-func WorkloadKey(w models.CloudWorkload) string { return Key("aws", w.NativeID) }
-
-// ResourceKey is the recognition key of a resource: its ARN, or the selector
-// that named it when the selector never resolved. A selector is still a
-// distinct grant target, so it still earns a key.
-func ResourceKey(r models.CloudResource) string { return Key("aws", r.NativeID) }
-
-// EntitlementKey keys one grant occurrence by its policy scope (§2.6).
+// ImmutableKey reads the creation boundary the collector wrote into attrs:
+// RoleId (AROA…), UserId (AIDA…) or GroupId (AGPA…). "" where there is none.
 //
-// cloud_permission.native_id is "<source>#s<n>", where <source> is a managed
-// policy ARN or "inline:<name>" (services/cloud_aws_permission_scan.go), and
-// the row's grain is (identity, statement, resource) per
-// uq_cloud_permission_grant (013:178) -- so one statement naming three
-// resources produces three rows and therefore three entitlements.
-//
-// resourceKey is the projected resource's source key, or "" for an
-// account-wide or wildcard grant, which keys as "*".
-func EntitlementKey(p models.CloudPermission, holder models.CloudIdentity, resourceKey string) string {
-	if resourceKey == "" {
-		// An unresolved or wildcard selector is still a distinct grant, and
-		// must not collide with a grant that names a resource.
-		resourceKey = "*"
+// Continuity and ImmutableKey must agree: 028's CHECK rejects 'immutable' with
+// an empty key, and that loud failure is correct -- fix the mapping, never
+// relax the check.
+func ImmutableKey(ci models.CloudIdentity) string { return ci.AWSAttrs().UniqueID }
+
+// EndpointKey names an identity INSIDE AN EDGE KEY: its immutable key when it
+// has one, so a role recreated under the same ARN yields different edge keys
+// and inherits none of the old role's relationships.
+func EndpointKey(ci models.CloudIdentity) string {
+	if imm := ImmutableKey(ci); imm != "" {
+		return Key("aws", "uid", imm)
 	}
-	return Key("aws", policyScope(p, holder), p.NativeID, resourceKey)
+	return IdentityKey(ci)
 }
 
-// policyScope decides whether an entitlement is SHARED.
-//
-// A managed policy is one object two roles can both attach, so both must
-// resolve to ONE entitlement -- that is what makes "detach from one role ends
-// that grant, the entitlement and the other role's grant survive" true rather
-// than aspirational.
-//
-// An inline policy is not shared. Two roles can each have one named ReadData
-// and they are different grants, because the inline name is unique only WITHIN
-// an identity. Scoping by the holder's ARN keeps them apart.
-func policyScope(p models.CloudPermission, holder models.CloudIdentity) string {
-	source, _, _ := strings.Cut(p.NativeID, "#")
-	if strings.HasPrefix(source, "inline:") {
-		return holder.NativeID
-	}
-	return source
+// WorkloadKey is the recognition key of a runtime: its ARN, CONSTRUCTED where
+// the collector stores a bare id (EC2 instances, and a Bedrock agent or gateway
+// whose detail call failed), so the key never changes with a transient failure.
+func WorkloadKey(w models.CloudWorkload, account string) string {
+	return Key("aws", WorkloadARN(w, account))
 }
 
-// PermissionSubjectKey is the fully-qualifying subject_native_id for a
-// permission observation (§4.8).
+// WorkloadARN returns the collected ARN, or constructs one from the bare id.
+func WorkloadARN(w models.CloudWorkload, account string) string {
+	if strings.HasPrefix(w.NativeID, "arn:") {
+		return w.NativeID
+	}
+	switch w.RuntimeKind {
+	case models.WorkloadEC2Instance:
+		return fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", w.Region, account, w.NativeID)
+	case models.WorkloadBedrockAgent:
+		return fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s", w.Region, account, w.NativeID)
+	case models.WorkloadBedrockAgentCoreGW:
+		return fmt.Sprintf("arn:aws:bedrock-agentcore:%s:%s:gateway/%s", w.Region, account, w.NativeID)
+	case models.WorkloadBedrockAgentCoreRT:
+		return fmt.Sprintf("arn:aws:bedrock-agentcore:%s:%s:runtime/%s", w.Region, account, w.NativeID)
+	}
+	return w.NativeID
+}
+
+// PolicyKey is the RECOGNITION key of a policy: what it is called. Managed
+// policies are one object across holders and accounts; inline policies belong
+// to their holder. Used only to find the live object and detect recreation.
+func PolicyKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
+	if p.PolicyKind == models.CloudPolicyInline && holder != nil {
+		return Key("aws", "inline", holder.NativeID, p.Name)
+	}
+	return Key("aws", p.NativeID) // the policy ARN
+}
+
+// PolicyImmutableKey is the policy's creation boundary: the PolicyId for a
+// managed policy; the holder's immutable key for an inline policy, because an
+// inline policy lives and dies with its holder.
+func PolicyImmutableKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
+	if p.PolicyKind == models.CloudPolicyInline {
+		if holder == nil {
+			return ""
+		}
+		return ImmutableKey(*holder)
+	}
+	return p.PolicyID
+}
+
+// PolicyIncarnationKey names ONE incarnation of a policy. Every descendant key
+// -- statements, assignments, grants -- is built from this, never from the ARN,
+// so a recreated policy shares no key with its predecessor (§2.4).
 //
-// A permission's native id alone is ambiguous: one statement produces one
-// cloud_permission row per resource, and two holders of the same managed
-// policy produce more. Once migration 024 made cloud_observation's subject FKs
-// ON DELETE SET NULL, the row id stops being available at all -- the observation
-// outlives its subject and subject_native_id is what remains. So the evidence
-// has to carry its own unambiguous identity at write time.
+// immutable is the incarnation's creation boundary, normally
+// PolicyImmutableKey(p, holder). It is passed in because an UNREADABLE policy
+// whose GetPolicy failed has no PolicyId this run, and must keep the
+// incarnation the graph already holds rather than mint an empty one.
+func PolicyIncarnationKey(p models.CloudPolicy, holder *models.CloudIdentity, immutable string) string {
+	if p.PolicyKind == models.CloudPolicyInline && holder != nil {
+		return Key("aws", "inline", EndpointKey(*holder), p.Name)
+	}
+	return Key("aws", "policy", immutable)
+}
+
+// PolicyKind maps the collected row to iga_policy.policy_kind.
+func PolicyKind(p models.CloudPolicy) string {
+	switch {
+	case p.PolicyKind == models.CloudPolicyInline:
+		return models.PolicyKindInline
+	case p.AWSManaged:
+		return models.PolicyKindAWSManaged
+	default:
+		return models.PolicyKindCustomerManaged
+	}
+}
+
+// StatementKey implements §2.6: sid:<Sid> when the Sid is unique within the
+// document, else h:<content hash>#n where n disambiguates identical Sid-less
+// statements by their order among equals. `sids` counts Sid occurrences in the
+// document; `hashSeen` counts content hashes seen so far, in document order.
 //
-// Both the observation writer and the projector's evidence pass call this, so
-// the key written and the key looked up cannot drift.
+// A reorder keeps every key. A Sid-keyed edit keeps the key (and records a
+// revision); a Sid-less edit changes the hash, so the old statement ends and a
+// new one begins.
+func StatementKey(policyIncarnation string, st awsdiscovery.PolicyStatement,
+	sids map[string]int, hashSeen map[string]int) (key, hash string) {
+	hash = st.ContentHash()
+	if st.Sid != "" && sids[st.Sid] == 1 {
+		return Key("aws", policyIncarnation, "stmt", "sid:"+st.Sid), hash
+	}
+	hashSeen[hash]++
+	return Key("aws", policyIncarnation, "stmt", fmt.Sprintf("h:%s#%d", hash, hashSeen[hash])), hash
+}
+
+// SidKeyed reports whether a statement key is Sid-keyed, which is what earns
+// it revisions rather than replacement.
+func SidKeyed(statementKey string) bool {
+	return strings.Contains(statementKey, Sep+"sid:")
+}
+
+// CountSids counts each Sid's occurrences in a document, for StatementKey.
+func CountSids(stmts []awsdiscovery.PolicyStatement) map[string]int {
+	out := map[string]int{}
+	for _, st := range stmts {
+		if st.Sid != "" {
+			out[st.Sid]++
+		}
+	}
+	return out
+}
+
+// ResourceRefKey keys a resource reference by the text the statement used. An
+// exact ARN and a pattern are different objects; "*" is one workspace-wide
+// selector node, supported per connector.
+func ResourceRefKey(resource string) string { return Key("aws", "ref", resource) }
+
+// AssignmentKey: policy incarnation ␟ holder endpoint ␟ kind.
+func AssignmentKey(policyIncarnation, holderEndpoint, kind string) string {
+	return Key("aws", "assign", policyIncarnation, holderEndpoint, kind)
+}
+
+// GrantKey: assignment ␟ statement.
+func GrantKey(assignmentKey, statementKey string) string {
+	return Key("aws", "grant", assignmentKey, statementKey)
+}
+
+// RelationshipKey names both endpoints, so moving a Lambda from RoleA to
+// RoleB computes a NEW key and the old edge ends instead of being overwritten.
+func RelationshipKey(relType, sourceKey, targetEndpoint string) string {
+	return Key("aws", relType, sourceKey, targetEndpoint)
+}
+
+// CredentialKey: holder ARN ␟ key id (§2.4).
+func CredentialKey(holder models.CloudIdentity, keyID string) string {
+	return Key("aws", holder.NativeID, keyID)
+}
+
+// ScopeKey is the estate scope's recognition key: for AWS, the connected
+// account (§4.8).
+func ScopeKey(provider, scopeKind, scopeID string) string {
+	return Key(provider, scopeKind, scopeID)
+}
+
+// Continuity reports whether a kind has a provider-given creation boundary.
+//
+// Roles, users and groups carry RoleId / UserId / GroupId; managed policies a
+// PolicyId; inline policies their holder's. Workloads, resource references and
+// external principals do not: the name is the strongest claim available, and
+// continuity says so rather than implying a check we never made.
+func Continuity(kind string) string {
+	switch kind {
+	case models.CloudIdentityIAMRole, models.CloudIdentityIAMUser, models.CloudIdentityIAMGroup,
+		"managed_policy", "inline_policy":
+		return ContinuityImmutable
+	default:
+		return ContinuityRecognitionOnly
+	}
+}
+
+// PolicyContinuityKind is the Continuity() kind for a collected policy.
+func PolicyContinuityKind(p models.CloudPolicy) string {
+	if p.PolicyKind == models.CloudPolicyInline {
+		return "inline_policy"
+	}
+	return "managed_policy"
+}
+
+// PermissionSubjectKey is the qualifying subject_native_id of a cloud_permission
+// observation: holder ␟ statement native id ␟ resource. Kept for Cloud
+// Inventory's evidence (§1.5); the projector no longer reads permission
+// observations -- grants are evidenced by the policy version and the holder.
 func PermissionSubjectKey(p models.CloudPermission, holderNativeID, resourceNativeID string) string {
 	if resourceNativeID == "" {
 		resourceNativeID = "*"
@@ -120,71 +239,7 @@ func PermissionSubjectKey(p models.CloudPermission, holderNativeID, resourceNati
 }
 
 // Qualified reports whether a stored subject_native_id carries the separator,
-// i.e. whether it was written by the qualifying writer.
-//
-// Observations collected before that change cannot be attributed to one grant
-// without guessing, so they are never attached as supporting evidence -- see
-// indexObservations and §4.8.
+// i.e. was written by the qualifying writer.
 func Qualified(subjectNativeID string) bool {
 	return strings.Contains(subjectNativeID, Sep)
-}
-
-// Continuity reports whether a kind has a provider-given creation boundary.
-//
-// Only IAM roles and users do, via AWSIdentityAttrs.UniqueID (AROA.../AIDA...),
-// which the collector already writes.
-//
-// EC2 INSTANCES ARE DELIBERATELY NOT immutable HERE, though §4.4 of the spec
-// lists them. Verified against the collector: AWSWorkloadAttrs has no
-// instance-id or creation-boundary field, and cloud_aws_workload_scan.go
-// writes only ExecutionRoleARN, InstanceProfileARN, EnvVarNames,
-// FoundationModel and Status. Claiming 'immutable' with nothing to put in
-// immutable_key makes 028's CHECK reject every EC2 workload row. The spec's
-// own instruction for exactly this case is to fix the mapping or downgrade the
-// kind -- never to relax the CHECK. Downgrading is correct until a collector
-// records InstanceId; at that point add the case here and to ImmutableKey
-// together, never one without the other.
-//
-// This also resolves §4.4 against §4.6, which states that every runtime kind
-// Phase 2 collects is recognition_only: with EC2 downgraded, no workload or
-// resource kind is immutable, and only identities are.
-func Continuity(kind string) string {
-	switch kind {
-	case models.CloudIdentityIAMRole, models.CloudIdentityIAMUser:
-		return ContinuityImmutable
-	default:
-		// Lambda, ECS task definition, Bedrock, S3 bucket, EC2 instance: the
-		// name is the strongest claim available. Stored so the console can say
-		// exactly that rather than implying a continuity we cannot verify.
-		return ContinuityRecognitionOnly
-	}
-}
-
-// ImmutableKey reads the provider's creation-boundary id out of the collected
-// attrs, and returns "" where the provider exposes none.
-//
-// Continuity and ImmutableKey must agree: 028's CHECK rejects a row claiming
-// 'immutable' with an empty immutable_key, deliberately -- a silent
-// disagreement here disables delete-and-recreate detection entirely, which is
-// a failure nothing downstream could detect.
-//
-// Uses the typed accessor, never a hand-rolled json.Unmarshal of a guessed
-// field name: a wrong key returns "" silently while Continuity still says
-// 'immutable', and then 028's CHECK rejects every IAM identity.
-//
-// Note AWSAttrs returns one value, not (attrs, error) -- it decodes to the
-// zero value rather than failing a read.
-func ImmutableKey(ci models.CloudIdentity) string {
-	return ci.AWSAttrs().UniqueID
-}
-
-// ScopeKey is the estate scope's recognition key: for AWS, the connected
-// account.
-//
-// cloud_connector.ScopeKind is "account" for AWS -- models.CloudScopeAccount,
-// constrained by cloud_connector_scope_kind_chk to
-// account|project|folder|org|subscription. It is NOT "aws_account"; the
-// provider is carried by the key's own prefix.
-func ScopeKey(provider, scopeKind, scopeID string) string {
-	return Key(provider, scopeKind, scopeID)
 }

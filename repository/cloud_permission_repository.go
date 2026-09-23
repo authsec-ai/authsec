@@ -318,7 +318,7 @@ func (r *cloudPermissionRepository) ReconcileGeneration(
 ) (int64, int64, int64, error) {
 
 	var edgesRemoved, permissionsRemoved, resourcesRemoved int64
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudAssumeEdge{})
 		if res.Error != nil {

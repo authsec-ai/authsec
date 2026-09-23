@@ -29,17 +29,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// claimedJob sets up a projecting barrier and a job claimed by `owner`,
-// returning the job and the barrier version -- the state every exit starts in.
+// claimedJob sets up a projecting barrier HELD BY THE JOB (job:<id>, §2.10A)
+// and the job claimed by `owner`, returning the job and the barrier version --
+// the state every exit starts in.
 func claimedJob(t *testing.T, owner string) (*fixture, *models.IGAProjectionJob, int64) {
 	t.Helper()
 	f := newFixture(t)
 	run := f.publishedRun(f.connector, 1, map[string]models.SurfaceCoverage{})
-	f.exec(`INSERT INTO iga_projection_job (workspace_id, scan_run_id, connector_id, generation)
-	        VALUES ($1,$2,$3,1)`, f.workspace, run.ID, f.connector)
+	jobID := uuid.New()
+	f.exec(`INSERT INTO iga_projection_job (id, workspace_id, scan_run_id, connector_id, generation)
+	        VALUES ($1,$2,$3,$4,1)`, jobID, f.workspace, run.ID, f.connector)
 	f.exec(`INSERT INTO iga_pipeline_lease (workspace_id, state, holder, scan_run_id, expires_at, version)
 	        VALUES ($1,'projecting',$2,$3, now() + interval '15 minutes', 7)`,
-		f.workspace, owner, run.ID)
+		f.workspace, models.PipelineJobHolder(jobID), run.ID)
 
 	jobs := repositories.NewIGAProjectionJobRepository(f.gorm)
 	job, err := jobs.Claim(owner, time.Minute, time.Now())
@@ -160,24 +162,23 @@ func TestExitFailKeepBarrierAtCeilingEscalates(t *testing.T) {
 }
 
 // FENCING. A superseded worker must change NOTHING -- not the job, not the
-// barrier. Both writes are fenced and share one transaction, so if either
-// fence matches zero rows the whole thing rolls back and the current owner
-// decides the outcome.
+// barrier. With the barrier held by the JOB, supersession is a job-lease
+// reclaim: the barrier's holder and version do not move, and the old worker is
+// fenced out by the job's lease_version inside the same transaction.
 func TestExitsRefuseASupersededWorker(t *testing.T) {
 	f, job, version := claimedJob(t, "w1")
 
-	// Someone else reclaims: the barrier version moves on.
-	pipe := repositories.NewIGAPipelineLeaseRepository(f.gorm)
-	newVersion, err := pipe.RecoverProjecting(f.workspace, "w2", job.ScanRunID, time.Minute,
-		time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("recover as w2: %v", err)
+	// w2 reclaims the job once w1's lease lapses: lease_version moves on.
+	f.exec(`UPDATE iga_projection_job SET lease_expires_at = now() - interval '1 minute' WHERE id = $1`, job.ID)
+	jobs := repositories.NewIGAProjectionJobRepository(f.gorm)
+	reclaimed, err := jobs.Claim("w2", time.Minute, time.Now())
+	if err != nil || reclaimed == nil || reclaimed.ID != job.ID {
+		t.Fatalf("w2 reclaim: job=%v err=%v", reclaimed, err)
 	}
-	if newVersion == version {
-		t.Fatal("recovery did not move the barrier version")
+	if reclaimed.LeaseVersion == job.LeaseVersion {
+		t.Fatal("reclaim did not move the job's lease version")
 	}
 
-	// w1 is superseded and still holds its OLD barrier version.
 	stale := projectionServiceAs(f, "w1")
 	for _, tc := range []struct {
 		name string
@@ -194,7 +195,6 @@ func TestExitsRefuseASupersededWorker(t *testing.T) {
 			if err := tc.run(); err == nil {
 				t.Fatal("a superseded worker was allowed to settle the job")
 			}
-			// NOTHING changed: not the job, not the barrier.
 			if got := jobStatus(t, f, job.ID); got != models.ProjectionRunning {
 				t.Errorf("job = %q, want running: a superseded worker must not terminalize it", got)
 			}
@@ -202,6 +202,16 @@ func TestExitsRefuseASupersededWorker(t *testing.T) {
 				t.Errorf("barrier = %q, want projecting: a superseded worker must not release it", got)
 			}
 		})
+	}
+
+	// And the CURRENT holder of the job proceeds at once -- no expiry to wait
+	// out, because the barrier names the job, not a worker (T1.2).
+	if err := projectionServiceAs(f, "w2").
+		CompleteAndReleaseForTest(context.Background(), reclaimed, version); err != nil {
+		t.Fatalf("the reclaiming worker could not settle the job it holds: %v", err)
+	}
+	if got := barrierState(t, f); got != models.PipelineIdle {
+		t.Errorf("barrier = %q after the holder completed, want idle", got)
 	}
 }
 
@@ -214,7 +224,7 @@ func TestBarrierHeartbeatRenewsWithoutBreakingTheFence(t *testing.T) {
 	pipe := repositories.NewIGAPipelineLeaseRepository(f.gorm)
 	fence := repositories.PipelineFence{
 		WorkspaceID: f.workspace, Phase: models.PipelineProjecting,
-		RunID: job.ScanRunID, Version: version,
+		RunID: job.ScanRunID, Version: version, Holder: models.PipelineJobHolder(job.ID),
 	}
 
 	// Let it lapse: recovery would now consider this workspace stalled.

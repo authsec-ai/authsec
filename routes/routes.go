@@ -281,6 +281,7 @@ func SetupRoutes(
 	// read from a body, query parameter or provider identifier.
 	{
 		igaController := platformCtrl.NewIGAController(config.DB)
+		igaGraphRead := platformCtrl.NewIGAGraphReadController()
 
 		// Provider ingress. Unauthenticated at the TOKEN layer only — GitHub
 		// holds no AuthSec token — but authenticated by HMAC signature over the
@@ -318,19 +319,11 @@ func SetupRoutes(
 			iga.GET("/agents/:agent_id/access-paths", middlewares.Require("iga", "read"), igaController.GetAgentAccessPaths)
 			iga.GET("/identity-accounts", middlewares.Require("iga", "read"), igaController.ListIdentityAccounts)
 
-			// P2-11: the first read path over the Phase 2 identity graph.
-			// One workload -> its executes_as identity -> that identity's
-			// grants, each with basis, state, last-confirmed time and the
-			// evidence behind it, plus every surface whose coverage was not
-			// reached. Read-only; the workspace comes from the authenticated
-			// context and a foreign workload id returns 404.
-			iga.GET("/workloads/:workload_id/access-path", middlewares.Require("iga", "read"), igaController.GetWorkloadAccessPath)
-
-			// §2.14.3: a person's decision about what a workload IS. The
-			// handler additionally requires a workspace-member session --
-			// Require alone cannot express that, because a machine token can
-			// carry the permission without being a member.
-			iga.POST("/estate/:workload_id/classification", middlewares.Require("discovery", "admin"), igaController.ClassifyWorkload)
+			// Phase 2 graph reads (SPEC §5.3) live in iga_graph_read_controller.go.
+			// The graph branch's GET /workloads/:id/access-path and
+			// POST /estate/:id/classification were removed (§6.1): §5.3 replaces
+			// both, with revisions, typed refs and operation ids.
+			iga.GET("/capabilities", igaGraphRead.GetCapabilities)
 			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 			// Governance decisions. Both require an expected version, so a

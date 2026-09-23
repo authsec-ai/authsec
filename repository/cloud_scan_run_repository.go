@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -37,8 +36,15 @@ type CloudScanRunRepository interface {
 	Enqueue(workspaceID, connectorID uuid.UUID, trigger string) (*models.CloudScanRun, error)
 
 	// Claim takes ownership of one claimable run for `owner`, for `lease`.
-	// Returns nil when there is nothing to claim.
+	// Returns nil when there is nothing to claim. This is the Phase 1 claim:
+	// it names no Phase 2 table, so it runs against any schema.
 	Claim(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
+
+	// ClaimForPipeline is Claim with the projection predicate: a connector
+	// whose previous run is still being projected is not claimable (§4.5).
+	// Used ONLY when IGA_GRAPH_PROJECTION is on and verified -- the switch
+	// decides, never a probe of the schema (§2.8).
+	ClaimForPipeline(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
 
 	// Renew extends a lease the caller still holds. ErrLeaseLost otherwise.
 	Renew(runID uuid.UUID, owner string, version int64, lease time.Duration) error
@@ -102,29 +108,7 @@ type CloudScanRunRepository interface {
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
 }
 
-type cloudScanRunRepository struct {
-	db *gorm.DB
-
-	// projectionJobsOnce caches whether iga_projection_job exists. The answer
-	// only changes when a migration runs, which does not happen under a live
-	// worker, so probing once per process is enough -- and it keeps Claim from
-	// paying for a catalogue lookup on every poll.
-	projectionJobsOnce sync.Once
-	projectionJobs     bool
-}
-
-// hasProjectionJobs reports whether the projection job table exists yet.
-func (r *cloudScanRunRepository) hasProjectionJobs() bool {
-	r.projectionJobsOnce.Do(func() {
-		ok, err := HasRelation(r.db, "iga_projection_job")
-		// On error, assume ABSENT: the predicate is an extra guard, and the
-		// workspace barrier is what actually prevents the overwrite. Losing it
-		// degrades throughput protection; wrongly including it would break
-		// scanning outright.
-		r.projectionJobs = err == nil && ok
-	})
-	return r.projectionJobs
-}
+type cloudScanRunRepository struct{ db *gorm.DB }
 
 func NewCloudScanRunRepository(db *gorm.DB) CloudScanRunRepository {
 	return &cloudScanRunRepository{db: db}
@@ -159,6 +143,18 @@ func (r *cloudScanRunRepository) Enqueue(
 func (r *cloudScanRunRepository) Claim(
 	owner string, lease time.Duration, now time.Time,
 ) (*models.CloudScanRun, error) {
+	return r.claim(owner, lease, now, false)
+}
+
+func (r *cloudScanRunRepository) ClaimForPipeline(
+	owner string, lease time.Duration, now time.Time,
+) (*models.CloudScanRun, error) {
+	return r.claim(owner, lease, now, true)
+}
+
+func (r *cloudScanRunRepository) claim(
+	owner string, lease time.Duration, now time.Time, pipeline bool,
+) (*models.CloudScanRun, error) {
 	if owner == "" {
 		return nil, errors.New("a claim needs an owner")
 	}
@@ -176,14 +172,12 @@ func (r *cloudScanRunRepository) Claim(
 	// of its own demands the row still carry it.
 	var out []models.CloudScanRun
 
-	// The projection predicate names iga_projection_job, which does not exist
-	// until migration 033. Referencing it unconditionally makes this statement
-	// fail at PLAN time on a database at 026 -- so a binary carrying Phase 2
-	// could not claim a scan at all during the window between the two
-	// releases, which is exactly the S0 state the staged rollout exists to
-	// keep working. Include the predicate only once the table is there.
+	// The projection predicate names iga_projection_job. It is included only
+	// in pipeline mode, which the IGA_GRAPH_PROJECTION switch decides after
+	// verifying the schema -- so the Phase 1 claim never names a Phase 2 table
+	// and runs unchanged against any schema (S1, §7.5).
 	projectionPredicate := ""
-	if r.hasProjectionJobs() {
+	if pipeline {
 		// A connector whose previous run is still being projected is not
 		// claimable (SPEC §4.5). The projection reads that run's inventory,
 		// and a new scan would rewrite it underneath.
@@ -354,11 +348,18 @@ func (r *cloudScanRunRepository) Requeue(runID uuid.UUID, owner string, version 
 	now := time.Now()
 	// attempts is decremented back: Claim incremented it, and a run that never
 	// got to start must not be charged an attempt against scanMaxAttempts.
+	//
+	// requested_at = now() SENDS IT TO THE BACK OF THE QUEUE (§2.10A). Claim
+	// takes the oldest claimable row, so a refused run that kept its original
+	// requested_at stayed the oldest row and was re-claimed in a tight loop --
+	// starving every other workspace's scans, and with the attempt refund
+	// above, never tripping the retry ceiling either.
 	return r.fenced(runID, owner, version, map[string]any{
 		"status":           models.CloudScanRunQueued,
 		"lease_owner":      "",
 		"lease_expires_at": nil,
 		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"requested_at":     now,
 		"updated_at":       now,
 	})
 }

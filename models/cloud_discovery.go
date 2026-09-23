@@ -229,6 +229,11 @@ const (
 	SurfaceIAMUsers      = "iam_users"
 	SurfaceIAMAccessKeys = "iam_access_keys"
 	SurfaceIAMPolicies   = "iam_policies"
+	// SurfaceIAMGroups is the groups-and-memberships read (035). Required by
+	// the member_of partition and by every policy, statement, assignment and
+	// grant partition (§4.10): a policy attached only to a group is seen only
+	// when groups are read.
+	SurfaceIAMGroups = "iam_groups"
 	// SurfacePolicyDocuments covers parsing what those APIs returned, as
 	// opposed to fetching it. A document can be fetched successfully and still
 	// be unreadable.
@@ -374,6 +379,9 @@ func DecodeScanCoverage(raw json.RawMessage) ScanCoverage {
 const (
 	CloudIdentityIAMRole = "iam_role"
 	CloudIdentityIAMUser = "iam_user"
+	// CloudIdentityIAMGroup is kind 'iam_group' (035). cloud_identity_kind_chk
+	// only requires kind <> '', so no constraint change was needed.
+	CloudIdentityIAMGroup = "iam_group"
 
 	// GCP. A service account is the only identity kind GCP discovery writes
 	// today; workload-identity and federated principals arrive with the
@@ -430,6 +438,14 @@ type CloudIdentity struct {
 	LastUsedAt *time.Time      `json:"last_used_at,omitempty"`
 	Enabled    bool            `json:"enabled" gorm:"not null;default:true"`
 	Attrs      json.RawMessage `json:"attrs" gorm:"type:jsonb;not null;default:'{}'"`
+
+	// The role's trust document, verbatim (035), so the projector parses Allow
+	// AND Deny statements with their conditions. TrustParseError is non-empty
+	// when the document could not be parsed: that role's trust edges go stale,
+	// never ended (§4.10).
+	TrustDocument     json.RawMessage `json:"trust_document,omitempty" gorm:"type:jsonb"`
+	TrustDocumentHash string          `json:"trust_document_hash" gorm:"not null;default:''"`
+	TrustParseError   string          `json:"trust_parse_error" gorm:"not null;default:''"`
 
 	LastSeenGeneration int       `json:"last_seen_generation" gorm:"not null;default:0"`
 	FirstSeenAt        time.Time `json:"first_seen_at" gorm:"not null;default:now()"`

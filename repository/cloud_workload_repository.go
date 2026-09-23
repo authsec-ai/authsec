@@ -224,7 +224,7 @@ func (r *cloudWorkloadRepository) ReconcileGeneration(
 ) (int64, int64, error) {
 
 	var workloadsRemoved, usageRemoved int64
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
 		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
 			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
 		if res.Error != nil {

@@ -49,6 +49,11 @@ type IAMAPI interface {
 	// ListOpenIDConnectProviders is ticket [2]'s addition: the account's OIDC
 	// providers, as join targets for IRSA and the EKS identity edge.
 	ListOpenIDConnectProviders(ctx context.Context, in *iam.ListOpenIDConnectProvidersInput, opts ...func(*iam.Options)) (*iam.ListOpenIDConnectProvidersOutput, error)
+
+	// GetAccountAuthorizationDetails reads groups and user group memberships
+	// (authdetails.go). Already granted by the role template; the SPEC's T3.1
+	// moves the whole IAM read onto it.
+	GetAccountAuthorizationDetails(ctx context.Context, in *iam.GetAccountAuthorizationDetailsInput, opts ...func(*iam.Options)) (*iam.GetAccountAuthorizationDetailsOutput, error)
 }
 
 // NewIAMClient builds a real IAM client from an assumed-role config.
@@ -136,7 +141,18 @@ type AttachedPolicy struct {
 	Name      string
 	ARN       string
 	VersionID string
-	Document  string
+	// PolicyID is AWS's PolicyId (ANPA...) from GetPolicy: the policy's
+	// CREATION BOUNDARY. A customer-managed policy deleted and recreated under
+	// the same ARN has a new one, and every graph key below the policy is
+	// built from it (SPEC §2.4). It was in the GetPolicy response all along,
+	// and was discarded.
+	PolicyID string
+	Document string
+	// FetchError is non-empty when this policy could not be read this run:
+	// "fetch: <reason>". PER-DOCUMENT ISOLATION (§1.4): one unreadable policy
+	// is recorded on that policy and the scan continues -- it used to abort
+	// every policy of the identity, and then the whole permission scan.
+	FetchError string
 	// AWSManaged distinguishes an AWS-owned policy from a customer-owned one.
 	// Ticket [2] weighs them differently: a customer-authored policy is a local
 	// decision, an AWS-managed one is a well-known grant.
@@ -147,6 +163,8 @@ type AttachedPolicy struct {
 type InlinePolicy struct {
 	Name     string
 	Document string
+	// FetchError: as AttachedPolicy.FetchError.
+	FetchError string
 }
 
 // IdentityPolicies is everything attached to one identity.
@@ -382,7 +400,14 @@ func (r *IAMReader) ListAccessKeys(ctx context.Context, userName string) ([]IAMA
 // the read is the same two calls; what differs is how the caller must record
 // the result.
 func (r *IAMReader) BoundaryPolicy(ctx context.Context, boundaryARN string) (AttachedPolicy, error) {
-	return r.managedPolicy(ctx, boundaryARN, boundaryPolicyName(boundaryARN))
+	p := r.managedPolicy(ctx, boundaryARN, boundaryPolicyName(boundaryARN))
+	if p.FetchError != "" {
+		// The caller still learns it failed: the identity keeps
+		// constraint_state 'bounded' from the ARN alone, and the policy row
+		// records the error.
+		return p, fmt.Errorf("boundary %s: %s", boundaryARN, p.FetchError)
+	}
+	return p, nil
 }
 
 // boundaryPolicyName recovers the policy name from its ARN. The boundary is
@@ -410,11 +435,10 @@ func (r *IAMReader) RolePolicies(ctx context.Context, roleARN, roleName string) 
 			return out, classify(err)
 		}
 		for _, p := range resp.AttachedPolicies {
-			managed, err := r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName))
-			if err != nil {
-				return out, err
-			}
-			out.Attached = append(out.Attached, managed)
+			// Never fails the identity: an unreadable document is recorded on
+			// the policy (FetchError) and the attachment is still listed.
+			out.Attached = append(out.Attached,
+				r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName)))
 		}
 		if !resp.IsTruncated || resp.Marker == nil {
 			break
@@ -438,7 +462,10 @@ func (r *IAMReader) RolePolicies(ctx context.Context, roleARN, roleName string) 
 				RoleName: aws.String(roleName), PolicyName: aws.String(name),
 			})
 			if err != nil {
-				return out, classify(err)
+				out.Inline = append(out.Inline, InlinePolicy{
+					Name: name, FetchError: "fetch: " + classify(err).Error(),
+				})
+				continue
 			}
 			out.Inline = append(out.Inline, InlinePolicy{
 				Name: name, Document: decodePolicyDocument(doc.PolicyDocument),
@@ -467,11 +494,10 @@ func (r *IAMReader) UserPolicies(ctx context.Context, userARN, userName string) 
 			return out, classify(err)
 		}
 		for _, p := range resp.AttachedPolicies {
-			managed, err := r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName))
-			if err != nil {
-				return out, err
-			}
-			out.Attached = append(out.Attached, managed)
+			// Never fails the identity: an unreadable document is recorded on
+			// the policy (FetchError) and the attachment is still listed.
+			out.Attached = append(out.Attached,
+				r.managedPolicy(ctx, aws.ToString(p.PolicyArn), aws.ToString(p.PolicyName)))
 		}
 		if !resp.IsTruncated || resp.Marker == nil {
 			break
@@ -495,7 +521,10 @@ func (r *IAMReader) UserPolicies(ctx context.Context, userARN, userName string) 
 				UserName: aws.String(userName), PolicyName: aws.String(name),
 			})
 			if err != nil {
-				return out, classify(err)
+				out.Inline = append(out.Inline, InlinePolicy{
+					Name: name, FetchError: "fetch: " + classify(err).Error(),
+				})
+				continue
 			}
 			out.Inline = append(out.Inline, InlinePolicy{
 				Name: name, Document: decodePolicyDocument(doc.PolicyDocument),
@@ -510,42 +539,51 @@ func (r *IAMReader) UserPolicies(ctx context.Context, userARN, userName string) 
 
 // managedPolicy fetches a managed policy's default version, through the cache.
 //
-// Two calls per policy: GetPolicy names the default version, GetPolicyVersion
-// returns the document. There is no single call that does both.
-func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName string) (AttachedPolicy, error) {
+// Two calls per policy: GetPolicy names the default version (and gives the
+// PolicyId), GetPolicyVersion returns the document. There is no single call
+// that does both.
+//
+// It NEVER fails its caller. A failure is recorded on the returned policy as
+// FetchError and cached with it, so every holder of that policy in this scan
+// sees the same answer -- one row per connector per run, one state.
+func (r *IAMReader) managedPolicy(ctx context.Context, policyARN, policyName string) AttachedPolicy {
 	if cached, ok := r.policyCache[policyARN]; ok {
-		return cached, nil
-	}
-
-	meta, err := r.api.GetPolicy(ctx, &iam.GetPolicyInput{PolicyArn: aws.String(policyARN)})
-	if err != nil {
-		return AttachedPolicy{}, classify(err)
+		return cached
 	}
 	built := AttachedPolicy{
 		Name:       policyName,
 		ARN:        policyARN,
 		AWSManaged: isAWSManagedPolicyARN(policyARN),
 	}
+	defer func() { r.policyCache[policyARN] = built }()
+
+	meta, err := r.api.GetPolicy(ctx, &iam.GetPolicyInput{PolicyArn: aws.String(policyARN)})
+	if err != nil {
+		built.FetchError = "fetch: " + classify(err).Error()
+		return built
+	}
 	if meta.Policy != nil {
 		built.VersionID = aws.ToString(meta.Policy.DefaultVersionId)
+		built.PolicyID = aws.ToString(meta.Policy.PolicyId)
 		if built.Name == "" {
 			built.Name = aws.ToString(meta.Policy.PolicyName)
 		}
 	}
-	if built.VersionID != "" {
-		ver, err := r.api.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
-			PolicyArn: aws.String(policyARN), VersionId: aws.String(built.VersionID),
-		})
-		if err != nil {
-			return AttachedPolicy{}, classify(err)
-		}
-		if ver.PolicyVersion != nil {
-			built.Document = decodePolicyDocument(ver.PolicyVersion.Document)
-		}
+	if built.VersionID == "" {
+		built.FetchError = "fetch: GetPolicy returned no default version"
+		return built
 	}
-
-	r.policyCache[policyARN] = built
-	return built, nil
+	ver, err := r.api.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
+		PolicyArn: aws.String(policyARN), VersionId: aws.String(built.VersionID),
+	})
+	if err != nil {
+		built.FetchError = "fetch: " + classify(err).Error()
+		return built
+	}
+	if ver.PolicyVersion != nil {
+		built.Document = decodePolicyDocument(ver.PolicyVersion.Document)
+	}
+	return built
 }
 
 /* -------------------------------- helpers --------------------------------- */

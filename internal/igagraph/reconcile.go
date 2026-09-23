@@ -6,17 +6,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/models"
 )
 
-// Reconciler decides what to do about what a run did NOT see.
+// Reconciler decides what to do about what a run did NOT see (§4.10).
 //
 // The naive version -- "end everything older than this generation" -- is wrong
 // and dangerous: a denied surface produces no rows, so every relationship
-// behind it looks absent, and a credential outage reads as a successful
-// cleanup. Hence canEnd.
+// behind it looks absent, and a credential outage reads as a cleanup. Hence
+// canEnd.
 type Reconciler struct {
 	now func() time.Time
 }
@@ -28,29 +29,26 @@ func NewReconciler(now func() time.Time) *Reconciler {
 	return &Reconciler{now: now}
 }
 
-// Reconcile closes what this run SHOULD have seen and did not.
-//
-// Runs in the CALLER'S transaction -- see ProjectAndReconcile. Separate
-// transactions would publish a graph in which nothing has been closed yet.
-func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot) error {
+// Reconcile closes what this run SHOULD have seen and did not, in the caller's
+// transaction. Node partitions act on SUPPORT rows; edge partitions on the
+// edge tables. ex names what unreadable documents declared; events receives
+// every retirement so the Changes history survives the node row.
+func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions, events *EventLog) error {
 	for _, part := range Partitions(snap) {
 		stale := !rc.canEnd(snap, part)
 		var err error
-		// Routing on part.Target matters: a NODE partition sent through the
-		// edge helpers matches nothing -- its relationship_type is empty -- and
-		// silently reconciles nothing.
 		if part.Target == "" {
-			err = rc.reconcileNodes(tx, part, snap, stale)
+			err = rc.reconcileNodes(tx, part, snap, ex, stale)
 		} else {
-			err = rc.reconcileEdges(tx, part, snap, stale)
+			err = rc.reconcileEdges(tx, part, snap, ex, stale)
 		}
 		if err != nil {
 			return fmt.Errorf("reconcile %s: %w", part.Key(), err)
 		}
 	}
-	// Only NOW, with every partition's support settled, is it safe to ask
+	// Only now, with every partition's support settled, is it safe to ask
 	// which objects have no support left (§2.10B).
-	if err := rc.retireUnsupported(tx, snap); err != nil {
+	if err := rc.retireUnsupported(tx, snap, events); err != nil {
 		return err
 	}
 	return rc.markReconciled(tx, snap)
@@ -58,295 +56,316 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot) error {
 
 // canEnd gates every close. All four conditions of §2.7 must hold.
 func (rc *Reconciler) canEnd(snap *Snapshot, part Partition) bool {
-	// 1. The run reached status 'published'. The value is 'published' -- the
-	//    cloud_scan_run CHECK is
-	//    ('queued','running','published','failed','abandoned') and there is no
-	//    'complete'.
+	// 1. The run reached status 'published' (there is no 'complete').
 	if snap.Run.Status != models.CloudScanRunPublished {
 		return false
 	}
-
-	// 2/3. POSITIVE EVIDENCE THAT THE SCANNER RAN, FIRST.
-	//
-	// policy_documents is written ONLY when parsing dropped something
-	// (cloud_aws_permission_scan.go), so its ABSENCE is ambiguous: either
-	// parsing was clean, or parsing never happened. This fixture must NOT
-	// license closing anything, and a bare "absent means clean" rule lets it:
-	//
-	//     iam_roles        reached
-	//     iam_policies     reached
-	//     permission_scan  denied      <- the scanner died before parsing
-	//     policy_documents absent
-	//
-	// permission_scan / workload_scan are written by FinalizeCoverage ONLY
-	// when a scanner failed before producing a snapshot at all. Their PRESENCE
-	// is therefore proof of failure, and must veto every partition that
-	// depends on that scanner.
+	// 2/3. POSITIVE EVIDENCE THAT THE SCANNER RAN, FIRST. permission_scan /
+	// workload_scan are written ONLY when a scanner died before producing a
+	// snapshot, so their PRESENCE proves failure and vetoes the partition.
 	for _, gate := range part.RequiredScanners {
 		if cov, ok := snap.Coverage[gate]; ok && cov.State != models.CloudCoverageReached {
 			return false
 		}
 	}
-
 	for _, name := range part.RequiredSurfaces {
 		cov, ok := snap.Coverage[name]
-
 		if name == models.SurfacePolicyDocuments {
-			// Only meaningful once RequiredScanners has established that the
-			// permission scanner actually ran. Present => something was
-			// dropped; absent => nothing was.
+			// Present => something was dropped; absent => nothing was.
 			if ok && cov.State != models.CloudCoverageReached {
 				return false
 			}
 			continue
 		}
-
-		// Every other surface: an ABSENT report means DID NOT LOOK.
+		// Every other surface: ABSENT MEANS DID NOT LOOK.
 		if !ok || cov.State != models.CloudCoverageReached {
 			return false
 		}
 	}
-
-	// 4. Generation ownership is asserted by the projector before any write
-	//    (ErrObsoleteGeneration), and the pipeline fence holds for the whole
-	//    transaction, so by the time Reconcile runs this job owns the
-	//    generation for every partition it touches.
-	//
-	//    NOTE: snap.Generation is cloud_scan_run.Generation for ONE connector's
-	//    run. Two connectors in one workspace advance independently, so a
-	//    generation number is only comparable within part.ConnectorID -- never
-	//    order two integrations' generations against each other.
+	// 4. The job owns the partition's generation: asserted by the projector
+	// before any write, and the barrier holds for the whole transaction.
 	return true
 }
 
-// CanEnd exposes the gate for testing. The decision is pure: it reads only the
-// snapshot's own coverage report and the partition's requirements.
+// CanEnd exposes the gate for testing. The decision is pure.
 func (rc *Reconciler) CanEnd(snap *Snapshot, part Partition) bool { return rc.canEnd(snap, part) }
 
-// scope selects exactly the rows this partition is responsible for, BY THE
-// MEMBERSHIP THE PROJECTOR STAMPED ON THEM.
+// scope selects exactly the rows an EDGE partition is responsible for, by the
+// membership the projector stamped on them. No joins, no endpoint union.
 //
-// Not a join through endpoint tables. Three reasons, each of which was a
-// defect in an earlier draft:
-//
-//   - filtering on (workspace_id, relationship_type) ends ANOTHER ACCOUNT'S
-//     relationships, because a scan of account A does not confirm account B's;
-//   - adding only estate_scope_id still crosses REGIONS AND CONNECTORS: a clean
-//     lambda:us-east-1 read would license closing lambda:eu-west-1 rows in the
-//     same account;
-//   - the endpoint union has to enumerate every source type, and missing one
-//     silently excludes it -- `realizes` starts at an agent_instance, which a
-//     union of workloads and identities does not contain, so those rows would
-//     never reconcile at all.
-func (rc *Reconciler) scope(tx *gorm.DB, part Partition, snap *Snapshot) *gorm.DB {
-	var model any = &models.IGARelationship{}
-	if part.Target == "access_edge" {
+// EXHAUSTIVE. A default that fell through to iga_relationship would send an
+// assignment partition to the wrong table: grants would end, their assignment
+// would stay current, and a reattach would revive the old period.
+func (rc *Reconciler) scope(tx *gorm.DB, part Partition, snap *Snapshot) (*gorm.DB, error) {
+	var model any
+	switch part.Target {
+	case "relationship":
+		model = &models.IGARelationship{}
+	case "assignment":
+		model = &models.IGAPolicyAssignment{}
+	case "access_edge":
 		model = &models.IGAAccessEdge{}
+	default:
+		return nil, fmt.Errorf("partition %s: no edge table for target %q", part.Key(), part.Target)
 	}
 	return tx.Model(model).
 		Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",
-			snap.Run.WorkspaceID, part.ConnectorID, part.Key())
+			snap.Run.WorkspaceID, part.ConnectorID, part.Key()), nil
+}
+
+// ScopeForTest exposes scope's table decision for the exhaustiveness test.
+func (rc *Reconciler) ScopeForTest(tx *gorm.DB, part Partition, snap *Snapshot) error {
+	_, err := rc.scope(tx, part, snap)
+	return err
+}
+
+// protected returns the predicate for rows of this partition that an
+// UNREADABLE document declared. Exhaustive: every partition answers.
+//
+// When a partition CAN end, protected rows this run did not confirm move
+// current -> stale BEFORE the end statement runs, and the end statement
+// excludes them. So an unreadable document's statements, grants and the
+// support of resources only it names are never ended, while a genuinely
+// detached policy in the same account still ends.
+func protected(part Partition, ex Exclusions) (string, []any, bool) {
+	pol := ex.UnreadablePolicies
+	switch {
+	case part.Target == "access_edge":
+		return `entitlement_id IN (SELECT id FROM iga_entitlements
+		          WHERE workspace_id = iga_access_edges.workspace_id AND policy_id = ANY(?))`,
+			[]any{pq.Array(pol)}, len(pol) > 0
+	case part.Target == "relationship" && part.RelationshipType == models.RelTypeCanAssume && part.Kind == "trust":
+		return `target_identity_account_id = ANY(?)`,
+			[]any{pq.Array(ex.UnreadableTrust)}, len(ex.UnreadableTrust) > 0
+	case part.Class == models.ObjectEntitlement:
+		return `entitlement_id IN (SELECT id FROM iga_entitlements
+		          WHERE workspace_id = iga_object_support.workspace_id AND policy_id = ANY(?))`,
+			[]any{pq.Array(pol)}, len(pol) > 0
+	case part.Class == models.ObjectResource:
+		// A resource another statement still names is confirmed anyway; one
+		// named ONLY by an unreadable policy must not lose this source's support.
+		return `resource_id IN (SELECT t.resource_id FROM iga_entitlement_target t
+		          JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
+		          WHERE t.workspace_id = iga_object_support.workspace_id AND e.policy_id = ANY(?))`,
+			[]any{pq.Array(pol)}, len(pol) > 0
+	default:
+		// identities, workloads, policies (still listed), assignments
+		// (attachment lists are read independently of documents), member_of,
+		// executes_as, task_execution_role, pod-identity can_assume
+		return "", nil, false
+	}
 }
 
 // reconcileEdges: stale when we could not look, ended when we could and it was
-// not there.
-func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+// not there. Protected rows first: stale, never ended.
+func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
 	if stale {
-		return rc.markStale(tx, part, snap)
+		return rc.markStale(tx, part, snap, "")
 	}
-	return rc.endOlderThan(tx, part, snap, models.EndedNotSeen)
+	if p, args, ok := protected(part, ex); ok {
+		if err := rc.markStale(tx, part, snap, p, args...); err != nil {
+			return err
+		}
+		return rc.endOlderThan(tx, part, snap, models.EndedNotSeen, "NOT ("+p+")", args...)
+	}
+	return rc.endOlderThan(tx, part, snap, models.EndedNotSeen, "")
 }
 
-// markStale: we could not look at THIS partition.
-//
-// Two rules, both learned the hard way:
-//
-//   - Rows this run DID confirm are excluded. Without that, a denied us-west
-//     partition marks us-east's freshly-confirmed relationships stale as well,
-//     because the update matched on partition membership alone.
-//   - last_confirmed_at is NOT touched. It is the honest answer to "how old is
-//     this?", and refreshing it would launder an outage into a confirmation.
-func (rc *Reconciler) markStale(tx *gorm.DB, part Partition, snap *Snapshot) error {
-	return rc.scope(tx, part, snap).
-		Where("state = ?", models.RelCurrent).
-		Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID).
-		Update("state", models.RelStale).Error
+// markStale: we could not look at THIS partition. Rows this run DID confirm
+// are excluded, and last_confirmed_at is NOT touched -- it is the honest
+// answer to "how old is this?", and refreshing it launders an outage.
+func (rc *Reconciler) markStale(tx *gorm.DB, part Partition, snap *Snapshot, extra string, args ...any) error {
+	q, err := rc.scope(tx, part, snap)
+	if err != nil {
+		return err
+	}
+	q = q.Where("state = ?", models.RelCurrent).
+		Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID)
+	if extra != "" {
+		q = q.Where(extra, args...)
+	}
+	return q.Update("state", models.RelStale).Error
 }
 
 // endOlderThan: we looked properly at this partition and it was not there.
-func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, reason string) error {
-	return rc.scope(tx, part, snap).
-		Where("state <> ?", models.RelEnded).
-		// IS DISTINCT FROM, never <>. last_confirmed_by is nullable, and
-		// NULL <> uuid evaluates to NULL rather than true -- a plain <> would
-		// silently skip every row that never carried a run id and leave
-		// pre-graph rows `current` forever.
+// IS DISTINCT FROM, never <>: last_confirmed_by is nullable, and NULL <> uuid
+// is NULL, which would leave pre-graph rows current forever.
+func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, reason, extra string, args ...any) error {
+	q, err := rc.scope(tx, part, snap)
+	if err != nil {
+		return err
+	}
+	if extra != "" {
+		q = q.Where(extra, args...)
+	}
+	return q.Where("state <> ?", models.RelEnded).
 		Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID).
 		Updates(map[string]any{
 			"state":        models.RelEnded,
 			"valid_to":     rc.now(),
-			"ended_reason": reason, // never empty: 031's CHECK enforces it
-			"updated_at":   rc.now(),
+			"ended_reason": reason,
 		}).Error
 }
 
-// reconcileNodes -- STEP 1: end this partition's SUPPORT, not the object.
-//
-// Never the node directly: a node touched by this partition may still be held
-// by another account (§2.10B).
-func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
-	// The TYPED column for this class. One mapping (models.SupportColumn),
-	// shared with the upsert's conflict target, so a support row cannot be
-	// written against one column and reconciled against another.
+// reconcileNodes -- STEP 1: end this partition's SUPPORT, never the object. A
+// node touched here may still be held by another account (§2.10B).
+func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
 	col := models.SupportColumn(part.Class)
 	if col == "" {
-		return fmt.Errorf("no support column for node class %q", part.Class)
+		return fmt.Errorf("no support column for node class %q", part.Class) // a programming error, never a no-op
 	}
-	q := tx.Model(&models.IGAObjectSupport{}).
-		Where("workspace_id = ? AND "+col+" IS NOT NULL AND connector_id = ? AND partition_key = ?",
-			snap.Run.WorkspaceID, part.ConnectorID, part.Key()).
-		Where("state <> ?", models.RelEnded).
-		Where("last_confirmed_run_id IS DISTINCT FROM ?", snap.Run.ID)
-
+	base := func() *gorm.DB {
+		return tx.Model(&models.IGAObjectSupport{}).
+			Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",
+				snap.Run.WorkspaceID, part.ConnectorID, part.Key()).
+			Where(col+" IS NOT NULL").
+			Where("state <> ?", models.RelEnded).
+			Where("last_confirmed_run_id IS DISTINCT FROM ?", snap.Run.ID)
+	}
 	if stale {
-		return q.Where("state = ?", models.RelCurrent).
-			Update("state", models.RelStale).Error
+		return base().Where("state = ?", models.RelCurrent).Update("state", models.RelStale).Error
 	}
-	return q.Updates(map[string]any{
-		"state":        models.RelEnded,
-		"ended_reason": models.EndedNotSeen,
-	}).Error
+	q := base()
+	if p, args, ok := protected(part, ex); ok {
+		if err := base().Where("state = ?", models.RelCurrent).Where(p, args...).
+			Update("state", models.RelStale).Error; err != nil {
+			return err
+		}
+		q = q.Where("NOT ("+p+")", args...)
+	}
+	return q.Updates(map[string]any{"state": models.RelEnded, "ended_reason": models.EndedNotSeen}).Error
 }
 
-// retireUnsupported -- STEP 2: derive each object's lifecycle from what
-// support REMAINS.
+// retireUnsupported -- STEP 2: derive each object's lifecycle from what support
+// REMAINS, then cascade what depends on it, in the same transaction:
 //
-// Same transaction, after every partition's support has been reconciled, so an
-// object is retired only when NO SOURCE ANYWHERE still holds it.
-func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
-	// The first EXISTS matters: an object with NO support rows at all is
-	// pre-graph, not unsupported, and must not be retired by this pass -- 035
-	// handles those deliberately.
-	// %s is the node table, %s its typed support column. Both come from the
-	// same class, so the join column and the table cannot drift apart.
-	const stmt = `
-		UPDATE %s n
-		   SET lifecycle = 'retired', retired_reason = ?, updated_at = now()
-		 WHERE n.workspace_id = ?
-		   AND n.lifecycle = 'active'
-		   AND EXISTS (SELECT 1 FROM iga_object_support s
-		                WHERE s.workspace_id = n.workspace_id
-		                  AND s.%s = n.id)
-		   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
-		                    WHERE s.workspace_id = n.workspace_id
-		                      AND s.%s = n.id
-		                      AND s.state <> 'ended')`
-
-	for _, t := range []struct{ table, class string }{
-		{"iga_identity_accounts", models.ObjectIdentity},
-		{"iga_workload", models.ObjectWorkload},
-		{"iga_resources", models.ObjectResource},
-		{"iga_entitlements", models.ObjectEntitlement},
-		{"iga_agents", models.ObjectAgent},
-	} {
-		col := models.SupportColumn(t.class)
-		if col == "" {
-			return fmt.Errorf("no support column for node class %q", t.class)
-		}
-		if err := tx.Exec(fmt.Sprintf(stmt, t.table, col, col),
-			models.RetiredUnsupported, snap.Run.WorkspaceID).Error; err != nil {
-			return fmt.Errorf("retire unsupported %s: %w", t.table, err)
-		}
-	}
-
-	// Retiring a node ends its incident relationships, in the same
-	// transaction. An edge pointing at a retired object and reading `current`
-	// is a lie the read path would repeat.
-	if err := rc.endEdgesOnRetiredIdentities(tx, snap); err != nil {
-		return err
-	}
-
-	// And it settles the resolutions pointing at what just retired -- IN THIS
-	// SAME TRANSACTION. Deferring it to the next pass would leave a resolution
-	// in force, pointing at a retired row, for a full scan cycle.
-	//
-	// The two bases settle differently, and that asymmetry is the point:
-	//   * DERIVED is recomputed from evidence every pass, so it is simply
-	//     cleared -- the next pass re-derives it, or leaves it unresolved.
-	//   * ASSERTED is a person's decision. It is PRESERVED, still pointing at
-	//     the retired row so it stays explicable, but SUSPENDED so it is no
-	//     longer in force. It never returns to active on its own.
-	return rc.settleResolutionsOnRetired(tx, snap)
-}
-
-func (rc *Reconciler) endEdgesOnRetiredIdentities(tx *gorm.DB, snap *Snapshot) error {
+//	retired      ends                                  ended_reason
+//	identity     its relationships, assignments,       subject_retired
+//	             grants
+//	workload     its executes_as / task_execution_role subject_retired
+//	policy       its assignments, and their grants     policy_retired
+//	statement    its grants                            statement_retired
+//	resource     nothing: targets are statement content
+func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *EventLog) error {
+	ws := snap.Run.WorkspaceID
 	now := rc.now()
-	if err := tx.Exec(`
-		UPDATE iga_access_edges e
-		   SET state = 'ended', valid_to = ?, ended_reason = ?, updated_at = ?
-		 WHERE e.workspace_id = ?
-		   AND e.state <> 'ended'
-		   AND EXISTS (SELECT 1 FROM iga_identity_accounts a
-		                WHERE a.workspace_id = e.workspace_id
-		                  AND a.id = e.subject_identity_account_id
-		                  AND a.lifecycle = 'retired')`,
-		now, models.EndedSubjectRetired, now, snap.Run.WorkspaceID).Error; err != nil {
-		return err
-	}
-	return tx.Exec(`
-		UPDATE iga_relationship r
-		   SET state = 'ended', valid_to = ?, ended_reason = ?, updated_at = ?
-		 WHERE r.workspace_id = ?
-		   AND r.state <> 'ended'
-		   AND (EXISTS (SELECT 1 FROM iga_identity_accounts a
-		                 WHERE a.workspace_id = r.workspace_id
-		                   AND a.id IN (r.source_identity_account_id, r.target_identity_account_id)
-		                   AND a.lifecycle = 'retired')
-		     OR EXISTS (SELECT 1 FROM iga_workload w
-		                 WHERE w.workspace_id = r.workspace_id
-		                   AND w.id IN (r.source_workload_id, r.target_workload_id)
-		                   AND w.lifecycle = 'retired'))`,
-		now, models.EndedSubjectRetired, now, snap.Run.WorkspaceID).Error
-}
-
-// settleResolutionsOnRetired suspends asserted resolutions and clears derived
-// ones whose target has just retired.
-func (rc *Reconciler) settleResolutionsOnRetired(tx *gorm.DB, snap *Snapshot) error {
-	// Asserted: preserved and suspended, target intact.
-	if err := tx.Exec(`
-		UPDATE iga_external_principal ep
-		   SET resolution_state = ?
-		 WHERE ep.workspace_id = ?
-		   AND ep.resolution_basis = ?
-		   AND ep.resolution_state = ?
-		   AND EXISTS (SELECT 1 FROM iga_identity_accounts a
-		                WHERE a.workspace_id = ep.workspace_id
-		                  AND a.id = ep.resolved_identity_account_id
-		                  AND a.lifecycle = 'retired')`,
-		models.ResolutionSuspended, snap.Run.WorkspaceID,
-		models.BasisAsserted, models.ResolutionActive).Error; err != nil {
-		return fmt.Errorf("suspend asserted resolutions: %w", err)
+	retiredBy := map[string][]uuid.UUID{}
+	for _, class := range models.NodeClasses {
+		col, table := models.SupportColumn(class), models.NodeTable(class)
+		if col == "" || table == "" {
+			return fmt.Errorf("unmapped node class %q", class)
+		}
+		// The first EXISTS matters: an object with NO support rows at all is
+		// pre-graph, not unsupported. provider = 'aws': GitHub's rows share
+		// these tables and are never retired by this pass.
+		stmt := fmt.Sprintf(`
+			UPDATE %[1]s n
+			   SET lifecycle = 'retired', retired_reason = ?
+			 WHERE n.workspace_id = ? AND n.provider = 'aws'
+			   AND n.lifecycle = 'active'
+			   AND EXISTS (SELECT 1 FROM iga_object_support s
+			                WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id)
+			   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
+			                    WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id
+			                      AND s.state <> 'ended')
+			RETURNING n.id`, table, col)
+		var ids []uuid.UUID
+		if err := tx.Raw(stmt, models.RetiredUnsupported, ws).Scan(&ids).Error; err != nil {
+			return fmt.Errorf("retire unsupported %s: %w", table, err)
+		}
+		for _, id := range ids {
+			events.Retired(class, id, models.RetiredUnsupported)
+		}
+		retiredBy[class] = ids
 	}
 
-	// Derived: cleared, so the next pass re-derives from evidence rather than
-	// leaving a computed answer standing over a retired object. The CHECK
-	// requires basis and target to go together, so both clear at once.
-	return tx.Exec(`
-		UPDATE iga_external_principal ep
-		   SET resolved_identity_account_id = NULL,
-		       resolution_basis = '',
-		       resolution_rule  = ''
-		 WHERE ep.workspace_id = ?
-		   AND ep.resolution_basis = ?
-		   AND EXISTS (SELECT 1 FROM iga_identity_accounts a
-		                WHERE a.workspace_id = ep.workspace_id
-		                  AND a.id = ep.resolved_identity_account_id
-		                  AND a.lifecycle = 'retired')`,
-		snap.Run.WorkspaceID, models.BasisDerived).Error
+	end := map[string]any{"state": models.RelEnded, "valid_to": now}
+	endWith := func(reason string) map[string]any {
+		m := map[string]any{"ended_reason": reason}
+		for k, v := range end {
+			m[k] = v
+		}
+		return m
+	}
+	if ids := retiredBy[models.ObjectIdentity]; len(ids) > 0 {
+		if err := tx.Model(&models.IGARelationship{}).
+			Where("workspace_id = ? AND state <> ? AND (source_identity_account_id IN ? OR target_identity_account_id IN ?)",
+				ws, models.RelEnded, ids, ids).Updates(endWith(models.EndedSubjectRetired)).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.IGAPolicyAssignment{}).
+			Where("workspace_id = ? AND state <> ? AND holder_identity_account_id IN ?", ws, models.RelEnded, ids).
+			Updates(endWith(models.EndedSubjectRetired)).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.IGAAccessEdge{}).
+			Where("workspace_id = ? AND state <> ? AND subject_identity_account_id IN ?", ws, models.RelEnded, ids).
+			Updates(endWith(models.EndedSubjectRetired)).Error; err != nil {
+			return err
+		}
+	}
+	if ids := retiredBy[models.ObjectWorkload]; len(ids) > 0 {
+		if err := tx.Model(&models.IGARelationship{}).
+			Where("workspace_id = ? AND state <> ? AND source_workload_id IN ?", ws, models.RelEnded, ids).
+			Updates(endWith(models.EndedSubjectRetired)).Error; err != nil {
+			return err
+		}
+	}
+	if ids := retiredBy[models.ObjectPolicy]; len(ids) > 0 {
+		if err := tx.Model(&models.IGAAccessEdge{}).
+			Where(`workspace_id = ? AND state <> ? AND assignment_id IN
+			       (SELECT id FROM iga_policy_assignment WHERE workspace_id = ? AND policy_id IN ?)`,
+				ws, models.RelEnded, ws, ids).Updates(endWith(models.EndedPolicyRetired)).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.IGAPolicyAssignment{}).
+			Where("workspace_id = ? AND state <> ? AND policy_id IN ?", ws, models.RelEnded, ids).
+			Updates(endWith(models.EndedPolicyRetired)).Error; err != nil {
+			return err
+		}
+	}
+	if ids := retiredBy[models.ObjectEntitlement]; len(ids) > 0 {
+		if err := tx.Model(&models.IGAAccessEdge{}).
+			Where("workspace_id = ? AND state <> ? AND entitlement_id IN ?", ws, models.RelEnded, ids).
+			Updates(endWith(models.EndedStatementRetired)).Error; err != nil {
+			return err
+		}
+		// A retired statement's live revision closes: its content is history.
+		if err := tx.Model(&models.IGAStatementRevision{}).
+			Where("workspace_id = ? AND valid_to IS NULL AND entitlement_id IN ?", ws, ids).
+			Update("valid_to", now).Error; err != nil {
+			return err
+		}
+	}
+
+	// A person's association with an object that just retired is SUSPENDED,
+	// not cleared (§2.12); a derived one is re-derived now -- unresolved.
+	for class, epCol := range map[string]string{
+		models.ObjectIdentity: "resolved_identity_account_id",
+		models.ObjectWorkload: "resolved_workload_id",
+	} {
+		ids := retiredBy[class]
+		if len(ids) == 0 {
+			continue
+		}
+		if err := tx.Exec(`UPDATE iga_external_principal SET resolution_state = ?
+		                    WHERE workspace_id = ? AND resolution_basis = ? AND resolution_state = ?
+		                      AND `+epCol+` IN ?`,
+			models.ResolutionSuspended, ws, models.BasisAsserted, models.ResolutionActive, ids).Error; err != nil {
+			return fmt.Errorf("suspend assertions on retired %s: %w", class, err)
+		}
+		if err := tx.Exec(`UPDATE iga_external_principal
+		                      SET `+epCol+` = NULL, resolution_basis = '', resolution_rule = ''
+		                    WHERE workspace_id = ? AND resolution_basis = ? AND `+epCol+` IN ?`,
+			ws, models.BasisDerived, ids).Error; err != nil {
+			return fmt.Errorf("re-derive resolutions on retired %s: %w", class, err)
+		}
+	}
+	return nil
 }
 
-// markReconciled flips every partition's watermark, in the same transaction
-// that did the closing.
+// markReconciled flips every partition's watermark, in the transaction that
+// did the closing.
 func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
 	for _, part := range Partitions(snap) {
 		if err := tx.Model(&models.IGAProjectionState{}).
@@ -359,10 +378,8 @@ func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
 	return nil
 }
 
-// LastGenerationFor reads a partition's watermark.
-//
-// Keyed EXACTLY as 033 keys the table and exactly as scope() filters rows --
-// one value, three call sites, no predicate to keep in agreement.
+// LastGenerationFor reads a partition's watermark -- keyed exactly as 033 keys
+// the table and as scope() filters rows.
 func LastGenerationFor(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error) {
 	var st models.IGAProjectionState
 	err := tx.Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",

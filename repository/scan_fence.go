@@ -79,6 +79,24 @@ func runFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error 
 	})
 }
 
+// runFencedTx is runFenced for a mutation that must be atomic on its own --
+// the multi-table deletes of ReconcileGeneration. It ALWAYS opens a
+// transaction, and asserts the fence inside it when one is set.
+//
+// Deletes are fenced exactly like upserts (§2.10A). Without it a superseded
+// worker could still reach its reconcile step and delete rows the CURRENT
+// owner had just written at the same generation.
+func runFencedTx(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if fence != nil {
+			if err := assertScanFence(tx, *fence); err != nil {
+				return err
+			}
+		}
+		return fn(tx)
+	})
+}
+
 // MigrationHead reports the highest successfully-applied master migration, or
 // 0 when that cannot be determined.
 //
@@ -118,4 +136,15 @@ func HasRelation(db *gorm.DB, name string) (bool, error) {
 	var exists bool
 	err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, "public."+name).Scan(&exists).Error
 	return exists, err
+}
+
+// HasColumn reports whether public.<table> has <column>. The partner of
+// HasRelation, for checks that a migration applied COMPLETELY -- an applied
+// but incomplete migration is invisible to a relation check (§9).
+func HasColumn(db *gorm.DB, table, column string) (bool, error) {
+	var n int64
+	err := db.Raw(`SELECT count(*) FROM information_schema.columns
+	               WHERE table_schema = 'public' AND table_name = ? AND column_name = ?`,
+		table, column).Scan(&n).Error
+	return n > 0, err
 }

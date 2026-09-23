@@ -43,6 +43,20 @@ type fakeIAM struct {
 
 	managedPolicies map[string]string // policy arn -> document
 
+	// policyIDs is each managed policy's PolicyId. Unset derives a stable one
+	// from the ARN; a test RECREATES a policy under the same ARN by changing it.
+	policyIDs map[string]string
+	// policyVersions is each managed policy's default version id ("v3" unset).
+	policyVersions map[string]string
+	// failPolicyVersion makes GetPolicyVersion fail for ONE policy ARN -- the
+	// per-document isolation scenario ("deny iam:GetPolicyVersion on TicketRead
+	// only").
+	failPolicyVersion map[string]error
+
+	// groups and userGroups back GetAccountAuthorizationDetails.
+	groups     []iamtypes.GroupDetail
+	userGroups map[string][]string // user name -> group names
+
 	// fail maps an operation name to the error it should return.
 	fail map[string]error
 	// calls counts every operation, so a test can assert on call volume.
@@ -60,6 +74,10 @@ func newFakeIAM() *fakeIAM {
 		attachedUserPolicies: map[string][]iamtypes.AttachedPolicy{},
 		inlineUserPolicies:   map[string]map[string]string{},
 		managedPolicies:      map[string]string{},
+		policyIDs:            map[string]string{},
+		policyVersions:       map[string]string{},
+		failPolicyVersion:    map[string]error{},
+		userGroups:           map[string][]string{},
 		fail:                 map[string]error{},
 		calls:                map[string]int{},
 	}
@@ -212,8 +230,17 @@ func (f *fakeIAM) GetPolicy(_ context.Context, in *iam.GetPolicyInput, _ ...func
 	if _, ok := f.managedPolicies[arn]; !ok {
 		return nil, &smithy.GenericAPIError{Code: "NoSuchEntity", Message: "no such policy"}
 	}
+	version := f.policyVersions[arn]
+	if version == "" {
+		version = "v3"
+	}
+	policyID := f.policyIDs[arn]
+	if policyID == "" {
+		policyID = "ANPA" + strings.ToUpper(fmt.Sprintf("%x", len(arn)*7919+int(arn[len(arn)-1])))
+	}
 	return &iam.GetPolicyOutput{Policy: &iamtypes.Policy{
-		Arn: in.PolicyArn, DefaultVersionId: aws.String("v3"),
+		Arn: in.PolicyArn, DefaultVersionId: aws.String(version),
+		PolicyId:   aws.String(policyID),
 		PolicyName: aws.String(arn[strings.LastIndex(arn, "/")+1:]),
 	}}, nil
 }
@@ -222,10 +249,30 @@ func (f *fakeIAM) GetPolicyVersion(_ context.Context, in *iam.GetPolicyVersionIn
 	if err := f.track("GetPolicyVersion"); err != nil {
 		return nil, err
 	}
+	if err := f.failPolicyVersion[aws.ToString(in.PolicyArn)]; err != nil {
+		return nil, err
+	}
 	doc := f.managedPolicies[aws.ToString(in.PolicyArn)]
 	return &iam.GetPolicyVersionOutput{PolicyVersion: &iamtypes.PolicyVersion{
 		VersionId: in.VersionId, Document: aws.String(url.QueryEscape(doc)),
 	}}, nil
+}
+
+// GetAccountAuthorizationDetails serves groups and user group lists -- the
+// read groups and memberships come from (035). Unpaginated: a fixture's group
+// count never needs a second page.
+func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetAccountAuthorizationDetailsInput, _ ...func(*iam.Options)) (*iam.GetAccountAuthorizationDetailsOutput, error) {
+	if err := f.track("GetAccountAuthorizationDetails"); err != nil {
+		return nil, err
+	}
+	out := &iam.GetAccountAuthorizationDetailsOutput{GroupDetailList: f.groups}
+	for _, u := range f.users {
+		out.UserDetailList = append(out.UserDetailList, iamtypes.UserDetail{
+			Arn: u.Arn, UserName: u.UserName, UserId: u.UserId,
+			GroupList: f.userGroups[aws.ToString(u.UserName)],
+		})
+	}
+	return out, nil
 }
 
 // ListOpenIDConnectProviders satisfies awsdiscovery.IAMAPI, added by ticket

@@ -122,6 +122,9 @@ type ObservationSubject struct {
 	PermissionID *uuid.UUID
 	ResourceID   *uuid.UUID
 	WorkloadID   *uuid.UUID
+	// PolicyID is a policy VERSION as an evidence subject (035): the grant,
+	// the assignment and the target all cite it.
+	PolicyID *uuid.UUID
 }
 
 // IdentitySubject and friends keep call sites from constructing the struct by
@@ -131,6 +134,7 @@ func IdentitySubject(id uuid.UUID) ObservationSubject   { return ObservationSubj
 func PermissionSubject(id uuid.UUID) ObservationSubject { return ObservationSubject{PermissionID: &id} }
 func ResourceSubject(id uuid.UUID) ObservationSubject   { return ObservationSubject{ResourceID: &id} }
 func WorkloadSubject(id uuid.UUID) ObservationSubject   { return ObservationSubject{WorkloadID: &id} }
+func PolicySubject(id uuid.UUID) ObservationSubject     { return ObservationSubject{PolicyID: &id} }
 
 // ObservationWriter records evidence for one scan run.
 //
@@ -206,6 +210,7 @@ func (w *ObservationWriter) Record(
 		PermissionID:       subject.PermissionID,
 		ResourceID:         subject.ResourceID,
 		WorkloadID:         subject.WorkloadID,
+		PolicyID:           subject.PolicyID,
 		SourceAPI:          sourceAPI,
 		Surface:            surface,
 		SurfaceState:       surfaceState,
@@ -237,7 +242,7 @@ func (w *ObservationWriter) Record(
 	// identifier, turning the expression into a single invalid, literally-quoted
 	// column name instead of the function call Postgres needs to match the index.
 	hasSubject := subject.IdentityID != nil || subject.PermissionID != nil ||
-		subject.ResourceID != nil || subject.WorkloadID != nil
+		subject.ResourceID != nil || subject.WorkloadID != nil || subject.PolicyID != nil
 
 	conflict := clause.OnConflict{
 		DoUpdates: clause.Assignments(map[string]interface{}{
@@ -269,7 +274,9 @@ func (w *ObservationWriter) Record(
 	if hasSubject {
 		conflict.Columns = []clause.Column{
 			{Name: "workspace_id"},
-			{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id)", Raw: true},
+			// Must match uq_cloud_observation_dedupe EXACTLY, which 035 widened
+			// with policy_id. A mismatch fails every write at runtime.
+			{Name: "COALESCE(identity_id, permission_id, resource_id, workload_id, policy_id)", Raw: true},
 			{Name: "source_api"},
 			{Name: "content_hash"},
 		}
@@ -281,7 +288,7 @@ func (w *ObservationWriter) Record(
 		// predicate -- Postgres will not infer a partial index from the column
 		// list alone.
 		conflict.TargetWhere = clause.Where{Exprs: []clause.Expression{clause.Expr{
-			SQL: "identity_id IS NULL AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL",
+			SQL: "identity_id IS NULL AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL AND policy_id IS NULL",
 		}}}
 	}
 

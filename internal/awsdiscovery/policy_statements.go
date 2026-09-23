@@ -2,9 +2,12 @@ package awsdiscovery
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -55,6 +58,10 @@ type PolicyStatement struct {
 	// customer at the exact statement; not an identity, since it is optional
 	// and not unique across documents.
 	Sid string
+	// Raw is the statement exactly as the document carried it, compacted. It
+	// is what a revision stores and what evidence quotes -- never our reading
+	// of it (SPEC §2.6: "verbatim, as AWS returned it").
+	Raw json.RawMessage
 }
 
 // Unbounded reports whether the statement names no concrete resource at all --
@@ -74,6 +81,8 @@ type permissionStatement struct {
 	Resource    json.RawMessage `json:"Resource"`
 	NotResource json.RawMessage `json:"NotResource"`
 	Condition   json.RawMessage `json:"Condition"`
+
+	raw json.RawMessage // the statement's own bytes; set by the list decoder
 }
 
 type permissionStatementList []permissionStatement
@@ -81,12 +90,23 @@ type permissionStatementList []permissionStatement
 func (l *permissionStatementList) UnmarshalJSON(b []byte) error {
 	var one permissionStatement
 	if err := json.Unmarshal(b, &one); err == nil && one.Effect != "" {
+		one.raw = append(json.RawMessage(nil), b...)
 		*l = []permissionStatement{one}
 		return nil
 	}
-	var many []permissionStatement
-	if err := json.Unmarshal(b, &many); err != nil {
+	// Decoded element by element so each statement keeps its own bytes.
+	var raws []json.RawMessage
+	if err := json.Unmarshal(b, &raws); err != nil {
 		return err
+	}
+	many := make([]permissionStatement, 0, len(raws))
+	for _, r := range raws {
+		var st permissionStatement
+		if err := json.Unmarshal(r, &st); err != nil {
+			return err
+		}
+		st.raw = append(json.RawMessage(nil), r...)
+		many = append(many, st)
 	}
 	*l = many
 	return nil
@@ -138,9 +158,57 @@ func ParsePolicyDocument(doc string) (statements []PolicyStatement, skipped int,
 			Resources:    decodeResourceField(stmt.Resource),
 			NotResources: decodeResourceField(stmt.NotResource),
 			Condition:    compactJSON(stmt.Condition),
+			Raw:          json.RawMessage(compactJSON(stmt.raw)),
 		})
 	}
 	return out, skipped, nil
+}
+
+// ContentHash is the statement's content identity (SPEC §2.6): SHA-256 over
+// the canonical JSON of Effect, Action, NotAction, Resource, NotResource and
+// Condition. Canonical means lowercase effect, each list de-duplicated and
+// sorted, and the condition re-encoded with sorted keys -- so reordering the
+// actions inside a statement, or reformatting it, is not an edit, while any
+// change to what it says is.
+//
+// Sid is deliberately NOT hashed: a Sid-keyed statement keeps its identity
+// across content edits (a revision), and a Sid-less one is identified by this
+// hash alone.
+func (s PolicyStatement) ContentHash() string {
+	canon := map[string]any{
+		"Effect":      strings.ToLower(s.Effect),
+		"Action":      canonicalList(s.Actions),
+		"NotAction":   canonicalList(s.NotActions),
+		"Resource":    canonicalList(s.Resources),
+		"NotResource": canonicalList(s.NotResources),
+	}
+	if s.Condition != "" {
+		var cond any
+		if err := json.Unmarshal([]byte(s.Condition), &cond); err == nil {
+			canon["Condition"] = cond // json.Marshal sorts map keys
+		} else {
+			canon["Condition"] = s.Condition
+		}
+	}
+	b, _ := json.Marshal(canon)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalList(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // compactJSON returns the raw message with insignificant whitespace removed, so

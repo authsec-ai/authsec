@@ -201,7 +201,10 @@ func (f *fixture) project(snap *igagraph.Snapshot) error {
 		if err := p.Project(tx, snap); err != nil {
 			return err
 		}
-		return rc.Reconcile(tx, snap)
+		if err := rc.Reconcile(tx, snap, p.Exclusions(), p.Events()); err != nil {
+			return err
+		}
+		return p.Events().Flush(tx, f.graph)
 	})
 }
 
@@ -228,6 +231,7 @@ func cleanCoverage(region string) map[string]models.SurfaceCoverage {
 	return map[string]models.SurfaceCoverage{
 		models.SurfaceIAMRoles:        reached(2),
 		models.SurfaceIAMUsers:        reached(1),
+		models.SurfaceIAMGroups:       reached(0),
 		models.SurfaceIAMPolicies:     reached(3),
 		"lambda:" + region:            reached(1),
 		"ecs:" + region:               reached(0),
@@ -237,4 +241,71 @@ func cleanCoverage(region string) map[string]models.SurfaceCoverage {
 		// policy_documents deliberately ABSENT: the permission scanner writes
 		// it only when parsing dropped something, so absence means clean.
 	}
+}
+
+/* --------------------------------- estate --------------------------------- */
+
+const region = "eu-central-1"
+
+// estate is one Lambda -> its role -> one attached managed policy, as REAL
+// cloud_* rows, so every proof runs through the real igagraph.Load (§4.5).
+type estate struct {
+	f                                    *fixture
+	roleID, lambdaID, policyID, attachID uuid.UUID
+	roleARN, uniqueID                    string
+	noRole                               bool
+}
+
+const (
+	estateLambdaARN = "arn:aws:lambda:eu-central-1:1234:function:refund-processor"
+	estatePolicyARN = "arn:aws:iam::1234:policy/RefundS3Access"
+	estatePolicyDoc = `{"Version":"2012-10-17","Statement":[{"Sid":"ReadRefunds","Effect":"Allow",` +
+		`"Action":"s3:GetObject","Resource":"arn:aws:s3:::refunds-bucket/*"}]}`
+)
+
+func newEstate(f *fixture, roleARN, uniqueID string) *estate {
+	return &estate{f: f, roleID: uuid.New(), lambdaID: uuid.New(), policyID: uuid.New(), attachID: uuid.New(),
+		roleARN: roleARN, uniqueID: uniqueID}
+}
+
+// seed writes (or re-stamps) the estate's rows AT generation gen.
+func (e *estate) seed(gen int) {
+	f := e.f
+	f.t.Helper()
+	gx := func(q string, a ...any) {
+		f.t.Helper()
+		if err := f.gorm.Exec(q, a...).Error; err != nil {
+			f.t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+	gx(`INSERT INTO cloud_identity (id, workspace_id, connector_id, kind, native_id, name, attrs, last_seen_generation)
+	    VALUES (?, ?, ?, 'iam_role', ?, 'role', ?, ?)
+	    ON CONFLICT (id) DO UPDATE SET last_seen_generation = EXCLUDED.last_seen_generation, attrs = EXCLUDED.attrs`,
+		e.roleID, f.workspace, f.connector, e.roleARN, `{"unique_id":"`+e.uniqueID+`"}`, gen)
+	var identity any = e.roleID
+	if e.noRole {
+		identity = nil
+	}
+	gx(`INSERT INTO cloud_workload (id, workspace_id, connector_id, identity_id, runtime_kind, native_id, name, region, last_seen_generation)
+	    VALUES (?, ?, ?, ?, 'lambda_function', ?, 'refund-processor', ?, ?)
+	    ON CONFLICT (id) DO UPDATE SET last_seen_generation = EXCLUDED.last_seen_generation, identity_id = EXCLUDED.identity_id`,
+		e.lambdaID, f.workspace, f.connector, identity, estateLambdaARN, region, gen)
+	gx(`INSERT INTO cloud_policy (id, workspace_id, connector_id, policy_kind, native_id, name, policy_id, version_id, document, document_hash, last_seen_generation)
+	    VALUES (?, ?, ?, 'managed', ?, 'RefundS3Access', 'ANPA7QEXAMPLE', 'v2', ?::jsonb, 'h1', ?)
+	    ON CONFLICT (id) DO UPDATE SET last_seen_generation = EXCLUDED.last_seen_generation`,
+		e.policyID, f.workspace, f.connector, estatePolicyARN, estatePolicyDoc, gen)
+	gx(`INSERT INTO cloud_policy_attachment (id, workspace_id, connector_id, policy_row_id, principal_identity_id, attachment_kind, last_seen_generation)
+	    VALUES (?, ?, ?, ?, ?, 'attached', ?)
+	    ON CONFLICT (id) DO UPDATE SET last_seen_generation = EXCLUDED.last_seen_generation`,
+		e.attachID, f.workspace, f.connector, e.policyID, e.roleID, gen)
+}
+
+// load runs the REAL loader for a run.
+func (e *estate) load(run models.CloudScanRun) *igagraph.Snapshot {
+	e.f.t.Helper()
+	snap, err := igagraph.Load(e.f.t.Context(), e.f.gorm, run.ID)
+	if err != nil {
+		e.f.t.Fatalf("load run %s: %v", run.ID, err)
+	}
+	return snap
 }

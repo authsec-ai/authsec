@@ -103,55 +103,35 @@ COMMENT ON TABLE public.iga_external_principal IS
     'policy said, never that the named principal exists.';
 
 -- widen iga_relationship -----------------------------------------------------
--- The fourth typed SOURCE. Typed and FK''d like every other endpoint -- an
--- unresolved far end is still a real endpoint, not a string.
+-- The external-principal source, wired in here because 031 could not
+-- forward-reference this table. Verbatim from SPEC §3 034: the relationship
+-- types are exactly 031's (executes_as, task_execution_role, member_of,
+-- can_assume) -- no realizes, no agent-instance endpoint (§2.2).
 ALTER TABLE public.iga_relationship
-    ADD COLUMN IF NOT EXISTS source_external_principal_id uuid;
-
-ALTER TABLE public.iga_relationship
+    ADD COLUMN IF NOT EXISTS source_external_principal_id uuid,
     ADD CONSTRAINT iga_rel_src_external_fkey
         FOREIGN KEY (workspace_id, source_external_principal_id)
-        REFERENCES public.iga_external_principal (workspace_id, id) ON DELETE CASCADE;
+        REFERENCES public.iga_external_principal (workspace_id, id) ON DELETE CASCADE,
 
--- Exactly-one-source, now over four columns. Dropped and re-added rather than
--- edited: a CHECK cannot be altered in place.
-ALTER TABLE public.iga_relationship
     DROP CONSTRAINT iga_relationship_source_chk,
     ADD CONSTRAINT iga_relationship_source_chk CHECK (
         (source_identity_account_id   IS NOT NULL)::int
       + (source_workload_id           IS NOT NULL)::int
-      + (source_agent_instance_id     IS NOT NULL)::int
-      + (source_external_principal_id IS NOT NULL)::int = 1);
+      + (source_external_principal_id IS NOT NULL)::int = 1),
 
--- The legal-pair CHECK, with can_assume widened. The ELSE false arm stays
--- exactly as load-bearing as it was: this widening is the deliberate review
--- point the arm exists to force.
-ALTER TABLE public.iga_relationship
     DROP CONSTRAINT iga_relationship_pair_chk,
     ADD CONSTRAINT iga_relationship_pair_chk CHECK (
         CASE relationship_type
-            WHEN 'executes_as' THEN
-                source_workload_id IS NOT NULL
-                AND target_identity_account_id IS NOT NULL
-            WHEN 'can_assume' THEN
-                -- Either one of OUR identities, or an external principal a
-                -- trust policy names. Both are legitimate assumption sources.
-                (source_identity_account_id IS NOT NULL
-                 OR source_external_principal_id IS NOT NULL)
-                AND target_identity_account_id IS NOT NULL
-            WHEN 'realizes' THEN
-                source_agent_instance_id IS NOT NULL
-                AND target_workload_id IS NOT NULL
+            WHEN 'executes_as'         THEN source_workload_id IS NOT NULL
+            WHEN 'task_execution_role' THEN source_workload_id IS NOT NULL
+            WHEN 'member_of'           THEN source_identity_account_id IS NOT NULL
+            WHEN 'can_assume'          THEN source_identity_account_id IS NOT NULL
+                                         OR source_external_principal_id IS NOT NULL
             ELSE false
         END);
-
--- The source index has to know about the fourth column, or an external-
--- principal edge is invisible to it.
-DROP INDEX IF EXISTS public.idx_iga_relationship_source;
-CREATE INDEX IF NOT EXISTS idx_iga_relationship_source
-    ON public.iga_relationship (workspace_id, relationship_type,
-        COALESCE(source_identity_account_id, source_workload_id,
-                 source_agent_instance_id, source_external_principal_id));
+CREATE INDEX IF NOT EXISTS idx_iga_relationship_source_external
+    ON public.iga_relationship (workspace_id, source_external_principal_id)
+    WHERE source_external_principal_id IS NOT NULL;
 
 -- verify ---------------------------------------------------------------------
 SELECT

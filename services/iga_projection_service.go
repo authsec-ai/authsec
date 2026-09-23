@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,15 +15,6 @@ import (
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
-
-// MinProjectionSchemaVersion is the migration the projector cannot run below.
-//
-// §6.3: 027-034 ship in ONE release, and core reconciliation writes 034's
-// table. With 027-033 applied and 034 missing, every reconcile run fails with
-// relation "iga_external_principal" does not exist -- a PLAN-time error, so it
-// fires even when no row matches. Declining to start is the honest failure;
-// starting and failing every pass is not.
-const MinProjectionSchemaVersion = 34
 
 // ProjectionService claims projection jobs and turns published runs into the
 // canonical graph.
@@ -63,13 +55,26 @@ func NewProjectionService(
 	}
 }
 
+// NewDefaultProjectionService wires the production service. The owner names
+// this process for the job lease; the barrier is held by the JOB, so two
+// services with different owners hand work to each other without waiting.
+func NewDefaultProjectionService(db *gorm.DB) *ProjectionService {
+	host, _ := os.Hostname()
+	return NewProjectionService(db,
+		repositories.NewIGAProjectionJobRepository(db),
+		repositories.NewIGAPipelineLeaseRepository(db),
+		repositories.NewIGAGraphRepository(),
+		fmt.Sprintf("projector/%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8]),
+		5*time.Minute)
+}
+
 // projectionFencer binds the two ownership proofs the graph transaction needs:
-// this worker still owns the JOB, and still holds the workspace BARRIER in the
-// projecting phase.
+// this worker still owns the JOB, and the workspace BARRIER is still projecting
+// this run, held by this job, at this version.
 type projectionFencer struct {
 	jobs     repositories.IGAProjectionJobRepository
 	pipeline repositories.IGAPipelineLeaseRepository
-	version  int64
+	jobID    uuid.UUID
 }
 
 func (f projectionFencer) AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, v int64) error {
@@ -79,44 +84,16 @@ func (f projectionFencer) AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner stri
 func (f projectionFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version int64) error {
 	return f.pipeline.AssertHeldTx(tx, repositories.PipelineFence{
 		WorkspaceID: ws, Phase: models.PipelineProjecting, RunID: runID, Version: version,
+		Holder: models.PipelineJobHolder(f.jobID),
 	})
 }
 
-// RequiredRelation is the table whose absence makes every reconcile run fail
-// at PLAN time -- so it fails even when no row would match.
-const RequiredRelation = "iga_external_principal"
-
-// EnsureSchema refuses to start below the schema this phase requires.
-//
-// The RELATION is the ground truth, not the migration log: a database migrated
-// by psql has no migration_logs at all, and a bookkeeping table can be stale or
-// written by another tool. The head is read only to make the error message say
-// WHICH migration is missing rather than just naming a table.
-func (s *ProjectionService) EnsureSchema() error {
-	ok, err := repositories.HasRelation(s.db, RequiredRelation)
-	if err != nil {
-		return fmt.Errorf("check schema: %w", err)
-	}
-	if !ok {
-		head, herr := repositories.MigrationHead(s.db)
-		at := "unknown"
-		if herr == nil && head > 0 {
-			at = fmt.Sprintf("%d", head)
-		}
-		return fmt.Errorf(
-			"projector requires migration %03d (relation %s is missing, database is at %s): "+
-				"core reconciliation writes it and would fail at plan time on every pass",
-			MinProjectionSchemaVersion, RequiredRelation, at)
-	}
-	return nil
-}
-
 // Run claims jobs until the context ends.
+//
+// main starts it ONLY once IGA_GRAPH_PROJECTION is on and the schema verified
+// (GraphProjectionGate.VerifyUntilReady), so it never runs against a schema it
+// cannot use -- the switch decides, not a probe here.
 func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
-	if err := s.EnsureSchema(); err != nil {
-		log.Printf("[projection] not starting: %v", err)
-		return
-	}
 	if poll <= 0 {
 		poll = 10 * time.Second
 	}
@@ -179,6 +156,7 @@ func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) e
 			Phase:       lease.State,
 			RunID:       *lease.ScanRunID,
 			Version:     lease.Version,
+			Holder:      lease.Holder,
 		}
 		reason, action := s.recoveryFor(lease, now)
 		switch action {
@@ -264,20 +242,15 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || job == nil {
 		return false, err
 	}
-	// The barrier must be PROJECTING for this run and held by us. A reclaimed
-	// job inherits a barrier whose previous holder is gone: recover it into
-	// the SAME phase under a new version rather than releasing it, because the
-	// published run's inventory is still being read.
+	// The barrier must be PROJECTING this run and held by THIS JOB (§2.10A).
+	// The job lease is the fence between workers; the barrier names the job,
+	// so a reclaimed job proceeds at once instead of waiting out a lease held
+	// in a dead worker's name.
 	version, err := s.holdBarrier(job)
 	if err != nil {
-		// Cannot establish the barrier -- another live worker holds it, or it
-		// is not in the phase this job needs. Do NOT terminalize the job and
-		// do NOT touch a barrier we may not hold.
-		//
-		// Hand the job back rather than sitting on it: leaving it claimed
-		// costs a whole lease before anyone retries, and with the attempts
-		// ceiling that burns a retry for something that was never this job's
-		// fault.
+		// The barrier is not this job's -- an inconsistency, not contention.
+		// Do NOT terminalize the job and do NOT touch the barrier. Hand the job
+		// back (to the back of the queue) and let recovery settle the barrier.
 		if rerr := s.jobs.Requeue(job.ID, s.owner, job.LeaseVersion); rerr != nil {
 			log.Printf("[projection] could not requeue job %s: %v", job.ID, rerr)
 		}
@@ -321,30 +294,23 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	return true, s.completeAndRelease(ctx, job, version)
 }
 
-// holdBarrier returns the barrier version this worker holds for the job's run,
-// recovering an expired projecting lease into the same phase when its previous
-// holder is gone.
+// holdBarrier returns the barrier version when the barrier is projecting this
+// job's run and is held by this job. There is no worker name to match and no
+// expiry to consult: whoever holds the job's lease may proceed (§4.11).
 func (s *ProjectionService) holdBarrier(job *models.IGAProjectionJob) (int64, error) {
 	lease, err := s.pipeline.Get(job.WorkspaceID)
 	if err != nil {
 		return 0, fmt.Errorf("pipeline barrier missing: %w", err)
 	}
+	want := models.PipelineJobHolder(job.ID)
 	if lease.State != models.PipelineProjecting ||
-		lease.ScanRunID == nil || *lease.ScanRunID != job.ScanRunID {
-		return 0, fmt.Errorf("%w: barrier is %s for run %v, not projecting run %s",
-			repositories.ErrPipelineLost, lease.State, lease.ScanRunID, job.ScanRunID)
+		lease.ScanRunID == nil || *lease.ScanRunID != job.ScanRunID ||
+		lease.Holder != want {
+		return 0, fmt.Errorf("%w: barrier is %s/%s for run %v, not %s for run %s",
+			repositories.ErrPipelineLost, lease.State, lease.Holder, lease.ScanRunID,
+			want, job.ScanRunID)
 	}
-	now := s.now()
-	if lease.ExpiresAt != nil && lease.ExpiresAt.After(now) {
-		// Still live. Only its own holder may proceed.
-		if lease.Holder != s.owner {
-			return 0, fmt.Errorf("%w: barrier held by %s", repositories.ErrPipelineLost, lease.Holder)
-		}
-		_ = now
-		return lease.Version, nil
-	}
-	// Expired: take it over IN THE SAME PHASE.
-	return s.pipeline.RecoverProjecting(job.WorkspaceID, s.owner, job.ScanRunID, s.lease, now)
+	return lease.Version, nil
 }
 
 // There are exactly THREE exits from a claimed projection job, and each has ONE
@@ -413,6 +379,7 @@ func (s *ProjectionService) fence(job *models.IGAProjectionJob, version int64) r
 		Phase:       models.PipelineProjecting,
 		RunID:       job.ScanRunID,
 		Version:     version,
+		Holder:      models.PipelineJobHolder(job.ID),
 	}
 }
 
@@ -432,7 +399,7 @@ func (s *ProjectionService) projectAndReconcile(
 		return err
 	}
 
-	fencer := projectionFencer{jobs: s.jobs, pipeline: s.pipeline, version: pipelineVersion}
+	fencer := projectionFencer{jobs: s.jobs, pipeline: s.pipeline, jobID: job.ID}
 	projector := igagraph.NewProjector(
 		s.graph, fencer, existing,
 		job.ID, s.owner, job.LeaseVersion, pipelineVersion,
@@ -444,7 +411,14 @@ func (s *ProjectionService) projectAndReconcile(
 		if err := projector.Project(tx, snap); err != nil {
 			return err
 		}
-		return reconciler.Reconcile(tx, snap)
+		// Reconcile with the exclusions Project computed -- what this run's
+		// unreadable documents declared, which must go stale and never end --
+		// then flush the lifecycle log. Its FK to the publication is
+		// DEFERRED, so the events commit only together with it (036).
+		if err := reconciler.Reconcile(tx, snap, projector.Exclusions(), projector.Events()); err != nil {
+			return err
+		}
+		return projector.Events().Flush(tx, s.graph)
 	})
 }
 
@@ -471,12 +445,8 @@ func (s *ProjectionService) heartbeat(
 				// And the barrier, on the SAME tick. Renewing one without the
 				// other is how a healthy long projection ends up looking
 				// stalled to the recovery loop.
-				if err := s.pipeline.RenewHeld(repositories.PipelineFence{
-					WorkspaceID: job.WorkspaceID,
-					Phase:       models.PipelineProjecting,
-					RunID:       job.ScanRunID,
-					Version:     barrierVersion,
-				}, s.barrierLease, s.now()); err != nil {
+				if err := s.pipeline.RenewHeld(s.fence(job, barrierVersion),
+					s.barrierLease, s.now()); err != nil {
 					return
 				}
 			}

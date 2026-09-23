@@ -84,10 +84,18 @@ func NewIGAProjectionJobRepository(db *gorm.DB) IGAProjectionJobRepository {
 func (r *igaProjectionJobRepository) EnqueueTx(tx *gorm.DB, job *models.IGAProjectionJob) error {
 	// One job per scan run (033's UNIQUE). A retried publish must not enqueue
 	// a second.
-	return tx.Clauses(clause.OnConflict{
+	if err := tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "scan_run_id"}},
 		DoNothing: true,
-	}).Create(job).Error
+	}).Create(job).Error; err != nil {
+		return err
+	}
+	// READ BACK THE STORED ID. On a conflict DO NOTHING leaves the struct
+	// holding the id GORM generated, which names no row -- and the publish
+	// transaction hands the barrier to job:<that id>, a holder no worker could
+	// ever match. The barrier would then wait out its whole lease.
+	return tx.Raw(`SELECT id FROM iga_projection_job WHERE workspace_id = ? AND scan_run_id = ?`,
+		job.WorkspaceID, job.ScanRunID).Row().Scan(&job.ID)
 }
 
 // Claim takes one claimable job. Claimable is a queued job, or a running one
@@ -146,6 +154,9 @@ func (r *igaProjectionJobRepository) Requeue(jobID uuid.UUID, owner string, vers
 		// attempts is given back: this worker never got to try.
 		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
 		"lease_expires_at": nil,
+		// To the back of the queue, for the same reason a refused scan run
+		// goes there (§2.10A): an oldest-first claim would re-take it at once.
+		"requested_at": time.Now(),
 	})
 }
 

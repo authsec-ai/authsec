@@ -2,6 +2,7 @@ package igagraph
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -9,122 +10,154 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
-// attachEvidence links each projected edge to the observations THIS run
-// confirmed.
+// attachEvidence links every projected edge to the observations THIS run
+// confirmed (§4.8), joined on the typed subject and subject_native_id -- never
+// on a cloud_* row id, because an observation outlives the row it describes.
 //
-// The join is on subject_native_id, not on a cloud_* row id, because 024 made
-// the subject FKs ON DELETE SET NULL -- an observation outlives the inventory
-// row it describes, and the native id is what survives.
+//	grant, assignment        the policy version's observation AND the holder's
+//	executes_as,
+//	task_execution_role      the workload's own observation
+//	member_of                the user's observation (it lists the group)
 //
 // EVERY PROJECTED EDGE NEEDS EVIDENCE, COUNTED PER EDGE, NOT PER CLASS. A
-// non-zero count per class passes with one evidenced edge and ten thousand
-// bare ones, which is exactly the shape of the bug this pass had in draft: the
-// access pass never retained its edge ids, so the map was empty and the
-// pipeline wrote nothing while appearing to work. P2-6's gate asserts
-// count(edges without evidence) == 0 for every projected class.
+// per-class count passes with one evidenced edge and ten thousand bare ones.
+// An edge whose observation cannot be found is still written -- the
+// configuration was read -- and counted in EvidenceMissing; the gate asserts
+// zero.
 func (p *Projector) attachEvidence(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	byID := make(map[uuid.UUID]models.CloudIdentity, len(snap.Identities))
-	for _, ci := range snap.Identities {
-		byID[ci.ID] = ci
-	}
-	resourceNative := make(map[uuid.UUID]string, len(snap.Resources))
-	for _, cr := range snap.Resources {
-		resourceNative[cr.ID] = cr.NativeID
-	}
-
-	// Access edges: the permission's own observation.
-	for _, cp := range snap.Permissions {
-		edgeID, ok := r.accessEdge[cp.ID]
-		if !ok {
-			continue
-		}
-		holder, ok := byID[cp.IdentityID]
-		if !ok {
-			continue
-		}
-		resNative := ""
-		if cp.ResourceID != nil {
-			resNative = resourceNative[*cp.ResourceID]
-		}
-		// Built with the SAME function the observation writer uses, so the two
-		// cannot drift. One shared helper, never two spellings.
-		ref := SubjectRef{
-			Kind:     "permission",
-			NativeID: PermissionSubjectKey(cp, holder.NativeID, resNative),
-		}
-		for _, obsID := range snap.ConfirmedBy[ref] {
-			if err := p.repo.LinkAccessEdgeEvidence(tx, snap.Run.WorkspaceID,
-				edgeID, obsID, "supports"); err != nil {
-				return fmt.Errorf("link access edge evidence: %w", err)
+	ws := snap.Run.WorkspaceID
+	link := func(kind string, n int, fn func(obsID uuid.UUID) error, refs ...SubjectRef) error {
+		found := 0
+		for _, ref := range refs {
+			for _, obsID := range snap.ConfirmedBy[ref] {
+				if err := fn(obsID); err != nil {
+					return err
+				}
+				found++
 			}
 		}
+		if found == 0 {
+			p.EvidenceMissing[kind] += n
+		}
+		return nil
 	}
 
-	// DERIVED RELATIONSHIPS STILL GET EVIDENCE. executes_as comes from a field
-	// on the workload, so its supporting observation is the WORKLOAD'S -- link
-	// that rather than leaving the edge bare.
-	for _, w := range snap.Workloads {
-		relID, ok := r.executesAs[w.ID]
-		if !ok {
-			continue
-		}
-		ref := SubjectRef{Kind: "workload", NativeID: w.NativeID}
-		for _, obsID := range snap.ConfirmedBy[ref] {
-			if err := p.repo.LinkRelationshipEvidence(tx, snap.Run.WorkspaceID,
-				relID, obsID, "supports"); err != nil {
-				return fmt.Errorf("link executes_as evidence: %w", err)
-			}
+	for _, g := range r.grants {
+		g := g
+		if err := link("grant", 1, func(obs uuid.UUID) error {
+			return p.repo.LinkAccessEdgeEvidence(tx, ws, g.ID, obs, "supports")
+		}, SubjectRef{Kind: "policy", NativeID: g.PolicyNative},
+			SubjectRef{Kind: "identity", NativeID: g.HolderNative}); err != nil {
+			return fmt.Errorf("link grant evidence: %w", err)
 		}
 	}
-
-	// can_assume is evidenced by the ROLE'S trust-policy observation, which is
-	// recorded against the identity the trust policy belongs to.
-	identityNative := make(map[uuid.UUID]string, len(snap.Identities))
-	for _, ci := range snap.Identities {
-		identityNative[ci.ID] = ci.NativeID
+	for _, a := range r.assignRefs {
+		a := a
+		if err := link("assignment", 1, func(obs uuid.UUID) error {
+			return p.repo.LinkAssignmentEvidence(tx, ws, a.ID, obs, "supports")
+		}, SubjectRef{Kind: "identity", NativeID: a.HolderNative},
+			SubjectRef{Kind: "policy", NativeID: a.PolicyNative}); err != nil {
+			return fmt.Errorf("link assignment evidence: %w", err)
+		}
 	}
-	for _, ae := range snap.AssumeEdges {
-		relID, ok := r.canAssume[ae.ID]
-		if !ok {
-			continue
-		}
-		native, ok := identityNative[ae.IdentityID]
-		if !ok {
-			continue
-		}
-		ref := SubjectRef{Kind: "identity", NativeID: native}
-		for _, obsID := range snap.ConfirmedBy[ref] {
-			if err := p.repo.LinkRelationshipEvidence(tx, snap.Run.WorkspaceID,
-				relID, obsID, "supports"); err != nil {
-				return fmt.Errorf("link can_assume evidence: %w", err)
+	for kind, rels := range map[string][]relRef{"executes_as": r.executes, "member_of": r.memberOf} {
+		for _, rel := range rels {
+			rel := rel
+			if err := link(kind, 1, func(obs uuid.UUID) error {
+				return p.repo.LinkRelationshipEvidence(tx, ws, rel.ID, obs, "supports")
+			}, SubjectRef{Kind: rel.SubjectKind, NativeID: rel.SubjectNativ}); err != nil {
+				return fmt.Errorf("link %s evidence: %w", kind, err)
 			}
 		}
 	}
 	return nil
 }
 
-// recordState writes the per-partition watermark.
-//
-// reconciled=false until the Reconciler commits, so a pass interrupted between
-// projection and reconciliation is visible as exactly that and gets redone.
+// recordState writes the per-partition watermark. reconciled=false until the
+// Reconciler commits, so a pass interrupted between projection and
+// reconciliation is visible as exactly that and gets redone (§2.8).
 func (p *Projector) recordState(tx *gorm.DB, snap *Snapshot, reconciled bool) error {
 	for _, part := range Partitions(snap) {
 		if err := p.repo.UpsertProjectionState(tx, &models.IGAProjectionState{
 			WorkspaceID:      snap.Run.WorkspaceID,
-			EstateScopeID:    part.ScopeID,
+			EstateScopeID:    snap.ScopeID,
 			ConnectorID:      part.ConnectorID,
 			ObjectClass:      part.Class,
 			RelationshipType: part.RelationshipType,
-			// The partition's FULL identity. A partition can depend on several
-			// surfaces, so no single one of them can key it.
-			PartitionKey:   part.Key(),
-			LastRunID:      snap.Run.ID,
-			LastGeneration: int64(snap.Generation),
-			CoverageState:  part.CoverageSummary(snap),
-			Reconciled:     reconciled,
+			PartitionKey:     part.Key(),
+			LastRunID:        snap.Run.ID,
+			LastGeneration:   int64(snap.Generation),
+			CoverageState:    part.CoverageSummary(snap),
+			Reconciled:       reconciled,
 		}); err != nil {
 			return fmt.Errorf("record projection state %s: %w", part.Key(), err)
 		}
 	}
+	return nil
+}
+
+// EventLog is the lifecycle history this projection writes (036): every
+// first_seen, retired and restored transition, stamped with the revision and
+// the run. Appended by the node passes and by reconciliation, flushed in the
+// same transaction -- the node row alone cannot say when or why after it has
+// been overwritten.
+type EventLog struct {
+	ws     uuid.UUID
+	rev    int64
+	run    uuid.UUID
+	at     time.Time
+	events []models.IGALifecycleEvent
+}
+
+// NewEventLog starts a log for one projection.
+func NewEventLog(ws uuid.UUID, rev int64, run uuid.UUID, at time.Time) *EventLog {
+	return &EventLog{ws: ws, rev: rev, run: run, at: at}
+}
+
+func (l *EventLog) add(event, reason, class string, id uuid.UUID) {
+	if l == nil {
+		return
+	}
+	e := models.IGALifecycleEvent{
+		WorkspaceID: l.ws, Rev: l.rev, ScanRunID: l.run, OccurredAt: l.at,
+		Event: event, Reason: reason,
+	}
+	if e.SetObject(class, id) {
+		l.events = append(l.events, e)
+	}
+}
+
+// FirstSeen records an insert.
+func (l *EventLog) FirstSeen(class string, id uuid.UUID) {
+	l.add(models.LifecycleFirstSeen, "", class, id)
+}
+
+// Retired records a retirement with its reason.
+func (l *EventLog) Retired(class string, id uuid.UUID, reason string) {
+	l.add(models.LifecycleRetired, reason, class, id)
+}
+
+// Restored records a restoration.
+func (l *EventLog) Restored(class string, id uuid.UUID) {
+	l.add(models.LifecycleRestored, "", class, id)
+}
+
+// Len reports how many events are pending.
+func (l *EventLog) Len() int {
+	if l == nil {
+		return 0
+	}
+	return len(l.events)
+}
+
+// Flush writes every pending event in the caller's transaction.
+func (l *EventLog) Flush(tx *gorm.DB, repo GraphWriter) error {
+	if l == nil || len(l.events) == 0 {
+		return nil
+	}
+	if err := repo.InsertLifecycleEvents(tx, l.events); err != nil {
+		return fmt.Errorf("write lifecycle events: %w", err)
+	}
+	l.events = nil
 	return nil
 }

@@ -1,5 +1,5 @@
 -- ============================================================================
--- 033: the projection job, the per-partition watermark, and agent origin.
+-- 033: the projection job, the per-partition watermark, and publication.
 --
 -- SPEC-iga-phase2-graph.md §2.8, §4.10.
 --
@@ -116,38 +116,9 @@ COMMENT ON COLUMN public.iga_projection_state.partition_key IS
     'iga_access_edges.partition_key, so "what this run reconciles" and "what '
     'this run recorded a watermark for" are the same set by construction.';
 
--- agent origin and the instance link -----------------------------------------
--- The exit gate''s "a registered agent is distinguished from native
--- discovery": they get different review treatment and must never silently
--- merge. A discovered object a human later registers KEEPS ITS ID and flips
--- origin, with the decision recorded -- the projector must never overwrite
--- origin once it reads 'registered'.
-ALTER TABLE public.iga_agents
-    ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'discovered';
-
-ALTER TABLE public.iga_agents
-    ADD CONSTRAINT iga_agents_origin_chk CHECK (origin IN ('registered', 'discovered'));
-
--- iga_agent_instances already has first_seen_at/last_seen_at and
--- native_workload_id from 004:563 -- it needs the key, the origin and the
--- typed link, not a rebuild.
-ALTER TABLE public.iga_agent_instances
-    ADD COLUMN IF NOT EXISTS workload_id    uuid,
-    ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
-    ADD COLUMN IF NOT EXISTS origin         text NOT NULL DEFAULT 'discovered',
-    ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
-
-ALTER TABLE public.iga_agent_instances
-    ADD CONSTRAINT iga_agent_instances_workload_fkey
-        FOREIGN KEY (workspace_id, workload_id)
-        REFERENCES public.iga_workload (workspace_id, id)
-        ON DELETE SET NULL (workload_id),
-    ADD CONSTRAINT iga_agent_instances_origin_chk CHECK (
-        origin IN ('registered', 'discovered'));
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_agent_instances_source_key
-    ON public.iga_agent_instances (workspace_id, source_key)
-    WHERE source_key <> '' AND lifecycle <> 'retired';
+-- No agent or agent-instance columns: this milestone writes neither for AWS
+-- (§2.2). iga_agents and iga_agent_instances are GitHub-confirmed agents, read
+-- by GitHub lists and by the Kubernetes bridge's name matching (§1.5).
 
 -- iga_publication -- the durable "this run's projection committed" fact -------
 --
@@ -195,13 +166,7 @@ COMMENT ON TABLE public.iga_publication IS
     'cannot do.';
 
 -- verify ---------------------------------------------------------------------
-SELECT
-    (SELECT count(*) FROM information_schema.tables
-      WHERE table_schema = 'public'
-        AND table_name IN ('iga_projection_job', 'iga_projection_state',
-                           'iga_publication'))                                 AS tables_created,
-    (SELECT count(*) FROM information_schema.columns
-      WHERE table_name = 'iga_agents' AND column_name = 'origin')          AS agents_origin,
-    (SELECT count(*) FROM information_schema.columns
-      WHERE table_name = 'iga_agent_instances'
-        AND column_name IN ('workload_id', 'source_key', 'origin'))        AS instance_cols;
+SELECT count(*) AS tables_created
+  FROM information_schema.tables
+ WHERE table_schema = 'public'
+   AND table_name IN ('iga_projection_job', 'iga_projection_state', 'iga_publication');

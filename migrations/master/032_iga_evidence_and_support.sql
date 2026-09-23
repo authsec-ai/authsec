@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS public.iga_object_support (
     workload_id         uuid,
     resource_id         uuid,
     entitlement_id      uuid,
-    agent_id            uuid,
+    -- No agent_id: this milestone writes no AWS agents (§2.2), and 036 adds
+    -- policy_id when policies become nodes.
 
     connector_id  uuid NOT NULL,
     partition_key text NOT NULL,
@@ -137,8 +138,6 @@ CREATE TABLE IF NOT EXISTS public.iga_object_support (
         REFERENCES public.iga_resources (workspace_id, id) ON DELETE CASCADE,
     CONSTRAINT iga_os_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id)
         REFERENCES public.iga_entitlements (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT iga_os_agent_fkey FOREIGN KEY (workspace_id, agent_id)
-        REFERENCES public.iga_agents (workspace_id, id) ON DELETE CASCADE,
 
     -- The confirming run is workspace-qualified too (§2.9).
     CONSTRAINT iga_os_run_fkey FOREIGN KEY (workspace_id, last_confirmed_run_id)
@@ -147,8 +146,7 @@ CREATE TABLE IF NOT EXISTS public.iga_object_support (
 
     CONSTRAINT iga_object_support_one_chk CHECK (
         (identity_account_id IS NOT NULL)::int + (workload_id    IS NOT NULL)::int
-      + (resource_id         IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int
-      + (agent_id            IS NOT NULL)::int = 1),
+      + (resource_id         IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int = 1),
     CONSTRAINT iga_object_support_state_chk CHECK (state IN ('current','stale','ended')),
     CONSTRAINT iga_object_support_ended_chk CHECK ((state = 'ended') = (ended_reason <> ''))
 );
@@ -169,9 +167,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_resource
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_entitlement
     ON public.iga_object_support (workspace_id, entitlement_id, connector_id, partition_key)
     WHERE entitlement_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_agent
-    ON public.iga_object_support (workspace_id, agent_id, connector_id, partition_key)
-    WHERE agent_id IS NOT NULL;
 
 -- The query reconcileNodes runs: "what did this partition support?"
 CREATE INDEX IF NOT EXISTS idx_iga_object_support_partition

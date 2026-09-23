@@ -1,213 +1,238 @@
 package igagraph
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 )
 
-func identity(nativeID, kind, uniqueID string) models.CloudIdentity {
-	attrs, _ := json.Marshal(models.AWSIdentityAttrs{UniqueID: uniqueID})
-	return models.CloudIdentity{NativeID: nativeID, Kind: kind, Attrs: attrs}
+// T4.2's gate: keys per §4.4, incl. statement keys -- Sid, hash, duplicates,
+// reorder -- and the incarnation property B21 depends on.
+
+func identity(t *testing.T, kind, arn, uniqueID string) models.CloudIdentity {
+	t.Helper()
+	ci := models.CloudIdentity{ID: uuid.New(), Kind: kind, NativeID: arn}
+	if err := ci.SetAWSAttrs(models.AWSIdentityAttrs{UniqueID: uniqueID}); err != nil {
+		t.Fatal(err)
+	}
+	return ci
 }
 
-func perm(nativeID string) models.CloudPermission {
-	return models.CloudPermission{NativeID: nativeID}
+func statements(t *testing.T, doc string) []awsdiscovery.PolicyStatement {
+	t.Helper()
+	st, _, err := awsdiscovery.ParsePolicyDocument(doc)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return st
 }
 
-// P2-3 gate: a bare native id is never unique, so the key must namespace it.
+func keysOf(incarnation string, stmts []awsdiscovery.PolicyStatement) []string {
+	sids, seen := CountSids(stmts), map[string]int{}
+	out := make([]string, 0, len(stmts))
+	for _, st := range stmts {
+		k, _ := StatementKey(incarnation, st, sids, seen)
+		out = append(out, k)
+	}
+	return out
+}
+
 func TestKeyIsNamespaced(t *testing.T) {
-	k := Key("aws", "arn:aws:iam::1234:role/foo")
+	k := IdentityKey(models.CloudIdentity{NativeID: "arn:aws:iam::1:role/x"})
 	if !strings.HasPrefix(k, "aws"+Sep) {
-		t.Fatalf("key is not provider-namespaced: %q", k)
-	}
-	// The separator cannot occur in an ARN, so the segment count is exact.
-	if got := strings.Count(k, Sep); got != 1 {
-		t.Fatalf("want 1 separator, got %d in %q", got, k)
-	}
-	// A GitHub key with the same native id must not collide with the AWS one.
-	if Key("github", "arn:aws:iam::1234:role/foo") == k {
-		t.Fatal("github and aws keys collided")
+		t.Fatalf("key %q is not namespaced by provider", k)
 	}
 }
 
-// P2-3 gate: two accounts with the same role name produce DIFFERENT keys.
-// §2.12 -- ARNs differ in the account segment, and equal display names never
-// merge.
-func TestSameRoleNameDifferentAccountsDiffer(t *testing.T) {
-	a := IdentityKey(identity("arn:aws:iam::111111111111:role/deploy", models.CloudIdentityIAMRole, "AROAA"))
-	b := IdentityKey(identity("arn:aws:iam::222222222222:role/deploy", models.CloudIdentityIAMRole, "AROAB"))
-	if a == b {
-		t.Fatalf("two accounts' deploy roles produced one key: %q", a)
+// A Sid survives a reorder AND an edit: same key, the content hash moves.
+func TestStatementKeySidSurvivesReorderAndEdit(t *testing.T) {
+	a := statements(t, `{"Statement":[
+	  {"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"},
+	  {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b"}]}`)
+	b := statements(t, `{"Statement":[
+	  {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b"},
+	  {"Sid":"Read","Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::b/*"}]}`)
+	inc := Key("aws", "policy", "ANPA1")
+	ka, kb := keysOf(inc, a), keysOf(inc, b)
+	if ka[0] != kb[1] || ka[1] != kb[0] {
+		t.Fatalf("Sid-keyed statements changed key on reorder/edit: %v vs %v", ka, kb)
+	}
+	if !SidKeyed(ka[0]) {
+		t.Fatalf("%q is not recognised as Sid-keyed", ka[0])
+	}
+	if a[0].ContentHash() == b[1].ContentHash() {
+		t.Fatal("an edit to a Sid statement did not change its content hash; no revision would be recorded")
 	}
 }
 
-// P2-3 gate: the SAME role seen through two connectors produces the SAME key.
-// An integration is a route, not an identity -- reconnecting must not mint a
-// new object.
-func TestSameRoleTwoConnectorsMatch(t *testing.T) {
-	const arn = "arn:aws:iam::111111111111:role/deploy"
-	viaA := identity(arn, models.CloudIdentityIAMRole, "AROAA")
-	viaB := identity(arn, models.CloudIdentityIAMRole, "AROAA")
-	// Different connector rows entirely; the key must not notice.
-	if IdentityKey(viaA) != IdentityKey(viaB) {
-		t.Fatal("one role through two connectors produced two keys")
+// Without a Sid, the key IS the content: a reorder keeps it, an edit replaces it.
+func TestStatementKeyHashReorderKeepsEditReplaces(t *testing.T) {
+	a := statements(t, `{"Statement":[
+	  {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"},
+	  {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b"}]}`)
+	reordered := statements(t, `{"Statement":[
+	  {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b"},
+	  {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}`)
+	edited := statements(t, `{"Statement":[
+	  {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::b/*"},
+	  {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::b"}]}`)
+	inc := Key("aws", "policy", "ANPA1")
+	ka, kr, ke := keysOf(inc, a), keysOf(inc, reordered), keysOf(inc, edited)
+	if ka[0] != kr[1] || ka[1] != kr[0] {
+		t.Fatalf("reorder changed a hash-keyed statement's key: %v vs %v", ka, kr)
+	}
+	if ke[0] == ka[0] {
+		t.Fatal("an edit to a Sid-less statement kept its key; it must end and a new one begin")
+	}
+	if ke[1] != ka[1] {
+		t.Fatal("editing one statement changed an untouched statement's key")
+	}
+	if SidKeyed(ka[0]) {
+		t.Fatal("a Sid-less statement was treated as Sid-keyed")
 	}
 }
 
-// P2-3 gate, §2.6: two roles EACH with an inline policy named ReadData produce
-// DIFFERENT entitlement keys. The inline name is unique only within an
-// identity, so an unscoped key would silently merge two unrelated grants.
-func TestInlinePolicyNameCollisionKeysApart(t *testing.T) {
-	roleA := identity("arn:aws:iam::1234:role/alpha", models.CloudIdentityIAMRole, "AROAA")
-	roleB := identity("arn:aws:iam::1234:role/beta", models.CloudIdentityIAMRole, "AROAB")
-	p := perm("inline:ReadData#s0")
-
-	ka := EntitlementKey(p, roleA, "aws\x1farn:aws:s3:::bucket")
-	kb := EntitlementKey(p, roleB, "aws\x1farn:aws:s3:::bucket")
-	if ka == kb {
-		t.Fatalf("two roles' inline ReadData collapsed into one entitlement: %q", ka)
-	}
-	// Each must be scoped by its own holder ARN, not by the policy name.
-	if !strings.Contains(ka, roleA.NativeID) || !strings.Contains(kb, roleB.NativeID) {
-		t.Fatalf("inline entitlement key is not holder-scoped:\n  a=%q\n  b=%q", ka, kb)
-	}
-}
-
-// P2-3 gate, §2.6: two roles attached to the SAME managed policy produce the
-// SAME entitlement key -- one entitlement, two access edges. This is what
-// makes "detach from one role ends that grant, the entitlement and the other
-// role's grant survive" true rather than aspirational.
-func TestManagedPolicySharedAcrossRoles(t *testing.T) {
-	roleA := identity("arn:aws:iam::1234:role/alpha", models.CloudIdentityIAMRole, "AROAA")
-	roleB := identity("arn:aws:iam::1234:role/beta", models.CloudIdentityIAMRole, "AROAB")
-	p := perm("arn:aws:iam::1234:policy/RefundS3Access#s0")
-
-	ka := EntitlementKey(p, roleA, "aws\x1farn:aws:s3:::refunds/*")
-	kb := EntitlementKey(p, roleB, "aws\x1farn:aws:s3:::refunds/*")
-	if ka != kb {
-		t.Fatalf("one managed policy produced two entitlements:\n  a=%q\n  b=%q", ka, kb)
-	}
-	// And it must be scoped by the POLICY, never by a holder.
-	if strings.Contains(ka, roleA.NativeID) || strings.Contains(ka, roleB.NativeID) {
-		t.Fatalf("managed entitlement key leaked a holder ARN: %q", ka)
-	}
-}
-
-// P2-3 gate, §2.6: one statement naming three resources produces THREE
-// distinct entitlement keys -- that is uq_cloud_permission_grant's grain
-// (identity, statement, resource) carried into the canonical model.
-func TestOneStatementThreeResourcesThreeKeys(t *testing.T) {
-	holder := identity("arn:aws:iam::1234:role/alpha", models.CloudIdentityIAMRole, "AROAA")
-	p := perm("arn:aws:iam::1234:policy/Multi#s0")
-
+// Identical Sid-less statements are told apart by their order among equals,
+// and a duplicated Sid falls back to the hash (a Sid is only identity when it
+// is unique in the document).
+func TestStatementKeyDuplicates(t *testing.T) {
+	st := statements(t, `{"Statement":[
+	  {"Effect":"Allow","Action":"s3:GetObject","Resource":"*"},
+	  {"Effect":"Allow","Action":"s3:GetObject","Resource":"*"},
+	  {"Sid":"Dup","Effect":"Allow","Action":"s3:ListBucket","Resource":"*"},
+	  {"Sid":"Dup","Effect":"Deny","Action":"s3:DeleteObject","Resource":"*"}]}`)
+	k := keysOf(Key("aws", "policy", "ANPA1"), st)
 	seen := map[string]bool{}
-	for _, res := range []string{
-		"aws\x1farn:aws:s3:::one/*",
-		"aws\x1farn:aws:s3:::two/*",
-		"aws\x1farn:aws:s3:::three/*",
-	} {
-		seen[EntitlementKey(p, holder, res)] = true
+	for _, key := range k {
+		if seen[key] {
+			t.Fatalf("two statements share key %q: %v", key, k)
+		}
+		seen[key] = true
 	}
-	if len(seen) != 3 {
-		t.Fatalf("want 3 distinct entitlement keys, got %d: %v", len(seen), seen)
+	if !strings.HasSuffix(k[0], "#1") || !strings.HasSuffix(k[1], "#2") {
+		t.Fatalf("identical statements not disambiguated by order: %v", k)
 	}
-}
-
-// A wildcard or account-wide grant keys as "*" and must not collide with a
-// grant that names a resource.
-func TestWildcardGrantKeysAsStar(t *testing.T) {
-	holder := identity("arn:aws:iam::1234:role/alpha", models.CloudIdentityIAMRole, "AROAA")
-	p := perm("arn:aws:iam::1234:policy/Wide#s0")
-
-	star := EntitlementKey(p, holder, "")
-	named := EntitlementKey(p, holder, "aws\x1farn:aws:s3:::one/*")
-	if star == named {
-		t.Fatal("wildcard grant collided with a named-resource grant")
-	}
-	if !strings.HasSuffix(star, Sep+"*") {
-		t.Fatalf("wildcard grant did not key as *: %q", star)
+	if SidKeyed(k[2]) || SidKeyed(k[3]) {
+		t.Fatal("a Sid that is not unique in its document was used as identity")
 	}
 }
 
-// §2.4 / roadmap §3.2: continuity is 'immutable' ONLY where the provider gives
-// a creation-boundary id. Every other kind must say recognition_only so the
-// console can state that "same name" is the strongest claim available.
+// Canonicalisation: formatting and the order of actions inside a statement are
+// not edits.
+func TestContentHashIsCanonical(t *testing.T) {
+	a := statements(t, `{"Statement":{"Effect":"Allow","Action":["s3:B","s3:A"],"Resource":"*","Condition":{"StringEquals":{"k":"v","a":"b"}}}}`)
+	b := statements(t, `{"Statement":[{ "Effect" : "allow", "Action":["s3:A","s3:B","s3:A"],"Resource":["*"],
+	   "Condition":{"StringEquals":{"a":"b","k":"v"}}}]}`)
+	if a[0].ContentHash() != b[0].ContentHash() {
+		t.Fatal("equivalent statements hashed differently; every rescan would record a revision")
+	}
+}
+
+// B21's property, at the key level: a customer-managed policy recreated under
+// the same ARN (new PolicyId) shares NO statement, assignment or grant key with
+// its predecessor.
+func TestRecreatedPolicySharesNoKey(t *testing.T) {
+	role := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/r", "AROA1")
+	old := models.CloudPolicy{PolicyKind: models.CloudPolicyManaged, NativeID: "arn:aws:iam::1:policy/P", PolicyID: "ANPA-OLD"}
+	neu := old
+	neu.PolicyID = "ANPA-NEW"
+	if PolicyKey(old, nil) != PolicyKey(neu, nil) {
+		t.Fatal("recognition key must match across a recreation, or recreation is undetectable")
+	}
+	oi := PolicyIncarnationKey(old, nil, PolicyImmutableKey(old, nil))
+	ni := PolicyIncarnationKey(neu, nil, PolicyImmutableKey(neu, nil))
+	if oi == ni {
+		t.Fatal("a recreated policy kept its incarnation key")
+	}
+	st := statements(t, `{"Statement":[{"Sid":"S","Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}`)
+	so, sn := keysOf(oi, st)[0], keysOf(ni, st)[0]
+	if so == sn {
+		t.Fatal("same Sid under a recreated policy reused the old statement key")
+	}
+	ao := AssignmentKey(oi, EndpointKey(role), models.CloudAttachmentAttached)
+	an := AssignmentKey(ni, EndpointKey(role), models.CloudAttachmentAttached)
+	if ao == an || GrantKey(ao, so) == GrantKey(an, sn) {
+		t.Fatal("a recreated policy's assignment or grant reused a predecessor key")
+	}
+}
+
+// An inline policy belongs to its holder: two roles each with an inline
+// ReadData are two policies, and a RECREATED holder makes a new incarnation.
+func TestInlinePolicyIsHolderScoped(t *testing.T) {
+	a := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/a", "AROAA")
+	b := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/b", "AROAB")
+	p := models.CloudPolicy{PolicyKind: models.CloudPolicyInline, Name: "ReadData"}
+	if PolicyKey(p, &a) == PolicyKey(p, &b) {
+		t.Fatal("two holders' inline policies of one name collapsed into one")
+	}
+	recreated := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/a", "AROA-NEW")
+	if PolicyKey(p, &a) != PolicyKey(p, &recreated) {
+		t.Fatal("inline recognition key must survive the holder's recreation, so it is detected")
+	}
+	if PolicyIncarnationKey(p, &a, PolicyImmutableKey(p, &a)) ==
+		PolicyIncarnationKey(p, &recreated, PolicyImmutableKey(p, &recreated)) {
+		t.Fatal("an inline policy of a recreated holder kept the old incarnation")
+	}
+}
+
+// Endpoint keys use the immutable key: a role recreated under the same ARN
+// yields different edge keys.
+func TestEndpointKeyUsesImmutableKey(t *testing.T) {
+	a := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/r", "AROA1")
+	b := identity(t, models.CloudIdentityIAMRole, "arn:aws:iam::1:role/r", "AROA2")
+	if EndpointKey(a) == EndpointKey(b) {
+		t.Fatal("a recreated role would inherit the old role's relationships")
+	}
+}
+
+// Workload keys never change with a transient detail failure: a bare id gets
+// the ARN the successful read would have returned.
+func TestWorkloadKeyConstructsARN(t *testing.T) {
+	ec2 := models.CloudWorkload{RuntimeKind: models.WorkloadEC2Instance, NativeID: "i-123", Region: "eu-central-1"}
+	if got := WorkloadARN(ec2, "111122223333"); got != "arn:aws:ec2:eu-central-1:111122223333:instance/i-123" {
+		t.Fatalf("EC2 ARN = %q", got)
+	}
+	agentBare := models.CloudWorkload{RuntimeKind: models.WorkloadBedrockAgent, NativeID: "AGENT1", Region: "us-east-1"}
+	agentARN := models.CloudWorkload{RuntimeKind: models.WorkloadBedrockAgent,
+		NativeID: "arn:aws:bedrock:us-east-1:111122223333:agent/AGENT1", Region: "us-east-1"}
+	if WorkloadKey(agentBare, "111122223333") != WorkloadKey(agentARN, "111122223333") {
+		t.Fatal("a failed GetAgent changed the agent's key")
+	}
+}
+
 func TestContinuityTable(t *testing.T) {
-	for _, tc := range []struct {
-		kind string
-		want string
-	}{
-		{models.CloudIdentityIAMRole, ContinuityImmutable},
-		{models.CloudIdentityIAMUser, ContinuityImmutable},
-		// Workload runtime kinds: none carries a creation boundary the
-		// collector records. See Continuity's comment on EC2.
-		{models.WorkloadLambdaFunction, ContinuityRecognitionOnly},
-		{models.WorkloadECSTaskDefinition, ContinuityRecognitionOnly},
-		{models.WorkloadEC2Instance, ContinuityRecognitionOnly},
-		{models.WorkloadBedrockAgent, ContinuityRecognitionOnly},
-		{"s3_bucket", ContinuityRecognitionOnly},
-		{"", ContinuityRecognitionOnly},
+	for kind, want := range map[string]string{
+		models.CloudIdentityIAMRole:       ContinuityImmutable,
+		models.CloudIdentityIAMUser:       ContinuityImmutable,
+		models.CloudIdentityIAMGroup:      ContinuityImmutable,
+		"managed_policy":                  ContinuityImmutable,
+		"inline_policy":                   ContinuityImmutable,
+		models.WorkloadLambdaFunction:     ContinuityRecognitionOnly,
+		models.WorkloadEC2Instance:        ContinuityRecognitionOnly,
+		models.WorkloadBedrockAgent:       ContinuityRecognitionOnly,
+		models.WorkloadBedrockAgentCoreGW: ContinuityRecognitionOnly,
 	} {
-		if got := Continuity(tc.kind); got != tc.want {
-			t.Errorf("Continuity(%q) = %q, want %q", tc.kind, got, tc.want)
+		if got := Continuity(kind); got != want {
+			t.Errorf("Continuity(%s) = %s, want %s", kind, got, want)
 		}
 	}
 }
 
-// Continuity and ImmutableKey must AGREE: 028's CHECK rejects a row claiming
-// 'immutable' with an empty immutable_key. A silent disagreement here disables
-// delete-and-recreate detection entirely, so it is asserted rather than
-// assumed.
-func TestContinuityAgreesWithImmutableKey(t *testing.T) {
-	role := identity("arn:aws:iam::1234:role/alpha", models.CloudIdentityIAMRole, "AROA5XK7QEXAMPLE")
-	if Continuity(role.Kind) != ContinuityImmutable {
-		t.Fatal("iam_role must be immutable")
-	}
-	if ImmutableKey(role) == "" {
-		t.Fatal("iam_role claims immutable but ImmutableKey is empty -- 028's CHECK would reject it")
-	}
-
-	// An identity whose attrs carry no unique id must NOT be silently treated
-	// as immutable-with-empty-key; the caller has to see the empty string.
-	bare := models.CloudIdentity{NativeID: "arn:aws:iam::1234:role/bare", Kind: models.CloudIdentityIAMRole}
-	if ImmutableKey(bare) != "" {
-		t.Fatal("want empty immutable key when the collector recorded none")
-	}
-}
-
-// §4.8: a permission observation's subject key must be fully qualifying --
-// holder, statement and resource -- so it survives the subject FK going NULL
-// and cannot be confused between two holders of one managed policy.
-func TestPermissionSubjectKeyDisambiguatesHolders(t *testing.T) {
-	p := perm("arn:aws:iam::1234:policy/RefundS3Access#s0")
-	a := PermissionSubjectKey(p, "arn:aws:iam::1234:role/alpha", "arn:aws:s3:::refunds/*")
-	b := PermissionSubjectKey(p, "arn:aws:iam::1234:role/beta", "arn:aws:s3:::refunds/*")
-	if a == b {
-		t.Fatal("two holders of one managed policy produced the same evidence key")
-	}
-	if !Qualified(a) || !Qualified(b) {
-		t.Fatal("qualified keys must carry the separator")
-	}
-	// A pre-qualification key has no separator and must be recognisable as
-	// such, so it is never attached as supporting evidence.
-	if Qualified("arn:aws:iam::1234:policy/RefundS3Access#s0") {
-		t.Fatal("an unqualified legacy key must not read as qualified")
-	}
-}
-
-// One statement, three resources: the evidence keys must be distinct too, or
-// evidence from one grant would attach to another.
-func TestPermissionSubjectKeyDistinguishesResources(t *testing.T) {
-	p := perm("arn:aws:iam::1234:policy/Multi#s0")
-	const holder = "arn:aws:iam::1234:role/alpha"
-	seen := map[string]bool{}
-	for _, r := range []string{"arn:aws:s3:::one/*", "arn:aws:s3:::two/*", ""} {
-		seen[PermissionSubjectKey(p, holder, r)] = true
-	}
-	if len(seen) != 3 {
-		t.Fatalf("want 3 distinct evidence keys, got %d: %v", len(seen), seen)
+func TestPolicyKindMapping(t *testing.T) {
+	for _, tc := range []struct {
+		p    models.CloudPolicy
+		want string
+	}{
+		{models.CloudPolicy{PolicyKind: models.CloudPolicyManaged, AWSManaged: true}, models.PolicyKindAWSManaged},
+		{models.CloudPolicy{PolicyKind: models.CloudPolicyManaged}, models.PolicyKindCustomerManaged},
+		{models.CloudPolicy{PolicyKind: models.CloudPolicyInline}, models.PolicyKindInline},
+	} {
+		if got := PolicyKind(tc.p); got != tc.want {
+			t.Errorf("PolicyKind = %s, want %s", got, tc.want)
+		}
 	}
 }

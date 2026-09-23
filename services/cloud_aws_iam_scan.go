@@ -73,6 +73,23 @@ type AWSIAMScanner struct {
 	// a caller with no durable run to anchor evidence to (a test, a legacy
 	// path) degrades to no evidence rather than failing.
 	evidence *ObservationWriter
+
+	// generation, when set, is the scan run's own generation (T1.5). Zero only
+	// for a caller with no run -- a test, a legacy path -- which falls back to
+	// scan_generation + 1.
+	generation int
+
+	// policies writes group memberships (035), fenced like identities.
+	policies repositories.CloudPolicyRepository
+}
+
+// WithGeneration stamps every row with the RUN's generation instead of
+// recomputing connector.scan_generation + 1 (§1.3). A reclaimed run keeps the
+// generation assigned at its first claim; recomputing it here named a
+// different number from the one the run's evidence and projection job carry.
+func (s *AWSIAMScanner) WithGeneration(g int) *AWSIAMScanner {
+	s.generation = g
+	return s
 }
 
 // WithEvidence attaches an observation writer for this run.
@@ -86,6 +103,7 @@ func (s *AWSIAMScanner) WithEvidence(w *ObservationWriter) *AWSIAMScanner {
 // carries this scanner's UpsertIdentity and UpsertSecret writes.
 func (s *AWSIAMScanner) WithFence(f repositories.ScanFence) *AWSIAMScanner {
 	s.identities = s.identities.Fenced(f)
+	s.policies = s.policies.Fenced(f)
 	return s
 }
 
@@ -96,6 +114,7 @@ func NewAWSIAMScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWSIAMScan
 		connectors:  repositories.NewCloudConnectorRepository(db),
 		identities:  repositories.NewCloudIdentityRepository(db),
 		checkpoints: repositories.NewCloudScanCheckpointRepository(db),
+		policies:    repositories.NewCloudPolicyRepository(db),
 		onboarding:  onboarding,
 	}
 }
@@ -188,6 +207,9 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	// therefore mean "the previous attempt was interrupted part-way", and this
 	// run continues it rather than repeating its work.
 	generation := connector.ScanGeneration + 1
+	if s.generation > 0 {
+		generation = s.generation
+	}
 	resuming, err := s.checkpoints.HasAny(workspaceID, connectorID, generation)
 	if err != nil {
 		return nil, err
@@ -237,11 +259,13 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	users, usersErr := reader.ListUsers(ctx)
 	keyCount := 0
 	var keysErr error
+	userIDByARN := make(map[string]uuid.UUID, len(users))
 	for _, user := range users {
 		identity, err := s.upsertUser(workspaceID, connectorID, generation, user, coverage.Counters)
 		if err != nil {
 			return nil, err
 		}
+		userIDByARN[user.ARN] = identity.ID
 		keys, err := reader.ListAccessKeys(ctx, user.Name)
 		if err != nil {
 			// One user's keys being unreadable does not mean every user's are.
@@ -261,6 +285,49 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	}
 	coverage.Surfaces[models.SurfaceIAMUsers] = surfaceResult(len(users), usersErr)
 	coverage.Surfaces[models.SurfaceIAMAccessKeys] = surfaceResult(keyCount, keysErr)
+
+	// ---- groups and memberships (035) --------------------------------------
+	//
+	// Groups are identities (§2.2), and had no read at all before this. Their
+	// policies join snapshot.Policies like any holder's, so the permission
+	// scanner writes them the same way. A membership is written only when BOTH
+	// ends were read by this scan -- never against a user or group this read
+	// did not list.
+	groupsRead, groupsErr := reader.GroupsAndMemberships(ctx)
+	groupIDByARN := make(map[string]uuid.UUID, len(groupsRead.Groups))
+	for _, g := range groupsRead.Groups {
+		identity, err := s.upsertGroup(workspaceID, connectorID, generation, g, coverage.Counters)
+		if err != nil {
+			return nil, err
+		}
+		groupIDByARN[g.ARN] = identity.ID
+		if len(g.Policies.Attached) > 0 || len(g.Policies.Inline) > 0 {
+			snapshot.Policies[g.ARN] = g.Policies
+		}
+	}
+	memberships := 0
+	for userARN, groupARNs := range groupsRead.Members {
+		uid, ok := userIDByARN[userARN]
+		if !ok {
+			continue
+		}
+		for _, gARN := range groupARNs {
+			gid, ok := groupIDByARN[gARN]
+			if !ok {
+				continue
+			}
+			if err := s.policies.UpsertMembership(&models.CloudGroupMembership{
+				WorkspaceID: workspaceID, ConnectorID: connectorID,
+				UserIdentityID: uid, GroupIdentityID: gid,
+				LastSeenGeneration: generation,
+			}); err != nil {
+				return nil, fmt.Errorf("record membership %s -> %s: %w", userARN, gARN, err)
+			}
+			memberships++
+		}
+	}
+	coverage.Surfaces[models.SurfaceIAMGroups] = surfaceResult(len(groupsRead.Groups), groupsErr)
+	coverage.Counters["group_memberships"] = memberships
 
 	// ---- policy documents, for ticket [2] ----------------------------------
 	//
@@ -297,6 +364,11 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 		}
 		coverage.Counters["identities_removed"] = int(removedIdentities)
 		coverage.Counters["secrets_removed"] = int(removedSecrets)
+		removedMemberships, err := s.policies.ReconcileMemberships(workspaceID, connectorID, generation)
+		if err != nil {
+			return nil, err
+		}
+		coverage.Counters["memberships_removed"] = int(removedMemberships)
 		coverage.Status = models.ScanStatusComplete
 
 		// The attempt finished, so its checkpoints have served their purpose.
@@ -511,6 +583,35 @@ func (s *AWSIAMScanner) upsertUser(
 	return identity, nil
 }
 
+// upsertGroup records one IAM group. GroupId is its creation boundary, carried
+// in attrs.unique_id like RoleId and UserId, so a group deleted and recreated
+// under the same name is a different object (§2.4).
+func (s *AWSIAMScanner) upsertGroup(
+	workspaceID, connectorID uuid.UUID, generation int,
+	group awsdiscovery.IAMGroup, counters map[string]int,
+) (*models.CloudIdentity, error) {
+	identity := &models.CloudIdentity{
+		WorkspaceID:        workspaceID,
+		ConnectorID:        connectorID,
+		Kind:               models.CloudIdentityIAMGroup,
+		NativeID:           group.ARN,
+		Name:               group.Name,
+		ProviderCreatedAt:  group.CreatedAt,
+		Enabled:            true,
+		LastSeenGeneration: generation,
+	}
+	if err := identity.SetAWSAttrs(models.AWSIdentityAttrs{
+		UniqueID: group.UniqueID,
+		Path:     group.Path,
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.recordIdentity(identity, counters); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
 func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters map[string]int) error {
 	stored, created, err := s.identities.UpsertIdentity(identity)
 	if err != nil {
@@ -545,8 +646,11 @@ func (s *AWSIAMScanner) recordIdentityEvidence(
 	attrs := identity.AWSAttrs()
 	api := "iam:GetRole"
 	surface := models.SurfaceIAMRoles
-	if identity.Kind == models.CloudIdentityIAMUser {
+	switch identity.Kind {
+	case models.CloudIdentityIAMUser:
 		api, surface = "iam:ListUsers", models.SurfaceIAMUsers
+	case models.CloudIdentityIAMGroup:
+		api, surface = "iam:GetAccountAuthorizationDetails", models.SurfaceIAMGroups
 	}
 	// observed_at is the provider's own creation time where AWS gave one. It is
 	// not "now": conflating them makes a delayed scan look like a change.

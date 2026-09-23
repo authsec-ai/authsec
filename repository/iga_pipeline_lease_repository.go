@@ -56,14 +56,12 @@ type IGAPipelineLeaseRepository interface {
 	// busy.
 	AcquireForCollection(ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time) (int64, error)
 
-	// RecoverProjecting takes over an EXPIRED projecting barrier, staying in
-	// projecting under a new holder and version. This is how a reclaimed
-	// projection job re-acquires the barrier its dead predecessor held.
-	RecoverProjecting(ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time) (int64, error)
-
 	// ToProjectingTx flips collecting -> projecting IN THE PUBLISH
-	// TRANSACTION, so the barrier is never released between the two.
-	ToProjectingTx(tx *gorm.DB, ws uuid.UUID, holder string, runID uuid.UUID, version int64, lease time.Duration) (int64, error)
+	// TRANSACTION, so the barrier is never released between the two, and
+	// hands it to the JOB: holder becomes job:<jobID> (§2.10A). Whoever holds
+	// that job's lease may then proceed at once -- there is no worker name to
+	// match and no expiry to wait out.
+	ToProjectingTx(tx *gorm.DB, ws uuid.UUID, scanHolder string, runID uuid.UUID, version int64, jobID uuid.UUID, lease time.Duration) (int64, error)
 
 	// RenewHeld extends the barrier's expiry WITHOUT bumping the version, so
 	// the holder's fence stays valid. A projection longer than the barrier
@@ -100,14 +98,23 @@ type IGAPipelineLeaseRepository interface {
 // collecting@v7 must not be able to perform a projecting transition even if
 // the version happens to match.
 //
-// RunID rather than JobID because the barrier row stores scan_run_id, and the
-// two are 1:1 -- iga_projection_job has UNIQUE (scan_run_id) -- so binding the
-// run is exactly as strong and is directly expressible against the row.
+// Holder binds the holder too (§2.10A): the scan worker's owner while
+// collecting, models.PipelineJobHolder(job) while projecting. Empty means "any
+// holder", which only the recovery loop uses -- it acts on the row it read.
 type PipelineFence struct {
 	WorkspaceID uuid.UUID
 	Phase       string
 	RunID       uuid.UUID
 	Version     int64
+	Holder      string
+}
+
+// holderClause adds the holder predicate when the fence names one.
+func (f PipelineFence) holderClause() (string, []any) {
+	if f.Holder == "" {
+		return "", nil
+	}
+	return " AND holder = ?", []any{f.Holder}
 }
 
 type igaPipelineLeaseRepository struct{ db *gorm.DB }
@@ -163,56 +170,26 @@ func (r *igaPipelineLeaseRepository) AcquireForCollection(
 	return out[0].Version, nil
 }
 
-// RecoverProjecting keeps the phase and changes only the holder and version.
-//
-// The published run's inventory is still being read by whoever picks the job
-// up; returning to idle here is the defect this method exists to avoid.
-func (r *igaPipelineLeaseRepository) RecoverProjecting(
-	ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time,
-) (int64, error) {
-	var out []models.IGAPipelineLease
-	err := r.db.Raw(`
-		UPDATE iga_pipeline_lease SET
-			holder     = ?,
-			expires_at = ?,
-			version    = version + 1,
-			updated_at = now()
-		 WHERE workspace_id = ?
-		   AND state = ?
-		   AND scan_run_id = ?
-		   AND expires_at IS NOT NULL
-		   AND expires_at <= ?
-		RETURNING *`,
-		holder, now.Add(lease), ws, models.PipelineProjecting, runID, now,
-	).Scan(&out).Error
-	if err != nil {
-		return 0, err
-	}
-	if len(out) == 0 {
-		return 0, fmt.Errorf("%w: workspace=%s has no expired projecting lease for run %s",
-			ErrPipelineLost, ws, runID)
-	}
-	return out[0].Version, nil
-}
-
 // ToProjectingTx runs INSIDE the publish transaction. If publication rolls
 // back so does this, and the barrier is never left claiming to be projecting a
 // run that was never published.
 func (r *igaPipelineLeaseRepository) ToProjectingTx(
-	tx *gorm.DB, ws uuid.UUID, holder string, runID uuid.UUID, version int64, lease time.Duration,
+	tx *gorm.DB, ws uuid.UUID, scanHolder string, runID uuid.UUID, version int64,
+	jobID uuid.UUID, lease time.Duration,
 ) (int64, error) {
 	var out []models.IGAPipelineLease
 	err := tx.Raw(`
 		UPDATE iga_pipeline_lease SET
 			state      = ?,
+			holder     = ?,
 			expires_at = ?,
 			version    = version + 1,
 			updated_at = now()
 		 WHERE workspace_id = ? AND state = ? AND holder = ?
 		   AND scan_run_id = ? AND version = ?
 		RETURNING *`,
-		models.PipelineProjecting, time.Now().Add(lease),
-		ws, models.PipelineCollecting, holder, runID, version,
+		models.PipelineProjecting, models.PipelineJobHolder(jobID), time.Now().Add(lease),
+		ws, models.PipelineCollecting, scanHolder, runID, version,
 	).Scan(&out).Error
 	if err != nil {
 		return 0, err
@@ -224,18 +201,17 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 	return out[0].Version, nil
 }
 
-// ReleaseAfterProjectionTx is the only non-abandon path back to idle, and it
-// is bound to the projecting phase, this run and this version.
-//
-// iga_pipeline_lease_busy_chk requires holder=” and scan_run_id IS NULL
-// exactly when state='idle', so all three move together or the row is refused.
+// RenewHeld is the heartbeat for EITHER phase: it extends the expiry and
+// leaves the version alone, so the holder's fence stays valid.
 func (r *igaPipelineLeaseRepository) RenewHeld(
 	f PipelineFence, lease time.Duration, now time.Time,
 ) error {
+	hc, hargs := f.holderClause()
+	args := append([]any{now.Add(lease), f.WorkspaceID, f.Phase, f.RunID, f.Version}, hargs...)
 	res := r.db.Exec(`
 		UPDATE iga_pipeline_lease SET expires_at = ?, updated_at = now()
-		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`,
-		now.Add(lease), f.WorkspaceID, f.Phase, f.RunID, f.Version)
+		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`+hc,
+		args...)
 	if res.Error != nil {
 		return res.Error
 	}
@@ -260,7 +236,8 @@ func (r *igaPipelineLeaseRepository) AssertHeldTx(tx *gorm.DB, f PipelineFence) 
 		return fmt.Errorf("%w: workspace=%s has no barrier row", ErrPipelineLost, f.WorkspaceID)
 	}
 	if lease.State != f.Phase || lease.Version != f.Version ||
-		lease.ScanRunID == nil || *lease.ScanRunID != f.RunID {
+		lease.ScanRunID == nil || *lease.ScanRunID != f.RunID ||
+		(f.Holder != "" && lease.Holder != f.Holder) {
 		return fmt.Errorf("%w: workspace=%s wanted %s/run=%s/v%d, found %s/run=%v/v%d",
 			ErrPipelineLost, f.WorkspaceID, f.Phase, f.RunID, f.Version,
 			lease.State, lease.ScanRunID, lease.Version)
@@ -268,13 +245,20 @@ func (r *igaPipelineLeaseRepository) AssertHeldTx(tx *gorm.DB, f PipelineFence) 
 	return nil
 }
 
+// ReleaseTx is the only non-abandon path back to idle, bound to phase, run,
+// version and -- when the fence names one -- holder.
+//
+// iga_pipeline_lease_busy_chk requires an empty holder and a NULL scan_run_id
+// exactly when state='idle', so all three move together or the row is refused.
 func (r *igaPipelineLeaseRepository) ReleaseTx(tx *gorm.DB, f PipelineFence) error {
+	hc, hargs := f.holderClause()
+	args := append([]any{models.PipelineIdle, f.WorkspaceID, f.Phase, f.RunID, f.Version}, hargs...)
 	res := tx.Exec(`
 		UPDATE iga_pipeline_lease SET
 			state = ?, holder = '', scan_run_id = NULL, expires_at = NULL,
 			version = version + 1, updated_at = now()
-		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`,
-		models.PipelineIdle, f.WorkspaceID, f.Phase, f.RunID, f.Version)
+		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`+hc,
+		args...)
 	if res.Error != nil {
 		return res.Error
 	}

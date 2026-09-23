@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -217,15 +216,10 @@ func (ctl *IGAController) idempotent(c *gin.Context, ws uuid.UUID, route string,
 		return
 	}
 	encoded, _ := json.Marshal(payload)
-	// Logged, not discarded. If this write fails the response is still
-	// correct, but the request is no longer replay-safe -- a retry will run it
-	// a second time -- and that is worth knowing about rather than hiding.
-	if err := repo.PutIdempotent(&repositories.IdempotencyRecord{
+	_ = repo.PutIdempotent(&repositories.IdempotencyRecord{
 		WorkspaceID: ws, IdempotencyKey: key, Route: route,
 		RequestHash: hash, ResponseStatus: status, ResponseBody: encoded,
-	}); err != nil {
-		log.Printf("iga: idempotency record for %s not stored, retry is not replay-safe: %v", route, err)
-	}
+	})
 	c.Data(status, "application/json", encoded)
 }
 

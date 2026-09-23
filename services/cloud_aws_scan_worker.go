@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -24,10 +23,9 @@ import (
 // quarter-hour.
 const (
 	scanLeaseDuration = 5 * time.Minute
-	// projectionPipelineLease is how long the workspace barrier is held once
-	// publication hands it to the projector. Longer than the scan lease
-	// because a projection that overruns must not have its workspace stolen
-	// mid-transaction; the expiry sweep is the backstop, not the normal path.
+	// projectionPipelineLease is the workspace barrier's expiry, in either
+	// phase. Renewed on every heartbeat, so it bounds how long a DEAD holder
+	// blocks recovery, not how long a live one may work.
 	projectionPipelineLease = 15 * time.Minute
 	scanLeaseHeartbeat      = 1 * time.Minute
 	scanPollInterval        = 10 * time.Second
@@ -35,6 +33,11 @@ const (
 	// permanently broken connector is retried forever and starves the queue.
 	scanMaxAttempts = 3
 )
+
+// ScannerHook lets a caller configure the three scanners a run uses -- how the
+// integration suite gives the REAL worker fake AWS clients, so two consecutive
+// scans through the worker are exercised rather than reasoned about.
+type ScannerHook func(iam *AWSIAMScanner, perm *AWSPermissionScanner, wl *AWSWorkloadScanner)
 
 // AWSScanWorker executes queued AWS scans.
 //
@@ -54,44 +57,22 @@ type AWSScanWorker struct {
 	poll    time.Duration
 	nowFunc func() time.Time
 
+	// gate is IGA_GRAPH_PROJECTION (§2.8), and the ONLY thing that decides
+	// whether this worker uses the barrier and enqueues projection jobs:
+	//
+	//	off                 Phase 1 exactly: no barrier, no job, no Phase 2 SQL
+	//	on, not verified    claims nothing (fail closed)
+	//	on, verified        barrier + job enqueue + hand-off to the job
+	gate *GraphProjectionGate
+
 	// The Phase 2 pipeline (§2.10A). jobs enqueues the projection work inside
 	// the publish transaction; pipeline is the workspace-wide barrier that
 	// stops a second connector's scan rewriting inventory a projection is
 	// about to read.
 	jobs     repositories.IGAProjectionJobRepository
 	pipeline repositories.IGAPipelineLeaseRepository
-	// pipelineVersion is the fence this worker claimed for the workspace. It
-	// is demanded by every later transition, so a worker that slept past its
-	// expiry is refused because the version moved on.
-	pipelineVersion int64
 
-	// phase2Once caches whether the Phase 2 pipeline tables exist yet.
-	phase2Once  sync.Once
-	phase2Ready bool
-}
-
-// phase2Available reports whether the Phase 2 pipeline tables are present.
-//
-// STAGED ROLLOUT (§6.3, S0). This binary carries Phase 2, but it is deployed
-// while the database may still be at 026 -- the barrier arrives in 027 and the
-// projection job in 033. Referencing either before then fails at PLAN time,
-// which would stop the worker claiming or publishing ANY scan: Phase 1 would
-// break precisely during the window the staged rollout exists to make safe.
-//
-// So when they are absent the worker behaves exactly as it did before Phase 2:
-// no barrier, no projection job. The projector itself refuses to start below
-// 034 (ProjectionService.EnsureSchema), so nothing is left half-wired.
-func (w *AWSScanWorker) phase2Available() bool {
-	w.phase2Once.Do(func() {
-		lease, lerr := repositories.HasRelation(w.db, "iga_pipeline_lease")
-		jobs, jerr := repositories.HasRelation(w.db, "iga_projection_job")
-		w.phase2Ready = lerr == nil && jerr == nil && lease && jobs
-		if !w.phase2Ready {
-			log.Printf("aws scan worker %s: Phase 2 tables absent; "+
-				"scanning without the workspace barrier until migrations 027-034 are applied", w.owner)
-		}
-	})
-	return w.phase2Ready
+	scannerHook ScannerHook
 }
 
 func NewAWSScanWorker(db *gorm.DB, svc *AWSOnboardingService) *AWSScanWorker {
@@ -119,6 +100,26 @@ func (w *AWSScanWorker) WithLease(d time.Duration) *AWSScanWorker { w.lease = d;
 // WithClock replaces time.Now, so a test can move past a lease expiry.
 func (w *AWSScanWorker) WithClock(f func() time.Time) *AWSScanWorker { w.nowFunc = f; return w }
 
+// WithPoll sets the sleep between empty or refused claims.
+func (w *AWSScanWorker) WithPoll(d time.Duration) *AWSScanWorker { w.poll = d; return w }
+
+// WithGraphProjection binds the worker to a projection gate. Without one it
+// reads the process-wide gate, which defaults to off.
+func (w *AWSScanWorker) WithGraphProjection(g *GraphProjectionGate) *AWSScanWorker {
+	w.gate = g
+	return w
+}
+
+// WithScannerHook configures every run's scanners, e.g. with fake AWS clients.
+func (w *AWSScanWorker) WithScannerHook(h ScannerHook) *AWSScanWorker { w.scannerHook = h; return w }
+
+func (w *AWSScanWorker) projectionGate() *GraphProjectionGate {
+	if w.gate != nil {
+		return w.gate
+	}
+	return GraphProjection()
+}
+
 // Run polls for claimable scans until the context ends.
 func (w *AWSScanWorker) Run(ctx context.Context) {
 	log.Printf("aws scan worker %s started", w.owner)
@@ -143,12 +144,30 @@ func (w *AWSScanWorker) Run(ctx context.Context) {
 	}
 }
 
-// RunOnce claims and executes at most one scan. Reports whether it found work.
+// RunOnce claims and executes at most one scan. Reports whether it did work;
+// false after an empty queue AND after a refused claim, so Run sleeps its poll
+// interval before claiming again (§2.10A -- a refused run that is re-claimed at
+// once is a hot loop).
 //
 // Separated from Run so a test can drive exactly one pass rather than race a
 // polling loop.
 func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
-	run, err := w.runs.Claim(w.owner, w.lease, w.nowFunc())
+	gate := w.projectionGate()
+	if !gate.ClaimAllowed() {
+		// FAIL CLOSED (§2.8). The switch is on and the schema is not verified.
+		// Falling back to Phase 1 here would scan without the barrier while a
+		// projector elsewhere may run, which is the overwrite it prevents.
+		return false, nil
+	}
+	pipeline := gate.PipelineMode()
+
+	var run *models.CloudScanRun
+	var err error
+	if pipeline {
+		run, err = w.runs.ClaimForPipeline(w.owner, w.lease, w.nowFunc())
+	} else {
+		run, err = w.runs.Claim(w.owner, w.lease, w.nowFunc())
+	}
 	if err != nil {
 		return false, fmt.Errorf("claim: %w", err)
 	}
@@ -165,19 +184,11 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// THE WORKSPACE BARRIER (§2.10A). Claimed before any inventory is written
-	// and released only after projection finishes, so a published run's
-	// inventory cannot change while its projection reads it.
-	//
-	// Refusal is not an error: another connector in this workspace is
-	// collecting or projecting. The run goes back to the queue and is claimed
-	// again once the workspace is free. THIS IS THE THROUGHPUT CEILING the
-	// spec states plainly -- a customer with five AWS accounts scans them one
-	// at a time, and nothing narrower is sound because the shared-resource
-	// writer crosses connectors.
-	if !w.phase2Available() {
-		// Pre-Phase-2 schema: scan exactly as before, with no barrier.
-		if err := w.execute(ctx, run); err != nil {
+	if !pipeline {
+		// IGA_GRAPH_PROJECTION off: exactly the Phase 1 behaviour. No barrier,
+		// no job, and nothing in this path names a Phase 2 table -- so it runs
+		// unchanged against any schema, any number of consecutive times (S1).
+		if err := w.execute(ctx, run, 0); err != nil {
 			if ferr := w.runs.Fail(run.ID, w.owner, run.LeaseVersion, err.Error()); ferr != nil {
 				log.Printf("aws scan worker %s: could not record failure for run %s: %v",
 					w.owner, run.ID, ferr)
@@ -187,25 +198,31 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	// THE WORKSPACE BARRIER (§2.10A). Claimed before any inventory is written
+	// and released only after projection finishes, so a published run's
+	// inventory cannot change while its projection reads it.
+	//
+	// Refusal is not an error: another connector in this workspace is
+	// collecting or projecting. The run goes to the BACK of the queue and this
+	// worker backs off. THIS IS THE THROUGHPUT CEILING the spec states
+	// plainly -- a customer with five AWS accounts scans them one at a time.
 	version, perr := w.pipeline.AcquireForCollection(
 		run.WorkspaceID, w.owner, run.ID, projectionPipelineLease, w.nowFunc())
 	if perr != nil {
 		if rerr := w.runs.Requeue(run.ID, w.owner, run.LeaseVersion); rerr != nil {
 			log.Printf("aws scan worker %s: could not requeue run %s: %v", w.owner, run.ID, rerr)
 		}
-		return true, nil
+		return false, nil
 	}
-	w.pipelineVersion = version
 
-	if err := w.execute(ctx, run); err != nil {
+	if err := w.execute(ctx, run, version); err != nil {
 		// TERMINALIZE THE RUN AND RELEASE THE BARRIER TOGETHER (§2.10A).
 		//
 		// The run is `failed`, not `abandoned`: abandon means giving up past
 		// the attempts ceiling, and a transient scan failure is retried. But
 		// the barrier must still come back to idle, because publication never
 		// happened -- nothing is waiting to be projected, and holding
-		// `collecting` would block every other connector in the workspace
-		// until expiry, which on its own is no longer allowed to release it.
+		// `collecting` would block every other connector in the workspace.
 		//
 		// One transaction, both fenced: if this worker has already been
 		// superseded, neither write lands and the current owner decides.
@@ -217,7 +234,8 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 				WorkspaceID: run.WorkspaceID,
 				Phase:       models.PipelineCollecting,
 				RunID:       run.ID,
-				Version:     w.pipelineVersion,
+				Version:     version,
+				Holder:      w.owner,
 			})
 		}); terr != nil {
 			log.Printf("aws scan worker %s: could not record failure for run %s: %v",
@@ -229,7 +247,11 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 }
 
 // execute performs the three scans and publishes, holding the lease throughout.
-func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) error {
+// barrierVersion is 0 in Phase 1 mode, and the collecting barrier's version in
+// pipeline mode.
+func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, barrierVersion int64) error {
+	pipeline := barrierVersion > 0
+
 	// CANCELLATION FOR PROMPTNESS (§2.10A, part 3). If this worker loses its
 	// lease mid-scan, the heartbeat cancels execCtx so context-aware work stops
 	// as soon as possible. That is NECESSARY but NOT SUFFICIENT: an in-flight
@@ -237,28 +259,32 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 	// guarantee a superseded worker writes nothing.
 	execCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := w.heartbeat(execCtx, run, cancel)
+	stop := w.heartbeat(execCtx, run, barrierVersion, cancel)
 	defer stop()
 
-	// THE FENCE FOR CORRECTNESS (§2.10A, part 3). Every inventory upsert this
-	// run makes validates, in the same transaction as the write, that this
-	// worker still owns the run -- against the row Claim bumps on reclaim. A
-	// superseded worker's writes are refused, whatever its context did.
+	// THE FENCE FOR CORRECTNESS (§2.10A, part 3). Every inventory write AND
+	// DELETE this run makes validates, in the same transaction, that this
+	// worker still owns the run -- against the row Claim bumps on reclaim.
 	fence := repositories.ScanFence{
 		RunID: run.ID, Owner: w.owner, LeaseVersion: run.LeaseVersion,
 	}
 
-	// Evidence is anchored on THIS run. That anchor is why the observation
-	// table could exist at all: before cloud_scan_run there was nothing durable
-	// for a cloud fact to point at, and the alternative -- borrowing the GitHub
-	// pipeline's iga_scan_runs -- would have forced AWS into that pipeline as a
-	// side effect of adding evidence.
+	// Evidence is anchored on THIS run.
 	evidence := NewObservationWriter(
 		w.db, run.WorkspaceID, run.ConnectorID, run.ID, run.Generation)
 
-	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
+	// ONE GENERATION PER RUN (§1.3, T1.5). The run's generation was assigned at
+	// its first claim and survives a reclaim; the scanner stamps every row with
+	// it and never recomputes scan_generation + 1 from the connector, which on
+	// a reclaimed run named a DIFFERENT generation from the one its evidence
+	// and its projection job carry.
+	scanner := NewAWSIAMScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence).
+		WithGeneration(run.Generation)
 	permissionScanner := NewAWSPermissionScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
 	workloadScanner := NewAWSWorkloadScanner(w.db, w.svc).WithEvidence(evidence).WithFence(fence)
+	if w.scannerHook != nil {
+		w.scannerHook(scanner, permissionScanner, workloadScanner)
+	}
 
 	snapshot, err := scanner.Scan(execCtx, run.WorkspaceID, run.ConnectorID)
 	if err != nil {
@@ -286,47 +312,41 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 		workloadSurfaces = workloadSnapshot.Surfaces
 	}
 
-	// COVERAGE FIRST, THEN PUBLICATION AND THE PROJECTION JOB -- ALL IN ONE
-	// TRANSACTION, under the existing lease fence (§2.8).
-	//
-	// FinalizeCoverage performs no writes, so computing it before publication
-	// costs nothing. The previous sequence published first and stamped
-	// coverage best-effort afterwards, on the argument that a superseded
-	// worker must not overwrite the winner's report -- but the FENCE already
-	// guarantees that, and inside one transaction the ordering of the two
-	// writes is not observable.
-	//
-	// What the old sequence could not guarantee: a crash between publication
-	// and coverage made the loss PERMANENT. The projection job would then read
-	// absent coverage, canEnd would refuse every partition, and the graph would
-	// silently never close anything -- an outage that looks like caution.
+	// COVERAGE FIRST, THEN PUBLICATION, THE PROJECTION JOB AND THE BARRIER
+	// HAND-OFF -- ALL IN ONE TRANSACTION, under the existing lease fence
+	// (§2.8). A crash between publication and coverage used to make the loss
+	// permanent: the projection would read absent coverage, canEnd would refuse
+	// every partition, and the graph would silently never close anything.
 	merged := scanner.FinalizeCoverage(run.WorkspaceID, run.ConnectorID, snapshot.Coverage,
 		snapshot.CredentialReportSurface, permErr, permSurfaces, workloadErr, workloadSurfaces)
 
 	if err := w.runs.PublishWithCoverage(run.ID, w.owner, run.LeaseVersion, merged,
 		func(tx *gorm.DB, published *models.CloudScanRun) error {
-			if !w.phase2Available() {
-				// Nothing to project into yet; publication and coverage still
-				// commit together, which is all Phase 1 needs.
+			if !pipeline {
+				// Phase 1: publication and coverage commit together, which is
+				// all it needs. No job -- nothing would ever claim it.
 				return nil
 			}
 			// A published run ALWAYS has a job. A crash between the two is
 			// impossible rather than recovered.
-			if err := w.jobs.EnqueueTx(tx, &models.IGAProjectionJob{
+			job := &models.IGAProjectionJob{
 				WorkspaceID: published.WorkspaceID,
 				ScanRunID:   published.ID,
 				ConnectorID: published.ConnectorID,
 				Generation:  published.Generation,
 				Status:      models.ProjectionQueued,
-			}); err != nil {
+			}
+			if err := w.jobs.EnqueueTx(tx, job); err != nil {
 				return fmt.Errorf("enqueue projection job: %w", err)
 			}
-			// Hand the workspace barrier from collecting to projecting in the
-			// SAME transaction, so it is never released in between -- that gap
-			// is where a second connector's scan would overwrite a shared
-			// resource row the projection is about to read (§2.10A).
+			// HAND THE BARRIER TO THE JOB in the SAME transaction (§2.10A):
+			// collecting -> projecting, holder = job:<id>. It is never
+			// released in between -- that gap is where a second connector's
+			// scan would overwrite a shared row the projection is about to
+			// read -- and it is held by the JOB, so whichever worker claims
+			// that job may proceed at once.
 			if _, err := w.pipeline.ToProjectingTx(tx, published.WorkspaceID,
-				w.owner, published.ID, w.pipelineVersion, projectionPipelineLease); err != nil {
+				w.owner, published.ID, barrierVersion, job.ID, projectionPipelineLease); err != nil {
 				return fmt.Errorf("pipeline to projecting: %w", err)
 			}
 			return nil
@@ -343,8 +363,12 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 // heartbeat renews the lease while the scan runs, and stops on return.
 //
 // Without it a scan longer than the lease would have its run claimed by another
-// worker mid-flight, and both would then be walking the same account.
-func (w *AWSScanWorker) heartbeat(ctx context.Context, run *models.CloudScanRun, onLost context.CancelFunc) func() {
+// worker mid-flight, and both would then be walking the same account. In
+// pipeline mode it renews the COLLECTING barrier on the same tick, so a long
+// scan never looks stalled to recovery.
+func (w *AWSScanWorker) heartbeat(
+	ctx context.Context, run *models.CloudScanRun, barrierVersion int64, onLost context.CancelFunc,
+) func() {
 	done := make(chan struct{})
 	go func() {
 		t := time.NewTicker(scanLeaseHeartbeat)
@@ -360,16 +384,19 @@ func (w *AWSScanWorker) heartbeat(ctx context.Context, run *models.CloudScanRun,
 					// Losing the lease mid-scan is not recoverable by renewing
 					// harder. The run belongs to someone else now; this worker's
 					// publication will be refused, which is the correct outcome.
-					//
-					// Cancel the scan context so in-flight collection stops
-					// promptly rather than racing on -- the promptness half of
-					// §2.10A part 3. The fence on every inventory write is what
-					// makes it CORRECT even for a write already past its ctx
-					// check: that write's transaction re-checks ownership and is
-					// refused.
 					log.Printf("aws scan worker %s: lease lost on run %s: %v", w.owner, run.ID, err)
 					onLost()
 					return
+				}
+				if barrierVersion > 0 {
+					if err := w.pipeline.RenewHeld(repositories.PipelineFence{
+						WorkspaceID: run.WorkspaceID, Phase: models.PipelineCollecting,
+						RunID: run.ID, Version: barrierVersion, Holder: w.owner,
+					}, projectionPipelineLease, w.nowFunc()); err != nil {
+						log.Printf("aws scan worker %s: barrier lost on run %s: %v", w.owner, run.ID, err)
+						onLost()
+						return
+					}
 				}
 			}
 		}

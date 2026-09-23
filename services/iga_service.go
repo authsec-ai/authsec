@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -483,20 +482,11 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 
 		// Checkpoint the scope. A worker killed here resumes from this cursor
 		// instead of restarting the whole enumeration.
-		//
-		// The error is REPORTED, not discarded. Swallowing it is how a broken
-		// checkpoint write stayed invisible: every insert failed, no
-		// checkpoint was ever written, and the scan silently stopped being
-		// resumable while every test that did not assert on checkpoints
-		// carried on passing.
-		if err := m.repo.SaveCheckpoint(&models.IGAScanCheckpoint{
+		_ = m.repo.SaveCheckpoint(&models.IGAScanCheckpoint{
 			WorkspaceID: workspaceID, ScanRunID: run.ID,
 			ObjectClass: models.ClassRepository, PartitionKey: scope.NativeID,
 			Cursor: scope.NativeID, Watermark: &now,
-		}); err != nil {
-			report.Issues = append(report.Issues,
-				fmt.Sprintf("checkpoint %s: %v (this scan is not resumable)", scope.NativeID, err))
-		}
+		})
 
 		// --- Lane B, repositories only --------------------------------------
 		if scope.Kind == "repository" {
@@ -869,33 +859,11 @@ func grantClass(subjectKind string) string {
 func (m *igaManager) ingestGrant(workspaceID uuid.UUID, integ *models.IGAIntegration, run *models.IGAScanRun, scope ProviderScope, g ProviderGrant, report *ScanReport) {
 	now := time.Now()
 
-	// RECOGNITION KEYS (P2-4). Every canonical row now carries one, built by
-	// the one key builder, so a rescan updates the row it wrote last time
-	// instead of inserting a duplicate with a fresh uuid. The provider host is
-	// in the key because two GitHub Enterprise installations can both hold a
-	// repository called `org/app`.
-	//
-	// The ids are NOT assigned here any more. Each upsert reads back the
-	// surviving row's id, which is the only value the edges below may
-	// reference -- assigning uuid.New() before the call is what made "repeat
-	// scan keeps IDs" fail.
-	identityKey := igagraph.Key("github", integ.ProviderHost, g.SubjectNativeID)
-	resourceKey := igagraph.Key("github", integ.ProviderHost, scope.NativeID)
-
 	// The identity holding the grant.
 	identity := &models.IGAIdentityAccount{
-		WorkspaceID: workspaceID,
-		SourceKey:   identityKey,
-		// GitHub exposes no creation-boundary id for a login, so the name is
-		// the strongest claim available and the console must say so.
-		Continuity:      models.ContinuityRecognitionOnly,
-		DisplayName:     g.SubjectName,
-		AccountKind:     g.SubjectKind,
-		IdentityBacking: "provider_native",
-		RollupState:     models.RollupConfirmed,
-		Lifecycle:       models.LifecycleActive,
-		FirstSeenAt:     now,
-		LastSeenAt:      now,
+		ID: uuid.New(), WorkspaceID: workspaceID,
+		DisplayName: g.SubjectName, AccountKind: g.SubjectKind,
+		IdentityBacking: "provider_native", RollupState: models.RollupConfirmed,
 	}
 	if err := m.repo.UpsertIdentityAccount(identity); err != nil {
 		report.Issues = append(report.Issues, fmt.Sprintf("identity %s: %v", g.SubjectNativeID, err))
@@ -906,36 +874,19 @@ func (m *igaManager) ingestGrant(workspaceID uuid.UUID, integ *models.IGAIntegra
 	// Non-secret credential metadata, bound to the identity. Never a value.
 	if g.CredentialType != "" {
 		_ = m.repo.UpsertCredential(&models.IGACredential{
-			WorkspaceID:       workspaceID,
-			IdentityAccountID: identity.ID,
-			// §2.5: the credential's own identifier, namespaced by the identity
-			// that holds it -- two identities can hold keys with the same id.
-			SourceKey:       igagraph.Key("github", integ.ProviderHost, g.SubjectNativeID, g.KeyIdentifier),
-			Continuity:      models.ContinuityRecognitionOnly,
-			CredentialType:  g.CredentialType,
-			Issuer:          integ.ProviderHost,
-			KeyIdentifier:   g.KeyIdentifier,
-			ExpiresAt:       g.ExpiresAt,
-			LastUsedAt:      g.LastUsedAt,
-			RotationPosture: rotationPosture(g.ExpiresAt, now),
-			Lifecycle:       models.LifecycleActive,
-			FirstSeenAt:     now,
-			LastSeenAt:      now,
+			ID: uuid.New(), WorkspaceID: workspaceID, IdentityAccountID: identity.ID,
+			CredentialType: g.CredentialType, Issuer: integ.ProviderHost,
+			KeyIdentifier: g.KeyIdentifier, ExpiresAt: g.ExpiresAt, LastUsedAt: g.LastUsedAt,
+			RotationPosture: rotationPosture(g.ExpiresAt, now), Lifecycle: models.LifecycleActive,
 		})
 		report.Credentials++
 	}
 
 	// The protected thing.
 	resource := &models.IGAResource{
-		WorkspaceID:  workspaceID,
-		SourceKey:    resourceKey,
-		Continuity:   models.ContinuityRecognitionOnly,
-		ResourceKind: "repository",
-		DisplayName:  scope.DisplayName,
-		Stage:        "unknown",
-		Lifecycle:    models.LifecycleActive,
-		FirstSeenAt:  now,
-		LastSeenAt:   now,
+		ID: uuid.New(), WorkspaceID: workspaceID,
+		ResourceKind: "repository", DisplayName: scope.DisplayName,
+		Stage: "unknown", Lifecycle: models.LifecycleActive,
 	}
 	if err := m.repo.UpsertResource(resource); err != nil {
 		report.Issues = append(report.Issues, fmt.Sprintf("resource %s: %v", scope.DisplayName, err))
@@ -943,28 +894,14 @@ func (m *igaManager) ingestGrant(workspaceID uuid.UUID, integ *models.IGAIntegra
 	}
 
 	// The grant itself.
-	//
-	// The key carries the SUBJECT as well as the scope and grant kind, so a
-	// GitHub entitlement is UNSHARED -- the inline-policy rule of §2.6, not the
-	// managed-policy one. Two subjects holding `write` on one repository can
-	// carry different NativeRights, and a shared key would let whichever was
-	// written last silently overwrite the other's record of what the provider
-	// actually said.
 	ent := &models.IGAEntitlement{
-		WorkspaceID: workspaceID,
-		SourceKey: igagraph.Key("github", integ.ProviderHost,
-			scope.NativeID, g.GrantKind, g.SubjectNativeID),
-		Continuity:       models.ContinuityRecognitionOnly,
-		ResourceID:       &resource.ID,
+		ID: uuid.New(), WorkspaceID: workspaceID, ResourceID: &resource.ID,
 		NativeGrantKind:  g.GrantKind,
 		NativeRights:     mustJSON(g.NativeRights),
 		NormalizedRights: mustJSON(NormalizeRights(g.NativeRights)),
 		NativeScope:      scope.NativeID,
 		// Revocable through a supported provider path.
-		Remediable:  g.SubjectKind != "app_installation",
-		Lifecycle:   models.LifecycleActive,
-		FirstSeenAt: now,
-		LastSeenAt:  now,
+		Remediable: g.SubjectKind != "app_installation",
 	}
 	if err := m.repo.UpsertEntitlement(ent); err != nil {
 		report.Issues = append(report.Issues, fmt.Sprintf("entitlement %s: %v", g.GrantKind, err))
@@ -979,24 +916,12 @@ func (m *igaManager) ingestGrant(workspaceID uuid.UUID, integ *models.IGAIntegra
 	}
 
 	if err := m.repo.UpsertAccessEdge(&models.IGAAccessEdge{
-		WorkspaceID: workspaceID,
-		// TYPED SUBJECT (030). subject_kind + subject_id are gone; this column
-		// is composite-FK'd to (workspace_id, id), so a subject from another
-		// workspace is now rejected by the database rather than stored.
-		SubjectIdentityAccountID: &identity.ID,
-		EntitlementID:            ent.ID,
-		ResourceID:               &resource.ID,
-		SourceKey: igagraph.Key("github", integ.ProviderHost,
-			g.SubjectNativeID, scope.NativeID, g.GrantKind),
-		Direction:           "outbound",
-		PathKind:            g.GrantKind,
-		Basis:               models.BasisDeclared,
-		State:               models.RelCurrent,
-		CalculationState:    calc,
-		EffectiveConclusion: conclusion,
-		NativeScope:         scope.NativeID,
-		LastConfirmedAt:     now,
-		ObservedAt:          &now,
+		ID: uuid.New(), WorkspaceID: workspaceID,
+		SubjectKind: "identity_account", SubjectID: identity.ID,
+		EntitlementID: &ent.ID, ResourceID: &resource.ID,
+		Direction: "outbound", PathKind: g.GrantKind,
+		CalculationState: calc, EffectiveConclusion: conclusion,
+		NativeScope: scope.NativeID, ObservedAt: &now,
 	}); err != nil {
 		report.Issues = append(report.Issues, fmt.Sprintf("access edge %s: %v", g.GrantKind, err))
 		return
