@@ -10,10 +10,12 @@ package igaread
 //
 //	identity   restrictions (Deny statements held directly or through a live
 //	           group membership; a live boundary assignment, D-78),
+//	           a group's member users with a boundary (D-22, for its grants),
 //	           used_by_count (UsedByCounts, the list's count), trust flags
 //	statement  its policy, its label, group_key (D-37) and exclusions (the
 //	           NotResource entries -- never edges, §5.4)
-//	every type stale_reason for stale nodes (NodeStaleReasons, D-74)
+//	every type stale_reason for stale nodes (NodeStaleReasons, D-74; an
+//	           external principal's from its stale can_assume edges)
 
 import (
 	"crypto/sha256"
@@ -513,6 +515,10 @@ func (t *graphTraversal) decorateNodes(lv *graphLevel, nodes []*GraphNode) error
 			return err
 		}
 	}
+	// External principals have no support rows: theirs come from their edges.
+	if err := t.principalStaleReasons(lv, byType[RefExternalPrincipal]); err != nil {
+		return err
+	}
 	for _, n := range nodes {
 		n.Limitations = t.nodeLimitations(n)
 	}
@@ -527,7 +533,8 @@ func graphIDs(nodes []*GraphNode) []uuid.UUID {
 	return ids
 }
 
-// decorateIdentities reads the identities' restrictions and used-by counts.
+// decorateIdentities reads the identities' restrictions, the member
+// boundaries of the groups among them, and their used-by counts.
 //
 // Deny statements are counted for the identity AND its groups (a live --
 // current or stale -- member_of): a group's Deny applies to its members
@@ -593,6 +600,51 @@ func (t *graphTraversal) decorateIdentities(lv *graphLevel, nodes []*GraphNode) 
 	}
 	for _, id := range bounded {
 		byID[id].boundary = true
+	}
+
+	// D-22: a group's member users with a live boundary assignment, for the
+	// group's grant edges. A member is a live -- current or stale -- member_of,
+	// the same membership the group's Deny statements count through above
+	// (§5.4: a stale edge is still believed); an ended membership is not.
+	// The member must be a readable identity (D-6): a ref is something the
+	// client can open.
+	var groups []uuid.UUID
+	for _, n := range nodes {
+		if n.Kind == models.CloudIdentityIAMGroup {
+			groups = append(groups, n.id)
+		}
+	}
+	if len(groups) > 0 {
+		if tx, err = lv.db(); err != nil {
+			return err
+		}
+		var members []struct {
+			GroupID  uuid.UUID
+			MemberID uuid.UUID
+		}
+		if err := tx.Raw(`SELECT r.target_identity_account_id AS group_id, m.id AS member_id
+		                    FROM iga_relationship r
+		                    JOIN iga_identity_accounts m
+		                      ON m.workspace_id = r.workspace_id AND m.id = r.source_identity_account_id
+		                   WHERE r.workspace_id = ? AND r.relationship_type = 'member_of'
+		                     AND r.target_identity_account_id IN ?
+		                     AND r.state IN ('current', 'stale')
+		                     AND m.provider = 'aws' AND `+SupportedSQL("m", "identity_account_id")+`
+		                     AND EXISTS (SELECT 1 FROM iga_policy_assignment pa
+		                                  WHERE pa.workspace_id = m.workspace_id AND pa.holder_identity_account_id = m.id
+		                                    AND pa.assignment_kind = 'boundary' AND pa.state <> 'ended')
+		                   GROUP BY r.target_identity_account_id, m.id, m.source_key
+		                   ORDER BY r.target_identity_account_id, m.source_key, m.id`,
+			t.q.WS, groups).Scan(&members).Error; err != nil {
+			return err
+		}
+		for _, m := range members {
+			g := byID[m.GroupID]
+			g.memberBoundaryCount++
+			if len(g.memberBoundaryRefs) < graphRefCap {
+				g.memberBoundaryRefs = append(g.memberBoundaryRefs, R(RefIdentity, m.MemberID))
+			}
+		}
 	}
 
 	if tx, err = lv.db(); err != nil {
@@ -679,10 +731,12 @@ func (t *graphTraversal) nodeStaleReasons(lv *graphLevel, nodes []*GraphNode, co
 	if len(subjects) == 0 {
 		return nil
 	}
-	if _, err := lv.db(); err != nil { // arm the level's timeout for its statements
+	if _, err := lv.db(); err != nil { // the level's allowance is spent
 		return err
 	}
-	reasons, err := NodeStaleReasons(t.q, t.accts, column, subjects)
+	// The level's query: every statement NodeStaleReasons issues, and its
+	// nested optional history read, is held to the level's allowance.
+	reasons, err := NodeStaleReasons(lv.query(), t.accts, column, subjects)
 	if err != nil {
 		return err
 	}

@@ -1,9 +1,10 @@
 package igaread
 
 // Unit tests for the traversal's pure helpers (T6.4): labels (D-87, §2.6),
-// group keys (D-37), statement parsing, reserve (D-40), and the path
-// enumeration's order and bounds (§5.4). The traversal itself is tested
-// against real PostgreSQL in tests/integration/p2_graph_*_test.go.
+// group keys (D-37), statement parsing, reserve (D-40), the path
+// enumeration's order and bounds (§5.4), and the path verdict over both
+// orientations (D-38). The traversal itself is tested against real
+// PostgreSQL in tests/integration/p2_graph_*_test.go and p2_graph_level_test.go.
 
 import (
 	"strings"
@@ -163,5 +164,62 @@ func TestP2GraphEnumeratePaths(t *testing.T) {
 	// No path at all.
 	if paths, _, _, _ := graphEnumeratePaths(edges, "x", "w", 200, 4); len(paths) != 0 {
 		t.Errorf("x -> w = %v, want none", paths)
+	}
+}
+
+// graphUnitSearch is one orientation's search result: exhausted both sides
+// (or not), with the given paths and bound.
+func graphUnitSearch(paths int, bound string, exhausted bool) *graphSearch {
+	s := &graphSearch{fwd: &graphSide{}, rev: &graphSide{}, bound: bound}
+	for i := 0; i < paths; i++ {
+		s.paths = append(s.paths, []*GraphEdge{graphUnitEdge("e", GraphEdgeGrant, "a", "b")})
+	}
+	if !exhausted {
+		s.fwd.frontier = []*GraphNode{{}}
+	}
+	return s
+}
+
+// /graph/path over both orientations (§5.4, D-38): none_exists only when both
+// were searched to exhaustion before any budget bound; a reverse list is
+// complete only when the forward orientation finished too.
+func TestP2GraphPathDecide(t *testing.T) {
+	none := func() *graphSearch { return graphUnitSearch(0, "", true) }
+	for _, tc := range []struct {
+		name        string
+		there, back *graphSearch
+		outcome     string
+		reverse     bool
+		more        bool
+		boundBy     string
+	}{
+		{"forward paths, complete", graphUnitSearch(1, "", true), nil, GraphPathFound, false, false, ""},
+		{"forward paths, a budget bound", graphUnitSearch(1, GraphBoundNodes, false), nil, GraphPathFound, false, true, GraphBoundNodes},
+		{"reverse paths, both complete", none(), graphUnitSearch(2, "", true), GraphPathFound, true, false, ""},
+		{"reverse paths, forward unfinished", graphUnitSearch(0, GraphBoundEdges, false), graphUnitSearch(1, "", true),
+			GraphPathFound, true, true, GraphBoundEdges},
+		{"reverse paths, reverse bound first", graphUnitSearch(0, GraphBoundEdges, false), graphUnitSearch(1, GraphBoundTime, false),
+			GraphPathFound, true, true, GraphBoundTime},
+		{"none either way", none(), none(), GraphPathNoneExists, false, false, ""},
+		{"forward none, reverse bound", none(), graphUnitSearch(0, GraphBoundEdges, false), GraphPathNotFoundWithinBudget, false, false, GraphBoundEdges},
+		{"forward bound, reverse none", graphUnitSearch(0, GraphBoundTime, false), none(), GraphPathNotFoundWithinBudget, false, false, GraphBoundTime},
+		{"reverse never searched", none(), nil, GraphPathNotFoundWithinBudget, false, false, GraphBoundTime},
+	} {
+		d := graphPathDecide(tc.there, tc.back)
+		if d.outcome != tc.outcome || d.reverse != tc.reverse || d.morePaths != tc.more || d.boundBy != tc.boundBy {
+			t.Errorf("%s: %+v, want outcome %s reverse %v more %v bound_by %q", tc.name, d, tc.outcome, tc.reverse, tc.more, tc.boundBy)
+		}
+	}
+	// An unfollowed resolution, the hop limit and the path budget are never
+	// "none": each is a reason, in that order after a budget.
+	s := none()
+	s.unfollowed = true
+	if d := graphPathDecide(s, none()); d.outcome != GraphPathNotFoundWithinBudget || d.boundBy != GraphBoundResolution {
+		t.Errorf("unfollowed resolution: %+v, want not_found_within_budget, resolution_not_followed", d)
+	}
+	s = none()
+	s.hopBound, s.unfollowed = true, true
+	if d := graphPathDecide(none(), s); d.boundBy != GraphBoundAssumeHops {
+		t.Errorf("hop limit and resolution: %+v, want bound_by assume_hops first", d)
 	}
 }

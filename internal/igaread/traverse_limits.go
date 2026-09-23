@@ -125,6 +125,25 @@ func graphHolderLimitations(holder *GraphNode) []GraphLimitation {
 	return ls
 }
 
+// graphMemberBoundaryLimitations is D-22's second boundary rule: a grant held
+// by a GROUP also carries permissions_boundary_present, with the count and the
+// member refs, when a member user of the group has a boundary assignment --
+// the grant reaches that member only on a path through a restricted node (§2.6
+// l.549, §5.4). Nothing is evaluated: the boundary may or may not narrow the
+// grant. It is the grant edge's limitation, not the group node's: the group
+// itself has no boundary (its restrictions say so).
+func graphMemberBoundaryLimitations(holder *GraphNode) []GraphLimitation {
+	if holder.memberBoundaryCount == 0 {
+		return nil
+	}
+	refs := holder.memberBoundaryRefs
+	l := GraphLimitation{"code": graphLimBoundary, "count": holder.memberBoundaryCount, "refs": refs}
+	if int64(len(refs)) < holder.memberBoundaryCount {
+		l["refs_truncated"] = true
+	}
+	return []GraphLimitation{l}
+}
+
 // graphSortLimits dedupes limitations and orders them by code, then by their
 // canonical JSON, so the same claim renders the same list every time.
 func graphSortLimits(ls []GraphLimitation) []GraphLimitation {
@@ -172,7 +191,7 @@ func graphSortPairs(ps []graphPair, pos, kindPos map[string]int) {
 
 // decorateEdges completes a level's new edges once both endpoints are read:
 // a target's state (its statement's, §5.4), crosses_account (D-36), the
-// stale_reason of stale relationships and grants (D-74), and limitations.
+// stale_reason of every stale edge (D-74), and limitations.
 func (t *graphTraversal) decorateEdges(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
 	if len(edges) == 0 {
 		return nil
@@ -195,7 +214,7 @@ func (t *graphTraversal) decorateEdges(lv *graphLevel, edges []*GraphEdge, node 
 			crossing = true
 		}
 	}
-	if err := t.edgeStaleReasons(lv, edges); err != nil {
+	if err := t.edgeStaleReasons(lv, edges, node); err != nil {
 		return err
 	}
 	if crossing {
@@ -254,6 +273,7 @@ func (t *graphTraversal) edgeLimitations(e *GraphEdge, from, to *GraphNode) []Gr
 	case GraphEdgeGrant:
 		ls = append(ls, graphStatementLimitations(to)...)
 		ls = append(ls, graphHolderLimitations(from)...)
+		ls = append(ls, graphMemberBoundaryLimitations(from)...)
 	case GraphEdgeTarget:
 		// The target's staleness is its statement's.
 		ls = append(ls, from.surfaceLims...)
@@ -269,10 +289,12 @@ func (t *graphTraversal) loadFarCoverage(lv *graphLevel) error {
 	if t.covDone {
 		return nil
 	}
-	if _, err := lv.db(); err != nil { // arm the level's timeout
+	if _, err := lv.db(); err != nil { // the level's allowance is spent
 		return err
 	}
-	accounts, err := t.q.Coverage(nil)
+	// Coverage is several statements and a nested optional read: the level's
+	// query holds every one of them to the level's allowance.
+	accounts, err := lv.query().Coverage(nil)
 	if err != nil {
 		return err
 	}
@@ -294,34 +316,121 @@ func (t *graphTraversal) loadFarCoverage(lv *graphLevel) error {
 	return nil
 }
 
-// edgeStaleReasons fills D-74's stale_reason on stale relationships and grants:
-// the surfaces of the edge's OWN partition that the run the current revision
-// holds that partition from did not reach. The partition is the projector's
-// own (igagraph.Partitions over that run's coverage, with the watermark's
-// scope and connector), matched by its key -- never parsed out of the key.
-// A grant is document-protected (its statement's policy_documents), like the
-// statement it points at. since is read as optional work, as NodeStaleReasons
-// reads it.
-func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge) error {
-	type part struct {
-		conn uuid.UUID
-		key  string
-	}
-	want := map[part][]*GraphEdge{}
-	var conns []uuid.UUID
-	var keys []string
-	seenConn, seenKey := map[uuid.UUID]bool{}, map[string]bool{}
+// graphPartStale is one stale thing whose D-74 stale_reason comes from ONE
+// edge partition: a stale relationship or grant, or a stale external
+// principal through one of its stale can_assume edges (it has no support rows
+// of its own, D-47). into is the stale_reason being filled.
+type graphPartStale struct {
+	conn  uuid.UUID
+	key   string
+	class string // "" for relationships; ObjectEntitlement for a grant (document-protected)
+	into  *[]StaleReason
+}
+
+// edgeStaleReasons fills D-74's stale_reason on stale relationships, grants
+// and targets. A relationship's or grant's is its OWN partition's
+// (partitionStaleReasons). A target has no state or partition of its own: its
+// state is its statement's (§5.4 "Filtered by: statement lifecycle"), so a
+// stale target carries its statement's stale_reason -- the statement node is
+// decorated before its edges, in this level or an earlier one.
+func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
+	var items []graphPartStale
 	for _, e := range edges {
-		if e.State != StateStale || e.Kind == GraphEdgeTarget {
+		if e.State != StateStale {
 			continue
 		}
 		empty := []StaleReason{}
 		e.StaleReason = &empty
+		if e.Kind == GraphEdgeTarget {
+			if st := node(e.From); st != nil && st.StaleReason != nil {
+				rs := append([]StaleReason{}, (*st.StaleReason)...)
+				e.StaleReason = &rs
+			}
+			continue
+		}
 		if e.connectorID == nil || e.partitionKey == "" {
 			continue // nothing recorded explains it
 		}
-		p := part{*e.connectorID, e.partitionKey}
-		want[p] = append(want[p], e)
+		class := ""
+		if e.Kind == GraphEdgeGrant {
+			class = models.ObjectEntitlement // document-protected, like its statement
+		}
+		items = append(items, graphPartStale{conn: *e.connectorID, key: e.partitionKey, class: class, into: e.StaleReason})
+	}
+	return t.partitionStaleReasons(lv, items)
+}
+
+// principalStaleReasons fills stale_reason on stale external principals. A
+// principal's state is derived from its can_assume edges (D-1, D-47): stale
+// when none is current and one is stale. So its stale_reason is the union of
+// the stale_reasons of those stale edges -- read in one statement for the
+// level, whether or not the response carries the edges themselves.
+func (t *graphTraversal) principalStaleReasons(lv *graphLevel, nodes []*GraphNode) error {
+	byID := map[uuid.UUID]*GraphNode{}
+	var ids []uuid.UUID
+	for _, n := range nodes {
+		if n.State != StateStale {
+			continue
+		}
+		empty := []StaleReason{}
+		n.StaleReason = &empty
+		byID[n.id] = n
+		ids = append(ids, n.id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := lv.db()
+	if err != nil {
+		return err
+	}
+	var rows []struct {
+		NodeID       uuid.UUID
+		ConnectorID  uuid.UUID
+		PartitionKey string
+	}
+	if err := tx.Raw(`SELECT r.source_external_principal_id AS node_id, r.connector_id, r.partition_key
+	                    FROM iga_relationship r
+	                   WHERE r.workspace_id = ? AND r.source_external_principal_id IN ?
+	                     AND r.relationship_type = 'can_assume' AND r.state = 'stale'
+	                     AND r.connector_id IS NOT NULL AND r.partition_key <> ''
+	                   GROUP BY r.source_external_principal_id, r.connector_id, r.partition_key
+	                   ORDER BY r.source_external_principal_id, r.connector_id, r.partition_key`,
+		t.q.WS, ids).Scan(&rows).Error; err != nil {
+		return err
+	}
+	var items []graphPartStale
+	for _, r := range rows {
+		items = append(items, graphPartStale{conn: r.ConnectorID, key: r.PartitionKey, into: byID[r.NodeID].StaleReason})
+	}
+	if err := t.partitionStaleReasons(lv, items); err != nil {
+		return err
+	}
+	for _, n := range byID {
+		n.surfaceLims = graphSurfaceLimitations(*n.StaleReason)
+	}
+	return nil
+}
+
+// partitionStaleReasons appends to each item's stale_reason the surfaces of
+// its partition that the run the current revision holds that partition from
+// did not reach. The partition is the projector's own (igagraph.Partitions
+// over that run's coverage, with the watermark's scope and connector), matched
+// by its key -- never parsed out of the key. since is read as optional work,
+// as NodeStaleReasons reads it. Each list is sorted by (account, surface) and
+// deduplicated.
+func (t *graphTraversal) partitionStaleReasons(lv *graphLevel, items []graphPartStale) error {
+	type part struct {
+		conn uuid.UUID
+		key  string
+	}
+	want := map[part][]graphPartStale{}
+	var conns []uuid.UUID
+	var keys []string
+	seenConn, seenKey := map[uuid.UUID]bool{}, map[string]bool{}
+	for _, it := range items {
+		p := part{it.conn, it.key}
+		want[p] = append(want[p], it)
 		if !seenConn[p.conn] {
 			seenConn[p.conn] = true
 			conns = append(conns, p.conn)
@@ -372,15 +481,15 @@ func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge) er
 	}
 
 	type pending struct {
-		edge *GraphEdge
+		into *[]StaleReason
 		run  *staleRun
 		gap  surfaceGap
 	}
 	var found []pending
 	for _, m := range marks {
-		es := want[part{m.ConnectorID, m.PartitionKey}]
+		its := want[part{m.ConnectorID, m.PartitionKey}]
 		run := runByID[m.LastRunID]
-		if len(es) == 0 || run == nil {
+		if len(its) == 0 || run == nil {
 			continue
 		}
 		snap := &igagraph.Snapshot{
@@ -392,13 +501,9 @@ func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge) er
 			if p.Key() != m.PartitionKey {
 				continue
 			}
-			for _, e := range es {
-				class := ""
-				if e.Kind == GraphEdgeGrant {
-					class = models.ObjectEntitlement // document-protected, like its statement
-				}
-				for _, g := range partitionGaps(p, run.cov, class) {
-					found = append(found, pending{edge: e, run: run, gap: g})
+			for _, it := range its {
+				for _, g := range partitionGaps(p, run.cov, it.class) {
+					found = append(found, pending{into: it.into, run: run, gap: g})
 				}
 			}
 			break
@@ -416,7 +521,7 @@ func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge) er
 			hconns = append(hconns, f.run.ConnectorID)
 		}
 	}
-	history, haveHistory, err := graphRunHistory(t.q, hconns)
+	history, haveHistory, err := graphRunHistory(lv.query(), hconns)
 	if err != nil {
 		return err
 	}
@@ -429,21 +534,22 @@ func (t *graphTraversal) edgeStaleReasons(lv *graphLevel, edges []*GraphEdge) er
 		if c := t.accts.Connector(f.run.ConnectorID); c != nil {
 			acct = c.AccountID
 		}
-		*f.edge.StaleReason = append(*f.edge.StaleReason, StaleReason{AccountID: acct, Surface: f.gap.surface, State: f.gap.state, Since: since})
+		*f.into = append(*f.into, StaleReason{AccountID: acct, Surface: f.gap.surface, State: f.gap.state, Since: since})
 	}
-	for _, e := range edges {
-		if e.StaleReason == nil {
+	sorted := map[*[]StaleReason]bool{}
+	for _, it := range items {
+		if sorted[it.into] {
 			continue
 		}
-		rs := *e.StaleReason
+		sorted[it.into] = true
+		rs := *it.into
 		sort.Slice(rs, func(i, j int) bool {
 			if rs[i].AccountID != rs[j].AccountID {
 				return rs[i].AccountID < rs[j].AccountID
 			}
 			return rs[i].Surface < rs[j].Surface
 		})
-		rs = dedupeReasons(rs)
-		e.StaleReason = &rs
+		*it.into = dedupeReasons(rs)
 	}
 	return nil
 }

@@ -30,12 +30,26 @@ package igaread
 //	                         current and stale edges
 //	not_found_within_budget  a budget bound first; bound_by names it
 //
-// One case is neither found nor none: the reverse search reached an external
-// principal whose resolution IN FORCE names a node the forward search reached
-// (§2.12). The principal is terminal (§5.4) -- its resolution is shown, never
-// walked -- so a path through it is neither drawn nor ruled out:
-// not_found_within_budget (or more_paths) with bound_by
-// "resolution_not_followed", additive to §5.4's vocabulary.
+// One case is neither found nor none: the search passed an external
+// principal whose resolution IN FORCE links the two sides (§2.12). The
+// principal is terminal (§5.4) -- its resolution is shown, never walked -- so
+// a path through it is neither drawn nor ruled out: not_found_within_budget
+// (or more_paths) with bound_by "resolution_not_followed", additive to §5.4's
+// vocabulary.
+//
+// Both orientations. The route has no direction, and a path runs along its
+// edges' own directions -- but §5.4's reverse question ("what reaches this":
+// Resource › Access, *View in graph* from a resource) asks for a path from a
+// resource to what reaches it, against the edges. So when no path runs from
+// `from` to `to`, the same bounded search runs from `to` to `from`, in the
+// same traversal state (the budgets are the request's, and edges already read
+// cost nothing). data.direction says which orientation the paths are in:
+// forward (each edge runs from its node toward `to`) or reverse (each edge
+// runs toward `from`: `to` reaches `from`). Either way a path's nodes run from
+// `from` to `to`. none_exists is said only when BOTH orientations were
+// searched to exhaustion before any budget bound: an orientation that was not
+// searched is never reported as having no path. direction is additive to
+// D-35's shape, null when no path was found.
 //
 // Nothing claims a distance that was not measured: a path's length is the
 // path, and no "shortest distance" is reported beside it.
@@ -68,11 +82,13 @@ type GraphPath struct {
 	Limitations []GraphLimitation `json:"limitations"`
 }
 
-// GraphPathData is /graph/path's data (D-35).
+// GraphPathData is /graph/path's data (D-35), plus direction: the orientation
+// the paths run in (forward | reverse), null when none was found.
 type GraphPathData struct {
 	From      string      `json:"from"`
 	To        string      `json:"to"`
 	Outcome   string      `json:"outcome"`
+	Direction *string     `json:"direction"`
 	Paths     []GraphPath `json:"paths"`
 	MorePaths bool        `json:"more_paths"`
 	BoundBy   *string     `json:"bound_by"`
@@ -129,7 +145,7 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 		if src == nil || dst == nil {
 			return NotFound()
 		}
-		data, err := t.bidirectional(src, dst, g.b)
+		data, err := t.pathVerdict(src, dst, g.b)
 		if err != nil {
 			return err
 		}
@@ -142,12 +158,134 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 	return out, nil
 }
 
-// bidirectional is /graph/path's search and verdict.
-func (t *graphTraversal) bidirectional(src, dst *GraphNode, b GraphBudgets) (*GraphPathData, error) {
+// graphSearch is one orientation's bounded bidirectional search: a forward
+// side out of `src`, a reverse side into `dst`, and the paths enumerated from
+// the edges it read.
+type graphSearch struct {
+	fwd, rev  *graphSide
+	bound     string // the budget that stopped the search, "" when none did
+	paths     [][]*GraphEdge
+	overflow  bool // more paths than the path budget
+	hopBound  bool // a path was cut by the hop limit
+	workBound bool // the enumeration's work bound stopped it
+	// unfollowed: a resolution in force links the two sides (§2.12) and was
+	// not walked.
+	unfollowed bool
+}
+
+// boundBy is the first reason the search's answer is not known complete, ""
+// when it is: a budget, the hop limit, the path budget, an unfollowed
+// resolution -- in that order.
+func (s *graphSearch) boundBy() string {
+	switch {
+	case s.bound != "":
+		return s.bound
+	case s.hopBound:
+		return GraphBoundAssumeHops
+	case s.overflow || s.workBound:
+		return GraphBoundPaths
+	case s.unfollowed:
+		return GraphBoundResolution
+	}
+	return ""
+}
+
+// noneExists is D-38 for one orientation: no path, both frontiers exhausted,
+// and nothing bound first.
+func (s *graphSearch) noneExists() bool {
+	return len(s.paths) == 0 && s.boundBy() == "" && s.fwd.exhausted() && s.rev.exhausted()
+}
+
+// pathVerdict is /graph/path's answer: the paths from `from` to `to` along
+// the edges (forward) when there are any, else the paths from `to` to `from`
+// (reverse) -- and none_exists only when both orientations say none (see the
+// file comment). The second search runs only when the first found nothing.
+func (t *graphTraversal) pathVerdict(src, dst *GraphNode, b GraphBudgets) (*GraphPathData, error) {
+	there, err := t.pathSearch(src, dst, b)
+	if err != nil {
+		return nil, err
+	}
+	var back *graphSearch
+	if len(there.paths) == 0 {
+		if back, err = t.pathSearch(dst, src, b); err != nil {
+			return nil, err
+		}
+	}
+	d := graphPathDecide(there, back)
+	data := &GraphPathData{From: src.Ref, To: dst.Ref, Outcome: d.outcome, Paths: []GraphPath{}, MorePaths: d.morePaths}
+	if d.boundBy != "" {
+		data.BoundBy = &d.boundBy
+	}
+	if d.outcome == GraphPathFound {
+		dir, paths := GraphForward, there.paths
+		if d.reverse {
+			dir, paths = GraphReverse, back.paths
+		}
+		data.Direction = &dir
+		for _, ep := range paths {
+			data.Paths = append(data.Paths, t.renderPath(src, ep, d.reverse))
+		}
+	}
+	return data, nil
+}
+
+// graphPathDecision is the verdict over one or two orientations' searches.
+type graphPathDecision struct {
+	outcome   string
+	reverse   bool // the paths are the reverse orientation's
+	morePaths bool
+	boundBy   string
+}
+
+// graphPathDecide combines the two orientations (back is nil when the
+// forward one found paths, and was then not run):
+//
+//   - forward paths: found, complete unless its own search says otherwise --
+//     the search finished (no budget bound), no path was cut by the hop
+//     limit, every path fit, and no resolution was left unfollowed;
+//   - else reverse paths: found, complete only when the reverse list is
+//     complete AND the forward orientation was searched to the end -- an
+//     unfinished forward search may hold paths the list lacks;
+//   - else D-38 in both orientations: none_exists ONLY when each was searched
+//     to exhaustion before any budget bound. Anything else is "not found
+//     within the limits", bound_by naming the first reason: the answer is
+//     unknown, and must not look like "there is none".
+func graphPathDecide(there, back *graphSearch) graphPathDecision {
+	first := func(reasons ...string) string {
+		for _, r := range reasons {
+			if r != "" {
+				return r
+			}
+		}
+		return ""
+	}
+	switch {
+	case len(there.paths) > 0:
+		bb := there.boundBy()
+		return graphPathDecision{outcome: GraphPathFound, morePaths: bb != "", boundBy: bb}
+	case back == nil:
+		// Never: the reverse orientation runs whenever the forward one found
+		// nothing. Were it skipped, nothing could be claimed of it.
+		return graphPathDecision{outcome: GraphPathNotFoundWithinBudget, boundBy: first(there.boundBy(), GraphBoundTime)}
+	case len(back.paths) > 0:
+		bb := first(back.boundBy(), there.boundBy())
+		return graphPathDecision{outcome: GraphPathFound, reverse: true, morePaths: bb != "", boundBy: bb}
+	case there.noneExists() && back.noneExists():
+		return graphPathDecision{outcome: GraphPathNoneExists}
+	}
+	return graphPathDecision{outcome: GraphPathNotFoundWithinBudget, boundBy: first(there.boundBy(), back.boundBy())}
+}
+
+// pathSearch is one orientation's search: from src along the edges, to dst.
+//
+// It runs until BOTH frontiers are exhausted, a budget binds, or a path is
+// known and ONE frontier is exhausted (every edge of every path is then in
+// hand); then it enumerates the paths.
+func (t *graphTraversal) pathSearch(src, dst *GraphNode, b GraphBudgets) (*graphSearch, error) {
 	fwd := &graphSide{dir: GraphForward, visited: map[string]bool{src.Ref: true}, frontier: []*GraphNode{src}}
 	rev := &graphSide{dir: GraphReverse, visited: map[string]bool{dst.Ref: true}, frontier: []*GraphNode{dst}}
+	out := &graphSearch{fwd: fwd, rev: rev}
 
-	var bound string
 	found := false
 	for {
 		if fwd.exhausted() && rev.exhausted() {
@@ -166,7 +304,7 @@ func (t *graphTraversal) bidirectional(src, dst *GraphNode, b GraphBudgets) (*Gr
 			side = rev
 		}
 		if !t.timeLeft() {
-			bound = GraphBoundTime
+			out.bound = GraphBoundTime
 			break
 		}
 		// No hop limit while searching: the limit is applied to the paths,
@@ -177,7 +315,7 @@ func (t *graphTraversal) bidirectional(src, dst *GraphNode, b GraphBudgets) (*Gr
 			return nil, err
 		}
 		if !ok {
-			bound = GraphBoundTime
+			out.bound = GraphBoundTime
 			break
 		}
 		t.commit(s)
@@ -190,85 +328,66 @@ func (t *graphTraversal) bidirectional(src, dst *GraphNode, b GraphBudgets) (*Gr
 		}
 		side.frontier = next
 		if s.bound != "" {
-			bound = s.bound
+			out.bound = s.bound
 			break
 		}
 		found = graphReachable(t.edges, src.Ref, dst.Ref)
 	}
-
-	edgePaths, overflow, hopBound, workBound := graphEnumeratePaths(t.edges, src.Ref, dst.Ref, b.Paths, b.AssumeHops)
-	data := &GraphPathData{From: src.Ref, To: dst.Ref, Paths: []GraphPath{}}
-	boundBy := func(s string) {
-		if s != "" && data.BoundBy == nil {
-			data.BoundBy = &s
-		}
-	}
-	if len(edgePaths) > 0 {
-		data.Outcome = GraphPathFound
-		for _, ep := range edgePaths {
-			data.Paths = append(data.Paths, t.renderPath(src, ep))
-		}
-		// The list is complete only when the search finished (no budget
-		// bound), no path was cut by the hop limit, and every path fit.
-		unfollowed := t.unfollowedResolution(fwd, rev)
-		data.MorePaths = bound != "" || hopBound || overflow || workBound || unfollowed
-		boundBy(bound)
-		if hopBound {
-			boundBy(GraphBoundAssumeHops)
-		}
-		if overflow || workBound {
-			boundBy(GraphBoundPaths)
-		}
-		if unfollowed {
-			boundBy(GraphBoundResolution)
-		}
-		return data, nil
-	}
-	// D-38: none_exists ONLY when both frontiers were exhausted before any
-	// budget bound. Anything else is "not found within the limits": the
-	// answer is unknown, and must not look like "there is none".
-	unfollowed := t.unfollowedResolution(fwd, rev)
-	if bound == "" && !hopBound && !workBound && !unfollowed && fwd.exhausted() && rev.exhausted() {
-		data.Outcome = GraphPathNoneExists
-		return data, nil
-	}
-	data.Outcome = GraphPathNotFoundWithinBudget
-	boundBy(bound)
-	if hopBound {
-		boundBy(GraphBoundAssumeHops)
-	}
-	if workBound {
-		boundBy(GraphBoundPaths)
-	}
-	if unfollowed {
-		boundBy(GraphBoundResolution)
-	}
-	return data, nil
+	out.paths, out.overflow, out.hopBound, out.workBound = graphEnumeratePaths(t.edges, src.Ref, dst.Ref, b.Paths, b.AssumeHops)
+	out.unfollowed = t.unfollowedResolution(fwd, rev)
+	return out, nil
 }
 
 // unfollowedResolution reports whether the search passed an external
-// principal that reaches `to` and whose resolution IN FORCE names a node
-// `from` reaches. The principal is terminal (§5.4): its resolution is shown,
-// never walked -- so a path through it is neither drawn nor ruled out. D-41
-// makes this ordinary: a trust naming an account's role before that account
-// connected keeps its external-principal source, with a derived resolution,
-// while the same trust projected after the account connected is sourced from
-// the role itself.
+// principal whose resolution IN FORCE links its two sides: the principal is
+// terminal (§5.4) -- its resolution is shown, never walked -- so a path
+// through it is neither drawn nor ruled out. The principal and its resolved
+// node are one principal (§2.12), so either end of the link may be on either
+// side:
+//
+//   - the reverse side reached the principal (it may assume something that
+//     leads to dst) and the forward side reached its resolved node;
+//   - the forward side holds the principal (src itself: nothing leads to a
+//     principal) and the reverse side reached its resolved node, whose own
+//     edges lead to dst.
+//
+// D-41 makes this ordinary: a trust naming an account's role before that
+// account connected keeps its external-principal source, with a derived
+// resolution, while the same trust projected after the account connected is
+// sourced from the role itself.
 func (t *graphTraversal) unfollowedResolution(fwd, rev *graphSide) bool {
-	for ref := range rev.visited {
-		if n := t.nodes[ref]; n != nil && n.typ == RefExternalPrincipal && n.resolvedTo != "" && fwd.visited[n.resolvedTo] {
-			return true
+	links := func(principals, other *graphSide) bool {
+		for ref := range principals.visited {
+			if n := t.nodes[ref]; n != nil && n.typ == RefExternalPrincipal && n.resolvedTo != "" && other.visited[n.resolvedTo] {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	return links(rev, fwd) || links(fwd, rev)
 }
 
-// renderPath is one path's nodes, edges and the union of their limitations.
-func (t *graphTraversal) renderPath(src *GraphNode, edges []*GraphEdge) GraphPath {
+// renderPath is one path's nodes, from `from` (src) to `to`, its edges in
+// that order, and the union of their limitations. A forward path's edges
+// each run toward `to`; a reverse one (edges enumerated from `to` to `from`)
+// is walked backwards, so its edges each run toward `from`. Every edge keeps
+// its own from and to.
+func (t *graphTraversal) renderPath(src *GraphNode, edges []*GraphEdge, reverse bool) GraphPath {
+	if reverse {
+		rs := make([]*GraphEdge, len(edges))
+		for i, e := range edges {
+			rs[len(edges)-1-i] = e
+		}
+		edges = rs
+	}
 	p := GraphPath{Nodes: []*GraphNode{src}, Edges: edges}
 	lims := append([]GraphLimitation{}, src.Limitations...)
 	for _, e := range edges {
-		n := t.nodes[e.To]
+		next := e.To
+		if reverse {
+			next = e.From
+		}
+		n := t.nodes[next]
 		p.Nodes = append(p.Nodes, n)
 		lims = append(lims, e.Limitations...)
 		lims = append(lims, n.Limitations...)

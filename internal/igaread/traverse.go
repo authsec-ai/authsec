@@ -96,7 +96,9 @@ const (
 	// look through an external principal's resolution IN FORCE that could
 	// connect the two ends (§2.12): the principal is terminal (§5.4), so the
 	// path is not drawn -- and "none exists" would claim more than was
-	// searched. Additive to §5.4's vocabulary; see the path file.
+	// searched. /graph says the same in truncated when its walk passed one
+	// (graphResolutionUnfollowed). Additive to §5.4's vocabulary; see the
+	// path file.
 	GraphBoundResolution = "resolution_not_followed"
 )
 
@@ -236,7 +238,11 @@ type GraphNode struct {
 	denyRefs       []string
 	denyCount      int64
 	boundary       bool
-	fetched        bool
+	// Groups: member users with a boundary assignment (D-22), for the
+	// group's grant edges.
+	memberBoundaryCount int64
+	memberBoundaryRefs  []string
+	fetched             bool
 }
 
 // GraphRestrictions is an identity's restrictions (§5.4, D-78): how many Deny
@@ -298,7 +304,9 @@ type GraphFrontier struct {
 }
 
 // GraphTruncated names the budget that bound (§5.4): nodes | edges |
-// assume_hops | time. null when none did.
+// assume_hops | time -- or, additive to §5.4's vocabulary and exactly as
+// /graph/path says it, resolution_not_followed: nothing bound, but the walk
+// passed a resolution in force it does not follow. null when none did.
 type GraphTruncated struct {
 	BoundBy string `json:"bound_by"`
 }
@@ -460,44 +468,8 @@ func newGraphTraversal(q *Query, b GraphBudgets, budget time.Duration, ended boo
 	}, nil
 }
 
-// graphLevel bounds one level's statements. A level runs inside
-// Query.Optional, whose savepoint sets ONE statement_timeout -- but a level is
-// a dozen statements, and a dozen statements each allowed the whole allowance
-// could outrun the request deadline, which would fail the request instead of
-// truncating it. So every statement of a level is re-armed with what is LEFT
-// of the level's allowance. The zero deadline is the mandatory root read: the
-// request's own backstop applies.
-type graphLevel struct {
-	q        *Query
-	deadline time.Time
-}
-
-// graphErrLevelTime is a level that used its whole allowance. It is a timeout
-// (IsTimeout), so Optional rolls the level back and reports it not done.
-var graphErrLevelTime = fmt.Errorf("igaread: traversal level out of time: %w", context.DeadlineExceeded)
-
-func (t *graphTraversal) mandatory() *graphLevel { return &graphLevel{q: t.q} }
-
-// optionalLevel starts a level inside Optional's savepoint: its allowance is
-// the half of the remaining budget Optional gave it.
-func (t *graphTraversal) optionalLevel() *graphLevel {
-	return &graphLevel{q: t.q, deadline: time.Now().Add(t.q.Remaining() / 2)}
-}
-
-// db arms the next statement of the level and returns the snapshot.
-func (lv *graphLevel) db() (*gorm.DB, error) {
-	if lv.deadline.IsZero() {
-		return lv.q.DB(), nil
-	}
-	left := time.Until(lv.deadline)
-	if left < time.Millisecond {
-		return nil, graphErrLevelTime
-	}
-	if err := lv.q.DB().Exec(fmt.Sprintf("SET LOCAL statement_timeout = %d", left.Milliseconds())).Error; err != nil {
-		return nil, err
-	}
-	return lv.q.DB(), nil
-}
+// The level mechanism -- graphLevel, its allowance and the re-arming of every
+// statement -- is in traverse_level.go.
 
 // node returns a node the traversal holds, or nil.
 func (t *graphTraversal) node(ref string) *GraphNode { return t.nodes[ref] }
@@ -733,11 +705,16 @@ func (t *graphTraversal) commit(s *graphStep) {
 // time, in which case its savepoint was rolled back and nothing of it is kept.
 func (t *graphTraversal) runLevel(frontier []*GraphNode, dir string, opts graphStepOpts) (*graphStep, bool, error) {
 	var s *graphStep
+	var lv *graphLevel
 	ok, err := t.q.Optional(func(*gorm.DB) error {
 		var err error
-		s, err = t.step(t.optionalLevel(), frontier, dir, opts)
+		lv = t.optionalLevel()
+		s, err = t.step(lv, frontier, dir, opts)
 		return err
 	})
+	if lv != nil {
+		lv.done()
+	}
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -807,8 +784,9 @@ func (t *graphTraversal) frontier(pairs []graphPair, dir string, known bool) ([]
 			byKind[p.kind] = append(byKind[p.kind], t.nodes[p.ref])
 		}
 		var counted map[graphPair]*int64
+		var lv *graphLevel
 		ok, err := t.q.Optional(func(*gorm.DB) error {
-			lv := t.optionalLevel()
+			lv = t.optionalLevel()
 			counted = map[graphPair]*int64{}
 			for _, k := range graphEdgeKinds {
 				if len(byKind[k]) == 0 {
@@ -824,6 +802,9 @@ func (t *graphTraversal) frontier(pairs []graphPair, dir string, known bool) ([]
 			}
 			return nil
 		})
+		if lv != nil {
+			lv.done()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1030,10 +1011,100 @@ func (t *graphTraversal) breadthFirst(start *GraphNode, dir string, maxHops int)
 			}
 		}
 	}
+	if truncated == nil {
+		// Nothing bound -- but an external principal's resolution IN FORCE
+		// is shown, never walked (§5.4, D-87), so a walk that passed one did
+		// not look past it and must not read as complete: /graph/path calls
+		// the same thing resolution_not_followed, and the two routes agree.
+		unfollowed, known, err := t.graphResolutionUnfollowed(dir)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !known:
+			truncated = &GraphTruncated{BoundBy: GraphBoundTime} // not established in time
+		case unfollowed:
+			truncated = &GraphTruncated{BoundBy: GraphBoundResolution}
+		}
+	}
 	return &GraphData{
 		Root: start.Ref, Nodes: t.order, Edges: graphEdgesOrEmpty(t.edges),
 		Frontier: front, Truncated: truncated,
 	}, nil
+}
+
+// graphResolutionUnfollowed reports whether the traversal passed a resolution
+// IN FORCE (resolution_state active, §2.12, D-41) that it did not follow --
+// the two ends of it are one principal, and the walk saw only one of them:
+//
+//   - a principal it holds whose resolved node it does not hold (reverse:
+//     what reaches that node was not walked; forward from a principal root:
+//     what that node reaches was not walked);
+//   - forward only: a node it holds that a principal it does NOT hold
+//     resolves to, when that principal has can_assume edges under the
+//     request's lifecycle filter -- nothing leads to a principal, so the walk
+//     can never reach it, and what it may assume was not walked.
+//
+// The second is one OPTIONAL statement for the whole response: known=false
+// when it did not finish, and the caller then claims nothing.
+func (t *graphTraversal) graphResolutionUnfollowed(dir string) (unfollowed, known bool, err error) {
+	var identities, workloads, principals []uuid.UUID
+	for _, n := range t.order {
+		switch n.typ {
+		case RefExternalPrincipal:
+			if n.resolvedTo != "" && t.nodes[n.resolvedTo] == nil {
+				return true, true, nil
+			}
+			principals = append(principals, n.id) // walked: its edges are in hand
+		case RefIdentity:
+			identities = append(identities, n.id)
+		case RefWorkload:
+			workloads = append(workloads, n.id)
+		}
+	}
+	if dir != GraphForward || len(identities)+len(workloads) == 0 {
+		return false, true, nil
+	}
+	spec := graphSpecFor(GraphForward, GraphEdgeCanAssume)
+	var ors []string
+	args := []any{t.q.WS, graphResolutionActive}
+	if len(identities) > 0 {
+		ors = append(ors, "ep.resolved_identity_account_id IN ?")
+		args = append(args, identities)
+	}
+	if len(workloads) > 0 {
+		ors = append(ors, "ep.resolved_workload_id IN ?")
+		args = append(args, workloads)
+	}
+	held := ""
+	if len(principals) > 0 {
+		held = "AND ep.id NOT IN ?"
+		args = append(args, principals)
+	}
+	var found []uuid.UUID
+	var lv *graphLevel
+	ok, err := t.q.Optional(func(*gorm.DB) error {
+		lv = t.optionalLevel()
+		tx, err := lv.db()
+		if err != nil {
+			return err
+		}
+		return tx.Raw(`SELECT ep.id FROM iga_external_principal ep
+		                WHERE ep.workspace_id = ? AND ep.resolution_state = ?
+		                  AND (`+strings.Join(ors, " OR ")+`) `+held+`
+		                  AND EXISTS (SELECT 1 FROM `+spec.from+`
+		                               WHERE e0.workspace_id = ep.workspace_id
+		                                 AND e0.source_external_principal_id = ep.id
+		                                 AND `+t.predicates(spec)+`)
+		                LIMIT 1`, args...).Scan(&found).Error
+	})
+	if lv != nil {
+		lv.done()
+	}
+	if err != nil || !ok {
+		return false, false, err
+	}
+	return len(found) > 0, true, nil
 }
 
 func graphEdgesOrEmpty(es []*GraphEdge) []*GraphEdge {
@@ -1133,15 +1204,21 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 			return NotFound()
 		}
 		data := &GraphExpandData{Nodes: []*GraphNode{}, Edges: []*GraphEdge{}, Frontier: []GraphFrontier{}}
-		s, ok, err := t.runLevel([]*GraphNode{start}, dir, graphStepOpts{
-			kinds: []string{kind}, pageSize: g.b.Neighbours, after: after,
-		})
-		if err != nil {
-			return err
+		// D-40, as /graph and /graph/path apply it: the page is a level, and
+		// it is not STARTED with less than the reserve left -- a slow root
+		// read must not leave a page begun that cannot finish.
+		var s *graphStep
+		ok := t.timeLeft()
+		if ok {
+			if s, ok, err = t.runLevel([]*GraphNode{start}, dir, graphStepOpts{
+				kinds: []string{kind}, pageSize: g.b.Neighbours, after: after,
+			}); err != nil {
+				return err
+			}
 		}
 		if !ok {
-			// The page itself ran out of time: nothing partial, and the same
-			// call (same cursor) is the continuation.
+			// The page was not started, or ran out of time: nothing partial,
+			// and the same call (same cursor) is the continuation.
 			expand := t.expandURL(start.Ref, kind, dir)
 			if tok := vals.Get("cursor"); tok != "" {
 				expand += "&cursor=" + url.QueryEscape(tok)

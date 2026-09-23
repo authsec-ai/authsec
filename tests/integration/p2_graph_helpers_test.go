@@ -59,6 +59,19 @@ func graphResource(t *testing.T, l *p2Lab, text string) string {
 	return refOf("resource", graphID(t, l, "iga_resources", text))
 }
 
+// graphStatementOf is the ref of a policy's active statement (the fixtures'
+// policies have one statement each).
+func graphStatementOf(t *testing.T, l *p2Lab, policy string) string {
+	t.Helper()
+	var id uuid.UUID
+	if err := l.db.Raw(`SELECT e.id FROM iga_entitlements e JOIN iga_policy p ON p.id = e.policy_id
+	                     WHERE e.workspace_id = ? AND e.provider = 'aws' AND p.display_name = ? AND e.lifecycle = 'active'
+	                     ORDER BY e.created_at DESC LIMIT 1`, l.ws, policy).Row().Scan(&id); err != nil {
+		t.Fatalf("no active statement of %q: %v", policy, err)
+	}
+	return refOf("statement", id)
+}
+
 // graphGet calls a traversal route through the real route table and requires
 // 200.
 func graphGet(t *testing.T, api *readAPI, path string) map[string]any {

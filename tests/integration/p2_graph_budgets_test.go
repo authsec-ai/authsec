@@ -249,6 +249,42 @@ func TestP2GraphTimeReserve(t *testing.T) {
 	}
 }
 
+// D-40 on /graph/expand: its page is a level, and it is not STARTED under the
+// reserve either. The page is not begun: nothing partial, truncated time, and
+// the same call is the continuation. As above, a machine too loaded to read
+// the root in 240 ms answers 504, which is retried.
+func TestP2GraphExpandTimeReserve(t *testing.T) {
+	l := newP2Lab(t, "p2-graph-expand-reserve", true)
+	l.scanAndProject(graphTeaching(t, l))
+	role := graphIdentity(t, l, "SharedToolRole")
+	r := igaread.NewReader(l.db, readTestCursorKey).WithBudget(240 * time.Millisecond)
+	var code int
+	var body map[string]any
+	for attempt := 0; attempt < 20; attempt++ {
+		code, body = graphDirect(t, r, igaread.DefaultGraphBudgets, l.ws, "/graph/expand", "node", role, "edge", "grant", "direction", "forward")
+		if code != 504 {
+			break
+		}
+	}
+	mustStatus(t, "expand under the reserve", code, body, 200)
+	if digs(body, "data", "truncated", "bound_by") != "time" || len(digl(body, "data", "edges")) != 0 ||
+		len(digl(body, "data", "nodes")) != 0 || dig(body, "data", "next_cursor") != nil {
+		t.Errorf("expand under the reserve = %v, want no page begun: truncated time, nothing partial", body["data"])
+	}
+	f := graphFrontier(body, role, "grant")
+	if f == nil || dig(f, "more", "exact") != false ||
+		digs(f, "expand") != "/api/iga/v1/graph/expand?node="+role+"&edge=grant&direction=forward" {
+		t.Errorf("frontier = %v, want the same call as the continuation", dig(body, "data", "frontier"))
+	}
+	// Control: the full budget pages normally.
+	code, body = graphDirect(t, igaread.NewReader(l.db, readTestCursorKey), igaread.DefaultGraphBudgets, l.ws,
+		"/graph/expand", "node", role, "edge", "grant", "direction", "forward")
+	mustStatus(t, "control", code, body, 200)
+	if dig(body, "data", "truncated") != nil || len(digl(body, "data", "edges")) != 2 {
+		t.Errorf("control expand = %v, want both grants, not truncated", body["data"])
+	}
+}
+
 // §5.1: 504 query_timeout ONLY when even the root cannot be read.
 func TestP2GraphRootTimeoutIs504(t *testing.T) {
 	l := newP2Lab(t, "p2-graph-root504", true)

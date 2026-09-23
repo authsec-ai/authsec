@@ -231,6 +231,11 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 			t.Errorf("an external principal is terminal; frontier = %v", dig(body, "data", "frontier"))
 		}
 	}
+	// Unresolved principals are the end of what can be read: nothing was
+	// left unfollowed, so the walk is complete.
+	if dig(body, "data", "truncated") != nil {
+		t.Errorf("reverse from partner-access: truncated = %v, want null (no resolution in force)", dig(body, "data", "truncated"))
+	}
 	labels := []string{digs(nodes[edges[0].From], "label"), digs(nodes[edges[1].From], "label")}
 	if !(labels[0] == trustAccountC || labels[1] == trustAccountC) {
 		t.Errorf("principal labels = %v, want the account id for the :root principal (D-87)", labels)
@@ -253,6 +258,7 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	// resolution (D-41). It is displayed on the node and never walked.
 	b := l.account(accountB)
 	b.role("data-reader", "AROADATAREADERDATARE")
+	b.attach("data-reader", b.managed("ReaderTickets", docTicketRead))
 	trustCycle(l, b, nil)
 	reader, access := graphIdentity(t, l, "data-reader"), graphIdentity(t, l, "reader-access")
 	rev := graphGet(t, api, "/graph"+qs("root", access, "direction", "reverse"))
@@ -269,14 +275,43 @@ func TestP2GraphExternalPrincipalIsTerminal(t *testing.T) {
 	if rn[reader] != nil {
 		t.Errorf("the resolution was walked: data-reader %s is a node of reader-access's reverse graph", reader)
 	}
+	// ...so what reaches data-reader was not walked, and the answer to "what
+	// reaches reader-access" is not complete: it must not read as complete.
+	if digs(rev, "data", "truncated", "bound_by") != "resolution_not_followed" {
+		t.Errorf("reverse from reader-access: truncated = %v, want bound_by resolution_not_followed", dig(rev, "data", "truncated"))
+	}
 	fwd := graphGet(t, api, "/graph"+qs("root", reader, "direction", "forward"))
 	if graphNodes(t, digl(fwd, "data", "nodes"))[access] != nil {
 		t.Errorf("forward from data-reader reaches reader-access through the principal's resolution: %v", fwd["data"])
+	}
+	// Forward from data-reader nothing bound -- but the principal that IS
+	// data-reader may assume reader-access, and the walk (which can never
+	// reach a principal) did not look: not complete, as /graph/path says.
+	if digs(fwd, "data", "truncated", "bound_by") != "resolution_not_followed" {
+		t.Errorf("forward from data-reader: truncated = %v, want bound_by resolution_not_followed", dig(fwd, "data", "truncated"))
 	}
 	// The path search did not look through the resolution, so it must not
 	// say none_exists: the trust names data-reader's exact ARN.
 	p := graphGet(t, api, "/graph/path"+qs("from", reader, "to", access))
 	if digs(p, "data", "outcome") != "not_found_within_budget" || digs(p, "data", "bound_by") != "resolution_not_followed" {
 		t.Errorf("path data-reader -> reader-access = %v, want not_found_within_budget, bound_by resolution_not_followed", p["data"])
+	}
+
+	// From the principal itself: its own edges are walked, data-reader's
+	// (its resolved self) are not -- on /graph and on /graph/path alike.
+	extRef := digs(ext, "ref")
+	fromExt := graphGet(t, api, "/graph"+qs("root", extRef, "direction", "forward"))
+	if graphNodes(t, digl(fromExt, "data", "nodes"))[access] == nil ||
+		digs(fromExt, "data", "truncated", "bound_by") != "resolution_not_followed" {
+		t.Errorf("forward from the principal = %v, want reader-access, truncated resolution_not_followed", fromExt["data"])
+	}
+	tickets := graphResource(t, l, "arn:aws:s3:::support-tickets/*")
+	p = graphGet(t, api, "/graph/path"+qs("from", extRef, "to", tickets))
+	if digs(p, "data", "outcome") != "not_found_within_budget" || digs(p, "data", "bound_by") != "resolution_not_followed" {
+		t.Errorf("path principal -> data-reader's resource = %v, want not_found_within_budget, bound_by resolution_not_followed", p["data"])
+	}
+	// Control: data-reader's own path to it is declared and found.
+	if p = graphGet(t, api, "/graph/path"+qs("from", reader, "to", tickets)); digs(p, "data", "outcome") != "found" {
+		t.Errorf("path data-reader -> its resource = %v, want found", p["data"])
 	}
 }
