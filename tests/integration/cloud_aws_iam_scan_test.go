@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,14 +24,21 @@ import (
 
 // IAM identity discovery, against a real database.
 //
-// The AWS boundary is a fake IAMAPI: it paginates like IAM does, URL-encodes
+// The AWS boundary is a fake IAMAPI: it serves GetAccountAuthorizationDetails
+// from its state one filter at a time and paginates like IAM does, URL-encodes
 // policy documents like IAM does, and can be told to deny or throttle a
-// specific operation. Everything else — the reader, the scanner, the upserts,
-// the reconciliation gate and the coverage report — is the real thing.
+// specific operation or one filter's listing. Everything else — the reader, the
+// scanner, the upserts, the reconciliation gate and the coverage report — is
+// the real thing.
 
 /* ------------------------------- the fake IAM ------------------------------ */
 
 type fakeIAM struct {
+	// roles and users are the account's principals. Each one's attachments,
+	// inline documents and group list below are served in its authorization-
+	// details entry; Tags, PermissionsBoundary, RoleLastUsed and the trust
+	// document come from the struct itself. (Description and
+	// MaxSessionDuration are NOT served: RoleDetail does not carry them.)
 	roles      []iamtypes.Role
 	users      []iamtypes.User
 	keys       map[string][]iamtypes.AccessKeyMetadata // by user name
@@ -38,10 +46,16 @@ type fakeIAM struct {
 
 	attachedRolePolicies map[string][]iamtypes.AttachedPolicy
 	inlineRolePolicies   map[string]map[string]string // role -> policy -> document
+	// instanceProfiles is each role's InstanceProfileList, by role name.
+	instanceProfiles     map[string][]iamtypes.InstanceProfile
 	attachedUserPolicies map[string][]iamtypes.AttachedPolicy
 	inlineUserPolicies   map[string]map[string]string
 
-	managedPolicies map[string]string // policy arn -> document
+	// managedPolicies is every managed policy document by ARN. A
+	// customer-managed one (any account but "aws") is in the LocalManagedPolicy
+	// listing, attached or not; an AWS-managed one is served by GetPolicy /
+	// GetPolicyVersion only.
+	managedPolicies map[string]string
 
 	// policyIDs is each managed policy's PolicyId. Unset derives a stable one
 	// from the ARN; a test RECREATES a policy under the same ARN by changing it.
@@ -49,15 +63,18 @@ type fakeIAM struct {
 	// policyVersions is each managed policy's default version id ("v3" unset).
 	policyVersions map[string]string
 	// failPolicyVersion makes GetPolicyVersion fail for ONE policy ARN -- the
-	// per-document isolation scenario ("deny iam:GetPolicyVersion on TicketRead
-	// only").
+	// per-document isolation scenario, on an attached AWS-managed policy (D-51).
 	failPolicyVersion map[string]error
 
-	// groups and userGroups back GetAccountAuthorizationDetails.
+	// groups and userGroups back the Group listing and each user's GroupList.
+	// A group's GroupPolicyList documents are served as set (fixtures encode).
 	groups     []iamtypes.GroupDetail
 	userGroups map[string][]string // user name -> group names
 
-	// fail maps an operation name to the error it should return.
+	// fail maps an operation name to the error it should return. For
+	// authorization details, "GetAccountAuthorizationDetails" fails every
+	// listing and "GetAccountAuthorizationDetails:<Filter>" (Role, User, Group,
+	// LocalManagedPolicy) fails that one.
 	fail map[string]error
 	// calls counts every operation, so a test can assert on call volume.
 	calls map[string]int
@@ -71,6 +88,7 @@ func newFakeIAM() *fakeIAM {
 		keyLastUse:           map[string]*time.Time{},
 		attachedRolePolicies: map[string][]iamtypes.AttachedPolicy{},
 		inlineRolePolicies:   map[string]map[string]string{},
+		instanceProfiles:     map[string][]iamtypes.InstanceProfile{},
 		attachedUserPolicies: map[string][]iamtypes.AttachedPolicy{},
 		inlineUserPolicies:   map[string]map[string]string{},
 		managedPolicies:      map[string]string{},
@@ -116,38 +134,6 @@ func (f *fakeIAM) page(total int, marker *string) (from, to int, next *string) {
 	return from, to, &m
 }
 
-func (f *fakeIAM) ListRoles(_ context.Context, in *iam.ListRolesInput, _ ...func(*iam.Options)) (*iam.ListRolesOutput, error) {
-	if err := f.track("ListRoles"); err != nil {
-		return nil, err
-	}
-	from, to, next := f.page(len(f.roles), in.Marker)
-	return &iam.ListRolesOutput{
-		Roles: f.roles[from:to], IsTruncated: next != nil, Marker: next,
-	}, nil
-}
-
-func (f *fakeIAM) GetRole(_ context.Context, in *iam.GetRoleInput, _ ...func(*iam.Options)) (*iam.GetRoleOutput, error) {
-	if err := f.track("GetRole"); err != nil {
-		return nil, err
-	}
-	for i := range f.roles {
-		if aws.ToString(f.roles[i].RoleName) == aws.ToString(in.RoleName) {
-			return &iam.GetRoleOutput{Role: &f.roles[i]}, nil
-		}
-	}
-	return nil, &smithy.GenericAPIError{Code: "NoSuchEntity", Message: "no such role"}
-}
-
-func (f *fakeIAM) ListUsers(_ context.Context, in *iam.ListUsersInput, _ ...func(*iam.Options)) (*iam.ListUsersOutput, error) {
-	if err := f.track("ListUsers"); err != nil {
-		return nil, err
-	}
-	from, to, next := f.page(len(f.users), in.Marker)
-	return &iam.ListUsersOutput{
-		Users: f.users[from:to], IsTruncated: next != nil, Marker: next,
-	}, nil
-}
-
 func (f *fakeIAM) ListAccessKeys(_ context.Context, in *iam.ListAccessKeysInput, _ ...func(*iam.Options)) (*iam.ListAccessKeysOutput, error) {
 	if err := f.track("ListAccessKeys"); err != nil {
 		return nil, err
@@ -166,78 +152,32 @@ func (f *fakeIAM) GetAccessKeyLastUsed(_ context.Context, in *iam.GetAccessKeyLa
 	}, nil
 }
 
-func (f *fakeIAM) ListAttachedRolePolicies(_ context.Context, in *iam.ListAttachedRolePoliciesInput, _ ...func(*iam.Options)) (*iam.ListAttachedRolePoliciesOutput, error) {
-	if err := f.track("ListAttachedRolePolicies"); err != nil {
-		return nil, err
-	}
-	return &iam.ListAttachedRolePoliciesOutput{
-		AttachedPolicies: f.attachedRolePolicies[aws.ToString(in.RoleName)],
-	}, nil
-}
-
-func (f *fakeIAM) ListRolePolicies(_ context.Context, in *iam.ListRolePoliciesInput, _ ...func(*iam.Options)) (*iam.ListRolePoliciesOutput, error) {
-	if err := f.track("ListRolePolicies"); err != nil {
-		return nil, err
-	}
-	var names []string
-	for name := range f.inlineRolePolicies[aws.ToString(in.RoleName)] {
-		names = append(names, name)
-	}
-	return &iam.ListRolePoliciesOutput{PolicyNames: names}, nil
-}
-
-func (f *fakeIAM) GetRolePolicy(_ context.Context, in *iam.GetRolePolicyInput, _ ...func(*iam.Options)) (*iam.GetRolePolicyOutput, error) {
-	if err := f.track("GetRolePolicy"); err != nil {
-		return nil, err
-	}
-	doc := f.inlineRolePolicies[aws.ToString(in.RoleName)][aws.ToString(in.PolicyName)]
-	return &iam.GetRolePolicyOutput{PolicyDocument: aws.String(url.QueryEscape(doc))}, nil
-}
-
-func (f *fakeIAM) ListAttachedUserPolicies(_ context.Context, in *iam.ListAttachedUserPoliciesInput, _ ...func(*iam.Options)) (*iam.ListAttachedUserPoliciesOutput, error) {
-	if err := f.track("ListAttachedUserPolicies"); err != nil {
-		return nil, err
-	}
-	return &iam.ListAttachedUserPoliciesOutput{
-		AttachedPolicies: f.attachedUserPolicies[aws.ToString(in.UserName)],
-	}, nil
-}
-
-func (f *fakeIAM) ListUserPolicies(_ context.Context, in *iam.ListUserPoliciesInput, _ ...func(*iam.Options)) (*iam.ListUserPoliciesOutput, error) {
-	if err := f.track("ListUserPolicies"); err != nil {
-		return nil, err
-	}
-	var names []string
-	for name := range f.inlineUserPolicies[aws.ToString(in.UserName)] {
-		names = append(names, name)
-	}
-	return &iam.ListUserPoliciesOutput{PolicyNames: names}, nil
-}
-
-func (f *fakeIAM) GetUserPolicy(_ context.Context, in *iam.GetUserPolicyInput, _ ...func(*iam.Options)) (*iam.GetUserPolicyOutput, error) {
-	if err := f.track("GetUserPolicy"); err != nil {
-		return nil, err
-	}
-	doc := f.inlineUserPolicies[aws.ToString(in.UserName)][aws.ToString(in.PolicyName)]
-	return &iam.GetUserPolicyOutput{PolicyDocument: aws.String(url.QueryEscape(doc))}, nil
-}
-
-func (f *fakeIAM) GetPolicy(_ context.Context, in *iam.GetPolicyInput, _ ...func(*iam.Options)) (*iam.GetPolicyOutput, error) {
-	if err := f.track("GetPolicy"); err != nil {
-		return nil, err
-	}
-	arn := aws.ToString(in.PolicyArn)
-	if _, ok := f.managedPolicies[arn]; !ok {
-		return nil, &smithy.GenericAPIError{Code: "NoSuchEntity", Message: "no such policy"}
-	}
-	version := f.policyVersions[arn]
+// s3aPolicyMeta is a managed policy's default version id and PolicyId, as both
+// GetPolicy and the LocalManagedPolicy listing report them.
+func (f *fakeIAM) s3aPolicyMeta(arn string) (version, policyID string) {
+	version = f.policyVersions[arn]
 	if version == "" {
 		version = "v3"
 	}
-	policyID := f.policyIDs[arn]
+	policyID = f.policyIDs[arn]
 	if policyID == "" {
 		policyID = "ANPA" + strings.ToUpper(fmt.Sprintf("%x", len(arn)*7919+int(arn[len(arn)-1])))
 	}
+	return version, policyID
+}
+
+// GetPolicy and GetPolicyVersion also count per ARN ("GetPolicy:<arn>"), so a
+// test can prove a customer-managed policy is never fetched this way.
+func (f *fakeIAM) GetPolicy(_ context.Context, in *iam.GetPolicyInput, _ ...func(*iam.Options)) (*iam.GetPolicyOutput, error) {
+	arn := aws.ToString(in.PolicyArn)
+	f.calls["GetPolicy:"+arn]++
+	if err := f.track("GetPolicy"); err != nil {
+		return nil, err
+	}
+	if _, ok := f.managedPolicies[arn]; !ok {
+		return nil, &smithy.GenericAPIError{Code: "NoSuchEntity", Message: "no such policy"}
+	}
+	version, policyID := f.s3aPolicyMeta(arn)
 	return &iam.GetPolicyOutput{Policy: &iamtypes.Policy{
 		Arn: in.PolicyArn, DefaultVersionId: aws.String(version),
 		PolicyId:   aws.String(policyID),
@@ -246,6 +186,7 @@ func (f *fakeIAM) GetPolicy(_ context.Context, in *iam.GetPolicyInput, _ ...func
 }
 
 func (f *fakeIAM) GetPolicyVersion(_ context.Context, in *iam.GetPolicyVersionInput, _ ...func(*iam.Options)) (*iam.GetPolicyVersionOutput, error) {
+	f.calls["GetPolicyVersion:"+aws.ToString(in.PolicyArn)]++
 	if err := f.track("GetPolicyVersion"); err != nil {
 		return nil, err
 	}
@@ -258,21 +199,112 @@ func (f *fakeIAM) GetPolicyVersion(_ context.Context, in *iam.GetPolicyVersionIn
 	}}, nil
 }
 
-// GetAccountAuthorizationDetails serves groups and user group lists -- the
-// read groups and memberships come from (035). Unpaginated: a fixture's group
-// count never needs a second page.
+// GetAccountAuthorizationDetails serves the account's whole IAM configuration
+// from the fake's state, the way IAM does: every document URL-encoded, each
+// listing paginated at pageSize with an integer marker.
+//
+// ONE FILTER PER CALL. That is the reader's contract (P2-DECISIONS D-48: each
+// listing is its own surface), and a request naming several filters -- or
+// none, which IAM reads as "all" -- is refused, so a regression to one
+// combined call fails every test that scans.
 func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetAccountAuthorizationDetailsInput, _ ...func(*iam.Options)) (*iam.GetAccountAuthorizationDetailsOutput, error) {
 	if err := f.track("GetAccountAuthorizationDetails"); err != nil {
 		return nil, err
 	}
-	out := &iam.GetAccountAuthorizationDetailsOutput{GroupDetailList: f.groups}
-	for _, u := range f.users {
-		out.UserDetailList = append(out.UserDetailList, iamtypes.UserDetail{
-			Arn: u.Arn, UserName: u.UserName, UserId: u.UserId,
-			GroupList: f.userGroups[aws.ToString(u.UserName)],
+	if len(in.Filter) != 1 {
+		return nil, &smithy.GenericAPIError{Code: "ValidationError",
+			Message: fmt.Sprintf("the fake serves exactly one filter per call, got %v", in.Filter)}
+	}
+	filter := in.Filter[0]
+	if err := f.track("GetAccountAuthorizationDetails:" + string(filter)); err != nil {
+		return nil, err
+	}
+	out := &iam.GetAccountAuthorizationDetailsOutput{}
+	var next *string
+	switch filter {
+	case iamtypes.EntityTypeRole:
+		var from, to int
+		from, to, next = f.page(len(f.roles), in.Marker)
+		for _, r := range f.roles[from:to] {
+			name := aws.ToString(r.RoleName)
+			out.RoleDetailList = append(out.RoleDetailList, iamtypes.RoleDetail{
+				Arn: r.Arn, RoleName: r.RoleName, RoleId: r.RoleId, Path: r.Path,
+				CreateDate: r.CreateDate, AssumeRolePolicyDocument: r.AssumeRolePolicyDocument,
+				RoleLastUsed: r.RoleLastUsed, Tags: r.Tags, PermissionsBoundary: r.PermissionsBoundary,
+				AttachedManagedPolicies: f.attachedRolePolicies[name],
+				RolePolicyList:          s3aInlineDetails(f.inlineRolePolicies[name]),
+				InstanceProfileList:     f.instanceProfiles[name],
+			})
+		}
+	case iamtypes.EntityTypeUser:
+		var from, to int
+		from, to, next = f.page(len(f.users), in.Marker)
+		for _, u := range f.users[from:to] {
+			name := aws.ToString(u.UserName)
+			out.UserDetailList = append(out.UserDetailList, iamtypes.UserDetail{
+				Arn: u.Arn, UserName: u.UserName, UserId: u.UserId, Path: u.Path,
+				CreateDate: u.CreateDate, Tags: u.Tags, PermissionsBoundary: u.PermissionsBoundary,
+				GroupList:               f.userGroups[name],
+				AttachedManagedPolicies: f.attachedUserPolicies[name],
+				UserPolicyList:          s3aInlineDetails(f.inlineUserPolicies[name]),
+			})
+		}
+	case iamtypes.EntityTypeGroup:
+		var from, to int
+		from, to, next = f.page(len(f.groups), in.Marker)
+		out.GroupDetailList = f.groups[from:to]
+	case iamtypes.EntityTypeLocalManagedPolicy:
+		var local []string
+		for arn := range f.managedPolicies {
+			if !strings.Contains(arn, ":iam::aws:policy/") {
+				local = append(local, arn)
+			}
+		}
+		sort.Strings(local)
+		var from, to int
+		from, to, next = f.page(len(local), in.Marker)
+		for _, arn := range local[from:to] {
+			version, policyID := f.s3aPolicyMeta(arn)
+			out.Policies = append(out.Policies, iamtypes.ManagedPolicyDetail{
+				Arn: aws.String(arn), PolicyName: aws.String(arn[strings.LastIndex(arn, "/")+1:]),
+				PolicyId: aws.String(policyID), DefaultVersionId: aws.String(version),
+				// Every version is listed, the superseded one FIRST: a reader
+				// that takes anything but the default reads a statement no
+				// fixture declares.
+				PolicyVersionList: []iamtypes.PolicyVersion{
+					{VersionId: aws.String("v0-superseded"), IsDefaultVersion: false,
+						Document: aws.String(url.QueryEscape(s3aSupersededVersion))},
+					{VersionId: aws.String(version), IsDefaultVersion: true,
+						Document: aws.String(url.QueryEscape(f.managedPolicies[arn]))},
+				},
+			})
+		}
+	default:
+		return nil, &smithy.GenericAPIError{Code: "ValidationError", Message: "unsupported filter " + string(filter)}
+	}
+	out.IsTruncated, out.Marker = next != nil, next
+	return out, nil
+}
+
+// s3aSupersededVersion is a non-default policy version no reader may use.
+const s3aSupersededVersion = `{"Version":"2012-10-17","Statement":[` +
+	`{"Sid":"SupersededVersion","Effect":"Allow","Action":"iam:*","Resource":"*"}]}`
+
+// s3aInlineDetails serves inline documents as IAM does: URL-encoded, and in a
+// stable order.
+func s3aInlineDetails(docs map[string]string) []iamtypes.PolicyDetail {
+	names := make([]string, 0, len(docs))
+	for n := range docs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]iamtypes.PolicyDetail, 0, len(names))
+	for _, n := range names {
+		out = append(out, iamtypes.PolicyDetail{
+			PolicyName: aws.String(n), PolicyDocument: aws.String(url.QueryEscape(docs[n])),
 		})
 	}
-	return out, nil
+	return out
 }
 
 // ListOpenIDConnectProviders satisfies awsdiscovery.IAMAPI, added by ticket
@@ -606,7 +638,7 @@ func TestIAMPartialScanNeverDeletes(t *testing.T) {
 
 	// Now IAM refuses to list roles. The roles still exist in AWS; we simply
 	// cannot see them. Nothing may be deleted.
-	fake.fail["ListRoles"] = denied("iam:ListRoles")
+	fake.fail["GetAccountAuthorizationDetails:Role"] = denied("iam:GetAccountAuthorizationDetails")
 	snap, err := scanner.Scan(context.Background(), ws, connectorID)
 	if err != nil {
 		t.Fatalf("a denied surface must not fail the whole scan: %v", err)
@@ -689,7 +721,7 @@ func TestIAMThrottlingIsReportedDistinctlyFromDenial(t *testing.T) {
 	defer cleanIdentities(t, db, ws)
 
 	fake := populatedIAM()
-	fake.fail["ListUsers"] = throttled("iam:ListUsers")
+	fake.fail["GetAccountAuthorizationDetails:User"] = throttled("iam:GetAccountAuthorizationDetails")
 	scanner, connectorID := scanFixture(t, db, ws, fake)
 
 	snap, err := scanner.Scan(context.Background(), ws, connectorID)
@@ -748,8 +780,8 @@ func TestIAMPaginationRunsToCompletion(t *testing.T) {
 	if got := snap.Coverage.Surfaces[models.SurfaceIAMUsers].Count; got != 12 {
 		t.Fatalf("pagination lost users: got %d of 12", got)
 	}
-	if fake.calls["ListRoles"] < 7 {
-		t.Fatalf("expected at least 7 role pages at size 4, saw %d calls", fake.calls["ListRoles"])
+	if got := fake.calls["GetAccountAuthorizationDetails:Role"]; got < 7 {
+		t.Fatalf("expected at least 7 role pages at size 4, saw %d calls", got)
 	}
 	_, total, _ := repositories.NewCloudIdentityRepository(db).
 		ListIdentities(ws, repositories.CloudIdentityFilter{Limit: 500})
@@ -757,7 +789,7 @@ func TestIAMPaginationRunsToCompletion(t *testing.T) {
 		t.Fatalf("expected 37 identities across all pages, got %d", total)
 	}
 	t.Logf("PASS: %d roles over %d pages and %d users over %d pages, all persisted",
-		25, fake.calls["ListRoles"], 12, fake.calls["ListUsers"])
+		25, fake.calls["GetAccountAuthorizationDetails:Role"], 12, fake.calls["GetAccountAuthorizationDetails:User"])
 }
 
 // Managed policy documents are cached: AWS-managed policies are attached to

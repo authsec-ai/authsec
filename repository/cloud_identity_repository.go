@@ -3,6 +3,7 @@ package repositories
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -21,7 +22,12 @@ type CloudIdentityRepository interface {
 	// UpsertIdentity records one identity, keyed on (workspace_id, native_id).
 	// A repeat scan updates the same row and stamps the generation; it never
 	// creates a duplicate. Reports whether the row was newly created.
-	UpsertIdentity(i *models.CloudIdentity) (stored *models.CloudIdentity, created bool, err error)
+	//
+	// keepAttrs names attrs keys the caller's read DOES NOT RETURN (D-48): on a
+	// rescan the stored value of each is kept unless the new attrs carry the
+	// key, so a field no call supplies is never blanked. Every other key is
+	// replaced wholesale, so a tag or boundary removed in AWS disappears.
+	UpsertIdentity(i *models.CloudIdentity, keepAttrs ...string) (stored *models.CloudIdentity, created bool, err error)
 
 	// UpsertSecret records one secret, keyed on (workspace_id, native_id).
 	UpsertSecret(s *models.CloudSecret) (stored *models.CloudSecret, created bool, err error)
@@ -84,7 +90,7 @@ func (r *cloudIdentityRepository) Fenced(f ScanFence) CloudIdentityRepository {
 	return &copy
 }
 
-func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*models.CloudIdentity, bool, error) {
+func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAttrs ...string) (*models.CloudIdentity, bool, error) {
 	if i.WorkspaceID == uuid.Nil || i.ConnectorID == uuid.Nil {
 		return nil, false, errors.New("workspace_id and connector_id are required")
 	}
@@ -114,6 +120,42 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*mode
 		"last_seen_generation": i.LastSeenGeneration,
 		"last_seen_at":         now,
 		"row_updated_at":       now,
+		// The role's trust document and its readability (035). Named here or a
+		// rescan never updates them -- a role whose trust became unreadable
+		// would keep reading as parsed, and one fixed in AWS would keep its
+		// error. From the INSERT tuple, so NULL stays NULL for a document that
+		// is not JSON (and for every identity that is not a role).
+		"trust_document":      gorm.Expr("excluded.trust_document"),
+		"trust_document_hash": gorm.Expr("excluded.trust_document_hash"),
+		"trust_parse_error":   gorm.Expr("excluded.trust_parse_error"),
+	}
+	// Attrs merge, never blank (§1.3, D-48), for exactly the keys the caller's
+	// read does not return: the stored value is laid UNDER the new attrs, so
+	// the new read wins wherever it has the key and the old value survives only
+	// where the read is silent. jsonb_strip_nulls drops a key the stored row
+	// never had, rather than writing it as null. A plain `stored || new` merge
+	// would be wrong: omitempty leaves a removed tag or boundary ABSENT from the
+	// new attrs, and it would survive forever.
+	//
+	// ONLY FOR THE SAME PRINCIPAL. The row is keyed by ARN, and a role deleted
+	// and recreated under its name keeps the row but is a different role with a
+	// new unique id (§2.4's creation boundary): the stored values describe its
+	// predecessor, and the read that would correct them never comes (D-48: new
+	// roles get none). So they are kept only when the stored unique_id equals
+	// the new one -- a row with none on either side cannot prove it is the same
+	// principal, and keeps nothing.
+	if len(keepAttrs) > 0 {
+		pairs := make([]string, 0, len(keepAttrs))
+		args := make([]interface{}, 0, 2*len(keepAttrs))
+		for _, k := range keepAttrs {
+			pairs = append(pairs, "?::text, cloud_identity.attrs -> ?::text")
+			args = append(args, k, k)
+		}
+		assignments["attrs"] = gorm.Expr(
+			"CASE WHEN cloud_identity.attrs ->> 'unique_id' = excluded.attrs ->> 'unique_id'"+
+				" THEN jsonb_strip_nulls(jsonb_build_object("+strings.Join(pairs, ", ")+")) || excluded.attrs"+
+				" ELSE excluded.attrs END",
+			args...)
 	}
 	// last_used_at is only advanced, never cleared. AWS reports it from
 	// different places with different freshness — GetRole's RoleLastUsed, the

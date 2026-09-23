@@ -19,25 +19,23 @@ import (
 // IAM identity discovery: the foundation every later AWS surface resolves
 // against.
 //
-// What this writes: cloud_identity (IAM roles and users) and cloud_secret
-// (access keys). Nothing else. Trust-policy parsing, permission and resource
-// extraction, Bedrock, Lambda, ECS, EC2, EKS, CloudTrail and classification are
-// later tickets, and the scope line in ticket [1] is explicit that no other
-// write path belongs here.
+// What this writes: cloud_identity (IAM roles, users and groups, with each
+// role's trust document), cloud_secret (access keys) and cloud_group_membership.
 //
-// What it RETRIEVES but does not persist: the policy documents attached to
-// every identity. Ticket [1] is responsible for fetching them; ticket [2] parses
-// them into cloud_permission and cloud_resource. They are handed over in the
-// IAMSnapshot rather than staged in a table, because a full policy document is
-// not something the plan wants stored — a summary plus the policy identifier is
-// enough, and the document can always be re-fetched.
+// What it READS: the whole IAM configuration, through
+// iam:GetAccountAuthorizationDetails, one paginated call per filter (SPEC
+// T3.1, P2-DECISIONS D-48), plus GetPolicy/GetPolicyVersion for the AWS-managed
+// policies a principal attaches or is bounded by. The policy documents are
+// handed to the permission scanner in the IAMSnapshot, which writes them as
+// cloud_policy rows (035) and, for Cloud Inventory, cloud_permission.
 
 // iamScanTimeout bounds one whole scan.
 //
-// A large account is thousands of GetRole and GetPolicyVersion calls under a
-// retrying client. Twenty minutes is generous for that and still short enough
-// that a wedged scan releases its connector rather than blocking every later
-// one forever.
+// A large account is hundreds of authorization-details pages, one
+// GetPolicyVersion per attached AWS-managed policy and two calls per access
+// key, under a retrying client. Twenty minutes is generous for that and still
+// short enough that a wedged scan releases its connector rather than blocking
+// every later one forever.
 const iamScanTimeout = 20 * time.Minute
 
 // ErrScanNotPermitted is returned when the connector cannot currently be used.
@@ -146,13 +144,27 @@ type IAMSnapshot struct {
 	Coverage    models.ScanCoverage
 
 	// Policies is one entry per identity that had any policy attached, keyed by
-	// identity ARN. Empty for an identity with no policies, absent for one whose
-	// policies could not be read — a distinction ticket [2] must preserve.
+	// identity ARN: its attachments, inline documents and boundary, exactly as
+	// its authorization-details entry listed them. Absent for an identity with
+	// none, and for one its listing never reached.
 	Policies map[string]awsdiscovery.IdentityPolicies
+
+	// ManagedPolicies is every managed policy the read resolved, by ARN (T3.1):
+	// every customer-managed policy in the account -- ATTACHED OR NOT -- and
+	// every AWS-managed policy a principal attaches or is bounded by. The
+	// permission scanner writes ONE cloud_policy row per entry, so a policy
+	// detached from its last holder keeps its row (§2.15) and an AWS-managed
+	// policy is one row per connector however many principals attach it.
+	ManagedPolicies map[string]awsdiscovery.AttachedPolicy
 
 	// TrustPolicies is the decoded AssumeRolePolicyDocument per role ARN, the
 	// input for cloud_assume_edge in ticket [2].
 	TrustPolicies map[string]string
+
+	// UnreadableTrust names each role whose trust document is unreadable this
+	// run, with the reason stored on its row (trust_parse_error), so
+	// policy_documents names it beside the unreadable policies (T3.3, D-71).
+	UnreadableTrust []models.CoverageItem
 
 	// CredentialReportSurface is bonus evidence about users this scan already
 	// wrote, kept OUT of Coverage on purpose -- see the comment where this is
@@ -201,18 +213,17 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	ctx, cancel := context.WithTimeout(ctx, iamScanTimeout)
 	defer cancel()
 
-	// The generation an interrupted attempt was using is the same number this
-	// one computes: commitScan only advances scan_generation on success, so a
-	// scan that died left it untouched. Checkpoints at this generation
-	// therefore mean "the previous attempt was interrupted part-way", and this
-	// run continues it rather than repeating its work.
+	// The run's own generation (T1.5); scan_generation + 1 only for a caller
+	// with no run.
+	//
+	// NO RESUME. The per-identity policy phase a checkpoint used to let a
+	// second attempt skip no longer exists: the whole configuration is a
+	// handful of paginated listings, re-read in full by every attempt, so
+	// nothing here depends on what an interrupted attempt managed to write
+	// (the spec is silent; the conservative reading, reported for review).
 	generation := connector.ScanGeneration + 1
 	if s.generation > 0 {
 		generation = s.generation
-	}
-	resuming, err := s.checkpoints.HasAny(workspaceID, connectorID, generation)
-	if err != nil {
-		return nil, err
 	}
 
 	started := time.Now()
@@ -226,46 +237,51 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	s.persistCoverage(workspaceID, connectorID, coverage)
 
 	snapshot := &IAMSnapshot{
-		ConnectorID:   connectorID,
-		AccountID:     connector.ScopeID,
-		Generation:    generation,
-		Policies:      map[string]awsdiscovery.IdentityPolicies{},
-		TrustPolicies: map[string]string{},
+		ConnectorID:     connectorID,
+		AccountID:       connector.ScopeID,
+		Generation:      generation,
+		Policies:        map[string]awsdiscovery.IdentityPolicies{},
+		ManagedPolicies: map[string]awsdiscovery.AttachedPolicy{},
+		TrustPolicies:   map[string]string{},
 	}
 
+	// ---- the IAM configuration: authorization details (T3.1) ---------------
+	//
+	// One paginated call per filter, each its own surface (D-48). Everything
+	// below is from this one read, so a principal, its attachments and the
+	// documents they name are one picture. A policy document that could not be
+	// read is recorded on that policy, never on the listing (§1.4).
+	details := reader.AuthorizationDetails(ctx)
+
 	// ---- roles -------------------------------------------------------------
-	roles, rolesErr := reader.ListRoles(ctx)
-	for _, role := range roles {
-		if err := s.upsertRole(workspaceID, connectorID, generation, role, coverage.Counters); err != nil {
+	for _, role := range details.Roles {
+		identity, err := s.upsertRole(workspaceID, connectorID, generation, role, coverage.Counters)
+		if err != nil {
 			return nil, err
 		}
 		if role.TrustPolicy != "" {
 			snapshot.TrustPolicies[role.ARN] = role.TrustPolicy
 		}
+		if identity.TrustParseError != "" {
+			snapshot.UnreadableTrust = append(snapshot.UnreadableTrust, models.CoverageItem{
+				Policy: "trust policy of " + role.Name, Error: identity.TrustParseError,
+			})
+		}
+		snapshot.addPolicies(role.ARN, role.Policies)
 	}
-	// A role whose GetRole failed is listed but not understood: its tags,
-	// last-used date and permissions boundary are unknown. Reporting the
-	// surface as reached would let reconciliation delete on the strength of an
-	// inventory we only half-read, and would present an unknown boundary as no
-	// boundary.
-	if incomplete := coverage.Counters["roles_detail_incomplete"]; incomplete > 0 && rolesErr == nil {
-		coverage.Surfaces[models.SurfaceIAMRoles] = surfacePartial(
-			len(roles), incomplete, "roles could not be read in detail")
-	} else {
-		coverage.Surfaces[models.SurfaceIAMRoles] = surfaceResult(len(roles), rolesErr)
-	}
+	coverage.Surfaces[models.SurfaceIAMRoles] = surfaceResult(len(details.Roles), details.RolesErr)
 
 	// ---- users and their access keys ---------------------------------------
-	users, usersErr := reader.ListUsers(ctx)
 	keyCount := 0
 	var keysErr error
-	userIDByARN := make(map[string]uuid.UUID, len(users))
-	for _, user := range users {
+	userIDByARN := make(map[string]uuid.UUID, len(details.Users))
+	for _, user := range details.Users {
 		identity, err := s.upsertUser(workspaceID, connectorID, generation, user, coverage.Counters)
 		if err != nil {
 			return nil, err
 		}
 		userIDByARN[user.ARN] = identity.ID
+		snapshot.addPolicies(user.ARN, user.Policies)
 		keys, err := reader.ListAccessKeys(ctx, user.Name)
 		if err != nil {
 			// One user's keys being unreadable does not mean every user's are.
@@ -283,30 +299,26 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 			keyCount++
 		}
 	}
-	coverage.Surfaces[models.SurfaceIAMUsers] = surfaceResult(len(users), usersErr)
+	coverage.Surfaces[models.SurfaceIAMUsers] = surfaceResult(len(details.Users), details.UsersErr)
 	coverage.Surfaces[models.SurfaceIAMAccessKeys] = surfaceResult(keyCount, keysErr)
 
 	// ---- groups and memberships (035) --------------------------------------
 	//
-	// Groups are identities (§2.2), and had no read at all before this. Their
-	// policies join snapshot.Policies like any holder's, so the permission
-	// scanner writes them the same way. A membership is written only when BOTH
-	// ends were read by this scan -- never against a user or group this read
-	// did not list.
-	groupsRead, groupsErr := reader.GroupsAndMemberships(ctx)
-	groupIDByARN := make(map[string]uuid.UUID, len(groupsRead.Groups))
-	for _, g := range groupsRead.Groups {
+	// Groups are identities (§2.2). Their policies join snapshot.Policies like
+	// any holder's, so the permission scanner writes them the same way. A
+	// membership is written only when BOTH ends were read by this scan --
+	// never against a user or group this read did not list.
+	groupIDByARN := make(map[string]uuid.UUID, len(details.Groups))
+	for _, g := range details.Groups {
 		identity, err := s.upsertGroup(workspaceID, connectorID, generation, g, coverage.Counters)
 		if err != nil {
 			return nil, err
 		}
 		groupIDByARN[g.ARN] = identity.ID
-		if len(g.Policies.Attached) > 0 || len(g.Policies.Inline) > 0 {
-			snapshot.Policies[g.ARN] = g.Policies
-		}
+		snapshot.addPolicies(g.ARN, g.Policies)
 	}
 	memberships := 0
-	for userARN, groupARNs := range groupsRead.Members {
+	for userARN, groupARNs := range details.Members {
 		uid, ok := userIDByARN[userARN]
 		if !ok {
 			continue
@@ -326,34 +338,23 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 			memberships++
 		}
 	}
-	coverage.Surfaces[models.SurfaceIAMGroups] = surfaceResult(len(groupsRead.Groups), groupsErr)
+	coverage.Surfaces[models.SurfaceIAMGroups] = surfaceResult(len(details.Groups), details.GroupsErr)
 	coverage.Counters["group_memberships"] = memberships
 
-	// ---- policy documents, for ticket [2] ----------------------------------
+	// ---- policies ----------------------------------------------------------
 	//
-	// The expensive phase: roughly seven calls per identity, so this is what
-	// dominates a scan of a large account and what resume exists for. On a
-	// resumed attempt the identities whose permissions were already written are
-	// skipped entirely -- no AWS call at all for them.
-	policyCursor := ""
-	if resuming {
-		cursor, _, err := s.checkpoints.Cursor(
-			workspaceID, connectorID, generation, models.ScanPhaseIdentityPolicies)
-		if err != nil {
-			return nil, err
-		}
-		policyCursor = cursor
+	// iam_policies is the LocalManagedPolicy listing's outcome: "reached when
+	// the authorization-details listing completed" (§1.4). One document that
+	// could not be fetched or parsed is NOT a reason to call it partial --
+	// that would veto every policy partition in the account -- but a
+	// FetchError on that one policy, reported under policy_documents.
+	snapshot.ManagedPolicies = details.ManagedPolicies
+	policyCount := len(details.ManagedPolicies)
+	for _, p := range snapshot.Policies {
+		policyCount += len(p.Inline)
 	}
-
-	policyCount, skippedIdentities, policiesErr := s.readPolicies(
-		ctx, reader, roles, users, snapshot, policyCursor)
-	coverage.Surfaces[models.SurfaceIAMPolicies] = surfaceResult(policyCount, policiesErr)
+	coverage.Surfaces[models.SurfaceIAMPolicies] = surfaceResult(policyCount, details.PoliciesErr)
 	coverage.Counters["policies_fetched"] = policyCount
-	if skippedIdentities > 0 {
-		coverage.Counters["identities_resumed_past"] = skippedIdentities
-		log.Printf("aws iam scan: connector=%s resuming generation %d, skipped %d identities already done",
-			connectorID, generation, skippedIdentities)
-	}
 
 	// ---- reconcile, but only if we were allowed to look everywhere ----------
 	if coverage.Complete() {
@@ -402,7 +403,7 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	// surfaces. snapshot.CredentialReportSurface carries this one the same
 	// way, merged only at FinalizeCoverage, after every scanner's local gate
 	// has already fired against the unpolluted coverage.
-	reportCount, reportErr := s.scanCredentialReport(ctx, workspaceID, connectorID, users)
+	reportCount, reportErr := s.scanCredentialReport(ctx, workspaceID, connectorID, details.Users)
 	snapshot.CredentialReportSurface = surfaceResult(reportCount, reportErr)
 
 	finished := time.Now()
@@ -419,105 +420,29 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	return snapshot, nil
 }
 
-// readPolicies fetches the managed and inline policy documents for every
-// discovered identity.
-//
-// A failure on one identity is remembered and the rest are still read. The
-// alternative — abandoning the surface on the first denied GetRolePolicy —
-// would throw away every document already fetched because of one role the
-// audit role happens not to cover.
-// resumeCursor is exceeded when an identity sorts after the last one a previous
-// attempt finished. Everything at or before the cursor already has its
-// permissions written and stamped with this generation.
-//
-// Identities are walked in sorted ARN order rather than the order AWS returned
-// them, because a cursor over an unstable order would silently skip work AWS
-// happened to list earlier the second time.
-func (s *AWSIAMScanner) readPolicies(
-	ctx context.Context, reader *awsdiscovery.IAMReader,
-	roles []awsdiscovery.IAMRole, users []awsdiscovery.IAMUser, snapshot *IAMSnapshot,
-	resumeCursor string,
-) (fetched int, skipped int, err error) {
-
-	// One list of (arn, name, isRole) so the sort order spans roles and users
-	// together -- the cursor is a single position through every identity, not
-	// one per kind.
-	type target struct {
-		arn    string
-		name   string
-		isRole bool
-		// boundaryARN is set for roles that carry a permissions boundary, so
-		// the policy pass can read the capping document alongside the grants.
-		boundaryARN string
+// addPolicies hands one principal's policies to the permission scanner. An
+// identity with none has no entry.
+func (snap *IAMSnapshot) addPolicies(arn string, p awsdiscovery.IdentityPolicies) {
+	if len(p.Attached) > 0 || len(p.Inline) > 0 || p.Boundary != nil {
+		snap.Policies[arn] = p
 	}
-	targets := make([]target, 0, len(roles)+len(users))
-	for _, role := range roles {
-		targets = append(targets, target{
-			arn: role.ARN, name: role.Name, isRole: true,
-			boundaryARN: role.PermissionsBoundaryARN,
-		})
-	}
-	for _, user := range users {
-		targets = append(targets, target{arn: user.ARN, name: user.Name})
-	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].arn < targets[j].arn })
-
-	count := 0
-	skippedCount := 0
-	var firstErr error
-
-	for _, t := range targets {
-		// The saving resume exists for: no AWS call at all for an identity a
-		// previous attempt already finished.
-		if resumeCursor != "" && t.arn <= resumeCursor {
-			skippedCount++
-			continue
-		}
-
-		var policies awsdiscovery.IdentityPolicies
-		var perr error
-		if t.isRole {
-			policies, perr = reader.RolePolicies(ctx, t.arn, t.name)
-		} else {
-			policies, perr = reader.UserPolicies(ctx, t.arn, t.name)
-		}
-		if perr != nil {
-			if firstErr == nil {
-				firstErr = perr
-			}
-			continue
-		}
-
-		// The boundary caps everything the policies above allow, so it is read
-		// in the same pass. A failure to read it degrades this identity rather
-		// than the scan: the grants are still worth recording, and the identity
-		// keeps constraint_state 'bounded' from the ARN alone, so a missing
-		// boundary document never renders as unconstrained access.
-		if t.isRole && t.boundaryARN != "" {
-			boundary, berr := reader.BoundaryPolicy(ctx, t.boundaryARN)
-			if berr != nil {
-				if firstErr == nil {
-					firstErr = berr
-				}
-			} else {
-				policies.Boundary = &boundary
-			}
-		}
-
-		if len(policies.Attached) > 0 || len(policies.Inline) > 0 || policies.Boundary != nil {
-			snapshot.Policies[t.arn] = policies
-			count += len(policies.Attached) + len(policies.Inline)
-		}
-	}
-	return count, skippedCount, firstErr
 }
 
 /* -------------------------------- upserts --------------------------------- */
 
+// roleAttrsNotRead are the attrs keys RoleDetail does not carry (D-48). A
+// role's stored description and max session duration -- written by an
+// earlier GetRole-based read -- are KEPT rather than blanked, because this
+// read says nothing about them: for the same role only (same unique id),
+// never inherited by one recreated under its ARN. Everything else in attrs is
+// replaced: tags and the permissions boundary ARE in the listing, so their
+// removal in AWS must be observed as removal.
+var roleAttrsNotRead = []string{"description", "max_session_duration"}
+
 func (s *AWSIAMScanner) upsertRole(
 	workspaceID, connectorID uuid.UUID, generation int,
 	role awsdiscovery.IAMRole, counters map[string]int,
-) error {
+) (*models.CloudIdentity, error) {
 	identity := &models.CloudIdentity{
 		WorkspaceID:        workspaceID,
 		ConnectorID:        connectorID,
@@ -529,27 +454,89 @@ func (s *AWSIAMScanner) upsertRole(
 		Enabled:            true, // IAM has no disable switch for a role.
 		LastSeenGeneration: generation,
 	}
+	profiles := instanceProfiles(role.InstanceProfiles)
 	if err := identity.SetAWSAttrs(models.AWSIdentityAttrs{
 		UniqueID:               role.UniqueID,
 		Path:                   role.Path,
-		Description:            role.Description,
-		MaxSessionDuration:     role.MaxSessionDuration,
 		Tags:                   role.Tags,
 		HasTrustPolicy:         role.TrustPolicy != "",
 		PermissionsBoundaryARN: role.PermissionsBoundaryARN,
-		DetailIncomplete:       !role.DetailComplete,
+		// D-52: in attrs, replaced on every read (it is not in
+		// roleAttrsNotRead), so a role taken out of a profile loses it.
+		InstanceProfiles: profiles,
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	if !role.DetailComplete {
-		// GetRole failed. The role exists -- ListRoles named it -- but its
-		// tags, last-used date and permissions boundary are unknown. Count it
-		// so the surface reports partial rather than complete: a role whose
-		// boundary we could not read must not be presented as a role with no
-		// boundary.
-		counters["roles_detail_incomplete"]++
+	setRoleTrustDocument(identity, role.TrustPolicy)
+
+	listed := listedPolicyFacts(role.Policies)
+	// As plain maps, so the redactor walks them like every other fact.
+	profileFacts := make([]any, 0, len(profiles))
+	for _, p := range profiles {
+		profileFacts = append(profileFacts, map[string]any{"arn": p.ARN, "name": p.Name})
 	}
-	return s.recordIdentity(identity, counters)
+	listed["instance_profiles"] = profileFacts
+	// The role's observation CARRIES its trust document (§4.8): can_assume
+	// evidence is the role's own observation. Decoded, so the redactor walks it
+	// like any other fact; the text itself when it is not JSON.
+	listed["trust_document"] = trustDocumentFact(role.TrustPolicy)
+	listed["trust_document_hash"] = identity.TrustDocumentHash
+	listed["trust_parse_error"] = identity.TrustParseError
+	if err := s.recordIdentity(identity, counters, listed, roleAttrsNotRead...); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+// setRoleTrustDocument records a role's trust document on its row (035; T3.1
+// collects it, T3.3 judges it). The document verbatim as jsonb -- NULL when it
+// is not JSON, which a jsonb column refuses -- the sha256 of the text as read,
+// and trust_parse_error: the verdict of the trust parser the projector runs
+// (awsdiscovery.ValidateTrustDocument, D-45), so a role recorded readable here
+// cannot fail to parse there. Non-empty means that role's trust edges go stale,
+// never ended (§4.10). A role whose entry carried no document at all is
+// unreadable too: it cannot be read as trusting nobody.
+//
+// Written on EVERY scan through the fenced UpsertIdentity, which names the
+// three columns, so a document fixed in AWS clears its error.
+func setRoleTrustDocument(identity *models.CloudIdentity, doc string) {
+	var raw json.RawMessage
+	if doc != "" {
+		raw = json.RawMessage(doc)
+		identity.TrustDocumentHash = documentHash(doc)
+		if json.Valid(raw) {
+			identity.TrustDocument = raw
+		}
+	}
+	identity.TrustParseError = awsdiscovery.ValidateTrustDocument(raw)
+}
+
+// instanceProfiles is a role's InstanceProfileList as attrs store it, sorted by
+// ARN so an unchanged list is an unchanged row and an unchanged observation.
+// Nil for none, so the key is absent rather than an empty list.
+func instanceProfiles(in []awsdiscovery.InstanceProfileRef) []models.AWSInstanceProfile {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]models.AWSInstanceProfile, 0, len(in))
+	for _, p := range in {
+		out = append(out, models.AWSInstanceProfile{ARN: p.ARN, Name: p.Name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ARN < out[j].ARN })
+	return out
+}
+
+// trustDocumentFact is the trust document as an observation fact: decoded when
+// it is JSON, so the redactor sees its keys; the raw text otherwise.
+func trustDocumentFact(doc string) any {
+	if doc == "" {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal([]byte(doc), &v); err != nil {
+		return doc
+	}
+	return v
 }
 
 func (s *AWSIAMScanner) upsertUser(
@@ -562,11 +549,10 @@ func (s *AWSIAMScanner) upsertUser(
 		Kind:        models.CloudIdentityIAMUser,
 		NativeID:    user.ARN,
 		Name:        user.Name,
-		// PasswordLastUsed is CONSOLE sign-in, deliberately not written to
-		// last_used_at. That column means "this identity did something", and a
+		// Console sign-in (PasswordLastUsed) is deliberately never written to
+		// last_used_at: that column means "this identity did something", and a
 		// human logging in says nothing about whether the credential a workload
-		// uses is live. Conflating them would make a dormant access key look
-		// active because someone opened the console.
+		// uses is live. Authorization details do not carry it anyway.
 		ProviderCreatedAt:  user.CreatedAt,
 		Enabled:            true,
 		LastSeenGeneration: generation,
@@ -574,10 +560,20 @@ func (s *AWSIAMScanner) upsertUser(
 	if err := identity.SetAWSAttrs(models.AWSIdentityAttrs{
 		UniqueID: user.UniqueID,
 		Path:     user.Path,
+		Tags:     user.Tags,
+		// Read for the first time (§1.3): with it, the user's statements are
+		// stored 'bounded' instead of 'unconstrained'.
+		PermissionsBoundaryARN: user.PermissionsBoundaryARN,
 	}); err != nil {
 		return nil, err
 	}
-	if err := s.recordIdentity(identity, counters); err != nil {
+	listed := listedPolicyFacts(user.Policies)
+	// member_of evidence is the user's observation, which lists the group
+	// (§4.8): the entry's GroupList, verbatim and sorted.
+	groups := append([]string{}, user.GroupNames...)
+	sort.Strings(groups)
+	listed["groups"] = groups
+	if err := s.recordIdentity(identity, counters, listed); err != nil {
 		return nil, err
 	}
 	return identity, nil
@@ -606,14 +602,35 @@ func (s *AWSIAMScanner) upsertGroup(
 	}); err != nil {
 		return nil, err
 	}
-	if err := s.recordIdentity(identity, counters); err != nil {
+	if err := s.recordIdentity(identity, counters, listedPolicyFacts(group.Policies)); err != nil {
 		return nil, err
 	}
 	return identity, nil
 }
 
-func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters map[string]int) error {
-	stored, created, err := s.identities.UpsertIdentity(identity)
+// listedPolicyFacts is what a principal's entry lists about its policies, for
+// its observation: grant and assignment evidence is the policy version's
+// observation AND the holder's, "whose authorization-details entry lists the
+// attachment" (§4.8). ARNs and names only, sorted; the documents are the
+// policies' own observations.
+func listedPolicyFacts(p awsdiscovery.IdentityPolicies) map[string]any {
+	attached := make([]string, 0, len(p.Attached))
+	for _, a := range p.Attached {
+		attached = append(attached, a.ARN)
+	}
+	inline := make([]string, 0, len(p.Inline))
+	for _, in := range p.Inline {
+		inline = append(inline, in.Name)
+	}
+	sort.Strings(attached)
+	sort.Strings(inline)
+	return map[string]any{"attached_policies": attached, "inline_policies": inline}
+}
+
+func (s *AWSIAMScanner) recordIdentity(
+	identity *models.CloudIdentity, counters map[string]int, listed map[string]any, keepAttrs ...string,
+) error {
+	stored, created, err := s.identities.UpsertIdentity(identity, keepAttrs...)
 	if err != nil {
 		return fmt.Errorf("record identity %s: %w", identity.NativeID, err)
 	}
@@ -631,26 +648,28 @@ func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters 
 	// A failure here does NOT fail the scan. Losing the explanation for a row
 	// is bad; losing the row is worse, and an inventory that refuses to record
 	// an identity because its evidence write failed is the wrong trade.
-	if err := s.recordIdentityEvidence(stored, identity); err != nil {
+	if err := s.recordIdentityEvidence(stored, identity, listed); err != nil {
 		log.Printf("aws iam scan: evidence for %s: %v", identity.NativeID, err)
 	}
 	return nil
 }
 
 func (s *AWSIAMScanner) recordIdentityEvidence(
-	stored *models.CloudIdentity, identity *models.CloudIdentity,
+	stored *models.CloudIdentity, identity *models.CloudIdentity, listed map[string]any,
 ) error {
 	if s.evidence == nil || stored == nil {
 		return nil
 	}
 	attrs := identity.AWSAttrs()
-	api := "iam:GetRole"
+	// One observation per role, user and group, citing the call that returned
+	// it (§1.4): every one of them is an authorization-details entry now.
+	const api = "iam:GetAccountAuthorizationDetails"
 	surface := models.SurfaceIAMRoles
 	switch identity.Kind {
 	case models.CloudIdentityIAMUser:
-		api, surface = "iam:ListUsers", models.SurfaceIAMUsers
+		surface = models.SurfaceIAMUsers
 	case models.CloudIdentityIAMGroup:
-		api, surface = "iam:GetAccountAuthorizationDetails", models.SurfaceIAMGroups
+		surface = models.SurfaceIAMGroups
 	}
 	// observed_at is the provider's own creation time where AWS gave one. It is
 	// not "now": conflating them makes a delayed scan look like a change.
@@ -658,21 +677,25 @@ func (s *AWSIAMScanner) recordIdentityEvidence(
 	if identity.ProviderCreatedAt != nil {
 		observed = *identity.ProviderCreatedAt
 	}
+	// What THIS read returned, and nothing it did not: a description or max
+	// session kept from an earlier read (D-48) is not a fact this observation
+	// can vouch for.
+	facts := map[string]any{
+		"kind":                     identity.Kind,
+		"native_id":                identity.NativeID,
+		"name":                     identity.Name,
+		"unique_id":                attrs.UniqueID,
+		"path":                     attrs.Path,
+		"tags":                     attrs.Tags,
+		"has_trust_policy":         attrs.HasTrustPolicy,
+		"permissions_boundary_arn": attrs.PermissionsBoundaryARN,
+	}
+	for k, v := range listed {
+		facts[k] = v
+	}
 	return s.evidence.Record(
 		IdentitySubject(stored.ID), api, surface, s.evidenceSurfaceState(surface),
-		observed, stored.NativeID,
-		map[string]any{
-			"kind":                     identity.Kind,
-			"native_id":                identity.NativeID,
-			"name":                     identity.Name,
-			"unique_id":                attrs.UniqueID,
-			"path":                     attrs.Path,
-			"max_session_duration":     attrs.MaxSessionDuration,
-			"tags":                     attrs.Tags,
-			"has_trust_policy":         attrs.HasTrustPolicy,
-			"permissions_boundary_arn": attrs.PermissionsBoundaryARN,
-			"detail_incomplete":        attrs.DetailIncomplete,
-		},
+		observed, stored.NativeID, facts,
 	)
 }
 
@@ -933,14 +956,11 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	return merged
 }
 
-// surfaceResult turns a read's outcome into a coverage entry.
-//
-// The count is reported even on failure, where it is a FLOOR rather than a
-// total — we read this many before we were stopped. The state is what tells a
-// reader which of the two it is.
 // surfacePartial reports a surface that was listed successfully but whose
-// contents are not fully known -- for example roles listed by ListRoles whose
-// GetRole detail failed.
+// contents are not fully known -- for example a listing whose per-item detail
+// call failed for some items. (The IAM read no longer has one: authorization
+// details carry every detail in the listing itself. Kept for the other
+// scanners' detail calls.)
 //
 // Kept distinct from an error: the list call worked, so the rows are real and
 // worth keeping. What must not happen is reconciliation treating this run as an
@@ -953,15 +973,31 @@ func surfacePartial(count int, incomplete int, reason string) models.SurfaceCove
 	}
 }
 
+// surfaceResult turns a read's outcome into a coverage entry.
+//
+// The count is reported even on failure, where it is a FLOOR rather than a
+// total — we read this many before we were stopped. The state is what tells a
+// reader which of the two it is.
+//
+// A failure that names its call (awsdiscovery.APICallError) also stamps the
+// call and AWS's error code as fields (D-71), so /coverage reports them
+// without parsing the prose. Any other error leaves both empty: unknown is
+// said as unknown, never inferred from the message.
 func surfaceResult(count int, err error) models.SurfaceCoverage {
+	var out models.SurfaceCoverage
 	switch {
 	case err == nil:
 		return models.SurfaceCoverage{State: models.CloudCoverageReached, Count: count}
 	case errors.Is(err, awsdiscovery.ErrThrottled):
-		return models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
+		out = models.SurfaceCoverage{State: models.CloudCoverageThrottled, Count: count, Error: err.Error()}
 	default:
-		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
+		out = models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count, Error: err.Error()}
 	}
+	var call *awsdiscovery.APICallError
+	if errors.As(err, &call) {
+		out.API, out.ErrorCode = call.API, call.Code
+	}
+	return out
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }

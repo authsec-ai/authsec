@@ -113,14 +113,26 @@ func TestP2TwoPoliciesOneDetached(t *testing.T) {
 // genuinely DETACHED, in the same account and run. The unreadable policy's
 // statements, grants and the support of resources only it names go STALE; the
 // detached policy's assignment and grants END.
+//
+// Re-expressed per P2-DECISIONS D-51. Since T3.1 a customer-managed document
+// arrives INSIDE the LocalManagedPolicy listing, which has no per-policy
+// permission, so it cannot fail to fetch on its own: the GetPolicyVersion
+// denial is on an attached AWS-MANAGED TicketRead. OtherPolicy is AWS-managed
+// too, for the same reason in reverse: a detached customer-managed policy is
+// still listed -- still a policy in the account, keeping its row and its
+// statements (§2.15) -- while an AWS-managed policy detached from its last
+// holder is no longer read at all, which is what "a resource named only by the
+// detached policy is gone" requires.
 func TestP2UnreadableAndDetachedInOneRun(t *testing.T) {
 	l := newP2Lab(t, "p2-unreadable", true)
 	a := l.account(accountA)
 	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
-	ticket := a.managed("TicketRead", `{"Version":"2012-10-17","Statement":[{"Sid":"ReadTickets",`+
-		`"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::support-tickets/*","arn:aws:s3:::ticket-archive/*"]}]}`)
-	other := a.managed("OtherPolicy", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",`+
-		`"Action":"s3:GetObject","Resource":"arn:aws:s3:::other-bucket/*"}]}`)
+	ticket := "arn:aws:iam::aws:policy/TicketRead"
+	a.iam.managedPolicies[ticket] = `{"Version":"2012-10-17","Statement":[{"Sid":"ReadTickets",` +
+		`"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::support-tickets/*","arn:aws:s3:::ticket-archive/*"]}]}`
+	other := "arn:aws:iam::aws:policy/OtherPolicy"
+	a.iam.managedPolicies[other] = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",` +
+		`"Action":"s3:GetObject","Resource":"arn:aws:s3:::other-bucket/*"}]}`
 	a.attach("SharedToolRole", ticket)
 	a.attach("SharedToolRole", a.managed("ToolboxRead", docToolboxRead))
 	a.attach("SharedToolRole", other)
@@ -130,10 +142,21 @@ func TestP2UnreadableAndDetachedInOneRun(t *testing.T) {
 	a.detach("SharedToolRole", other)
 	run := l.scanAndProject(a)
 
-	// Coverage names the unreadable document; the scan continued.
-	cov := models.DecodeScanCoverage(run.Coverage).Surfaces[models.SurfacePolicyDocuments]
-	if cov.State == models.CloudCoverageReached || !strings.Contains(cov.Error, "TicketRead") {
-		t.Errorf("policy_documents = %+v, want partial naming TicketRead", cov)
+	// Coverage names the unreadable document AND the call that failed; the scan
+	// continued, and iam_policies stayed reached (one document does not make
+	// the listing partial, §1.4).
+	surfaces := models.DecodeScanCoverage(run.Coverage).Surfaces
+	cov := surfaces[models.SurfacePolicyDocuments]
+	// In AWS's words, never classify()'s "the role could not be assumed": the
+	// role WAS assumed, and one read was refused (§2.14.13, E9 "coverage names
+	// the call").
+	if cov.State != models.CloudCoveragePartial || !strings.Contains(cov.Error, "TicketRead") ||
+		!strings.Contains(cov.Error, "AWS returned AccessDenied for iam:GetPolicyVersion") ||
+		strings.Contains(cov.Error, "could not be assumed") {
+		t.Errorf("policy_documents = %+v, want partial naming TicketRead, the call and the error code", cov)
+	}
+	if s := surfaces[models.SurfaceIAMPolicies].State; s != models.CloudCoverageReached {
+		t.Errorf("iam_policies = %q, want reached: one unreadable document must not veto the account", s)
 	}
 
 	g := l.grants()
@@ -149,8 +172,11 @@ func TestP2UnreadableAndDetachedInOneRun(t *testing.T) {
 	if asg := l.assignments("TicketRead"); len(asg) != 1 || asg[0].State != models.RelCurrent {
 		t.Errorf("unreadable policy's assignment = %+v, want CURRENT: attachment lists are read independently", asg)
 	}
-	if asg := l.assignments("OtherPolicy"); len(asg) != 1 || asg[0].State != models.RelEnded {
-		t.Errorf("detached policy's assignment = %+v, want ended", asg)
+	// Ended by the ASSIGNMENT partition (not_seen), before any retirement
+	// cascade could (D-67).
+	if asg := l.assignments("OtherPolicy"); len(asg) != 1 || asg[0].State != models.RelEnded ||
+		asg[0].EndedReason != models.EndedNotSeen {
+		t.Errorf("detached policy's assignment = %+v, want ended not_seen", asg)
 	}
 	// The statement of the unreadable policy: support stale, still active.
 	var stmtID uuid.UUID
@@ -436,7 +462,12 @@ func TestP2TwoAccountsOneBucket(t *testing.T) {
 		t.Errorf("%d '*' resources: a grant naming the shared bucket became a wildcard", n)
 	}
 
+	// E10: "Remove B's policy naming support-tickets". Removed, not merely
+	// detached: since T3.1 a detached customer-managed policy is still in the
+	// LocalManagedPolicy listing, still a policy in the account that names the
+	// bucket (§2.15), so detaching alone rightly keeps B's support current.
 	b.detach("data-reader", bPolicy)
+	delete(b.iam.managedPolicies, bPolicy)
 	l.scanAndProject(b)
 
 	res2, life2 := l.resourceID("arn:aws:s3:::support-tickets/*")

@@ -35,11 +35,10 @@ import (
 // permissions on different schedules, which is the inconsistency the shared
 // generation exists to prevent.
 type AWSPermissionScanner struct {
-	db          *gorm.DB
-	identities  repositories.CloudIdentityRepository
-	grants      repositories.CloudPermissionRepository
-	checkpoints repositories.CloudScanCheckpointRepository
-	onboarding  *AWSOnboardingService
+	db         *gorm.DB
+	identities repositories.CloudIdentityRepository
+	grants     repositories.CloudPermissionRepository
+	onboarding *AWSOnboardingService
 
 	// policies writes policies as objects, with their attachments (035). The
 	// projector reads THESE; cloud_permission keeps being written from the
@@ -81,12 +80,11 @@ func (s *AWSPermissionScanner) WithFence(f repositories.ScanFence) *AWSPermissio
 // NewAWSPermissionScanner constructs the scanner.
 func NewAWSPermissionScanner(db *gorm.DB, onboarding *AWSOnboardingService) *AWSPermissionScanner {
 	return &AWSPermissionScanner{
-		db:          db,
-		identities:  repositories.NewCloudIdentityRepository(db),
-		grants:      repositories.NewCloudPermissionRepository(db),
-		checkpoints: repositories.NewCloudScanCheckpointRepository(db),
-		policies:    repositories.NewCloudPolicyRepository(db),
-		onboarding:  onboarding,
+		db:         db,
+		identities: repositories.NewCloudIdentityRepository(db),
+		grants:     repositories.NewCloudPermissionRepository(db),
+		policies:   repositories.NewCloudPolicyRepository(db),
+		onboarding: onboarding,
 	}
 }
 
@@ -126,14 +124,22 @@ type PermissionSnapshot struct {
 	// StatementsSkipped counts statements dropped for having no Effect, or
 	// neither Action nor NotAction. Surfaced so a silent skip is countable.
 	StatementsSkipped int
-	// PoliciesWritten counts cloud_policy rows this run recorded (035).
+	// PoliciesWritten counts cloud_policy rows this run recorded (035): each
+	// managed policy once, however many principals attach it, plus each
+	// inline policy.
 	PoliciesWritten int
-	// UnreadableDocuments names each policy whose document could not be
-	// fetched or parsed this run, with the reason -- reported under
-	// policy_documents so coverage says WHICH document, not only that one
-	// failed (§1.4). Deduplicated: a managed policy is one row per connector.
-	UnreadableDocuments []string
-	unreadableSeen      map[string]bool
+	// UnreadableDocuments names each document -- policy or role trust policy
+	// -- that could not be fetched or parsed this run, with the reason,
+	// reported under policy_documents so coverage says WHICH document, not only
+	// that one failed (§1.4, T3.3): as items (D-71) and in the prose.
+	// Deduplicated, in the order the scan met them.
+	UnreadableDocuments []models.CoverageItem
+	unreadableSeen      map[models.CoverageItem]bool
+	// policyHoldersMissing counts principals whose policies could not be
+	// written because their identity row was not found. Their attachments
+	// were not re-stamped this run, so cloud_policy reconciliation must not
+	// run over them.
+	policyHoldersMissing int
 	// OIDCProviders is the account's registered providers. Returned rather than
 	// only persisted so a caller resolving a cluster by issuer is not forced to
 	// make this same call again for data this scan already read.
@@ -205,6 +211,12 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	providers, oidcErr := reader.OIDCProviders(ctx)
 	out.OIDCProviders = providers
 
+	// Roles whose trust documents are unreadable (the IAM scan judged them and
+	// stored the reason on each row) are named under policy_documents too:
+	// "names the documents" (T3.3) covers both kinds.
+	for _, item := range snapshot.UnreadableTrust {
+		out.noteUnreadableItem(item)
+	}
 	if err := s.writeAssumeEdges(workspaceID, snapshot, out); err != nil {
 		return out, err
 	}
@@ -255,25 +267,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 		models.SurfaceEKSPodIdentity: surfaceResult(out.PodIdentityEdges, eksErr),
 	}
 	if len(out.UnreadableDocuments) > 0 || out.ParseFailures > 0 || out.StatementsSkipped > 0 {
-		// Written ONLY when something was dropped (canEnd relies on that), and
-		// naming the documents: "1 policy could not be read: TicketRead v3
-		// (fetch: AccessDenied)". The rest of the scan continued.
-		reason := "policy or trust documents could not be fully read"
-		if n := len(out.UnreadableDocuments); n > 0 {
-			noun := "policies"
-			if n == 1 {
-				noun = "policy"
-			}
-			reason = fmt.Sprintf("%d %s could not be read: %s", n, noun,
-				strings.Join(out.UnreadableDocuments, "; "))
-			if out.StatementsSkipped > 0 {
-				reason += fmt.Sprintf("; %d statements skipped", out.StatementsSkipped)
-			}
-		}
-		out.Surfaces[models.SurfacePolicyDocuments] = surfacePartial(
-			out.PermissionsWritten+out.EdgesWritten,
-			len(out.UnreadableDocuments)+out.ParseFailures+out.StatementsSkipped,
-			reason)
+		out.Surfaces[models.SurfacePolicyDocuments] = policyDocumentsSurface(out, len(snapshot.TrustPolicies))
 	}
 
 	// Resource-based policies for the S3 buckets and KMS keys writePermissions
@@ -296,6 +290,15 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 		_ = edgesRemoved
 		_ = permsRemoved
 		_ = resRemoved
+	}
+	// cloud_policy and its attachments reconcile on the LISTINGS alone, not on
+	// out.Complete. An unreadable document's row is re-stamped at this
+	// generation like any other (with document_error), so it is never among
+	// the rows deleted here; vetoing the account's policy cleanup over one
+	// unreadable document is the account-wide veto per-document isolation
+	// exists to avoid (§1.4: "the rest of the scan continues"). OIDC and EKS
+	// say nothing about policies.
+	if snapshot.Coverage.Complete() && out.policyHoldersMissing == 0 {
 		if _, _, err := s.policies.ReconcilePolicies(
 			workspaceID, snapshot.ConnectorID, snapshot.Generation); err != nil {
 			return out, err
@@ -462,22 +465,39 @@ func (s *AWSPermissionScanner) writePodIdentityEdge(
 func (s *AWSPermissionScanner) writePermissions(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, out *PermissionSnapshot,
 ) error {
-	// Sorted, not map order, because the checkpoint advanced below is a cursor
-	// through this same order. Advancing it out of order would let a resumed
-	// scan skip an identity that was never written -- see migration 017.
-	arns := make([]string, 0, len(snapshot.Policies))
-	for arn := range snapshot.Policies {
+	// ---- managed policies, each ONCE (T3.1, 035) ---------------------------
+	//
+	// Every managed policy the read resolved -- every customer-managed policy
+	// in the account, attached or not, and every AWS-managed one a principal
+	// uses -- is one row per connector with one state and one observation,
+	// written before any attachment names it. In ARN order, so a run is
+	// reproducible.
+	rows := make(map[string]*models.CloudPolicy, len(snapshot.ManagedPolicies))
+	arns := make([]string, 0, len(snapshot.ManagedPolicies))
+	for arn := range snapshot.ManagedPolicies {
 		arns = append(arns, arn)
 	}
 	sort.Strings(arns)
+	for _, arn := range arns {
+		if _, err := s.managedPolicyRow(workspaceID, snapshot, snapshot.ManagedPolicies[arn], rows, out); err != nil {
+			return err
+		}
+	}
 
-	done := 0
-	for _, identityARN := range arns {
+	// ---- per holder: attachments, inline policies, Cloud Inventory rows -----
+	holders := make([]string, 0, len(snapshot.Policies))
+	for arn := range snapshot.Policies {
+		holders = append(holders, arn)
+	}
+	sort.Strings(holders)
+
+	for _, identityARN := range holders {
 		policies := snapshot.Policies[identityARN]
 		identity, err := s.identities.GetIdentityByNativeID(workspaceID, identityARN)
 		if err != nil {
 			if errors.Is(err, repositories.ErrCloudIdentityNotFound) {
 				out.Skipped++
+				out.policyHoldersMissing++
 				continue
 			}
 			return err
@@ -496,61 +516,53 @@ func (s *AWSPermissionScanner) writePermissions(
 		grants := grantOptions(state)
 
 		for _, p := range policies.Attached {
-			readable, err := s.recordManagedPolicy(workspaceID, snapshot, identity, p,
-				models.CloudAttachmentAttached, out)
+			row, err := s.managedPolicyRow(workspaceID, snapshot, p, rows, out)
 			if err != nil {
 				return err
 			}
-			if !readable {
-				continue // recorded as unreadable; the rest of the scan continues
-			}
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, p.ARN, p.Document, out, grants); err != nil {
+			if err := s.attach(workspaceID, snapshot, row, identity, models.CloudAttachmentAttached); err != nil {
 				return err
+			}
+			// Cloud Inventory's rows, from any document that parses at all --
+			// an unreadable one (document_error) contributes nothing to the
+			// graph either way, and one with a skipped statement keeps writing
+			// its usable statements here, as it always has.
+			if parses(p.FetchError, p.Document) {
+				if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID,
+					p.ARN, managedPolicyAPI(p), p.Document, out, grants); err != nil {
+					return err
+				}
 			}
 		}
 		for _, p := range policies.Inline {
-			readable, err := s.recordInlinePolicy(workspaceID, snapshot, identity, p, out)
-			if err != nil {
+			if err := s.recordInlinePolicy(workspaceID, snapshot, identity, p, out); err != nil {
 				return err
 			}
-			if !readable {
-				continue
-			}
-			source := "inline:" + p.Name
-			if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, source, p.Document, out, grants); err != nil {
-				return err
+			if parses(p.FetchError, p.Document) {
+				if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID,
+					"inline:"+p.Name, authDetailsAPI, p.Document, out, grants); err != nil {
+					return err
+				}
 			}
 		}
 		// The boundary's own statements, recorded as a ceiling. Written with a
 		// distinct derivation so nothing counts them as access granted, and
 		// attached as kind 'boundary', which the graph never makes a grant.
+		// Users have one too now (§1.3).
 		if b := policies.Boundary; b != nil {
-			readable, err := s.recordManagedPolicy(workspaceID, snapshot, identity, *b,
-				models.CloudAttachmentBoundary, out)
+			row, err := s.managedPolicyRow(workspaceID, snapshot, *b, rows, out)
 			if err != nil {
 				return err
 			}
-			if readable {
-				source := "boundary:" + b.ARN
-				if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID, source, b.Document, out, boundaryOptions()); err != nil {
+			if err := s.attach(workspaceID, snapshot, row, identity, models.CloudAttachmentBoundary); err != nil {
+				return err
+			}
+			if parses(b.FetchError, b.Document) {
+				if err := s.writePolicyDocument(workspaceID, snapshot, identity.ID, identity.NativeID,
+					"boundary:"+b.ARN, managedPolicyAPI(*b)+" (permissions boundary)", b.Document, out, boundaryOptions()); err != nil {
 					return err
 				}
 			}
-		}
-
-		// This identity's permissions are now durably written and stamped with
-		// this generation, so the cursor may move past it. Advanced AFTER the
-		// write, never before: a cursor ahead of the data would make a resumed
-		// scan skip an identity nothing had recorded.
-		done++
-		if err := s.checkpoints.Advance(
-			workspaceID, snapshot.ConnectorID, snapshot.Generation,
-			models.ScanPhaseIdentityPolicies, identityARN, done,
-		); err != nil {
-			// A checkpoint that cannot be written costs efficiency on the next
-			// attempt, not correctness of this one. Losing the scan over it
-			// would be the worse trade.
-			log.Printf("aws permission scan: checkpoint advance failed at %s: %v", identityARN, err)
 		}
 	}
 	return nil
@@ -605,18 +617,18 @@ func nullableJSON(s string) *string {
 	return &s
 }
 
-// policySourceAPI names the AWS call a statement came from, so evidence points
-// at something a reader can re-issue. An inline policy came from GetRolePolicy;
-// anything else is a managed policy read through GetPolicyVersion.
-func policySourceAPI(source string) string {
-	switch {
-	case strings.HasPrefix(source, "inline:"):
-		return "iam:GetRolePolicy"
-	case strings.HasPrefix(source, "boundary:"):
-		return "iam:GetPolicyVersion (permissions boundary)"
-	default:
+// authDetailsAPI is the call inline and customer-managed documents come from:
+// both arrive in the authorization-details listing itself (T3.1).
+const authDetailsAPI = "iam:GetAccountAuthorizationDetails"
+
+// managedPolicyAPI names the AWS call a managed policy's document came from,
+// so evidence points at something a reader can re-issue: GetPolicyVersion for
+// an AWS-managed policy, the LocalManagedPolicy listing for a customer one.
+func managedPolicyAPI(p awsdiscovery.AttachedPolicy) string {
+	if p.AWSManaged {
 		return "iam:GetPolicyVersion"
 	}
+	return authDetailsAPI
 }
 
 // constraintState decides how far a recorded permission may be trusted as a
@@ -653,17 +665,25 @@ func constraintState(stmt awsdiscovery.PolicyStatement, b boundaryState) string 
 // resource_id=NULL row for that nativeID -- an accepted limitation, since
 // cloud_resource never stores a wildcarded string for either one to keep
 // distinct in the first place.
+//
+// A document that does NOT PARSE never fails the scan: it is counted and
+// skipped. Returning an error for it aborted ScanFromSnapshot, which recorded
+// permission_scan denied and vetoed every partition in the account over one
+// document -- the §1.3 defect per-document isolation exists to remove. (The
+// callers only hand over documents that parse; this is the backstop.) A
+// failed WRITE still returns its error: that includes a lost fence, and a
+// superseded worker must stop.
 func (s *AWSPermissionScanner) writePolicyDocument(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, identityID uuid.UUID,
-	holderNativeID, source, document string, out *PermissionSnapshot, opts policyWriteOptions,
+	holderNativeID, source, sourceAPI, document string, out *PermissionSnapshot, opts policyWriteOptions,
 ) error {
 	statements, skipped, err := awsdiscovery.ParsePolicyDocument(document)
 	if err != nil {
 		// A document we cannot read is a coverage failure, not an identity with
-		// no permissions. Returning nil here is what used to make a malformed
-		// managed policy look like an empty one.
+		// no permissions: counted, so the legacy reconcile never runs.
 		out.ParseFailures++
-		return fmt.Errorf("parse policy %s: %w", source, err)
+		log.Printf("aws permission scan: parse policy %s: %v", source, err)
+		return nil
 	}
 	out.StatementsSkipped += skipped
 
@@ -762,7 +782,7 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 				subjectKey := igagraph.PermissionSubjectKey(*stored, holderNativeID, resourceNativeID)
 				if err := s.evidence.Record(
 					PermissionSubject(stored.ID),
-					policySourceAPI(source), models.SurfaceIAMPolicies, "",
+					sourceAPI, models.SurfaceIAMPolicies, "",
 					time.Now(), subjectKey,
 					map[string]any{
 						"source":           source,
@@ -786,21 +806,35 @@ func (s *AWSPermissionScanner) writePolicyDocument(
 	return nil
 }
 
-// documentError decides whether a fetched document is readable, and why not:
-// "fetch: ..." from the reader, or "parse: ..." from the parser the projector
-// will use. The same parser at collection and at projection, so a document
-// recorded readable here cannot fail to parse there (§4.7).
-func documentError(fetchErr, document string) string {
+// documentError decides whether a document is readable, and why not (T3.3):
+// "fetch: ..." from the reader -- naming the call and AWS's error code --
+// "fetch: empty document", or awsdiscovery.PolicyDocumentError's "parse: ..."
+// (which includes D-49's unusable statements). One definition of readable,
+// over the parser the projector runs, so a document recorded readable here
+// cannot fail to parse there (§4.7). skipped is the per-document count of
+// unusable statements (§1.4: "skipped statements are counted per document").
+func documentError(fetchErr, document string) (docErr string, skipped int) {
 	if fetchErr != "" {
-		return fetchErr
+		return fetchErr, 0
 	}
 	if strings.TrimSpace(document) == "" {
-		return "fetch: empty document"
+		return "fetch: empty document", 0
 	}
-	if _, _, err := awsdiscovery.ParsePolicyDocument(document); err != nil {
-		return "parse: " + err.Error()
+	if _, n, err := awsdiscovery.ParsePolicyDocument(document); err == nil {
+		skipped = n
 	}
-	return ""
+	return awsdiscovery.PolicyDocumentError(document), skipped
+}
+
+// parses reports whether a document was fetched and parses at all -- the bar
+// for Cloud Inventory's cloud_permission rows, which a skipped statement does
+// not lower.
+func parses(fetchErr, document string) bool {
+	if fetchErr != "" || strings.TrimSpace(document) == "" {
+		return false
+	}
+	_, _, err := awsdiscovery.ParsePolicyDocument(document)
+	return err == nil
 }
 
 // documentJSON is the document for cloud_policy.document (jsonb), or nil when
@@ -813,17 +847,37 @@ func documentJSON(document string) json.RawMessage {
 	return json.RawMessage(document)
 }
 
-// recordManagedPolicy writes a managed policy (as this connector read it) and
-// its attachment to the holder. Returns whether the document was readable.
+// managedPolicyRow returns the cloud_policy row for a managed policy, writing
+// it the first time this run meets the ARN -- ONE row per connector per run,
+// one state, one observation, however many principals attach it.
+func (s *AWSPermissionScanner) managedPolicyRow(
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, p awsdiscovery.AttachedPolicy,
+	rows map[string]*models.CloudPolicy, out *PermissionSnapshot,
+) (*models.CloudPolicy, error) {
+	if row, ok := rows[p.ARN]; ok {
+		return row, nil
+	}
+	row, err := s.recordManagedPolicy(workspaceID, snapshot, p, out)
+	if err != nil {
+		return nil, err
+	}
+	rows[p.ARN] = row
+	return row, nil
+}
+
+// recordManagedPolicy writes a managed policy (as this connector read it), and
+// its observation.
 //
-// Written whether or not the document could be read: the ATTACHMENT is a fact
+// Written whether or not the document could be read: its ATTACHMENTS are facts
 // read independently of the document (§1.4), and the projector needs the
 // unreadable policy at THIS generation to protect what it declared last time.
+// The document itself is stored whenever it was fetched and is JSON -- also
+// when it did not parse, because document_error, not the column's NULL, is
+// what says the graph may not use it.
 func (s *AWSPermissionScanner) recordManagedPolicy(
-	workspaceID uuid.UUID, snapshot *IAMSnapshot, holder *models.CloudIdentity,
-	p awsdiscovery.AttachedPolicy, attachmentKind string, out *PermissionSnapshot,
-) (bool, error) {
-	docErr := documentError(p.FetchError, p.Document)
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, p awsdiscovery.AttachedPolicy, out *PermissionSnapshot,
+) (*models.CloudPolicy, error) {
+	docErr, skipped := documentError(p.FetchError, p.Document)
 	row := &models.CloudPolicy{
 		WorkspaceID:        workspaceID,
 		ConnectorID:        snapshot.ConnectorID,
@@ -836,40 +890,50 @@ func (s *AWSPermissionScanner) recordManagedPolicy(
 		DocumentError:      docErr,
 		LastSeenGeneration: snapshot.Generation,
 	}
-	if docErr == "" {
+	if p.FetchError == "" {
 		row.Document = documentJSON(p.Document)
 		row.DocumentHash = documentHash(p.Document)
-	} else {
+	}
+	if docErr != "" {
 		out.noteUnreadable(p.Name, p.VersionID, docErr)
 	}
 	stored, err := s.policies.UpsertPolicy(row)
 	if err != nil {
-		return false, fmt.Errorf("record policy %s: %w", p.ARN, err)
+		return nil, fmt.Errorf("record policy %s: %w", p.ARN, err)
 	}
 	out.PoliciesWritten++
-	if err := s.policies.UpsertAttachment(&models.CloudPolicyAttachment{
-		WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
-		PolicyRowID: stored.ID, PrincipalIdentityID: holder.ID,
-		AttachmentKind: attachmentKind, LastSeenGeneration: snapshot.Generation,
-	}); err != nil {
-		return false, fmt.Errorf("record attachment %s -> %s: %w", p.ARN, holder.NativeID, err)
-	}
-	s.recordPolicyEvidence(stored, "iam:GetPolicyVersion", map[string]any{
+	s.recordPolicyEvidence(stored, managedPolicyAPI(p), map[string]any{
 		"arn": p.ARN, "policy_id": p.PolicyID, "name": p.Name,
 		"version_id": p.VersionID, "aws_managed": p.AWSManaged,
 		"document_hash": row.DocumentHash, "document_error": docErr,
+		"statements_skipped": skipped,
 	})
-	return docErr == "", nil
+	return stored, nil
 }
 
-// recordInlinePolicy writes one holder's inline policy and its 'inline'
-// attachment. Keyed by its holder: two roles each with an inline ReadData are
-// two policies (§2.6).
+// attach records policy -> principal at this generation.
+func (s *AWSPermissionScanner) attach(
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, policy *models.CloudPolicy,
+	holder *models.CloudIdentity, kind string,
+) error {
+	if err := s.policies.UpsertAttachment(&models.CloudPolicyAttachment{
+		WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
+		PolicyRowID: policy.ID, PrincipalIdentityID: holder.ID,
+		AttachmentKind: kind, LastSeenGeneration: snapshot.Generation,
+	}); err != nil {
+		return fmt.Errorf("record %s attachment %s -> %s: %w", kind, policy.NativeID, holder.NativeID, err)
+	}
+	return nil
+}
+
+// recordInlinePolicy writes one holder's inline policy, its 'inline'
+// attachment and its observation. Keyed by its holder: two roles each with an
+// inline ReadData are two policies (§2.6).
 func (s *AWSPermissionScanner) recordInlinePolicy(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, holder *models.CloudIdentity,
 	p awsdiscovery.InlinePolicy, out *PermissionSnapshot,
-) (bool, error) {
-	docErr := documentError(p.FetchError, p.Document)
+) error {
+	docErr, skipped := documentError(p.FetchError, p.Document)
 	holderID := holder.ID
 	row := &models.CloudPolicy{
 		WorkspaceID:        workspaceID,
@@ -881,40 +945,37 @@ func (s *AWSPermissionScanner) recordInlinePolicy(
 		DocumentError:      docErr,
 		LastSeenGeneration: snapshot.Generation,
 	}
-	if docErr == "" {
+	if p.FetchError == "" {
 		row.Document = documentJSON(p.Document)
 		row.DocumentHash = documentHash(p.Document)
-	} else {
+	}
+	if docErr != "" {
 		out.noteUnreadable(p.Name+" (inline on "+holder.Name+")", "", docErr)
 	}
 	stored, err := s.policies.UpsertPolicy(row)
 	if err != nil {
-		return false, fmt.Errorf("record inline policy %s: %w", row.NativeID, err)
+		return fmt.Errorf("record inline policy %s: %w", row.NativeID, err)
 	}
 	out.PoliciesWritten++
-	if err := s.policies.UpsertAttachment(&models.CloudPolicyAttachment{
-		WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
-		PolicyRowID: stored.ID, PrincipalIdentityID: holder.ID,
-		AttachmentKind: models.CloudAttachmentInline, LastSeenGeneration: snapshot.Generation,
-	}); err != nil {
-		return false, fmt.Errorf("record inline attachment %s: %w", row.NativeID, err)
+	if err := s.attach(workspaceID, snapshot, stored, holder, models.CloudAttachmentInline); err != nil {
+		return err
 	}
-	api := "iam:GetRolePolicy"
-	switch holder.Kind {
-	case models.CloudIdentityIAMUser:
-		api = "iam:GetUserPolicy"
-	case models.CloudIdentityIAMGroup:
-		api = "iam:GetAccountAuthorizationDetails"
-	}
-	s.recordPolicyEvidence(stored, api, map[string]any{
+	// Inline documents of roles, users and groups alike arrive in the
+	// authorization-details listing (T3.1).
+	s.recordPolicyEvidence(stored, authDetailsAPI, map[string]any{
 		"name": p.Name, "holder": holder.NativeID,
 		"document_hash": row.DocumentHash, "document_error": docErr,
+		"statements_skipped": skipped,
 	})
-	return docErr == "", nil
+	return nil
 }
 
 // recordPolicyEvidence records the policy version as an evidence subject
-// (035). The grant, the assignment and the target all cite it (§4.8).
+// (035, T3.5): subject policy_id, subject_native_id the policy's native id,
+// which is what the projector joins on. The grant, the assignment and the
+// target all cite it (§4.8). The facts carry the document hash, so a new
+// default version is a new observation and an unchanged one is confirmed on
+// the dedupe path: one observation per policy version.
 func (s *AWSPermissionScanner) recordPolicyEvidence(p *models.CloudPolicy, api string, facts map[string]any) {
 	if s.evidence == nil || p == nil {
 		return
@@ -934,19 +995,70 @@ func documentHash(document string) string {
 
 // noteUnreadable records one unreadable document, once per name and version.
 func (o *PermissionSnapshot) noteUnreadable(name, version, reason string) {
-	label := name
-	if version != "" {
-		label += " " + version
-	}
-	label += " (" + reason + ")"
+	o.noteUnreadableItem(models.CoverageItem{Policy: name, Version: version, Error: reason})
+}
+
+// noteUnreadableItem records one unreadable document -- a policy, or a role's
+// trust policy the IAM scan judged -- once.
+func (o *PermissionSnapshot) noteUnreadableItem(item models.CoverageItem) {
 	if o.unreadableSeen == nil {
-		o.unreadableSeen = map[string]bool{}
+		o.unreadableSeen = map[models.CoverageItem]bool{}
 	}
-	if o.unreadableSeen[label] {
+	if o.unreadableSeen[item] {
 		return
 	}
-	o.unreadableSeen[label] = true
-	o.UnreadableDocuments = append(o.UnreadableDocuments, label)
+	o.unreadableSeen[item] = true
+	o.UnreadableDocuments = append(o.UnreadableDocuments, item)
+}
+
+// unreadableLabel is one unreadable document as the coverage prose names it:
+// "TicketRead v3 (fetch: AWS returned AccessDenied for iam:GetPolicyVersion: ...)".
+func unreadableLabel(item models.CoverageItem) string {
+	label := item.Policy
+	if item.Version != "" {
+		label += " " + item.Version
+	}
+	return label + " (" + item.Error + ")"
+}
+
+// policyDocumentsSurface is policy_documents when something could not be read
+// (§1.4): partial, Count the documents examined (policies and role trust
+// documents), and the error naming each unreadable one with its reason --
+// "1 policy could not be read: TicketRead v3 (parse: ...)". Written ONLY when
+// something was dropped; canEnd reads its absence as "nothing was".
+//
+// The same documents as Items (D-71), and both BOUNDED at
+// models.CoverageItemLimit: the count in the prose is always the full one,
+// Truncated says the list is not, and an account with thousands of broken
+// documents does not write a report that size into every run.
+func policyDocumentsSurface(out *PermissionSnapshot, trustDocuments int) models.SurfaceCoverage {
+	cov := models.SurfaceCoverage{
+		State: models.CloudCoveragePartial,
+		Count: out.PoliciesWritten + trustDocuments,
+		Error: "policy or trust documents could not be fully read",
+	}
+	n := len(out.UnreadableDocuments)
+	if n == 0 {
+		return cov
+	}
+	listed := out.UnreadableDocuments
+	if n > models.CoverageItemLimit {
+		listed, cov.Truncated = listed[:models.CoverageItemLimit], true
+	}
+	cov.Items = append([]models.CoverageItem(nil), listed...)
+	labels := make([]string, 0, len(listed))
+	for _, item := range listed {
+		labels = append(labels, unreadableLabel(item))
+	}
+	noun := "policies"
+	if n == 1 {
+		noun = "policy"
+	}
+	cov.Error = fmt.Sprintf("%d %s could not be read: %s", n, noun, strings.Join(labels, "; "))
+	if cov.Truncated {
+		cov.Error += fmt.Sprintf("; and %d more", n-len(listed))
+	}
+	return cov
 }
 
 func (s *AWSPermissionScanner) getOrCreateResource(
