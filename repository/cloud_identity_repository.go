@@ -157,6 +157,16 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAt
 				" ELSE excluded.attrs END",
 			args...)
 	}
+	// A role's trust document and its readability (035, T3.4), refreshed on
+	// every scan through this FENCED write like the rest of the row -- a
+	// superseded worker must not replace them. Roles only: no other identity
+	// has a trust document, and a user, group or GCP upsert must never clear a
+	// role's.
+	if i.Kind == models.CloudIdentityIAMRole {
+		for _, col := range []string{"trust_document", "trust_document_hash", "trust_parse_error"} {
+			assignments[col] = gorm.Expr("excluded." + col)
+		}
+	}
 	// last_used_at is only advanced, never cleared. AWS reports it from
 	// different places with different freshness — GetRole's RoleLastUsed, the
 	// credential report, CloudTrail — and a source that happens not to know must

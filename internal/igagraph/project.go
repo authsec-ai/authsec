@@ -61,6 +61,12 @@ type GraphWriter interface {
 	UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, statementEffect string) (uuid.UUID, error)
 	UpsertRelationship(tx *gorm.DB, r *models.IGARelationship) (uuid.UUID, error)
 
+	// External principals (034, §4.7). UpsertExternalPrincipal never touches
+	// the resolution columns; SetDerivedResolution is the only projector
+	// write to them, and refuses an asserted row.
+	UpsertExternalPrincipal(tx *gorm.DB, e *models.IGAExternalPrincipal) (uuid.UUID, error)
+	SetDerivedResolution(tx *gorm.DB, ws, externalID, identityID uuid.UUID, rule string) error
+
 	UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error
 	UpsertProjectionState(tx *gorm.DB, s *models.IGAProjectionState) error
 
@@ -217,6 +223,7 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		{"grants", p.projectGrants},
 		{"memberships", p.projectMemberships},
 		{"execution", p.projectExecution},
+		{"trust", p.projectTrust}, // can_assume + external principals (§4.7)
 		{"evidence", p.attachEvidence},
 	}
 	for _, st := range steps {
@@ -225,6 +232,7 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		}
 	}
 	p.exclusions = exclusionsOf(snap, r)
+	p.exclusions.UnreadableTrust, p.exclusions.UnattributedPodIdentity = trustExclusions(snap, r)
 	if err := p.recordState(tx, snap, false); err != nil {
 		return err
 	}
@@ -298,7 +306,12 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 		cont := Continuity(ci.Kind)
 		imm := ImmutableKey(ci)
 		part := snap.PartitionFor(models.ObjectIdentity, ci.Kind, "")
+		live := r.existing.identity[key]
 
+		trust, err := p.trustFlags(r, snap, ci, live)
+		if err != nil {
+			return err
+		}
 		desc := models.IGAIdentityAccount{
 			WorkspaceID: snap.Run.WorkspaceID, EstateScopeID: &snap.ScopeID,
 			Provider: models.ProviderAWS, SourceKey: key,
@@ -306,12 +319,10 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 			DisplayName: ci.Name, AccountKind: ci.Kind,
 			IdentityBacking: "provider_native", Lifecycle: models.IGALifecycleActive,
 			RollupState: models.RollupConfirmed, LastSeenAt: now,
-			ProviderAttrs: identityProviderAttrs(ci),
+			ProviderAttrs: identityProviderAttrs(ci, trust),
 		}
 
 		var id uuid.UUID
-		var err error
-		live := r.existing.identity[key]
 		switch {
 		// (a) RECREATION. Same recognition key, different non-empty creation
 		//     boundary: a different principal wearing the old name.
@@ -375,8 +386,10 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 }
 
 // identityProviderAttrs is display-only provider fact (§3 028): path, tags,
-// permissions-boundary ARN -- so the read APIs never read cloud_*.
-func identityProviderAttrs(ci models.CloudIdentity) json.RawMessage {
+// permissions-boundary ARN, and for a role what its trust document says
+// (trust_has_deny, trust_has_not_principal; see trustFlags) -- so the read APIs
+// never read cloud_*.
+func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.RawMessage {
 	a := ci.AWSAttrs()
 	out := map[string]any{"path": a.Path}
 	if len(a.Tags) > 0 {
@@ -384,6 +397,9 @@ func identityProviderAttrs(ci models.CloudIdentity) json.RawMessage {
 	}
 	if a.PermissionsBoundaryARN != "" {
 		out["permissions_boundary_arn"] = a.PermissionsBoundaryARN
+	}
+	for k, v := range trust {
+		out[k] = v
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {

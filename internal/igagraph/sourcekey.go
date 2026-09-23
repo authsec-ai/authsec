@@ -41,7 +41,12 @@ func Key(provider string, parts ...string) string {
 }
 
 // IdentityKey is the recognition key of an IAM role, user or group: its ARN.
-func IdentityKey(i models.CloudIdentity) string { return Key("aws", i.NativeID) }
+func IdentityKey(i models.CloudIdentity) string { return IdentityARNKey(i.NativeID) }
+
+// IdentityARNKey is IdentityKey spelled from the ARN alone -- how a trust
+// principal naming an identity in ANOTHER account finds its live row, which
+// this run did not collect.
+func IdentityARNKey(arn string) string { return Key("aws", arn) }
 
 // ImmutableKey reads the creation boundary the collector wrote into attrs:
 // RoleId (AROA…), UserId (AIDA…) or GroupId (AGPA…). "" where there is none.
@@ -190,6 +195,104 @@ func GrantKey(assignmentKey, statementKey string) string {
 // RoleB computes a NEW key and the old edge ends instead of being overwritten.
 func RelationshipKey(relType, sourceKey, targetEndpoint string) string {
 	return Key("aws", relType, sourceKey, targetEndpoint)
+}
+
+// ExternalPrincipalKey is an external principal's recognition key: issuer ␟
+// subject (§2.4, §4.4), exactly as §4.4 spells it. The kind is NOT part of it,
+// so the normalisation must keep kinds apart by subject: D-42's issuers and
+// subjects do (and PodIdentitySubject is why an IRSA node and a pod-identity
+// node for one service account do not collide).
+//
+// It is also the principal's ENDPOINT key inside a can_assume edge key (D-41).
+func ExternalPrincipalKey(issuer, subject string) string {
+	return Key("aws", "ext", issuer, subject)
+}
+
+// IdentityAccountEndpointKey is EndpointKey spelled from a graph row -- how a
+// trust principal names an identity this run did not collect (another
+// connector's, §4.7) inside an edge key. The same two spellings as EndpointKey:
+// the immutable key when the row has one, else its source key (the ARN key).
+// So an identity reached through its own connector and through another
+// account's trust document is one endpoint, never two.
+func IdentityAccountEndpointKey(a models.IGAIdentityAccount) string {
+	if a.ImmutableKey != "" {
+		return Key("aws", "uid", a.ImmutableKey)
+	}
+	return a.SourceKey
+}
+
+// TrustStatementKey names one statement of a role's trust document, as
+// StatementKey names a policy statement (§2.6, §4.7): the role's endpoint key
+// ␟ trust ␟ sid:<Sid> when the Sid is unique in the document, else h:<content
+// hash>#n, n numbering identical Sid-less statements by their order among
+// equals. The hash covers Principal and NotPrincipal (D-46).
+//
+// Built from the role's ENDPOINT key, so a role recreated under the same ARN
+// shares no statement -- and no edge -- with its predecessor.
+func TrustStatementKey(roleEndpoint string, st awsdiscovery.TrustStatement,
+	sids map[string]int, hashSeen map[string]int) (key, hash string) {
+	hash = st.ContentHash()
+	if st.Sid != "" && sids[st.Sid] == 1 {
+		return Key("aws", roleEndpoint, "trust", "sid:"+st.Sid), hash
+	}
+	hashSeen[hash]++
+	return Key("aws", roleEndpoint, "trust", fmt.Sprintf("h:%s#%d", hash, hashSeen[hash])), hash
+}
+
+// CountTrustSids counts each Sid's occurrences in a trust document, for
+// TrustStatementKey.
+func CountTrustSids(stmts []awsdiscovery.TrustStatement) map[string]int {
+	out := map[string]int{}
+	for _, st := range stmts {
+		if st.Sid != "" {
+			out[st.Sid]++
+		}
+	}
+	return out
+}
+
+// PodIdentityStatementKey names the declaration behind a pod-identity
+// can_assume: no trust statement names the service account, the EKS
+// association does -- one per (role, cluster issuer, service account). k8sRef
+// is system:serviceaccount:<ns>:<sa>.
+func PodIdentityStatementKey(roleEndpoint, issuer, k8sRef string) string {
+	return Key("aws", roleEndpoint, "pod_identity", issuer, k8sRef)
+}
+
+// CanAssumeKey names a can_assume edge by the declaring statement, the SOURCE
+// endpoint and the TARGET endpoint (§4.4, §4.6, §4.7; P2-DECISIONS D-41) --
+// RelationshipKey with the statement added, so two statements naming one
+// principal under different conditions are two edges.
+//
+// sourceEndpoint is the source's endpoint key: EndpointKey (or
+// IdentityAccountEndpointKey) for an identity, ExternalPrincipalKey for an
+// external principal. Never a principal's ARN standing in for an identity
+// (B7's ARN-only defect): a recreated source or target yields a new key, and
+// no edge is ever re-pointed from one source to another in place. What
+// continues across a far account connecting is the external principal NODE
+// (its derived resolution, §2.12), not a re-sourced edge.
+func CanAssumeKey(sourceEndpoint, targetEndpoint, statementKey string) string {
+	return Key("aws", models.RelTypeCanAssume, sourceEndpoint, targetEndpoint, statementKey)
+}
+
+// PodIdentitySubject is the subject_claim of the k8s_service_account node an
+// EKS Pod Identity association names (D-42): system:serviceaccount:<ns>:<sa>
+// prefixed "pod:". An IRSA trust statement names the same service account as
+// an `oidc` node under the same issuer; ExternalPrincipalKey omits the kind,
+// so without the prefix the two would collide on
+// uq_iga_external_principal_key (D-42's Raise, until decided).
+func PodIdentitySubject(k8sRef string) string { return "pod:" + k8sRef }
+
+// PodIdentitySubjectKey is the subject_native_id of a pod-identity
+// association's observation (§4.8: its can_assume evidence is "the
+// association's observation"; §1.4: eks_pod_identity "observation added").
+// The writer (T3.5) records it with the ROLE as the typed subject and this
+// key, so it indexes as SubjectRef{identity, key} beside -- never colliding
+// with -- the role's own observation, keyed by the bare ARN. Built from values
+// both the collector and Snapshot.PodIdentity carry: the role ARN, the
+// cluster's scheme-less OIDC issuer and system:serviceaccount:<ns>:<sa>.
+func PodIdentitySubjectKey(roleARN, issuer, k8sRef string) string {
+	return Key("aws", "pod_identity", roleARN, issuer, k8sRef)
 }
 
 // CredentialKey: holder ARN ␟ key id (§2.4).

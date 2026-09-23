@@ -137,6 +137,13 @@ func protected(part Partition, ex Exclusions) (string, []any, bool) {
 	case part.Target == "relationship" && part.RelationshipType == models.RelTypeCanAssume && part.Kind == "trust":
 		return `target_identity_account_id = ANY(?)`,
 			[]any{pq.Array(ex.UnreadableTrust)}, len(ex.UnreadableTrust) > 0
+	case part.Target == "relationship" && part.RelationshipType == models.RelTypeCanAssume &&
+		part.Kind == models.MechanismEKSPodIdentity:
+		// A pod-identity association no cluster could be named for wrote no
+		// edge (trust.go); what that role's associations declared before
+		// must not look absent.
+		return `target_identity_account_id = ANY(?)`,
+			[]any{pq.Array(ex.UnattributedPodIdentity)}, len(ex.UnattributedPodIdentity) > 0
 	case part.Class == models.ObjectEntitlement:
 		return `entitlement_id IN (SELECT id FROM iga_entitlements
 		          WHERE workspace_id = iga_object_support.workspace_id AND policy_id = ANY(?))`,
@@ -151,7 +158,7 @@ func protected(part Partition, ex Exclusions) (string, []any, bool) {
 	default:
 		// identities, workloads, policies (still listed), assignments
 		// (attachment lists are read independently of documents), member_of,
-		// executes_as, task_execution_role, pod-identity can_assume
+		// executes_as, task_execution_role
 		return "", nil, false
 	}
 }

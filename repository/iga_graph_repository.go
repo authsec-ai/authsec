@@ -53,6 +53,9 @@ type IGAGraphRepository interface {
 	UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, statementEffect string) (uuid.UUID, error)
 	UpsertRelationship(tx *gorm.DB, r *models.IGARelationship) (uuid.UUID, error)
 
+	UpsertExternalPrincipal(tx *gorm.DB, e *models.IGAExternalPrincipal) (uuid.UUID, error)
+	SetDerivedResolution(tx *gorm.DB, ws, externalID, identityID uuid.UUID, rule string) error
+
 	UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error
 	UpsertProjectionState(tx *gorm.DB, s *models.IGAProjectionState) error
 
@@ -428,12 +431,45 @@ func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, s
 	return e.ID, err
 }
 
+// UpsertRelationship refreshes a live edge in place. It never writes a SOURCE
+// column: every edge key names its source endpoint, so a live row found by key
+// already has the source the caller computed, and no edge is ever re-pointed
+// from one source to another (P2-DECISIONS D-41).
 func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARelationship) (uuid.UUID, error) {
 	err := tx.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 		"statement_key", "conditions", "mechanism", "updated_at",
 	})).Create(rel).Error
 	return rel.ID, err
+}
+
+// UpsertExternalPrincipal writes the node for a principal a trust policy or
+// pod-identity association names (034, §4.7). The conflict target is
+// uq_iga_external_principal_key, which is NOT partial: an external principal
+// never retires (D-47), so there is no predicate to restate.
+//
+// DoUpdates names descriptive columns only -- mechanism, a function of the
+// key, and last_seen_at. NEVER first_seen_at, and NEVER the resolution
+// columns: an asserted resolution is a person's decision (Rules the DDL cannot
+// express, 5), and a derived one is written by SetDerivedResolution alone.
+func (r *igaGraphRepository) UpsertExternalPrincipal(tx *gorm.DB, e *models.IGAExternalPrincipal) (uuid.UUID, error) {
+	err := tx.Clauses(returningID, clause.OnConflict{
+		Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"mechanism", "last_seen_at"}),
+	}).Create(e).Error
+	return e.ID, err
+}
+
+// SetDerivedResolution records an exact-match resolution (§2.3: derived, rule
+// recorded). Guarded in SQL, whatever the caller believed: a row a person
+// asserted is never touched.
+func (r *igaGraphRepository) SetDerivedResolution(tx *gorm.DB, ws, externalID, identityID uuid.UUID, rule string) error {
+	return tx.Model(&models.IGAExternalPrincipal{}).
+		Where("workspace_id = ? AND id = ? AND resolution_basis IN ?", ws, externalID, []string{"", models.BasisDerived}).
+		Updates(map[string]any{
+			"resolved_identity_account_id": identityID, "resolved_workload_id": nil,
+			"resolution_basis": models.BasisDerived, "resolution_rule": rule,
+		}).Error
 }
 
 // UpsertObjectSupport records that this connector, in this partition, still

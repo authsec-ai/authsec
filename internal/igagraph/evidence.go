@@ -18,6 +18,9 @@ import (
 //	executes_as,
 //	task_execution_role      the workload's own observation
 //	member_of                the user's observation (it lists the group)
+//	can_assume               the role's observation (it is the read of the
+//	                         trust document); pod identity: the association's
+//	                         observation (PodIdentitySubjectKey)
 //
 // EVERY PROJECTED EDGE NEEDS EVIDENCE, COUNTED PER EDGE, NOT PER CLASS. A
 // per-class count passes with one evidenced edge and ten thousand bare ones.
@@ -60,7 +63,9 @@ func (p *Projector) attachEvidence(tx *gorm.DB, snap *Snapshot, r *resolved) err
 			return fmt.Errorf("link assignment evidence: %w", err)
 		}
 	}
-	for kind, rels := range map[string][]relRef{"executes_as": r.executes, "member_of": r.memberOf} {
+	for kind, rels := range map[string][]relRef{
+		"executes_as": r.executes, "member_of": r.memberOf, "can_assume": r.canAssume,
+	} {
 		for _, rel := range rels {
 			rel := rel
 			if err := link(kind, 1, func(obs uuid.UUID) error {

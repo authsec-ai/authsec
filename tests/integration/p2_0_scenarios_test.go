@@ -40,8 +40,9 @@ func (l *p2Lab) shape() map[uuid.UUID]shapeRow {
 		UNION ALL SELECT 'resource', id, first_seen_at FROM iga_resources WHERE workspace_id = ? AND provider = 'aws'
 		UNION ALL SELECT 'assignment', id, valid_from FROM iga_policy_assignment WHERE workspace_id = ?
 		UNION ALL SELECT 'grant', id, valid_from FROM iga_access_edges WHERE workspace_id = ? AND provider = 'aws'
-		UNION ALL SELECT 'relationship', id, valid_from FROM iga_relationship WHERE workspace_id = ?`,
-		l.ws, l.ws, l.ws, l.ws, l.ws, l.ws, l.ws, l.ws).Scan(&rows)
+		UNION ALL SELECT 'relationship', id, valid_from FROM iga_relationship WHERE workspace_id = ?
+		UNION ALL SELECT 'external_principal', id, first_seen_at FROM iga_external_principal WHERE workspace_id = ?`,
+		l.ws, l.ws, l.ws, l.ws, l.ws, l.ws, l.ws, l.ws, l.ws).Scan(&rows)
 	out := make(map[uuid.UUID]shapeRow, len(rows))
 	for _, r := range rows {
 		out[r.ID] = r
@@ -73,8 +74,11 @@ func TestP2UnchangedRescan(t *testing.T) {
 	if len(before) == 0 || revisions != 1 {
 		t.Fatalf("setup: %d graph rows, %d revisions; want a projected slice with one revision", len(before), revisions)
 	}
+	// Two relationships since T4.7 (§4.12's table): executes_as, and the
+	// role's trust document's can_assume from the external principal
+	// aws_service lambda.amazonaws.com -- which must be as stable as the rest.
 	for kind, want := range map[string]int{"identity": 1, "workload": 1, "policy": 1, "statement": 1,
-		"resource": 1, "assignment": 1, "grant": 1, "relationship": 1} {
+		"resource": 1, "assignment": 1, "grant": 1, "relationship": 2, "external_principal": 1} {
 		got := 0
 		for _, r := range before {
 			if r.Kind == kind {

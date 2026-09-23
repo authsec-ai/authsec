@@ -37,6 +37,13 @@ type Snapshot struct {
 	Workloads   []models.CloudWorkload
 	Secrets     []models.CloudSecret // access keys
 
+	// PodIdentity is this run's EKS pod-identity associations: cloud_assume_edge
+	// rows with mechanism eks_pod_identity ONLY (§4.3, §4.5). No other
+	// cloud_assume_edge row is read -- trust comes from the roles' trust
+	// documents themselves, which keep the Deny statements and conditions
+	// that table drops.
+	PodIdentity []models.CloudAssumeEdge
+
 	// Coverage is THIS RUN'S OWN report, decoded from the jsonb column stamped
 	// at publish (024). NEVER cloud_connector.coverage, which a later scan has
 	// overwritten.
@@ -46,6 +53,10 @@ type Snapshot struct {
 	// not be fetched or parsed. What they declared goes stale instead of
 	// ending (§4.10).
 	UnreadablePolicy map[uuid.UUID]bool // cloud_policy.id
+	// UnreadableTrust: a role whose trust document did not parse
+	// (trust_parse_error <> ''), or was not collected at all (D-45). Its trust
+	// edges go stale instead of ending (§4.10).
+	UnreadableTrust map[uuid.UUID]bool // cloud_identity.id
 
 	// ConfirmedBy holds the observation ids THIS run confirmed, keyed by
 	// subject. Selected on last_confirmed_run_id = this run (024), because
@@ -79,6 +90,18 @@ func (s *Snapshot) IdentityByID(id *uuid.UUID) *models.CloudIdentity {
 	}
 	s.index()
 	return s.identityByID[*id]
+}
+
+// Roles returns this snapshot's IAM roles, in snapshot order: the identities
+// that carry a trust document.
+func (s *Snapshot) Roles() []models.CloudIdentity {
+	var out []models.CloudIdentity
+	for _, ci := range s.Identities {
+		if ci.Kind == models.CloudIdentityIAMRole {
+			out = append(out, ci)
+		}
+	}
+	return out
 }
 
 // PolicyByID returns a collected policy of this snapshot, or nil.
