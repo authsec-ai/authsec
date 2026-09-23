@@ -500,8 +500,9 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 		{[]string{"integration", a.conn.String(), "provider", "aws"}, wantTexts},
 		{[]string{"integration", uuid.NewString()}, nil},
 		{[]string{"q", "support"}, []string{"arn:aws:s3:::support-tickets/*"}},
-		// '*' is not a LIKE metacharacter, and matches only itself.
-		{[]string{"q", "/*"}, []string{"arn:aws:s3:::support-tickets/*", "arn:aws:s3:::finance/*"}},
+		// '*' is not a LIKE metacharacter, and matches only itself: every
+		// reference whose text contains "/*", and never the bare "*".
+		{[]string{"q", "/*"}, []string{"arn:aws:s3:::support-tickets/*", "arn:aws:s3:::finance/*", partners}},
 	} {
 		got := listsField(listsWalk(t, api, "/resources", 2, tc.kv...), "text")
 		if !listsSameSet(got, tc.want) {
@@ -528,10 +529,7 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	} {
 		got := listsField(listsWalk(t, api, "/resources", 1, "sort", tc.sort), "text")
 		if strings.Join(got, " | ") != strings.Join(tc.want, " | ") {
-			t.Errorf("sort=%s =
-  %v
-want
-  %v", tc.sort, got, tc.want)
+			t.Errorf("sort=%s =\n  %v\nwant\n  %v", tc.sort, got, tc.want)
 		}
 	}
 }

@@ -39,26 +39,26 @@ import (
 
 // List routes, as bound into their cursors.
 const (
-	ListRouteWorkloads  = "workloads"
-	ListRouteIdentities = "identities"
-	ListRouteResources  = "resources"
+	listsRouteWorkloads  = "workloads"
+	listsRouteIdentities = "identities"
+	listsRouteResources  = "resources"
 )
 
 // Filter values beyond §5.2's common ones.
 const (
-	// RegionNotStated selects objects whose ARN states no region (§2.14.10).
-	RegionNotStated = "not_stated"
-	// ClassificationAgent is the Agents chip: provider-native or classified
+	// listsRegionNotStated selects objects whose ARN states no region (§2.14.10).
+	listsRegionNotStated = "not_stated"
+	// listsClassificationAgent is the Agents chip: provider-native or classified
 	// (§2.14.6).
-	ClassificationAgent = "agent"
-	// UsedByWorkloads selects identities some workload uses (§5.3).
-	UsedByWorkloads = "workloads"
+	listsClassificationAgent = "agent"
+	// listsUsedByWorkloads selects identities some workload uses (§5.3).
+	listsUsedByWorkloads = "workloads"
 )
 
-// ListingClassificationChanged is the reason 409 listing_changed carries: a
+// listsClassificationChanged is the reason 409 listing_changed carries: a
 // classification decision landed between two pages of a list that filters or
 // sorts on classification (§5.5).
-const ListingClassificationChanged = "classification_changed"
+const listsClassificationChanged = "classification_changed"
 
 // ListWorkloads serves GET /api/iga/v1/workloads (§5.3 Agents & workloads).
 func (r *Reader) ListWorkloads(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
@@ -243,7 +243,7 @@ func listsRun[S listsScan](ctx context.Context, r *Reader, ws uuid.UUID, vals ur
 			}
 			classSeq = &seq
 			if after != nil && (after.classSeq == nil || *after.classSeq != seq) {
-				return ListingChanged(ListingClassificationChanged)
+				return ListingChanged(listsClassificationChanged)
 			}
 		}
 
@@ -636,7 +636,7 @@ func listsRegions(p *ListParams) (names []string, notStated bool, perr *Error) {
 		v = strings.TrimSpace(v)
 		switch {
 		case v == "":
-		case v == RegionNotStated:
+		case v == listsRegionNotStated:
 			notStated = true
 		case listsRegionRE.MatchString(v):
 			if !contains(names, v) {
@@ -775,13 +775,13 @@ func listsAccountFacet(counts map[string]int64, accts *Accounts) []FacetValue {
 // listsRegionFacet: each stated region, and ALWAYS not_stated (D-14), even at
 // 0 -- "Region not stated" follows the unknown-account rules (§2.14.10).
 func listsRegionFacet(counts map[string]int64, _ *Accounts) []FacetValue {
-	out := []FacetValue{{Value: RegionNotStated, Label: "Region not stated", Count: counts[""]}}
+	out := []FacetValue{{Value: listsRegionNotStated, Label: "Region not stated", Count: counts[""]}}
 	for v, n := range counts {
 		if v != "" {
 			out = append(out, FacetValue{Value: v, Label: v, Count: n})
 		}
 	}
-	return listsFacetOrder(out, RegionNotStated)
+	return listsFacetOrder(out, listsRegionNotStated)
 }
 
 /* ------------------------------ meta.coverage ------------------------------ */
@@ -872,9 +872,9 @@ func listsCoverage(q *Query, accts *Accounts, list string, sc listsScope) ([]Cov
 
 // listsRevokedAffects is what a revoked account's "*" note says, per list.
 var listsRevokedAffects = map[string]string{
-	ListRouteWorkloads:  "all workloads of this account",
-	ListRouteIdentities: "all identities of this account",
-	ListRouteResources:  "resources named by this account's policies",
+	listsRouteWorkloads:  "all workloads of this account",
+	listsRouteIdentities: "all identities of this account",
+	listsRouteResources:  "resources named by this account's policies",
 }
 
 // listsWorkloadSurfaces maps a regional workload surface's prefix to the
@@ -909,7 +909,7 @@ func listsKindInScope(sc listsScope, kind string) bool {
 //	resources   iam_policies, policy_documents, permission_scan
 func listsAffects(list, surface string, sc listsScope) string {
 	switch list {
-	case ListRouteWorkloads:
+	case listsRouteWorkloads:
 		if surface == models.SurfaceWorkloadScan {
 			return "all workloads"
 		}
@@ -923,7 +923,7 @@ func listsAffects(list, surface string, sc listsScope) string {
 		if kind, ok := listsWorkloadSurfaces[prefix]; ok && listsKindInScope(sc, kind) {
 			return "workloads of kind " + kind + " in " + region
 		}
-	case ListRouteIdentities:
+	case listsRouteIdentities:
 		for surf, kind := range map[string]string{
 			models.SurfaceIAMRoles:  models.CloudIdentityIAMRole,
 			models.SurfaceIAMUsers:  models.CloudIdentityIAMUser,
@@ -936,7 +936,7 @@ func listsAffects(list, surface string, sc listsScope) string {
 		if surface == models.SurfacePermissionScan {
 			return "permissions and trust of identities"
 		}
-	case ListRouteResources:
+	case listsRouteResources:
 		switch surface {
 		case models.SurfaceIAMPolicies:
 			return "resources named by managed policies"
@@ -995,7 +995,7 @@ var listsWorkloadRuntimeKinds = []string{
 var listsWorkloadName = listsOne(listsText("lower(w.display_name)"))
 
 var listsWorkloads = listsSpec[listsWorkloadScan]{
-	route:   ListRouteWorkloads,
+	route:   listsRouteWorkloads,
 	sorts:   []string{"name", "account", "last_confirmed", "classification"},
 	defSort: "name",
 	params: map[string]bool{"region": true, "integration": true, "runtime_kind": true,
@@ -1071,7 +1071,7 @@ func listsWorkloadFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	sc.kinds = kinds
 	fs = append(fs, listsIn("runtime_kind", "w.runtime_kind", kinds)...)
 
-	cls, perr := listsEnum(p, "classification", ClassificationAgent,
+	cls, perr := listsEnum(p, "classification", listsClassificationAgent,
 		models.ClassificationProviderAgent, models.ClassificationClassified, models.ClassificationUnclassified)
 	if perr != nil {
 		return nil, sc, false, perr
@@ -1080,7 +1080,7 @@ func listsWorkloadFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 		classBound = true
 		var values []string
 		for _, c := range cls {
-			if c == ClassificationAgent {
+			if c == listsClassificationAgent {
 				values = append(values, models.ClassificationProviderAgent, models.ClassificationClassified)
 			} else {
 				values = append(values, c)
@@ -1107,7 +1107,7 @@ func listsClassificationFacet(counts map[string]int64, accts *Accounts) []FacetV
 		models.ClassificationUnclassified:  "Unclassified",
 	})(counts, accts)
 	agents := counts[models.ClassificationProviderAgent] + counts[models.ClassificationClassified]
-	return append([]FacetValue{{Value: ClassificationAgent, Label: "Agents (provider-native or classified)", Count: agents}}, out...)
+	return append([]FacetValue{{Value: listsClassificationAgent, Label: "Agents (provider-native or classified)", Count: agents}}, out...)
 }
 
 /* -------------------------------- identities ------------------------------- */
@@ -1134,7 +1134,7 @@ var (
 )
 
 var listsIdentities = listsSpec[listsIdentityScan]{
-	route:   ListRouteIdentities,
+	route:   listsRouteIdentities,
 	sorts:   []string{"name", "kind", "account", "last_confirmed"},
 	defSort: "name",
 	// region is accepted and never filters: IAM is global (D-75).
@@ -1218,7 +1218,7 @@ func listsIdentityFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScop
 	sc.kinds = kinds
 	fs = append(fs, listsIn("kind", "ia.account_kind", kinds)...)
 
-	used, perr := listsEnum(p, "used_by", UsedByWorkloads)
+	used, perr := listsEnum(p, "used_by", listsUsedByWorkloads)
 	if perr != nil {
 		return nil, sc, false, perr
 	}
@@ -1257,7 +1257,7 @@ var (
 )
 
 var listsResources = listsSpec[listsResourceScan]{
-	route:     ListRouteResources,
+	route:     listsRouteResources,
 	sorts:     []string{"kind", "name", "service", "account"},
 	defSort:   "kind",
 	params:    map[string]bool{"region": true, "kind": true, "service": true, "integration": true},

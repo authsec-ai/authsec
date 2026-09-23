@@ -59,12 +59,12 @@ func TestP2ListsAccountFacetOffersUnknownAndConnected(t *testing.T) {
 // D-14: the region facet ALWAYS offers not_stated, even at 0, labelled, last.
 func TestP2ListsRegionFacetAlwaysOffersNotStated(t *testing.T) {
 	got := listsRegionFacet(map[string]int64{"us-east-1": 3}, nil)
-	if len(got) != 2 || got[0].Value != "us-east-1" || got[1].Value != RegionNotStated ||
+	if len(got) != 2 || got[0].Value != "us-east-1" || got[1].Value != listsRegionNotStated ||
 		got[1].Count != 0 || got[1].Label != "Region not stated" {
 		t.Errorf("region facet = %+v, want us-east-1 then not_stated at 0", got)
 	}
 	got = listsRegionFacet(map[string]int64{"": 2}, nil)
-	if len(got) != 1 || got[0].Value != RegionNotStated || got[0].Count != 2 {
+	if len(got) != 1 || got[0].Value != listsRegionNotStated || got[0].Count != 2 {
 		t.Errorf("region facet = %+v, want not_stated 2", got)
 	}
 }
@@ -196,32 +196,32 @@ func TestP2ListsCoverageAffects(t *testing.T) {
 		sc            listsScope
 		want          string
 	}{
-		{ListRouteIdentities, "iam_users", all, "identities of kind iam_user"},
-		{ListRouteIdentities, "iam_roles", all, "identities of kind iam_role"},
-		{ListRouteIdentities, "iam_groups", all, "identities of kind iam_group"},
-		{ListRouteIdentities, "iam_roles", users, ""},
-		{ListRouteIdentities, "iam_users", users, "identities of kind iam_user"},
-		{ListRouteIdentities, "permission_scan", users, "permissions and trust of identities"},
-		{ListRouteIdentities, "lambda:eu-west-1", all, ""},
-		{ListRouteIdentities, "policy_documents", all, ""},
-		{ListRouteIdentities, "organizations", all, ""},
-		{ListRouteWorkloads, "lambda:eu-west-1", all, "workloads of kind lambda_function in eu-west-1"},
-		{ListRouteWorkloads, "lambda:eu-west-1", usEast, ""},
-		{ListRouteWorkloads, "lambda:us-east-1", usEast, "workloads of kind lambda_function in us-east-1"},
-		{ListRouteWorkloads, "lambda:us-east-1", onlyNotStated, ""},
-		{ListRouteWorkloads, "lambda:us-east-1", ec2, ""},
-		{ListRouteWorkloads, "ec2:us-east-1", ec2, "workloads of kind ec2_instance in us-east-1"},
-		{ListRouteWorkloads, "agentcore-gateways:us-east-1", all, "workloads of kind bedrock_agentcore_gateway in us-east-1"},
-		{ListRouteWorkloads, "compute:eu-west-1", ec2, "workloads in eu-west-1"},
-		{ListRouteWorkloads, "compute:eu-west-1", usEast, ""},
-		{ListRouteWorkloads, "workload_scan", usEast, "all workloads"},
-		{ListRouteWorkloads, "iam_roles", all, ""},
-		{ListRouteWorkloads, "activity", all, ""},
-		{ListRouteResources, "iam_policies", all, "resources named by managed policies"},
-		{ListRouteResources, "policy_documents", all, "resources named by unreadable policy documents"},
-		{ListRouteResources, "permission_scan", all, "all resources"},
-		{ListRouteResources, "iam_users", all, ""},
-		{ListRouteResources, "lambda:eu-west-1", all, ""},
+		{listsRouteIdentities, "iam_users", all, "identities of kind iam_user"},
+		{listsRouteIdentities, "iam_roles", all, "identities of kind iam_role"},
+		{listsRouteIdentities, "iam_groups", all, "identities of kind iam_group"},
+		{listsRouteIdentities, "iam_roles", users, ""},
+		{listsRouteIdentities, "iam_users", users, "identities of kind iam_user"},
+		{listsRouteIdentities, "permission_scan", users, "permissions and trust of identities"},
+		{listsRouteIdentities, "lambda:eu-west-1", all, ""},
+		{listsRouteIdentities, "policy_documents", all, ""},
+		{listsRouteIdentities, "organizations", all, ""},
+		{listsRouteWorkloads, "lambda:eu-west-1", all, "workloads of kind lambda_function in eu-west-1"},
+		{listsRouteWorkloads, "lambda:eu-west-1", usEast, ""},
+		{listsRouteWorkloads, "lambda:us-east-1", usEast, "workloads of kind lambda_function in us-east-1"},
+		{listsRouteWorkloads, "lambda:us-east-1", onlyNotStated, ""},
+		{listsRouteWorkloads, "lambda:us-east-1", ec2, ""},
+		{listsRouteWorkloads, "ec2:us-east-1", ec2, "workloads of kind ec2_instance in us-east-1"},
+		{listsRouteWorkloads, "agentcore-gateways:us-east-1", all, "workloads of kind bedrock_agentcore_gateway in us-east-1"},
+		{listsRouteWorkloads, "compute:eu-west-1", ec2, "workloads in eu-west-1"},
+		{listsRouteWorkloads, "compute:eu-west-1", usEast, ""},
+		{listsRouteWorkloads, "workload_scan", usEast, "all workloads"},
+		{listsRouteWorkloads, "iam_roles", all, ""},
+		{listsRouteWorkloads, "activity", all, ""},
+		{listsRouteResources, "iam_policies", all, "resources named by managed policies"},
+		{listsRouteResources, "policy_documents", all, "resources named by unreadable policy documents"},
+		{listsRouteResources, "permission_scan", all, "all resources"},
+		{listsRouteResources, "iam_users", all, ""},
+		{listsRouteResources, "lambda:eu-west-1", all, ""},
 	} {
 		if got := listsAffects(tc.list, tc.surface, tc.sc); got != tc.want {
 			t.Errorf("%s / %s (%+v) = %q, want %q", tc.list, tc.surface, tc.sc, got, tc.want)

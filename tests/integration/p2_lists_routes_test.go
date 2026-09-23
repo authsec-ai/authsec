@@ -118,7 +118,9 @@ func TestP2ListsRoutesPermissionsAndCrossWorkspace(t *testing.T) {
 		"GET /resources/:id/access":  {path: "/resources/" + res + "/access", perm: read, want: 404},
 		"GET /resources/:id/changes": {path: "/resources/" + res + "/changes", perm: read, want: 404},
 
-		"GET /graph":        {path: "/graph" + qs("root", refOf("workload", f.workload)), perm: read, want: 404},
+		// direction is required on /graph and /graph/expand (D-35), so the
+		// probes are otherwise well-formed: the foreign id is the only fault.
+		"GET /graph":        {path: "/graph" + qs("root", refOf("workload", f.workload), "direction", "forward"), perm: read, want: 404},
 		"GET /graph/expand": {path: "/graph/expand" + qs("node", refOf("identity", f.identity), "edge", "can_assume", "direction", "forward"), perm: read, want: 404},
 		"GET /graph/path":   {path: "/graph/path" + qs("from", refOf("workload", f.workload), "to", refOf("resource", f.resource)), perm: read, want: 404},
 		"GET /evidence":     {path: "/evidence" + qs("claim", refOf("grant", f.grant)), perm: read, want: 404},
