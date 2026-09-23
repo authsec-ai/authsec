@@ -102,7 +102,7 @@ func graphFeatures(on bool) gin.H {
 		"workloads": on,
 		"identities": false,
 		"resources": false,
-		"graph": false,
+		"graph": on,
 		"evidence": false,
 		"changes": on,
 		"classification": on,
