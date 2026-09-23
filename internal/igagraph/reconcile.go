@@ -33,14 +33,24 @@ func NewReconciler(now func() time.Time) *Reconciler {
 // transaction. Node partitions act on SUPPORT rows; edge partitions on the
 // edge tables. ex names what unreadable documents declared; events receives
 // every retirement so the Changes history survives the node row.
+//
+// Every valid_to it writes is the PASS's timestamp, taken from events -- the
+// publication's published_at (D-26) -- never a clock read now: an end stamped
+// after publication joins to no revision, and the Changes view could not say
+// which run ended it. Only a Reconcile outside a projection pass (no event
+// log) falls back to the reconciler's own clock.
 func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions, events *EventLog) error {
+	at := PassTime(rc.now())
+	if events != nil {
+		at = events.At()
+	}
 	for _, part := range Partitions(snap) {
 		stale := !rc.canEnd(snap, part)
 		var err error
 		if part.Target == "" {
 			err = rc.reconcileNodes(tx, part, snap, ex, stale)
 		} else {
-			err = rc.reconcileEdges(tx, part, snap, ex, stale)
+			err = rc.reconcileEdges(tx, part, snap, ex, stale, at)
 		}
 		if err != nil {
 			return fmt.Errorf("reconcile %s: %w", part.Key(), err)
@@ -48,7 +58,7 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions, even
 	}
 	// Only now, with every partition's support settled, is it safe to ask
 	// which objects have no support left (§2.10B).
-	if err := rc.retireUnsupported(tx, snap, events); err != nil {
+	if err := rc.retireUnsupported(tx, snap, events, at); err != nil {
 		return err
 	}
 	return rc.markReconciled(tx, snap)
@@ -165,7 +175,7 @@ func protected(part Partition, ex Exclusions) (string, []any, bool) {
 
 // reconcileEdges: stale when we could not look, ended when we could and it was
 // not there. Protected rows first: stale, never ended.
-func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
+func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool, at time.Time) error {
 	if stale {
 		return rc.markStale(tx, part, snap, "")
 	}
@@ -173,9 +183,9 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot
 		if err := rc.markStale(tx, part, snap, p, args...); err != nil {
 			return err
 		}
-		return rc.endOlderThan(tx, part, snap, models.EndedNotSeen, "NOT ("+p+")", args...)
+		return rc.endOlderThan(tx, part, snap, at, models.EndedNotSeen, "NOT ("+p+")", args...)
 	}
-	return rc.endOlderThan(tx, part, snap, models.EndedNotSeen, "")
+	return rc.endOlderThan(tx, part, snap, at, models.EndedNotSeen, "")
 }
 
 // markStale: we could not look at THIS partition. Rows this run DID confirm
@@ -197,7 +207,7 @@ func (rc *Reconciler) markStale(tx *gorm.DB, part Partition, snap *Snapshot, ext
 // endOlderThan: we looked properly at this partition and it was not there.
 // IS DISTINCT FROM, never <>: last_confirmed_by is nullable, and NULL <> uuid
 // is NULL, which would leave pre-graph rows current forever.
-func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, reason, extra string, args ...any) error {
+func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, at time.Time, reason, extra string, args ...any) error {
 	q, err := rc.scope(tx, part, snap)
 	if err != nil {
 		return err
@@ -209,7 +219,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 		Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID).
 		Updates(map[string]any{
 			"state":        models.RelEnded,
-			"valid_to":     rc.now(),
+			"valid_to":     at, // D-26: the pass's one timestamp
 			"ended_reason": reason,
 		}).Error
 }
@@ -253,9 +263,8 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 //	policy       its assignments, and their grants     policy_retired
 //	statement    its grants                            statement_retired
 //	resource     nothing: targets are statement content
-func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *EventLog) error {
+func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *EventLog, now time.Time) error {
 	ws := snap.Run.WorkspaceID
-	now := rc.now()
 	retiredBy := map[string][]uuid.UUID{}
 	for _, class := range models.NodeClasses {
 		col, table := models.SupportColumn(class), models.NodeTable(class)

@@ -88,6 +88,23 @@ var ErrNotAGrant = errors.New("only Allow statements are grants")
 
 var returningID = clause.Returning{Columns: []clause.Column{{Name: "id"}}}
 
+// ErrNoPassTime means a node, edge, support, revision, lifecycle-event or
+// publication row reached the write without the projection pass's timestamp. Refused, never defaulted: the column default
+// now() is the TRANSACTION's start, which no publication carries, so a row
+// written with it could never be joined to the revision and run that started
+// it (D-26: one pass, one timestamp -- the publication's published_at).
+var ErrNoPassTime = errors.New("graph write without the pass timestamp")
+
+// requirePassTime refuses a zero pass timestamp on a row about to be written.
+func requirePassTime(what string, ts ...time.Time) error {
+	for _, t := range ts {
+		if t.IsZero() {
+			return fmt.Errorf("%w: %s", ErrNoPassTime, what)
+		}
+	}
+	return nil
+}
+
 // onKey is the conflict target shared by every source-keyed table. predicate
 // MUST match that table's partial unique index exactly.
 func onKey(predicate string, update []string) clause.OnConflict {
@@ -112,6 +129,9 @@ func (r *igaGraphRepository) UpsertEstateScope(tx *gorm.DB, s *models.IGAEstateS
 }
 
 func (r *igaGraphRepository) UpsertIdentity(tx *gorm.DB, a *models.IGAIdentityAccount) (uuid.UUID, error) {
+	if err := requirePassTime("identity "+a.SourceKey, a.FirstSeenAt, a.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey(liveNode, []string{
 		"display_name", "account_kind", "identity_backing", "estate_scope_id",
 		"continuity", "immutable_key", "provider_attrs", "last_seen_at", "updated_at",
@@ -195,6 +215,9 @@ func (r *igaGraphRepository) MarkAssertionsPendingReconfirm(tx *gorm.DB, ws, ide
 // UpsertWorkload NEVER updates classification: provider_native_agent is
 // written on insert only, and a person's decision survives every scan.
 func (r *igaGraphRepository) UpsertWorkload(tx *gorm.DB, w *models.IGAWorkload) (uuid.UUID, error) {
+	if err := requirePassTime("workload "+w.SourceKey, w.FirstSeenAt, w.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey("lifecycle <> 'retired'", []string{
 		"display_name", "runtime_kind", "region", "estate_scope_id",
 		"continuity", "immutable_key", "provider_attrs", "last_seen_at", "updated_at",
@@ -209,6 +232,9 @@ func (r *igaGraphRepository) SetExecutionRoleState(tx *gorm.DB, ws, workloadID u
 }
 
 func (r *igaGraphRepository) UpsertResource(tx *gorm.DB, res *models.IGAResource) (uuid.UUID, error) {
+	if err := requirePassTime("resource "+res.SourceKey, res.FirstSeenAt, res.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey(liveNode, []string{
 		"display_name", "resource_kind", "estate_scope_id",
 		"continuity", "immutable_key", "provider_attrs", "last_seen_at", "updated_at",
@@ -217,6 +243,9 @@ func (r *igaGraphRepository) UpsertResource(tx *gorm.DB, res *models.IGAResource
 }
 
 func (r *igaGraphRepository) UpsertPolicy(tx *gorm.DB, p *models.IGAPolicy) (uuid.UUID, error) {
+	if err := requirePassTime("policy "+p.SourceKey, p.FirstSeenAt, p.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey("lifecycle <> 'retired'", []string{
 		"policy_kind", "display_name", "native_ref", "continuity", "immutable_key",
 		"version_id", "document_hash", "last_seen_at",
@@ -301,6 +330,9 @@ func (r *igaGraphRepository) RetirePolicyIncarnation(tx *gorm.DB, ws, policyID u
 }
 
 func (r *igaGraphRepository) UpsertStatement(tx *gorm.DB, e *models.IGAEntitlement) (uuid.UUID, error) {
+	if err := requirePassTime("statement "+e.SourceKey, e.FirstSeenAt, e.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey(liveNode, []string{
 		"policy_id", "statement_key", "sid", "statement_index", "effect", "content_hash",
 		"negated", "conditional", "native_grant_kind", "native_rights", "normalized_rights",
@@ -331,6 +363,9 @@ func (r *igaGraphRepository) RecordRevision(
 	tx *gorm.DB, ws, entitlementID uuid.UUID, hash string, statement json.RawMessage,
 	policyVersionID string, runID uuid.UUID, now time.Time,
 ) error {
+	if err := requirePassTime("statement revision", now); err != nil {
+		return err
+	}
 	var live []models.IGAStatementRevision
 	if err := tx.Where("workspace_id = ? AND entitlement_id = ? AND valid_to IS NULL", ws, entitlementID).
 		Find(&live).Error; err != nil {
@@ -404,6 +439,9 @@ func (r *igaGraphRepository) ReplaceTargets(tx *gorm.DB, ws, entitlementID uuid.
 }
 
 func (r *igaGraphRepository) UpsertCredential(tx *gorm.DB, c *models.IGACredential) (uuid.UUID, error) {
+	if err := requirePassTime("credential "+c.SourceKey, c.FirstSeenAt, c.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey("source_key <> '' AND lifecycle NOT IN ('revoked', 'expired')", []string{
 		"credential_type", "issuer", "key_identifier", "expires_at", "last_used_at",
 		"rotation_posture", "lifecycle", "last_seen_at", "updated_at",
@@ -414,7 +452,13 @@ func (r *igaGraphRepository) UpsertCredential(tx *gorm.DB, c *models.IGACredenti
 // UpsertAssignment: a detached-then-reattached policy matches NO live row
 // (the ended period is excluded by the index predicate), so a reattach is a
 // NEW row and the ended period stays exactly as it was.
+//
+// valid_from is the caller's pass timestamp (D-26) and is written on INSERT
+// only: DoUpdates never names it, so a confirmed period keeps its start.
 func (r *igaGraphRepository) UpsertAssignment(tx *gorm.DB, a *models.IGAPolicyAssignment) (uuid.UUID, error) {
+	if err := requirePassTime("assignment "+a.SourceKey, a.ValidFrom, a.LastConfirmedAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 	})).Create(a).Error
@@ -424,6 +468,10 @@ func (r *igaGraphRepository) UpsertAssignment(tx *gorm.DB, a *models.IGAPolicyAs
 func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, statementEffect string) (uuid.UUID, error) {
 	if statementEffect != models.EffectAllow {
 		return uuid.Nil, fmt.Errorf("%w: effect %q", ErrNotAGrant, statementEffect)
+	}
+	// valid_from: the pass timestamp, on insert only (as UpsertAssignment).
+	if err := requirePassTime("grant "+e.SourceKey, e.ValidFrom, e.LastConfirmedAt); err != nil {
+		return uuid.Nil, err
 	}
 	err := tx.Clauses(returningID, onKey("source_key <> '' AND "+liveEdge, []string{
 		"entitlement_id", "assignment_id", "calculation_state", "effective_conclusion",
@@ -435,8 +483,12 @@ func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, s
 // UpsertRelationship refreshes a live edge in place. It never writes a SOURCE
 // column: every edge key names its source endpoint, so a live row found by key
 // already has the source the caller computed, and no edge is ever re-pointed
-// from one source to another (P2-DECISIONS D-41).
+// from one source to another (P2-DECISIONS D-41). valid_from is the pass
+// timestamp, on insert only (as UpsertAssignment).
 func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARelationship) (uuid.UUID, error) {
+	if err := requirePassTime("relationship "+rel.SourceKey, rel.ValidFrom, rel.LastConfirmedAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 		"statement_key", "conditions", "mechanism", "updated_at",
@@ -454,6 +506,9 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 // columns: an asserted resolution is a person's decision (Rules the DDL cannot
 // express, 5), and a derived one is written by SetDerivedResolution alone.
 func (r *igaGraphRepository) UpsertExternalPrincipal(tx *gorm.DB, e *models.IGAExternalPrincipal) (uuid.UUID, error) {
+	if err := requirePassTime("external principal "+e.SourceKey, e.FirstSeenAt, e.LastSeenAt); err != nil {
+		return uuid.Nil, err
+	}
 	err := tx.Clauses(returningID, clause.OnConflict{
 		Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"mechanism", "last_seen_at"}),
@@ -476,8 +531,16 @@ func (r *igaGraphRepository) SetDerivedResolution(tx *gorm.DB, ws, externalID, i
 // UpsertObjectSupport records that this connector, in this partition, still
 // vouches for this object. Conflict target: the TYPED partial index for the
 // row's class. DoUpdates clears ended_reason -- what makes reappearance
-// correct -- and never touches first_seen_at.
+// correct -- and never touches first_seen_at, which is the pass timestamp of
+// the insert (D-26).
 func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error {
+	var confirmed time.Time
+	if s.LastConfirmedAt != nil {
+		confirmed = *s.LastConfirmedAt
+	}
+	if err := requirePassTime("object support "+s.PartitionKey, s.FirstSeenAt, confirmed); err != nil {
+		return err
+	}
 	var col string
 	switch {
 	case s.IdentityAccountID != nil:
@@ -576,6 +639,9 @@ func (r *igaGraphRepository) LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.Raw
 }
 
 func (r *igaGraphRepository) InsertPublication(tx *gorm.DB, p *models.IGAPublication) error {
+	if err := requirePassTime("publication", p.PublishedAt); err != nil {
+		return err
+	}
 	if len(p.Manifest) == 0 {
 		p.Manifest = json.RawMessage(`{}`)
 	}
@@ -587,6 +653,11 @@ func (r *igaGraphRepository) InsertPublication(tx *gorm.DB, p *models.IGAPublica
 func (r *igaGraphRepository) InsertLifecycleEvents(tx *gorm.DB, events []models.IGALifecycleEvent) error {
 	if len(events) == 0 {
 		return nil
+	}
+	for i := range events {
+		if err := requirePassTime("lifecycle event", events[i].OccurredAt); err != nil {
+			return err
+		}
 	}
 	return tx.CreateInBatches(events, 500).Error
 }

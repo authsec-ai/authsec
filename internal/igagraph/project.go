@@ -108,7 +108,17 @@ type Projector struct {
 	now       func() time.Time
 	watermark func(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error)
 
-	rev        int64
+	rev int64
+	// at is THE ONE TIMESTAMP of this pass (D-26): the publication's
+	// published_at, and every valid_from, valid_to, last_confirmed_at,
+	// first_seen_at, last_seen_at and lifecycle occurred_at the pass writes.
+	// Taken once, when the revision is allocated, so the Changes view recovers
+	// the revision and run of any start or end EXACTLY by joining on
+	// (workspace_id, published_at) to iga_publication -- no column records
+	// which run started or ended a relationship, assignment or grant, and
+	// clocks read at different moments (or the database's now(), the
+	// transaction start) never join.
+	at         time.Time
 	events     *EventLog
 	exclusions Exclusions
 
@@ -139,6 +149,16 @@ func NewProjector(
 
 // Rev is the revision this pass published; valid after a successful Project.
 func (p *Projector) Rev() int64 { return p.rev }
+
+// At is this pass's one timestamp (D-26) -- its publication's published_at;
+// valid after a successful Project.
+func (p *Projector) At() time.Time { return p.at }
+
+// PassTime normalises a clock reading into a pass timestamp: UTC, at
+// PostgreSQL's microsecond precision and without a monotonic reading, so the
+// value the pass holds is exactly the value every timestamptz column stores,
+// and equality survives the round trip (D-26).
+func PassTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsecond) }
 
 // Events is the lifecycle log this pass is building; Reconcile appends to it
 // and the caller flushes it before commit.
@@ -210,7 +230,10 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		return err
 	}
 	p.rev = rev
-	p.events = NewEventLog(snap.Run.WorkspaceID, rev, snap.Run.ID, p.now())
+	// ONE CLOCK READ for the whole pass (D-26), before the first timed write.
+	// Reconcile takes it from the event log, so its ends carry it too.
+	p.at = PassTime(p.now())
+	p.events = NewEventLog(snap.Run.WorkspaceID, rev, snap.Run.ID, p.at)
 
 	r := newResolved(p.existing)
 
@@ -253,7 +276,8 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		WorkspaceID: snap.Run.WorkspaceID,
 		Rev:         rev,
 		ScanRunID:   snap.Run.ID,
-		PublishedAt: p.now(),
+		// D-26: the pass's one timestamp, which every row above carries.
+		PublishedAt: p.at,
 		Manifest:    manifestOf(prev, snap, parts),
 	})
 }
@@ -303,7 +327,7 @@ func (p *Projector) projectEstateScope(tx *gorm.DB, snap *Snapshot) error {
 // node. THE STEP THAT MAKES A NODE VISIBLE TO RECONCILIATION (§4.10 node write
 // contract, step 2): a node written without it is never reconciled.
 func (p *Projector) support(tx *gorm.DB, snap *Snapshot, class string, id uuid.UUID, part Partition) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	row := &models.IGAObjectSupport{
 		WorkspaceID:        snap.Run.WorkspaceID,
 		ConnectorID:        snap.Run.ConnectorID,
@@ -311,6 +335,9 @@ func (p *Projector) support(tx *gorm.DB, snap *Snapshot, class string, id uuid.U
 		State:              models.RelCurrent,
 		LastConfirmedRunID: &snap.Run.ID,
 		LastConfirmedAt:    &now,
+		// Explicit, never the column default now() -- the transaction's start,
+		// which no publication carries (D-26). The upsert never updates it.
+		FirstSeenAt: now,
 	}
 	if !row.SetObject(class, id) {
 		return fmt.Errorf("igagraph: no support column for object class %q", class)
@@ -321,7 +348,7 @@ func (p *Projector) support(tx *gorm.DB, snap *Snapshot, class string, id uuid.U
 // projectIdentities: roles, users, groups -- recreate / continue / restore /
 // new (§4.6). One pass in full; workloads and policies share the shape.
 func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	for _, ci := range snap.Identities {
 		key := IdentityKey(ci)
 		cont := Continuity(ci.Kind)
@@ -434,7 +461,7 @@ func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.R
 // AgentCore runtimes are classified provider_native_agent ON INSERT ONLY; no
 // AWS row is ever written to iga_agents or iga_agent_instances (§2.2).
 func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	account, partition := snap.Connector.ScopeID, snap.Connector.AWSAttrs().Partition
 	for _, cw := range snap.Workloads {
 		key := WorkloadKey(cw, partition, account)
@@ -491,7 +518,7 @@ func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) e
 // key NEVER implies the old one was replaced: two active keys is a correct,
 // common state. 'rotated' is only ever a human assertion.
 func (p *Projector) projectCredentials(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	for _, cs := range snap.Secrets {
 		identityID, ok := r.identity[cs.IdentityID]
 		if !ok {
@@ -530,7 +557,7 @@ func (p *Projector) projectCredentials(tx *gorm.DB, snap *Snapshot, r *resolved)
 // projectMemberships writes user --member_of--> group. The group's grants
 // reach the user by TRAVERSAL; nothing is copied onto the user (§2.6).
 func (p *Projector) projectMemberships(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	part := snap.EdgePartitionFor(models.RelTypeMemberOf, "", "")
 	for _, m := range snap.Memberships {
 		src, ok1 := r.identity[m.UserIdentityID]
@@ -543,7 +570,7 @@ func (p *Projector) projectMemberships(tx *gorm.DB, snap *Snapshot, r *resolved)
 			WorkspaceID: snap.Run.WorkspaceID, RelationshipType: models.RelTypeMemberOf,
 			SourceIdentityAccountID: &src, TargetIdentityAccountID: &dst,
 			Basis: models.BasisDeclared, State: models.RelCurrent,
-			LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
+			ValidFrom: now, LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
 			ConnectorID: &snap.Run.ConnectorID, PartitionKey: part.Key(),
 			SourceKey: RelationshipKey(models.RelTypeMemberOf, EndpointKey(*user), EndpointKey(*group)),
 		})
@@ -559,7 +586,7 @@ func (p *Projector) projectMemberships(tx *gorm.DB, snap *Snapshot, r *resolved)
 // projectExecution writes the configured execution identity of every workload
 // (§4.6): executes_as, ECS's task_execution_role, and the execution-role state.
 func (p *Projector) projectExecution(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	account, partition := snap.Connector.ScopeID, snap.Connector.AWSAttrs().Partition
 	for _, w := range snap.Workloads {
 		src, ok := r.workload[w.ID]
@@ -594,7 +621,7 @@ func (p *Projector) projectExecution(tx *gorm.DB, snap *Snapshot, r *resolved) e
 				WorkspaceID: snap.Run.WorkspaceID, RelationshipType: models.RelTypeExecutesAs,
 				SourceWorkloadID: &src, TargetIdentityAccountID: &dst,
 				Basis: models.BasisDeclared, State: models.RelCurrent,
-				LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
+				ValidFrom: now, LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
 				ConnectorID: &snap.Run.ConnectorID, PartitionKey: part.Key(),
 				SourceKey: RelationshipKey(models.RelTypeExecutesAs, wkey, EndpointKey(*role)),
 			})
@@ -612,7 +639,7 @@ func (p *Projector) projectExecution(tx *gorm.DB, snap *Snapshot, r *resolved) e
 						WorkspaceID: snap.Run.WorkspaceID, RelationshipType: models.RelTypeTaskExecutionRole,
 						SourceWorkloadID: &src, TargetIdentityAccountID: &gid,
 						Basis: models.BasisDeclared, State: models.RelCurrent,
-						LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
+						ValidFrom: now, LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
 						ConnectorID: &snap.Run.ConnectorID, PartitionKey: part.Key(),
 						SourceKey: RelationshipKey(models.RelTypeTaskExecutionRole, wkey, EndpointKey(*ci)),
 					})

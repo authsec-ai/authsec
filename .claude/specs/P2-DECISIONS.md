@@ -169,20 +169,144 @@ defect that should be fixed in the spec itself.
   `/pipeline` reports live state by design.
 ## Changes (§5.3 Changes, T5.4)
 
-- **D-26 Run attribution.** One projection pass uses ONE timestamp — the
-  publication's `published_at` — for every `valid_from`, `valid_to`,
-  `first_seen_at`/`last_seen_at` write and lifecycle `occurred_at` it makes, so
-  an event's revision and run are recovered by joining on `published_at`.
-  *Why:* today `valid_from` is the database's transaction start and `valid_to`
-  is taken after publication, so no join is exact.
-- **D-27 Event shape, paging.** Defined in the implementation and documented
-  beside the route; `kind=configuration` by default; 50 per page, `limit` 1–200
-  accepted; keyset on `(at, event, id)`.
-- **D-28 Remaining grants (revised after audit).** At the current revision, the
-  holder's non-ended grants (`current` and `stale`, each with its state and
-  `last_confirmed_at`) whose statements name the same positive target. When only
-  stale grants remain, the event says the path remains and marks it stale; it
-  says no path remains only when none, current or stale, is left.
+- **D-26 Run attribution (implemented with T5.4).** One projection pass uses
+  ONE timestamp — the publication's `published_at` — for every `valid_from`,
+  `valid_to`, `last_confirmed_at`, `first_seen_at`/`last_seen_at` write and
+  lifecycle `occurred_at` it makes, so an event's revision and run are
+  recovered by joining on `(workspace_id, published_at)`. The projector reads
+  its clock once, when the revision is allocated (`Projector.At`, normalised
+  by `igagraph.PassTime` to UTC microseconds); Reconcile takes the same value
+  from the pass's event log; `valid_from` is always written explicitly, never
+  the column default `now()` (the transaction's start). The graph repository
+  refuses an edge, support, node, revision, event or publication write
+  without it (`ErrNoPassTime`). *Why:* before, `valid_from` was the
+  database's transaction start and `valid_to` was taken after publication, so
+  no join was exact. *Raise:* nothing in §3 makes the join unique; propose
+  `CREATE UNIQUE INDEX uq_iga_publication_published_at ON
+  public.iga_publication (workspace_id, published_at)` (D-27a is the read
+  side's answer when two publications share a time).
+- **D-27 Event shape, paging (defined with T5.4).**
+  `GET /{workloads|identities|resources}/:id/changes?kind=&limit=&cursor=&rev=`.
+  `kind` is `configuration` (the default: every event but `coverage_changed`)
+  or `coverage` (only `coverage_changed`); `limit` 1–200, default 50; any
+  other parameter is `400 invalid_parameter`. Newest first, keyset on `(at,
+  event, id)`, all descending; the cursor's route is `<type>/<id>/changes`
+  (D-62), its filter hash is over the EFFECTIVE kind (an absent kind and
+  `kind=configuration` page the same list), its sort `-at`. The §5.2 list
+  envelope (D-77) with `meta.kind` and `meta.history_begins` (D-70; null
+  when the object has no `first_seen` event) added; `meta.coverage` names
+  the object's own partitions' gaps in the runs the current revision was
+  built from (D-73), `affects: "changes of this <type>"`. Like every object
+  route, the object must be this workspace's graph row (D-6), in any
+  lifecycle, and before the first publication there is none: `404` (D-4).
+  Each event:
+  `{id: "<event>:<uuid>", event, at, rev, run: "cloud_scan_run:<id>", subject,
+  claims: [refs, subject first], reason, via?, detail, before?, after?,
+  remaining?, paths?, labels: {ref: name}}`. `detail` per event: lifecycle
+  `{object}`; relationship `{type, source, target, mechanism?, state}`;
+  assignment `{policy, holder, assignment_kind, state}`; grant `{policy,
+  statement, holder, assignment, state, actions, not_actions?, targets}`;
+  `statement_revised` `{policy, statement}` with before/after `{statement
+  (verbatim), policy_version_id, content_hash}` (D-69); `statement_replaced`
+  `{policy}` with before/after `{policy_version_id, statements: [{statement,
+  content, content_hash}]}` (D-69, D-27c); `coverage_changed`
+  `{integration, account_id, surface}` with before `{state, recorded, run,
+  coverage}` and after `{state, recorded, error_code, api, error, prevents}`
+  (D-58). `detail.state` is the row's state
+  at the current revision. The full contract is in
+  `internal/igaread/changes.go`, the route's summary beside it in
+  `controllers/platform/iga_graph_read_changes.go`.
+- **D-27a Attribution on read.** `at` is rendered to the microsecond (it IS
+  the pass's `published_at`, D-26). A lifecycle event carries its own `rev`
+  and run; a revision its `first_seen_run_id` (the rev is that run's
+  publication's); every start and end joins its time to the ONE publication
+  with that `published_at`. A time shared by two publications, or by none (a
+  row written before D-26), renders `rev` and `run` null — never guessed.
+- **D-27b `statement_revised`.** Only a revision whose immediate predecessor
+  on the same statement has DIFFERENT content: the first revision is not an
+  edit, and the revision a restored statement reopens with unchanged content
+  is a restoration (its lifecycle `restored` event says so).
+- **D-27c `statement_replaced`.** One event per (policy, run): its subject is
+  the policy, its id derived from (policy, run) (`md5(policy || ':' ||
+  run)::uuid`, as `coverage_changed`'s is from (run, surface)), so two
+  replacements of one policy are two ids. `before` lists every Sid-less
+  statement of the policy retired `unsupported` in that run, `after` every
+  statement of it first seen or restored in the same run. Listed as they are,
+  never paired: with several Sid-less statements edited in one run nothing
+  says which replaced which. A Sid-less statement deleted with nothing
+  beginning in its policy in that run is its grant's end only, and a Sid-keyed
+  statement deleted beside a new one is a deletion and a new statement, never
+  a replacement. The grant ends and starts a replacement causes are listed
+  beside it, not folded into it (the view may group by run).
+  `policy_version_id` (D-69) comes from the policy-version observations (the
+  D-66 source; a Sid-less statement has no revision, and `iga_policy` keeps
+  only its current version): `after` is the version the replacing run read,
+  `before` the version read by the runs that last confirmed the ended
+  statements, published before the replacing run. A run is proven to have
+  read a version only when that version's observation was first recorded or
+  last confirmed by it, from a readable document; a side is `null` when no
+  such proof exists (a later re-read moved the confirmation on; a restored
+  statement's support row keeps only its later confirmation) or the runs read
+  more than one version. An inline policy has no versions: `""` both sides,
+  as its revisions store. *Raise:* D-69 cannot be met exactly for Sid-less
+  statements from the §3 DDL; propose `ALTER TABLE public.iga_lifecycle_event
+  ADD COLUMN policy_version_id text NOT NULL DEFAULT ''` (a statement's
+  `first_seen`/`restored`: the version read in that pass) and `ALTER TABLE
+  public.iga_entitlements ADD COLUMN last_policy_version_id text NOT NULL
+  DEFAULT ''` (the version of its last confirmation, kept on retirement).
+- **D-27d Scope limits (D-68 applied).** An identity's revision and
+  replacement events are those of statements it held a grant to WHILE that
+  grant was valid (`valid_from <= at <= valid_to`); a workload's events via an
+  execution identity are those at instants its `executes_as` edge to that
+  identity was valid, inclusive at both ends, one row per event. Deny
+  statements appear on the resources they name, not on the identity (it holds
+  no grant to them). *Raise:* whether an identity should see its own Deny
+  statements' revisions.
+- **D-27e `coverage_changed` lanes (D-70 applied).** One lane per (supporting
+  connector, surface) of the object's support rows' partitions, rebuilt by the
+  projector's partition table and accepted only when the rebuilt key is the
+  stored `partition_key` (a partition this build cannot rebuild claims no
+  transitions). The sequence is that connector's runs with a publication in
+  the snapshot, in revision order, from the support row's first pass; an ENDED
+  support speaks only up to the run that last confirmed it. An absent entry
+  reads as `canEnd` reads it: a required surface absent was not looked at
+  (`unknown`); a scanner marker absent means the scanner ran (`reached`).
+  Transitions only; the event id is derived from (run, surface).
+- **D-27f Resource Changes use current targets.** A statement's targets are
+  replaced with its content (`ReplaceTargets`), so a resource's Changes are
+  those of the statements that name it NOW (a retired statement keeps its last
+  targets). A statement edited to stop naming the resource drops out of that
+  resource's Changes, earlier events included. *Raise:* targets have no
+  validity period; a historical target table would let the resource keep that
+  history.
+- **D-27g Grant history and the Allow rule (added in the T5.4 review).** §3
+  rule 7 ("every grant query joins its statement with `effect = 'allow'`")
+  is applied to HISTORY as the statement stood when the grant started: a
+  grant is a Changes event when the statement revision covering its
+  `valid_from` is Allow; with no covering revision (a Sid-less statement,
+  whose key is its content, so its effect cannot change in place) the
+  statement's current effect decides. A covering revision naming no Effect is
+  not Allow. The D-28 candidates (what REMAINS) keep the current effect.
+  *Why:* a Sid-keyed statement keeps its id when edited, effect included
+  (§2.6), so the current effect would erase an Allow grant's start and its end
+  the moment the statement became Deny, and the removal would carry no
+  `grant_ended` and no `remaining`; a grant row written for a statement that
+  was Deny at the time is still never shown. *Raise:* rule 7 assumes a
+  statement's effect never changes in place.
+- **D-28 Remaining grants (revised after audit; implemented with T5.4).** At
+  the current revision, the holder's non-ended grants (`current` and `stale`,
+  each with its state and `last_confirmed_at`) whose statements name the same
+  positive target. When only stale grants remain, the event says the path
+  remains and marks it stale; it says no path remains only when none, current
+  or stale, is left. On `grant_ended` the targets are the ended grant's
+  statement's positive targets; on `policy_detached` (attached or inline) the
+  positive targets of every Allow statement granted through the detached
+  assignment, and a grant still reached through that assignment is not
+  another path. A boundary detach carries neither field (it grants nothing).
+  Rendered as `remaining: [{grant, state, last_confirmed_at, policy,
+  statement, targets}]` (current first) and `paths: [{target, remains:
+  current|stale|none}]`, one per target of the ended claim. Matching is by
+  reference: a selector and an exact ARN are different targets.
 ## Classification (§5.5)
 
 - **D-29 Request hash.** SHA-256 over canonical JSON of `{workload_id,
