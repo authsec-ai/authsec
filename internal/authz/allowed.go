@@ -16,7 +16,9 @@ import (
 // never infers permissions from role names, §2.14.6). The route that performs
 // the action keeps its Require middleware, which remains the enforcement; this
 // only decides what to offer, so it fails closed: no claims, or claims of an
-// unexpected type, is false.
+// unexpected type, is false -- and so is a role-binding lookup that fails
+// (hasDBPermission reports a database error as "not granted", which is also
+// what makes Require deny).
 func Allows(c *gin.Context, resource, action string) bool {
 	claimsAny, ok := c.Get("claims")
 	if !ok {

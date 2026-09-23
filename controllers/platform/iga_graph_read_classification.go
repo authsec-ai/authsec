@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -106,19 +107,56 @@ type classifyBody struct {
 	UndoesDecisionID *string `json:"undoes_decision_id"`
 }
 
+// classifyBodyFields are the only keys a decision body may carry (§5.5),
+// spelled exactly. encoding/json alone would ignore any other key and match
+// these case-insensitively; neither is acceptable here. A field the server
+// ignored is one the request hash does not bind, so a client could believe it
+// had set something (a workload, a version under another spelling) that the
+// recorded decision never saw. An unknown key is therefore 400 naming it, as
+// an unknown list parameter is (D-75).
+var classifyBodyFields = map[string]bool{
+	"operation_id": true, "decision": true, "purpose": true,
+	"reason": true, "expected_version": true, "undoes_decision_id": true,
+}
+
 // parseClassifyBody reads the request into a ClassifyRequest (without the
 // workload and actor). Missing operation_id, decision, reason or
-// expected_version, a malformed UUID, or a body that is not the JSON object
-// above is 400 invalid_parameter (D-30); the service validates the values.
+// expected_version, a malformed UUID, a field of the wrong JSON type, an
+// unknown field, or a body that is not exactly one JSON object is 400
+// invalid_parameter (D-30), naming the field where there is one; the service
+// validates the values.
 func parseClassifyBody(c *gin.Context) (services.ClassifyRequest, *igaread.Error) {
 	var req services.ClassifyRequest
-	var b classifyBody
+	var raw json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, classifyBodyLimit))
-	if err := dec.Decode(&b); err != nil {
+	if err := dec.Decode(&raw); err != nil {
 		return req, igaread.InvalidParameter("body", "the body must be a JSON object: "+err.Error())
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return req, igaread.InvalidParameter("body", "the body must be exactly one JSON object")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return req, igaread.InvalidParameter("body", "the body must be a JSON object")
+	}
+	var unknown []string
+	for k := range fields {
+		if !classifyBodyFields[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown) // the same body always names the same field
+		return req, igaread.InvalidParameter(unknown[0], "unknown field "+strconv.Quote(unknown[0])+
+			": a decision takes only operation_id, decision, purpose, reason, expected_version and undoes_decision_id")
+	}
+	var b classifyBody
+	if err := json.Unmarshal(raw, &b); err != nil {
+		var te *json.UnmarshalTypeError
+		if errors.As(err, &te) && classifyBodyFields[te.Field] {
+			return req, igaread.InvalidParameter(te.Field, te.Field+" has the wrong type: "+err.Error())
+		}
+		return req, igaread.InvalidParameter("body", "the body must be a JSON object: "+err.Error())
 	}
 	if b.OperationID == nil || *b.OperationID == "" {
 		return req, igaread.InvalidParameter("operation_id", "operation_id is required")

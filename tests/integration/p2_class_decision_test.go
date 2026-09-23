@@ -123,6 +123,28 @@ func (f *classFixture) insertWorkload(name, runtimeKind, classification string) 
 	return id
 }
 
+// classPublish gives a workspace with no graph one publication (rev 1): the
+// connector and scan run its foreign keys need, and the publication row --
+// nothing else. It is how a test tells a scoping 404 from D-4's
+// nothing-published 404. Removed before the lab's cleanup clears the runs.
+func classPublish(t *testing.T, db *gorm.DB, ws uuid.UUID) {
+	t.Helper()
+	conn := connectorFor(t, db, ws)
+	run := uuid.New()
+	if err := db.Exec(`INSERT INTO cloud_scan_run (id, workspace_id, connector_id) VALUES (?, ?, ?)`, run, ws, conn).Error; err != nil {
+		t.Fatalf("seed scan run: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO iga_publication (workspace_id, rev, published_at, scan_run_id, manifest)
+		VALUES (?, 1, now(), ?, '{}')`, ws, run).Error; err != nil {
+		t.Fatalf("seed publication: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec(`DELETE FROM iga_publication WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM cloud_scan_run WHERE workspace_id = ?`, ws)
+		db.Exec(`DELETE FROM cloud_connector WHERE workspace_id = ?`, ws)
+	})
+}
+
 func (f *classFixture) path(workload uuid.UUID) string {
 	return "/workloads/" + workload.String() + "/classification"
 }
@@ -268,6 +290,55 @@ func TestP2ClassConcurrentRetriesReplay(t *testing.T) {
 	if got := f.l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, f.l.ws); got != pubs {
 		t.Fatalf("a decision wrote a publication: %d -> %d", pubs, got)
 	}
+}
+
+// B22 as a free-running race: identical retries of one operation, released at
+// once. Nothing orchestrates their order; each decision only dawdles 50 ms
+// before its commit -- the window a slow commit or a busy database opens --
+// so the retries genuinely overlap instead of running one after another. The
+// row lock serializes them and the lookup after it turns every one but the
+// first into a replay: all 200, exactly one replayed:false, one decision id,
+// one row, one clock tick. The deterministic proof of the order is
+// TestP2ClassConcurrentRetriesReplay; this one shows that whatever
+// interleaving the scheduler picks, no retry is shown a 409, a 422 or a
+// duplicate decision.
+func TestP2ClassRetryStormReplays(t *testing.T) {
+	f := classSetup(t, "p2-class-storm")
+	f.api.ctl.WithClassificationService(services.NewClassificationService(f.l.db).WithBeforeCommit(func() {
+		time.Sleep(50 * time.Millisecond)
+	}))
+	const retries = 8
+	body := classBody(uuid.New(), models.ClassificationClassified, "Owns tier-1 ticket routing", 0, nil)
+	start := make(chan struct{})
+	results := make(chan classResp, retries)
+	var wg sync.WaitGroup
+	for i := 0; i < retries; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- classPost(f.api, f.path(f.workload), body)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	fresh, ids := 0, map[string]bool{}
+	for r := range results {
+		if r.err != nil || r.status != http.StatusOK {
+			t.Fatalf("a retry in the storm = %d %v, want 200", r.status, r.body)
+		}
+		if dig(r.body, "data", "replayed") == false {
+			fresh++
+		}
+		ids[digs(r.body, "data", "decision", "id")] = true
+	}
+	if fresh != 1 || len(ids) != 1 {
+		t.Fatalf("%d retries: %d answered replayed:false over %d decision ids, want exactly 1 and 1", retries, fresh, len(ids))
+	}
+	classWant(t, "after the storm", f.state(f.workload),
+		classState{Classification: models.ClassificationClassified, Version: 1, Decisions: 1, Seq: 1})
 }
 
 // Step 6: the SAME operation id used concurrently on two DIFFERENT workloads.
@@ -527,8 +598,20 @@ func TestP2ClassValidation(t *testing.T) {
 		{"purpose over 500 characters", func(b map[string]any) { b["purpose"] = strings.Repeat("é", 501) }, "purpose"},
 		{"no expected_version", func(b map[string]any) { delete(b, "expected_version") }, "expected_version"},
 		{"negative expected_version", func(b map[string]any) { b["expected_version"] = -1 }, "expected_version"},
-		{"expected_version not a number", func(b map[string]any) { b["expected_version"] = "0" }, "body"},
+		{"expected_version not a number", func(b map[string]any) { b["expected_version"] = "0" }, "expected_version"},
+		{"expected_version not an integer", func(b map[string]any) { b["expected_version"] = 1.5 }, "expected_version"},
+		{"decision not a string", func(b map[string]any) { b["decision"] = 1 }, "decision"},
 		{"undoes_decision_id not a UUID", func(b map[string]any) { b["undoes_decision_id"] = "x" }, "undoes_decision_id"},
+		// Keys the contract does not define are refused, never ignored: an
+		// ignored key is one the request hash does not bind.
+		{"an unknown field", func(b map[string]any) { b["workload_id"] = uuid.NewString() }, "workload_id"},
+		{"two unknown fields name the first", func(b map[string]any) { b["zeta"], b["alpha"] = 1, 1 }, "alpha"},
+		// encoding/json alone matches keys case-insensitively: this would set
+		// the version under a spelling the contract does not have.
+		{"a field in another case", func(b map[string]any) {
+			delete(b, "expected_version")
+			b["Expected_Version"] = 0
+		}, "Expected_Version"},
 	} {
 		b := good()
 		tc.edit(b)
@@ -537,14 +620,18 @@ func TestP2ClassValidation(t *testing.T) {
 			t.Errorf("%s = %d %v, want 400 invalid_parameter on %s", tc.name, st, out, tc.param)
 		}
 	}
-	for _, raw := range []string{`[]`, `{"operation_id": "`, `{} {}`} {
+	// A body past the size bound is refused even when it would otherwise be a
+	// valid decision: here the padding is whitespace inside the object.
+	oversized, _ := json.Marshal(good())
+	oversized = append(oversized[:1], append(bytes.Repeat([]byte(" "), 70<<10), oversized[1:]...)...)
+	for _, raw := range []string{`[]`, `{"operation_id": "`, `{} {}`, `null`, `"x"`, ``, string(oversized)} {
 		req := httptest.NewRequest(http.MethodPost, "/api/iga/v1"+f.path(f.workload), strings.NewReader(raw))
 		w := httptest.NewRecorder()
 		f.api.eng.ServeHTTP(w, req)
 		var out map[string]any
 		_ = json.Unmarshal(w.Body.Bytes(), &out)
-		if w.Code != http.StatusBadRequest || errCode(out) != "invalid_parameter" {
-			t.Errorf("body %q = %d %v, want 400 invalid_parameter", raw, w.Code, out)
+		if w.Code != http.StatusBadRequest || errCode(out) != "invalid_parameter" || digs(out, "error", "parameter") != "body" {
+			t.Errorf("body %.40q = %d %v, want 400 invalid_parameter on body", raw, w.Code, out)
 		}
 	}
 	classWant(t, "after every 400", f.state(f.workload),
@@ -573,7 +660,21 @@ func TestP2ClassReplacementIsANewDecision(t *testing.T) {
 	alex := "Alex Kim"
 	u2, m2 := classMember(t, f.l.db, f.l.ws, &alex, "alex@test.local", "active")
 	f.api.withClaims(classClaims(u2, m2))
-	out := f.classify(f.workload, classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 1, nil))
+	// Purpose is optional: this one gives none.
+	body := classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 1, nil)
+	delete(body, "purpose")
+	out := f.classify(f.workload, body)
+	// No purpose given is null -- never "", which would read as a purpose that
+	// was recorded as empty -- in the POST outcome and in the history alike.
+	if p, present := dig(out, "data", "decision").(map[string]any)["purpose"]; !present || p != nil {
+		t.Fatalf("decision.purpose with none given = %v (present %v), want null", p, present)
+	}
+	st, hist := f.api.get(f.path(f.workload))
+	mustStatus(t, "history", st, hist, http.StatusOK)
+	if items := digl(hist, "data"); len(items) != 2 || dig(items[0], "purpose") != nil ||
+		digs(items[1], "purpose") != "Customer support triage" {
+		t.Fatalf("history purposes = %v, want [null, the first decision's]", hist)
+	}
 	if digs(out, "data", "classification") != models.ClassificationClassified || num(out, "data", "classification_version") != 2 ||
 		digs(out, "data", "decision", "decided_by", "display") != "Alex Kim" ||
 		digs(out, "data", "decision", "id") == digs(first, "data", "decision", "id") {
@@ -779,6 +880,18 @@ func TestP2ClassMembershipCheckFailureIs500(t *testing.T) {
 func TestP2ClassCrossWorkspaceIs404(t *testing.T) {
 	f := classSetup(t, "p2-class-cross")
 	otherWS := newWorkspace(t, f.l.db, "p2-class-cross-other")
+	// The other workspace HAS a publication: otherwise the history's 404 would
+	// be D-4's "nothing published", and would prove nothing about scoping.
+	classPublish(t, f.l.db, otherWS)
+	if err := igaread.NewReader(f.l.db, readTestCursorKey).Read(context.Background(), otherWS, igaread.Pin{},
+		func(q *igaread.Query) error {
+			if !q.Published() {
+				t.Fatal("the other workspace is not published")
+			}
+			return nil
+		}); err != nil {
+		t.Fatalf("read the other workspace: %v", err)
+	}
 	ou, om := classMember(t, f.l.db, otherWS, nil, "other@test.local", "active")
 	f.api.asWorkspace(otherWS).withClaims(classClaims(ou, om))
 
@@ -1252,7 +1365,7 @@ func TestP2ClassCanClassifyCaller(t *testing.T) {
 
 func classPtr(u uuid.UUID) *uuid.UUID { return &u }
 
-// refUUIDBare parses a bare UUID from a response (decision ids are not typed
+// classUUID parses a bare UUID from a response (decision ids are not typed
 // references: a decision is not a graph object).
 func classUUID(t *testing.T, s string) uuid.UUID {
 	t.Helper()
