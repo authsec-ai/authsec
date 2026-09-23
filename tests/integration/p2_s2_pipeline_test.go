@@ -310,6 +310,19 @@ func TestP2S2PipelineAccountsAtTheCurrentRevision(t *testing.T) {
 		t.Fatalf("A after a failed run = %v, want failed with its error, still at the graph's rev", accA)
 	}
 
+	// A's next run is queued. It is A's latest run even if the failed run's
+	// requested_at sorts after it (clock skew between hosts, or a refused
+	// claim's requeue): the live run is what the account is doing now (D-92).
+	next, err := l.runs.Enqueue(l.ws, a.conn, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.db.Exec(`UPDATE cloud_scan_run SET requested_at = now() + interval '1 hour' WHERE id = ?`, failed.ID)
+	accA = s2PipelineAccount(t, s2Pipeline(t, api), a)
+	if digs(accA, "state") != "queued" || digs(accA, "latest_run", "ref") != refOf("cloud_scan_run", next.ID) {
+		t.Fatalf("A with a queued run = %v, want the queued run as latest_run", accA)
+	}
+
 	// No parameters: rev is refused rather than honoured as a pin it is not.
 	for _, q := range []string{qs("rev", "2"), qs("account", a.id)} {
 		code, body := api.get("/pipeline" + q)

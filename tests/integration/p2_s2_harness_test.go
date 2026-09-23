@@ -35,6 +35,8 @@ type s2FakeRegions struct {
 	err     error
 	calls   int
 	lastIn  *ec2.DescribeRegionsInput
+	// during, when set, runs inside the call -- while "AWS is answering".
+	during func()
 }
 
 func s2Regions(enabled ...string) *s2FakeRegions {
@@ -44,6 +46,9 @@ func s2Regions(enabled ...string) *s2FakeRegions {
 func (f *s2FakeRegions) DescribeRegions(_ context.Context, in *ec2.DescribeRegionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.during != nil {
+		f.during()
+	}
 	f.calls++
 	f.lastIn = in
 	if f.err != nil {

@@ -104,7 +104,8 @@ func TestP2S2RegionsListedWithSelection(t *testing.T) {
 func TestP2S2RegionPatchNamesTheOffenders(t *testing.T) {
 	l := newP2Lab(t, "p2-s2-regions-patch", true)
 	a := l.account(accountA, "us-east-1")
-	a.svc.WithRegionsAPI(s2Regions("us-east-1", "eu-central-1"))
+	fake := s2Regions("us-east-1", "eu-central-1")
+	a.svc.WithRegionsAPI(fake)
 	api := s2DiscoveryAPI(t, l, a.svc)
 
 	// Well-formed, but not enabled in this account.
@@ -121,10 +122,15 @@ func TestP2S2RegionPatchNamesTheOffenders(t *testing.T) {
 	}
 
 	// Not region codes at all: 422 naming them, before AWS is asked.
+	asked := fake.calls
 	code, body = api.patchRegions(a.conn, "us-east-1", "moon-1", "US_EAST")
 	mustStatus(t, "PATCH with malformed codes", code, body, http.StatusUnprocessableEntity)
 	if got := s2Strings(dig(body, "error", "regions")); !reflect.DeepEqual(got, []string{"moon-1", "us_east"}) {
 		t.Fatalf("malformed offenders = %v", got)
+	}
+	if fake.calls != asked || digs(body, "error", "reason") != "not AWS region codes" {
+		t.Fatalf("malformed codes: %d DescribeRegions calls, reason %q; want refused on shape, before AWS is asked",
+			fake.calls-asked, digs(body, "error", "reason"))
 	}
 
 	// An EMPTY selection names no region, and is still 422 invalid_region
@@ -187,8 +193,20 @@ func TestP2S2RegionPatchNamesTheOffenders(t *testing.T) {
 		t.Fatalf("a foreign PATCH changed the regions to %v", got)
 	}
 
-	// A revoked connection cannot be reconfigured.
-	l.db.Exec(`UPDATE cloud_connector SET status = 'revoked', auth_ref = '' WHERE id = ?`, a.conn)
+	// A connection REVOKED WHILE AWS WAS ANSWERING is not reconfigured: the
+	// write itself refuses a revoked row, whatever the read before it saw.
+	fake.during = func() {
+		l.db.Exec(`UPDATE cloud_connector SET status = 'revoked', auth_ref = '' WHERE id = ?`, a.conn)
+	}
+	code, body = api.patchRegions(a.conn, "us-east-1")
+	if code != http.StatusConflict || errCode(body) != "connector_revoked" {
+		t.Fatalf("PATCH racing a revocation = %d %v, want 409 connector_revoked", code, body)
+	}
+	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
+		t.Fatalf("a PATCH racing a revocation wrote %v", got)
+	}
+	// And a connection already revoked cannot be reconfigured at all.
+	fake.during = nil
 	code, body = api.patchRegions(a.conn, "us-east-1")
 	if code != http.StatusConflict || errCode(body) != "connector_revoked" {
 		t.Fatalf("PATCH on a revoked connector = %d %v, want 409 connector_revoked", code, body)
