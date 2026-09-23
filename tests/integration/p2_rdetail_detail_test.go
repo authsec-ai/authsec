@@ -11,14 +11,18 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 )
 
 // rdetailSourceLines renders sources as integration|account|state|ended_reason?.
@@ -169,10 +173,11 @@ func TestP2RDetailResourcePolicy(t *testing.T) {
 	}
 
 	// Observations the scanner cannot be made to write on cue are inserted
-	// directly: a Deny for nopolicy (1) from a run that has not published,
-	// recorded before the revision's publication, and (2) from the published
-	// run, but recorded after the publication. Neither belongs to the
-	// revision; (3) belongs to it but is not a resource-policy read.
+	// directly, first and last recorded by the same run as the writer does: a
+	// Deny for nopolicy (1) from a run that has not published, recorded before
+	// the revision's publication, and (2) from the published run, but recorded
+	// after the publication. Neither belongs to the revision; (3) belongs to it
+	// but is not a resource-policy read.
 	pending, err := l.runs.Enqueue(l.ws, a.conn, "manual")
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
@@ -187,18 +192,181 @@ func TestP2RDetailResourcePolicy(t *testing.T) {
 		// (3) in the revision, about the same ARN, but not a resource-policy read.
 		{run2.ID, "iam:GetAccountAuthorizationDetails", run2.PublishedAt.Add(-time.Minute)},
 	} {
-		if err := l.db.Exec(`INSERT INTO cloud_observation (workspace_id, connector_id, scan_run_id, generation,
-		                         subject_native_id, source_api, surface, surface_state, observed_at, ingested_at,
-		                         sanitized_facts, content_hash)
-		                     VALUES (?, ?, ?, 1, 'arn:aws:s3:::nopolicy', ?, 'resource_policies', '',
-		                             ?, ?, '{"kind":"s3_bucket","has_deny":true,"parse_failed":false,"statements":1}', ?)`,
-			l.ws, a.conn, o.run, o.api, o.at, o.at, "rdetail-outside-"+string(rune('a'+i))).Error; err != nil {
-			t.Fatalf("seed observation %d: %v", i, err)
-		}
+		rdetailSeedPolicyObservation(t, l.db, l.ws, a.conn, o.run, o.api, o.at, "rdetail-outside-"+string(rune('a'+i)))
 	}
 	if got := policyOf("arn:aws:s3:::nopolicy"); got != `{"has_deny":null,"read":false}` {
 		t.Errorf("nopolicy with observations outside the revision = %s, want not read (D-19)", got)
 	}
+
+	// E14: another tenant scanned the same ARN. Its Deny for nopolicy was
+	// recorded before THIS revision's publication, by a run that published
+	// there at a rev below this one's -- every condition but the workspace
+	// holds -- and must never answer here. Last, because the foreign
+	// workspace's seeded run is queued, and a lab worker would claim it.
+	other := newWorkspace(t, l.db, "p2-rdetail-resource-policy-other")
+	classPublish(t, l.db, other)
+	var foreign struct {
+		ScanRunID   uuid.UUID
+		ConnectorID uuid.UUID
+	}
+	if err := l.db.Raw(`SELECT pb.scan_run_id, sr.connector_id FROM iga_publication pb
+	                      JOIN cloud_scan_run sr ON sr.id = pb.scan_run_id WHERE pb.workspace_id = ?`, other).
+		Scan(&foreign).Error; err != nil || foreign.ScanRunID == uuid.Nil {
+		t.Fatalf("setup: the foreign publication's run: %v", err)
+	}
+	rdetailSeedPolicyObservation(t, l.db, other, foreign.ConnectorID, foreign.ScanRunID, "s3:GetBucketPolicy",
+		run2.PublishedAt.Add(-time.Minute), "rdetail-foreign")
+	if got := policyOf("arn:aws:s3:::nopolicy"); got != `{"has_deny":null,"read":false}` {
+		t.Errorf("nopolicy beside another workspace's read of it = %s, want not read: foreign data (E14)", got)
+	}
+}
+
+// rdetailSeedPolicyObservation inserts a Deny resource-policy observation of
+// arn:aws:s3:::nopolicy, first and last recorded by run at `at` (as
+// ObservationWriter.Record writes a new row), and deletes it at cleanup --
+// before the runs and workspaces it references.
+func rdetailSeedPolicyObservation(t *testing.T, db *gorm.DB, ws, conn, run uuid.UUID, api string, at time.Time, hash string) {
+	t.Helper()
+	var id uuid.UUID
+	if err := db.Raw(`INSERT INTO cloud_observation (workspace_id, connector_id, scan_run_id, generation,
+	                      subject_native_id, source_api, surface, surface_state, observed_at, ingested_at,
+	                      sanitized_facts, content_hash, last_confirmed_run_id, last_confirmed_at)
+	                  VALUES (?, ?, ?, 1, 'arn:aws:s3:::nopolicy', ?, 'resource_policies', '',
+	                          ?, ?, '{"kind":"s3_bucket","has_deny":true,"parse_failed":false,"statements":1}', ?, ?, ?)
+	                  RETURNING id`,
+		ws, conn, run, api, at, at, hash, run, at).Row().Scan(&id); err != nil {
+		t.Fatalf("seed observation %s: %v", hash, err)
+	}
+	t.Cleanup(func() { db.Exec(`DELETE FROM cloud_observation WHERE id = ?`, id) })
+}
+
+// rdetailPhase1Scan runs ONE scan through the REAL worker with
+// IGA_GRAPH_PROJECTION off: the run collects and publishes its Phase 1
+// results, and no projection job or publication ever exists for it -- the
+// run that first read a policy in a workspace upgraded to Phase 2.
+func rdetailPhase1Scan(l *p2Lab, a *p2Account, f *s3bFakes) models.CloudScanRun {
+	l.t.Helper()
+	queued, err := l.runs.Enqueue(l.ws, a.conn, "manual")
+	if err != nil {
+		l.t.Fatalf("enqueue: %v", err)
+	}
+	w := services.NewAWSScanWorker(l.db, a.svc).WithOwner("scan-worker-rdetail-phase1").
+		WithGraphProjection(services.NewGraphProjectionGate(false, "")).WithScannerHook(f.hook(a))
+	if worked, err := w.RunOnce(context.Background()); err != nil || !worked {
+		l.t.Fatalf("phase 1 scan: worked=%v err=%v", worked, err)
+	}
+	var run models.CloudScanRun
+	if err := l.db.First(&run, "id = ?", queued.ID).Error; err != nil || run.Status != models.CloudScanRunPublished {
+		l.t.Fatalf("phase 1 run = %s (%v), want published", run.Status, err)
+	}
+	if n := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws); n != 0 {
+		l.t.Fatalf("setup: %d publications after a Phase 1 scan, want none", n)
+	}
+	return run
+}
+
+// rdetailPolicyRows is every resource-policy observation of a reference, as
+// "first-recorder|confirmations", oldest first.
+func rdetailPolicyRows(t *testing.T, l *p2Lab, text string) []string {
+	t.Helper()
+	var rows []struct {
+		ScanRunID         uuid.UUID
+		ConfirmationCount int
+	}
+	l.db.Raw(`SELECT scan_run_id, confirmation_count FROM cloud_observation
+	           WHERE workspace_id = ? AND subject_native_id = ? AND source_api IN ?
+	           ORDER BY ingested_at, id`, l.ws, text, igaread.ResourcePolicySourceAPIs).Scan(&rows)
+	out := []string{}
+	for _, r := range rows {
+		out = append(out, fmt.Sprintf("%s|%d", r.ScanRunID, r.ConfirmationCount))
+	}
+	return out
+}
+
+// D-19 over deduplicated reads, through the REAL worker and projector. An
+// unchanged re-read writes no new row: it moves the existing row's
+// last_confirmed_run_id. So a row names only its first and latest readers.
+//
+//  1. guarded's Deny is first read while projection is off (a run that never
+//     publishes); the first projected run re-reads it unchanged, onto that
+//     row. The revision's run DID read it: read, has_deny true -- keyed on the
+//     first reader alone it read "not read" at every revision.
+//  2. A collection in flight moves the row's latest reader past the revision
+//     while its first reader never published: the proof is gone, so "not
+//     read", never a has_deny from a run the revision was not built from
+//     (D-19's Raise: no per-run confirmation record). Once it publishes, read.
+//  3. The Deny is removed (a new row): has_deny false, unchanged while the
+//     next collection is in flight -- that row's first reader published.
+//  4. The Deny is restored: the re-read dedupes onto the OLD row, whose first
+//     recording is older than the no-Deny row's. The latest READ decides:
+//     has_deny true, never the latest first-recorded's false.
+//  5. In flight again, the old row's latest reader is past the revision and
+//     its first never published: it may or may not have been read after the
+//     no-Deny row, so has_deny is null -- read, and never a guessed false.
+func TestP2RDetailResourcePolicyConfirmations(t *testing.T) {
+	l := newP2Lab(t, "p2-rdetail-policy-confirmations", true)
+	a := l.account(accountA)
+	a.role("BucketRole", "AROABUCKETROLEBUCKET")
+	a.iam.inlineRolePolicies["BucketRole"] = map[string]string{"Buckets": `{"Version":"2012-10-17","Statement":[` +
+		`{"Sid":"Buckets","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::guarded"}]}`}
+	withDeny := `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::guarded/*"}]}`
+	allowOnly := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::guarded/*"}]}`
+	s3p := &s3bS3Policy{docs: map[string]string{"guarded": withDeny}}
+	f := &s3bFakes{s3: s3p, kms: &fakeKMSPolicy{}}
+	api := l.api()
+	const guarded = "arn:aws:s3:::guarded"
+	check := func(step, want string) {
+		t.Helper()
+		body := rdetailGet(t, api, "/resources/"+rdetailResource(t, l, guarded))
+		if got := rdetailJSON(t, dig(body, "data", "resource_policy")); got != want {
+			t.Errorf("%s (rev %v): resource_policy = %s, want %s", step, dig(body, "meta", "rev"), got, want)
+		}
+	}
+	inFlight := func() {
+		t.Helper()
+		scanSeq++
+		s3bScan(l, a, f, fmt.Sprintf("scan-worker-rdetail-inflight-%d", scanSeq))
+	}
+	project := func() {
+		t.Helper()
+		l.project(fmt.Sprintf("projector-rdetail-inflight-%d", scanSeq))
+	}
+
+	// 1.
+	first := rdetailPhase1Scan(l, a, f)
+	s3bScanAndProject(l, a, f)
+	if got := strings.Join(rdetailPolicyRows(t, l, guarded), ","); got != first.ID.String()+"|2" {
+		t.Fatalf("setup: guarded's rows = %s, want ONE row first recorded by the Phase 1 run, read twice", got)
+	}
+	check("first read by an unpublished run, confirmed by a published one", `{"has_deny":true,"read":true}`)
+
+	// 2.
+	inFlight()
+	check("its latest reader in flight, its first never published", `{"has_deny":null,"read":false}`)
+	project()
+	check("that reader published", `{"has_deny":true,"read":true}`)
+
+	// 3.
+	s3p.docs["guarded"] = allowOnly
+	s3bScanAndProject(l, a, f)
+	check("the Deny removed", `{"has_deny":false,"read":true}`)
+	inFlight()
+	check("the Deny removed, the next collection in flight", `{"has_deny":false,"read":true}`)
+	project()
+
+	// 4.
+	s3p.docs["guarded"] = withDeny
+	s3bScanAndProject(l, a, f)
+	if rows := rdetailPolicyRows(t, l, guarded); len(rows) != 2 || !strings.HasPrefix(rows[0], first.ID.String()+"|") {
+		t.Fatalf("setup: guarded's rows = %v, want the restored Deny deduplicated onto the Phase 1 run's row", rows)
+	}
+	check("the Deny restored onto its old row", `{"has_deny":true,"read":true}`)
+
+	// 5.
+	inFlight()
+	check("the restored row's latest reader in flight", `{"has_deny":null,"read":true}`)
+	project()
+	check("that reader published", `{"has_deny":true,"read":true}`)
 }
 
 // E14, D-4, D-5, D-6, E8 and the parameter contract. A foreign id, another
@@ -410,6 +578,99 @@ func TestP2RDetailStaleReferenceAndCoverage(t *testing.T) {
 	cur := rdetailGet(t, api, "/resources/"+rdetailResource(t, l, "arn:aws:s3:::support-tickets/*"))
 	if _, has := dig(cur, "data").(map[string]any)["stale_reason"]; has {
 		t.Errorf("a current reference carries stale_reason %v", dig(cur, "data", "stale_reason"))
+	}
+}
+
+// §2.14.14, D-73, D-93: a detail and its tab carry every gap that bears on
+// THEM. Account A names the bucket locked (and locked/*), and its crew group
+// holds a grant on locked/*; account B names b-locked, and at first locked
+// too, until a clean scan drops it (B's support for locked ENDS). Then A's
+// scan cannot read locked's bucket policy or the groups listing, nor B's
+// b-locked's policy or its groups listing.
+//
+//   - locked's Overview names A's resource_policies gap -- the only thing that
+//     explains its resource_policy read = false -- and BOTH accounts' iam_groups
+//     gaps: groups' inline policies arrive with the groups listing, and an
+//     unread one in either account may name locked. Not B's resource_policies
+//     gap: B's run no longer names locked, so it never tried to read its
+//     policy; that gap is about b-locked.
+//   - locked/*'s Overview has no resource_policies gap: no policy is read for
+//     an object selector.
+//   - locked/* > Access names both iam_groups gaps, which its member rows
+//     (D-18) depend on, and keeps kim's member row, stale, never dropped.
+//   - The resources list carries neither: D-73's list table has no
+//     resource_policies or iam_groups for resources.
+func TestP2RDetailCoverageEveryGapThatBears(t *testing.T) {
+	l := newP2Lab(t, "p2-rdetail-own-coverage", true)
+	a := l.account(accountA)
+	a.role("LockedRole", "AROALOCKEDROLELOCKED")
+	a.iam.inlineRolePolicies["LockedRole"] = map[string]string{"Locked": `{"Version":"2012-10-17","Statement":[` +
+		`{"Sid":"Locked","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::locked","arn:aws:s3:::locked/*"]}]}`}
+	s3aGroup(a, "crew", "AGPACREWCREWCREWCREW")
+	s3aGroupAttach(t, a, "crew", a.managed("CrewRead", `{"Version":"2012-10-17","Statement":[{"Sid":"Crew",`+
+		`"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::locked/*"}]}`))
+	s3aUser(a, "kim", "AIDAKIMKIMKIMKIMKIM1")
+	s3aJoin(a, "kim", "crew")
+	b := l.account(accountB)
+	b.role("BRole", "AROABROLEBROLEBROLE1")
+	bNames := func(resources string) {
+		b.iam.inlineRolePolicies["BRole"] = map[string]string{"B": `{"Version":"2012-10-17","Statement":[` +
+			`{"Sid":"B","Effect":"Allow","Action":"s3:ListBucket","Resource":[` + resources + `]}]}`}
+	}
+	bNames(`"arn:aws:s3:::b-locked","arn:aws:s3:::locked"`)
+	fa := &s3bFakes{s3: &s3bS3Policy{docs: map[string]string{}, errs: map[string]error{}}, kms: &fakeKMSPolicy{}}
+	fb := &s3bFakes{s3: &s3bS3Policy{docs: map[string]string{}, errs: map[string]error{}}, kms: &fakeKMSPolicy{}}
+	s3bScanAndProject(l, a, fa)
+	s3bScanAndProject(l, b, fb)
+	bNames(`"arn:aws:s3:::b-locked"`)
+	s3bScanAndProject(l, b, fb)
+	api := l.api()
+	locked := rdetailResource(t, l, "arn:aws:s3:::locked")
+	lockedObjects := rdetailResource(t, l, "arn:aws:s3:::locked/*")
+	if got := listsNotes(rdetailGet(t, api, "/resources/"+locked)); len(got) != 0 {
+		t.Fatalf("setup: locked's coverage after clean scans = %v, want none", got)
+	}
+	if got := l.supportOf("resource_id", refUUID(t, locked)); got[a.conn] != "current" || got[b.conn] != "ended" {
+		t.Fatalf("setup: locked's supports = %v, want A current and B ended", got)
+	}
+
+	fa.s3.(*s3bS3Policy).errs["locked"] = denied("s3:GetBucketPolicy")
+	a.iam.fail["GetAccountAuthorizationDetails:Group"] = denied("iam:GetAccountAuthorizationDetails")
+	s3bScanAndProject(l, a, fa)
+	fb.s3.(*s3bS3Policy).errs["b-locked"] = denied("s3:GetBucketPolicy")
+	b.iam.fail["GetAccountAuthorizationDetails:Group"] = denied("iam:GetAccountAuthorizationDetails")
+	s3bScanAndProject(l, b, fb)
+
+	named := "resources named by groups' inline policies"
+	policy := "whether this resource's policy was read"
+	groupsA, groupsB := listsNote(accountA, "iam_groups", "denied", named), listsNote(accountB, "iam_groups", "denied", named)
+	body := rdetailGet(t, api, "/resources/"+locked)
+	if got, want := strings.Join(listsNotes(body), ","),
+		strings.Join([]string{groupsA, listsNote(accountA, "resource_policies", "denied", policy), groupsB}, ","); got != want {
+		t.Errorf("locked meta.coverage = %q,\nwant both accounts' iam_groups and A's resource_policies %q", got, want)
+	}
+	if got := rdetailJSON(t, dig(body, "data", "resource_policy")); got != `{"has_deny":null,"read":false}` {
+		t.Errorf("locked resource_policy = %s, want not read", got)
+	}
+	if got, want := strings.Join(listsNotes(rdetailGet(t, api, "/resources/"+lockedObjects)), ","), groupsA+","+groupsB; got != want {
+		t.Errorf("locked/* meta.coverage = %q, want only %q: no policy is read for an object selector", got, want)
+	}
+	acc := rdetailGet(t, api, "/resources/"+lockedObjects+"/access")
+	held := "access held by groups and their members"
+	if got, want := strings.Join(listsNotes(acc), ","),
+		listsNote(accountA, "iam_groups", "denied", held)+","+listsNote(accountB, "iam_groups", "denied", held); got != want {
+		t.Errorf("locked/* access meta.coverage = %q, want both accounts' iam_groups gaps %q", got, want)
+	}
+	if got := strings.Join(rdetailLines(digl(acc, "data", "access")), ","); !strings.Contains(got, "kim|CrewRead|Crew|via crew|stale") {
+		t.Errorf("locked/* access = %s, want kim's member row kept, stale, while the groups read failed", got)
+	}
+	bLocked := rdetailGet(t, api, "/resources/"+rdetailResource(t, l, "arn:aws:s3:::b-locked"))
+	if got, want := strings.Join(listsNotes(bLocked), ","),
+		strings.Join([]string{groupsA, groupsB, listsNote(accountB, "resource_policies", "denied", policy)}, ","); got != want {
+		t.Errorf("b-locked meta.coverage = %q,\nwant both accounts' iam_groups and B's resource_policies %q", got, want)
+	}
+	if got := listsNotes(rdetailGet(t, api, "/resources")); len(got) != 0 {
+		t.Errorf("resources list meta.coverage = %v, want none (D-73's list table)", got)
 	}
 }
 

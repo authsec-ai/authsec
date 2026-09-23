@@ -247,7 +247,7 @@ func (r *Reader) ResourceAccess(ctx context.Context, ws uuid.UUID, rawID string,
 			return err
 		}
 
-		if meta.Coverage, err = ResourceCoverage(q, accts); err != nil {
+		if meta.Coverage, err = ResourceAccessCoverage(q, accts, rec); err != nil {
 			return err
 		}
 

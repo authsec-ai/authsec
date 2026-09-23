@@ -19,12 +19,15 @@ package igaread
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/authsec-ai/authsec/models"
 )
 
 // ResourceExistenceNotVerified is every reference's existence this phase:
@@ -53,7 +56,8 @@ type ResourceDetailView struct {
 // policy was read for this exact reference, and whether it contains a Deny.
 // has_deny is null whenever read is false -- and also when the latest policy
 // read did not parse, since an unparsed document proves neither a Deny nor its
-// absence.
+// absence, and when the revision cannot prove which of two disagreeing reads
+// is the latest (resourcePolicyState).
 type ResourcePolicyState struct {
 	Read    bool  `json:"read"`
 	HasDeny *bool `json:"has_deny"`
@@ -147,7 +151,7 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 		if err != nil {
 			return err
 		}
-		cov, err := ResourceCoverage(q, accts)
+		cov, err := ResourceDetailCoverage(q, accts, rec)
 		if err != nil {
 			return err
 		}
@@ -188,75 +192,314 @@ func ResourceByID(q *Query, id uuid.UUID) (*ResourceRecord, error) {
 	return &rows[0], nil
 }
 
-// ResourceCoverage is meta.coverage for a resource's detail and its tabs: the
-// resources list's own notes (listsCoverage over every connector's resource
-// partitions), unnarrowed. A reference's account is what its ARN states, not
-// who scanned it, and any connector's unread policies may name it -- so every
-// connector's resource-surface gap bears on its named-by counts and its
-// Access, whether or not that connector supports it today (the same reasoning
-// listsResourceFilters records for the list). One definition, so the list and
-// the Overview never disagree about what is complete.
-func ResourceCoverage(q *Query, accts *Accounts) ([]CoverageNote, error) {
-	return listsCoverage(q, accts, listsRouteResources, listsScope{})
+// ResourcePolicyTypes are the typed kinds (ResourceType) whose resource policy
+// the permission scanner reads (services' getOrCreateResource collects exactly
+// these as resource-policy candidates): the only references a
+// resource_policies gap bears on.
+var ResourcePolicyTypes = map[string]bool{"s3_bucket": true, "kms_key": true}
+
+// ResourcePolicyAffects is the affects of a resource_policies note on a
+// resource's Overview: the read behind resource_policy failed.
+const ResourcePolicyAffects = "whether this resource's policy was read"
+
+// The identity-listing surfaces, per result. A resource partition requires
+// them (igagraph.Partitions: iam_roles, iam_users, iam_groups, iam_policies,
+// permission_scan), and the resources list's table (D-73) does not carry
+// them: inline policies arrive WITH the identity listing
+// (GetAccountAuthorizationDetails, one filter per surface), so a gap there is
+// a set of unread policies that may name ANY reference -- in any account's,
+// for the same reason the list's iam_policies notes are never narrowed. On
+// Access they also decide who holds what: iam_users and iam_groups are the
+// member_of partitions' surfaces, which D-18's member rows depend on.
+var (
+	resourceDetailIdentityAffects = map[string]string{
+		models.SurfaceIAMRoles:  "resources named by roles' inline policies",
+		models.SurfaceIAMUsers:  "resources named by users' inline policies",
+		models.SurfaceIAMGroups: "resources named by groups' inline policies",
+	}
+	resourceAccessIdentityAffects = map[string]string{
+		models.SurfaceIAMRoles:  "access held by roles",
+		models.SurfaceIAMUsers:  "access held by users, directly or as group members",
+		models.SurfaceIAMGroups: "access held by groups and their members",
+	}
+)
+
+// ResourceDetailCoverage is meta.coverage on GET /resources/:id: every gap
+// that bears on the Overview (§2.14.14) -- the resources list's notes (its
+// counts are the row's), every account's identity-listing gaps (the rest of
+// the reference's own partitions' surfaces, D-73), and, for a bucket or key,
+// the resource_policies read of each connector that names it (D-93): the one
+// gap that explains resource_policy.read = false.
+func ResourceDetailCoverage(q *Query, accts *Accounts, rec *ResourceRecord) ([]CoverageNote, error) {
+	return resourceCoverage(q, accts, rec.ID, resourceDetailIdentityAffects,
+		ResourcePolicyTypes[ResourceType(rec.DisplayName)])
+}
+
+// ResourceAccessCoverage is meta.coverage on GET /resources/:id/access: the
+// resources list's notes and every account's identity-listing gaps. No
+// resource_policies: Access lists identity-policy grants only, and a bucket
+// policy's own grants are not projected (resource_policy_not_projected).
+func ResourceAccessCoverage(q *Query, accts *Accounts, rec *ResourceRecord) ([]CoverageNote, error) {
+	return resourceCoverage(q, accts, rec.ID, resourceAccessIdentityAffects, false)
+}
+
+// resourceCoverage is the resources list's notes (listsCoverage over every
+// connector's resource partitions, unnarrowed), plus the identity surfaces
+// with their affects, plus -- when policy is set -- resource_policies.
+//
+// The list's notes stay unnarrowed on a detail: a reference's account is what
+// its ARN states, not who scanned it, and any connector's unread policies may
+// name it -- so every connector's gap on a surface that carries policies bears
+// on its counts and its Access, whether or not that connector supports it
+// today (the reasoning listsResourceFilters records for the list). Dropping
+// them would present an Overview as complete where the list row it came from
+// is not; the identity surfaces follow the same rule.
+//
+// The runs are the ones listsCoverage reads: each connector's resource
+// partitions' last projected runs (iga_projection_state, D-57), the runs this
+// revision was built from. Per account and surface the newest such run
+// decides; reached and unsupported are no gap and not_selected is stale
+// (D-58); a surface the run did not report is not guessed at.
+//
+// resource_policies is narrower. A run reads the policy of the buckets and
+// keys ITS policies named (services' resourcePolicyCandidates), so only a
+// connector whose partition still supports the reference (current or stale,
+// in the run its partition was built from) tried to read it; an ended one's
+// run no longer named it and its resource_policies gap is about other
+// resources. names_it is that support, per partition.
+func resourceCoverage(q *Query, accts *Accounts, resourceID uuid.UUID, identity map[string]string, policy bool) ([]CoverageNote, error) {
+	notes, err := listsCoverage(q, accts, listsRouteResources, listsScope{})
+	if err != nil {
+		return nil, err
+	}
+	var runs []struct {
+		ConnectorID uuid.UUID
+		Coverage    json.RawMessage
+		NamesIt     bool
+	}
+	if err := q.DB().Raw(`SELECT sr.connector_id, sr.coverage,
+	                             EXISTS (SELECT 1 FROM iga_object_support s
+	                                      WHERE s.workspace_id = ps.workspace_id AND s.resource_id = ?
+	                                        AND s.connector_id = ps.connector_id AND s.partition_key = ps.partition_key
+	                                        AND s.state IN ?) AS names_it
+	                        FROM iga_projection_state ps
+	                        JOIN cloud_scan_run sr ON sr.workspace_id = ps.workspace_id AND sr.id = ps.last_run_id
+	                       WHERE ps.workspace_id = ? AND ps.object_class = ?
+	                       ORDER BY sr.published_at DESC NULLS LAST, sr.requested_at DESC, sr.id`,
+		resourceID, []string{StateCurrent, StateStale}, q.WS, models.ObjectResource).Scan(&runs).Error; err != nil {
+		return nil, err
+	}
+	affects := map[string]string{}
+	for s, a := range identity {
+		affects[s] = a
+	}
+	if policy {
+		affects[models.SurfaceResourcePolicies] = ResourcePolicyAffects
+	}
+	surfaces := make([]string, 0, len(affects))
+	for s := range affects {
+		surfaces = append(surfaces, s)
+	}
+	sort.Strings(surfaces)
+
+	type key struct{ account, surface string }
+	decided := map[key]bool{}
+	for _, run := range runs { // newest first
+		conn := accts.Connector(run.ConnectorID)
+		if conn == nil {
+			continue
+		}
+		cov := models.DecodeScanCoverage(run.Coverage)
+		for _, surface := range surfaces {
+			if surface == models.SurfaceResourcePolicies && !run.NamesIt {
+				continue // this partition's run never tried to read the reference's policy
+			}
+			k := key{conn.AccountID, surface}
+			s, reported := cov.Surfaces[surface]
+			if decided[k] || !reported {
+				continue
+			}
+			decided[k] = true
+			state := s.State
+			switch state {
+			case models.CloudCoverageReached, models.CloudCoverageUnsupported:
+				continue
+			case models.CloudCoverageNotSelected:
+				state = models.CloudCoverageStale
+			}
+			notes = append(notes, CoverageNote{AccountID: conn.AccountID, Surface: surface, State: state, Affects: affects[surface]})
+		}
+	}
+	sort.SliceStable(notes, func(i, j int) bool {
+		if notes[i].AccountID != notes[j].AccountID {
+			return notes[i].AccountID < notes[j].AccountID
+		}
+		return notes[i].Surface < notes[j].Surface
+	})
+	return notes, nil
 }
 
 // ResourcePolicyOf is resource_policy (D-19) for a reference's text, at the
-// snapshot's revision. An observation counts only when it belongs to the
-// revision:
+// snapshot's revision. Only observations about THIS exact ARN
+// (subject_native_id = the reference text) from a resource-policy read
+// (ResourcePolicySourceAPIs), first recorded at or before the revision's
+// published_at, are candidates: a selector never matches a bucket's policy, a
+// bucket's policy says nothing about another bucket, and a collection that
+// started after the revision cannot change its answer (§5.1, D-25).
 //
-//   - its subject is THIS exact ARN (subject_native_id = the reference text):
-//     a selector never matches a bucket's policy, and a bucket's policy says
-//     nothing about another bucket;
-//   - it came from a resource-policy read (ResourcePolicySourceAPIs);
-//   - it was first recorded at or before the revision's published_at, by a run
-//     that published at a rev at or below the current one (iga_publication is
-//     unique per run) -- so a collection in flight, or one whose projection
-//     never committed, cannot change the answer at a revision (§5.1, D-25).
+// An unchanged re-read writes no new row: it dedupes onto the existing one and
+// moves only last_confirmed_run_id / last_confirmed_at / confirmation_count
+// (services.ObservationWriter.Record). So a row names only TWO of the runs
+// that read that content -- the first (scan_run_id) and the latest
+// (last_confirmed_run_id) -- plus how many did. A candidate BELONGS to the
+// revision (D-19: "by a run that published") when either of the two published
+// at a rev at or below the current one (iga_publication is unique per run).
+// Keying on the first recorder alone would leave a policy first read by a run
+// that never published -- superseded, abandoned, or collected while
+// IGA_GRAPH_PROJECTION was off -- "not read" at every revision until its
+// content changed, hiding its Deny for good.
 //
-// Of the observations that qualify, the latest first-recorded one decides
-// has_deny. First-recorded, not last-confirmed: last_confirmed_* is moved by
-// every later collection, published or not, so ordering on it would let a
-// run that has not published change the answer at the same revision
-// (§2.14.11). None qualifies: {read: false, has_deny: null} -- "not read" and
-// "read, no policy" are indistinguishable today (D-19's Raise: the scanner
-// records nothing for an absent policy). A policy that did not parse is read,
-// with has_deny null: its has_deny fact is false only because nothing was
-// parsed.
+// "The latest such observation" (D-19) is the one whose latest confirmation
+// the revision can PROVE is latest -- never simply the latest first-recorded:
+// a policy whose Deny is removed and then restored dedupes the restored read
+// onto the OLD row, and ordering on first-recorded would keep answering "no
+// Deny". resourcePolicyState has the rule, including the case the two named
+// runs cannot settle (a later collection moved last_confirmed_run_id past the
+// revision): has_deny is then null, never a guess. None belongs: {read:
+// false, has_deny: null} -- "not read" and "read, no policy" are
+// indistinguishable today (D-19's Raise: the scanner records nothing for an
+// absent policy). A policy that did not parse is read, with has_deny null: its
+// has_deny fact is false only because nothing was parsed.
 //
-// Keyed on subject_native_id, which no index serves; see the report's
-// proposed index. Resource ids are not used because reconciliation SETs NULL
-// an observation's resource_id when the cloud_resource row goes, and that
-// happens during collection -- again, before any publication.
+// Keyed on subject_native_id, which no index serves (a proposed index is
+// raised as a spec question). Resource ids are not used because
+// reconciliation SETs NULL an observation's resource_id when the
+// cloud_resource row goes, and that happens during collection -- before any
+// publication -- so a resource_id key would change the answer at a revision.
 func ResourcePolicyOf(q *Query, text string) (ResourcePolicyState, error) {
 	if q.Rev == nil {
 		return ResourcePolicyState{}, nil
 	}
-	var rows []struct {
-		HasDeny     *bool
-		ParseFailed *bool
-	}
-	if err := q.DB().Raw(`SELECT (o.sanitized_facts->>'has_deny')::boolean AS has_deny,
-	                             (o.sanitized_facts->>'parse_failed')::boolean AS parse_failed
+	var rows []ResourcePolicyObservation
+	if err := q.DB().Raw(`SELECT o.id, o.ingested_at, o.last_confirmed_at, o.confirmation_count,
+	                             (o.sanitized_facts->>'has_deny')::boolean AS has_deny,
+	                             (o.sanitized_facts->>'parse_failed')::boolean AS parse_failed,
+	                             EXISTS (SELECT 1 FROM iga_publication pb
+	                                      WHERE pb.workspace_id = o.workspace_id AND pb.scan_run_id = o.scan_run_id
+	                                        AND pb.rev <= ?) AS first_in,
+	                             EXISTS (SELECT 1 FROM iga_publication pb
+	                                      WHERE pb.workspace_id = o.workspace_id AND pb.scan_run_id = o.last_confirmed_run_id
+	                                        AND pb.rev <= ?) AS last_in
 	                        FROM cloud_observation o
 	                       WHERE o.workspace_id = ? AND o.source_api IN ? AND o.subject_native_id = ?
 	                         AND o.ingested_at <= ?
-	                         AND EXISTS (SELECT 1 FROM iga_publication pb
-	                                      WHERE pb.workspace_id = o.workspace_id AND pb.scan_run_id = o.scan_run_id
-	                                        AND pb.rev <= ?)
-	                       ORDER BY o.ingested_at DESC, o.id DESC
-	                       LIMIT 1`,
-		q.WS, ResourcePolicySourceAPIs, text, q.Rev.PublishedAt, q.Rev.Rev).Scan(&rows).Error; err != nil {
+	                       ORDER BY o.ingested_at DESC, o.id DESC`,
+		q.Rev.Rev, q.Rev.Rev, q.WS, ResourcePolicySourceAPIs, text, q.Rev.PublishedAt).Scan(&rows).Error; err != nil {
 		return ResourcePolicyState{}, err
 	}
-	if len(rows) == 0 {
-		return ResourcePolicyState{Read: false, HasDeny: nil}, nil
+	return resourcePolicyState(rows, q.Rev.PublishedAt), nil
+}
+
+// ResourcePolicyObservation is one candidate observation for resource_policy:
+// its content's verdict, its times, and whether each of the two runs it names
+// belongs to the revision.
+type ResourcePolicyObservation struct {
+	ID                uuid.UUID
+	IngestedAt        time.Time  // when the first recording run wrote it
+	LastConfirmedAt   *time.Time // when the latest confirming run re-read it
+	ConfirmationCount int        // how many reads, the first included
+	HasDeny           *bool
+	ParseFailed       *bool
+	FirstIn           bool // scan_run_id published at a rev <= the current one
+	LastIn            bool // last_confirmed_run_id did
+}
+
+// verdict is what the observation says about a Deny: "deny", "no_deny", or ""
+// when nothing parsed proves either.
+func (o ResourcePolicyObservation) verdict() string {
+	if o.HasDeny == nil || (o.ParseFailed != nil && *o.ParseFailed) {
+		return ""
+	}
+	if *o.HasDeny {
+		return "deny"
+	}
+	return "no_deny"
+}
+
+// window is the time, as far as the revision can prove it, of the observation's
+// LATEST read by a run that belongs to the revision: at least lo, at most hi.
+// proven is false when no such read is proven; possible is false when none can
+// have happened.
+//
+//   - Its latest confirmer belongs: that read is exact (lo = hi =
+//     last_confirmed_at) -- no later read of this content exists at all.
+//   - Otherwise the reads that may belong are the first one and the
+//     confirmation_count - 2 unnamed reads between it and the latest. With
+//     none unnamed (count <= 2), the first read is the only candidate, exact
+//     when it belongs. With some, an unnamed read may belong, as late as the
+//     latest confirmation or the revision's publication, whichever is earlier;
+//     only the first read, if it belongs, is proven.
+func (o ResourcePolicyObservation) window(publishedAt time.Time) (lo, hi time.Time, proven, possible bool) {
+	if o.LastIn && o.LastConfirmedAt != nil {
+		return *o.LastConfirmedAt, *o.LastConfirmedAt, true, true
+	}
+	if o.ConfirmationCount <= 2 {
+		return o.IngestedAt, o.IngestedAt, o.FirstIn, o.FirstIn
+	}
+	hi = publishedAt
+	if o.LastConfirmedAt != nil && o.LastConfirmedAt.Before(hi) {
+		hi = *o.LastConfirmedAt
+	}
+	return o.IngestedAt, hi, o.FirstIn, true
+}
+
+// resourcePolicyState decides resource_policy from the candidates (D-19).
+// read is true when any candidate is PROVEN to belong to the revision. The
+// winner is the proven candidate with the latest proven read (then the latest
+// first recorded, then the highest id: deterministic). has_deny is the
+// winner's verdict -- unless another candidate that disagrees with it MAY have
+// been read by the revision after the winner's proven read: the data cannot
+// say which is latest, so has_deny is null (never a guessed false over a
+// possible Deny, nor the reverse).
+func resourcePolicyState(obs []ResourcePolicyObservation, publishedAt time.Time) ResourcePolicyState {
+	winner := -1
+	var best time.Time
+	for i, o := range obs {
+		lo, _, proven, _ := o.window(publishedAt)
+		if !proven {
+			continue
+		}
+		if winner < 0 || lo.After(best) || (lo.Equal(best) && rdetailLater(o, obs[winner])) {
+			winner, best = i, lo
+		}
+	}
+	if winner < 0 {
+		return ResourcePolicyState{Read: false, HasDeny: nil}
 	}
 	st := ResourcePolicyState{Read: true}
-	if rows[0].HasDeny != nil && (rows[0].ParseFailed == nil || !*rows[0].ParseFailed) {
-		v := *rows[0].HasDeny
-		st.HasDeny = &v
+	v := obs[winner].verdict()
+	for i, o := range obs {
+		if i == winner || o.verdict() == v {
+			continue
+		}
+		if _, hi, _, possible := o.window(publishedAt); possible && hi.After(best) {
+			return st // undecidable: read, has_deny null
+		}
 	}
-	return st, nil
+	if v != "" {
+		deny := v == "deny"
+		st.HasDeny = &deny
+	}
+	return st
+}
+
+// rdetailLater breaks a tie between two equally late proven reads: the later
+// first recorded, then the higher id.
+func rdetailLater(a, b ResourcePolicyObservation) bool {
+	if !a.IngestedAt.Equal(b.IngestedAt) {
+		return a.IngestedAt.After(b.IngestedAt)
+	}
+	return a.ID.String() > b.ID.String()
 }
 
 // ResourceSourcesOf is sources: every support row of the reference, in any
