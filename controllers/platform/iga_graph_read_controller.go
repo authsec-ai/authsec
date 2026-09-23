@@ -96,14 +96,17 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 // when the switch is on (D-11): off or misconfigured, every graph route
 // answers 503, so nothing is usable.
 func graphFeatures(on bool) gin.H {
+	// A feature is true only when every route it names is implemented AND the
+	// switch is on (D-11).
 	return gin.H{
-		"workloads": false, "identities": false, "resources": false,
-		"graph": false, "evidence": false,
-		// T6.6: POST and GET /workloads/:id/classification. T2.3: /coverage.
-		"classification": on,
-		"coverage":       on,
-		// T5.4: GET /{workloads|identities|resources}/:id/changes.
+		"workloads": on,
+		"identities": false,
+		"resources": false,
+		"graph": false,
+		"evidence": false,
 		"changes": on,
+		"classification": on,
+		"coverage": on,
 	}
 }
 

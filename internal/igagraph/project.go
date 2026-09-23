@@ -456,6 +456,68 @@ func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.R
 	return raw
 }
 
+// workloadProviderAttrs is a workload's display-only provider facts (§1.4,
+// §5.3 workload detail, D-85): its status, foundation model, environment
+// variable NAMES and gateway targets [{id, name, status, type}], copied from
+// what the collector stored on cloud_workload, so the read APIs never read
+// cloud_* (§2.1). Display only: never an identity, a key, a filter or an input
+// to reconciliation. UpsertWorkload rewrites it on every pass, so a rescan
+// that sees new facts replaces the old ones.
+//
+// A fact the collector recorded nothing for is left out, and the detail
+// renders it null: not applicable to this kind, or not collected. Two lists
+// are written even when empty, because there empty is a collected answer --
+// and each is left out when this scan did not read it, because an unread list
+// is unknown, never empty and never the last one we saw:
+//
+//   - a Lambda function's variable names come with its ListFunctions entry,
+//     so none listed means the function has none. When AWS returned the
+//     environment as an error instead (env_vars_unread: Lambda could not
+//     decrypt the variables with the function's KMS key), nothing was read.
+//   - a gateway's target list read in full is its whole list. One NOT read in
+//     full (targets_incomplete) is left out, although the collector keeps the
+//     list of its last complete read on cloud_workload (workloadAttrsMerge):
+//     that list is not confirmed by this scan, and D-85's shape has no field
+//     to say so, so showing it would present an old list as the current one.
+//     A list cut short after its first page is not the gateway's list either.
+//
+// Values are never read: EnvVarNames holds names only, by construction of the
+// collector (awsdiscovery lambdaEnvVarNames).
+func workloadProviderAttrs(cw models.CloudWorkload) json.RawMessage {
+	a := cw.AWSAttrs()
+	out := map[string]any{}
+	if a.Status != "" {
+		out["status"] = a.Status
+	}
+	if a.FoundationModel != "" {
+		out["foundation_model"] = a.FoundationModel
+	}
+	switch {
+	case a.EnvVarsUnread:
+		// Not read this scan: null, whatever kind, whatever was kept.
+	case cw.RuntimeKind == models.WorkloadLambdaFunction:
+		names := a.EnvVarNames
+		if names == nil {
+			names = []string{}
+		}
+		out["env_var_names"] = names
+	case len(a.EnvVarNames) > 0:
+		out["env_var_names"] = a.EnvVarNames
+	}
+	if cw.RuntimeKind == models.WorkloadBedrockAgentCoreGW && !a.TargetsIncomplete {
+		targets := a.GatewayTargets
+		if targets == nil {
+			targets = []models.AWSGatewayTarget{}
+		}
+		out["gateway_targets"] = targets
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
 // projectWorkloads: every runtime the collector reported, INCLUDING GATEWAYS
 // (the graph branch crashed the process on them). Bedrock agents and
 // AgentCore runtimes are classified provider_native_agent ON INSERT ONLY; no
@@ -484,7 +546,7 @@ func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) e
 			DisplayName: cw.Name, Region: cw.Region,
 			SourceKey: key, Continuity: Continuity(cw.RuntimeKind),
 			Stage: "unknown", Lifecycle: models.IGALifecycleActive,
-			LastSeenAt: now, ProviderAttrs: json.RawMessage(`{}`),
+			LastSeenAt: now, ProviderAttrs: workloadProviderAttrs(cw),
 			Classification: models.ClassificationUnclassified,
 		}
 		switch cw.RuntimeKind {

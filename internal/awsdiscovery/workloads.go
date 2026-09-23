@@ -88,6 +88,10 @@ type Workload struct {
 	InstanceProfileARN string
 	// EnvVarNames are Lambda environment variable NAMES. Never values.
 	EnvVarNames []string
+	// EnvVarsUnread is true when Lambda returned the environment as an error
+	// rather than as variables (lambdaEnvVarsUnread): no names were read, so
+	// an empty EnvVarNames is unknown, not "none".
+	EnvVarsUnread bool
 	// FoundationModel is Bedrock only: the model the agent invokes. Part of the
 	// workload's identity in a way a Lambda's runtime version is not -- it is
 	// what the agent thinks with.
@@ -196,13 +200,14 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 		}
 		for _, fn := range resp.Functions {
 			out = append(out, Workload{
-				RuntimeKind: "lambda_function",
-				NativeID:    aws.ToString(fn.FunctionArn),
-				Name:        aws.ToString(fn.FunctionName),
-				RoleARN:     aws.ToString(fn.Role),
-				EnvVarNames: lambdaEnvVarNames(fn.Environment),
-				Status:      string(fn.State),
-				SourceAPI:   "lambda:ListFunctions",
+				RuntimeKind:   "lambda_function",
+				NativeID:      aws.ToString(fn.FunctionArn),
+				Name:          aws.ToString(fn.FunctionName),
+				RoleARN:       aws.ToString(fn.Role),
+				EnvVarNames:   lambdaEnvVarNames(fn.Environment),
+				EnvVarsUnread: lambdaEnvVarsUnread(fn.Environment),
+				Status:        string(fn.State),
+				SourceAPI:     "lambda:ListFunctions",
 			})
 		}
 		if resp.NextMarker == nil || *resp.NextMarker == "" {
@@ -224,7 +229,7 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 // Sorted, so a re-scan of an unchanged function produces an identical attrs
 // blob instead of a spurious update from Go's randomised map order.
 func lambdaEnvVarNames(env *lambdatypes.EnvironmentResponse) []string {
-	if env == nil || len(env.Variables) == 0 {
+	if env == nil || len(env.Variables) == 0 || lambdaEnvVarsUnread(env) {
 		return nil
 	}
 	names := make([]string, 0, len(env.Variables))
@@ -233,6 +238,17 @@ func lambdaEnvVarNames(env *lambdatypes.EnvironmentResponse) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// lambdaEnvVarsUnread reports whether Lambda returned the function's
+// environment as an error instead of its variables. The SDK documents
+// EnvironmentResponse as the variables when the operation succeeds and "the
+// error details" when it fails -- for example when Lambda cannot decrypt them
+// with the function's KMS key. No names were read then, and saying "none"
+// would claim more than the scan saw. The error's message is not kept: it is
+// AWS prose, and nothing here needs it.
+func lambdaEnvVarsUnread(env *lambdatypes.EnvironmentResponse) bool {
+	return env != nil && env.Error != nil
 }
 
 // ECSTaskDefinitions lists every ACTIVE task definition in the region and
