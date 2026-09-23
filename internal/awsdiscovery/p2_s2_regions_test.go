@@ -209,22 +209,45 @@ func TestS2AssumeFailureUnderDescribeRegionsIsNotAssumable(t *testing.T) {
 	}
 }
 
-// classify keeps its message exactly and now keeps the SDK error in the chain,
-// so coverage can record the call and the code (§5.3 /coverage error_code,
-// api). A fake's bare error carries neither, and FailedCall must then say
-// nothing rather than guess.
+// classify keeps the SDK error in the chain, so coverage can record the call
+// and the code (§5.3 /coverage error_code, api). A fake's bare error carries
+// neither, and FailedCall must then say nothing rather than guess.
+//
+// And a call refused to the ASSUMED role is not an assume failure: the message
+// names the call and AWS's code, never "the role could not be assumed" -- a
+// cause the response never stated, which used to land in every denied
+// surface's coverage.
 func TestS2ClassifyKeepsTheFailedCall(t *testing.T) {
 	op := &smithy.OperationError{ServiceID: "Lambda", OperationName: "ListFunctions",
 		Err: &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "no lambda for you"}}
 	err := classify(op)
-	if got, want := err.Error(), "the role could not be assumed: no lambda for you (AccessDeniedException)"; got != want {
-		t.Fatalf("classify message changed:\n got %q\nwant %q", got, want)
+	if got, want := err.Error(), "AWS refused the call lambda:ListFunctions: no lambda for you (AccessDeniedException)"; got != want {
+		t.Fatalf("classify message:\n got %q\nwant %q", got, want)
 	}
-	if !errors.Is(err, ErrNotAssumable) {
-		t.Fatalf("classify lost its sentinel: %v", err)
+	if !errors.Is(err, ErrCallDenied) || errors.Is(err, ErrNotAssumable) {
+		t.Fatalf("a refused Lambda call = %v, want ErrCallDenied and not ErrNotAssumable", err)
 	}
 	if api, code := FailedCall(err); api != "lambda:ListFunctions" || code != "AccessDeniedException" {
 		t.Fatalf("FailedCall = (%q, %q), want (lambda:ListFunctions, AccessDeniedException)", api, code)
+	}
+	// STS's own refusal IS the assume failing -- directly, or wrapped in the
+	// call whose credentials it was fetching.
+	sts := &smithy.OperationError{ServiceID: "STS", OperationName: "AssumeRole",
+		Err: &smithy.GenericAPIError{Code: "AccessDenied", Message: "not authorized to perform sts:AssumeRole"}}
+	for name, e := range map[string]error{
+		"direct":  sts,
+		"wrapped": &smithy.OperationError{ServiceID: "Lambda", OperationName: "ListFunctions", Err: sts},
+	} {
+		c := classify(e)
+		if !errors.Is(c, ErrNotAssumable) || errors.Is(c, ErrCallDenied) ||
+			c.Error() != "the role could not be assumed: not authorized to perform sts:AssumeRole (AccessDenied)" {
+			t.Fatalf("%s STS refusal = %v, want ErrNotAssumable with its old message", name, c)
+		}
+	}
+	// No operation in the chain: which call failed is unknown, and the old
+	// classification stands.
+	if bare := classify(&smithy.GenericAPIError{Code: "AccessDenied", Message: "no"}); !errors.Is(bare, ErrNotAssumable) {
+		t.Fatalf("a bare AccessDenied = %v, want the unchanged ErrNotAssumable", bare)
 	}
 
 	throttle := classify(&smithy.OperationError{ServiceID: "IAM", OperationName: "GetAccountAuthorizationDetails",

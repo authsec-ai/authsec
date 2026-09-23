@@ -52,6 +52,13 @@ func TestP2S2CoverageFromTheCurrentRevision(t *testing.T) {
 	if digs(lam, "since_run") != refOf("cloud_scan_run", runA1.ID) || digs(lam, "since") != s2TS(runA1.PublishedAt) {
 		t.Fatalf("A's first denied run: since %v / since_run %v, want this run", dig(lam, "since"), dig(lam, "since_run"))
 	}
+	// The role WAS assumed; AWS refused one call to it. The prose says so in
+	// AWS's words, never "the role could not be assumed" -- a cause the
+	// response did not give.
+	if msg := digs(lam, "error"); strings.Contains(msg, "could not be assumed") ||
+		!strings.Contains(msg, "lambda:ListFunctions") || !strings.Contains(msg, "AccessDeniedException") {
+		t.Fatalf("A's denied Lambda surface error = %q, want the refused call and AWS's code", msg)
+	}
 	// Never a guessed permission: the call and the code, and nothing that names
 	// a permission to grant.
 	for k := range lam.(map[string]any) {

@@ -110,6 +110,14 @@ var (
 	// customer-side mismatch — wrong ExternalId, or a trust policy naming a
 	// different principal — so it is a 400, not a 500.
 	ErrNotAssumable = errors.New("the role could not be assumed")
+	// ErrCallDenied means AWS refused one call made WITH the assumed role --
+	// lambda:ListFunctions, iam:GetPolicyVersion -- to the role. The role was
+	// assumed: the connection is fine, and the trust-policy remedy of
+	// ErrNotAssumable would send the customer to the wrong place. Why it was
+	// refused (the role's grant, an SCP, a permissions boundary, a region
+	// opt-out) the response does not say, so neither does the message: it
+	// names the call and AWS's code, never a guessed cause (§2.14.13).
+	ErrCallDenied = errors.New("AWS refused the call")
 	// ErrThrottled means AWS throttled us even after the SDK's own backoff.
 	ErrThrottled = errors.New("AWS throttled the request")
 	// ErrNoBaseCredentials means AuthSec's OWN AWS identity is missing or
@@ -312,9 +320,19 @@ func ValidateRegion(region string) error {
 // anything else is ours to investigate. Collapsing all three into "AWS error"
 // sends every case to the same unhelpful place.
 //
-// The SDK error stays in the chain (classifiedError): the message is exactly
-// what it always was, but FailedCall can still read the operation and the
-// error code AWS returned, which coverage reports as api and error_code.
+// The SDK error stays in the chain (classifiedError), so FailedCall can still
+// read the operation and the error code AWS returned, which coverage reports
+// as api and error_code.
+//
+// AN AUTHORIZATION REFUSAL OF A CALL MADE AS THE ROLE IS NOT AN ASSUME
+// FAILURE. When the SDK names the operation and it is not STS's (and no STS
+// operation failed underneath it -- the credential provider assumes lazily),
+// AccessDenied means the role was assumed and then refused that one call. It
+// used to read "the role could not be assumed: ..." -- and that sentence was
+// written into every denied surface's coverage, stating a cause the response
+// never gave. It is ErrCallDenied, naming the call. An error with no operation
+// in its chain (a bare API error) keeps the old classification: which call
+// failed is then unknown.
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -322,8 +340,18 @@ func classify(err error) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "AccessDenied", "AccessDeniedException", "InvalidClientTokenId",
-			"SignatureDoesNotMatch", "ExpiredToken", "MalformedPolicyDocument":
+		case "AccessDenied", "AccessDeniedException":
+			if api, _ := FailedCall(err); api != "" && !assumeFailed(err) {
+				return &classifiedError{
+					msg:      fmt.Sprintf("%v %s: %s (%s)", ErrCallDenied, api, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+					sentinel: ErrCallDenied, cause: err,
+				}
+			}
+			return &classifiedError{
+				msg:      fmt.Sprintf("%v: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode()),
+				sentinel: ErrNotAssumable, cause: err,
+			}
+		case "InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken", "MalformedPolicyDocument":
 			return &classifiedError{
 				msg:      fmt.Sprintf("%v: %s (%s)", ErrNotAssumable, apiErr.ErrorMessage(), apiErr.ErrorCode()),
 				sentinel: ErrNotAssumable, cause: err,
