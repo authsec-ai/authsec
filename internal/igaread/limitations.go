@@ -164,7 +164,8 @@ type limInput struct {
 }
 
 // evStatement is one statement (iga_entitlements, provider aws) as a claim
-// uses it.
+// uses it: its current row, or its content as of an earlier run
+// (stmtContent.applyTo).
 type evStatement struct {
 	ID           uuid.UUID
 	Sid          string
@@ -176,7 +177,6 @@ type evStatement struct {
 	PolicyID     uuid.UUID
 	PolicyName   string
 	PolicyKind   string
-	VersionID    string
 	text         statementText
 }
 

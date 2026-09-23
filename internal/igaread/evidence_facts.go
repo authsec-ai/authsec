@@ -3,8 +3,9 @@ package igaread
 // Supporting facts and freshness for /evidence (§5.3, D-23, D-24, D-66,
 // D-80). Every read here is ONE statement for all the claims of the request
 // that need it: one per evidence junction (§5.6 "junction -> observation, one
-// query per edge type"), one for every object observation, one for Access
-// Advisor, one for stale_since.
+// query per edge type"), one (plus one for references) for the content of the
+// statements the object observations describe, one for every object
+// observation, one for Access Advisor, one for stale_since.
 
 import (
 	"crypto/sha256"
@@ -77,19 +78,21 @@ func isHolderEntry(kind string) bool {
 
 // factMaker composes a claim's fact for one kind of linked observation, or
 // reports that the kind does not bear on the claim.
-type factMaker func(kind string) (EvidenceFact, bool)
+type factMaker func(kind string, o obsRow) (EvidenceFact, bool)
 
 // grantFactsFor: the holder's entry (it lists the attachment) and the policy
 // version's observation (it holds the statement) -- §4.8's two for a grant.
+// st is the statement's content as of the grant's last confirming run
+// (contentAsOf), so the sentence and the excerpt are what that run confirmed.
 func grantFactsFor(r grantRow, st *evStatement, pos, excl []evTarget) factMaker {
 	pol := &EvidencePolicy{Ref: R(RefPolicy, st.PolicyID), Name: st.PolicyName, Kind: st.PolicyKind}
 	allows := fmt.Sprintf("Statement %s allows %s on %s", st.label(), actionsPhrase(st.text), targetsPhrase(pos, excl, false))
-	return func(kind string) (EvidenceFact, bool) {
+	return func(kind string, o obsRow) (EvidenceFact, bool) {
 		switch {
 		case isHolderEntry(kind):
 			return EvidenceFact{Fact: holderAttachmentFact(r.AssignmentKind, r.HolderName, r.PolicyName)}, true
 		case kind == factPolicyVersion:
-			return EvidenceFact{Fact: allows, rank: 2, PolicyVersion: strPtr(st.VersionID),
+			return EvidenceFact{Fact: allows, rank: 2, PolicyVersion: strPtr(o.VersionID),
 				StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}, true
 		}
 		return EvidenceFact{}, false
@@ -141,17 +144,48 @@ type obsRow struct {
 	ConnectorID uuid.UUID
 	Region      string
 	IdentityID  *uuid.UUID
-	Raw         json.RawMessage
+	// VersionID is the policy version the observation itself records
+	// (sanitized_facts.version_id, written by recordPolicyEvidence for a
+	// managed policy; "" for an inline one, which has no versions). A
+	// policy-version fact is labelled with it, never with the policy row's
+	// CURRENT version: the label and the raw record cannot disagree.
+	VersionID string
+	Raw       json.RawMessage
 }
 
+// observationColumns are the columns every fact query reads for obsRow (alias
+// o); rawColumn is appended separately.
+const observationColumns = `o.id AS obs_id, o.source_api, o.surface, o.connector_id,
+       COALESCE(o.sanitized_facts->>'region', '') AS region, o.identity_id,
+       COALESCE(o.sanitized_facts->>'version_id', '') AS version_id`
+
+// asOfRunSQL is D-24's rule for one observation o and the run cr a claim (or
+// one of its support rows) was last confirmed by: o EXISTED at cr -- first
+// recorded (o.scan_run_id, run fr) by cr or an earlier run of cr's connector --
+// and was still confirmed as of cr -- last confirmed (run lr) by cr or a later
+// run of that connector.
+//
+// Both bounds are needed. Without the upper one, an older policy version that
+// a newer run of the connector no longer confirmed would be shown as support
+// (the junction is never pruned). Without the lower one, a run that has
+// collected but is not projected yet -- or failed to project -- would lend its
+// NEW observations to the unchanged revision (D-25: never an unpublished
+// run), labelled with the claim's older run. A published-only bound instead
+// would be wrong the other way: an in-flight run re-confirms every unchanged
+// observation (024's confirm-on-dedupe), and those existed at cr.
+//
+// The store keeps only an observation's first and last confirmation, so one
+// that went unconfirmed AT cr and was confirmed again after it (content that
+// changed and changed back) cannot be told from one confirmed throughout.
+const asOfRunSQL = `fr.connector_id = cr.connector_id AND fr.generation <= cr.generation
+	AND lr.connector_id = cr.connector_id AND lr.generation >= cr.generation`
+
 // runJunction reads one junction for every edge wanted: the 'supports' links
-// whose observation was last confirmed by the edge's own last confirming run
-// or a LATER run of the same connector (D-24). A link whose observation a
-// newer run of that connector no longer confirmed -- the previous policy
-// version, say -- is dropped; the junction is never pruned, so without this
-// every version the statement ever had would be shown as support. An edge
-// with no recorded run (its run row deleted) keeps its links: there is
-// nothing to date them by.
+// whose observation existed at the edge's last confirming run and was still
+// confirmed as of it (asOfRunSQL, D-24). A link to the previous policy version
+// is dropped; the junction is never pruned, so without this every version the
+// statement ever had would be shown as support. An edge with no recorded run
+// (its run row deleted) keeps its links: there is nothing to date them by.
 func (l *claimLoader) runJunction(key string, wants []junctionWant) error {
 	table, column, _ := strings.Cut(key, "|")
 	values := []string{}
@@ -167,16 +201,16 @@ func (l *claimLoader) runJunction(key string, wants []junctionWant) error {
 	}
 	args = append(args, l.q.WS)
 	var rows []obsRow
-	if err := l.q.DB().Raw(`SELECT j.`+column+` AS edge_id, o.id AS obs_id, o.source_api, o.surface, o.connector_id,
-	                               COALESCE(o.sanitized_facts->>'region', '') AS region, o.identity_id,
+	if err := l.q.DB().Raw(`SELECT j.`+column+` AS edge_id, `+observationColumns+`,
 	                               `+l.rawColumn()+` AS raw
 	                          FROM (VALUES `+strings.Join(values, ", ")+`) AS v(edge, run)
 	                          JOIN `+table+` j ON j.`+column+` = v.edge
 	                          JOIN cloud_observation o ON o.workspace_id = j.workspace_id AND o.id = j.observation_id
 	                          LEFT JOIN cloud_scan_run cr ON cr.workspace_id = j.workspace_id AND cr.id = v.run
+	                          LEFT JOIN cloud_scan_run fr ON fr.workspace_id = o.workspace_id AND fr.id = o.scan_run_id
 	                          LEFT JOIN cloud_scan_run lr ON lr.workspace_id = o.workspace_id AND lr.id = o.last_confirmed_run_id
 	                         WHERE j.workspace_id = ? AND j.relation = 'supports'
-	                           AND (v.run IS NULL OR (lr.connector_id = cr.connector_id AND lr.generation >= cr.generation))
+	                           AND (v.run IS NULL OR (`+asOfRunSQL+`))
 	                         ORDER BY j.`+column+`, o.id`, args...).Scan(&rows).Error; err != nil {
 		return err
 	}
@@ -187,7 +221,7 @@ func (l *claimLoader) runJunction(key string, wants []junctionWant) error {
 	for _, o := range rows {
 		kind := classifyObservation(o.SourceAPI, o.Surface)
 		for _, w := range byEdge[o.EdgeID] {
-			f, ok := w.make(kind)
+			f, ok := w.make(kind, o)
 			if !ok {
 				continue
 			}
@@ -247,10 +281,24 @@ type obsAnchor struct {
 	suffix    bool
 	surface   string
 	api       string
-	make      func(o obsRow) EvidenceFact
+	// make composes the fact; st is the anchor's statement as of its run
+	// (nil when the anchor has none).
+	make func(o obsRow, st *evStatement) EvidenceFact
 	// identity marks an identity's own entry, whose cloud identity keys its
 	// Access Advisor rows.
 	identity bool
+
+	// stmt is the statement a policy-version fact describes (a statement's
+	// presence, a target, a resource's namer): its excerpt is the content as
+	// of THIS support row's run, which another account's newer read may have
+	// revised since (contentAsOf).
+	stmt *evStatement
+	// names, when set, is the target that content must name for the fact to
+	// stand: the support row's run proves "names R" only if what it
+	// confirmed named R.
+	names *evTarget
+	// drop: the content as of the run did not name it.
+	drop bool
 }
 
 func (l *claimLoader) wantAnchor(a obsAnchor) {
@@ -279,7 +327,7 @@ func (l *claimLoader) wantIdentityObservations(c *evClaim, ss []evSupport, row *
 		l.wantAnchor(obsAnchor{
 			claim: c, connector: s.ConnectorID, run: *s.LastConfirmedRunID, at: s.LastConfirmedAt,
 			native: NativeOfKey(row.SourceKey), surface: surface, api: authDetailsAPI, identity: true,
-			make: func(obsRow) EvidenceFact {
+			make: func(obsRow, *evStatement) EvidenceFact {
 				return EvidenceFact{Fact: fmt.Sprintf("%s is listed in the authorization details of %s", name, label)}
 			},
 		})
@@ -302,7 +350,7 @@ func (l *claimLoader) wantWorkloadObservations(c *evClaim, ss []evSupport, row *
 		l.wantAnchor(obsAnchor{
 			claim: c, connector: s.ConnectorID, run: *s.LastConfirmedRunID, at: s.LastConfirmedAt,
 			native: NativeOfKey(row.SourceKey), suffix: true, surface: surface,
-			make: func(o obsRow) EvidenceFact {
+			make: func(o obsRow, _ *evStatement) EvidenceFact {
 				return EvidenceFact{Fact: fmt.Sprintf("%s is listed by %s", name, o.SourceAPI)}
 			},
 		})
@@ -311,8 +359,11 @@ func (l *claimLoader) wantWorkloadObservations(c *evClaim, ss []evSupport, row *
 
 // wantPolicyObservations: a policy version's observation in each connector
 // that supports the claim's node, keyed as the collector keys it
-// (cloud_policy.native_id: the ARN; "inline:<holder ARN>:<name>" inline).
-func (l *claimLoader) wantPolicyObservations(c *evClaim, ss []evSupport, kind, nativeRef, sourceKey string, make func() EvidenceFact) {
+// (cloud_policy.native_id: the ARN; "inline:<holder ARN>:<name>" inline). stmt
+// and names are the anchor's (obsAnchor); both nil for a policy's own
+// presence.
+func (l *claimLoader) wantPolicyObservations(c *evClaim, ss []evSupport, kind, nativeRef, sourceKey string,
+	stmt *evStatement, names *evTarget, make func(o obsRow, st *evStatement) EvidenceFact) {
 	native := policyNativeID(kind, nativeRef, sourceKey)
 	for _, s := range ss {
 		if s.LastConfirmedRunID == nil {
@@ -320,8 +371,7 @@ func (l *claimLoader) wantPolicyObservations(c *evClaim, ss []evSupport, kind, n
 		}
 		l.wantAnchor(obsAnchor{
 			claim: c, connector: s.ConnectorID, run: *s.LastConfirmedRunID, at: s.LastConfirmedAt,
-			native: native, surface: models.SurfaceIAMPolicies,
-			make: func(obsRow) EvidenceFact { return make() },
+			native: native, surface: models.SurfaceIAMPolicies, stmt: stmt, names: names, make: make,
 		})
 	}
 }
@@ -355,7 +405,8 @@ func (l *claimLoader) wantResourceNamers(c *evClaim, resource uuid.UUID) {
 
 // resourceNamers turns each queued resource into policy-version anchors: for
 // every support row, the statements naming the resource (at most
-// LimitationRefCap per resource), in that row's connector.
+// LimitationRefCap per resource), in that row's connector -- each kept only
+// where the statement's content as of that row's run named the resource.
 func (l *claimLoader) resourceNamers() error {
 	if len(l.namedByRes) == 0 {
 		return nil
@@ -371,7 +422,7 @@ func (l *claimLoader) resourceNamers() error {
 	}
 	if err := l.q.DB().Raw(`SELECT x.resource_id, x.mode, x.statement_id, x.sid, x.statement_index, x.effect, x.negated,
 	                               x.conditional, x.native_rights, x.policy_id, x.policy_name, x.policy_kind,
-	                               x.policy_version_id, x.revision_version_id, x.policy_native_ref, x.policy_source_key
+	                               x.policy_native_ref, x.policy_source_key
 	                          FROM (SELECT t.resource_id, t.target_mode AS mode, `+stmtColumns+`,
 	                                       row_number() OVER (PARTITION BY t.resource_id ORDER BY p.display_name, e.statement_index, e.id) AS n
 	                                  FROM iga_entitlement_target t
@@ -392,45 +443,74 @@ func (l *claimLoader) resourceNamers() error {
 			}
 			pol := &EvidencePolicy{Ref: R(RefPolicy, st.PolicyID), Name: st.PolicyName, Kind: st.PolicyKind}
 			text := fmt.Sprintf("Statement %s of %s %s this reference", st.label(), st.PolicyName, verb)
-			for _, s := range c.supports {
-				if s.LastConfirmedRunID == nil {
-					continue
-				}
-				l.wantAnchor(obsAnchor{
-					claim: c, connector: s.ConnectorID, run: *s.LastConfirmedRunID, at: s.LastConfirmedAt,
-					native: policyNativeID(r.PolicyKind, r.PolicyNativeRef, r.PolicySourceKey), surface: models.SurfaceIAMPolicies,
-					make: func(obsRow) EvidenceFact {
-						return EvidenceFact{Fact: text, rank: 2, PolicyVersion: strPtr(st.VersionID),
-							StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
-					},
+			named := &evTarget{ResourceID: r.ResourceID, Mode: r.Mode}
+			l.wantPolicyObservations(c, c.supports, r.PolicyKind, r.PolicyNativeRef, r.PolicySourceKey, st, named,
+				func(o obsRow, st *evStatement) EvidenceFact {
+					return EvidenceFact{Fact: text, rank: 2, PolicyVersion: strPtr(o.VersionID),
+						StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
 				})
-			}
 		}
+	}
+	return nil
+}
+
+// anchorsAsOf reads, in one statement, the content of every statement-bearing
+// anchor as of its run: an anchor whose content then did not name its target
+// is dropped, and every other one describes that content.
+func (l *claimLoader) anchorsAsOf() error {
+	var wants []contentWant
+	var idx []int
+	for k := range l.anchors {
+		a := &l.anchors[k]
+		if a.stmt == nil {
+			continue
+		}
+		run := a.run
+		wants = append(wants, contentWant{stmt: a.stmt.ID, run: &run, at: a.at})
+		idx = append(idx, k)
+	}
+	hist, err := contentAsOf(l.q, wants)
+	if err != nil {
+		return err
+	}
+	for j, k := range idx {
+		a := &l.anchors[k]
+		h := hist[j]
+		if h == nil {
+			continue // the row's own content is the content as of this run
+		}
+		if a.names != nil && !h.names(*a.names) {
+			a.drop = true
+			continue
+		}
+		a.stmt = h.applyTo(a.stmt)
 	}
 	return nil
 }
 
 // runAnchors reads every queued object observation in one statement. The run
 // is walked through cloud_scan_run so the lookup rides
-// idx_cloud_observation_last_confirmed_run: observations last confirmed by the
-// support row's run or a later run of its connector (the D-24 rule).
+// idx_cloud_observation_last_confirmed_run; each observation must satisfy
+// asOfRunSQL against the support row's run (the D-24 rule).
 func (l *claimLoader) runAnchors() ([]obsRow, error) {
-	if len(l.anchors) == 0 {
-		return nil, nil
-	}
 	values := make([]string, 0, len(l.anchors))
 	args := make([]any, 0, 7*len(l.anchors)+1)
 	for k, a := range l.anchors {
+		if a.drop {
+			continue
+		}
 		values = append(values, "(?::int, ?::uuid, ?::uuid, ?::text, ?::bool, ?::text, ?::text)")
 		args = append(args, k, a.connector, a.run, a.native, a.suffix, a.surface, a.api)
 	}
+	if len(values) == 0 {
+		return nil, nil
+	}
 	args = append(args, l.q.WS)
 	var rows []obsRow
-	if err := l.q.DB().Raw(`SELECT v.k, o.id AS obs_id, o.source_api, o.surface, o.connector_id,
-	                               COALESCE(o.sanitized_facts->>'region', '') AS region, o.identity_id,
+	if err := l.q.DB().Raw(`SELECT v.k, `+observationColumns+`,
 	                               `+l.rawColumn()+` AS raw
 	                          FROM (VALUES `+strings.Join(values, ", ")+`) AS v(k, cid, rid, native, suffix, surface, api)
-	                          JOIN cloud_scan_run cr ON cr.id = v.rid
+	                          JOIN cloud_scan_run cr ON cr.id = v.rid AND cr.connector_id = v.cid
 	                          JOIN cloud_scan_run lr ON lr.workspace_id = cr.workspace_id AND lr.connector_id = v.cid
 	                           AND lr.generation >= cr.generation
 	                          JOIN cloud_observation o ON o.workspace_id = lr.workspace_id AND o.last_confirmed_run_id = lr.id
@@ -439,7 +519,9 @@ func (l *claimLoader) runAnchors() ([]obsRow, error) {
 	                                OR (v.suffix AND o.subject_native_id <> ''
 	                                    AND right(v.native, length(o.subject_native_id) + 1)
 	                                        IN ('/' || o.subject_native_id, ':' || o.subject_native_id)))
+	                          JOIN cloud_scan_run fr ON fr.workspace_id = o.workspace_id AND fr.id = o.scan_run_id
 	                         WHERE cr.workspace_id = ? AND (v.api = '' OR o.source_api = v.api)
+	                           AND `+asOfRunSQL+`
 	                         ORDER BY v.k, o.id`, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -533,6 +615,9 @@ func (l *claimLoader) loadFacts() error {
 	if err := l.resourceNamers(); err != nil {
 		return err
 	}
+	if err := l.anchorsAsOf(); err != nil {
+		return err
+	}
 	rows, err := l.runAnchors()
 	if err != nil {
 		return err
@@ -543,7 +628,7 @@ func (l *claimLoader) loadFacts() error {
 		}
 		a := l.anchors[o.K]
 		run := a.run
-		l.addFact(a.claim, a.make(o), o, &run, a.at)
+		l.addFact(a.claim, a.make(o, a.stmt), o, &run, a.at)
 		if a.identity && o.IdentityID != nil {
 			l.usage = append(l.usage, usageWant{claim: a.claim, obs: o.ObsID, run: a.run, at: a.at})
 		}

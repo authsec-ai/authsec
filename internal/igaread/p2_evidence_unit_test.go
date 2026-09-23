@@ -228,3 +228,68 @@ func TestP2EvidenceLimitationOrder(t *testing.T) {
 		t.Errorf("order = %v, want the §5.3 table's %v", got, want)
 	}
 }
+
+// An ended claim is stated in the past tense and says it ended -- never
+// "removed", never a present-tense configuration (§2.14.8).
+func TestP2EvidenceEndedSentences(t *testing.T) {
+	for _, c := range []struct{ got, want string }{
+		{relationshipSentence(models.RelTypeExecutesAs, "", "fn", "R", true), "fn was configured to run as R; the relationship ended"},
+		{relationshipSentence(models.RelTypeMemberOf, "", "priya", "ops", true), "priya was a member of ops; the membership ended"},
+		{relationshipSentence(models.RelTypeCanAssume, "", "lambda.amazonaws.com", "R", true),
+			"The trust policy of R named lambda.amazonaws.com; the relationship ended"},
+		{relationshipSentence(models.RelTypeCanAssume, "", "lambda.amazonaws.com", "R", false), "lambda.amazonaws.com may assume R"},
+		{assignmentSentence(models.CloudAttachmentAttached, "P", "R", true), "P was attached to R; the assignment ended"},
+		{assignmentSentence(models.CloudAttachmentBoundary, "P", "R", true), "P was the permissions boundary of R; the assignment ended"},
+		{assignmentSentence(models.CloudAttachmentInline, "P", "R", false), "P is an inline policy of R"},
+	} {
+		if c.got != c.want {
+			t.Errorf("sentence = %q, want %q", c.got, c.want)
+		}
+		for _, banned := range []string{"removed", "can access", "allowed"} {
+			if strings.Contains(strings.ToLower(c.got), banned) {
+				t.Errorf("%q uses %q", c.got, banned)
+			}
+		}
+	}
+}
+
+// contentTargets derives an earlier content's targets the way the projector
+// writes them: Resource targets, NotResource exclusions, and the implicit "*"
+// of a NotResource statement without Resource.
+func TestP2EvidenceContentTargets(t *testing.T) {
+	got := contentTargets(parseStatementText(json.RawMessage(`{"Effect":"Allow","Action":"s3:*","NotResource":["a","b"]}`)))
+	want := []contentTarget{{"a", models.TargetNotResource, 0}, {"b", models.TargetNotResource, 1}, {"*", models.TargetResource, 0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NotResource targets = %v, want %v", got, want)
+	}
+	got = contentTargets(parseStatementText(json.RawMessage(`{"Effect":"Allow","Action":"s3:*","Resource":["x"],"NotResource":"y"}`)))
+	want = []contentTarget{{"x", models.TargetResource, 0}, {"y", models.TargetNotResource, 0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mixed targets = %v, want %v (no implicit * when Resource is stated)", got, want)
+	}
+}
+
+// applyTo describes the earlier content -- flags re-derived from its text, no
+// claimed position -- and names matches a target by reference and mode.
+func TestP2EvidenceContentApply(t *testing.T) {
+	idx := 2
+	live := &evStatement{ID: uuid.New(), Sid: "S", Index: &idx, Effect: models.EffectAllow, Negated: false, Conditional: true,
+		NativeRights: json.RawMessage(`{"Sid":"S","Effect":"Allow","Action":"s3:*","Resource":"*","Condition":{"Bool":{"k":"v"}}}`)}
+	raw := json.RawMessage(`{"Sid":"S","Effect":"Allow","NotAction":"iam:*","Resource":"arn:aws:s3:::a/*"}`)
+	res := uuid.New()
+	h := &stmtContent{raw: raw, text: parseStatementText(raw), effect: models.EffectAllow,
+		targets: []evTarget{{ResourceID: res, Mode: models.TargetResource, Text: "arn:aws:s3:::a/*"}}}
+	st := h.applyTo(live)
+	if st.Index != nil || !st.Negated || st.Conditional || string(st.NativeRights) != string(raw) || st.Sid != "S" {
+		t.Errorf("applyTo = %+v, want the earlier content, negated, unconditional, no index", st)
+	}
+	if live.Index == nil || !live.Conditional {
+		t.Errorf("applyTo changed the live statement")
+	}
+	if !h.names(evTarget{ResourceID: res, Mode: models.TargetResource}) {
+		t.Errorf("names: the content's own target is not named")
+	}
+	if h.names(evTarget{ResourceID: res, Mode: models.TargetNotResource}) || h.names(evTarget{ResourceID: uuid.New(), Mode: models.TargetResource}) {
+		t.Errorf("names: another mode or reference is named")
+	}
+}

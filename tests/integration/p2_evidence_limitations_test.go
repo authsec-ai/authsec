@@ -235,6 +235,59 @@ func evidenceStatementRef(t *testing.T, l *p2Lab, policy, sid string) string {
 	return refOf("statement", ids[0])
 }
 
+// deny_statements_present counts only the Deny statements that still bear on
+// the holder (§5.3 "the holder (or its groups) has Deny statements"; E4
+// "Fails if: a limitation that does not apply"): not those of an assignment
+// that ended, not those of a group the holder has left. Both Deny statements
+// stay ACTIVE -- GuardRails moves to PlainRole, ops keeps OpsDeny -- so only
+// the assignment's and the membership's own state can keep them off.
+func TestP2EvidenceDenyOnlyWhileAssignedAndMember(t *testing.T) {
+	e := evidenceE4Lab(t, "p2-evidence-deny-ended")
+	l := e.l
+	read := evidenceGrant(t, l, "SharedToolRole", "TicketRead", "ReadTickets")
+	own := evidenceGrant(t, l, "priya", "PriyaOwn", "OwnRead")
+	for _, c := range []string{read, own} {
+		if evidenceLim(evidenceGet(t, e.api, c), "deny_statements_present") == nil {
+			t.Fatalf("fixture: %s carries no Deny before", c)
+		}
+	}
+	noDeletes := evidenceStatementRef(t, l, "GuardRails", "NoDeletes")
+	noBucketDeletes := evidenceStatementRef(t, l, "OpsDeny", "NoBucketDeletes")
+
+	guard := e.a.policyARN("GuardRails")
+	e.a.detach("SharedToolRole", guard)
+	e.a.attach("PlainRole", guard)
+	e.a.iam.userGroups["priya"] = nil
+	evidenceCycle(l, e.a, evidenceFakes{})
+	if got := digs(evidenceGet(t, e.api, evidenceAssignment(t, l, "GuardRails", "SharedToolRole")), "data", "status", "lifecycle"); got != "ended" {
+		t.Fatalf("fixture: GuardRails on SharedToolRole is %q, want ended", got)
+	}
+	member := evidenceGet(t, e.api, evidenceRelationship(t, l, models.RelTypeMemberOf, "priya", "ops"))
+	if got := digs(member, "data", "status", "lifecycle"); got != "ended" {
+		t.Fatalf("fixture: priya's membership of ops is %q, want ended", got)
+	}
+	if got, want := digs(member, "data", "claim", "sentence"), "priya was a member of ops; the membership ended."; got != want {
+		t.Errorf("ended membership sentence = %q, want %q (never the present tense)", got, want)
+	}
+	// Both statements are still live Deny restrictions of their CURRENT holders.
+	for claim, want := range map[string]string{
+		evidenceGrant(t, l, "PlainRole", "PlainRead", "PlainGet"): noDeletes,
+		evidenceGrant(t, l, "ops", "OpsRead", "ReadOps"):          noBucketDeletes,
+	} {
+		lim := evidenceLim(evidenceGet(t, e.api, claim), "deny_statements_present")
+		if lim == nil || !reflect.DeepEqual(evidenceStrings(lim["statements"]), []string{want}) {
+			t.Fatalf("fixture: %s deny = %v, want [%s] (the statement must stay active)", claim, lim, want)
+		}
+	}
+
+	if lim := evidenceLim(evidenceGet(t, e.api, read), "deny_statements_present"); lim != nil {
+		t.Errorf("SharedToolRole's grant carries %s: GuardRails' assignment to it ended", evidenceJSON(lim))
+	}
+	if lim := evidenceLim(evidenceGet(t, e.api, own), "deny_statements_present"); lim != nil {
+		t.Errorf("priya's grant carries %s: she is no longer a member of ops", evidenceJSON(lim))
+	}
+}
+
 // The plain grant carries EXACTLY what applies to it, and nothing else: the
 // strongest form of "a limitation that does not apply never appears".
 func TestP2EvidencePlainGrantCarriesOnlyWhatApplies(t *testing.T) {

@@ -26,15 +26,24 @@ package igaread
 // rows (D-65), or for an external principal its can_assume edges (D-47, D-80).
 //
 // Facts (D-24) are the claim's junction rows (relation 'supports') whose
-// observation was still confirmed as of the claim's last confirming run: an
-// observation last confirmed by an EARLIER run of the claim's connector (an
-// older policy version, a workload's earlier detail read) is dropped on read,
-// because the junction is never pruned. Only observations that bear on the
-// claim type are kept (§4.8's table): a user's credential report is linked to
-// every grant the user holds, and it proves none of them. Each fact carries
-// the CLAIM's run and confirmation time, never the observation's own, which
+// observation existed at the claim's last confirming run and was still
+// confirmed as of it (asOfRunSQL): an observation last confirmed by an EARLIER
+// run of the claim's connector (an older policy version, a workload's earlier
+// detail read) is dropped on read, because the junction is never pruned; one
+// first recorded by a LATER run -- a run collected but not yet projected --
+// is not the revision's (D-25). Only observations that bear on the claim type
+// are kept (§4.8's table): a user's credential report is linked to every
+// grant the user holds, and it proves none of them. Each fact carries the
+// CLAIM's run and confirmation time, never the observation's own, which
 // collection stamps before publication. Sentences are composed from the claim
-// rows, never from observation contents (which differ by collector).
+// rows, never from observation contents (which differ by collector) -- with
+// one exception, a policy-version fact's version label, which is the version
+// its own observation read, so the label and the raw record cannot disagree.
+//
+// A statement is described by its content as of the run in question
+// (contentAsOf, evidence_content.go): a Sid-keyed statement's row carries its
+// latest content, and an ended or stale grant -- or a support row of an
+// account that has not re-read the policy since -- confirmed an earlier one.
 //
 // Targets have no junction (032/036 define three, D-66): a target's facts are
 // its statement's policy-version observation. Presence has none either: an
@@ -520,41 +529,35 @@ type grantRow struct {
 // policy. Exported only because gorm skips the fields of an embedded
 // unexported struct; nothing outside this package needs it.
 type StatementRow struct {
-	StatementID       uuid.UUID
-	Sid               string
-	StatementIndex    *int
-	Effect            string
-	Negated           bool
-	Conditional       bool
-	NativeRights      json.RawMessage
-	PolicyID          uuid.UUID
-	PolicyName        string
-	PolicyKind        string
-	PolicyVersionID   string
-	RevisionVersionID *string
-	PolicyNativeRef   string
-	PolicySourceKey   string
+	StatementID     uuid.UUID
+	Sid             string
+	StatementIndex  *int
+	Effect          string
+	Negated         bool
+	Conditional     bool
+	NativeRights    json.RawMessage
+	PolicyID        uuid.UUID
+	PolicyName      string
+	PolicyKind      string
+	PolicyNativeRef string
+	PolicySourceKey string
 }
 
-// stmtColumns / stmtJoins read a statement (alias e) with its policy (p) and
-// its live revision's policy version (sr). No bind variables.
+// stmtColumns / stmtJoins read a statement (alias e) with its policy (p). No
+// bind variables. They read the statement's CURRENT content; a claim or fact
+// of an earlier run describes the content as of that run (contentAsOf), and a
+// fact's policy version is its own observation's (obsRow.VersionID).
 const stmtColumns = `e.id AS statement_id, e.sid, e.statement_index, e.effect, e.negated, e.conditional,
        e.native_rights, p.id AS policy_id, p.display_name AS policy_name, p.policy_kind,
-       p.version_id AS policy_version_id, sr.policy_version_id AS revision_version_id,
        p.native_ref AS policy_native_ref, p.source_key AS policy_source_key`
 
-const stmtJoins = `JOIN iga_policy p ON p.workspace_id = e.workspace_id AND p.id = e.policy_id AND p.provider = 'aws'
-  LEFT JOIN iga_statement_revision sr ON sr.workspace_id = e.workspace_id AND sr.entitlement_id = e.id AND sr.valid_to IS NULL`
+const stmtJoins = `JOIN iga_policy p ON p.workspace_id = e.workspace_id AND p.id = e.policy_id AND p.provider = 'aws'`
 
 func (s StatementRow) statement() *evStatement {
-	v := s.PolicyVersionID
-	if v == "" && s.RevisionVersionID != nil {
-		v = *s.RevisionVersionID
-	}
 	return &evStatement{
 		ID: s.StatementID, Sid: s.Sid, Index: s.StatementIndex, Effect: s.Effect,
 		Negated: s.Negated, Conditional: s.Conditional, NativeRights: s.NativeRights,
-		PolicyID: s.PolicyID, PolicyName: s.PolicyName, PolicyKind: s.PolicyKind, VersionID: v,
+		PolicyID: s.PolicyID, PolicyName: s.PolicyName, PolicyKind: s.PolicyKind,
 		text: parseStatementText(s.NativeRights),
 	}
 }
@@ -562,6 +565,12 @@ func (s StatementRow) statement() *evStatement {
 // grants loads grant claims. EVERY grant read joins its statement with effect
 // 'allow' (§3 rule 7): a projector defect can never surface a Deny as access
 // -- such a row is simply not a readable grant (404).
+//
+// A grant is described -- sentence, targets, group key, limitations and the
+// policy-version fact's excerpt -- by its statement's content as of the
+// grant's last confirming run (contentAsOf): an ended grant, a stale one, or
+// one whose account has not re-read a shared AWS-managed policy since another
+// account saw it revised never claims the revised actions or targets.
 func (l *claimLoader) grants(ids []uuid.UUID) error {
 	var rows []grantRow
 	if err := l.q.DB().Raw(`SELECT g.id, g.state, g.basis, g.valid_from, g.valid_to, g.ended_reason,
@@ -583,16 +592,26 @@ func (l *claimLoader) grants(ids []uuid.UUID) error {
 		return err
 	}
 	stmtIDs := make([]uuid.UUID, 0, len(rows))
+	wants := make([]contentWant, 0, len(rows))
 	for _, r := range rows {
 		stmtIDs = append(stmtIDs, r.StatementID)
+		wants = append(wants, contentWant{stmt: r.StatementID, run: r.LastConfirmedBy, at: tptr(r.LastConfirmedAt)})
 	}
 	targets, err := loadTargets(l.q, stmtIDs)
 	if err != nil {
 		return err
 	}
-	for _, r := range rows {
+	asOf, err := contentAsOf(l.q, wants)
+	if err != nil {
+		return err
+	}
+	for i, r := range rows {
 		st := r.statement()
 		pos, excl := splitTargets(targets[r.StatementID])
+		if h := asOf[i]; h != nil {
+			st = h.applyTo(st)
+			pos, excl = splitTargets(h.targets)
+		}
 		holder := r.HolderID
 		c := &evClaim{
 			ref: Ref{Type: RefGrant, ID: r.ID}, basis: r.Basis, state: r.State,
@@ -603,15 +622,23 @@ func (l *claimLoader) grants(ids []uuid.UUID) error {
 			actionsText: actionsPhrase(st.text), targetsText: targetsPhrase(pos, excl, true),
 			groupKey: StatementGroupKey(st.text, targetIDs(pos), targetIDs(excl)), isGrantClaim: true,
 		}
-		c.sentence = fmt.Sprintf("%s is granted %s on %s by %s (statement %s).",
-			r.HolderName, c.actionsText, c.targetsText, r.PolicyName, st.label())
+		if r.State == StateEnded {
+			// §2.14.8: never "removed" -- the grant ended; and never in the
+			// present tense, which would claim access the data no longer shows.
+			c.sentence = fmt.Sprintf("%s was granted %s on %s by %s (statement %s); the grant ended.",
+				r.HolderName, c.actionsText, c.targetsText, r.PolicyName, st.label())
+		} else {
+			c.sentence = fmt.Sprintf("%s is granted %s on %s by %s (statement %s).",
+				r.HolderName, c.actionsText, c.targetsText, r.PolicyName, st.label())
+		}
+		named := resolvedTargets(pos)
 		c.lim = limInput{
-			grant: true, stmt: st, named: pos, policyTargets: pos,
+			grant: true, stmt: st, named: named, policyTargets: named,
 			holder: &holder, holderKind: r.HolderKind,
 			parts: partsOf(r.ConnectorID, r.PartitionKey), stale: r.State == StateStale, docProtected: true,
 		}
 		c.lim.endpoints = append(l.connectorEndpoints(r.ConnectorID), l.identityEndpoint(r.HolderKey))
-		for _, t := range pos {
+		for _, t := range named {
 			c.lim.endpoints = append(c.lim.endpoints, l.resourceEndpoint(t))
 		}
 		l.claims[c.ref.String()] = c
@@ -689,9 +716,12 @@ type assignmentRow struct {
 	PolicyID        uuid.UUID
 	PolicyName      string
 	PolicyKind      string
-	PolicyVersionID string
 }
 
+// assignments loads assignment claims. The policy-version fact names the
+// version its own observation read (obsRow.VersionID) -- for an ended
+// assignment the version it was last confirmed with, never the policy's
+// current one.
 func (l *claimLoader) assignments(ids []uuid.UUID) error {
 	var rows []assignmentRow
 	if err := l.q.DB().Raw(`SELECT pa.id, pa.assignment_kind, pa.basis, pa.state, pa.valid_from, pa.valid_to,
@@ -699,8 +729,7 @@ func (l *claimLoader) assignments(ids []uuid.UUID) error {
 	                               pa.connector_id, pa.partition_key,
 	                               ia.id AS holder_id, ia.display_name AS holder_name,
 	                               ia.account_kind AS holder_kind, ia.source_key AS holder_key,
-	                               p.id AS policy_id, p.display_name AS policy_name, p.policy_kind,
-	                               p.version_id AS policy_version_id
+	                               p.id AS policy_id, p.display_name AS policy_name, p.policy_kind
 	                          FROM iga_policy_assignment pa
 	                          JOIN iga_identity_accounts ia
 	                            ON ia.workspace_id = pa.workspace_id AND ia.id = pa.holder_identity_account_id
@@ -718,18 +747,18 @@ func (l *claimLoader) assignments(ids []uuid.UUID) error {
 			validTo: r.ValidTo, endedReason: r.EndedReason,
 			anchorConnector: r.ConnectorID, anchorRun: r.LastConfirmedBy,
 		}
-		c.sentence = assignmentSentence(r.AssignmentKind, r.PolicyName, r.HolderName) + "."
+		c.sentence = assignmentSentence(r.AssignmentKind, r.PolicyName, r.HolderName, r.State == StateEnded) + "."
 		c.lim = limInput{parts: partsOf(r.ConnectorID, r.PartitionKey), stale: r.State == StateStale}
 		c.lim.endpoints = append(l.connectorEndpoints(r.ConnectorID), l.identityEndpoint(r.HolderKey))
 		l.claims[c.ref.String()] = c
 		pol := &EvidencePolicy{Ref: R(RefPolicy, r.PolicyID), Name: r.PolicyName, Kind: r.PolicyKind}
-		l.wantJunction(tableAssignmentEvidence, c, r.ID, r.LastConfirmedBy, c.lastConfirmed, func(kind string) (EvidenceFact, bool) {
+		l.wantJunction(tableAssignmentEvidence, c, r.ID, r.LastConfirmedBy, c.lastConfirmed, func(kind string, o obsRow) (EvidenceFact, bool) {
 			switch {
 			case isHolderEntry(kind):
 				return EvidenceFact{Fact: holderAttachmentFact(r.AssignmentKind, r.HolderName, r.PolicyName), rank: 0}, true
 			case kind == factPolicyVersion:
-				return EvidenceFact{Fact: policyReadFact(r.PolicyName, r.PolicyVersionID), rank: 2,
-					PolicyVersion: strPtr(r.PolicyVersionID), Policy: pol}, true
+				return EvidenceFact{Fact: policyReadFact(r.PolicyName, o.VersionID), rank: 2,
+					PolicyVersion: strPtr(o.VersionID), Policy: pol}, true
 			}
 			return EvidenceFact{}, false
 		})
@@ -737,7 +766,18 @@ func (l *claimLoader) assignments(ids []uuid.UUID) error {
 	return nil
 }
 
-func assignmentSentence(kind, policy, holder string) string {
+// assignmentSentence states an assignment; an ended one in the past tense,
+// saying it ended (§2.14.8: "Removed" is never said).
+func assignmentSentence(kind, policy, holder string, ended bool) string {
+	if ended {
+		switch kind {
+		case models.CloudAttachmentInline:
+			return fmt.Sprintf("%s was an inline policy of %s; the assignment ended", policy, holder)
+		case models.CloudAttachmentBoundary:
+			return fmt.Sprintf("%s was the permissions boundary of %s; the assignment ended", policy, holder)
+		}
+		return fmt.Sprintf("%s was attached to %s; the assignment ended", policy, holder)
+	}
 	switch kind {
 	case models.CloudAttachmentInline:
 		return fmt.Sprintf("%s is an inline policy of %s", policy, holder)
@@ -831,7 +871,7 @@ func (l *claimLoader) relationships(ids []uuid.UUID) error {
 			anchorConnector: r.ConnectorID, anchorRun: r.LastConfirmedBy,
 		}
 		src := r.sourceLabel()
-		c.sentence = relationshipSentence(r.RelationshipType, r.Mechanism, src, r.TargetName) + "."
+		c.sentence = relationshipSentence(r.RelationshipType, r.Mechanism, src, r.TargetName, r.State == StateEnded) + "."
 		c.lim = limInput{relType: r.RelationshipType, parts: partsOf(r.ConnectorID, r.PartitionKey), stale: r.State == StateStale}
 		c.lim.endpoints = append(l.connectorEndpoints(r.ConnectorID), l.identityEndpoint(r.TargetKey))
 		if r.SrcIdentityKey != nil {
@@ -865,8 +905,26 @@ func (r relationshipRow) sourceLabel() string {
 }
 
 // relationshipSentence uses the §2.14.11 edge labels: "configured to run as",
-// "may assume" -- never "can access" or "uses".
-func relationshipSentence(relType, mechanism, source, target string) string {
+// "may assume" -- never "can access" or "uses". An ended relationship is
+// stated in the past tense and says it ended: the present tense would claim a
+// configuration the data no longer shows.
+func relationshipSentence(relType, mechanism, source, target string, ended bool) string {
+	if ended {
+		switch relType {
+		case models.RelTypeExecutesAs:
+			return fmt.Sprintf("%s was configured to run as %s; the relationship ended", source, target)
+		case models.RelTypeTaskExecutionRole:
+			return fmt.Sprintf("%s was configured with %s as its task execution role; the relationship ended", source, target)
+		case models.RelTypeMemberOf:
+			return fmt.Sprintf("%s was a member of %s; the membership ended", source, target)
+		case models.RelTypeCanAssume:
+			if mechanism == models.MechanismEKSPodIdentity {
+				return fmt.Sprintf("An EKS Pod Identity association named %s for %s; the relationship ended", source, target)
+			}
+			return fmt.Sprintf("The trust policy of %s named %s; the relationship ended", target, source)
+		}
+		return fmt.Sprintf("%s was related to %s; the relationship ended", source, target)
+	}
 	switch relType {
 	case models.RelTypeExecutesAs:
 		return fmt.Sprintf("%s is configured to run as %s", source, target)
@@ -884,7 +942,7 @@ func relationshipSentence(relType, mechanism, source, target string) string {
 }
 
 func relationshipFactsFor(r relationshipRow, src string) factMaker {
-	return func(kind string) (EvidenceFact, bool) {
+	return func(kind string, _ obsRow) (EvidenceFact, bool) {
 		switch r.RelationshipType {
 		case models.RelTypeExecutesAs:
 			if kind == factWorkload {
@@ -928,7 +986,16 @@ type targetClaimRow struct {
 // targets loads target claims: "statement names resource". A target row has
 // no lifecycle or times of its own; they are its statement's (the target set
 // is rewritten with the statement's content, §4.9), and its facts are its
-// statement's policy-version observation (D-66).
+// statement's policy-version observation per support row (D-66).
+//
+// The claim is the CURRENT content's: a target row exists only while the
+// statement's latest content names it, and D-1's anchor -- the latest
+// confirmation of any support row -- is the run that wrote that content (every
+// projection that reads the statement confirms its support). Each FACT,
+// though, is one support row's run, which may have read an earlier content (an
+// account that has not re-read a shared AWS-managed policy since another
+// account saw it revised): that fact stands only if the content as of its run
+// named the target (obsAnchor.names), and quotes that content.
 func (l *claimLoader) targets(ids []uuid.UUID) error {
 	var rows []targetClaimRow
 	if err := l.q.DB().Raw(`SELECT t.id AS target_id, t.target_mode AS mode, t.ordinal,
@@ -989,10 +1056,12 @@ func (l *claimLoader) targets(ids []uuid.UUID) error {
 		l.claims[c.ref.String()] = c
 		pol := &EvidencePolicy{Ref: R(RefPolicy, st.PolicyID), Name: st.PolicyName, Kind: st.PolicyKind}
 		fact := fmt.Sprintf("Statement %s of %s %s %s", st.label(), st.PolicyName, verb, t.Text)
-		l.wantPolicyObservations(c, n.supports, r.PolicyKind, r.PolicyNativeRef, r.PolicySourceKey, func() EvidenceFact {
-			return EvidenceFact{Fact: fact, rank: 2, PolicyVersion: strPtr(st.VersionID),
-				StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
-		})
+		named := t
+		l.wantPolicyObservations(c, n.supports, r.PolicyKind, r.PolicyNativeRef, r.PolicySourceKey, st, &named,
+			func(o obsRow, st *evStatement) EvidenceFact {
+				return EvidenceFact{Fact: fact, rank: 2, PolicyVersion: strPtr(o.VersionID),
+					StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
+			})
 	}
 	return nil
 }
@@ -1138,7 +1207,6 @@ type nodeRow struct {
 	RetiredReason    string
 	FirstSeenAt      time.Time
 	NativeRef        string
-	VersionID        string
 	Reference        string
 	AccountID        string
 	AccountConnected bool
@@ -1168,7 +1236,7 @@ var nodeSpecs = map[string]nodeSpec{
 	                                FROM iga_resources r
 	                               WHERE r.workspace_id = ? AND r.id IN ? AND r.provider = 'aws'`},
 	RefPolicy: {"policy_id", `SELECT n.id, n.display_name AS name, n.policy_kind AS kind, n.source_key,
-	                                 n.lifecycle, n.retired_reason, n.first_seen_at, n.native_ref, n.version_id
+	                                 n.lifecycle, n.retired_reason, n.first_seen_at, n.native_ref
 	                            FROM iga_policy n
 	                           WHERE n.workspace_id = ? AND n.id IN ? AND n.provider = 'aws'`},
 	RefStatement: {"entitlement_id", `SELECT e.id, e.lifecycle, e.retired_reason, e.first_seen_at, ` + stmtColumns + `
@@ -1377,21 +1445,25 @@ func (l *claimLoader) presence(ref Ref, refType string, row *nodeRow, n *evNode)
 		c.lim.docProtected = true
 		l.wantResourceNamers(c, row.ID)
 	case RefPolicy:
+		// Each support row's fact names the version ITS observation read.
 		c.lim.docProtected = true
 		pol := &EvidencePolicy{Ref: R(RefPolicy, row.ID), Name: row.Name, Kind: row.Kind}
-		fact := policyReadFact(row.Name, row.VersionID)
-		l.wantPolicyObservations(c, n.supports, row.Kind, row.NativeRef, row.SourceKey, func() EvidenceFact {
-			return EvidenceFact{Fact: fact, rank: 2, PolicyVersion: strPtr(row.VersionID), Policy: pol}
-		})
+		l.wantPolicyObservations(c, n.supports, row.Kind, row.NativeRef, row.SourceKey, nil, nil,
+			func(o obsRow, _ *evStatement) EvidenceFact {
+				return EvidenceFact{Fact: policyReadFact(row.Name, o.VersionID), rank: 2,
+					PolicyVersion: strPtr(o.VersionID), Policy: pol}
+			})
 	case RefStatement:
+		// Each support row's fact quotes the content as of ITS run.
 		c.lim.docProtected = true
 		st := row.statement()
 		pol := &EvidencePolicy{Ref: R(RefPolicy, st.PolicyID), Name: st.PolicyName, Kind: st.PolicyKind}
 		fact := fmt.Sprintf("Statement %s is in policy %s", st.label(), st.PolicyName)
-		l.wantPolicyObservations(c, n.supports, row.PolicyKind, row.PolicyNativeRef, row.PolicySourceKey, func() EvidenceFact {
-			return EvidenceFact{Fact: fact, rank: 2, PolicyVersion: strPtr(st.VersionID),
-				StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
-		})
+		l.wantPolicyObservations(c, n.supports, row.PolicyKind, row.PolicyNativeRef, row.PolicySourceKey, st, nil,
+			func(o obsRow, st *evStatement) EvidenceFact {
+				return EvidenceFact{Fact: fact, rank: 2, PolicyVersion: strPtr(o.VersionID),
+					StatementExcerpt: excerpt(st.NativeRights), Policy: pol, Statement: stmtRef(st)}
+			})
 	}
 	l.claims[ref.String()] = c
 }
