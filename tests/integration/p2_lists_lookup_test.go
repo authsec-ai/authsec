@@ -7,6 +7,8 @@ package integration
 import (
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/google/uuid"
 )
 
@@ -142,4 +144,65 @@ func TestP2ListsLookupBeforeFirstPublication(t *testing.T) {
 		t.Errorf("lookup before any publication = %d %v, want 404", code, body)
 	}
 	l.project("projector-lookup-unpublished")
+}
+
+// Names repeat INSIDE one account too, and there only the source key tells
+// the objects apart: a function name in two regions (same connector, no
+// creation-boundary id on a workload row), and a role and a user sharing a
+// name. The identity rows' unique ids are removed, as for a row collected
+// without one (D-81 matches the immutable key only "when the row has one"),
+// so nothing but the key can separate them. And /lookup is revision-bound
+// (D-82): a stale rev is 409.
+func TestP2ListsLookupSameNameInOneAccount(t *testing.T) {
+	l := newP2Lab(t, "p2-lists-lookup-names", true)
+	a := l.account(accountA, "us-east-1", "eu-west-1")
+	role := a.role("deployer", "AROADEPLOYERDEPLOYE1")
+	a.iam.users = append(a.iam.users, iamtypes.User{
+		Arn: aws.String("arn:aws:iam::" + accountA + ":user/deployer"), UserName: aws.String("deployer"),
+		UserId: aws.String("AIDADEPLOYERDEPLOYE1"), Path: aws.String("/"), CreateDate: ago(0),
+	})
+	listsFunctions(a, "us-east-1", "ticket-tools", role)
+	listsFunctions(a, "eu-west-1", "ticket-tools", role)
+	l.scanAndProject(a)
+	if err := l.db.Exec(`UPDATE cloud_identity SET attrs = attrs - 'unique_id' WHERE workspace_id = ? AND name = 'deployer'`,
+		l.ws).Error; err != nil {
+		t.Fatalf("drop unique ids: %v", err)
+	}
+	api := l.api()
+
+	for table, typ := range map[string]string{"cloud_workload": "workload", "cloud_identity": "identity"} {
+		var rows []struct {
+			ID       uuid.UUID
+			NativeID string
+		}
+		l.db.Raw(`SELECT id, native_id FROM `+table+` WHERE workspace_id = ? AND name IN ('ticket-tools', 'deployer')`,
+			l.ws).Scan(&rows)
+		if len(rows) != 2 {
+			t.Fatalf("setup: %d %s rows share the name, want 2", len(rows), table)
+		}
+		got := map[string]bool{}
+		for _, r := range rows {
+			node := "iga_identity_accounts"
+			if typ == "workload" {
+				node = "iga_workload"
+			}
+			want := refOf(typ, listsLiveNode(t, l, node, r.NativeID))
+			code, body := api.get("/lookup" + qs("cloud_ref", table+":"+r.ID.String()))
+			mustStatus(t, "lookup "+r.NativeID, code, body, 200)
+			if ref := digs(body, "data", "ref"); ref != want {
+				t.Errorf("%s row %s -> %s, want %s (the object with ITS key)", table, r.NativeID, ref, want)
+			}
+			got[digs(body, "data", "ref")] = true
+		}
+		if len(got) != 2 {
+			t.Errorf("the two %s rows sharing a name opened %d object(s), want 2", table, len(got))
+		}
+	}
+
+	var ci uuid.UUID
+	l.db.Raw(`SELECT id FROM cloud_identity WHERE workspace_id = ? AND name = 'deployer' LIMIT 1`, l.ws).Scan(&ci)
+	l.scanAndProject(a) // rev 2
+	if code, body := api.get("/lookup" + qs("cloud_ref", "cloud_identity:"+ci.String(), "rev", "1")); code != 409 || errCode(body) != "revision_stale" {
+		t.Errorf("lookup at a stale rev = %d %v, want 409 revision_stale", code, body)
+	}
 }
