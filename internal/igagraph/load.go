@@ -337,8 +337,9 @@ type resolved struct {
 	// The trust pass's working state (trust.go).
 	trustDocs       map[uuid.UUID]*awsdiscovery.TrustDocument // cloud_identity.id -> parsed, once per pass
 	external        map[string]uuid.UUID                      // external principal source_key -> id, this pass
-	principalByARN  map[string]uuid.UUID                      // this snapshot's role/user ARN -> iga id
-	podUnattributed []uuid.UUID                               // roles with a pod association no cluster could be named for
+	liveExternal    map[string]bool                           // source_key of aws_principal nodes with a live edge, at pass start
+	principalByARN  map[string]*models.CloudIdentity          // this snapshot's roles and users, by ARN
+	podUnattributed []uuid.UUID                               // roles with a pod association no cluster issuer could be named for
 
 	existing *existing
 }

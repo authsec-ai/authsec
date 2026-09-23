@@ -7,14 +7,13 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 )
 
 // Trust (SPEC-iga-phase2-graph.md §4.7 "Trust and external principals", §2.12,
-// §2.3; P2-DECISIONS D-41..D-47):
+// §2.3; P2-DECISIONS D-41..D-47, D-88):
 //
 //	principal ──can_assume──▶ role        declared by an Allow statement of
 //	                                       the ROLE's trust document, or an EKS
@@ -31,23 +30,35 @@ import (
 // NotPrincipal statement ("everyone except X" names no one we could draw an
 // edge from). Both are recorded on the role instead, as provider_attrs
 // trust_has_deny / trust_has_not_principal (D-44).
+//
+// NO EDGE IS EVER RE-POINTED IN PLACE (D-41). Every can_assume key names the
+// statement, the source ENDPOINT and the target endpoint (CanAssumeKey), and
+// UpsertRelationship never writes a source column. What survives a far account
+// connecting is the external principal NODE: it stays the source of its edges,
+// and gains a derived resolution to the identity it now matches (§2.12 "the
+// edge keeps its identity and its whole history"). An identity source that
+// retires or is recreated ends its edges (subject_retired / subject_recreated,
+// the ordinary cascade); what the trusting role's document still names is
+// re-sourced by the next pass that reads it, as a NEW edge.
 
 // TrustPartitionKind is the can_assume partition's kind for trust-document
 // edges; pod-identity edges use models.MechanismEKSPodIdentity (§4.10).
 const TrustPartitionKind = "trust"
 
-// provider_attrs keys a role carries about its trust document (028, §5.3).
+// provider_attrs keys a role carries about its trust document (028, §5.3,
+// D-85).
 const (
 	TrustHasDenyAttr         = "trust_has_deny"
 	TrustHasNotPrincipalAttr = "trust_has_not_principal"
 )
 
-// podIdentityAttrs is what cloud_assume_edge.attrs may carry for a pod-identity
-// association. cluster_arn is the issuer fallback for a cluster with no OIDC
-// issuer (D-42); the collector does not write it yet (T3.5), and a row without
-// either is not attributable to a cluster -- see projectPodIdentity.
-type podIdentityAttrs struct {
-	ClusterARN string `json:"cluster_arn"`
+// trustSource is the ONE source an edge gets (iga_relationship_source_chk):
+// an identity or an external principal, and the endpoint key the edge key is
+// built from.
+type trustSource struct {
+	endpoint string
+	identity *uuid.UUID
+	external *uuid.UUID
 }
 
 // projectTrust writes every can_assume edge this run's trust documents and
@@ -55,6 +66,12 @@ type podIdentityAttrs struct {
 // the derived resolutions of those principals (§4.7). It runs after every
 // node pass, so each endpoint it needs is in r, and before attachEvidence.
 func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error {
+	live, err := liveExternalPrincipals(tx, snap.Run.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	r.liveExternal = live
+
 	now := p.now()
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, TrustPartitionKind, "")
 	for _, role := range snap.Roles() {
@@ -76,17 +93,19 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 		sids, seen := CountTrustSids(doc.Statements), map[string]int{}
 		for _, st := range doc.Statements {
 			// Keyed for EVERY statement, in document order, so #n numbering of
-			// identical Sid-less statements never depends on which are skipped.
+			// identical Sid-less statements never depends on which are edges.
 			stKey, _ := TrustStatementKey(roleEP, st, sids, seen)
 			if st.Effect == models.EffectDeny || st.HasNotPrincipal() {
 				continue // D-44: recorded on the role (trustFlags), never an edge
 			}
 			for _, sub := range st.Subjects() {
-				rel := trustEdge(snap, part, target, now, sub.Mechanism, stKey, st.Condition,
-					CanAssumeKey(ExternalPrincipalKey(sub.Issuer, sub.Subject), roleEP, stKey))
-				if err := p.trustSource(tx, snap, r, rel, sub); err != nil {
+				src, err := p.trustSourceFor(tx, snap, r, sub)
+				if err != nil {
 					return fmt.Errorf("trust principal %q of %s: %w", sub.Entry.Value, role.NativeID, err)
 				}
+				rel := trustEdge(snap, part, target, now, sub.Mechanism, stKey, st.Condition,
+					CanAssumeKey(src.endpoint, roleEP, stKey))
+				rel.SourceIdentityAccountID, rel.SourceExternalPrincipalID = src.identity, src.external
 				id, err := p.repo.UpsertRelationship(tx, rel)
 				if err != nil {
 					return fmt.Errorf("upsert can_assume %q -> %s: %w", sub.Entry.Value, role.NativeID, err)
@@ -105,7 +124,7 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 
 // trustEdge is the can_assume row both declarations write. Stamped with the
 // partition it reconciles in and this run -- a row without them is invisible
-// to reconciliation and never ends (§4.10).
+// to reconciliation and never ends (§4.10). The caller sets its one source.
 func trustEdge(snap *Snapshot, part Partition, target uuid.UUID, now time.Time,
 	mechanism, statementKey string, conditions json.RawMessage, key string) *models.IGARelationship {
 	tgt := target
@@ -122,65 +141,101 @@ func trustEdge(snap *Snapshot, part Partition, target uuid.UUID, now time.Time,
 	}
 }
 
-// trustSource sets the edge's ONE source (§4.7's table, D-41): the identity an
-// exact role or user ARN names, when that identity is live in a connected
-// account; otherwise an external principal. Either way the edge's KEY is the
-// principal's recognition key (CanAssumeKey), so which one it is can change
-// in place.
-func (p *Projector) trustSource(tx *gorm.DB, snap *Snapshot, r *resolved,
-	rel *models.IGARelationship, sub awsdiscovery.TrustSubject) error {
-	if sub.IdentityARN != "" {
-		if gid, ok := p.trustIdentity(snap, r, sub.IdentityARN, sub.Account); ok {
-			rel.SourceIdentityAccountID = &gid
-			return nil
+// trustSourceFor chooses the edge's source (§4.7's table, in D-41's order):
+//
+//  1. A LIVE external principal already exists for this principal (issuer,
+//     subject): it stays the source, so its edges keep their keys and their
+//     history. If it now exactly matches a live identity, that is recorded on
+//     the node (deriveResolutions), never by re-sourcing an edge.
+//  2. Otherwise an exact role or user ARN of a live identity in a connected
+//     account is that identity (basis declared, §4.7 l.4411).
+//  3. Otherwise an external principal of the principal's kind (D-42):
+//     another account, a service, a federation, a session, a unique id, "*",
+//     or an ARN in an account that is not connected or whose identity is not
+//     live (not scanned yet, its read denied, deleted) -- unresolved.
+//
+// Only an exact identity ARN can reach rule 2, so only it consults rule 1;
+// every other principal is external whichever way it is asked.
+func (p *Projector) trustSourceFor(tx *gorm.DB, snap *Snapshot, r *resolved,
+	sub awsdiscovery.TrustSubject) (trustSource, error) {
+	extKey := ExternalPrincipalKey(sub.Issuer, sub.Subject)
+	if sub.IdentityARN != "" && !r.liveExternal[extKey] {
+		if gid, endpoint, ok := p.trustIdentity(snap, r, sub.IdentityARN, sub.Account); ok {
+			return trustSource{endpoint: endpoint, identity: &gid}, nil
 		}
 	}
-	// Not connected, connected with no live identity of that ARN (not scanned
-	// yet, its read denied, deleted), or no identity at all -- an account, a
-	// service, a federation, a session, a unique id, "*": unresolved.
 	ext, err := p.upsertExternal(tx, snap, r, sub.Issuer, sub.Subject, sub.Kind)
 	if err != nil {
-		return err
+		return trustSource{}, err
 	}
-	rel.SourceExternalPrincipalID = &ext
-	return nil
+	return trustSource{endpoint: extKey, external: &ext}, nil
+}
+
+// liveExternalPrincipals is rule 1's set: the source keys of the workspace's
+// aws_principal nodes that are live -- D-1's derived state, not ended: at
+// least one can_assume edge from them has not ended. External principals have
+// no lifecycle of their own (D-47); a node whose every edge ended is history,
+// and a principal named again after that starts afresh under rule 2 or 3.
+//
+// Read once per pass, inside the projection transaction, so it already
+// reflects the recreation cascade projectIdentities just ran. Only
+// aws_principal nodes can be named by an identity ARN, so no other kind is
+// read.
+func liveExternalPrincipals(tx *gorm.DB, ws uuid.UUID) (map[string]bool, error) {
+	var keys []string
+	if err := tx.Raw(`
+		SELECT ep.source_key
+		  FROM iga_external_principal ep
+		 WHERE ep.workspace_id = ? AND ep.issuer = ? AND ep.mechanism = ?
+		   AND EXISTS (SELECT 1 FROM iga_relationship r
+		                WHERE r.workspace_id = ep.workspace_id
+		                  AND r.source_external_principal_id = ep.id
+		                  AND r.relationship_type = ? AND r.state <> ?)`,
+		ws, awsdiscovery.IssuerAWS, models.ExternalPrincipalAWSPrincipal,
+		models.RelTypeCanAssume, models.RelEnded).Scan(&keys).Error; err != nil {
+		return nil, fmt.Errorf("load live external principals: %w", err)
+	}
+	out := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		out[k] = true
+	}
+	return out, nil
 }
 
 // trustIdentity finds the live identity an exact role or user ARN names, in a
 // connected account (§4.7; D-61: a revoked connector's account is not read, so
-// nothing in it resolves).
+// nothing in it resolves), and its endpoint key.
 //
 // THIS RUN'S OWN IDENTITIES FIRST. After a recreation in this pass, the
 // prefetched graph still holds the OLD row under the ARN -- just retired
-// `recreated` -- and an edge pointed at it would claim a principal that no
-// longer exists. The row this pass projected for the ARN is the one the
-// document means. Anything else -- another account, or a role this run did
-// not list -- is the workspace's live graph; a row about to retire
-// unsupported is re-pointed to an external principal when it does
-// (downgradeTrustSources).
-func (p *Projector) trustIdentity(snap *Snapshot, r *resolved, arn, account string) (uuid.UUID, bool) {
+// `recreated` -- and an edge from it would claim a principal that no longer
+// exists. The row this pass projected for the ARN is the one the document
+// means, and its endpoint is the NEW incarnation's. Anything else -- another
+// account, or an identity this run did not list -- is the workspace's live
+// graph (lifecycle <> 'retired', every connector's).
+func (p *Projector) trustIdentity(snap *Snapshot, r *resolved, arn, account string) (uuid.UUID, string, bool) {
 	if account == "" || !snap.ConnectedAccounts[account] {
-		return uuid.Nil, false
+		return uuid.Nil, "", false
 	}
 	if r.principalByARN == nil {
-		r.principalByARN = map[string]uuid.UUID{}
-		for _, ci := range snap.Identities {
-			if ci.Kind != models.CloudIdentityIAMRole && ci.Kind != models.CloudIdentityIAMUser {
-				continue
-			}
-			if gid, ok := r.identity[ci.ID]; ok {
-				r.principalByARN[ci.NativeID] = gid
+		r.principalByARN = map[string]*models.CloudIdentity{}
+		for i := range snap.Identities {
+			ci := &snap.Identities[i]
+			if ci.Kind == models.CloudIdentityIAMRole || ci.Kind == models.CloudIdentityIAMUser {
+				r.principalByARN[ci.NativeID] = ci
 			}
 		}
 	}
-	if gid, ok := r.principalByARN[arn]; ok {
-		return gid, true
+	if ci := r.principalByARN[arn]; ci != nil {
+		if gid, ok := r.identity[ci.ID]; ok {
+			return gid, EndpointKey(*ci), true
+		}
 	}
 	live := r.existing.identity[IdentityARNKey(arn)]
 	if live == nil || (live.AccountKind != models.CloudIdentityIAMRole && live.AccountKind != models.CloudIdentityIAMUser) {
-		return uuid.Nil, false
+		return uuid.Nil, "", false
 	}
-	return live.ID, true
+	return live.ID, IdentityAccountEndpointKey(*live), true
 }
 
 // upsertExternal writes (or re-sights) one external principal, once per pass.
@@ -206,10 +261,10 @@ func (p *Projector) upsertExternal(tx *gorm.DB, snap *Snapshot, r *resolved, iss
 
 // projectPodIdentity writes one can_assume per EKS pod-identity association:
 // the Kubernetes service account -- a k8s_service_account external principal,
-// issuer = the cluster's OIDC issuer (else its ARN), subject =
-// system:serviceaccount:<ns>:<sa> -- to the role (§1.4, D-42). The same
-// service account an IRSA trust statement names is the SAME node: one node,
-// one edge per declaration.
+// issuer = the cluster's scheme-less OIDC issuer, subject =
+// PodIdentitySubject(system:serviceaccount:<ns>:<sa>) -- to the role (§1.4,
+// §4.7, D-42). An IRSA trust statement naming the same service account is a
+// separate `oidc` node with its own edge.
 func (p *Projector) projectPodIdentity(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, models.MechanismEKSPodIdentity, "")
@@ -222,50 +277,52 @@ func (p *Projector) projectPodIdentity(tx *gorm.DB, snap *Snapshot, r *resolved)
 		if role == nil || !ok {
 			continue
 		}
-		var attrs podIdentityAttrs
-		_ = json.Unmarshal(pi.Attrs, &attrs)
-		issuer, subject := "", pi.Subject
+		issuer := ""
 		if pi.Issuer != nil {
 			issuer = *pi.Issuer
 		}
-		issuer = PodIdentityIssuer(issuer, attrs.ClusterARN)
-		if issuer == "" || subject == "" {
-			// No cluster can be named for this association (a failed
-			// DescribeCluster, or a cluster without OIDC and no ARN collected).
-			// An issuer-less node would MERGE this service account with the
-			// same namespace/name in every other cluster -- claiming one
-			// principal where there may be several. So no edge is written, and
-			// the role's pod-identity edges are protected instead: stale,
-			// never ended on the strength of a read we could not attribute.
+		if issuer == "" || pi.Subject == "" {
+			// No cluster issuer for this association (a failed DescribeCluster):
+			// it stays UNRESOLVED (D-42, no cluster-ARN fallback -- the key must
+			// not change between scans). An issuer-less node would MERGE this
+			// service account with the same namespace/name in every other
+			// cluster, claiming one principal where there may be several. So no
+			// edge is written, and the role's pod-identity edges are protected:
+			// stale, never ended on the strength of a read we could not
+			// attribute.
 			r.podUnattributed = append(r.podUnattributed, target)
 			continue
 		}
-		roleEP := EndpointKey(*role)
-		stKey := PodIdentityStatementKey(roleEP, issuer, subject)
+		subject := PodIdentitySubject(pi.Subject)
 		ext, err := p.upsertExternal(tx, snap, r, issuer, subject, models.ExternalPrincipalK8sServiceAccount)
 		if err != nil {
 			return err
 		}
+		roleEP := EndpointKey(*role)
+		stKey := PodIdentityStatementKey(roleEP, issuer, pi.Subject)
 		rel := trustEdge(snap, part, target, now, models.MechanismEKSPodIdentity, stKey, nil,
 			CanAssumeKey(ExternalPrincipalKey(issuer, subject), roleEP, stKey))
 		rel.SourceExternalPrincipalID = &ext
 		id, err := p.repo.UpsertRelationship(tx, rel)
 		if err != nil {
-			return fmt.Errorf("upsert pod-identity can_assume %s -> %s: %w", subject, role.NativeID, err)
+			return fmt.Errorf("upsert pod-identity can_assume %s -> %s: %w", pi.Subject, role.NativeID, err)
 		}
 		// Evidence: the association's own observation (§4.8), keyed beside
 		// the role's (PodIdentitySubjectKey).
 		r.canAssume = append(r.canAssume, relRef{ID: id, SubjectKind: "identity",
-			SubjectNativ: PodIdentitySubjectKey(role.NativeID, issuer, subject)})
+			SubjectNativ: PodIdentitySubjectKey(role.NativeID, issuer, pi.Subject)})
 	}
 	return nil
 }
 
 // deriveResolutions is the resolution pass §4.10 places in projection, before
-// reconciliation (§2.3, 034): an aws_principal whose subject is EXACTLY the ARN
-// of a live role or user in a connected account resolves to it, basis
-// 'derived', rule exact_arn_match. After a recreation the exact match points
-// at the NEW object, which is correct for a mechanical fact (§2.12).
+// reconciliation (§2.3, 034, D-41 rule 1): an aws_principal whose subject is
+// EXACTLY the ARN of a live role or user in a connected account resolves to
+// it, basis 'derived', rule exact_arn_match. After a recreation the exact match
+// points at the NEW object, which is correct for a mechanical fact (§2.12).
+//
+// Every such node in the workspace, not only those this run named: the far
+// account connecting is exactly the run that names none of them.
 //
 // It never CLEARS a resolution. A derived resolution whose target could not be
 // found this run is kept -- "collection becomes incomplete: kept" (§2.12) --
@@ -282,9 +339,9 @@ func (p *Projector) deriveResolutions(tx *gorm.DB, snap *Snapshot, r *resolved) 
 	for _, ep := range eps {
 		account, ok := awsdiscovery.IdentityPrincipalARN(ep.SubjectClaim)
 		if !ok {
-			continue // "*", a session, a unique id, a root: never an identity
+			continue // a session, a unique id: never an identity
 		}
-		gid, ok := p.trustIdentity(snap, r, ep.SubjectClaim, account)
+		gid, _, ok := p.trustIdentity(snap, r, ep.SubjectClaim, account)
 		if !ok {
 			continue
 		}
@@ -323,8 +380,8 @@ func (r *resolved) trustDocument(role models.CloudIdentity) (*awsdiscovery.Trust
 }
 
 // trustFlags returns what a role's provider_attrs say about its trust document
-// (D-44): trust_has_deny and trust_has_not_principal, as booleans. nil for
-// anything that is not a role.
+// (D-44, D-85): trust_has_deny and trust_has_not_principal, as booleans. nil
+// for anything that is not a role.
 //
 // An UNREADABLE document says nothing new, so the flags this SAME incarnation
 // already carried stand. A recreated role (different immutable key) inherits
@@ -360,8 +417,8 @@ func (p *Projector) trustFlags(r *resolved, snap *Snapshot, ci models.CloudIdent
 
 // trustExclusions names, in graph ids, the roles whose trust edges
 // reconciliation must never END this run (§4.10): roles whose trust document
-// was unreadable, and roles with a pod-identity association no cluster could
-// be named for.
+// was unreadable (D-45), and roles with a pod-identity association no cluster
+// issuer could be named for (D-42).
 func trustExclusions(snap *Snapshot, r *resolved) (unreadable, unattributedPod []uuid.UUID) {
 	for _, role := range snap.Roles() {
 		if snap.UnreadableTrust[role.ID] {
@@ -371,77 +428,4 @@ func trustExclusions(snap *Snapshot, r *resolved) (unreadable, unattributedPod [
 		}
 	}
 	return unreadable, r.podUnattributed
-}
-
-// downgradeTrustSources re-points, IN PLACE, every live can_assume edge whose
-// SOURCE is one of these identities -- about to retire or be replaced by a
-// recreation -- to the external principal its ARN names (D-41, corrected).
-//
-// Such an edge is declared by the TRUSTING role's policy, often in another
-// account; the source identity going away says nothing about that
-// declaration, which was read by the trusting role's own scan. Ending it here
-// would end what this run did not read. Re-pointed instead, it keeps its id
-// and history: the trusting role's next projection confirms or ends it, and a
-// principal that resolves again (the same ARN, recreated or reconnected)
-// becomes that identity -- the same row, since the key is the principal's.
-//
-// Edges whose TARGET is also going away are left to the cascade: the role
-// that declares them is itself gone. Reads and writes go through tx, as the
-// rest of reconciliation does; the external-principal write has
-// UpsertExternalPrincipal's contract -- keyed on (workspace_id, source_key),
-// never touching the resolution columns.
-func downgradeTrustSources(tx *gorm.DB, ws uuid.UUID, identities []uuid.UUID, now time.Time) error {
-	if len(identities) == 0 {
-		return nil
-	}
-	var sources []struct {
-		ID        uuid.UUID
-		SourceKey string
-	}
-	if err := tx.Raw(`
-		SELECT DISTINCT i.id, i.source_key
-		  FROM iga_identity_accounts i
-		  JOIN iga_relationship r
-		    ON r.workspace_id = i.workspace_id AND r.source_identity_account_id = i.id
-		 WHERE i.workspace_id = ? AND i.id IN ?
-		   AND r.relationship_type = ? AND r.state <> ?
-		   AND r.target_identity_account_id NOT IN ?`,
-		ws, identities, models.RelTypeCanAssume, models.RelEnded, identities).
-		Scan(&sources).Error; err != nil {
-		return fmt.Errorf("find trust edges sourced from retiring identities: %w", err)
-	}
-	for _, src := range sources {
-		arn, ok := ARNOfIdentityKey(src.SourceKey)
-		if !ok {
-			continue // nothing to name the principal by: the cascade ends it
-		}
-		ext := &models.IGAExternalPrincipal{
-			WorkspaceID: ws, Issuer: awsdiscovery.IssuerAWS, SubjectClaim: arn,
-			Mechanism:   models.ExternalPrincipalAWSPrincipal,
-			SourceKey:   ExternalPrincipalKey(awsdiscovery.IssuerAWS, arn),
-			FirstSeenAt: now, LastSeenAt: now,
-		}
-		// DoUpdates names mechanism alone -- a no-op, since the kind is a
-		// function of the key -- so RETURNING yields the surviving row's id.
-		// last_seen_at is NOT bumped: no trust document was read here.
-		if err := tx.Clauses(clause.Returning{Columns: []clause.Column{{Name: "id"}}},
-			clause.OnConflict{
-				Columns:   []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
-				DoUpdates: clause.AssignmentColumns([]string{"mechanism"}),
-			}).Create(ext).Error; err != nil {
-			return fmt.Errorf("external principal for retiring %s: %w", arn, err)
-		}
-		if err := tx.Model(&models.IGARelationship{}).
-			Where(`workspace_id = ? AND relationship_type = ? AND state <> ?
-			       AND source_identity_account_id = ? AND target_identity_account_id NOT IN ?`,
-				ws, models.RelTypeCanAssume, models.RelEnded, src.ID, identities).
-			Updates(map[string]any{
-				"source_identity_account_id":   nil,
-				"source_external_principal_id": ext.ID,
-				"updated_at":                   now,
-			}).Error; err != nil {
-			return fmt.Errorf("re-point trust edges from retiring %s: %w", arn, err)
-		}
-	}
-	return nil
 }

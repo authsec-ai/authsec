@@ -1,8 +1,8 @@
 package integration
 
 // T3.4 + T4.7 through the REAL pipeline (SPEC-iga-phase2-graph.md §4.7 Trust,
-// §2.12, §2.3; P2-DECISIONS D-41..D-47): the IAM scanner writes each role's
-// trust document (cloud_identity.trust_document, trust_parse_error), the
+// §2.12, §2.3; P2-DECISIONS D-41..D-47, D-88): the IAM scanner writes each
+// role's trust document (cloud_identity.trust_document, trust_parse_error), the
 // projector turns it into can_assume edges and external principals, and
 // reconciliation keeps what could not be read.
 //
@@ -117,6 +117,7 @@ func trustCycle(l *p2Lab, a *p2Account, eks *fakeEKS) models.CloudScanRun {
 // trustEdge is one can_assume row with both endpoints described.
 type trustEdge struct {
 	ID             uuid.UUID
+	SourceKey      string
 	Target         string
 	State          string
 	EndedReason    string
@@ -140,7 +141,7 @@ func trustEdges(l *p2Lab) []trustEdge {
 	l.t.Helper()
 	var out []trustEdge
 	if err := l.db.Raw(`
-		SELECT r.id, t.display_name AS target, r.state, r.ended_reason, r.mechanism, r.statement_key,
+		SELECT r.id, r.source_key, t.display_name AS target, r.state, r.ended_reason, r.mechanism, r.statement_key,
 		       r.conditions::text AS conditions, r.valid_from, r.last_confirmed_at AS last_confirmed,
 		       r.source_identity_account_id AS source_identity, COALESCE(si.display_name, '') AS source_name,
 		       r.source_external_principal_id AS ext_id, COALESCE(ep.mechanism, '') AS ext_kind,
@@ -158,6 +159,8 @@ func trustEdges(l *p2Lab) []trustEdge {
 	return out
 }
 
+// trustEdgesTo filters edges by the target role's display name. A recreated
+// role and its predecessor share a name, so both incarnations' edges appear.
 func trustEdgesTo(edges []trustEdge, target string) []trustEdge {
 	var out []trustEdge
 	for _, e := range edges {
@@ -166,6 +169,18 @@ func trustEdgesTo(edges []trustEdge, target string) []trustEdge {
 		}
 	}
 	return out
+}
+
+// trustNode reads the external principal a (issuer, subject) names.
+func trustNode(l *p2Lab, issuer, subject string) (models.IGAExternalPrincipal, bool) {
+	l.t.Helper()
+	var ep models.IGAExternalPrincipal
+	err := l.db.Where("workspace_id = ? AND source_key = ?", l.ws, igagraph.ExternalPrincipalKey(issuer, subject)).
+		Limit(1).Find(&ep).Error
+	if err != nil {
+		l.t.Fatalf("read external principal %s/%s: %v", issuer, subject, err)
+	}
+	return ep, ep.ID != uuid.Nil
 }
 
 // trustProviderAttrs reads a role's provider_attrs trust flags.
@@ -200,8 +215,8 @@ func trustBool(b *bool) string {
 
 /* ================================ scenarios ============================== */
 
-// T4.7's gate and E11's first half: cross-account, service, OIDC, SAML, "*"
-// and same-account principals all appear, each as the node §4.7's table and
+// T4.7's gate and E11's first half: same-account, cross-account, service,
+// OIDC, SAML and "*" principals all appear, each as the node §4.7's table and
 // D-42 say; Deny and NotPrincipal produce no edge and set the role's flags; a
 // condition with non-string values no longer fails the document. Then an
 // unchanged rescan keeps every can_assume and external-principal id and
@@ -217,11 +232,16 @@ func TestP2TrustPrincipalsAppear(t *testing.T) {
 		`{"Effect":"Allow","Principal":{"Federated":"`+trustGitHubProvider+`"},"Action":"sts:AssumeRoleWithWebIdentity",`+
 			`"Condition":{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"},`+
 			`"StringLike":{"token.actions.githubusercontent.com:sub":"repo:authsec-ai/authsec:*"}}}`))
+	trustRole(a, "gha-envs", "AROAGHAENVSGHAENVSGH", trustDoc(
+		`{"Effect":"Allow","Principal":{"Federated":"`+trustGitHubProvider+`"},"Action":"sts:AssumeRoleWithWebIdentity",`+
+			`"Condition":{"StringEquals":{"token.actions.githubusercontent.com:sub":`+
+			`["repo:authsec-ai/authsec:environment:prod","repo:authsec-ai/authsec:ref:refs/heads/main"]}}}`))
 	trustRole(a, "gha-unscoped", "AROAGHAUNSCOPED00001", trustDoc(
 		`{"Effect":"Allow","Principal":{"Federated":"`+trustGitHubProvider+`"},"Action":"sts:AssumeRoleWithWebIdentity"}`))
 	trustRole(a, "saml-admin", "AROASAMLADMINSAMLADM", trustDoc(
 		trustAllow(`{"Federated":"`+trustSAMLProvider+`"}`, "sts:AssumeRoleWithSAML")))
 	trustRole(a, "open-role", "AROAOPENROLEOPENROLE", trustDoc(trustAllow(`"*"`, "sts:AssumeRole")))
+	trustRole(a, "open-aws-role", "AROAOPENAWSROLEOPENA", trustDoc(trustAllow(`{"AWS":"*"}`, "sts:AssumeRole")))
 	trustRole(a, "deny-role", "AROADENYROLEDENYROLE", trustDoc(
 		trustAllow(`{"Service":"lambda.amazonaws.com"}`, "sts:AssumeRole"),
 		`{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::`+trustAccountC+`:root"},"Action":"sts:AssumeRole"}`))
@@ -256,8 +276,9 @@ func TestP2TrustPrincipalsAppear(t *testing.T) {
 		e.Mechanism != models.MechanismSTSAssumeRole {
 		t.Errorf("self-trust = %+v, want identity-sourced from helper, sts_assume_role", e)
 	}
-	// An unconnected account: its role is an unresolved aws_principal, its
-	// root an aws_account whose subject is the parsed account id.
+	// An unconnected account: its role is an unresolved aws_principal named by
+	// its ARN, its root an aws_account whose subject is the account id parsed
+	// out of the ARN.
 	partner := trustEdgesTo(edges, "partner-access")
 	kinds := map[string]trustEdge{}
 	for _, e := range partner {
@@ -278,6 +299,14 @@ func TestP2TrustPrincipalsAppear(t *testing.T) {
 		e.Conditions == nil || !strings.Contains(*e.Conditions, "repo:authsec-ai/authsec:*") {
 		t.Errorf("gha-deploy = %+v, want an unresolved oidc principal with the wildcard subject and its condition", e)
 	}
+	// Every positive sub value is its own principal and its own edge.
+	envs := map[string]bool{}
+	for _, e := range trustEdgesTo(edges, "gha-envs") {
+		envs[e.ExtSubject] = e.ExtKind == models.ExternalPrincipalOIDC && e.Mechanism == models.MechanismOIDCFederation
+	}
+	if len(envs) != 2 || !envs["repo:authsec-ai/authsec:environment:prod"] || !envs["repo:authsec-ai/authsec:ref:refs/heads/main"] {
+		t.Errorf("gha-envs subjects = %v, want one oidc edge per sub value", envs)
+	}
 	if e := one("gha-unscoped"); e.ExtKind != models.ExternalPrincipalOIDC || e.ExtSubject != "*" || e.Conditions != nil {
 		t.Errorf("gha-unscoped = %+v, want oidc subject * and NULL conditions", e)
 	}
@@ -285,8 +314,11 @@ func TestP2TrustPrincipalsAppear(t *testing.T) {
 		e.ExtSubject != "*" || e.Mechanism != models.MechanismSAMLFederation {
 		t.Errorf("saml-admin = %+v, want saml issuer %s subject *, saml_federation", e, trustSAMLProvider)
 	}
-	if e := one("open-role"); e.ExtKind != models.ExternalPrincipalAWSPrincipal || e.ExtSubject != "*" {
-		t.Errorf("open-role = %+v, want aws_principal *", e)
+	// "*" either way it is spelled: ONE aws_account node, subject "*" (D-42).
+	open, openAWS := one("open-role"), one("open-aws-role")
+	if open.ExtKind != models.ExternalPrincipalAWSAccount || open.ExtSubject != "*" || open.ExtID == nil ||
+		openAWS.ExtID == nil || *openAWS.ExtID != *open.ExtID || open.Mechanism != models.MechanismSTSAssumeRole {
+		t.Errorf("open-role = %+v, open-aws-role = %+v; want both from the one aws_account \"*\" node", open, openAWS)
 	}
 	// The lab's Lambda trust: aws_service lambda.amazonaws.com (§4.12).
 	if e := one("helper"); e.ExtKind != models.ExternalPrincipalAWSService || e.ExtSubject != "lambda.amazonaws.com" ||
@@ -356,8 +388,8 @@ func TestP2TrustPrincipalsAppear(t *testing.T) {
 // B12's trust analogue, in ONE run: a role whose trust document gained one
 // malformed statement is unreadable (trust_parse_error), so its existing
 // can_assume edges go STALE -- never ended, last confirmation kept -- even the
-// one whose principal the new document dropped; while another role's removed
-// principal, in the same run, ENDS not_seen.
+// one whose principal the new document dropped; while other roles' removed
+// principals, in the same run, END not_seen.
 func TestP2TrustUnreadableDocumentKeepsItsEdges(t *testing.T) {
 	l := newP2Lab(t, "p2-trust-unreadable", true)
 	a := l.account(accountA)
@@ -405,7 +437,11 @@ func TestP2TrustUnreadableDocumentKeepsItsEdges(t *testing.T) {
 	for _, e := range before {
 		prev[e.ID] = e
 	}
-	for _, e := range trustEdgesTo(after, "broken-later") {
+	broken := trustEdgesTo(after, "broken-later")
+	if len(broken) != 2 {
+		t.Errorf("unreadable role has %d edges %+v, want its 2 and no new one", len(broken), broken)
+	}
+	for _, e := range broken {
 		if e.State != models.RelStale || !e.LastConfirmed.Equal(prev[e.ID].LastConfirmed) {
 			t.Errorf("unreadable role's edge %s (%s) = %s, confirmed %s -> %s; want STALE with its last confirmation kept",
 				e.ExtSubject, e.ID, e.State, prev[e.ID].LastConfirmed, e.LastConfirmed)
@@ -440,12 +476,13 @@ func TestP2TrustUnreadableDocumentKeepsItsEdges(t *testing.T) {
 	}
 }
 
-// D-41 and §2.12: A's role trusts B's data-reader before B is connected -- an
-// unresolved aws_principal. B connects: A's next pass updates THE SAME ROW
-// (same id, same valid_from) to source from B's identity, and the old node
-// gets a derived resolution. B's data-reader is then deleted: the edge -- A's
-// declaration, which B's scan did not read -- is re-pointed back to the
-// external principal in place, not ended.
+// D-41 rule 1 and §2.12: A's role trusts B's data-reader before B is
+// connected -- an unresolved aws_principal. B connects: B's own pass gives the
+// NODE a derived resolution to data-reader, and A's next pass keeps THE SAME
+// EDGE (same id, same valid_from), still sourced from that node -- continuity
+// is the node's, the edge is never re-pointed. B's data-reader is then
+// deleted: the resolution is re-derived away (unresolved), and A's edge --
+// A's declaration -- is untouched.
 func TestP2TrustFarAccountConnectsLater(t *testing.T) {
 	l := newP2Lab(t, "p2-trust-far", true)
 	a := l.account(accountA)
@@ -463,34 +500,100 @@ func TestP2TrustFarAccountConnectsLater(t *testing.T) {
 	b.role("data-reader", "AROADATAREADERDATARE")
 	trustCycle(l, b, nil)
 	readerID := trustIdentityID(l, "data-reader")
+	if ep, _ := trustNode(l, "aws", reader); ep.ID != extID || ep.ResolutionBasis != models.BasisDerived ||
+		ep.ResolutionRule != models.ResolutionRuleExactARN || ep.ResolvedIdentityAccountID == nil ||
+		*ep.ResolvedIdentityAccountID != readerID {
+		t.Errorf("after B's pass the node = %+v, want a derived exact_arn_match resolution to data-reader %s", ep, readerID)
+	}
 	time.Sleep(10 * time.Millisecond)
 	trustCycle(l, a, nil)
 
 	now := trustEdgesTo(trustEdges(l), "reader-access")
 	if len(now) != 1 {
-		t.Fatalf("after B connects: %d edges %+v, want the one row, upgraded in place", len(now), now)
+		t.Fatalf("after B connects: %d edges %+v, want the one row", len(now), now)
 	}
-	e := now[0]
-	if e.ID != edgeID || !e.ValidFrom.Equal(validFrom) || e.State != models.RelCurrent ||
-		e.SourceIdentity == nil || *e.SourceIdentity != readerID || e.ExtID != nil {
-		t.Errorf("after B connects = %+v, want edge %s (valid_from %s) current, sourced from data-reader %s",
-			e, edgeID, validFrom, readerID)
+	if e := now[0]; e.ID != edgeID || !e.ValidFrom.Equal(validFrom) || e.State != models.RelCurrent ||
+		e.ExtID == nil || *e.ExtID != extID || e.SourceIdentity != nil || !e.LastConfirmed.After(first[0].LastConfirmed) {
+		t.Errorf("after B connects = %+v, want edge %s (valid_from %s) current, confirmed again, still from node %s",
+			e, edgeID, validFrom, extID)
 	}
-	var ep models.IGAExternalPrincipal
-	l.db.First(&ep, "id = ?", extID)
-	if ep.ResolutionBasis != models.BasisDerived || ep.ResolutionRule != models.ResolutionRuleExactARN ||
-		ep.ResolvedIdentityAccountID == nil || *ep.ResolvedIdentityAccountID != readerID {
-		t.Errorf("the principal's node = %+v, want a derived exact_arn_match resolution to data-reader", ep)
+
+	// data-reader is recreated under the same ARN: an exact ARN match now
+	// names the NEW object, which is right for a mechanical fact (§2.12's
+	// "recreated" row) -- re-derived in B's own pass, A's edge untouched.
+	b.role("data-reader", "AROADATAREADERSECOND")
+	trustCycle(l, b, nil)
+	secondID := trustIdentityID(l, "data-reader")
+	if ep, _ := trustNode(l, "aws", reader); secondID == readerID || ep.ResolutionBasis != models.BasisDerived ||
+		ep.ResolvedIdentityAccountID == nil || *ep.ResolvedIdentityAccountID != secondID {
+		t.Errorf("after data-reader is recreated the node = %+v, want it re-derived to the new data-reader %s (was %s)",
+			ep, secondID, readerID)
 	}
 
 	// B's data-reader is deleted; B's rescan retires it.
 	trustRemoveRole(b, "data-reader")
 	trustCycle(l, b, nil)
+	if ep, _ := trustNode(l, "aws", reader); ep.ResolvedIdentityAccountID != nil || ep.ResolutionBasis != "" {
+		t.Errorf("after data-reader retires the node = %+v, want the derived resolution re-derived away", ep)
+	}
 	gone := trustEdgesTo(trustEdges(l), "reader-access")
-	if len(gone) != 1 || gone[0].ID != edgeID || gone[0].State == models.RelEnded || gone[0].ExtID == nil ||
-		*gone[0].ExtID != extID || gone[0].ExtResolved != nil {
-		t.Errorf("after data-reader retires = %+v, want edge %s NOT ended, re-pointed to its unresolved principal %s",
-			gone, edgeID, extID)
+	if len(gone) != 1 || gone[0].ID != edgeID || gone[0].State != models.RelCurrent {
+		t.Errorf("after data-reader retires = %+v, want edge %s untouched: it is A's declaration", gone, edgeID)
+	}
+}
+
+// D-41 rule 2 and "no edge is re-pointed": B is connected first, so A's trust
+// of B's data-reader is an identity-sourced edge crossing accounts, and no
+// external principal exists for it. data-reader is then deleted: B's pass
+// ENDS the edge subject_retired (the ordinary cascade -- its source is gone),
+// and A's next pass, whose document still names the ARN, re-sources the
+// principal as a NEW edge from an unresolved aws_principal.
+func TestP2TrustConnectedIdentityIsTheSource(t *testing.T) {
+	l := newP2Lab(t, "p2-trust-connected", true)
+	b := l.account(accountB)
+	b.role("data-reader", "AROADATAREADERCONNEC")
+	trustCycle(l, b, nil)
+	readerID := trustIdentityID(l, "data-reader")
+
+	a := l.account(accountA)
+	reader := "arn:aws:iam::" + accountB + ":role/data-reader"
+	trustRole(a, "reader-access", "AROAREADERACCESSCONN", trustDoc(trustAllow(`{"AWS":"`+reader+`"}`, "sts:AssumeRole")))
+	trustCycle(l, a, nil)
+	first := trustEdgesTo(trustEdges(l), "reader-access")
+	if len(first) != 1 || first[0].SourceIdentity == nil || *first[0].SourceIdentity != readerID || first[0].ExtID != nil {
+		t.Fatalf("A's trust of connected B = %+v, want identity-sourced from data-reader %s", first, readerID)
+	}
+	if _, ok := trustNode(l, "aws", reader); ok {
+		t.Error("an external principal exists for a principal that is a live identity in a connected account")
+	}
+
+	trustRemoveRole(b, "data-reader")
+	trustCycle(l, b, nil)
+	ended := trustEdgesTo(trustEdges(l), "reader-access")
+	if len(ended) != 1 || ended[0].ID != first[0].ID || ended[0].State != models.RelEnded ||
+		ended[0].EndedReason != models.EndedSubjectRetired || ended[0].SourceIdentity == nil {
+		t.Fatalf("after data-reader retires = %+v, want edge %s ended subject_retired, its source unchanged", ended, first[0].ID)
+	}
+	// The retired role's OWN trust edges end with it: its lab Lambda trust is
+	// sourced from an external principal (aws_service), which never retires,
+	// so only the target's cascade can close it.
+	own := trustEdgesTo(trustEdges(l), "data-reader")
+	if len(own) != 1 || own[0].ExtKind != models.ExternalPrincipalAWSService || own[0].State != models.RelEnded ||
+		own[0].EndedReason != models.EndedSubjectRetired {
+		t.Errorf("retired data-reader's own trust edges = %+v, want its aws_service edge ended subject_retired", own)
+	}
+
+	trustCycle(l, a, nil)
+	edges := trustEdgesTo(trustEdges(l), "reader-access")
+	var fresh []trustEdge
+	for _, e := range edges {
+		if e.ID != first[0].ID {
+			fresh = append(fresh, e)
+		}
+	}
+	if len(edges) != 2 || len(fresh) != 1 || fresh[0].State != models.RelCurrent || fresh[0].ExtID == nil ||
+		fresh[0].ExtKind != models.ExternalPrincipalAWSPrincipal || fresh[0].ExtSubject != reader || fresh[0].ExtResolved != nil {
+		t.Errorf("A's next pass = %+v, want the ended edge plus a NEW edge from an unresolved aws_principal %s", edges, reader)
 	}
 }
 
@@ -515,12 +618,12 @@ func TestP2TrustLoopProjectsBothEdges(t *testing.T) {
 	}
 }
 
-// A trusted role deleted and recreated. AWS rewrites a trust policy naming a
-// deleted principal to that principal's unique id, which never resolves: the
-// ARN-keyed edge ENDS (the document no longer says it) and an edge from an
-// unresolved aws_principal "AROA…" begins. A second role whose document still
-// names the ARN keeps its edge -- the same row, re-pointed to the NEW role in
-// place (D-41: the recreation must not end an edge the trust pass re-points).
+// A trusted role deleted and recreated (B7 for trust). AWS rewrites a trust
+// policy naming a deleted principal to that principal's unique id, which
+// never resolves: consumer's identity edge ENDS and an edge from an unresolved
+// aws_principal "AROA…" begins. follower's document still names the ARN: its
+// old edge ends subject_recreated and a NEW edge -- a new key, naming the new
+// incarnation's endpoint -- comes from the new producer.
 func TestP2TrustRecreatedTrustedRole(t *testing.T) {
 	l := newP2Lab(t, "p2-trust-recreated", true)
 	a := l.account(accountA)
@@ -544,28 +647,44 @@ func TestP2TrustRecreatedTrustedRole(t *testing.T) {
 	}
 	edges := trustEdges(l)
 	consumer := trustEdgesTo(edges, "consumer")
-	var ended, uid []trustEdge
+	var ended, live []trustEdge
 	for _, e := range consumer {
 		if e.State == models.RelEnded {
 			ended = append(ended, e)
 		} else {
-			uid = append(uid, e)
+			live = append(live, e)
 		}
 	}
-	if len(ended) != 1 || ended[0].EndedReason != models.EndedNotSeen {
-		t.Errorf("consumer's ARN edge = %+v, want ended not_seen: the document no longer names the ARN", ended)
+	if len(ended) != 1 || ended[0].SourceIdentity == nil || *ended[0].SourceIdentity != oldProducer ||
+		ended[0].EndedReason != models.EndedSubjectRecreate {
+		t.Errorf("consumer's identity edge = %+v, want ended subject_recreated", ended)
 	}
-	if len(uid) != 1 || uid[0].ExtKind != models.ExternalPrincipalAWSPrincipal || uid[0].ExtSubject != "AROAPRODUCEROLD00001" ||
-		uid[0].ExtResolved != nil || uid[0].SourceIdentity != nil {
-		t.Errorf("consumer's live edge = %+v, want an unresolved aws_principal AROAPRODUCEROLD00001", uid)
+	if len(live) != 1 || live[0].ExtKind != models.ExternalPrincipalAWSPrincipal || live[0].ExtSubject != "AROAPRODUCEROLD00001" ||
+		live[0].ExtResolved != nil || live[0].SourceIdentity != nil {
+		t.Errorf("consumer's live edge = %+v, want an unresolved aws_principal AROAPRODUCEROLD00001", live)
 	}
 	f := trustEdgesTo(edges, "follower")
-	if len(f) != 1 || f[0].ID != follower[0].ID || f[0].State != models.RelCurrent || f[0].SourceIdentity == nil ||
-		*f[0].SourceIdentity != newProducer {
-		t.Errorf("follower = %+v, want edge %s kept, current, re-pointed to the new producer %s", f, follower[0].ID, newProducer)
+	var old, fresh *trustEdge
+	for i := range f {
+		if f[i].ID == follower[0].ID {
+			old = &f[i]
+		} else {
+			fresh = &f[i]
+		}
 	}
-	// B7: the recreated role's OWN trust edges (it is their target) end, and
-	// the new role's are new rows.
+	if len(f) != 2 || old == nil || fresh == nil {
+		t.Fatalf("follower = %+v, want its old edge and one new edge", f)
+	}
+	if old.State != models.RelEnded || old.EndedReason != models.EndedSubjectRecreate || old.SourceIdentity == nil ||
+		*old.SourceIdentity != oldProducer {
+		t.Errorf("follower's old edge = %+v, want ended subject_recreated, still from the OLD producer: never re-pointed", *old)
+	}
+	if fresh.State != models.RelCurrent || fresh.SourceIdentity == nil || *fresh.SourceIdentity != newProducer ||
+		fresh.SourceKey == old.SourceKey {
+		t.Errorf("follower's new edge = %+v, want current from the new producer under a NEW key (old key %q)", *fresh, old.SourceKey)
+	}
+	// The recreated role's OWN trust edges (it is their target) end, and the
+	// new role's are new rows.
 	oldOwn := trustEdgesTo(before, "producer")
 	for _, e := range trustEdgesTo(edges, "producer") {
 		switch {
@@ -580,11 +699,13 @@ func TestP2TrustRecreatedTrustedRole(t *testing.T) {
 	}
 }
 
-// IRSA and EKS Pod Identity for the SAME service account: one
-// k8s_service_account node, two edges -- oidc_federation from the trust
-// document, eks_pod_identity from the association -- each with its evidence.
-// Then the cluster's issuer cannot be read: no edge can be attributed, and the
-// pod-identity edge goes stale instead of ending.
+// IRSA and EKS Pod Identity for the SAME service account (D-42): the trust
+// document's IRSA statement is an `oidc` node (issuer = the cluster's OIDC
+// host and path), the association a `k8s_service_account` node whose subject
+// carries the pod: prefix -- two nodes, one edge each, oidc_federation and
+// eks_pod_identity, each with its evidence and its own partition. Then the
+// cluster's issuer cannot be read: the association cannot be attributed, and
+// its edge goes stale instead of ending.
 func TestP2TrustIRSAAndPodIdentity(t *testing.T) {
 	l := newP2Lab(t, "p2-trust-pods", true)
 	a := l.account(accountA)
@@ -618,9 +739,16 @@ func TestP2TrustIRSAAndPodIdentity(t *testing.T) {
 		byMech[e.Mechanism] = e
 	}
 	irsa, pod := byMech[models.MechanismOIDCFederation], byMech[models.MechanismEKSPodIdentity]
-	if len(edges) != 3 || irsa.ExtID == nil || pod.ExtID == nil || *irsa.ExtID != *pod.ExtID ||
-		irsa.ExtKind != models.ExternalPrincipalK8sServiceAccount || irsa.ExtIssuer != eksIssuerNoSch || irsa.ExtSubject != sa {
-		t.Fatalf("ledger-role edges = %+v, want IRSA and pod identity from ONE k8s_service_account node (+ pods.eks service)", edges)
+	if len(edges) != 3 || irsa.ExtID == nil || pod.ExtID == nil {
+		t.Fatalf("ledger-role edges = %+v, want IRSA, pod identity and the pods.eks service", edges)
+	}
+	if irsa.ExtKind != models.ExternalPrincipalOIDC || irsa.ExtIssuer != eksIssuerNoSch || irsa.ExtSubject != sa {
+		t.Errorf("IRSA source = (%s, %s, %s), want oidc %s / %s", irsa.ExtKind, irsa.ExtIssuer, irsa.ExtSubject, eksIssuerNoSch, sa)
+	}
+	if pod.ExtKind != models.ExternalPrincipalK8sServiceAccount || pod.ExtIssuer != eksIssuerNoSch ||
+		pod.ExtSubject != igagraph.PodIdentitySubject(sa) || *pod.ExtID == *irsa.ExtID {
+		t.Errorf("pod source = (%s, %s, %s), want its own k8s_service_account node %s / %s",
+			pod.ExtKind, pod.ExtIssuer, pod.ExtSubject, eksIssuerNoSch, igagraph.PodIdentitySubject(sa))
 	}
 	if pod.Conditions != nil || irsa.Conditions == nil {
 		t.Errorf("conditions: pod %v irsa %v; want NULL for the association, the sub condition for IRSA", pod.Conditions, irsa.Conditions)
@@ -633,21 +761,23 @@ func TestP2TrustIRSAAndPodIdentity(t *testing.T) {
 	if podObs != 1 || roleObs != 1 {
 		t.Errorf("evidence: pod edge %d association observations, IRSA edge %d role observations; want 1 and 1", podObs, roleObs)
 	}
-	var podParts int64
-	l.db.Raw(`SELECT count(DISTINCT partition_key) FROM iga_relationship WHERE id IN (?, ?)`, pod.ID, irsa.ID).Scan(&podParts)
-	if podParts != 2 {
+	var parts int64
+	l.db.Raw(`SELECT count(DISTINCT partition_key) FROM iga_relationship WHERE id IN (?, ?)`, pod.ID, irsa.ID).Scan(&parts)
+	if parts != 2 {
 		t.Errorf("IRSA and pod edges share a partition; they reconcile on different surfaces (§4.10)")
 	}
 
-	// The cluster's issuer is gone (a failed DescribeCluster, or a cluster
-	// without OIDC) and no cluster ARN was collected: the association cannot
-	// be attributed to a cluster. eks_pod_identity is still "reached", so only
-	// the projector's protection keeps the edge from ending.
+	// The cluster's issuer is gone (a failed DescribeCluster): the association
+	// cannot be attributed to a cluster. eks_pod_identity is still "reached",
+	// so only the projector's protection keeps the edge from ending.
 	eks.clusters["prod-cluster"] = ""
 	trustCycle(l, a, eks)
 	for _, e := range trustEdgesTo(trustEdges(l), "ledger-role") {
 		if e.ID == pod.ID && (e.State != models.RelStale || e.EndedReason != "") {
 			t.Errorf("unattributable association's edge = %s/%s, want stale: we could not name its cluster", e.State, e.EndedReason)
+		}
+		if e.ID == irsa.ID && e.State != models.RelCurrent {
+			t.Errorf("IRSA edge = %s, want current: the trust document was read", e.State)
 		}
 	}
 	var issuerless int64

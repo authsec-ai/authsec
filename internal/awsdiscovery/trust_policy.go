@@ -60,15 +60,30 @@ const (
 )
 
 // External-principal kinds (iga_external_principal.mechanism, 034): what KIND
-// of far endpoint a principal is, independent of how it assumes the role.
+// of far endpoint a principal is, independent of how it assumes the role
+// (P2-DECISIONS D-42).
 const (
-	ExternalAWSAccount   = "aws_account"         // "any principal in that account the account permits"
-	ExternalAWSPrincipal = "aws_principal"       // one named AWS principal, or "*"
-	ExternalAWSService   = "aws_service"         // lambda.amazonaws.com
-	ExternalOIDC         = "oidc"                // an OIDC issuer and subject
-	ExternalSAML         = "saml"                // a SAML provider and subject
-	ExternalK8sSA        = "k8s_service_account" // IRSA and EKS Pod Identity alike
+	// ExternalAWSAccount is "any principal in that account the account
+	// permits" (§4.7) -- and, with subject "*", any AWS principal at all.
+	ExternalAWSAccount = "aws_account"
+	// ExternalAWSPrincipal is one named AWS principal: a role or user ARN, or
+	// what never resolves -- a unique id, a session ARN.
+	ExternalAWSPrincipal = "aws_principal"
+	ExternalAWSService   = "aws_service" // lambda.amazonaws.com
+	// ExternalOIDC is every Federated web-identity principal, EKS IRSA
+	// included (§4.7 l.4416): the subject claim is a string the issuer mints,
+	// and "system:serviceaccount:ns:sa" is no exception.
+	ExternalOIDC = "oidc"
+	ExternalSAML = "saml" // a SAML provider and subject
+	// ExternalK8sSA is produced ONLY for an EKS Pod Identity association
+	// (§1.4, §4.7 l.4393), never by this file: no trust policy names it.
+	ExternalK8sSA = "k8s_service_account"
 )
+
+// AnyAWSPrincipal is the subject of the one node for a "*" principal --
+// `"Principal": "*"` and `{"AWS": "*"}` alike -- an aws_account whose account
+// is unknown, shown as "any AWS principal" (§4.7 l.4414, D-42).
+const AnyAWSPrincipal = "*"
 
 // IssuerAWS is the issuer of every principal AWS itself names -- accounts, IAM
 // and STS principals, service principals (D-42). Only federated principals
@@ -100,7 +115,9 @@ var accountRootPattern = regexp.MustCompile(`^arn:[^:]+:iam::(\d{12}):root$`)
 
 // k8sSubjectPattern matches the IRSA subject claim shape. This is the ONLY
 // signal that tells an IRSA federation apart from any other OIDC federation --
-// AWS does not label it, the subject string is the only evidence.
+// AWS does not label it, the subject string is the only evidence. Used by the
+// legacy cloud_assume_edge view only: the graph keeps IRSA an `oidc` principal
+// (D-42).
 var k8sSubjectPattern = regexp.MustCompile(`^system:serviceaccount:[^:]+:[^:]+$`)
 
 // stringOrSlice unmarshals an IAM policy field that AWS allows to be written
@@ -382,26 +399,31 @@ func wildcardMatch(pattern, s string) bool {
 
 // TrustSubject is one principal a statement names, normalised to the far
 // endpoint it identifies (P2-DECISIONS D-42) and the mechanism by which it may
-// assume the role (D-43).
+// assume the role (D-43, D-88).
 type TrustSubject struct {
 	// Entry is the principal entry this subject came from, verbatim.
 	Entry TrustPrincipalEntry
 	// Kind is the external-principal kind (034): aws_account, aws_principal,
-	// aws_service, oidc, saml or k8s_service_account.
+	// aws_service, oidc or saml. Never k8s_service_account: only an EKS Pod
+	// Identity association names one.
 	Kind string
 	// Issuer and Subject are the far endpoint's identity (iga_external_principal
-	// issuer / subject_claim). Together they are its recognition key, and the
-	// edge's (D-41): a principal that later resolves to an identity keeps them.
+	// issuer / subject_claim), its recognition key (§2.4).
 	Issuer  string
 	Subject string
-	// Account is the AWS account the principal names, when it names one.
+	// Account is the AWS account the principal names, when it names one: the
+	// account of an aws_account, or the account field of an aws_principal ARN.
+	// Never guessed -- "" for "*", a unique id, a service or a federation (a
+	// provider ARN's account is where the provider is registered, not where
+	// its subjects live).
 	Account string
 	// IdentityARN is set when the principal is the exact ARN of an IAM role or
 	// user -- the one form that may be an identity in the workspace (§4.7).
 	// Session ARNs, unique ids and "*" never are.
 	IdentityARN string
-	// Mechanism is how it may assume the role: sts_assume_role,
-	// oidc_federation or saml_federation.
+	// Mechanism is how it may assume the role, from the principal's TYPE
+	// (D-88): sts_assume_role for AWS, Service and "*"; oidc_federation for a
+	// web-identity provider; saml_federation for a SAML provider.
 	Mechanism string
 	// Wildcard reports that Subject is a pattern (or "*"): it names a set of
 	// principals, never one, and never resolves (§2.12).
@@ -410,24 +432,26 @@ type TrustSubject struct {
 
 // Subjects returns every principal this statement names, one per far endpoint,
 // in a deterministic order. A federated principal yields one subject per
-// positive `sub` value, or one unscoped "*" subject when there is none. A
-// principal whose type the statement's actions cannot serve -- a Federated
-// principal under sts:AssumeRole alone, anything under sts:TagSession alone --
-// yields nothing: the statement permits no assumption by it (D-43).
+// positive `sub` value, or one unscoped "*" subject when there is none.
+//
+// A principal yields a subject only when the statement allows the ONE assume
+// action its type can call (D-43, D-88): sts:AssumeRole for AWS, Service and
+// "*"; sts:AssumeRoleWithWebIdentity for a web-identity provider;
+// sts:AssumeRoleWithSAML for a SAML provider. A Federated principal under
+// sts:AssumeRole alone, an AWS principal under web identity alone, anything
+// under sts:TagSession alone: the statement permits no assumption by it, and
+// claiming one would say more than the document does.
 //
 // Callers decide what an effect means; a Deny statement's subjects are what it
 // denies, never who may assume the role.
 func (s TrustStatement) Subjects() []TrustSubject {
-	federated := 0
-	for _, p := range s.Principals {
-		if p.Type == PrincipalFederated {
-			federated++
-		}
-	}
 	var out []TrustSubject
 	seen := map[string]bool{}
 	add := func(sub TrustSubject) {
-		sub.Wildcard = sub.Subject == "*" || strings.ContainsAny(sub.Subject, "*?")
+		sub.Wildcard = sub.Subject == AnyAWSPrincipal || strings.ContainsAny(sub.Subject, "*?")
+		// One subject per far endpoint: `"*"` and `{"AWS":"*"}`, or an account
+		// id and its :root ARN, in one statement are one principal (D-88: one
+		// edge per statement, principal and role).
 		k := sub.Issuer + "\x00" + sub.Subject
 		if !seen[k] {
 			seen[k] = true
@@ -437,20 +461,10 @@ func (s TrustStatement) Subjects() []TrustSubject {
 	for _, p := range s.Principals {
 		switch p.Type {
 		case PrincipalAnyone:
-			// Anyone at all: the mechanism is the first assume action allowed.
-			mech := ""
-			for _, m := range []struct{ action, mech string }{
-				{actionAssumeRole, MechanismSTSAssumeRole},
-				{actionAssumeRoleWebIdentity, MechanismOIDCFederation},
-				{actionAssumeRoleSAML, MechanismSAMLFederation},
-			} {
-				if s.allows(m.action) {
-					mech = m.mech
-					break
-				}
-			}
-			if mech != "" {
-				add(TrustSubject{Entry: p, Kind: ExternalAWSPrincipal, Issuer: IssuerAWS, Subject: "*", Mechanism: mech})
+			if s.allows(actionAssumeRole) {
+				sub := classifyAWSEntry(AnyAWSPrincipal)
+				sub.Entry, sub.Mechanism = p, MechanismSTSAssumeRole
+				add(sub)
 			}
 		case PrincipalAWS:
 			if s.allows(actionAssumeRole) {
@@ -464,7 +478,7 @@ func (s TrustStatement) Subjects() []TrustSubject {
 					Mechanism: MechanismSTSAssumeRole})
 			}
 		case PrincipalFederated:
-			for _, sub := range s.federatedSubjects(p, federated == 1) {
+			for _, sub := range s.federatedSubjects(p) {
 				add(sub)
 			}
 		}
@@ -472,39 +486,35 @@ func (s TrustStatement) Subjects() []TrustSubject {
 	return out
 }
 
-// federatedSubjects classifies one Federated entry: an OIDC provider ARN (its
-// issuer is the host after ":oidc-provider/"), a SAML provider ARN (its issuer
-// is the ARN itself), or a named web-identity provider such as
-// accounts.google.com or cognito-identity.amazonaws.com (its issuer is the
-// name). The subjects are the positive `sub` values the conditions require of
-// that issuer -- or "*" when there are none, or only negative ones.
+// federatedSubjects classifies one Federated entry (D-42): an OIDC provider
+// ARN, whose issuer is the provider URL without scheme -- host AND path, what
+// follows ":oidc-provider/" -- EKS IRSA included; a SAML provider ARN, whose
+// issuer is the ARN itself; or a web-identity provider named without an ARN
+// (accounts.google.com, cognito-identity.amazonaws.com), whose issuer is the
+// name.
 //
-// `alone` is whether this is the statement's only Federated entry. Then any
-// "…:sub" key is unambiguously about it; with two, only a key naming its own
-// issuer is.
-func (s TrustStatement) federatedSubjects(p TrustPrincipalEntry, alone bool) []TrustSubject {
+// The subjects are the positive `sub` values the conditions require under
+// THAT issuer's key -- "<issuer>:sub", or "SAML:sub" -- compared
+// case-insensitively as IAM compares condition keys. "*" when there are none,
+// or only negative ones. A `sub` key naming some other issuer is not this
+// principal's subject: reading it as one would name a principal the condition
+// was never about.
+func (s TrustStatement) federatedSubjects(p TrustPrincipalEntry) []TrustSubject {
 	base := TrustSubject{Entry: p, Kind: ExternalOIDC, Issuer: p.Value, Mechanism: MechanismOIDCFederation}
-	action := actionAssumeRoleWebIdentity
-	prefix := ""
+	action, keyPrefix := actionAssumeRoleWebIdentity, p.Value
 	switch {
 	case strings.Contains(p.Value, ":saml-provider/"):
-		base.Kind, base.Mechanism, action, prefix = ExternalSAML, MechanismSAMLFederation, actionAssumeRoleSAML, "saml"
-		base.Account = arnAccount(p.Value)
+		base.Kind, base.Mechanism = ExternalSAML, MechanismSAMLFederation
+		action, keyPrefix = actionAssumeRoleSAML, "saml"
 	case strings.Contains(p.Value, ":oidc-provider/") && oidcIssuerFromARN(p.Value) != "":
 		base.Issuer = oidcIssuerFromARN(p.Value)
-		base.Account = arnAccount(p.Value)
-		prefix = base.Issuer
-	default:
-		prefix = p.Value
+		keyPrefix = base.Issuer
 	}
 	if !s.allows(action) {
 		return nil
 	}
-	want := strings.ToLower(prefix) + ":sub"
-	values, _ := s.cond.subValues(func(key string) bool {
-		k := strings.ToLower(key)
-		return k == want || (alone && strings.HasSuffix(k, ":sub"))
-	})
+	want := strings.ToLower(keyPrefix) + ":sub"
+	values, _ := s.cond.subValues(func(key string) bool { return strings.ToLower(key) == want })
 	if len(values) == 0 {
 		// No usable sub condition: none was present, or the only ones present
 		// were negative and name principals that may NOT assume the role.
@@ -516,26 +526,22 @@ func (s TrustStatement) federatedSubjects(p TrustPrincipalEntry, alone bool) []T
 	for _, v := range values {
 		sub := base
 		sub.Subject = v
-		if sub.Kind == ExternalOIDC && k8sSubjectPattern.MatchString(v) && !strings.ContainsAny(v, "*?") {
-			// IRSA. The same service account an EKS Pod Identity association
-			// binds: one node, whichever way it assumes the role (D-42).
-			sub.Kind = ExternalK8sSA
-		}
 		out = append(out, sub)
 	}
 	return out
 }
 
 // classifyAWSEntry normalises one Principal.AWS value (D-42): an account --
-// bare id or :root ARN, one node either way -- is aws_account; anything else
-// is aws_principal, and only the exact ARN of an IAM role or user may resolve
-// to an identity. A unique id (AROA…, AIDA…) is what AWS writes into a trust
-// policy once the principal it named is deleted; a session ARN names a
-// session. Neither is an identity, so neither ever resolves.
+// bare id or :root ARN, one node either way -- is aws_account, and so is "*"
+// (any AWS principal, account unknown); anything else is aws_principal, and
+// only the exact ARN of an IAM role or user may resolve to an identity. A
+// unique id (AROA…, AIDA…) is what AWS writes into a trust policy once the
+// principal it named is deleted; a session ARN names a session. Neither is an
+// identity, so neither ever resolves.
 func classifyAWSEntry(v string) TrustSubject {
 	switch {
-	case v == "*":
-		return TrustSubject{Kind: ExternalAWSPrincipal, Issuer: IssuerAWS, Subject: "*"}
+	case v == AnyAWSPrincipal:
+		return TrustSubject{Kind: ExternalAWSAccount, Issuer: IssuerAWS, Subject: AnyAWSPrincipal}
 	case accountIDPattern.MatchString(v):
 		return TrustSubject{Kind: ExternalAWSAccount, Issuer: IssuerAWS, Subject: v, Account: v}
 	}

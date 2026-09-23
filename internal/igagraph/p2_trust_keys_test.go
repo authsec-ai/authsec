@@ -87,29 +87,58 @@ func TestTrustStatementKeys(t *testing.T) {
 	}
 }
 
-// D-41: the edge key is the principal's recognition key, never its endpoint.
-func TestTrustEdgeKeyIsThePrincipalsRecognitionKey(t *testing.T) {
+// D-41: a can_assume key names the statement, the source ENDPOINT and the
+// target endpoint. An identity source is its endpoint key -- the same spelling
+// whether this run collected it or another connector did -- never its ARN; an
+// external source is its recognition key. So a recreated endpoint, or a
+// principal that is an identity rather than an external node, is a different
+// edge: nothing is re-pointed in place.
+func TestTrustEdgeKeyNamesItsEndpoints(t *testing.T) {
 	arn := "arn:aws:iam::905418271234:role/data-reader"
+	role := models.CloudIdentity{Kind: models.CloudIdentityIAMRole, NativeID: arn,
+		Attrs: json.RawMessage(`{"unique_id":"AROADATAREADER000001"}`)}
+	row := models.IGAIdentityAccount{SourceKey: IdentityKey(role), ImmutableKey: ImmutableKey(role)}
+	if IdentityAccountEndpointKey(row) != EndpointKey(role) {
+		t.Errorf("graph-row endpoint %q != collected endpoint %q: one identity, two spellings",
+			IdentityAccountEndpointKey(row), EndpointKey(role))
+	}
+	bare := models.CloudIdentity{Kind: models.CloudIdentityIAMRole, NativeID: arn}
+	if IdentityAccountEndpointKey(models.IGAIdentityAccount{SourceKey: IdentityKey(bare)}) != EndpointKey(bare) {
+		t.Error("without an immutable key the two endpoint spellings disagree")
+	}
+
 	st := trustStatements(t, `{"Statement":[{"Effect":"Allow","Principal":{"AWS":"`+arn+`"},"Action":"sts:AssumeRole"}]}`)[0]
 	sub := st.Subjects()[0]
-	if ExternalPrincipalKey(sub.Issuer, sub.Subject) != ExternalPrincipalKey(awsdiscovery.IssuerAWS, arn) {
-		t.Fatalf("principal key = %q", ExternalPrincipalKey(sub.Issuer, sub.Subject))
+	target := Key("aws", "uid", "AROATARGET0000000001")
+	stKey, _ := TrustStatementKey(target, st, CountTrustSids([]awsdiscovery.TrustStatement{st}), map[string]int{})
+	asIdentity := CanAssumeKey(EndpointKey(role), target, stKey)
+	asExternal := CanAssumeKey(ExternalPrincipalKey(sub.Issuer, sub.Subject), target, stKey)
+	if asIdentity == asExternal {
+		t.Error("an identity source and an external source share an edge key: an edge would be re-pointed in place")
 	}
-	got, ok := ARNOfIdentityKey(IdentityARNKey(arn))
-	if !ok || got != arn {
-		t.Errorf("ARNOfIdentityKey(IdentityARNKey(arn)) = %q, %v", got, ok)
+	if strings.Contains(asIdentity, arn) {
+		t.Errorf("identity-sourced key %q names the principal's ARN: B7's ARN-only key", asIdentity)
 	}
-	for _, bad := range []string{"", Key("aws", "uid", "AROA1"), Key("github", arn), "aws" + Sep} {
-		if _, ok := ARNOfIdentityKey(bad); ok {
-			t.Errorf("ARNOfIdentityKey(%q) accepted a non-identity key", bad)
-		}
+	recreated := role
+	recreated.Attrs = json.RawMessage(`{"unique_id":"AROADATAREADER000002"}`)
+	if CanAssumeKey(EndpointKey(recreated), target, stKey) == asIdentity {
+		t.Error("a recreated source keeps its predecessor's edge key")
 	}
-	if PodIdentityIssuer("oidc.eks.us-east-1.amazonaws.com/id/X", "arn:aws:eks:us-east-1:1:cluster/c") != "oidc.eks.us-east-1.amazonaws.com/id/X" ||
-		PodIdentityIssuer("", "arn:aws:eks:us-east-1:1:cluster/c") != "arn:aws:eks:us-east-1:1:cluster/c" ||
-		PodIdentityIssuer("", "") != "" {
-		t.Error("PodIdentityIssuer: the cluster OIDC issuer, else the cluster ARN, else nothing (D-42)")
+	if CanAssumeKey(EndpointKey(role), Key("aws", "uid", "AROATARGET0000000002"), stKey) == asIdentity {
+		t.Error("a recreated target keeps its predecessor's edge key")
 	}
-	if PodIdentitySubjectKey("arn:aws:iam::1:role/r", "i", "s") == "arn:aws:iam::1:role/r" {
+
+	// D-42: the pod-identity node and the IRSA node for one service account
+	// have different recognition keys, and the association's observation key
+	// never collides with the role's own observation (keyed by the bare ARN).
+	const issuer, sa = "oidc.eks.us-east-1.amazonaws.com/id/X", "system:serviceaccount:payments:ledger"
+	if ExternalPrincipalKey(issuer, PodIdentitySubject(sa)) == ExternalPrincipalKey(issuer, sa) {
+		t.Error("pod-identity and IRSA nodes collide on uq_iga_external_principal_key")
+	}
+	if PodIdentitySubject(sa) != "pod:"+sa {
+		t.Errorf("PodIdentitySubject = %q, want the pod: prefix", PodIdentitySubject(sa))
+	}
+	if PodIdentitySubjectKey(arn, issuer, sa) == arn {
 		t.Error("the association observation's key collides with the role's own observation")
 	}
 }

@@ -81,9 +81,11 @@ const (
 // External-principal kinds (iga_external_principal.mechanism, 034; §2.2). A
 // DIFFERENT vocabulary from the relationship mechanisms above, sharing only
 // the column name: this one says WHAT the far endpoint is, the relationship's
-// says HOW it may assume the role. So one k8s_service_account node carries an
-// oidc_federation edge (IRSA) and an eks_pod_identity edge (an association)
-// for the same service account (P2-DECISIONS D-42). 034 has no CHECK on the
+// says HOW it may assume the role -- an aws_account, aws_principal or
+// aws_service node's edges are sts_assume_role, an oidc node's (EKS IRSA
+// included) oidc_federation, a saml node's saml_federation, and a
+// k8s_service_account node (an EKS Pod Identity association, only) has
+// eks_pod_identity edges (P2-DECISIONS D-42, D-43). 034 has no CHECK on the
 // column; these constants and awsdiscovery's External* equal them exactly,
 // asserted by a test in internal/igagraph.
 const (

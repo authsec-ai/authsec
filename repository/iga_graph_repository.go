@@ -431,18 +431,14 @@ func (r *igaGraphRepository) UpsertGrant(tx *gorm.DB, e *models.IGAAccessEdge, s
 	return e.ID, err
 }
 
-// UpsertRelationship refreshes a live edge in place. The identity and
-// external-principal SOURCE columns are updated too: a can_assume edge is
-// keyed by its principal's recognition key, not by the endpoint type, so when
-// the far account connects the SAME row becomes identity-sourced -- same id,
-// same valid_from -- instead of ending (P2-DECISIONS D-41, §2.12). Exactly one
-// of the two is set on every write, so iga_relationship_source_chk holds; for
-// every other type the key names the source, so the assignment is a no-op.
+// UpsertRelationship refreshes a live edge in place. It never writes a SOURCE
+// column: every edge key names its source endpoint, so a live row found by key
+// already has the source the caller computed, and no edge is ever re-pointed
+// from one source to another (P2-DECISIONS D-41).
 func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARelationship) (uuid.UUID, error) {
 	err := tx.Clauses(returningID, onKey(liveEdge, []string{
 		"state", "basis", "last_confirmed_at", "last_confirmed_by", "partition_key", "connector_id",
 		"statement_key", "conditions", "mechanism", "updated_at",
-		"source_identity_account_id", "source_external_principal_id",
 	})).Create(rel).Error
 	return rel.ID, err
 }

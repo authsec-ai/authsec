@@ -180,25 +180,40 @@ func TestTrustPrincipalForms(t *testing.T) {
 				account: "905418271234", mech: MechanismSTSAssumeRole}}},
 		"unique id of a deleted principal": {`{"Effect":"Allow","Principal":{"AWS":"AROA3XFRBF535PLBIFPI4"},` + role + `}`,
 			[]want{{kind: ExternalAWSPrincipal, issuer: "aws", subject: "AROA3XFRBF535PLBIFPI4", mech: MechanismSTSAssumeRole}}},
+		// D-42: "*" is an aws_account whose account is unknown -- "any AWS
+		// principal" -- and both spellings are one node.
 		"anyone": {`{"Effect":"Allow","Principal":"*",` + role + `}`,
-			[]want{{kind: ExternalAWSPrincipal, issuer: "aws", subject: "*", mech: MechanismSTSAssumeRole, wildcard: true}}},
+			[]want{{kind: ExternalAWSAccount, issuer: "aws", subject: "*", mech: MechanismSTSAssumeRole, wildcard: true}}},
 		"any aws principal is the same node": {`{"Effect":"Allow","Principal":{"AWS":"*"},` + role + `}`,
-			[]want{{kind: ExternalAWSPrincipal, issuer: "aws", subject: "*", mech: MechanismSTSAssumeRole, wildcard: true}}},
+			[]want{{kind: ExternalAWSAccount, issuer: "aws", subject: "*", mech: MechanismSTSAssumeRole, wildcard: true}}},
+		"anyone and an account in one statement": {`{"Effect":"Allow","Principal":{"AWS":["*","905418271234"]},` + role + `}`,
+			[]want{{kind: ExternalAWSAccount, issuer: "aws", subject: "*", mech: MechanismSTSAssumeRole, wildcard: true},
+				{kind: ExternalAWSAccount, issuer: "aws", subject: "905418271234", account: "905418271234", mech: MechanismSTSAssumeRole}}},
+		"an account and its root in one statement are one principal": {`{"Effect":"Allow","Principal":{"AWS":["905418271234","arn:aws:iam::905418271234:root"]},` + role + `}`,
+			[]want{{kind: ExternalAWSAccount, issuer: "aws", subject: "905418271234", account: "905418271234", mech: MechanismSTSAssumeRole}}},
 		"service": {`{"Effect":"Allow","Principal":{"Service":["lambda.amazonaws.com","ecs-tasks.amazonaws.com"]},` + role + `}`,
 			[]want{{kind: ExternalAWSService, issuer: "aws", subject: "lambda.amazonaws.com", mech: MechanismSTSAssumeRole},
 				{kind: ExternalAWSService, issuer: "aws", subject: "ecs-tasks.amazonaws.com", mech: MechanismSTSAssumeRole}}},
 		"github oidc wildcard sub": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"},` + web +
 			`,"Condition":{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"},"StringLike":{"token.actions.githubusercontent.com:sub":"repo:authsec-ai/authsec:*"}}}`,
 			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "repo:authsec-ai/authsec:*",
-				account: "429418377036", mech: MechanismOIDCFederation, wildcard: true}}},
+				mech: MechanismOIDCFederation, wildcard: true}}},
 		"oidc with no sub is unscoped": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"},` + web +
 			`,"Condition":{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"}}}`,
-			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "*", account: "429418377036",
+			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "*",
 				mech: MechanismOIDCFederation, wildcard: true}}},
 		"a negated sub names nobody": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"},` + web +
 			`,"Condition":{"StringNotEquals":{"token.actions.githubusercontent.com:sub":"repo:acme/deploy:ref:refs/heads/main"}}}`,
-			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "*", account: "429418377036",
+			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "*",
 				mech: MechanismOIDCFederation, wildcard: true}}},
+		"a sub key naming another issuer is not this principal's subject": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"},` + web +
+			`,"Condition":{"StringEquals":{"gitlab.example.com:sub":"project_path:acme/deploy"}}}`,
+			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "*",
+				mech: MechanismOIDCFederation, wildcard: true}}},
+		"condition keys compare case-insensitively": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"},` + web +
+			`,"Condition":{"StringEquals":{"Token.Actions.GitHubUserContent.com:SUB":"repo:acme/deploy:ref:refs/heads/main"}}}`,
+			[]want{{kind: ExternalOIDC, issuer: "token.actions.githubusercontent.com", subject: "repo:acme/deploy:ref:refs/heads/main",
+				mech: MechanismOIDCFederation}}},
 		"a Null operator is not a subject": {`{"Effect":"Allow","Principal":{"Federated":"accounts.google.com"},` + web +
 			`,"Condition":{"Null":{"accounts.google.com:sub":"false"}}}`,
 			[]want{{kind: ExternalOIDC, issuer: "accounts.google.com", subject: "*", mech: MechanismOIDCFederation, wildcard: true}}},
@@ -206,22 +221,24 @@ func TestTrustPrincipalForms(t *testing.T) {
 			`,"Condition":{"ForAnyValue:StringEquals":{"cognito-identity.amazonaws.com:sub":["us-east-1:bbb","us-east-1:aaa"]}}}`,
 			[]want{{kind: ExternalOIDC, issuer: "cognito-identity.amazonaws.com", subject: "us-east-1:bbb", mech: MechanismOIDCFederation},
 				{kind: ExternalOIDC, issuer: "cognito-identity.amazonaws.com", subject: "us-east-1:aaa", mech: MechanismOIDCFederation}}},
-		"irsa is a kubernetes service account": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"},` + web +
+		// D-42: IRSA is an oidc principal like any other web identity, issuer
+		// host AND path; only a Pod Identity association is k8s_service_account.
+		"irsa stays an oidc principal": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"},` + web +
 			`,"Condition":{"StringEquals":{"oidc.eks.us-east-1.amazonaws.com/id/ABC:sub":"system:serviceaccount:payments:ledger-agent"}}}`,
-			[]want{{kind: ExternalK8sSA, issuer: "oidc.eks.us-east-1.amazonaws.com/id/ABC", subject: "system:serviceaccount:payments:ledger-agent",
-				account: "429418377036", mech: MechanismOIDCFederation}}},
-		"an irsa wildcard is not one service account": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"},` + web +
+			[]want{{kind: ExternalOIDC, issuer: "oidc.eks.us-east-1.amazonaws.com/id/ABC", subject: "system:serviceaccount:payments:ledger-agent",
+				mech: MechanismOIDCFederation}}},
+		"an irsa wildcard": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/ABC"},` + web +
 			`,"Condition":{"StringLike":{"oidc.eks.us-east-1.amazonaws.com/id/ABC:sub":"system:serviceaccount:payments:*"}}}`,
 			[]want{{kind: ExternalOIDC, issuer: "oidc.eks.us-east-1.amazonaws.com/id/ABC", subject: "system:serviceaccount:payments:*",
-				account: "429418377036", mech: MechanismOIDCFederation, wildcard: true}}},
+				mech: MechanismOIDCFederation, wildcard: true}}},
 		"saml without a sub": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:saml-provider/Okta"},"Action":"sts:AssumeRoleWithSAML",` +
 			`"Condition":{"StringEquals":{"SAML:aud":"https://signin.aws.amazon.com/saml"}}}`,
-			[]want{{kind: ExternalSAML, issuer: "arn:aws:iam::429418377036:saml-provider/Okta", subject: "*", account: "429418377036",
+			[]want{{kind: ExternalSAML, issuer: "arn:aws:iam::429418377036:saml-provider/Okta", subject: "*",
 				mech: MechanismSAMLFederation, wildcard: true}}},
 		"saml with a sub": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::429418377036:saml-provider/Okta"},"Action":"sts:AssumeRoleWithSAML",` +
 			`"Condition":{"StringEquals":{"SAML:sub":"priya@example.com"}}}`,
 			[]want{{kind: ExternalSAML, issuer: "arn:aws:iam::429418377036:saml-provider/Okta", subject: "priya@example.com",
-				account: "429418377036", mech: MechanismSAMLFederation}}},
+				mech: MechanismSAMLFederation}}},
 	} {
 		st := trustOnly(t, tc.stmt)
 		var got []want
@@ -234,8 +251,8 @@ func TestTrustPrincipalForms(t *testing.T) {
 	}
 }
 
-// D-43: the mechanism follows the action, and a principal the actions cannot
-// serve assumes nothing.
+// D-43 / D-88: the mechanism comes from the principal's type, and a principal
+// whose one assume action the statement does not allow assumes nothing.
 func TestTrustActionDecidesMechanism(t *testing.T) {
 	gh := `"Federated":"arn:aws:iam::429418377036:oidc-provider/token.actions.githubusercontent.com"`
 	for name, tc := range map[string]struct {
@@ -251,7 +268,13 @@ func TestTrustActionDecidesMechanism(t *testing.T) {
 		"aws principal under web identity":  {`{"Effect":"Allow","Principal":{"AWS":"905418271234"},"Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
 		"mixed statement": {`{"Effect":"Allow","Principal":{"AWS":"905418271234",` + gh + `},` +
 			`"Action":["sts:AssumeRole","sts:AssumeRoleWithWebIdentity"]}`, []string{MechanismSTSAssumeRole, MechanismOIDCFederation}},
-		"anyone by web identity": {`{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithWebIdentity"}`, []string{MechanismOIDCFederation}},
+		"anyone by assume role":  {`{"Effect":"Allow","Principal":"*","Action":"sts:Assume*"}`, []string{MechanismSTSAssumeRole}},
+		"anyone by web identity": {`{"Effect":"Allow","Principal":"*","Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
+		"everything":             {`{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"*"}`, []string{MechanismSTSAssumeRole}},
+		"saml under web identity": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::1:saml-provider/Okta"},` +
+			`"Action":"sts:AssumeRoleWithWebIdentity"}`, nil},
+		"saml by not action": {`{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::1:saml-provider/Okta"},` +
+			`"NotAction":"sts:AssumeRoleWithWebIdentity"}`, []string{MechanismSAMLFederation}},
 	} {
 		var got []string
 		for _, s := range trustOnly(t, tc.stmt).Subjects() {

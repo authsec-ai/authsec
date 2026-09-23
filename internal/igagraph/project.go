@@ -332,13 +332,6 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 				return fmt.Errorf("retire recreated %s: %w", key, err)
 			}
 			p.events.Retired(models.ObjectIdentity, live.ID, models.RetiredRecreated)
-			// Trust edges OTHER roles declare naming the old role are theirs,
-			// not its: re-pointed to the principal its ARN names, in place,
-			// before the rest of its edges end (D-41). The trust pass below
-			// re-points this account's own to the new role, by the same key.
-			if err = downgradeTrustSources(tx, snap.Run.WorkspaceID, []uuid.UUID{live.ID}, now); err != nil {
-				return fmt.Errorf("re-point trust edges from recreated %s: %w", key, err)
-			}
 			if err = p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID, live.ID,
 				models.EndedSubjectRecreate, now); err != nil {
 				return fmt.Errorf("end edges of recreated %s: %w", key, err)

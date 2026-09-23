@@ -295,12 +295,6 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *Eve
 		return m
 	}
 	if ids := retiredBy[models.ObjectIdentity]; len(ids) > 0 {
-		// A can_assume edge whose SOURCE retired is declared by the trusting
-		// role's policy, which this run may not have read: re-pointed to an
-		// external principal in place, never ended here (D-41).
-		if err := downgradeTrustSources(tx, ws, ids, now); err != nil {
-			return err
-		}
 		if err := tx.Model(&models.IGARelationship{}).
 			Where("workspace_id = ? AND state <> ? AND (source_identity_account_id IN ? OR target_identity_account_id IN ?)",
 				ws, models.RelEnded, ids, ids).Updates(endWith(models.EndedSubjectRetired)).Error; err != nil {
