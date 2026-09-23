@@ -844,8 +844,14 @@ pipelines:
 |---|---|---|
 | `/iga/agents` | `/authsec/discovery/agents` → `discovered_agents` (`models/discovery.go:343`) | Legacy discovery — **not** the IGA graph |
 | `/iga/identities` | `iga_identity_accounts` via `/api/iga/v1/identity-accounts` | GitHub IGA path |
-| `/iga/cloud/aws/identities` | `cloud_identity` | AWS collection path |
-| `/iga/cloud/aws/compute` | `cloud_workload` | AWS collection path |
+| `/iga/cloud/identities` | `cloud_identity` | AWS collection path |
+| `/iga/cloud/compute` | `cloud_workload` | AWS collection path |
+| `/iga/cloud/resources` | `cloud_permission` resource references | AWS collection path |
+
+The older `/iga/cloud/aws/*` paths already redirect to these (`App.tsx`,
+`CloudInventoryRedirect`). None of these URLs carries an object id; detail
+drawers are local state, so only filters (`account`, `kind`, `view`) are
+bookmarkable today.
 
 So a customer sees **two pages called Identities** fed by different pipelines,
 and an **Agents page that never shows a Bedrock agent** — Bedrock agents land
@@ -1031,7 +1037,7 @@ provider says so — never because their names look alike.
 | AgentCore gateway | `ListGateways`, `ListGatewayTargets` | yes | A gateway; its targets recorded as evidence under it |
 
 So in Phase 2 **a Bedrock agent has no known instances.** Aliases are what
-separate `live` from `canary`, and nothing reads them. The Estate list
+separate `live` from `canary`, and nothing reads them. The Agents & workloads list
 therefore shows the agent with its instance state stated honestly:
 
 ```
@@ -1054,86 +1060,175 @@ display — not a count of zero, and not a guess.
 
 #### 2.14.5 Navigation model
 
-One selected object, five views, shared filters. The views are **alternate
-lenses on one investigation**, not separate pages that forget each other.
+One selected object, a fixed set of views, shared filters. The views are
+**alternate lenses on one investigation**, not separate pages that forget each
+other.
 
-| URL | View | Purpose |
+**Sidebar.** Under IGA: **Agents & workloads**, **Identities**, **Resources**.
+Nothing else in this area; coverage is reached from banners and from each
+integration, not from its own nav item.
+
+##### Routes and views
+
+Every object type gets the tabs that answer its own questions. An identity is
+not a workload, so it does not borrow the workload's tabs.
+
+| Object | URL | Tabs | What each tab answers |
+|---|---|---|---|
+| Agent or workload | `/iga/estate/:id/{overview,identities,resources,graph,changes}` | **Overview · Identities · Resources · Graph · Changes** | What it is · what it runs as and who else does · what its declared access names · the path, drawn · what changed |
+| Identity (role, user) | `/iga/identities/:id/{overview,used-by,permissions,graph,changes}` | **Overview · Used by · Permissions · Graph · Changes** | What it is and where · which workloads run as it and which principals may assume it · which policies grant what, each statement separately · the path, drawn · what changed |
+| Resource or selector | `/iga/resources/:id/{overview,access,graph,changes}` | **Overview · Access · Graph · Changes** | Its kind (§2.14.12) and what we know about it · which identities are granted what on it, by which statement · the path, drawn · what changed |
+| External principal | `/iga/identities/:id/{overview,referenced-by}` | **Overview · Referenced by** | Which account it belongs to and why it is unresolved · what names it. No Graph tab: there is nothing on the far side we could read |
+
+`/iga/estate/:id` with no tab segment is Overview. The **Evidence panel** is
+not a tab. It is `?evidence=<claim id>` on whichever view opened it.
+
+##### What a URL carries, and what it promises
+
+| In the URL | In history state only | Never in the URL |
 |---|---|---|
-| `/iga/estate` | List | Agents and workloads, all providers |
-| `/iga/estate/:id` | **Overview** | What it is, where it lives, classification basis, freshness |
-| `/iga/estate/:id/identities` | **Identities** | Execution identity and other identity relationships |
-| `/iga/estate/:id/resources` | **Resources** | Resources and selectors its declared access names |
-| `/iga/estate/:id/graph` | **Graph** | Focused visual explanation of this object |
-| `/iga/estate/:id/changes` | **Changes** | Confirmed configuration changes, separate from coverage changes |
-| `/iga/estate/:id/graph?evidence=:edgeId` | Evidence | A panel, not a nested drawer |
-| `/iga/identities`, `/iga/identities/:id` | Estate-wide identities | Same five-view shape where applicable |
-| `/iga/resources`, `/iga/resources/:id` | Estate-wide resources | Same |
+| Object id, tab, `provider`, `account`, `region`, `integration`, `q` (search), `sort`, `evidence`, `node` (graph selection), `target` (*View in graph*), `as=paths`, `via` (originating object), `from` (when a link was shared) | Page cursor, scroll position, expanded graph nodes | `rev` |
 
-**Rules the implementation must honour:**
+**`rev` is not in the URL.** A revision is current-only (§2.15 *Revision
+pinning*), so a `rev` in a shared link would promise a snapshot the server
+cannot serve. The client pins `rev` **in memory** for the life of an
+investigation and sends it on every request. A pasted link therefore
+reproduces **the same object, the same view and the same filters, as they are
+now**. It does not reproduce the same revision, and nothing on screen may say
+it does.
 
-- **Filters live in the query string and survive every view switch.**
-  `?provider=aws&account=220171243705&region=eu-central-1&rev=<revision>`.
-  Switching Overview → Graph changes the path segment only.
-- **Every view is deep-linkable and every link is shareable.** A URL pasted
-  into a ticket reproduces the same object, the same filters and the same
-  published revision.
-- **Back always goes back one step in the customer's own narrative** — view
-  switches and evidence panels are history entries; filter edits **replace**
-  rather than push, so Back does not walk a filter keystroke at a time.
-- **No nested drawers.** Evidence is a side panel over the current view, with
-  its own URL. Opening evidence from inside a drawer is forbidden; the drawer
-  navigates instead.
+What a link recipient sees when the graph has changed:
+
+| Case | Shown |
+|---|---|
+| The object still exists | The current state, and, **only if** the link carries `from=<published_at>` (the "Copy link" action adds it), a one-line notice: *"Shared 22 Sep 14:02. The graph has been rescanned since, so this shows it as it is now."* |
+| The object has retired | *"`ticket-tools` is no longer in the latest scan. It was last confirmed 18 Sep."* Overview still renders from the retired row. Other tabs say they have no current data rather than rendering empty |
+| The object never existed in this workspace, or belongs to another | *"Not found in this workspace."* The page must not reveal whether it exists elsewhere |
+| The `evidence` claim has ended | The panel opens on the ended claim with its `valid_to` and `ended_reason` |
+
+##### When the revision moves mid-investigation
+
+The server answers a stale `rev` with `409` (§2.15). The client must not lose
+the investigation to it:
+
+1. **Keep what is on screen.** The rendered data stays, marked with a banner:
+   *"A newer scan published at 14:31. You are viewing the previous result.
+   [Refresh]"*. It never swaps automatically.
+2. **Pause, don't break, further reads.** Anything that would need a new read
+   at the old `rev` (the next page, a graph expansion, a different evidence
+   claim) shows the same banner inline in place of its result. It must not
+   show an empty list or an error.
+3. **Refresh keeps the investigation.** Refresh re-pins to the current `rev`
+   and reloads the **same object, tab, filters, search, sort and open evidence
+   claim**. Pagination restarts at page one, because cursors are
+   revision-bound. Graph expansions are re-requested in the order they were
+   made.
+4. **Say what did not survive.** If the open evidence claim, a selected node
+   or an expanded node no longer exists at the new revision, say so in
+   place: *"This grant ended in the newer scan. [See the change]"*. Never
+   silently close the panel or drop the node.
+
+##### Rows, panels and returning
+
+- **Rows are links.** Clicking a row opens that object's Overview. Rows are
+  real anchors, so middle-click and Cmd/Ctrl-click open a new tab. Row
+  actions (a menu at the end of the row) are **Open graph**, **Open
+  identities** (workloads) / **Open permissions** (identities) / **Open
+  access** (resources), and **Copy ARN**.
+- **Tabs are routes.** Switching tab pushes one history entry and keeps every
+  query parameter except `evidence` and `node`, which belong to the view that
+  set them.
+- **Evidence panel.** Opening it from a closed state **pushes**, so browser
+  Back closes it. Opening a different claim while it is open **replaces**, so
+  Back does not step through every claim viewed. **Close** (×, or Esc)
+  **replaces** the URL without `evidence`. Focus returns to the control that
+  opened it. The panel never opens a second panel; a link inside it navigates
+  the page and closes the panel.
+- **Filter, search and sort edits replace**, not push. Back does not walk a
+  filter one keystroke at a time.
+- **Returning to a list restores it.** Back from an object restores the list's
+  filters, search and sort (from the URL) and its page and scroll position
+  (from history state). If the revision moved in between, the list reloads at
+  the current revision from page one and says why: *"The list was refreshed
+  because a newer scan published."*
 - **Breadcrumbs name the investigation**, not the schema:
-  `Estate → customer-support-agent → Identities`. Never
-  `iga_agents → iga_relationship`.
-- **The selected object persists** across estate-wide detours. Jumping from an
-  agent's Identities view to the shared role's own page keeps a "back to
-  customer-support-agent" affordance until the customer dismisses it.
+  `Agents & workloads › customer-support-agent › Identities`. Never
+  `iga_agents › iga_relationship`.
+- **The originating object persists** across detours. Following
+  `SharedToolRole` from `ticket-tools`' Identities tab shows *"← Back to
+  ticket-tools"* on the role's page. It is carried as `via=<id>`, and is
+  dropped when the customer navigates from the sidebar or dismisses it.
+
+##### Old routes
+
+Old cloud URLs redirect **only once the replacement list has shipped**. Until
+then they stay as they are. Redirects translate filters and must never guess
+an object:
+
+| Old | New | Filter translation |
+|---|---|---|
+| `/iga/cloud/identities?account=A&kind=K` | `/iga/identities?provider=aws&account=A&kind=K` | `kind` values must be mapped by a table checked against both enums in code review. An unmapped value is dropped **and** the page says a filter could not be carried over |
+| `/iga/cloud/compute?account=A` | `/iga/estate?provider=aws&account=A` | `view=workload-identities` → `/iga/identities?provider=aws&used_by=workloads` |
+| `/iga/cloud/resources?account=A&kind=K` | `/iga/resources?provider=aws&account=A` | Same `kind` rule |
+| `/iga/identities` (GitHub path today) | Same path, now all providers | None needed |
+
+**No object-level redirects in this phase.** No current URL carries an object
+id (verified), so none is needed. Graph objects have no column pointing back
+to a `cloud_*` row; they are keyed by `source_key`. So a future id redirect
+needs a server lookup (`cloud_* id → iga id`), flagged in §2.14.14. It must
+never be approximated by name, because names repeat across accounts.
 
 #### 2.14.6 Wireframes
 
-**Estate list.** The entry point. Filters at the top apply everywhere.
+**Agents & workloads list.** The entry point. Filters at the top apply everywhere.
+Two rows named `ticket-tools` are two workloads in two accounts, so the
+account is always a column, never a tooltip.
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Estate                                    [aws ▾][all accounts ▾][all ▾]   │
-│ 3 integrations · 2 complete, 1 partial                    rev 2026-09-22.4 │
-├────────────────────────────────────────────────────────────────────────────┤
-│ ⚠ sandbox (905418271234): iam_users denied. Identity lists for that        │
-│   account are incomplete — see Coverage.                          [details]│
-├────────────────────────────────────────────────────────────────────────────┤
-│ NAME                      CLASSIFICATION           RUNTIME      CONFIRMED  │
-│   customer-support-agent  Provider-native agent    bedrock      22 min ago │
-│                           instances not collected                          │
-│   cs-runtime-prod         Provider-native agent    agentcore    22 min ago │
-│   ticket-tools            Unclassified workload    lambda       22 min ago │
-│   refund-tools            Unclassified workload    lambda       22 min ago │
-│   nightly-etl             Unclassified workload    ecs          6 days ago │
-│                                                    ↑ stale: eu-west denied │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 47 of 47 shown                                                             │
-└────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ Agents & workloads                                    as of 22 Sep, 14:02      │
+│ 3 integrations · 2 complete · 1 partial                                        │
+│ [Search name, ARN or account id] [AWS ▾] [All accounts ▾] [All regions ▾]      │
+├────────────────────────────────────────────────────────────────────────────────┤
+│ ⚠ sandbox (905418271234): iam_users denied. Identity lists for that account    │
+│   are incomplete.                                                  [Coverage]  │
+├────────────────────────────────────────────────────────────────────────────────┤
+│ NAME                    CLASSIFICATION ▾       RUNTIME    ACCOUNT    CONFIRMED │
+│ customer-support-agent  Provider-native agent  Bedrock    production 22 min ago│
+│   instances not collected                                                      │
+│ cs-runtime-prod         Provider-native agent  AgentCore  production 22 min ago│
+│ refund-tools            Classified as agent    Lambda     production 22 min ago│
+│ ticket-tools            Unclassified workload  Lambda     production 22 min ago│
+│ ticket-tools            Unclassified workload  Lambda     sandbox    22 min ago│
+│ nightly-etl             Unclassified workload  ECS        production 6 days ago│
+│   stale: eu-west-1 compute not read since 15 Sep                               │
+├────────────────────────────────────────────────────────────────────────────────┤
+│ 1–100 of 412 found · sandbox incomplete                      [‹ Prev] [Next ›] │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Overview.** Answers "what is this and how much do we know?"
+**Overview.** Answers "what is this and how much do we know?" Plain words
+first; the ARN and the raw evidence are one click away, not the headline.
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Estate › ticket-tools                          [aws][production][eu-central-1]│
-│ ┌ Overview ┬ Identities ┬ Resources ┬ Graph ┬ Changes ┐                    │
-├────────────────────────────────────────────────────────────────────────────┤
-│ ticket-tools                                                                │
-│ arn:aws:lambda:eu-central-1:220171243705:function:ticket-tools             │
-│                                                                             │
-│ Classification   Unclassified workload                                      │
-│                  Nobody has recorded what this is for.                      │
-│ Runtime          AWS Lambda · eu-central-1 · production (220171243705)      │
-│ Continuity       recognition_only — the ARN embeds the name, not a          │
-│                  creation boundary, so "same name" is the strongest claim   │
-│ Owner            Not assigned                                               │
-│ First seen       12 Mar 2026     Last confirmed   22 min ago                │
-│ Evidence         lambda:ListFunctions · surface lambda:eu-central-1         │
-└────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ Agents & workloads › ticket-tools             AWS · production · eu-central-1  │
+│ [Overview] Identities  Resources  Graph  Changes                               │
+├────────────────────────────────────────────────────────────────────────────────┤
+│ ticket-tools                                             [Classify as agent]   │
+│ Lambda function · production (220171243705) · eu-central-1                     │
+│ arn:aws:lambda:eu-central-1:220171243705:function:ticket-tools        [Copy]   │
+│                                                                                │
+│ Classification   Unclassified workload                                         │
+│                  Nobody has recorded what this is for.                         │
+│ Runs as          SharedToolRole  (shared with 1 other workload)                │
+│ Owner            Not assigned                                                  │
+│ First seen       12 Mar 2026          Last confirmed   22 min ago              │
+│ Identity         Same name only. AWS gives a function no creation id, so a     │
+│ continuity       function deleted and recreated under this name looks the      │
+│                  same to us.                                          [why?]   │
+│ Found by         lambda:ListFunctions in eu-central-1               [evidence] │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Identities.** The execution identity, and who else uses it.
@@ -1188,13 +1283,72 @@ lenses on one investigation**, not separate pages that forget each other.
 │               No relationship ended. This is a visibility change.           │
 ```
 
+##### Interaction contract per screen
+
+**Rules every list follows:**
+
+| Concern | Contract |
+|---|---|
+| **Primary text** | The name the customer recognises. The ARN, account id and provider id are always one step away: a secondary line where it disambiguates, **Copy** on Overview, and the full raw record in the Evidence panel. Search matches them. They are never the headline |
+| **Account is always visible** | Names repeat across accounts, so every list row shows its account, by name where the connector has one, and the id on hover and in search. Two rows that differ only by account must look different at a glance |
+| **Search** | Server-side, over the **whole inventory** at the pinned revision, never a filter over the loaded page. Matches name (substring, case-insensitive), full ARN, account id, and provider id (exact). Debounced 250 ms; in the URL as `q`; a new search restarts pagination. The empty result names the query and the active filters: *"No workloads match 'ticket' in production. [Clear filters]"* |
+| **Ordering** | Every sort has a stable tiebreaker (name, then account, then object id), so paging never repeats or skips a row. The sort is in the URL; only the columns listed as sortable below are |
+| **Pagination** | Cursor-based, 100 per page, **Prev / Next**. There are no page numbers, because a cursor cannot jump. Cursors are bound to the pinned revision; a cursor from another revision is refused (§2.14.5). Pages from different revisions are never shown together |
+| **Totals** | Two different numbers, never merged. **Found**: how many rows we hold that match, shown only when the server returns `total_known: true`: *"1–100 of 412 found"*. When it cannot count cheaply: *"1–100 · more available"*, never a guessed number. **Completeness** is a separate claim from coverage: if any account in scope is partial, the footer adds *"sandbox incomplete"* and links to Coverage. *"412 found"* is never written as *"412 total"* |
+| **Row click** | Opens the object's Overview (§2.14.5, *Rows are links*) |
+
+**Columns and default order:**
+
+| List | Columns (default) | Sortable | Default order | Available, off by default |
+|---|---|---|---|---|
+| **Agents & workloads** | Name · Classification · Runtime · Account · Last confirmed | Name, Classification, Account, Last confirmed | Classification (provider-native, classified, unclassified), then name | Region · Runs as · Integration · First seen · ARN |
+| **Identities** | Name · Type · Account · Used by · Last confirmed | Name, Type, Account, Last confirmed | Name | Region (`global` for IAM) · Trust (may be assumed by) · Integration · ARN |
+| **Resources** | Name or pattern · Kind (§2.14.12) · Service · Account · Named by · Last confirmed | Name, Kind, Service, Account | Kind (exact reference, selector, external), then name | Region · ARN |
+
+*Used by* and *Named by* are counts of **declared** relationships, shown as
+*"3 workloads"* or *"2 statements"*, and follow the totals rule: if the count
+is not known, it reads *"3+"*, not a number that looks exact.
+
+**Detail tabs:**
+
+| Tab | Rows | Grouping | Order |
+|---|---|---|---|
+| Workload › Identities | Execution identity first, in its own section, then other identity relationships | By relationship kind | Execution identity, then name |
+| Workload › Resources | One row per target; under it, **one line per declaring statement** (policy, Sid, actions) | By target; **never** merge two statements into one line | Kind, then name |
+| Identity › Used by | Workloads that run as it, then principals that may assume it | Two sections | Name, then account |
+| Identity › Permissions | One row per statement: policy · Sid · effect · actions · targets | By policy | Policy name, then statement index |
+| Resource › Access | One row per (identity, statement) | By identity | Identity name |
+
+Each tab paginates on its own at 100, with the same totals rule, and says so:
+*"20 of 63 statements"*.
+
+**Classification: save, conflict, undo.** The flow the §2.14.3 contract
+implies:
+
+| Step | Behaviour |
+|---|---|
+| **Offered** | **Classify as agent** on Overview, for workloads that are not provider-native, and only when the server says this user may (a capability flag on the object, §2.14.14). Otherwise the button is absent, not disabled without a reason. Provider-native agents show why there is no action: *"AWS reports this as an agent."* |
+| **Dialog** | Decision (preselected), purpose (optional), reason (**required**, because it is the audit record). Save is enabled once there is a reason |
+| **Saving** | **Not optimistic.** The dialog shows *Saving…* and the page does not change until the server answers. A human decision in a security record must not appear to have landed when it has not |
+| **200** | Dialog closes; Overview shows the decision line (*"Classified as agent by Priya Shah · 22 Sep · 'handles tier-1 tickets'"*); the list row updates on return. A toast offers **Undo** for 10 seconds |
+| **Undo** | A new decision (`unclassified`) with `expected_version` set to the version just returned, and reason *"Undo of the decision at 14:02"*. It is recorded, not a deletion. After the toast is gone, the same action is the **Undo classification** button on Overview, which asks for a reason |
+| **409** | The dialog **stays open, with the customer's input kept**, and shows who decided what and when: *"Alex Kim classified this as an agent at 14:01: 'owns refunds'."* Two choices: **Keep theirs** (closes) or **Replace with mine** (resubmits against the new version, as a deliberate second act). Never auto-retry |
+| **409 that is our own write** | A retry after a lost response can return `409` with `decided_by` = this user and the same decision. The client treats that as success, not as a conflict |
+| **403** | *"You need discovery admin to classify workloads."* The input is kept |
+| **422** | Only reachable if the object became provider-native since load: the dialog closes and Overview reloads |
+| **Network failure** | The input is kept and the outcome is **unknown**, so the client re-reads the object before allowing a retry. `expected_version` makes a blind retry safe, but the customer should see which state they are in |
+
+Classification is **human-owned current state, not part of a revision**: a
+decision shows immediately on every screen, and it does not trigger the
+*revision moved* banner.
+
 #### 2.14.7 Screen and state table
 
-Every screen defines all eight. **A failed request must never render as an
-empty list** — "No identities" and "we could not ask" are different answers,
+Every screen defines every row below. **A failed request must never render as
+an empty list**: "No identities" and "we could not ask" are different answers,
 and conflating them is the failure the whole coverage model exists to prevent.
 
-| State | Estate list | Overview | Identities | Resources | Graph | Changes |
+| State | Agents & workloads list | Overview | Identities | Resources | Graph | Changes |
 |---|---|---|---|---|---|---|
 | **Loading** | skeleton rows, filters interactive | skeleton | skeleton | skeleton | spinner on canvas, no partial graph | skeleton |
 | **Empty** | "No agents or workloads in this scope" + which filters are narrowing it | n/a | Read from `execution_role_state`, never inferred from the absence of an edge: `none` → "No execution role configured" (a real finding); `not_in_inventory` → "Runs as `<arn>` — matches no identity we hold"; `not_in_scan` → "Runs as `<arn>` — not read in the latest scan", plus the coverage reason | "No declared access names any resource" | "No relationships at this depth" + expand control | "No changes recorded since first seen" |
@@ -1203,7 +1357,9 @@ and conflating them is the failure the whole coverage model exists to prevent.
 | **Stale** | age on each row + banner | "Last confirmed 6 days ago" | relationship rows show `stale` and their last confirmation | same | stale edges dashed, legend explains | coverage-change entry |
 | **Unconnected** | "No integrations connected" + Connect AWS | n/a | n/a | n/a | n/a | n/a |
 | **Truncated** | "100 of 412 shown" + Load more | n/a | "20 of 63 shown" | "20 of 148 shown" | "Showing 87 of 210 nodes at this depth" + Expand | "50 of 900" |
-| **Revision moved** | toast: "A newer scan published. [Refresh]" — never auto-swaps | same | same | same | same | same |
+| **Revision moved** | banner: *"A newer scan published at 14:31. You are viewing the previous result. [Refresh]"*. Data stays on screen; never auto-swaps (§2.14.5) | same | same | same | same, and expansion pauses | same |
+| **Next page failed** | loaded rows **stay**; the footer shows the error and **Retry** | n/a | same | same | expansion failed: the node shows *"Could not load. Retry"*; the canvas stays | same |
+| **Unavailable** | the backend for this view is not deployed: *"Changes will show configuration and coverage history. Not available yet."* Neither an error nor empty | same | same | same | same | same |
 | **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | freshness shows the queue, not just the age | same | same | same | same |
 
 **Queued is a real state, because the barrier serializes per workspace.** A
@@ -1213,6 +1369,39 @@ which are waiting, since when — rather than a spinner that implies progress.
 **Measure the wait** (p50/p95 time from enqueue to claim, per workspace)
 before optimizing; the serialization is correct, and only its cost is
 negotiable.
+
+##### Four answers that must never look alike
+
+| Answer | What it means | Where it is shown | Copy |
+|---|---|---|---|
+| **Empty** | We looked, completely, and there is nothing | In place of the rows | *"No declared access names any resource."* |
+| **Partial collection** | We could not look at some surface, so some rows may be missing | A coverage banner above the rows, per account and surface. Rows we do have still render | *"sandbox: iam_users denied. Identities for that account are incomplete."* |
+| **Truncated** | We have more rows than this page, or more nodes than this canvas | The table footer or the canvas chip. Always continuable | *"1–100 · more available [Next ›]"* / *"Showing 87 of 210 nodes. [Expand]"* |
+| **Failed** | We could not ask this time | In place of the rows, with Retry. Previously loaded rows stay | *"Could not load identities. [Retry]"* |
+
+Partial and truncated **can both be true** at once, and then both show, in
+their own places. A truncated list is never described as incomplete
+coverage, and a coverage gap is never described as "more available".
+
+##### The Evidence panel
+
+The panel answers one question: **why does the product claim this?** It
+opens for a relationship, a grant, a node's existence, or a coverage claim,
+and always has the same five parts, in this order:
+
+| Part | Contents | Example |
+|---|---|---|
+| **Claim** | One sentence in the §2.14.8 wording | *"SharedToolRole is granted s3:GetObject on support-tickets/\* by 2 statements."* |
+| **Status** | The four dimensions (§2.14.9) as four separate facts | *declared · current · collection complete · effective access unknown* |
+| **Supporting facts** | Each fact on its own line: the source API call, account, region, the scan and time it was collected, and for a grant the **policy, Sid, statement index and the statement excerpt**. Two declaring statements are two entries, each with its own status | *TicketRead (managed) · statement 2 "ReadTickets" · current* / *ToolboxRead (managed) · statement 1 · current* |
+| **Freshness** | First seen, last confirmed, and if stale, why and since when | *"Last confirmed 22 min ago by the scan of production."* |
+| **Limitations** | What this claim does **not** establish, and any coverage gap that bears on it | *"Conditions, SCPs, permission boundaries and resource policies were not evaluated. We have not confirmed any object exists under this prefix."* |
+
+The **Limitations** part is never empty and never generic boilerplate. It
+lists the specific gaps that apply to this claim: an unread surface, an
+unevaluated condition key present in the statement, an unresolved external
+account. A **Show raw record** control at the bottom reveals the stored
+observation JSON, for the engineer who needs it.
 
 #### 2.14.8 Terminology
 
@@ -1282,13 +1471,13 @@ owner and a different fix.
 | Filter | Means | On an object with no value |
 |---|---|---|
 | Provider | Objects collected from this provider | An object with relationships from two providers appears under **both**, and its detail names both |
-| Account | Objects whose **own** estate scope is this account | An unknown *execution identity* never erases the workload's own account — the workload has a source integration regardless, and Compute must stop ignoring the account filter (it does today, deliberately, and that is now wrong: the correct fix is to attribute the workload to its connector's account, not to hide the filter) |
-| Region | Objects whose ARN carries this region | Global services (IAM) are labelled `global` and always shown; they are never filtered out by a region choice |
+| Account | Objects whose **own** estate scope is this account | Shown as **Unknown account**. See the rules below |
+| Region | Objects whose ARN carries this region | Global services (IAM) are labelled `global` and always shown; a region choice never filters them out. An object whose ARN carries **no** region (every S3 ARN) is **Region not stated**, never `global`, and follows the same rules as an unknown account |
 | Integration | Objects supported by this connector | A shared object supported by two connectors appears under both, and its detail lists every supporting source |
 
 **Scoping to Production, precisely:**
 
-- **Starting objects** respect the scope — the Estate list shows production's
+- **Starting objects** respect the scope — the Agents & workloads list shows production's
   agents and workloads.
 - **Paths leaving the scope stay visible and are labelled.** Filtering to
   production must not hide that production's Lambda can assume sandbox's role.
@@ -1298,9 +1487,31 @@ owner and a different fix.
   into "nothing there".
 - **Switching views preserves the investigation.** The filter is in the query
   string; Identities → Graph carries it unchanged.
-- **Genuinely unknown scope** renders as `Unknown account`, never blank and
-  never defaulted to the connector's account. It is filtered by an explicit
-  "Unknown" checkbox, off by default, so unattributed objects cannot hide.
+**Where the account comes from, and when it is unknown:**
+
+| Object | Its own account | Unknown when |
+|---|---|---|
+| Workload | The account of the connector that collected it. **Always known** | Never. An unresolved *execution identity* (`not_in_scan`, `not_in_inventory`) is a fact about the role, not about the workload, and must not blank the workload's account or drop it from an account filter. The AWS Compute page ignores the account filter today; the fix is to attribute the workload to its connector's account, not to hide the filter |
+| Identity | From its ARN | Never for a collected identity |
+| External principal | From its ARN | The ARN is malformed or a service principal (`lambda.amazonaws.com`) |
+| Resource or selector | From its ARN | The ARN has no account field: **every S3 ARN** (`arn:aws:s3:::bucket`), and wildcards such as `*` or `arn:aws:s3:::*`. The parser sets no account for S3 (`policy_statements.go`), which is correct. Guessing the grantor's account would be wrong for cross-account buckets |
+
+**Filtering rules for unknown scope:**
+
+- **"All accounts" includes Unknown account.** The default view hides
+  nothing. Unattributed objects are often the ones that need attention.
+- **Unknown account is an option in the account filter**, alongside each
+  connected account, with its own count. It can be chosen alone.
+- **Choosing a specific account excludes unknowns, and says so.** The filter
+  bar then reads *"production · 23 with unknown account not shown [Show]"*.
+  Selecting production must not look like the complete answer for production
+  when a bucket production's roles are granted on has no account in its ARN.
+- **An account filter applies to the starting objects, not to paths**: the
+  scoping rules above still hold. Filtering Resources to production hides the
+  S3 selector row; opening production's `ticket-tools` still shows the path to
+  it.
+- Unknown renders as **Unknown account**, never blank and never defaulted to
+  the connector's account.
 
 #### 2.14.11 The graph
 
@@ -1383,10 +1594,64 @@ When any limit binds, **every completeness claim on the screen is suppressed**
 
 ##### The graph and the lists must agree
 
-Both read the **same published revision**, pinned in the URL as `rev`. They
-apply the same provider/account/region filters and the same lifecycle filter.
-A resource in the Resources list and absent from the Graph at the same `rev`
-and filters is a bug, not a view difference.
+The graph is bounded and a list is paginated, so **they will not show the same
+set of objects**, and nothing may suggest they do. What must hold is narrower
+and testable:
+
+- **Same revision, same claims.** Both read the pinned revision (§2.14.5) with
+  the same filters. Any fact shown on both — an object's name and kind, a
+  relationship's basis and lifecycle, the list of statements declaring a
+  grant, a coverage gap — is identical on both. A disagreement at the same
+  revision is a bug, not a view difference.
+- **Absence on the canvas is never a claim.** An object missing from the
+  canvas is *not drawn*, not *not there*. When any limit binds, the canvas
+  shows its truncation chip and suppresses every count presented as a total
+  (see *Limits*).
+- **"View in graph" must find the thing it was asked for.** From a list row
+  (for example a resource under `ticket-tools` › Resources), it opens the Graph
+  tab rooted at the current object with `target=<id>`. The server returns the
+  declared paths from the root to that target within the limits, and the
+  canvas draws and highlights them. If no path fits within the limits, the
+  canvas says so and offers what does work: *"support-tickets/\* is 5 steps
+  from ticket-tools; the graph shows up to 4 here. [Show the path as a list]
+  [Expand one more step]"*. It never opens a canvas that silently lacks the
+  target.
+
+##### Controls
+
+| Concern | Behaviour |
+|---|---|
+| **Select vs open** | One click (or Enter on a focused element) **selects**: a node shows its summary, an edge shows its evidence, in the side panel. Selection is `node=` / `evidence=` in the URL and **replaces** history. **Open** (double-click, or the panel's **Open** button) **navigates** to that object's own page and pushes history. **Focus here** re-roots the graph on the selected node, as a new history entry |
+| **Expand** | A node with unshown neighbours carries a count: *"+3 roles"* (or *"+3 or more"* when the count is not known). Expanding adds exactly those neighbours, one step. `max_assume_hops` is a starting depth, never a ceiling on expansion |
+| **Collapse** | Collapsing removes what that expansion added **unless** the same node is also reached by another expanded path. Nodes are reference-counted by expansion, so collapsing one path never breaks another |
+| **Shared paths** | A node reached by several paths is drawn **once**. Many workloads sharing one identity collapse into one group node, *"Used by 14 workloads"*, which expands into its members |
+| **Grouped edges** | Several grants between the same two nodes may be drawn as **one line with a count badge** (*"2 statements"*) for legibility. The grouping is visual only. The evidence panel lists every grant separately, each with its own status. Line style follows the most-current member: solid if **any** grant is current, dashed only if **all** are stale, and the badge carries the mix (*"1 current · 1 ended"*). Ending one grant never restyles the line while another is current |
+| **Cycles** | Role A may assume B, and B may assume A. Each node is drawn once; the edge back to an already-drawn node is drawn to it and marked *cycle*. Expansion never re-adds a visited node. The server de-duplicates too (§2.14.14) |
+| **Loading and failure** | The first load is all-or-nothing: an error with Retry, never a partial canvas presented as the answer (§2.14.7). An **expansion** failure is local: that node shows *"Could not load. Retry"*, and everything already drawn stays. A truncated response is not a failure and is never shown as one |
+| **Layout stability** | A deterministic left-to-right layered layout: workload → identity → entitlement → resource or selector, with external principals in their own lane. Expanding and collapsing **never moves nodes already on screen**; new nodes take free positions. Only a refresh to a new revision may re-lay out, and it says so (*"Layout updated for the newer scan"*). Transitions are 200 ms at most and are removed under `prefers-reduced-motion` |
+| **Legend** | Always visible: node kinds, edge labels (§2.14.11 *Wording*), dashed = stale, the cycle marker, the out-of-scope marker, the truncation chip |
+
+##### The path list, the accessible equivalent
+
+The Graph tab has two presentations of **the same response**: **Canvas** and
+**Paths**. Paths is a nested list: each declared path is an ordered list of
+steps, each step naming the node, its kind and account, and the edge label
+into it (*"ticket-tools — configured to run as → SharedToolRole — granted by
+TicketRead, ToolboxRead → s3:GetObject — names → support-tickets/\*
+(prefix selector)"*).
+
+- It is **complete for what was loaded**. Anything drawn on the canvas is in
+  the list, and expansion and truncation work the same way in both.
+- Grouped edges are **never** grouped in the list. Each statement is its own
+  item.
+- It is the **default below 768 px**, with the canvas available but not
+  imposed.
+- Selecting a step opens the same Evidence panel as selecting the edge on the
+  canvas. The toggle's state is in the URL (`as=paths`).
+
+The canvas itself supports the keyboard (§2.14.14), but the path list is how
+a screen-reader user, or anyone who prefers text, gets the whole answer.
+Neither presentation may know something the other does not.
 
 #### 2.14.12 Resources: four kinds, never conflated
 
@@ -1441,15 +1706,16 @@ least one of them. Where the cause is genuinely a missing permission, name
 that permission; where it is a configuration choice or a parse failure, say so
 instead.
 
-#### 2.14.14 Mapping to the existing console primitives
+#### 2.14.14 Console primitives and frontend handoff
 
 Verified against `Authsec-ui` on `authsec-staging`. Nothing here needs a new
-layout system; every screen composes from what exists.
+layout system; every screen composes from what exists, with two exceptions
+named below.
 
 | Screen | Composition |
 |---|---|
-| Agents & workloads, Identities, Resources lists | `ConsolePage` (title, description, actions) → `ConsoleFilterBar` (`console/iam-console.tsx`) → `TableCard` (`theme/components/cards.tsx`) → `AdaptiveTable` (`ui/adaptive-table.tsx`), with `ui/table-pagination` and `ui/table-skeleton` for the loading state |
-| Object detail header + five views | `ConsolePage` with `ui/breadcrumb` in the title slot and `ui/tabs` for Overview / Identities / Resources / Graph / Changes. **Tabs are routes**, not local state, so Back and deep links work (§2.14.5) |
+| Agents & workloads, Identities, Resources lists | `ConsolePage` (title, description, actions) → `ConsoleFilterBar` (`console/iam-console.tsx`) → `TableCard` (`theme/components/cards.tsx`) → `AdaptiveTable` (`ui/adaptive-table.tsx`), with `ui/table-skeleton` for the loading state. **Pagination needs a cursor variant**: `ui/table-pagination` takes `currentPage`, `totalPages` and `totalItems`, none of which a cursor list has. Add a Prev/Next control that renders *"1–100 of 412 found"* or *"1–100 · more available"* from `total_known` |
+| Object detail header + tabs | `ConsolePage` with `ui/breadcrumb` in the title slot and `ui/tabs` for each object type's tabs (§2.14.5). **Tabs are routes**, not local state, so Back and deep links work |
 | Overview body | `console/detail.tsx`: `DetailGrid` + `DetailRow`, `CopyField` for ARNs |
 | Relationship and evidence rows | `AdaptiveTable` rows; lifecycle via `console/status.tsx` `StatusBadge` — **one badge per dimension**, never a combined tone (§2.14.9) |
 | Coverage and partial banners | `console/status.tsx` `DecisionBanner`, per affected account |
@@ -1458,7 +1724,117 @@ layout system; every screen composes from what exists.
 
 The graph canvas is the only surface with no existing primitive, and it
 should be built last (§6.3) — the list views answer every question in §2.14.11
-except the visual one, and they can ship first.
+except the visual one, and they can ship first. No graph or layout library is
+a dependency today (checked: `package.json`); choosing one is part of that
+work, judged against *Layout stability* in §2.14.11.
+
+##### What every IGA response must carry
+
+The UI depends on these on **every** list and detail response. They belong in
+§2.15's contracts, not in per-screen special cases:
+
+| Field | Used for |
+|---|---|
+| `rev`, `published_at` | Pinning (§2.14.5); the *"as of 14:02"* label; the shared-link notice |
+| `items[].id`, `name`, `arn`, `account_id`, `account_name` (or `null` = Unknown account), `region` (or `global`, or `null` = not stated), `provider` | Rows, disambiguation, search display |
+| `next_cursor` | Next page. **Prev is client-side**: the client keeps the stack of cursors it has used, so the server needs no backward cursor |
+| `total_known`, `total` | The totals rule (§2.14.6). `total` is present only when `total_known` is true |
+| `coverage[]`: `{account_id, surface, state, prevents}` for every gap that bears on this result | Partial banners (§2.14.7). Computed by the server, never inferred client-side from row counts |
+| `capabilities` on objects (`can_classify`) | Offering actions (§2.14.6). The client never infers permissions from role names |
+
+##### Contracts the UI needs that §2.15 does not yet define
+
+**These are flagged for backend coordination, not designed here.** Each needs
+a backend decision before the screen that depends on it is built. The frontend
+must not work around a missing one — no client-side search over a loaded page,
+no totals computed by paging to the end, no name-based matching, no evidence
+assembled by joining lists.
+
+| Need | Screen | Why the client cannot supply it |
+|---|---|---|
+| `q` search on every list, over the whole inventory at `rev` | All lists | Only the server holds the whole inventory |
+| `sort` with a stable tiebreaker | All lists | Cursor paging is only stable if the server orders deterministically |
+| Account facet counts, including Unknown | Account filter; *"23 with unknown account not shown"* | Same |
+| Graph `target=<id>`: paths from root to target within limits, or a `not_within_limits` reason with the distance | *View in graph* (§2.14.11) | Path finding over data the client does not have |
+| Neighbour counts per node, with known/unknown | Expand affordance (*"+3 roles"*) | Same |
+| Server-side de-duplication of visited nodes in traversal and expansion | Cycles | A client-side guard alone would still download cycles |
+| `/identities/:id/used-by` (workloads **and** principals that may assume it), `/identities/:id/permissions` (per statement) | Identity tabs | §2.15 has only `/identities/:id/workloads` |
+| `/resources/:id/access` (per identity and statement) | Resource tabs | Missing |
+| `/identities/:id/referenced-by` for external principals | External principal tabs | Missing |
+| Evidence as **structured** parts: facts, freshness, and `limitations[]` as codes (`condition_not_evaluated`, `surface_unread`, `account_not_connected`, …) | Evidence panel (§2.14.7) | Which limitations apply depends on stored conditions and coverage; the client would have to reproduce the server's logic |
+| `409` body including `current_published_at` | Revision banner time | §2.15's body has `current_rev` and `changed_since` only |
+| Retired objects readable by id, with `lifecycle` and `last_confirmed_at` | Shared links to retired objects (§2.14.5) | A `404` would be indistinguishable from "never existed" |
+| Classification response with `decided_by_user_id` and a display name | Decision line; recognising our own write on `409` | §2.14.3 returns `decided_by` as an email |
+| A way to tell "this route is not deployed" from "this object does not exist", e.g. `GET /api/iga/v1/capabilities` listing enabled views | The *Unavailable* state | Both are `404` today. The UI and the backend deploy separately, so skew is a normal state, not an edge case |
+| `cloud_* id → iga id` lookup | Object-level redirects from old routes | **Not needed this phase** (§2.14.5, *Old routes*) |
+
+##### Development fixtures
+
+The UI is built against fixtures first, so screens can be designed and tested
+before the backend ships, and fixtures double as the acceptance data in §6.2.
+**Proposed tooling:** MSW for request mocking in development and tests. It is
+not a dependency today (checked: `package.json` has Vitest and Testing Library,
+no mock server). Fixtures are typed from the same TypeScript contract types
+the API slice uses, so a contract change breaks the fixture build rather than
+drifting silently.
+
+| Fixture | Contents | Exercises |
+|---|---|---|
+| `worked-example` | §2.14.11's picture: `ticket-tools`, `refund-tools`, `SharedToolRole`, `TicketRead` + `ToolboxRead` on `support-tickets/*`, the unresolved role in 9054, stale `nightly-etl` | Every screen's primary story; U1–U5 |
+| `grant-detached` | `worked-example` at the next revision, with `TicketRead` detached | Independent grants; revision moved; Changes |
+| `large-inventory` | 5,000 workloads, 3 accounts, 40 duplicate names across accounts, one account partial | Search, paging, totals, duplicate names |
+| `unknown-scope` | S3 selectors, a service principal, a `*` resource | Unknown account and Region not stated |
+| `partial-and-truncated` | A result that is both coverage-partial and paginated | *Four answers that must never look alike* |
+| `classification-conflict` | An object whose `classification_version` moves between read and save | The `409` flow, including our own lost-response retry |
+| `cycles` | A may assume B, B may assume A, and a 6-hop chain | Cycle marker; expansion past `max_assume_hops`; *not within limits* |
+| `failures` | Each endpoint failing: `500`, network drop, `409` stale revision, route not deployed | Failed, Next page failed, Unavailable |
+| `retired-object` | A shared link to a workload no longer in the latest scan | Retired-object notice |
+
+##### Unavailable features
+
+The UI and the backend release separately, so a UI build may be live against
+a backend that lacks a view. The rule: **a view whose backend is not deployed
+is not shown in navigation**, driven by the capabilities contract above. A
+view reached anyway, through an old link or a race, renders the *Unavailable*
+state (§2.14.7). It is never an error and never empty. Views planned for a
+later phase are **not** shown as greyed-out teasers: nothing in the product
+claims a capability that is not live.
+
+##### Cache isolation: workspace and revision
+
+- **Workspace.** Every IGA cache entry is keyed by workspace. Switching
+  workspace resets the IGA API state and discards in-flight responses for the
+  previous workspace. Nothing in `src/` calls `resetApiState` today (checked),
+  so this has to be built, not assumed.
+- **Revision.** Every IGA cache entry is keyed by the pinned `rev`. A response
+  whose echoed `rev` differs from the pinned one is never merged into the
+  pinned entries. It triggers the *revision moved* banner (§2.14.5). Pages from
+  different revisions are never concatenated.
+- **Classification** is not revision-bound. A successful save invalidates that
+  object and the lists containing it, at the same `rev`.
+
+##### Responsive layouts
+
+| Width | Lists | Detail | Evidence panel | Graph |
+|---|---|---|---|---|
+| ≥ 1280 px | Full table | Tabs across the top | Side panel **beside** the view; the view stays usable | Canvas + side panel |
+| 768–1279 px | Table; off-by-default columns stay off | Same | Sheet **over** the view | Canvas; panel as a sheet |
+| < 768 px | `AdaptiveTable` card layout: name, account and classification on every card | Tabs become a select | Full-screen sheet with a back arrow | **Paths** by default (§2.14.11); canvas on request |
+
+##### Keyboard
+
+| Where | Keys |
+|---|---|
+| Anywhere in IGA | `/` focuses search. `Esc` closes the Evidence panel, then clears a selection |
+| Lists | `↑` / `↓` move between rows; `Enter` opens; `Cmd/Ctrl+Enter` opens in a new tab; `.` opens the row's action menu |
+| Tabs | `←` / `→` between tabs (the `ui/tabs` default); `Enter` activates |
+| Evidence panel | Focus moves into the panel on open and returns to the opener on close; `Tab` is trapped only on the full-screen sheet |
+| Graph canvas | `Tab` moves through nodes in path order; arrow keys follow edges from the focused node; `Enter` selects; `Shift+Enter` opens; `+` / `-` expand and collapse |
+| Paths | A standard nested list: arrow keys, `Enter` selects a step |
+
+Every interactive element has a visible focus state, and every state in
+§2.14.7 is announced to screen readers through a live region (*"Showing 100 of
+412 found"*, *"Could not load. Retry"*, *"A newer scan published"*).
 
 ### 2.15 The API contracts this experience needs
 
@@ -1467,7 +1843,7 @@ Every screen in §2.14 mapped to the contract behind it, and whether it exists.
 
 | Screen / interaction | Contract | Today |
 |---|---|---|
-| Estate list | `GET /api/iga/v1/estate` — agents + workloads, one page, filters, cursor | **Missing.** `GET /agents` exists but is the GitHub path over `iga_agents`; cloud workloads are only under the AWS connector routes |
+| Agents & workloads list | `GET /api/iga/v1/estate` — agents + workloads, one page, filters, cursor | **Missing.** `GET /agents` exists but is the GitHub path over `iga_agents`; cloud workloads are only under the AWS connector routes |
 | Classification + provenance | `classification`, `classification_version` and the latest decision (who, when, why) on the estate row | **Missing — in this phase** (P2-G). Provider-native derived from `runtime_kind`; manual classification per §2.14.3 |
 | Classify / undo | `POST /api/iga/v1/estate/:id/classification` — contract below | **Missing — in this phase** (P2-G) |
 | Agent → instances | `GET /api/iga/v1/agents/:id/instances` | **Missing.** `AgentDetail` returns `Instances: []` unconditionally (`iga_service.go:1300`) — P2-10 |
@@ -1527,12 +1903,15 @@ result — but a manifest of run ids is not a graph.
 
 One conflict response, two presentations, chosen by the client from context:
 
-- **Mid-investigation** (the customer has been navigating under `rev=N`):
-  *"A newer scan published. Refresh to see the current graph."* Never swapped
-  automatically — they may be halfway through explaining a path.
-- **Opening a shared link**: *"This link was created on 22 Sep. The graph has
-  changed since — showing it as it is now."* The page then loads current. It
-  does not pretend to show the graph as it was.
+- **Mid-investigation** (the customer has been navigating under `rev=N`): the
+  rendered data stays, with *"A newer scan published at 14:31. You are viewing
+  the previous result. [Refresh]"*. It is never swapped automatically: they may
+  be halfway through explaining a path. Refresh keeps the object, tab, filters
+  and open evidence (§2.14.5, *When the revision moves mid-investigation*).
+- **Opening a shared link**: links never carry `rev` (§2.14.5), so this is not
+  a conflict at all. The page loads current. If the link carries `from=`, it
+  says *"Shared 22 Sep 14:02. The graph has been rescanned since, so this shows
+  it as it is now."* It does not pretend to show the graph as it was.
 
 **What the Changes view reads, given this.** Configuration changes come from
 what *is* retained: `valid_from`, `valid_to` and `ended_reason` on
@@ -1551,7 +1930,7 @@ suppresses every completeness claim (§2.14.11).
 
 | Experience | Needs | Phase |
 |---|---|---|
-| Estate list, Overview, Identities, Resources | The graph tables and projector | **2** |
+| Agents & workloads list, Overview, Identities, Resources | The graph tables and projector | **2** |
 | Graph view with expansion | Traversal API with bounded depth and truncation | **4** |
 | Changes view | Relationship lifecycle history | **2** (schema) + **4** (read path) |
 | Manual classification as agent | `029` classification columns + decision record; the endpoint below | **2** (P2-G) |
@@ -1666,7 +2045,7 @@ recovery never has to infer one from the other.
 
 #### The path that is not yet traceable
 
-**Step 19's Estate list does not exist**, and neither does the Graph view's
+**Step 19's Agents & workloads list does not exist**, and neither does the Graph view's
 expansion contract. §2.15 marks both missing. The customer journey is
 traceable end to end **only as far as P2-11's single read path**; the rest is
 Phase 4/5 and is specified, not built.
@@ -5125,8 +5504,9 @@ query parameter.
 
 ## 6. Acceptance
 
-Twelve executable scenarios and five usability tasks. Each names what it
-breaks if removed — a scenario that cannot fail is not a gate.
+Twelve executable backend scenarios (§6.1) and the UI acceptance gates
+(§6.2). Each names what it breaks if removed — a scenario that cannot fail is
+not a gate.
 
 **Status: these are planned acceptance gates, not results.** None has been run
 against the contracts in this document. What *has* been demonstrated is listed
@@ -5154,10 +5534,38 @@ the fix, confirm the scenario fails, restore it, confirm it passes. Record the
 test name, the command, and the observed failure. A test that passes with its
 fix removed is worse than no test, because it is believed.
 
-### 6.2 Usability tasks
+### 6.2 UI acceptance
 
-Run with someone who has not seen the product. Each is pass/fail on whether
-they can say it out loud, unaided, in under two minutes.
+Three gates, deliberately separate. Passing one says nothing about the others:
+an approved design can be built wrong, and a correctly built screen can still
+confuse the person using it.
+
+| Gate | Who | Passes when | Recorded |
+|---|---|---|---|
+| **A. Design approved** | The product owner and the engineer who will build it | Every screen in §2.14 has every state in §2.14.7 drawn or specified; every contract flagged in §2.14.14 has a backend decision and an owner; the fixtures in §2.14.14 exist | Date, commit of this spec, names |
+| **B. Behaviour implemented** | Automated, against the §2.14.14 fixtures | Every scenario below passes **and** fails when its safeguard is removed, the same rule as §6.1 | Test name, command, fixture, expected, observed, safeguard removed |
+| **C. Usability observed** | Sessions with at least five people who have not seen the product, from the buyer's security or platform team | At least four of five complete each task unaided in under two minutes | Per task: completed or not, time, what they said, where they hesitated |
+
+**B. Behaviour scenarios**
+
+| # | Scenario | Fixture | Passes when | Catches |
+|---|---|---|---|---|
+| UI1 | **Large inventory** | `large-inventory` | Searching `ticket` finds rows that are not on the first page, and the request carries `q`; paging Next through every page never repeats or skips a row; *"of N found"* appears only when `total_known` is true | Client-side search over the loaded page; an unstable sort |
+| UI2 | **Duplicate names across accounts** | `large-inventory` | Two `ticket-tools` rows are distinguishable in the list, in search results, in the breadcrumb and on the canvas; opening one never shows the other's data, even from cache | Name-keyed routing or caching |
+| UI3 | **Deep links** | `worked-example`, `retired-object` | Every route, tab, filter set and `evidence` claim, opened cold in a new session, renders the same object, view and filters; a retired object shows its notice; another workspace's id reads *"Not found in this workspace"*; `from=` shows the shared-link notice | State held only in memory; a link that claims a revision |
+| UI4 | **Partial scans** | `partial-and-truncated`, `failures` | The coverage banner and *"more available"* both show, each in its own place; a failed request renders an error with Retry, never an empty list; a failed next page keeps the rows already loaded; an undeployed route renders *Unavailable* | A failure rendered as empty; partial and truncated merged |
+| UI5 | **Independent grants** | `worked-example`, `grant-detached` | Resources lists two statement lines under `support-tickets/*`; the canvas line reads *"2 statements"*; evidence lists both. After the detach: the line stays solid, the badge reads *"1 current · 1 ended"*, and the change entry names both policies | Merging two grants into one |
+| UI6 | **Revision changes mid-investigation** | `worked-example` → `grant-detached` | The banner appears and the data stays; the next page and any expansion show the paused state, not empty; Refresh keeps object, tab, filters and evidence; an evidence claim that ended says so in place; no list ever combines pages from two revisions | Auto-swap; a lost investigation; mixed-revision cache |
+| UI7 | **Classification conflicts** | `classification-conflict`, `failures` | Saving is not optimistic; a `409` keeps the input and shows the other decision; *Replace with mine* resubmits against the new version; a `409` for our own lost write is treated as success; after a network failure the object is re-read before retry | Overwriting a colleague's decision; a phantom save |
+| UI8 | **Unknown scope** | `unknown-scope` | *All accounts* includes Unknown account; choosing production shows *"N with unknown account not shown"*; a workload whose role is `not_in_scan` keeps its account and stays in the production filter | A default filter hiding unattributed objects |
+| UI9 | **Graph controls** | `worked-example`, `cycles` | *View in graph* highlights the target or states the distance and the limit; collapsing one path leaves a node another path still needs; a cycle draws each node once with the marker; expanding does not move any node already on screen (positions asserted); the Paths list contains exactly what the canvas draws | A canvas that silently lacks the target; layout jumps; a text view that knows less |
+| UI10 | **Accessibility** | Every fixture | Zero serious or critical violations from an automated checker on every screen in every §2.14.7 state (proposed: axe, not a dependency today); U1–U5's routes completed keyboard-only; state changes announced by the live region; no motion under `prefers-reduced-motion` | An interface only a mouse user can finish |
+| UI11 | **Workspace isolation** | Two workspaces | Switching workspace while a list is loading never shows a row from the previous workspace | A shared cache across workspaces |
+
+**C. Usability tasks**
+
+Each is pass/fail on whether the participant can say the answer out loud,
+unaided, in under two minutes.
 
 | # | Task | Fails if |
 |---|---|---|
@@ -5166,6 +5574,10 @@ they can say it out loud, unaided, in under two minutes.
 | U3 | Explain why the path to `support-tickets/*` exists | They cannot name the policy statements, or they say "it can access it" — the wording failed |
 | U4 | Say what we could not see, and what that prevents | Coverage reads as a complaint rather than a bounded conclusion |
 | U5 | Explain why removing one grant did not remove the path | The UI merged two independent grants |
+| U6 | In an inventory of 5,000, open the `ticket-tools` in **sandbox** | They open the production one, or page instead of searching |
+| U7 | A newer scan publishes mid-task: say what changed, then carry on | They lose their place, or believe the old result is current |
+| U8 | Say which of production's resources we cannot attribute to an account, and why | Unknown account reads as an error, or they do not find it |
+| U9 | Classify a Lambda as an agent, then explain the conflict when a colleague got there first | They overwrite without reading the other decision |
 
 U3 and U5 are the ones that fail most designs. U3 fails when the interface
 lets a reader say *"can access"*; U5 fails when the canvas merged two edges
@@ -5180,9 +5592,9 @@ and the evidence panel did not keep them apart.
 | **P2-C** Edges and evidence | `030`–`032`, projector, evidence | Scenarios 2, 11 |
 | **P2-D** Lifecycle | Reconciliation, barrier, job | Scenarios 4, 5, 6 |
 | **P2-E** External | The **resolution pass** that populates `iga_external_principal`. The table itself ships with the core rollout (see below) | Scenario 10 |
-| **P2-F** One read path | P2-11: Identities + Resources for one workload, pinned `rev` via `iga_publication`, with evidence | Scenario 12, tasks U1–U5 |
-| **P2-G** Classification | `classification` + `iga_workload_classification` (029), the Classify-as-agent action on Overview | A classified Lambda appears as *Classified as agent* with its decision record; undo records its own decision; recreation starts `unclassified` |
-| **Graph canvas** | The one new UI component (§2.14.14) | Built **last**. The list views answer every §2.14.11 question except the visual one |
+| **P2-F** One read path | P2-11: Identities + Resources for one workload, pinned `rev` via `iga_publication`, with evidence | Scenario 12; §6.2 gate A for these views; UI1–UI6, UI8, UI10, UI11; tasks U1–U8 |
+| **P2-G** Classification | `classification` + `iga_workload_classification` (029), the Classify-as-agent action on Overview | A classified Lambda appears as *Classified as agent* with its decision record; undo records its own decision; recreation starts `unclassified`; UI7; task U9 |
+| **Graph canvas** | The one new UI component (§2.14.14) | Built **last**. The list views answer every §2.14.11 question except the visual one. UI9, and UI5/UI10 re-run on the canvas |
 | **Not scheduled** | Bedrock alias collection (`ListAgentAliases`) | Required before any instance count is shown. Until then the UI says *"instances not collected"* |
 | **Deferred** | `035` retirement of legacy unkeyed rows | After one clean production scan on the new path. **Not in the initial rollout** |
 

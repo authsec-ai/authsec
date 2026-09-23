@@ -522,7 +522,9 @@ from a query parameter. View permissions and integration mutations are separate.
 
 Every list, graph and evidence read accepts and echoes a **published revision**
 (`rev`), so one investigation cannot mix revisions. A newer publication is
-offered, never applied silently.
+offered, never applied silently. A revision is **current-only** in Phase 2:
+the client pins it in memory, links never carry it, and a shared link
+reproduces the object, view and filters as they are now.
 
 The console uses `ConsolePage` and existing API/state conventions, and shows
 source scope, identity continuity, basis, state, observation time, evidence and
