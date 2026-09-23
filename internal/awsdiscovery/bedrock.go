@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagent"
+	bedrockagenttypes "github.com/aws/aws-sdk-go-v2/service/bedrockagent/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentcorecontrol"
 )
 
@@ -86,11 +87,30 @@ func NewAgentCoreClient(cfg aws.Config) AgentCoreAPI {
 type BedrockReader struct {
 	agents    BedrockAgentAPI
 	agentCore AgentCoreAPI
+
+	// The scope a constructed ARN is built in (WithScope). Without it a row
+	// whose detail call failed keeps its bare id, and the graph constructs the
+	// ARN from the connector instead.
+	partition, region, account string
 }
 
 // NewBedrockReader constructs a reader over the given clients.
 func NewBedrockReader(a BedrockAgentAPI, c AgentCoreAPI) *BedrockReader {
 	return &BedrockReader{agents: a, agentCore: c}
+}
+
+// WithScope names the partition, region and account this reader's region
+// belongs to, so an agent or gateway whose detail call failed is still keyed
+// by its ARN -- constructed, deterministically, in the connector's partition --
+// rather than by a bare id that changes the object's key on a transient
+// failure (§1.3, E7).
+func (r *BedrockReader) WithScope(partition, region, account string) *BedrockReader {
+	r.partition, r.region, r.account = partition, region, account
+	return r
+}
+
+func (r *BedrockReader) arn(runtimeKind, id string) string {
+	return WorkloadARN(r.partition, runtimeKind, r.region, r.account, id)
 }
 
 // Agents lists every Bedrock agent in the region and resolves each one's
@@ -106,23 +126,24 @@ func (r *BedrockReader) Agents(ctx context.Context) ([]Workload, error) {
 	}
 	var out []Workload
 	var next *string
+	details := NewItemFailures("agents could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: bedrock agents", errTooManyPages)
 		}
 		resp, err := r.agents.ListAgents(ctx, &bedrockagent.ListAgentsInput{NextToken: next})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr(err)
 		}
 		for _, summary := range resp.AgentSummaries {
-			w, ok := r.agentDetail(ctx, aws.ToString(summary.AgentId), aws.ToString(summary.AgentName))
+			w, ok := r.agentDetail(ctx, summary, details)
 			if !ok {
 				continue
 			}
 			out = append(out, w)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
@@ -130,32 +151,52 @@ func (r *BedrockReader) Agents(ctx context.Context) ([]Workload, error) {
 
 // agentDetail resolves the execution role and foundation model.
 //
-// A detail call that fails degrades to the summary rather than dropping the
-// agent: an agent AWS listed exists, and recording it unattributed is better
-// than reporting an account as having no agents.
-func (r *BedrockReader) agentDetail(ctx context.Context, agentID, agentName string) (Workload, bool) {
+// A detail call that fails KEEPS the agent -- AWS listed it, so it exists --
+// under its ARN, CONSTRUCTED in the connector's partition, so a transient
+// GetAgent failure never changes the object's key (§1.3, E7). Its status comes
+// from the summary; its role and model are unknown this run and it is marked
+// DetailIncomplete, so nothing downstream writes "no execution role" (D-53).
+// The failure is counted, which makes bedrock-agents:<region> partial rather
+// than silently reached.
+func (r *BedrockReader) agentDetail(
+	ctx context.Context, summary bedrockagenttypes.AgentSummary, details *ItemFailures,
+) (Workload, bool) {
+	agentID := aws.ToString(summary.AgentId)
 	if agentID == "" {
 		return Workload{}, false
 	}
+	details.Attempt()
 	built := Workload{
 		RuntimeKind: "bedrock_agent",
-		NativeID:    agentID,
-		Name:        agentName,
+		NativeID:    r.arn("bedrock_agent", agentID),
+		Name:        aws.ToString(summary.AgentName),
+		Status:      string(summary.AgentStatus),
+		SourceAPI:   "bedrock:ListAgents",
 	}
 
 	detail, err := r.agents.GetAgent(ctx, &bedrockagent.GetAgentInput{AgentId: aws.String(agentID)})
-	if err != nil || detail.Agent == nil {
+	if err == nil && detail.Agent == nil {
+		err = fmt.Errorf("GetAgent returned no agent for %s", agentID)
+	}
+	if err != nil {
+		details.Fail(agentID, "bedrock:GetAgent", err)
+		built.DetailIncomplete = true
+		built.DetailError = DetailErrorOf("bedrock:GetAgent", err)
 		return built, true
 	}
 	a := detail.Agent
-	// Prefer the ARN as the native id once we have it: it is globally unique,
-	// where an agent id is only unique within a region.
+	// Prefer the ARN AWS returned: it is globally unique, where an agent id is
+	// only unique within a region. The constructed one above is the same
+	// string for a normal agent (unit-tested), so the key does not move.
 	if arn := aws.ToString(a.AgentArn); arn != "" {
 		built.NativeID = arn
 	}
 	built.RoleARN = aws.ToString(a.AgentResourceRoleArn)
 	built.FoundationModel = aws.ToString(a.FoundationModel)
-	built.Status = string(a.AgentStatus)
+	if s := string(a.AgentStatus); s != "" {
+		built.Status = s
+	}
+	built.SourceAPI = "bedrock:GetAgent"
 	// a.Instruction is deliberately not read -- see this file's header.
 	return built, true
 }
@@ -171,6 +212,7 @@ func (r *BedrockReader) AgentRuntimes(ctx context.Context) ([]Workload, error) {
 	}
 	var out []Workload
 	var next *string
+	details := NewItemFailures("runtimes could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: agentcore runtimes", errTooManyPages)
@@ -179,51 +221,77 @@ func (r *BedrockReader) AgentRuntimes(ctx context.Context) ([]Workload, error) {
 			NextToken: next,
 		})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr(err)
 		}
 		for _, rt := range resp.AgentRuntimes {
+			id := aws.ToString(rt.AgentRuntimeId)
+			native := aws.ToString(rt.AgentRuntimeArn)
+			if native == "" {
+				native = r.arn("bedrock_agentcore_runtime", id)
+			}
+			if native == "" {
+				continue
+			}
+			details.Attempt()
+			// Status is on the list item (§1.4: "ARN, name, status"); the
+			// detail call's own value, when it succeeds, is fresher.
 			w := Workload{
 				RuntimeKind: "bedrock_agentcore_runtime",
-				NativeID:    aws.ToString(rt.AgentRuntimeArn),
+				NativeID:    native,
 				Name:        aws.ToString(rt.AgentRuntimeName),
+				Status:      string(rt.Status),
+				SourceAPI:   "bedrock-agentcore:ListAgentRuntimes",
 			}
-			if role, ok := r.runtimeRole(ctx, aws.ToString(rt.AgentRuntimeId)); ok {
-				w.RoleARN = role
-			}
+			r.runtimeDetail(ctx, id, &w, details)
 			out = append(out, w)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
-// runtimeRole resolves one runtime's role. A failure leaves the runtime
-// unattributed rather than dropping it, same rule as agentDetail.
-func (r *BedrockReader) runtimeRole(ctx context.Context, runtimeID string) (string, bool) {
+// runtimeDetail resolves one runtime's role and status. A failure keeps the
+// runtime -- it was listed -- marked DetailIncomplete (role unknown, never
+// "none", D-53), and is counted, same rule as agentDetail.
+func (r *BedrockReader) runtimeDetail(ctx context.Context, runtimeID string, w *Workload, details *ItemFailures) {
+	var err error
+	var detail *bedrockagentcorecontrol.GetAgentRuntimeOutput
 	if runtimeID == "" {
-		return "", false
+		err = fmt.Errorf("ListAgentRuntimes returned no runtime id for %s", w.NativeID)
+	} else {
+		detail, err = r.agentCore.GetAgentRuntime(ctx, &bedrockagentcorecontrol.GetAgentRuntimeInput{
+			AgentRuntimeId: aws.String(runtimeID),
+		})
 	}
-	detail, err := r.agentCore.GetAgentRuntime(ctx, &bedrockagentcorecontrol.GetAgentRuntimeInput{
-		AgentRuntimeId: aws.String(runtimeID),
-	})
 	if err != nil {
-		return "", false
+		details.Fail(w.NativeID, "bedrock-agentcore:GetAgentRuntime", err)
+		w.DetailIncomplete = true
+		w.DetailError = DetailErrorOf("bedrock-agentcore:GetAgentRuntime", err)
+		return
 	}
-	return aws.ToString(detail.RoleArn), true
+	w.RoleARN = aws.ToString(detail.RoleArn)
+	if s := string(detail.Status); s != "" {
+		w.Status = s
+	}
+	w.SourceAPI = "bedrock-agentcore:GetAgentRuntime"
 }
 
-// GatewayTarget is one backend a Gateway exposes as an MCP tool. Recorded as
-// evidence under the gateway's workload row rather than as its own inventory
-// row: a target has no identity of its own to attribute it to, and no
-// reconciled table it would belong in without inventing one for a single
-// evidence fact.
+// GatewayTarget is one backend a Gateway exposes as an MCP tool. An ATTRIBUTE
+// of the gateway (§1.4: "targets are attributes, not objects"), carried on the
+// gateway's own workload row and recorded as evidence under it: a target has
+// no identity of its own to attribute it to, and its backing tool is not
+// collected (GetGatewayTarget is never called, §1.2).
 type GatewayTarget struct {
 	GatewayNativeID string
 	TargetID        string
 	Name            string
 	Status          string
+	// Type is the provider's target type, verbatim: LAMBDA, MCP_SERVER,
+	// OPEN_API_SCHEMA, SMITHY_MODEL, ... (§1.4 "each target's id, name, status
+	// and type").
+	Type string
 }
 
 // Gateways lists every AgentCore Gateway in the region, resolves each one's
@@ -238,51 +306,82 @@ func (r *BedrockReader) Gateways(ctx context.Context) ([]Workload, []GatewayTarg
 	var workloads []Workload
 	var targets []GatewayTarget
 	var next *string
+	details := NewItemFailures("gateways could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return workloads, targets, fmt.Errorf("%w: agentcore gateways", errTooManyPages)
 		}
 		resp, err := r.agentCore.ListGateways(ctx, &bedrockagentcorecontrol.ListGatewaysInput{NextToken: next})
 		if err != nil {
-			return workloads, targets, classify(err)
+			return workloads, targets, listErr(err)
 		}
 		for _, summary := range resp.Items {
 			id := aws.ToString(summary.GatewayId)
+			if id == "" {
+				continue
+			}
+			details.Attempt()
+			// GatewaySummary carries no ARN, so the key starts CONSTRUCTED --
+			// the same string GetGateway returns for a normal gateway -- and a
+			// failed GetGateway cannot move it (§1.3).
 			w := Workload{
 				RuntimeKind: "bedrock_agentcore_gateway",
-				NativeID:    id,
+				NativeID:    r.arn("bedrock_agentcore_gateway", id),
 				Name:        aws.ToString(summary.Name),
 				Status:      string(summary.Status),
+				SourceAPI:   "bedrock-agentcore:ListGateways",
 			}
-			if detail, err := r.agentCore.GetGateway(ctx,
-				&bedrockagentcorecontrol.GetGatewayInput{GatewayIdentifier: summary.GatewayId}); err == nil {
+			detail, gerr := r.agentCore.GetGateway(ctx,
+				&bedrockagentcorecontrol.GetGatewayInput{GatewayIdentifier: summary.GatewayId})
+			if gerr != nil {
+				// Role unknown this run, never "none" (D-53). Counted: until
+				// the role template grants GetGateway (T2.4) this is every
+				// gateway, and the surface must say so rather than read reached.
+				details.Fail(id, "bedrock-agentcore:GetGateway", gerr)
+				w.DetailIncomplete = true
+				w.DetailError = DetailErrorOf("bedrock-agentcore:GetGateway", gerr)
+			} else {
 				if arn := aws.ToString(detail.GatewayArn); arn != "" {
 					w.NativeID = arn
 				}
 				w.RoleARN = aws.ToString(detail.RoleArn)
+				if s := string(detail.Status); s != "" {
+					w.Status = s
+				}
+				w.SourceAPI = "bedrock-agentcore:GetGateway"
 			}
+			gwTargets, terr := r.gatewayTargets(ctx, id, w.NativeID)
+			if terr != nil {
+				details.Fail(id, "bedrock-agentcore:ListGatewayTargets", terr)
+				w.TargetsIncomplete = true
+			}
+			w.Targets = gwTargets
 			workloads = append(workloads, w)
-			targets = append(targets, r.gatewayTargets(ctx, id, w.NativeID)...)
+			targets = append(targets, gwTargets...)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return workloads, targets, nil
+			return workloads, targets, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
-// gatewayTargets lists one gateway's targets. A failure here costs only this
+// gatewayTargets lists one gateway's targets. A failure costs only this
 // gateway's targets, never the gateway row itself or any other gateway's --
-// the same per-surface isolation scanRegion already applies across services.
-func (r *BedrockReader) gatewayTargets(ctx context.Context, gatewayID, gatewayNativeID string) []GatewayTarget {
+// but it is RETURNED, not swallowed: a target list cut short is not the
+// gateway's whole list, and must not read as one.
+func (r *BedrockReader) gatewayTargets(ctx context.Context, gatewayID, gatewayNativeID string) ([]GatewayTarget, error) {
 	var out []GatewayTarget
 	var next *string
-	for page := 0; page < maxPages; page++ {
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return out, fmt.Errorf("%w: gateway targets", errTooManyPages)
+		}
 		resp, err := r.agentCore.ListGatewayTargets(ctx, &bedrockagentcorecontrol.ListGatewayTargetsInput{
 			GatewayIdentifier: aws.String(gatewayID), NextToken: next,
 		})
 		if err != nil {
-			return out
+			return out, err
 		}
 		for _, t := range resp.Items {
 			out = append(out, GatewayTarget{
@@ -290,14 +389,14 @@ func (r *BedrockReader) gatewayTargets(ctx context.Context, gatewayID, gatewayNa
 				TargetID:        aws.ToString(t.TargetId),
 				Name:            aws.ToString(t.Name),
 				Status:          string(t.Status),
+				Type:            string(t.TargetType),
 			})
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out
+			return out, nil
 		}
 		next = resp.NextToken
 	}
-	return out
 }
 
 // WorkloadIdentity is AgentCore's own principal for a runtime or tool --
@@ -323,7 +422,7 @@ func (r *BedrockReader) WorkloadIdentities(ctx context.Context) ([]WorkloadIdent
 		resp, err := r.agentCore.ListWorkloadIdentities(ctx,
 			&bedrockagentcorecontrol.ListWorkloadIdentitiesInput{NextToken: next})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr(err)
 		}
 		for _, wi := range resp.WorkloadIdentities {
 			out = append(out, WorkloadIdentity{
@@ -372,7 +471,7 @@ func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialPr
 		resp, err := r.agentCore.ListOauth2CredentialProviders(ctx,
 			&bedrockagentcorecontrol.ListOauth2CredentialProvidersInput{NextToken: oauthNext})
 		if err != nil {
-			firstErr = classify(err)
+			firstErr = listErr(err)
 			break
 		}
 		for _, p := range resp.CredentialProviders {
@@ -402,7 +501,7 @@ func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialPr
 			&bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput{NextToken: apiKeyNext})
 		if err != nil {
 			if firstErr == nil {
-				firstErr = classify(err)
+				firstErr = listErr(err)
 			}
 			break
 		}

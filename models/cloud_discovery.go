@@ -149,14 +149,18 @@ const (
 	// keep prior findings visible without claiming it re-confirmed them.
 	CloudCoverageStale = "stale"
 
-	// CloudCoverageUnsupported is a surface AuthSec has built no collector for.
+	// CloudCoverageUnsupported: nothing there is claimed, for one of two
+	// reasons (§1.4) -- the service is not offered in that region (its regional
+	// endpoint does not resolve; awsdiscovery.ErrServiceNotInRegion), or AuthSec
+	// does not collect the surface at all (organizations: SCPs are not read).
 	//
 	// Distinct from denied and from not_configured, and the distinction is the
 	// whole point: denied is the customer's to fix by granting a permission,
-	// not_configured is their deliberate choice, and unsupported is OURS to
-	// build. Collapsing them lets a gap in our product read as a gap in their
-	// estate. CloudTrail is the live example -- the role template grants it and
-	// no collector calls it.
+	// not_configured is their deliberate choice, and unsupported is neither --
+	// nobody can fix it, because there is nothing to read. Collapsing them lets
+	// a gap in our product, or in AWS's regional footprint, read as a gap in
+	// their estate. NEVER inferred from AccessDenied: an SCP or a region opt-out
+	// produces that too (§2.14.13), and a false unsupported licenses deletion.
 	CloudCoverageUnsupported = "unsupported"
 
 	// CloudCoverageNotSelected is a surface excluded from the scan's selected
@@ -279,13 +283,64 @@ const (
 // SurfaceCompute names the per-region compute stand-in surface.
 func SurfaceCompute(region string) string { return SurfaceComputePrefix + region }
 
+// The rest of the coverage vocabulary (§1.4, §4.10: "the surface names are
+// models.Surface* constants, not invented strings"). Promoted from literals in
+// the scanners so a writer and a reader cannot drift by a typo.
+const (
+	// SurfaceActivity is Access Advisor (GenerateServiceLastAccessedDetails):
+	// partial above the per-scan identity cap, throttled on throttle (T3.7).
+	SurfaceActivity = "activity"
+	// SurfaceIAMCredentialReport is the account credential report. Bonus
+	// evidence, merged only at FinalizeCoverage.
+	SurfaceIAMCredentialReport = "iam_credential_report"
+	// SurfaceResourcePolicies is the per-resource GetBucketPolicy/GetKeyPolicy
+	// read; per-resource failures are counted (T3.7), never silently reached.
+	SurfaceResourcePolicies = "resource_policies"
+	// SurfaceOrganizations is AWS Organizations and SCPs, which AuthSec does
+	// not collect. Always reported unsupported (§1.2, §1.4, T3.8), so coverage
+	// can say what that prevents instead of staying silent about it.
+	SurfaceOrganizations = "organizations"
+)
+
+// Regional surface prefixes: each is reported as "<prefix>:<region>"
+// (SurfaceRegional), one key per service per selected region (§1.4).
+const (
+	SurfaceLambdaPrefix                = "lambda"
+	SurfaceECSPrefix                   = "ecs"
+	SurfaceEC2Prefix                   = "ec2"
+	SurfaceBedrockAgentsPrefix         = "bedrock-agents"
+	SurfaceBedrockAgentCorePrefix      = "bedrock-agentcore"
+	SurfaceAgentCoreGatewaysPrefix     = "agentcore-gateways"
+	SurfaceAgentCoreIdentitiesPrefix   = "agentcore-workload-identities"
+	SurfaceAgentCoreCredProviderPrefix = "agentcore-credential-providers"
+	SurfaceCloudTrailEventsPrefix      = "cloudtrail-events"
+	SurfaceCloudTrailStatusPrefix      = "cloudtrail-status"
+)
+
+// SurfaceRegional names one service's surface in one region: "ecs:eu-west-1".
+func SurfaceRegional(prefix, region string) string { return prefix + ":" + region }
+
+// OrganizationsCoverage is the fixed entry every AWS scan reports for
+// SurfaceOrganizations. unsupported, so ScanCoverage.Complete skips it and no
+// reconciliation gate ever waits on it; the Error is AuthSec's own words
+// because there are no provider words for a call never made.
+func OrganizationsCoverage() SurfaceCoverage {
+	return SurfaceCoverage{
+		State: CloudCoverageUnsupported,
+		Error: "AWS Organizations and service control policies (SCPs) are not collected by AuthSec",
+	}
+}
+
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`
-	// Count is how many objects were read. Only meaningful when State is
-	// reached — a count from a denied surface is a floor, not a total.
+	// Count is how many objects were read. A total when State is reached; a
+	// FLOOR otherwise -- for partial, the rows that were read, with Error
+	// naming how many were not (§1.4: "the report names how many").
 	Count int `json:"count"`
-	// Error is the provider's own words when State is not reached.
+	// Error says why State is not reached: the failed call and the provider's
+	// error code, or for partial "N of M <items> could not be read: <call>
+	// <code>". Never a guessed missing permission (§2.14.13).
 	Error string `json:"error,omitempty"`
 }
 
@@ -1353,6 +1408,32 @@ type AWSWorkloadAttrs struct {
 	// not find in inventory, so an unattributed row still says which role it
 	// was looking for.
 	UnresolvedRoleARN string `json:"unresolved_role_arn,omitempty"`
+
+	// DetailIncomplete: the workload was LISTED but its detail call failed
+	// (GetAgent, DescribeTaskDefinition, GetAgentRuntime, GetGateway,
+	// GetInstanceProfile). Its execution role is UNKNOWN this run -- not
+	// absent -- so the repository keeps the previous row's attribution and
+	// attrs instead of blanking them, and the projector leaves the execution
+	// role state and edges as they were rather than writing "none" (D-53).
+	// DetailError names the call and the AWS error code.
+	DetailIncomplete bool   `json:"detail_incomplete,omitempty"`
+	DetailError      string `json:"detail_error,omitempty"`
+
+	// GatewayTargets are an AgentCore gateway's targets, which §1.4 makes
+	// ATTRIBUTES of the gateway, not objects. TargetsIncomplete is set when
+	// ListGatewayTargets failed; the previous list is then kept, never
+	// replaced by an empty one.
+	GatewayTargets    []AWSGatewayTarget `json:"gateway_targets,omitempty"`
+	TargetsIncomplete bool               `json:"targets_incomplete,omitempty"`
+}
+
+// AWSGatewayTarget is one AgentCore gateway target: id, name, status and type
+// verbatim (§1.4). Its backing tool is not collected (§1.2).
+type AWSGatewayTarget struct {
+	TargetID string `json:"target_id"`
+	Name     string `json:"name,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Type     string `json:"type,omitempty"`
 }
 
 // AWSAttrs decodes the AWS attrs, returning the zero value on anything

@@ -285,7 +285,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// s3:GetBucketPolicy/kms:GetKeyPolicy must not have an otherwise-complete
 	// permission scan refuse to reconcile edges and grants over it.
 	resourcePolicyCount, resourcePolicyErr := s.scanResourcePolicies(ctx, workspaceID, snapshot.ConnectorID, out)
-	out.Surfaces["resource_policies"] = surfaceResult(resourcePolicyCount, resourcePolicyErr)
+	out.Surfaces[models.SurfaceResourcePolicies] = surfaceResult(resourcePolicyCount, resourcePolicyErr)
 
 	if out.Complete {
 		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
@@ -454,6 +454,8 @@ func (s *AWSPermissionScanner) writePodIdentityEdge(
 	if _, _, err := s.grants.UpsertAssumeEdge(edge); err != nil {
 		return fmt.Errorf("record pod identity edge for %s: %w", assoc.RoleARN, err)
 	}
+	// T3.5: the association's observation (cloud_aws_collection_evidence.go).
+	s.recordPodIdentityEvidence(identity.ID, cluster, assoc, edge)
 	out.EdgesWritten++
 	out.PodIdentityEdges++
 	return nil
@@ -1116,6 +1118,11 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 
 	seen := make(map[string]bool, len(out.resourcePolicyCandidates))
 	checked := 0
+	// T3.7: every per-resource read is counted, so resource_policies is
+	// reached only when every read succeeded ("no policy" is a success),
+	// partial / denied / throttled otherwise -- never reached "even when
+	// every read was denied" (§1.3). See itemFailureCoverage.
+	reads := awsdiscovery.NewItemFailures("resource policies could not be read", false)
 	for _, c := range out.resourcePolicyCandidates {
 		if seen[c.NativeID] {
 			continue
@@ -1134,8 +1141,10 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 		default:
 			continue
 		}
+		reads.Attempt()
 		if rerr != nil {
 			log.Printf("aws permission scan: resource policy for %s: %v", c.NativeID, rerr)
+			reads.Fail(c.NativeID, resourcePolicySourceAPI(c.Kind), rerr)
 			continue
 		}
 		checked++
@@ -1144,7 +1153,7 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 		}
 		if werr := s.evidence.Record(
 			ResourceSubject(c.ResourceID), resourcePolicySourceAPI(c.Kind),
-			"resource_policies", "", time.Now(), c.NativeID,
+			models.SurfaceResourcePolicies, "", time.Now(), c.NativeID,
 			map[string]any{
 				"kind":         c.Kind,
 				"has_deny":     policy.HasDeny,
@@ -1155,7 +1164,7 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 			log.Printf("aws permission scan: resource policy evidence for %s: %v", c.NativeID, werr)
 		}
 	}
-	return checked, nil
+	return checked, reads.Err(nil)
 }
 
 // resourcePolicySourceAPI names the call each resource kind's policy came

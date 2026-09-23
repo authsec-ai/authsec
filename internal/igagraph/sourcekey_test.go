@@ -193,14 +193,43 @@ func TestEndpointKeyUsesImmutableKey(t *testing.T) {
 // the ARN the successful read would have returned.
 func TestWorkloadKeyConstructsARN(t *testing.T) {
 	ec2 := models.CloudWorkload{RuntimeKind: models.WorkloadEC2Instance, NativeID: "i-123", Region: "eu-central-1"}
-	if got := WorkloadARN(ec2, "111122223333"); got != "arn:aws:ec2:eu-central-1:111122223333:instance/i-123" {
-		t.Fatalf("EC2 ARN = %q", got)
+	if got := WorkloadARN(ec2, "", "111122223333"); got != "arn:aws:ec2:eu-central-1:111122223333:instance/i-123" {
+		t.Fatalf("EC2 ARN = %q (an empty partition is the commercial one)", got)
 	}
 	agentBare := models.CloudWorkload{RuntimeKind: models.WorkloadBedrockAgent, NativeID: "AGENT1", Region: "us-east-1"}
 	agentARN := models.CloudWorkload{RuntimeKind: models.WorkloadBedrockAgent,
 		NativeID: "arn:aws:bedrock:us-east-1:111122223333:agent/AGENT1", Region: "us-east-1"}
-	if WorkloadKey(agentBare, "111122223333") != WorkloadKey(agentARN, "111122223333") {
+	if WorkloadKey(agentBare, "aws", "111122223333") != WorkloadKey(agentARN, "aws", "111122223333") {
 		t.Fatal("a failed GetAgent changed the agent's key")
+	}
+}
+
+// The partition is the connector's, never assumed: a GovCloud instance keyed
+// arn:aws:... would disagree with every ARN AWS itself returns there.
+func TestWorkloadKeyUsesTheConnectorPartition(t *testing.T) {
+	ec2 := models.CloudWorkload{RuntimeKind: models.WorkloadEC2Instance, NativeID: "i-9", Region: "us-gov-west-1"}
+	if got := WorkloadARN(ec2, "aws-us-gov", "111122223333"); got != "arn:aws-us-gov:ec2:us-gov-west-1:111122223333:instance/i-9" {
+		t.Fatalf("GovCloud EC2 ARN = %q", got)
+	}
+	gw := models.CloudWorkload{RuntimeKind: models.WorkloadBedrockAgentCoreGW, NativeID: "gw-1", Region: "cn-north-1"}
+	if got := WorkloadARN(gw, "aws-cn", "111122223333"); got != "arn:aws-cn:bedrock-agentcore:cn-north-1:111122223333:gateway/gw-1" {
+		t.Fatalf("China gateway ARN = %q", got)
+	}
+	// ONE constructor: what the graph derives from a bare id is exactly what
+	// the collector keys a detail-failed row by (awsdiscovery.WorkloadARN).
+	for _, w := range []models.CloudWorkload{ec2, gw,
+		{RuntimeKind: models.WorkloadBedrockAgent, NativeID: "A1", Region: "us-gov-east-1"},
+		{RuntimeKind: models.WorkloadBedrockAgentCoreRT, NativeID: "R1", Region: "us-gov-east-1"}} {
+		for _, part := range []string{"aws", "aws-us-gov", "aws-cn"} {
+			if got, want := WorkloadARN(w, part, "111122223333"),
+				awsdiscovery.WorkloadARN(part, w.RuntimeKind, w.Region, "111122223333", w.NativeID); got != want {
+				t.Fatalf("%s in %s: graph %q, collector %q", w.RuntimeKind, part, got, want)
+			}
+		}
+	}
+	// Never an ARN on a guessed account.
+	if got := WorkloadARN(ec2, "aws", ""); got != "i-9" {
+		t.Fatalf("no account must leave the bare id, got %q", got)
 	}
 }
 

@@ -123,10 +123,13 @@ func (r *ActivityReader) ServiceActivityFor(ctx context.Context, principalARN st
 		return nil, errors.New("service activity needs a principal arn")
 	}
 
+	// Every failure below names its call (callErr), because coverage must say
+	// WHICH call failed and with which AWS code (§2.14.13) -- the submit and
+	// the poll fail for different reasons and are fixed in different places.
 	submitted, err := r.api.GenerateServiceLastAccessedDetails(ctx,
 		&iam.GenerateServiceLastAccessedDetailsInput{Arn: aws.String(principalARN)})
 	if err != nil {
-		return nil, classify(err)
+		return nil, callErr("iam:GenerateServiceLastAccessedDetails", err)
 	}
 	jobID := aws.ToString(submitted.JobId)
 	if jobID == "" {
@@ -138,7 +141,7 @@ func (r *ActivityReader) ServiceActivityFor(ctx context.Context, principalARN st
 		out, err := r.api.GetServiceLastAccessedDetails(ctx,
 			&iam.GetServiceLastAccessedDetailsInput{JobId: aws.String(jobID)})
 		if err != nil {
-			return nil, classify(err)
+			return nil, callErr("iam:GetServiceLastAccessedDetails", err)
 		}
 
 		switch out.JobStatus {
@@ -199,7 +202,7 @@ func (r *ActivityReader) drainReport(
 			// Partial activity with an error is better than silently returning
 			// page one as though it were everything: the caller records the
 			// surface as incomplete rather than complete-and-wrong.
-			return activity, classify(err)
+			return activity, callErr("iam:GetServiceLastAccessedDetails", err)
 		}
 		activity = append(activity, activityFromReport(next)...)
 		out = next

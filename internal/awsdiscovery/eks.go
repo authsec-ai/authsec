@@ -91,13 +91,17 @@ func NewEKSReader(api EKSAPI) *EKSReader { return &EKSReader{api: api} }
 //
 // DescribeCluster is a second call per cluster and is not avoidable:
 // ListClusters returns names only. The issuer is what tells two clusters apart
-// when both present the same namespace and service account name, so a cluster
-// whose describe fails is still returned -- with an empty issuer -- rather than
-// dropped. Losing the whole cluster would lose its associations too, which is a
-// worse answer than an association that cannot yet be attributed to a cluster.
+// when both present the same namespace and service account name, and it is
+// part of every pod-identity edge's identity (D-42). So a cluster whose
+// describe FAILS is left out of this run's list and the failure is RETURNED
+// (*ItemFailures, eks_pod_identity partial): its associations are then not
+// rewritten with an empty issuer -- which would re-key their edges -- and
+// partial keeps every edge they last confirmed, as stale (§1.4). It used to
+// be returned with an empty issuer while the surface read reached.
 func (r *EKSReader) Clusters(ctx context.Context) ([]EKSCluster, error) {
 	var out []EKSCluster
 	var next *string
+	details := NewItemFailures("clusters could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: eks clusters", errTooManyPages)
@@ -107,39 +111,52 @@ func (r *EKSReader) Clusters(ctx context.Context) ([]EKSCluster, error) {
 			return out, classify(err)
 		}
 		for _, name := range resp.Clusters {
-			out = append(out, r.clusterDetail(ctx, name))
+			details.Attempt()
+			cluster, derr := r.clusterDetail(ctx, name)
+			if derr != nil {
+				details.Fail(name, "eks:DescribeCluster", derr)
+				continue
+			}
+			out = append(out, cluster)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
 // clusterDetail enriches a listed cluster name with DescribeCluster.
-func (r *EKSReader) clusterDetail(ctx context.Context, name string) EKSCluster {
+func (r *EKSReader) clusterDetail(ctx context.Context, name string) (EKSCluster, error) {
 	built := EKSCluster{Name: name}
 
 	detail, err := r.api.DescribeCluster(ctx, &eks.DescribeClusterInput{Name: aws.String(name)})
-	if err != nil || detail.Cluster == nil {
-		return built
+	if err == nil && detail.Cluster == nil {
+		err = fmt.Errorf("DescribeCluster returned no cluster for %s", name)
+	}
+	if err != nil {
+		return built, err
 	}
 	built.ARN = aws.ToString(detail.Cluster.Arn)
 	if id := detail.Cluster.Identity; id != nil && id.Oidc != nil {
 		built.OIDCIssuer = issuerWithoutScheme(aws.ToString(id.Oidc.Issuer))
 	}
-	return built
+	return built, nil
 }
 
 // PodIdentityAssociations reads one cluster's associations, resolving the role
 // for each.
 //
-// A describe that fails skips that one association rather than failing the
-// cluster: an association whose role cannot be read yields no edge, and an edge
-// without its role would be a binding pointing at nothing.
+// A describe that fails skips that one association -- an edge without its role
+// would be a binding pointing at nothing -- and is COUNTED: the associations
+// read are returned beside an *ItemFailures error, so eks_pod_identity reads
+// partial and the skipped association's edge is kept as stale, never ended
+// (§1.4). It used to be skipped silently while the surface read reached, which
+// let reconciliation end a binding it had simply failed to read.
 func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName string) ([]PodIdentityAssociation, error) {
 	var out []PodIdentityAssociation
 	var next *string
+	details := NewItemFailures("pod identity associations could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: pod identity associations", errTooManyPages)
@@ -151,32 +168,44 @@ func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName str
 			return out, classify(err)
 		}
 		for _, summary := range resp.Associations {
-			assoc, ok := r.associationDetail(ctx, clusterName, aws.ToString(summary.AssociationId))
+			id := aws.ToString(summary.AssociationId)
+			if id == "" {
+				continue
+			}
+			details.Attempt()
+			assoc, ok, derr := r.associationDetail(ctx, clusterName, id)
+			if derr != nil {
+				details.Fail(id, "eks:DescribePodIdentityAssociation", derr)
+				continue
+			}
 			if !ok {
 				continue
 			}
 			out = append(out, assoc)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
-// associationDetail resolves the role ARN, which the list response omits.
+// associationDetail resolves the role ARN, which the list response omits. An
+// error means the describe failed; ok=false with no error means AWS answered
+// with an association this package cannot bind (no role, or half a service
+// account), which is skipped as before.
 func (r *EKSReader) associationDetail(
 	ctx context.Context, clusterName, associationID string,
-) (PodIdentityAssociation, bool) {
+) (PodIdentityAssociation, bool, error) {
 
-	if associationID == "" {
-		return PodIdentityAssociation{}, false
-	}
 	detail, err := r.api.DescribePodIdentityAssociation(ctx, &eks.DescribePodIdentityAssociationInput{
 		ClusterName: aws.String(clusterName), AssociationId: aws.String(associationID),
 	})
-	if err != nil || detail.Association == nil {
-		return PodIdentityAssociation{}, false
+	if err == nil && detail.Association == nil {
+		err = fmt.Errorf("DescribePodIdentityAssociation returned no association for %s", associationID)
+	}
+	if err != nil {
+		return PodIdentityAssociation{}, false, err
 	}
 	a := detail.Association
 
@@ -192,9 +221,9 @@ func (r *EKSReader) associationDetail(
 	// service account the k8s_ref would not match what the Kubernetes connector
 	// wrote for the same pod.
 	if built.RoleARN == "" || built.Namespace == "" || built.ServiceAccount == "" {
-		return PodIdentityAssociation{}, false
+		return PodIdentityAssociation{}, false, nil
 	}
-	return built, true
+	return built, true, nil
 }
 
 // issuerWithoutScheme strips https:// from an EKS OIDC issuer URL.

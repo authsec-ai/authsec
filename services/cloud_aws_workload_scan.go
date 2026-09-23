@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
@@ -123,17 +124,26 @@ type WorkloadSnapshot struct {
 	// finding -- compute nobody can tie to an identity -- reported rather than
 	// hidden among the total.
 	Unattributed int
-	UsageWritten int
+	// DetailIncomplete counts workloads that were listed but whose detail call
+	// failed (T3.6). Kept apart from Unattributed: their role is UNKNOWN this
+	// run, which is not the finding "attributed to nothing".
+	DetailIncomplete int
+	UsageWritten     int
 
 	// ByKind counts workloads per runtime kind, so "we found no Bedrock agents"
 	// is distinguishable from "we never looked".
 	ByKind map[string]int
 
-	// Complete is false when any surface was denied, throttled or timed out.
-	// Reconciliation only runs when it is true, for the reason the rest of this
-	// schema follows: unreached is not missing.
-	Complete bool
+	// Complete is true only when BOTH tables this scanner reconciles were read
+	// authoritatively: every compute surface (WorkloadsComplete) and activity
+	// (UsageComplete). Each gates its own table's reconciliation, for the
+	// reason the rest of this schema follows: unreached is not missing.
+	Complete          bool
+	WorkloadsComplete bool
+	UsageComplete     bool
 	// Errors carries what went wrong per surface, for the coverage report.
+	// Only surfaces whose state BLOCKS are listed: an unsupported surface
+	// (the service is not offered in that region) is not an error.
 	Errors map[string]string
 	// Surfaces is the same information as Errors, but in the connector-level
 	// coverage shape (state + count, not just an error string), so the caller
@@ -164,11 +174,18 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	if err != nil {
 		return nil, err
 	}
-	regions := connector.AWSAttrs().Regions
+	connAttrs := connector.AWSAttrs()
+	regions := connAttrs.Regions
+	// The scope a constructed ARN is built in (T3.6): the connector's own
+	// partition and account, never assumed.
+	scope := arnScope{partition: connAttrs.Partition, account: snapshot.AccountID}
+	if scope.account == "" {
+		scope.account = connector.ScopeID
+	}
 
 	// ---- regional compute --------------------------------------------------
 	for _, region := range regions {
-		s.scanRegion(ctx, workspaceID, snapshot, region, out)
+		s.scanRegion(ctx, workspaceID, snapshot, scope, region, out)
 	}
 
 	// Regions the operator did NOT select are recorded, not omitted.
@@ -185,29 +202,89 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	}
 
 	// ---- activity, which is global because IAM is -------------------------
-	s.scanActivity(ctx, workspaceID, snapshot, out)
-	if activityErr, failed := out.Errors["activity"]; failed {
-		out.Surfaces["activity"] = models.SurfaceCoverage{
-			State: models.CloudCoverageDenied, Count: out.UsageWritten, Error: activityErr,
-		}
-	} else {
-		out.Surfaces["activity"] = models.SurfaceCoverage{
-			State: models.CloudCoverageReached, Count: out.UsageWritten,
-		}
-	}
+	activity := s.scanActivity(ctx, workspaceID, snapshot, out)
+	out.setSurface(models.SurfaceActivity, activity)
 
-	out.Complete = len(out.Errors) == 0 && snapshot.Coverage.Complete()
+	// Each table is reconciled on the surfaces it depends on, and only those
+	// (T3.7). The IAM baseline gates both, as before: a workload or a usage
+	// row is attributed to an identity that scan must have read.
+	iamComplete := snapshot.Coverage.Complete()
+	out.WorkloadsComplete = iamComplete && out.computeAuthoritative()
+	out.UsageComplete = iamComplete && activity.State == models.CloudCoverageReached
+	out.Complete = out.WorkloadsComplete && out.UsageComplete
 
-	if out.Complete {
-		workloadsRemoved, usageRemoved, err := s.workloads.ReconcileGeneration(
-			workspaceID, snapshot.ConnectorID, snapshot.Generation)
-		if err != nil {
+	if out.WorkloadsComplete {
+		if _, err := s.workloads.ReconcileWorkloads(
+			workspaceID, snapshot.ConnectorID, snapshot.Generation); err != nil {
 			return out, err
 		}
-		_ = workloadsRemoved
-		_ = usageRemoved
+	}
+	if out.UsageComplete {
+		if _, err := s.workloads.ReconcileUsage(
+			workspaceID, snapshot.ConnectorID, snapshot.Generation); err != nil {
+			return out, err
+		}
 	}
 	return out, nil
+}
+
+// arnScope is what a constructed workload ARN is built in: the connector's
+// partition ("" is aws) and account.
+type arnScope struct {
+	partition, account string
+}
+
+// setSurface records one surface's coverage. Only a state that BLOCKS is also
+// written to Errors: unsupported and not_selected are not errors, and reached
+// is not either.
+func (out *WorkloadSnapshot) setSurface(key string, cov models.SurfaceCoverage) {
+	out.Surfaces[key] = cov
+	if !nonBlocking(cov.State) {
+		out.Errors[key] = cov.Error
+	}
+}
+
+// nonBlocking is the set of states that do not block ending a relationship or
+// deleting a row (§1.4): reached, and the two that mean nothing there is
+// claimed. Everything else -- partial, denied, throttled -- keeps what the
+// surface last confirmed.
+func nonBlocking(state string) bool {
+	switch state {
+	case models.CloudCoverageReached, models.CloudCoverageNotSelected, models.CloudCoverageUnsupported:
+		return true
+	}
+	return false
+}
+
+// computeSurfacePrefixes are the surfaces cloud_workload rows come from, plus
+// the per-region stand-in. They, and only they, license deleting workloads.
+// The bonus surfaces (AgentCore workload identities and credential providers,
+// CloudTrail) have no reconciled table and never gate it.
+var computeSurfacePrefixes = map[string]bool{
+	models.SurfaceLambdaPrefix:            true,
+	models.SurfaceECSPrefix:               true,
+	models.SurfaceEC2Prefix:               true,
+	models.SurfaceBedrockAgentsPrefix:     true,
+	models.SurfaceBedrockAgentCorePrefix:  true,
+	models.SurfaceAgentCoreGatewaysPrefix: true,
+	"compute":                             true, // models.SurfaceComputePrefix, without its colon
+}
+
+// computeAuthoritative reports whether every compute surface this run reported
+// is in a non-blocking state -- derived from the coverage itself, so a
+// detail-call failure (partial) blocks workload deletion and a service not
+// offered in a region (unsupported) does not (§1.3).
+func (out *WorkloadSnapshot) computeAuthoritative() bool {
+	for key, cov := range out.Surfaces {
+		prefix := key
+		if i := strings.Index(key, ":"); i >= 0 {
+			prefix = key[:i]
+		}
+		if computeSurfacePrefixes[prefix] && !nonBlocking(cov.State) {
+			return false
+		}
+	}
+	return true
 }
 
 // awsRegionsWithCompute is every region AuthSec can read compute in. Kept here
@@ -243,7 +320,7 @@ func unselectedRegions(selected []string) []string {
 // attempted.
 func (s *AWSWorkloadScanner) scanRegion(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
-	region string, out *WorkloadSnapshot,
+	scope arnScope, region string, out *WorkloadSnapshot,
 ) {
 	cfgFor := func() (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI, awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI, awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI, error) {
 		if s.regionalAPIs != nil {
@@ -271,47 +348,49 @@ func (s *AWSWorkloadScanner) scanRegion(
 
 	l, e, c, p, b, ac, ct, err := cfgFor()
 	if err != nil {
-		out.Errors[models.SurfaceCompute(region)] = err.Error()
 		// Nothing in this region was even attempted -- one surface entry
-		// stands in for the five that never ran, so Complete() correctly sees
-		// this region as unreached instead of silently passing it.
-		out.Surfaces[models.SurfaceCompute(region)] = models.SurfaceCoverage{
+		// stands in for the services that never ran, so computeAuthoritative
+		// and the graph's region gate see this region as unreached instead of
+		// silently passing it.
+		out.setSurface(models.SurfaceCompute(region), models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: err.Error(),
-		}
+		})
 		return
 	}
 
 	compute := awsdiscovery.NewWorkloadReader(l, e, c, p)
-	bedrock := awsdiscovery.NewBedrockReader(b, ac)
+	// Scoped, so an agent or gateway whose detail call fails is still keyed by
+	// its ARN, constructed in the connector's partition (T3.6).
+	bedrock := awsdiscovery.NewBedrockReader(b, ac).WithScope(scope.partition, region, scope.account)
 	trail := awsdiscovery.NewCloudTrailReader(ct)
 
 	surfaces := []struct {
-		name string
-		read func(context.Context) ([]awsdiscovery.Workload, error)
+		prefix      string
+		runtimeKind string
+		read        func(context.Context) ([]awsdiscovery.Workload, error)
 	}{
-		{"lambda", compute.LambdaFunctions},
-		{"ecs", compute.ECSTaskDefinitions},
-		{"ec2", compute.EC2Instances},
-		{"bedrock-agents", bedrock.Agents},
-		{"bedrock-agentcore", bedrock.AgentRuntimes},
+		{models.SurfaceLambdaPrefix, models.WorkloadLambdaFunction, compute.LambdaFunctions},
+		{models.SurfaceECSPrefix, models.WorkloadECSTaskDefinition, compute.ECSTaskDefinitions},
+		{models.SurfaceEC2Prefix, models.WorkloadEC2Instance, compute.EC2Instances},
+		{models.SurfaceBedrockAgentsPrefix, models.WorkloadBedrockAgent, bedrock.Agents},
+		{models.SurfaceBedrockAgentCorePrefix, models.WorkloadBedrockAgentCoreRT, bedrock.AgentRuntimes},
 	}
 
 	for _, surface := range surfaces {
-		key := surface.name + ":" + region
+		key := models.SurfaceRegional(surface.prefix, region)
+		// err is a listing failure (denied, throttled, not offered here) or an
+		// *awsdiscovery.ItemFailures: listed, but some detail calls failed.
+		// Whatever was read is real and still worth recording either way;
+		// surfaceResult decides what the surface may claim.
 		found, err := surface.read(ctx)
-		if err != nil {
-			out.Errors[key] = err.Error()
-			// Whatever was read before the failure is still real and still
-			// worth recording -- the surface is marked unread either way.
-		}
 		for _, w := range found {
-			if _, werr := s.recordWorkload(workspaceID, snapshot, region, w, out); werr != nil {
-				out.Errors[key] = werr.Error()
+			if _, werr := s.recordWorkload(workspaceID, snapshot, key, region, w, out); werr != nil {
 				err = werr
 				break
 			}
 		}
-		out.Surfaces[key] = surfaceResult(len(found), err)
+		out.setSurface(key, s.regionalCoverage(workspaceID, snapshot.ConnectorID,
+			surface.runtimeKind, region, len(found), err))
 	}
 
 	s.scanGateways(ctx, workspaceID, snapshot, region, bedrock, out)
@@ -323,35 +402,29 @@ func (s *AWSWorkloadScanner) scanRegion(
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are
 // written to cloud_workload through the same recordWorkload path as Lambda,
-// ECS, EC2 and the other managed-agent surfaces; targets have no identity or
-// reconciled table of their own (see the GatewayTarget doc comment), so they
-// are recorded as evidence under the gateway's own workload row instead.
+// ECS, EC2 and the other managed-agent surfaces. Targets are ATTRIBUTES of the
+// gateway (§1.4): carried on its row (attrs.gateway_targets, with id, name,
+// status and type) and recorded as evidence under it, keyed by the target id so
+// a target's observation never stands in for the gateway's own.
 func (s *AWSWorkloadScanner) scanGateways(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
 ) {
-	key := "agentcore-gateways:" + region
-	workloads, targets, err := bedrock.Gateways(ctx)
-	if err != nil {
-		out.Errors[key] = err.Error()
-	}
-
-	targetsByGateway := make(map[string][]awsdiscovery.GatewayTarget, len(targets))
-	for _, t := range targets {
-		targetsByGateway[t.GatewayNativeID] = append(targetsByGateway[t.GatewayNativeID], t)
-	}
+	key := models.SurfaceRegional(models.SurfaceAgentCoreGatewaysPrefix, region)
+	// A failed GetGateway or ListGatewayTargets comes back as ItemFailures:
+	// agentcore-gateways:<region> partial, never silently reached (T3.6).
+	workloads, _, err := bedrock.Gateways(ctx)
 
 	for _, w := range workloads {
-		stored, werr := s.recordWorkload(workspaceID, snapshot, region, w, out)
+		stored, werr := s.recordWorkload(workspaceID, snapshot, key, region, w, out)
 		if werr != nil {
-			out.Errors[key] = werr.Error()
 			err = werr
 			continue
 		}
 		if s.evidence == nil || stored == nil {
 			continue
 		}
-		for _, t := range targetsByGateway[w.NativeID] {
+		for _, t := range w.Targets {
 			if rerr := s.evidence.Record(
 				WorkloadSubject(stored.ID), "bedrock-agentcore:ListGatewayTargets",
 				key, "", time.Now(), t.TargetID,
@@ -360,13 +433,47 @@ func (s *AWSWorkloadScanner) scanGateways(
 					"target_id":         t.TargetID,
 					"name":              t.Name,
 					"status":            t.Status,
+					"type":              t.Type,
 				},
 			); rerr != nil {
 				log.Printf("aws workload scan: gateway target evidence for %s: %v", t.TargetID, rerr)
 			}
 		}
 	}
-	out.Surfaces[key] = surfaceResult(len(workloads), err)
+	out.setSurface(key, s.regionalCoverage(workspaceID, snapshot.ConnectorID,
+		models.WorkloadBedrockAgentCoreGW, region, len(workloads), err))
+}
+
+// regionalCoverage is surfaceResult for one compute surface in one region,
+// with one extra guard on "unsupported".
+//
+// An endpoint that does not resolve means the service is not offered there
+// (ErrServiceNotInRegion), and unsupported blocks nothing. But if an earlier
+// scan COLLECTED this runtime kind in this region, the service evidently is
+// offered there, and a resolver failure is the likelier story; unsupported
+// would then license deleting what that scan found. So it is reported denied
+// instead -- the call failed -- with the reason spelled out. Never claim more
+// than the data proves.
+func (s *AWSWorkloadScanner) regionalCoverage(
+	workspaceID, connectorID uuid.UUID, runtimeKind, region string, count int, err error,
+) models.SurfaceCoverage {
+	cov := surfaceResult(count, err)
+	if cov.State != models.CloudCoverageUnsupported || runtimeKind == "" {
+		return cov
+	}
+	prior, cerr := s.workloads.CountWorkloads(workspaceID, connectorID, runtimeKind, region)
+	switch {
+	case cerr != nil:
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count,
+			Error: fmt.Sprintf("%s (and whether earlier scans found %s here could not be checked: %v)",
+				cov.Error, runtimeKind, cerr)}
+	case prior > 0:
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: count,
+			Error: fmt.Sprintf("%s, but an earlier scan collected %d %s here; not treated as unsupported",
+				cov.Error, prior, runtimeKind)}
+	}
+	cov.Error = fmt.Sprintf("not offered in %s (%s)", region, cov.Error)
+	return cov
 }
 
 // scanWorkloadIdentities reads AgentCore's own workload identities and
@@ -377,13 +484,14 @@ func (s *AWSWorkloadScanner) scanWorkloadIdentities(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
 ) {
-	// Deliberately not written to out.Errors, which gates out.Complete below
-	// and therefore ReconcileGeneration for cloud_workload/cloud_usage: this
+	// Deliberately NOT a compute surface (computeSurfacePrefixes), so it never
+	// gates out.WorkloadsComplete and therefore ReconcileWorkloads: this
 	// surface is bonus evidence with no reconciled table of its own, and a
 	// customer whose deployed role predates this permission must not have
 	// their otherwise-complete Lambda/ECS/EC2 scan refuse to age out stale
-	// rows over a surface those rows have nothing to do with.
-	key := "agentcore-workload-identities:" + region
+	// rows over a surface those rows have nothing to do with. Its coverage is
+	// still reported exactly (and unsupported where AgentCore is not offered).
+	key := models.SurfaceRegional(models.SurfaceAgentCoreIdentitiesPrefix, region)
 	identities, err := bedrock.WorkloadIdentities(ctx)
 	if s.evidence != nil {
 		for _, wi := range identities {
@@ -424,7 +532,7 @@ func (s *AWSWorkloadScanner) scanCredentialProviders(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, bedrock *awsdiscovery.BedrockReader, out *WorkloadSnapshot,
 ) {
-	key := "agentcore-credential-providers:" + region
+	key := models.SurfaceRegional(models.SurfaceAgentCoreCredProviderPrefix, region)
 	providers, err := bedrock.CredentialProviders(ctx)
 	if s.evidence != nil {
 		for _, p := range providers {
@@ -455,10 +563,10 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
 ) {
-	// Not written to out.Errors -- same reasoning as scanWorkloadIdentities
-	// just above: bonus evidence, no reconciled table, must not block
+	// Not a compute surface -- same reasoning as scanWorkloadIdentities just
+	// above: bonus evidence, no reconciled table, must not block
 	// Lambda/ECS/EC2's own otherwise-complete reconciliation.
-	key := "cloudtrail-events:" + region
+	key := models.SurfaceRegional(models.SurfaceCloudTrailEventsPrefix, region)
 	events, err := trail.RecentEvents(ctx)
 	if s.evidence != nil && len(events) > 0 {
 		// Matched by NAME, not NativeID: CloudTrail's Username is the IAM
@@ -516,12 +624,12 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 // Recorded under two source APIs, matching the two AWS calls Trails makes:
 // DescribeTrails for the configuration, GetTrailStatus for whether it is
 // live. Same reasoning as scanCredentialProviders for why this is bonus
-// evidence with no reconciled table, not written to out.Errors.
+// evidence with no reconciled table, and not a compute surface.
 func (s *AWSWorkloadScanner) scanTrailStatus(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
 ) {
-	key := "cloudtrail-status:" + region
+	key := models.SurfaceRegional(models.SurfaceCloudTrailStatusPrefix, region)
 	trails, err := trail.Trails(ctx)
 	if s.evidence != nil {
 		for _, t := range trails {
@@ -562,8 +670,11 @@ func (s *AWSWorkloadScanner) scanTrailStatus(
 // where possible. Returns the stored row so a caller with more evidence to
 // attach under the same subject -- a gateway's targets, say -- does not have
 // to re-fetch it.
+//
+// surface is the per-service coverage key the row came from (lambda:<region>,
+// ...), stamped on its evidence.
 func (s *AWSWorkloadScanner) recordWorkload(
-	workspaceID uuid.UUID, snapshot *IAMSnapshot, region string,
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, surface, region string,
 	w awsdiscovery.Workload, out *WorkloadSnapshot,
 ) (*models.CloudWorkload, error) {
 
@@ -583,12 +694,27 @@ func (s *AWSWorkloadScanner) recordWorkload(
 		EnvVarNames:        w.EnvVarNames,
 		FoundationModel:    w.FoundationModel,
 		Status:             w.Status,
+		DetailIncomplete:   w.DetailIncomplete,
+		DetailError:        w.DetailError,
+		TargetsIncomplete:  w.TargetsIncomplete,
+	}
+	for _, t := range w.Targets {
+		attrs.GatewayTargets = append(attrs.GatewayTargets, models.AWSGatewayTarget{
+			TargetID: t.TargetID, Name: t.Name, Status: t.Status, Type: t.Type,
+		})
 	}
 
 	// Attribution. A role the IAM scan never recorded leaves identity_id NULL
 	// and the ARN in attrs, so the row still says which role it was looking
 	// for -- that is a finding, not a defect.
-	if w.RoleARN != "" {
+	//
+	// A workload whose detail call FAILED is neither: its role is unknown this
+	// run. It is not counted unattributed, and UpsertWorkload keeps the
+	// previous attribution rather than clearing it (D-53).
+	switch {
+	case w.DetailIncomplete:
+		out.DetailIncomplete++
+	case w.RoleARN != "":
 		identity, err := s.identities.GetIdentityByNativeID(workspaceID, w.RoleARN)
 		switch {
 		case err == nil:
@@ -599,7 +725,7 @@ func (s *AWSWorkloadScanner) recordWorkload(
 		default:
 			return nil, err
 		}
-	} else {
+	default:
 		out.Unattributed++
 	}
 
@@ -618,24 +744,31 @@ func (s *AWSWorkloadScanner) recordWorkload(
 	// identity was not found, because "names a role we never discovered" is
 	// itself the finding for an unattributed workload.
 	if s.evidence != nil && stored != nil {
+		facts := map[string]any{
+			"runtime_kind": w.RuntimeKind,
+			"native_id":    w.NativeID,
+			"name":         w.Name,
+			"region":       region,
+		}
+		if w.DetailIncomplete {
+			// Only what the LISTING proved, and which call failed: no
+			// attribution fact at all, because none was read (D-53).
+			facts["detail_incomplete"] = true
+			facts["detail_error"] = w.DetailError
+		} else {
+			// Unchanged keys for a complete read, so an unchanged workload
+			// keeps deduping onto the observation it already has.
+			facts["identity_native_id"] = w.RoleARN
+			facts["attributed"] = workload.IdentityID != nil
+		}
 		if err := s.evidence.Record(
 			WorkloadSubject(stored.ID),
-			// NOTE: this labels the evidence with the per-region compute
-			// stand-in rather than the per-service surface the row actually
-			// came from (lambda:<region>, ecs:<region>, ...). Left as-is --
-			// changing what Phase 1 stamps on existing observations is out of
-			// Phase 2's scope -- but the evidence drawer (§2.14 D) wants the
-			// per-service name, so this is worth correcting deliberately.
-			workloadSourceAPI(w.RuntimeKind), models.SurfaceCompute(region), "",
-			time.Now(), w.NativeID,
-			map[string]any{
-				"runtime_kind":       w.RuntimeKind,
-				"native_id":          w.NativeID,
-				"name":               w.Name,
-				"region":             region,
-				"identity_native_id": w.RoleARN,
-				"attributed":         workload.IdentityID != nil,
-			},
+			// The call that actually produced this row (the listing, when the
+			// detail read failed) and the per-service surface it came from --
+			// what the Evidence panel names (§2.14.7). The compute:<region>
+			// stand-in is a coverage marker, not a source.
+			workloadSourceAPI(w), surface, "",
+			time.Now(), w.NativeID, facts,
 		); err != nil {
 			log.Printf("aws workload scan: evidence for %s: %v", w.NativeID, err)
 		}
@@ -657,10 +790,16 @@ func (s *AWSWorkloadScanner) WithFence(f repositories.ScanFence) *AWSWorkloadSca
 	return s
 }
 
-// workloadSourceAPI names the call each runtime came from, so evidence points
-// at something a reader can re-issue themselves.
-func workloadSourceAPI(runtimeKind string) string {
-	switch runtimeKind {
+// workloadSourceAPI names the call a row came from, so evidence points at
+// something a reader can re-issue themselves: the reader's own SourceAPI --
+// the call that actually returned the data, the listing when a detail call
+// failed -- else the kind's usual call. Gateways had no entry here and every
+// one was labelled aws:unknown (§1.3, T3.5).
+func workloadSourceAPI(w awsdiscovery.Workload) string {
+	if w.SourceAPI != "" {
+		return w.SourceAPI
+	}
+	switch w.RuntimeKind {
 	case models.WorkloadLambdaFunction:
 		return "lambda:ListFunctions"
 	case models.WorkloadECSTaskDefinition:
@@ -671,29 +810,43 @@ func workloadSourceAPI(runtimeKind string) string {
 		return "bedrock:GetAgent"
 	case models.WorkloadBedrockAgentCoreRT:
 		return "bedrock-agentcore:GetAgentRuntime"
+	case models.WorkloadBedrockAgentCoreGW:
+		return "bedrock-agentcore:GetGateway"
 	default:
 		return "aws:unknown"
 	}
 }
 
-// scanActivity reads service-last-accessed for every discovered identity.
+// scanActivity reads service-last-accessed for the connector's identities and
+// returns the activity surface's coverage (T3.7).
 //
 // One report job per identity, each of which is a submit plus polling, so this
-// is the most expensive surface in the whole AWS connector. It is driven from
-// the snapshot's own trust-policy and policy maps rather than a fresh identity
-// list, so it covers exactly the identities this generation recorded.
+// is the most expensive surface in the whole AWS connector, and it is capped
+// (activityIdentityCap). The coverage says exactly what that cost:
+//
+//   - reached    every identity's report was read;
+//   - partial    the cap applied ("500 of 1234 identities"), or some reports
+//     failed while others were read;
+//   - throttled  AWS throttled a report past the retry budget ("throttled on
+//     throttle", §1.3 -- it used to be reported denied);
+//   - denied     no attempted report could be read.
+//
+// Count is the usage rows written, a floor whenever the state is not reached;
+// the Error names the identities. Anything but reached keeps every usage row
+// the last good read wrote (UsageComplete gates ReconcileUsage), and none of
+// it blocks workload reconciliation any more.
 func (s *AWSWorkloadScanner) scanActivity(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot, out *WorkloadSnapshot,
-) {
+) models.SurfaceCoverage {
 	api := s.activityAPI
 	if api == nil {
 		if s.onboarding == nil {
-			return
+			return models.SurfaceCoverage{State: models.CloudCoverageDenied,
+				Error: "no service-last-accessed client and no onboarding service to assume a role with"}
 		}
 		cfg, _, err := s.onboarding.ConfigForConnector(ctx, workspaceID, snapshot.ConnectorID, "")
 		if err != nil {
-			out.Errors["activity"] = err.Error()
-			return
+			return surfaceResult(0, err)
 		}
 		api = awsdiscovery.NewServiceLastAccessedClient(cfg)
 	}
@@ -703,22 +856,26 @@ func (s *AWSWorkloadScanner) scanActivity(
 		reader = reader.WithSleep(s.activitySleep)
 	}
 
-	identities, _, err := s.identities.ListIdentities(workspaceID, repositories.CloudIdentityFilter{
+	// The total is kept, not discarded: an account above the cap must say so,
+	// or the identities past it silently read as having no activity (§1.3).
+	identities, total, err := s.identities.ListIdentities(workspaceID, repositories.CloudIdentityFilter{
 		ConnectorID: &snapshot.ConnectorID,
 		Limit:       activityIdentityCap,
 	})
 	if err != nil {
-		out.Errors["activity"] = err.Error()
-		return
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Error: err.Error()}
 	}
 
+	reads := awsdiscovery.NewItemFailures("identities' activity reports could not be read", false)
+	var writeErr error
 	for _, identity := range identities {
+		reads.Attempt()
 		activity, err := reader.ServiceActivityFor(ctx, identity.NativeID)
 		if err != nil {
-			// One identity's report failing does not mean the rest will. The
-			// surface is marked unread so nothing is reconciled away, and the
-			// remaining identities are still attempted.
-			out.Errors["activity"] = err.Error()
+			// One identity's report failing does not mean the rest will. It is
+			// counted, so nothing is reconciled away, and the remaining
+			// identities are still attempted.
+			reads.Fail(identity.NativeID, activityCall(err), err)
 			continue
 		}
 		for _, svc := range activity {
@@ -733,12 +890,42 @@ func (s *AWSWorkloadScanner) scanActivity(
 				LastSeenGeneration: snapshot.Generation,
 			}
 			if _, _, err := s.workloads.UpsertUsage(usage); err != nil {
-				out.Errors["activity"] = err.Error()
+				if writeErr == nil {
+					writeErr = err
+				}
 				break
 			}
 			out.UsageWritten++
 		}
 	}
+	if writeErr != nil {
+		// Our own write failed: nothing about the account, but this run's usage
+		// is not whole, and it must not be reconciled as if it were.
+		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Count: out.UsageWritten,
+			Error: "recording activity: " + writeErr.Error()}
+	}
+
+	cov := surfaceResult(out.UsageWritten, reads.Err(nil))
+	if total > int64(len(identities)) {
+		capped := fmt.Sprintf("activity was read for %d of %d identities (Access Advisor is capped at %d identities per scan)",
+			len(identities), total, activityIdentityCap)
+		if cov.State == models.CloudCoverageReached {
+			cov = models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: out.UsageWritten, Error: capped}
+		} else {
+			// throttled / denied / partial already block; the cap is named too.
+			cov.Error += "; " + capped
+		}
+	}
+	return cov
+}
+
+// activityCall is the call an activity read failed on, for the coverage text;
+// the reader names it on every error it returns.
+func activityCall(err error) string {
+	if call := awsdiscovery.FailedCall(err); call != "" {
+		return call
+	}
+	return "iam:GetServiceLastAccessedDetails"
 }
 
 // activityIdentityCap bounds how many identities one scan will submit report
@@ -748,7 +935,8 @@ func (s *AWSWorkloadScanner) scanActivity(
 // would otherwise turn this surface into the whole scan. The cap is high enough
 // for any account seen so far and exists to make the cost bounded rather than
 // to express a limit anyone should hit; an account above it reports activity for
-// the identities it did reach and is marked incomplete.
+// the identities it did reach and the surface reads partial, naming both
+// counts (T3.7).
 const activityIdentityCap = 500
 
 func (s *AWSWorkloadScanner) connector(

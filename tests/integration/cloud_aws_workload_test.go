@@ -67,6 +67,9 @@ func (f *fakeLambda) ListFunctions(_ context.Context, _ *lambda.ListFunctionsInp
 type fakeECS struct {
 	defs map[string]ecstypes.TaskDefinition
 	fail error
+	// describeFail fails DescribeTaskDefinition for every definition while
+	// ListTaskDefinitions still lists them.
+	describeFail error
 }
 
 func (f *fakeECS) ListTaskDefinitions(_ context.Context, _ *ecs.ListTaskDefinitionsInput, _ ...func(*ecs.Options)) (*ecs.ListTaskDefinitionsOutput, error) {
@@ -81,6 +84,9 @@ func (f *fakeECS) ListTaskDefinitions(_ context.Context, _ *ecs.ListTaskDefiniti
 }
 
 func (f *fakeECS) DescribeTaskDefinition(_ context.Context, in *ecs.DescribeTaskDefinitionInput, _ ...func(*ecs.Options)) (*ecs.DescribeTaskDefinitionOutput, error) {
+	if f.describeFail != nil {
+		return nil, f.describeFail
+	}
 	def, ok := f.defs[aws.ToString(in.TaskDefinition)]
 	if !ok {
 		return nil, denied("ecs:DescribeTaskDefinition")
@@ -120,19 +126,27 @@ func (f *fakeInstanceProfile) GetInstanceProfile(_ context.Context, in *iam.GetI
 
 type fakeBedrock struct {
 	agents map[string]bedrockagenttypes.Agent
+	// getFail makes GetAgent fail for every agent while ListAgents still lists
+	// them -- the detail-call failure T3.6 is about.
+	getFail error
 }
 
 func (f *fakeBedrock) ListAgents(_ context.Context, _ *bedrockagent.ListAgentsInput, _ ...func(*bedrockagent.Options)) (*bedrockagent.ListAgentsOutput, error) {
 	var summaries []bedrockagenttypes.AgentSummary
 	for id, a := range f.agents {
+		// The summary carries id, name and status -- never the ARN or the
+		// role, exactly as AWS's does.
 		summaries = append(summaries, bedrockagenttypes.AgentSummary{
-			AgentId: aws.String(id), AgentName: a.AgentName,
+			AgentId: aws.String(id), AgentName: a.AgentName, AgentStatus: a.AgentStatus,
 		})
 	}
 	return &bedrockagent.ListAgentsOutput{AgentSummaries: summaries}, nil
 }
 
 func (f *fakeBedrock) GetAgent(_ context.Context, in *bedrockagent.GetAgentInput, _ ...func(*bedrockagent.Options)) (*bedrockagent.GetAgentOutput, error) {
+	if f.getFail != nil {
+		return nil, f.getFail
+	}
 	a, ok := f.agents[aws.ToString(in.AgentId)]
 	if !ok {
 		return nil, denied("bedrock:GetAgent")
@@ -149,6 +163,16 @@ type fakeAgentCore struct {
 	targetsByGateway   map[string][]agentcoretypes.TargetSummary
 	workloadIdentities []agentcoretypes.WorkloadIdentityType
 
+	// runtimeStatusByID is what GetAgentRuntime reports as Status.
+	runtimeStatusByID map[string]agentcoretypes.AgentRuntimeStatus
+	// getGatewayFail / listTargetsFail fail those calls for every gateway
+	// while ListGateways still lists them.
+	getGatewayFail  error
+	listTargetsFail error
+	// account is the account GetGateway's ARN names; the connector's own
+	// (testAccount) when unset, as in a real account.
+	account string
+
 	oauth2Providers []agentcoretypes.Oauth2CredentialProviderItem
 	apiKeyProviders []agentcoretypes.ApiKeyCredentialProviderItem
 }
@@ -162,7 +186,8 @@ func (f *fakeAgentCore) GetAgentRuntime(_ context.Context, in *bedrockagentcorec
 	if !ok {
 		return nil, denied("bedrock-agentcore:GetAgentRuntime")
 	}
-	return &bedrockagentcorecontrol.GetAgentRuntimeOutput{RoleArn: aws.String(role)}, nil
+	return &bedrockagentcorecontrol.GetAgentRuntimeOutput{RoleArn: aws.String(role),
+		Status: f.runtimeStatusByID[aws.ToString(in.AgentRuntimeId)]}, nil
 }
 
 // Gateways and workload identities: empty by default. Fixture-specific tests
@@ -173,17 +198,27 @@ func (f *fakeAgentCore) ListGateways(_ context.Context, _ *bedrockagentcorecontr
 }
 
 func (f *fakeAgentCore) GetGateway(_ context.Context, in *bedrockagentcorecontrol.GetGatewayInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.GetGatewayOutput, error) {
+	if f.getGatewayFail != nil {
+		return nil, f.getGatewayFail
+	}
 	role, ok := f.gatewayRoleByID[aws.ToString(in.GatewayIdentifier)]
 	if !ok {
 		return nil, denied("bedrock-agentcore:GetGateway")
 	}
+	account := f.account
+	if account == "" {
+		account = testAccount
+	}
 	return &bedrockagentcorecontrol.GetGatewayOutput{
-		GatewayArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:491056652413:gateway/" + aws.ToString(in.GatewayIdentifier)),
+		GatewayArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:" + account + ":gateway/" + aws.ToString(in.GatewayIdentifier)),
 		RoleArn:    aws.String(role),
 	}, nil
 }
 
 func (f *fakeAgentCore) ListGatewayTargets(_ context.Context, in *bedrockagentcorecontrol.ListGatewayTargetsInput, _ ...func(*bedrockagentcorecontrol.Options)) (*bedrockagentcorecontrol.ListGatewayTargetsOutput, error) {
+	if f.listTargetsFail != nil {
+		return nil, f.listTargetsFail
+	}
 	return &bedrockagentcorecontrol.ListGatewayTargetsOutput{
 		Items: f.targetsByGateway[aws.ToString(in.GatewayIdentifier)],
 	}, nil

@@ -712,6 +712,8 @@ func (s *AWSIAMScanner) upsertAccessKey(
 	if err != nil {
 		return fmt.Errorf("record access key %s: %w", key.KeyID, err)
 	}
+	// T3.5: the key's observation, keyed by the key id (cloud_aws_collection_evidence.go).
+	s.recordAccessKeyEvidence(identityID, key)
 	if created {
 		counters["secrets_new"]++
 	} else {
@@ -896,8 +898,12 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	// checks. A denied credential report is honest to show as "partial"
 	// overall; it must never be a reason to refuse deleting a stale identity.
 	if credentialReportSurface.State != "" {
-		merged.Surfaces["iam_credential_report"] = credentialReportSurface
+		merged.Surfaces[models.SurfaceIAMCredentialReport] = credentialReportSurface
 	}
+	// T3.8: SCPs are never read, and coverage says so on every AWS scan rather
+	// than staying silent. unsupported: Complete() skips it, no partition
+	// requires it, so it gates nothing (§1.4).
+	merged.Surfaces[models.SurfaceOrganizations] = models.OrganizationsCoverage()
 
 	// A scanner that returned an error before producing a snapshot at all
 	// (could not assume the role, connector vanished mid-scan, …) gets one
@@ -954,6 +960,10 @@ func surfacePartial(count int, incomplete int, reason string) models.SurfaceCove
 }
 
 func surfaceResult(count int, err error) models.SurfaceCoverage {
+	// unsupported and partial (T3.6-T3.8): see cloud_aws_collection_coverage.go.
+	if cov, ok := collectionCoverage(count, err); ok {
+		return cov
+	}
 	switch {
 	case err == nil:
 		return models.SurfaceCoverage{State: models.CloudCoverageReached, Count: count}

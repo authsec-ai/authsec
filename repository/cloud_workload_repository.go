@@ -39,6 +39,20 @@ type CloudWorkloadRepository interface {
 	// depends on was actually reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (workloadsRemoved, usageRemoved int64, err error)
 
+	// ReconcileWorkloads and ReconcileUsage are ReconcileGeneration's two
+	// halves, gated SEPARATELY (T3.7): the compute surfaces license deleting
+	// workloads, Access Advisor licenses deleting usage. One gate for both let
+	// an activity read that is permanently partial above its identity cap veto
+	// workload reconciliation forever -- the connector-wide veto §1.3 removes
+	// for unoffered regions, in another costume.
+	ReconcileWorkloads(workspaceID, connectorID uuid.UUID, generation int) (int64, error)
+	ReconcileUsage(workspaceID, connectorID uuid.UUID, generation int) (int64, error)
+
+	// CountWorkloads counts a connector's rows of one runtime kind in one
+	// region, whatever their generation: whether an earlier scan ever found
+	// that service there.
+	CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (int64, error)
+
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
 	Fenced(f ScanFence) CloudWorkloadRepository
@@ -94,11 +108,18 @@ func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*mode
 					// changed in place, and a workload that became unattributed
 					// (role deleted, or IAM denied this run) must stop claiming the
 					// old one.
-					"identity_id":          w.IdentityID,
+					//
+					// EXCEPT when the detail call that names the role FAILED this
+					// run (attrs.detail_incomplete, T3.6): then the role is
+					// unknown, not gone, and the previous attribution stands --
+					// "attrs merge, never blank" (§1.3), and D-53's "left as the
+					// previous row had it". Decided from EXCLUDED in the same
+					// statement, so there is no read-then-write race.
+					"identity_id":          gorm.Expr(workloadIdentityMerge),
 					"runtime_kind":         w.RuntimeKind,
 					"name":                 w.Name,
 					"region":               w.Region,
-					"attrs":                w.Attrs,
+					"attrs":                gorm.Expr(workloadAttrsMerge),
 					"last_seen_generation": w.LastSeenGeneration,
 					"last_seen_at":         now,
 					"row_updated_at":       now,
@@ -112,6 +133,31 @@ func (r *cloudWorkloadRepository) UpsertWorkload(w *models.CloudWorkload) (*mode
 	}
 	return w, w.ID == proposed, nil
 }
+
+// workloadIdentityMerge keeps the previous attribution when this run's detail
+// call failed; see UpsertWorkload.
+const workloadIdentityMerge = `CASE WHEN (EXCLUDED.attrs->>'detail_incomplete')::boolean IS TRUE
+	THEN cloud_workload.identity_id ELSE EXCLUDED.identity_id END`
+
+// workloadAttrsMerge is the attrs half of UpsertWorkload's conflict update.
+//
+//   - detail_incomplete: the previous attrs, with this run's listed values
+//     laid over them. jsonb || takes the right side's keys, and the collector
+//     omits every empty field, so only what the listing actually returned
+//     (status, the detail_incomplete flag and its error) replaces anything;
+//     the role, model and env-var names the last good read recorded survive.
+//   - targets_incomplete (a gateway whose ListGatewayTargets failed): this
+//     run's attrs, with the previous target list kept -- an unread target list
+//     is unknown, never empty.
+//   - otherwise: replaced wholesale, as before. A successful detail read is
+//     the whole truth, and clears the incomplete flags with it.
+const workloadAttrsMerge = `CASE
+	WHEN (EXCLUDED.attrs->>'detail_incomplete')::boolean IS TRUE
+		THEN cloud_workload.attrs || EXCLUDED.attrs
+	WHEN (EXCLUDED.attrs->>'targets_incomplete')::boolean IS TRUE
+		THEN EXCLUDED.attrs || jsonb_strip_nulls(jsonb_build_object(
+			'gateway_targets', cloud_workload.attrs->'gateway_targets'))
+	ELSE EXCLUDED.attrs END`
 
 func (r *cloudWorkloadRepository) UpsertUsage(u *models.CloudUsage) (*models.CloudUsage, bool, error) {
 	if u.WorkspaceID == uuid.Nil || u.ConnectorID == uuid.Nil || u.IdentityID == uuid.Nil {
@@ -213,6 +259,48 @@ func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uu
 		return 0, 0, err
 	}
 	return workloads, usage, nil
+}
+
+func (r *cloudWorkloadRepository) CountWorkloads(
+	workspaceID, connectorID uuid.UUID, runtimeKind, region string,
+) (int64, error) {
+	var n int64
+	err := r.db.Model(&models.CloudWorkload{}).
+		Where("workspace_id = ? AND connector_id = ? AND runtime_kind = ? AND region = ?",
+			workspaceID, connectorID, runtimeKind, region).
+		Count(&n).Error
+	return n, err
+}
+
+// ReconcileWorkloads removes the workloads this connector did not see in the
+// given generation. The caller invokes it only when every compute surface was
+// reached (or deliberately not read: not_selected, unsupported).
+func (r *cloudWorkloadRepository) ReconcileWorkloads(
+	workspaceID, connectorID uuid.UUID, generation int,
+) (int64, error) {
+	var removed int64
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation).Delete(&models.CloudWorkload{})
+		removed = res.RowsAffected
+		return res.Error
+	})
+	return removed, err
+}
+
+// ReconcileUsage removes the usage rows this connector did not see in the
+// given generation. The caller invokes it only when activity was reached.
+func (r *cloudWorkloadRepository) ReconcileUsage(
+	workspaceID, connectorID uuid.UUID, generation int,
+) (int64, error) {
+	var removed int64
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
+		removed = res.RowsAffected
+		return res.Error
+	})
+	return removed, err
 }
 
 // ReconcileGeneration removes what this connector did not see. Usage before
