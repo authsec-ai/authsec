@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Spec** | `SPEC-iga-phase2-graph.md` at `d9741e7` (`authsec-staging`), merged into `graph` |
-| **Results observed on** | `graph` @ **`4593476`** (this report is committed on top of it) |
+| **Results observed on** | `graph` @ **`4593476`**, plus the B7/B21 test added with this report (§3) |
 | **Date** | 2026-09-23 |
 | **Database** | PostgreSQL 16 (`postgres:16`), migrations `001`–`036` applied in order, one transaction per file |
 | **Status** | M0 complete as far as this report says. **Stopping here for review**, per the handoff |
@@ -49,8 +49,8 @@ go test -count=1 -p 1 -v -run 'TestP2' ./tests/integration/
 | `internal/igagraph` (unit) | 24 | **0** | 0 |
 | `internal/awsdiscovery` (unit) | 23 | **0** | 0 |
 | `tests/igagraph` (graph suite, real Postgres) | 22 | **0** | 0 |
-| `tests/integration` (at `036`; includes the 18 `TestP2*`) | 177 | **0** | 0 |
-| **IGA total** | **246** | **0** | **0** |
+| `tests/integration` (at `036`; includes the 19 `TestP2*`) | 178 | **0** | 0 |
+| **IGA total** | **247** | **0** | **0** |
 | Whole repository, `go test ./...` | 1063 | 12 | 22 |
 
 The whole-repository failures are **not** from this branch. The same six
@@ -99,14 +99,16 @@ switch on and verified, and every AWS call answered by a fake
 | **T1.5** a reclaimed run keeps its generation; rows and evidence at one generation | `TestP2ReclaimedRunKeepsItsGeneration` | **M17** scanner recomputes → *"identity rows at generations [2], want only the run's own 1"* |
 | **T4.9** zero edges without evidence (per edge) | inside `TestP2UnchangedRescan` | **M1b** above |
 | **E16 / T4.8** AWS identities never in GitHub's `/identity-accounts`; GitHub writer stamps `provider` | `TestP2AWSRowsAbsentFromGitHubReaders` | **M18** provider filter dropped → *"would return 2 rows"* |
+| **B7 / B21 / E8a** role recreated under the same ARN: old identity retired `recreated`; its `executes_as`, assignments and grants ended `subject_recreated`; the Lambda's current edge is to the new role; its same-named **inline** policy is a new incarnation; no statement key reused | `TestP2RecreatedRoleIsANewObject` | **M19** recreation branch disabled → *"identities = [one, active, new RoleId] … want the old retired 'recreated' and a new one"* |
 | **B13/B14, T1.1** the switch: fails closed below `036`, verifies at `036`, a transient error is **retried, not cached**, a typo is misconfigured | `TestGraphSwitch*` (5, graph suite) | — (the fail-open cache is M15) |
 | The three exits, fenced, with the **job-held** barrier; a reclaiming worker settles at once | `TestExit*`, `TestBarrierHeartbeatRenewsWithoutBreakingTheFence` | kept from the graph branch, adapted |
 | not_in_scan, retire → suspend → restore → reconfirm (**now with B24 lifecycle events**), AlreadyPublished replay | `TestProof2*`, `TestProof3*`, `TestProof4*` | kept |
 | Wedge recovery | `TestTransientFailureIsRetriedThenRecovered` and 4 more | kept |
 
-**23 mutations, 23 caught** (M1, M1b, M2, M3, M4, M5, M5b, M6, M7, M8a, M8b,
-M9, M10–M15, M16a, M16b, M17, M18), re-run as one batch on `4593476` after the
-last test change.
+**24 mutations, 24 caught** (M1, M1b, M2, M3, M4, M5, M5b, M6, M7, M8a, M8b,
+M9, M10–M15, M16a, M16b, M17, M18, M19). M1–M18 were re-run as one batch on
+`4593476` after the last change to a scenario; M19 was run with the test that
+added it.
 
 ### Scenarios that initially passed for the wrong reason
 
@@ -249,9 +251,10 @@ projection. Correct, but relevant to T6.10's load target.
   classification (§5.5, T6.6), the T6.10 load test. The classification
   write route was **removed** per §6.1; there is none until T6.6.
 - **The §9 production-schema rehearsal** — needs the dump from you.
-- **B1–B24** as a set; those covered here are B2, B5, B6, B7-equivalent
-  (`TestRecreatedRole…` moved to M1 with the old projection tests), B10,
-  B12, B13, B14, B15, B18, B19, B21, B24.
+- **B1–B24** as a set. Covered here: B2, B5, B6, B7, B10, B12, B13, B14,
+  B15, B18, B19, B21, B24. Not yet: B1, B3, B4 and B8 as their own rows
+  (their mechanisms run in scenarios 1, 10 and proof 3), B9, B11, B16, B17,
+  B20, B22, B23.
 - Deploys: none; not in scope.
 
 ## 8. Corrections to earlier reports

@@ -777,3 +777,66 @@ func TestP2AWSRowsAbsentFromGitHubReaders(t *testing.T) {
 		t.Errorf("GET /identity-accounts would return %d rows %+v; want only the GitHub identity", len(listed), listed)
 	}
 }
+
+// B7 / B21 / E8a. A role deleted and recreated under the same ARN (new RoleId)
+// is a NEW identity: the old one retires `recreated`, its edges end
+// `subject_recreated`, and its same-named INLINE policy is a new incarnation --
+// nothing of the old history carries over.
+func TestP2RecreatedRoleIsANewObject(t *testing.T) {
+	l := newP2Lab(t, "p2-recreated-role", true)
+	a := l.account(accountA)
+	role := a.role("SharedToolRole", "AROAOLDOLDOLDOLDOLD1")
+	a.attach("SharedToolRole", a.managed("TicketRead", docTicketRead))
+	a.iam.inlineRolePolicies["SharedToolRole"] = map[string]string{"ToolsInline": docToolboxRead}
+	a.lambda("us-east-1", "ticket-tools", role)
+	l.scanAndProject(a)
+
+	a.role("SharedToolRole", "AROANEWNEWNEWNEWNEW2") // same name, new RoleId
+	l.scanAndProject(a)
+
+	var ids []struct {
+		ID            uuid.UUID
+		ImmutableKey  string
+		Lifecycle     string
+		RetiredReason string
+	}
+	l.db.Raw(`SELECT id, immutable_key, lifecycle, retired_reason FROM iga_identity_accounts
+	           WHERE workspace_id = ? AND provider = 'aws' ORDER BY first_seen_at, id`, l.ws).Scan(&ids)
+	if len(ids) != 2 || ids[0].ImmutableKey != "AROAOLDOLDOLDOLDOLD1" ||
+		ids[0].Lifecycle != models.IGALifecycleRetired || ids[0].RetiredReason != models.RetiredRecreated ||
+		ids[1].Lifecycle != models.IGALifecycleActive {
+		t.Fatalf("identities = %+v, want the old retired 'recreated' and a new active one", ids)
+	}
+	old, neu := ids[0].ID, ids[1].ID
+	for what, q := range map[string]string{
+		"executes_as": `SELECT count(*) FROM iga_relationship WHERE workspace_id = ? AND target_identity_account_id = ?
+		                AND state = 'ended' AND ended_reason = 'subject_recreated'`,
+		"assignments": `SELECT count(*) FROM iga_policy_assignment WHERE workspace_id = ? AND holder_identity_account_id = ?
+		                AND state = 'ended' AND ended_reason = 'subject_recreated'`,
+		"grants": `SELECT count(*) FROM iga_access_edges WHERE workspace_id = ? AND subject_identity_account_id = ?
+		           AND state = 'ended' AND ended_reason = 'subject_recreated'`,
+	} {
+		if n := l.count(q, l.ws, old); n == 0 {
+			t.Errorf("the old role's %s did not end subject_recreated", what)
+		}
+	}
+	if n := l.count(`SELECT count(*) FROM iga_relationship WHERE workspace_id = ? AND target_identity_account_id = ?
+	                  AND state = 'current' AND relationship_type = 'executes_as'`, l.ws, neu); n != 1 {
+		t.Errorf("the new role has %d current executes_as, want 1 (the Lambda runs as it now)", n)
+	}
+	// The inline policy: two incarnations, the old retired, none shared.
+	var inl []struct {
+		ID            uuid.UUID
+		Lifecycle     string
+		RetiredReason string
+	}
+	l.db.Raw(`SELECT id, lifecycle, retired_reason FROM iga_policy WHERE workspace_id = ? AND display_name = 'ToolsInline'
+	           ORDER BY first_seen_at, id`, l.ws).Scan(&inl)
+	if len(inl) != 2 || inl[0].Lifecycle != models.IGALifecycleRetired || inl[1].Lifecycle != models.IGALifecycleActive {
+		t.Errorf("inline policies = %+v, want the old incarnation retired and a new one", inl)
+	}
+	if n := l.count(`SELECT count(*) FROM (SELECT source_key FROM iga_entitlements WHERE workspace_id = ?
+	                  AND provider = 'aws' GROUP BY source_key HAVING count(*) > 1) d`, l.ws); n != 0 {
+		t.Errorf("%d statement keys reused across incarnations", n)
+	}
+}
