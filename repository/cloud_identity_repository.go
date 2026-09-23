@@ -136,6 +136,14 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAt
 	// never had, rather than writing it as null. A plain `stored || new` merge
 	// would be wrong: omitempty leaves a removed tag or boundary ABSENT from the
 	// new attrs, and it would survive forever.
+	//
+	// ONLY FOR THE SAME PRINCIPAL. The row is keyed by ARN, and a role deleted
+	// and recreated under its name keeps the row but is a different role with a
+	// new unique id (§2.4's creation boundary): the stored values describe its
+	// predecessor, and the read that would correct them never comes (D-48: new
+	// roles get none). So they are kept only when the stored unique_id equals
+	// the new one -- a row with none on either side cannot prove it is the same
+	// principal, and keeps nothing.
 	if len(keepAttrs) > 0 {
 		pairs := make([]string, 0, len(keepAttrs))
 		args := make([]interface{}, 0, 2*len(keepAttrs))
@@ -144,7 +152,9 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, keepAt
 			args = append(args, k, k)
 		}
 		assignments["attrs"] = gorm.Expr(
-			"jsonb_strip_nulls(jsonb_build_object("+strings.Join(pairs, ", ")+")) || excluded.attrs",
+			"CASE WHEN cloud_identity.attrs ->> 'unique_id' = excluded.attrs ->> 'unique_id'"+
+				" THEN jsonb_strip_nulls(jsonb_build_object("+strings.Join(pairs, ", ")+")) || excluded.attrs"+
+				" ELSE excluded.attrs END",
 			args...)
 	}
 	// last_used_at is only advanced, never cleared. AWS reports it from

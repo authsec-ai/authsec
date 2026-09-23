@@ -433,9 +433,10 @@ func (snap *IAMSnapshot) addPolicies(arn string, p awsdiscovery.IdentityPolicies
 // roleAttrsNotRead are the attrs keys RoleDetail does not carry (D-48). A
 // role's stored description and max session duration -- written by an
 // earlier GetRole-based read -- are KEPT rather than blanked, because this
-// read says nothing about them. Everything else in attrs is replaced: tags
-// and the permissions boundary ARE in the listing, so their removal in AWS
-// must be observed as removal.
+// read says nothing about them: for the same role only (same unique id),
+// never inherited by one recreated under its ARN. Everything else in attrs is
+// replaced: tags and the permissions boundary ARE in the listing, so their
+// removal in AWS must be observed as removal.
 var roleAttrsNotRead = []string{"description", "max_session_duration"}
 
 func (s *AWSIAMScanner) upsertRole(

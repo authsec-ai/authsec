@@ -785,7 +785,8 @@ func TestP2S3aPaginationAcrossPages(t *testing.T) {
 // D-48: attrs merge, never blank -- for the fields the listing does NOT
 // return. A role's tags and boundary are in the listing, so their removal is
 // observed; its description and max session duration are not, so what an
-// earlier GetRole-based read stored is kept.
+// earlier GetRole-based read stored is kept -- for that role, not for a new
+// one recreated under its name.
 func TestP2S3aRescanReplacesListedAttrsKeepsUnlisted(t *testing.T) {
 	l := newP2Lab(t, "p2-s3a-attrs", true)
 	a := l.account(accountA)
@@ -838,6 +839,19 @@ func TestP2S3aRescanReplacesListedAttrsKeepsUnlisted(t *testing.T) {
 			x.State != models.RelEnded {
 			t.Errorf("%s's boundary assignment = %+v, want ended", holder, x)
 		}
+	}
+
+	// Kept only for the SAME role. Deleted and recreated under its name (a new
+	// RoleId, §2.4), it keeps the row but is a new role: its predecessor's
+	// description and max session are not facts about it, and D-48 gives a new
+	// role none.
+	a.role("TaggedRole", "AROATAGGEDROLENEW001")
+	l.scanAndProject(a)
+	role = models.CloudIdentity{}
+	l.db.Where("workspace_id = ? AND native_id = ?", l.ws, roleARN).First(&role)
+	if ra = role.AWSAttrs(); ra.UniqueID != "AROATAGGEDROLENEW001" || ra.Description != "" || ra.MaxSessionDuration != 0 {
+		t.Errorf("recreated role attrs = %+v, want the new unique id and NO description or max session: "+
+			"those described the role it replaced", ra)
 	}
 }
 
@@ -912,7 +926,8 @@ func TestP2S3aPolicyObservationPerVersion(t *testing.T) {
 // judged by the trust parser's readability check. An unparseable one is
 // NULL in the jsonb column, carries trust_parse_error, is named under
 // policy_documents, and is travelled by the role's observation; fixing it in
-// AWS clears the error on the next scan.
+// AWS clears the error on the next scan. An entry with no trust document at
+// all is unreadable too (D-45), never a role that trusts nobody.
 func TestP2S3aTrustDocumentStoredAndJudged(t *testing.T) {
 	l := newP2Lab(t, "p2-s3a-trust", true)
 	a := l.account(accountA)
@@ -973,6 +988,34 @@ func TestP2S3aTrustDocumentStoredAndJudged(t *testing.T) {
 	if len(facts) != 1 || !strings.Contains(fmt.Sprint(facts[0]["trust_document"]), "lambda.amazonaws.com") ||
 		facts[0]["trust_parse_error"] != "" {
 		t.Errorf("role observation = %v, want one carrying the trust document (§4.8)", facts)
+	}
+	legacyEdges := func() int64 {
+		return l.count(`SELECT count(*) FROM cloud_assume_edge e JOIN cloud_identity i ON i.id = e.identity_id
+		                 WHERE e.workspace_id = ? AND i.native_id = ?`, l.ws, roleARN)
+	}
+	before := legacyEdges()
+	if before == 0 {
+		t.Fatalf("TrustRole has no cloud_assume_edge with its trust document readable")
+	}
+
+	// D-45: an entry that carries NO trust document at all is unreadable, not
+	// a role that trusts nobody: the error is recorded (the signal §4.10 reads
+	// to hold the role's trust edges stale, never ended), the role is named
+	// under policy_documents, and the edges its last readable document
+	// declared are not reconciled away.
+	s3aEditRole(t, a, "TrustRole", func(r *iamtypes.Role) { r.AssumeRolePolicyDocument = nil })
+	run = l.scanAndProject(a)
+	if doc, hash, perr = read(); len(doc) != 0 || hash != "" || perr != "parse: empty trust document" {
+		t.Errorf("absent trust = doc %q hash %q error %q, want NULL, no hash, 'parse: empty trust document'", doc, hash, perr)
+	}
+	if pd := s3aCoverage(run)[models.SurfacePolicyDocuments]; pd.State != models.CloudCoveragePartial ||
+		len(pd.Items) != 1 ||
+		pd.Items[0] != (models.CoverageItem{Policy: "trust policy of TrustRole", Error: "parse: empty trust document"}) ||
+		!strings.Contains(pd.Error, "trust policy of TrustRole (parse: empty trust document)") {
+		t.Errorf("policy_documents = %+v, want partial naming TrustRole's absent trust policy", pd)
+	}
+	if n := legacyEdges(); n != before {
+		t.Errorf("cloud_assume_edge rows for TrustRole = %d, want the %d from its last readable document kept", n, before)
 	}
 }
 

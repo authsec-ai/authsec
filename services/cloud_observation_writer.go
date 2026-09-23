@@ -136,6 +136,81 @@ func ResourceSubject(id uuid.UUID) ObservationSubject   { return ObservationSubj
 func WorkloadSubject(id uuid.UUID) ObservationSubject   { return ObservationSubject{WorkloadID: &id} }
 func PolicySubject(id uuid.UUID) ObservationSubject     { return ObservationSubject{PolicyID: &id} }
 
+// ObservedSubjectFact is the key under which Record names, inside a subject's
+// facts, the subject row they were observed on: "<kind>:<row id>".
+//
+// WHY THE FACTS NAME THEIR SUBJECT. content_hash is of the facts alone, and an
+// observation outlives the row it describes (024): reconciliation's delete SETs
+// NULL the subject column, and the row falls under
+// uq_cloud_observation_dedupe_no_subject (025/035), keyed only by
+// (workspace_id, source_api, content_hash). Equal facts about two different
+// rows are ORDINARY -- one statement fanned out to two resources, two holders
+// of one managed policy, the same AWS-managed policy read in two accounts, a
+// policy detached, reattached unchanged and detached again -- so the second
+// orphan collided with the first, the DELETE failed with a unique violation,
+// and it failed again on every later run, because the stale row kept its
+// colliding observation. Naming the row makes two observations' facts equal
+// only when they are about the same row, which the subject dedupe index
+// already keeps unique while the row lives; so no orphan can ever equal
+// another row. An unchanged re-read still dedupes: every upsert returns the
+// SURVIVING row's id, so a live subject's name never changes. Evidence with no
+// subject at all (AgentCore Workload Identities) is not stamped and dedupes on
+// content, as 025 intends.
+//
+// It is the row's identity, not a join key: evidence is joined on the typed
+// subject and subject_native_id, never on a cloud_* row id (§4.8). A caller's
+// own fact under this key is overwritten.
+const ObservedSubjectFact = "observed_subject"
+
+// ref names the subject column that is set, as "<kind>:<row id>", or "" for
+// evidence with no subject. At most one is set (the database checks it).
+func (s ObservationSubject) ref() string {
+	switch {
+	case s.IdentityID != nil:
+		return "identity:" + s.IdentityID.String()
+	case s.PermissionID != nil:
+		return "permission:" + s.PermissionID.String()
+	case s.ResourceID != nil:
+		return "resource:" + s.ResourceID.String()
+	case s.WorkloadID != nil:
+		return "workload:" + s.WorkloadID.String()
+	case s.PolicyID != nil:
+		return "policy:" + s.PolicyID.String()
+	}
+	return ""
+}
+
+// stampSubject returns the facts naming the subject they were observed on
+// (ObservedSubjectFact), or the facts unchanged for evidence with no subject.
+// A copy: the caller's map is not modified. Facts that are not a JSON object
+// cannot carry the name and are refused, rather than stored unstamped where
+// they would collide once orphaned.
+func stampSubject(facts any, ref string) (any, error) {
+	if ref == "" {
+		return facts, nil
+	}
+	var stamped map[string]any
+	switch t := facts.(type) {
+	case nil:
+		stamped = map[string]any{}
+	case map[string]any:
+		stamped = make(map[string]any, len(t)+1)
+		for k, v := range t {
+			stamped[k] = v
+		}
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalise observation: %w", err)
+		}
+		if err := json.Unmarshal(b, &stamped); err != nil || stamped == nil {
+			return nil, fmt.Errorf("observation facts must be a JSON object to name their subject, got %T", facts)
+		}
+	}
+	stamped[ObservedSubjectFact] = ref
+	return stamped, nil
+}
+
 // ObservationWriter records evidence for one scan run.
 //
 // Constructed per run so the run id, generation and connector are supplied once
@@ -189,7 +264,16 @@ func (w *ObservationWriter) Record(
 	if w == nil {
 		return nil
 	}
-	payload, hash, err := HashObservation(facts)
+	// The facts name their subject row BEFORE hashing (ObservedSubjectFact), so
+	// the observation cannot collide with another once its subject is deleted.
+	// Rows written before the stamp existed are not rewritten: the first
+	// stamped write for their subject is a new row, confirmed from then on.
+	ref := subject.ref()
+	stamped, err := stampSubject(facts, ref)
+	if err != nil {
+		return err
+	}
+	payload, hash, err := HashObservation(stamped)
 	if err != nil {
 		return err
 	}
@@ -241,8 +325,7 @@ func (w *ObservationWriter) Record(
 	// emits it verbatim; without that it quotes every Column.Name as a plain
 	// identifier, turning the expression into a single invalid, literally-quoted
 	// column name instead of the function call Postgres needs to match the index.
-	hasSubject := subject.IdentityID != nil || subject.PermissionID != nil ||
-		subject.ResourceID != nil || subject.WorkloadID != nil || subject.PolicyID != nil
+	hasSubject := ref != ""
 
 	conflict := clause.OnConflict{
 		DoUpdates: clause.Assignments(map[string]interface{}{
