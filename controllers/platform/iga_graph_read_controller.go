@@ -99,14 +99,14 @@ func graphFeatures(on bool) gin.H {
 	// A feature is true only when every route it names is implemented AND the
 	// switch is on (D-11).
 	return gin.H{
-		"workloads": on,
-		"identities": false,
-		"resources": false,
-		"graph": on,
-		"evidence": false,
-		"changes": on,
+		"workloads":      on,
+		"identities":     on,
+		"resources":      on,
+		"graph":          on,
+		"evidence":       on,
+		"changes":        on,
 		"classification": on,
-		"coverage": on,
+		"coverage":       on,
 	}
 }
 

@@ -39,9 +39,11 @@ import (
 const ResourceExistenceNotVerified = "not_verified"
 
 // ResourcePolicySourceAPIs are the calls the permission scanner records a
-// resource policy under (services.resourcePolicySourceAPI): the only
-// observations resource_policy is computed from.
-var ResourcePolicySourceAPIs = []string{"s3:GetBucketPolicy", "kms:GetKeyPolicy"}
+// resource policy under (services.resourcePolicySourceAPI, including its
+// default arm): the only observations resource_policy -- and evidence's
+// resource_policy_not_projected, which uses the same rule (D-19) -- is
+// computed from.
+var ResourcePolicySourceAPIs = []string{"s3:GetBucketPolicy", "kms:GetKeyPolicy", "resource:GetPolicy"}
 
 // ResourceDetailView is data of GET /resources/:id: the §5.3 list row (its
 // fields flattened in), plus existence, resource_policy and sources.
