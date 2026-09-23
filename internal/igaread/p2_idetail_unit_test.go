@@ -52,10 +52,11 @@ func TestIdetailStatementIndexOf(t *testing.T) {
 	}
 }
 
-// The stored credential lifecycle maps to AWS's status; anything that does
-// not record one is null, never guessed.
+// The stored credential lifecycle maps to AWS's status, spelled as AWS spells
+// it (D-86: Active/Inactive); anything that does not record one is null,
+// never guessed.
 func TestIdetailCredentialStatusOf(t *testing.T) {
-	for lc, want := range map[string]string{"active": "active", "revoked": "inactive", "expired": "", "rotated": "", "": ""} {
+	for lc, want := range map[string]string{"active": "Active", "revoked": "Inactive", "expired": "", "rotated": "", "": ""} {
 		got := CredentialStatusOf(lc)
 		if (want == "" && got != nil) || (want != "" && (got == nil || *got != want)) {
 			t.Errorf("CredentialStatusOf(%q) = %v, want %q", lc, got, want)
@@ -118,6 +119,8 @@ func TestIdetailUnresolvedReasonOf(t *testing.T) {
 		"oidc pattern":       {models.ExternalPrincipalOIDC, "repo:org/*", nil, nil, UnresolvedWildcard},
 		"service":            {models.ExternalPrincipalAWSService, "lambda.amazonaws.com", nil, nil, UnresolvedServicePrincipal},
 		"unconnected":        {models.ExternalPrincipalAWSAccount, "300000000003", off, nil, UnresolvedAccountNotConnected},
+		"unconnected role":   {models.ExternalPrincipalAWSPrincipal, "arn:aws:iam::300000000003:role/r", off, nil, UnresolvedAccountNotConnected},
+		"connected root":     {models.ExternalPrincipalAWSAccount, "220171243705", on, nil, UnresolvedAccountPrincipal},
 		"connected, no id":   {models.ExternalPrincipalAWSPrincipal, "arn:aws:iam::220171243705:role/gone", on, nil, UnresolvedNotInInventory},
 		"resolution off":     {models.ExternalPrincipalAWSPrincipal, "arn:aws:iam::220171243705:role/r", on, suspended, UnresolvedNotInInventory},
 		"exact oidc subject": {models.ExternalPrincipalOIDC, "repo:org/app:ref:main", nil, nil, UnresolvedNotInInventory},
@@ -133,6 +136,47 @@ func TestIdetailUnresolvedReasonOf(t *testing.T) {
 	if r := ExternalResolutionOf(models.BasisAsserted, models.ResolutionActive, "", "priya", nil, &id); r.ResolvedTo != R(RefWorkload, id) ||
 		r.Rule != nil || r.ResolvedBy == nil || *r.ResolvedBy != "priya" {
 		t.Errorf("asserted to a workload = %+v", r)
+	}
+}
+
+// An external principal's account is connected only as of the revision: a
+// live connector for it with a run in the revision. Onboarded but not yet
+// published, or revoked, is not connected; an account no connector reads is
+// named, not connected; no account is nil. An account connected twice --
+// its first connector revoked (its runs are what the revision holds), the
+// new one onboarded but not yet published -- is not connected either: the
+// revoked connector's runs never make it so (D-89), and the live one has
+// none in the revision.
+func TestIdetailExternalPrincipalAccount(t *testing.T) {
+	published, pending, revoked := uuid.New(), uuid.New(), uuid.New()
+	oldConn, newConn := uuid.New(), uuid.New()
+	accts := &Accounts{byAccount: map[string]*ConnectorInfo{}, byConnector: map[uuid.UUID]*ConnectorInfo{}}
+	for _, c := range []*ConnectorInfo{
+		{ID: published, AccountID: "111111111111", Label: "prod", Status: models.CloudConnectorActive},
+		{ID: pending, AccountID: "222222222222", Label: "new", Status: models.CloudConnectorActive},
+		{ID: revoked, AccountID: "333333333333", Label: "gone", Status: models.CloudConnectorRevoked},
+		{ID: oldConn, AccountID: "555555555555", Label: "again", Status: models.CloudConnectorRevoked},
+		{ID: newConn, AccountID: "555555555555", Label: "again", Status: models.CloudConnectorActive},
+	} {
+		accts.byConnector[c.ID] = c
+		// As LoadAccounts: a live connector is preferred for its account.
+		if prev, ok := accts.byAccount[c.AccountID]; !ok || prev.Status == models.CloudConnectorRevoked {
+			accts.byAccount[c.AccountID] = c
+		}
+	}
+	inRevision := map[uuid.UUID]bool{published: true, revoked: true, oldConn: true}
+	for id, want := range map[string]bool{"111111111111": true, "222222222222": false, "333333333333": false,
+		"444444444444": false, "555555555555": false} {
+		a := ExternalPrincipalAccount(accts, inRevision, id)
+		if a == nil || a.ID != id || a.Connected != want {
+			t.Errorf("ExternalPrincipalAccount(%s) = %+v, want connected %v", id, a, want)
+		}
+	}
+	if a := ExternalPrincipalAccount(accts, inRevision, "222222222222"); a.Label != "new" {
+		t.Errorf("a pending account keeps its label: %+v", a)
+	}
+	if ExternalPrincipalAccount(accts, inRevision, "") != nil {
+		t.Error("a principal that names no account has account null")
 	}
 }
 

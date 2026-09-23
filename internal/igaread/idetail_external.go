@@ -79,24 +79,84 @@ const (
 	UnresolvedWildcard = "wildcard"
 	// UnresolvedServicePrincipal: an AWS service, never an identity we hold.
 	UnresolvedServicePrincipal = "service_principal"
-	// UnresolvedAccountNotConnected: it names an account no live connector
-	// reads.
+	// UnresolvedAccountNotConnected: it names an account whose inventory is
+	// not in this revision (ExternalPrincipalAccount): no live connector
+	// reads it, or one was onboarded but none of its runs is published yet.
 	UnresolvedAccountNotConnected = "account_not_connected"
+	// UnresolvedAccountPrincipal: an aws_account principal in a connected
+	// account. It means "any principal that account permits" (§4.7), so no
+	// single identity can ever match it; "not in inventory" would claim we
+	// looked for one and found nothing.
+	UnresolvedAccountPrincipal = "account_principal"
 	// UnresolvedNotInInventory: everything else -- a connected account's
 	// principal we hold no identity for, a federated subject, an unresolved
 	// unique id, or a resolution that is not in force.
 	UnresolvedNotInInventory = "not_in_inventory"
 )
 
+// ExternalRetiredNoLongerReferenced is a retired external principal's
+// retired_reason (§5.2 "Every detail route returns retired objects with
+// lifecycle, retired_reason and last_confirmed_at"). DERIVED like its
+// lifecycle (D-47): nothing retires an external principal, it is retired
+// exactly when no can_assume from it is current or stale -- every trust
+// statement that named it has ended, or none was ever recorded.
+const ExternalRetiredNoLongerReferenced = "no_longer_referenced"
+
+// RevisionConnectors is the set of connectors the current revision holds a
+// projected run of: every connector with an iga_projection_state row, read in
+// this snapshot (D-57: at the current revision that is the manifest). A
+// connector onboarded after the revision, whose first publication is still
+// pending, is not in it.
+func RevisionConnectors(q *Query) (map[uuid.UUID]bool, error) {
+	var ids []uuid.UUID
+	if err := q.DB().Raw(`SELECT DISTINCT ps.connector_id FROM iga_projection_state ps WHERE ps.workspace_id = ?`,
+		q.WS).Scan(&ids).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// ExternalPrincipalAccount is the account an external principal names, with
+// connected fixed by the REVISION (§5.1 "a response cannot straddle two
+// publications"; D-3, D-25): connected only when a live connector for it has
+// a run in the revision (inRevision, RevisionConnectors). An identity or
+// workload is connected by construction -- it exists only because its account
+// was projected -- but the account an external principal names may never have
+// been read, and onboarding it publishes nothing: until its first publication
+// its inventory is not in the graph, so it reads not connected, exactly as it
+// did before onboarding, and nothing can say "not in inventory" of it. A
+// revoked connector is not connected (D-61, D-89). nil when the principal
+// names no account.
+func ExternalPrincipalAccount(accts *Accounts, inRevision map[uuid.UUID]bool, accountID string) *Account {
+	a := accts.Of(accountID)
+	if a == nil || !a.Connected {
+		return a
+	}
+	a.Connected = false
+	for _, c := range accts.All() {
+		if c.AccountID == accountID && c.Status != models.CloudConnectorRevoked && inRevision[c.ID] {
+			a.Connected = true
+			break
+		}
+	}
+	return a
+}
+
 // ExternalPrincipalDetail is the /external-principals/:id data object.
 //
-// account is {id, label, connected} (D-3) or null when the principal states
-// none; account_connected repeats account.connected, and is null with it --
-// a service principal is not "in an unconnected account". resolution is null
+// account is {id, label, connected} (D-3; connected as of the revision,
+// ExternalPrincipalAccount) or null when the principal states none;
+// account_connected repeats account.connected, and is null with it -- a
+// service principal is not "in an unconnected account". resolution is null
 // when no resolution was ever recorded (D-87), else the stored one;
 // unresolved_reason is null exactly when a resolution is in force (state
 // active, with a target). lifecycle is derived (D-47): active while any
-// can_assume from it is current or stale, retired once every one has ended.
+// can_assume from it is current or stale, retired once every one has ended,
+// and then retired_reason says so (ExternalRetiredNoLongerReferenced).
 type ExternalPrincipalDetail struct {
 	Ref              string              `json:"ref"`
 	Name             string              `json:"name"`
@@ -108,6 +168,7 @@ type ExternalPrincipalDetail struct {
 	Resolution       *ExternalResolution `json:"resolution"`
 	UnresolvedReason *string             `json:"unresolved_reason"`
 	Lifecycle        string              `json:"lifecycle"`
+	RetiredReason    string              `json:"retired_reason,omitempty"`
 	State            string              `json:"state"`
 	FirstSeenAt      any                 `json:"first_seen_at"`
 	LastSeenAt       any                 `json:"last_seen_at"`
@@ -212,19 +273,26 @@ func (r *Reader) GetExternalPrincipal(ctx context.Context, ws uuid.UUID, rawID s
 		if err != nil {
 			return err
 		}
+		inRevision, err := RevisionConnectors(q)
+		if err != nil {
+			return err
+		}
 		detail := ExternalPrincipalDetail{
 			Ref:             R(RefExternalPrincipal, ep.ID),
 			Name:            ep.Name,
 			Mechanism:       ep.Mechanism,
 			Issuer:          ep.Issuer,
 			Subject:         ep.SubjectClaim,
-			Account:         accts.Of(ep.AccountID),
+			Account:         ExternalPrincipalAccount(accts, inRevision, ep.AccountID),
 			Resolution:      ExternalResolutionOf(ep.ResolutionBasis, ep.ResolutionState, ep.ResolutionRule, ep.ResolvedBy, ep.ResolvedIdentityAccountID, ep.ResolvedWorkloadID),
 			Lifecycle:       ExternalLifecycleOf(ep.State),
 			State:           ep.State,
 			FirstSeenAt:     T(ep.FirstSeenAt),
 			LastSeenAt:      T(ep.LastSeenAt),
 			LastConfirmedAt: TS(ep.LastConfirmedAt),
+		}
+		if detail.Lifecycle == models.IGALifecycleRetired {
+			detail.RetiredReason = ExternalRetiredNoLongerReferenced
 		}
 		if detail.Account != nil {
 			c := detail.Account.Connected
@@ -274,7 +342,11 @@ func ExternalLifecycleOf(state string) string {
 // UnresolvedReasonOf derives why an external principal is unresolved (see the
 // Unresolved* constants), or nil when a resolution is in force -- recorded,
 // state active, pointing at an identity or workload. Checked in this order: a
-// pattern subject, a service, an unconnected account, else not in inventory.
+// pattern subject, a service, an unconnected account, a whole account (an
+// aws_account principal names no identity even in a connected account), else
+// not in inventory. account must be connected as of the revision
+// (ExternalPrincipalAccount): not_in_inventory is said only of an account
+// whose inventory the revision holds.
 func UnresolvedReasonOf(mechanism, subject string, account *Account, res *ExternalResolution) *string {
 	if res != nil && res.State == models.ResolutionActive && res.ResolvedTo != nil {
 		return nil
@@ -287,6 +359,8 @@ func UnresolvedReasonOf(mechanism, subject string, account *Account, res *Extern
 		reason = UnresolvedServicePrincipal
 	case account != nil && !account.Connected:
 		reason = UnresolvedAccountNotConnected
+	case mechanism == models.ExternalPrincipalAWSAccount:
+		reason = UnresolvedAccountPrincipal
 	}
 	return &reason
 }

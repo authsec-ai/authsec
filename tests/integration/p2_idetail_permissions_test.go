@@ -93,6 +93,13 @@ func TestP2IdetailPermissionsUserGroupBoundary(t *testing.T) {
 		t.Fatalf("policies = %v, want [PriyaAttached PriyaOwn]: %s", got, idetailJSON(pols))
 	}
 	own := idetailPolicy(t, pols, "PriyaOwn")
+	for _, p := range pols {
+		for _, s := range digl(p, "statements") {
+			if _, has := s.(map[string]any)["grant_stale_reason"]; has {
+				t.Errorf("statement %s carries grant_stale_reason: only a stale grant does", idetailJSON(s))
+			}
+		}
+	}
 	if digs(own, "kind") != models.PolicyKindInline || digs(own, "assignment", "kind") != models.AssignmentInline ||
 		dig(own, "assignment", "via_group") != nil || digs(own, "assignment", "state") != "current" ||
 		!strings.HasPrefix(digs(own, "assignment", "claim"), "assignment:") || digs(own, "assignment", "valid_from") == "" ||
@@ -432,6 +439,18 @@ func TestP2IdetailPermissionsStaleStatements(t *testing.T) {
 		}
 		if digs(st, "state") != "stale" || !named || digs(st, "grant_state") != "stale" || digs(st, "grant") == "" {
 			t.Errorf("%s = %s, want stale with stale_reason policy_documents partial, and its grant, stale", sid, idetailJSON(st))
+		}
+		// The stale grant says why, as every stale row does (D-74): the same
+		// unreadable document protects it.
+		var grantNamed bool
+		for _, r := range digl(st, "grant_stale_reason") {
+			if digs(r, "surface") == models.SurfacePolicyDocuments && digs(r, "state") == models.CloudCoveragePartial &&
+				digs(r, "account_id") == accountA {
+				grantNamed = true
+			}
+		}
+		if !grantNamed {
+			t.Errorf("%s grant_stale_reason = %s, want policy_documents partial in %s", sid, idetailJSON(dig(st, "grant_stale_reason")), accountA)
 		}
 	}
 	var covered bool

@@ -317,11 +317,16 @@ const idetailSupportPairs = `SELECT s.connector_id, s.partition_key FROM iga_obj
 
 // ClaimStaleSubject is one claim row for ClaimStaleReasons: its id and the
 // partition membership it was written with (connector_id, partition_key), the
-// same two columns reconciliation selects it by (§4.10).
+// same two columns reconciliation selects it by (§4.10). DocumentProtected
+// marks a claim an unreadable policy document keeps stale (a grant, through
+// its statement): when no required surface of its partition explains it, the
+// run's policy_documents gap does (D-74 "a document-protected row names
+// policy_documents") -- the rule NodeStaleReasons applies to statements.
 type ClaimStaleSubject struct {
-	ID           uuid.UUID
-	ConnectorID  *uuid.UUID
-	PartitionKey string
+	ID                uuid.UUID
+	ConnectorID       *uuid.UUID
+	PartitionKey      string
+	DocumentProtected bool
 }
 
 // ClaimStaleReasons computes D-74's stale_reason for claims -- relationships,
@@ -425,7 +430,11 @@ func ClaimStaleReasons(q *Query, accts *Accounts, subjects []ClaimStaleSubject) 
 			if p.Target == "" || p.Key() != s.PartitionKey {
 				continue
 			}
-			for _, g := range partitionGaps(p, run.cov, "") {
+			class := ""
+			if s.DocumentProtected {
+				class = models.ObjectEntitlement
+			}
+			for _, g := range partitionGaps(p, run.cov, class) {
 				found = append(found, pending{claim: s.ID, run: run, gap: g})
 			}
 			break

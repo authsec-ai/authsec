@@ -42,8 +42,8 @@ type IdentityDetail struct {
 // projectCredentials writes lifecycle 'revoked' for a key AWS reports
 // Inactive, and 'active' otherwise):
 //
-//	lifecycle active   -> status "active"
-//	lifecycle revoked  -> status "inactive"
+//	lifecycle active   -> status "Active"
+//	lifecycle revoked  -> status "Inactive"
 //	anything else      -> status null (expired and rotated are not AWS
 //	                      statuses; nothing stored says what AWS reported)
 //
@@ -61,10 +61,12 @@ type IdentityCredential struct {
 	LastSeenAt any     `json:"last_seen_at"`
 }
 
-// Credential statuses as AWS names them (lower-cased).
+// Credential statuses exactly as AWS names them (iam:ListAccessKeys
+// StatusType), as D-86 has the API return them -- not the lower-cased
+// cloud_secret status the collector stores.
 const (
-	CredentialStatusActive   = "active"
-	CredentialStatusInactive = "inactive"
+	CredentialStatusActive   = "Active"
+	CredentialStatusInactive = "Inactive"
 )
 
 // credentialLifecycleRevoked is the lifecycle projectCredentials writes for a

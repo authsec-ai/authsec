@@ -445,6 +445,12 @@ func (r *Reader) idetailPrincipals(q *Query, accts *Accounts, ident *idetailIden
 	if TrustHasNotPrincipal(ident.ProviderAttrs) {
 		sec.Limitations = []string{LimitationNotPrincipalUnresolved}
 	}
+	// An external principal's account is connected as of the revision, the
+	// same answer its own detail gives (ExternalPrincipalAccount, §5.1).
+	inRevision, err := RevisionConnectors(q)
+	if err != nil {
+		return nil, err
+	}
 	items := make([]UsedByPrincipal, 0, len(rows))
 	for _, p := range rows {
 		ref := PrincipalRef{Name: p.Name, Account: accts.Of(p.AccountID)}
@@ -454,6 +460,7 @@ func (r *Reader) idetailPrincipals(q *Query, accts *Accounts, ident *idetailIden
 			ref.Ref, ref.Kind, ref.ARN = R(RefIdentity, *p.IdentityID), p.IdentityKind, &arn
 		case p.ExternalID != nil:
 			ref.Ref, ref.Kind = R(RefExternalPrincipal, *p.ExternalID), p.ExternalKind
+			ref.Account = ExternalPrincipalAccount(accts, inRevision, p.AccountID)
 		}
 		items = append(items, UsedByPrincipal{
 			ClaimFields: p.fields(reasons),

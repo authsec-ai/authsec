@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -67,6 +69,9 @@ func TestP2IdetailExternalPrincipals(t *testing.T) {
 		digs(root, "first_seen_at") == "" || digs(root, "last_seen_at") == "" || digs(root, "last_confirmed_at") == "" ||
 		!strings.HasPrefix(digs(root, "ref"), "external_principal:") {
 		t.Errorf("account C = %s, want aws_account %s, account not connected, resolution null, active/current", idetailJSON(root), trustAccountC)
+	}
+	if _, has := root["retired_reason"]; has {
+		t.Errorf("active principal carries retired_reason %v: only a retired one does", root["retired_reason"])
 	}
 	role := detail("aws", "arn:aws:iam::"+trustAccountC+":role/partner-role")
 	if role["mechanism"] != models.ExternalPrincipalAWSPrincipal || digs(role, "account", "id") != trustAccountC ||
@@ -198,8 +203,10 @@ func TestP2IdetailExternalResolvedAndRetired(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	trustCycle(l, a, nil)
 	gone := dig(idetailGet(t, api, path), "data")
-	if digs(gone, "lifecycle") != models.IGALifecycleRetired || digs(gone, "state") != "ended" || digs(gone, "last_confirmed_at") == "" {
-		t.Errorf("after its last edge ended = %s, want lifecycle retired, state ended, its last confirmation kept", idetailJSON(gone))
+	if digs(gone, "lifecycle") != models.IGALifecycleRetired || digs(gone, "state") != "ended" || digs(gone, "last_confirmed_at") == "" ||
+		digs(gone, "retired_reason") != "no_longer_referenced" {
+		t.Errorf("after its last edge ended = %s, want lifecycle retired (no_longer_referenced, §5.2), state ended, its last confirmation kept",
+			idetailJSON(gone))
 	}
 	if n := len(digl(idetailGet(t, api, path+"/referenced-by"), "data")); n != 0 {
 		t.Errorf("referenced-by lists %d edges by default, want 0: its only edge ended", n)
@@ -241,9 +248,71 @@ func TestP2IdetailExternalLabels(t *testing.T) {
 		d := dig(idetailGet(t, api, "/external-principals/"+id), "data")
 		if digs(d, "name") != tc.name || dig(d, "account") != nil || dig(d, "account_connected") != nil ||
 			digs(d, "unresolved_reason") != tc.reason || digs(d, "state") != "ended" || digs(d, "lifecycle") != "retired" ||
-			dig(d, "last_confirmed_at") != nil {
-			t.Errorf("%s = %s, want name %q, no account, %s, derived ended/retired with no confirmation",
+			digs(d, "retired_reason") != "no_longer_referenced" || dig(d, "last_confirmed_at") != nil {
+			t.Errorf("%s = %s, want name %q, no account, %s, derived ended/retired (no_longer_referenced) with no confirmation",
 				tc.mech, idetailJSON(d), tc.name, tc.reason)
 		}
 	}
+}
+
+// §5.1 / D-3 / D-25: an external principal's account is connected AS OF THE
+// REVISION -- a live connector for it with a run in the revision -- never as
+// of the live connector table. Onboarding account B publishes nothing, so at
+// the same revision its principals read exactly as before (not connected);
+// "not in inventory" would claim we looked in an inventory that was never
+// read. Once B's first scan publishes, a role ARN we hold no identity for is
+// not_in_inventory, and B's root is account_principal -- "any principal B
+// permits" names no single identity, even in a fully scanned account (§4.7).
+// The used-by row that links to the principal says the same (§2.14.11).
+func TestP2IdetailExternalConnectedAsOfRevision(t *testing.T) {
+	l := newP2Lab(t, "p2-idetail-external-revision", true)
+	a := l.account(accountA)
+	ghost := "arn:aws:iam::" + accountB + ":role/ghost"
+	trustRole(a, "b-access", "AROABACCESSBACCESSBA", trustDoc(
+		trustAllow(`{"AWS":"arn:aws:iam::`+accountB+`:root"}`, "sts:AssumeRole"),
+		trustAllow(`{"AWS":"`+ghost+`"}`, "sts:AssumeRole")))
+	trustCycle(l, a, nil)
+	api := l.api()
+	rootID, ghostID := idetailExternalID(t, l, "aws", accountB), idetailExternalID(t, l, "aws", ghost)
+	roleID := idetailIdentityID(t, l, "b-access")
+	type answer struct {
+		rev                   int64
+		connected, chip, used any
+		reason                any
+	}
+	read := func(id uuid.UUID, name string) answer {
+		t.Helper()
+		body := idetailGet(t, api, "/external-principals/"+id.String())
+		row := idetailByRef(t, digl(idetailGet(t, api, "/identities/"+roleID.String()+"/used-by"), "data", "principals", "items"),
+			name, "principal", "name")
+		return answer{rev: num(body, "meta", "rev"), connected: dig(body, "data", "account_connected"),
+			chip: dig(body, "data", "account", "connected"), used: dig(row, "principal", "account", "connected"),
+			reason: dig(body, "data", "unresolved_reason")}
+	}
+	want := func(label string, got answer, connected bool, reason string) {
+		t.Helper()
+		if got.connected != connected || got.chip != connected || got.used != connected || got.reason != reason {
+			t.Errorf("%s = %+v, want account_connected, account.connected and the used-by chip all %v, unresolved_reason %s",
+				label, got, connected, reason)
+		}
+	}
+	root0, ghost0 := read(rootID, accountB), read(ghostID, ghost)
+	want("B root before B is onboarded", root0, false, "account_not_connected")
+	want("B's role before B is onboarded", ghost0, false, "account_not_connected")
+
+	b := l.account(accountB) // onboarded: a live connector, nothing scanned, nothing published
+	root1, ghost1 := read(rootID, accountB), read(ghostID, ghost)
+	if root1.rev != root0.rev {
+		t.Fatalf("rev moved from %v to %v on onboarding alone", root0.rev, root1.rev)
+	}
+	want("B root at the same revision after onboarding", root1, false, "account_not_connected")
+	want("B's role at the same revision after onboarding", ghost1, false, "account_not_connected")
+
+	trustCycle(l, b, nil) // B's first publication: its inventory, with no role named ghost
+	root2, ghost2 := read(rootID, accountB), read(ghostID, ghost)
+	if root2.rev <= root1.rev {
+		t.Fatalf("rev = %v after B published, want above %v", root2.rev, root1.rev)
+	}
+	want("B root once B published", root2, true, "account_principal")
+	want("B's unknown role once B published", ghost2, true, "not_in_inventory")
 }

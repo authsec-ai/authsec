@@ -80,25 +80,29 @@ type PermissionAssignment struct {
 // verbatim (recorded, never evaluated). grant is the grant of THIS
 // assignment and statement for an Allow, null for a Deny and on a boundary;
 // grant_state is that grant's own state (a grant can be stale under a
-// current assignment). state is the statement's D-1 state: a statement whose
-// document could not be read is stale, and says so, rather than reading as
-// current. revision_count counts its recorded content revisions (only a
-// Sid-keyed statement is revised in place, §2.6; null when the optional count
-// did not finish).
+// current assignment), and a stale grant carries grant_stale_reason (D-74),
+// as every stale row does. state is the statement's D-1 state: a statement
+// whose document could not be read is stale, and says so, rather than
+// reading as current; a statement the policy no longer has (a replaced
+// Sid-less statement, every statement of a retired policy) is ended, and
+// appears only with include_ended. revision_count counts its recorded content
+// revisions (only a Sid-keyed statement is revised in place, §2.6; null when
+// the optional count did not finish).
 type PermissionStatement struct {
-	Ref           string             `json:"ref"`
-	Sid           string             `json:"sid"`
-	Index         *int               `json:"index"`
-	Effect        string             `json:"effect"`
-	Actions       []string           `json:"actions"`
-	NotActions    []string           `json:"not_actions"`
-	Targets       []PermissionTarget `json:"targets"`
-	Condition     json.RawMessage    `json:"condition"`
-	Grant         any                `json:"grant"`
-	GrantState    *string            `json:"grant_state"`
-	RevisionCount *int64             `json:"revision_count"`
-	State         string             `json:"state"`
-	StaleReason   *[]StaleReason     `json:"stale_reason,omitempty"`
+	Ref              string             `json:"ref"`
+	Sid              string             `json:"sid"`
+	Index            *int               `json:"index"`
+	Effect           string             `json:"effect"`
+	Actions          []string           `json:"actions"`
+	NotActions       []string           `json:"not_actions"`
+	Targets          []PermissionTarget `json:"targets"`
+	Condition        json.RawMessage    `json:"condition"`
+	Grant            any                `json:"grant"`
+	GrantState       *string            `json:"grant_state"`
+	GrantStaleReason *[]StaleReason     `json:"grant_stale_reason,omitempty"`
+	RevisionCount    *int64             `json:"revision_count"`
+	State            string             `json:"state"`
+	StaleReason      *[]StaleReason     `json:"stale_reason,omitempty"`
 }
 
 // PermissionTarget is one resource a statement names: mode "resource" (a
@@ -163,7 +167,7 @@ func (r *Reader) IdentityPermissions(ctx context.Context, ws uuid.UUID, rawID st
 		if err != nil {
 			return err
 		}
-		data, err := idetailPermissions(q, accts, ident, idetailEdgeStates(includeEnded))
+		data, err := idetailPermissions(q, accts, ident, includeEnded)
 		if err != nil {
 			return err
 		}
@@ -253,15 +257,24 @@ type idetailGrantScan struct {
 	AssignmentID  uuid.UUID
 	EntitlementID uuid.UUID
 	State         string
+	ConnectorID   *uuid.UUID
+	PartitionKey  string
 }
 
-// idetailPermissions reads and assembles the Permissions tab.
-func idetailPermissions(q *Query, accts *Accounts, ident *idetailIdentityRow, states []string) (*IdentityPermissionsView, error) {
+// idetailPermissions reads and assembles the Permissions tab. includeEnded
+// (D-12) adds ended memberships, assignments and grants, and the statements a
+// policy no longer has.
+func idetailPermissions(q *Query, accts *Accounts, ident *idetailIdentityRow, includeEnded bool) (*IdentityPermissionsView, error) {
+	states := idetailEdgeStates(includeEnded)
 	out := &IdentityPermissionsView{Identity: ident.header(), Policies: []PermissionPolicy{},
 		Inherited: []InheritedPolicies{}}
 
 	// The user's groups: member_of FROM it, over the expression the
-	// idx_iga_relationship_source index is built on.
+	// idx_iga_relationship_source index is built on. Only a LIVE membership
+	// (current or stale) passes a group's policies on (§2.6: a group's access
+	// reaches a user only through member_of): a user who left a group
+	// inherits nothing from it by default, and with include_ended the group
+	// appears under its ended membership, marked.
 	var groups []idetailGroupScan
 	if ident.AccountKind == models.CloudIdentityIAMUser {
 		if err := q.DB().Raw(`SELECT `+idetailClaimColumns+`, ia.id AS group_id, ia.display_name,
@@ -330,7 +343,7 @@ func idetailPermissions(q *Query, accts *Accounts, ident *idetailIdentityRow, st
 	for _, g := range groups {
 		ordered = append(ordered, byGroup[g.GroupID]...)
 	}
-	stmts, err := idetailStatements(q, ordered)
+	stmts, err := idetailStatements(q, ordered, includeEnded)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +396,14 @@ func idetailPermissions(q *Query, accts *Accounts, ident *idetailIdentityRow, st
 			staleClaims = append(staleClaims, g.staleSubject())
 		}
 	}
+	// A stale grant is a document-protected row (its statement's document):
+	// when nothing else explains it, policy_documents does (D-74).
+	for _, g := range grants {
+		if g.State == StateStale {
+			staleClaims = append(staleClaims, ClaimStaleSubject{ID: g.ID, ConnectorID: g.ConnectorID,
+				PartitionKey: g.PartitionKey, DocumentProtected: true})
+		}
+	}
 	claimReasons, err := ClaimStaleReasons(q, accts, staleClaims)
 	if err != nil {
 		return nil, err
@@ -419,6 +440,7 @@ func idetailPermissions(q *Query, accts *Accounts, ident *idetailIdentityRow, st
 				st.Grant = R(RefGrant, g.ID)
 				state := g.State
 				st.GrantState = &state
+				st.GrantStaleReason = StaleReasonOf(g.State, g.ID, claimReasons)
 			}
 			p.Statements = append(p.Statements, st)
 		}
@@ -465,12 +487,22 @@ func idetailStateRank(state string) int {
 	return 2
 }
 
-// idetailStatements reads the ACTIVE statements of every policy the ordered
+// idetailStatements reads the statements of every policy the ordered
 // assignments apply, in display order (the policy's first appearance, then
 // the stored statement_index, D-84), at most PermissionsStatementCap+1 rows --
 // a bound on the query only: the render budget is what caps the response and
 // says truncated, since one policy can render under several assignments.
-func idetailStatements(q *Query, ordered []idetailAssignmentScan) ([]idetailStatementScan, error) {
+//
+// By default only ACTIVE statements: a statement the policy no longer has --
+// a Sid-less statement replaced by an edit (§2.6: replaced, never revised),
+// every statement of a retired or recreated policy -- is not part of what the
+// policy declares, and rendering it would list one statement twice. With
+// includeEnded (D-12) retired statements are read too, so an ended
+// assignment of a retired policy shows what it declared and the grants that
+// ended with it, and a replaced statement shows its ended grant; each is
+// marked by its own D-1 state (ended), after every active statement (of all
+// policies, so the query bound drops history before anything live).
+func idetailStatements(q *Query, ordered []idetailAssignmentScan, includeEnded bool) ([]idetailStatementScan, error) {
 	var values []string
 	var args []any
 	seen := map[uuid.UUID]bool{}
@@ -485,6 +517,10 @@ func idetailStatements(q *Query, ordered []idetailAssignmentScan) ([]idetailStat
 	if len(values) == 0 {
 		return nil, nil
 	}
+	lifecycle := ` AND e.lifecycle = 'active'`
+	if includeEnded {
+		lifecycle = ""
+	}
 	args = append(args, q.WS, PermissionsStatementCap+1)
 	var rows []idetailStatementScan
 	if err := q.DB().Raw(`SELECT e.id, e.policy_id, e.sid, e.statement_index, e.effect, e.native_rights,
@@ -492,8 +528,8 @@ func idetailStatements(q *Query, ordered []idetailAssignmentScan) ([]idetailStat
 	                        FROM iga_entitlements e
 	                        JOIN (VALUES `+strings.Join(values, ", ")+`) AS o(policy_id, rank) ON o.policy_id = e.policy_id
 	                        `+SupportLateral("e", "entitlement_id")+`
-	                       WHERE e.workspace_id = ? AND e.provider = 'aws' AND e.lifecycle = 'active'
-	                       ORDER BY o.rank, e.statement_index NULLS LAST, e.id
+	                       WHERE e.workspace_id = ? AND e.provider = 'aws'`+lifecycle+`
+	                       ORDER BY (e.lifecycle = 'active') DESC, o.rank, e.statement_index NULLS LAST, e.id
 	                       LIMIT ?`, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -539,7 +575,7 @@ func idetailGrants(q *Query, assignments, stmtIDs []uuid.UUID, states []string) 
 		return out, nil
 	}
 	var rows []idetailGrantScan
-	if err := q.DB().Raw(`SELECT g.id, g.assignment_id, g.entitlement_id, g.state
+	if err := q.DB().Raw(`SELECT g.id, g.assignment_id, g.entitlement_id, g.state, g.connector_id, g.partition_key
 	                        FROM iga_access_edges g
 	                        JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id
 	                       WHERE g.workspace_id = ? AND g.provider = 'aws'
@@ -656,6 +692,10 @@ const (
 	ActivityOutsideSample = "outside_sample"      // above the per-scan identity cap (T3.7)
 	ActivityReportNotRead = "report_not_read"     // sampled, but no report of it is known to have been read
 	ActivitySurfaceFailed = "surface_not_reached" // the activity surface was denied, throttled ...
+	// ActivityNewerScan: a scan the revision does not include has rewritten
+	// the connector's activity rows since (cloud_usage is upserted in place and
+	// reconciled by deletion), so the revision's own answer is gone.
+	ActivityNewerScan = "newer_scan_not_published"
 )
 
 // IdentityActivity is Access Advisor for one identity (§5.3, §2.14.8, D-86):
@@ -699,9 +739,20 @@ const (
 //     not collected;
 //  3. the cloud row is the same principal: its ARN, its connector, and its
 //     unique id when the graph holds one;
-//  4. rows are those that run (or a later one) confirmed -- last_seen_generation
-//     at or above the run's generation; an older row that run did not report
-//     is not part of the revision's answer.
+//  4. the answer must be THAT run's (D-25: never an unpublished run; §5.1: it
+//     cannot straddle two publications). cloud_usage is upserted in place and
+//     a later run's reconcile deletes what it did not see, so once any of the
+//     connector's rows carries a newer generation -- a scan the revision does
+//     not include has written activity -- the run's answer can no longer be
+//     told apart from the newer one: not_collected, newer_scan_not_published,
+//     until that scan publishes. Checked across the connector, not only this
+//     identity's rows: a newer run that deleted every row of this identity
+//     leaves none to carry its generation; and on the newer runs' coverage
+//     too: one that reached activity may have deleted every row it did not
+//     see and written none;
+//  5. rows are exactly that run's -- last_seen_generation equal to its
+//     generation; an older row that run did not report is not part of the
+//     revision's answer.
 func idetailActivity(q *Query, ident *idetailIdentityRow) (IdentityActivity, error) {
 	act := IdentityActivity{Source: "access_advisor", State: ActivityNotCollected, TrackingNote: ActivityTrackingNote}
 	notCollected := func(reason string) (IdentityActivity, error) {
@@ -753,13 +804,33 @@ func idetailActivity(q *Query, ident *idetailIdentityRow) (IdentityActivity, err
 	if surf.State == models.CloudCoveragePartial && surf.CappedAfter != "" && arn > surf.CappedAfter {
 		return notCollected(ActivityOutsideSample)
 	}
+	// A newer scan has touched the connector's activity when it left a row
+	// (idx_cloud_usage_connector_generation), or when it REACHED activity --
+	// the only state ReconcileUsage runs in, and one that can delete every row
+	// without writing any (an account whose sampled identities are all gone):
+	// then no row carries its generation, but its coverage says so
+	// (idx_cloud_scan_run_history).
+	var newer []bool
+	if err := q.DB().Raw(`SELECT EXISTS (SELECT 1 FROM cloud_usage u
+	                                      WHERE u.connector_id = ? AND u.last_seen_generation > ?
+	                                        AND u.workspace_id = ? AND u.source = ?)
+	                          OR EXISTS (SELECT 1 FROM cloud_scan_run sr
+	                                      WHERE sr.workspace_id = ? AND sr.connector_id = ? AND sr.generation > ?
+	                                        AND sr.coverage->'surfaces'->?->>'state' = ?)`,
+		run.ConnectorID, run.Generation, q.WS, models.UsageSourceServiceLastAccessed,
+		q.WS, run.ConnectorID, run.Generation, models.SurfaceActivity, models.CloudCoverageReached).Scan(&newer).Error; err != nil {
+		return act, err
+	}
+	if len(newer) == 1 && newer[0] {
+		return notCollected(ActivityNewerScan)
+	}
 	var rows []struct {
 		Service    string
 		LastUsedAt *time.Time
 	}
 	if err := q.DB().Raw(`SELECT u.service, u.last_used_at FROM cloud_usage u
 	                       WHERE u.workspace_id = ? AND u.identity_id = ? AND u.connector_id = ?
-	                         AND u.source = ? AND u.last_seen_generation >= ?
+	                         AND u.source = ? AND u.last_seen_generation = ?
 	                       ORDER BY u.service`,
 		q.WS, cloudIDs[0], run.ConnectorID, models.UsageSourceServiceLastAccessed, run.Generation).Scan(&rows).Error; err != nil {
 		return act, err

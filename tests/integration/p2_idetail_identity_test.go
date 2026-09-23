@@ -115,11 +115,11 @@ func TestP2IdetailIdentityOverview(t *testing.T) {
 	}
 	active := idetailByRef(t, creds, "AKIAIDETAILACTIVE001", "key_id")
 	inactive := idetailByRef(t, creds, "AKIAIDETAILINACTIVE1", "key_id")
-	if active["status"] != "active" || active["lifecycle"] != "active" || digs(active, "last_used_at") == "" {
-		t.Errorf("active key = %v, want status active, lifecycle active, its last use", active)
+	if active["status"] != "Active" || active["lifecycle"] != "active" || digs(active, "last_used_at") == "" {
+		t.Errorf("active key = %v, want status Active (AWS's spelling, D-86), lifecycle active, its last use", active)
 	}
-	if inactive["status"] != "inactive" || inactive["lifecycle"] != "revoked" || inactive["last_used_at"] != nil {
-		t.Errorf("inactive key = %v, want status inactive (lifecycle revoked), never used -> null", inactive)
+	if inactive["status"] != "Inactive" || inactive["lifecycle"] != "revoked" || inactive["last_used_at"] != nil {
+		t.Errorf("inactive key = %v, want status Inactive (lifecycle revoked), never used -> null", inactive)
 	}
 	for _, c := range creds {
 		if _, has := c.(map[string]any)["created_at"]; !has || digs(c, "last_seen_at") == "" {
@@ -139,7 +139,7 @@ func TestP2IdetailIdentityOverview(t *testing.T) {
 	}
 }
 
-// A key that turns Inactive: ONE entry, status inactive. The projector
+// A key that turns Inactive: ONE entry, status Inactive. The projector
 // inserts a new 'revoked' row beside the frozen 'active' one on every pass
 // (the credential defect D-64 decides to fix); the read must report the
 // latest reading, never the key twice.
@@ -165,7 +165,7 @@ func TestP2IdetailCredentialTurnsInactive(t *testing.T) {
 		t.Fatalf("setup: %d rows for the key, want the projector's duplicate (>= 2)", n)
 	}
 	creds := digl(idetailGet(t, l.api(), "/identities/"+userID.String()), "data", "credentials")
-	if len(creds) != 1 || digs(creds[0], "status") != "inactive" || digs(creds[0], "lifecycle") != "revoked" {
+	if len(creds) != 1 || digs(creds[0], "status") != "Inactive" || digs(creds[0], "lifecycle") != "revoked" {
 		t.Errorf("credentials = %s, want the key ONCE, inactive", idetailJSON(creds))
 	}
 }
