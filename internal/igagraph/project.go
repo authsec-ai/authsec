@@ -854,7 +854,7 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 		srcCloudID, ok := snap.IdentityIDByKey(Key("aws", ae.Subject))
 		if !ok {
 			// Unresolved far end. §2.12 makes this an iga_external_principal
-			// node in 033 rather than a dropped edge; until that path is wired
+			// node in 034 rather than a dropped edge; until that path is wired
 			// the edge is not written, which is the honest state -- we do not
 			// claim an endpoint we cannot name.
 			continue

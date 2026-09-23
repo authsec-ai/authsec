@@ -1,5 +1,5 @@
 -- ============================================================================
--- 031: evidence junctions, and per-source support for shared nodes.
+-- 032: evidence junctions, and per-source support for shared nodes.
 --
 -- SPEC-iga-phase2-graph.md §2.10B, §4.8.
 --
@@ -91,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_iga_relationship_evidence_rel
 -- support is current or stale, retired with retired_reason='unsupported' only
 -- when EVERY support has ended.
 --
--- This is why nodes carry no connector_id and edges do (029, 030): an access
+-- This is why nodes carry no connector_id and edges do (030, 031): an access
 -- edge's subject is an identity in one account, an executes_as joins a
 -- workload and identity in one account, and a can_assume edge is evidenced by
 -- exactly one trust policy. None is multiply-supported.

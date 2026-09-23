@@ -1,5 +1,5 @@
 -- ============================================================================
--- 026: every provenance reference is workspace-qualified.
+-- 027: every provenance reference is workspace-qualified.
 --
 -- SPEC-iga-phase2-graph.md §2.9. A single-column
 --     FOREIGN KEY (scan_run_id) REFERENCES cloud_scan_run (id)
@@ -11,12 +11,12 @@
 --   no single-column foreign key to a workspace-scoped table. Every reference
 --   is (workspace_id, id) against a UNIQUE (workspace_id, id).
 --
--- Why this must land before the projector: 029-033 write their references in
+-- Why this must land before the projector: 030-034 write their references in
 -- composite form against targets that do not exist yet. cloud_connector has
 -- only a PRIMARY KEY (id) and the unique INDEX uq_cloud_connector_scope
 -- (010) -- neither is a usable composite FK target -- so without the UNIQUE
 -- added below, every REFERENCES cloud_connector (workspace_id, id) in
--- 029-033 fails to apply. Verified against the schema, not assumed.
+-- 030-034 fails to apply. Verified against the schema, not assumed.
 --
 -- SCOPE NOTE. §2.9's table names three references to convert, all to
 -- cloud_scan_run. Two more single-column FKs to the workspace-scoped
@@ -65,13 +65,13 @@ BEGIN
             'cross-workspace provenance rows found: scan_run_id=%, '
             'last_confirmed_run_id=%, observation.connector_id=%, '
             'scan_run.connector_id=%. These are real cross-tenant references '
-            'and must be investigated before 026 can apply.',
+            'and must be investigated before 027 can apply.',
             n_run, n_confirmed, n_obs_conn, n_scan_conn;
     END IF;
 END $$;
 
 -- composite FK targets -------------------------------------------------------
--- Each is the target some reference below (or in 029-033) needs. None of the
+-- Each is the target some reference below (or in 030-034) needs. None of the
 -- three tables has one today; all three are workspace-scoped.
 ALTER TABLE public.cloud_connector
     ADD CONSTRAINT cloud_connector_workspace_id_key UNIQUE (workspace_id, id);
@@ -139,8 +139,8 @@ SELECT c.conrelid::regclass::text AS tbl,
 -- ============================================================================
 -- iga_pipeline_lease -- the pipeline barrier (§2.10A).
 --
--- Placed in 026 because §2.10A's own DDL comment labels it 026 and the ERD
--- lists it as 026; §3's numbered sections never gave it a slot. It belongs
+-- Placed in 027 because §2.10A's own DDL comment labels it 027 and the ERD
+-- lists it as 027; §3's numbered sections never gave it a slot. It belongs
 -- before the projector either way, since the projector cannot be correct
 -- without it.
 --

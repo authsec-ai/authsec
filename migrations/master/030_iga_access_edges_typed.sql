@@ -1,5 +1,5 @@
 -- ============================================================================
--- 029: iga_access_edges gets a typed subject, a required entitlement, a
+-- 030: iga_access_edges gets a typed subject, a required entitlement, a
 -- lifecycle, and stored partition membership.
 --
 -- SPEC-iga-phase2-graph.md §2.2, §2.7, §4.10.
@@ -100,7 +100,7 @@ ALTER TABLE public.iga_access_edges
         FOREIGN KEY (workspace_id, subject_agent_instance_id)
         REFERENCES public.iga_agent_instances (workspace_id, id) ON DELETE CASCADE,
 
-    -- §2.9: workspace-qualified, against the UNIQUE 026 added. A bare FK here
+    -- §2.9: workspace-qualified, against the UNIQUE 027 added. A bare FK here
     -- would admit another workspace's scan run as this edge's provenance --
     -- the same defect class this table is being rewritten to close.
     ADD CONSTRAINT iga_access_edges_run_fkey

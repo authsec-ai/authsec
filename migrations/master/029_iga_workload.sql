@@ -1,5 +1,5 @@
 -- ============================================================================
--- 028: iga_workload -- the runtime, missing from the canonical model.
+-- 029: iga_workload -- the runtime, missing from the canonical model.
 --
 -- SPEC-iga-phase2-graph.md §2.4. cloud_workload has existed since 015 and has
 -- no canonical counterpart, so the graph has had nowhere to say "this Lambda
@@ -10,12 +10,12 @@
 -- A WORKLOAD IS NOT AN AGENT INSTANCE. An instance may not be compute at all
 -- (a published SaaS agent, a Bedrock alias), and compute is frequently not an
 -- agent. Where a Bedrock agent IS the runtime, the projector writes BOTH rows
--- and links them with a `realizes` relationship (030) rather than collapsing
+-- and links them with a `realizes` relationship (031) rather than collapsing
 -- them -- collapsing would make "this agent runs on this runtime" inexpressible
 -- the moment one agent has two runtimes.
 --
 -- New table, so source_key is NOT NULL with a non-empty CHECK from the start:
--- the DEFAULT '' allowance in 027 exists only for rows that predate the graph,
+-- the DEFAULT '' allowance in 028 exists only for rows that predate the graph,
 -- and nothing predates this table.
 -- ============================================================================
 
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS public.iga_workload (
     CONSTRAINT iga_workload_retired_chk CHECK (
         (lifecycle = 'retired') = (retired_reason <> '')),
 
-    -- NOT decoration: this is the target every composite FK in 030 and 032
+    -- NOT decoration: this is the target every composite FK in 031 and 033
     -- needs. Without it, REFERENCES iga_workload (workspace_id, id) cannot
     -- apply at all.
     CONSTRAINT iga_workload_workspace_id_key UNIQUE (workspace_id, id)

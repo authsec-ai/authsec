@@ -139,7 +139,7 @@ type Partition struct {
 // Key is the partition's stable identity: scope, connector, class,
 // relationship type, target and its required surfaces, joined.
 //
-// It is the unique key on iga_projection_state (032), the value
+// It is the unique key on iga_projection_state (033), the value
 // lastGenerationFor looks up, AND the value stamped on every edge's
 // partition_key -- one value, three call sites, so "what this run reconciles"
 // and "what this run recorded a watermark for" are the same set by

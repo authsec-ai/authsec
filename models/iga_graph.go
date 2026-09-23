@@ -9,7 +9,7 @@ import (
 
 // This file holds the Phase 2 identity-graph types: the canonical runtime, the
 // binary structural edge, per-source support, and the projection's own durable
-// job and watermark. SPEC-iga-phase2-graph.md §2 and §3 (migrations 026-033).
+// job and watermark. SPEC-iga-phase2-graph.md §2 and §3 (migrations 027-034).
 //
 // The vocabularies below are duplicated as CHECK constraints in the
 // migrations. That duplication is deliberate and one-directional: the database
@@ -87,7 +87,7 @@ const (
 	// RetiredUnsupported -- every source that vouched for this object has
 	// ended its support (§2.10B).
 	RetiredUnsupported = "unsupported"
-	// RetiredPreGraph -- a legacy row with no recognition key, retired by 034.
+	// RetiredPreGraph -- a legacy row with no recognition key, retired by 035.
 	RetiredPreGraph = "pre_graph"
 )
 
@@ -98,7 +98,7 @@ const (
 	EndedSubjectRecreate = "subject_recreated"
 )
 
-// Agent origin (§3, 032). The exit gate's "a registered agent is distinguished
+// Agent origin (§3, 033). The exit gate's "a registered agent is distinguished
 // from native discovery": the two get different review treatment and must
 // never silently merge.
 const (

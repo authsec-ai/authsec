@@ -22,7 +22,7 @@ import (
 // would silently stop evidence matching its edge.
 const Sep = "\x1f"
 
-// Continuity values. Mirrors the CHECK added by migration 027.
+// Continuity values. Mirrors the CHECK added by migration 028.
 const (
 	// ContinuityImmutable means the provider gives a creation-boundary id, so
 	// a delete-and-recreate under the same name is detectable.
@@ -139,7 +139,7 @@ func Qualified(subjectNativeID string) bool {
 // instance-id or creation-boundary field, and cloud_aws_workload_scan.go
 // writes only ExecutionRoleARN, InstanceProfileARN, EnvVarNames,
 // FoundationModel and Status. Claiming 'immutable' with nothing to put in
-// immutable_key makes 027's CHECK reject every EC2 workload row. The spec's
+// immutable_key makes 028's CHECK reject every EC2 workload row. The spec's
 // own instruction for exactly this case is to fix the mapping or downgrade the
 // kind -- never to relax the CHECK. Downgrading is correct until a collector
 // records InstanceId; at that point add the case here and to ImmutableKey
@@ -163,14 +163,14 @@ func Continuity(kind string) string {
 // ImmutableKey reads the provider's creation-boundary id out of the collected
 // attrs, and returns "" where the provider exposes none.
 //
-// Continuity and ImmutableKey must agree: 027's CHECK rejects a row claiming
+// Continuity and ImmutableKey must agree: 028's CHECK rejects a row claiming
 // 'immutable' with an empty immutable_key, deliberately -- a silent
 // disagreement here disables delete-and-recreate detection entirely, which is
 // a failure nothing downstream could detect.
 //
 // Uses the typed accessor, never a hand-rolled json.Unmarshal of a guessed
 // field name: a wrong key returns "" silently while Continuity still says
-// 'immutable', and then 027's CHECK rejects every IAM identity.
+// 'immutable', and then 028's CHECK rejects every IAM identity.
 //
 // Note AWSAttrs returns one value, not (attrs, error) -- it decodes to the
 // zero value rather than failing a read.

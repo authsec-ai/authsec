@@ -1,5 +1,5 @@
 -- ============================================================================
--- 027: recognition keys and continuity on the canonical node tables.
+-- 028: recognition keys and continuity on the canonical node tables.
 --
 -- SPEC-iga-phase2-graph.md §2.4. Before this migration THERE IS NO COLUMN A
 -- RESCAN COULD MATCH ON. iga_agents (004:532) is id, workspace_id,
@@ -19,7 +19,7 @@
 --   recognition key and cannot be given one: they were minted by uuid.New()
 --   from GitHub scans and nothing records their origin. A TOTAL unique index
 --   would collapse every one of them into a single row. The partial index lets
---   legacy rows coexist while constraining every new one. 034 retires them,
+--   legacy rows coexist while constraining every new one. 035 retires them,
 --   as a separate PR, after one clean production scan on the new path --
 --   never tighten a constraint in the release that introduces its column.
 --

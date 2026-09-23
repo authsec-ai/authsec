@@ -65,7 +65,7 @@ func NewIGAProjectionJobRepository(db *gorm.DB) IGAProjectionJobRepository {
 }
 
 func (r *igaProjectionJobRepository) EnqueueTx(tx *gorm.DB, job *models.IGAProjectionJob) error {
-	// One job per scan run (032's UNIQUE). A retried publish must not enqueue
+	// One job per scan run (033's UNIQUE). A retried publish must not enqueue
 	// a second.
 	return tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "scan_run_id"}},

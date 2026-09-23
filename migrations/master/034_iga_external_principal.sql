@@ -1,5 +1,5 @@
 -- ============================================================================
--- 033: external principals, and cross-provider can_assume.
+-- 034: external principals, and cross-provider can_assume.
 --
 -- SPEC-iga-phase2-graph.md §2.12.
 --

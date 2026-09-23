@@ -1,5 +1,5 @@
 -- ============================================================================
--- 032: the projection job, the per-partition watermark, and agent origin.
+-- 033: the projection job, the per-partition watermark, and agent origin.
 --
 -- SPEC-iga-phase2-graph.md §2.8, §4.10.
 --
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS public.iga_projection_state (
         REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE CASCADE,
     -- (workspace_id, connector_id), never connector_id alone: a bare FK lets a
     -- row in workspace A reference workspace B's integration, which is the
-    -- §2.9 defect this phase exists to close. 026 adds the UNIQUE this needs.
+    -- §2.9 defect this phase exists to close. 027 adds the UNIQUE this needs.
     CONSTRAINT iga_projection_state_connector_fkey
         FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,

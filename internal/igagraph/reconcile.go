@@ -185,7 +185,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 		Updates(map[string]any{
 			"state":        models.RelEnded,
 			"valid_to":     rc.now(),
-			"ended_reason": reason, // never empty: 030's CHECK enforces it
+			"ended_reason": reason, // never empty: 031's CHECK enforces it
 			"updated_at":   rc.now(),
 		}).Error
 }
@@ -218,7 +218,7 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 // object is retired only when NO SOURCE ANYWHERE still holds it.
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	// The first EXISTS matters: an object with NO support rows at all is
-	// pre-graph, not unsupported, and must not be retired by this pass -- 034
+	// pre-graph, not unsupported, and must not be retired by this pass -- 035
 	// handles those deliberately.
 	const stmt = `
 		UPDATE %s n
@@ -299,7 +299,7 @@ func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
 
 // LastGenerationFor reads a partition's watermark.
 //
-// Keyed EXACTLY as 032 keys the table and exactly as scope() filters rows --
+// Keyed EXACTLY as 033 keys the table and exactly as scope() filters rows --
 // one value, three call sites, no predicate to keep in agreement.
 func LastGenerationFor(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error) {
 	var st models.IGAProjectionState

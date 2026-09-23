@@ -1,5 +1,5 @@
 -- ============================================================================
--- 030: iga_relationship -- binary structural edges, typed on BOTH ends.
+-- 031: iga_relationship -- binary structural edges, typed on BOTH ends.
 --
 -- SPEC-iga-phase2-graph.md §2.2.
 --
@@ -14,12 +14,12 @@
 -- iga_entitlements.resource_id, which already exists and is already FK'd.
 --
 -- ORDERING NOTE, deliberate and different from a literal reading of the spec.
--- §3's 030 listing shows source_external_principal_id and its FK inline, while
--- §3's 033 says 033 adds "the table in §2.12, plus
+-- §3's 031 listing shows source_external_principal_id and its FK inline, while
+-- §3's 034 says 034 adds "the table in §2.12, plus
 -- iga_relationship.source_external_principal_id, its composite FK and the
 -- widened can_assume arm". Both cannot be true: iga_external_principal does
--- not exist until 033, so an inline FK to it here cannot apply. 033's reading
--- is the one implemented -- this table ships with three typed sources, and 033
+-- not exist until 034, so an inline FK to it here cannot apply. 034's reading
+-- is the one implemented -- this table ships with three typed sources, and 034
 -- adds the fourth together with the table it points at. The spec's own reason
 -- for putting external principals last holds either way: the graph is correct
 -- without them, since a trust policy naming an unconnected provider simply
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
     ended_reason      text NOT NULL DEFAULT '',
     source_key        text NOT NULL,
 
-    -- Partition membership, stored not inferred. See 029's note -- a
+    -- Partition membership, stored not inferred. See 030's note -- a
     -- relationship written without these is invisible to reconciliation and
     -- never ends.
     partition_key     text NOT NULL DEFAULT '',
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
         REFERENCES public.cloud_connector (workspace_id, id)
         ON DELETE SET NULL (connector_id),
 
-    -- Exactly one source and exactly one target, always. 033 widens the source
+    -- Exactly one source and exactly one target, always. 034 widens the source
     -- arm to four when it adds external principals.
     CONSTRAINT iga_relationship_source_chk CHECK (
         (source_identity_account_id IS NOT NULL)::int

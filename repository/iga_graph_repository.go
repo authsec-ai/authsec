@@ -98,7 +98,7 @@ func (r *igaGraphRepository) UpsertWorkload(tx *gorm.DB, w *models.IGAWorkload) 
 	err := tx.Clauses(graphReturningID, clause.OnConflict{
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
 		// iga_workload's index has no source_key <> '' arm: the column is
-		// NOT NULL with a non-empty CHECK from the start (028), because
+		// NOT NULL with a non-empty CHECK from the start (029), because
 		// nothing predates this table.
 		TargetWhere: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: "lifecycle <> 'retired'"},
