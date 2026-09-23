@@ -520,10 +520,23 @@ bounded relationships and access paths, and object/relationship evidence.
 The server takes the authorized workspace from the authenticated context, never
 from a query parameter. View permissions and integration mutations are separate.
 
+Every list, graph and evidence read accepts and echoes a **published revision**
+(`rev`), so one investigation cannot mix revisions. A newer publication is
+offered, never applied silently.
+
 The console uses `ConsolePage` and existing API/state conventions, and shows
 source scope, identity continuity, basis, state, observation time, evidence and
-unresolved selectors. Loading, denied, empty, partial and failed states must look
-different from one another.
+unresolved selectors. Loading, empty, partial, failed, stale, unconnected and
+truncated states must look different from one another — in particular a failed
+request must never render as an empty list.
+
+The entry point is the **estate** — agents and workloads across every connected
+provider — not a graph and not a per-provider inventory tree. Estate-wide
+identity and resource lists stay first-class, because an investigation often
+starts from a shared role or a sensitive resource.
+[SPEC-iga-phase2-graph.md](SPEC-iga-phase2-graph.md) §2.14 specifies the
+experience, §2.15 the contracts behind it, and §2.16 traces one path end to
+end.
 
 ---
 

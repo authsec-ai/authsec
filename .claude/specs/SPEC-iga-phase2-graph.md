@@ -52,7 +52,7 @@ projection that can be rebuilt from evidence at any time.
   selector resolution are Phase 3.
 - **Effective access.** Conditions are recorded, never evaluated (roadmap §3.5a).
 - **Traversal API and console.** Phases 4 and 5. §2.14 specifies the
-  screens so they are not invented twice; P2-11 builds only the first read
+  experience and §2.15 the contracts it needs, so neither is invented twice; P2-11 builds only the first read
   path.
 - **Migrating the GitHub path.** GitHub keeps writing through `ingestGrant`;
   P2-4 makes that write path correct rather than replacing it.
@@ -102,8 +102,7 @@ unconditionally: the instance concept is in the schema and not in the product.
 
 Four defects blocked any graph: coverage was not per-run, evidence was deleted by
 inventory churn, content dedupe erased run confirmation, and the completeness
-gate was unclear. Migration `024` (`b47adeb`, merged) closed **all four**, two of
-them by better mechanisms than this document originally proposed.
+gate was unclear. Migration `024` (`b47adeb`, merged) closed **all four**.
 
 | | Closed by | Note |
 |---|---|---|
@@ -452,36 +451,45 @@ window between them is exactly where the overwrite happens.
 
 So the barrier is a **row**, not a lock:
 
-```sql
--- 026
-CREATE TABLE IF NOT EXISTS public.iga_pipeline_lease (
-    workspace_id uuid NOT NULL,
-    -- idle -> collecting -> projecting -> idle
-    state        text NOT NULL DEFAULT 'idle',
-    holder       text NOT NULL DEFAULT '',   -- worker identity
-    scan_run_id  uuid,
-    expires_at   timestamptz,
-    -- Fence token. Every transition demands the version it read, so a
-    -- worker that slept past its expiry is refused because the version
-    -- moved on -- never because a clock was consulted.
-    version      bigint NOT NULL DEFAULT 0,
-    updated_at   timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT iga_pipeline_lease_pkey PRIMARY KEY (workspace_id),
-    CONSTRAINT iga_pipeline_lease_state_chk CHECK (
-        state IN ('idle', 'collecting', 'projecting')),
-    CONSTRAINT iga_pipeline_lease_busy_chk CHECK (
-        (state = 'idle') = (holder = '' AND scan_run_id IS NULL))
-);
-```
+Its DDL is migration `026` (§3); it is not repeated here.
 
 Every transition is one conditional `UPDATE`, atomic and recoverable:
 
 | Transition | Guard | Effect |
 |---|---|---|
-| scan claim | `state='idle'` **or** expired | `collecting`, `version+1` |
-| publish | `state='collecting' AND version=?` | `projecting`, in the publish transaction |
-| projection done | `state='projecting' AND version=?` | `idle` |
-| recovery | `expires_at < now()` | any state → `idle`, `version+1` |
+| scan claim | `state='idle' AND version=?` | `collecting`, `version+1`, new `holder` |
+| publish | `state='collecting' AND version=?` | `projecting`, **in the publish transaction**, job enqueued |
+| projection done | `state='projecting' AND version=?` | `idle`, `version+1` |
+| **recover `collecting`** | `state='collecting' AND expires_at < now()` | `collecting`, `version+1`, new `holder` — **same run, same phase** |
+| **recover `projecting`** | `state='projecting' AND expires_at < now()` | `projecting`, `version+1`, new `holder` — **same phase** |
+| **abandon** | expired, past the attempts ceiling | terminalize the scan run **and** its projection job, *then* `idle`, `version+1` |
+
+**Expiry alone must never return the barrier to `idle`.** A `projecting`
+lease whose worker died still has a published run whose inventory is being
+read; releasing the barrier lets the next scan rewrite a shared resource
+underneath it, which is the exact overwrite §2.10A exists to prevent. Recovery
+therefore **reclaims the same phase under a new fencing version** — the dead
+worker is fenced out by the version, and the phase invariant holds throughout.
+
+Only `abandon` returns to `idle`, and it is not a timeout: it fires past the
+attempts ceiling and **first drives both the scan run and the projection job
+to a terminal state in the same transaction**. Nothing is admitted while
+either could still commit.
+
+```
+                 expired                    expired
+        ┌───────────────────────┐  ┌──────────────────────────┐
+        ▼                       │  ▼                          │
+     collecting ──publish──▶ projecting ──done──▶ idle ──claim─┘
+        │                       │                  ▲
+        └──── abandon ──────────┴──────────────────┘
+              (terminalize run + job first)
+```
+
+Every ownership check binds **(workspace, phase, run-or-job id, version)** —
+not the version alone. A worker holding `collecting@v7` cannot perform a
+`projecting` transition even if the version happens to match, because the
+phase is part of the predicate.
 
 `state='projecting'` is what a later scan's claim collides with, and because
 it is a committed row rather than a session lock, it survives the gap between
@@ -531,32 +539,7 @@ Serialization does not help; this happens sequentially and is still wrong.
 
 **Object identity and source support are separate rows.**
 
-```sql
--- 031
-CREATE TABLE IF NOT EXISTS public.iga_object_support (
-    id            uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id  uuid NOT NULL,
-    object_type   text NOT NULL,  -- identity|workload|resource|entitlement|agent
-    object_id     uuid NOT NULL,
-    connector_id  uuid NOT NULL,
-    partition_key text NOT NULL,
-
-    state         text NOT NULL DEFAULT 'current',  -- current|stale|ended
-    first_seen_at timestamptz NOT NULL DEFAULT now(),
-    last_confirmed_run_id uuid,
-    last_confirmed_at     timestamptz,
-    ended_reason  text NOT NULL DEFAULT '',
-
-    CONSTRAINT iga_object_support_pkey PRIMARY KEY (id),
-    CONSTRAINT iga_object_support_connector_fkey
-        FOREIGN KEY (workspace_id, connector_id)
-        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT iga_object_support_state_chk CHECK (state IN ('current','stale','ended')),
-    CONSTRAINT iga_object_support_ended_chk CHECK ((state = 'ended') = (ended_reason <> '')),
-    CONSTRAINT iga_object_support_key
-        UNIQUE (workspace_id, object_type, object_id, connector_id, partition_key)
-);
-```
+Its DDL is migration `031` (§3); it is not repeated here.
 
 - **Projection** upserts one support row per `(object, connector, partition)`
   it observed, stamping `last_confirmed_run_id`.
@@ -681,38 +664,7 @@ repo:authsec-ai/authsec  ──▶  role/gha-deploy    ──▶  s3:PutObject �
 
 The far end is a **node**, not a string on the edge:
 
-```sql
--- 034
-CREATE TABLE IF NOT EXISTS public.iga_external_principal (
-    id            uuid NOT NULL DEFAULT gen_random_uuid(),
-    workspace_id  uuid NOT NULL,
-    issuer        text NOT NULL,   -- token.actions.githubusercontent.com
-    subject_claim text NOT NULL,   -- repo:org/repo:ref:refs/heads/main
-    mechanism     text NOT NULL,   -- oidc | saml | aws_account | service_principal
-    source_key    text NOT NULL,
-
-    -- Filled when the far provider connects AND the claim resolves to exactly
-    -- one object. Nullable forever otherwise, which is an honest state.
-    resolved_object_type text NOT NULL DEFAULT '',
-    resolved_object_id   uuid,
-    resolution_basis     text NOT NULL DEFAULT '',   -- derived | asserted
-    resolution_rule      text NOT NULL DEFAULT '',
-
-    first_seen_at timestamptz NOT NULL DEFAULT now(),
-    last_seen_at  timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT iga_external_principal_pkey PRIMARY KEY (id),
-    CONSTRAINT iga_external_principal_workspace_fkey FOREIGN KEY (workspace_id)
-        REFERENCES public.workspaces(id) ON DELETE CASCADE,
-    CONSTRAINT iga_external_principal_workspace_id_key UNIQUE (workspace_id, id),
-    CONSTRAINT iga_external_principal_resolution_chk CHECK (
-        (resolved_object_id IS NULL) = (resolution_basis = '')),
-    CONSTRAINT iga_external_principal_derived_chk CHECK (
-        resolution_basis <> 'derived' OR resolution_rule <> '')
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_external_principal_key
-    ON public.iga_external_principal (workspace_id, source_key);
-```
+Its DDL is migration `033` (§3); it is not repeated here.
 
 `iga_relationship` gains `source_external_principal_id` as a fourth typed
 source, with the legal-pair CHECK widened so `can_assume` accepts it.
@@ -722,6 +674,24 @@ source, with the legal-pair CHECK widened so `can_assume` accepts it.
 > and its whole history. A string endpoint would force delete-and-recreate,
 > destroying "this access has existed since March" — which is precisely the
 > fact a reviewer needs and the one hardest to recover.
+
+**The lifecycle of a resolution follows its basis.** A `derived` resolution
+is a mechanical fact about current evidence and is simply re-derived. An
+`asserted` one is a person's decision, and restoring its target's *record*
+must not silently renew it:
+
+| Situation | `derived` | `asserted` |
+|---|---|---|
+| Collection becomes incomplete | Kept; its supporting evidence shown stale | Kept; evidence shown stale. **Still `active`** — we could not look, which proves nothing |
+| Target confirmed absent and retired | Re-derived against current evidence; usually becomes unresolved | **`suspended`.** The decision is preserved and still points at the retired row, so it stays explicable; it is not in force |
+| Same immutable identity returns (restored) | Re-derived | **`pending_reconfirmation`.** The record is restored; the person's association is *offered back*, not reinstated. Nothing grants on it until someone confirms |
+| A different identity appears under the same name (recreated) | Re-derived — an exact ARN match now points at the new object, which is correct for a mechanical fact | **Stays `suspended` on the old object. Never transferred.** The person decided about X, not about whatever now wears X's name |
+
+`suspended` and `pending_reconfirmation` are both **not in force**: no path is
+drawn through them as current, and the UI shows them as a decision awaiting a
+person. `SuspendAssertions` and `MarkAssertionsPendingReconfirm` in
+`projectIdentities` (§4.6, branches a and c) are the two writes that implement
+the retire and restore rows; they touch `asserted` rows only.
 
 **Resolution is a claim, not a fact.** `repo:org/repo:*` matches every branch
 and tag in that repository. So it carries the same `basis` discipline as
@@ -757,7 +727,7 @@ cheap to state and expensive to walk back.
 | Not built | Why not |
 |---|---|
 | Automatic cross-provider identity merging | Above |
-| Unbounded transitive traversal | **Capped at two hops** from any start. Depth three yields paths nobody can verify, and each hop multiplies the chance one link is `stale` |
+| Unbounded transitive traversal | Bounded by **four separate limits** (§2.14.11), not one hop count: a blanket two-hop cap makes the product's own workload→identity→entitlement→resource example untraversable. Role-assumption chaining is the one capped at 2, because each hop multiplies the chance a link is `stale` |
 | Resolving every external principal | Exact matches only; wildcards stay unresolved and visible |
 | Effective access | Conditions recorded, never evaluated. No SCPs, boundaries or session policies. Every conclusion reads `unknown` (roadmap §3.5a) |
 | Blast-radius or risk scoring | Needs effective access to mean anything. A score over declared grants is a number that looks like analysis |
@@ -845,180 +815,860 @@ yet met a real estate. The canonical model should be *checked* against a
 second provider's payloads as a design exercise (roadmap §7), which is
 different from building the integration.
 
-### 2.14 The console — screens, states, and what is deliberately not a screen
+### 2.14 The product experience
 
 Phases 4 and 5 build this. It is specified here because P2-11 builds the first
-read path, and the shape must not be invented twice.
+read path and the shape must not be invented twice — and because several
+decisions below constrain the schema and the API, not just the pixels.
 
-#### The jobs, in order
+**Status of this section.** Everything here is **proposed** unless a row says
+*built*. Nothing in §2.14 exists today beyond the three inventory tabs.
 
-A customer does four things, and each is a screen. Anything that is not one of
-these four is a candidate for cutting.
+#### 2.14.1 The journey, and what the current IA does to it
 
-1. **Connect an estate and find out what we can actually see.**
-2. **Look up a thing** — an identity, a workload, a resource.
-3. **Answer a reach question** — what can this reach, who can reach this.
-4. **Challenge an answer** — why do you believe this, and when did you last check?
-
-Job 3 is the graph's entire purpose and is the screen that does not exist
-today. Job 4 is what separates this from a dashboard.
-
----
-
-#### A · Accounts and coverage
-
-The first screen, and the one that makes every number on every other screen
-trustworthy. Per connected account: what was read, what was refused and why,
-and when it was last confirmed.
+The intended journey:
 
 ```
-  ┌─ Accounts ──────────────────────────────────────────────────────┐
-  │                                                                  │
-  │  220171243705 · production                          [complete]   │
-  │  14 surfaces read · last scan 22 min ago                         │
-  │                                                                  │
-  │  905418271234 · sandbox                             [partial]    │
-  │  iam_users denied — role lacks iam:ListUsers                     │
-  │  11 of 14 surfaces read                                          │
-  │                                                                  │
-  │  551209887761 · data-eu                             [stale]      │
-  │  Last confirmed 6 days ago. Nothing deleted — we could not look. │
-  └──────────────────────────────────────────────────────────────────┘
+connect an integration → see agents and workloads → pick one you recognise
+    → explore it → inspect the evidence for one relationship → see what changed
 ```
 
-**Never a percentage.** "78% covered" averages a denied IAM read with an
-unselected region, and those have different owners and different fixes. The
-per-surface state is the answer, and the account rolls up to
-`complete | partial | stale` only.
+The customer never has to know our entity names, and never starts at a graph.
 
-Each refused surface states **the permission that would fix it**. A coverage
-gap the customer cannot act on is a complaint, not a finding.
+**Verified against `authsec-staging`, the console today does not support this.**
+Three separate trees claim overlapping territory, backed by three different
+pipelines:
 
----
+| Route | Backed by | Pipeline |
+|---|---|---|
+| `/iga/agents` | `/authsec/discovery/agents` → `discovered_agents` (`models/discovery.go:343`) | Legacy discovery — **not** the IGA graph |
+| `/iga/identities` | `iga_identity_accounts` via `/api/iga/v1/identity-accounts` | GitHub IGA path |
+| `/iga/cloud/aws/identities` | `cloud_identity` | AWS collection path |
+| `/iga/cloud/aws/compute` | `cloud_workload` | AWS collection path |
 
-#### B · Inventory — three provider-neutral tabs
+So a customer sees **two pages called Identities** fed by different pipelines,
+and an **Agents page that never shows a Bedrock agent** — Bedrock agents land
+in `cloud_workload` and surface under *Compute*, which is the one tab that
+sounds least like an agent.
 
-Identities · Compute · Resources. Built. A second provider filters into these
-tabs rather than adding `GCP Identities` beside `AWS Identities` — the tab set
-is about *what kind of thing*, never *which vendor*.
+There are also three distinct "agent" concepts in the tree: `discovered_agents`
+(legacy), `iga_agents` (`models/iga.go:421`, canonical), and Bedrock/AgentCore
+rows in `cloud_workload`. The IA exposes all three without distinguishing them.
 
-```
-  Identities | Compute | Resources          [All accounts ▾] 3 connected
+#### 2.14.2 One entry point: Agents & workloads
 
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ arn:aws:iam::1234:role/refund-lambda-role            [current]   │
-  │ production · immutable · first seen 12 Mar                       │
-  ├──────────────────────────────────────────────────────────────────┤
-  │ arn:aws:iam::9054:role/deploy                        [current]   │
-  │ sandbox · immutable · distinct from production/deploy            │
-  └──────────────────────────────────────────────────────────────────┘
-```
+The sidebar item is **Agents & workloads**. It lists the things that *run* —
+logical agents and workloads — across every connected provider. "Estate" stays
+an architectural term and the route segment (`/iga/estate`), because the list
+spans two object types and needs one URL namespace; the customer sees the
+label, and breadcrumbs use it.
 
-Two rules the list must honour:
+`/iga/cloud/*` stops being its own tree and becomes **provider filters** on
+this list.
 
-- **Show the account on every row whenever more than one is connected.** Two
-  roles named `deploy` are different objects (§2.12) and a list that hides
-  which account they came from makes them look like a duplicate bug.
-- **Say `immutable` or `recognition_only`.** For a Lambda, "same name" is the
-  strongest claim available, and the console should say so rather than
-  implying we verified continuity we cannot verify.
+Two estate-wide lists stay first-class, because an investigation often starts
+from a shared role or a sensitive bucket rather than from an agent:
 
----
+- **Identities** → `/iga/identities` — every identity account, all providers,
+  replacing the two pipeline-specific pages
+- **Resources** → `/iga/resources` — every resource and selector
 
-#### C · Access paths — the missing screen
+**The legacy Agents page leaves the navigation, not the product.**
+`/iga/agents` is backed by `discovered_agents` — a separate pipeline with its
+own semantics — and leaving it in the sidebar beside *Agents & workloads*
+would give the customer two competing "agents" destinations that disagree.
 
-Pick a start, pick a direction, read paths as rows. This is job 3.
-
-```
-  ○ What can this reach?   ● Who can reach this?
-  Start: refund-processor (lambda · eu-central-1)
-
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ refund-processor ─executes_as→ refund-lambda-role                │
-  │        ─granted→ s3:GetObject ─names→ refunds-bucket/*           │
-  │                                                                   │
-  │ current · declared · confirmed 22 min ago · 4 observations       │
-  ├──────────────────────────────────────────────────────────────────┤
-  │ refund-lambda-role ─can_assume→ arn:aws:iam::9054:role/          │
-  │                                 data-reader                       │
-  │                                                                   │
-  │ ⚠ CROSSES ACCOUNTS · stale 6 days                                │
-  │ sandbox not read since 15 Sep — this is not a removal            │
-  └──────────────────────────────────────────────────────────────────┘
-```
-
-That second row is most of the product's value in one line. One account's
-console shows one account's roles; nothing today shows that production's
-Lambda can assume sandbox's reader. **It is also why account is a filter and
-never a mode** — a mode makes the cross-account path unrepresentable, because
-the path has no single account to live in.
-
-Every row carries four things, and a row missing any of them is not shippable:
-
-| | Why it is on the row and not behind a click |
+| | During transition |
 |---|---|
-| `basis` | `declared` vs `observed` is the difference between "a policy says so" and "we saw it happen". Hiding it invites the reader to assume the stronger one |
-| `state` | `stale` must be visually distinct from `current`, or an outage reads as a clean result |
-| last confirmed | The honest age of the claim |
-| evidence count | A link into screen D. Zero is a defect, not a display state (§4.8) |
+| Route `/iga/agents` | **Stays live.** Existing links and bookmarks keep working |
+| Sidebar | **Removed.** No second agents destination in IGA navigation |
+| Reachable from | *Integrations → Runtime discovery (legacy)*, labelled as a separate pipeline |
+| Excluded from | Agents & workloads, the graph, every count, every coverage claim. Its rows never appear as graph nodes |
+| Retirement | A separate decision, outside this phase |
 
-**Two hops, and the cap is visible.** When a path is truncated the row says so
-— "2 of 2 hops shown; this identity can assume 3 more roles" — rather than
-silently ending. An invisible limit is indistinguishable from an absence.
+#### 2.14.3 Classification: what we may call an agent
 
----
+**Not every Lambda is an agent.** The column is *Classification*, never a
+badge reading "AI".
 
-#### D · Evidence drawer
+| State | Meaning | Evidence | Phase 2 |
+|---|---|---|---|
+| **Provider-native agent** | The provider's own API calls it an agent | The observation: `bedrock:GetAgent`, `bedrock-agentcore:GetAgentRuntime` | **Automatic.** Derived from `runtime_kind` (`bedrock_agent`, `bedrock_agentcore_runtime`) |
+| **Classified as agent** | A person said so, for a custom agent on Lambda/ECS/EC2 | A decision record: who, when, why | **In — as one narrow, audited action.** See below |
+| **Unclassified workload** | We found it; nobody has said what it is | Discovery evidence for the workload itself | The default |
 
-Opens from any path row or object. Job 4: *why do you believe this?*
+**Decision (proposed — confirm before build): manual classification is in
+this phase.** `cloud_workload` has no classification column, but a missing
+column is a migration, not a reason to cut scope. The journey this product exists for — *"select the customer support
+agent"* — is unreachable for any customer whose support agent is a Lambda,
+which is most of them, because it would stay "Unclassified workload"
+indefinitely. A missing column is a migration, not a reason.
 
-```
-  ┌─ Evidence · refund-lambda-role → s3:GetObject ──────────────────┐
-  │ iam:GetRole · 22 min ago                          [supports]    │
-  │ surface iam_roles · coverage reached at collection              │
-  │ confirmed by 14 runs                                             │
-  ├──────────────────────────────────────────────────────────────────┤
-  │ lambda:ListFunctions · 22 min ago                 [supports]    │
-  │ surface lambda:eu-central-1 · coverage reached                  │
-  ├──────────────────────────────────────────────────────────────────┤
-  │ iam:GetRole · 4 Aug                            [unattributed]   │
-  │ Subject no longer in inventory. Cannot be tied to one grant.    │
-  └──────────────────────────────────────────────────────────────────┘
-```
+What is in, and what stays out:
 
-Each row shows the API call, the surface, **the coverage that surface had at
-collection time**, and the redacted response. A fact collected during a
-degraded scan must still read as such a year later — that is what
-`cloud_observation.surface_state` is for.
-
-The third row is the rule from §4.8 made visible: pre-P2-2 observations cannot
-be tied to one grant without guessing, so they appear as history and are never
-counted toward the evidence gate.
-
----
-
-#### The account filter, precisely
-
-- **Multi-select, defaults to all.** The default view is the whole estate,
-  because cross-account reach is the thing being bought.
-- **Filtering also filters the coverage banner.** Otherwise a partial read in
-  a hidden account silently licenses a clean-looking list — the exact failure
-  the coverage model exists to prevent.
-- **Compute ignores the filter, deliberately.** Already true in
-  `cloudInventoryNav.ts`: workloads nobody can attribute must not hide behind
-  an account filter.
-- **A path that crosses the filter is shown, marked.** Filtering to
-  production and hiding a path into sandbox would answer the customer's
-  question wrongly.
-
-#### Not a screen
-
-| Not built | Instead |
+| In | Out |
 |---|---|
-| A node-link graph canvas | Path rows (C). The diagram earns its place only for one expanded path of 4–6 nodes: legible, printable, pasteable into a ticket |
-| A risk score or posture dial | Nothing. It needs effective access to mean anything (§2.13) |
-| A "Priya" unified person view | Correlation candidates with evidence, on their own review surface, affecting nothing until confirmed (§2.12) |
-| A remediation button | Phase 6 at the earliest, behind a separate credential and separate consent. The discovery role can never write |
+| A **Classify as agent** action on a workload's Overview | Automatic inference from names, tags, env vars or dependencies |
+| An optional free-text purpose ("Customer support triage") | Grouping several workloads into one logical agent |
+| Undo, which records its own decision rather than deleting the first | Bulk classification |
+| The decision shown on Overview: *"Classified as agent by priya@ · 22 Sep · 'handles tier-1 tickets'"* | Classification affecting any access conclusion |
+
+Grouping is the one to hold the line on. Deciding that `cs-handler-a` and
+`cs-handler-b` are one agent is a correlation claim, and §2.12's rule applies:
+no merging on names, ever, without evidence.
+
+**Schema** is in migration `028` (§3), with `iga_workload`.
+
+Two rules the projector must honour:
+
+- **`provider_native_agent` is set by the projector; `classified_agent` never
+  is.** The projector writes the former from `runtime_kind` and must not
+  overwrite the latter — classification is human-owned state, and §3's "never
+  `UpdateAll`" rule protects it.
+- **Recreation does not carry classification.** A workload retired as
+  `recreated` keeps its decisions on the old row; the new object starts
+  `unclassified`. A human classified *that* workload, not whatever now wears
+  its name.
+
+#### The classification contract
+
+A human decision in a security product needs five things pinned down, and
+each is a place this goes wrong quietly.
+
+| Concern | Contract |
+|---|---|
+| **Who may** | Classify and undo require `middlewares.Require("discovery", "admin")` — the same gate as connecting an integration. Viewing a decision needs `discovery:read`. A narrower `discovery:classify` action is a later refinement, not a Phase 2 dependency |
+| **Who did** | A **verified human workspace member**, and the actor recorded is their **stable user id**. See the rule below — the obvious checks are all wrong in this codebase |
+| **Atomic** | One transaction: insert the `iga_workload_classification` row, then update `iga_workload.classification` and bump `classification_version`. Either both land or neither does; there is never a classification with no decision behind it |
+| **Concurrent edits** | Optimistic. The request carries `expected_version`; the update is `… WHERE id=? AND classification_version=?`. Zero rows → `409` with the current classification, who set it and when, so the second person sees the first person's decision instead of overwriting it |
+| **Provider-native** | Not human-editable. The action is not offered on a `provider_native_agent`, and the endpoint returns `422` if called. The provider's own API says it is an agent; a person cannot overrule the evidence, only add context to it. **Undo** reverts only `classified_agent → unclassified`, and records its own decision row rather than deleting the first |
+
+**Identifying the human — verified against the token code, because every
+shortcut here is wrong:**
+
+| Tempting check | Why it fails |
+|---|---|
+| Reject if `client_id` is present | The human console session carries **both** `UserID` and `ClientID` (`GenerateWorkspaceToken`, `authmanager_token_service.go:71`), and the middleware sets both into context (`auth.go:864-868`). This would reject every legitimate user |
+| Accept if a `user_id` is present | `GenerateEndUserToken`, `GenerateAdminToken`, `GenerateCIBAToken`, `GenerateDeviceAuthToken` and others all set `UserID`. An **end-user of a customer's application** would pass |
+| `ResolveUserID(c)` | Falls back to `sub`, then email. A machine token's `sub` is the client |
+| `IGAController.workspace()` | Falls back to `client_id`, then to the workspace id itself (`iga_controller.go:114-122`) |
+
+**The rule.** Of the eleven token generators, **only `GenerateWorkspaceToken`
+sets `WorkspaceMembershipID`** — it is the discriminator for a human console
+session. But a claim is not a fact: the membership may have been revoked since
+the token was issued, so it is checked against the record.
+
+```go
+func requireWorkspaceHuman(c *gin.Context, db *gorm.DB) (userID uuid.UUID, err error) {
+    membershipID := c.GetString("workspace_membership_id") // only workspace sessions carry it
+    uid          := c.GetString("user_id")
+    ws           := c.GetString("workspace_id")
+    if membershipID == "" || uid == "" || ws == "" {
+        return uuid.Nil, errNotWorkspaceHuman // 403: machine, SDK, end-user, admin or CIBA token
+    }
+    // All three must agree with the RECORD, and the membership must be live.
+    // status is CHECKed to active|invited|suspended|left (001_bootstrap.sql:1668),
+    // so 'active' refuses an invitee who never accepted, a suspended member,
+    // and someone who has left.
+    // A token naming a membership that belongs to another user or workspace,
+    // or one revoked after issuance, is refused here.
+    var n int64
+    if err := db.Model(&models.WorkspaceMembership{}).
+        Where("id = ? AND workspace_id = ? AND user_id = ? AND status = 'active'",
+            membershipID, ws, uid).Count(&n).Error; err != nil {
+        return uuid.Nil, err
+    }
+    if n != 1 {
+        return uuid.Nil, errNotWorkspaceHuman // 403
+    }
+    return uuid.Parse(uid)
+}
+```
+
+Then `middlewares.Require("discovery", "admin")` applies as usual. `decided_by`
+stores the **user id**, never the email: an email can be reassigned, and the
+decision must stay attributable to the person who made it.
+
+```
+POST /api/iga/v1/estate/:id/classification
+  { "decision": "classified_agent" | "unclassified",
+    "purpose":  "Customer support triage",       // optional
+    "reason":   "Owns tier-1 ticket routing",
+    "expected_version": 3 }
+
+  200  { "classification": "classified_agent", "classification_version": 4,
+         "decided_by": "priya@acme.com", "decided_at": "…" }
+  403  not a live workspace member, or lacks discovery:admin
+  409  { "current": { classification, version, decided_by, decided_at } }
+  422  workload is provider_native_agent
+```
+
+**The projector never writes `classified_agent`,** and never overwrites it.
+It sets `provider_native_agent` from `runtime_kind` on insert and leaves the
+column alone otherwise — classification is human-owned state, protected by
+§3's rule that every `ON CONFLICT DO UPDATE` names its columns and never uses
+`UpdateAll`.
+
+**`Unclassified` does not mean "not an agent"** and is never rendered as a
+negative or filtered away by default. An ordinary workload stays discoverable
+whether or not anyone ever classifies it.
+
+#### 2.14.4 Logical agent versus deployed instance
+
+A logical agent persists across versions and deployments; an instance is one
+source-native realization. **The product only shows instances it has evidence
+for.** Production and staging are two instances of one agent only when the
+provider says so — never because their names look alike.
+
+**What the collector actually gathers — verified, `internal/awsdiscovery/bedrock.go`:**
+
+| Provider object | Called | Collected | Gives us |
+|---|---|---|---|
+| Bedrock agent | `ListAgents`, `GetAgent` | yes | The logical agent, its execution role |
+| Bedrock agent **alias** | `ListAgentAliases` | **no** | Nothing — no instances |
+| AgentCore runtime | `ListAgentRuntimes`, `GetAgentRuntime` | yes | One deployed runtime per row |
+| AgentCore gateway | `ListGateways`, `ListGatewayTargets` | yes | A gateway; its targets recorded as evidence under it |
+
+So in Phase 2 **a Bedrock agent has no known instances.** Aliases are what
+separate `live` from `canary`, and nothing reads them. The Estate list
+therefore shows the agent with its instance state stated honestly:
+
+```
+  customer-support-agent     Provider-native agent    bedrock    22 min ago
+                             instances: not collected
+  cs-runtime-prod            Provider-native agent    agentcore  22 min ago
+  cs-runtime-staging         Provider-native agent    agentcore  22 min ago
+```
+
+The two AgentCore runtimes are **two rows**, not one agent with two instances.
+Their names suggest they belong together; nothing the provider returns says so,
+and grouping on names is the correlation §2.12 forbids.
+
+**To show instances, one piece of collection work is required and is not yet
+scheduled**: `bedrock-agent:ListAgentAliases` per agent, written as
+`iga_agent_instances` rows with `origin = 'discovered'`, linked to the agent by
+the provider's own agent id. That is a Phase 1 collector change plus a P2-10
+projection change. Until it lands, "instances: not collected" is the correct
+display — not a count of zero, and not a guess.
+
+#### 2.14.5 Navigation model
+
+One selected object, five views, shared filters. The views are **alternate
+lenses on one investigation**, not separate pages that forget each other.
+
+| URL | View | Purpose |
+|---|---|---|
+| `/iga/estate` | List | Agents and workloads, all providers |
+| `/iga/estate/:id` | **Overview** | What it is, where it lives, classification basis, freshness |
+| `/iga/estate/:id/identities` | **Identities** | Execution identity and other identity relationships |
+| `/iga/estate/:id/resources` | **Resources** | Resources and selectors its declared access names |
+| `/iga/estate/:id/graph` | **Graph** | Focused visual explanation of this object |
+| `/iga/estate/:id/changes` | **Changes** | Confirmed configuration changes, separate from coverage changes |
+| `/iga/estate/:id/graph?evidence=:edgeId` | Evidence | A panel, not a nested drawer |
+| `/iga/identities`, `/iga/identities/:id` | Estate-wide identities | Same five-view shape where applicable |
+| `/iga/resources`, `/iga/resources/:id` | Estate-wide resources | Same |
+
+**Rules the implementation must honour:**
+
+- **Filters live in the query string and survive every view switch.**
+  `?provider=aws&account=220171243705&region=eu-central-1&rev=<revision>`.
+  Switching Overview → Graph changes the path segment only.
+- **Every view is deep-linkable and every link is shareable.** A URL pasted
+  into a ticket reproduces the same object, the same filters and the same
+  published revision.
+- **Back always goes back one step in the customer's own narrative** — view
+  switches and evidence panels are history entries; filter edits **replace**
+  rather than push, so Back does not walk a filter keystroke at a time.
+- **No nested drawers.** Evidence is a side panel over the current view, with
+  its own URL. Opening evidence from inside a drawer is forbidden; the drawer
+  navigates instead.
+- **Breadcrumbs name the investigation**, not the schema:
+  `Estate → customer-support-agent → Identities`. Never
+  `iga_agents → iga_relationship`.
+- **The selected object persists** across estate-wide detours. Jumping from an
+  agent's Identities view to the shared role's own page keeps a "back to
+  customer-support-agent" affordance until the customer dismisses it.
+
+#### 2.14.6 Wireframes
+
+**Estate list.** The entry point. Filters at the top apply everywhere.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Estate                                    [aws ▾][all accounts ▾][all ▾]   │
+│ 3 integrations · 2 complete, 1 partial                    rev 2026-09-22.4 │
+├────────────────────────────────────────────────────────────────────────────┤
+│ ⚠ sandbox (905418271234): iam_users denied. Identity lists for that        │
+│   account are incomplete — see Coverage.                          [details]│
+├────────────────────────────────────────────────────────────────────────────┤
+│ NAME                      CLASSIFICATION           RUNTIME      CONFIRMED  │
+│   customer-support-agent  Provider-native agent    bedrock      22 min ago │
+│                           instances not collected                          │
+│   cs-runtime-prod         Provider-native agent    agentcore    22 min ago │
+│   ticket-tools            Unclassified workload    lambda       22 min ago │
+│   refund-tools            Unclassified workload    lambda       22 min ago │
+│   nightly-etl             Unclassified workload    ecs          6 days ago │
+│                                                    ↑ stale: eu-west denied │
+├────────────────────────────────────────────────────────────────────────────┤
+│ 47 of 47 shown                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Overview.** Answers "what is this and how much do we know?"
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Estate › ticket-tools                          [aws][production][eu-central-1]│
+│ ┌ Overview ┬ Identities ┬ Resources ┬ Graph ┬ Changes ┐                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│ ticket-tools                                                                │
+│ arn:aws:lambda:eu-central-1:220171243705:function:ticket-tools             │
+│                                                                             │
+│ Classification   Unclassified workload                                      │
+│                  Nobody has recorded what this is for.                      │
+│ Runtime          AWS Lambda · eu-central-1 · production (220171243705)      │
+│ Continuity       recognition_only — the ARN embeds the name, not a          │
+│                  creation boundary, so "same name" is the strongest claim   │
+│ Owner            Not assigned                                               │
+│ First seen       12 Mar 2026     Last confirmed   22 min ago                │
+│ Evidence         lambda:ListFunctions · surface lambda:eu-central-1         │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Identities.** The execution identity, and who else uses it.
+
+```
+│ EXECUTION IDENTITY                                                          │
+│ SharedToolRole              arn:aws:iam::220171243705:role/SharedToolRole   │
+│ Relationship  executes_as · declared · current · confirmed 22 min ago       │
+│ Basis         Configuration. The function is configured to run as this      │
+│               role. We have not observed it run.                     [why?] │
+│                                                                             │
+│ ALSO USES THIS IDENTITY                                                     │
+│ refund-tools        lambda · eu-central-1 · confirmed 22 min ago            │
+│                                                                             │
+│ ⓘ Two workloads share this role. Changing the role affects both.           │
+```
+
+**Resources.** Honest about what a selector is.
+
+```
+│ NAMED BY DECLARED ACCESS                                                    │
+│                                                                             │
+│ arn:aws:s3:::support-tickets/*                        Prefix selector       │
+│   s3:GetObject · via SharedToolRole                                         │
+│   ⓘ A selector, not a resource. It names objects under a prefix; we have   │
+│     not enumerated them and do not know whether any exist.                  │
+│                                                                             │
+│ arn:aws:s3:::support-tickets                          Exact reference       │
+│   s3:ListBucket · via SharedToolRole                                        │
+│   ⓘ Named exactly by a policy statement. Not independently discovered —     │
+│     we have not confirmed this bucket exists.                               │
+│                                                                             │
+│ arn:aws:kms:eu-central-1:905418271234:key/abcd        External reference    │
+│   kms:Decrypt · via SharedToolRole                                          │
+│   ⚠ Account 905418271234 is connected but its KMS surface was not read.    │
+```
+
+**Changes.** Configuration changes and visibility changes never share a list.
+
+```
+│ ┌ Configuration changes ┬ Coverage changes ┐                               │
+│                                                                             │
+│ 21 Sep 14:02  Grant ended    s3:PutObject on support-tickets/*             │
+│               Policy TicketWrite detached from SharedToolRole.              │
+│               One other policy still grants s3:GetObject — the path to      │
+│               support-tickets/* remains.                          [evidence]│
+│                                                                             │
+│ 12 Mar 09:41  First seen     ticket-tools                                   │
+│                                                                             │
+│ ── Coverage changes ──                                                      │
+│ 15 Sep 03:10  Became stale   eu-west-1 compute not read since this date.   │
+│               No relationship ended. This is a visibility change.           │
+```
+
+#### 2.14.7 Screen and state table
+
+Every screen defines all eight. **A failed request must never render as an
+empty list** — "No identities" and "we could not ask" are different answers,
+and conflating them is the failure the whole coverage model exists to prevent.
+
+| State | Estate list | Overview | Identities | Resources | Graph | Changes |
+|---|---|---|---|---|---|---|
+| **Loading** | skeleton rows, filters interactive | skeleton | skeleton | skeleton | spinner on canvas, no partial graph | skeleton |
+| **Empty** | "No agents or workloads in this scope" + which filters are narrowing it | n/a | Read from `execution_role_state`, never inferred from the absence of an edge: `none` → "No execution role configured" (a real finding); `not_in_inventory` → "Runs as `<arn>` — matches no identity we hold"; `not_in_scan` → "Runs as `<arn>` — not read in the latest scan", plus the coverage reason | "No declared access names any resource" | "No relationships at this depth" + expand control | "No changes recorded since first seen" |
+| **Partial** | banner naming the account and surface, rows still shown | per-field "not collected" | "Identities for sandbox are incomplete (`iam_users` denied)" | same | truncation chip on canvas | "History begins 12 Mar — earlier changes predate collection" |
+| **Failed** | **error with retry — never "no results"** | error per panel, others still render | error | error | error, canvas stays blank | error |
+| **Stale** | age on each row + banner | "Last confirmed 6 days ago" | relationship rows show `stale` and their last confirmation | same | stale edges dashed, legend explains | coverage-change entry |
+| **Unconnected** | "No integrations connected" + Connect AWS | n/a | n/a | n/a | n/a | n/a |
+| **Truncated** | "100 of 412 shown" + Load more | n/a | "20 of 63 shown" | "20 of 148 shown" | "Showing 87 of 210 nodes at this depth" + Expand | "50 of 900" |
+| **Revision moved** | toast: "A newer scan published. [Refresh]" — never auto-swaps | same | same | same | same | same |
+| **Scan queued** | per-account: *"Queued behind the scan of sandbox — started 4 min ago"* | freshness shows the queue, not just the age | same | same | same | same |
+
+**Queued is a real state, because the barrier serializes per workspace.** A
+customer with five accounts will see scans wait. That is the price of §2.10A's
+guarantee, and the honest response is to show it — which scan is running,
+which are waiting, since when — rather than a spinner that implies progress.
+**Measure the wait** (p50/p95 time from enqueue to claim, per workspace)
+before optimizing; the serialization is correct, and only its cost is
+negotiable.
+
+#### 2.14.8 Terminology
+
+Wording the UI is **forbidden** to use, and what replaces it:
+
+| Never | Because | Say |
+|---|---|---|
+| "Can access" / "Allowed" | We evaluate nothing. Conditions, SCPs, boundaries and session policies are all unevaluated | "Declared access" / "A policy grants this" |
+| "Never used" | Absence is bounded by a tracking period that varies by Region, and excludes whole policy types | "No attempt reported in the available tracking period" |
+| "Last used" | It reports *authenticated attempts*, which include requests that were then denied | "Last authenticated attempt" |
+| "Unused permission" | Same, and it invites deletion on absent evidence | "No recorded attempt in the tracking period" |
+| "Verified" | Nothing is verified in this phase | "Confirmed by the scan on <date>" |
+| "Risk: High" | Needs effective access to mean anything | Nothing. There is no score |
+| "Removed" | We saw it stop being declared | "Grant ended" |
+| "Agent" for any workload | Most workloads are not agents | "Workload", until classification says otherwise |
+
+**AWS activity semantics, stated once.** Activity comes from
+`iam:GenerateServiceLastAccessedDetails` / `GetServiceLastAccessedDetails`
+(`internal/awsdiscovery/activity.go`). Verified against the AWS documentation
+(*Refine permissions in AWS using last accessed information*, IAM User Guide),
+not paraphrased from memory:
+
+1. **Attempts, not outcomes.** AWS: *"includes all attempts to access an AWS
+   API, not just the successful attempts."* A request that was then denied
+   still sets the timestamp. Unauthenticated attempts are excluded.
+2. **The window varies.** Service tracking is *"at least 400 days, or less if
+   your Region began tracking this feature within the last 400 days."* So
+   there is no universal "400 days". The Region's own tracking start date
+   bounds what absence can mean.
+3. **Only identity-based policies count.** AWS excludes access allowed by
+   *"resource-based policies, access control lists, AWS Organizations SCPs, IAM
+   permissions boundaries, and session policies."* A role that reads a bucket
+   **only through the bucket's own policy never appears in this report at
+   all.** Absence says nothing about access granted from the resource side.
+4. **Action-level data is management-plane only.** AWS: *"Action last accessed
+   information is not available for any data plane event."* `s3:GetObject` —
+   the action in this spec's own worked example — can never be reported at
+   action level. Only "touched S3" at service level.
+5. **Not authoritative.** AWS directs readers to *"your CloudTrail logs as the
+   authoritative source"* for whether calls happened and succeeded.
+
+So the only honest negative is **"No attempt reported in the available
+tracking period"**, shown with the verified interval where we have it
+(*"tracking since 1 Oct 2015 in eu-central-1"*), and it is **never presented
+as a reason to revoke** — point 3 alone means a genuinely used permission can
+read as absent.
+
+#### 2.14.9 Four dimensions, never one badge
+
+These are independent and a single status pill cannot carry them. The UI shows
+them as separate, individually explainable facts:
+
+| Dimension | Values | Answers |
+|---|---|---|
+| **Basis** | `declared` · `observed` · `derived` · `asserted` | Where did this claim come from? |
+| **Lifecycle** | `current` · `stale` · `ended` | Is it believed now, and how old is that belief? |
+| **Collection** | `complete` · `partial` · `stale` per surface | Could we look? |
+| **Effective access** | `unknown` — always, this phase | Would a request succeed? |
+
+A row may legitimately read *declared · current · collection partial ·
+effective unknown*. Compressing that into amber tells the customer nothing
+about which of four different problems they have, and each has a different
+owner and a different fix.
+
+#### 2.14.10 Filter semantics
+
+| Filter | Means | On an object with no value |
+|---|---|---|
+| Provider | Objects collected from this provider | An object with relationships from two providers appears under **both**, and its detail names both |
+| Account | Objects whose **own** estate scope is this account | An unknown *execution identity* never erases the workload's own account — the workload has a source integration regardless, and Compute must stop ignoring the account filter (it does today, deliberately, and that is now wrong: the correct fix is to attribute the workload to its connector's account, not to hide the filter) |
+| Region | Objects whose ARN carries this region | Global services (IAM) are labelled `global` and always shown; they are never filtered out by a region choice |
+| Integration | Objects supported by this connector | A shared object supported by two connectors appears under both, and its detail lists every supporting source |
+
+**Scoping to Production, precisely:**
+
+- **Starting objects** respect the scope — the Estate list shows production's
+  agents and workloads.
+- **Paths leaving the scope stay visible and are labelled.** Filtering to
+  production must not hide that production's Lambda can assume sandbox's role.
+  The far node renders as out-of-scope with its account named.
+- **Coverage for the far segment stays visible.** If sandbox was not read, the
+  path says so — otherwise the filter has quietly converted "we could not look"
+  into "nothing there".
+- **Switching views preserves the investigation.** The filter is in the query
+  string; Identities → Graph carries it unchanged.
+- **Genuinely unknown scope** renders as `Unknown account`, never blank and
+  never defaulted to the connector's account. It is filtered by an explicit
+  "Unknown" checkbox, off by default, so unattributed objects cannot hide.
+
+#### 2.14.11 The graph
+
+The graph opens **on the selected object**, showing one full declared path,
+and expands only when the customer asks. It is not an estate-wide canvas.
+
+The questions it exists to answer, and where each is read:
+
+| Question | Where |
+|---|---|
+| Which identity is this workload configured to use? | The `executes_as` edge, labelled *configured to run as* |
+| Which other workloads share that identity? | A count on the identity node; expanding lists them |
+| Which policies declare its permissions? | Each grant edge names its policy; two policies declaring the same grant are **two edges** |
+| Which resources or selectors do those statements name? | Terminal nodes, typed by §2.14.12 |
+| Where does this cross accounts or providers? | Edges crossing a boundary are marked and the far node names its account |
+| Why is this relationship shown? | Every edge opens evidence |
+| What is unavailable or stale? | Stale edges are dashed; unread surfaces appear as a coverage note on the affected edge |
+
+**The worked example.** This is the teaching case, and the shape the first
+implementation must reproduce:
+
+```
+                        ┌─ 2 policies declare this grant ─┐
+                        │                                  │
+  ticket-tools ──▶ SharedToolRole ══▶ s3:GetObject ──▶ s3:::support-tickets/*
+   (workload)    │   (identity)    │   (entitlement)      (prefix selector)
+                 │                 │
+  refund-tools ──┘                 └─ TicketRead   (managed)  current
+   (workload)                      └─ ToolboxRead  (managed)  current
+      also uses this identity
+                                   ┌──▶ arn:aws:iam::9054:role/data-reader
+  SharedToolRole ──can_assume──────┘     ⚠ account 9054 not connected
+                                          external principal, unresolved
+
+  ─── stale ───  nightly-etl ┄┄▶ EtlRole
+                 eu-west-1 compute not read since 15 Sep.
+                 This is a visibility change, not a removal.
+```
+
+Five things this single picture has to get right:
+
+1. **Two workloads, one identity.** `refund-tools` is a second source edge
+   into the same node, not a duplicate path.
+2. **Two policies, one grant.** `TicketRead` and `ToolboxRead` both declare
+   `s3:GetObject`. The canvas may draw **one** connection for legibility, but
+   **the evidence panel and the change history must preserve both
+   independently** — otherwise detaching one looks like losing the access.
+3. **Detach one, the path survives.** When `TicketRead` is detached, that
+   grant ends; the edge remains because `ToolboxRead` still declares it. The
+   change entry says exactly that, and the graph does not flicker.
+4. **The external role is unresolved.** Account 9054 is not connected, so the
+   far end is an `iga_external_principal` node, drawn distinctly, and the UI
+   says the account is not connected rather than implying the role is absent.
+5. **Stale is dashed, not missing.** A failed refresh makes an edge stale. It
+   stays on the canvas with its last-confirmed time.
+
+**Wording.** Edge labels are `configured to run as`, `may assume`, `granted
+by`, `names`. Never `can access`, never `uses`. Configuration is not observed
+activity, and a declared grant is not proof an AWS request succeeds.
+
+##### Limits — four, not one
+
+The blanket "two hops" was wrong: the basic workload → identity → entitlement
+→ resource path is already three edges, so a two-hop cap makes the product's
+own teaching example untraversable. The limits are separate because they bound
+different risks:
+
+| Limit | Default | Bounds |
+|---|---|---|
+| `max_semantic_paths` | 1 | How many complete workload→resource paths are expanded at once. One by default; expansion adds more |
+| `max_assume_hops` | 2, **then expandable** | Role-assumption chaining shown initially. Each hop multiplies the chance a link is stale, so two is the default — but the customer can expand further, one hop at a time, and the limit is always visible. A node at the limit reads *"may assume 3 more roles — expand"*; it must never look like the chain ends there |
+| `max_nodes` | 150 | Canvas legibility |
+| `max_edges` | 300 | Canvas legibility |
+| `page_size` | 100 | Every list, everywhere |
+
+**Truncation is always explicit and always continuable.** "Showing 87 of 210
+nodes at this depth" with an Expand control; never a silently clipped canvas.
+When any limit binds, **every completeness claim on the screen is suppressed**
+— no counts presented as totals, no "this workload reaches 3 resources".
+
+##### The graph and the lists must agree
+
+Both read the **same published revision**, pinned in the URL as `rev`. They
+apply the same provider/account/region filters and the same lifecycle filter.
+A resource in the Resources list and absent from the Graph at the same `rev`
+and filters is a bug, not a view difference.
+
+#### 2.14.12 Resources: four kinds, never conflated
+
+An ARN in a policy is not proof a resource exists. The UI types every resource
+row, and Phase 2 can only produce three of the four:
+
+| Kind | Meaning | Phase 2 |
+|---|---|---|
+| **Discovered resource** | Independently enumerated from the provider; we know it exists | **No.** Nothing enumerates resources this phase |
+| **Exact reference** | A statement names this exact ARN. Existence unconfirmed | Yes |
+| **Prefix / wildcard selector** | A statement names a pattern. It may match nothing | Yes |
+| **External / unresolved** | The ARN belongs to an account or provider we cannot read | Yes |
+
+**An S3 object selector is never rendered as a bucket.** `s3:::tickets/*` and
+`s3:::tickets` are different grant targets with different blast radius, and
+`TypeResourceARN` already distinguishes `s3_object` from `s3_bucket`
+(`internal/awsdiscovery/policy_statements.go`). The UI must carry that through
+rather than collapsing to "bucket: tickets".
+
+Counts follow the same rule: *"names 3 selectors and 1 exact reference"*, never
+*"has access to 4 resources"*.
+
+#### 2.14.13 Coverage UX
+
+Coverage explains **what is missing and which conclusion it prevents** — that
+second half is what makes it actionable rather than a complaint.
+
+```
+┌─ Coverage · sandbox (905418271234) ────────────────────────────────────────┐
+│ iam_users            denied                                                 │
+│   Missing: iam:ListUsers on the discovery role.                             │
+│   Prevents: listing IAM users in this account, and any path that starts at  │
+│             one. Role-based paths are unaffected.                           │
+│                                                                             │
+│ compute:eu-west-1    not read since 15 Sep                                  │
+│   Cause: region removed from the connector's selected scope.                │
+│   Prevents: ending anything in eu-west-1. Six relationships are stale and   │
+│             will not be closed while this persists.                         │
+│                                                                             │
+│ policy_documents     partial · 3 statements skipped                         │
+│   Cause: documents that could not be parsed.                                │
+│   Prevents: ending ANY grant in this account — a statement we could not     │
+│             read may be the one still granting access.                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Never promise that one permission fixes everything.** Each surface states
+its own cause and its own blast radius. `iam_users denied` and
+`compute:eu-west-1 not selected` have different owners and different fixes,
+and a single "grant these permissions" call-to-action would be wrong for at
+least one of them. Where the cause is genuinely a missing permission, name
+that permission; where it is a configuration choice or a parse failure, say so
+instead.
+
+#### 2.14.14 Mapping to the existing console primitives
+
+Verified against `Authsec-ui` on `authsec-staging`. Nothing here needs a new
+layout system; every screen composes from what exists.
+
+| Screen | Composition |
+|---|---|
+| Agents & workloads, Identities, Resources lists | `ConsolePage` (title, description, actions) → `ConsoleFilterBar` (`console/iam-console.tsx`) → `TableCard` (`theme/components/cards.tsx`) → `AdaptiveTable` (`ui/adaptive-table.tsx`), with `ui/table-pagination` and `ui/table-skeleton` for the loading state |
+| Object detail header + five views | `ConsolePage` with `ui/breadcrumb` in the title slot and `ui/tabs` for Overview / Identities / Resources / Graph / Changes. **Tabs are routes**, not local state, so Back and deep links work (§2.14.5) |
+| Overview body | `console/detail.tsx`: `DetailGrid` + `DetailRow`, `CopyField` for ARNs |
+| Relationship and evidence rows | `AdaptiveTable` rows; lifecycle via `console/status.tsx` `StatusBadge` — **one badge per dimension**, never a combined tone (§2.14.9) |
+| Coverage and partial banners | `console/status.tsx` `DecisionBanner`, per affected account |
+| Evidence panel | `ui/sheet` — a single side panel with its own URL. **Not** `ui/drawer` stacked on a drawer (§2.14.5 forbids nesting) |
+| Graph canvas | The one genuinely new component. Sits in the Graph tab's `TableCard` slot; its legend and truncation chip reuse `StatusBadge` |
+
+The graph canvas is the only surface with no existing primitive, and it
+should be built last (§6.3) — the list views answer every question in §2.14.11
+except the visual one, and they can ship first.
+
+### 2.15 The API contracts this experience needs
+
+Every screen in §2.14 mapped to the contract behind it, and whether it exists.
+**Verified against `routes.go` and `iga_controller.go` on `authsec-staging`.**
+
+| Screen / interaction | Contract | Today |
+|---|---|---|
+| Estate list | `GET /api/iga/v1/estate` — agents + workloads, one page, filters, cursor | **Missing.** `GET /agents` exists but is the GitHub path over `iga_agents`; cloud workloads are only under the AWS connector routes |
+| Classification + provenance | `classification`, `classification_version` and the latest decision (who, when, why) on the estate row | **Missing — in this phase** (P2-G). Provider-native derived from `runtime_kind`; manual classification per §2.14.3 |
+| Classify / undo | `POST /api/iga/v1/estate/:id/classification` — contract below | **Missing — in this phase** (P2-G) |
+| Agent → instances | `GET /api/iga/v1/agents/:id/instances` | **Missing.** `AgentDetail` returns `Instances: []` unconditionally (`iga_service.go:1300`) — P2-10 |
+| Object overview | `GET /api/iga/v1/estate/:id` | **Missing** |
+| Identities view | `GET /api/iga/v1/estate/:id/identities` — execution identity + relationships, each with basis/state/evidence | **Missing** |
+| Shared-role workloads | `GET /api/iga/v1/identities/:id/workloads` | **Missing.** The reverse edge is the point of the shared-role story |
+| Resources view | `GET /api/iga/v1/estate/:id/resources` — typed per §2.14.12, with the grants naming each | **Missing** |
+| Independent grant evidence | Each resource row carries **every** declaring statement, not a merged one | **Missing**, and the one most likely to be lost to "simplification" |
+| Graph | `GET /api/iga/v1/graph?root=:id&depth=…` | **Missing.** `GET /agents/:id/access-paths` exists (`iga_controller.go:725`) and is the closest thing — GitHub path, no expansion, no truncation contract |
+| Graph expansion | `GET /api/iga/v1/graph/expand?node=:id&rev=…` returning added nodes/edges plus `truncated` | **Missing** |
+| Evidence | `GET /api/iga/v1/edges/:id/evidence` | **Partial.** `GET /agents/:id/evidence` exists, agent-scoped, not per-edge |
+| Coverage for a scope | `GET /api/iga/v1/coverage?account=…` with per-surface cause **and prevented conclusion** | **Partial.** `GET /integrations/:id/coverage` exists; it reports state, not what the gap prevents |
+| Changes | `GET /api/iga/v1/estate/:id/changes?kind=configuration\|coverage` | **Missing.** Requires the lifecycle history 029/030 add |
+| Pagination + totals | Cursor + `total_known: bool` on every list | **Partial.** AWS lists clamp at 500 with no cursor (P1-8 unbuilt) |
+
+#### Revision pinning
+
+**A revision is a workspace publication, not a run.** An investigation into a
+cross-account path touches partitions last projected by different runs, so a
+single `last_run_id` cannot name what the customer is looking at. But the
+pipeline barrier (§2.10A) serializes projection per workspace, so every
+projection commit is a totally ordered event — and that gives a well-defined
+revision for free.
+
+Its DDL is migration `032` (§3), with `iga_projection_state`.
+
+`rev` is assigned **inside the projection transaction**, as
+`max(rev) + 1` under the barrier row's lock — so two publications can never
+share a number and there is never a gap a reader could mistake for a lost one.
+
+**What a revision can promise in Phase 2: consistency, not history.**
+
+A revision pins an investigation to *the current* publication so that the
+list, the graph expansion and the evidence a customer is looking at all come
+from one commit. It does **not** let an old link reproduce an old graph, and
+the API must not imply it can. Two things are not preserved:
+
+- **Relationship state is overwritten in place.** A relationship can go
+  `current → stale → current` without its validity interval changing — the
+  reconciler updates `state`, and `valid_from`/`valid_to` only record when it
+  began and ended. So "what state was this in at revision N" cannot be read
+  back from those columns.
+- **Node attributes and evidence links are current-only.** Display names are
+  refreshed on every upsert; evidence junctions carry no validity interval.
+
+Historical reads would need a state-transition log per relationship and
+versioned evidence associations. That is real work, deferred, and named in
+§6.3 rather than assumed. The manifest in `iga_publication` records *which run
+each partition came from* — useful for the Changes view and for explaining a
+result — but a manifest of run ids is not a graph.
+
+| The request | Response |
+|---|---|
+| No `rev` | Latest. The response **echoes** the `rev` it resolved to, and the client pins it for the rest of the investigation |
+| `rev=N`, N is current | `200`, `rev: N` |
+| `rev=N`, N is no longer current | `409 Conflict` with `current_rev` and `changed_since: <published_at of N>` |
+
+One conflict response, two presentations, chosen by the client from context:
+
+- **Mid-investigation** (the customer has been navigating under `rev=N`):
+  *"A newer scan published. Refresh to see the current graph."* Never swapped
+  automatically — they may be halfway through explaining a path.
+- **Opening a shared link**: *"This link was created on 22 Sep. The graph has
+  changed since — showing it as it is now."* The page then loads current. It
+  does not pretend to show the graph as it was.
+
+**What the Changes view reads, given this.** Configuration changes come from
+what *is* retained: `valid_from`, `valid_to` and `ended_reason` on
+relationships and access edges, which are never overwritten once set, and
+per-run coverage on `cloud_scan_run.coverage`. Coverage changes are derived by
+comparing consecutive runs' coverage, not from relationship `state`. Neither
+needs a state log.
+
+**Omitting `rev` means latest**, and the response always echoes which `rev` it
+resolved to, so the client can pin from its first read.
+
+`total_known: false` is returned whenever any limit bound, and the UI then
+suppresses every completeness claim (§2.14.11).
+
+#### Phase dependencies, stated rather than implied
+
+| Experience | Needs | Phase |
+|---|---|---|
+| Estate list, Overview, Identities, Resources | The graph tables and projector | **2** |
+| Graph view with expansion | Traversal API with bounded depth and truncation | **4** |
+| Changes view | Relationship lifecycle history | **2** (schema) + **4** (read path) |
+| Manual classification as agent | `028` classification columns + decision record; the endpoint below | **2** (P2-G) |
+| Inferred classification, grouping | Rules, evidence, review surface | **Not this phase** |
+| Ownership on Overview | Ownership attestation | **Post-graph** — shows "Not assigned" until then |
+| Activity on any screen | A CloudTrail collector for observed use | **Not this phase.** Access Advisor only, with §2.14.8 wording |
+
+P2-11 builds **one** read path — the Identities and Resources views for a
+selected workload, at a pinned revision, with evidence. Everything else here
+is Phase 4/5 and must not be presented as current.
+
+### 2.16 One path, traced end to end
+
+The spec's own coherence check. If any step below cannot be followed in §3 and
+§4, the spec is incomplete regardless of which terms appear in it.
+
+**Subject:** `ticket-tools`, a Lambda in `eu-central-1` of account
+`220171243705`, running as `SharedToolRole`, granted `s3:GetObject` on
+`s3:::support-tickets/*` by two managed policies.
+
+#### The happy path
+
+| # | Step | Where | What becomes true |
+|---|---|---|---|
+| 1 | Barrier claimed | `iga_pipeline_lease`: `idle → collecting`, `v7` | No other scan in this workspace |
+| 2 | Generation allocated | `generation := connector.ScanGeneration + 1` = 8 | Rows will be written at 8; the connector still reads 7 |
+| 3 | IAM read | `cloud_identity` row for `SharedToolRole`, `attrs.unique_id = AROA5XK…` | Surface `iam_roles: reached` |
+| 4 | Compute read | `cloud_workload` for `ticket-tools`, `identity_id →` the role | Surface `lambda:eu-central-1: reached` |
+| 5 | Policies parsed | Two `cloud_permission` rows, same statement, same resource, different policy ARNs | `policy_documents` **absent** = nothing dropped |
+| 6 | Evidence written | `cloud_observation` rows; permission subjects keyed `<holder>␟<native_id>␟<resource>` | `last_confirmed_run_id = run` |
+| 7 | **Publish** | One transaction: coverage stamped on `cloud_scan_run`, status `published`, `iga_projection_job` enqueued, barrier `collecting → projecting` | A published run always has a job and a coverage report |
+| 8 | Job claimed | Own lease, own fencing version | |
+| 9 | Snapshot loaded | `REPEATABLE READ`; rows at generation 8; coverage from the **run's** column; confirmed observations by `last_confirmed_run_id` | Inputs immutable for the pass — the barrier holds `projecting` |
+| 10 | Fence + ordering | `AssertOwnedTx` on **(workspace, phase=`projecting`, job, version)**, then every partition's watermark | A superseded job — or a `collecting` holder — commits nothing |
+| 11 | Scope | `iga_estate_scopes` row for the account | Partitions have somewhere to live |
+| 12 | Nodes | Each looked up in `existing.live`, then `existing.retired` for restoration; upserted on `(workspace_id, source_key)`; **each with its typed `iga_object_support` row**, partition from `snap.PartitionFor` | `first_seen_at` preserved; a returning object with the same `UniqueID` is restored, not duplicated |
+| 13 | Entitlements | **Two** — both managed, both keyed by policy ARN, so shared not merged | Detaching one later cannot end the other |
+| 14 | Edges | `executes_as` keyed on **both** endpoints with the identity's immutable key; two access edges, `partial`/`unknown` | No evaluation is claimed |
+| 15 | Evidence linked | `iga_access_edge_evidence` per edge, via qualified subject keys | Unqualified legacy rows skipped, never guessed |
+| 16 | Reconcile | Same transaction. `canEnd` → `published` ✓, `iam_roles`/`iam_policies` `reached` ✓, `policy_documents` absent with `permission_scan` absent ✓ | Nothing to end on a first run |
+| 17 | Commit, complete, release | Graph + watermark + **`iga_publication` row `rev = N`** commit together; job `complete`; barrier `projecting → idle`, `v8` | The customer's next read resolves to `rev = N` |
+| 18 | **API** | `GET /estate/:id/identities` → resolves and echoes `rev: N`; `SharedToolRole`, `executes_as`, `declared`, `current`, 2 evidence ids, `refund-tools` as a co-user. Every later view carries `rev=N` | §2.15 |
+| 19 | **Customer** | Overview → Identities: *"runs as SharedToolRole; refund-tools uses it too"* → Resources: *"names a prefix selector, via two policies"* → evidence | U1, U2, U3 |
+
+#### Failure and recovery: the role disappears, then returns
+
+A later scan reads IAM cleanly and `SharedToolRole` is absent — deleted in AWS.
+`canEnd` passes for the `iam_roles` partition, so its support ends; with no
+other source supporting it, `retireUnsupported` retires it
+(`retired_reason = 'unsupported'`) and its edges end `subject_retired`. The
+customer's Changes view shows *"Role no longer present — confirmed by the
+scan on 23 Sep."*
+
+Two days later the role is back. What happens depends on **one field**:
+
+- **`UniqueID` is `AROA5XK…`, the same as before.** It was never deleted —
+  perhaps a permissions blip that still read as `reached`, or a restored
+  backup. `existing.retired` matches on `(source_key, immutable_key)`, so
+  `RestoreIdentity` flips the **same row** back to `active`: same object id,
+  same `first_seen_at`, same classification. Its relationships are
+  re-projected as **new** rows — we did not observe them in the gap, so we do
+  not claim they were continuous. A person's association with it was
+  `suspended` at retirement and now becomes **`pending_reconfirmation`**: the
+  record is back, the decision is offered back, and nothing grants on it until
+  someone confirms.
+- **`UniqueID` is `AROA9ZZ…`, different.** Someone recreated it. The retired
+  row stays retired; a new object is inserted with a new id and a fresh
+  `first_seen_at`, and it starts `unclassified`. Last quarter's decisions stay
+  with the principal they were made about: an asserted association stays
+  `suspended` on the old row and is never transferred.
+
+#### Failure: a policy fails to parse
+
+At step 5 one document is unparseable. `policy_documents: partial` appears.
+Everything through 15 is unchanged — we still write what we read. At 16,
+`canEnd` sees `policy_documents` present and **not** `reached`, so the
+entitlement and access-edge partitions go **`stale`**, not `ended`. The API
+returns the relationships with `state: stale`; Coverage says *"3 statements
+skipped — prevents ending ANY grant in this account, because the statement we
+could not read may be the one still granting access."* The customer sees an
+unchanged graph with a stale marker, which is the truth.
+
+#### Failure: the projection worker dies at step 12
+
+Its job lease expires. The barrier is `projecting` and **stays `projecting`**
+— recovery reclaims the same phase under `v+1`. No scan is admitted, so the
+shared bucket row cannot be reassigned to another connector underneath the
+pending pass. The new worker reloads the snapshot, and because projection is
+idempotent it converges. The dead worker's `AssertOwnedTx` fails on the
+version and it commits nothing.
+
+#### Failure: crash between commit (17a) and job completion (17b)
+
+The graph and its `iga_publication` row are committed; the job still reads
+`running`. Recovery reclaims `projecting` under a new version. The replay
+passes step 1 (ownership), and at step 2 finds a publication for this run —
+so it returns `AlreadyPublished` **before any write**, and the service calls
+`completeAndRelease`. The job ends `complete`.
+
+It does not re-project. Re-projection cannot be relied on to converge here:
+after a committed pass the watermark equals this generation, so any
+generation guard sees the replay as stale, and a job that fails on every
+retry wedges the workspace behind a barrier that never releases. The
+publication row is what tells a replay from a supersession.
+
+#### Why there is no crash between job completion and barrier release
+
+They are one transaction (`completeAndRelease`). A crash either precedes its
+commit — the case above — or follows it, in which case both have moved. There
+is no committed state with a terminal job and a `projecting` barrier, so
+recovery never has to infer one from the other.
+
+#### The path that is not yet traceable
+
+**Step 19's Estate list does not exist**, and neither does the Graph view's
+expansion contract. §2.15 marks both missing. The customer journey is
+traceable end to end **only as far as P2-11's single read path**; the rest is
+Phase 4/5 and is specified, not built.
 
 ---
 
@@ -1026,8 +1676,7 @@ counted toward the evidence gate.
 
 Nine migrations, `026`–`034`, in `authsec/migrations/master/`. **`024` and
 `025` have shipped** — `024_scan_evidence_durability.sql` closed D1–D4 and
-`025_observation_subjectless_dedupe.sql` followed it; §1.2 says what they did
-and how the shipped shape differs from what this document first proposed.
+`025_observation_subjectless_dedupe.sql` followed it; §1.2 says what they did.
 
 > **Rehearse against a production schema dump before merging.** Migration `023`
 > exists only because that rehearsal caught seven columns added to
@@ -1038,6 +1687,31 @@ and how the shipped shape differs from what this document first proposed.
 > proves nothing about production.**
 
 ### 026 — close the cross-workspace provenance gap
+
+**The pipeline barrier (§2.10A) lands here**, in the foundation migration:
+everything downstream assumes a workspace cannot collect and project at
+once, and the barrier is the row that makes that true.
+
+```sql
+CREATE TABLE IF NOT EXISTS public.iga_pipeline_lease (
+    workspace_id uuid NOT NULL,
+    -- idle -> collecting -> projecting -> idle
+    state        text NOT NULL DEFAULT 'idle',
+    holder       text NOT NULL DEFAULT '',   -- worker identity
+    scan_run_id  uuid,
+    expires_at   timestamptz,
+    -- Fence token. Every transition demands the version it read, so a
+    -- worker that slept past its expiry is refused because the version
+    -- moved on -- never because a clock was consulted.
+    version      bigint NOT NULL DEFAULT 0,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_pipeline_lease_pkey PRIMARY KEY (workspace_id),
+    CONSTRAINT iga_pipeline_lease_state_chk CHECK (
+        state IN ('idle', 'collecting', 'projecting')),
+    CONSTRAINT iga_pipeline_lease_busy_chk CHECK (
+        (state = 'idle') = (holder = '' AND scan_run_id IS NULL))
+);
+```
 
 ```sql
 -- Every composite FK below needs this target, and it does not exist:
@@ -1107,10 +1781,22 @@ rule was.
 
 ### 027 — recognition keys and continuity
 
-For each of `iga_identity_accounts`, `iga_resources`, `iga_entitlements`,
-`iga_agents`, `iga_credentials`:
+Written out for **all five tables**. "Repeat the block for the others" is not
+something a migration can apply: it runs cleanly and leaves the other tables
+without `source_key`, so every upsert on them targets a column that does not
+exist. Executing the extracted SQL and checking the resulting columns (§8) is
+the check that catches an incomplete migration; reading does not.
+
+`iga_entitlements` has no `lifecycle` column (`004:667`), so it gets one first
+— the partial index below needs it.
 
 ```sql
+ALTER TABLE public.iga_entitlements
+    ADD COLUMN IF NOT EXISTS lifecycle text NOT NULL DEFAULT 'active',
+    ADD CONSTRAINT iga_entitlements_lifecycle_chk CHECK (
+        lifecycle IN ('active','retired','tombstoned'));
+
+
 ALTER TABLE public.iga_identity_accounts
     ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS continuity     text NOT NULL DEFAULT 'recognition_only',
@@ -1118,30 +1804,70 @@ ALTER TABLE public.iga_identity_accounts
     ADD COLUMN IF NOT EXISTS first_seen_at  timestamptz NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
-
 ALTER TABLE public.iga_identity_accounts
-    ADD CONSTRAINT iga_identity_accounts_continuity_chk CHECK (
-        continuity IN ('immutable', 'recognition_only')),
-    ADD CONSTRAINT iga_identity_accounts_immutable_chk CHECK (
-        continuity <> 'immutable' OR immutable_key <> '');
-
+    ADD CONSTRAINT iga_identity_accounts_continuity_chk CHECK (continuity IN ('immutable','recognition_only')),
+    ADD CONSTRAINT iga_identity_accounts_immutable_chk  CHECK (continuity <> 'immutable' OR immutable_key <> '');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_identity_accounts_source_key
     ON public.iga_identity_accounts (workspace_id, source_key)
     WHERE source_key <> '' AND lifecycle <> 'retired';
-```
 
-**`iga_entitlements` has no `lifecycle` column.** Checked: `004:667` is
-`id, workspace_id, resource_id, native_grant_kind, native_rights,
-normalized_rights, native_scope, remediable, created_at, updated_at`. The index
-predicate above therefore fails with `column "lifecycle" does not exist`. Add
-it, matching the other three tables rather than special-casing the index:
+ALTER TABLE public.iga_resources
+    ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS continuity     text NOT NULL DEFAULT 'recognition_only',
+    ADD COLUMN IF NOT EXISTS immutable_key  text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS first_seen_at  timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
+ALTER TABLE public.iga_resources
+    ADD CONSTRAINT iga_resources_continuity_chk CHECK (continuity IN ('immutable','recognition_only')),
+    ADD CONSTRAINT iga_resources_immutable_chk  CHECK (continuity <> 'immutable' OR immutable_key <> '');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_resources_source_key
+    ON public.iga_resources (workspace_id, source_key)
+    WHERE source_key <> '' AND lifecycle <> 'retired';
 
-```sql
 ALTER TABLE public.iga_entitlements
-    ADD COLUMN IF NOT EXISTS lifecycle text NOT NULL DEFAULT 'active',
-    ADD CONSTRAINT iga_entitlements_lifecycle_chk CHECK (
-        lifecycle IN ('active','retired','tombstoned'));
+    ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS continuity     text NOT NULL DEFAULT 'recognition_only',
+    ADD COLUMN IF NOT EXISTS immutable_key  text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS first_seen_at  timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
+ALTER TABLE public.iga_entitlements
+    ADD CONSTRAINT iga_entitlements_continuity_chk CHECK (continuity IN ('immutable','recognition_only')),
+    ADD CONSTRAINT iga_entitlements_immutable_chk  CHECK (continuity <> 'immutable' OR immutable_key <> '');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_entitlements_source_key
+    ON public.iga_entitlements (workspace_id, source_key)
+    WHERE source_key <> '' AND lifecycle <> 'retired';
+
+ALTER TABLE public.iga_agents
+    ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS continuity     text NOT NULL DEFAULT 'recognition_only',
+    ADD COLUMN IF NOT EXISTS immutable_key  text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS first_seen_at  timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
+ALTER TABLE public.iga_agents
+    ADD CONSTRAINT iga_agents_continuity_chk CHECK (continuity IN ('immutable','recognition_only')),
+    ADD CONSTRAINT iga_agents_immutable_chk  CHECK (continuity <> 'immutable' OR immutable_key <> '');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_agents_source_key
+    ON public.iga_agents (workspace_id, source_key)
+    WHERE source_key <> '' AND lifecycle <> 'retired';
+
+ALTER TABLE public.iga_credentials
+    ADD COLUMN IF NOT EXISTS source_key     text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS continuity     text NOT NULL DEFAULT 'recognition_only',
+    ADD COLUMN IF NOT EXISTS immutable_key  text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS first_seen_at  timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS last_seen_at   timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS retired_reason text NOT NULL DEFAULT '';
+ALTER TABLE public.iga_credentials
+    ADD CONSTRAINT iga_credentials_continuity_chk CHECK (continuity IN ('immutable','recognition_only')),
+    ADD CONSTRAINT iga_credentials_immutable_chk  CHECK (continuity <> 'immutable' OR immutable_key <> '');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_credentials_source_key
+    ON public.iga_credentials (workspace_id, source_key)
+    WHERE source_key <> '' AND lifecycle <> 'retired';
 ```
+
 
 Three notes, each a decision:
 
@@ -1203,6 +1929,55 @@ composite FK needs.
 (a published SaaS agent, a Bedrock alias). Where a Bedrock agent *is* the
 runtime, the projector writes both rows and links them with a `realizes`
 relationship.
+
+#### Unresolved execution role (§4.7)
+
+```sql
+-- What we know about the role a workload acts as, when there is no
+-- executes_as edge to say it. A bare "ARN or empty" cannot distinguish the
+-- four cases the Identities view has to word differently.
+ALTER TABLE public.iga_workload
+    ADD COLUMN IF NOT EXISTS execution_role_state text NOT NULL DEFAULT 'none',
+    ADD COLUMN IF NOT EXISTS execution_role_arn   text NOT NULL DEFAULT '',
+    ADD CONSTRAINT iga_workload_exec_role_state_chk CHECK (execution_role_state IN
+        ('resolved',          -- an executes_as edge exists; the ARN is on the edge
+         'not_in_scan',       -- configured and known; its identity absent from this run
+         'not_in_inventory',  -- configured; matches no identity we hold
+         'none')),            -- no role configured
+    -- The ARN is present exactly when it is the only place the role is recorded.
+    ADD CONSTRAINT iga_workload_exec_role_arn_chk CHECK (
+        (execution_role_state IN ('not_in_scan','not_in_inventory')) = (execution_role_arn <> ''));
+```
+
+#### Classification (§2.14.3)
+
+```sql
+ALTER TABLE public.iga_workload
+    ADD COLUMN IF NOT EXISTS classification text NOT NULL DEFAULT 'unclassified',
+    -- Optimistic-concurrency token for the classify endpoint (§2.14.3).
+    ADD COLUMN IF NOT EXISTS classification_version bigint NOT NULL DEFAULT 0,
+    ADD CONSTRAINT iga_workload_classification_chk CHECK (
+        classification IN ('unclassified', 'provider_native_agent', 'classified_agent'));
+
+-- The decision record. Same pattern as iga_classification_candidates (004),
+-- which cannot be reused directly: its subject FKs to iga_source_objects, the
+-- GitHub path's entity, not to a workload.
+CREATE TABLE IF NOT EXISTS public.iga_workload_classification (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    workload_id   uuid NOT NULL,
+    decision      text NOT NULL,   -- classified_agent | unclassified (an undo)
+    purpose       text NOT NULL DEFAULT '',
+    decided_by    text NOT NULL,
+    decided_at    timestamptz NOT NULL DEFAULT now(),
+    reason        text NOT NULL DEFAULT '',
+    CONSTRAINT iga_workload_classification_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_wc_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_wc_decision_chk CHECK (decision IN ('classified_agent', 'unclassified')),
+    CONSTRAINT iga_wc_decided_by_chk CHECK (decided_by <> '')
+);
+```
 
 ### 029 — `iga_access_edges`: typed subject, required entitlement, lifecycle
 
@@ -1316,10 +2091,10 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
     source_identity_account_id uuid,
     source_workload_id         uuid,
     source_agent_instance_id   uuid,
-    -- A trust policy names a principal from another provider, which may never
-    -- resolve to an object we hold (§2.12). Typed and FK'd like every other
-    -- endpoint -- an unresolved far end is still a real endpoint, not a string.
-    source_external_principal_id uuid,
+    -- source_external_principal_id is added by 033, NOT here: its table does
+    -- not exist yet and a forward reference makes 030 fail to apply. 033 adds
+    -- the column, its composite FK, and widens both CHECKs below.
+
 
     target_identity_account_id uuid,
     target_workload_id         uuid,
@@ -1358,14 +2133,11 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
         REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE SET NULL (last_confirmed_by),
 
     -- Exactly one source and exactly one target, always.
-    CONSTRAINT iga_rel_src_external_fkey
-        FOREIGN KEY (workspace_id, source_external_principal_id)
-        REFERENCES public.iga_external_principal (workspace_id, id) ON DELETE CASCADE,
+    -- Widened by 033 to admit source_external_principal_id.
     CONSTRAINT iga_relationship_source_chk CHECK (
         (source_identity_account_id   IS NOT NULL)::int
       + (source_workload_id           IS NOT NULL)::int
-      + (source_agent_instance_id     IS NOT NULL)::int
-      + (source_external_principal_id IS NOT NULL)::int = 1),
+      + (source_agent_instance_id     IS NOT NULL)::int = 1),
     CONSTRAINT iga_relationship_target_chk CHECK (
         (target_identity_account_id IS NOT NULL)::int
       + (target_workload_id         IS NOT NULL)::int
@@ -1379,10 +2151,9 @@ CREATE TABLE IF NOT EXISTS public.iga_relationship (
             WHEN 'executes_as' THEN
                 source_workload_id IS NOT NULL AND target_identity_account_id IS NOT NULL
             WHEN 'can_assume' THEN
-                -- Either one of our identities, or an external principal a
-                -- trust policy names. Both are legitimate assumption sources.
-                (source_identity_account_id IS NOT NULL
-                 OR source_external_principal_id IS NOT NULL)
+                -- 033 widens this to also admit source_external_principal_id,
+                -- once that table exists.
+                source_identity_account_id IS NOT NULL
                 AND target_identity_account_id IS NOT NULL
             WHEN 'realizes' THEN
                 source_agent_instance_id IS NOT NULL AND target_workload_id IS NOT NULL
@@ -1415,7 +2186,93 @@ other for the three current types. Keep both: the pair CHECK's `ELSE false` is
 the gate on new types, and the exactly-one CHECKs stay correct no matter how the
 pair CHECK is later widened.
 
-### 031 — evidence junctions
+### 031 — evidence junctions and object support
+
+**Object support first**: the evidence junctions and every node
+reconciliation path depend on it, and §2.10B explains why a shared node
+cannot carry a single owning connector.
+
+```sql
+CREATE TABLE IF NOT EXISTS public.iga_object_support (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    -- TYPED, not (object_type, object_id).
+    --
+    -- A text kind beside a bare uuid is not a foreign key -- it is the exact
+    -- A3 pattern §2.9 exists to eliminate, and putting it back here would let
+    -- a support row in workspace A claim to support workspace B's object, or
+    -- an object that no longer exists. The endpoint set is small and fixed,
+    -- so the same nullable-typed-columns pattern used everywhere else applies.
+    identity_account_id uuid,
+    workload_id         uuid,
+    resource_id         uuid,
+    entitlement_id      uuid,
+    agent_id            uuid,
+
+    connector_id  uuid NOT NULL,
+    partition_key text NOT NULL,
+
+    state         text NOT NULL DEFAULT 'current',  -- current|stale|ended
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_confirmed_run_id uuid,
+    last_confirmed_at     timestamptz,
+    ended_reason  text NOT NULL DEFAULT '',
+
+    CONSTRAINT iga_object_support_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_object_support_connector_fkey
+        FOREIGN KEY (workspace_id, connector_id)
+        REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
+
+    CONSTRAINT iga_os_identity_fkey FOREIGN KEY (workspace_id, identity_account_id)
+        REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_resource_fkey FOREIGN KEY (workspace_id, resource_id)
+        REFERENCES public.iga_resources (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id)
+        REFERENCES public.iga_entitlements (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.iga_agents (workspace_id, id) ON DELETE CASCADE,
+
+    -- The confirming run is workspace-qualified too (§2.9).
+    CONSTRAINT iga_os_run_fkey FOREIGN KEY (workspace_id, last_confirmed_run_id)
+        REFERENCES public.cloud_scan_run (workspace_id, id)
+        ON DELETE SET NULL (last_confirmed_run_id),
+
+    CONSTRAINT iga_object_support_one_chk CHECK (
+        (identity_account_id IS NOT NULL)::int + (workload_id    IS NOT NULL)::int
+      + (resource_id         IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int
+      + (agent_id            IS NOT NULL)::int = 1),
+    CONSTRAINT iga_object_support_state_chk CHECK (state IN ('current','stale','ended')),
+    CONSTRAINT iga_object_support_ended_chk CHECK ((state = 'ended') = (ended_reason <> ''))
+);
+```
+
+```sql
+-- One live support row per (object, connector, partition), per type. Partial
+-- indexes rather than one composite key, because the discriminating column
+-- differs per type.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_identity
+    ON public.iga_object_support (workspace_id, identity_account_id, connector_id, partition_key)
+    WHERE identity_account_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_workload
+    ON public.iga_object_support (workspace_id, workload_id, connector_id, partition_key)
+    WHERE workload_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_resource
+    ON public.iga_object_support (workspace_id, resource_id, connector_id, partition_key)
+    WHERE resource_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_entitlement
+    ON public.iga_object_support (workspace_id, entitlement_id, connector_id, partition_key)
+    WHERE entitlement_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_agent
+    ON public.iga_object_support (workspace_id, agent_id, connector_id, partition_key)
+    WHERE agent_id IS NOT NULL;
+```
+
+These indexes are the conflict targets for every support upsert, so they
+ship **with** the table, in the same migration as the table they index.
+
+Then the evidence junctions.
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.iga_access_edge_evidence (
@@ -1442,8 +2299,32 @@ CREATE TABLE IF NOT EXISTS public.iga_access_edge_evidence (
 );
 ```
 
-`iga_relationship_evidence` is the same table against
-`iga_relationship (workspace_id, id)`. Both endpoints typed and FK'd.
+```sql
+-- The same shape against iga_relationship. Written out rather than described
+-- as "the same table again": a migration author cannot apply prose, and the
+-- FK target and cascade differ.
+CREATE TABLE IF NOT EXISTS public.iga_relationship_evidence (
+    id              uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id    uuid NOT NULL,
+    relationship_id uuid NOT NULL,
+    observation_id  uuid NOT NULL,
+    relation        text NOT NULL DEFAULT 'supports',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_relationship_evidence_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_relationship_evidence_rel_fkey
+        FOREIGN KEY (workspace_id, relationship_id)
+        REFERENCES public.iga_relationship (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_relationship_evidence_obs_fkey
+        FOREIGN KEY (workspace_id, observation_id)
+        REFERENCES public.cloud_observation (workspace_id, id) ON DELETE RESTRICT,
+    CONSTRAINT iga_relationship_evidence_relation_chk CHECK (
+        relation IN ('supports','contradicts','supersedes','previously_supported')),
+    CONSTRAINT iga_relationship_evidence_key
+        UNIQUE (workspace_id, relationship_id, observation_id, relation)
+);
+```
+
+Both junctions have typed, workspace-qualified endpoints on both sides.
 `iga_observation_links` keeps its polymorphic `target_kind`/`target_id` for the
 GitHub path; P2-1's CI check forbids new writers to it.
 
@@ -1549,14 +2430,144 @@ distinguished from native discovery":** they get different review treatment and
 must never silently merge. A discovered object a human later registers keeps its
 id and flips `origin`, with the decision recorded.
 
+#### Publication revisions (§2.15)
+
+```sql
+-- One row per projection commit.
+CREATE TABLE IF NOT EXISTS public.iga_publication (
+    workspace_id  uuid   NOT NULL,
+    rev           bigint NOT NULL,       -- per-workspace, monotonic, no gaps
+    published_at  timestamptz NOT NULL,
+    scan_run_id   uuid   NOT NULL,       -- the run whose projection this was
+    -- The manifest: every partition's watermark AS OF this revision, so a
+    -- reader can see exactly which run each part of the graph came from.
+    manifest      jsonb  NOT NULL,       -- {partition_key: run_id, ...}
+    CONSTRAINT iga_publication_pkey PRIMARY KEY (workspace_id, rev),
+    -- One publication per run, ever. This is what lets a replayed job
+    -- recognise "I already committed" (§4.6 step 2) instead of republishing.
+    CONSTRAINT iga_publication_run_key UNIQUE (workspace_id, scan_run_id),
+    CONSTRAINT iga_publication_run_fkey FOREIGN KEY (workspace_id, scan_run_id)
+        REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE RESTRICT
+);
+```
+
 ### 033 — external principals
 
-The table in §2.12, plus `iga_relationship.source_external_principal_id`, its
-composite FK and the widened `can_assume` arm of the legal-pair CHECK.
+The node for a far endpoint we may never resolve (§2.12).
 
-Last in the sequence deliberately: the graph is correct without it — a trust
-policy naming an unconnected provider simply produces no edge — and shipping
-it after the core path is proven keeps P2-0's slice narrow.
+```sql
+CREATE TABLE IF NOT EXISTS public.iga_external_principal (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    issuer        text NOT NULL,   -- token.actions.githubusercontent.com
+    subject_claim text NOT NULL,   -- repo:org/repo:ref:refs/heads/main
+    mechanism     text NOT NULL,   -- oidc | saml | aws_account | service_principal
+    source_key    text NOT NULL,
+
+    -- Filled when the far provider connects AND the claim resolves to exactly
+    -- one object. Nullable forever otherwise, which is an honest state.
+    --
+    -- TYPED, for the same reason iga_object_support is: a text kind beside a
+    -- bare uuid would let a principal in workspace A "resolve" to workspace
+    -- B's identity, or to an id that no longer exists. A trust policy names
+    -- an identity or a workload -- nothing else can be assumed -- so two
+    -- typed columns cover the domain.
+    resolved_identity_account_id uuid,
+    resolved_workload_id         uuid,
+    resolution_basis     text NOT NULL DEFAULT '',   -- derived | asserted
+    resolution_rule      text NOT NULL DEFAULT '',
+    -- Who asserted it, when basis = 'asserted'. A resolution a human made
+    -- must be explicable and reversible.
+    resolved_by          text NOT NULL DEFAULT '',
+    -- Whether the resolution currently APPLIES. Separate from whether it
+    -- exists: a human's decision is preserved when its target is retired,
+    -- but it stops being in force until someone reconfirms it.
+    resolution_state     text NOT NULL DEFAULT 'active',
+
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iga_external_principal_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_external_principal_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT iga_external_principal_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT iga_ep_resolved_identity_fkey
+        FOREIGN KEY (workspace_id, resolved_identity_account_id)
+        REFERENCES public.iga_identity_accounts (workspace_id, id)
+        ON DELETE SET NULL (resolved_identity_account_id),
+    CONSTRAINT iga_ep_resolved_workload_fkey
+        FOREIGN KEY (workspace_id, resolved_workload_id)
+        REFERENCES public.iga_workload (workspace_id, id)
+        ON DELETE SET NULL (resolved_workload_id),
+    -- At most one target, and a basis exactly when there is a target.
+    CONSTRAINT iga_external_principal_resolution_chk CHECK (
+        (resolved_identity_account_id IS NOT NULL)::int
+      + (resolved_workload_id         IS NOT NULL)::int <= 1
+        AND ((resolved_identity_account_id IS NULL AND resolved_workload_id IS NULL)
+             = (resolution_basis = ''))),
+    CONSTRAINT iga_external_principal_asserted_chk CHECK (
+        resolution_basis <> 'asserted' OR resolved_by <> ''),
+    CONSTRAINT iga_external_principal_state_chk CHECK (
+        resolution_state IN ('active', 'suspended', 'pending_reconfirmation')),
+    CONSTRAINT iga_external_principal_derived_chk CHECK (
+        resolution_basis <> 'derived' OR resolution_rule <> '')
+);
+
+-- Deleting a resolved target cannot leave "resolved" with no target:
+-- SET NULL would violate the CHECK above. So a target is never hard-deleted
+-- while resolved -- nodes are RETIRED, not deleted (§2.7). Retirement does NOT
+-- clear the resolution: it SUSPENDS it (resolution_state below), keeping the
+-- FK pointed at the retired row so the decision stays explicable. The FK is
+-- the backstop, not the mechanism.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_external_principal_key
+    ON public.iga_external_principal (workspace_id, source_key);
+```
+
+The table in §2.12, and then — because 030 could not forward-reference it —
+the three `ALTER`s that wire it in:
+
+```sql
+ALTER TABLE public.iga_relationship
+    ADD COLUMN IF NOT EXISTS source_external_principal_id uuid,
+    ADD CONSTRAINT iga_rel_src_external_fkey
+        FOREIGN KEY (workspace_id, source_external_principal_id)
+        REFERENCES public.iga_external_principal (workspace_id, id) ON DELETE CASCADE,
+
+    DROP CONSTRAINT iga_relationship_source_chk,
+    ADD CONSTRAINT iga_relationship_source_chk CHECK (
+        (source_identity_account_id   IS NOT NULL)::int
+      + (source_workload_id           IS NOT NULL)::int
+      + (source_agent_instance_id     IS NOT NULL)::int
+      + (source_external_principal_id IS NOT NULL)::int = 1),
+
+    DROP CONSTRAINT iga_relationship_pair_chk,
+    ADD CONSTRAINT iga_relationship_pair_chk CHECK (
+        CASE relationship_type
+            WHEN 'executes_as' THEN
+                source_workload_id IS NOT NULL AND target_identity_account_id IS NOT NULL
+            WHEN 'can_assume' THEN
+                (source_identity_account_id IS NOT NULL
+                 OR source_external_principal_id IS NOT NULL)
+                AND target_identity_account_id IS NOT NULL
+            WHEN 'realizes' THEN
+                source_agent_instance_id IS NOT NULL AND target_workload_id IS NOT NULL
+            ELSE false
+        END);
+```
+
+**`033` is part of the core rollout, not an optional extra.** Core
+reconciliation writes this table — `retireUnsupported` suspends asserted
+resolutions and re-derives derived ones — and the projector's recreation and
+restoration branches call `SuspendAssertions` and
+`MarkAssertionsPendingReconfirm`. With `026`–`032` applied and `033` not, the
+reconciler fails with `relation "iga_external_principal" does not exist` on
+**every** run: the error is raised at plan time, so it fires even when no row
+could match. (Verified by applying exactly that intermediate state.)
+
+What *is* staged is the feature, not the schema. The table ships empty; the
+**resolution pass** — turning trust-policy principals into
+`iga_external_principal` rows and drawing `can_assume` edges from them — is
+P2-E and can be enabled later. An empty table makes every core write against
+it a no-op, which is the correct behaviour before that pass exists.
 
 ### 034 — retire the legacy unkeyed rows (deferred)
 
@@ -2004,12 +3015,27 @@ type existing struct {
     entitlement map[string]*models.IGAEntitlement
 }
 
-// One query per type, WHERE lifecycle <> 'retired' -- matching the partial
-// unique indexes, so what is loaded is exactly what a conflict could hit.
+// Two maps per type, because there are two different questions.
+//
+//   live     -- lifecycle <> 'retired', keyed by source_key. Matches the
+//               partial unique index, so it is exactly what an upsert can hit.
+//   retired  -- lifecycle = 'retired' AND retired_reason = 'unsupported',
+//               keyed by (source_key, immutable_key). Candidates for
+//               RESTORATION when an object comes back.
+//
+// Without the second map, reappearance after retirement silently mints a new
+// object: X is retired as unsupported, drops out of `live`, the next scan
+// sees it again, finds no live match, and inserts Y. Every review decision
+// and first_seen_at attached to X is orphaned.
+//
+// Retired-as-RECREATED rows are deliberately NOT candidates. They were
+// replaced by a different principal wearing the same name; restoring one
+// would carry the old history onto the new principal, which is exactly what
+// the recreate rule exists to prevent.
 func loadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, error) { … }
 ```
 
-§4.6's node passes then read `r.existing.identity[key]` — a map lookup, no
+§4.6's node passes then read `r.existing.live.identity[key]` — a map lookup, no
 query. The transaction still sees its own writes, because the upserts go
 through `tx`; `existing` is only the *pre-transaction* baseline, which is all
 the recreate-detection comparison needs.
@@ -2055,34 +3081,55 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot, job *models.IGAProjecti
             return err // ErrLeaseLost -> rollback, write nothing
         }
 
-        // ORDERED PUBLICATION, separate from job ownership.
-        //
-        // AssertOwnedTx protects this job's row. It does NOT order two
-        // DIFFERENT jobs: generation 7 and generation 8 hold different job
-        // rows, both legitimately own their leases, and nothing stops 7 from
-        // committing after 8 and overwriting the newer graph with an older
-        // one.
-        //
-        // Take a per-connector advisory lock so only one projection publishes
-        // at a time, then refuse to write if this generation is not ahead of
-        // what the partitions already hold. Both inside the transaction, both
-        // before any graph mutation.
-        // The workspace barrier (§2.10A) already excludes concurrent
-        // collection; this asserts THIS job still holds the projecting
-        // state, so a reclaimed pipeline cannot have its old job commit.
-        if err := p.pipeline.AssertProjectingTx(tx,
-            snap.Run.WorkspaceID, p.pipelineVersion); err != nil {
-            return err
+        // 1. OWNERSHIP. Binds workspace, phase, job and version (§2.10A): a
+        //    worker holding collecting@v7 cannot pass even if the version
+        //    matches, because phase and job are in the predicate. Locks the
+        //    barrier row FOR UPDATE for the rest of the transaction.
+        if err := p.pipeline.AssertOwnedTx(tx, PipelineFence{
+            WorkspaceID: snap.Run.WorkspaceID,
+            Phase:       models.PipelineProjecting,
+            JobID:       p.jobID,
+            Version:     p.pipelineVersion,
+        }); err != nil {
+            return err // ErrLeaseLost -> rollback, write nothing
         }
+
+        // 2. ALREADY PUBLISHED? Checked BEFORE the generation guard, because
+        //    the two outcomes it separates are opposite:
+        //
+        //      this run's projection already committed, then the worker died
+        //      before completing the job  -> SUCCESS: finish the job
+        //      a newer run already published over these partitions
+        //                                 -> SUPERSEDED: abandon
+        //
+        //    A generation comparison alone cannot tell them apart -- after a
+        //    committed pass the watermark EQUALS this generation, so a `<=`
+        //    guard reports the replay as obsolete and the job fails on every
+        //    retry, forever. The durable fact that separates them is the
+        //    publication row, which commits atomically with the graph (step 6).
+        if pub, err := p.repo.PublicationForRun(tx, snap.Run.WorkspaceID, snap.Run.ID); err != nil {
+            return err
+        } else if pub != nil {
+            return &AlreadyPublished{Rev: pub.Rev} // no writes; caller completes the job
+        }
+
+        // 3. SUPERSEDED? Only a STRICTLY newer generation. Under the barrier
+        //    this should be unreachable -- a newer run cannot project while
+        //    this job holds `projecting` -- so reaching it means an abandon
+        //    raced a reclaim, and the correct response is to stop, not to
+        //    overwrite. Equality without a publication row for this run is an
+        //    inconsistency, not a replay, and fails loudly.
         for _, part := range Partitions(snap) {
             have, err := p.reconciler.lastGenerationFor(tx, part, snap.Run.WorkspaceID)
             if err != nil {
                 return err
             }
-            if int64(snap.Generation) <= have {
-                // Not an error the operator must act on: the newer job
-                // already did this work. Recorded and skipped.
-                return ErrObsoleteGeneration
+            switch {
+            case int64(snap.Generation) < have:
+                return ErrSuperseded
+            case int64(snap.Generation) == have:
+                return fmt.Errorf("partition %s at generation %d with no publication for run %s: %w",
+                    part.Key(), have, snap.Run.ID, ErrInconsistentWatermark)
             }
         }
 
@@ -2103,7 +3150,25 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot, job *models.IGAProjecti
         // Reconciler commits; see §2.8 on interrupted passes.
         if err := p.attachEvidence(tx, snap, r); err != nil { return err }
         // reconciled=false here; Reconcile flips it in the same transaction.
-        return p.recordState(tx, snap, false)
+        if err := p.recordState(tx, snap, false); err != nil {
+            return err
+        }
+
+        // 6. PUBLICATION. Same transaction as every graph write above, so
+        //    "the graph changed" and "a publication exists for this run" can
+        //    never disagree -- which is exactly what step 2 relies on to tell
+        //    a replay from a supersession.
+        //
+        //    rev = max(rev)+1 is safe here: step 1 holds the barrier row FOR
+        //    UPDATE, and the barrier serializes projection per workspace.
+        //    UNIQUE (workspace_id, scan_run_id) makes a double publish of one
+        //    run impossible even if that reasoning were ever wrong.
+        return p.repo.InsertPublication(tx, &models.IGAPublication{
+            WorkspaceID: snap.Run.WorkspaceID,
+            ScanRunID:   snap.Run.ID,
+            PublishedAt: p.now(),
+            Manifest:    manifestOf(snap), // {partition_key: run_id}
+        })
     }(tx)
 }
 ```
@@ -2117,54 +3182,140 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
         key  := IdentityKey(ci)
         cont := Continuity(ci.Kind)
         imm  := ImmutableKey(ci)
+        // The partition this row is evidenced by -- looked up from the same
+        // list Partitions() builds, so the key written here is the key
+        // reconciliation filters on (roles and users are separate).
+        part := snap.PartitionFor(models.ObjectIdentity, ci.Kind, "")
 
-        // Map lookup, not a query. The workspace's live objects were loaded
-        // once before the transaction (§4.5); a SELECT per identity here is
-        // one round trip per row, inside a transaction holding locks.
-        existing := r.existing.identity[key]
-
-        // DELETE-AND-RECREATE. Same recognition key, different creation
-        // boundary => a different principal wearing the old name. Carrying
-        // the old row forward would carry last quarter's review decisions
-        // onto a stranger.
-        //
-        // Both immutable keys must be non-empty: one empty side means we
-        // could not tell, and "could not tell" is never "recreated".
-        if existing != nil && cont == models.ContinuityImmutable &&
-            imm != "" && existing.ImmutableKey != "" && existing.ImmutableKey != imm {
-
-            if err := p.repo.RetireIdentity(tx, existing.ID, "recreated", now); err != nil {
-                return err
-            }
-            if err := p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID,
-                existing.ID, "subject_recreated", now, snap.Run.ID); err != nil {
-                return err
-            }
-            existing = nil // fall through to INSERT, with a fresh first_seen_at
+        // Descriptive fields, applied on every path below: insert, update
+        // and restore all refresh them from what this run read.
+        desc := models.IGAIdentityAccount{
+            WorkspaceID: snap.Run.WorkspaceID, SourceKey: key,
+            Continuity: cont, ImmutableKey: imm,
+            DisplayName: ci.Name, AccountKind: ci.Kind,
+            IdentityBacking: "provider_native", LastSeenAt: now,
         }
 
-        row := &models.IGAIdentityAccount{
-            WorkspaceID: snap.Run.WorkspaceID,
-            SourceKey:   key,
-            Continuity:  cont,
-            ImmutableKey: imm,
-            DisplayName: ci.Name,
-            AccountKind: ci.Kind,
-            IdentityBacking: "provider_native",
-            LastSeenAt:  now,
-        }
-        if existing == nil {
+        var id uuid.UUID
+        live := r.existing.live.identity[key]   // prefetched once, §4.5
+
+        switch {
+        // (a) RECREATION. Same recognition key, different non-empty creation
+        //     boundary: a different principal wearing the old name. Retire the
+        //     old object, end its edges, and fall through to a fresh insert.
+        case live != nil && cont == models.ContinuityImmutable &&
+            imm != "" && live.ImmutableKey != "" && live.ImmutableKey != imm:
+
+            if err := p.repo.RetireIdentity(tx, live.ID, models.RetiredRecreated, now); err != nil {
+                return fmt.Errorf("retire recreated %s: %w", key, err)
+            }
+            if err := p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID, live.ID,
+                models.EndedSubjectRecreated, now, snap.Run.ID); err != nil {
+                return fmt.Errorf("end edges of recreated %s: %w", key, err)
+            }
+            if err := p.repo.SuspendAssertions(tx, snap.Run.WorkspaceID, live.ID, "recreated"); err != nil {
+                return err // §2.12: a human's decision about X never transfers to Y
+            }
+            row := desc
             row.FirstSeenAt = now
+            var err error
+            if id, err = p.repo.InsertIdentity(tx, &row); err != nil {
+                return fmt.Errorf("insert recreated %s: %w", key, err)
+            }
+
+        // (b) CONTINUING. The object is live; refresh descriptive fields only.
+        //     first_seen_at, lifecycle and human-owned columns are untouched.
+        case live != nil:
+            var err error
+            if id, err = p.repo.UpsertIdentity(tx, &desc); err != nil {
+                return fmt.Errorf("upsert %s: %w", key, err)
+            }
+
+        // (c) RESTORATION. No live row, but the same provider identity was
+        //     retired as UNSUPPORTED. Same id, same first_seen_at. Requires a
+        //     non-empty, equal immutable key -- a recognition_only object is
+        //     never restored, because without a creation boundary we cannot
+        //     prove the returning one is the one that left.
+        case imm != "" && r.existing.retired.identity[retiredKey(key, imm)] != nil:
+            prev := r.existing.retired.identity[retiredKey(key, imm)]
+            var err error
+            // Guarded UPDATE: only a row still retired as 'unsupported' with
+            // this immutable key. Zero rows -> ErrNotRestorable, and the pass
+            // fails rather than silently inserting a duplicate.
+            if id, err = p.repo.RestoreIdentity(tx, prev.ID, imm, &desc); err != nil {
+                return fmt.Errorf("restore %s: %w", key, err)
+            }
+            // Restoring the RECORD does not reactivate a human's decision about
+            // it. Asserted associations come back as pending reconfirmation.
+            if err := p.repo.MarkAssertionsPendingReconfirm(tx, snap.Run.WorkspaceID, id); err != nil {
+                return err
+            }
+
+        // (d) NEW.
+        default:
+            row := desc
+            row.FirstSeenAt = now
+            var err error
+            if id, err = p.repo.InsertIdentity(tx, &row); err != nil {
+                return fmt.Errorf("insert %s: %w", key, err)
+            }
         }
 
-        id, err := p.repo.UpsertIdentity(tx, row)
-        if err != nil {
-            return fmt.Errorf("upsert identity %s: %w", key, err)
+        // Step 2 of the contract, on EVERY path above -- including restore.
+        // A node without a current support row is never reconciled.
+        if err := p.repo.UpsertSupport(tx, &models.IGAObjectSupport{
+            WorkspaceID:        snap.Run.WorkspaceID,
+            IdentityAccountID:  &id,
+            ConnectorID:        snap.Run.ConnectorID,
+            PartitionKey:       part.Key(),
+            State:              models.RelCurrent,
+            LastConfirmedRunID: &snap.Run.ID,
+            LastConfirmedAt:    &now,
+            EndedReason:        "", // clears a previous 'not_seen' on reappearance
+        }); err != nil {
+            return fmt.Errorf("support %s: %w", key, err)
         }
+
         r.identity[ci.ID] = id
     }
     return nil
 }
+```
+
+**Reappearance is not recreation, and the difference is the immutable key.**
+
+| What changed | Recognition key | Immutable key | Result |
+|---|---|---|---|
+| A source stops reporting an object, then reports it again | same | same, **non-empty** | **Reappearance.** Same object id, same `first_seen_at` — restored from `retired` if it had been retired as unsupported (below). Its support row flips `ended → current` and `ended_reason` clears. Relationships ended by the gap are *not* revived — they are re-projected as new rows, because we did not observe them in between and cannot claim continuity we lack |
+| The object is deleted and remade under the same name | same | **different**, both non-empty | **Recreation.** New object id, fresh `first_seen_at`, old object retired `recreated`, its relationships ended `subject_recreated` |
+| Same name, no immutable key, **continuously present** | same | both empty | **Continues as one object.** `continuity = 'recognition_only'` is stored and surfaced so a reviewer knows "same name" is the strongest claim available |
+| Same name, no immutable key, **returns after a confirmed absence** | same | both empty | **New object.** Retirement only happens after `canEnd` passed — an authoritative read said it was gone — so a same-name return is more likely a recreation than a continuation, and we have no creation boundary to tell. Assuming continuity would hand the old object's history to what is probably a different workload |
+
+**Restoration** is branch (c) of `projectIdentities` above; there is no
+separate algorithm.
+
+Restoration requires a **non-empty, equal** immutable key. A
+`recognition_only` object (Lambda, S3 bucket) has none, so a retired one is
+never restored — it returns as a new object, and its `continuity` says why.
+That is the honest outcome: without a creation boundary we cannot prove the
+returning Lambda is the one that left.
+
+Restoring requires the partial unique index to admit it: the live row's slot
+is free because the retired row is excluded by `WHERE lifecycle <> 'retired'`,
+and a restore flips that same row back into the index. There is never a moment
+with two live rows for one key.
+
+Rows two and four are the only ones that split an object, and they differ in what licenses it: row two has proof (a changed immutable key); row four has a confirmed absence and no way to prove continuity. A *failed* read never reaches either — it makes support `stale`, never `ended`, so nothing is retired and nothing splits. Where the provider
+gives no creation boundary we cannot tell the first case from the second, and
+the honest answer is to continue the object and say why.
+
+```go
+// The support upsert's ON CONFLICT names ended_reason and state explicitly:
+DoUpdates: clause.AssignmentColumns([]string{
+    "state", "ended_reason", "last_confirmed_run_id", "last_confirmed_at",
+}),
+// NOT first_seen_at -- a reappearing object kept existing as far as we know;
+// we simply stopped being able to see it.
 ```
 
 Edges, where `resolved` pays for itself:
@@ -2175,18 +3326,48 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 
     // workload --executes_as--> identity
     for _, w := range snap.Workloads {
-        if w.IdentityID == nil {
-            continue // no configured execution identity; not an edge we can claim
-        }
         src, ok := r.workload[w.ID]
-        if !ok { continue }
-        dst, ok := r.identity[*w.IdentityID]
         if !ok {
-            // The identity was not in this run's snapshot -- a partial scan.
-            // Skipping is right: an edge whose endpoint we did not read this
-            // run must not be written as `current`.
-            continue
+            continue // the workload itself was not projected; nothing to annotate
         }
+
+        // DETERMINE THE ENDPOINT FIRST, then record what we know. Clearing a
+        // warning before the edge is known to exist is how a configured role
+        // silently disappears from the customer's view.
+        //
+        // Four outcomes, and each is a different sentence on the Identities
+        // view. The ARN is the role the workload ACTS AS -- RoleARN in the
+        // collector -- never attrs.ExecutionRoleARN, which for ECS is the
+        // image-pull role ECS itself uses (workloads.go:82), not the task's.
+        var dst uuid.UUID
+        state, arn := models.ExecRoleNone, ""
+        switch {
+        case w.IdentityID != nil:
+            if id, ok := r.identity[*w.IdentityID]; ok {
+                dst, state = id, models.ExecRoleResolved
+            } else {
+                // The collector resolved the role against an inventory row,
+                // but that row is not in THIS run's snapshot (a partial IAM
+                // read, or a row still at an older generation). The role is
+                // configured and known; we just cannot draw the edge now.
+                state, arn = models.ExecRoleNotInScan, snap.IdentityNativeID(*w.IdentityID)
+            }
+        case w.AWSAttrs().UnresolvedRoleARN != "":
+            // A role is configured but matches nothing in inventory -- another
+            // account, or iam_roles never read.
+            state, arn = models.ExecRoleNotInInventory, w.AWSAttrs().UnresolvedRoleARN
+        }
+
+        // Written on EVERY pass, for every projected workload, so a state from
+        // an earlier run cannot survive: resolved clears the ARN, the others
+        // set it, none clears both.
+        if err := p.repo.SetExecutionRoleState(tx, src, state, arn); err != nil {
+            return err
+        }
+        if state != models.ExecRoleResolved {
+            continue // no edge: there is no projected endpoint to point it at
+        }
+
         if err := p.repo.UpsertRelationship(tx, &models.IGARelationship{
             WorkspaceID:             snap.Run.WorkspaceID,
             RelationshipType:        "executes_as",
@@ -2196,7 +3377,7 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
             // The partition is chosen by the surface that produced the row,
             // so a Lambda edge lands in lambda:<region>, not in ECS's.
             ConnectorID:             &snap.Run.ConnectorID,
-            PartitionKey:            partitionFor(snap, "executes_as", w.RuntimeKind, w.Region).Key(),
+            PartitionKey:            snap.EdgePartitionFor("executes_as", w.RuntimeKind, w.Region).Key(),
             SourceWorkloadID:        &src,
             TargetIdentityAccountID: &dst,
             Basis:                   "declared", // configuration says so; we did not see it run
@@ -2244,7 +3425,13 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 }
 ```
 
-`projectWorkloads` and `projectResources` are the same shape as
+`projectWorkloads` is the same shape as `projectIdentities` — **including
+the support upsert**, with `part := snap.PartitionFor(models.ObjectWorkload,
+w.RuntimeKind, w.Region)`, because workload partitions are per service per
+region (`lambda:eu-central-1` is not `ecs:eu-central-1`). A description by
+reference is only safe if it carries the step that is easy to omit.
+
+`projectResources` above follows the same contract. Both are the same shape as
 `projectIdentities` above, differing only in which model they write and in
 `Continuity()` returning `recognition_only` for every runtime kind Phase 2
 collects — so a Lambda that is deleted and recreated under the same name
@@ -2299,10 +3486,29 @@ func (p *Projector) projectResources(tx *gorm.DB, snap *Snapshot, r *resolved) e
             Continuity:   Continuity(cr.Kind),
             Stage:        "unknown",
             LastSeenAt:   now,
-        }, p.existing.resource[key] == nil /* isNew */)
+        }, r.existing.live.resource[key] == nil /* isNew */)
         if err != nil {
             return fmt.Errorf("upsert resource %s: %w", key, err)
         }
+
+        // Step 2, identical in shape to projectIdentities. A resource named by
+        // two accounts gets TWO support rows -- one per connector -- and that
+        // is the whole mechanism by which account B dropping it leaves account
+        // A's support, and the resource, intact (§2.10B, scenario 3).
+        part := snap.PartitionFor(models.ObjectResource, "", "")
+        if err := p.repo.UpsertSupport(tx, &models.IGAObjectSupport{
+            WorkspaceID:        snap.Run.WorkspaceID,
+            ResourceID:         &id,
+            ConnectorID:        snap.Run.ConnectorID,
+            PartitionKey:       part.Key(),
+            State:              models.RelCurrent,
+            LastConfirmedRunID: &snap.Run.ID,
+            LastConfirmedAt:    &now,
+            EndedReason:        "",
+        }); err != nil {
+            return fmt.Errorf("upsert resource support %s: %w", key, err)
+        }
+
         r.resource[cr.ID] = id
     }
     return nil
@@ -2364,10 +3570,30 @@ func (p *Projector) projectEntitlements(tx *gorm.DB, snap *Snapshot, r *resolved
             // so this is a statement about the grant's shape, not a promise.
             Remediable: !strings.HasPrefix(cp.NativeID, "boundary:"),
             LastSeenAt: now,
-        }, p.existing.entitlement[key] == nil)
+        }, r.existing.live.entitlement[key] == nil)
         if err != nil {
             return fmt.Errorf("upsert entitlement %s: %w", key, err)
         }
+
+        // Step 2. This is the row that makes "two policies declare the same
+        // grant; detach one; the other survives" true at the node level: a
+        // managed-policy entitlement shared by two holders in two accounts
+        // carries one support row per connector, and ending one leaves it
+        // active while the other holds.
+        part := snap.PartitionFor(models.ObjectEntitlement, "", "")
+        if err := p.repo.UpsertSupport(tx, &models.IGAObjectSupport{
+            WorkspaceID:        snap.Run.WorkspaceID,
+            EntitlementID:      &id,
+            ConnectorID:        snap.Run.ConnectorID,
+            PartitionKey:       part.Key(),
+            State:              models.RelCurrent,
+            LastConfirmedRunID: &snap.Run.ID,
+            LastConfirmedAt:    &now,
+            EndedReason:        "",
+        }); err != nil {
+            return fmt.Errorf("upsert entitlement support %s: %w", key, err)
+        }
+
         r.entitlement[cp.ID] = id
     }
     return nil
@@ -2434,7 +3660,7 @@ func (p *Projector) projectAccessEdges(tx *gorm.DB, snap *Snapshot, r *resolved)
         edgeID, err := p.repo.UpsertAccessEdge(tx, &models.IGAAccessEdge{
             WorkspaceID:              snap.Run.WorkspaceID,
             ConnectorID:              &snap.Run.ConnectorID,
-            PartitionKey:             accessEdgePartition(snap).Key(),
+            PartitionKey:             snap.EdgePartitionFor("access_edge", "", "").Key(),
             SubjectIdentityAccountID: &subj,
             EntitlementID:            ent,          // NOT NULL since 029
             ResourceID:               resID,        // denormalized for the reverse query
@@ -2594,7 +3820,10 @@ nodes that reference it, or every object lands with a NULL scope and
 reconciliation has no partition to work in.
 
 For AWS the scope is the connected account: `cloud_connector.ScopeKind` /
-`ScopeID` already hold `("aws_account", "220171243705")`. One upsert per run,
+`ScopeID` already hold `("account", "220171243705")` — `models.CloudScopeAccount`,
+constrained by `cloud_connector_scope_kind_chk` to
+`account | project | folder | org | subscription`, with the provider carried
+separately in `provider`. One upsert per run,
 before the node passes, keyed the same way as everything else:
 
 ```go
@@ -2750,6 +3979,16 @@ func Partitions(snap *Snapshot) []Partition {
         {ScopeID: sc, ConnectorID: cn, Class: "identity",
             RequiredSurfaces: []string{models.SurfaceIAMUsers}},
 
+        // Resources come from the SAME read as entitlements -- the permission
+        // scanner writes cloud_resource for every ARN a statement names -- so
+        // they reconcile on the same evidence. Without this partition resources
+        // never reconcile at all, and a bucket two accounts share cannot show
+        // one account's support ending while the other's holds.
+        {ScopeID: sc, ConnectorID: cn, Class: "resource",
+            RequiredSurfaces: []string{
+                models.SurfaceIAMRoles, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments},
+            RequiredScanners: []string{models.SurfacePermissionScan}},
+
         {ScopeID: sc, ConnectorID: cn, Class: "entitlement",
             RequiredSurfaces: []string{
                 models.SurfaceIAMRoles, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments},
@@ -2780,11 +4019,26 @@ func Partitions(snap *Snapshot) []Partition {
     // RequiredScanners (presence = failure), never in RequiredSurfaces.
     for _, region := range snap.RegionsAttempted() {
         computeGate := []string{models.SurfaceWorkloadScan, "compute:" + region}
-        for _, svc := range []string{"lambda", "ecs", "ec2"} {
+        // Every workload surface gets a WORKLOAD partition -- Bedrock and
+        // AgentCore included. They previously had only a `realizes` edge
+        // partition, so a Bedrock agent's own node had nowhere to be
+        // reconciled and PartitionFor panicked on it.
+        for _, svc := range []string{"lambda", "ecs", "ec2",
+            "bedrock-agents", "bedrock-agentcore", "agentcore-gateways"} {
+            ps = append(ps, Partition{ScopeID: sc, ConnectorID: cn, Class: "workload",
+                RequiredSurfaces: []string{svc + ":" + region},
+                RequiredScanners: computeGate})
+        }
+        // executes_as for EVERY workload kind the collector attaches an
+        // execution role to -- verified: Lambda/ECS/EC2 (workloads.go),
+        // Bedrock AgentResourceRoleArn (bedrock.go:156), AgentCore runtime
+        // and gateway RoleArn (bedrock.go:191, :262). Covering only the first
+        // three meant a customer could select an AWS agent and never see the
+        // identity it runs as -- the one relationship this experience exists
+        // to explain.
+        for _, svc := range []string{"lambda", "ecs", "ec2",
+            "bedrock-agents", "bedrock-agentcore", "agentcore-gateways"} {
             ps = append(ps,
-                Partition{ScopeID: sc, ConnectorID: cn, Class: "workload",
-                    RequiredSurfaces: []string{svc + ":" + region},
-                    RequiredScanners: computeGate},
                 Partition{ScopeID: sc, ConnectorID: cn,
                     RelationshipType: "executes_as", Target: "relationship",
                     RequiredSurfaces: []string{svc + ":" + region, models.SurfaceIAMRoles},
@@ -2811,6 +4065,125 @@ and access-edge partitions name `permission_scan` in `RequiredScanners`:
 | `iam_policies` | `reached` | — |
 | `permission_scan` | `denied` | **vetoes** entitlement, `can_assume`, access-edge |
 | `policy_documents` | absent | would otherwise read as "nothing was dropped" |
+
+```go
+// PartitionFor returns the Partition that evidences a row of this class, from
+// the SAME list Partitions() builds -- looked up, never reconstructed. That is
+// the property that matters: the partition_key the projector stamps on a row
+// and the one reconciliation filters by are the same value by construction,
+// so a row cannot be written under one key and reconciled under another.
+//
+//   identity  -> by kind:          iam_role -> iam_roles, iam_user -> iam_users
+//   workload  -> by kind + region: lambda_function + eu-central-1
+//                -> lambda:eu-central-1, via workloadSurfacePrefix
+//   resource, entitlement -> the single permission-scan partition
+//
+// A class/kind/region with no partition is a programming error and panics in
+// tests. It must never fall back to a default partition: a row filed under
+// the wrong partition is reconciled against the wrong surface, and a clean
+// read of one surface would then license ending rows another surface owns.
+func (s *Snapshot) PartitionFor(class, kind, region string) Partition {
+    for _, p := range s.partitions { // built once, by Partitions(s), in Load
+        if p.Matches(class, kind, region) {
+            return p
+        }
+    }
+    panic(fmt.Sprintf("no partition for class=%q kind=%q region=%q", class, kind, region))
+}
+```
+
+```go
+// EdgePartitionFor is PartitionFor's counterpart for edges, over the same
+// list. Nodes key on Class; edges on RelationshipType or Target.
+func (s *Snapshot) EdgePartitionFor(relOrTarget, kind, region string) Partition
+
+// Matches is the membership predicate both lookups use. It is the ONLY place
+// that decides which partition a row belongs to.
+func (p Partition) Matches(class, kind, region string) bool {
+    if p.Class != class {
+        return false
+    }
+    switch class {
+    case models.ObjectIdentity:
+        // iam_role -> iam_roles, iam_user -> iam_users
+        return len(p.RequiredSurfaces) > 0 && p.RequiredSurfaces[0] == identitySurface(kind)
+    case models.ObjectWorkload:
+        // NOT kind+":"+region. RuntimeKind and the surface prefix are
+        // different vocabularies -- lambda_function vs lambda: -- so string
+        // concatenation never matches and every workload would panic here.
+        prefix, ok := workloadSurfacePrefix[kind]
+        return ok && len(p.RequiredSurfaces) > 0 && p.RequiredSurfaces[0] == prefix+":"+region
+    default:
+        return true // resource, entitlement: one partition per connector
+    }
+}
+
+// workloadSurfacePrefix maps cloud_workload.RuntimeKind to the prefix its
+// coverage surface is reported under. Verified against the collector at
+// efb67b2: cloud_aws_workload_scan.go:268-295 and scanGateways.
+//
+// Keep it exhaustive. A RuntimeKind missing here makes PartitionFor panic in
+// tests, which is the point -- a new runtime kind must be given a partition
+// deliberately, not fall into a default that reconciles it against the
+// wrong surface.
+var workloadSurfacePrefix = map[string]string{
+    "lambda_function":           "lambda",
+    "ecs_task_definition":       "ecs",
+    "ec2_instance":              "ec2",
+    "bedrock_agent":             "bedrock-agents",
+    "bedrock_agentcore_runtime": "bedrock-agentcore",
+    "bedrock_agentcore_gateway": "agentcore-gateways",
+}
+
+// Key is the partition's stable identity and the value stamped on every row.
+// Deterministic from the struct: scope, connector, class, relationship type,
+// target, and the SORTED required surfaces, joined with Sep.
+func (p Partition) Key() string
+
+// retiredKey is the restoration lookup: (source_key, immutable_key). Both,
+// because the recognition key alone would restore a RECREATED object.
+func retiredKey(sourceKey, immutableKey string) string {
+    return sourceKey + Sep + immutableKey
+}
+
+// endpointKey is what edge source_keys use for an identity endpoint: the
+// immutable key when the identity has one, the source key otherwise. This is
+// what makes a recreated role under the same ARN produce a DIFFERENT edge key.
+func endpointKey(snap *Snapshot, cloudIdentityID uuid.UUID) string {
+    ci := snap.IdentityByID(cloudIdentityID)
+    if imm := ImmutableKey(ci); imm != "" {
+        return Key("aws", "uid", imm)
+    }
+    return IdentityKey(ci)
+}
+```
+
+**Repository contracts named but not written out.** These share one shape,
+given in full by `UpsertIdentity` in §4.9 — `ON CONFLICT` on the partial
+unique index with `TargetWhere`, `DoUpdates` naming only descriptive columns,
+`Returning("id")` so the surviving row's id comes back:
+`UpsertResource`, `UpsertEntitlement`, `UpsertAccessEdge`,
+`UpsertRelationship`, `UpsertProjectionState`, `LinkAccessEdgeEvidence`.
+
+Three are **not** that shape, and are specified here because each carries a
+guard that is easy to lose:
+
+| Contract | Guard it must carry |
+|---|---|
+| `UpsertSupport` | Conflict target is the **typed** partial index for the row's class. `DoUpdates` sets `state='current'`, `ended_reason=''`, `last_confirmed_run_id`, `last_confirmed_at` — clearing `ended_reason` is what makes reappearance correct. Never `first_seen_at` |
+| `RestoreIdentity` | `UPDATE … SET lifecycle='active', retired_reason='', display_name=?, account_kind=?, last_seen_at=? WHERE id=? AND lifecycle='retired' AND retired_reason='unsupported' AND immutable_key=? RETURNING id`. **Zero rows is `ErrNotRestorable`**, never a fallback insert — a concurrent restore or a recreated row must not be silently restored. Refreshes descriptive fields; never touches `first_seen_at` or classification |
+| `AssertOwnedTx` | `SELECT … FOR UPDATE FROM iga_pipeline_lease WHERE workspace_id=? AND state=? AND version=?` plus the job row `WHERE id=? AND lease_version=?`. Zero rows on either is `ErrLeaseLost`. **Phase, job and version, all four** |
+| `PublicationForRun` | `SELECT rev FROM iga_publication WHERE workspace_id=? AND scan_run_id=?`, **inside** the graph transaction after `AssertOwnedTx`. Its answer is only trustworthy because `InsertPublication` commits in the same transaction as the graph |
+| `InsertPublication` | `rev = max(rev)+1` for the workspace, computed while `AssertOwnedTx` holds the barrier row `FOR UPDATE`. `UNIQUE (workspace_id, scan_run_id)` backstops a double publish |
+| `CompleteTx` / `ReleaseTx` | Always called together, in that order, in one transaction (`completeAndRelease`). Each is fenced; each returns `ErrLeaseLost` on zero rows |
+| `SuspendAssertions` | `UPDATE iga_external_principal SET resolution_state='suspended' WHERE resolution_basis='asserted' AND resolution_state='active' AND resolved_…_id=?`. **Asserted rows only** — derived rows are re-derived, never suspended |
+| `MarkAssertionsPendingReconfirm` | Same predicate, from `suspended` to `pending_reconfirmation`. Never to `active`: restoring a record never renews a person's decision |
+| `SetExecutionRoleState` | Called for **every projected** workload on every pass, **after** the endpoint is determined. Writes the state and the ARN together, so the `CHECK` pairing them can never be violated mid-update. Never skipped, so no earlier run's state survives |
+| `Snapshot.IdentityNativeID` | Native id of any `cloud_identity` a workload references, **regardless of generation** — loaded in `Load` by one `WHERE id IN (…)` over the snapshot's workload identity ids. It is how `not_in_scan` still names the role |
+
+Everything else called in §4 without a body (`orStar`, `keyOf`, `byIDOf`,
+`resourceKeyOf`, `nativeRightsOf`, `normalizeRights`, `now`, `stop`) is
+mechanical and has no correctness property beyond its name.
 
 > **`permission_scan` and `workload_scan` are not constants yet.** They are
 > string literals in `FinalizeCoverage` (`cloud_aws_iam_scan.go:795`, `:803`),
@@ -2938,8 +4311,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 
 #### Partition membership is stored, not inferred
 
-`scope()` cannot be a join through endpoint tables. Three reasons, each of
-which was a defect in an earlier draft of this section:
+`scope()` cannot be a join through endpoint tables. Three reasons:
 
 - Filtering on `(workspace_id, relationship_type)` ends **another account's**
   relationships, because a scan of account A does not confirm account B's.
@@ -2998,11 +4370,55 @@ and silently reconciles nothing:
 a node touched by this partition may still be held by another account.
 
 ```go
+// supportColumn maps a node class to its typed column on iga_object_support.
+// The single place that mapping lives: the projector's upsert, the conflict
+// target, reconcileNodes and retireUnsupported all go through it.
+func supportColumn(class string) (string, error) {
+    switch class {
+    case models.ObjectIdentity:    return "identity_account_id", nil
+    case models.ObjectWorkload:    return "workload_id", nil
+    case models.ObjectResource:    return "resource_id", nil
+    case models.ObjectEntitlement: return "entitlement_id", nil
+    case models.ObjectAgent:       return "agent_id", nil
+    }
+    return "", fmt.Errorf("no support column for node class %q", class)
+}
+
+// externalResolutionColumn names the iga_external_principal column that can
+// point at a node of this class. Only identities and workloads can be the
+// target of a trust relationship, so only they appear.
+var externalResolutionColumn = map[string]string{
+    models.ObjectIdentity: "resolved_identity_account_id",
+    models.ObjectWorkload: "resolved_workload_id",
+}
+
+// nodeTable is supportColumn's partner. Both switch on the same class set, so
+// adding a node class is one edit in two adjacent functions -- and a unit
+// test asserts every entry in models.NodeClasses resolves in both.
+func nodeTable(class string) string {
+    switch class {
+    case models.ObjectIdentity:    return "iga_identity_accounts"
+    case models.ObjectWorkload:    return "iga_workload"
+    case models.ObjectResource:    return "iga_resources"
+    case models.ObjectEntitlement: return "iga_entitlements"
+    case models.ObjectAgent:       return "iga_agents"
+    }
+    panic("unmapped node class " + class)
+}
+
 // Step 1 -- end this partition's SUPPORT, not the object.
 func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+    // The partition's class selects WHICH typed column is populated. There is
+    // no object_type to compare against -- the typed column's non-nullness is
+    // the type, and the database enforces that exactly one is set.
+    col, err := supportColumn(part.Class) // "identity_account_id", "workload_id", ...
+    if err != nil {
+        return err // an unmapped class is a programming error, never a no-op
+    }
     q := tx.Model(&models.IGAObjectSupport{}).
-        Where("workspace_id = ? AND object_type = ? AND connector_id = ? AND partition_key = ?",
-            snap.Run.WorkspaceID, part.Class, part.ConnectorID, part.Key()).
+        Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",
+            snap.Run.WorkspaceID, part.ConnectorID, part.Key()).
+        Where(col + " IS NOT NULL").
         Where("state <> ?", models.RelEnded).
         Where("last_confirmed_run_id IS DISTINCT FROM ?", snap.Run.ID)
 
@@ -3019,21 +4435,66 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 // Same transaction, after every partition's support has been reconciled, so
 // an object is retired only when no source anywhere still holds it.
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
-    return tx.Exec(`
-        UPDATE iga_identity_accounts n
-           SET lifecycle = 'retired', retired_reason = 'unsupported', updated_at = now()
-         WHERE n.workspace_id = ?
-           AND n.lifecycle = 'active'
-           AND EXISTS (SELECT 1 FROM iga_object_support s
-                        WHERE s.workspace_id = n.workspace_id
-                          AND s.object_type = 'identity' AND s.object_id = n.id)
-           AND NOT EXISTS (SELECT 1 FROM iga_object_support s
-                            WHERE s.workspace_id = n.workspace_id
-                              AND s.object_type = 'identity' AND s.object_id = n.id
-                              AND s.state <> 'ended')`, snap.Run.WorkspaceID).Error
-    // ...repeated per node table. The first EXISTS matters: an object with no
-    // support rows at all is pre-graph, not unsupported, and must not be
-    // retired by this pass -- 033 handles those deliberately.
+    // One statement per node table, each joined on ITS OWN typed support
+    // column. There is no object_type/object_id to switch on -- 031 made
+    // support typed precisely so a support row cannot point at a missing or
+    // foreign-workspace object -- so the join column is fixed per table.
+    for _, class := range models.NodeClasses { // identity, workload, resource, entitlement, agent
+        col, err := supportColumn(class)
+        if err != nil {
+            return err
+        }
+        t := struct{ table, col string }{nodeTable(class), col}
+        // The first EXISTS matters: an object with NO support rows at all is
+        // pre-graph, not unsupported, and must not be retired by this pass --
+        // 034 handles those deliberately.
+        stmt := fmt.Sprintf(`
+            UPDATE %[1]s n
+               SET lifecycle = 'retired', retired_reason = 'unsupported', updated_at = now()
+             WHERE n.workspace_id = $1
+               AND n.lifecycle = 'active'
+               AND EXISTS (SELECT 1 FROM iga_object_support s
+                            WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id)
+               AND NOT EXISTS (SELECT 1 FROM iga_object_support s
+                                WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id
+                                  AND s.state <> 'ended')
+            RETURNING n.id`, t.table, t.col)
+        var retired []uuid.UUID
+        if err := tx.Raw(stmt, snap.Run.WorkspaceID).Scan(&retired).Error; err != nil {
+            return fmt.Errorf("retire unsupported %s: %w", t.table, err)
+        }
+
+        // A person's association with an object that just retired is
+        // SUSPENDED, not left active and not cleared (§2.12). This is the
+        // reconciler-side twin of the projector's recreation branch: two
+        // paths retire nodes, and both must suspend, or a human assertion
+        // stays in force pointing at a row that is gone.
+        if epCol, ok := externalResolutionColumn[class]; ok && len(retired) > 0 {
+            if err := tx.Exec(`
+                UPDATE iga_external_principal
+                   SET resolution_state = 'suspended'
+                 WHERE workspace_id = ? AND resolution_basis = 'asserted'
+                   AND resolution_state = 'active' AND `+epCol+` IN ?`,
+                snap.Run.WorkspaceID, retired).Error; err != nil {
+                return fmt.Errorf("suspend assertions on retired %s: %w", t.table, err)
+            }
+            // DERIVED resolutions to a retired target are re-derived HERE,
+            // not left for the next projection. The resolution pass runs
+            // during projection, BEFORE this reconcile step, so without this
+            // a derived resolution would stay in force pointing at a retired
+            // row for a whole scan cycle. Re-deriving against current evidence
+            // -- the target no longer exists -- means unresolved.
+            if err := tx.Exec(`
+                UPDATE iga_external_principal
+                   SET `+epCol+` = NULL, resolution_basis = '', resolution_rule = ''
+                 WHERE workspace_id = ? AND resolution_basis = 'derived'
+                   AND `+epCol+` IN ?`,
+                snap.Run.WorkspaceID, retired).Error; err != nil {
+                return fmt.Errorf("re-derive resolutions on retired %s: %w", t.table, err)
+            }
+        }
+    }
+    return nil
 }
 ```
 
@@ -3049,7 +4510,10 @@ exactly this, and the examples in §4.6 and §4.7 are instances of it:
    descriptive columns and `last_seen_at`. It never touches `first_seen_at`,
    `lifecycle`, or human-owned state.
 2. **Upsert its support row** on
-   `(workspace_id, object_type, object_id, connector_id, partition_key)`,
+   the typed conflict target for its class — e.g.
+   `(workspace_id, identity_account_id, connector_id, partition_key) WHERE
+   identity_account_id IS NOT NULL` — which must be passed as GORM's
+   `TargetWhere`, because the unique index is partial (§4.9),
    setting `state='current'`, `last_confirmed_run_id = run.ID`,
    `last_confirmed_at = now`. **This is the step that makes the node visible
    to reconciliation** — a node written without it is never reconciled, and a
@@ -3112,10 +4576,10 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
         // Detected inside the snapshot, which is the only place it can be
         // detected reliably. Recorded, not silent: a permanently-losing job
         // must not look like one that never ran.
-        return true, s.jobs.Abandon(job, s.owner, job.LeaseVersion, "superseded during load")
+        return true, s.abandonAndRelease(ctx, job, "superseded during load")
     }
     if err != nil {
-        return true, s.jobs.Fail(job, s.owner, job.LeaseVersion, err.Error())
+        return true, s.failKeepBarrier(ctx, job, err)
     }
 
     // Project AND reconcile in ONE transaction. Committing projection first
@@ -3123,14 +4587,99 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
     // edge still reads `current` -- and a crash in between leaves it that way
     // until the next run. One transaction means readers see the before state
     // or the after state, never the gap.
-    if err := s.projectAndReconcile(ctx, snap, job); err != nil {
+    err = s.projectAndReconcile(ctx, snap, job)
+
+    // A replay of a run that already committed is SUCCESS, not failure.
+    // The graph transaction wrote nothing on this attempt (§4.6 step 2), so
+    // there is nothing to undo -- only the job and the barrier to settle,
+    // in the same order and transaction as a normal completion.
+    var done *igagraph.AlreadyPublished
+    if errors.As(err, &done) {
+        return true, s.completeAndRelease(ctx, job, done.Rev)
+    }
+    if errors.Is(err, igagraph.ErrSuperseded) {
+        return true, s.abandonAndRelease(ctx, job, "superseded by a newer publication")
+    }
+    if err != nil {
         // Fail, do not Complete. The lease expires, the job is reclaimed, and
         // projection is idempotent -- so a retry converges. A job marked
         // complete after a partial write is unrecoverable without a manual
         // rebuild.
-        return true, s.jobs.Fail(job, s.owner, job.LeaseVersion, err.Error())
+        return true, s.failKeepBarrier(ctx, job, err)
     }
-    return true, s.jobs.Complete(job, s.owner, job.LeaseVersion)
+    return true, s.completeAndRelease(ctx, job, 0)
+}
+
+// completeAndRelease is the ONLY way a projection leaves the `projecting`
+// phase successfully. One transaction, fenced, in this order:
+//
+//   1. job           running  -> complete   (fenced on job lease_version)
+//   2. barrier       projecting -> idle     (fenced on phase + version)
+//
+// Job first, barrier second, both in one transaction: there is no committed
+// state in which the barrier is idle while the job could still commit. A
+// crash BEFORE this commits leaves both as they were, and recovery reclaims
+// `projecting`; its replay then hits AlreadyPublished and lands here again.
+// Idempotent by construction, because every step is fenced.
+//
+// There are exactly three exits from a claimed projection job, and each has
+// ONE implementation. No path terminalizes a job or moves the barrier except
+// through these:
+//
+//   completeAndRelease  job complete  + barrier idle      (success, or replay)
+//   abandonAndRelease   job abandoned + barrier idle      (superseded, or past the ceiling)
+//   failKeepBarrier     job failed    + barrier UNCHANGED (transient; will be retried)
+//
+// FENCING IS WHAT MAKES "never release someone else's barrier" TRUE. Both
+// writes in a *AndRelease are fenced -- the job on its lease_version, the
+// barrier on (workspace, phase, job, version) -- and they share one
+// transaction. If recovery has already reclaimed either one, that fence
+// matches zero rows, the transaction rolls back, and THIS worker changes
+// nothing. The current owner decides the outcome. A superseded worker never
+// terminalizes a job or releases a barrier it no longer holds.
+
+func (s *ProjectionService) abandonAndRelease(ctx context.Context,
+    job *models.IGAProjectionJob, reason string) error {
+    return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        if err := s.jobs.AbandonTx(tx, job.ID, s.owner, job.LeaseVersion, reason); err != nil {
+            return err // ErrLeaseLost: not ours any more -- change nothing
+        }
+        return s.pipeline.ReleaseTx(tx, PipelineFence{
+            WorkspaceID: job.WorkspaceID, Phase: models.PipelineProjecting,
+            JobID: job.ID, Version: s.pipelineVersion,
+        })
+    })
+}
+
+// failKeepBarrier records a TRANSIENT failure and deliberately leaves the
+// barrier `projecting`. The job is not terminal: it is reclaimed and retried,
+// and its inventory must stay frozen until it succeeds -- releasing here would
+// admit a scan while this projection is still pending, which is the overwrite
+// the barrier exists to prevent.
+//
+// Past the attempts ceiling it is no longer transient, and escalates to
+// abandonAndRelease: the job becomes terminal and the workspace is unblocked,
+// with the failure recorded and alerting on it.
+func (s *ProjectionService) failKeepBarrier(ctx context.Context,
+    job *models.IGAProjectionJob, cause error) error {
+    if job.Attempts >= s.maxAttempts {
+        return s.abandonAndRelease(ctx, job,
+            fmt.Sprintf("gave up after %d attempts: %v", job.Attempts, cause))
+    }
+    return s.jobs.Fail(job, s.owner, job.LeaseVersion, cause.Error()) // fenced; barrier untouched
+}
+
+func (s *ProjectionService) completeAndRelease(ctx context.Context,
+    job *models.IGAProjectionJob, rev int64) error {
+    return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        if err := s.jobs.CompleteTx(tx, job.ID, s.owner, job.LeaseVersion); err != nil {
+            return err
+        }
+        return s.pipeline.ReleaseTx(tx, PipelineFence{
+            WorkspaceID: job.WorkspaceID, Phase: models.PipelineProjecting,
+            JobID: job.ID, Version: s.pipelineVersion,
+        })
+    })
 }
 ```
 
@@ -3217,27 +4766,90 @@ write it. **P2-2 must land before anything else** — the rest is built on it.
 ### P2-0 · One narrow slice, end to end, before anything widens
 
 Build exactly one path and prove it: **Lambda → IAM role → declared
-entitlement → resource reference**, with evidence and reconciliation. Nothing
-else — no agents, no assume edges, no credentials.
+entitlement → resource reference**, with evidence and reconciliation. **Build
+the happy path first, then introduce the failure cases one at a time.**
 
-Six scenarios it must survive before the graph widens. Each maps to a defect
-this document has already had to correct, which is why they are the gate and
-not a later hardening pass:
+Also in the slice, because they are the highest-risk contracts to get wrong:
+the manual-classification endpoint (the one human write, and the only way to
+exercise the actor rule), and the reconciler's handling of asserted
+associations — exercised against **seeded** `iga_external_principal` rows,
+not a resolution pass.
+
+Out of the slice: the graph canvas and every UI beyond the one read path,
+automatic classification, grouping, Bedrock/AgentCore, `can_assume` edges, the
+external-principal resolution pass, credentials, and traversal beyond one
+workload's declared path.
+
+Nine scenarios it must survive. Each maps to a defect this document has
+already had to correct, which is why they are the gate and not a later
+hardening pass:
 
 | Scenario | What it catches |
 |---|---|
 | Unchanged rescan | ids and `first_seen_at` stable; no duplicate rows |
 | Lambda switches `RoleA` → `RoleB` | the relationship key names both endpoints, so the old edge ends instead of being overwritten |
 | A policy that fails to parse | `policy_documents` appears as `partial`, and **nothing closes** in the entitlement or access-edge partitions |
-| One region denied, another clean | `compute:eu-central-1` stale while `compute:us-east-1` closes — per-region partitions really are independent |
+| One region denied, another clean | `eu-central-1` reports `compute:eu-central-1: denied` (the failure stand-in) and its workloads go stale; `us-east-1` reports `lambda:us-east-1: reached` and closes — per-region partitions really are independent |
 | Two AWS accounts in one workspace | a scan of A closes nothing in B |
 | An obsolete worker | a reclaimed job cannot commit; the graph is unchanged and the job reads `abandoned` |
 | **Two accounts naming the same bucket** | B's scan reassigns `cloud_resource.connector_id`; A's projection must not silently lose the resource or the edges needing it |
 | **A superseded scan worker that keeps running** | its writes stop at lease loss; its replacement's projection sees a stable input set |
 | **Crash between publication and coverage** | impossible — one transaction. Kill the worker mid-publish and the run is either fully published with coverage and a queued job, or not published at all |
 
-> **Gate:** all six, against real Postgres, with each verified non-vacuous by
-> removing the fix and confirming the test fails.
+> **Exit gate — all nine scenarios above, plus these five.** The five
+> supplement the table; they do not replace it. Executed through the
+> implementation, not the pseudocode, against real Postgres, each verified
+> non-vacuous by removing its fix and observing the failure:
+>
+> 1. **A normal human session** classifies a workload: a real workspace token
+>    — which carries **both** `user_id` and `client_id` — **succeeds**. A
+>    machine-only token, an end-user token, and a member with `invited` or
+>    `suspended` status are each **refused**.
+> 2. **A workload whose configured role is not in the current scan** shows
+>    `not_in_scan` with the role's ARN, and **no newly confirmed**
+>    `executes_as` edge. If a relationship was discovered in an earlier run,
+>    it is **preserved**: `stale`, with its last confirmation time, while
+>    coverage for its partition is incomplete; `ended` with `valid_to` — still
+>    readable, never deleted — only when coverage is complete and the role is
+>    genuinely absent. A workload with no role configured shows `none`. None of
+>    these is confused with another, and **no case deletes a prior edge**.
+>    The fixture must include the prior edge; a fixture starting empty cannot
+>    tell preservation from deletion.
+> 3. **Retirement and restoration**: a role confirmed absent retires and a
+>    person's association with it — a **seeded** asserted
+>    `iga_external_principal` row — is `suspended`; the same `UniqueID`
+>    returns and is restored — same id — with the association
+>    `pending_reconfirmation`, not active.
+> 4. **A crash after publication**: the graph transaction commits, the worker
+>    is killed before `completeAndRelease`; the replay finds `AlreadyPublished`,
+>    writes nothing, and completes the job. The job is `complete`, not
+>    `failed`, and the barrier is `idle`.
+> 5. **Deployment states S0–S2, in an isolated environment**: deploy into
+>    each and confirm what the table says must hold — in particular that
+>    Phase 1 scanning still works in S1, and that the projector declines to
+>    start below `033`.
+>
+> **S3 is not part of this gate.** It includes `034`, which depends on
+> evidence from a real rollout (one clean S2 production scan) and is a
+> separate cleanup gate. It must not block starting the first slice.
+>
+> The graph widens only after all nine scenarios and all five proofs pass.
+
+**Evidence report.** P2-0's deliverable is running behaviour plus a short
+report, one row per scenario and proof:
+
+| Field | Content |
+|---|---|
+| Commit | The implementation commit the result was observed on |
+| Command | The exact test invocation, reproducible by someone else |
+| Fixture | Starting state — the rows seeded, the coverage report, the token used |
+| Expected | The database state and, where there is one, the API/UI result |
+| Observed | What actually happened |
+| Safeguard removed | Where meaningful: the specific fix removed, and the failure then observed |
+
+A row without *Observed* is a plan, not evidence. A row whose *Safeguard
+removed* result is "still passes" is a test that proves nothing, and fails
+the gate.
 
 ### P2-1 · Extend the CI boundary check
 
@@ -3457,7 +5069,8 @@ a `realizes` relationship. `AgentDetail` surfaces `origin`.
 
 ### P2-11 · One read-only path-and-evidence view
 
-*Shape: §2.14, screen C. Do not invent a second one.*
+*Shape: §2.14.5 (navigation), §2.14.6 (wireframes), §2.14.7 (states).
+Contracts: §2.15. Do not invent a second shape.*
 
 Not the console. One authenticated endpoint under `/api/iga/v1` that returns,
 for a given workload: its `executes_as` identity, that identity's access edges
@@ -3478,35 +5091,162 @@ query parameter.
 
 ## 6. Acceptance
 
-1. **Repeat scan keeps IDs.** Two consecutive scans of an unchanged account
-   leave every `id` and `first_seen_at` unchanged, advance `last_seen_at`, and
-   leave row counts equal.
-2. **Role replacement closes the old edge.** Lambda moved `RoleA` → `RoleB`:
-   old `executes_as` `ended` with `valid_to`, new `current`, both readable.
-3. **Credential change preserves the account**, and two active keys is not
-   treated as a conflict (§2.5).
-4. **Recreation is recorded.** Same name, new `RoleId` ⇒ two objects, old
-   retired `recreated`.
-5. **A registered agent is distinguished from native discovery**, surfaced in
-   `AgentDetail`; equal display names never merge.
-6. **A3 is closed on both ends.** Every relationship endpoint *and* every
-   provenance reference is a composite FK. Cross-workspace subject, target and
-   `last_confirmed_by` are all rejected, each proven by a test that fails
-   without the constraint.
-7. **Illegal relationship shapes are rejected**: no target, two sources, or a
-   source/target pair not in §2.2's table.
-8. **A denied scan never ends anything**, and neither does a scan with one parse
-   failure in the owning scope. Both non-vacuous.
-9. **Evidence survives inventory deletion**, and a deduped re-read still
-   records run confirmation. Both shipped in `024` — assert them, do not
-   rebuild them.
-10. **Projection is durable.** Killing the worker mid-projection yields the same
-    final state; a job for a superseded generation abandons and writes nothing.
-11. **Projection is rebuildable and one-way.** Drop-and-re-project reproduces
-    the graph; CI fails on a write to `cloud_*` from the graph package, proven
-    by a deliberate failure.
-12. **Migrations rehearse cleanly against a production schema dump**, and the
-    suite's failure count does not rise above the known set below.
+Twelve executable scenarios and five usability tasks. Each names what it
+breaks if removed — a scenario that cannot fail is not a gate.
+
+**Status: these are planned acceptance gates, not results.** None has been run
+against the contracts in this document. What *has* been demonstrated is listed
+in §6.4, with why it does not transfer.
+
+### 6.1 Executable scenarios
+
+| # | Scenario | Passes when | Catches |
+|---|---|---|---|
+| 1 | **Two workloads share one role.** `ticket-tools` and `refund-tools` both `executes_as` `SharedToolRole` | Two `executes_as` rows, one identity object. The identity's workload list returns both. Neither edge's key collides | A relationship key that omits an endpoint |
+| 2 | **Duplicate grants, one removed.** `TicketRead` and `ToolboxRead` both declare `s3:GetObject`; detach `TicketRead` | Two entitlements before; after, one `ended` and one `current`; **the access edge survives**; the change entry names which policy went and which remains | Merging independent grants into one row |
+| 3 | **A resource supported by two integrations.** Accounts A and B both name the same bucket; B stops | One resource object, two support rows; B's `ended`, A's `current`; **the resource stays `active`** | Single-owner node membership |
+| 4 | **Collection failure preserves prior relationships.** IAM denied on rescan | Everything becomes `stale` with last-confirmation intact. **Zero rows `ended`.** Non-vacuity: the same fixture with coverage `reached` **does** end them | `canEnd` trusting the wrong signal |
+| 5 | **Lease expiry after publication, before projection** | The barrier recovers **into `projecting`**, same phase, new version. No scan is admitted. The old worker's fenced write is refused | Expiry returning the barrier to `idle` |
+| 6 | **Crash around graph commit and barrier release** | **(a)** Kill after the graph transaction commits, before `completeAndRelease`: recovery reclaims `projecting`, the replay hits `AlreadyPublished` in step 2, **writes nothing**, and completes. The job ends `complete`, not `failed`; `iga_publication` has exactly one row for the run. **(b)** Kill inside `completeAndRelease`: it is one transaction, so either both job and barrier moved or neither did — case (a) again. **(c)** No state admits a scan while a projection could still commit | A `<=` generation guard that makes every replay fail forever; a non-atomic complete/release |
+| 7 | **Recreated role, same ARN, new `UniqueID`** | Two identity objects; old retired `recreated` with its edges `subject_recreated`; new one has a later `first_seen_at` | ARN-only endpoint keys |
+| 8 | **Support ends, then reappears.** Same recognition *and* immutable key | Support flips `ended → current`, `ended_reason` cleared, **object id and `first_seen_at` unchanged**. Relationships are re-projected as new rows, not revived | Treating reappearance as recreation, and stale `ended_reason` |
+| 9 | **Cross-workspace reference rejected** | Inserting a support row, an edge endpoint, a `last_confirmed_run_id` or a `connector_id` from another workspace is refused **by the database**. One test per FK | The A3 pattern reappearing |
+| 10 | **Cross-account navigation, unconnected endpoint** | A `can_assume` into an unconnected account renders as an unresolved external principal naming the account; filtering to production **keeps it visible and labelled** | A filter converting "could not look" into "nothing there" |
+| 11 | **Consistent filtering** | The same `rev` + filters give the same object set in list, detail, resources and graph. A region filter does not drop `global` IAM objects | The graph and list disagreeing |
+| 12 | **Limits suppress completeness claims** | With any limit bound, the response sets `total_known: false` and **no screen shows a total or a "reaches N resources" claim** | Truncation presented as an answer |
+
+A scenario **counts as passing only once it has been mutation-tested**: break
+the fix, confirm the scenario fails, restore it, confirm it passes. Record the
+test name, the command, and the observed failure. A test that passes with its
+fix removed is worse than no test, because it is believed.
+
+### 6.2 Usability tasks
+
+Run with someone who has not seen the product. Each is pass/fail on whether
+they can say it out loud, unaided, in under two minutes.
+
+| # | Task | Fails if |
+|---|---|---|
+| U1 | Find which identity `ticket-tools` runs as | They cannot tell the execution identity from other identity relationships |
+| U2 | Say what else uses that identity, and what that implies | The shared-role relationship is not visible from the identity |
+| U3 | Explain why the path to `support-tickets/*` exists | They cannot name the policy statements, or they say "it can access it" — the wording failed |
+| U4 | Say what we could not see, and what that prevents | Coverage reads as a complaint rather than a bounded conclusion |
+| U5 | Explain why removing one grant did not remove the path | The UI merged two independent grants |
+
+U3 and U5 are the ones that fail most designs. U3 fails when the interface
+lets a reader say *"can access"*; U5 fails when the canvas merged two edges
+and the evidence panel did not keep them apart.
+
+### 6.3 Phased sequence and gates
+
+| Stage | Delivers | Gate |
+|---|---|---|
+| **P2-A** Foundation | `026` (workspace-qualified provenance) + P2-1 CI check + P2-3 `sourcekey.go` | `026` applies to a **production schema dump**, not a fresh bootstrap. Key table tests pass |
+| **P2-B** Objects | `027`–`028`, real upserts, support rows | Scenarios 1, 3, 7, 8, 9 |
+| **P2-C** Edges and evidence | `029`–`031`, projector, evidence | Scenarios 2, 11 |
+| **P2-D** Lifecycle | Reconciliation, barrier, job | Scenarios 4, 5, 6 |
+| **P2-E** External | The **resolution pass** that populates `iga_external_principal`. The table itself ships with the core rollout (see below) | Scenario 10 |
+| **P2-F** One read path | P2-11: Identities + Resources for one workload, pinned `rev` via `iga_publication`, with evidence | Scenario 12, tasks U1–U5 |
+| **P2-G** Classification | `classification` + `iga_workload_classification` (028), the Classify-as-agent action on Overview | A classified Lambda appears as *Classified as agent* with its decision record; undo records its own decision; recreation starts `unclassified` |
+| **Graph canvas** | The one new UI component (§2.14.14) | Built **last**. The list views answer every §2.14.11 question except the visual one |
+| **Not scheduled** | Bedrock alias collection (`ListAgentAliases`) | Required before any instance count is shown. Until then the UI says *"instances not collected"* |
+| **Deferred** | `034` retirement of legacy unkeyed rows | After one clean production scan on the new path. **Not in the initial rollout** |
+
+#### Supported deployment states
+
+Migrations run on boot, so a rollout split across releases passes through
+intermediate schemas in production. Only these are supported, and each is a
+state P2-0 must deploy into and check:
+
+| State | Schema | Projector | Must hold |
+|---|---|---|---|
+| **S0** | `001`–`025` (today) | not present | Phase 1 scanning unchanged |
+| **S1** | `001`–`033` | **disabled** | Phase 1 scanning still works against the migrated schema; nothing writes `iga_*` graph tables |
+| **S2** | `001`–`033` | enabled | The P2-0 slice end to end |
+| **S3** | `001`–`034` | enabled | After one clean S2 production scan |
+
+**`026`–`033` ship in one release.** Any other split is unsupported, because
+core code references tables across that whole range.
+
+As a backstop against a partial rollout anyway, **the projector refuses to
+start below schema head `033`**: `ProjectionService.Run` reads the migration
+head and, if it is lower, logs and exits without claiming a job. A partial
+schema therefore degrades to *"graph not projecting"* — visible, and fixed by
+finishing the rollout — rather than to a reconciler that fails on every run.
+
+### 6.4 What has actually been demonstrated
+
+Five mutations were run against real PostgreSQL 16 on **`origin/graph` at
+`5bc5809`** — a separate implementation branch, not `authsec-staging`. Each
+was introduced, the named test observed to fail, and the fix restored:
+
+| Mutation | Test | Observed |
+|---|---|---|
+| `canEnd` returns `true` unconditionally | `TestDeniedScanEndsNothing` | FAIL |
+| `retireUnsupported` retires when *any* support ends | `TestSharedResourceSurvivesOneAccountDroppingIt` | FAIL |
+| `scope()` drops `connector_id` | `TestScanOfOneAccountClosesNothingInAnother` | FAIL |
+| `attachEvidence` made a no-op | `TestEvidenceIsAttachedThroughLoad` | FAIL |
+| Unqualified observations no longer skipped | `TestUnqualifiedObservationAttachesNoEvidence` | FAIL |
+
+Command, for each: `TEST_DATABASE_URL=postgres://… go test ./tests/igagraph/... -run '<Test>'`.
+
+**Against this document's own SQL** (run 2026-09-23, PostgreSQL 16, on top of
+the shipped `001`–`025`): every `026`–`033` section's SQL was extracted and
+applied in order, **all eight apply**, and ten constraint probes were run with
+a seed that includes one insert that *must succeed* — so a rejection cannot
+pass merely because the seed was broken:
+
+| Probe | Expected | Rejected by |
+|---|---|---|
+| Support row, one typed column, own workspace | **accepted** | — |
+| Support with two typed columns | rejected | `iga_object_support_one_chk` |
+| Support with none | rejected | `iga_object_support_one_chk` |
+| Support in A → identity in B | rejected | `iga_os_identity_fkey` |
+| Support in A using B's connector | rejected | `iga_object_support_connector_fkey` |
+| Support → nonexistent identity | rejected | `iga_os_identity_fkey` |
+| Duplicate live support | rejected | `uq_iga_os_identity` |
+| External principal in A resolving to B's identity | rejected | `iga_ep_resolved_identity_fkey` |
+| Resolution `asserted` with no `resolved_by` | rejected | `iga_external_principal_asserted_chk` |
+| `executes_as` whose source is an identity | rejected | `iga_relationship_pair_chk` |
+| Unknown classification value | rejected | `iga_workload_classification_chk` |
+
+`retireUnsupported`'s statement was also **executed** against all five node
+tables. This is what caught that `027` altered only one of its five tables —
+it applied cleanly and left four without `source_key`. A reading review and a
+static forward-reference check both missed it.
+
+**State-transition probes** (same environment, each with a control row that
+must *not* change, so a pass cannot be vacuous):
+
+| Probe | Observed |
+|---|---|
+| Publish run R once | accepted |
+| Publish run R again | rejected, `iga_publication_run_key` |
+| The replay check (`publication for run R?`) | finds `rev 1` — the fact §4.6 step 2 relies on exists |
+| Retire an identity whose only support ended; its sibling stays supported | ended one `retired`, control `active` |
+| …an `asserted` resolution to the retired identity | `suspended`, still pointing at the retired row |
+| …a `derived` resolution to it | re-derived to unresolved in the same transaction |
+| …an `asserted` resolution to the control | unchanged, `active` |
+| Restore with the **same** `UniqueID` | 1 row |
+| Restore with a **different** `UniqueID` (recreation) | 0 rows |
+| Restore a row retired as `recreated` | 0 rows |
+
+The derived-resolution row was a real defect found by this probe: the
+resolution pass runs during projection, *before* reconciliation retires
+anything, so without the re-derive in `retireUnsupported` a derived resolution
+stayed in force for a full scan cycle pointing at a retired row.
+
+These exercise the SQL of each transition in isolation. **They do not exercise
+the Go control flow** — the projector's branch selection, the service loop's
+`AlreadyPublished` handling, or crash timing — which exist only as pseudocode
+here and are what P2-0 has to prove.
+
+**The graph branch results above do not validate this document.** That branch
+implements the earlier design: polymorphic `iga_object_support`, recovery that
+returns an expired lease to `idle`, no restoration of retired objects, no
+workload classification, no publication revision. The five results show that
+branch's tests are genuine; they say nothing about scenarios 5, 6 or 8, which
+test behaviour the branch does not have.
 
 ## 7. Known-failing tests, carried in
 
@@ -3525,11 +5265,27 @@ reports as 1 and masks everything behind it.
 
 ## 8. Verification
 
+**Execute the spec, not just read it.** Extract each migration section's SQL
+and apply it on top of the shipped migrations. Apply each file as **one
+transaction** — `006` depends on it (`CREATE TEMP TABLE … ON COMMIT DROP`):
+
+```bash
+for f in $(ls migrations/master/0*.sql | sort); do
+  psql "$DB" -v ON_ERROR_STOP=1 --single-transaction -q -f "$f"
+done
+# then each spec section 026..033 the same way; 034 is deferred
+```
+
+Then check the resulting schema has **every column the pseudocode uses**, not
+only that the SQL applied. A migration that applies and is incomplete is the
+failure mode this catches.
+
 ```bash
 # Migrations apply in order against a PRODUCTION schema dump, not a fresh bootstrap.
 pg_dump --schema-only "$PROD_URL" > /tmp/prod-schema.sql   # no rows
 createdb iga_rehearsal && psql iga_rehearsal < /tmp/prod-schema.sql
-for m in migrations/master/0{26,27,28,29,30,31,32,33,34}_*.sql; do
+# 034 is deferred (§6.3) and is NOT part of the initial rollout.
+for m in migrations/master/0{26,27,28,29,30,31,32,33}_*.sql; do
   psql iga_rehearsal -v ON_ERROR_STOP=1 -f "$m" || { echo "FAILED: $m"; break; }
 done
 
