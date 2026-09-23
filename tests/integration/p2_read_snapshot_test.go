@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/services"
 )
 
 // B23 (first clause): an OPTIONAL query that times out is rolled back to its
@@ -166,5 +167,33 @@ func TestP2ReadCursorBinding(t *testing.T) {
 	other := igaread.NewReader(nil, []byte("another-secret"))
 	if _, err := other.OpenCursor(tok, ctx); err == nil || err.Code != "cursor_invalid" {
 		t.Errorf("a cursor signed with another key = %v, want cursor_invalid", err)
+	}
+}
+
+// T6.9: with the switch off or misconfigured every graph read is 503
+// graph_unavailable with the reason -- never an empty 200 the console would
+// render as "nothing here". /capabilities still answers.
+func TestP2ReadGraphUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gate *services.GraphProjectionGate
+		mode string
+	}{
+		{"off", services.NewGraphProjectionGate(false, ""), services.GraphProjectionOff},
+		{"misconfigured", services.NewGraphProjectionGate(true, ""), services.GraphProjectionMisconfigured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newP2Lab(t, "p2-read-503-"+tc.name, false)
+			l.gate = tc.gate
+			api := l.api()
+			code, body := api.get("/workloads")
+			mustStatus(t, "GET /workloads", code, body, 503)
+			if errCode(body) != "graph_unavailable" || digs(body, "error", "graph_projection") != tc.mode {
+				t.Fatalf("503 body = %v, want graph_unavailable / %s", body, tc.mode)
+			}
+			if code, body := api.get("/capabilities"); code != 200 || digs(body, "data", "graph_projection") != tc.mode {
+				t.Fatalf("/capabilities = %d %v", code, body)
+			}
+		})
 	}
 }

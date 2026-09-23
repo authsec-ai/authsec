@@ -323,41 +323,9 @@ func SetupRoutes(
 			// The graph branch's GET /workloads/:id/access-path and
 			// POST /estate/:id/classification were removed (§6.1): §5.3 replaces
 			// both, with revisions, typed refs and operation ids.
-			iga.GET("/capabilities", igaGraphRead.GetCapabilities)
-			iga.GET("/pipeline", middlewares.Require("iga", "read"), igaGraphRead.GetPipeline)
-			iga.GET("/coverage", middlewares.Require("iga", "read"), igaGraphRead.GetCoverage)
-
-			iga.GET("/workloads", middlewares.Require("iga", "read"), igaGraphRead.ListWorkloads)
-			iga.GET("/workloads/:id", middlewares.Require("iga", "read"), igaGraphRead.GetWorkload)
-			iga.GET("/workloads/:id/identities", middlewares.Require("iga", "read"), igaGraphRead.GetWorkloadIdentities)
-			iga.GET("/workloads/:id/resources", middlewares.Require("iga", "read"), igaGraphRead.GetWorkloadResources)
-			iga.GET("/workloads/:id/changes", middlewares.Require("iga", "read"), igaGraphRead.GetWorkloadChanges)
-			// A human decision: iga:review, the permission every other IGA
-			// decision route uses, plus a verified human (§2.14.3, §5.5).
-			// Viewing the history needs only iga:read.
-			iga.POST("/workloads/:id/classification", middlewares.Require("iga", "review"), igaGraphRead.ClassifyWorkload)
-			iga.GET("/workloads/:id/classification", middlewares.Require("iga", "read"), igaGraphRead.GetWorkloadClassification)
-
-			iga.GET("/identities", middlewares.Require("iga", "read"), igaGraphRead.ListIdentities)
-			iga.GET("/identities/:id", middlewares.Require("iga", "read"), igaGraphRead.GetIdentity)
-			iga.GET("/identities/:id/used-by", middlewares.Require("iga", "read"), igaGraphRead.GetIdentityUsedBy)
-			iga.GET("/identities/:id/permissions", middlewares.Require("iga", "read"), igaGraphRead.GetIdentityPermissions)
-			iga.GET("/identities/:id/changes", middlewares.Require("iga", "read"), igaGraphRead.GetIdentityChanges)
-
-			iga.GET("/external-principals/:id", middlewares.Require("iga", "read"), igaGraphRead.GetExternalPrincipal)
-			iga.GET("/external-principals/:id/referenced-by", middlewares.Require("iga", "read"), igaGraphRead.GetExternalPrincipalReferencedBy)
-
-			iga.GET("/resources", middlewares.Require("iga", "read"), igaGraphRead.ListResources)
-			iga.GET("/resources/:id", middlewares.Require("iga", "read"), igaGraphRead.GetResource)
-			iga.GET("/resources/:id/access", middlewares.Require("iga", "read"), igaGraphRead.GetResourceAccess)
-			iga.GET("/resources/:id/changes", middlewares.Require("iga", "read"), igaGraphRead.GetResourceChanges)
-
-			iga.GET("/graph", middlewares.Require("iga", "read"), igaGraphRead.GetGraph)
-			iga.GET("/graph/expand", middlewares.Require("iga", "read"), igaGraphRead.ExpandGraph)
-			iga.GET("/graph/path", middlewares.Require("iga", "read"), igaGraphRead.GetGraphPath)
-			iga.GET("/evidence", middlewares.Require("iga", "read"), igaGraphRead.GetEvidence)
-			iga.GET("/lookup", middlewares.Require("iga", "read"), igaGraphRead.Lookup)
-
+			// The whole §5.3 graph catalogue, with its permissions, is one table
+			// in iga_graph_read_routes.go so tests assert the same one.
+			platformCtrl.RegisterIGAGraphReadRoutes(iga, igaGraphRead, middlewares.Require)
 			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 			// Governance decisions. Both require an expected version, so a
