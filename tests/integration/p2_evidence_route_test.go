@@ -505,6 +505,16 @@ func TestP2EvidenceFactsDropSupersededVersions(t *testing.T) {
 	if got := digs(body, "data", "claim", "sentence"); !strings.Contains(got, "s3:GetObject, s3:GetObjectVersion") {
 		t.Errorf("sentence = %q, want the current content's actions", got)
 	}
+	// The policy's own presence: its version observation per support row,
+	// found by subject -- the same rule, without a junction.
+	body = evidenceGet(t, l.api(), evidenceNode(t, l, "policy", "iga_policy", "TicketRead"))
+	versions = nil
+	for _, f := range digl(body, "data", "facts") {
+		versions = append(versions, digs(f, "policy_version")+" "+digs(f, "fact"))
+	}
+	if !reflect.DeepEqual(versions, []string{"v4 Policy TicketRead version v4 was read"}) {
+		t.Errorf("policy presence facts = %v, want only the v4 read", versions)
+	}
 }
 
 // D-35: the graph's limitations come from the SAME function as /evidence --

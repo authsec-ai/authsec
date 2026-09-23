@@ -8,6 +8,7 @@ package integration
 // "does not") is inserted directly and says so.
 
 import (
+	"context"
 	"net/http"
 	"reflect"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 )
 
 // evidenceLimCase is one code's pair: a claim that produces it (with its
@@ -476,5 +478,32 @@ func TestP2EvidenceActivityAttemptsNotOutcomes(t *testing.T) {
 	}
 	if attempts != 1 || none != 1 {
 		t.Fatalf("Access Advisor facts: %d attempts, %d none, want 1 and 1:\n%s", attempts, none, evidenceJSON(dig(body, "data", "facts")))
+	}
+
+	// A newer run rewrote the usage rows in place and is not projected yet:
+	// they now describe a read the revision does not hold (D-25), so they are
+	// not this revision's facts -- until that run publishes.
+	if _, err := l.runs.Enqueue(l.ws, a.conn, "manual"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	w := services.NewAWSScanWorker(l.db, a.svc).WithOwner("evidence-activity-unprojected").WithGraphProjection(l.gate).
+		WithScannerHook(evidenceHook(a, evidenceFakes{activity: []iamtypes.ServiceLastAccessed{
+			{ServiceName: aws.String("Amazon S3"), ServiceNamespace: aws.String("s3"), LastAuthenticated: &when}}}))
+	if worked, err := w.RunOnce(context.Background()); err != nil || !worked {
+		t.Fatalf("scan: worked=%v err=%v", worked, err)
+	}
+	claim := evidenceNode(t, l, "identity", "iga_identity_accounts", "ActiveRole")
+	body = evidenceGet(t, l.api(), claim)
+	for _, f := range digl(body, "data", "facts") {
+		if digs(f, "source_api") == "iam:GetServiceLastAccessedDetails" {
+			t.Errorf("fact %q comes from usage an unpublished run rewrote", digs(f, "fact"))
+		}
+	}
+	if evidenceLim(body, "activity_attempts_not_outcomes") != nil {
+		t.Errorf("no Access Advisor fact is shown, so the limitation does not apply: %v", evidenceCodes(body))
+	}
+	l.project("evidence-activity-late")
+	if evidenceLim(evidenceGet(t, l.api(), claim), "activity_attempts_not_outcomes") == nil {
+		t.Errorf("once the run published, its Access Advisor facts are back")
 	}
 }
