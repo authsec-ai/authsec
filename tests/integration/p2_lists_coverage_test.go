@@ -50,7 +50,9 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	// alone names ticket-archive/*.
 	a := l.account(accountA, "us-east-1", "eu-west-1")
 	role := a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
-	ticket := a.managed("TicketRead", `{"Version":"2012-10-17","Statement":[{"Sid":"ReadTickets",`+
+	// AWS-managed (D-51): after T3.1 a customer-managed document arrives in the
+	// LocalManagedPolicy listing, so only an AWS-managed one can fail to FETCH.
+	ticket := s3aAWSManaged(a, "TicketRead", `{"Version":"2012-10-17","Statement":[{"Sid":"ReadTickets",`+
 		`"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::support-tickets/*","arn:aws:s3:::ticket-archive/*"]}]}`)
 	a.attach("SharedToolRole", ticket)
 	a.attach("SharedToolRole", a.managed("ToolboxRead", docToolboxRead))
@@ -86,8 +88,12 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	a.lambdas["eu-west-1"].fail = denied("lambda:ListFunctions")
 	a.iam.failPolicyVersion[ticket] = denied("iam:GetPolicyVersion")
 	runA := l.scanAndProject(a)
-	b.iam.fail["ListUsers"] = denied("iam:ListUsers")
+	// T3.1: users come from the authorization-details User listing. OpsRead is
+	// DELETED, not only detached: an unattached customer-managed policy is still
+	// collected and still names its resources (§1.4 LocalManagedPolicy).
+	b.iam.fail["GetAccountAuthorizationDetails:User"] = denied("iam:GetAccountAuthorizationDetails")
 	b.detach("OpsRole", opsRead)
+	delete(b.iam.managedPolicies, opsRead)
 	runB := l.scanAndProject(b)
 	sinceA := runA.PublishedAt.UTC().Format(time.RFC3339)
 	sinceB := runB.PublishedAt.UTC().Format(time.RFC3339)
@@ -307,7 +313,9 @@ func TestP2ListsResourceCoverageKeepsOtherScannersGaps(t *testing.T) {
 		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"`+orders+`"}]}`))
 	b := l.account(accountB)
 	b.role("OpsRole", "AROAOPSROLEOPSROLE01")
-	cross := b.managed("CrossLedger", `{"Version":"2012-10-17","Statement":[{"Sid":"Ledger",`+
+	// AWS-managed (D-51): after T3.1 a customer-managed document arrives in the
+	// LocalManagedPolicy listing, so only an AWS-managed one can fail to FETCH.
+	cross := s3aAWSManaged(b, "CrossLedger", `{"Version":"2012-10-17","Statement":[{"Sid":"Ledger",`+
 		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"`+ledger+`"}]}`)
 	b.attach("OpsRole", cross)
 	l.scanAndProject(a)

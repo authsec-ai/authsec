@@ -952,7 +952,10 @@ func TestP2ListsIntegrationNeedsLiveSupport(t *testing.T) {
 		t.Fatalf("setup: integration=B = %v, want both of B's references", got)
 	}
 
+	// Deleted, not only detached: an unattached customer-managed policy is
+	// still collected and still names its resources (§1.4 LocalManagedPolicy).
 	b.detach("data-reader", sandbox)
+	delete(b.iam.managedPolicies, sandbox)
 	l.scanAndProject(b)
 	id, _ := l.resourceID(shared)
 	if sup := l.supportOf("resource_id", id); sup[a.conn] != "current" || sup[b.conn] != "ended" {
