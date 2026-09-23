@@ -51,6 +51,23 @@ var CloudFormationTemplate string
 // three.
 const TemplateVersion = "2026-09-23"
 
+// TemplateOutdated reports whether a connector's recorded template version is
+// older than the one this build ships -- a FACT about the two versions, never
+// a diagnosis of a denial (§2.14.13: an SCP or a boundary refuses the same
+// call). Versions are dates (YYYY-MM-DD), so string order is date order.
+//
+// nil when nothing was recorded: a connector onboarded before versions were
+// stamped is of unknown vintage, and "not outdated" would claim more than the
+// row proves. The recorded value is the one stamped at onboarding; nothing
+// refreshes it after the customer updates the stack.
+func TemplateOutdated(recorded string) *bool {
+	if recorded == "" {
+		return nil
+	}
+	outdated := recorded < TemplateVersion
+	return &outdated
+}
+
 // maxRetryAttempts bounds the SDK's built-in backoff. Above the SDK default of
 // 3 because IAM and CloudTrail throttle readily on a large account and a scan
 // that gives up on the first ThrottlingException reports a partial estate as if

@@ -964,34 +964,32 @@ func (ctl *CloudAWSController) GetScanRun(c *gin.Context) {
 		return
 	}
 
-	run, err := repositories.NewCloudScanRunRepository(ctl.db).Get(runID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
-		return
-	}
 	// The workspace comes from the authenticated context, never the URL: a run
 	// id from another workspace must read as absent, not as forbidden, so the
-	// endpoint cannot be used to test whether an id exists.
-	if run.WorkspaceID != workspaceID {
-		c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
-		return
-	}
-
+	// endpoint cannot be used to test whether an id exists. The read is
+	// workspace-qualified, so such a run is simply not found.
+	//
 	// The run gains projection: {status, rev} (§5.3): what became of its
-	// projection job, and the revision it published -- null when the run has no
-	// job (the switch was off, or it never published).
-	projection, err := repositories.NewCloudScanRunRepository(ctl.db).Projection(workspaceID, runID)
+	// projection job, and the revision it published -- null when the run has
+	// no job (the switch was off, or it never published). Read in the SAME
+	// statement as the run, so the two cannot straddle the projection's commit.
+	rec, err := repositories.NewCloudScanRunRepository(ctl.db).GetWithProjection(workspaceID, runID)
 	if err != nil {
-		log.Printf("[discovery] scan run %s projection: %v", runID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read the run's projection"})
+		if errors.Is(err, repositories.ErrCloudScanRunNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "scan run not found"})
+			return
+		}
+		log.Printf("[discovery] scan run %s: %v", runID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read the scan run"})
 		return
 	}
+	run := &rec.Run
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": scanRunWithProjection{
 			CloudScanRun: *run,
-			Projection:   projectionView(projection),
+			Projection:   projectionView(rec.Projection),
 		},
 		"meta": gin.H{
 			"as_of":    time.Now().UTC(),

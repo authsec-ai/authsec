@@ -1,6 +1,7 @@
 package igaread
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,20 +14,24 @@ import (
 	"github.com/authsec-ai/authsec/models"
 )
 
-// GET /api/iga/v1/coverage (SPEC-iga-phase2-graph.md §5.3, §2.14.13): per
-// account and surface, what the runs the CURRENT REVISION was built from could
-// read -- and which conclusion each gap prevents.
+// GET /api/iga/v1/coverage (SPEC-iga-phase2-graph.md §5.3, §2.14.13; D-57,
+// D-58, D-71, D-72): per account and surface, what the runs the CURRENT
+// REVISION was built from could read -- and which conclusion each gap
+// prevents.
 //
-// "The runs the current revision was built from" (D-57, corrected): every
-// partition's watermark, iga_projection_state.last_run_id, per connector. The
-// rows are written in the publication's own transaction, so inside this
-// request's snapshot they are exactly the current revision's. The manifest is
-// not used: its key (Partition.Key()) omits the connector.
+// "The runs the current revision was built from" are read from
+// iga_projection_state: every partition's watermark, last_run_id, per
+// connector (D-57). The rows are written in the publication's own
+// transaction, so inside this request's snapshot they are exactly the current
+// revision's. A revision published by account B's run is still BUILT FROM
+// account A's last projected run for A's partitions: the coverage is
+// cumulative across accounts, never just the publishing run's.
 //
 // NEVER a guessed missing permission (§2.14.13, E9): error_code and api are
-// what the SDK reported when the read failed (awsdiscovery.FailedCall, stored
-// with the run's coverage), or null. Nothing here maps a failed call to an IAM
-// action someone should grant.
+// what the SDK reported when the read failed (awsdiscovery.FailedCall, stamped
+// on the run's coverage at collection, D-71), or null. Nothing here maps a
+// failed call to an IAM action someone should grant, and the Error prose is
+// never parsed into a code.
 
 // Limitation codes a coverage gap prevents (§5.3 Evidence vocabulary; D-58).
 const (
@@ -40,25 +45,35 @@ const (
 // (§2.14.13): a region that is not selected is fixed by selecting it.
 const FixChangeRegions = "change_regions"
 
-// SurfaceOrganizations is the AWS Organizations surface (T3.8 records it
-// unsupported).
+// SurfaceOrganizations is the AWS Organizations surface (recorded unsupported
+// until a collector exists).
 const SurfaceOrganizations = "organizations"
 
+// sinceWalkLimit bounds the walk back through a connector's published runs
+// that finds when a surface entered its current state (D-72): a streak longer
+// than this is reported as not known (null), never guessed.
+const sinceWalkLimit = 50
+
 // Prevents maps a surface's state to the limitation it imposes (D-58):
-// denied -> surface_denied; partial -> surface_partial; throttled, error,
-// unknown -> surface_stale; organizations unsupported ->
-// organizations_not_collected; reached and not_selected -> null.
 //
-// States D-58 does not name are mapped by what they mean for the rows:
-// constrained is a refused read (surface_denied); stale is surface_stale;
-// not_configured and any other unsupported surface claim nothing, like
-// not_selected. An unrecognised state is surface_stale -- a read we meant to
-// make did not complete, so nothing it covers may be treated as confirmed.
+//	denied                                   -> surface_denied
+//	partial                                  -> surface_partial
+//	throttled, not_selected, unknown, stale,
+//	constrained                              -> surface_stale
+//	unsupported on organizations             -> organizations_not_collected
+//	any other unsupported, not_configured,
+//	reached                                  -> null
+//
+// not_selected is surface_stale because an unselected region's earlier results
+// are KEPT and marked stale (§2.14.13 l.1856-1859): nothing is claimed about
+// it now. A state this build does not know is surface_stale too -- a read we
+// meant to make is not known to have completed, so nothing it covers may be
+// treated as confirmed.
 func Prevents(surface, state string) any {
 	switch state {
-	case models.CloudCoverageReached, models.CloudCoverageNotSelected, models.CloudCoverageNotConfigured:
+	case models.CloudCoverageReached, models.CloudCoverageNotConfigured:
 		return nil
-	case models.CloudCoverageDenied, models.CloudCoverageConstrained:
+	case models.CloudCoverageDenied:
 		return PreventsSurfaceDenied
 	case models.CloudCoveragePartial:
 		return PreventsSurfacePartial
@@ -71,39 +86,62 @@ func Prevents(surface, state string) any {
 	return PreventsSurfaceStale
 }
 
-// CoverageAccount is one account's coverage.
+// CoverageAccount is one account's coverage in the current revision.
 type CoverageAccount struct {
 	Integration string   `json:"integration"`
 	Account     *Account `json:"account"`
-	// TemplateVersion is the CloudFormation template version recorded when
-	// the account was onboarded, and the one this build ships. Facts only:
-	// nothing refreshes the recorded value after a stack update, so "update
-	// the stack" is not offered on it (spec question raised).
-	TemplateVersion map[string]any    `json:"template_version"`
-	Surfaces        []CoverageSurface `json:"surfaces"`
+	// ConnectorStatus is active | error | revoked (additive): a revoked
+	// connector's runs still built part of the revision (D-89).
+	ConnectorStatus string `json:"connector_status"`
+	// Template is the CloudFormation stack version recorded when the account
+	// was onboarded against the one this build ships (D-72): a fact, never the
+	// cause of a denial. Nothing refreshes the recorded value after a stack
+	// update.
+	Template map[string]any `json:"template"`
+	// Runs are the runs the current revision was built from for this account,
+	// newest first -- empty when the revision holds nothing of it yet, so an
+	// empty surfaces list is never read as "no gaps".
+	Runs     []string          `json:"runs"`
+	Surfaces []CoverageSurface `json:"surfaces"`
 }
 
 // CoverageSurface is one surface of one account, from the newest run the
 // current revision holds for it.
 type CoverageSurface struct {
-	Surface   string `json:"surface"`
-	State     string `json:"state"`
-	Count     int    `json:"count"`
-	ErrorCode any    `json:"error_code"`
-	API       any    `json:"api"`
+	Surface string `json:"surface"`
+	State   string `json:"state"`
+	// Count is the stored count only when the surface was reached (D-72): a
+	// count from a surface that was not is a floor, not a total.
+	Count     *int `json:"count"`
+	ErrorCode any  `json:"error_code"`
+	API       any  `json:"api"`
 	// Error is the provider's own words (or the scanner's account of a partial
-	// read, naming the documents it could not read).
-	Error    any    `json:"error"`
-	Since    any    `json:"since"`
-	SinceRun any    `json:"since_run"`
-	Prevents any    `json:"prevents"`
-	Fix      any    `json:"fix"`
-	Run      string `json:"run"`
+	// read), shown as written -- never parsed.
+	Error any `json:"error"`
+	// Items is the per-document detail of a policy_documents surface, stamped
+	// at collection (D-71): [{policy, version, error}], bounded, with
+	// Truncated when the bound bit. null for a run collected without it.
+	Items     []CoverageItem `json:"items"`
+	Truncated bool           `json:"truncated"`
+	Since     any            `json:"since"`
+	SinceRun  any            `json:"since_run"`
+	Prevents  any            `json:"prevents"`
+	Fix       any            `json:"fix"`
+	Run       string         `json:"run"`
 	// Ref is the coverage claim (§5.2), for the Evidence panel.
 	Ref string `json:"ref"`
 
 	connectorID uuid.UUID
+	runID       uuid.UUID
 	publishedAt time.Time
+}
+
+// CoverageItem is one unreadable document of a policy_documents surface
+// (D-71). Only these three fields are rendered, whatever else was stored.
+type CoverageItem struct {
+	Policy  string `json:"policy"`
+	Version string `json:"version"`
+	Error   string `json:"error"`
 }
 
 // coverageRun is one run the current revision was built from.
@@ -112,6 +150,15 @@ type coverageRun struct {
 	ConnectorID uuid.UUID
 	PublishedAt *time.Time
 	Coverage    []byte
+}
+
+// coverageDetail decodes the optional per-surface detail D-71 adds to a run's
+// coverage, beside the typed models.ScanCoverage.
+type coverageDetail struct {
+	Surfaces map[string]struct {
+		Items     []CoverageItem `json:"items"`
+		Truncated bool           `json:"truncated"`
+	} `json:"surfaces"`
 }
 
 // Coverage reads per-account, per-surface coverage in the snapshot. accounts
@@ -131,7 +178,7 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 	}
 	var connectors []models.CloudConnector
 	if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
-		Order("created_at, id").Find(&connectors).Error; err != nil {
+		Find(&connectors).Error; err != nil {
 		return nil, err
 	}
 	want := map[string]bool{}
@@ -139,6 +186,7 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		want[a] = true
 	}
 	byConnector := map[uuid.UUID]*CoverageAccount{}
+	labels := map[uuid.UUID]string{}
 	order := []uuid.UUID{}
 	for i := range connectors {
 		c := &connectors[i]
@@ -146,24 +194,31 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 			continue
 		}
 		recorded := c.AWSAttrs().TemplateVersion
-		acct := &CoverageAccount{
-			Integration: R(RefConnector, c.ID),
-			Account:     dir.Of(c.ScopeID),
-			TemplateVersion: map[string]any{
-				"recorded": nullIfBlank(recorded),
+		byConnector[c.ID] = &CoverageAccount{
+			Integration:     R(RefConnector, c.ID),
+			Account:         dir.Of(c.ScopeID),
+			ConnectorStatus: c.Status,
+			Template: map[string]any{
+				"deployed": nullIfBlank(recorded),
 				"current":  awsdiscovery.TemplateVersion,
-				// Template versions are dates (YYYY-MM-DD), so string order is
-				// date order.
-				"recorded_older_than_current": recorded != "" && recorded < awsdiscovery.TemplateVersion,
+				"outdated": awsdiscovery.TemplateOutdated(recorded),
 			},
+			Runs:     []string{},
 			Surfaces: []CoverageSurface{},
 		}
-		byConnector[c.ID] = acct
+		labels[c.ID] = strings.ToLower(connectorLabel(c.Attrs, c.ScopeID))
 		order = append(order, c.ID)
 	}
 	if len(order) == 0 {
 		return out, nil
 	}
+	// Ordered by label then id, like /pipeline (D-92).
+	sort.SliceStable(order, func(i, j int) bool {
+		if labels[order[i]] != labels[order[j]] {
+			return labels[order[i]] < labels[order[j]]
+		}
+		return order[i].String() < order[j].String()
+	})
 
 	// The runs the current revision was built from: every partition watermark
 	// of these connectors. Usually one run per connector (its latest projected
@@ -182,7 +237,10 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 	// Newest first, so each surface is taken from the newest run that carries
 	// it: that run is the latest word on the surface in this revision.
 	sort.Slice(runs, func(i, j int) bool {
-		return pubTime(runs[i]).After(pubTime(runs[j]))
+		if !pubTime(runs[i]).Equal(pubTime(runs[j])) {
+			return pubTime(runs[i]).After(pubTime(runs[j]))
+		}
+		return runs[i].ID.String() > runs[j].ID.String()
 	})
 	seen := map[uuid.UUID]map[string]bool{}
 	for _, run := range runs {
@@ -190,17 +248,20 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		if acct == nil {
 			continue
 		}
+		acct.Runs = append(acct.Runs, R(RefScanRun, run.ID))
 		if seen[run.ConnectorID] == nil {
 			seen[run.ConnectorID] = map[string]bool{}
 		}
 		cov := models.DecodeScanCoverage(run.Coverage)
+		var detail coverageDetail
+		_ = json.Unmarshal(run.Coverage, &detail) // optional; absent is null
 		for name, s := range cov.Surfaces {
 			if seen[run.ConnectorID][name] {
 				continue
 			}
 			seen[run.ConnectorID][name] = true
 			entry := CoverageSurface{
-				Surface: name, State: s.State, Count: s.Count,
+				Surface: name, State: s.State,
 				ErrorCode: nullIfBlank(s.ErrorCode), API: nullIfBlank(s.API),
 				Error:    nullIfBlank(s.Error),
 				Prevents: Prevents(name, s.State),
@@ -208,14 +269,21 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 				Ref:      CoverageRef(run.ID, name),
 
 				connectorID: run.ConnectorID,
+				runID:       run.ID,
 				publishedAt: pubTime(run),
 			}
-			if s.State == models.CloudCoverageReached {
-				// A reached surface failed nothing: no call, no code, however
-				// the entry was written.
-				entry.ErrorCode, entry.API, entry.Error = nil, nil, nil
+			if d, ok := detail.Surfaces[name]; ok && d.Items != nil {
+				entry.Items, entry.Truncated = d.Items, d.Truncated
 			}
-			if s.State == models.CloudCoverageNotSelected {
+			switch s.State {
+			case models.CloudCoverageReached:
+				// A reached surface failed nothing: its count stands, and it
+				// has no call, no code and no detail, however it was written.
+				count := s.Count
+				entry.Count = &count
+				entry.ErrorCode, entry.API, entry.Error = nil, nil, nil
+				entry.Items, entry.Truncated = nil, false
+			case models.CloudCoverageNotSelected:
 				entry.Fix = FixChangeRegions
 			}
 			acct.Surfaces = append(acct.Surfaces, entry)
@@ -239,47 +307,66 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 	return out, nil
 }
 
-// coverageSince fills since (first run in the current state, §5.3): walking
-// back from the run shown, through the connector's published runs, the
-// earliest run of the unbroken streak in which the surface had this state. A
-// run whose coverage lacks the surface breaks the streak -- absent is not the
-// same state -- so since is never earlier than the runs prove.
+// coverageSince fills since (D-72: "first run in the current state", §5.3):
+// the published_at of the EARLIEST run of the unbroken streak, walking back
+// from the run shown through the connector's published runs, in which the
+// surface had this state. A run whose coverage lacks the surface breaks the
+// streak -- absent is not the same state -- so since is never earlier than the
+// runs prove. The walk covers at most sinceWalkLimit runs; a streak longer
+// than that is null (not known), never the oldest run looked at.
 //
 // OPTIONAL work (§5.1): the walk reads run history, which grows without bound,
 // so it runs in a savepoint; if it does not finish, since and since_run are
-// null (not known), never guessed, and the rest of the response stands.
+// null, never guessed, and the rest of the response stands.
 func (q *Query) coverageSince(entries []*CoverageSurface) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	values := make([]string, 0, len(entries))
-	args := []any{}
-	for i, e := range entries {
-		values = append(values, "(?::int, ?::uuid, ?::text, ?::text, ?::timestamptz)")
-		args = append(args, i, e.connectorID, e.Surface, e.State, e.publishedAt)
+	// One walk per (connector, run shown): every surface an account shows from
+	// the same run shares it.
+	type start struct {
+		connector, run uuid.UUID
+		at             time.Time
 	}
+	var starts []start
+	index := map[uuid.UUID]int{}
+	for _, e := range entries {
+		if _, ok := index[e.runID]; !ok {
+			index[e.runID] = len(starts)
+			starts = append(starts, start{connector: e.connectorID, run: e.runID, at: e.publishedAt})
+		}
+	}
+	values := make([]string, 0, len(starts))
+	args := []any{}
+	for i, s := range starts {
+		values = append(values, "(?::int, ?::uuid, ?::uuid, ?::timestamptz)")
+		args = append(args, i, s.connector, s.run, s.at)
+	}
+	// The state of every surface of each walked run, as one small object --
+	// not the whole coverage blob -- newest first, one more than the limit so
+	// a streak that fills the window can be told from one that ends in it.
 	stmt := fmt.Sprintf(`
-		SELECT v.k, s.id AS since_run, s.published_at AS since
-		  FROM (VALUES %s) AS v(k, cid, surface, state, at)
-		  LEFT JOIN LATERAL (
-		        SELECT r.id, r.published_at
+		SELECT v.k, w.id, w.published_at, w.states
+		  FROM (VALUES %s) AS v(k, cid, rid, at)
+		  CROSS JOIN LATERAL (
+		        SELECT r.id, r.published_at,
+		               CASE WHEN jsonb_typeof(r.coverage->'surfaces') = 'object'
+		                    THEN (SELECT jsonb_object_agg(s.key, s.value->>'state')
+		                            FROM jsonb_each(r.coverage->'surfaces') s)
+		               END AS states
 		          FROM cloud_scan_run r
 		         WHERE r.workspace_id = ? AND r.connector_id = v.cid AND r.status = ?
-		           AND r.published_at <= v.at
-		           AND r.published_at > COALESCE((
-		                 SELECT max(b.published_at) FROM cloud_scan_run b
-		                  WHERE b.workspace_id = ? AND b.connector_id = v.cid AND b.status = ?
-		                    AND b.published_at < v.at
-		                    AND (b.coverage->'surfaces'->v.surface->>'state') IS DISTINCT FROM v.state),
-		               '-infinity'::timestamptz)
-		         ORDER BY r.published_at ASC, r.id ASC
-		         LIMIT 1) s ON true`, strings.Join(values, ", "))
-	args = append(args, q.WS, models.CloudScanRunPublished, q.WS, models.CloudScanRunPublished)
+		           AND (r.published_at, r.id) <= (v.at, v.rid)
+		         ORDER BY r.published_at DESC, r.id DESC
+		         LIMIT %d) w
+		 ORDER BY v.k, w.published_at DESC, w.id DESC`, strings.Join(values, ", "), sinceWalkLimit+1)
+	args = append(args, q.WS, models.CloudScanRunPublished)
 
 	var rows []struct {
-		K        int
-		SinceRun *uuid.UUID
-		Since    *time.Time
+		K           int
+		ID          uuid.UUID
+		PublishedAt time.Time
+		States      []byte
 	}
 	ok, err := q.Optional(func(tx *gorm.DB) error {
 		return tx.Raw(stmt, args...).Scan(&rows).Error
@@ -290,12 +377,46 @@ func (q *Query) coverageSince(entries []*CoverageSurface) error {
 	if !ok {
 		return nil // not known in time: since stays null
 	}
+
+	type walked struct {
+		id     uuid.UUID
+		at     time.Time
+		states map[string]string
+	}
+	walks := make([][]walked, len(starts))
 	for _, r := range rows {
-		if r.K < 0 || r.K >= len(entries) || r.SinceRun == nil {
+		if r.K < 0 || r.K >= len(starts) {
 			continue
 		}
-		entries[r.K].Since = TS(r.Since)
-		entries[r.K].SinceRun = R(RefScanRun, *r.SinceRun)
+		w := walked{id: r.ID, at: r.PublishedAt, states: map[string]string{}}
+		_ = json.Unmarshal(r.States, &w.states) // null states: every surface absent
+		walks[r.K] = append(walks[r.K], w)
+	}
+	for _, e := range entries {
+		walk := walks[index[e.runID]]
+		if len(walk) == 0 || walk[0].id != e.runID {
+			continue // the run shown is not where the walk starts: not known
+		}
+		earliest := -1
+		broken := false
+		for i := 0; i < len(walk) && i < sinceWalkLimit; i++ {
+			if st, ok := walk[i].states[e.Surface]; !ok || st != e.State {
+				broken = true
+				break
+			}
+			earliest = i
+		}
+		if earliest < 0 {
+			continue
+		}
+		if !broken && len(walk) > sinceWalkLimit {
+			if st, ok := walk[sinceWalkLimit].states[e.Surface]; ok && st == e.State {
+				continue // the streak runs past the walk: not known
+			}
+		}
+		at := walk[earliest].at
+		e.Since = TS(&at)
+		e.SinceRun = R(RefScanRun, walk[earliest].id)
 	}
 	return nil
 }

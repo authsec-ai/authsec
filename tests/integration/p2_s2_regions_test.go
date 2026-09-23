@@ -8,6 +8,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -46,6 +47,15 @@ func TestP2S2RegionsListedWithSelection(t *testing.T) {
 	}
 	if fake.lastIn == nil || fake.lastIn.AllRegions == nil || *fake.lastIn.AllRegions {
 		t.Fatalf("DescribeRegions must ask for ENABLED regions only (AllRegions=false), got %+v", fake.lastIn)
+	}
+	if dig(body, "success") != true || dig(body, "meta", "error") != nil ||
+		digs(body, "meta", "integration") != refOf("cloud_connector", a.conn) {
+		t.Fatalf("GET regions envelope = %v, want success, no error, the connector named", body)
+	}
+	// The stack version is stated as a fact: recorded at onboarding, current.
+	if digs(body, "meta", "template", "deployed") != awsdiscovery.TemplateVersion ||
+		dig(body, "meta", "template", "outdated") != false || dig(body, "meta", "template_outdated") != false {
+		t.Fatalf("template facts = %v / %v", dig(body, "meta", "template"), dig(body, "meta", "template_outdated"))
 	}
 
 	// The account opts out of eu-central-1 after the connector selected it.
@@ -104,27 +114,64 @@ func TestP2S2RegionPatchNamesTheOffenders(t *testing.T) {
 		t.Fatalf("malformed offenders = %v", got)
 	}
 
-	// Not a selection: 400 invalid_parameter.
+	// An EMPTY selection names no region, and is still 422 invalid_region
+	// (D-90): it is no scan scope at all. Blank entries do not count.
+	for _, raw := range []string{`{"regions": []}`, `{"regions": ["", "  "]}`} {
+		code, body := api.do(http.MethodPatch, "/aws/connectors/"+a.conn.String(), json.RawMessage(raw))
+		mustStatus(t, "PATCH "+raw, code, body, http.StatusUnprocessableEntity)
+		if errCode(body) != "invalid_region" || dig(body, "error", "regions") == nil || len(digl(body, "error", "regions")) != 0 {
+			t.Fatalf("PATCH %s = %v, want 422 invalid_region with regions: []", raw, body)
+		}
+	}
+
+	// Not a region-selection body: 400 invalid_parameter. Only regions is
+	// accepted, and an unknown field is refused, never ignored.
+	tooMany := make([]string, 0, 33)
+	for i := 1; i <= 33; i++ {
+		tooMany = append(tooMany, fmt.Sprintf(`"us-east-%d"`, i))
+	}
 	for name, raw := range map[string]string{
-		"empty":         `{"regions": []}`,
 		"missing":       `{}`,
+		"null":          `{"regions": null}`,
+		"not a list":    `{"regions": "us-east-1"}`,
 		"unknown field": `{"regions": ["us-east-1"], "display_name": "x"}`,
 		"not json":      `{"regions": `,
+		"two objects":   `{"regions": ["us-east-1"]} {"regions": ["eu-central-1"]}`,
+		"over the cap":  `{"regions": [` + strings.Join(tooMany, ",") + `]}`,
 	} {
 		code, body := api.do(http.MethodPatch, "/aws/connectors/"+a.conn.String(), json.RawMessage(raw))
 		if code != http.StatusBadRequest || errCode(body) != "invalid_parameter" {
 			t.Fatalf("%s body = %d %v, want 400 invalid_parameter", name, code, body)
 		}
 	}
+	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"us-east-1"}) {
+		t.Fatalf("a refused PATCH wrote regions %v", got)
+	}
 
-	// A valid change: normalized, stored, returned.
-	code, body = api.patchRegions(a.conn, " EU-CENTRAL-1", "us-east-1", "eu-central-1")
+	// A valid change: normalized, de-duplicated, stored SORTED (D-90), and
+	// returned.
+	code, body = api.patchRegions(a.conn, "us-east-1", " EU-CENTRAL-1", "eu-central-1")
 	mustStatus(t, "valid PATCH", code, body, http.StatusOK)
 	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
 		t.Fatalf("stored regions = %v, want [eu-central-1 us-east-1]", got)
 	}
 	if got := s2Strings(dig(body, "meta", "previous_regions")); !reflect.DeepEqual(got, []string{"us-east-1"}) {
 		t.Fatalf("previous_regions = %v", got)
+	}
+	if got := s2Strings(dig(body, "meta", "regions")); !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
+		t.Fatalf("meta.regions = %v", got)
+	}
+	if dig(body, "success") != true || digs(body, "data", "id") != a.conn.String() || dig(body, "data", "auth_ref") != nil {
+		t.Fatalf("PATCH response = %v, want the connector (and never its secrets address)", body)
+	}
+	// Another workspace's connector is absent, not forbidden, and untouched.
+	other := newWorkspace(t, l.db, "p2-s2-regions-patch-foreign")
+	if code, body := api.asWorkspace(other).patchRegions(a.conn, "us-east-1"); code != http.StatusNotFound || errCode(body) != "not_found" {
+		t.Fatalf("PATCH of another workspace's connector = %d %v, want 404 not_found", code, body)
+	}
+	api.asWorkspace(l.ws)
+	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
+		t.Fatalf("a foreign PATCH changed the regions to %v", got)
 	}
 
 	// A revoked connection cannot be reconfigured.
@@ -135,43 +182,85 @@ func TestP2S2RegionPatchNamesTheOffenders(t *testing.T) {
 	}
 }
 
-// A DENIED ec2:DescribeRegions is a clear 502 naming the call and the code --
-// not the onboarding mapping's 400 "the role could not be assumed; check the
-// trust policy and the ExternalId", which sends the customer the wrong way.
-// PATCH, which cannot validate, refuses and writes nothing.
+// A DENIED ec2:DescribeRegions (D-90) is stated, not mis-mapped: GET still
+// answers 200 with the SELECTED regions, enabled: null (not known), and
+// meta.error naming the call and the code AWS returned -- never the onboarding
+// mapping's 400 "the role could not be assumed; check the trust policy and the
+// ExternalId", which sends the customer the wrong way. PATCH, which cannot
+// validate, is 422 regions_unavailable and writes nothing.
 func TestP2S2DeniedDescribeRegionsIsAClearError(t *testing.T) {
 	l := newP2Lab(t, "p2-s2-regions-denied", true)
-	a := l.account(accountA, "us-east-1")
+	a := l.account(accountA, "us-east-1", "eu-central-1")
 	fake := s2Regions()
 	fake.err = &smithy.OperationError{ServiceID: "EC2", OperationName: "DescribeRegions",
 		Err: &smithy.GenericAPIError{Code: "UnauthorizedOperation", Message: "You are not authorized to perform this operation."}}
 	a.svc.WithRegionsAPI(fake)
 	api := s2DiscoveryAPI(t, l, a.svc)
+	// The stack this account runs predates the one granting DescribeRegions
+	// explicitly: stated as a fact beside the failure, never as its cause.
+	l.db.Exec(`UPDATE cloud_connector SET attrs = jsonb_set(attrs, '{template_version}', '"2026-09-18"') WHERE id = ?`, a.conn)
 
-	for _, call := range []struct {
-		name string
-		do   func() (int, map[string]any)
-	}{
-		{"GET regions", func() (int, map[string]any) {
-			return api.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
-		}},
-		{"PATCH", func() (int, map[string]any) { return api.patchRegions(a.conn, "us-east-1", "eu-central-1") }},
-	} {
-		code, body := call.do()
-		mustStatus(t, call.name+" with DescribeRegions denied", code, body, http.StatusBadGateway)
-		if errCode(body) != "aws_access_denied" {
-			t.Fatalf("%s: code = %q, want aws_access_denied: %v", call.name, errCode(body), body)
-		}
-		if digs(body, "error", "api") != "ec2:DescribeRegions" || digs(body, "error", "error_code") != "UnauthorizedOperation" {
-			t.Fatalf("%s: the failed call is not named: %v", call.name, body)
-		}
-		if msg := digs(body, "error", "message"); strings.Contains(msg, "could not be assumed") ||
-			strings.Contains(strings.ToLower(msg), "externalid") {
-			t.Fatalf("%s: a denied DescribeRegions reads as an assume failure: %q", call.name, msg)
+	code, body := api.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
+	mustStatus(t, "GET regions with DescribeRegions denied", code, body, http.StatusOK)
+	if got := s2RegionRows(body); !reflect.DeepEqual(got, []string{
+		"eu-central-1|null|unknown|selected", "us-east-1|null|unknown|selected",
+	}) {
+		t.Fatalf("regions when AWS refused = %v, want the selection with enabled: null", got)
+	}
+	failure := dig(body, "meta", "error")
+	if digs(failure, "code") != "aws_access_denied" || digs(failure, "api") != "ec2:DescribeRegions" ||
+		digs(failure, "error_code") != "UnauthorizedOperation" || digs(failure, "fault") != "customer_account" {
+		t.Fatalf("meta.error = %v, want the failed call and AWS's code", failure)
+	}
+	if msg := digs(failure, "message"); strings.Contains(msg, "could not be assumed") ||
+		strings.Contains(strings.ToLower(msg), "externalid") || !strings.Contains(msg, "not authorized to perform") {
+		t.Fatalf("a denied DescribeRegions reads as an assume failure, or lost AWS's words: %q", msg)
+	}
+	if dig(body, "meta", "template_outdated") != true || digs(body, "meta", "template", "deployed") != "2026-09-18" ||
+		digs(body, "meta", "template", "current") != awsdiscovery.TemplateVersion {
+		t.Fatalf("template facts = %v / %v", dig(body, "meta", "template"), dig(body, "meta", "template_outdated"))
+	}
+	// Never a guessed permission: nothing names what to grant.
+	for k := range failure.(map[string]any) {
+		if strings.Contains(k, "permission") || strings.Contains(k, "missing") || strings.Contains(k, "grant") {
+			t.Fatalf("meta.error carries %q: a guessed permission", k)
 		}
 	}
-	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"us-east-1"}) {
+
+	code, body = api.patchRegions(a.conn, "us-east-1")
+	mustStatus(t, "PATCH with DescribeRegions denied", code, body, http.StatusUnprocessableEntity)
+	if errCode(body) != "regions_unavailable" || digs(body, "error", "api") != "ec2:DescribeRegions" ||
+		digs(body, "error", "error_code") != "UnauthorizedOperation" || digs(body, "error", "failure") != "aws_access_denied" {
+		t.Fatalf("PATCH when the enabled list cannot be read = %v, want 422 regions_unavailable naming the call", body)
+	}
+	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"us-east-1", "eu-central-1"}) {
 		t.Fatalf("a PATCH that could not validate wrote %v", got)
+	}
+
+	// Throttled: the same shape, on AWS's side.
+	fake.err = &smithy.OperationError{ServiceID: "EC2", OperationName: "DescribeRegions",
+		Err: &smithy.GenericAPIError{Code: "RequestLimitExceeded", Message: "Request limit exceeded."}}
+	code, body = api.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
+	mustStatus(t, "GET regions throttled", code, body, http.StatusOK)
+	if digs(body, "meta", "error", "code") != "aws_throttled" || digs(body, "meta", "error", "fault") != "aws" ||
+		digs(body, "meta", "error", "error_code") != "RequestLimitExceeded" {
+		t.Fatalf("throttled meta.error = %v", dig(body, "meta", "error"))
+	}
+	if code, body := api.patchRegions(a.conn, "us-east-1"); code != http.StatusUnprocessableEntity || errCode(body) != "regions_unavailable" {
+		t.Fatalf("PATCH throttled = %d %v, want 422 regions_unavailable", code, body)
+	}
+
+	// An AuthSec-side failure never reaches AWS and is ours: 500 -- never the
+	// 200-with-error (which would blame the customer's account) nor a 4xx.
+	// This verifier cannot build a session, so the service fails before any
+	// AWS call.
+	plain := s2DiscoveryAPI(t, l, services.NewAWSOnboardingService(l.db, newMemVault()).WithVerifier(&stubVerifier{}))
+	code, body = plain.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil)
+	if code != http.StatusInternalServerError || errCode(body) != "internal" || digs(body, "error", "fault") != "authsec" {
+		t.Fatalf("GET regions with no AWS session possible = %d %v, want 500 internal", code, body)
+	}
+	if code, body := plain.patchRegions(a.conn, "us-east-1"); code != http.StatusInternalServerError {
+		t.Fatalf("PATCH with no AWS session possible = %d %v, want 500", code, body)
 	}
 }
 
@@ -218,7 +307,7 @@ func TestP2S2RegionChangeAppliesFromTheNextScan(t *testing.T) {
 	if n := l.count(`SELECT count(*) FROM cloud_workload WHERE workspace_id = ? AND region = 'eu-central-1'`, l.ws); n != 0 {
 		t.Fatalf("the in-flight run wrote %d eu-central-1 workloads", n)
 	}
-	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"us-east-1", "eu-central-1"}) {
+	if got := s2ConnectorRegions(t, l, a.conn); !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
 		t.Fatalf("the PATCH itself did not persist: %v", got)
 	}
 	l.project("s2-projector-inflight")
@@ -266,7 +355,7 @@ func TestP2S2VerifyDoesNotUndoARegionChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if got := verified.AWSAttrs().Regions; !reflect.DeepEqual(got, []string{"us-east-1", "eu-central-1"}) {
+	if got := verified.AWSAttrs().Regions; !reflect.DeepEqual(got, []string{"eu-central-1", "us-east-1"}) {
 		t.Fatalf("regions after a verify that raced a PATCH = %v: the verify wrote back what it read before the probe", got)
 	}
 	if verified.AWSAttrs().CallerARN != v.identity.ARN {
@@ -334,8 +423,11 @@ func s2RegionRows(body map[string]any) []string {
 			opt = "null"
 		}
 		en, sel := "disabled", "-"
-		if dig(r, "enabled") == true {
+		switch dig(r, "enabled") {
+		case true:
 			en = "enabled"
+		case nil:
+			en = "unknown"
 		}
 		if dig(r, "selected") == true {
 			sel = "selected"

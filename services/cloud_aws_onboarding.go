@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -475,21 +476,41 @@ var ErrAWSConnectorRevoked = errors.New("this connection was revoked; re-onboard
 
 // InvalidRegionsError names the regions a selection cannot contain (§5.3:
 // "422 invalid_region names the offender"): malformed codes, or regions not
-// enabled in the account.
+// enabled in the account. An EMPTY selection is one too, with no region to
+// name (D-90): it is not a region list the account could be scanned under.
 type InvalidRegionsError struct {
 	Regions []string
 	Reason  string
 }
 
 func (e *InvalidRegionsError) Error() string {
+	if len(e.Regions) == 0 {
+		return e.Reason
+	}
 	return fmt.Sprintf("%s: %s", e.Reason, strings.Join(e.Regions, ", "))
 }
 
-// RegionSelectionError is a selection that is not a list of regions at all:
-// empty, or longer than the cap. 400, not 422 -- no region is at fault.
+// RegionSelectionError is a selection longer than the cap: 400 on the
+// parameter, not 422 -- no region in it is at fault.
 type RegionSelectionError struct{ Msg string }
 
 func (e *RegionSelectionError) Error() string { return e.Msg }
+
+// RegionsUnavailableError means the account's ENABLED regions could not be
+// read from AWS: ec2:DescribeRegions was refused or throttled, the role could
+// not be assumed underneath it, or AWS did not answer in time. Err keeps the
+// SDK error chain, so awsdiscovery.FailedCall still names the call and the
+// code AWS returned.
+//
+// It is distinct from every AuthSec-side failure (no secrets store, no base
+// credentials, a connector with no role recorded), which never reach AWS and
+// are 500s: GET .../regions answers THIS one with the selection it holds and
+// the failure stated (200), and PATCH refuses with 422 regions_unavailable,
+// because a selection is never accepted unvalidated (D-90).
+type RegionsUnavailableError struct{ Err error }
+
+func (e *RegionsUnavailableError) Error() string { return e.Err.Error() }
+func (e *RegionsUnavailableError) Unwrap() error { return e.Err }
 
 // EnabledRegions lists the regions enabled in the connector's account
 // (ec2:DescribeRegions through the discovery role; §5.3 GET .../regions), with
@@ -522,12 +543,16 @@ func (s *AWSOnboardingService) EnabledRegions(
 	}
 	regions, err := awsdiscovery.EnabledRegions(probeCtx, api)
 	if err != nil {
-		// Our own probe budget firing (not the client going away) is a
-		// timeout to report as one, never as a denial or bad input.
-		if probeCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-			return nil, c, fmt.Errorf("%w: %w", ErrAWSProbeTimeout, err)
+		if ctx.Err() != nil {
+			// The CLIENT went away: nothing to report to AWS's account of it.
+			return nil, c, err
 		}
-		return nil, c, err
+		// Our own probe budget firing is a timeout to report as one, never as
+		// a denial or bad input.
+		if probeCtx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("%w: %w", ErrAWSProbeTimeout, err)
+		}
+		return nil, c, &RegionsUnavailableError{Err: err}
 	}
 	return regions, c, nil
 }
@@ -539,8 +564,9 @@ func (s *AWSOnboardingService) EnabledRegions(
 // Validated in two steps, cheapest first: the codes' shape (no AWS call), then
 // membership of the account's ENABLED regions, read live. Every offender is
 // named. Nothing is written unless the whole selection is valid, and an
-// enabled list that cannot be read refuses the change -- a selection is never
-// accepted unvalidated.
+// enabled list that cannot be read refuses the change (RegionsUnavailableError)
+// -- a selection is never accepted unvalidated (D-90). Stored de-duplicated
+// and sorted.
 //
 // Applies from the NEXT scan: a run in flight reads its pinned row (ForRun).
 func (s *AWSOnboardingService) UpdateRegions(
@@ -710,40 +736,6 @@ func scanSessionName(connectorID uuid.UUID) string {
 // EC2, Bedrock, AgentCore, EKS — would silently find nothing, and "we scanned
 // and found no agents" is the most damaging wrong answer this connector can
 // give. Making the operator choose keeps the cost decision visible.
-// normalizeRegionSelection is normalizeRegions for a region CHANGE, where the
-// caller must be told every malformed code at once (422 invalid_region names
-// the offenders), not just the first.
-func normalizeRegionSelection(in []string) ([]string, error) {
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	var malformed []string
-	for _, r := range in {
-		r = strings.ToLower(strings.TrimSpace(r))
-		if r == "" {
-			continue
-		}
-		if _, dup := seen[r]; dup {
-			continue
-		}
-		seen[r] = struct{}{}
-		if err := awsdiscovery.ValidateRegion(r); err != nil {
-			malformed = append(malformed, r)
-			continue
-		}
-		out = append(out, r)
-	}
-	if len(malformed) > 0 {
-		return nil, &InvalidRegionsError{Regions: malformed, Reason: "not AWS region codes"}
-	}
-	if len(out) == 0 {
-		return nil, &RegionSelectionError{Msg: "select at least one AWS region to scan"}
-	}
-	if len(out) > maxRegionsPerConnector {
-		return nil, &RegionSelectionError{Msg: fmt.Sprintf("at most %d regions may be selected", maxRegionsPerConnector)}
-	}
-	return out, nil
-}
-
 func normalizeRegions(in []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))
@@ -767,5 +759,45 @@ func normalizeRegions(in []string) ([]string, error) {
 	if len(out) > maxRegionsPerConnector {
 		return nil, fmt.Errorf("at most %d regions may be selected", maxRegionsPerConnector)
 	}
+	return out, nil
+}
+
+// normalizeRegionSelection is normalizeRegions for a region CHANGE (PATCH
+// .../connectors/:id, D-90), where the caller must be told every malformed
+// code at once (422 invalid_region names the offenders), not just the first.
+// Duplicates are removed and the result is SORTED: a selection is a set, and
+// storing it in one canonical order keeps the audit's before/after comparable.
+// An empty selection is 422 invalid_region too -- no scan scope at all -- and
+// only a selection over the cap is a 400.
+func normalizeRegionSelection(in []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	var malformed []string
+	for _, r := range in {
+		r = strings.ToLower(strings.TrimSpace(r))
+		if r == "" {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		if err := awsdiscovery.ValidateRegion(r); err != nil {
+			malformed = append(malformed, r)
+			continue
+		}
+		out = append(out, r)
+	}
+	if len(malformed) > 0 {
+		sort.Strings(malformed)
+		return nil, &InvalidRegionsError{Regions: malformed, Reason: "not AWS region codes"}
+	}
+	if len(out) == 0 {
+		return nil, &InvalidRegionsError{Regions: []string{}, Reason: "select at least one AWS region to scan"}
+	}
+	if len(out) > maxRegionsPerConnector {
+		return nil, &RegionSelectionError{Msg: fmt.Sprintf("at most %d regions may be selected", maxRegionsPerConnector)}
+	}
+	sort.Strings(out)
 	return out, nil
 }

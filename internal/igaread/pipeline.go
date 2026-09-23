@@ -1,6 +1,8 @@
 package igaread
 
 import (
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,20 +11,24 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
-// GET /api/iga/v1/pipeline (SPEC-iga-phase2-graph.md §5.3, §2.14.7): the
-// workspace's collection and projection state, per AWS account.
+// GET /api/iga/v1/pipeline (SPEC-iga-phase2-graph.md §5.3, §2.14.7; D-55,
+// D-56, D-59, D-89, D-92): the workspace's collection and projection state,
+// per AWS account.
 //
-// It reads, inside the request's §5.1 snapshot, the barrier (iga_pipeline_lease),
-// each connector's latest run (cloud_scan_run, D-25), that run's projection job
-// and publication, and the revision that last published each connector. One
+// It reads, inside the request's §5.1 snapshot, the barrier
+// (iga_pipeline_lease), each connector's latest run (cloud_scan_run, D-25),
+// that run's projection job and publication, and the current revision. One
 // snapshot matters here as much as on any graph read: a run that publishes
-// while the request is in flight must not appear as published beside a barrier
-// still collecting it.
+// while the request is in flight must not appear as published beside a
+// barrier still collecting it. It reports LIVE state (D-82): it is not pinned
+// to a revision, and a queued scan is visible the moment it is queued (§2.15).
 
 // Per-account states, §2.14.7 "Pipeline and first-run states". Additive to the
 // §5.3 shape: the console renders the state it is TOLD rather than deriving it
 // from run and job statuses -- the derivation (D-59's retrying job in
-// particular) is the server's to own.
+// particular) is the server's to own. PipelineRevoked is D-89's: the
+// connection was revoked, nothing will scan it again, and its earlier results
+// stay in the graph with connected: false.
 const (
 	PipelineNeverScanned     = "never_scanned"
 	PipelineQueued           = "queued"
@@ -31,6 +37,7 @@ const (
 	PipelinePublished        = "published"
 	PipelineFailed           = "failed"
 	PipelineFirstPublication = "first_publication_pending"
+	PipelineRevoked          = "revoked"
 )
 
 // PipelineView is the /pipeline data object.
@@ -45,7 +52,8 @@ type PipelineView struct {
 // label and started_at are additive: "Queued behind the scan of sandbox, which
 // started 4 min ago" (§2.14.7) needs the holder's account and start, and the
 // run the barrier holds may be no account's latest_run (a connector can have a
-// new queued run while its previous, published run is still projecting).
+// new queued run while its previous, published run is still projecting). All
+// null when the barrier is idle.
 type PipelineBarrier struct {
 	State       string `json:"state"`
 	ScanRun     any    `json:"scan_run"`
@@ -61,8 +69,9 @@ type PipelineAccount struct {
 	Integration string `json:"integration"`
 	AccountID   string `json:"account_id"`
 	Label       string `json:"label"`
-	// ConnectorStatus is active | error (additive): a connector whose last
-	// verification failed still scans, and still has a line here.
+	// ConnectorStatus is active | error | revoked (additive, D-89, D-92): a
+	// connector whose last verification failed still scans; a revoked one
+	// never will.
 	ConnectorStatus  string         `json:"connector_status"`
 	State            string         `json:"state"`
 	LatestRun        map[string]any `json:"latest_run"`
@@ -90,20 +99,21 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 		view.CurrentPublishedAt = T(q.Rev.PublishedAt)
 	}
 
-	// "No integration: no active AWS connector" (§2.14.7) -- no accounts and no
-	// zeros. A revoked connector is not an integration any more; its earlier
-	// results stay in the graph (connected: false), but nothing will scan it.
+	// EVERY AWS connector, with its status (D-92) -- a revoked one included
+	// and said to be revoked (D-89), never silently dropped: its results are
+	// still in the graph. "No integration" (§2.14.7) is no connector that is
+	// not revoked, which the console reads from these lines.
 	var connectors []models.CloudConnector
-	if err := tx.Where("workspace_id = ? AND provider = ? AND status <> ?",
-		q.WS, models.CloudProviderAWS, models.CloudConnectorRevoked).
-		Order("created_at, id").Find(&connectors).Error; err != nil {
+	if err := tx.Where("workspace_id = ? AND provider = ?", q.WS, models.CloudProviderAWS).
+		Find(&connectors).Error; err != nil {
 		return nil, err
 	}
 
-	// Each connector's LATEST run. requested_at DESC is creation order per
-	// connector: at most one run of a connector is live (uq_cloud_scan_run_live),
-	// a new one can be enqueued only once the previous is terminal, and a refused
-	// claim only ever moves the live run's requested_at forward.
+	// Each connector's latest run (D-92): its newest NON-TERMINAL run when it
+	// has one -- uq_cloud_scan_run_live allows at most one -- else its newest
+	// terminal run. Ranked explicitly rather than trusting requested_at alone:
+	// a refused claim moves a live run's requested_at (T1.3), and the ranking
+	// must not depend on which way it moved.
 	var latest []pipelineRun
 	if err := tx.Raw(`
 		SELECT DISTINCT ON (r.connector_id) r.*,
@@ -113,7 +123,8 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 		  LEFT JOIN iga_projection_job j ON j.workspace_id = r.workspace_id AND j.scan_run_id = r.id
 		  LEFT JOIN iga_publication p ON p.workspace_id = r.workspace_id AND p.scan_run_id = r.id
 		 WHERE r.workspace_id = ?
-		 ORDER BY r.connector_id, r.requested_at DESC, r.id DESC`, q.WS).Scan(&latest).Error; err != nil {
+		 ORDER BY r.connector_id, (r.status IN (?, ?)) DESC, r.requested_at DESC, r.id DESC`,
+		q.WS, models.CloudScanRunQueued, models.CloudScanRunRunning).Scan(&latest).Error; err != nil {
 		return nil, err
 	}
 	latestBy := make(map[uuid.UUID]*pipelineRun, len(latest))
@@ -121,23 +132,20 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 		latestBy[latest[i].ConnectorID] = &latest[i]
 	}
 
-	// D-56: last_published_rev is the revision that published this connector's
-	// latest projected run.
-	var pubs []struct {
-		ConnectorID uuid.UUID
-		Rev         int64
-	}
+	// Which connectors have ever been published into the graph: a
+	// publication of one of their runs exists (at most one row per
+	// connector here).
+	var published []struct{ ConnectorID uuid.UUID }
 	if err := tx.Raw(`
-		SELECT DISTINCT ON (r.connector_id) r.connector_id, p.rev
+		SELECT DISTINCT r.connector_id
 		  FROM iga_publication p
 		  JOIN cloud_scan_run r ON r.workspace_id = p.workspace_id AND r.id = p.scan_run_id
-		 WHERE p.workspace_id = ?
-		 ORDER BY r.connector_id, p.rev DESC`, q.WS).Scan(&pubs).Error; err != nil {
+		 WHERE p.workspace_id = ?`, q.WS).Scan(&published).Error; err != nil {
 		return nil, err
 	}
-	lastRev := make(map[uuid.UUID]int64, len(pubs))
-	for _, p := range pubs {
-		lastRev[p.ConnectorID] = p.Rev
+	everPublished := make(map[uuid.UUID]bool, len(published))
+	for _, p := range published {
+		everPublished[p.ConnectorID] = true
 	}
 
 	barrier, holderRun, err := q.pipelineBarrier()
@@ -148,40 +156,58 @@ func (q *Query) Pipeline() (*PipelineView, error) {
 
 	for i := range connectors {
 		c := &connectors[i]
-		attrs := c.AWSAttrs()
-		label := attrs.DisplayName
-		if label == "" {
-			label = c.ScopeID
-		}
 		acct := PipelineAccount{
 			Integration:     R(RefConnector, c.ID),
 			AccountID:       c.ScopeID,
-			Label:           label,
+			Label:           connectorLabel(c.Attrs, c.ScopeID),
 			ConnectorStatus: c.Status,
 		}
-		if rev, ok := lastRev[c.ID]; ok {
-			r := rev
-			acct.LastPublishedRev = &r
+		// D-56: last_published_rev is the revision the graph is at -- the
+		// current rev -- for every connector the graph holds a publication of;
+		// null before its first ("First publication pending"). The rev that
+		// published the connector's own run is on the run, projection.rev.
+		if everPublished[c.ID] && view.CurrentRev != nil {
+			rev := *view.CurrentRev
+			acct.LastPublishedRev = &rev
 		}
 		run := latestBy[c.ID]
-		acct.State = accountState(run, acct.LastPublishedRev != nil)
+		acct.State = accountState(c.Status, run, everPublished[c.ID])
 		if run != nil {
 			acct.LatestRun = latestRunView(run, barrier.State, holderRun)
 			acct.Projection = projectionView(run)
 		}
 		view.Accounts = append(view.Accounts, acct)
 	}
+	// Ordered by label then id (D-92): stable across requests, and the order
+	// the operator named the accounts in.
+	sort.SliceStable(view.Accounts, func(i, j int) bool {
+		a, b := view.Accounts[i], view.Accounts[j]
+		if la, lb := strings.ToLower(a.Label), strings.ToLower(b.Label); la != lb {
+			return la < lb
+		}
+		return a.Integration < b.Integration
+	})
 	return view, nil
+}
+
+// connectorLabel is the operator's display name, falling back to the account
+// id (D-3) -- display only.
+func connectorLabel(attrs []byte, accountID string) string {
+	label := (&models.CloudConnector{Attrs: attrs}).AWSAttrs().DisplayName
+	if label == "" {
+		return accountID
+	}
+	return label
 }
 
 // pipelineBarrier reads the workspace barrier and the run it holds.
 //
-// since: collecting -> the held run's started_at (a refused claim clears it,
-// D-55, so it is when collection began); projecting -> its published_at, the
-// moment the barrier was handed to the projection job in the publish
-// transaction; idle -> updated_at, which only a transition to idle writes (the
-// heartbeat that bumps it runs only while the barrier is held). A workspace
-// that never scanned in pipeline mode has no row: idle, since null.
+// since is NEVER the lease's updated_at (D-92): the heartbeat bumps that on
+// every renewal. Collecting -> the held run's started_at (a refused claim
+// clears it, D-55, so it is when collection began); projecting -> its
+// published_at, the moment the barrier was handed to the projection job in
+// the publish transaction; idle -> null. A workspace that never scanned in
+// pipeline mode has no row: idle.
 func (q *Query) pipelineBarrier() (PipelineBarrier, *uuid.UUID, error) {
 	b := PipelineBarrier{State: models.PipelineIdle}
 	var leases []models.IGAPipelineLease
@@ -195,7 +221,6 @@ func (q *Query) pipelineBarrier() (PipelineBarrier, *uuid.UUID, error) {
 	lease := leases[0]
 	b.State = lease.State
 	if lease.State == models.PipelineIdle || lease.ScanRunID == nil {
-		b.Since = T(lease.UpdatedAt)
 		return b, nil, nil
 	}
 	runID := *lease.ScanRunID
@@ -217,14 +242,9 @@ func (q *Query) pipelineBarrier() (PipelineBarrier, *uuid.UUID, error) {
 	}
 	if len(held) == 1 {
 		h := held[0]
-		conn := models.CloudConnector{Attrs: h.Attrs}
-		label := conn.AWSAttrs().DisplayName
-		if label == "" {
-			label = h.ScopeID
-		}
 		b.Integration = R(RefConnector, h.ConnectorID)
 		b.AccountID = h.ScopeID
-		b.Label = label
+		b.Label = connectorLabel(h.Attrs, h.ScopeID)
 		b.StartedAt = TS(h.StartedAt)
 		switch lease.State {
 		case models.PipelineCollecting:
@@ -236,10 +256,13 @@ func (q *Query) pipelineBarrier() (PipelineBarrier, *uuid.UUID, error) {
 	return b, &runID, nil
 }
 
-// accountState derives §2.14.7's per-account state from the connector's latest
-// run and its projection job -- the table's conditions, in its order of
-// precedence for one account.
-func accountState(run *pipelineRun, everPublished bool) string {
+// accountState derives §2.14.7's per-account state from the connector's
+// status, its latest run and that run's projection job -- the table's
+// conditions, in its order of precedence for one account.
+func accountState(connectorStatus string, run *pipelineRun, everPublished bool) string {
+	if connectorStatus == models.CloudConnectorRevoked {
+		return PipelineRevoked // D-89
+	}
 	if run == nil {
 		return PipelineNeverScanned // Connected, never scanned
 	}
@@ -276,6 +299,7 @@ func accountState(run *pipelineRun, everPublished bool) string {
 			return PipelinePublished
 		}
 	}
+	// A status this build does not know: never claim it is fine.
 	return PipelineFailed
 }
 
@@ -286,16 +310,17 @@ func jobRetrying(run *pipelineRun) bool {
 
 // latestRunView renders latest_run with the fields §5.3 shows for its status:
 // queued -> queued_at and waiting_on; running -> started_at; finished runs ->
-// their start and end, and the error of a failed one.
+// their start and end, and the error of a failed or abandoned one (D-92).
 //
-// queued_at is requested_at: when the run last (re)entered the queue. D-55:
-// no column keeps the original enqueue time, and a refused claim moves
+// queued_at is requested_at: when the run LAST (re)entered the queue (D-55).
+// No column keeps the original enqueue time, and a refused claim moves
 // requested_at (T1.3).
 //
-// waiting_on names the run the barrier holds when it is not this one: the
-// workspace barrier serializes collection and projection (§2.10A), so a queued
-// run behind a busy barrier is waiting on exactly that run -- another
-// account's scan, or this account's own previous run still projecting.
+// waiting_on names the run the barrier holds whenever another run holds it
+// (D-92): the workspace barrier serializes collection and projection
+// (§2.10A), so a queued run behind a busy barrier is waiting on exactly that
+// run -- another account's scan, or this account's own previous run still
+// projecting.
 func latestRunView(run *pipelineRun, barrierState string, holder *uuid.UUID) map[string]any {
 	v := map[string]any{"ref": R(RefScanRun, run.ID), "status": run.Status}
 	switch run.Status {
@@ -313,10 +338,14 @@ func latestRunView(run *pipelineRun, barrierState string, holder *uuid.UUID) map
 		v["published_at"] = TS(run.PublishedAt)
 	case models.CloudScanRunFailed, models.CloudScanRunAbandoned:
 		v["started_at"] = TS(run.StartedAt)
-		// A terminal failed or abandoned run is never updated again, so its
-		// updated_at is when it finished (020 has no finished_at).
+		// "Last updated" (D-91): 020 has no finished_at, and the scan path
+		// does not touch a terminal run again.
 		v["finished_at"] = T(run.UpdatedAt)
-		v["last_error"] = run.LastError
+		var e any
+		if run.LastError != "" {
+			e = run.LastError
+		}
+		v["error"] = e
 	}
 	return v
 }

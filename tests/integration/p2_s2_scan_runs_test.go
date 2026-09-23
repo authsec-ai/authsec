@@ -91,8 +91,35 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 	if digs(pub, "projection", "status") != models.ProjectionComplete || num(pub, "projection", "rev") != 1 {
 		t.Fatalf("published run projection = %v, want complete at rev 1", dig(pub, "projection"))
 	}
-	if digs(pub, "coverage", "status") == "" || dig(pub, "coverage", "incomplete") == nil {
-		t.Fatalf("published run coverage summary = %v", dig(pub, "coverage"))
+	// Coverage summary (D-91): counts per state, and every surface NOT
+	// reached with its state -- exactly the run's own coverage, summarized.
+	stored := s2Coverage(published)
+	if digs(pub, "coverage", "status") != stored.Status {
+		t.Fatalf("published run coverage status = %v, want %q", dig(pub, "coverage"), stored.Status)
+	}
+	wantCounts := map[string]int64{}
+	var wantNotReached []string
+	for name, s := range stored.Surfaces {
+		wantCounts[s.State]++
+		if s.State != models.CloudCoverageReached {
+			wantNotReached = append(wantNotReached, name+"="+s.State)
+		}
+	}
+	sort.Strings(wantNotReached)
+	for state, n := range wantCounts {
+		if num(pub, "coverage", "counts", state) != n {
+			t.Fatalf("coverage counts[%s] = %d, want %d: %v", state, num(pub, "coverage", "counts", state), n, dig(pub, "coverage"))
+		}
+	}
+	var gotNotReached []string
+	for _, s := range digl(pub, "coverage", "not_reached") {
+		gotNotReached = append(gotNotReached, digs(s, "surface")+"="+digs(s, "state"))
+	}
+	if len(wantNotReached) == 0 || !reflect.DeepEqual(gotNotReached, wantNotReached) {
+		t.Fatalf("coverage not_reached = %v, want %v", gotNotReached, wantNotReached)
+	}
+	if dig(body, "success") != true || num(body, "meta", "limit") != 20 {
+		t.Fatalf("history envelope = success %v, limit %v; want the discovery envelope, 20 per page by default", dig(body, "success"), dig(body, "meta", "limit"))
 	}
 	if digs(pub, "finished_at") == "" || digs(pub, "finished_at") != digs(pub, "published_at") {
 		t.Fatalf("published run finished_at = %q, published_at = %q", digs(pub, "finished_at"), digs(pub, "published_at"))
@@ -137,8 +164,15 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 	if code != http.StatusBadRequest || errCode(body) != "cursor_invalid" {
 		t.Fatalf("tampered cursor = %d %v, want 400 cursor_invalid", code, body)
 	}
-	if code, body := api.do(http.MethodGet, path+qs("limit", "0"), nil); code != http.StatusBadRequest || errCode(body) != "invalid_parameter" {
-		t.Fatalf("limit=0 = %d %v", code, body)
+	// limit is 1-100 (D-91); any parameter but cursor and limit is refused,
+	// naming it, rather than ignored.
+	for _, q := range []string{qs("limit", "0"), qs("limit", "101"), qs("limit", "x"), qs("status", "failed")} {
+		if code, body := api.do(http.MethodGet, path+q, nil); code != http.StatusBadRequest || errCode(body) != "invalid_parameter" {
+			t.Fatalf("history%s = %d %v, want 400 invalid_parameter", q, code, body)
+		}
+	}
+	if code, body := api.do(http.MethodGet, path+qs("limit", "100"), nil); code != http.StatusOK || len(digl(body, "data")) != 3 {
+		t.Fatalf("limit=100 = %d %v", code, body)
 	}
 	other := newWorkspace(t, l.db, "p2-s2-history-foreign")
 	if code, body := api.asWorkspace(other).do(http.MethodGet, path, nil); code != http.StatusNotFound || errCode(body) != "not_found" {

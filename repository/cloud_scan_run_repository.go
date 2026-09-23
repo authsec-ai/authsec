@@ -108,13 +108,23 @@ type CloudScanRunRepository interface {
 	Latest(workspaceID, connectorID uuid.UUID) (*models.CloudScanRun, error)
 
 	// History lists one connector's runs, newest first, keyset-paged on
-	// (requested_at, id) -- every run however it ended, each with what became
-	// of its projection (GET .../connectors/:id/scan-runs, §5.3).
+	// (requested_at DESC, id DESC) -- every run however it ended, each with
+	// what became of its projection (GET .../connectors/:id/scan-runs, §5.3,
+	// D-91). limit is the page size the caller wants; it asks for one more to
+	// learn whether another page exists.
+	//
+	// requested_at is the run's last (re)queue time (D-55): a refused claim
+	// moves a LIVE run's forward. Only the connector's one live run can move,
+	// and it moves toward the head of the list, so a client paging older runs
+	// never skips a terminal one.
 	History(workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int) ([]ScanRunRecord, error)
 
-	// Projection reports what became of one run's projection: nil when the run
-	// has no projection job (the switch was off, or it never published).
-	Projection(workspaceID, runID uuid.UUID) (*RunProjection, error)
+	// GetWithProjection reads one run of the workspace together with what
+	// became of its projection, in ONE statement -- so a run and its job are
+	// never read either side of the projection's commit (GET .../scan-runs/:id
+	// gains projection: {status, rev}, §5.3). A run of another workspace is
+	// ErrCloudScanRunNotFound, exactly like an absent one.
+	GetWithProjection(workspaceID, runID uuid.UUID) (*ScanRunRecord, error)
 }
 
 // ScanRunPosition is where a history page ended: the last row's sort key.
@@ -516,7 +526,7 @@ func (r *cloudScanRunRepository) History(
 	workspaceID, connectorID uuid.UUID, after *ScanRunPosition, limit int,
 ) ([]ScanRunRecord, error) {
 	if limit <= 0 {
-		limit = 100
+		limit = 20
 	}
 	// ORDER BY (requested_at DESC, id DESC) walks idx_cloud_scan_run_history
 	// (workspace_id, connector_id, requested_at DESC); the id tiebreak makes
@@ -542,7 +552,7 @@ func (r *cloudScanRunRepository) History(
 	return out, nil
 }
 
-func (r *cloudScanRunRepository) Projection(workspaceID, runID uuid.UUID) (*RunProjection, error) {
+func (r *cloudScanRunRepository) GetWithProjection(workspaceID, runID uuid.UUID) (*ScanRunRecord, error) {
 	var rows []scanRunHistoryRow
 	if err := r.db.Raw(historySelect+`
 	 WHERE r.workspace_id = ? AND r.id = ?`, workspaceID, runID).Scan(&rows).Error; err != nil {
@@ -551,7 +561,7 @@ func (r *cloudScanRunRepository) Projection(workspaceID, runID uuid.UUID) (*RunP
 	if len(rows) == 0 {
 		return nil, ErrCloudScanRunNotFound
 	}
-	return rows[0].projection(), nil
+	return &ScanRunRecord{Run: rows[0].CloudScanRun, Projection: rows[0].projection()}, nil
 }
 
 // truncateError keeps a provider's message without letting a pathological one
