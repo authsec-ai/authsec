@@ -392,11 +392,7 @@ type IGAEstateScope struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 	ScopeKind   string    `json:"scope_kind" gorm:"not null"`
-<<<<<<< HEAD
 	// SourceKey is the scope's recognition key (028). For AWS this is the
-=======
-	// SourceKey is the scope's recognition key (027). For AWS this is the
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// connected account; nothing else in the tree writes this table.
 	SourceKey     string     `json:"source_key" gorm:"not null;default:''"`
 	DisplayName   string     `json:"display_name" gorm:"not null;default:''"`
@@ -427,11 +423,7 @@ type IGAAgent struct {
 	// ID and flips this; the projector must never overwrite 'registered'.
 	Origin string `json:"origin" gorm:"not null;default:'discovered'"`
 
-<<<<<<< HEAD
 	// Recognition and continuity (028). source_key is namespaced and built
-=======
-	// Recognition and continuity (027). source_key is namespaced and built
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
 	// makes delete-and-recreate expressible against the partial unique index.
 	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
@@ -463,11 +455,7 @@ type IGAAgentInstance struct {
 	Lifecycle        string     `json:"lifecycle" gorm:"not null;default:'active'"`
 
 	// WorkloadID is the typed link to the runtime that realizes this instance
-<<<<<<< HEAD
 	// (033). Nil where the instance is not compute we hold.
-=======
-	// (032). Nil where the instance is not compute we hold.
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	WorkloadID    *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
 	SourceKey     string     `json:"source_key" gorm:"not null;default:''"`
 	Origin        string     `json:"origin" gorm:"not null;default:'discovered'"`
@@ -491,11 +479,7 @@ type IGAIdentityAccount struct {
 	Lifecycle       string     `json:"lifecycle" gorm:"not null;default:'active'"`
 	RollupState     string     `json:"rollup_state" gorm:"not null;default:'unknown'"`
 
-<<<<<<< HEAD
 	// Recognition and continuity (028). source_key is namespaced and built
-=======
-	// Recognition and continuity (027). source_key is namespaced and built
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
 	// makes delete-and-recreate expressible against the partial unique index.
 	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
@@ -530,11 +514,7 @@ type IGACredential struct {
 	RotationPosture   string     `json:"rotation_posture" gorm:"not null;default:'unknown'"`
 	Lifecycle         string     `json:"lifecycle" gorm:"not null;default:'active'"`
 
-<<<<<<< HEAD
 	// Recognition and continuity (028). source_key is namespaced and built
-=======
-	// Recognition and continuity (027). source_key is namespaced and built
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
 	// makes delete-and-recreate expressible against the partial unique index.
 	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
@@ -563,11 +543,7 @@ type IGAResource struct {
 	Stage         string     `json:"stage" gorm:"not null;default:'unknown'"`
 	Lifecycle     string     `json:"lifecycle" gorm:"not null;default:'active'"`
 
-<<<<<<< HEAD
 	// Recognition and continuity (028). source_key is namespaced and built
-=======
-	// Recognition and continuity (027). source_key is namespaced and built
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
 	// makes delete-and-recreate expressible against the partial unique index.
 	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
@@ -599,20 +575,12 @@ type IGAEntitlement struct {
 	NativeScope      string          `json:"native_scope" gorm:"not null;default:''"`
 	Remediable       bool            `json:"remediable" gorm:"not null;default:false"`
 
-<<<<<<< HEAD
 	// Lifecycle did not exist on this table before 028. Added so entitlements
-=======
-	// Lifecycle did not exist on this table before 027. Added so entitlements
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// retire the same way every other node does, rather than needing a second
 	// retire path of their own.
 	Lifecycle string `json:"lifecycle" gorm:"not null;default:'active'"`
 
-<<<<<<< HEAD
 	// Recognition and continuity (028). source_key is namespaced and built
-=======
-	// Recognition and continuity (027). source_key is namespaced and built
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// only by internal/igagraph.Key; a retired row KEEPS its key, which is what
 	// makes delete-and-recreate expressible against the partial unique index.
 	SourceKey     string `json:"source_key" gorm:"not null;default:''"`
@@ -638,11 +606,7 @@ type IGAAccessEdge struct {
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
-<<<<<<< HEAD
 	// TYPED SUBJECT (030). Exactly one is set, enforced by
-=======
-	// TYPED SUBJECT (029). Exactly one is set, enforced by
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// iga_access_edges_subject_chk2, and each is composite-FK'd to
 	// (workspace_id, id). This replaces subject_kind + subject_id, which had
 	// NO foreign key of any kind -- defect A3.
@@ -655,11 +619,7 @@ type IGAAccessEdge struct {
 	SubjectAgentID           *uuid.UUID `json:"subject_agent_id,omitempty" gorm:"type:uuid"`
 	SubjectAgentInstanceID   *uuid.UUID `json:"subject_agent_instance_id,omitempty" gorm:"type:uuid"`
 
-<<<<<<< HEAD
 	// EntitlementID is NOT NULL since 030: an access edge that grants nothing
-=======
-	// EntitlementID is NOT NULL since 029: an access edge that grants nothing
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// is not a fact about access.
 	EntitlementID uuid.UUID `json:"entitlement_id" gorm:"type:uuid;not null"`
 	// ResourceID is denormalized from the entitlement for the reverse query.
@@ -676,11 +636,7 @@ type IGAAccessEdge struct {
 	EffectiveConclusion string `json:"effective_conclusion" gorm:"not null;default:'unknown'"`
 	NativeScope         string `json:"native_scope" gorm:"not null;default:''"`
 
-<<<<<<< HEAD
 	// Lifecycle (030), identical in meaning to IGARelationship's.
-=======
-	// Lifecycle (029), identical in meaning to IGARelationship's.
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	Basis           string     `json:"basis" gorm:"not null;default:'declared'"`
 	DerivationRule  string     `json:"derivation_rule" gorm:"not null;default:''"`
 	State           string     `json:"state" gorm:"not null;default:'current'"`

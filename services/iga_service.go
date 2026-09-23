@@ -971,11 +971,7 @@ func (m *igaManager) ingestGrant(workspaceID uuid.UUID, integ *models.IGAIntegra
 
 	if err := m.repo.UpsertAccessEdge(&models.IGAAccessEdge{
 		WorkspaceID: workspaceID,
-<<<<<<< HEAD
 		// TYPED SUBJECT (030). subject_kind + subject_id are gone; this column
-=======
-		// TYPED SUBJECT (029). subject_kind + subject_id are gone; this column
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		// is composite-FK'd to (workspace_id, id), so a subject from another
 		// workspace is now rejected by the database rather than stored.
 		SubjectIdentityAccountID: &identity.ID,

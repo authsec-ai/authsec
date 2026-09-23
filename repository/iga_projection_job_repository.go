@@ -51,16 +51,10 @@ type IGAProjectionJobRepository interface {
 	// transaction.
 	AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64) error
 
-<<<<<<< HEAD
 	// CompleteTx and AbandonTx are the transactional terminals, for the
 	// *AndRelease exits that must move the job and the barrier together.
 	CompleteTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64) error
 	AbandonTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64, reason string) error
-=======
-	// AssertProjectingTx proves this worker still holds the workspace pipeline
-	// in 'projecting'.
-	AssertProjectingTx(tx *gorm.DB, ws uuid.UUID, version int64) error
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 	Get(jobID uuid.UUID) (*models.IGAProjectionJob, error)
 }
@@ -72,11 +66,7 @@ func NewIGAProjectionJobRepository(db *gorm.DB) IGAProjectionJobRepository {
 }
 
 func (r *igaProjectionJobRepository) EnqueueTx(tx *gorm.DB, job *models.IGAProjectionJob) error {
-<<<<<<< HEAD
 	// One job per scan run (033's UNIQUE). A retried publish must not enqueue
-=======
-	// One job per scan run (032's UNIQUE). A retried publish must not enqueue
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// a second.
 	return tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "scan_run_id"}},
@@ -212,7 +202,6 @@ func (r *igaProjectionJobRepository) AssertOwnedTx(
 	return nil
 }
 
-<<<<<<< HEAD
 // fencedTx is fenced() against a caller-supplied transaction, so a job
 // terminal can share one transaction with the barrier release.
 func (r *igaProjectionJobRepository) fencedTx(
@@ -226,25 +215,10 @@ func (r *igaProjectionJobRepository) fencedTx(
 	}
 	if res.RowsAffected == 0 {
 		return fmt.Errorf("%w: job=%s owner=%s version=%d", ErrProjectionLeaseLost, jobID, owner, version)
-=======
-func (r *igaProjectionJobRepository) AssertProjectingTx(
-	tx *gorm.DB, ws uuid.UUID, version int64,
-) error {
-	var lease models.IGAPipelineLease
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("workspace_id = ?", ws).First(&lease).Error
-	if err != nil {
-		return err
-	}
-	if lease.State != models.PipelineProjecting || lease.Version != version {
-		return fmt.Errorf("%w: workspace=%s state=%s version=%d (wanted projecting/%d)",
-			ErrPipelineLost, ws, lease.State, lease.Version, version)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	}
 	return nil
 }
 
-<<<<<<< HEAD
 func (r *igaProjectionJobRepository) CompleteTx(
 	tx *gorm.DB, jobID uuid.UUID, owner string, version int64,
 ) error {
@@ -268,8 +242,6 @@ func (r *igaProjectionJobRepository) AbandonTx(
 	})
 }
 
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 func (r *igaProjectionJobRepository) Get(jobID uuid.UUID) (*models.IGAProjectionJob, error) {
 	var job models.IGAProjectionJob
 	if err := r.db.First(&job, "id = ?", jobID).Error; err != nil {

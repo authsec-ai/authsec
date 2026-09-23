@@ -10,3 +10,9 @@ main.exe
 
 # Credentials live only in the untracked local spec.
 .claude/specs/*.local.md
+
+# Windows reserved device name. A literal file called NUL breaks `git add .`
+# ("short read while indexing NUL"); it appears when a Windows-style `> NUL`
+# redirect is run under Git Bash, which creates a real file instead of
+# discarding output.
+NUL

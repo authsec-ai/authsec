@@ -146,11 +146,7 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	// spec states plainly -- a customer with five AWS accounts scans them one
 	// at a time, and nothing narrower is sound because the shared-resource
 	// writer crosses connectors.
-<<<<<<< HEAD
 	version, perr := w.pipeline.AcquireForCollection(
-=======
-	version, perr := w.pipeline.ClaimForCollection(
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		run.WorkspaceID, w.owner, run.ID, projectionPipelineLease, w.nowFunc())
 	if perr != nil {
 		if rerr := w.runs.Requeue(run.ID, w.owner, run.LeaseVersion); rerr != nil {
@@ -161,7 +157,6 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	w.pipelineVersion = version
 
 	if err := w.execute(ctx, run); err != nil {
-<<<<<<< HEAD
 		// TERMINALIZE THE RUN AND RELEASE THE BARRIER TOGETHER (§2.10A).
 		//
 		// The run is `failed`, not `abandoned`: abandon means giving up past
@@ -184,18 +179,6 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 				Version:     w.pipelineVersion,
 			})
 		}); terr != nil {
-=======
-		// Hand the workspace back: publication never happened, so nothing is
-		// waiting to be projected and holding the barrier would block every
-		// other connector until the sweep.
-		if rerr := w.pipeline.Release(run.WorkspaceID, w.pipelineVersion); rerr != nil {
-			log.Printf("aws scan worker %s: could not release pipeline: %v", w.owner, rerr)
-		}
-		// Fail is fenced too. If it returns ErrLeaseLost the run was already
-		// taken by someone else, and recording our failure on it would overwrite
-		// their result with ours.
-		if ferr := w.runs.Fail(run.ID, w.owner, run.LeaseVersion, err.Error()); ferr != nil {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			log.Printf("aws scan worker %s: could not record failure for run %s: %v",
 				w.owner, run.ID, terr)
 		}
@@ -297,11 +280,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 			// is where a second connector's scan would overwrite a shared
 			// resource row the projection is about to read (§2.10A).
 			if _, err := w.pipeline.ToProjectingTx(tx, published.WorkspaceID,
-<<<<<<< HEAD
 				w.owner, published.ID, w.pipelineVersion, projectionPipelineLease); err != nil {
-=======
-				w.owner, w.pipelineVersion, projectionPipelineLease); err != nil {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 				return fmt.Errorf("pipeline to projecting: %w", err)
 			}
 			return nil

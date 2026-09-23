@@ -2,10 +2,7 @@ package igagraph_test
 
 import (
 	"encoding/json"
-<<<<<<< HEAD
 	"errors"
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	"testing"
 	"time"
 
@@ -449,11 +446,7 @@ func TestSharedResourceSurvivesOneAccountDroppingIt(t *testing.T) {
 		t.Fatalf("one bucket ARN must be ONE object, got %d", n)
 	}
 	if n := f.scalar(`SELECT count(*) FROM iga_object_support
-<<<<<<< HEAD
 	                   WHERE resource_id IS NOT NULL AND state='current'`); n != 2 {
-=======
-	                   WHERE object_type='resource' AND state='current'`); n != 2 {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		t.Fatalf("want 2 support rows for the shared bucket, got %d", n)
 	}
 
@@ -473,19 +466,11 @@ func TestSharedResourceSurvivesOneAccountDroppingIt(t *testing.T) {
 
 	// B's support ended; A's did not; the OBJECT SURVIVES.
 	if n := f.scalar(`SELECT count(*) FROM iga_object_support
-<<<<<<< HEAD
 	                   WHERE resource_id IS NOT NULL AND connector_id=$1 AND state='ended'`, connB); n != 1 {
 		t.Error("B's support of the bucket should have ended")
 	}
 	if n := f.scalar(`SELECT count(*) FROM iga_object_support
 	                   WHERE resource_id IS NOT NULL AND connector_id=$1 AND state='ended'`, f.connector); n != 0 {
-=======
-	                   WHERE object_type='resource' AND connector_id=$1 AND state='ended'`, connB); n != 1 {
-		t.Error("B's support of the bucket should have ended")
-	}
-	if n := f.scalar(`SELECT count(*) FROM iga_object_support
-	                   WHERE object_type='resource' AND connector_id=$1 AND state='ended'`, f.connector); n != 0 {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		t.Error("B's scan must not touch A's support")
 	}
 	if n := f.scalar(`SELECT count(*) FROM iga_resources WHERE lifecycle='active'`); n != 1 {
@@ -552,11 +537,7 @@ func TestProjectionIsIdempotentAndRebuildable(t *testing.T) {
 		for _, tbl := range []string{
 			"iga_identity_accounts", "iga_workload", "iga_resources",
 			"iga_entitlements", "iga_access_edges", "iga_relationship",
-<<<<<<< HEAD
 			"iga_object_support", "iga_estate_scopes", "iga_publication",
-=======
-			"iga_object_support", "iga_estate_scopes",
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		} {
 			out[tbl] = f.scalar(`SELECT count(*) FROM ` + tbl)
 		}
@@ -569,7 +550,6 @@ func TestProjectionIsIdempotentAndRebuildable(t *testing.T) {
 		}
 	}
 
-<<<<<<< HEAD
 	// Re-projecting the SAME run is a REPLAY, and a replay of a committed
 	// pass is SUCCESS, not failure: the publication row written inside the
 	// graph transaction says "this run already committed", so Project returns
@@ -584,13 +564,6 @@ func TestProjectionIsIdempotentAndRebuildable(t *testing.T) {
 		t.Errorf("re-projecting a committed run must report AlreadyPublished, got %v", err)
 	} else if replay.Rev != 1 {
 		t.Errorf("want the replay to name rev 1, got %d", replay.Rev)
-=======
-	// Re-projecting the SAME run is a no-op: the generation is not ahead of
-	// the watermark, so it is refused as obsolete rather than reapplied.
-	err := f.project(est.snapshot(f, run, cleanCoverage(region)))
-	if err == nil {
-		t.Error("re-projecting the same generation should be refused as obsolete")
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	}
 	if got := shape(); !sameShape(first, got) {
 		t.Errorf("re-projecting the same run changed the graph:\n before %v\n after  %v", first, got)
@@ -600,13 +573,10 @@ func TestProjectionIsIdempotentAndRebuildable(t *testing.T) {
 	for _, tbl := range []string{
 		"iga_access_edge_evidence", "iga_relationship_evidence",
 		"iga_access_edges", "iga_relationship", "iga_object_support",
-<<<<<<< HEAD
 		// iga_publication is OUTPUT, not input: it records that this run's
 		// projection committed. A rebuild that kept it would be told
 		// AlreadyPublished and write nothing.
 		"iga_publication",
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		"iga_projection_state", "iga_entitlements", "iga_resources",
 		"iga_workload", "iga_credentials", "iga_agent_instances",
 		"iga_agents", "iga_identity_accounts", "iga_estate_scopes",

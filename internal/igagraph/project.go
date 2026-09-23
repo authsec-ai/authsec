@@ -18,7 +18,6 @@ import (
 // did the work with better data. Recorded and skipped.
 var ErrObsoleteGeneration = errors.New("igagraph: generation already projected")
 
-<<<<<<< HEAD
 // ErrInconsistentWatermark means a partition's watermark equals this run's
 // generation while no publication row exists for the run. Step 2 already
 // returned for the genuine replay, so this is neither a replay nor a
@@ -35,8 +34,6 @@ func (e *AlreadyPublished) Error() string {
 	return fmt.Sprintf("igagraph: run already published at rev %d", e.Rev)
 }
 
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // GraphWriter is the subset of the graph repository the projector uses.
 //
 // Declared here rather than imported so the projection logic can be driven by
@@ -55,7 +52,6 @@ type GraphWriter interface {
 	UpsertRelationship(tx *gorm.DB, r *models.IGARelationship) (uuid.UUID, error)
 	UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error
 	UpsertProjectionState(tx *gorm.DB, s *models.IGAProjectionState) error
-<<<<<<< HEAD
 	SetExecutionRoleState(tx *gorm.DB, ws, workloadID uuid.UUID, state, arn string) error
 	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) (int64, error)
@@ -64,10 +60,6 @@ type GraphWriter interface {
 	RestoreIdentity(tx *gorm.DB, ws, id uuid.UUID, immutableKey string, desc *models.IGAIdentityAccount, now time.Time) (uuid.UUID, error)
 	SuspendAssertions(tx *gorm.DB, ws, identityID uuid.UUID, reason string) error
 	MarkAssertionsPendingReconfirm(tx *gorm.DB, ws, identityID uuid.UUID) error
-=======
-	LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error
-	LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error
 	EndEdgesOnSubject(tx *gorm.DB, ws, identityID uuid.UUID, reason string, now time.Time, runID uuid.UUID) error
 }
@@ -83,18 +75,12 @@ type Fencer interface {
 	// the claimed lease version. The row stays locked for the transaction's
 	// life, so a reclaiming worker blocks rather than writing concurrently.
 	AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, leaseVersion int64) error
-<<<<<<< HEAD
 	// AssertHeldTx asserts this job still holds the workspace barrier in the
 	// PROJECTING phase for this run and version, and locks the barrier row
 	// FOR UPDATE for the transaction's life. The phase is part of the
 	// predicate: a worker holding collecting@v7 must not pass a projecting
 	// check even if the version matches.
 	AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version int64) error
-=======
-	// AssertProjectingTx asserts this job still holds the workspace's
-	// projecting state, so a reclaimed pipeline cannot have its old job commit.
-	AssertProjectingTx(tx *gorm.DB, ws uuid.UUID, version int64) error
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 // Projector turns one published run's Snapshot into graph writes.
@@ -111,13 +97,10 @@ type Projector struct {
 	// now is injectable so tests can assert first_seen_at is not advanced.
 	now func() time.Time
 
-<<<<<<< HEAD
 	// rev is the publication revision this pass stamped, readable after a
 	// successful Project.
 	rev int64
 
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// Reconciler is consulted for the watermark comparison before any write.
 	watermark func(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error)
 }
@@ -160,7 +143,6 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 	// 8 and overwriting the newer graph with an older one.
 	//
 	// The workspace barrier already excludes concurrent COLLECTION; this
-<<<<<<< HEAD
 	// asserts this job still holds the PROJECTING phase, and locks the barrier
 	// row FOR UPDATE for the rest of this transaction -- which is what makes
 	// rev = max(rev)+1 safe at step 6.
@@ -187,13 +169,6 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		return &AlreadyPublished{Rev: pub.Rev} // no writes; the caller completes the job
 	}
 
-=======
-	// asserts this job still holds the projecting state.
-	if err := p.fencer.AssertProjectingTx(tx, snap.Run.WorkspaceID, p.pipelineVersion); err != nil {
-		return err
-	}
-
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	parts := Partitions(snap)
 
 	// Assert the partition vocabulary before anything is written. A partition
@@ -204,7 +179,6 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		return fmt.Errorf("igagraph: partitions name unknown surfaces %v", bad)
 	}
 
-<<<<<<< HEAD
 	// 3. SUPERSEDED? Only a STRICTLY newer generation. Under the barrier this
 	//    should be unreachable -- a newer run cannot project while this job
 	//    holds `projecting` -- so reaching it means an abandon raced a
@@ -212,24 +186,17 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 	//    EQUALITY WITHOUT A PUBLICATION ROW for this run is an inconsistency,
 	//    not a replay (step 2 already returned for the replay case), and fails
 	//    loudly rather than being silently treated as either.
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	for _, part := range parts {
 		have, err := p.watermark(tx, part, snap.Run.WorkspaceID)
 		if err != nil {
 			return err
 		}
-<<<<<<< HEAD
 		switch {
 		case int64(snap.Generation) < have:
 			return ErrSuperseded
 		case int64(snap.Generation) == have:
 			return fmt.Errorf("partition %s at generation %d with no publication for run %s: %w",
 				part.Key(), have, snap.Run.ID, ErrInconsistentWatermark)
-=======
-		if int64(snap.Generation) <= have {
-			return ErrObsoleteGeneration
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		}
 	}
 
@@ -274,7 +241,6 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		return err
 	}
 	// reconciled=false here; Reconcile flips it in the same transaction.
-<<<<<<< HEAD
 	if err := p.recordState(tx, snap, false); err != nil {
 		return err
 	}
@@ -313,9 +279,6 @@ func manifestOf(snap *Snapshot, parts []Partition) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return raw
-=======
-	return p.recordState(tx, snap, false)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 func (p *Projector) projectEstateScope(tx *gorm.DB, snap *Snapshot) error {
@@ -338,21 +301,13 @@ func (p *Projector) projectEstateScope(tx *gorm.DB, snap *Snapshot) error {
 // node. THE STEP THAT MAKES A NODE VISIBLE TO RECONCILIATION.
 func (p *Projector) support(tx *gorm.DB, snap *Snapshot, objectType string, objectID uuid.UUID, part Partition) error {
 	now := p.now()
-<<<<<<< HEAD
 	row := &models.IGAObjectSupport{
 		WorkspaceID:        snap.Run.WorkspaceID,
-=======
-	return p.repo.UpsertObjectSupport(tx, &models.IGAObjectSupport{
-		WorkspaceID:        snap.Run.WorkspaceID,
-		ObjectType:         objectType,
-		ObjectID:           objectID,
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		ConnectorID:        snap.Run.ConnectorID,
 		PartitionKey:       part.Key(),
 		State:              models.RelCurrent,
 		LastConfirmedRunID: &snap.Run.ID,
 		LastConfirmedAt:    &now,
-<<<<<<< HEAD
 	}
 	if !row.SetObject(objectType, objectID) {
 		return fmt.Errorf("igagraph: no support column for object class %q", objectType)
@@ -368,114 +323,6 @@ func (p *Projector) support(tx *gorm.DB, snap *Snapshot, objectType string, obje
 // disagree with the reconciled set, and then the row is written under one key
 // and reconciled under another, or never reconciled at all. A lookup with no
 // match panics rather than guessing.
-=======
-	})
-}
-
-// identityPartition routes a role to the iam_roles partition and a user to
-// iam_users. Merged, a denied iam_users read would block role reconciliation.
-func identityPartition(snap *Snapshot, kind string) Partition {
-	surface := models.SurfaceIAMRoles
-	if kind == models.CloudIdentityIAMUser {
-		surface = models.SurfaceIAMUsers
-	}
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		Class: models.ObjectIdentity, RequiredSurfaces: []string{surface},
-	}
-}
-
-// workloadService maps a runtime kind to the coverage surface prefix the
-// scanner reports it under.
-//
-// The names here are the SCANNER'S, not ours: lambda, ecs, ec2,
-// bedrock-agents, bedrock-agentcore. A mismatch means the partition can never
-// satisfy canEnd and its workloads stay stale forever.
-func workloadService(runtimeKind string) string {
-	switch runtimeKind {
-	case models.WorkloadLambdaFunction:
-		return "lambda"
-	case models.WorkloadECSTaskDefinition:
-		return "ecs"
-	case models.WorkloadEC2Instance:
-		return "ec2"
-	case models.WorkloadBedrockAgent:
-		return "bedrock-agents"
-	case models.WorkloadBedrockAgentCoreRT, models.WorkloadBedrockAgentCoreGW:
-		return "bedrock-agentcore"
-	}
-	return ""
-}
-
-func workloadPartition(snap *Snapshot, w models.CloudWorkload) Partition {
-	svc := workloadService(w.RuntimeKind)
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		Class:            models.ObjectWorkload,
-		RequiredSurfaces: []string{svc + ":" + w.Region},
-		RequiredScanners: []string{models.SurfaceWorkloadScan, models.SurfaceCompute(w.Region)},
-	}
-}
-
-func executesAsPartition(snap *Snapshot, w models.CloudWorkload) Partition {
-	svc := workloadService(w.RuntimeKind)
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		RelationshipType: models.RelTypeExecutesAs, Target: "relationship",
-		RequiredSurfaces: []string{svc + ":" + w.Region, models.SurfaceIAMRoles},
-		RequiredScanners: []string{models.SurfaceWorkloadScan, models.SurfaceCompute(w.Region)},
-	}
-}
-
-func realizesPartition(snap *Snapshot, w models.CloudWorkload) Partition {
-	svc := workloadService(w.RuntimeKind)
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		RelationshipType: models.RelTypeRealizes, Target: "relationship",
-		RequiredSurfaces: []string{svc + ":" + w.Region},
-		RequiredScanners: []string{models.SurfaceWorkloadScan, models.SurfaceCompute(w.Region)},
-	}
-}
-
-func entitlementPartition(snap *Snapshot) Partition {
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		Class: models.ObjectEntitlement,
-		RequiredSurfaces: []string{
-			models.SurfaceIAMRoles, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments},
-		RequiredScanners: []string{models.SurfacePermissionScan},
-	}
-}
-
-func resourcePartition(snap *Snapshot) Partition {
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		Class: models.ObjectResource,
-		RequiredSurfaces: []string{
-			models.SurfaceIAMRoles, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments},
-		RequiredScanners: []string{models.SurfacePermissionScan},
-	}
-}
-
-func accessEdgePartition(snap *Snapshot) Partition {
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		Target: "access_edge",
-		RequiredSurfaces: []string{
-			models.SurfaceIAMRoles, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments},
-		RequiredScanners: []string{models.SurfacePermissionScan},
-	}
-}
-
-func canAssumePartition(snap *Snapshot) Partition {
-	return Partition{
-		ScopeID: snap.ScopeID, ConnectorID: snap.Run.ConnectorID,
-		RelationshipType: models.RelTypeCanAssume, Target: "relationship",
-		RequiredSurfaces: []string{models.SurfaceIAMRoles, models.SurfacePolicyDocuments},
-		RequiredScanners: []string{models.SurfacePermissionScan},
-	}
-}
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
@@ -487,38 +334,11 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 		// Map lookup, not a query. The workspace's live objects were loaded
 		// once before the transaction; a SELECT per identity here is one round
 		// trip per row, inside a transaction holding locks.
-<<<<<<< HEAD
 		live := r.existing.identity[key]
 
 		// Descriptive fields, applied on every path below: insert, update and
 		// restore all refresh them from what this run read.
 		desc := &models.IGAIdentityAccount{
-=======
-		prev := r.existing.identity[key]
-
-		// DELETE-AND-RECREATE. Same recognition key, different creation
-		// boundary => a different principal wearing the old name. Carrying the
-		// old row forward would carry last quarter's review decisions onto a
-		// stranger.
-		//
-		// BOTH immutable keys must be non-empty: one empty side means we could
-		// not tell, and "could not tell" is NEVER "recreated".
-		if prev != nil && cont == ContinuityImmutable &&
-			imm != "" && prev.ImmutableKey != "" && prev.ImmutableKey != imm {
-
-			if err := p.repo.RetireIdentity(tx, snap.Run.WorkspaceID, prev.ID,
-				models.RetiredRecreated, now); err != nil {
-				return err
-			}
-			if err := p.repo.EndEdgesOnSubject(tx, snap.Run.WorkspaceID, prev.ID,
-				models.EndedSubjectRecreate, now, snap.Run.ID); err != nil {
-				return err
-			}
-			prev = nil // fall through to INSERT, with a fresh first_seen_at
-		}
-
-		row := &models.IGAIdentityAccount{
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			WorkspaceID:     snap.Run.WorkspaceID,
 			EstateScopeID:   &snap.ScopeID,
 			SourceKey:       key,
@@ -531,7 +351,6 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 			RollupState:     models.RollupConfirmed,
 			LastSeenAt:      now,
 		}
-<<<<<<< HEAD
 
 		var id uuid.UUID
 		var err error
@@ -596,30 +415,12 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 			}
 		}
 
-=======
-		if prev == nil {
-			row.FirstSeenAt = now
-		} else {
-			// Carried, not advanced. DoUpdates never names first_seen_at, but
-			// sending the old value keeps an INSERT-that-conflicts honest too.
-			row.FirstSeenAt = prev.FirstSeenAt
-		}
-
-		id, err := p.repo.UpsertIdentity(tx, row)
-		if err != nil {
-			return fmt.Errorf("upsert identity %s: %w", key, err)
-		}
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		r.identity[ci.ID] = id
 		r.identityKey[id] = key
 		r.identityImmutable[id] = imm
 
 		if err := p.support(tx, snap, models.ObjectIdentity, id,
-<<<<<<< HEAD
 			snap.PartitionFor(models.ObjectIdentity, ci.Kind, "")); err != nil {
-=======
-			identityPartition(snap, ci.Kind)); err != nil {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			return err
 		}
 	}
@@ -628,11 +429,7 @@ func (p *Projector) projectIdentities(tx *gorm.DB, snap *Snapshot, r *resolved) 
 
 func (p *Projector) projectResources(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
-<<<<<<< HEAD
 	part := snap.PartitionFor(models.ObjectResource, "", "")
-=======
-	part := resourcePartition(snap)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	for _, cr := range snap.Resources {
 		key := ResourceKey(cr)
 		prev := r.existing.resource[key]
@@ -674,15 +471,6 @@ func (p *Projector) projectResources(tx *gorm.DB, snap *Snapshot, r *resolved) e
 func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
 	for _, cw := range snap.Workloads {
-<<<<<<< HEAD
-=======
-		if workloadService(cw.RuntimeKind) == "" {
-			// A runtime kind with no coverage surface has no partition, so it
-			// could never be reconciled. Skipping is better than writing a row
-			// nothing can ever close.
-			continue
-		}
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		key := WorkloadKey(cw)
 		prev := r.existing.workload[key]
 
@@ -714,11 +502,7 @@ func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) e
 		r.workload[cw.ID] = id
 
 		if err := p.support(tx, snap, models.ObjectWorkload, id,
-<<<<<<< HEAD
 			snap.PartitionFor(models.ObjectWorkload, cw.RuntimeKind, cw.Region)); err != nil {
-=======
-			workloadPartition(snap, cw)); err != nil {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			return err
 		}
 	}
@@ -727,11 +511,7 @@ func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) e
 
 func (p *Projector) projectEntitlements(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
-<<<<<<< HEAD
 	part := snap.PartitionFor(models.ObjectEntitlement, "", "")
-=======
-	part := entitlementPartition(snap)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 	// The holder is needed to key an INLINE policy (§2.6), so index identities
 	// by their cloud id first.
@@ -901,11 +681,7 @@ func (p *Projector) projectAgents(tx *gorm.DB, snap *Snapshot, r *resolved) erro
 			return fmt.Errorf("upsert agent %s: %w", key, err)
 		}
 		if err := p.support(tx, snap, models.ObjectAgent, agentID,
-<<<<<<< HEAD
 			snap.PartitionFor(models.ObjectWorkload, cw.RuntimeKind, cw.Region)); err != nil {
-=======
-			workloadPartition(snap, cw)); err != nil {
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			return err
 		}
 
@@ -931,11 +707,7 @@ func (p *Projector) projectAgents(tx *gorm.DB, snap *Snapshot, r *resolved) erro
 		// realizes: the instance is realized by this runtime. Both rows exist
 		// deliberately -- collapsing them makes "this agent runs on this
 		// runtime" inexpressible the moment one agent has two runtimes.
-<<<<<<< HEAD
 		part := snap.EdgePartitionFor(models.RelTypeRealizes, cw.RuntimeKind, cw.Region)
-=======
-		part := realizesPartition(snap, cw)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		relID, err := p.repo.UpsertRelationship(tx, &models.IGARelationship{
 			WorkspaceID:           snap.Run.WorkspaceID,
 			RelationshipType:      models.RelTypeRealizes,
@@ -969,11 +741,7 @@ func isAgentRuntime(kind string) bool {
 
 func (p *Projector) projectAccessEdges(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
-<<<<<<< HEAD
 	part := snap.EdgePartitionFor("access_edge", "", "")
-=======
-	part := accessEdgePartition(snap)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 	byID := make(map[uuid.UUID]models.CloudIdentity, len(snap.Identities))
 	for _, ci := range snap.Identities {
@@ -1051,7 +819,6 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 
 	// workload --executes_as--> identity
 	for _, w := range snap.Workloads {
-<<<<<<< HEAD
 		src, ok := r.workload[w.ID]
 		if !ok {
 			continue // the workload itself was not projected; nothing to annotate
@@ -1097,23 +864,6 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 			continue
 		}
 		part := snap.EdgePartitionFor(models.RelTypeExecutesAs, w.RuntimeKind, w.Region)
-=======
-		if w.IdentityID == nil {
-			continue // no configured execution identity; not an edge we can claim
-		}
-		src, ok := r.workload[w.ID]
-		if !ok {
-			continue
-		}
-		dst, ok := r.identity[*w.IdentityID]
-		if !ok {
-			// The identity was not in this run's snapshot -- a partial scan.
-			// Skipping is right: an edge whose endpoint we did not read this
-			// run must not be written as `current`.
-			continue
-		}
-		part := executesAsPartition(snap, w)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 		relID, err := p.repo.UpsertRelationship(tx, &models.IGARelationship{
 			WorkspaceID:      snap.Run.WorkspaceID,
@@ -1157,11 +907,7 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 	// a principal that may not exist in this account, or at all. Resolve it by
 	// source key and skip when unknown -- a trust statement naming a principal
 	// we have never seen is NOT evidence that principal exists (roadmap §3.1).
-<<<<<<< HEAD
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, "", "")
-=======
-	part := canAssumePartition(snap)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	for _, ae := range snap.AssumeEdges {
 		dst, ok := r.identity[ae.IdentityID]
 		if !ok {
@@ -1170,11 +916,7 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 		srcCloudID, ok := snap.IdentityIDByKey(Key("aws", ae.Subject))
 		if !ok {
 			// Unresolved far end. §2.12 makes this an iga_external_principal
-<<<<<<< HEAD
 			// node in 034 rather than a dropped edge; until that path is wired
-=======
-			// node in 033 rather than a dropped edge; until that path is wired
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			// the edge is not written, which is the honest state -- we do not
 			// claim an endpoint we cannot name.
 			continue

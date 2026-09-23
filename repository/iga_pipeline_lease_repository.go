@@ -20,7 +20,6 @@ import (
 // between them is exactly where a second connector's scan overwrites a shared
 // resource row. A committed row spans that window; a session lock cannot.
 //
-<<<<<<< HEAD
 // THE STATE MACHINE, and the one rule that shapes all of it:
 //
 //	           expired                    expired
@@ -85,34 +84,10 @@ type IGAPipelineLeaseRepository interface {
 	// loop. It changes nothing: recovery is phase-specific and is performed by
 	// the worker that takes the work over.
 	ExpiredCandidates(now time.Time, limit int) ([]models.IGAPipelineLease, error)
-=======
-// COST, STATED PLAINLY: scanning is serialized per WORKSPACE, not per
-// connector. A customer with five AWS accounts scans them one at a time.
-//
-// Every transition is ONE CONDITIONAL UPDATE that demands the version it read,
-// so a worker that slept past its expiry is refused because the version moved
-// on -- never because a clock was consulted.
-type IGAPipelineLeaseRepository interface {
-	// ClaimForCollection takes an idle (or expired) pipeline for a scan.
-	// Returns the new version, or ErrPipelineLost when someone else holds it.
-	ClaimForCollection(ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time) (int64, error)
-
-	// ToProjectingTx flips collecting -> projecting IN THE PUBLISH
-	// TRANSACTION, so the barrier is never released between the two.
-	ToProjectingTx(tx *gorm.DB, ws uuid.UUID, holder string, version int64, lease time.Duration) (int64, error)
-
-	// Release returns the pipeline to idle after projection completes.
-	Release(ws uuid.UUID, version int64) error
-
-	// Sweep returns expired pipelines to idle. Recovery, so a dead worker
-	// cannot wedge a workspace permanently.
-	Sweep(now time.Time) (int64, error)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 	Get(ws uuid.UUID) (*models.IGAPipelineLease, error)
 }
 
-<<<<<<< HEAD
 // PipelineFence binds a barrier operation to (workspace, phase, run, version).
 //
 // THE PHASE IS PART OF THE PREDICATE, not decoration: a worker holding
@@ -129,42 +104,29 @@ type PipelineFence struct {
 	Version     int64
 }
 
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 type igaPipelineLeaseRepository struct{ db *gorm.DB }
 
 func NewIGAPipelineLeaseRepository(db *gorm.DB) IGAPipelineLeaseRepository {
 	return &igaPipelineLeaseRepository{db: db}
 }
 
-<<<<<<< HEAD
 // AcquireForCollection is the transition a later scan COLLIDES WITH while a
 // projection is in flight: projecting is not claimable here at all, expired or
 // not, and because the barrier is a committed row rather than a session lock
 // it survives the gap between the publish transaction and the projection
 // transaction.
 func (r *igaPipelineLeaseRepository) AcquireForCollection(
-=======
-// ClaimForCollection is the transition a later scan COLLIDES WITH while a
-// projection is in flight: state='projecting' is not claimable, and because it
-// is a committed row rather than a session lock it survives the gap between
-// the publish transaction and the projection transaction.
-func (r *igaPipelineLeaseRepository) ClaimForCollection(
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	ws uuid.UUID, holder string, runID uuid.UUID, lease time.Duration, now time.Time,
 ) (int64, error) {
 	var out []models.IGAPipelineLease
 	// INSERT ... ON CONFLICT so the first scan in a workspace does not need a
 	// separate row-creation step that could race with itself.
-<<<<<<< HEAD
 	//
 	// The WHERE admits exactly two cases:
 	//   * idle -- an ordinary claim;
 	//   * collecting, EXPIRED, and for THIS run -- recovery of a dead
 	//     collector, staying in the same phase for the same run.
 	// An expired PROJECTING lease matches neither, which is the whole point.
-=======
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	err := r.db.Raw(`
 		INSERT INTO iga_pipeline_lease
 			(workspace_id, state, holder, scan_run_id, expires_at, version, updated_at)
@@ -177,7 +139,6 @@ func (r *igaPipelineLeaseRepository) ClaimForCollection(
 			version     = iga_pipeline_lease.version + 1,
 			updated_at  = EXCLUDED.updated_at
 		WHERE iga_pipeline_lease.state = ?
-<<<<<<< HEAD
 		   OR (iga_pipeline_lease.state = ?
 		       AND iga_pipeline_lease.scan_run_id = ?
 		       AND iga_pipeline_lease.expires_at IS NOT NULL
@@ -186,13 +147,6 @@ func (r *igaPipelineLeaseRepository) ClaimForCollection(
 		ws, models.PipelineCollecting, holder, runID, now.Add(lease), now,
 		models.PipelineIdle,
 		models.PipelineCollecting, runID, now,
-=======
-		   OR iga_pipeline_lease.expires_at IS NULL
-		   OR iga_pipeline_lease.expires_at <= ?
-		RETURNING *`,
-		ws, models.PipelineCollecting, holder, runID, now.Add(lease), now,
-		models.PipelineIdle, now,
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	).Scan(&out).Error
 	if err != nil {
 		return 0, err
@@ -203,7 +157,6 @@ func (r *igaPipelineLeaseRepository) ClaimForCollection(
 	return out[0].Version, nil
 }
 
-<<<<<<< HEAD
 // RecoverProjecting keeps the phase and changes only the holder and version.
 //
 // The published run's inventory is still being read by whoever picks the job
@@ -241,13 +194,6 @@ func (r *igaPipelineLeaseRepository) RecoverProjecting(
 // run that was never published.
 func (r *igaPipelineLeaseRepository) ToProjectingTx(
 	tx *gorm.DB, ws uuid.UUID, holder string, runID uuid.UUID, version int64, lease time.Duration,
-=======
-// ToProjectingTx runs INSIDE the publish transaction. If publication rolls
-// back so does this, and the pipeline is never left claiming to be projecting
-// a run that was never published.
-func (r *igaPipelineLeaseRepository) ToProjectingTx(
-	tx *gorm.DB, ws uuid.UUID, holder string, version int64, lease time.Duration,
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 ) (int64, error) {
 	var out []models.IGAPipelineLease
 	err := tx.Raw(`
@@ -256,34 +202,22 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 			expires_at = ?,
 			version    = version + 1,
 			updated_at = now()
-<<<<<<< HEAD
 		 WHERE workspace_id = ? AND state = ? AND holder = ?
 		   AND scan_run_id = ? AND version = ?
 		RETURNING *`,
 		models.PipelineProjecting, time.Now().Add(lease),
 		ws, models.PipelineCollecting, holder, runID, version,
-=======
-		 WHERE workspace_id = ? AND state = ? AND holder = ? AND version = ?
-		RETURNING *`,
-		models.PipelineProjecting, time.Now().Add(lease),
-		ws, models.PipelineCollecting, holder, version,
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	).Scan(&out).Error
 	if err != nil {
 		return 0, err
 	}
 	if len(out) == 0 {
-<<<<<<< HEAD
 		return 0, fmt.Errorf("%w: workspace=%s not collecting run %s at version %d",
 			ErrPipelineLost, ws, runID, version)
-=======
-		return 0, fmt.Errorf("%w: workspace=%s not collecting at version %d", ErrPipelineLost, ws, version)
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	}
 	return out[0].Version, nil
 }
 
-<<<<<<< HEAD
 // ReleaseAfterProjectionTx is the only non-abandon path back to idle, and it
 // is bound to the projecting phase, this run and this version.
 //
@@ -358,14 +292,6 @@ func (r *igaPipelineLeaseRepository) AbandonTx(
 		return err
 	}
 	res := tx.Exec(`
-=======
-// Release returns the pipeline to idle.
-//
-// iga_pipeline_lease_busy_chk requires holder=” and scan_run_id IS NULL
-// exactly when state='idle', so all three move together or the row is refused.
-func (r *igaPipelineLeaseRepository) Release(ws uuid.UUID, version int64) error {
-	res := r.db.Exec(`
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		UPDATE iga_pipeline_lease SET
 			state = ?, holder = '', scan_run_id = NULL, expires_at = NULL,
 			version = version + 1, updated_at = now()
@@ -380,7 +306,6 @@ func (r *igaPipelineLeaseRepository) Release(ws uuid.UUID, version int64) error 
 	return nil
 }
 
-<<<<<<< HEAD
 // ExpiredCandidates is read-only on purpose. There is no blind sweep: the
 // phase decides what recovery means, and only the worker that takes the work
 // over can perform it.
@@ -397,18 +322,6 @@ func (r *igaPipelineLeaseRepository) ExpiredCandidates(
 		 ORDER BY updated_at
 		 LIMIT ?`, models.PipelineIdle, now, limit).Scan(&out).Error
 	return out, err
-=======
-// Sweep is the recovery path. Without it a worker that died holding
-// 'projecting' would block every future scan in that workspace forever.
-func (r *igaPipelineLeaseRepository) Sweep(now time.Time) (int64, error) {
-	res := r.db.Exec(`
-		UPDATE iga_pipeline_lease SET
-			state = ?, holder = '', scan_run_id = NULL, expires_at = NULL,
-			version = version + 1, updated_at = now()
-		 WHERE state <> ? AND expires_at IS NOT NULL AND expires_at <= ?`,
-		models.PipelineIdle, models.PipelineIdle, now)
-	return res.RowsAffected, res.Error
->>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 func (r *igaPipelineLeaseRepository) Get(ws uuid.UUID) (*models.IGAPipelineLease, error) {
