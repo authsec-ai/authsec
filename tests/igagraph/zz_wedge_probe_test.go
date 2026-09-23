@@ -39,12 +39,18 @@ func wedgeSetup(t *testing.T) (*fixture, models.CloudScanRun) {
 
 // projectionService builds the real service over the real repositories.
 func projectionService(f *fixture) *services.ProjectionService {
+	return projectionServiceAs(f, "recovery-worker")
+}
+
+// projectionServiceAs is the same, under a named owner -- the exits are fenced
+// on the owner, so a test that supersedes a worker needs to choose it.
+func projectionServiceAs(f *fixture, owner string) *services.ProjectionService {
 	return services.NewProjectionService(
 		f.gorm,
 		repositories.NewIGAProjectionJobRepository(f.gorm),
 		repositories.NewIGAPipelineLeaseRepository(f.gorm),
 		repositories.NewIGAGraphRepository(),
-		"recovery-worker", time.Minute,
+		owner, time.Minute,
 	)
 }
 

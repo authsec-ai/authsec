@@ -82,17 +82,31 @@ func (f projectionFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version
 	})
 }
 
-// EnsureSchema refuses to run below the migration head this phase requires.
+// RequiredRelation is the table whose absence makes every reconcile run fail
+// at PLAN time -- so it fails even when no row would match.
+const RequiredRelation = "iga_external_principal"
+
+// EnsureSchema refuses to start below the schema this phase requires.
+//
+// The RELATION is the ground truth, not the migration log: a database migrated
+// by psql has no migration_logs at all, and a bookkeeping table can be stale or
+// written by another tool. The head is read only to make the error message say
+// WHICH migration is missing rather than just naming a table.
 func (s *ProjectionService) EnsureSchema() error {
-	head, err := repositories.MigrationHead(s.db)
+	ok, err := repositories.HasRelation(s.db, RequiredRelation)
 	if err != nil {
-		return fmt.Errorf("read migration head: %w", err)
+		return fmt.Errorf("check schema: %w", err)
 	}
-	if head < MinProjectionSchemaVersion {
+	if !ok {
+		head, herr := repositories.MigrationHead(s.db)
+		at := "unknown"
+		if herr == nil && head > 0 {
+			at = fmt.Sprintf("%d", head)
+		}
 		return fmt.Errorf(
-			"projector requires migration %d, database is at %d: core reconciliation "+
-				"writes iga_external_principal and would fail at plan time on every pass",
-			MinProjectionSchemaVersion, head)
+			"projector requires migration %03d (relation %s is missing, database is at %s): "+
+				"core reconciliation writes it and would fail at plan time on every pass",
+			MinProjectionSchemaVersion, RequiredRelation, at)
 	}
 	return nil
 }
@@ -470,3 +484,37 @@ func (s *ProjectionService) heartbeat(
 	}()
 	return func() { close(done) }
 }
+
+/* ----------------------------- test seams -------------------------------- */
+//
+// The three exits are the contract that decides whether a workspace is left
+// usable, and they were previously reachable only through a full RunOnce with
+// a real snapshot -- which is why they had no coverage at all and the wedge
+// went unnoticed. These expose them directly, named for their purpose, so a
+// test asserts job state + barrier state + fencing rather than the plumbing
+// that leads there.
+
+// CompleteAndReleaseForTest exposes completeAndRelease.
+func (s *ProjectionService) CompleteAndReleaseForTest(
+	ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64,
+) error {
+	return s.completeAndRelease(ctx, job, barrierVersion)
+}
+
+// AbandonAndReleaseForTest exposes abandonAndRelease.
+func (s *ProjectionService) AbandonAndReleaseForTest(
+	ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64, reason string,
+) error {
+	return s.abandonAndRelease(ctx, job, barrierVersion, reason)
+}
+
+// FailKeepBarrierForTest exposes failKeepBarrier, including its escalation to
+// abandonAndRelease past the attempts ceiling.
+func (s *ProjectionService) FailKeepBarrierForTest(
+	ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64, cause error,
+) error {
+	return s.failKeepBarrier(ctx, job, barrierVersion, cause)
+}
+
+// MaxAttemptsForTest reports the ceiling failKeepBarrier escalates at.
+func (s *ProjectionService) MaxAttemptsForTest() int { return s.maxAttempts }

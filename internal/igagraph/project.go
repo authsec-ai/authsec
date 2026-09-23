@@ -850,6 +850,19 @@ func (p *Projector) projectRelationships(tx *gorm.DB, snap *Snapshot, r *resolve
 			state, arn = models.ExecRoleNotInInventory, w.AWSAttrs().UnresolvedRoleARN
 		}
 
+		// The two middle states MUST name the role: they exist precisely to say
+		// "it runs as <arn>, and here is why there is no edge". Writing one
+		// with an empty ARN violates iga_workload_exec_role_arn_chk, and
+		// silently downgrading to 'none' would be worse -- that is the
+		// "configured role disappears from view" bug this state exists to
+		// prevent. So fail loudly and name the workload.
+		if (state == models.ExecRoleNotInScan || state == models.ExecRoleNotInInventory) && arn == "" {
+			return fmt.Errorf(
+				"workload %s: execution role state %q with no ARN to name it "+
+					"(snapshot built without Load, which resolves referenced identities)",
+				w.NativeID, state)
+		}
+
 		// Written on EVERY pass, for every projected workload, so a state from
 		// an earlier run cannot survive: resolved clears the ARN, the others
 		// set it, none clears both.

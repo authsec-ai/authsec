@@ -79,20 +79,43 @@ func runFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error 
 	})
 }
 
-// MigrationHead reports the highest successfully-applied master migration.
+// MigrationHead reports the highest successfully-applied master migration, or
+// 0 when that cannot be determined.
 //
 // Read from migration_logs rather than from the files on disk: what matters is
-// what the DATABASE has, not what the binary shipped with.
+// what the DATABASE has, not what the binary shipped with. A MISSING
+// migration_logs is not an error -- a database migrated by psql rather than by
+// the runner has no such table, and treating that as a failure would conflate
+// "cannot tell" with "too old". Callers pair this with HasRelation, which is
+// the ground truth.
 func MigrationHead(db *gorm.DB) (int, error) {
+	var exists bool
+	if err := db.Raw(`SELECT to_regclass('public.migration_logs') IS NOT NULL`).
+		Scan(&exists).Error; err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
 	var head *int
-	err := db.Raw(
+	if err := db.Raw(
 		`SELECT max(version) FROM migration_logs WHERE db_type = 'master' AND success = true`,
-	).Scan(&head).Error
-	if err != nil {
+	).Scan(&head).Error; err != nil {
 		return 0, err
 	}
 	if head == nil {
 		return 0, nil
 	}
 	return *head, nil
+}
+
+// HasRelation reports whether a table or view exists in the public schema.
+//
+// This is the GROUND TRUTH for a schema precondition: a bookkeeping table can
+// be absent, stale, or written by a different tool, but the relation the code
+// is about to query either exists or does not.
+func HasRelation(db *gorm.DB, name string) (bool, error) {
+	var exists bool
+	err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, "public."+name).Scan(&exists).Error
+	return exists, err
 }
