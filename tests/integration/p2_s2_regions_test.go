@@ -84,6 +84,19 @@ func TestP2S2RegionsListedWithSelection(t *testing.T) {
 	if code, body := api.asWorkspace(other).do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil); code != http.StatusNotFound || errCode(body) != "not_found" {
 		t.Fatalf("another workspace's connector = %d %v, want 404 not_found", code, body)
 	}
+	// No workspace in the token: 401 in the structured envelope, and AWS is
+	// never asked.
+	calls := fake.calls
+	api.asWorkspace(uuid.Nil)
+	if code, body := api.do(http.MethodGet, "/aws/connectors/"+a.conn.String()+"/regions", nil); code != http.StatusUnauthorized || errCode(body) != "unauthenticated" {
+		t.Fatalf("GET regions with no workspace = %d %v, want 401 unauthenticated", code, body)
+	}
+	if code, body := api.patchRegions(a.conn, "us-east-1"); code != http.StatusUnauthorized || errCode(body) != "unauthenticated" {
+		t.Fatalf("PATCH with no workspace = %d %v, want 401 unauthenticated", code, body)
+	}
+	if fake.calls != calls {
+		t.Fatalf("an unauthenticated request reached DescribeRegions")
+	}
 }
 
 // PATCH validates against the ENABLED list and names every offender with 422

@@ -6,9 +6,12 @@ package integration
 
 import (
 	"net/http"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/models"
@@ -61,17 +64,34 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Run 4: published, but its PROJECTION abandoned -- the barrier's abandon
+	// exit while projecting. The run stays published (terminal already); its
+	// job goes abandoned, and no revision is ever published for it.
+	time.Sleep(5 * time.Millisecond)
+	unprojected := l.scan(a, "s2-scan-unprojected")
+	var lease models.IGAPipelineLease
+	if err := l.db.First(&lease, "workspace_id = ?", l.ws).Error; err != nil || lease.State != models.PipelineProjecting {
+		t.Fatalf("setup: barrier after run 4 = %+v %v, want projecting", lease, err)
+	}
+	if err := l.db.Transaction(func(tx *gorm.DB) error {
+		return pipe.AbandonTx(tx, repositories.PipelineFence{WorkspaceID: l.ws,
+			Phase: models.PipelineProjecting, RunID: unprojected.ID, Version: lease.Version}, "projector gone")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	path := "/aws/connectors/" + a.conn.String() + "/scan-runs"
 	code, body := api.do(http.MethodGet, path, nil)
 	mustStatus(t, "history", code, body, http.StatusOK)
 	rows := digl(body, "data")
-	if len(rows) != 3 {
-		t.Fatalf("history rows = %d, want 3 (published, failed, abandoned): %v", len(rows), body)
+	if len(rows) != 4 {
+		t.Fatalf("history rows = %d, want 4 (published twice, failed, abandoned): %v", len(rows), body)
 	}
 	// Newest first.
 	wantOrder := []struct {
 		ref, status string
 	}{
+		{refOf("cloud_scan_run", unprojected.ID), models.CloudScanRunPublished},
 		{refOf("cloud_scan_run", abandoned.ID), models.CloudScanRunAbandoned},
 		{refOf("cloud_scan_run", failed.ID), models.CloudScanRunFailed},
 		{refOf("cloud_scan_run", published.ID), models.CloudScanRunPublished},
@@ -85,9 +105,16 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 		}
 	}
 
+	// The run whose projection was abandoned: published, with the job's end
+	// and its reason, and NO revision -- never the revision the graph is at.
+	if p := dig(rows[0], "projection"); digs(p, "status") != models.ProjectionAbandoned || dig(p, "rev") != nil ||
+		digs(p, "last_error") != "projector gone" || dig(p, "retrying") != false {
+		t.Fatalf("published run with an abandoned projection = %v, want {abandoned, rev null, its reason}", p)
+	}
+
 	// The published run: projection complete at rev 1, coverage summarized,
 	// finished when it published.
-	pub := rows[2]
+	pub := rows[3]
 	if digs(pub, "projection", "status") != models.ProjectionComplete || num(pub, "projection", "rev") != 1 {
 		t.Fatalf("published run projection = %v, want complete at rev 1", dig(pub, "projection"))
 	}
@@ -129,7 +156,7 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 	}
 	// The failed and abandoned runs: no projection, no coverage, finished,
 	// with their error.
-	for _, i := range []int{0, 1} {
+	for _, i := range []int{1, 2} {
 		r := rows[i]
 		if dig(r, "projection") != nil || dig(r, "coverage") != nil {
 			t.Fatalf("%s run carries projection %v / coverage %v, want null", digs(r, "status"), dig(r, "projection"), dig(r, "coverage"))
@@ -150,8 +177,16 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 	code, body = api.do(http.MethodGet, path+qs("limit", "2", "cursor", cursor), nil)
 	mustStatus(t, "page 2", code, body, http.StatusOK)
 	page2 := digl(body, "data")
-	if len(page2) != 1 || digs(page2[0], "ref") != refOf("cloud_scan_run", published.ID) || dig(body, "meta", "next_cursor") != nil {
-		t.Fatalf("page 2 = %v, want only the published run and no further cursor", body)
+	if len(page2) != 2 || digs(page2[0], "ref") != refOf("cloud_scan_run", failed.ID) ||
+		digs(page2[1], "ref") != refOf("cloud_scan_run", published.ID) || dig(body, "meta", "next_cursor") != nil {
+		t.Fatalf("page 2 = %v, want the failed and the first published run, and no further cursor", body)
+	}
+	for _, r := range page1 {
+		for _, r2 := range page2 {
+			if digs(r, "ref") == digs(r2, "ref") {
+				t.Fatalf("run %s is on both pages", digs(r, "ref"))
+			}
+		}
 	}
 
 	// A cursor is bound to its connector: presented on another's history it
@@ -171,12 +206,22 @@ func TestP2S2ScanRunHistoryShowsEveryEnding(t *testing.T) {
 			t.Fatalf("history%s = %d %v, want 400 invalid_parameter", q, code, body)
 		}
 	}
-	if code, body := api.do(http.MethodGet, path+qs("limit", "100"), nil); code != http.StatusOK || len(digl(body, "data")) != 3 {
+	if code, body := api.do(http.MethodGet, path+qs("limit", "100"), nil); code != http.StatusOK || len(digl(body, "data")) != 4 {
 		t.Fatalf("limit=100 = %d %v", code, body)
 	}
+	// A cursor is bound to its workspace too: the same connector's history
+	// read as another workspace is 404 before any cursor is looked at, and the
+	// run itself is absent there, not forbidden.
 	other := newWorkspace(t, l.db, "p2-s2-history-foreign")
 	if code, body := api.asWorkspace(other).do(http.MethodGet, path, nil); code != http.StatusNotFound || errCode(body) != "not_found" {
 		t.Fatalf("another workspace's history = %d %v, want 404", code, body)
+	}
+	if code, body := api.do(http.MethodGet, "/aws/scan-runs/"+published.ID.String(), nil); code != http.StatusNotFound {
+		t.Fatalf("another workspace's run = %d %v, want 404", code, body)
+	}
+	// No workspace in the token at all: 401, in the structured envelope.
+	if code, body := api.asWorkspace(uuid.Nil).do(http.MethodGet, path, nil); code != http.StatusUnauthorized || errCode(body) != "unauthenticated" {
+		t.Fatalf("history with no workspace = %d %v, want 401 unauthenticated", code, body)
 	}
 	api.asWorkspace(l.ws)
 

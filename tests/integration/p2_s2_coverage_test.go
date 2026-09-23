@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/smithy-go"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -58,16 +59,34 @@ func TestP2S2CoverageFromTheCurrentRevision(t *testing.T) {
 			t.Fatalf("coverage carries %q: a guessed permission", k)
 		}
 	}
-	// Reached: no call, no code, prevents nothing.
+	// Reached: its stored count, and no call, no code, prevents nothing.
 	roles := s2Surface(t, accA, models.SurfaceIAMRoles)
 	if digs(roles, "state") != models.CloudCoverageReached || dig(roles, "api") != nil ||
-		dig(roles, "error_code") != nil || dig(roles, "prevents") != nil || dig(roles, "fix") != nil {
-		t.Fatalf("a reached surface = %v, want no api, error_code, prevents or fix", roles)
+		dig(roles, "error_code") != nil || dig(roles, "prevents") != nil || dig(roles, "fix") != nil ||
+		num(roles, "count") != int64(s2Coverage(runA1).Surfaces[models.SurfaceIAMRoles].Count) {
+		t.Fatalf("a reached surface = %v, want its count and no api, error_code, prevents or fix", roles)
 	}
-	// Not selected: prevents nothing claimed, and the one fix the evidence
-	// supports.
+	// The account and its stack are stated as facts (D-72).
+	if dig(accA, "account", "connected") != true || digs(accA, "connector_status") != models.CloudConnectorActive ||
+		digs(accA, "template", "current") != awsdiscovery.TemplateVersion || dig(accA, "template", "outdated") != false ||
+		len(digl(accA, "runs")) != 1 || digs(digl(accA, "runs")[0]) != refOf("cloud_scan_run", runA1.ID) {
+		t.Fatalf("A's account facts = %v", accA)
+	}
+	// NOTHING FOR REACHED, whatever the stored row says: a surface that was
+	// reached failed no call, so a stray code or api written beside it (an
+	// older writer, a bug) is never rendered as a failure.
+	l.db.Exec(`UPDATE cloud_scan_run SET coverage = jsonb_set(coverage, '{surfaces,iam_roles}',
+	             (coverage->'surfaces'->'iam_roles') || '{"api":"iam:ListRoles","error_code":"AccessDenied","error":"stale words"}')
+	            WHERE id = ?`, runA1.ID)
+	roles = s2Surface(t, s2CoverageAccount(t, api, "", a), models.SurfaceIAMRoles)
+	if dig(roles, "api") != nil || dig(roles, "error_code") != nil || dig(roles, "error") != nil || dig(roles, "prevents") != nil {
+		t.Fatalf("a reached surface rendered a failure from its stored row: %v", roles)
+	}
+	// Not selected: its earlier results are kept and marked stale (§2.14.13),
+	// so it prevents what surface_stale says (D-58) -- and carries the one fix
+	// the evidence supports.
 	if ns := s2Surface(t, accA, "compute:eu-west-1"); digs(ns, "state") != models.CloudCoverageNotSelected ||
-		dig(ns, "prevents") != nil || digs(ns, "fix") != "change_regions" {
+		digs(ns, "prevents") != "surface_stale" || digs(ns, "fix") != "change_regions" || dig(ns, "count") != nil {
 		t.Fatalf("an unselected region = %v", ns)
 	}
 

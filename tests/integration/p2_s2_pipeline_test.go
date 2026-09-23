@@ -7,6 +7,7 @@ package integration
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -55,7 +56,12 @@ func TestP2S2PipelineQueuedBehindCollectingProjecting(t *testing.T) {
 	w := services.NewAWSScanWorker(l.db, a.svc).WithOwner("s2-pipeline-worker-a").
 		WithGraphProjection(l.gate).WithScannerHook(func(i *services.AWSIAMScanner, p *services.AWSPermissionScanner, wl *services.AWSWorkloadScanner) {
 		a.hook()(i, p, wl)
-		p.WithEKSAPI(&s2DuringEKS{fakeEKS: newFakeEKS(), during: func() { during = s2Pipeline(t, api) }})
+		p.WithEKSAPI(&s2DuringEKS{fakeEKS: newFakeEKS(), during: func() {
+			// A heartbeat moves the lease's updated_at on every renewal; since
+			// must not follow it (D-92).
+			l.db.Exec(`UPDATE iga_pipeline_lease SET updated_at = updated_at + interval '2 hours' WHERE workspace_id = ?`, l.ws)
+			during = s2Pipeline(t, api)
+		}})
 	})
 	if worked, err := w.RunOnce(context.Background()); err != nil || !worked {
 		t.Fatalf("scan A: worked=%v err=%v", worked, err)
@@ -83,6 +89,9 @@ func TestP2S2PipelineQueuedBehindCollectingProjecting(t *testing.T) {
 	}
 
 	// A published, not yet projected: projecting, and B still waits on A.
+	// since is when the barrier passed to the projection (A's publication),
+	// however often the lease has been renewed since.
+	l.db.Exec(`UPDATE iga_pipeline_lease SET updated_at = updated_at + interval '2 hours' WHERE workspace_id = ?`, l.ws)
 	view = s2Pipeline(t, api)
 	l.db.First(&started, "id = ?", runA.ID)
 	if digs(view, "barrier", "state") != models.PipelineProjecting ||
@@ -225,6 +234,91 @@ func TestP2S2PipelineAndCoverageUnavailableWhenOff(t *testing.T) {
 	if code, body := on.api().get("/capabilities"); code != http.StatusOK || dig(body, "data", "features", "coverage") != true ||
 		dig(body, "data", "features", "workloads") != false {
 		t.Fatalf("/capabilities on = %d %v, want coverage true and nothing else claimed", code, body)
+	}
+}
+
+// D-56, D-89, D-92, D-82: with two accounts projected, BOTH are at the
+// revision the graph is at (the §5.3 example's "41" twice), while each run
+// carries the revision that published it; a failed run is shown with its
+// error and does not take the account out of the graph; a revoked connector is
+// listed as revoked; accounts come in label order; and the route takes no
+// parameters -- a rev in particular is refused, since it reports live state.
+func TestP2S2PipelineAccountsAtTheCurrentRevision(t *testing.T) {
+	l := newP2Lab(t, "p2-s2-pipeline-revs", true)
+	a := oneLambda(l)
+	b := l.account(accountB)
+	b.role("sandbox-role", "AROAS2PIPELINEREVSBB")
+	c := l.account("111122223333")
+	api := l.api()
+
+	runA := l.scanAndProject(a) // rev 1
+	time.Sleep(5 * time.Millisecond)
+	runB := l.scanAndProject(b) // rev 2
+	if _, err := repositories.NewCloudConnectorRepository(l.db).Revoke(l.ws, c.conn); err != nil {
+		t.Fatal(err)
+	}
+
+	view := s2Pipeline(t, api)
+	if num(view, "current_rev") != 2 {
+		t.Fatalf("current_rev = %v, want 2", dig(view, "current_rev"))
+	}
+	for _, x := range []struct {
+		acct *p2Account
+		run  models.CloudScanRun
+		rev  int64
+	}{{a, runA, 1}, {b, runB, 2}} {
+		acc := s2PipelineAccount(t, view, x.acct)
+		if digs(acc, "state") != "published" || num(acc, "last_published_rev") != 2 ||
+			digs(acc, "latest_run", "ref") != refOf("cloud_scan_run", x.run.ID) ||
+			num(acc, "projection", "rev") != x.rev || digs(acc, "connector_status") != models.CloudConnectorActive {
+			t.Fatalf("account %s = %v, want published, last_published_rev 2 (the graph's), projection.rev %d (its run's)",
+				x.acct.id, acc, x.rev)
+		}
+	}
+	accC := s2PipelineAccount(t, view, c)
+	if digs(accC, "state") != "revoked" || digs(accC, "connector_status") != models.CloudConnectorRevoked ||
+		dig(accC, "latest_run") != nil || dig(accC, "last_published_rev") != nil {
+		t.Fatalf("revoked, never-scanned connector = %v, want listed as revoked with nothing published", accC)
+	}
+	// Label order (D-92): acct-111122223333, acct-429418377036, acct-905418271234.
+	var order []string
+	for _, acc := range digl(view, "accounts") {
+		order = append(order, digs(acc, "account_id"))
+	}
+	if !reflect.DeepEqual(order, []string{c.id, a.id, b.id}) {
+		t.Fatalf("accounts in order %v, want by label", order)
+	}
+
+	// A's next run FAILS: it is A's latest run, shown failed with its error;
+	// the graph still holds A's earlier publication.
+	time.Sleep(5 * time.Millisecond)
+	failed, err := l.runs.Enqueue(l.ws, a.conn, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := l.runs.ClaimForPipeline("s2-failing-worker", time.Minute, time.Now())
+	if err != nil || claimed == nil || claimed.ID != failed.ID {
+		t.Fatalf("claim the run to fail: %v %v", claimed, err)
+	}
+	if err := l.runs.Fail(failed.ID, "s2-failing-worker", claimed.LeaseVersion, "iam scan: connection reset"); err != nil {
+		t.Fatal(err)
+	}
+	accA := s2PipelineAccount(t, s2Pipeline(t, api), a)
+	if digs(accA, "state") != "failed" || digs(accA, "latest_run", "ref") != refOf("cloud_scan_run", failed.ID) ||
+		digs(accA, "latest_run", "error") != "iam scan: connection reset" || digs(accA, "latest_run", "finished_at") == "" ||
+		dig(accA, "projection") != nil || num(accA, "last_published_rev") != 2 {
+		t.Fatalf("A after a failed run = %v, want failed with its error, still at the graph's rev", accA)
+	}
+
+	// No parameters: rev is refused rather than honoured as a pin it is not.
+	for _, q := range []string{qs("rev", "2"), qs("account", a.id)} {
+		code, body := api.get("/pipeline" + q)
+		if code != http.StatusBadRequest || errCode(body) != "invalid_parameter" {
+			t.Fatalf("/pipeline%s = %d %v, want 400 invalid_parameter", q, code, body)
+		}
+	}
+	if _, body := api.get("/pipeline" + qs("rev", "2")); digs(body, "error", "parameter") != "rev" {
+		t.Fatalf("/pipeline?rev must name rev: %v", body)
 	}
 }
 
