@@ -21,8 +21,9 @@ issuance, and the ORY Hydra boundary.
 - Issue native tokens only through `NativeIssuer`; never construct JWTs ad hoc.
 - Audit security-relevant mutations and authorization decisions.
 - Reuse existing services and adapters before adding a parallel abstraction.
-- Do not add tests unless requested. Always run `go build ./...`, `go vet ./...`,
-  and `gofmt -l` for affected Go code.
+- Do not add tests unless requested. For Go changes, run `go build ./...`,
+  `go vet ./...`, and `gofmt -l` for affected files. For documentation-only
+  changes, verify references and the diff; no application build is required.
 
 ## Schema contract
 
@@ -34,18 +35,27 @@ issuance, and the ORY Hydra boundary.
 - Migrations run at backend startup and are verified through `migration_logs`.
 - Use expand → backfill → contract for removals, renames, type changes, and new
   `NOT NULL` constraints.
-- Rehearse against a **production schema dump**, never a fresh bootstrap. A green
-  run on a fresh bootstrap proves nothing about production — migration `023`
-  exists only because that rehearsal caught columns added to `001_bootstrap.sql`
-  with no numbered migration.
+- Rehearse the upgrade against a **production schema dump restored into an
+  isolated scratch database**. Check fresh bootstrap separately for parity;
+  bootstrap-only success does not establish upgrade compatibility. Never apply
+  rehearsal SQL to the deployed database.
 - Follow [`../.claude/commands/schema-change.md`](../.claude/commands/schema-change.md).
 
 ## Agentic IGA
 
-- Migration head is **`026`** (governance schema parity); Phase 2 migrations start at `027`.
-- Phase 2 status, and the corrections to the spec that reality has outrun, are in
-  [`docs/iga-phase2-verified-state.md`](docs/iga-phase2-verified-state.md).
-  Read it before trusting any Phase 2 document's present tense.
+- The active graph design is
+  [`.claude/specs/SPEC-iga-phase2-graph.md`](.claude/specs/SPEC-iga-phase2-graph.md).
+  The objective is the complete AWS scanning-to-graph experience, including
+  read APIs and UI integration. Treat unfinished contracts as work to resolve,
+  not as implemented behavior or an automatic reason to defer the user journey.
+- Inspect [migrations/master](migrations/master) and the current source before
+  assigning migration numbers or claiming a task is complete. Dated status
+  reports do not override either; do not require reading a separate historical
+  status report as the entrypoint for graph work.
+- Preserve existing GitHub, Kubernetes and legacy consumers of shared IGA tables
+  and APIs. Trace those consumers before structural changes. Earlier work on
+  `origin/graph` may be inspected when requested or relevant; reuse requires
+  verification against the current spec, not an automatic merge.
 - Invariants that are not style preferences: coverage is a state, never a
   percentage; `stale` is not `ended`; a configured path is not proven access;
   conditions are recorded, never evaluated; redact before hashing;
@@ -54,7 +64,7 @@ issuance, and the ORY Hydra boundary.
 
 ## Production deployment
 
-The only active release path is the K3s procedure in
+The production release procedure is documented in
 [`.claude/specs/SPEC-deployment-k3s.md`](.claude/specs/SPEC-deployment-k3s.md).
 
 - Production Deployment/container: `authsec-prod/prod-authsec` / `prod-authsec`.
@@ -62,7 +72,10 @@ The only active release path is the K3s procedure in
 - Back up Postgres before any release containing migrations.
 - Roll out backend before the matching UI and verify health, migrations, OAuth
   metadata, and protected routes.
-- Pushing `authsec-staging` does not deploy the cluster.
+- [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) declares a push
+  trigger on `authsec-staging` and manual dispatch. A push may deploy; verify
+  workflow prerequisites and environment gates for release work. Do not assume
+  CI is operational from the file alone. The root cutover restrictions apply.
 
 ## Deep docs
 
@@ -78,5 +91,7 @@ The only active release path is the K3s procedure in
 
 ## Completion
 
-Run the backend gates in [`../.claude/DEFINITION-OF-DONE.md`](../.claude/DEFINITION-OF-DONE.md).
+Run the applicable backend gates in
+[`../.claude/DEFINITION-OF-DONE.md`](../.claude/DEFINITION-OF-DONE.md).
+A review or documentation task does not require a commit or deployment.
 Do not push without explicit per-command approval.
