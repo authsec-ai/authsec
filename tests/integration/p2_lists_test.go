@@ -532,6 +532,27 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 			t.Errorf("sort=%s =\n  %v\nwant\n  %v", tc.sort, got, tc.want)
 		}
 	}
+
+	// D-3 / D-16: a reference's kind and its account's connectedness are the
+	// PROJECTED values, fixed while the revision stays the same. Connecting
+	// 999999999999 now -- no projection pass has rewritten the reference --
+	// changes neither: partner is still external, its account still not
+	// connected; only the label follows the new connector.
+	l.account("999999999999")
+	now := listsGet(t, api, "/resources"+qs("kind", "external", "facets", "kind"))
+	if num(now, "meta", "rev") != num(body, "meta", "rev") {
+		t.Fatalf("setup: onboarding published a revision (%v -> %v)", num(body, "meta", "rev"), num(now, "meta", "rev"))
+	}
+	if got := listsField(digl(now, "data"), "text"); len(got) != 1 || got[0] != partner {
+		t.Errorf("kind=external after connecting its account = %v, want still %s at the same revision", got, partner)
+	}
+	if r := listsRowBy(t, digl(now, "data"), "text", partner); dig(r, "account", "connected") != false ||
+		digs(r, "account", "label") != "acct-999999999999" {
+		t.Errorf("partner account = %v, want connected false (projected) with the new connector's label", dig(r, "account"))
+	}
+	if f, _ := listsFacet(now, "kind"); f["external"] != 1 || f["exact"] != 1 {
+		t.Errorf("kind facet after connecting = %v, want the revision's kinds unchanged", f)
+	}
 }
 
 // Identities: kind, ARN, the account from the ARN, region global, and
@@ -818,5 +839,35 @@ func TestP2ListsInvalidParameters(t *testing.T) {
 	}
 	if code, b := api.get("/workloads" + qs("cursor", "garbage")); code != 400 || errCode(b) != "cursor_invalid" {
 		t.Errorf("a garbage cursor = %d %v, want 400 cursor_invalid", code, b)
+	}
+}
+
+// D-61 / D-3 / D-16: "connected" has ONE definition, a connector that exists
+// and is not revoked, on the projection side and the read side alike. A
+// reference into a REVOKED account projects as external, with its account
+// not connected -- the same answer the revoked account's own objects give.
+func TestP2ListsRevokedAccountReferenceIsExternal(t *testing.T) {
+	l := newP2Lab(t, "p2-lists-revoked-ref", true)
+	a := l.account(accountA)
+	b := l.account(accountB)
+	inB := "arn:aws:dynamodb:us-east-1:" + accountB + ":table/partner"
+	inA := "arn:aws:dynamodb:us-east-1:" + accountA + ":table/orders"
+	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	a.attach("SharedToolRole", a.managed("Tables", `{"Version":"2012-10-17","Statement":[{"Sid":"Tables",`+
+		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":["`+inA+`","`+inB+`"]}]}`))
+	if err := l.db.Exec(`UPDATE cloud_connector SET status = 'revoked' WHERE workspace_id = ? AND id = ?`, l.ws, b.conn).Error; err != nil {
+		t.Fatalf("revoke B: %v", err)
+	}
+	l.scanAndProject(a)
+
+	rows := digl(listsGet(t, l.api(), "/resources"), "data")
+	for text, want := range map[string]struct {
+		kind      string
+		connected bool
+	}{inA: {"exact", true}, inB: {"external", false}} {
+		r := listsRowBy(t, rows, "text", text)
+		if digs(r, "kind") != want.kind || dig(r, "account", "connected") != want.connected {
+			t.Errorf("%s = kind %v account %v, want %s with connected %v", text, r["kind"], r["account"], want.kind, want.connected)
+		}
 	}
 }

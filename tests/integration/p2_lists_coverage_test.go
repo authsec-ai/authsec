@@ -57,9 +57,12 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	listsFunctions(a, "us-east-1", "east-fn", role)
 	listsFunctions(a, "eu-west-1", "west-fn", role)
 
-	// B: a role and a user, us-east-1 only.
+	// B: a role and a user, us-east-1 only; the role's policy ALSO names
+	// support-tickets/*, so that reference has one support row per account.
 	b := l.account(accountB)
 	b.role("OpsRole", "AROAOPSROLEOPSROLE01")
+	opsRead := b.managed("OpsRead", docToolboxRead)
+	b.attach("OpsRole", opsRead)
 	b.iam.users = append(b.iam.users, iamtypes.User{
 		Arn: aws.String("arn:aws:iam::" + accountB + ":user/ci-deployer"), UserName: aws.String("ci-deployer"),
 		UserId: aws.String("AIDACIDEPLOYER000001"), Path: aws.String("/"), CreateDate: ago(0),
@@ -78,11 +81,13 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	}
 
 	// Then: A's eu-west-1 Lambda read is denied and TicketRead's document is
-	// unreadable; B's user listing is denied.
+	// unreadable; B's user listing is denied while OpsRead is detached, so B's
+	// support of support-tickets/* can only go stale, never end.
 	a.lambdas["eu-west-1"].fail = denied("lambda:ListFunctions")
 	a.iam.failPolicyVersion[ticket] = denied("iam:GetPolicyVersion")
 	runA := l.scanAndProject(a)
 	b.iam.fail["ListUsers"] = denied("iam:ListUsers")
+	b.detach("OpsRole", opsRead)
 	runB := l.scanAndProject(b)
 	sinceA := runA.PublishedAt.UTC().Format(time.RFC3339)
 	sinceB := runB.PublishedAt.UTC().Format(time.RFC3339)
@@ -205,8 +210,55 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 	if got := listsRowStaleReasons(archive); strings.Join(got, ",") != accountA+"|policy_documents|partial|"+sinceA {
 		t.Errorf("ticket-archive/* stale_reason = %v, want A's policy_documents partial since %s", got, sinceA)
 	}
-	if r := listsRowBy(t, digl(res, "data"), "text", "arn:aws:s3:::support-tickets/*"); digs(r, "state") != "current" {
-		t.Errorf("support-tickets/* = %v, want current: ToolboxRead still names it", r["state"])
+	// D-1: current if ANY support row is current -- A's is (ToolboxRead still
+	// names it) though B's went stale.
+	tickets := listsRowBy(t, digl(res, "data"), "text", "arn:aws:s3:::support-tickets/*")
+	if sup := l.supportOf("resource_id", refUUID(t, digs(tickets, "ref"))); sup[a.conn] != "current" || sup[b.conn] != "stale" {
+		t.Fatalf("setup: support-tickets/* support = %v, want A current and B stale", sup)
+	}
+	if digs(tickets, "state") != "current" {
+		t.Errorf("support-tickets/* = %v, want current: one current support row makes the node current", tickets["state"])
+	}
+	if _, has := tickets["stale_reason"]; has {
+		t.Errorf("support-tickets/* carries stale_reason %v but is not stale", tickets["stale_reason"])
+	}
+
+	/* ------------------- which runs a list was built from ------------------- */
+
+	// A's failures clear and a third scan reaches everything.
+	a.lambdas["eu-west-1"].fail = nil
+	delete(a.iam.failPolicyVersion, ticket)
+	l.scanAndProject(a)
+	// listsWatermark adds a watermark of one node class still naming A's
+	// SECOND run: a partition the latest run no longer carries.
+	listsWatermark := func(class string) {
+		t.Helper()
+		if err := l.db.Exec(`INSERT INTO iga_projection_state (workspace_id, estate_scope_id, connector_id, object_class,
+		                            relationship_type, partition_key, last_run_id, last_generation, coverage_state, reconciled)
+		                     SELECT workspace_id, estate_scope_id, connector_id, ?, '', ?, ?, last_generation, 'partial', true
+		                       FROM iga_projection_state WHERE workspace_id = ? AND connector_id = ? LIMIT 1`,
+			class, "lists-test|"+class, runA.ID, l.ws, a.conn).Error; err != nil {
+			t.Fatalf("seed an older %s watermark: %v", class, err)
+		}
+	}
+	// A lagging WORKLOAD watermark: the newer run that also built workloads
+	// reports lambda:eu-west-1 reached, and the newest report decides; and a
+	// workload partition's run is not what the resources list was built from.
+	listsWatermark("workload")
+	for route, kv := range map[string][]string{
+		"/workloads": {"account", accountA, "region", "eu-west-1"},
+		"/resources": {"account", accountA},
+	} {
+		if got := listsNotes(listsGet(t, api, route+qs(kv...))); len(got) != 0 {
+			t.Errorf("%s %v coverage with a lagging workload watermark = %v, want none", route, kv, got)
+		}
+	}
+	// A lagging RESOURCE watermark: that partition's references were built from
+	// the second run, whose unreadable document therefore still bears on the
+	// resources list (the newer run's silence about documents is not a report).
+	listsWatermark("resource")
+	if got := strings.Join(listsNotes(listsGet(t, api, "/resources"+qs("account", accountA))), ","); got != docsA {
+		t.Errorf("/resources coverage with a lagging resource watermark = %q, want %q", got, docsA)
 	}
 
 	/* -------------------------------- revoked ------------------------------- */

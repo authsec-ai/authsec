@@ -790,11 +790,17 @@ func listsRegionFacet(counts map[string]int64, _ *Accounts) []FacetValue {
 // the current revision was built from intended to read and did not, that bears
 // on THIS result, as {account_id, surface, state, affects}.
 //
-// The runs are the ones iga_projection_state names (D-57): each partition's
-// last projected run, written in the publication's transaction, so this
-// snapshot sees exactly the runs its graph came from. Per account and surface,
-// the newest such run that reports the surface decides its state. Every state
-// but reached is a gap, except unsupported (ours to build, not the customer's
+// The runs are the ones iga_projection_state names for THIS list's node
+// partitions (D-57): each partition's last projected run, written in the
+// publication's transaction, so this snapshot sees exactly the runs the
+// listed objects came from. Normally that is each connector's latest run; a
+// partition the latest run no longer carries keeps an older watermark, and
+// its objects were built from that older run, so that run's gaps still bear
+// on the list -- kept, never dropped, which can only over-report. Watermarks
+// of other classes (a workload partition's, for the resources list) are not
+// this list's objects and are left out. Per account and surface, the newest
+// such run that reports the surface decides its state. Every state but
+// reached is a gap, except unsupported (ours to build, not the customer's
 // estate); not_selected is reported as stale -- nobody looked, earlier results
 // are kept and marked stale (D-58, §2.14.13).
 //
@@ -813,9 +819,10 @@ func listsCoverage(q *Query, accts *Accounts, list string, sc listsScope) ([]Cov
 	if err := q.DB().Raw(`SELECT sr.id, sr.connector_id, sr.coverage
 	                        FROM cloud_scan_run sr
 	                       WHERE sr.workspace_id = ?
-	                         AND sr.id IN (SELECT ps.last_run_id FROM iga_projection_state ps WHERE ps.workspace_id = ?)
+	                         AND sr.id IN (SELECT ps.last_run_id FROM iga_projection_state ps
+	                                        WHERE ps.workspace_id = ? AND ps.object_class = ?)
 	                       ORDER BY sr.published_at DESC NULLS LAST, sr.requested_at DESC, sr.id`,
-		q.WS, q.WS).Scan(&runs).Error; err != nil {
+		q.WS, q.WS, listsClass[list]).Scan(&runs).Error; err != nil {
 		return nil, err
 	}
 	all := len(sc.accounts) == 0 || contains(sc.accounts, AccountUnknown)
@@ -868,6 +875,14 @@ func listsCoverage(q *Query, accts *Accounts, list string, sc listsScope) ([]Cov
 		return notes[i].Surface < notes[j].Surface
 	})
 	return notes, nil
+}
+
+// listsClass is the node class each list shows: its partitions' watermarks
+// name the runs its rows were built from.
+var listsClass = map[string]string{
+	listsRouteWorkloads:  models.ObjectWorkload,
+	listsRouteIdentities: models.ObjectIdentity,
+	listsRouteResources:  models.ObjectResource,
 }
 
 // listsRevokedAffects is what a revoked account's "*" note says, per list.

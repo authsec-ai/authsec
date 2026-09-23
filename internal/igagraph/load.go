@@ -102,10 +102,14 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
 	}
 
 	// Every AWS account connected in this workspace: a resource reference in
-	// any other account is an EXTERNAL reference (§1.4).
+	// any other account is an EXTERNAL reference (§1.4). Connected means a
+	// connector exists and is not revoked -- the read side's rule too (D-61,
+	// D-3), so a revoked account's references project as external while its
+	// objects read account.connected = false.
 	var accounts []string
 	if err := tx.Model(&models.CloudConnector{}).
-		Where("workspace_id = ? AND provider = ?", run.WorkspaceID, models.CloudProviderAWS).
+		Where("workspace_id = ? AND provider = ? AND status <> ?", run.WorkspaceID, models.CloudProviderAWS,
+			models.CloudConnectorRevoked).
 		Pluck("scope_id", &accounts).Error; err != nil {
 		return nil, fmt.Errorf("load connected accounts: %w", err)
 	}
