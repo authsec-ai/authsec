@@ -120,6 +120,14 @@ type WorkloadSnapshot struct {
 	Complete bool
 	// Errors carries what went wrong per surface, for the coverage report.
 	Errors map[string]string
+	// ActivityTruncated says the activity pass hit activityIdentityCap and so
+	// read only a prefix of the account's identities. It is tracked apart from
+	// Errors because the two mean different things to a reader: nothing was
+	// denied, the read simply stopped short. It blocks reconciliation exactly
+	// as an error does, but reports the surface as `partial`, not `denied`.
+	ActivityTruncated bool
+	// ActivityTruncatedNote is the operator-facing explanation for the above.
+	ActivityTruncatedNote string
 	// Surfaces is the same information as Errors, but in the connector-level
 	// coverage shape (state + count, not just an error string), so the caller
 	// can fold it into the overall report instead of dropping it. Keyed
@@ -171,17 +179,32 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 
 	// ---- activity, which is global because IAM is -------------------------
 	s.scanActivity(ctx, workspaceID, snapshot, out)
-	if activityErr, failed := out.Errors["activity"]; failed {
+	// Three outcomes, most severe first. A denial outranks a short read: if some
+	// identity's report was refused we say so, even if the pass also stopped at
+	// the cap. Truncation alone is `partial` -- reached, but not exhaustively --
+	// because nothing was denied, the read simply ran out of budget.
+	switch {
+	case out.Errors["activity"] != "":
 		out.Surfaces["activity"] = models.SurfaceCoverage{
-			State: models.CloudCoverageDenied, Count: out.UsageWritten, Error: activityErr,
+			State: models.CloudCoverageDenied, Count: out.UsageWritten,
+			Error: out.Errors["activity"],
 		}
-	} else {
+	case out.ActivityTruncated:
+		out.Surfaces["activity"] = models.SurfaceCoverage{
+			State: models.CloudCoveragePartial, Count: out.UsageWritten,
+			Error: out.ActivityTruncatedNote,
+		}
+	default:
 		out.Surfaces["activity"] = models.SurfaceCoverage{
 			State: models.CloudCoverageReached, Count: out.UsageWritten,
 		}
 	}
 
-	out.Complete = len(out.Errors) == 0 && snapshot.Coverage.Complete()
+	// A truncated activity read blocks reconciliation for the same reason a
+	// denied one does: rows for the identities past the cap were never looked
+	// at, and absence from a read that stopped early is not evidence of
+	// deletion. This is the only place a bounded read could license a delete.
+	out.Complete = len(out.Errors) == 0 && !out.ActivityTruncated && snapshot.Coverage.Complete()
 
 	if out.Complete {
 		workloadsRemoved, usageRemoved, err := s.workloads.ReconcileGeneration(
@@ -671,13 +694,34 @@ func (s *AWSWorkloadScanner) scanActivity(
 		reader = reader.WithSleep(s.activitySleep)
 	}
 
-	identities, _, err := s.identities.ListIdentities(workspaceID, repositories.CloudIdentityFilter{
+	identities, total, err := s.identities.ListIdentities(workspaceID, repositories.CloudIdentityFilter{
 		ConnectorID: &snapshot.ConnectorID,
 		Limit:       activityIdentityCap,
 	})
 	if err != nil {
 		out.Errors["activity"] = err.Error()
 		return
+	}
+	// The cap is a real ceiling, and above it this pass reads a PREFIX of the
+	// account -- ListIdentities orders by (kind, name, id), so it is the same
+	// prefix every scan and the same identities are starved every time.
+	//
+	// Recording that is not cosmetic. Without it the surface reports `reached`,
+	// Complete() stays true, and ReconcileGeneration deletes the cloud_usage
+	// rows carried from the previous generation for every identity past the cap
+	// -- destroying real "granted but never used" history on the authority of a
+	// read that never looked at those identities.
+	//
+	// This is deliberately NOT an Errors entry, though it gates reconciliation
+	// just as one does. A later per-identity failure writes that same key and
+	// would overwrite the message, and a denial should outrank a short read when
+	// deciding what to show the operator. ScanFromSnapshot consults both.
+	if total > int64(len(identities)) {
+		out.ActivityTruncated = true
+		out.ActivityTruncatedNote = fmt.Sprintf(
+			"read service activity for %d of %d identities: the per-scan cap is %d, "+
+				"so the rest were not attempted and nothing may be reconciled away",
+			len(identities), total, activityIdentityCap)
 	}
 
 	for _, identity := range identities {

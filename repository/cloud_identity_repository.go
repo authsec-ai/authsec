@@ -21,7 +21,13 @@ type CloudIdentityRepository interface {
 	// UpsertIdentity records one identity, keyed on (workspace_id, native_id).
 	// A repeat scan updates the same row and stamps the generation; it never
 	// creates a duplicate. Reports whether the row was newly created.
-	UpsertIdentity(i *models.CloudIdentity) (stored *models.CloudIdentity, created bool, err error)
+	//
+	// partialRead says the caller could not read this principal in full — some
+	// of what it is passing in Attrs is UNKNOWN rather than absent. The row is
+	// still stamped (it was seen, so it must not be reconciled away), but the
+	// attrs blob is left as an earlier complete read established it. See the
+	// implementation for why that distinction cannot be made inside the repo.
+	UpsertIdentity(i *models.CloudIdentity, partialRead bool) (stored *models.CloudIdentity, created bool, err error)
 
 	// UpsertSecret records one secret, keyed on (workspace_id, native_id).
 	UpsertSecret(s *models.CloudSecret) (stored *models.CloudSecret, created bool, err error)
@@ -70,7 +76,7 @@ func NewCloudIdentityRepository(db *gorm.DB) CloudIdentityRepository {
 	return &cloudIdentityRepository{db: db}
 }
 
-func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*models.CloudIdentity, bool, error) {
+func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity, partialRead bool) (*models.CloudIdentity, bool, error) {
 	if i.WorkspaceID == uuid.Nil || i.ConnectorID == uuid.Nil {
 		return nil, false, errors.New("workspace_id and connector_id are required")
 	}
@@ -112,6 +118,39 @@ func (r *cloudIdentityRepository) UpsertIdentity(i *models.CloudIdentity) (*mode
 			        OR excluded.last_used_at > cloud_identity.last_used_at
 			      THEN excluded.last_used_at ELSE cloud_identity.last_used_at END`)
 	}
+	// attrs gets the same treatment as last_used_at, for the same reason, and it
+	// is the caller who must say so. A partial read carries a THIN blob, not a
+	// corrective one: a throttled iam:GetRole yields Tags=nil, boundary="" and
+	// Description="", all `omitempty`, so they vanish from the serialised JSON
+	// and a blind overwrite erases what a complete read established. IAM tags are
+	// the only ownership signal we collect, so that loss is permanent and silent.
+	//
+	// This cannot be decided here. `detail_incomplete` lives inside the attrs
+	// JSON, not in a column, and it is `omitempty` -- so false is ABSENT from the
+	// blob and "key missing" would have to be read as complete. Parsing provider
+	// JSON in a provider-neutral repository to find out is the wrong place for
+	// that knowledge; the scanner already knows, so it tells us.
+	//
+	// Keeping the old blob is only half of it. The blob an earlier COMPLETE read
+	// stored carries no detail_incomplete key (it is `omitempty`, and it was
+	// false), so preserving it verbatim would leave the row asserting it is
+	// fully read when this scan could not confirm that. For a role whose last
+	// complete read found no boundary, constraintState would then still answer
+	// `unconstrained` -- a firmer claim than the evidence now supports.
+	//
+	// So: merge, do not replace. `||` keeps every key the good read established
+	// and overlays the one fact this read actually learned -- that it fell
+	// short. Old tags and boundary survive AND the row stays honest about its
+	// freshness, which is what makes constraintState degrade to unknown.
+	//
+	// This one key is the only provider-specific knowledge in this method, and
+	// it buys the whole guarantee. Only an UPDATE is affected; a first insert
+	// still writes whatever the partial read had, because a thin row beats no
+	// row and there is nothing yet to preserve.
+	if partialRead {
+		assignments["attrs"] = gorm.Expr(
+			`cloud_identity.attrs || jsonb_build_object('detail_incomplete', true)`)
+	}
 
 	err := r.db.Clauses(
 		clause.OnConflict{
@@ -141,12 +180,22 @@ func (r *cloudIdentityRepository) UpsertSecret(s *models.CloudSecret) (*models.C
 	now := time.Now()
 
 	assignments := map[string]interface{}{
-		"connector_id":         s.ConnectorID,
-		"identity_id":          s.IdentityID,
-		"kind":                 s.Kind,
-		"created_at":           s.ProviderCreatedAt,
-		"expires_at":           s.ExpiresAt,
-		"status":               s.Status,
+		"connector_id": s.ConnectorID,
+		"identity_id":  s.IdentityID,
+		"kind":         s.Kind,
+		"created_at":   s.ProviderCreatedAt,
+		"expires_at":   s.ExpiresAt,
+		"status":       s.Status,
+		// Unconditional, unlike UpsertIdentity's attrs, and safe only because no
+		// caller writes a secret's attrs today: upsertAccessKey builds the row
+		// from ListAccessKeys alone and never calls SetAWSAttrs, so this blob is
+		// always "{}" and there is nothing an overwrite could destroy.
+		//
+		// If a collector ever populates it -- a key's rotation date from the
+		// credential report is the obvious candidate -- this acquires the exact
+		// bug UpsertIdentity's partialRead parameter exists to prevent, and it
+		// needs the same treatment. It is written here rather than fixed because
+		// a flag no caller can set is speculative API surface.
 		"attrs":                s.Attrs,
 		"last_seen_generation": s.LastSeenGeneration,
 		"last_seen_at":         now,

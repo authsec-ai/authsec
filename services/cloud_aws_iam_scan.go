@@ -73,11 +73,35 @@ type AWSIAMScanner struct {
 	// a caller with no durable run to anchor evidence to (a test, a legacy
 	// path) degrades to no evidence rather than failing.
 	evidence *ObservationWriter
+
+	// generation, when non-zero, is the number this scan stamps its rows with,
+	// supplied by the caller instead of derived here. See WithGeneration.
+	generation int
 }
 
 // WithEvidence attaches an observation writer for this run.
 func (s *AWSIAMScanner) WithEvidence(w *ObservationWriter) *AWSIAMScanner {
 	s.evidence = w
+	return s
+}
+
+// WithGeneration fixes the generation this scan stamps its rows with, making
+// the caller the single authority for it.
+//
+// It exists because there were two. cloud_scan_run.generation is assigned once
+// at Claim and preserved across re-claims (`CASE WHEN generation > 0`), while
+// Scan independently recomputed connector.ScanGeneration+1 on every attempt.
+// Those agree until a run is re-claimed after commitScan already advanced the
+// connector -- the crashed-worker path -- and then the entity rows land one
+// generation ahead of the cloud_observation rows written for the very same
+// pass, because the worker built the ObservationWriter from run.Generation.
+// Evidence then no longer joins to the inventory it explains, which is the one
+// thing cloud_observation.generation exists to guarantee.
+//
+// Unset (zero) keeps the derived behaviour, which is what callers with no
+// cloud_scan_run row -- the integration tests -- rely on.
+func (s *AWSIAMScanner) WithGeneration(generation int) *AWSIAMScanner {
+	s.generation = generation
 	return s
 }
 
@@ -179,7 +203,17 @@ func (s *AWSIAMScanner) Scan(ctx context.Context, workspaceID, connectorID uuid.
 	// scan that died left it untouched. Checkpoints at this generation
 	// therefore mean "the previous attempt was interrupted part-way", and this
 	// run continues it rather than repeating its work.
-	generation := connector.ScanGeneration + 1
+	//
+	// ...except when the attempt died AFTER commitScan and before Publish, which
+	// is exactly the crashed-worker case Claim is built to recover. Then the
+	// connector HAS advanced, this would compute one too many, and the evidence
+	// the worker is writing against run.Generation would be stamped a generation
+	// behind the rows it explains. So the run's number wins when there is one;
+	// see WithGeneration.
+	generation := s.generation
+	if generation == 0 {
+		generation = connector.ScanGeneration + 1
+	}
 	resuming, err := s.checkpoints.HasAny(workspaceID, connectorID, generation)
 	if err != nil {
 		return nil, err
@@ -469,7 +503,10 @@ func (s *AWSIAMScanner) upsertRole(
 		// boundary.
 		counters["roles_detail_incomplete"]++
 	}
-	return s.recordIdentity(identity, counters)
+	// !DetailComplete is exactly the "partial read" the repository asks about:
+	// the attrs we just built carry "" / nil for description, boundary and tags
+	// because GetRole failed, not because the role lacks them.
+	return s.recordIdentity(identity, !role.DetailComplete, counters)
 }
 
 func (s *AWSIAMScanner) upsertUser(
@@ -497,14 +534,18 @@ func (s *AWSIAMScanner) upsertUser(
 	}); err != nil {
 		return nil, err
 	}
-	if err := s.recordIdentity(identity, counters); err != nil {
+	// ListUsers is the whole read for a user today -- there is no GetUser call to
+	// half-fail -- so a user's attrs are always as complete as this collector
+	// gets. Not partial. (When GetUser and the user's permissions boundary are
+	// added, this becomes conditional the way upsertRole's is.)
+	if err := s.recordIdentity(identity, false, counters); err != nil {
 		return nil, err
 	}
 	return identity, nil
 }
 
-func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, counters map[string]int) error {
-	stored, created, err := s.identities.UpsertIdentity(identity)
+func (s *AWSIAMScanner) recordIdentity(identity *models.CloudIdentity, partialRead bool, counters map[string]int) error {
+	stored, created, err := s.identities.UpsertIdentity(identity, partialRead)
 	if err != nil {
 		return fmt.Errorf("record identity %s: %w", identity.NativeID, err)
 	}
