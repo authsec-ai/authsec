@@ -31,6 +31,10 @@ type IGAGraphReadController struct {
 
 	readerOnce sync.Once
 	reader     *igaread.Reader
+
+	// classifier is the classification decision service a test installed
+	// (WithClassificationService); nil builds one over db() per request.
+	classifier *services.ClassificationService
 }
 
 // NewIGAGraphReadController reads the process-wide projection gate on every
@@ -83,8 +87,10 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 	return ctl.reader
 }
 
-// graphFeatures is what THIS build serves (§5.3 /capabilities). A feature is
-// true only when its routes exist: the console hides a feature it is told is
+// graphFeatures is what THIS build serves NOW (§5.3 /capabilities). A feature
+// is true only when its routes are implemented AND graph_projection is on
+// (D-11): with the switch off or misconfigured every graph route answers 503,
+// so nothing is usable. The console hides a feature it is told is
 // unavailable, and a feature reported available with no route behind it would
 // render as empty rather than as unavailable -- which §2.14.7 forbids. And only
 // when the switch is on (D-11): off or misconfigured, every graph route
@@ -93,7 +99,9 @@ func graphFeatures(on bool) gin.H {
 	return gin.H{
 		"workloads": false, "identities": false, "resources": false,
 		"graph": false, "evidence": false, "changes": false,
-		"classification": false, "coverage": on,
+		// T6.6: POST and GET /workloads/:id/classification. T2.3: /coverage.
+		"classification": on,
+		"coverage":       on,
 	}
 }
 
