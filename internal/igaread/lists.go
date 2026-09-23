@@ -805,11 +805,15 @@ func listsRegionFacet(counts map[string]int64, _ *Accounts) []FacetValue {
 // are kept and marked stale (D-58, §2.14.13).
 //
 // Which surfaces bear on which list is listsAffects (D-73's table), narrowed
-// by the request's account, region and kind filters. An account filter keeps
-// the chosen accounts' notes; with "unknown" chosen (or no filter) every
-// account's notes stay, since an object with no stated account may come from
-// any of them. A revoked account in scope adds {account_id, surface: "*",
-// state: "revoked"}: nothing of it is refreshed any more (D-73, D-89).
+// by the request's account, region and kind filters as the route's filters
+// put them in sc. An account filter keeps the chosen accounts' notes where an
+// object's account IS its connector's (workloads, identities); with "unknown"
+// chosen (or no filter) every account's notes stay, since an object with no
+// stated account may come from any of them. The resources list never narrows
+// by account (see listsResourceFilters): a reference's account is what its
+// ARN states, not who scanned it. A revoked account in scope adds
+// {account_id, surface: "*", state: "revoked"}: nothing of it is refreshed
+// any more (D-73, D-89).
 func listsCoverage(q *Query, accts *Accounts, list string, sc listsScope) ([]CoverageNote, error) {
 	var runs []struct {
 		ID          uuid.UUID
@@ -1329,7 +1333,17 @@ var listsResources = listsSpec[listsResourceScan]{
 var listsServiceRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 func listsResourceFilters(p *ListParams, ws uuid.UUID) ([]listsFilter, listsScope, bool, *Error) {
-	sc := listsScope{accounts: p.Accounts}
+	// meta.coverage is NOT narrowed by the account filter here. A coverage
+	// note's account is the SCANNING connector's, but a resource's account is
+	// the one its ARN states (D-3), and any connector's policies may name
+	// resources in any account: with B's policies unread, account=A cannot
+	// know which of A's resources B names. Narrowing would turn B's "we could
+	// not look" into "nothing there" for A (§2.14.10: "Selecting production
+	// must not look like the complete answer for production"), so every
+	// connector's resource-surface gaps and revoked notes stay, whatever the
+	// account values -- as they already do for "unknown". The region, kind and
+	// service filters never narrowed the resources notes (listsAffects).
+	sc := listsScope{}
 	// provider = 'aws' and supported: GitHub resources share the table (D-6).
 	fs := []listsFilter{listsReadable("r", "resource_id", ws)}
 	fs = append(fs, listsLifecycle(p, "r.lifecycle")...)

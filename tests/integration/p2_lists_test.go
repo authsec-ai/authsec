@@ -775,10 +775,33 @@ func TestP2ListsClassificationChangeBetweenPages(t *testing.T) {
 	l.scanAndProject(a)
 	api := l.api()
 
+	// Another workspace's clock, far ahead of this one's (which has no row
+	// yet): the clock is per workspace, so neither its value nor its moves
+	// may reach this workspace's cursors.
+	other := newWorkspace(t, l.db, "p2-lists-classification-other")
+	if err := l.db.Exec(`INSERT INTO iga_classification_clock (workspace_id, seq) VALUES (?, 41)`, other).Error; err != nil {
+		t.Fatalf("seed the other workspace's clock: %v", err)
+	}
+
 	byClass := listsGet(t, api, "/workloads"+qs("classification", "unclassified", "limit", "2"))
 	bySort := listsGet(t, api, "/workloads"+qs("sort", "classification", "limit", "2"))
 	plain := listsGet(t, api, "/workloads"+qs("limit", "2"))
 	target := refUUID(t, digs(byClass, "data", 0, "ref"))
+
+	// A decision in the OTHER workspace between pages: this workspace's
+	// listing did not change, so its next page is 200 -- a 409 here would be
+	// one tenant's decisions breaking another's paging.
+	listsDecide(t, l.db, other, uuid.New())
+	for name, path := range map[string]string{
+		"classification filter": "/workloads" + qs("classification", "unclassified", "limit", "2",
+			"cursor", digs(byClass, "meta", "next_cursor")),
+		"classification sort": "/workloads" + qs("sort", "classification", "limit", "2",
+			"cursor", digs(bySort, "meta", "next_cursor")),
+	} {
+		if code, b := api.get(path); code != 200 {
+			t.Errorf("%s: next page after ANOTHER workspace's decision = %d %v, want 200", name, code, b)
+		}
+	}
 
 	listsDecide(t, l.db, l.ws, target)
 
@@ -897,6 +920,59 @@ func TestP2ListsRevokedAccountReferenceIsExternal(t *testing.T) {
 		r := listsRowBy(t, rows, "text", text)
 		if digs(r, "kind") != want.kind || dig(r, "account", "connected") != want.connected {
 			t.Errorf("%s = kind %v account %v, want %s with connected %v", text, r["kind"], r["account"], want.kind, want.connected)
+		}
+	}
+}
+
+// D-75: integration selects objects with a NON-ENDED support row from that
+// connector (§2.14.10 "objects supported by this connector"). A reference
+// both accounts named, that B stops naming, keeps A's current support and B's
+// ENDED one: it is no longer B's, and still A's.
+func TestP2ListsIntegrationNeedsLiveSupport(t *testing.T) {
+	l := newP2Lab(t, "p2-lists-integration", true)
+	shared, bOnly := "arn:aws:s3:::support-tickets/*", "arn:aws:s3:::b-only/*"
+	a := l.account(accountA)
+	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	a.attach("SharedToolRole", a.managed("TicketRead", docTicketRead))
+	b := l.account(accountB)
+	b.role("data-reader", "AROADATAREADERDATARE")
+	sandbox := b.managed("SandboxTickets", docToolboxRead)
+	b.attach("data-reader", sandbox)
+	b.attach("data-reader", b.managed("BOnly", `{"Version":"2012-10-17","Statement":[{"Sid":"BOnly",`+
+		`"Effect":"Allow","Action":"s3:GetObject","Resource":"`+bOnly+`"}]}`))
+	l.scanAndProject(a)
+	l.scanAndProject(b)
+	api := l.api()
+
+	byConn := func(kv ...string) []string {
+		t.Helper()
+		return listsField(listsWalk(t, api, "/resources", 100, kv...), "text")
+	}
+	if got := byConn("integration", refOf("cloud_connector", b.conn)); !listsSameSet(got, []string{shared, bOnly}) {
+		t.Fatalf("setup: integration=B = %v, want both of B's references", got)
+	}
+
+	b.detach("data-reader", sandbox)
+	l.scanAndProject(b)
+	id, _ := l.resourceID(shared)
+	if sup := l.supportOf("resource_id", id); sup[a.conn] != "current" || sup[b.conn] != "ended" {
+		t.Fatalf("setup: %s support = %v, want A current and B ended", shared, sup)
+	}
+
+	for _, tc := range []struct {
+		kv   []string
+		want []string
+	}{
+		// B's support ENDED: the reference is not B's any more, though the
+		// ended row is still there.
+		{[]string{"integration", refOf("cloud_connector", b.conn)}, []string{bOnly}},
+		{[]string{"integration", b.conn.String(), "lifecycle", "all"}, []string{bOnly}},
+		{[]string{"integration", refOf("cloud_connector", a.conn)}, []string{shared}},
+		{[]string{"integration", refOf("cloud_connector", a.conn), "integration", refOf("cloud_connector", b.conn)},
+			[]string{shared, bOnly}},
+	} {
+		if got := byConn(tc.kv...); !listsSameSet(got, tc.want) {
+			t.Errorf("/resources %v = %v, want %v", tc.kv, got, tc.want)
 		}
 	}
 }

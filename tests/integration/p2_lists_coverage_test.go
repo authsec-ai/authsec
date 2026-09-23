@@ -286,3 +286,85 @@ func TestP2ListsCoverageAndStaleRows(t *testing.T) {
 		t.Errorf("/identities of A after B's revocation = %q, want none: B is not in scope", got)
 	}
 }
+
+// A resource's account is the one its ARN STATES, never the scanning account
+// (D-3), so on /resources the account filter must not narrow meta.coverage by
+// the SCANNING connector's account: B's policies can name resources in A, and
+// with B's documents unread, "A's resources" is incomplete however clean A's
+// own scan was (§2.14.10 "Selecting production must not look like the
+// complete answer for production"). Identities stay narrowed: an identity's
+// account is its connector's.
+func TestP2ListsResourceCoverageKeepsOtherScannersGaps(t *testing.T) {
+	l := newP2Lab(t, "p2-lists-resource-coverage", true)
+	orders := "arn:aws:dynamodb:us-east-1:" + accountA + ":table/orders"
+	ledger := "arn:aws:dynamodb:us-east-1:" + accountA + ":table/ledger"
+
+	// A names its own orders table; B names A's ledger table -- a reference IN
+	// A that only B's policy makes.
+	a := l.account(accountA)
+	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	a.attach("SharedToolRole", a.managed("Orders", `{"Version":"2012-10-17","Statement":[{"Sid":"Orders",`+
+		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"`+orders+`"}]}`))
+	b := l.account(accountB)
+	b.role("OpsRole", "AROAOPSROLEOPSROLE01")
+	cross := b.managed("CrossLedger", `{"Version":"2012-10-17","Statement":[{"Sid":"Ledger",`+
+		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"`+ledger+`"}]}`)
+	b.attach("OpsRole", cross)
+	l.scanAndProject(a)
+	l.scanAndProject(b)
+	api := l.api()
+
+	inA := listsGet(t, api, "/resources"+qs("account", accountA))
+	if got := listsField(digl(inA, "data"), "text"); !listsSameSet(got, []string{orders, ledger}) {
+		t.Fatalf("setup: /resources account=A = %v, want both tables: an account is what the ARN states", got)
+	}
+	if notes := listsNotes(inA); len(notes) != 0 {
+		t.Fatalf("setup: coverage after clean scans = %v, want none", notes)
+	}
+
+	// B's document becomes unreadable: A's own scan is still clean, but the
+	// list of A's resources can no longer be known to be complete.
+	b.iam.failPolicyVersion[cross] = denied("iam:GetPolicyVersion")
+	runB := l.scanAndProject(b)
+	docsB := listsNote(accountB, "policy_documents", "partial", "resources named by unreadable policy documents")
+
+	inA = listsGet(t, api, "/resources"+qs("account", accountA))
+	row := listsRowBy(t, digl(inA, "data"), "text", ledger)
+	if digs(row, "state") != "stale" || digs(row, "account", "id") != accountA {
+		t.Fatalf("setup: ledger = state %v account %v, want stale in A (only B's unread policy names it)", row["state"], row["account"])
+	}
+	if got, want := strings.Join(listsRowStaleReasons(row), ","),
+		accountB+"|policy_documents|partial|"+runB.PublishedAt.UTC().Format(time.RFC3339); got != want {
+		t.Errorf("ledger stale_reason = %q, want %q", got, want)
+	}
+	for _, kv := range [][]string{
+		{"account", accountA},
+		{"account", accountB},
+		// An account no connector reads: B's unread policies may name its
+		// resources as well.
+		{"account", "999999999999"},
+		{"account", accountA, "account", "unknown"},
+		nil,
+	} {
+		if got := strings.Join(listsNotes(listsGet(t, api, "/resources"+qs(kv...))), ","); got != docsB {
+			t.Errorf("/resources %v coverage = %q, want %q: B's gap bears on every account's resources", kv, got, docsB)
+		}
+	}
+	// Identities are not widened: B's document gap is not a gap in A's IAM.
+	if got := listsNotes(listsGet(t, api, "/identities"+qs("account", accountA))); len(got) != 0 {
+		t.Errorf("/identities account=A coverage = %v, want none", got)
+	}
+
+	// Revoked B: nothing B's policies name is refreshed any more, in any
+	// account -- A's resources included.
+	if err := l.db.Exec(`UPDATE cloud_connector SET status = 'revoked' WHERE workspace_id = ? AND id = ?`, l.ws, b.conn).Error; err != nil {
+		t.Fatalf("revoke B: %v", err)
+	}
+	revokedB := listsNote(accountB, "*", "revoked", "resources named by this account's policies")
+	if got := strings.Join(listsNotes(listsGet(t, api, "/resources"+qs("account", accountA))), ","); got != revokedB+","+docsB {
+		t.Errorf("/resources account=A after B's revocation = %q, want %q", got, revokedB+","+docsB)
+	}
+	if got := listsNotes(listsGet(t, api, "/identities"+qs("account", accountA))); len(got) != 0 {
+		t.Errorf("/identities account=A after B's revocation = %v, want none: B's IAM is not A's", got)
+	}
+}
