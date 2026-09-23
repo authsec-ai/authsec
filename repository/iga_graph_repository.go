@@ -1,8 +1,11 @@
 package repositories
 
 import (
+<<<<<<< HEAD
 	"errors"
 	"fmt"
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +22,11 @@ import (
 // transactions would publish a graph in which nothing has been closed yet.
 //
 // THE UPSERT TRAP, STATED ONCE. Every node upsert targets a PARTIAL unique
+<<<<<<< HEAD
 // index (... WHERE source_key <> ” AND lifecycle <> 'retired'). Postgres will
+=======
+// index (... WHERE source_key <> '' AND lifecycle <> 'retired'). Postgres will
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // not infer a partial index from a bare ON CONFLICT (cols): the predicate must
 // be restated, and in GORM that is TargetWhere, NOT Where. `Where` emits the
 // DO UPDATE ... WHERE condition, a different clause that silently does not
@@ -45,6 +52,7 @@ type IGAGraphRepository interface {
 	LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error
 	LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
 
+<<<<<<< HEAD
 	// PublicationForRun answers "did THIS run's projection already commit?".
 	// Trustworthy only because InsertPublication commits in the same
 	// transaction as the graph writes.
@@ -75,6 +83,8 @@ type IGAGraphRepository interface {
 	// not to assume.
 	MarkAssertionsPendingReconfirm(tx *gorm.DB, ws, identityID uuid.UUID) error
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error
 	EndEdgesOnSubject(tx *gorm.DB, ws, identityID uuid.UUID, reason string, now time.Time, runID uuid.UUID) error
 }
@@ -130,7 +140,11 @@ func (r *igaGraphRepository) UpsertWorkload(tx *gorm.DB, w *models.IGAWorkload) 
 	err := tx.Clauses(graphReturningID, clause.OnConflict{
 		Columns: []clause.Column{{Name: "workspace_id"}, {Name: "source_key"}},
 		// iga_workload's index has no source_key <> '' arm: the column is
+<<<<<<< HEAD
 		// NOT NULL with a non-empty CHECK from the start (029), because
+=======
+		// NOT NULL with a non-empty CHECK from the start (028), because
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		// nothing predates this table.
 		TargetWhere: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: "lifecycle <> 'retired'"},
@@ -242,6 +256,7 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 // THIS IS THE STEP THAT MAKES A NODE VISIBLE TO RECONCILIATION. A node pass
 // that upserts the node and returns its id but skips this compiles, passes an
 // unchanged-rescan test, and silently never reconciles.
+<<<<<<< HEAD
 // supportColumnOf reports which typed column this row sets.
 func supportColumnOf(s *models.IGAObjectSupport) string {
 	switch {
@@ -275,6 +290,14 @@ func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjec
 		TargetWhere: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: col + " IS NOT NULL"},
 		}},
+=======
+func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error {
+	return tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "workspace_id"}, {Name: "object_type"}, {Name: "object_id"},
+			{Name: "connector_id"}, {Name: "partition_key"},
+		},
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		DoUpdates: clause.Assignments(map[string]any{
 			"state":                 models.RelCurrent,
 			"ended_reason":          "",
@@ -316,6 +339,7 @@ func (r *igaGraphRepository) LinkRelationshipEvidence(tx *gorm.DB, ws, relID, ob
 // The key must stay: the partial unique index is what lets the new row take
 // the same key while only one of them is live, and that is the whole mechanism
 // of delete-and-recreate. Nothing is ever deleted.
+<<<<<<< HEAD
 func (r *igaGraphRepository) PublicationForRun(
 	tx *gorm.DB, ws, runID uuid.UUID,
 ) (*models.IGAPublication, error) {
@@ -422,6 +446,8 @@ func (r *igaGraphRepository) MarkAssertionsPendingReconfirm(
 		Update("resolution_state", models.ResolutionPendingReconfirmation).Error
 }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 func (r *igaGraphRepository) RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error {
 	return tx.Model(&models.IGAIdentityAccount{}).
 		Where("workspace_id = ? AND id = ?", ws, id).

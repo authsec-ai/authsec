@@ -75,11 +75,14 @@ type CloudScanRunRepository interface {
 	// Fail marks a run finished without publishing, under the same fence.
 	Fail(runID uuid.UUID, owner string, version int64, reason string) error
 
+<<<<<<< HEAD
 	// FailTx is Fail in the caller's transaction, so a run's failure and the
 	// pipeline barrier's release commit together (§2.10A: nothing returns the
 	// barrier to idle without the run already being terminal).
 	FailTx(tx *gorm.DB, runID uuid.UUID, owner string, version int64, reason string) error
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// Requeue returns a claimed run to the queue WITHOUT counting it as a
 	// failure.
 	//
@@ -289,6 +292,7 @@ func (r *cloudScanRunRepository) Fail(
 // that slept past its expiry is refused because the version moved on, not
 // because we compared timestamps and decided it was late. Clock skew between
 // two hosts therefore cannot let a superseded worker publish.
+<<<<<<< HEAD
 func (r *cloudScanRunRepository) FailTx(
 	tx *gorm.DB, runID uuid.UUID, owner string, version int64, reason string,
 ) error {
@@ -311,6 +315,8 @@ func (r *cloudScanRunRepository) FailTx(
 	return nil
 }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 func (r *cloudScanRunRepository) Requeue(runID uuid.UUID, owner string, version int64) error {
 	now := time.Now()
 	// attempts is decremented back: Claim incremented it, and a run that never

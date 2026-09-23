@@ -325,12 +325,15 @@ func SetupRoutes(
 			// reached. Read-only; the workspace comes from the authenticated
 			// context and a foreign workload id returns 404.
 			iga.GET("/workloads/:workload_id/access-path", middlewares.Require("iga", "read"), igaController.GetWorkloadAccessPath)
+<<<<<<< HEAD
 
 			// §2.14.3: a person's decision about what a workload IS. The
 			// handler additionally requires a workspace-member session --
 			// Require alone cannot express that, because a machine token can
 			// carry the permission without being a member.
 			iga.POST("/estate/:workload_id/classification", middlewares.Require("discovery", "admin"), igaController.ClassifyWorkload)
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			iga.GET("/classification-candidates", middlewares.Require("iga", "review"), igaController.ListCandidates)
 
 			// Governance decisions. Both require an expected version, so a

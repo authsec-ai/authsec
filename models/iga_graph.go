@@ -9,7 +9,11 @@ import (
 
 // This file holds the Phase 2 identity-graph types: the canonical runtime, the
 // binary structural edge, per-source support, and the projection's own durable
+<<<<<<< HEAD
 // job and watermark. SPEC-iga-phase2-graph.md §2 and §3 (migrations 027-034).
+=======
+// job and watermark. SPEC-iga-phase2-graph.md §2 and §3 (migrations 026-033).
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 //
 // The vocabularies below are duplicated as CHECK constraints in the
 // migrations. That duplication is deliberate and one-directional: the database
@@ -87,7 +91,11 @@ const (
 	// RetiredUnsupported -- every source that vouched for this object has
 	// ended its support (§2.10B).
 	RetiredUnsupported = "unsupported"
+<<<<<<< HEAD
 	// RetiredPreGraph -- a legacy row with no recognition key, retired by 035.
+=======
+	// RetiredPreGraph -- a legacy row with no recognition key, retired by 034.
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	RetiredPreGraph = "pre_graph"
 )
 
@@ -98,6 +106,7 @@ const (
 	EndedSubjectRecreate = "subject_recreated"
 )
 
+<<<<<<< HEAD
 // Workload classification (§2.14.3).
 const (
 	ClassificationUnclassified  = "unclassified"
@@ -144,6 +153,9 @@ const (
 )
 
 // Agent origin (§3, 033). The exit gate's "a registered agent is distinguished
+=======
+// Agent origin (§3, 032). The exit gate's "a registered agent is distinguished
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // from native discovery": the two get different review treatment and must
 // never silently merge.
 const (
@@ -204,6 +216,7 @@ type IGAWorkload struct {
 	Continuity   string `json:"continuity" gorm:"not null;default:'recognition_only'"`
 	ImmutableKey string `json:"immutable_key" gorm:"not null;default:''"`
 
+<<<<<<< HEAD
 	// Classification is what this workload IS. provider_native_agent is
 	// derived from the provider and is not human-editable; classified_agent is
 	// a person's decision. ClassificationVersion is the optimistic-concurrency
@@ -217,6 +230,8 @@ type IGAWorkload struct {
 	ExecutionRoleState string `json:"execution_role_state" gorm:"not null;default:'none'"`
 	ExecutionRoleARN   string `json:"execution_role_arn" gorm:"not null;default:''"`
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -314,6 +329,7 @@ type IGAExternalPrincipal struct {
 
 	// Nullable forever when the claim is wildcarded or the far provider is not
 	// connected. That is an honest state, not a gap to fill with a guess.
+<<<<<<< HEAD
 	// TYPED: a text kind beside a bare uuid is not a foreign key.
 	ResolvedIdentityAccountID *uuid.UUID `json:"resolved_identity_account_id,omitempty" gorm:"type:uuid"`
 	ResolvedWorkloadID        *uuid.UUID `json:"resolved_workload_id,omitempty" gorm:"type:uuid"`
@@ -325,6 +341,12 @@ type IGAExternalPrincipal struct {
 	// ResolutionState is whether the resolution currently APPLIES, separate
 	// from whether it exists.
 	ResolutionState string `json:"resolution_state" gorm:"not null;default:'active'"`
+=======
+	ResolvedObjectType string     `json:"resolved_object_type" gorm:"not null;default:''"`
+	ResolvedObjectID   *uuid.UUID `json:"resolved_object_id,omitempty" gorm:"type:uuid"`
+	ResolutionBasis    string     `json:"resolution_basis" gorm:"not null;default:''"`
+	ResolutionRule     string     `json:"resolution_rule" gorm:"not null;default:''"`
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 
 	FirstSeenAt time.Time `json:"first_seen_at" gorm:"not null;default:now()"`
 	LastSeenAt  time.Time `json:"last_seen_at" gorm:"not null;default:now()"`
@@ -368,6 +390,7 @@ func (IGARelationshipEvidence) TableName() string { return "iga_relationship_evi
 // every support of it has ended -- which is what stops account B's scan
 // retiring a bucket account A still holds.
 type IGAObjectSupport struct {
+<<<<<<< HEAD
 	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
 
@@ -380,6 +403,12 @@ type IGAObjectSupport struct {
 	EntitlementID     *uuid.UUID `json:"entitlement_id,omitempty" gorm:"type:uuid"`
 	AgentID           *uuid.UUID `json:"agent_id,omitempty" gorm:"type:uuid"`
 
+=======
+	ID           uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	ObjectType   string    `json:"object_type" gorm:"not null"`
+	ObjectID     uuid.UUID `json:"object_id" gorm:"type:uuid;not null"`
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	ConnectorID  uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
 	PartitionKey string    `json:"partition_key" gorm:"not null"`
 
@@ -392,6 +421,7 @@ type IGAObjectSupport struct {
 
 func (IGAObjectSupport) TableName() string { return "iga_object_support" }
 
+<<<<<<< HEAD
 // SetObject points this support row at one object, by class. Returns false for
 // an unknown class rather than leaving every column nil, which the
 // exactly-one CHECK would reject at the end of a long scan instead of here.
@@ -433,6 +463,8 @@ func SupportColumn(class string) string {
 	return ""
 }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 /* --------------------------- projection job and state --------------------- */
 
 // IGAProjectionJob is the durable, separately-fenced unit of projection work.
@@ -483,6 +515,7 @@ type IGAProjectionState struct {
 
 func (IGAProjectionState) TableName() string { return "iga_projection_state" }
 
+<<<<<<< HEAD
 /* ------------------------------ iga_publication --------------------------- */
 
 // IGAPublication is the durable record that one run's projection COMMITTED.
@@ -505,6 +538,8 @@ type IGAPublication struct {
 
 func (IGAPublication) TableName() string { return "iga_publication" }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 /* ----------------------------- iga_pipeline_lease ------------------------- */
 
 // IGAPipelineLease is the workspace-wide barrier between collection and

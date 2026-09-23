@@ -78,6 +78,7 @@ func runFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error 
 		return fn(tx)
 	})
 }
+<<<<<<< HEAD
 
 // MigrationHead reports the highest successfully-applied master migration.
 //
@@ -96,3 +97,5 @@ func MigrationHead(db *gorm.DB) (int, error) {
 	}
 	return *head, nil
 }
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e

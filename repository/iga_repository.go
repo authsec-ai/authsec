@@ -617,7 +617,11 @@ func (r *igaRepository) ListAgents(workspaceID uuid.UUID, rollup string, limit, 
 //
 // P2-4. All five of these were named Upsert* and every one of them was a bare
 // db.Create -- so a rescan inserted a duplicate row with a fresh uuid, and
+<<<<<<< HEAD
 // "repeat scan keeps IDs" was not merely broken but inexpressible: before 028
+=======
+// "repeat scan keeps IDs" was not merely broken but inexpressible: before 027
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // there was no column to match on.
 //
 // TWO TRAPS, both of which must stay covered by a test against REAL POSTGRES.
@@ -723,7 +727,11 @@ func (r *igaRepository) UpsertAccessEdge(e *models.IGAAccessEdge) error {
 
 // subjectColumn maps a subject kind to the typed column that holds it.
 //
+<<<<<<< HEAD
 // 030 replaced subject_kind + subject_id with three nullable typed columns, so
+=======
+// 029 replaced subject_kind + subject_id with three nullable typed columns, so
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // a read has to name the column rather than compare a discriminator. Returns
 // "" for an unknown kind, which callers treat as "no such subject" rather than
 // silently querying every edge in the workspace.
@@ -741,7 +749,11 @@ func subjectColumn(subjectKind string) string {
 
 // ListAccessEdges returns one subject's access edges.
 //
+<<<<<<< HEAD
 // Takes a TYPED subject since 030: the old (workspace_id, subject_id) filter
+=======
+// Takes a TYPED subject since 029: the old (workspace_id, subject_id) filter
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // named a column that no longer exists, and a uuid alone cannot say which of
 // the three subject kinds it is.
 //
@@ -1060,7 +1072,11 @@ func (r *igaRepository) ListAccessPaths(workspaceID uuid.UUID, subjectID uuid.UU
 	out := make([]AccessPath, 0, len(edges))
 	for i := range edges {
 		p := AccessPath{Edge: edges[i]}
+<<<<<<< HEAD
 		// entitlement_id is NOT NULL since 030 -- an access edge that grants
+=======
+		// entitlement_id is NOT NULL since 029 -- an access edge that grants
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		// nothing is not a fact about access -- so there is no nil case left
 		// to guard, only a lookup that may not resolve.
 		{

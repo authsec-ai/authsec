@@ -185,7 +185,11 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 		Updates(map[string]any{
 			"state":        models.RelEnded,
 			"valid_to":     rc.now(),
+<<<<<<< HEAD
 			"ended_reason": reason, // never empty: 031's CHECK enforces it
+=======
+			"ended_reason": reason, // never empty: 030's CHECK enforces it
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			"updated_at":   rc.now(),
 		}).Error
 }
@@ -195,6 +199,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 // Never the node directly: a node touched by this partition may still be held
 // by another account (§2.10B).
 func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+<<<<<<< HEAD
 	// The TYPED column for this class. One mapping (models.SupportColumn),
 	// shared with the upsert's conflict target, so a support row cannot be
 	// written against one column and reconciled against another.
@@ -205,6 +210,11 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 	q := tx.Model(&models.IGAObjectSupport{}).
 		Where("workspace_id = ? AND "+col+" IS NOT NULL AND connector_id = ? AND partition_key = ?",
 			snap.Run.WorkspaceID, part.ConnectorID, part.Key()).
+=======
+	q := tx.Model(&models.IGAObjectSupport{}).
+		Where("workspace_id = ? AND object_type = ? AND connector_id = ? AND partition_key = ?",
+			snap.Run.WorkspaceID, part.Class, part.ConnectorID, part.Key()).
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		Where("state <> ?", models.RelEnded).
 		Where("last_confirmed_run_id IS DISTINCT FROM ?", snap.Run.ID)
 
@@ -225,10 +235,15 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 // object is retired only when NO SOURCE ANYWHERE still holds it.
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	// The first EXISTS matters: an object with NO support rows at all is
+<<<<<<< HEAD
 	// pre-graph, not unsupported, and must not be retired by this pass -- 035
 	// handles those deliberately.
 	// %s is the node table, %s its typed support column. Both come from the
 	// same class, so the join column and the table cannot drift apart.
+=======
+	// pre-graph, not unsupported, and must not be retired by this pass -- 034
+	// handles those deliberately.
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	const stmt = `
 		UPDATE %s n
 		   SET lifecycle = 'retired', retired_reason = ?, updated_at = now()
@@ -236,6 +251,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 		   AND n.lifecycle = 'active'
 		   AND EXISTS (SELECT 1 FROM iga_object_support s
 		                WHERE s.workspace_id = n.workspace_id
+<<<<<<< HEAD
 		                  AND s.%s = n.id)
 		   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
 		                    WHERE s.workspace_id = n.workspace_id
@@ -243,18 +259,33 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 		                      AND s.state <> 'ended')`
 
 	for _, t := range []struct{ table, class string }{
+=======
+		                  AND s.object_type = ? AND s.object_id = n.id)
+		   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
+		                    WHERE s.workspace_id = n.workspace_id
+		                      AND s.object_type = ? AND s.object_id = n.id
+		                      AND s.state <> 'ended')`
+
+	for _, t := range []struct{ table, objectType string }{
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		{"iga_identity_accounts", models.ObjectIdentity},
 		{"iga_workload", models.ObjectWorkload},
 		{"iga_resources", models.ObjectResource},
 		{"iga_entitlements", models.ObjectEntitlement},
 		{"iga_agents", models.ObjectAgent},
 	} {
+<<<<<<< HEAD
 		col := models.SupportColumn(t.class)
 		if col == "" {
 			return fmt.Errorf("no support column for node class %q", t.class)
 		}
 		if err := tx.Exec(fmt.Sprintf(stmt, t.table, col, col),
 			models.RetiredUnsupported, snap.Run.WorkspaceID).Error; err != nil {
+=======
+		if err := tx.Exec(fmt.Sprintf(stmt, t.table),
+			models.RetiredUnsupported, snap.Run.WorkspaceID,
+			t.objectType, t.objectType).Error; err != nil {
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			return fmt.Errorf("retire unsupported %s: %w", t.table, err)
 		}
 	}
@@ -262,6 +293,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	// Retiring a node ends its incident relationships, in the same
 	// transaction. An edge pointing at a retired object and reading `current`
 	// is a lie the read path would repeat.
+<<<<<<< HEAD
 	if err := rc.endEdgesOnRetiredIdentities(tx, snap); err != nil {
 		return err
 	}
@@ -277,6 +309,9 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	//     the retired row so it stays explicable, but SUSPENDED so it is no
 	//     longer in force. It never returns to active on its own.
 	return rc.settleResolutionsOnRetired(tx, snap)
+=======
+	return rc.endEdgesOnRetiredIdentities(tx, snap)
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 func (rc *Reconciler) endEdgesOnRetiredIdentities(tx *gorm.DB, snap *Snapshot) error {
@@ -309,6 +344,7 @@ func (rc *Reconciler) endEdgesOnRetiredIdentities(tx *gorm.DB, snap *Snapshot) e
 		now, models.EndedSubjectRetired, now, snap.Run.WorkspaceID).Error
 }
 
+<<<<<<< HEAD
 // settleResolutionsOnRetired suspends asserted resolutions and clears derived
 // ones whose target has just retired.
 func (rc *Reconciler) settleResolutionsOnRetired(tx *gorm.DB, snap *Snapshot) error {
@@ -345,6 +381,8 @@ func (rc *Reconciler) settleResolutionsOnRetired(tx *gorm.DB, snap *Snapshot) er
 		snap.Run.WorkspaceID, models.BasisDerived).Error
 }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // markReconciled flips every partition's watermark, in the same transaction
 // that did the closing.
 func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
@@ -361,7 +399,11 @@ func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
 
 // LastGenerationFor reads a partition's watermark.
 //
+<<<<<<< HEAD
 // Keyed EXACTLY as 033 keys the table and exactly as scope() filters rows --
+=======
+// Keyed EXACTLY as 032 keys the table and exactly as scope() filters rows --
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // one value, three call sites, no predicate to keep in agreement.
 func LastGenerationFor(tx *gorm.DB, part Partition, ws uuid.UUID) (int64, error) {
 	var st models.IGAProjectionState

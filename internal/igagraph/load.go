@@ -92,6 +92,7 @@ func Load(ctx context.Context, db *gorm.DB, jobRunID uuid.UUID) (*Snapshot, erro
 
 	// Index identities by source key, for cloud_assume_edge.Subject.
 	snap.identityByKey = make(map[string]uuid.UUID, len(snap.Identities))
+<<<<<<< HEAD
 	snap.identityNativeByID = make(map[uuid.UUID]string, len(snap.Identities))
 	for _, ci := range snap.Identities {
 		snap.identityByKey[IdentityKey(ci)] = ci.ID
@@ -121,6 +122,10 @@ func Load(ctx context.Context, db *gorm.DB, jobRunID uuid.UUID) (*Snapshot, erro
 		for _, ci := range rows {
 			snap.identityNativeByID[ci.ID] = ci.NativeID
 		}
+=======
+	for _, ci := range snap.Identities {
+		snap.identityByKey[IdentityKey(ci)] = ci.ID
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	}
 
 	// A DEFENCE IN DEPTH, NOT THE GUARANTEE.
@@ -196,6 +201,7 @@ type existing struct {
 	entitlement map[string]*models.IGAEntitlement
 	credential  map[string]*models.IGACredential
 	agent       map[string]*models.IGAAgent
+<<<<<<< HEAD
 
 	// retiredIdentity holds rows retired as UNSUPPORTED, keyed by
 	// (source_key, immutable_key). Both, because the recognition key alone
@@ -208,6 +214,8 @@ type existing struct {
 // existing.retiredIdentity.
 func retiredKey(sourceKey, immutableKey string) string {
 	return sourceKey + Sep + immutableKey
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 // LoadExisting reads the workspace's live objects ONCE, before the projection
@@ -220,6 +228,7 @@ func retiredKey(sourceKey, immutableKey string) string {
 // comparison needs.
 func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, error) {
 	ex := &existing{
+<<<<<<< HEAD
 		identity:        map[string]*models.IGAIdentityAccount{},
 		workload:        map[string]*models.IGAWorkload{},
 		resource:        map[string]*models.IGAResource{},
@@ -227,6 +236,14 @@ func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, er
 		credential:      map[string]*models.IGACredential{},
 		agent:           map[string]*models.IGAAgent{},
 		retiredIdentity: map[string]*models.IGAIdentityAccount{},
+=======
+		identity:    map[string]*models.IGAIdentityAccount{},
+		workload:    map[string]*models.IGAWorkload{},
+		resource:    map[string]*models.IGAResource{},
+		entitlement: map[string]*models.IGAEntitlement{},
+		credential:  map[string]*models.IGACredential{},
+		agent:       map[string]*models.IGAAgent{},
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	}
 	live := func(dst any) error {
 		return db.WithContext(ctx).
@@ -286,6 +303,7 @@ func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, er
 	for i := range creds {
 		ex.credential[creds[i].SourceKey] = &creds[i]
 	}
+<<<<<<< HEAD
 
 	// Retired identities, for RESTORATION. Only those retired as
 	// 'unsupported': a row retired as 'recreated' is a different principal and
@@ -301,6 +319,8 @@ func LoadExisting(ctx context.Context, db *gorm.DB, ws uuid.UUID) (*existing, er
 	for i := range retired {
 		ex.retiredIdentity[retiredKey(retired[i].SourceKey, retired[i].ImmutableKey)] = &retired[i]
 	}
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	return ex, nil
 }
 

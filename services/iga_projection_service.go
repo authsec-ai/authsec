@@ -3,11 +3,17 @@ package services
 import (
 	"context"
 	"errors"
+<<<<<<< HEAD
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/google/uuid"
+=======
+	"log"
+	"time"
+
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagraph"
@@ -15,6 +21,7 @@ import (
 	repositories "github.com/authsec-ai/authsec/repository"
 )
 
+<<<<<<< HEAD
 // MinProjectionSchemaVersion is the migration the projector cannot run below.
 //
 // §6.3: 027-034 ship in ONE release, and core reconciliation writes 034's
@@ -24,6 +31,8 @@ import (
 // starting and failing every pass is not.
 const MinProjectionSchemaVersion = 34
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // ProjectionService claims projection jobs and turns published runs into the
 // canonical graph.
 //
@@ -35,10 +44,16 @@ type ProjectionService struct {
 	pipeline repositories.IGAPipelineLeaseRepository
 	graph    repositories.IGAGraphRepository
 
+<<<<<<< HEAD
 	owner       string
 	lease       time.Duration
 	maxAttempts int
 	now         func() time.Time
+=======
+	owner string
+	lease time.Duration
+	now   func() time.Time
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 func NewProjectionService(
@@ -53,6 +68,7 @@ func NewProjectionService(
 	}
 	return &ProjectionService{
 		db: db, jobs: jobs, pipeline: pipeline, graph: graph,
+<<<<<<< HEAD
 		owner: owner, lease: lease,
 		maxAttempts: repositories.MaxProjectionAttempts,
 		now:         time.Now,
@@ -99,6 +115,14 @@ func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
 		log.Printf("[projection] not starting: %v", err)
 		return
 	}
+=======
+		owner: owner, lease: lease, now: time.Now,
+	}
+}
+
+// Run claims jobs until the context ends.
+func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	if poll <= 0 {
 		poll = 10 * time.Second
 	}
@@ -118,6 +142,14 @@ func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
 					break
 				}
 			}
+<<<<<<< HEAD
+=======
+			// Recovery sweep: a worker that died holding the pipeline must not
+			// wedge its workspace permanently.
+			if _, err := s.pipeline.Sweep(s.now()); err != nil {
+				log.Printf("[projection] pipeline sweep: %v", err)
+			}
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		}
 	}
 }
@@ -131,6 +163,7 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	stop := s.heartbeat(ctx, job)
 	defer stop()
 
+<<<<<<< HEAD
 	// The barrier must be PROJECTING for this run and held by us. A reclaimed
 	// job inherits a barrier whose previous holder is gone: recover it into
 	// the SAME phase under a new version rather than releasing it, because the
@@ -142,11 +175,14 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 		return true, fmt.Errorf("projection job %s: %w", job.ID, err)
 	}
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	// STALENESS IS NOT CHECKED HERE. A check before the read is stale by the
 	// time the read runs; Load performs it inside the same repeatable-read
 	// snapshot as the inventory queries and returns ErrSuperseded.
 	snap, err := igagraph.Load(ctx, s.db, job.ScanRunID)
 	if errors.Is(err, igagraph.ErrSuperseded) {
+<<<<<<< HEAD
 		return true, s.abandonAndRelease(ctx, job, version, "superseded during load")
 	}
 	if err != nil {
@@ -264,6 +300,44 @@ func (s *ProjectionService) fence(job *models.IGAProjectionJob, version int64) r
 		RunID:       job.ScanRunID,
 		Version:     version,
 	}
+=======
+		// Detected inside the snapshot, which is the only place it can be
+		// detected reliably. RECORDED, not silent: a permanently-losing job
+		// must not look like one that never ran.
+		return true, s.jobs.Abandon(job.ID, s.owner, job.LeaseVersion, "superseded during load")
+	}
+	if err != nil {
+		return true, s.jobs.Fail(job.ID, s.owner, job.LeaseVersion, err.Error())
+	}
+
+	// The pipeline version this job must still hold. Read once, asserted
+	// inside the graph transaction.
+	lease, err := s.pipeline.Get(snap.Run.WorkspaceID)
+	if err != nil {
+		return true, s.jobs.Fail(job.ID, s.owner, job.LeaseVersion, "pipeline lease missing: "+err.Error())
+	}
+
+	if err := s.projectAndReconcile(ctx, snap, job, lease.Version); err != nil {
+		if errors.Is(err, igagraph.ErrObsoleteGeneration) {
+			return true, s.jobs.Abandon(job.ID, s.owner, job.LeaseVersion, "generation already projected")
+		}
+		// FAIL, DO NOT COMPLETE. The lease expires, the job is reclaimed, and
+		// projection is idempotent -- so a retry converges. A job marked
+		// complete after a partial write is unrecoverable without a manual
+		// rebuild.
+		return true, s.jobs.Fail(job.ID, s.owner, job.LeaseVersion, err.Error())
+	}
+
+	if err := s.jobs.Complete(job.ID, s.owner, job.LeaseVersion); err != nil {
+		return true, err
+	}
+	// Projection is done; hand the workspace back so the next scan can claim
+	// it. A failure here is recovered by the expiry sweep.
+	if err := s.pipeline.Release(snap.Run.WorkspaceID, lease.Version); err != nil {
+		log.Printf("[projection] release pipeline: %v", err)
+	}
+	return true, nil
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 // projectAndReconcile is THE ONE TRANSACTION.
@@ -282,9 +356,14 @@ func (s *ProjectionService) projectAndReconcile(
 		return err
 	}
 
+<<<<<<< HEAD
 	fencer := projectionFencer{jobs: s.jobs, pipeline: s.pipeline, version: pipelineVersion}
 	projector := igagraph.NewProjector(
 		s.graph, fencer, existing,
+=======
+	projector := igagraph.NewProjector(
+		s.graph, s.jobs, existing,
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		job.ID, s.owner, job.LeaseVersion, pipelineVersion,
 		s.now, igagraph.LastGenerationFor,
 	)

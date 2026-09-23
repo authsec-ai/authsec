@@ -1,7 +1,10 @@
 package igagraph
 
 import (
+<<<<<<< HEAD
 	"fmt"
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	"sort"
 	"strings"
 
@@ -47,6 +50,7 @@ type Snapshot struct {
 	// identityByKey indexes identities by source key, for cloud_assume_edge's
 	// Subject -- which is a STRING naming a principal that may not exist.
 	identityByKey map[string]uuid.UUID
+<<<<<<< HEAD
 
 	// identityNativeByID names any cloud_identity a workload references,
 	// REGARDLESS OF GENERATION. It is how not_in_scan still names the role:
@@ -58,6 +62,8 @@ type Snapshot struct {
 	// one can silently disagree with the reconciled set, and then the row is
 	// written under one key and reconciled under another -- or never.
 	partitions []Partition
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 }
 
 // SubjectRef keys observations by what SURVIVES inventory deletion.
@@ -82,12 +88,15 @@ func (s *Snapshot) IdentityIDByKey(key string) (uuid.UUID, bool) {
 	return id, ok
 }
 
+<<<<<<< HEAD
 // IdentityNativeID returns the native id of a cloud_identity a workload
 // references, whatever generation it sits at. Empty when unknown.
 func (s *Snapshot) IdentityNativeID(id uuid.UUID) string {
 	return s.identityNativeByID[id]
 }
 
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // RegionsAttempted derives the regions this run tried, from the coverage
 // report's own surface keys.
 //
@@ -101,7 +110,11 @@ func (s *Snapshot) RegionsAttempted() []string {
 		// bedrock-agents:..., bedrock-agentcore:...
 		if svc, region, ok := strings.Cut(name, ":"); ok && region != "" {
 			switch svc {
+<<<<<<< HEAD
 			case "lambda", "ecs", "ec2", "bedrock-agents", "bedrock-agentcore", "agentcore-gateways":
+=======
+			case "lambda", "ecs", "ec2", "bedrock-agents", "bedrock-agentcore":
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 				seen[region] = true
 			case "compute":
 				// The failure/unselected stand-in. The region WAS attempted --
@@ -157,7 +170,11 @@ type Partition struct {
 // Key is the partition's stable identity: scope, connector, class,
 // relationship type, target and its required surfaces, joined.
 //
+<<<<<<< HEAD
 // It is the unique key on iga_projection_state (033), the value
+=======
+// It is the unique key on iga_projection_state (032), the value
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 // lastGenerationFor looks up, AND the value stamped on every edge's
 // partition_key -- one value, three call sites, so "what this run reconciles"
 // and "what this run recorded a watermark for" are the same set by
@@ -172,11 +189,15 @@ func (p Partition) Key() string {
 		target = "node"
 	}
 	parts := []string{target, p.Class, p.RelationshipType}
+<<<<<<< HEAD
 	// SORTED, so the key is deterministic from the struct rather than from
 	// the order a caller happened to list surfaces in.
 	surfaces := append([]string{}, p.RequiredSurfaces...)
 	sort.Strings(surfaces)
 	parts = append(parts, surfaces...)
+=======
+	parts = append(parts, p.RequiredSurfaces...)
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 	return strings.Join(parts, "|")
 }
 
@@ -254,6 +275,7 @@ func Partitions(snap *Snapshot) []Partition {
 		// RequiredScanners (presence = failure), NEVER in RequiredSurfaces.
 		computeGate := []string{models.SurfaceWorkloadScan, models.SurfaceCompute(region)}
 
+<<<<<<< HEAD
 		// EVERY workload surface gets a WORKLOAD partition -- Bedrock and
 		// AgentCore included. With only a `realizes` edge partition, a Bedrock
 		// agent's own node had nowhere to be reconciled.
@@ -279,6 +301,27 @@ func Partitions(snap *Snapshot) []Partition {
 				RelationshipType: models.RelTypeRealizes, Target: "relationship",
 				RequiredSurfaces: []string{svc + ":" + region},
 				RequiredScanners: computeGate})
+=======
+		for _, svc := range []string{"lambda", "ecs", "ec2"} {
+			ps = append(ps,
+				Partition{ScopeID: sc, ConnectorID: cn, Class: models.ObjectWorkload,
+					RequiredSurfaces: []string{svc + ":" + region},
+					RequiredScanners: computeGate},
+				Partition{ScopeID: sc, ConnectorID: cn,
+					RelationshipType: models.RelTypeExecutesAs, Target: "relationship",
+					RequiredSurfaces: []string{svc + ":" + region, models.SurfaceIAMRoles},
+					RequiredScanners: computeGate})
+		}
+		for _, svc := range []string{"bedrock-agents", "bedrock-agentcore"} {
+			ps = append(ps,
+				Partition{ScopeID: sc, ConnectorID: cn, Class: models.ObjectWorkload,
+					RequiredSurfaces: []string{svc + ":" + region},
+					RequiredScanners: computeGate},
+				Partition{ScopeID: sc, ConnectorID: cn,
+					RelationshipType: models.RelTypeRealizes, Target: "relationship",
+					RequiredSurfaces: []string{svc + ":" + region},
+					RequiredScanners: computeGate})
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 		}
 	}
 	return ps
@@ -304,7 +347,11 @@ func KnownSurfaces(regions []string) map[string]bool {
 	}
 	for _, r := range regions {
 		known[models.SurfaceCompute(r)] = true
+<<<<<<< HEAD
 		for _, svc := range workloadServices {
+=======
+		for _, svc := range []string{"lambda", "ecs", "ec2", "bedrock-agents", "bedrock-agentcore"} {
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 			known[svc+":"+r] = true
 		}
 	}
@@ -330,6 +377,7 @@ func AssertPartitionVocabulary(parts []Partition, regions []string) []string {
 	sort.Strings(bad)
 	return bad
 }
+<<<<<<< HEAD
 
 // workloadServices is the coverage-surface prefix for every workload kind the
 // collector reports, in a stable order. One list, used by Partitions,
@@ -451,3 +499,5 @@ func (p Partition) MatchesEdge(relOrTarget, kind, region string) bool {
 		return true
 	}
 }
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e

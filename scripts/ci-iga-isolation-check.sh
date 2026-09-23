@@ -57,6 +57,7 @@ ALLOWED_NON_IGA=(
   # from graph code are forbidden by the separate one-way check below, which is
   # what actually protects the projection's rebuildable guarantee.
   "cloud_observation"
+<<<<<<< HEAD
 
   # The scan lifecycle the barrier coordinates. §2.10A's abandon transition is
   # defined as "terminalize the scan run AND its projection job, THEN idle" --
@@ -73,6 +74,8 @@ ALLOWED_NON_IGA=(
   # authz lookup -- a bridge would be a cached copy of the answer, which is
   # the thing least safe to cache. Read-only.
   "workspace_memberships"
+=======
+>>>>>>> 5bc580923b6db60cc95c9aa818bc95aa102d923e
 )
 
 echo "== IGA isolation =="
