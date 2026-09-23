@@ -44,6 +44,7 @@ type AWSWorkloadScanner struct {
 	evidence *ObservationWriter
 
 	lambdaAPI     awsdiscovery.LambdaAPI
+	regionalAPIs  RegionalAPIs
 	ecsAPI        awsdiscovery.ECSAPI
 	ec2API        awsdiscovery.EC2API
 	profileAPI    awsdiscovery.InstanceProfileAPI
@@ -72,6 +73,20 @@ func (s *AWSWorkloadScanner) WithWorkloadAPIs(
 	c awsdiscovery.EC2API, p awsdiscovery.InstanceProfileAPI,
 ) *AWSWorkloadScanner {
 	s.lambdaAPI, s.ecsAPI, s.ec2API, s.profileAPI = l, e, c, p
+	return s
+}
+
+// RegionalAPIs returns the compute clients for ONE region. A test seam: the
+// clients WithWorkloadAPIs installs stand in for every region, which cannot
+// express "one region denied, another clean" (§6.3).
+type RegionalAPIs func(region string) (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI,
+	awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI,
+	awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI)
+
+// WithRegionalAPIs installs per-region compute clients; it wins over
+// WithWorkloadAPIs.
+func (s *AWSWorkloadScanner) WithRegionalAPIs(f RegionalAPIs) *AWSWorkloadScanner {
+	s.regionalAPIs = f
 	return s
 }
 
@@ -231,6 +246,10 @@ func (s *AWSWorkloadScanner) scanRegion(
 	region string, out *WorkloadSnapshot,
 ) {
 	cfgFor := func() (awsdiscovery.LambdaAPI, awsdiscovery.ECSAPI, awsdiscovery.EC2API, awsdiscovery.InstanceProfileAPI, awsdiscovery.BedrockAgentAPI, awsdiscovery.AgentCoreAPI, awsdiscovery.CloudTrailAPI, error) {
+		if s.regionalAPIs != nil {
+			l, e, c, p, b, ac, ct := s.regionalAPIs(region)
+			return l, e, c, p, b, ac, ct, nil
+		}
 		// Injected clients win, and stand in for every region.
 		if s.lambdaAPI != nil || s.ecsAPI != nil || s.ec2API != nil ||
 			s.bedrockAPI != nil || s.agentCoreAPI != nil || s.cloudTrailAPI != nil {
