@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -59,6 +61,14 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
 		}
 	}
 
+	// EKS pod-identity associations, and NO other cloud_assume_edge row: trust
+	// is read from the roles' own documents (§4.5).
+	if err := tx.Where("workspace_id = ? AND connector_id = ? AND last_seen_generation = ? AND mechanism = ?",
+		run.WorkspaceID, run.ConnectorID, run.Generation, models.MechanismEKSPodIdentity).
+		Find(&snap.PodIdentity).Error; err != nil {
+		return nil, fmt.Errorf("load pod identity: %w", err)
+	}
+
 	snap.Coverage = models.DecodeScanCoverage(run.Coverage).Surfaces
 	if snap.Coverage == nil {
 		snap.Coverage = map[string]models.SurfaceCoverage{}
@@ -69,6 +79,7 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
 			snap.UnreadablePolicy[p.ID] = true
 		}
 	}
+	snap.UnreadableTrust = unreadableTrust(snap.Identities)
 
 	// Which observations THIS run confirmed (024, D4).
 	var obs []models.CloudObservation
@@ -102,10 +113,14 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
 	}
 
 	// Every AWS account connected in this workspace: a resource reference in
-	// any other account is an EXTERNAL reference (§1.4).
+	// any other account is an EXTERNAL reference (§1.4), and a trust principal
+	// in any other account never resolves to an identity (§4.7). Connected
+	// means a connector exists and is not revoked -- the read side's rule
+	// (D-3, D-61).
 	var accounts []string
 	if err := tx.Model(&models.CloudConnector{}).
-		Where("workspace_id = ? AND provider = ?", run.WorkspaceID, models.CloudProviderAWS).
+		Where("workspace_id = ? AND provider = ? AND status <> ?",
+			run.WorkspaceID, models.CloudProviderAWS, models.CloudConnectorRevoked).
 		Pluck("scope_id", &accounts).Error; err != nil {
 		return nil, fmt.Errorf("load connected accounts: %w", err)
 	}
@@ -123,6 +138,26 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
 		return nil, ErrSuperseded
 	}
 	return snap, tx.Commit().Error
+}
+
+// unreadableTrust names the roles whose trust document this run could not
+// read: the collector recorded a parse error, or recorded no document at all.
+// The second is D-45's rule, and it matters: a role with no document and no
+// error would otherwise read as "trusts nobody", and every trust edge it had
+// would END -- ending what we never read. No cloud_* CHECK pairs the two
+// columns the way cloud_policy_readable_chk does for policies.
+func unreadableTrust(identities []models.CloudIdentity) map[uuid.UUID]bool {
+	out := map[uuid.UUID]bool{}
+	for _, ci := range identities {
+		if ci.Kind != models.CloudIdentityIAMRole {
+			continue
+		}
+		doc := strings.TrimSpace(string(ci.TrustDocument))
+		if ci.TrustParseError != "" || doc == "" || doc == "null" {
+			out[ci.ID] = true
+		}
+	}
+	return out
 }
 
 // indexObservations groups confirmed observation ids by typed subject and
@@ -297,6 +332,13 @@ type resolved struct {
 	executes   []relRef
 	memberOf   []relRef
 	assignRefs []assignRef
+	canAssume  []relRef // trust and pod-identity edges, each with its evidence subject
+
+	// The trust pass's working state (trust.go).
+	trustDocs       map[uuid.UUID]*awsdiscovery.TrustDocument // cloud_identity.id -> parsed, once per pass
+	external        map[string]uuid.UUID                      // external principal source_key -> id, this pass
+	principalByARN  map[string]uuid.UUID                      // this snapshot's role/user ARN -> iga id
+	podUnattributed []uuid.UUID                               // roles with a pod association no cluster could be named for
 
 	existing *existing
 }
@@ -329,6 +371,8 @@ func newResolved(ex *existing) *resolved {
 		resource:   map[string]uuid.UUID{},
 		assignment: map[uuid.UUID]uuid.UUID{},
 		assignKey:  map[uuid.UUID]string{},
+		trustDocs:  map[uuid.UUID]*awsdiscovery.TrustDocument{},
+		external:   map[string]uuid.UUID{},
 		existing:   ex,
 	}
 }

@@ -78,6 +78,28 @@ const (
 	MechanismEKSPodIdentity = "eks_pod_identity"
 )
 
+// External-principal kinds (iga_external_principal.mechanism, 034; §2.2). A
+// DIFFERENT vocabulary from the relationship mechanisms above, sharing only
+// the column name: this one says WHAT the far endpoint is, the relationship's
+// says HOW it may assume the role. So one k8s_service_account node carries an
+// oidc_federation edge (IRSA) and an eks_pod_identity edge (an association)
+// for the same service account (P2-DECISIONS D-42). 034 has no CHECK on the
+// column; these constants and awsdiscovery's External* equal them exactly,
+// asserted by a test in internal/igagraph.
+const (
+	ExternalPrincipalAWSAccount        = "aws_account"
+	ExternalPrincipalAWSPrincipal      = "aws_principal"
+	ExternalPrincipalAWSService        = "aws_service"
+	ExternalPrincipalOIDC              = "oidc"
+	ExternalPrincipalSAML              = "saml"
+	ExternalPrincipalK8sServiceAccount = "k8s_service_account"
+)
+
+// ResolutionRuleExactARN is the one DERIVED resolution rule (§2.3, 034): an
+// aws_principal whose subject is exactly the ARN of a live identity in a
+// connected account. Wildcards, unique ids and session ARNs never match.
+const ResolutionRuleExactARN = "exact_arn_match"
+
 // Continuity (§2.4). Mirrors internal/igagraph's constants; kept here too so
 // model code does not have to import the projection package.
 const (

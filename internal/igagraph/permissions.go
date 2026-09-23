@@ -450,6 +450,10 @@ func (p *Projector) projectGrants(tx *gorm.DB, snap *Snapshot, r *resolved) erro
 type Exclusions struct {
 	UnreadablePolicies []uuid.UUID // iga_policy ids whose document was unreadable this run
 	UnreadableTrust    []uuid.UUID // iga_identity_accounts ids of roles whose trust did not parse
+	// UnattributedPodIdentity: roles with a pod-identity association this run
+	// could name no cluster for (trust.go, projectPodIdentity). Their
+	// pod-identity edges go stale, never ended.
+	UnattributedPodIdentity []uuid.UUID
 }
 
 func exclusionsOf(snap *Snapshot, r *resolved) Exclusions {

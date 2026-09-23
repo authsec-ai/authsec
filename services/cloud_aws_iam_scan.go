@@ -541,6 +541,13 @@ func (s *AWSIAMScanner) upsertRole(
 	}); err != nil {
 		return err
 	}
+	// T3.4 / 035: the trust document, verbatim, and whether it can be read --
+	// the projector's only trust input (§4.5, §4.7). Checked with the parser
+	// the projector re-runs, so any unusable statement makes trust_parse_error
+	// non-empty and the role's trust edges go stale, never end (D-45). Stopgap
+	// on the per-role read: T3.1 moves this onto authorization details.
+	identity.TrustDocument, identity.TrustDocumentHash, identity.TrustParseError =
+		awsdiscovery.ReadTrustDocument(role.TrustPolicy)
 	if !role.DetailComplete {
 		// GetRole failed. The role exists -- ListRoles named it -- but its
 		// tags, last-used date and permissions boundary are unknown. Count it

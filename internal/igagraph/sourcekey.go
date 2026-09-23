@@ -41,7 +41,23 @@ func Key(provider string, parts ...string) string {
 }
 
 // IdentityKey is the recognition key of an IAM role, user or group: its ARN.
-func IdentityKey(i models.CloudIdentity) string { return Key("aws", i.NativeID) }
+func IdentityKey(i models.CloudIdentity) string { return IdentityARNKey(i.NativeID) }
+
+// IdentityARNKey is IdentityKey spelled from the ARN alone -- how a trust
+// principal naming an identity in ANOTHER account finds its live row, which
+// this run did not collect.
+func IdentityARNKey(arn string) string { return Key("aws", arn) }
+
+// ARNOfIdentityKey reads an identity's source key back to its ARN: the
+// inverse of IdentityARNKey, false for any other key shape. Reading the native
+// segment back is not formatting a key (P2-DECISIONS D-2).
+func ARNOfIdentityKey(key string) (string, bool) {
+	arn, ok := strings.CutPrefix(key, "aws"+Sep)
+	if !ok || arn == "" || strings.Contains(arn, Sep) {
+		return "", false
+	}
+	return arn, true
+}
 
 // ImmutableKey reads the creation boundary the collector wrote into attrs:
 // RoleId (AROA…), UserId (AIDA…) or GroupId (AGPA…). "" where there is none.
@@ -190,6 +206,87 @@ func GrantKey(assignmentKey, statementKey string) string {
 // RoleB computes a NEW key and the old edge ends instead of being overwritten.
 func RelationshipKey(relType, sourceKey, targetEndpoint string) string {
 	return Key("aws", relType, sourceKey, targetEndpoint)
+}
+
+// ExternalPrincipalKey is an external principal's recognition key: issuer ␟
+// subject (§2.4, §4.4). The kind is NOT part of it: one service account is one
+// node whether IRSA or a pod-identity association names it (D-42).
+func ExternalPrincipalKey(issuer, subject string) string {
+	return Key("aws", "ext", issuer, subject)
+}
+
+// TrustStatementKey names one statement of a role's trust document, as
+// StatementKey names a policy statement (§2.6, §4.7): the role's endpoint key
+// ␟ trust ␟ sid:<Sid> when the Sid is unique in the document, else h:<content
+// hash>#n, n numbering identical Sid-less statements by their order among
+// equals. The hash covers Principal and NotPrincipal (D-46).
+//
+// Built from the role's ENDPOINT key, so a role recreated under the same ARN
+// shares no statement -- and no edge -- with its predecessor.
+func TrustStatementKey(roleEndpoint string, st awsdiscovery.TrustStatement,
+	sids map[string]int, hashSeen map[string]int) (key, hash string) {
+	hash = st.ContentHash()
+	if st.Sid != "" && sids[st.Sid] == 1 {
+		return Key("aws", roleEndpoint, "trust", "sid:"+st.Sid), hash
+	}
+	hashSeen[hash]++
+	return Key("aws", roleEndpoint, "trust", fmt.Sprintf("h:%s#%d", hash, hashSeen[hash])), hash
+}
+
+// CountTrustSids counts each Sid's occurrences in a trust document, for
+// TrustStatementKey.
+func CountTrustSids(stmts []awsdiscovery.TrustStatement) map[string]int {
+	out := map[string]int{}
+	for _, st := range stmts {
+		if st.Sid != "" {
+			out[st.Sid]++
+		}
+	}
+	return out
+}
+
+// PodIdentityStatementKey names the declaration behind a pod-identity
+// can_assume: no trust statement names the service account, the EKS
+// association does -- one per (service account, cluster issuer, role).
+func PodIdentityStatementKey(roleEndpoint, issuer, subject string) string {
+	return Key("aws", roleEndpoint, "pod_identity", issuer, subject)
+}
+
+// CanAssumeKey names a can_assume edge by the PRINCIPAL'S RECOGNITION KEY, the
+// target role's endpoint key and the declaring statement (§4.7, P2-DECISIONS
+// D-41).
+//
+// The principal's recognition key -- ExternalPrincipalKey of its normalised
+// issuer and subject -- is used WHETHER OR NOT the principal resolves to an
+// identity. So when the far account connects and the principal becomes an
+// identity, or that identity retires and the principal becomes external again,
+// the key is unchanged: the upsert updates the SAME row in place and the edge
+// keeps its id, valid_from and history (§2.12). Keying on the endpoint type
+// would end the edge and start another at every such change.
+func CanAssumeKey(principalKey, targetEndpoint, statementKey string) string {
+	return Key("aws", models.RelTypeCanAssume, principalKey, targetEndpoint, statementKey)
+}
+
+// PodIdentityIssuer is the issuer of an EKS service account (D-42): the
+// cluster's OIDC issuer, which IRSA's trust policies name too, else the
+// cluster's ARN. "" when neither is known -- the principal cannot be told
+// apart from the same namespace/name in another cluster.
+func PodIdentityIssuer(oidcIssuer, clusterARN string) string {
+	if oidcIssuer != "" {
+		return oidcIssuer
+	}
+	return clusterARN
+}
+
+// PodIdentitySubjectKey is the subject_native_id of a pod-identity
+// association's observation (§4.8: its can_assume evidence is "the
+// association's observation"; §1.4: eks_pod_identity "observation added").
+// The writer records it with the ROLE as the typed subject and this key, so it
+// indexes as SubjectRef{identity, key} beside -- never colliding with -- the
+// role's own observation, which is keyed by the bare ARN. Built from values
+// both the collector and Snapshot.PodIdentity carry.
+func PodIdentitySubjectKey(roleARN, issuer, subject string) string {
+	return Key("aws", "pod_identity", roleARN, issuer, subject)
 }
 
 // CredentialKey: holder ARN ␟ key id (§2.4).
