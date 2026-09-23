@@ -210,7 +210,14 @@ last confirmed, as `stale`. **Absence is only ever inferred from `reached`.**
 | `iam_users` | Same call, `Filter: User` | ARN, UserId, path, tags, **permissions boundary**, **group list**, attached and inline policies | `cloud_identity` (`iam_user`) | Identity (`immutable` on UserId) | Same |
 | `iam_groups` | Same call, `Filter: Group` | ARN, GroupId, path, attached and inline policies | `cloud_identity` (`iam_group`), `cloud_group_membership` | Identity; `member_of` relationship | Identity › Used by lists members |
 | `iam_policies` | Same call, `Filter: LocalManagedPolicy` (customer-managed, with default version document); `GetPolicy` + `GetPolicyVersion` for each **attached** AWS-managed policy, cached per scan | ARN, PolicyId, name, default version id, document, AWS-managed flag | `cloud_policy`, `cloud_policy_attachment` (`attached`, `inline`, `boundary`); observation per policy version | Policy, statements, assignments, grants (§2.6) | Identity › Permissions; evidence |
-| `policy_documents` | — (parse) | Every statement: Sid, effect, Action/NotAction, Resource/NotResource, Condition, verbatim | Parse failures and skipped statements counted **per document**; the rest of the scan continues | A document that fails to parse contributes no statements; its policy's assignments go `stale`, never `ended` | Coverage: *"1 policy could not be parsed: TicketRead v3"* |
+
+`iam_policies` is `reached` when the authorization-details listing completed.
+A failure to fetch **one** policy's document does not make it partial — that
+would veto every policy partition in the account — but is recorded on that
+policy (`document_error`) and reported under `policy_documents`, so only what
+that document declared is protected (§4.10).
+
+| `policy_documents` | — (fetch and parse) | Every statement: Sid, effect, Action/NotAction, Resource/NotResource, Condition, verbatim | A document that could not be fetched or parsed is recorded per policy (`cloud_policy.document_error`); skipped statements are counted per document; the rest of the scan continues | An unreadable document contributes no statements this run; what it declared before — its statements, grants, and the support of resources only it names — goes `stale`, never `ended` (§4.10). Its assignments stay current: attachment lists are read independently of documents | Coverage: *"1 policy could not be read: TicketRead v3 (parse)"* |
 | `iam_access_keys` | `ListAccessKeys`, `GetAccessKeyLastUsed` | Key id, status, created, last used | `cloud_secret`; **observation added** | Credential (`iga_credentials`) | Identity › Overview |
 | `iam_credential_report` | `GenerateCredentialReport`, `GetCredentialReport` | Password enabled, MFA active, key rotation and last use | Observation per user | Evidence on the identity | Identity › Overview, as evidence |
 | `activity` | `GenerateServiceLastAccessedDetails`, `GetServiceLastAccessedDetails` | Per service: last authenticated attempt | `cloud_usage`; `partial` when the 500-identity cap applies; `throttled` on throttle | Not a relationship | Identity › Permissions, with §2.14.8 wording |
@@ -410,9 +417,9 @@ because two spellings of a key is the duplication bug in a new costume.
 |---|---|---|---|
 | IAM role / user / group | ARN | `immutable` | RoleId (`AROA…`) / UserId (`AIDA…`) / GroupId (`AGPA…`) |
 | Managed policy | Policy ARN | `immutable` | PolicyId (`ANPA…`) |
-| Inline policy | `inline ␟ <holder ARN> ␟ <name>` | `recognition_only` | — |
-| Statement | policy key `␟ stmt ␟` `sid:<Sid>`, else `h:<content hash>[#n]` | inherits the policy's | — |
-| Assignment | policy key `␟` holder endpoint key `␟` kind | — | — |
+| Inline policy | `inline ␟ <holder ARN> ␟ <name>` | `immutable` when its holder is (always, for IAM) | The holder's immutable key |
+| Statement | policy **incarnation** key `␟ stmt ␟` `sid:<Sid>`, else `h:<content hash>[#n]` | inherits the policy's | — |
+| Assignment | policy incarnation key `␟` holder endpoint key `␟` kind | — | — |
 | Grant | assignment key `␟` statement key | — | — |
 | Workload | ARN (EC2 and a failed `GetAgent`: constructed ARN) | `recognition_only` | — (no provider creation id; stored so the console can say so) |
 | Resource reference | ARN or selector pattern | `recognition_only` | — |
@@ -420,7 +427,21 @@ because two spellings of a key is the duplication bug in a new costume.
 | Credential | holder ARN `␟` key id | `recognition_only` | — |
 
 An **endpoint key** — how an edge key names an identity — is the identity's
-immutable key when it has one, and its source key otherwise. So a role deleted
+immutable key when it has one, and its source key otherwise.
+
+A **policy incarnation key** is the same idea for policies, and every key
+below a policy is built from it, never from the ARN:
+
+| Policy | Incarnation key |
+|---|---|
+| Managed | `aws ␟ policy ␟ <PolicyId>` |
+| Inline | `aws ␟ inline ␟ <holder endpoint key> ␟ <name>` |
+
+So a customer-managed policy deleted and recreated under the same ARN (new
+PolicyId), or a role recreated with an inline policy of the same name (new
+RoleId), yields a **new policy object whose statements, assignments and grants
+all have new keys**. Nothing of the old incarnation can be matched, reused or
+revived by the new one. So a role deleted
 and recreated under the same ARN yields different edge keys: its old
 relationships end and the new role does not inherit them.
 
@@ -587,6 +608,8 @@ cleanup.**
 | Second access key added | New credential `active`; the user and every relationship unchanged |
 | Access key disappears | Credential `revoked`, only under the four conditions |
 | Role deleted and recreated, same name | Old identity retired `recreated`; new id, new `first_seen_at`; old edges `ended` |
+| Customer-managed policy deleted and recreated, same ARN and Sids | Old policy retired `recreated`, its statements retired `policy_recreated`, its assignments and grants `ended` `policy_recreated`; new policy, statements, assignments and grants with new ids |
+| Role recreated with a same-named inline policy | The old inline policy retires with the old role's incarnation; the new role's inline policy is a new object with new statements |
 | IAM read denied | Everything under IAM `stale`; zero rows `ended` |
 | One of two accounts stops naming a shared bucket | That account's support ends; the bucket stays active; the other account's grants unchanged |
 | A policy document fails to parse | Its assignments and statements `stale`; the rest of the account reconciles normally |
@@ -1082,7 +1105,7 @@ place this goes wrong quietly.
 | **Who did** | A **verified human workspace member**, recorded by **stable user id** (§ rule below). The response returns the id and, separately, a display name resolved at read time |
 | **Atomic** | One transaction: insert the decision row, update `iga_workload.classification`, bump `classification_version`, bump the workspace's `iga_classification_clock.seq`. Either all land or none does |
 | **Concurrent edits** | Optimistic. The request carries `expected_version`; a mismatch is `409` with the current decision, so the second person sees the first person's decision instead of overwriting it |
-| **Retries** | The request carries a client-generated **`operation_id`** (UUID), one per intent, reused on every retry of that intent. `UNIQUE (workspace_id, operation_id)`: a retry of an operation that already committed returns the **stored outcome** with `200` and `replayed: true`, even if the version has since moved. A lost response is therefore never mistaken for a conflict, and a conflict is never mistaken for success — no inference from "the actor and value match" |
+| **Retries** | The request carries a client-generated **`operation_id`** (UUID), one per intent, reused on every retry of that intent. The operation is **bound to its request**: workload, actor and every request field are hashed into `request_hash`. A retry of an operation that already committed returns the **stored outcome** with `200` and `replayed: true`, even if the version has since moved; the same id with a different workload, actor or content is `422 operation_id_reused`. The check runs **after** the workload row is locked (§5.5), so two concurrent retries cannot both miss it |
 | **Deliberate replacement** | Replacing someone else's decision after a `409` is a **new operation** with a new `operation_id` and the version returned in the `409` |
 | **Undo** | A new decision (`unclassified`) with `undoes_decision_id` set, recorded, never a deletion. Only `classified_agent → unclassified` |
 | **Provider-native** | Not human-editable. The action is not offered; the endpoint returns `422 provider_native` |
@@ -1769,6 +1792,7 @@ and testable:
 | **Collapse** | Collapsing removes what that expansion added **unless** the same node is also reached by another expanded path. Nodes are reference-counted by expansion, so collapsing one path never breaks another |
 | **Shared paths** | A node reached by several paths is drawn **once**. Many workloads sharing one identity collapse into one group node, *"Used by 14 workloads"*, which expands into its members |
 | **Grouped edges** | Several grants between the same two nodes may be drawn as **one line with a count badge** (*"2 statements"*) for legibility. The grouping is visual only. The evidence panel lists every grant separately, each with its own status. Line style follows the most-current member: solid if **any** grant is current, dashed only if **all** are stale, and the badge carries the mix (*"1 current · 1 ended"*). Ending one grant never restyles the line while another is current |
+| **Exclusions** | A `NotResource` statement is drawn with an *"except finance/\*"* chip on its statement node and a positive edge only to the `*` selector. An excluded resource is **never** drawn as the end of a path, and the Paths list reads *"all resources except finance/\*"* |
 | **Cycles** | Role A may assume B, and B may assume A. Each node is drawn once; the edge back to an already-drawn node is drawn to it and marked *cycle*. Expansion never re-adds a visited node. The server de-duplicates too (§5.4) |
 | **Loading and failure** | The first load is all-or-nothing: an error with Retry, never a partial canvas presented as the answer (§2.14.7). An **expansion** failure is local: that node shows *"Could not load. Retry"*, and everything already drawn stays. A truncated response is not a failure and is never shown as one |
 | **Layout stability** | A deterministic left-to-right layered layout: workload → identity → statement → resource or selector, with external principals in the identity column's upper band. Expanding and collapsing **never moves nodes already on screen**; new nodes take free positions by the placement rule in §2.14.15. Only a refresh to a new revision may re-lay out, and it says so (*"Layout updated for the newer scan"*). Transitions are 200 ms at most and are removed under `prefers-reduced-motion` |
@@ -2450,6 +2474,7 @@ CREATE TABLE IF NOT EXISTS public.iga_workload_classification (
     reason                text NOT NULL,
     decided_by_user_id    uuid NOT NULL,   -- stable identity; never an email
     against_version       bigint NOT NULL, -- the classification_version it was made against
+    request_hash          text NOT NULL,   -- sha256(workload, actor, decision, purpose, reason, expected_version, undoes)
     result_version        bigint NOT NULL,
     undoes_decision_id    uuid,
     decided_at            timestamptz NOT NULL DEFAULT now(),
@@ -2996,15 +3021,29 @@ with its rule recorded; wildcards stay unresolved and visible.
 Phase 1 collection gains what §1.4 requires. These are `cloud_*` tables:
 authoritative, per connector, written by the scanners under the run fence.
 
+**Every reference is workspace- and integration-qualified.** These rows are
+facts one integration collected about its own account, so a membership, an
+inline policy's holder and an attachment's principal and policy must all belong
+to **the same workspace and the same integration** as the row. A foreign key to
+`cloud_identity (id)` alone admits another workspace's identity (§2.9); the
+composite keys below make the database refuse it.
+
 ```sql
+-- Targets for integration-qualified references. id is already the primary
+-- key, so both are always satisfiable.
+ALTER TABLE public.cloud_identity
+    ADD CONSTRAINT cloud_identity_scope_key UNIQUE (workspace_id, connector_id, id);
+
 -- Groups are identities: kind 'iam_group' (cloud_identity_kind_chk only
 -- requires kind <> '', so no constraint change).
 
 -- The role's trust document, verbatim, so the projector parses Allow AND Deny
--- statements with their conditions (trust_policy.go keeps only Allow today).
+-- statements with their conditions. trust_parse_error is non-empty when the
+-- document could not be parsed: that role's trust edges go stale (§4.10).
 ALTER TABLE public.cloud_identity
     ADD COLUMN IF NOT EXISTS trust_document jsonb,
-    ADD COLUMN IF NOT EXISTS trust_document_hash text NOT NULL DEFAULT '';
+    ADD COLUMN IF NOT EXISTS trust_document_hash text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS trust_parse_error  text NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS public.cloud_group_membership (
     id                   uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -3018,10 +3057,10 @@ CREATE TABLE IF NOT EXISTS public.cloud_group_membership (
     CONSTRAINT cloud_group_membership_pkey PRIMARY KEY (id),
     CONSTRAINT cloud_gm_connector_fkey FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT cloud_gm_user_fkey FOREIGN KEY (user_identity_id)
-        REFERENCES public.cloud_identity (id) ON DELETE CASCADE,
-    CONSTRAINT cloud_gm_group_fkey FOREIGN KEY (group_identity_id)
-        REFERENCES public.cloud_identity (id) ON DELETE CASCADE,
+    CONSTRAINT cloud_gm_user_fkey FOREIGN KEY (workspace_id, connector_id, user_identity_id)
+        REFERENCES public.cloud_identity (workspace_id, connector_id, id) ON DELETE CASCADE,
+    CONSTRAINT cloud_gm_group_fkey FOREIGN KEY (workspace_id, connector_id, group_identity_id)
+        REFERENCES public.cloud_identity (workspace_id, connector_id, id) ON DELETE CASCADE,
     CONSTRAINT cloud_gm_key UNIQUE (user_identity_id, group_identity_id)
 );
 
@@ -3039,20 +3078,26 @@ CREATE TABLE IF NOT EXISTS public.cloud_policy (
     policy_id            text NOT NULL DEFAULT '',  -- AWS PolicyId (ANPA…), managed only
     aws_managed          boolean NOT NULL DEFAULT false,
     version_id           text NOT NULL DEFAULT '',  -- default version, managed only
-    document             jsonb,             -- NULL only when the document could not be read
+    document             jsonb,             -- NULL when the document could not be fetched
     document_hash        text NOT NULL DEFAULT '',
-    parse_error          text NOT NULL DEFAULT '',  -- non-empty: the document did not parse
+    -- Non-empty when the document is UNREADABLE this run: it could not be
+    -- fetched ("fetch: AccessDenied") or did not parse ("parse: …"). Such a
+    -- policy's statements, grants and the resources only it names go stale,
+    -- never ended (§4.10).
+    document_error       text NOT NULL DEFAULT '',
     last_seen_generation integer NOT NULL,
     first_seen_at        timestamptz NOT NULL DEFAULT now(),
     last_seen_at         timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT cloud_policy_pkey PRIMARY KEY (id),
     CONSTRAINT cloud_policy_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT cloud_policy_scope_key UNIQUE (workspace_id, connector_id, id),
     CONSTRAINT cloud_policy_connector_fkey FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT cloud_policy_holder_fkey FOREIGN KEY (holder_identity_id)
-        REFERENCES public.cloud_identity (id) ON DELETE CASCADE,
+    CONSTRAINT cloud_policy_holder_fkey FOREIGN KEY (workspace_id, connector_id, holder_identity_id)
+        REFERENCES public.cloud_identity (workspace_id, connector_id, id) ON DELETE CASCADE,
     CONSTRAINT cloud_policy_kind_chk CHECK (policy_kind IN ('managed','inline')),
     CONSTRAINT cloud_policy_inline_chk CHECK ((policy_kind = 'inline') = (holder_identity_id IS NOT NULL)),
+    CONSTRAINT cloud_policy_readable_chk CHECK (document IS NOT NULL OR document_error <> ''),
     CONSTRAINT cloud_policy_key UNIQUE (connector_id, native_id)
 );
 
@@ -3069,21 +3114,23 @@ CREATE TABLE IF NOT EXISTS public.cloud_policy_attachment (
     CONSTRAINT cloud_policy_attachment_pkey PRIMARY KEY (id),
     CONSTRAINT cloud_pa_connector_fkey FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT cloud_pa_policy_fkey FOREIGN KEY (workspace_id, policy_row_id)
-        REFERENCES public.cloud_policy (workspace_id, id) ON DELETE CASCADE,
-    CONSTRAINT cloud_pa_principal_fkey FOREIGN KEY (principal_identity_id)
-        REFERENCES public.cloud_identity (id) ON DELETE CASCADE,
+    -- Same workspace AND same integration: an attachment is one account's fact
+    -- about its own policy and its own principal.
+    CONSTRAINT cloud_pa_policy_fkey FOREIGN KEY (workspace_id, connector_id, policy_row_id)
+        REFERENCES public.cloud_policy (workspace_id, connector_id, id) ON DELETE CASCADE,
+    CONSTRAINT cloud_pa_principal_fkey FOREIGN KEY (workspace_id, connector_id, principal_identity_id)
+        REFERENCES public.cloud_identity (workspace_id, connector_id, id) ON DELETE CASCADE,
     CONSTRAINT cloud_pa_kind_chk CHECK (attachment_kind IN ('attached','inline','boundary')),
     CONSTRAINT cloud_pa_key UNIQUE (policy_row_id, principal_identity_id, attachment_kind)
 );
 
--- Policy versions as evidence subjects. Widening the subject columns means
--- widening the at-most-one check AND both dedupe indexes, or a policy
--- observation dedupes against the wrong key.
+-- Policy versions as evidence subjects, integration-qualified like the rest.
+-- Widening the subject columns means widening the at-most-one check AND both
+-- dedupe indexes, or a policy observation dedupes against the wrong key.
 ALTER TABLE public.cloud_observation
     ADD COLUMN IF NOT EXISTS policy_id uuid,
-    ADD CONSTRAINT cloud_observation_policy_fkey FOREIGN KEY (workspace_id, policy_id)
-        REFERENCES public.cloud_policy (workspace_id, id) ON DELETE SET NULL (policy_id);
+    ADD CONSTRAINT cloud_observation_policy_fkey FOREIGN KEY (workspace_id, connector_id, policy_id)
+        REFERENCES public.cloud_policy (workspace_id, connector_id, id) ON DELETE SET NULL (policy_id);
 ALTER TABLE public.cloud_observation DROP CONSTRAINT IF EXISTS cloud_observation_subject_chk;
 ALTER TABLE public.cloud_observation ADD CONSTRAINT cloud_observation_subject_chk CHECK (
       (identity_id IS NOT NULL)::int + (permission_id IS NOT NULL)::int
@@ -3285,6 +3332,61 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_policy
     WHERE policy_id IS NOT NULL;
 ```
 
+```sql
+-- Durable node lifecycle history for the Changes view (§5.3). Written in the
+-- projection transaction; the FK to the publication is DEFERRED because the
+-- publication row is inserted at the end of the same transaction, so an event
+-- can exist only together with the publication it belongs to.
+CREATE TABLE IF NOT EXISTS public.iga_lifecycle_event (
+    id                  uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid NOT NULL,
+    rev                 bigint NOT NULL,
+    scan_run_id         uuid NOT NULL,
+    occurred_at         timestamptz NOT NULL,
+    event               text NOT NULL,   -- first_seen | retired | restored
+    reason              text NOT NULL DEFAULT '',  -- retired: unsupported | recreated | policy_recreated
+    identity_account_id uuid,
+    workload_id         uuid,
+    resource_id         uuid,
+    entitlement_id      uuid,
+    policy_id           uuid,
+    CONSTRAINT iga_lifecycle_event_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_le_publication_fkey FOREIGN KEY (workspace_id, rev)
+        REFERENCES public.iga_publication (workspace_id, rev) ON DELETE RESTRICT
+        DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT iga_le_run_fkey FOREIGN KEY (workspace_id, scan_run_id)
+        REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE RESTRICT,
+    CONSTRAINT iga_le_identity_fkey FOREIGN KEY (workspace_id, identity_account_id)
+        REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_le_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_le_resource_fkey FOREIGN KEY (workspace_id, resource_id)
+        REFERENCES public.iga_resources (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_le_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id)
+        REFERENCES public.iga_entitlements (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_le_policy_fkey FOREIGN KEY (workspace_id, policy_id)
+        REFERENCES public.iga_policy (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_le_event_chk CHECK (event IN ('first_seen','retired','restored')),
+    CONSTRAINT iga_le_reason_chk CHECK ((event = 'retired') = (reason <> '')),
+    CONSTRAINT iga_le_one_chk CHECK (
+        (identity_account_id IS NOT NULL)::int + (workload_id IS NOT NULL)::int
+      + (resource_id IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int
+      + (policy_id IS NOT NULL)::int = 1)
+);
+CREATE INDEX IF NOT EXISTS idx_iga_le_identity ON public.iga_lifecycle_event (workspace_id, identity_account_id, occurred_at DESC) WHERE identity_account_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_le_workload ON public.iga_lifecycle_event (workspace_id, workload_id, occurred_at DESC) WHERE workload_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_le_resource ON public.iga_lifecycle_event (workspace_id, resource_id, occurred_at DESC) WHERE resource_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_iga_le_policy   ON public.iga_lifecycle_event (workspace_id, policy_id, occurred_at DESC) WHERE policy_id IS NOT NULL;
+```
+
+**Lifecycle history is an append-only log, not the node row.** Node and support
+updates overwrite `lifecycle`, and a restoration clears `retired_reason`, so
+the row alone cannot answer "when was this retired, and why". Every transition
+— insert (`first_seen`), retirement (with its reason) and restoration — appends
+an event stamped with the revision and run, in the transaction that makes the
+transition. A recreation writes `retired`/`recreated` on the old object and
+`first_seen` on the new one.
+
 **The Deny rule is structural.** `iga_access_edges_aws_grant_chk` cannot see
 the statement's effect, so the rule "only Allow statements are grants" is
 enforced by the projector and by a test that seeds a Deny statement and
@@ -3424,10 +3526,12 @@ type Snapshot struct {
     // cloud_scan_run.coverage, NEVER cloud_connector.coverage.
     Coverage map[string]models.SurfaceCoverage
 
-    // Policies whose document did not parse in this run (parse_error <> '').
-    // Their statements and grants go stale instead of ending (§4.10).
-    Unparsed      map[uuid.UUID]bool // cloud_policy.id
-    UnparsedTrust map[uuid.UUID]bool // cloud_identity.id of roles whose trust document did not parse
+    // Documents that were UNREADABLE this run: a policy whose document could
+    // not be fetched or parsed (cloud_policy.document_error <> ''), and a role
+    // whose trust document did not parse (cloud_identity.trust_parse_error <> '').
+    // What they declare goes stale instead of ending (§4.10).
+    UnreadablePolicy map[uuid.UUID]bool // cloud_policy.id
+    UnreadableTrust  map[uuid.UUID]bool // cloud_identity.id
 
     // Observation ids this run CONFIRMED, keyed by subject.
     ConfirmedBy map[SubjectRef][]uuid.UUID
@@ -3485,8 +3589,9 @@ func Key(provider string, parts ...string) string {
 func IdentityKey(i models.CloudIdentity) string { return Key("aws", i.NativeID) }
 func WorkloadKey(w models.CloudWorkload) string { return Key("aws", workloadARN(w)) }
 
-// PolicyKey: managed policies are one object across holders and accounts;
-// inline policies belong to their holder.
+// PolicyKey is the RECOGNITION key: what the policy is called. Managed
+// policies are one object across holders and accounts; inline policies belong
+// to their holder. Used only to find the live object and detect recreation.
 func PolicyKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
     if p.PolicyKind == "inline" {
         return Key("aws", "inline", holder.NativeID, p.Name)
@@ -3494,18 +3599,38 @@ func PolicyKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
     return Key("aws", p.NativeID) // the policy ARN
 }
 
+// PolicyImmutableKey is the policy's creation boundary: the PolicyId for a
+// managed policy; the holder's immutable key for an inline policy, because an
+// inline policy lives and dies with its holder.
+func PolicyImmutableKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
+    if p.PolicyKind == "inline" {
+        return ImmutableKey(*holder)
+    }
+    return p.PolicyID
+}
+
+// PolicyIncarnationKey names ONE incarnation of a policy. Every descendant key
+// -- statements, assignments, grants -- is built from this, never from the
+// ARN, so a recreated policy shares no key with its predecessor.
+func PolicyIncarnationKey(p models.CloudPolicy, holder *models.CloudIdentity) string {
+    if p.PolicyKind == "inline" {
+        return Key("aws", "inline", EndpointKey(*holder), p.Name)
+    }
+    return Key("aws", "policy", p.PolicyID)
+}
+
 // StatementKey implements §2.6. `sids` counts Sid occurrences in the
 // document; `hashSeen` counts identical content hashes seen so far, in
 // document order.
-func StatementKey(policyKey string, st awsdiscovery.PolicyStatement,
+func StatementKey(policyIncarnation string, st awsdiscovery.PolicyStatement,
     sids map[string]int, hashSeen map[string]int) (key, hash string) {
     hash = ContentHash(st) // sha256 of canonical JSON: Effect, Action, NotAction,
                            // Resource, NotResource, Condition
     if st.Sid != "" && sids[st.Sid] == 1 {
-        return Key("aws", policyKey, "stmt", "sid:"+st.Sid), hash
+        return Key("aws", policyIncarnation, "stmt", "sid:"+st.Sid), hash
     }
     hashSeen[hash]++
-    return Key("aws", policyKey, "stmt", fmt.Sprintf("h:%s#%d", hash, hashSeen[hash])), hash
+    return Key("aws", policyIncarnation, "stmt", fmt.Sprintf("h:%s#%d", hash, hashSeen[hash])), hash
 }
 
 // ResourceRefKey keys a resource reference by the text the statement used.
@@ -3513,8 +3638,8 @@ func StatementKey(policyKey string, st awsdiscovery.PolicyStatement,
 // selector node, supported per connector.
 func ResourceRefKey(resource string) string { return Key("aws", "ref", resource) }
 
-func AssignmentKey(policyKey, holderEndpoint, kind string) string {
-    return Key("aws", "assign", policyKey, holderEndpoint, kind)
+func AssignmentKey(policyIncarnation, holderEndpoint, kind string) string {
+    return Key("aws", "assign", policyIncarnation, holderEndpoint, kind)
 }
 func GrantKey(assignmentKey, statementKey string) string {
     return Key("aws", "grant", assignmentKey, statementKey)
@@ -3542,10 +3667,10 @@ with a transient failure.
 ```go
 func Continuity(kind string) string {
     switch kind {
-    case "iam_role", "iam_user", "iam_group", "managed_policy":
+    case "iam_role", "iam_user", "iam_group", "managed_policy", "inline_policy":
         return models.ContinuityImmutable
     default:
-        // Workloads, inline policies, resource references, external
+        // Workloads, resource references, external
         // principals: the name is the strongest claim available.
         return models.ContinuityRecognitionOnly
     }
@@ -3553,7 +3678,8 @@ func Continuity(kind string) string {
 ```
 
 `ImmutableKey` reads `AWSIdentityAttrs.UniqueID` (RoleId / UserId / GroupId,
-written by the collector) and `cloud_policy.policy_id`. Continuity and the
+written by the collector); `PolicyImmutableKey` reads `cloud_policy.policy_id`,
+or the holder's immutable key for an inline policy. Continuity and the
 immutable key must agree: `028`'s check rejects `immutable` with an empty key,
 and that loud failure is correct — fix the mapping, never relax the check.
 
@@ -3597,7 +3723,8 @@ func Load(ctx context.Context, db *gorm.DB, runID uuid.UUID) (*Snapshot, error) 
     }
 
     snap.Coverage = models.DecodeScanCoverage(run.Coverage).Surfaces
-    snap.Unparsed = unparsed(snap.Policies)
+    snap.UnreadablePolicy = unreadablePolicies(snap.Policies)   // document_error <> ''
+    snap.UnreadableTrust = unreadableTrust(snap.Identities)     // trust_parse_error <> ''
 
     var obs []models.CloudObservation
     if err := tx.Select("id", "subject_native_id", "identity_id", "policy_id", "workload_id").
@@ -3741,8 +3868,9 @@ does not change, because reconciliation is already per-scope.
 One transaction per job: every node, every edge, reconciliation and the
 publication. Nodes first, edges second.
 
-`projectAndReconcile` runs `Project` and then `Reconcile` in one transaction
-(graph branch, kept). `Project`:
+`projectAndReconcile` runs `Project`, then `Reconcile` with the exclusions
+`Project` computed, then flushes the lifecycle event log — all in one
+transaction (graph branch, kept and extended). `Project`:
 
 ```go
 func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
@@ -3769,6 +3897,15 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
     if err := p.guardWatermarks(tx, snap); err != nil {
         return err
     }
+
+    // 4. THE REVISION, allocated now: max(rev)+1 is safe because step 1 holds
+    //    the barrier row FOR UPDATE. Every lifecycle event is stamped with
+    //    it, and the publication row at step 6 carries it.
+    rev, err := p.repo.NextRevision(tx, snap.Run.WorkspaceID)
+    if err != nil {
+        return err
+    }
+    p.events = newEventLog(snap.Run.WorkspaceID, rev, snap.Run.ID, p.now())
 
     r := newResolved(p.existing)
     scope, err := p.upsertEstateScope(tx, snap) // aws␟account␟<account id>
@@ -3802,8 +3939,13 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
         return err
     }
 
+    // 5. LIFECYCLE EVENTS: every first_seen / retired / restored transition
+    //    the node passes made is in p.events. Reconciliation, which runs next
+    //    in this same transaction, appends its retirements to the same log,
+    //    and projectAndReconcile flushes it before commit.
+
     // 6. PUBLICATION, in the same transaction as every write above.
-    return p.repo.InsertPublication(tx, snap.Run.WorkspaceID, snap.Run.ID, p.now(), manifestOf(snap))
+    return p.repo.InsertPublication(tx, snap.Run.WorkspaceID, rev, snap.Run.ID, p.now(), manifestOf(snap))
 }
 ```
 
@@ -4028,7 +4170,8 @@ func (p *Projector) projectPolicies(tx *gorm.DB, snap *Snapshot, r *resolved) er
         id, err := p.repo.UpsertPolicy(tx, &models.IGAPolicy{
             WorkspaceID: snap.Run.WorkspaceID, Provider: "aws", PolicyKind: kind,
             DisplayName: cp.Name, NativeRef: cp.NativeID, SourceKey: key,
-            Continuity: Continuity(policyContinuityKind(cp)), ImmutableKey: cp.PolicyID,
+            Continuity: Continuity(policyContinuityKind(cp)),
+            ImmutableKey: PolicyImmutableKey(cp, holder),
             VersionID: cp.VersionID, DocumentHash: cp.DocumentHash, LastSeenAt: p.now(),
         }, r.existing) // same recreate / continue / restore / new branches as identities
         if err != nil {
@@ -4043,23 +4186,38 @@ func (p *Projector) projectPolicies(tx *gorm.DB, snap *Snapshot, r *resolved) er
 }
 ```
 
-A managed policy's `PolicyId` is its creation boundary: a customer-managed
-policy deleted and recreated under the same name is a new policy, and its old
-assignments end `policy_recreated`.
+**Recreation is decided here, and cascades in the same transaction.** When a
+live policy has the same recognition key but a different non-empty immutable
+key — a customer-managed policy recreated under the same ARN, or an inline
+policy whose holder was recreated — the old policy retires `recreated`, and in
+the same transaction:
+
+| Old incarnation's | Becomes | `ended_reason` / `retired_reason` |
+|---|---|---|
+| Statements | retired, support ended | `policy_recreated` |
+| Assignments | `ended` | `policy_recreated` |
+| Grants | `ended` | `policy_recreated` |
+| Statement revisions | closed (`valid_to`) | — |
+
+The new incarnation is then inserted with its own id, and `projectStatements`
+builds its statements from `PolicyIncarnationKey`, so none of the old rows can
+be matched or reused. A **restored** policy (same recognition and immutable key
+after retirement as `unsupported`) keeps its incarnation key, so its statements
+are matched by key and continue.
 
 #### Statements, revisions, resource references, targets
 
 ```go
 func (p *Projector) projectStatements(tx *gorm.DB, snap *Snapshot, r *resolved) error {
     for _, cp := range snap.Policies {
-        if snap.Unparsed[cp.ID] || cp.Document == nil {
-            continue // its existing statements are left for reconciliation to mark stale
+        if snap.UnreadablePolicy[cp.ID] {
+            continue // its existing statements are protected by reconciliation (§4.10)
         }
         stmts, _, err := awsdiscovery.ParsePolicyDocument(cp.Document) // the collector's own parser
         if err != nil {
             return fmt.Errorf("policy %s parsed at collection, failed now: %w", cp.NativeID, err)
         }
-        polKey := PolicyKey(cp, snap.IdentityByID(cp.HolderIdentityID))
+        polKey := PolicyIncarnationKey(cp, snap.IdentityByID(cp.HolderIdentityID))
         sids, seen := countSids(stmts), map[string]int{}
         for _, st := range stmts {
             key, hash := StatementKey(polKey, st, sids, seen)
@@ -4145,7 +4303,7 @@ func (p *Projector) projectAssignments(tx *gorm.DB, snap *Snapshot, r *resolved)
             continue // the holder was not projected; nothing to attach to
         }
         pol := snap.PolicyByID(at.PolicyRowID)
-        key := AssignmentKey(PolicyKey(pol, snap.IdentityByID(pol.HolderIdentityID)),
+        key := AssignmentKey(PolicyIncarnationKey(pol, snap.IdentityByID(pol.HolderIdentityID)),
             EndpointKey(snap.IdentityByID(at.PrincipalIdentityID)), at.AttachmentKind)
         id, err := p.repo.UpsertAssignment(tx, &models.IGAPolicyAssignment{
             WorkspaceID: snap.Run.WorkspaceID, PolicyID: r.policy[pol.ID],
@@ -4209,9 +4367,12 @@ moves.
 func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error {
     for _, role := range snap.Roles() {
         target := r.identity[role.ID]
+        if snap.UnreadableTrust[role.ID] {
+            continue // its existing trust edges are protected by reconciliation (§4.10)
+        }
         stmts, err := awsdiscovery.ParseTrustPolicy(role.TrustDocument) // Allow and Deny, conditions kept
         if err != nil {
-            continue // counted in policy_documents at collection; trust edges go stale
+            return fmt.Errorf("trust document of %s parsed at collection, failed now: %w", role.NativeID, err)
         }
         for _, st := range stmts {
             if st.Effect == "deny" {
@@ -4400,14 +4561,14 @@ what it did not — and this is the function to get right.
 // Routing on part.Target matters: a node partition sent through the edge
 // helpers matches nothing (its relationship_type is empty) and silently
 // reconciles nothing.
-func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot) error {
+func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions) error {
     for _, part := range Partitions(snap) {
         stale := !rc.canEnd(snap, part)
         var err error
         if part.Target == "" {
-            err = rc.reconcileNodes(tx, part, snap, stale) // identity|workload|resource|entitlement
+            err = rc.reconcileNodes(tx, part, snap, ex, stale) // identity|workload|policy|entitlement|resource
         } else {
-            err = rc.reconcileEdges(tx, part, snap, stale) // relationship|access_edge
+            err = rc.reconcileEdges(tx, part, snap, ex, stale) // relationship|assignment|access_edge
         }
         if err != nil {
             return err
@@ -4528,17 +4689,64 @@ func Partitions(snap *Snapshot) []Partition {
 }
 ```
 
-**Unparsed policies are excluded row by row.** A partition's `canEnd`
-decides for the whole partition, and `policy_documents: partial` would
-otherwise block every statement and grant in the account. That is too coarse:
-a statement in a policy that parsed cleanly is fully known. So
+**Unreadable documents are protected row by row.** A partition's `canEnd`
+decides for the whole partition, and treating one unreadable document as a
+veto would freeze every statement and grant in the account. That is too
+coarse — a statement in a policy that was read is fully known — so
 `policy_documents` is **not** a required surface of the policy, statement,
-resource, assignment, grant or trust partitions. Instead, rows that belong to
-a document in `snap.Unparsed` (policies) or `snap.UnparsedTrust` (roles whose
-trust document did not parse) are marked `stale` and excluded from
-`endOlderThan`, and every other row reconciles normally. A `policy_documents` failure the scanner could **not** attribute to a
-document (the scanner died) is still a partition veto through
-`permission_scan`.
+resource, assignment, grant or trust partitions. But the projector skips an
+unreadable document's statements, so without protection its unconfirmed rows
+would look absent to a partition that *can* end. **Protection is therefore
+explicit, and applied inside every reconciliation update:**
+
+```go
+// Exclusions are computed by the projector, in graph ids, and passed to
+// Reconcile in the same transaction. They name what an unreadable document
+// declared, so reconciliation can never end it.
+type Exclusions struct {
+    UnreadablePolicies []uuid.UUID // iga_policy ids whose document was unreadable this run
+    UnreadableTrust    []uuid.UUID // iga_identity_accounts ids of roles whose trust document did not parse
+}
+
+// protected returns the predicate for rows of this partition that an
+// unreadable document declared. Exhaustive: every partition answers.
+func protected(part Partition, ex Exclusions) (sql string, args []any, ok bool) {
+    pol := ex.UnreadablePolicies
+    switch {
+    case part.Target == "access_edge":
+        return `entitlement_id IN (SELECT id FROM iga_entitlements
+                  WHERE workspace_id = iga_access_edges.workspace_id AND policy_id = ANY(?))`,
+            []any{pq.Array(pol)}, len(pol) > 0
+    case part.Target == "relationship" && part.RelationshipType == "can_assume" && part.Kind == "trust":
+        return `target_identity_account_id = ANY(?)`, []any{pq.Array(ex.UnreadableTrust)}, len(ex.UnreadableTrust) > 0
+    case part.Class == models.ObjectEntitlement:
+        return `entitlement_id IN (SELECT id FROM iga_entitlements
+                  WHERE workspace_id = iga_object_support.workspace_id AND policy_id = ANY(?))`,
+            []any{pq.Array(pol)}, len(pol) > 0
+    case part.Class == models.ObjectResource:
+        // A resource another statement still names is confirmed anyway; one
+        // named ONLY by an unreadable policy must not lose this source's support.
+        return `resource_id IN (SELECT t.resource_id FROM iga_entitlement_target t
+                  JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
+                  WHERE t.workspace_id = iga_object_support.workspace_id AND e.policy_id = ANY(?))`,
+            []any{pq.Array(pol)}, len(pol) > 0
+    default:
+        // identities, workloads, policies (still listed by authorization
+        // details), assignments (attachment lists are read independently of
+        // documents), member_of, executes_as, pod-identity can_assume
+        return "", nil, false
+    }
+}
+```
+
+Both update paths apply it. When a partition **can** end, protected rows that
+this run did not confirm are moved `current → stale` (last confirmation kept)
+**before** the end statement runs, and the end statement excludes them. When it
+cannot end, everything unconfirmed goes stale anyway. So an unreadable
+document's grants, statements, and the support of resources only it names are
+never ended; a genuinely detached policy in the same account still ends. A
+`policy_documents` failure the scanner could **not** attribute to a document
+(the scanner died) remains a partition veto through `permission_scan`.
 
 **Trace the gate against these definitions, not against the struct.** The
 fixture below must close nothing, and it only does so because the entitlement
@@ -4750,11 +4958,18 @@ each other.
 ```go
 // reconcileEdges is the edge half of Reconcile: stale when we could not look,
 // ended when we could and it was not there.
-func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
     if stale {
-        return rc.markStale(tx, part, snap)
+        return rc.markStale(tx, part, snap, "")
     }
-    return rc.endOlderThan(tx, part, snap, "not_seen")
+    // Protected rows first: stale, never ended (§4.10, unreadable documents).
+    if p, args, ok := protected(part, ex); ok {
+        if err := rc.markStale(tx, part, snap, p, args...); err != nil {
+            return err
+        }
+        return rc.endOlderThan(tx, part, snap, "not_seen", "NOT ("+p+")", args...)
+    }
+    return rc.endOlderThan(tx, part, snap, "not_seen", "")
 }
 
 // markStale: we could not look at THIS partition.
@@ -4767,16 +4982,29 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot
 //   - last_confirmed_at is NOT touched. It is the honest answer to "how old
 //     is this?", and refreshing it would launder an outage into a
 //     confirmation.
-func (rc *Reconciler) markStale(tx *gorm.DB, part Partition, snap *Snapshot) error {
-    return rc.scope(tx, part, snap).
-        Where("state = ?", models.RelCurrent).
-        Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID).
-        Update("state", models.RelStale).Error
+func (rc *Reconciler) markStale(tx *gorm.DB, part Partition, snap *Snapshot, extra string, args ...any) error {
+    q, err := rc.scope(tx, part, snap)
+    if err != nil {
+        return err
+    }
+    q = q.Where("state = ?", models.RelCurrent).
+        Where("last_confirmed_by IS DISTINCT FROM ?", snap.Run.ID)
+    if extra != "" {
+        q = q.Where(extra, args...)
+    }
+    return q.Update("state", models.RelStale).Error
 }
 
 // endOlderThan: we looked properly at this partition and it was not there.
-func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, reason string) error {
-    return rc.scope(tx, part, snap).
+func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, reason, extra string, args ...any) error {
+    q, err := rc.scope(tx, part, snap)
+    if err != nil {
+        return err
+    }
+    if extra != "" {
+        q = q.Where(extra, args...) // "NOT (<protected>)"
+    }
+    return q.
         Where("state <> ?", models.RelEnded).
         // IS DISTINCT FROM, never <>. last_confirmed_by is nullable, and
         // NULL <> uuid evaluates to NULL rather than true -- a plain <> would
@@ -4806,10 +5034,12 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
   would never reconcile at all.
 
 So membership is **written at projection time and queried directly**. Each
-relationship and access edge records the partition that produced it:
+relationship, assignment and grant records the partition that produced it:
 
-The columns are created in migrations `030` (`iga_access_edges`) and `031`
-(`iga_relationship`); the fragment below shows their shape only.
+The columns are created in migrations `030` (`iga_access_edges`), `031`
+(`iga_relationship`) and `036` (`iga_policy_assignment`); the fragment below
+shows their shape only. A unit test asserts every `Target` that `Partitions()`
+emits resolves in `scope()`.
 
 ```sql
 -- EDGES ONLY: 030 (iga_access_edges) and 031 (iga_relationship).
@@ -4829,14 +5059,24 @@ CONSTRAINT …_connector_fkey FOREIGN KEY (workspace_id, connector_id)
 // scope selects exactly the rows this partition is responsible for, by the
 // membership the projector stamped on them. No joins, no endpoint union, no
 // type it can silently omit.
-func (rc *Reconciler) scope(tx *gorm.DB, part Partition, snap *Snapshot) *gorm.DB {
-    model := any(&models.IGARelationship{})
-    if part.Target == "access_edge" {
+func (rc *Reconciler) scope(tx *gorm.DB, part Partition, snap *Snapshot) (*gorm.DB, error) {
+    // EXHAUSTIVE. A default that fell through to iga_relationship would send
+    // an assignment partition to the wrong table: grants would end, their
+    // assignment would stay current, and a reattach would revive the old period.
+    var model any
+    switch part.Target {
+    case "relationship":
+        model = &models.IGARelationship{}
+    case "assignment":
+        model = &models.IGAPolicyAssignment{}
+    case "access_edge":
         model = &models.IGAAccessEdge{}
+    default:
+        return nil, fmt.Errorf("partition %s: no edge table for target %q", part.Key(), part.Target)
     }
     return tx.Model(model).
         Where("workspace_id = ? AND connector_id = ? AND partition_key = ?",
-            snap.Run.WorkspaceID, part.ConnectorID, part.Key())
+            snap.Run.WorkspaceID, part.ConnectorID, part.Key()), nil
 }
 ```
 
@@ -4892,7 +5132,7 @@ func nodeTable(class string) string {
 }
 
 // Step 1 -- end this partition's SUPPORT, not the object.
-func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
     // The partition's class selects WHICH typed column is populated. There is
     // no object_type to compare against -- the typed column's non-nullness is
     // the type, and the database enforces that exactly one is set.
@@ -4910,6 +5150,14 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
     if stale {
         return q.Where("state = ?", models.RelCurrent).
             Update("state", models.RelStale).Error
+    }
+    // Support declared only by an unreadable document: stale, never ended.
+    if p, args, ok := protected(part, ex); ok {
+        if err := q.Session(&gorm.Session{}).Where("state = ?", models.RelCurrent).Where(p, args...).
+            Update("state", models.RelStale).Error; err != nil {
+            return err
+        }
+        q = q.Where("NOT ("+p+")", args...)
     }
     return q.Updates(map[string]any{
         "state": models.RelEnded, "ended_reason": "not_seen",
@@ -4992,6 +5240,11 @@ Retiring a node ends what depends on it, in the same transaction:
 | Policy | Its assignments, and their grants | `policy_retired` |
 | Statement | Its grants | `statement_retired` |
 | Resource reference | Nothing: targets are statement content, and a resource retires only when no statement anywhere names it |  |
+
+Every retirement here, and every restoration and first insert in the node
+passes, appends to the projection's lifecycle event log (`iga_lifecycle_event`,
+`036`), so the Changes view can say when and why after the node row itself has
+been overwritten.
 
 #### The node write contract, stated once
 
@@ -5299,14 +5552,21 @@ workspace's graph. (The per-partition run ids in `iga_publication.manifest`
 record which scan each part came from; they are provenance for the Changes and
 Coverage views, never a way to read the graph.)
 
-**Every read request runs as one read-only snapshot:**
+**Every read request runs as one read-only snapshot, under one deadline:**
 
 ```go
+const requestBudget = 3 * time.Second
+
 func (r *Reader) read(ctx context.Context, ws uuid.UUID, requested *int64,
-    fn func(tx *gorm.DB, rev Revision) error) error {
+    fn func(q *Query, rev Revision) error) error {
+    // ONE deadline for the whole request, as a context. Every query runs with
+    // it, and the driver cancels the in-flight statement when it passes.
+    // statement_timeout alone cannot do this: it bounds each statement
+    // separately, so ten statements could each take the full allowance.
+    ctx, cancel := context.WithTimeout(ctx, requestBudget)
+    defer cancel()
     return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
         tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        tx.Exec("SET LOCAL statement_timeout = '3s'")
         cur, err := currentRevision(tx, ws) // max(rev), published_at; nil if none
         if err != nil {
             return err
@@ -5314,10 +5574,37 @@ func (r *Reader) read(ctx context.Context, ws uuid.UUID, requested *int64,
         if requested != nil && (cur == nil || cur.Rev != *requested) {
             return ErrRevisionStale{Requested: *requested, Current: cur}
         }
-        return fn(tx, rev(cur))
+        return fn(&Query{tx: tx, deadline: deadlineOf(ctx)}, rev(cur))
     })
 }
+
+// Optional runs work whose absence the response can state honestly (a total,
+// a facet, a neighbour count) inside a SAVEPOINT, with a local statement
+// timeout of at most half the remaining budget. If it times out, the
+// savepoint is rolled back and the transaction continues in the same
+// snapshot. Without the savepoint, a timed-out statement aborts the whole
+// transaction and every later query fails.
+func (q *Query) Optional(fn func(tx *gorm.DB) error) (ok bool, err error)
 ```
+
+Verified on PostgreSQL 16 (23 Sep): without a savepoint, a timed-out statement
+leaves the transaction aborted and the next query fails; with one, `ROLLBACK
+TO SAVEPOINT` recovers and the next query runs in the same snapshot, and the
+`SET LOCAL statement_timeout` made inside the savepoint is undone with it.
+
+**What each kind of read does when time or the database fails** — one
+contract per response type, so the console never has to guess:
+
+| Situation | Lists and details | Graph (`/graph`, `/graph/expand`, `/graph/path`) |
+|---|---|---|
+| An **optional** query (total, facet, neighbour count) times out | `200`; `total_known: false` / the facet or count `null` | `200`; that `more.count` is `null`, `exact: false` |
+| The **budget runs low** between steps | — (a list page is one mandatory query) | `200` with what was traversed; `truncated.bound_by: "time"`. The traverser checks the remaining deadline before each level and stops while it still has time to answer. Each level's query runs in a savepoint, so a level that times out is rolled back and the previous levels are returned the same way |
+| A **mandatory** query fails or the deadline passes | `504 query_timeout`, nothing partial | `504 query_timeout` only if even the root could not be read |
+| Any other database error | `500 internal`, nothing partial | `500 internal`, nothing partial |
+
+A truncated graph is a **controlled** answer: it is correct for what it
+contains and says where it stopped. A `504` or `500` is a **failure**: the
+console shows *Failed* (§2.14.7), never an empty or partial result.
 
 Because the revision check and every data query run in the same
 `REPEATABLE READ` snapshot, and a publication commits atomically with its
@@ -5360,8 +5647,9 @@ one revision is ever merged with another's.
 
 **What history is retained, and what is not.** Relationships, assignments and
 grants keep `valid_from`/`valid_to`/`ended_reason` and are never deleted;
-statement revisions keep content history; node lifecycle keeps first seen,
-retired, restored and recreated; every run keeps its coverage. From these the
+statement revisions keep content history; `iga_lifecycle_event` keeps every
+node's first seen, retirement (with reason) and restoration, stamped with the
+revision; every run keeps its coverage. From these the
 Changes view answers *"what changed, and when"*. What is **not** retained: a
 relationship's `current`↔`stale` transitions (state is updated in place), node
 display attributes over time, and evidence associations over time. So the
@@ -5428,10 +5716,11 @@ checks the id exists **in that table and this workspace**; anything else is
 | `lifecycle` | `active` (default), `retired`, `all` |
 | `account` | An account id, repeatable; `unknown` selects objects with no stated account (§2.14.10). Absent means all accounts **including unknown** |
 
-**Totals.** Counted in the same snapshot with `LIMIT 10001`: up to 10 000,
-`total_known: true` and `total`; beyond, `total_known: false` and
-`total_at_least: 10000`. A count that would exceed the statement timeout is
-abandoned and reported as `total_known: false`, never guessed.
+**Totals.** Counted in the same snapshot with `LIMIT 10001`, as an
+**optional** query (§5.1): up to 10 000, `total_known: true` and `total`;
+beyond, `total_known: false` and `total_at_least: 10000`. A count that times out
+is rolled back to its savepoint and reported as `total_known: false`, never
+guessed; the page itself is unaffected.
 
 **Retired objects.** Every detail route returns retired objects with
 `lifecycle`, `retired_reason` and `last_confirmed_at`. Lists exclude them
@@ -5446,9 +5735,10 @@ unless `lifecycle` asks.
 | `403` | `forbidden` | Missing `iga:read` (or `iga:review` for classification); not a verified human for decisions |
 | `404` | `not_found` | Not in this table in this workspace |
 | `409` | `revision_stale`, `listing_changed`, `classification_conflict` | §5.1, §5.5 |
-| `422` | `provider_native`, `invalid_decision` | Classification rules |
+| `422` | `provider_native`, `invalid_decision`, `operation_id_reused` | Classification rules |
 | `503` | `graph_unavailable` | `IGA_GRAPH_PROJECTION` off or misconfigured (§2.8), with `reason` |
-| `504` | `query_timeout` | A read exceeded its statement timeout; nothing partial is returned |
+| `500` | `internal` | A database error; nothing partial is returned |
+| `504` | `query_timeout` | A mandatory query did not finish within the request deadline (§5.1); nothing partial is returned. A graph that ran out of time returns `200` with `truncated` instead |
 
 ### 5.3 The API catalogue
 
@@ -5565,8 +5855,10 @@ the tab says *"Runs as `<arn>` — not read in the latest scan"* rather than
 showing nothing.
 
 `GET /api/iga/v1/workloads/:id/resources` — for every resource the workload's
-execution identities (and their groups) have a **grant** to, one row per
-target, and under it **one line per grant**:
+execution identities (and their groups) have a **grant** to — positive
+targets only; a `NotResource` statement contributes its `*` row, with its
+exclusions listed on the grant line — one row per target, and under it **one
+line per grant**:
 
 ```json
 { "resource": { "ref": "resource:0b9…", "text": "arn:aws:s3:::support-tickets/*",
@@ -5645,7 +5937,7 @@ edges from it, with target roles, statements and conditions.
 `region` (incl. `not_stated`), `kind` (`exact`, `selector`, `external`),
 `service`, `lifecycle`; sort `kind` (default), `name`, `service`, `account`;
 facets `kind`, `service`, `account`. Rows: text (the ARN or pattern), kind,
-service, account, region, `named_by_count` (`{value, exact}` — statements),
+service, account, region, `named_by_count` (`{value, exact}` — statements naming it as a positive target; exclusions are counted separately as `excluded_by_count`),
 `last_confirmed_at`.
 
 `GET /api/iga/v1/resources/:id` — list fields plus
@@ -5653,10 +5945,13 @@ service, account, region, `named_by_count` (`{value, exact}` — statements),
 (`{ read: true|false, has_deny: true|false|null }` from the existing
 resource-policy observations), sources.
 
-`GET /api/iga/v1/resources/:id/access` — one row per (holder, grant):
-holder identity, via group (if any), policy, statement, target mode, state;
-paged by holder; plus `deny_statements_naming` (statements with
-`effect = deny` targeting it, listed as restrictions).
+`GET /api/iga/v1/resources/:id/access` — `access`: one row per (holder,
+grant) whose statement names this resource as a **positive** target
+(`mode = resource`): holder identity, via group (if any), policy, statement,
+state; paged by holder. Separately, never mixed into `access` or its counts:
+`excluded_by` (Allow statements that name it in `NotResource` — they exclude
+it, they do not grant it) and `deny_statements_naming` (Deny statements
+targeting it). Both are restrictions, shown as such.
 
 #### Graph
 
@@ -5679,8 +5974,8 @@ paged by holder; plus `deny_statements_naming` (statements with
     "edges": [ { "claim": "relationship:88a…", "kind": "executes_as", "from": "workload:6f1e…", "to": "identity:c41…", "state": "current" },
                { "claim": "grant:a11…", "kind": "grant", "from": "identity:c41…", "to": "statement:77e…", "state": "current" },
                { "claim": "grant:a12…", "kind": "grant", "from": "identity:c41…", "to": "statement:91b…", "state": "current" },
-               { "claim": "target:c20…", "kind": "target", "from": "statement:77e…", "to": "resource:0b9…" },
-               { "claim": "target:c21…", "kind": "target", "from": "statement:91b…", "to": "resource:0b9…" } ],
+               { "claim": "target:c20…", "kind": "target", "mode": "resource", "from": "statement:77e…", "to": "resource:0b9…" },
+               { "claim": "target:c21…", "kind": "target", "mode": "resource", "from": "statement:91b…", "to": "resource:0b9…" } ],
     "frontier": [ { "node": "identity:c41…", "edge": "can_assume", "direction": "forward",
                     "more": { "count": 3, "exact": true },
                     "expand": "/api/iga/v1/graph/expand?node=identity:c41…&edge=can_assume&direction=forward" } ],
@@ -5747,7 +6042,7 @@ them. The **limitations vocabulary**, with the exact condition for each, is:
 
 | Event | Source |
 |---|---|
-| `first_seen`, `retired`, `restored`, `recreated` | Node lifecycle and support |
+| `first_seen`, `retired` (with reason: `unsupported`, `recreated`, `policy_recreated`), `restored` | `iga_lifecycle_event` (`036`) |
 | `relationship_started` / `relationship_ended` | `iga_relationship` `valid_from` / `valid_to`, `ended_reason` |
 | `policy_attached` / `policy_detached` | Assignment periods |
 | `grant_started` / `grant_ended` | Grants |
@@ -5783,7 +6078,8 @@ direction:
 | `member_of` | user → group | group → members | lifecycle |
 | `can_assume` | principal → role (who may assume it → the role) | role → its principals | lifecycle |
 | `grant` | identity → statement (Allow only) | statement → holders | lifecycle |
-| `target` | statement → resource | resource → statements | statement lifecycle |
+| `target` (`mode = resource`) | statement → resource | resource → statements | statement lifecycle |
+| exclusion (`mode = not_resource`) | **not an edge** | **not an edge** | — |
 
 A **path** is a sequence of these edges. The forward path of the product's
 teaching case is workload → `executes_as` → role → `grant` → statement →
@@ -5794,7 +6090,13 @@ B").
 
 **Forward** answers "what can this reach, declared"; **reverse** answers "what
 reaches this" (Resource › Access, Identity › Used by, *View in graph* from a
-resource). Deny statements and boundaries are **not edges**: each node carries
+resource). **A `NotResource` entry is an exclusion, not a destination** (AWS
+defines `NotResource` as "every resource except these"): it is never traversed,
+in either direction, and never counts toward a declared-access path or a
+`named_by` count. It is returned on its statement node as `exclusions`, so the
+canvas and the path list can say *"all resources except finance/\*"*. The
+statement's positive target is the implicit `*` selector (§4.7). Deny
+statements and boundaries are **not edges** either: each node carries
 `restrictions` (§5.3), and every path through a restricted node carries the
 matching limitation.
 
@@ -5822,7 +6124,7 @@ traversal (§2.14.10).
 | Edges | 300 drawn | 2 000 |
 | Paths (`/graph/path`) | 50 listed | 200 |
 | Neighbours per expansion | 100 per page | 100 per page, cursor for the rest |
-| Time | — | 3 s statement timeout for the whole request |
+| Time | — | 3 s request deadline (§5.1); a graph that reaches it returns what it has, `truncated.bound_by: "time"` |
 
 **Continuation.** When a budget binds, the response returns what it has,
 `truncated: { bound_by: "nodes" | "edges" | "assume_hops" | "time" }`, and a
@@ -5876,24 +6178,33 @@ POST /api/iga/v1/workloads/:id/classification          iga:review + verified hum
                  "current": { "classification": "classified_agent", "classification_version": 4,
                               "decided_by": { "user_id": "…", "display": "Alex Kim" },
                               "decided_at": "…", "reason": "owns refunds" } } }
-422 provider_native | invalid_decision     403 forbidden     404 not_found
+422 provider_native | invalid_decision | operation_id_reused     403 forbidden     404 not_found
 ```
 
-**The transaction:**
+**The transaction** — `READ COMMITTED`, so a statement after the lock sees
+rows another transaction committed while this one waited:
 
-1. `SELECT … FROM iga_workload_classification WHERE workspace_id = ? AND
-   operation_id = ?`. Found → return its stored outcome, `replayed: true`,
-   `200`. (A replay returns what that operation did, even if the version has
-   since moved.)
-2. `SELECT … FROM iga_workload WHERE id = ? FOR UPDATE`. Provider-native →
-   `422`. `classification_version <> expected_version` → `409` with the current
-   decision.
-3. Insert the decision row (operation id, actor user id, decision, previous,
-   reason, purpose, `against_version`, `result_version`).
-4. Update `iga_workload` classification and version; increment
+1. `SELECT … FROM iga_workload WHERE workspace_id = ? AND id = ? FOR UPDATE`.
+   Missing → `404`. **The lock comes first**: every request for this workload
+   now serializes behind it.
+2. `SELECT … FROM iga_workload_classification WHERE workspace_id = ? AND
+   operation_id = ?`, **after** the lock. Found with the same `request_hash` →
+   return its stored outcome, `replayed: true`, `200`. Found with a different
+   hash (another workload, actor or content) → `422 operation_id_reused`.
+3. Provider-native → `422`. `classification_version <> expected_version` →
+   `409 classification_conflict` with the current decision.
+4. Insert the decision row (operation id, request hash, actor user id,
+   decision, previous, reason, purpose, `against_version`, `result_version`).
+5. Update `iga_workload` classification and version; increment
    `iga_classification_clock.seq` (upsert).
-5. Commit. A unique violation on `operation_id` at step 3 (two concurrent
-   retries) rolls back and re-reads step 1.
+6. Commit. A unique violation on `operation_id` at step 4 can only come from
+   the same id used concurrently on a **different** workload (the lock
+   serializes one workload): it rolls back and returns `422
+   operation_id_reused`.
+
+Verified with two sessions (23 Sep): the retry, blocked on the lock while the
+original committed, found no operation before the lock and found it after, and
+took the replay branch.
 
 **Display names** are resolved at read time from the user record, falling back
 to the user id; the stable `user_id` is always returned beside them.
@@ -5979,8 +6290,8 @@ check. `Proof` is the §7 scenario that fails without it.
 | Task | Files | Change | Gate |
 |---|---|---|---|
 | T3.1 | `internal/awsdiscovery/authdetails.go` (new), `services/cloud_aws_iam_scan.go` | `GetAccountAuthorizationDetails` replaces the per-role/per-user calls; roles, users, groups, memberships, boundaries, tags, attachments, inline and customer-managed documents; AWS-managed documents for attached policies via `GetPolicy`/`GetPolicyVersion` | Lab: a user in a group with a boundary appears with membership, boundary and inherited policies. E3, E4 |
-| T3.2 | `035`, `repository/cloud_policy_repository.go` | `cloud_policy`, `cloud_policy_attachment`, `cloud_group_membership`, `trust_document`; fenced upserts; per-connector keys | An AWS-managed policy in two accounts is two `cloud_policy` rows. E10 |
-| T3.3 | `internal/awsdiscovery/policy_statements.go`, `services/cloud_aws_permission_scan.go` | Per-document parse isolation; `parse_error`; `policy_documents: partial` names documents; the scan continues | One malformed document: every other policy's statements written. E9 |
+| T3.2 | `035`, `repository/cloud_policy_repository.go` | `cloud_policy`, `cloud_policy_attachment`, `cloud_group_membership`, `trust_document`; fenced upserts; per-connector keys; composite (workspace, integration) references | An AWS-managed policy in two accounts is two `cloud_policy` rows; a membership, holder or attachment across workspaces or integrations is rejected by the database (B20). E10, E14 |
+| T3.3 | `internal/awsdiscovery/policy_statements.go`, `services/cloud_aws_permission_scan.go` | Per-document fetch and parse isolation; `document_error` (policies) and `trust_parse_error` (roles); `policy_documents: partial` names the documents; the scan continues | One unreadable document: every other policy's statements written. E9 |
 | T3.4 | `internal/awsdiscovery/trust_policy.go` | Parse Allow and Deny, all principals, conditions verbatim; `NotPrincipal` recorded; per-statement failure isolation | Trust statement with a non-string condition value no longer fails the document. E11 |
 | T3.5 | `services/cloud_observation_writer.go`, scanners | Evidence for policies (`policy_id` subject), access keys, pod-identity associations; gateway `source_api` fixed; conflict target names `policy_id` | Every surface in §1.4 writes evidence. E4 |
 | T3.6 | `services/cloud_aws_workload_scan.go`, `internal/awsdiscovery/{workloads,bedrock}.go` | Detail-call failures make the surface `partial`; "not available in region" → `unsupported`; Bedrock ARN constructed; AgentCore runtime status; gateway target type | A failed `GetAgent` keeps the same key and blocks deletion. E7, E9 |
@@ -5995,7 +6306,7 @@ check. `Proof` is the §7 scenario that fails without it.
 | T4.2 | `internal/igagraph/sourcekey.go` | Keys per §4.4, incl. statement keys | Unit tests: Sid, hash, duplicates, reorder. E7 |
 | T4.3 | `internal/igagraph/load.go`, `snapshot.go` | Snapshot per §4.3; no `cloud_resource` | Shared bucket across two accounts survives in both snapshots. E10 |
 | T4.4 | `internal/igagraph/project.go` | Identities (incl. groups), workloads (`provider_native_agent`), credentials; no agents | Rescan keeps ids. E1 |
-| T4.5 | `internal/igagraph/permissions.go` | Policies, statements, revisions, targets, assignments, grants per §4.7 | Two policies same action → two grants; Deny → zero grants. E6, E7 |
+| T4.5 | `internal/igagraph/permissions.go` | Policies (incarnation keys, recreation cascade), statements, revisions, targets with `mode`, assignments, grants per §4.7 | Two policies same action → two grants; Deny → zero grants; recreated policy shares no key with its predecessor (B21). E6, E7, E8 |
 | T4.6 | `internal/igagraph/project.go` | `executes_as`, `task_execution_role`, `member_of`, execution-role state | Role switch ends the old edge. E5, E8 |
 | T4.7 | `internal/igagraph/trust.go` | `can_assume` and external principals per §4.7 | Cross-account, service and OIDC principals appear. E11 |
 | T4.8 | `services/iga_service.go`, `repository/iga_repository.go` | GitHub: revert keys, keep typed subject, set `provider`; readers filter `provider = 'github'`; `ListAccessPaths` base semantics | GitHub suites pass; AWS rows absent from `/api/iga/v1/identity-accounts`. E16 |
@@ -6005,21 +6316,21 @@ check. `Proof` is the §7 scenario that fails without it.
 
 | Task | Files | Change | Gate |
 |---|---|---|---|
-| T5.1 | `internal/igagraph/snapshot.go`, `reconcile.go` | Partitions per §4.10; per-row exclusion of unparsed documents | Unparsed policy: its grants stale, other policies' detached grants end. E9 |
+| T5.1 | `internal/igagraph/snapshot.go`, `reconcile.go` | Partitions per §4.10; `Exclusions` and `protected()` applied in every edge and support update; exhaustive `scope()` | B12 and B18. E9 |
 | T5.2 | `reconcile.go` | Retirement cascade table (§4.10); policy recreation | Policy retired → assignments end `policy_retired`. E7 |
 | T5.3 | `repository/iga_graph_repository.go` | Revisions and target replacement (§4.10 contracts) | Sid edit → one new revision, same grant id. E7 |
-| T5.4 | `internal/igaread` | Changes events (§5.3) | Detach → `policy_detached` with remaining grants. E6 |
+| T5.4 | `internal/igagraph` (event log), `internal/igaread` | `iga_lifecycle_event` written in the projection transaction; Changes events (§5.3) | Detach → `policy_detached` with remaining grants; retire → restore → both events present after later updates (B24). E6, E8 |
 
 **S6 · Read APIs and traversal**
 
 | Task | Files | Change | Gate |
 |---|---|---|---|
-| T6.1 | `internal/igaread/snapshot.go`, `refs.go`, `cursor.go` | §5.1–§5.2 contract | Revision advanced between pages → `409 revision_stale`; tampered cursor → `400`. E12 |
+| T6.1 | `internal/igaread/snapshot.go`, `refs.go`, `cursor.go` | §5.1–§5.2 contract: request deadline, optional queries in savepoints | Revision advanced between pages → `409 revision_stale`; tampered cursor → `400`; B23. E12 |
 | T6.2 | `internal/igaread/lists.go` | Workloads, identities, resources lists | Search finds a row beyond page one; facets include `unknown`. E2 |
 | T6.3 | `internal/igaread/detail.go` | Every detail and tab route | Execution role states each worded; retired object readable. E3, E8 |
 | T6.4 | `internal/igaread/traverse.go` | §5.4 | Cycle, budget and exhaustion outcomes distinguished. E11 |
 | T6.5 | `internal/igaread/evidence.go` | §5.3 *Evidence*, limitations vocabulary | Each limitation code has a fixture that produces it and one that does not. E4 |
-| T6.6 | `services/iga_classification_service.go` | §5.5 | Replay with the same operation id → `200 replayed`; different operation, stale version → `409`. E12 |
+| T6.6 | `services/iga_classification_service.go` | §5.5: lock, then operation lookup, then version; request hash | Concurrent retries (B22); same id, different content → `422 operation_id_reused`; different operation, stale version → `409`. E12 |
 | T6.7 | `controllers/platform/iga_graph_read_controller.go`, `routes/routes.go` | Routes, `iga:read` / `iga:review`; remove the graph branch's two routes | Cross-workspace ids → `404`. E14 |
 | T6.8 | same | `GET /lookup` | Cloud Inventory row → graph object. E16 |
 | T6.9 | `controllers/platform/iga_graph_read_controller.go` | `503 graph_unavailable` when the switch is off or misconfigured | Console shows *Unavailable*, never empty. E1 |
@@ -6066,7 +6377,10 @@ It must survive, each verified by removing its fix and observing the failure:
 | Unchanged rescan | ids, `first_seen_at` stable; no duplicate rows; no new revision |
 | Lambda switches `RoleA` → `RoleB` | the old `executes_as` ends |
 | Two policies grant the same action; one detached | one grant ends, the other stays current |
-| A policy that fails to parse | its grants go stale; another policy's detached grant ends |
+| One previously collected policy becomes unreadable **and** another is genuinely detached, same account and run | the unreadable one's statements, grants and the support of resources only it names go stale; the detached one's assignment and grants end |
+| Attach → detach → reattach | the first assignment period ends with `valid_to`; reattach creates a second row; grants follow; Permissions and Changes agree |
+| A `NotResource` statement | produces a grant to the `*` selector and no path to the excluded resource |
+| A customer-managed policy recreated under the same ARN and Sid | new policy, statements, assignments and grants; the old ones retired or ended `policy_recreated` |
 | A Deny statement | produces no grant |
 | One region denied, another clean | per-region partitions independent |
 | Two accounts naming one bucket | both keep the reference; neither becomes `*` |
@@ -6136,12 +6450,12 @@ restoring it afterwards.
 | **E1** | Connect and publish the first graph | Clean workspace | Connect A with regions `eu-central-1`, `us-east-1`; scan | One published run; one job `complete`; barrier `idle`; one `iga_publication` `rev 1`; no AWS rows in `iga_agents` | `/pipeline` moves queued → collecting → projecting → published; `/workloads` lists A's workloads at `rev 1` | First-run states in order; the list appears without a reload; *as of* shows the publication time | Any state is skipped or shown as empty; a reload is needed; the second scan cannot start |
 | **E2** | The right workload among duplicates | A and B connected and scanned | Search `ticket` | Two workloads named `ticket-tools`, different accounts | `q=ticket` returns both with distinct `account`; facet counts per account | Both rows, each with its account; opening B's shows B's ARN and account throughout | Rows indistinguishable; search misses rows beyond page one; one opens the other's data |
 | **E3** | Workload → identity → statements → resource | E1 | Open A's `ticket-tools`; Identities; Resources | `executes_as` to `SharedToolRole`; two grants; two statements; one selector | `/identities` returns the execution identity; `/resources` returns `support-tickets/*` with **two** grant lines | Identities names the role as execution identity; Resources shows the selector with two statement lines; the Graph draws the same path | Any hop missing; one grant line; "can access" wording anywhere |
-| **E4** | Evidence and limitations | E3 | Open evidence on each grant, on the selector, on `priya`'s group grant | Evidence junction rows for every edge | `/evidence` returns claim, status, facts (policy version, Sid, excerpt), freshness, limitations incl. `selector_may_match_nothing`, `effective_access_not_evaluated`, `permissions_boundary_present` for `priya` | Five parts, in order; raw record only on request | A generic limitation; a missing fact; a limitation that does not apply |
+| **E4** | Evidence and limitations | E3, plus a lab policy allowing `s3:*` with `NotResource: arn:aws:s3:::finance/*` | Open evidence on each grant, on the selector, on `priya`'s group grant; open `finance/*` › Access | Evidence junction rows for every edge | `/evidence` returns claim, status, facts (policy version, Sid, excerpt), freshness, limitations incl. `selector_may_match_nothing`, `effective_access_not_evaluated`, `permissions_boundary_present` for `priya`, `negated_statement` for the `NotResource` grant; `finance/*` › Access lists the statement under `excluded_by`, not `access` | Five parts, in order; raw record only on request; the `NotResource` statement drawn as *except finance/\** with no edge to it | A generic limitation; a missing fact; a limitation that does not apply; any path or access row ending at `finance/*` |
 | **E5** | Two workloads share one role | E1 | Open `SharedToolRole` › Used by | Two `executes_as` rows to one identity | `/used-by` lists both | Both listed; Overview says *shared with 1 other workload* | One missing; the role shown twice |
 | **E6** | Detach one of two equivalent grants | E3 | Detach `TicketRead` from `SharedToolRole`; rescan | `TicketRead` assignment and grant `ended`, `valid_to` set; `ToolboxRead` grant `current` | Resources shows one current grant line; Changes has `policy_detached` naming the remaining grant | *"The path remains through ToolboxRead"*; the canvas line stays solid | The path disappears; both grants end; the line turns dashed |
 | **E7** | Policy edits and detach/reattach | E6 | (a) Edit `ReadTickets` actions; rescan. (b) Edit `ToolboxRead`'s statement; rescan. (c) Reattach `TicketRead`; rescan | (a) Same statement id; a new revision. (b) Old statement retired, new statement and grant. (c) A **new** assignment row; the ended period unchanged | Changes returns `statement_revised` with before/after, `statement_replaced`, `policy_attached` | Each event worded per §2.6 | (a) creates a new statement; (b) is shown as an edit; (c) reopens the old assignment row |
-| **E8** | Replace a role | E3 | Delete and recreate `SharedToolRole` under the same name; rescan | Old identity `retired` `recreated`; its edges `ended` `subject_recreated`; new identity, new id, new `first_seen_at`; a classification on the workload stays | Old identity readable with `lifecycle: retired`; new one current | Changes on the workload: old role ended, new role started; nothing of the old role's history on the new one | The new role inherits history or ids |
-| **E9** | Collection fails and relationships are retained | E3 | Remove IAM permissions from the discovery role; rescan; restore | Zero rows `ended`; IAM partitions `stale`; `last_confirmed_at` unchanged | `/coverage` reports the denied surfaces with the failed API call; grants `state: stale` | Graph unchanged with stale markers; coverage names the call and what it prevents; no guessed missing permission | Anything ends; data disappears; coverage invents a permission name |
+| **E8** | Replace a role, and a policy | E3, with an inline policy `ToolsInline` on `SharedToolRole` | (a) Delete and recreate `SharedToolRole` under the same name, with the same inline policy; rescan. (b) Delete and recreate `TicketRead` under the same ARN and Sid; rescan | (a) Old identity `retired` `recreated`; its edges `ended` `subject_recreated`; the old inline policy retired with its statements; new identity **and new inline policy**, new ids. (b) Old `TicketRead` `retired` `recreated`; its statements, assignments and grants retired or ended `policy_recreated`; new ones with new ids. Lifecycle events for every transition | Old objects readable with `lifecycle: retired`; new ones current | Changes: old role and policy ended, new ones started; nothing of the old history on the new objects | Any new object reuses an old id or key, or inherits history |
+| **E9** | Collection fails and relationships are retained | E3 | (a) Remove IAM permissions from the discovery role; rescan; restore. (b) Deny `iam:GetPolicyVersion` on `TicketRead` only, and in the same change detach `ToolboxRead`; rescan | (a) Zero rows `ended`; IAM partitions `stale`; `last_confirmed_at` unchanged. (b) `TicketRead`'s grants and statements `stale`; `ToolboxRead`'s assignment and grants `ended` | `/coverage` reports the denied surfaces or the unreadable document with the failed API call; affected grants `state: stale` | Graph unchanged with stale markers; coverage names the call and what it prevents; no guessed missing permission | Anything unreadable ends; the detached policy stays current; coverage invents a permission name |
 | **E10** | A shared object survives one source dropping it | A and B scanned | Remove B's policy naming `support-tickets`; rescan B | B's support row for the bucket reference `ended`; A's `current`; the resource `active`; A's grants unchanged | Resource detail `sources` shows A current, B ended | Resource still listed; Access shows A's grants | The resource retires; A's grant becomes `*` |
 | **E11** | External accounts, cycles and limits | A and B scanned | Open A's role trusting C; open `loop-a`'s graph; expand past the display default; search a path to an unreachable resource | External principal for C, unresolved; `can_assume` edges both ways between `loop-a`/`loop-b` | `/graph` marks `closes_cycle`; `crosses_account`; frontier `more` counts exact or `null`; `/graph/path` returns `none_exists` or `not_found_within_budget` correctly | *Account not connected*; each loop node drawn once; truncation chip; the two not-found messages distinct | A cycle duplicates nodes; an unreachable search claims a distance; "none exists" when a budget bound |
 | **E12** | Changes during paging and exploration | A scanned, > 200 workloads (lab fixture generator) | Page the list; mid-way, trigger a new publication; separately, classify a workload between pages of the *Agents* filter; retry a classification after dropping its response | — | `409 revision_stale` on the next page; `409 listing_changed` on the classification list; the retry returns `200 replayed: true` | Banner, data kept, Refresh restores view and filters; list restarts with notice; the retried save closes as success | Pages from two revisions combined; a retried save shows a conflict; a conflict shows success |
@@ -6204,15 +6518,22 @@ once removing its safeguard makes it fail.
 | B5 | Scan → projection hand-off with different worker names | Projection completes on the first pass | A worker-held barrier |
 | B6 | Crash after commit | Replay `AlreadyPublished`, no writes, job complete, barrier idle | A `<=` generation guard |
 | B7 | Recreated role, same ARN | Two identities; old retired `recreated`; edges ended | ARN-only endpoint keys |
+| B21 | Recreated policy, same ARN and Sid; recreated role with a same-named inline policy | New policy and statements with new keys; old ones retired `policy_recreated` / `recreated`; no statement id reused | ARN-based statement and assignment keys |
 | B8 | Support ends then reappears, same immutable key | Restored: same id and `first_seen_at` | Reappearance treated as recreation |
 | B9 | Cross-workspace references | Every composite FK rejects a foreign row; one test per FK | The A3 pattern |
 | B10 | Deny and boundary statements | Zero grants; restrictions present | A Deny as access |
 | B11 | Statement identity | Reorder keeps ids; Sid edit keeps id with a revision; Sid-less edit replaces | Index-keyed statements |
-| B12 | Unparsed document | Its grants stale; others reconcile | An account-wide veto, or ending unreadable grants |
+| B12 | One unreadable document and one genuinely detached policy, one run | Unreadable: statements, grants and sole-named resource support stale. Detached: assignment and grants ended | An account-wide veto, or ending what could not be read |
 | B13 | Switch off at `036` | Two consecutive scans publish; no job, no barrier change | Table-probing enablement |
 | B14 | Schema verification error | Worker claims nothing; `/capabilities` `misconfigured` | Fail-open caching |
 | B15 | Busy barrier | The refused run does not starve another workspace | The requeue hot loop |
 | B16 | Reads straddling a publication | A read in flight when a publication commits returns only the old revision | Non-snapshot reads |
+| B18 | Attach → detach → reattach | Assignment period 1 ended; period 2 a new row; grants follow each; `scope()` rejects an unknown target | A default table in `scope()` |
+| B19 | `NotResource` | Grant to `*` only; no traversal edge, path or `access` row to the excluded resource; `excluded_by` lists it | Exclusions as destinations |
+| B20 | Cross-workspace and cross-integration collection facts | Membership, inline holder, attachment principal and attachment policy from another workspace or integration rejected; same-integration controls accepted | Single-column references to `cloud_identity` |
+| B22 | Two concurrent retries of one classification operation | The second replays (`200`, `replayed: true`) | Operation lookup before the lock |
+| B23 | Deadlines | An optional count that times out → `total_known: false`, page returned; graph at the deadline → `200` with `truncated.bound_by: "time"`; a mandatory query past the deadline → `504` | Timeouts poisoning the transaction; incompatible outcomes |
+| B24 | Lifecycle history | Retire → restore → further upserts: both events remain, with rev, run and reason | Lifecycle read from the overwritten node row |
 | B17 | Limits suppress completeness | Any bound budget → `total_known: false` / `truncated` / `not_found_within_budget` | Truncation presented as an answer |
 
 ### 7.4 Recording results
@@ -6255,6 +6576,7 @@ document**; they are what exists to build on.
 | Earlier mutations on `5bc5809` | Five safeguards each shown load-bearing (canEnd, retireUnsupported, scope, attachEvidence, unqualified evidence) | Those mechanisms, which this design keeps | — |
 | This document's SQL, `028`–`037` (23 Sep) | Extracted from §3 and applied in order on a fresh PostgreSQL 16 with the shipped `001`–`026` and the graph branch's `027`: **all apply**. 27 constraint probes on a database at `036`, each rejection paired with a control that must succeed: **27 of 27 as expected**, including a GitHub-shaped legacy edge accepted (the rollback case), the Deny-statement and grant checks, the observation subject and dedupe widening, revision uniqueness, reattach-as-new-row, operation-id uniqueness and cross-workspace FKs; `iga_access_edges_honesty_chk` present | That the DDL is internally consistent and enforces what §3 says it enforces | Anything about production: the **production-schema rehearsal (§9) has not been run** (it needs a dump from someone with production access). Nothing about the Go control flow, which does not exist yet |
 | The previous revision's `027`–`034` SQL | Applied on `001`–`025` with state-transition probes | The transitions `027`, `032`–`034` keep | — |
+| Review fixes (23 Sep, second round) | **Composite collection keys:** with the revised `035` on the real `001`–`034` schema, the four cross-workspace / cross-integration inserts the review found accepted are now rejected (membership, inline holder, attachment principal, attachment policy) plus a second-integration holder; four controls accepted — 10 of 10. **Classification race:** two sessions, the retry blocked on the workload lock while the original committed; before the lock it found no operation, after it found it and took the replay branch. **Timeouts:** without a savepoint a timed-out statement aborts the transaction; with one, `ROLLBACK TO SAVEPOINT` recovers in the same snapshot | The DDL and the transaction orderings the fixes rely on | The Go reconciler, projector and reader, which do not exist yet |
 | Graph rendering (§2.14.15) | Measured in a scratch project | Compatibility, layout timing, bundle size, keyboard, stability | The console integration |
 
 ## 8. Known-failing tests and ratchets
@@ -6318,6 +6640,9 @@ rejection cannot pass because the seed was broken:
 | Support row with two typed columns, or none | rejected, `iga_object_support_one_chk` |
 | Any composite FK given another workspace's row | rejected, one probe per FK |
 | `iga_access_edges_honesty_chk` from `004` | still present |
+| Group membership, inline-policy holder, attachment principal or attachment policy from another workspace **or another integration** | rejected by the composite FKs (`cloud_gm_*`, `cloud_policy_holder_fkey`, `cloud_pa_*`); same-integration controls accepted |
+| A policy with neither a document nor a `document_error` | rejected, `cloud_policy_readable_chk` |
+| A lifecycle event whose revision has no publication, at commit | rejected (deferred `iga_le_publication_fkey`); inserting the publication in the same transaction commits both |
 
 Then the code:
 
