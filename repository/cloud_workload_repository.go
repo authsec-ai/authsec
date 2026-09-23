@@ -53,6 +53,10 @@ type CloudWorkloadRepository interface {
 	// that service there.
 	CountWorkloads(workspaceID, connectorID uuid.UUID, runtimeKind, region string) (int64, error)
 
+	// ActivitySample is the connector's identities whose activity (cloud_usage)
+	// one scan reads: the first limit by ARN, byte order, and the total.
+	ActivitySample(workspaceID, connectorID uuid.UUID, limit int) ([]models.CloudIdentity, int64, error)
+
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
 	Fenced(f ScanFence) CloudWorkloadRepository
@@ -261,6 +265,34 @@ func (r *cloudWorkloadRepository) CountsForConnector(workspaceID, connectorID uu
 	return workloads, usage, nil
 }
 
+// ReconcileGeneration removes what this connector did not see. Usage before
+// workloads only for tidiness -- neither references the other, so there is no
+// foreign-key ordering to respect here, unlike cloud_permission and
+// cloud_resource.
+func (r *cloudWorkloadRepository) ReconcileGeneration(
+	workspaceID, connectorID uuid.UUID, generation int,
+) (int64, int64, error) {
+
+	var workloadsRemoved, usageRemoved int64
+	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
+		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
+		if res.Error != nil {
+			return res.Error
+		}
+		usageRemoved = res.RowsAffected
+
+		res = tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation).Delete(&models.CloudWorkload{})
+		if res.Error != nil {
+			return res.Error
+		}
+		workloadsRemoved = res.RowsAffected
+		return nil
+	})
+	return workloadsRemoved, usageRemoved, err
+}
+
 func (r *cloudWorkloadRepository) CountWorkloads(
 	workspaceID, connectorID uuid.UUID, runtimeKind, region string,
 ) (int64, error) {
@@ -303,30 +335,28 @@ func (r *cloudWorkloadRepository) ReconcileUsage(
 	return removed, err
 }
 
-// ReconcileGeneration removes what this connector did not see. Usage before
-// workloads only for tidiness -- neither references the other, so there is no
-// foreign-key ordering to respect here, unlike cloud_permission and
-// cloud_resource.
-func (r *cloudWorkloadRepository) ReconcileGeneration(
-	workspaceID, connectorID uuid.UUID, generation int,
-) (int64, int64, error) {
-
-	var workloadsRemoved, usageRemoved int64
-	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
-		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudUsage{})
-		if res.Error != nil {
-			return res.Error
-		}
-		usageRemoved = res.RowsAffected
-
-		res = tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudWorkload{})
-		if res.Error != nil {
-			return res.Error
-		}
-		workloadsRemoved = res.RowsAffected
-		return nil
-	})
-	return workloadsRemoved, usageRemoved, err
+// ActivitySample returns the identities one scan reads Access Advisor for: at
+// most limit of the connector's identities, in BYTE order of their ARN
+// (native_id COLLATE "C", then id), and how many the connector holds.
+//
+// Deterministic by ARN (D-86), so the sample a capped scan read is one a
+// reader can name: the scanner stamps the last ARN it read on the activity
+// coverage (SurfaceCoverage.CappedAfter), and an identity that sorts after it
+// was not sampled. "C" collation because it is Go's string order too, so that
+// comparison means the same thing in SQL and in code; the default collation
+// would order case and punctuation by locale.
+func (r *cloudWorkloadRepository) ActivitySample(
+	workspaceID, connectorID uuid.UUID, limit int,
+) ([]models.CloudIdentity, int64, error) {
+	q := r.db.Model(&models.CloudIdentity{}).
+		Where("workspace_id = ? AND connector_id = ?", workspaceID, connectorID)
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var out []models.CloudIdentity
+	if err := q.Order(`native_id COLLATE "C", id`).Limit(clampLimit(limit)).Find(&out).Error; err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
 }

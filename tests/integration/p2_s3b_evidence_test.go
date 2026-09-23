@@ -310,3 +310,100 @@ func TestP2S3bEverySurfaceWritesEvidence(t *testing.T) {
 		}
 	}
 }
+
+// T3.5's dedupe half, through the real writer and conflict targets (022, 025,
+// 035): an unchanged policy version rescanned writes no second observation --
+// its one row is CONFIRMED by the second run (count 2, last_confirmed_run_id =
+// run 2) -- and a subject-less observation (an AgentCore workload identity,
+// which has no cloud_* row) dedupes the same way under the partial index.
+// Nothing exercised the policy_id branch of the five-column COALESCE before.
+//
+// Safeguard (mutation-checked): the policy_id term of the writer's conflict
+// target (cloud_observation_writer.go) -- without it the upsert names no
+// index and every write fails.
+func TestP2S3bPolicyAndSubjectlessObservationsDedupe(t *testing.T) {
+	l := newP2Lab(t, "p2-s3b-dedupe", true)
+	a := l.account(accountA)
+	a.role("dedupe-role", "AROAS3BDEDUPEROLE1")
+	a.attach("dedupe-role", a.managed("TicketRead", docTicketRead))
+	f := &s3bFakes{agentCore: &fakeAgentCore{workloadIdentities: []agentcoretypes.WorkloadIdentityType{{
+		Name:                aws.String("s3b-wid"),
+		WorkloadIdentityArn: aws.String("arn:aws:bedrock-agentcore:us-east-1:" + a.id + ":workload-identity-directory/default/workload-identity/s3b-wid"),
+	}}}}
+
+	type row struct {
+		PolicyID           *uuid.UUID
+		SourceAPI          string
+		ConfirmationCount  int
+		LastConfirmedRunID *uuid.UUID
+	}
+	read := func() (policy, subjectless []row) {
+		t.Helper()
+		if err := l.db.Raw(`SELECT policy_id, source_api, confirmation_count, last_confirmed_run_id
+		                      FROM cloud_observation WHERE workspace_id = ? AND policy_id IS NOT NULL
+		                     ORDER BY policy_id, source_api`, l.ws).Scan(&policy).Error; err != nil {
+			t.Fatalf("read policy observations: %v", err)
+		}
+		if err := l.db.Raw(`SELECT policy_id, source_api, confirmation_count, last_confirmed_run_id
+		                      FROM cloud_observation WHERE workspace_id = ? AND identity_id IS NULL
+		                       AND permission_id IS NULL AND resource_id IS NULL AND workload_id IS NULL
+		                       AND policy_id IS NULL`, l.ws).Scan(&subjectless).Error; err != nil {
+			t.Fatalf("read subject-less observations: %v", err)
+		}
+		return policy, subjectless
+	}
+
+	s3bScanAndProject(l, a, f)
+	p1, n1 := read()
+	if len(p1) == 0 || len(n1) == 0 {
+		t.Fatalf("setup: %d policy-subject and %d subject-less observations, want both", len(p1), len(n1))
+	}
+	run2 := s3bScanAndProject(l, a, f)
+	p2, n2 := read()
+	if len(p2) != len(p1) || len(n2) != len(n1) {
+		t.Fatalf("after an unchanged rescan: %d policy / %d subject-less rows, want %d / %d (no new rows)",
+			len(p2), len(n2), len(p1), len(n1))
+	}
+	for _, r := range append(p2, n2...) {
+		if r.ConfirmationCount != 2 || r.LastConfirmedRunID == nil || *r.LastConfirmedRunID != run2.ID {
+			t.Errorf("%s observation (policy %v): count %d, confirmed by %v; want 2, run %s",
+				r.SourceAPI, r.PolicyID, r.ConfirmationCount, r.LastConfirmedRunID, run2.ID)
+		}
+	}
+}
+
+// T3.8, the reader's side of the vocabulary: every regional surface a graph
+// partition may require (igagraph.KnownSurfaces) is a models.Surface*Prefix
+// key the workload scanner emits -- so the collector's constants and the
+// projector's own list (snapshot.go, frozen by D-60) cannot drift apart
+// without this failing. The global surfaces are checked the same way.
+func TestP2S3bGraphSurfaceVocabularyIsTheModelsVocabulary(t *testing.T) {
+	const region = "eu-west-1"
+	emitted := map[string]bool{models.SurfaceCompute(region): true}
+	for _, p := range []string{models.SurfaceLambdaPrefix, models.SurfaceECSPrefix, models.SurfaceEC2Prefix,
+		models.SurfaceBedrockAgentsPrefix, models.SurfaceBedrockAgentCorePrefix, models.SurfaceAgentCoreGatewaysPrefix} {
+		emitted[models.SurfaceRegional(p, region)] = true
+	}
+	for _, s := range []string{models.SurfaceIAMRoles, models.SurfaceIAMUsers, models.SurfaceIAMGroups,
+		models.SurfaceIAMAccessKeys, models.SurfaceIAMPolicies, models.SurfacePolicyDocuments,
+		models.SurfaceOIDCProviders, models.SurfaceEKSPodIdentity, models.SurfacePermissionScan,
+		models.SurfaceWorkloadScan} {
+		emitted[s] = true
+	}
+	known := igagraph.KnownSurfaces([]string{region})
+	for s := range known {
+		if !emitted[s] {
+			t.Errorf("the graph may require %q, which no scanner emits under a models.Surface* name", s)
+		}
+	}
+	for s := range emitted {
+		if !known[s] {
+			t.Errorf("%q is emitted but the graph's vocabulary does not know it", s)
+		}
+	}
+	// organizations is reported, never required: no partition may wait on a
+	// surface that is always unsupported.
+	if known[models.SurfaceOrganizations] {
+		t.Error("organizations must not be a surface any partition can require")
+	}
+}

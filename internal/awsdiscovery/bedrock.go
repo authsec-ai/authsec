@@ -133,7 +133,7 @@ func (r *BedrockReader) Agents(ctx context.Context) ([]Workload, error) {
 		}
 		resp, err := r.agents.ListAgents(ctx, &bedrockagent.ListAgentsInput{NextToken: next})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("bedrock:ListAgents", err)
 		}
 		for _, summary := range resp.AgentSummaries {
 			w, ok := r.agentDetail(ctx, summary, details)
@@ -221,7 +221,7 @@ func (r *BedrockReader) AgentRuntimes(ctx context.Context) ([]Workload, error) {
 			NextToken: next,
 		})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("bedrock-agentcore:ListAgentRuntimes", err)
 		}
 		for _, rt := range resp.AgentRuntimes {
 			id := aws.ToString(rt.AgentRuntimeId)
@@ -313,7 +313,7 @@ func (r *BedrockReader) Gateways(ctx context.Context) ([]Workload, []GatewayTarg
 		}
 		resp, err := r.agentCore.ListGateways(ctx, &bedrockagentcorecontrol.ListGatewaysInput{NextToken: next})
 		if err != nil {
-			return workloads, targets, listErr(err)
+			return workloads, targets, listErr("bedrock-agentcore:ListGateways", err)
 		}
 		for _, summary := range resp.Items {
 			id := aws.ToString(summary.GatewayId)
@@ -422,7 +422,7 @@ func (r *BedrockReader) WorkloadIdentities(ctx context.Context) ([]WorkloadIdent
 		resp, err := r.agentCore.ListWorkloadIdentities(ctx,
 			&bedrockagentcorecontrol.ListWorkloadIdentitiesInput{NextToken: next})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("bedrock-agentcore:ListWorkloadIdentities", err)
 		}
 		for _, wi := range resp.WorkloadIdentities {
 			out = append(out, WorkloadIdentity{
@@ -471,7 +471,7 @@ func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialPr
 		resp, err := r.agentCore.ListOauth2CredentialProviders(ctx,
 			&bedrockagentcorecontrol.ListOauth2CredentialProvidersInput{NextToken: oauthNext})
 		if err != nil {
-			firstErr = listErr(err)
+			firstErr = listErr("bedrock-agentcore:ListOauth2CredentialProviders", err)
 			break
 		}
 		for _, p := range resp.CredentialProviders {
@@ -501,7 +501,7 @@ func (r *BedrockReader) CredentialProviders(ctx context.Context) ([]CredentialPr
 			&bedrockagentcorecontrol.ListApiKeyCredentialProvidersInput{NextToken: apiKeyNext})
 		if err != nil {
 			if firstErr == nil {
-				firstErr = listErr(err)
+				firstErr = listErr("bedrock-agentcore:ListApiKeyCredentialProviders", err)
 			}
 			break
 		}

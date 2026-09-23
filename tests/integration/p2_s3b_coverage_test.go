@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -41,11 +42,14 @@ type s3bActivity struct {
 	fail    map[string]error
 	failAll error
 	jobs    int
+	// submitted is every principal a report was requested for, in order.
+	submitted []string
 }
 
 func (f *s3bActivity) GenerateServiceLastAccessedDetails(_ context.Context, in *iam.GenerateServiceLastAccessedDetailsInput, _ ...func(*iam.Options)) (*iam.GenerateServiceLastAccessedDetailsOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.submitted = append(f.submitted, aws.ToString(in.Arn))
 	if f.failAll != nil {
 		return nil, f.failAll
 	}
@@ -224,6 +228,83 @@ func TestP2S3bActivityIsPartialAboveTheCap(t *testing.T) {
 	}
 }
 
+// D-86: the capped sample is the first activityIdentityCap identities in BYTE
+// order of their ARN -- deterministic, and named on the coverage
+// (capped_after) so a reader can tell "not collected" from "no attempt
+// reported" for any identity without re-deriving the sample.
+//
+// The fixture makes every plausible wrong order pick a different sample: the
+// 498 extra users have ARNs user/Z-bulk-NNN (uppercase, so byte order puts
+// them BEFORE user/ci-deployer while a locale collation puts them after) and
+// names d-bulk-NNN (so ordering by name puts ci-deployer first). Byte order
+// leaves out ci-deployer alone; name order or the database's default
+// collation would leave out user/Z-bulk-498 instead.
+//
+// Safeguard (mutation-checked): the ORDER BY native_id COLLATE "C" in
+// ActivitySample, and the CappedAfter stamp in scanActivity.
+func TestP2S3bActivitySampleIsTheFirstByARN(t *testing.T) {
+	db := igaDB(t)
+	ws := newWorkspace(t, db, "p2-s3b-activity-sample")
+	defer cleanWorkloadTables(t, db, ws)
+
+	svc, snap := s3bActivityFixture(t, db, ws, 0) // 3 identities
+	if err := db.Exec(`INSERT INTO cloud_identity (workspace_id, connector_id, kind, native_id, name, last_seen_generation)
+	                   SELECT ?, ?, 'iam_user', 'arn:aws:iam::429418377036:user/Z-bulk-' || lpad(g::text, 3, '0'),
+	                          'd-bulk-' || lpad(g::text, 3, '0'), ?
+	                     FROM generate_series(1, 498) g`, ws, snap.ConnectorID, snap.Generation).Error; err != nil {
+		t.Fatalf("add bulk identities: %v", err)
+	}
+	var all []string
+	if err := db.Raw(`SELECT native_id FROM cloud_identity WHERE workspace_id = ? AND connector_id = ?`,
+		ws, snap.ConnectorID).Scan(&all).Error; err != nil || len(all) != 501 {
+		t.Fatalf("identities = %d (%v), want 501", len(all), err)
+	}
+	sort.Strings(all) // Go's string order is byte order
+	want := all[:500]
+	if all[500] != ciUserARN {
+		t.Fatalf("fixture: byte order must leave out %s, leaves out %s", ciUserARN, all[500])
+	}
+
+	fake := &s3bActivity{}
+	out := s3bWorkloadScan(t, db, ws, svc, snap, fake, nil)
+	got := append([]string(nil), fake.submitted...)
+	sort.Strings(got)
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		missing := map[string]bool{}
+		for _, a := range want {
+			missing[a] = true
+		}
+		for _, a := range got {
+			delete(missing, a)
+		}
+		t.Fatalf("sampled %d identities; not the first 500 by ARN (byte order) -- %d of those were skipped, e.g. %v",
+			len(got), len(missing), s3bFirstKeys(missing, 3))
+	}
+	cov := out.Surfaces[models.SurfaceActivity]
+	if cov.State != models.CloudCoveragePartial || cov.CappedAfter != want[499] {
+		t.Fatalf("activity = %+v, want partial with capped_after %q (the last ARN sampled)", cov, want[499])
+	}
+	// Run it again: the same 500, in the same order.
+	again := &s3bActivity{}
+	s3bWorkloadScan(t, db, ws, svc, snap, again, nil)
+	if strings.Join(again.submitted, "|") != strings.Join(fake.submitted, "|") {
+		t.Fatal("the capped sample is not deterministic between scans of an unchanged inventory")
+	}
+}
+
+// s3bFirstKeys lists up to n keys of a set, sorted, for a failure message.
+func s3bFirstKeys(m map[string]bool, n int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
 // T3.7 / E4 (the throttling fixture): a throttle is reported THROTTLED, not
 // denied, naming the call and the AWS code; one identity denied among many
 // read is partial; every identity denied is denied. None reconciles usage.
@@ -246,6 +327,9 @@ func TestP2S3bActivityThrottledOnThrottle(t *testing.T) {
 	if !strings.Contains(cov.Error, "1 of 3") ||
 		!strings.Contains(cov.Error, "iam:GenerateServiceLastAccessedDetails ThrottlingException") {
 		t.Errorf("throttled must name the count, the call and the code, got %q", cov.Error)
+	}
+	if cov.API != "iam:GenerateServiceLastAccessedDetails" || cov.ErrorCode != "ThrottlingException" {
+		t.Errorf("throttled api/error_code = %q/%q (D-71)", cov.API, cov.ErrorCode)
 	}
 	if out.UsageComplete {
 		t.Error("a throttled activity read must not license deleting usage")
@@ -275,12 +359,17 @@ func TestP2S3bActivityThrottledOnThrottle(t *testing.T) {
 
 /* ----------------------------- resource policies ---------------------------- */
 
-// T3.7 / E4: per-resource GetBucketPolicy failures are COUNTED -- the surface
-// used to read reached even when every read was denied. "No policy"
-// (NoSuchBucketPolicy) is a clean answer, not a failure. The surface stays out
-// of the permission scan's own reconciliation gate: it is bonus evidence.
+// T3.7 / E4, as D-93 records it: per-resource GetBucketPolicy failures are
+// COUNTED -- the surface used to read reached even when every read was denied.
+// All reads succeed -> reached (count = reads); some fail -> partial (count =
+// the failures); all fail -> denied. "No policy" (NoSuchBucketPolicy) is a
+// successful read, and a throttled read is a failed one (D-93 gives this
+// surface no throttled state) whose error still names ThrottlingException. The
+// surface stays out of the permission scan's own reconciliation gate: it is
+// bonus evidence.
 //
-// Safeguard (mutation-checked): the failure count in scanResourcePolicies.
+// Safeguards (mutation-checked): the failure count in scanResourcePolicies;
+// the partial / denied split and the failure count in resourcePolicyCoverage.
 func TestP2S3bResourcePolicyFailuresAreCounted(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "p2-s3b-resource-policies")
@@ -319,31 +408,39 @@ func TestP2S3bResourcePolicyFailuresAreCounted(t *testing.T) {
 	// One denied, one read, one with no policy at all: partial, 1 of 3.
 	out := scan(map[string]error{"s3b-locked": denied("s3:GetBucketPolicy"), "s3b-nopolicy": noPolicy})
 	cov := out.Surfaces[models.SurfaceResourcePolicies]
-	if cov.State != models.CloudCoveragePartial || cov.Count != 2 ||
+	if cov.State != models.CloudCoveragePartial || cov.Count != 1 ||
 		!strings.Contains(cov.Error, "1 of 3 resource policies could not be read: s3:GetBucketPolicy AccessDenied") {
-		t.Fatalf("resource_policies with one denied read = %+v, want partial, count 2 (no-policy is a clean read), naming the call", cov)
+		t.Fatalf("resource_policies with one denied read = %+v, want partial, count 1 (the failures, D-93; "+
+			"no-policy is a clean read), naming the call", cov)
+	}
+	// D-71: the call and AWS's own code, as stored fields -- never parsed back out of Error.
+	if cov.API != "s3:GetBucketPolicy" || cov.ErrorCode != "AccessDenied" {
+		t.Errorf("resource_policies api/error_code = %q/%q, want s3:GetBucketPolicy/AccessDenied", cov.API, cov.ErrorCode)
 	}
 	if !out.Complete {
 		t.Error("resource-policy coverage must stay out of the permission scan's reconciliation gate")
 	}
 
-	// Every read denied: denied, never reached.
+	// Every read denied: denied, never reached; count = the 3 failures.
 	out = scan(map[string]error{"s3b-readable": denied("s3:GetBucketPolicy"),
 		"s3b-locked": denied("s3:GetBucketPolicy"), "s3b-nopolicy": denied("s3:GetBucketPolicy")})
-	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoverageDenied || cov.Count != 0 {
-		t.Fatalf("resource_policies with every read denied = %+v, want denied", cov)
+	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoverageDenied || cov.Count != 3 ||
+		!strings.Contains(cov.Error, "3 of 3") {
+		t.Fatalf("resource_policies with every read denied = %+v, want denied, count 3", cov)
 	}
 
-	// Throttled.
+	// A throttled read is a failed read: partial, naming the throttle.
 	out = scan(map[string]error{"s3b-locked": throttled("s3:GetBucketPolicy"), "s3b-nopolicy": noPolicy})
-	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoverageThrottled {
-		t.Fatalf("resource_policies with a throttled read = %+v, want throttled", cov)
+	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoveragePartial || cov.Count != 1 ||
+		!strings.Contains(cov.Error, "s3:GetBucketPolicy Throttling") || cov.ErrorCode != "Throttling" {
+		t.Fatalf("resource_policies with a throttled read = %+v, want partial (D-93) naming the throttle", cov)
 	}
 
 	// Clean: reached, every resource counted.
 	out = scan(map[string]error{"s3b-nopolicy": noPolicy})
-	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoverageReached || cov.Count != 3 {
-		t.Fatalf("resource_policies with every read clean = %+v, want reached, count 3", cov)
+	if cov := out.Surfaces[models.SurfaceResourcePolicies]; cov.State != models.CloudCoverageReached || cov.Count != 3 ||
+		cov.API != "" || cov.ErrorCode != "" {
+		t.Fatalf("resource_policies with every read clean = %+v, want reached, count 3, no failed call", cov)
 	}
 }
 
@@ -405,6 +502,10 @@ func TestP2S3bServiceNotOfferedInRegionIsUnsupported(t *testing.T) {
 	cov := out.Surfaces["lambda:us-east-1"]
 	if cov.State != models.CloudCoverageUnsupported || !strings.Contains(cov.Error, "not offered in us-east-1") {
 		t.Fatalf("lambda with a non-resolving endpoint = %+v, want unsupported", cov)
+	}
+	if cov.API != "lambda:ListFunctions" || cov.ErrorCode != "" {
+		t.Errorf("unsupported api/error_code = %q/%q, want lambda:ListFunctions and no code (AWS returned none)",
+			cov.API, cov.ErrorCode)
 	}
 	if _, listed := out.Errors["lambda:us-east-1"]; listed {
 		t.Error("an unsupported surface is not an error")

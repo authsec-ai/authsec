@@ -43,6 +43,9 @@ func TestS3bItemFailuresCountsItemsOnceAndNamesEachCall(t *testing.T) {
 	if f.Error() != want {
 		t.Fatalf("Error() = %q\nwant      %q", f.Error(), want)
 	}
+	if f.Calls[0].AWSCode != "AccessDeniedException" || f.Calls[1].AWSCode != "ThrottlingException" {
+		t.Fatalf("per-call AWS codes = %+v, want AWS's own codes for coverage's error_code", f.Calls)
+	}
 	var got *ItemFailures
 	if err := f.Err(nil); !errors.As(err, &got) || got != f {
 		t.Fatal("Err must return the tally itself when an item failed")
@@ -61,7 +64,7 @@ func TestS3bErrorCodeIsStable(t *testing.T) {
 		want string
 	}{
 		{s3bAPIErr("AccessDeniedException"), "AccessDeniedException"},
-		{callErr("bedrock:GetAgent", s3bAPIErr("AccessDenied")), "AccessDenied"},
+		{withCallName("bedrock:GetAgent", s3bAPIErr("AccessDenied")), "AccessDenied"},
 		{fmt.Errorf("wrapped: %w", ErrActivityJobFailed), "JobFailed"},
 		{context.DeadlineExceeded, "RequestTimeout"},
 		{errors.New("something else"), "UnknownError"},
@@ -75,15 +78,20 @@ func TestS3bErrorCodeIsStable(t *testing.T) {
 	}
 }
 
-// callErr keeps both halves: errors.Is sees the classified sentinel, and the
-// raw AWS code survives for coverage.
-func TestS3bCallErrKeepsSentinelAndCode(t *testing.T) {
-	err := callErr("iam:GenerateServiceLastAccessedDetails", s3bAPIErr("ThrottlingException"))
+// withCallName keeps both halves: errors.Is sees the classified sentinel, and
+// the raw AWS code survives for coverage.
+func TestS3bCallNameKeepsSentinelAndCode(t *testing.T) {
+	err := withCallName("iam:GenerateServiceLastAccessedDetails", s3bAPIErr("ThrottlingException"))
 	if !errors.Is(err, ErrThrottled) {
 		t.Fatal("a throttle must still be ErrThrottled")
 	}
-	if ErrorCode(err) != "ThrottlingException" || FailedCall(err) != "iam:GenerateServiceLastAccessedDetails" {
-		t.Fatalf("code %q, call %q", ErrorCode(err), FailedCall(err))
+	if ErrorCode(err) != "ThrottlingException" || AWSErrorCode(err) != "ThrottlingException" ||
+		CallName(err) != "iam:GenerateServiceLastAccessedDetails" {
+		t.Fatalf("code %q, aws code %q, call %q", ErrorCode(err), AWSErrorCode(err), CallName(err))
+	}
+	// error_code is AWS's own word or nothing -- never one of our labels.
+	if got := AWSErrorCode(fmt.Errorf("wrapped: %w", ErrActivityJobFailed)); got != "" {
+		t.Fatalf("AWSErrorCode of a job failure = %q, want \"\" (AWS returned no code)", got)
 	}
 	if !strings.HasPrefix(err.Error(), "iam:GenerateServiceLastAccessedDetails: ") {
 		t.Fatalf("the error must name its call: %q", err)
@@ -94,15 +102,16 @@ func TestS3bCallErrKeepsSentinelAndCode(t *testing.T) {
 func TestS3bListErrMapsOnlyNXDOMAINToNotInRegion(t *testing.T) {
 	nx := &url.Error{Op: "Post", URL: "https://bedrock-agent.ap-south-2.amazonaws.com/", Err: &net.OpError{
 		Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "bedrock-agent.ap-south-2.amazonaws.com", IsNotFound: true}}}
-	if err := listErr(nx); !errors.Is(err, ErrServiceNotInRegion) || !strings.Contains(err.Error(), "does not resolve") {
-		t.Fatalf("NXDOMAIN = %v, want ErrServiceNotInRegion", err)
+	if err := listErr("bedrock:ListAgents", nx); !errors.Is(err, ErrServiceNotInRegion) ||
+		!strings.Contains(err.Error(), "does not resolve") || CallName(err) != "bedrock:ListAgents" || AWSErrorCode(err) != "" {
+		t.Fatalf("NXDOMAIN = %v (call %q), want ErrServiceNotInRegion naming the list call, with no AWS code", err, CallName(err))
 	}
 	timeout := &net.DNSError{Err: "i/o timeout", Name: "lambda.us-east-1.amazonaws.com", IsTimeout: true}
-	if errors.Is(listErr(timeout), ErrServiceNotInRegion) {
+	if errors.Is(listErr("lambda:ListFunctions", timeout), ErrServiceNotInRegion) {
 		t.Fatal("a DNS timeout is not proof the service is absent")
 	}
 	for _, code := range []string{"AccessDenied", "AccessDeniedException", "InvalidClientTokenId", "UnrecognizedClientException"} {
-		if errors.Is(listErr(s3bAPIErr(code)), ErrServiceNotInRegion) {
+		if errors.Is(listErr("lambda:ListFunctions", s3bAPIErr(code)), ErrServiceNotInRegion) {
 			t.Fatalf("%s must never read as not offered: an SCP or a region opt-out produces it too", code)
 		}
 	}

@@ -1,7 +1,5 @@
 package igagraph
 
-import "strings"
-
 // Evidence subject keys for observations whose typed subject is an IDENTITY
 // but which are NOT evidence about that identity's own configuration (T3.5).
 //
@@ -23,12 +21,18 @@ func AccessKeyEvidenceKey(keyID string) string { return keyID }
 
 // PodIdentityEvidenceKey is the subject_native_id of an EKS Pod Identity
 // association's observation (eks:DescribePodIdentityAssociation), whose typed
-// subject is the ROLE the service account may assume: role ARN ␟ issuer ␟
-// Kubernetes subject. Every part is on the collected cloud_assume_edge row (the
-// role through identity_id, then issuer and subject), so the projector's
-// pod-identity can_assume pass (§4.8: "pod identity: the association's
-// observation") can rebuild the key from its snapshot exactly. The issuer is
-// the one the edge row stores, "" when the cluster has none.
+// subject is the ROLE the service account may assume: aws ␟ pod_identity ␟
+// role ARN ␟ issuer ␟ Kubernetes subject. Every part is on the collected
+// cloud_assume_edge row (the role through identity_id, then issuer and
+// subject), so the projector's pod-identity can_assume pass (§4.8: "pod
+// identity: the association's observation") rebuilds the key from its
+// snapshot exactly. The issuer is the one the edge row stores, "" when the
+// cluster has none -- D-42 leaves such an association without an edge, so
+// nothing joins on that key.
+//
+// The "pod_identity" segment keeps it clear of the role's own observation
+// (the bare ARN) and of every other key shape. It is the string the trust
+// projection (T4.7) builds for the same join; the two must stay byte-equal.
 func PodIdentityEvidenceKey(roleARN, issuer, k8sSubject string) string {
-	return strings.Join([]string{roleARN, issuer, k8sSubject}, Sep)
+	return Key("aws", "pod_identity", roleARN, issuer, k8sSubject)
 }

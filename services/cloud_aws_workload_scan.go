@@ -267,24 +267,36 @@ var computeSurfacePrefixes = map[string]bool{
 	models.SurfaceBedrockAgentsPrefix:     true,
 	models.SurfaceBedrockAgentCorePrefix:  true,
 	models.SurfaceAgentCoreGatewaysPrefix: true,
-	"compute":                             true, // models.SurfaceComputePrefix, without its colon
+	// The per-region stand-in, models.SurfaceComputePrefix without its colon.
+	strings.TrimSuffix(models.SurfaceComputePrefix, ":"): true,
 }
 
 // computeAuthoritative reports whether every compute surface this run reported
 // is in a non-blocking state -- derived from the coverage itself, so a
 // detail-call failure (partial) blocks workload deletion and a service not
 // offered in a region (unsupported) does not (§1.3).
+//
+// And at least one compute surface must have been READ: a run whose every
+// compute surface was not selected or unsupported established nothing, and
+// must not license deleting what an earlier run found -- the same rule
+// ScanCoverage.Complete applies ("attempted > 0"). It is what keeps a resolver
+// that answers NXDOMAIN for everything from reading as an empty estate.
 func (out *WorkloadSnapshot) computeAuthoritative() bool {
+	read := false
 	for key, cov := range out.Surfaces {
 		prefix := key
 		if i := strings.Index(key, ":"); i >= 0 {
 			prefix = key[:i]
 		}
-		if computeSurfacePrefixes[prefix] && !nonBlocking(cov.State) {
+		if !computeSurfacePrefixes[prefix] {
+			continue
+		}
+		if !nonBlocking(cov.State) {
 			return false
 		}
+		read = read || cov.State == models.CloudCoverageReached
 	}
-	return true
+	return read
 }
 
 // awsRegionsWithCompute is every region AuthSec can read compute in. Kept here
@@ -832,9 +844,10 @@ func workloadSourceAPI(w awsdiscovery.Workload) string {
 //   - denied     no attempted report could be read.
 //
 // Count is the usage rows written, a floor whenever the state is not reached;
-// the Error names the identities. Anything but reached keeps every usage row
-// the last good read wrote (UsageComplete gates ReconcileUsage), and none of
-// it blocks workload reconciliation any more.
+// the Error names the identities, and above the cap CappedAfter names the last
+// ARN sampled. Anything but reached keeps every usage row the last good read
+// wrote (UsageComplete gates ReconcileUsage), and none of it blocks workload
+// reconciliation any more.
 func (s *AWSWorkloadScanner) scanActivity(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot, out *WorkloadSnapshot,
 ) models.SurfaceCoverage {
@@ -858,10 +871,10 @@ func (s *AWSWorkloadScanner) scanActivity(
 
 	// The total is kept, not discarded: an account above the cap must say so,
 	// or the identities past it silently read as having no activity (§1.3).
-	identities, total, err := s.identities.ListIdentities(workspaceID, repositories.CloudIdentityFilter{
-		ConnectorID: &snapshot.ConnectorID,
-		Limit:       activityIdentityCap,
-	})
+	// The sample is the first activityIdentityCap identities by ARN (D-86):
+	// the same identities every scan while the inventory is unchanged, and a
+	// set a reader can name from CappedAfter below.
+	identities, total, err := s.workloads.ActivitySample(workspaceID, snapshot.ConnectorID, activityIdentityCap)
 	if err != nil {
 		return models.SurfaceCoverage{State: models.CloudCoverageDenied, Error: err.Error()}
 	}
@@ -906,7 +919,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 	}
 
 	cov := surfaceResult(out.UsageWritten, reads.Err(nil))
-	if total > int64(len(identities)) {
+	if total > int64(len(identities)) && len(identities) > 0 {
 		capped := fmt.Sprintf("activity was read for %d of %d identities (Access Advisor is capped at %d identities per scan)",
 			len(identities), total, activityIdentityCap)
 		if cov.State == models.CloudCoverageReached {
@@ -915,6 +928,10 @@ func (s *AWSWorkloadScanner) scanActivity(
 			// throttled / denied / partial already block; the cap is named too.
 			cov.Error += "; " + capped
 		}
+		// Where the sample ended (D-86): every identity whose ARN sorts after
+		// this one was not read this run -- "not collected", never "no attempt
+		// reported".
+		cov.CappedAfter = identities[len(identities)-1].NativeID
 	}
 	return cov
 }
@@ -922,7 +939,7 @@ func (s *AWSWorkloadScanner) scanActivity(
 // activityCall is the call an activity read failed on, for the coverage text;
 // the reader names it on every error it returns.
 func activityCall(err error) string {
-	if call := awsdiscovery.FailedCall(err); call != "" {
+	if call := awsdiscovery.CallName(err); call != "" {
 		return call
 	}
 	return "iam:GetServiceLastAccessedDetails"

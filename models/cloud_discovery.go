@@ -334,14 +334,31 @@ func OrganizationsCoverage() SurfaceCoverage {
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`
+	// CappedAfter is set when a per-scan cap, not a failure, stopped the read
+	// (activity above its identity cap, T3.7): the native id of the LAST item
+	// read, in the surface's deterministic order -- byte order of the ARN
+	// (D-86). An item that sorts after it was not read this run, so its
+	// activity is "not collected", never "no attempt reported". Stamped by the
+	// collector so no reader has to re-derive the sample from a later
+	// inventory.
+	CappedAfter string `json:"capped_after,omitempty"`
 	// Count is how many objects were read. A total when State is reached; a
 	// FLOOR otherwise -- for partial, the rows that were read, with Error
-	// naming how many were not (§1.4: "the report names how many").
+	// naming how many were not (§1.4: "the report names how many"). One
+	// exception, recorded in D-93: resource_policies counts its FAILED reads
+	// whenever it is not reached.
 	Count int `json:"count"`
 	// Error says why State is not reached: the failed call and the provider's
 	// error code, or for partial "N of M <items> could not be read: <call>
 	// <code>". Never a guessed missing permission (§2.14.13).
 	Error string `json:"error,omitempty"`
+	// ErrorCode and API are the AWS error code and the call that failed
+	// (iam:GetAccountAuthorizationDetails), exactly as the SDK reported them
+	// (awsdiscovery.FailedCall) -- empty when the failure carried neither.
+	// GET /coverage returns them as error_code and api (§5.3): the call is
+	// named, a missing permission never guessed (§2.14.13).
+	ErrorCode string `json:"error_code,omitempty"`
+	API       string `json:"api,omitempty"`
 }
 
 // ScanCoverage is the typed shape of CloudConnector.Coverage: the durable

@@ -192,7 +192,7 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 		}
 		resp, err := r.lambdaAPI.ListFunctions(ctx, &lambda.ListFunctionsInput{Marker: marker})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("lambda:ListFunctions", err)
 		}
 		for _, fn := range resp.Functions {
 			out = append(out, Workload{
@@ -258,7 +258,7 @@ func (r *WorkloadReader) ECSTaskDefinitions(ctx context.Context) ([]Workload, er
 			Status: "ACTIVE", NextToken: next,
 		})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("ecs:ListTaskDefinitions", err)
 		}
 		for _, arn := range resp.TaskDefinitionArns {
 			if arn == "" {
@@ -344,7 +344,7 @@ func (r *WorkloadReader) EC2Instances(ctx context.Context) ([]Workload, error) {
 		}
 		resp, err := r.ec2API.DescribeInstances(ctx, &ec2.DescribeInstancesInput{NextToken: next})
 		if err != nil {
-			return out, listErr(err)
+			return out, listErr("ec2:DescribeInstances", err)
 		}
 		for _, reservation := range resp.Reservations {
 			for _, inst := range reservation.Instances {
@@ -409,7 +409,7 @@ func (r *WorkloadReader) roleForInstanceProfile(ctx context.Context, profileARN 
 	ans := profileAnswer{}
 	switch {
 	case err != nil:
-		ans.err = callErr("iam:GetInstanceProfile", err)
+		ans.err = withCallName("iam:GetInstanceProfile", err)
 	// An instance profile holds exactly one role in practice; AWS models it as
 	// a list and has never allowed a second.
 	case resp.InstanceProfile != nil && len(resp.InstanceProfile.Roles) > 0:

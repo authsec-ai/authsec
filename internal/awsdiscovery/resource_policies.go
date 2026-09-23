@@ -83,7 +83,7 @@ func resourcePolicyFrom(call, doc string, readErr error) (ResourcePolicy, error)
 			// is not the same as a denied read, which learns nothing.
 			return ResourcePolicy{}, nil
 		}
-		return ResourcePolicy{}, callErr(call, readErr)
+		return ResourcePolicy{}, withCallName(call, readErr)
 	}
 	stmts, _, err := ParsePolicyDocument(doc)
 	if err != nil {

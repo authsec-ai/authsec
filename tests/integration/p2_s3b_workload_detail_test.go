@@ -155,6 +155,9 @@ func TestP2S3bFailedGetAgentKeepsKeyAndBlocksDeletion(t *testing.T) {
 		!strings.Contains(cov.Error, "1 of 1 agents") {
 		t.Errorf("partial must name the count, the call and the AWS code, got %q", cov.Error)
 	}
+	if cov.API != "bedrock:GetAgent" || cov.ErrorCode != "AccessDenied" {
+		t.Errorf("partial api/error_code = %q/%q, want bedrock:GetAgent/AccessDenied (D-71)", cov.API, cov.ErrorCode)
+	}
 
 	// The SAME key: one collected row, the same ARN, the same graph node.
 	cw2 := s3bCloudWorkloads(t, l, models.WorkloadBedrockAgent)

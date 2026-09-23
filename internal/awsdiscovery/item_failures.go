@@ -42,45 +42,49 @@ import (
 var ErrServiceNotInRegion = errors.New("the service is not offered in this region")
 
 // listErr classifies the error of a LIST call against a regional endpoint: an
-// endpoint that does not resolve is ErrServiceNotInRegion; anything else is
-// classify()'d exactly as before.
+// endpoint that does not resolve is ErrServiceNotInRegion, naming the call;
+// anything else is classify()'d exactly as before, so the coverage text of an
+// ordinary denial or throttle does not change.
 //
 // The SDK does not retry a not-found DNS answer (aws/retry retryable_error.go),
 // so this surfaces on the first attempt rather than after the retry budget.
-func listErr(err error) error {
+func listErr(call string, err error) error {
 	if err == nil {
 		return nil
 	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) && dns.IsNotFound {
-		return fmt.Errorf("%w: %s does not resolve", ErrServiceNotInRegion, dns.Name)
+		return &namedCallError{call: call, raw: err,
+			classified: fmt.Errorf("%w: %s does not resolve", ErrServiceNotInRegion, dns.Name)}
 	}
 	return classify(err)
 }
 
-// callError keeps BOTH halves of a failed call: the classified sentinel
-// (ErrThrottled, ErrNotAssumable -- what errors.Is asks) and the raw SDK error
-// (the AWS error code -- what coverage must name, §2.14.13). classify() alone
-// keeps only the first, so "which call, which code" was unrecoverable.
-type callError struct {
+// namedCallError keeps BOTH halves of a failed call: the classified sentinel
+// (ErrThrottled, ErrNotAssumable, ErrServiceNotInRegion -- what errors.Is
+// asks) and the raw SDK error (the AWS error code -- what coverage must name,
+// §2.14.13). classify() alone keeps only the first, so "which call, which
+// code" was unrecoverable.
+type namedCallError struct {
 	call       string
 	raw        error
 	classified error
 }
 
-func (e *callError) Error() string   { return e.call + ": " + e.classified.Error() }
-func (e *callError) Unwrap() []error { return []error{e.classified, e.raw} }
+func (e *namedCallError) Error() string   { return e.call + ": " + e.classified.Error() }
+func (e *namedCallError) Unwrap() []error { return []error{e.classified, e.raw} }
 
-// callErr names the AWS call that failed. Nil stays nil.
-func callErr(call string, err error) error {
+// withCallName names the AWS call that failed. Nil stays nil, and an error
+// that already names its call keeps the name it has.
+func withCallName(call string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var already *callError
+	var already *namedCallError
 	if errors.As(err, &already) {
 		return err
 	}
-	return &callError{call: call, raw: err, classified: classify(err)}
+	return &namedCallError{call: call, raw: err, classified: classify(err)}
 }
 
 // ErrorCode is the AWS error code of a failed call ("AccessDeniedException",
@@ -114,14 +118,31 @@ func ErrorCode(err error) string {
 	return "UnknownError"
 }
 
+// AWSErrorCode is the error code AWS itself returned, or "" when the failure
+// carried none (a DNS failure, a timeout, a job AWS reported FAILED). Unlike
+// ErrorCode it never substitutes a label of ours: it is what coverage stores
+// as error_code, "exactly as the SDK reported it" (D-71).
+func AWSErrorCode(err error) string {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode()
+	}
+	return ""
+}
+
 // CallFailure is one AWS call's share of an ItemFailures report.
 type CallFailure struct {
 	// Call is the AWS action, "bedrock:GetAgent".
 	Call string
 	// Failed is how many items this call failed for.
 	Failed int
-	// Code is the first failure's AWS error code (ErrorCode).
+	// Code is the first failure's error code (ErrorCode: AWS's own, else a
+	// fixed label of ours), for the coverage text.
 	Code string
+	// AWSCode is the first failure's AWS error code exactly as the SDK
+	// reported it, "" when there was none (AWSErrorCode) -- what coverage
+	// stores as error_code.
+	AWSCode string
 }
 
 // ItemFailures reports a read whose listing succeeded but some of whose items
@@ -177,7 +198,7 @@ func (f *ItemFailures) Fail(item, call string, err error) {
 			return
 		}
 	}
-	f.Calls = append(f.Calls, CallFailure{Call: call, Failed: 1, Code: ErrorCode(err)})
+	f.Calls = append(f.Calls, CallFailure{Call: call, Failed: 1, Code: ErrorCode(err), AWSCode: AWSErrorCode(err)})
 }
 
 // Error names how many items failed, and which calls with which codes:
@@ -215,11 +236,11 @@ func DetailErrorOf(call string, err error) string {
 	return call + " " + ErrorCode(err)
 }
 
-// FailedCall is the AWS call a reader named on its error ("" when it named
+// CallName is the AWS call a reader named on its error ("" when it named
 // none), so a caller tallying per-item failures (T3.7) can attribute each one
 // to the call that produced it without re-deriving it.
-func FailedCall(err error) string {
-	var ce *callError
+func CallName(err error) string {
+	var ce *namedCallError
 	if errors.As(err, &ce) {
 		return ce.call
 	}

@@ -285,7 +285,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// s3:GetBucketPolicy/kms:GetKeyPolicy must not have an otherwise-complete
 	// permission scan refuse to reconcile edges and grants over it.
 	resourcePolicyCount, resourcePolicyErr := s.scanResourcePolicies(ctx, workspaceID, snapshot.ConnectorID, out)
-	out.Surfaces[models.SurfaceResourcePolicies] = surfaceResult(resourcePolicyCount, resourcePolicyErr)
+	out.Surfaces[models.SurfaceResourcePolicies] = resourcePolicyCoverage(resourcePolicyCount, resourcePolicyErr) // D-93
 
 	if out.Complete {
 		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
@@ -1120,8 +1120,8 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 	checked := 0
 	// T3.7: every per-resource read is counted, so resource_policies is
 	// reached only when every read succeeded ("no policy" is a success),
-	// partial / denied / throttled otherwise -- never reached "even when
-	// every read was denied" (§1.3). See itemFailureCoverage.
+	// partial or denied otherwise -- never reached "even when every read was
+	// denied" (§1.3). See resourcePolicyCoverage (D-93).
 	reads := awsdiscovery.NewItemFailures("resource policies could not be read", false)
 	for _, c := range out.resourcePolicyCandidates {
 		if seen[c.NativeID] {
