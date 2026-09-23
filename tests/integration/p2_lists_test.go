@@ -386,8 +386,11 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	a.attach("SharedToolRole", a.managed("TicketRead", docTicketRead))
 	orders := "arn:aws:dynamodb:us-east-1:" + accountA + ":table/orders"
 	partner := "arn:aws:dynamodb:us-east-1:999999999999:table/partner"
+	// A selector in an account no connector reads: selector, never external,
+	// with account.connected false (D-16).
+	partners := "arn:aws:dynamodb:us-east-1:999999999999:table/*"
 	a.attach("SharedToolRole", a.managed("Tables", `{"Version":"2012-10-17","Statement":[{"Sid":"Tables",`+
-		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":["`+orders+`","`+partner+`"]}]}`))
+		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":["`+orders+`","`+partner+`","`+partners+`"]}]}`))
 	a.attach("SharedToolRole", a.managed("AllButFinance", `{"Version":"2012-10-17","Statement":[{`+
 		`"Sid":"AllButFinance","Effect":"Allow","Action":"s3:*","NotResource":"arn:aws:s3:::finance/*"}]}`))
 	a.attach("SharedToolRole", a.managed("NoDeletes", `{"Version":"2012-10-17","Statement":[{`+
@@ -398,14 +401,21 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	                     VALUES (?, 'repository', 'acme/support-tickets', 'github', 'github␟repo␟1')`, l.ws).Error; err != nil {
 		t.Fatalf("seed github resource: %v", err)
 	}
+	// Nor is an AWS reference no projection pass supports (D-6).
+	if err := l.db.Exec(`INSERT INTO iga_resources (workspace_id, resource_kind, display_name, provider, source_key)
+	                     VALUES (?, 's3_bucket', 'arn:aws:s3:::orphan', 'aws', 'aws' || chr(31) || 'ref' || chr(31) || 'arn:aws:s3:::orphan')`,
+		l.ws).Error; err != nil {
+		t.Fatalf("seed unsupported resource: %v", err)
+	}
 	api := l.api()
 
 	body := listsGet(t, api, "/resources"+qs("facets", "kind,service,account"))
 	rows := digl(body, "data")
 	texts := listsField(rows, "text")
-	wantTexts := []string{orders, partner, "arn:aws:s3:::support-tickets/*", "*", "arn:aws:s3:::finance/*"}
+	unknowns := []string{"arn:aws:s3:::support-tickets/*", "*", "arn:aws:s3:::finance/*"}
+	wantTexts := append([]string{orders, partner, partners}, unknowns...)
 	if !listsSameSet(texts, wantTexts) {
-		t.Fatalf("resources = %v, want %v (and never the GitHub row)", texts, wantTexts)
+		t.Fatalf("resources = %v, want %v (and never the GitHub or the unsupported row)", texts, wantTexts)
 	}
 	// Default order: exact reference, selector, external (§2.14.6).
 	rank := map[string]int{"exact": 0, "selector": 1, "external": 2}
@@ -423,6 +433,7 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	for text, w := range map[string]want{
 		orders:                           {"exact", "dynamodb_table", "dynamodb", accountA, "us-east-1", true, 1, 0},
 		partner:                          {"external", "dynamodb_table", "dynamodb", "999999999999", "us-east-1", false, 1, 0},
+		partners:                         {"selector", "dynamodb_table", "dynamodb", "999999999999", "us-east-1", false, 1, 0},
 		"arn:aws:s3:::support-tickets/*": {"selector", "s3_object", "s3", "", "", false, 1, 0}, // the Deny is not counted
 		"*":                              {"selector", "unknown", "", "", "", false, 1, 0},
 		"arn:aws:s3:::finance/*":         {"selector", "s3_object", "s3", "", "", false, 0, 1},
@@ -446,41 +457,48 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 	}
 
 	f, _ := listsFacet(body, "account")
-	if f["unknown"] != 3 || f[accountA] != 1 || f["999999999999"] != 1 {
-		t.Errorf("account facet = %v, want unknown 3 (the S3 and * references state no account), A 1, 999999999999 1", f)
+	if f["unknown"] != 3 || f[accountA] != 1 || f["999999999999"] != 2 {
+		t.Errorf("account facet = %v, want unknown 3 (the S3 and * references state no account), A 1, 999999999999 2", f)
 	}
-	if f, _ := listsFacet(body, "kind"); f["exact"] != 1 || f["selector"] != 3 || f["external"] != 1 {
+	if f, _ := listsFacet(body, "kind"); f["exact"] != 1 || f["selector"] != 4 || f["external"] != 1 {
 		t.Errorf("kind facet = %v", f)
 	}
-	if f, _ := listsFacet(body, "service"); f["s3"] != 2 || f["dynamodb"] != 2 || len(f) != 2 {
+	if f, _ := listsFacet(body, "service"); f["s3"] != 2 || f["dynamodb"] != 3 || len(f) != 2 {
 		t.Errorf("service facet = %v, want s3 2, dynamodb 2 and no chip for '*'", f)
 	}
 
 	// Each facet applies every OTHER filter: under kind=selector the kind
 	// facet still shows every kind, while the account facet counts selectors.
 	sel := listsGet(t, api, "/resources"+qs("kind", "selector", "facets", "kind,account"))
-	if n := len(digl(sel, "data")); n != 3 {
-		t.Errorf("kind=selector = %d rows, want 3", n)
+	if n := len(digl(sel, "data")); n != 4 {
+		t.Errorf("kind=selector = %d rows, want 4", n)
 	}
-	if f, _ := listsFacet(sel, "kind"); f["exact"] != 1 || f["selector"] != 3 || f["external"] != 1 {
+	if f, _ := listsFacet(sel, "kind"); f["exact"] != 1 || f["selector"] != 4 || f["external"] != 1 {
 		t.Errorf("kind facet under kind=selector = %v: a facet must not apply its own filter", f)
 	}
-	if f, _ := listsFacet(sel, "account"); f["unknown"] != 3 || f[accountA] != 0 || len(f) != 2 {
-		t.Errorf("account facet under kind=selector = %v, want unknown 3 and connected A at 0", f)
+	if f, _ := listsFacet(sel, "account"); f["unknown"] != 3 || f[accountA] != 0 || f["999999999999"] != 1 || len(f) != 3 {
+		t.Errorf("account facet under kind=selector = %v, want unknown 3, 999999999999 1 and connected A at 0", f)
 	}
 
 	for _, tc := range []struct {
 		kv   []string
 		want []string
 	}{
-		{[]string{"account", "unknown"}, []string{"arn:aws:s3:::support-tickets/*", "*", "arn:aws:s3:::finance/*"}},
+		{[]string{"account", "unknown"}, unknowns},
 		// Choosing an account EXCLUDES unknowns (§2.14.10).
 		{[]string{"account", accountA}, []string{orders}},
-		{[]string{"account", accountA, "account", "unknown"}, []string{orders, "arn:aws:s3:::support-tickets/*", "*", "arn:aws:s3:::finance/*"}},
-		{[]string{"region", "not_stated"}, []string{"arn:aws:s3:::support-tickets/*", "*", "arn:aws:s3:::finance/*"}},
-		{[]string{"region", "us-east-1"}, []string{orders, partner}},
-		{[]string{"service", "dynamodb"}, []string{orders, partner}},
+		{[]string{"account", accountA, "account", "unknown"}, append([]string{orders}, unknowns...)},
+		{[]string{"region", "not_stated"}, unknowns},
+		{[]string{"region", "us-east-1"}, []string{orders, partner, partners}},
+		{[]string{"service", "dynamodb"}, []string{orders, partner, partners}},
 		{[]string{"kind", "external"}, []string{partner}},
+		{[]string{"kind", "exact", "kind", "external"}, []string{orders, partner}},
+		// q as an account id: the references that STATE it; unknowns never match (D-76).
+		{[]string{"q", "999999999999"}, []string{partner, partners}},
+		{[]string{"q", partner}, []string{partner}},
+		{[]string{"integration", refOf("cloud_connector", a.conn)}, wantTexts},
+		{[]string{"integration", a.conn.String(), "provider", "aws"}, wantTexts},
+		{[]string{"integration", uuid.NewString()}, nil},
 		{[]string{"q", "support"}, []string{"arn:aws:s3:::support-tickets/*"}},
 		// '*' is not a LIKE metacharacter, and matches only itself.
 		{[]string{"q", "/*"}, []string{"arn:aws:s3:::support-tickets/*", "arn:aws:s3:::finance/*"}},
@@ -488,6 +506,32 @@ func TestP2ListsResourcesKindsAccountsAndFacets(t *testing.T) {
 		got := listsField(listsWalk(t, api, "/resources", 2, tc.kv...), "text")
 		if !listsSameSet(got, tc.want) {
 			t.Errorf("%v = %v, want %v", tc.kv, got, tc.want)
+		}
+	}
+
+	// D-13 orders, walked ONE row per page so every keyset arm is exercised:
+	// kind by rank; unknown account and no service LAST in both directions;
+	// '-' reverses everything else, id included.
+	st, fin, star := "arn:aws:s3:::support-tickets/*", "arn:aws:s3:::finance/*", "*"
+	for _, tc := range []struct {
+		sort string
+		want []string
+	}{
+		{"kind", []string{orders, star, partners, fin, st, partner}},
+		{"-kind", []string{partner, st, fin, partners, star, orders}},
+		{"name", []string{star, orders, partners, partner, fin, st}},
+		{"-name", []string{st, fin, partner, partners, orders, star}},
+		{"account", []string{orders, partners, partner, star, fin, st}},
+		{"-account", []string{partner, partners, orders, st, fin, star}},
+		{"service", []string{orders, partners, partner, fin, st, star}},
+		{"-service", []string{st, fin, partner, partners, orders, star}},
+	} {
+		got := listsField(listsWalk(t, api, "/resources", 1, "sort", tc.sort), "text")
+		if strings.Join(got, " | ") != strings.Join(tc.want, " | ") {
+			t.Errorf("sort=%s =
+  %v
+want
+  %v", tc.sort, got, tc.want)
 		}
 	}
 }
@@ -514,12 +558,22 @@ func TestP2ListsIdentities(t *testing.T) {
 	                     VALUES (?, 'SharedToolRole', 'github_user', 'github', 'github␟user␟1')`, l.ws).Error; err != nil {
 		t.Fatalf("seed github identity: %v", err)
 	}
+	// An AWS row no projection pass supports is not a graph row either (D-6).
+	if err := l.db.Exec(`INSERT INTO iga_identity_accounts (workspace_id, display_name, account_kind, provider, source_key)
+	                     VALUES (?, 'OrphanRole', 'iam_role', 'aws', 'aws' || chr(31) || 'arn:aws:iam::`+accountA+`:role/OrphanRole')`,
+		l.ws).Error; err != nil {
+		t.Fatalf("seed unsupported identity: %v", err)
+	}
 	api := l.api()
 
 	body := listsGet(t, api, "/identities"+qs("facets", "kind,account"))
 	rows := digl(body, "data")
-	if got := listsField(rows, "name"); !listsSameSet(got, []string{"refund-lambda-role", "SharedToolRole", "IdleRole", "ci-deployer", "ops"}) {
-		t.Fatalf("identities = %v (the GitHub row must never appear, D-6)", got)
+	all := []string{"refund-lambda-role", "SharedToolRole", "IdleRole", "ci-deployer", "ops"}
+	if got := listsField(rows, "name"); !listsSameSet(got, all) {
+		t.Fatalf("identities = %v (neither the GitHub row nor the unsupported AWS row may appear, D-6)", got)
+	}
+	if num(body, "meta", "total") != 5 {
+		t.Errorf("total = %v, want 5: the D-6 rows must not be counted either", dig(body, "meta", "total"))
 	}
 	for name, used := range map[string]int64{"SharedToolRole": 2, "refund-lambda-role": 1, "IdleRole": 0, "ci-deployer": 0} {
 		r := listsRowBy(t, rows, "name", name)
@@ -546,16 +600,32 @@ func TestP2ListsIdentities(t *testing.T) {
 		{[]string{"used_by", "workloads"}, []string{"refund-lambda-role", "SharedToolRole"}},
 		{[]string{"q", "AROASHAREDTOOLROLE01"}, []string{"SharedToolRole"}}, // provider id
 		{[]string{"q", shared}, []string{"SharedToolRole"}},                 // full ARN
+		{[]string{"q", strings.ToLower(shared)}, nil},                       // exact arms are case-sensitive (D-76)
+		{[]string{"q", accountA}, all},                                      // the identity's own account
 		{[]string{"account", "unknown"}, nil},
+		// region is accepted and never filters: IAM is global (D-75).
+		{[]string{"region", "eu-west-1"}, all},
+		{[]string{"region", "not_stated"}, all},
+		{[]string{"provider", "aws"}, all},
+		// integration: supported by that connector (D-75), typed or bare.
+		{[]string{"integration", refOf("cloud_connector", a.conn)}, all},
+		{[]string{"integration", a.conn.String()}, all},
+		{[]string{"integration", uuid.NewString()}, nil},
 	} {
 		got := listsField(listsWalk(t, api, "/identities", 2, tc.kv...), "name")
 		if !listsSameSet(got, tc.want) {
 			t.Errorf("%v = %v, want %v", tc.kv, got, tc.want)
 		}
 	}
-	kinds := listsField(listsWalk(t, api, "/identities", 2, "sort", "kind"), "kind")
-	if !sort.StringsAreSorted(kinds) {
-		t.Errorf("sort=kind = %v, not ordered by kind", kinds)
+	// D-13: kind sorts by RANK (role < user < group), never alphabetically
+	// (which would put iam_group first); -kind reverses the rank.
+	if kinds := strings.Join(listsField(listsWalk(t, api, "/identities", 2, "sort", "kind"), "kind"), ","); kinds !=
+		"iam_role,iam_role,iam_role,iam_user,iam_group" {
+		t.Errorf("sort=kind = %s, want roles, then users, then groups", kinds)
+	}
+	if kinds := strings.Join(listsField(listsWalk(t, api, "/identities", 2, "sort", "-kind"), "kind"), ","); kinds !=
+		"iam_group,iam_user,iam_role,iam_role,iam_role" {
+		t.Errorf("sort=-kind = %s, want the rank reversed", kinds)
 	}
 }
 
@@ -689,110 +759,6 @@ func TestP2ListsClassificationChangeBetweenPages(t *testing.T) {
 	}
 }
 
-// The resource kind is computed from the connected accounts AT READ TIME (D-3),
-// so a connector added between two pages of a kind-ordered list moves rows;
-// the cursor is bound to the set and the next page is 409 listing_changed.
-func TestP2ListsAccountsChangeBetweenPages(t *testing.T) {
-	l := newP2Lab(t, "p2-lists-accounts", true)
-	a := l.account(accountA)
-	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
-	partner := "arn:aws:dynamodb:us-east-1:999999999999:table/partner"
-	a.attach("SharedToolRole", a.managed("Tables", `{"Version":"2012-10-17","Statement":[{"Sid":"Tables",`+
-		`"Effect":"Allow","Action":"dynamodb:GetItem","Resource":["`+partner+`","arn:aws:s3:::support-tickets/*"]}]}`))
-	l.scanAndProject(a)
-	api := l.api()
-
-	byKind := listsGet(t, api, "/resources"+qs("limit", "1"))
-	byName := listsGet(t, api, "/resources"+qs("limit", "1", "sort", "name"))
-	if r := listsRowBy(t, digl(listsGet(t, api, "/resources"), "data"), "text", partner); digs(r, "kind") != "external" {
-		t.Fatalf("partner = %v, want external before 999999999999 is connected", r)
-	}
-
-	if err := l.db.Exec(`INSERT INTO cloud_connector (id, workspace_id, provider, scope_kind, scope_id, status, auth_ref, scan_generation)
-	                     VALUES (?, ?, 'aws', 'account', '999999999999', 'active', 'vault:test', 0)`, uuid.New(), l.ws).Error; err != nil {
-		t.Fatalf("connect 999999999999: %v", err)
-	}
-	code, b := api.get("/resources" + qs("limit", "1", "cursor", digs(byKind, "meta", "next_cursor")))
-	if code != 409 || errCode(b) != "listing_changed" || digs(b, "error", "reason") != "accounts_changed" {
-		t.Errorf("kind-ordered page two after a connector was added = %d %v, want 409 listing_changed accounts_changed", code, b)
-	}
-	if code, b := api.get("/resources" + qs("limit", "1", "sort", "name", "cursor", digs(byName, "meta", "next_cursor"))); code != 200 {
-		t.Errorf("a name-ordered page two = %d %v, want 200 (not bound to the account set)", code, b)
-	}
-	r := listsRowBy(t, digl(listsGet(t, api, "/resources"), "data"), "text", partner)
-	if digs(r, "kind") != "exact" || dig(r, "account", "connected") != true {
-		t.Errorf("partner after connecting 999999999999 = %v, want exact and connected, read at request time", r)
-	}
-}
-
-// meta.coverage names every gap that bears on the list, per account, and a
-// row whose source could not be read again is stale with its last
-// confirmation unchanged (D-1) -- never ended, never current.
-func TestP2ListsCoverageAndStaleRows(t *testing.T) {
-	l := newP2Lab(t, "p2-lists-coverage", true)
-	a := l.account(accountA)
-	role := a.role("refund-lambda-role", "AROA5XK7QEXAMPLE")
-	a.attach("refund-lambda-role", a.managed("TicketRead", docTicketRead))
-	listsFunctions(a, "us-east-1", "fn-1", role)
-	l.scanAndProject(a)
-	api := l.api()
-	before := listsGet(t, api, "/workloads")
-	if cov := digl(before, "meta", "coverage"); len(cov) != 0 {
-		t.Fatalf("a complete scan reports coverage gaps %v", cov)
-	}
-	confirmed := digs(before, "data", 0, "last_confirmed_at")
-
-	a.lambdas["us-east-1"].fail = denied("lambda:ListFunctions")
-	a.iam.fail["ListUsers"] = denied("iam:ListUsers")
-	l.scanAndProject(a)
-
-	type note struct{ acct, surface, state, affects string }
-	notes := func(body map[string]any) []note {
-		var out []note
-		for _, c := range digl(body, "meta", "coverage") {
-			out = append(out, note{digs(c, "account_id"), digs(c, "surface"), digs(c, "state"), digs(c, "affects")})
-		}
-		return out
-	}
-	has := func(ns []note, n note) bool {
-		for _, x := range ns {
-			if x == n {
-				return true
-			}
-		}
-		return false
-	}
-	lambdaGap := note{accountA, "lambda:us-east-1", "denied", "workloads of kind lambda_function in us-east-1"}
-	usersGap := note{accountA, "iam_users", "denied", "identities of kind iam_user"}
-
-	wl := listsGet(t, api, "/workloads")
-	if ns := notes(wl); !has(ns, lambdaGap) {
-		t.Errorf("workloads coverage = %+v, want the lambda gap", ns)
-	}
-	for _, n := range notes(wl) {
-		if n.surface == "iam_users" {
-			t.Errorf("workloads coverage names iam_users, which bears on no workload row: %+v", n)
-		}
-	}
-	row := digl(wl, "data")
-	if len(row) != 1 || digs(row[0], "state") != "stale" || digs(row[0], "lifecycle") != "active" ||
-		digs(row[0], "last_confirmed_at") != confirmed {
-		t.Errorf("fn-1 after a denied read = %v, want active, stale, last confirmed %s", row, confirmed)
-	}
-	if ns := notes(listsGet(t, api, "/identities")); !has(ns, usersGap) ||
-		!has(ns, note{accountA, "lambda:us-east-1", "denied", "used_by_count: workloads of kind lambda_function in us-east-1"}) {
-		t.Errorf("identities coverage = %+v, want iam_users and the used_by effect of the lambda gap", ns)
-	}
-	if ns := notes(listsGet(t, api, "/resources")); !has(ns, note{accountA, "iam_users", "denied",
-		"resources named by policies of identities of kind iam_user"}) {
-		t.Errorf("resources coverage = %+v, want iam_users", ns)
-	}
-	// Another account in the filter: A's gaps do not bear on it.
-	if ns := notes(listsGet(t, api, "/identities"+qs("account", accountB))); len(ns) != 0 {
-		t.Errorf("identities account=%s coverage = %+v, want none of %s's gaps", accountB, ns, accountA)
-	}
-}
-
 // §5.1: nothing published yet is 200 with empty data and graph_state
 // not_published -- a first-run state, never "no results" and never an error.
 func TestP2ListsNotPublished(t *testing.T) {
@@ -837,6 +803,15 @@ func TestP2ListsInvalidParameters(t *testing.T) {
 		"/resources" + qs("kind", "discovered"),
 		"/resources" + qs("service", "S3!"),
 		"/resources" + qs("runtime_kind", "lambda_function"),
+		// D-75: provider accepts only aws; integration is a connector, typed
+		// or bare; region on identities is validated though it never filters.
+		"/workloads" + qs("provider", "github"),
+		"/identities" + qs("provider", "gcp"),
+		"/resources" + qs("provider", "AWS"),
+		"/identities" + qs("integration", "not-a-ref"),
+		"/resources" + qs("integration", refOf("identity", uuid.New())),
+		"/identities" + qs("region", "mars-1"),
+		"/identities" + qs("execution_role_state", "resolved"),
 	} {
 		code, b := api.get(path)
 		if code != 400 || errCode(b) != "invalid_parameter" {

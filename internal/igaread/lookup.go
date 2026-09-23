@@ -1,8 +1,8 @@
 package igaread
 
 // GET /api/iga/v1/lookup?cloud_ref=cloud_identity:<id>|cloud_workload:<id>
-// (§5.3 Lookup, T6.8): the graph object projected from a Cloud Inventory row,
-// behind Cloud Inventory's "Open in graph" (§2.14.5).
+// (§5.3 Lookup, T6.8, D-81): the graph object projected from a Cloud
+// Inventory row, behind Cloud Inventory's "Open in graph" (§2.14.5).
 //
 // The object is found the way the projector made it -- the row's source key,
 // rebuilt with igagraph's own key functions, through the row's OWN connector
@@ -35,10 +35,11 @@ type LookupResult struct {
 	Lifecycle string `json:"lifecycle"`
 }
 
-// Lookup serves GET /lookup. 404 not_found when the row is not this
-// workspace's, is not AWS, or has no live projected counterpart supported by
-// its connector -- and when nothing is published yet (D-4: no object exists
-// before the first publication).
+// Lookup serves GET /lookup. It is revision-bound like every graph read: it
+// echoes meta.rev and a stale rev parameter is 409 (D-82). 404 not_found when
+// the row is not this workspace's, is not AWS, or has no projected counterpart
+// supported by its connector -- and when nothing is published yet (D-4: no
+// object exists before the first publication).
 func (r *Reader) Lookup(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
 	for name := range vals {
 		if name != "cloud_ref" && name != "rev" {
@@ -117,14 +118,21 @@ func lookupConnector(q *Query, connectorID uuid.UUID) (string, bool, error) {
 	return rows[0].ScopeID, true, nil
 }
 
+// lookupOrder prefers the active object, else the most recently seen retired
+// incarnation (D-81): detail routes serve retired objects (§5.2), so a Cloud
+// Inventory row whose object has since been retired still opens it.
+const lookupOrder = `ORDER BY (n.lifecycle = 'active') DESC, n.last_seen_at DESC, n.id LIMIT 1`
+
 // lookupIdentity: cloud_identity -> iga_identity_accounts.
 //
-// The key is igagraph.IdentityKey, the projector's own. A match must also be
-// supported (non-ended) by the row's connector, and carry the row's immutable
-// key: a role deleted and recreated under the same ARN has the SAME key and a
-// DIFFERENT RoleId, and until the recreation is projected the live node is the
-// OLD principal -- opening it from the new row would show another principal's
-// history as this one's (§2.4). So a mismatch is 404, never the old node.
+// The key is igagraph.IdentityKey, the projector's own. A match must carry
+// the row's immutable key when the row has one: a role deleted and recreated
+// under the same ARN has the SAME key and a DIFFERENT RoleId, and until the
+// recreation is projected the live node is the OLD principal -- opening it
+// from the new row would show another principal's history as this one's
+// (§2.4). So no node with the row's RoleId is 404, never the old node. And it
+// must be supported by the row's own connector (a support row in any state:
+// a retired object's supports have ended).
 func lookupIdentity(q *Query, id uuid.UUID) (*LookupResult, error) {
 	var rows []models.CloudIdentity
 	if err := q.DB().Where("workspace_id = ? AND id = ?", q.WS, id).Limit(1).Find(&rows).Error; err != nil {
@@ -137,35 +145,30 @@ func lookupIdentity(q *Query, id uuid.UUID) (*LookupResult, error) {
 	if _, ok, err := lookupConnector(q, ci.ConnectorID); err != nil || !ok {
 		return nil, err
 	}
-	var nodes []struct {
-		ID           uuid.UUID
-		Lifecycle    string
-		ImmutableKey string
-	}
-	if err := q.DB().Raw(`SELECT ia.id, ia.lifecycle, ia.immutable_key
-	                        FROM iga_identity_accounts ia
-	                       WHERE ia.workspace_id = ? AND ia.provider = 'aws'
-	                         AND ia.source_key = ? AND ia.lifecycle <> 'retired'
+	imm := igagraph.ImmutableKey(ci)
+	var nodes []LookupResult
+	if err := q.DB().Raw(`SELECT 'identity:' || n.id AS ref, n.lifecycle
+	                        FROM iga_identity_accounts n
+	                       WHERE n.workspace_id = ? AND n.provider = 'aws' AND n.source_key = ?
+	                         AND (? = '' OR n.immutable_key = ?)
 	                         AND EXISTS (SELECT 1 FROM iga_object_support s
-	                                      WHERE s.workspace_id = ia.workspace_id AND s.identity_account_id = ia.id
-	                                        AND s.connector_id = ? AND s.state <> 'ended')`,
-		q.WS, igagraph.IdentityKey(ci), ci.ConnectorID).Scan(&nodes).Error; err != nil {
+	                                      WHERE s.workspace_id = n.workspace_id AND s.identity_account_id = n.id
+	                                        AND s.connector_id = ?)
+	                       `+lookupOrder,
+		q.WS, igagraph.IdentityKey(ci), imm, imm, ci.ConnectorID).Scan(&nodes).Error; err != nil {
 		return nil, err
 	}
-	if len(nodes) != 1 {
+	if len(nodes) == 0 {
 		return nil, nil
 	}
-	n := nodes[0]
-	if n.ImmutableKey != "" && n.ImmutableKey != igagraph.ImmutableKey(ci) {
-		return nil, nil
-	}
-	return &LookupResult{Ref: R(RefIdentity, n.ID), Lifecycle: n.Lifecycle}, nil
+	return &nodes[0], nil
 }
 
 // lookupWorkload: cloud_workload -> iga_workload, keyed by igagraph.WorkloadKey
 // with the row's connector's account -- the same construction the projector
 // uses for EC2 instances and bare Bedrock ids -- and supported by that
-// connector.
+// connector. A Cloud Inventory workload row carries no creation-boundary id,
+// so the key is the whole match.
 func lookupWorkload(q *Query, id uuid.UUID) (*LookupResult, error) {
 	var rows []models.CloudWorkload
 	if err := q.DB().Where("workspace_id = ? AND id = ?", q.WS, id).Limit(1).Find(&rows).Error; err != nil {
@@ -179,22 +182,19 @@ func lookupWorkload(q *Query, id uuid.UUID) (*LookupResult, error) {
 	if err != nil || !ok {
 		return nil, err
 	}
-	var nodes []struct {
-		ID        uuid.UUID
-		Lifecycle string
-	}
-	if err := q.DB().Raw(`SELECT w.id, w.lifecycle
-	                        FROM iga_workload w
-	                       WHERE w.workspace_id = ? AND w.provider = 'aws'
-	                         AND w.source_key = ? AND w.lifecycle <> 'retired'
+	var nodes []LookupResult
+	if err := q.DB().Raw(`SELECT 'workload:' || n.id AS ref, n.lifecycle
+	                        FROM iga_workload n
+	                       WHERE n.workspace_id = ? AND n.provider = 'aws' AND n.source_key = ?
 	                         AND EXISTS (SELECT 1 FROM iga_object_support s
-	                                      WHERE s.workspace_id = w.workspace_id AND s.workload_id = w.id
-	                                        AND s.connector_id = ? AND s.state <> 'ended')`,
+	                                      WHERE s.workspace_id = n.workspace_id AND s.workload_id = n.id
+	                                        AND s.connector_id = ?)
+	                       `+lookupOrder,
 		q.WS, igagraph.WorkloadKey(cw, account), cw.ConnectorID).Scan(&nodes).Error; err != nil {
 		return nil, err
 	}
-	if len(nodes) != 1 {
+	if len(nodes) == 0 {
 		return nil, nil
 	}
-	return &LookupResult{Ref: R(RefWorkload, nodes[0].ID), Lifecycle: nodes[0].Lifecycle}, nil
+	return &nodes[0], nil
 }
