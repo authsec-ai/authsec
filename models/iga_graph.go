@@ -98,6 +98,28 @@ const (
 	EndedSubjectRecreate = "subject_recreated"
 )
 
+// Workload classification (§2.14.3).
+const (
+	ClassificationUnclassified  = "unclassified"
+	ClassificationProviderAgent = "provider_native_agent"
+	ClassificationClassified    = "classified_agent"
+)
+
+// IGAWorkloadClassification is the decision record behind a classification.
+type IGAWorkloadClassification struct {
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+	WorkloadID  uuid.UUID `json:"workload_id" gorm:"type:uuid;not null"`
+	Decision    string    `json:"decision" gorm:"not null"`
+	Purpose     string    `json:"purpose" gorm:"not null;default:''"`
+	// DecidedBy is the USER id, never the email.
+	DecidedBy string    `json:"decided_by" gorm:"not null"`
+	DecidedAt time.Time `json:"decided_at" gorm:"not null;default:now()"`
+	Reason    string    `json:"reason" gorm:"not null;default:''"`
+}
+
+func (IGAWorkloadClassification) TableName() string { return "iga_workload_classification" }
+
 // Execution-role state (§4.7). Read INSTEAD of inferring from the absence of
 // an executes_as edge -- the absence cannot tell "no role configured" from
 // "configured, but its identity was not in this scan", and those are opposite
@@ -181,6 +203,13 @@ type IGAWorkload struct {
 	SourceKey    string `json:"source_key" gorm:"not null"`
 	Continuity   string `json:"continuity" gorm:"not null;default:'recognition_only'"`
 	ImmutableKey string `json:"immutable_key" gorm:"not null;default:''"`
+
+	// Classification is what this workload IS. provider_native_agent is
+	// derived from the provider and is not human-editable; classified_agent is
+	// a person's decision. ClassificationVersion is the optimistic-concurrency
+	// token the classify endpoint checks.
+	Classification        string `json:"classification" gorm:"not null;default:'unclassified'"`
+	ClassificationVersion int64  `json:"classification_version" gorm:"not null;default:0"`
 
 	// ExecutionRoleState says what we know about the role this workload acts
 	// as when no executes_as edge records it. ExecutionRoleARN is set exactly

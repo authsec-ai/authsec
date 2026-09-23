@@ -57,6 +57,22 @@ ALLOWED_NON_IGA=(
   # from graph code are forbidden by the separate one-way check below, which is
   # what actually protects the projection's rebuildable guarantee.
   "cloud_observation"
+
+  # The scan lifecycle the barrier coordinates. §2.10A's abandon transition is
+  # defined as "terminalize the scan run AND its projection job, THEN idle" --
+  # all three in ONE transaction, because nothing may be admitted while either
+  # could still commit. Splitting the run update out to another package would
+  # put it in another transaction and break exactly that guarantee. READ AND
+  # WRITE here is the design; the projection's one-way rule is enforced
+  # separately below, over internal/igagraph.
+  "cloud_scan_run"
+
+  # The authorization check for a human decision (§2.14.3). Recording who
+  # classified a workload requires proving the caller is a LIVE member of this
+  # workspace, and membership lives here. There is no bridge table for an
+  # authz lookup -- a bridge would be a cached copy of the answer, which is
+  # the thing least safe to cache. Read-only.
+  "workspace_memberships"
 )
 
 echo "== IGA isolation =="

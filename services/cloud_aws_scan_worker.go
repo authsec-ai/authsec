@@ -157,28 +157,30 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	w.pipelineVersion = version
 
 	if err := w.execute(ctx, run); err != nil {
-		// Hand the workspace back: publication never happened, so nothing is
-		// waiting to be projected and holding the barrier would block every
-		// other connector. This is the COLLECTING phase, so abandon is the
-		// correct exit -- it terminalizes the run (already failed below) and
-		// the job (none exists yet) before returning the barrier to idle.
-		// Expiry alone must never do this (§2.10A).
-		if rerr := w.db.Transaction(func(tx *gorm.DB) error {
-			return w.pipeline.AbandonTx(tx, repositories.PipelineFence{
+		// TERMINALIZE THE RUN AND RELEASE THE BARRIER TOGETHER (§2.10A).
+		//
+		// The run is `failed`, not `abandoned`: abandon means giving up past
+		// the attempts ceiling, and a transient scan failure is retried. But
+		// the barrier must still come back to idle, because publication never
+		// happened -- nothing is waiting to be projected, and holding
+		// `collecting` would block every other connector in the workspace
+		// until expiry, which on its own is no longer allowed to release it.
+		//
+		// One transaction, both fenced: if this worker has already been
+		// superseded, neither write lands and the current owner decides.
+		if terr := w.db.Transaction(func(tx *gorm.DB) error {
+			if ferr := w.runs.FailTx(tx, run.ID, w.owner, run.LeaseVersion, err.Error()); ferr != nil {
+				return ferr
+			}
+			return w.pipeline.ReleaseTx(tx, repositories.PipelineFence{
 				WorkspaceID: run.WorkspaceID,
 				Phase:       models.PipelineCollecting,
 				RunID:       run.ID,
 				Version:     w.pipelineVersion,
-			}, "scan failed before publication")
-		}); rerr != nil {
-			log.Printf("aws scan worker %s: could not release pipeline: %v", w.owner, rerr)
-		}
-		// Fail is fenced too. If it returns ErrLeaseLost the run was already
-		// taken by someone else, and recording our failure on it would overwrite
-		// their result with ours.
-		if ferr := w.runs.Fail(run.ID, w.owner, run.LeaseVersion, err.Error()); ferr != nil {
+			})
+		}); terr != nil {
 			log.Printf("aws scan worker %s: could not record failure for run %s: %v",
-				w.owner, run.ID, ferr)
+				w.owner, run.ID, terr)
 		}
 		return true, err
 	}

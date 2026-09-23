@@ -116,6 +116,50 @@ COMMENT ON COLUMN public.iga_workload.execution_role_state IS
     'identity we hold; not_in_scan = runs as <arn>, not read in the latest '
     'scan; resolved = the edge carries it.';
 
+-- Classification (§2.14.3) ----------------------------------------------------
+--
+-- What a workload IS, as opposed to what it runs as. provider_native_agent is
+-- derived from the provider (a Bedrock agent is one by construction) and is
+-- NOT human-editable; classified_agent is a person's decision and carries a
+-- decision record.
+ALTER TABLE public.iga_workload
+    ADD COLUMN IF NOT EXISTS classification text NOT NULL DEFAULT 'unclassified',
+    -- Optimistic-concurrency token for the classify endpoint: a decision made
+    -- against a stale view is rejected rather than silently overwriting a
+    -- newer one.
+    ADD COLUMN IF NOT EXISTS classification_version bigint NOT NULL DEFAULT 0;
+
+ALTER TABLE public.iga_workload
+    ADD CONSTRAINT iga_workload_classification_chk CHECK (
+        classification IN ('unclassified', 'provider_native_agent', 'classified_agent'));
+
+-- The decision record. Same pattern as iga_classification_candidates (004),
+-- which cannot be reused directly: its subject FKs to iga_source_objects, the
+-- GitHub path's entity, not to a workload.
+CREATE TABLE IF NOT EXISTS public.iga_workload_classification (
+    id            uuid NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  uuid NOT NULL,
+    workload_id   uuid NOT NULL,
+    decision      text NOT NULL,   -- classified_agent | unclassified (an undo)
+    purpose       text NOT NULL DEFAULT '',
+    -- The USER id, never the email: an email is a display string that can be
+    -- reassigned, and a decision record has to survive that.
+    decided_by    text NOT NULL,
+    decided_at    timestamptz NOT NULL DEFAULT now(),
+    reason        text NOT NULL DEFAULT '',
+
+    CONSTRAINT iga_workload_classification_pkey PRIMARY KEY (id),
+    CONSTRAINT iga_wc_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT iga_wc_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_wc_decision_chk CHECK (decision IN ('classified_agent', 'unclassified')),
+    CONSTRAINT iga_wc_decided_by_chk CHECK (decided_by <> '')
+);
+
+CREATE INDEX IF NOT EXISTS idx_iga_workload_classification_workload
+    ON public.iga_workload_classification (workspace_id, workload_id, decided_at DESC);
+
 -- verify ---------------------------------------------------------------------
 SELECT count(*) AS iga_workload_created
   FROM information_schema.tables
