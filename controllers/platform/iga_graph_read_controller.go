@@ -97,8 +97,11 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 // answers 503, so nothing is usable.
 func graphFeatures(on bool) gin.H {
 	return gin.H{
-		"workloads": false, "identities": false, "resources": false,
+		"identities": false, "resources": false,
 		"graph": false, "evidence": false, "changes": false,
+		// T6.2 + T6.3: GET /workloads, /workloads/:id and its identities and
+		// resources tabs (its Changes tab is the "changes" feature).
+		"workloads": on,
 		// T6.6: POST and GET /workloads/:id/classification. T2.3: /coverage.
 		"classification": on,
 		"coverage":       on,

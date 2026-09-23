@@ -429,6 +429,60 @@ func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.R
 	return raw
 }
 
+// workloadProviderAttrs is a workload's display-only provider facts (§1.4,
+// §5.3 workload detail, D-85): its status, foundation model, environment
+// variable NAMES and gateway targets [{id, name, status, type}], copied from
+// what the collector stored on cloud_workload, so the read APIs never read
+// cloud_* (§2.1). Display only: never an identity, a key, a filter or an input
+// to reconciliation. UpsertWorkload rewrites it on every pass, so a rescan
+// that sees new facts replaces the old ones.
+//
+// A fact the collector recorded nothing for is left out, and the detail
+// renders it null: not applicable to this kind, or not collected. Two lists
+// are written even when empty, because there empty is a collected answer:
+//
+//   - a Lambda function's variable names come with its ListFunctions entry,
+//     so none listed means the function has none;
+//   - a gateway's target list read in full is its whole list. One NOT read in
+//     full (targets_incomplete) carries what the collector kept from its last
+//     complete read (workloadAttrsMerge), and nothing when it kept nothing --
+//     an unread target list is unknown, never empty.
+//
+// Values are never read: EnvVarNames holds names only, by construction of the
+// collector (awsdiscovery lambdaEnvVarNames).
+func workloadProviderAttrs(cw models.CloudWorkload) json.RawMessage {
+	a := cw.AWSAttrs()
+	out := map[string]any{}
+	if a.Status != "" {
+		out["status"] = a.Status
+	}
+	if a.FoundationModel != "" {
+		out["foundation_model"] = a.FoundationModel
+	}
+	switch {
+	case cw.RuntimeKind == models.WorkloadLambdaFunction:
+		names := a.EnvVarNames
+		if names == nil {
+			names = []string{}
+		}
+		out["env_var_names"] = names
+	case len(a.EnvVarNames) > 0:
+		out["env_var_names"] = a.EnvVarNames
+	}
+	if cw.RuntimeKind == models.WorkloadBedrockAgentCoreGW && (len(a.GatewayTargets) > 0 || !a.TargetsIncomplete) {
+		targets := a.GatewayTargets
+		if targets == nil {
+			targets = []models.AWSGatewayTarget{}
+		}
+		out["gateway_targets"] = targets
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
 // projectWorkloads: every runtime the collector reported, INCLUDING GATEWAYS
 // (the graph branch crashed the process on them). Bedrock agents and
 // AgentCore runtimes are classified provider_native_agent ON INSERT ONLY; no
@@ -457,7 +511,7 @@ func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) e
 			DisplayName: cw.Name, Region: cw.Region,
 			SourceKey: key, Continuity: Continuity(cw.RuntimeKind),
 			Stage: "unknown", Lifecycle: models.IGALifecycleActive,
-			LastSeenAt: now, ProviderAttrs: json.RawMessage(`{}`),
+			LastSeenAt: now, ProviderAttrs: workloadProviderAttrs(cw),
 			Classification: models.ClassificationUnclassified,
 		}
 		switch cw.RuntimeKind {

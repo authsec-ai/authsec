@@ -232,8 +232,9 @@ func TestP2S2PipelineAndCoverageUnavailableWhenOff(t *testing.T) {
 
 	on := newP2Lab(t, "p2-s2-on", true)
 	if code, body := on.api().get("/capabilities"); code != http.StatusOK || dig(body, "data", "features", "coverage") != true ||
-		dig(body, "data", "features", "workloads") != false {
-		t.Fatalf("/capabilities on = %d %v, want coverage true and nothing else claimed", code, body)
+		dig(body, "data", "features", "workloads") != true {
+		// workloads: T6.2's list and T6.3's detail and tabs are all served (D-11).
+		t.Fatalf("/capabilities on = %d %v, want coverage and workloads true", code, body)
 	}
 }
 
