@@ -35,10 +35,13 @@ type ProjectionService struct {
 	pipeline repositories.IGAPipelineLeaseRepository
 	graph    repositories.IGAGraphRepository
 
-	owner       string
-	lease       time.Duration
-	maxAttempts int
-	now         func() time.Time
+	owner string
+	lease time.Duration
+	// barrierLease is the workspace barrier's expiry, renewed on the same
+	// heartbeat tick as the job lease.
+	barrierLease time.Duration
+	maxAttempts  int
+	now          func() time.Time
 }
 
 func NewProjectionService(
@@ -54,8 +57,9 @@ func NewProjectionService(
 	return &ProjectionService{
 		db: db, jobs: jobs, pipeline: pipeline, graph: graph,
 		owner: owner, lease: lease,
-		maxAttempts: repositories.MaxProjectionAttempts,
-		now:         time.Now,
+		barrierLease: 15 * time.Minute,
+		maxAttempts:  repositories.MaxProjectionAttempts,
+		now:          time.Now,
 	}
 }
 
@@ -118,8 +122,126 @@ func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
 					break
 				}
 			}
+			// Recovery. Deleting the old blind sweep was right -- it returned
+			// an expired projecting barrier to idle, which is the overwrite
+			// the barrier exists to prevent -- but nothing replaced it, and
+			// then NOTHING ever reached idle. A workspace whose projection
+			// failed once stayed frozen forever.
+			if err := s.RecoverStalled(ctx, s.now()); err != nil {
+				log.Printf("[projection] recovery: %v", err)
+			}
 		}
 	}
+}
+
+// RecoverStalled frees barriers whose work can no longer make progress.
+//
+// It is PHASE-AWARE, which is the whole point: expiry alone never means
+// "release". For each expired barrier it asks whether the work behind it is
+// still reachable, and only gives up when it is not.
+//
+//	collecting + run still claimable   -> leave it; the scan's own reclaim wins
+//	collecting + run terminal          -> abandon; nobody will ever finish it
+//	projecting + job still claimable   -> leave it; the job's own reclaim wins
+//	projecting + job complete          -> release; completeAndRelease was
+//	                                      interrupted between its two writes
+//	projecting + job unreachable       -> abandon
+//
+// Abandon terminalizes the run and the job FIRST and only then returns the
+// barrier to idle, in one transaction, so nothing is admitted while either
+// could still commit.
+func (s *ProjectionService) RecoverStalled(ctx context.Context, now time.Time) error {
+	stalled, err := s.pipeline.ExpiredCandidates(now, 50)
+	if err != nil {
+		return err
+	}
+	for i := range stalled {
+		lease := stalled[i]
+		if lease.ScanRunID == nil {
+			continue // idle rows carry no run; ExpiredCandidates excludes them
+		}
+		fence := repositories.PipelineFence{
+			WorkspaceID: lease.WorkspaceID,
+			Phase:       lease.State,
+			RunID:       *lease.ScanRunID,
+			Version:     lease.Version,
+		}
+		reason, action := s.recoveryFor(lease, now)
+		switch action {
+		case recoveryLeave:
+			continue
+		case recoveryRelease:
+			if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return s.pipeline.ReleaseTx(tx, fence)
+			}); err != nil {
+				log.Printf("[projection] recovery release %s: %v", lease.WorkspaceID, err)
+			}
+		case recoveryAbandon:
+			if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return s.pipeline.AbandonTx(tx, fence, reason)
+			}); err != nil {
+				log.Printf("[projection] recovery abandon %s: %v", lease.WorkspaceID, err)
+			} else {
+				log.Printf("[projection] recovered wedged workspace %s (%s): %s",
+					lease.WorkspaceID, lease.State, reason)
+			}
+		}
+	}
+	return nil
+}
+
+type recoveryAction int
+
+const (
+	recoveryLeave recoveryAction = iota
+	recoveryRelease
+	recoveryAbandon
+)
+
+// recoveryFor decides what an expired barrier needs, by asking whether the
+// work behind it can still be picked up by anyone.
+func (s *ProjectionService) recoveryFor(
+	lease models.IGAPipelineLease, now time.Time,
+) (string, recoveryAction) {
+	switch lease.State {
+	case models.PipelineCollecting:
+		var run models.CloudScanRun
+		if err := s.db.First(&run, "id = ?", *lease.ScanRunID).Error; err != nil {
+			return "collecting barrier for a run that no longer exists", recoveryAbandon
+		}
+		if run.Terminal() {
+			// The scan gave up (or was abandoned) without releasing the
+			// barrier a previous attempt took. Nobody will finish it.
+			return fmt.Sprintf("scan run is %s and will not resume", run.Status), recoveryAbandon
+		}
+		// queued or running-but-expired: the scan worker's own Claim reclaims
+		// it and AcquireForCollection takes the barrier back in-phase.
+		return "", recoveryLeave
+
+	case models.PipelineProjecting:
+		var job models.IGAProjectionJob
+		if err := s.db.First(&job, "scan_run_id = ?", *lease.ScanRunID).Error; err != nil {
+			return "projecting barrier with no projection job", recoveryAbandon
+		}
+		switch job.Status {
+		case models.ProjectionComplete:
+			// completeAndRelease is one transaction, so this should be
+			// unreachable -- but if the barrier is somehow still held for a
+			// completed job, releasing is right and abandoning would wrongly
+			// mark a successful job abandoned.
+			return "", recoveryRelease
+		case models.ProjectionAbandoned:
+			return "projection job already abandoned", recoveryAbandon
+		}
+		if job.Attempts >= s.maxAttempts {
+			// Past the ceiling, Claim will never pick it up again.
+			return fmt.Sprintf("projection gave up after %d attempts", job.Attempts), recoveryAbandon
+		}
+		// queued, running-but-expired, or failed past its backoff: all
+		// claimable, so the job's own reclaim gets another go.
+		return "", recoveryLeave
+	}
+	return "", recoveryLeave
 }
 
 // RunOnce claims at most one job and projects it. Returns whether it worked.
@@ -128,19 +250,32 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || job == nil {
 		return false, err
 	}
-	stop := s.heartbeat(ctx, job)
-	defer stop()
-
 	// The barrier must be PROJECTING for this run and held by us. A reclaimed
 	// job inherits a barrier whose previous holder is gone: recover it into
 	// the SAME phase under a new version rather than releasing it, because the
 	// published run's inventory is still being read.
 	version, err := s.holdBarrier(job)
 	if err != nil {
-		// Cannot establish the barrier -- do not terminalize the job and do
-		// not touch a barrier we may not hold. Let the lease lapse.
+		// Cannot establish the barrier -- another live worker holds it, or it
+		// is not in the phase this job needs. Do NOT terminalize the job and
+		// do NOT touch a barrier we may not hold.
+		//
+		// Hand the job back rather than sitting on it: leaving it claimed
+		// costs a whole lease before anyone retries, and with the attempts
+		// ceiling that burns a retry for something that was never this job's
+		// fault.
+		if rerr := s.jobs.Requeue(job.ID, s.owner, job.LeaseVersion); rerr != nil {
+			log.Printf("[projection] could not requeue job %s: %v", job.ID, rerr)
+		}
 		return true, fmt.Errorf("projection job %s: %w", job.ID, err)
 	}
+
+	// Heartbeat starts only once the barrier is established, because it
+	// renews BOTH the job lease and the barrier: a projection that outruns the
+	// barrier lease would otherwise show up in ExpiredCandidates while
+	// perfectly healthy, and recovery could abandon live work.
+	stop := s.heartbeat(ctx, job, version)
+	defer stop()
 
 	// STALENESS IS NOT CHECKED HERE. A check before the read is stale by the
 	// time the read runs; Load performs it inside the same repeatable-read
@@ -191,6 +326,7 @@ func (s *ProjectionService) holdBarrier(job *models.IGAProjectionJob) (int64, er
 		if lease.Holder != s.owner {
 			return 0, fmt.Errorf("%w: barrier held by %s", repositories.ErrPipelineLost, lease.Holder)
 		}
+		_ = now
 		return lease.Version, nil
 	}
 	// Expired: take it over IN THE SAME PHASE.
@@ -299,7 +435,9 @@ func (s *ProjectionService) projectAndReconcile(
 }
 
 // heartbeat renews the job lease while the projection runs.
-func (s *ProjectionService) heartbeat(ctx context.Context, job *models.IGAProjectionJob) func() {
+func (s *ProjectionService) heartbeat(
+	ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64,
+) func() {
 	done := make(chan struct{})
 	go func() {
 		t := time.NewTicker(s.lease / 3)
@@ -314,6 +452,17 @@ func (s *ProjectionService) heartbeat(ctx context.Context, job *models.IGAProjec
 				if err := s.jobs.Renew(job.ID, s.owner, job.LeaseVersion, s.lease); err != nil {
 					// The lease is gone. Stop renewing; the next fenced write
 					// inside the transaction fails and nothing is committed.
+					return
+				}
+				// And the barrier, on the SAME tick. Renewing one without the
+				// other is how a healthy long projection ends up looking
+				// stalled to the recovery loop.
+				if err := s.pipeline.RenewHeld(repositories.PipelineFence{
+					WorkspaceID: job.WorkspaceID,
+					Phase:       models.PipelineProjecting,
+					RunID:       job.ScanRunID,
+					Version:     barrierVersion,
+				}, s.barrierLease, s.now()); err != nil {
 					return
 				}
 			}

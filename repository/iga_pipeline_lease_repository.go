@@ -65,6 +65,12 @@ type IGAPipelineLeaseRepository interface {
 	// TRANSACTION, so the barrier is never released between the two.
 	ToProjectingTx(tx *gorm.DB, ws uuid.UUID, holder string, runID uuid.UUID, version int64, lease time.Duration) (int64, error)
 
+	// RenewHeld extends the barrier's expiry WITHOUT bumping the version, so
+	// the holder's fence stays valid. A projection longer than the barrier
+	// lease would otherwise appear in ExpiredCandidates while perfectly
+	// healthy, and the recovery loop could abandon live work.
+	RenewHeld(f PipelineFence, lease time.Duration, now time.Time) error
+
 	// AssertHeldTx proves, inside the caller's transaction, that this worker
 	// still holds the barrier in the phase it thinks it does -- and LOCKS the
 	// row FOR UPDATE for the transaction's life, which is what makes
@@ -223,6 +229,23 @@ func (r *igaPipelineLeaseRepository) ToProjectingTx(
 //
 // iga_pipeline_lease_busy_chk requires holder=” and scan_run_id IS NULL
 // exactly when state='idle', so all three move together or the row is refused.
+func (r *igaPipelineLeaseRepository) RenewHeld(
+	f PipelineFence, lease time.Duration, now time.Time,
+) error {
+	res := r.db.Exec(`
+		UPDATE iga_pipeline_lease SET expires_at = ?, updated_at = now()
+		 WHERE workspace_id = ? AND state = ? AND scan_run_id = ? AND version = ?`,
+		now.Add(lease), f.WorkspaceID, f.Phase, f.RunID, f.Version)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("%w: workspace=%s run=%s version=%d not in %s",
+			ErrPipelineLost, f.WorkspaceID, f.RunID, f.Version, f.Phase)
+	}
+	return nil
+}
+
 func (r *igaPipelineLeaseRepository) AssertHeldTx(tx *gorm.DB, f PipelineFence) error {
 	var lease models.IGAPipelineLease
 	// FOR UPDATE, not a bare read: the lock is held for the transaction's

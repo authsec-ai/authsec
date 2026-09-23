@@ -38,7 +38,7 @@ import (
 
 // setupSchema rebuilds public and applies EVERY migration in order.
 //
-// Not just the bootstrap: this suite tests constraints added in 026-033, and a
+// Not just the bootstrap: this suite tests constraints added in 027-034, and a
 // harness that stopped at 001 would pass while proving nothing about them.
 func setupSchema(t *testing.T) (*sql.DB, *gorm.DB) {
 	t.Helper()

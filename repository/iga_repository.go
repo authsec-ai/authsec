@@ -354,7 +354,11 @@ func (r *igaRepository) NextGeneration(workspaceID, integrationID uuid.UUID) (in
 
 func (r *igaRepository) SaveCheckpoint(cp *models.IGAScanCheckpoint) error {
 	cp.UpdatedAt = time.Now()
-	return r.db.Clauses(returningID, clause.OnConflict{
+	// NO returningID here: iga_scan_checkpoints has no id column, and asking
+	// for one made every insert fail with `column "id" does not exist` -- so
+	// no checkpoint was ever written and a GitHub scan could not resume. The
+	// caller does not read an id back either.
+	return r.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "workspace_id"}, {Name: "scan_run_id"},
 			{Name: "object_class"}, {Name: "partition_key"},
@@ -1110,5 +1114,8 @@ func (r *igaRepository) GetIdempotent(workspaceID uuid.UUID, key string) (*Idemp
 func (r *igaRepository) PutIdempotent(rec *IdempotencyRecord) error {
 	// DoNothing so a concurrent duplicate does not error; the first writer wins
 	// and the second reads back the stored response.
-	return r.db.Clauses(returningID, clause.OnConflict{DoNothing: true}).Create(rec).Error
+	// NO returningID: iga_idempotency_keys has no id column either. With it,
+	// no replay record was stored, so a retried POST ran a second time instead
+	// of returning the stored response.
+	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(rec).Error
 }

@@ -29,6 +29,17 @@ var (
 // Past this ceiling the job stays failed with its last error.
 const MaxProjectionAttempts = 5
 
+// ProjectionRetryBackoff is how long a FAILED job waits before it may be
+// claimed again.
+//
+// A failed job stays claimable (see Claim) because the barrier it holds is not
+// released on failure -- failKeepBarrier keeps the workspace frozen so the
+// pending projection's inventory cannot change. If `failed` were terminal, the
+// job would never be retried, the escalation to the attempts ceiling would be
+// unreachable, and the workspace would be frozen FOREVER. The backoff is what
+// stops that retry becoming a hot loop.
+const ProjectionRetryBackoff = 30 * time.Second
+
 // IGAProjectionJobRepository owns the projection job's lifecycle.
 //
 // It mirrors CloudScanRunRepository deliberately: one worker shape in the
@@ -50,6 +61,11 @@ type IGAProjectionJobRepository interface {
 	// AssertOwnedTx locks the job row and proves ownership INSIDE the caller's
 	// transaction.
 	AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64) error
+
+	// Requeue hands a claimed job back WITHOUT counting the attempt. Used when
+	// the worker cannot proceed for a reason that is not the job's fault --
+	// e.g. another live worker holds the workspace barrier.
+	Requeue(jobID uuid.UUID, owner string, version int64) error
 
 	// CompleteTx and AbandonTx are the transactional terminals, for the
 	// *AndRelease exits that must move the job and the barrier together.
@@ -97,6 +113,11 @@ func (r *igaProjectionJobRepository) Claim(
 			SELECT id FROM iga_projection_job
 			 WHERE attempts < ?
 			   AND (status = ?
+			     -- A running job whose worker died.
+			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+			     -- A FAILED job past its backoff. Not terminal below the
+			     -- attempts ceiling: its barrier is still held, so if it were
+			     -- never reclaimed the workspace would never be released.
 			     OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED
@@ -107,6 +128,7 @@ func (r *igaProjectionJobRepository) Claim(
 		MaxProjectionAttempts,
 		models.ProjectionQueued,
 		models.ProjectionRunning, now,
+		models.ProjectionFailed, now,
 	).Scan(&out).Error
 	if err != nil {
 		return nil, err
@@ -115,6 +137,16 @@ func (r *igaProjectionJobRepository) Claim(
 		return nil, nil
 	}
 	return &out[0], nil
+}
+
+func (r *igaProjectionJobRepository) Requeue(jobID uuid.UUID, owner string, version int64) error {
+	return r.fenced(jobID, owner, version, map[string]any{
+		"status":      models.ProjectionQueued,
+		"lease_owner": "",
+		// attempts is given back: this worker never got to try.
+		"attempts":         gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"lease_expires_at": nil,
+	})
 }
 
 func (r *igaProjectionJobRepository) Renew(
@@ -139,10 +171,14 @@ func (r *igaProjectionJobRepository) Fail(
 	jobID uuid.UUID, owner string, version int64, reason string,
 ) error {
 	return r.fenced(jobID, owner, version, map[string]any{
-		"status":           models.ProjectionFailed,
-		"last_error":       truncateError(reason),
-		"lease_owner":      "",
-		"lease_expires_at": nil,
+		"status":      models.ProjectionFailed,
+		"last_error":  truncateError(reason),
+		"lease_owner": "",
+		// A BACKOFF, not nil. Claim admits a failed job once this passes, so
+		// the retry happens without spinning. Clearing it would make the job
+		// instantly claimable in a tight loop; leaving it terminal would
+		// freeze the workspace forever.
+		"lease_expires_at": time.Now().Add(ProjectionRetryBackoff),
 	})
 }
 

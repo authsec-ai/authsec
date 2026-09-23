@@ -483,11 +483,20 @@ func (m *igaManager) RunScan(ctx context.Context, workspaceID, scanRunID uuid.UU
 
 		// Checkpoint the scope. A worker killed here resumes from this cursor
 		// instead of restarting the whole enumeration.
-		_ = m.repo.SaveCheckpoint(&models.IGAScanCheckpoint{
+		//
+		// The error is REPORTED, not discarded. Swallowing it is how a broken
+		// checkpoint write stayed invisible: every insert failed, no
+		// checkpoint was ever written, and the scan silently stopped being
+		// resumable while every test that did not assert on checkpoints
+		// carried on passing.
+		if err := m.repo.SaveCheckpoint(&models.IGAScanCheckpoint{
 			WorkspaceID: workspaceID, ScanRunID: run.ID,
 			ObjectClass: models.ClassRepository, PartitionKey: scope.NativeID,
 			Cursor: scope.NativeID, Watermark: &now,
-		})
+		}); err != nil {
+			report.Issues = append(report.Issues,
+				fmt.Sprintf("checkpoint %s: %v (this scan is not resumable)", scope.NativeID, err))
+		}
 
 		// --- Lane B, repositories only --------------------------------------
 		if scope.Kind == "repository" {

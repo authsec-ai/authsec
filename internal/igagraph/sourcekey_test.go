@@ -157,7 +157,7 @@ func TestContinuityTable(t *testing.T) {
 	}
 }
 
-// Continuity and ImmutableKey must AGREE: 027's CHECK rejects a row claiming
+// Continuity and ImmutableKey must AGREE: 028's CHECK rejects a row claiming
 // 'immutable' with an empty immutable_key. A silent disagreement here disables
 // delete-and-recreate detection entirely, so it is asserted rather than
 // assumed.
@@ -167,7 +167,7 @@ func TestContinuityAgreesWithImmutableKey(t *testing.T) {
 		t.Fatal("iam_role must be immutable")
 	}
 	if ImmutableKey(role) == "" {
-		t.Fatal("iam_role claims immutable but ImmutableKey is empty -- 027's CHECK would reject it")
+		t.Fatal("iam_role claims immutable but ImmutableKey is empty -- 028's CHECK would reject it")
 	}
 
 	// An identity whose attrs carry no unique id must NOT be silently treated
