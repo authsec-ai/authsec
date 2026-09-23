@@ -1,6 +1,8 @@
 package repositories
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,7 +19,7 @@ import (
 // transactions would publish a graph in which nothing has been closed yet.
 //
 // THE UPSERT TRAP, STATED ONCE. Every node upsert targets a PARTIAL unique
-// index (... WHERE source_key <> '' AND lifecycle <> 'retired'). Postgres will
+// index (... WHERE source_key <> ” AND lifecycle <> 'retired'). Postgres will
 // not infer a partial index from a bare ON CONFLICT (cols): the predicate must
 // be restated, and in GORM that is TargetWhere, NOT Where. `Where` emits the
 // DO UPDATE ... WHERE condition, a different clause that silently does not
@@ -42,6 +44,17 @@ type IGAGraphRepository interface {
 
 	LinkAccessEdgeEvidence(tx *gorm.DB, ws, edgeID, obsID uuid.UUID, relation string) error
 	LinkRelationshipEvidence(tx *gorm.DB, ws, relID, obsID uuid.UUID, relation string) error
+
+	// PublicationForRun answers "did THIS run's projection already commit?".
+	// Trustworthy only because InsertPublication commits in the same
+	// transaction as the graph writes.
+	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
+
+	// InsertPublication stamps the revision, in the graph transaction.
+	// rev = max(rev)+1 is safe because the caller holds the barrier row
+	// FOR UPDATE (AssertHeldTx) and the barrier serializes projection per
+	// workspace.
+	InsertPublication(tx *gorm.DB, p *models.IGAPublication) (int64, error)
 
 	RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error
 	EndEdgesOnSubject(tx *gorm.DB, ws, identityID uuid.UUID, reason string, now time.Time, runID uuid.UUID) error
@@ -210,12 +223,39 @@ func (r *igaGraphRepository) UpsertRelationship(tx *gorm.DB, rel *models.IGARela
 // THIS IS THE STEP THAT MAKES A NODE VISIBLE TO RECONCILIATION. A node pass
 // that upserts the node and returns its id but skips this compiles, passes an
 // unchanged-rescan test, and silently never reconciles.
+// supportColumnOf reports which typed column this row sets.
+func supportColumnOf(s *models.IGAObjectSupport) string {
+	switch {
+	case s.IdentityAccountID != nil:
+		return "identity_account_id"
+	case s.WorkloadID != nil:
+		return "workload_id"
+	case s.ResourceID != nil:
+		return "resource_id"
+	case s.EntitlementID != nil:
+		return "entitlement_id"
+	case s.AgentID != nil:
+		return "agent_id"
+	}
+	return ""
+}
+
 func (r *igaGraphRepository) UpsertObjectSupport(tx *gorm.DB, s *models.IGAObjectSupport) error {
+	col := supportColumnOf(s)
+	if col == "" {
+		return fmt.Errorf("object support row names no object")
+	}
+	// The conflict target is the PARTIAL unique index for this type
+	// (uq_iga_os_<type>), so its predicate must be restated -- Postgres will
+	// not infer a partial index from the column list alone.
 	return tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
-			{Name: "workspace_id"}, {Name: "object_type"}, {Name: "object_id"},
+			{Name: "workspace_id"}, {Name: col},
 			{Name: "connector_id"}, {Name: "partition_key"},
 		},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: col + " IS NOT NULL"},
+		}},
 		DoUpdates: clause.Assignments(map[string]any{
 			"state":                 models.RelCurrent,
 			"ended_reason":          "",
@@ -257,6 +297,41 @@ func (r *igaGraphRepository) LinkRelationshipEvidence(tx *gorm.DB, ws, relID, ob
 // The key must stay: the partial unique index is what lets the new row take
 // the same key while only one of them is live, and that is the whole mechanism
 // of delete-and-recreate. Nothing is ever deleted.
+func (r *igaGraphRepository) PublicationForRun(
+	tx *gorm.DB, ws, runID uuid.UUID,
+) (*models.IGAPublication, error) {
+	var out models.IGAPublication
+	err := tx.Where("workspace_id = ? AND scan_run_id = ?", ws, runID).First(&out).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (r *igaGraphRepository) InsertPublication(
+	tx *gorm.DB, p *models.IGAPublication,
+) (int64, error) {
+	if p.Rev == 0 {
+		var next int64
+		if err := tx.Raw(
+			`SELECT COALESCE(max(rev), 0) + 1 FROM iga_publication WHERE workspace_id = ?`,
+			p.WorkspaceID).Scan(&next).Error; err != nil {
+			return 0, err
+		}
+		p.Rev = next
+	}
+	if len(p.Manifest) == 0 {
+		p.Manifest = []byte(`{}`)
+	}
+	if err := tx.Create(p).Error; err != nil {
+		return 0, err
+	}
+	return p.Rev, nil
+}
+
 func (r *igaGraphRepository) RetireIdentity(tx *gorm.DB, ws, id uuid.UUID, reason string, now time.Time) error {
 	return tx.Model(&models.IGAIdentityAccount{}).
 		Where("workspace_id = ? AND id = ?", ws, id).

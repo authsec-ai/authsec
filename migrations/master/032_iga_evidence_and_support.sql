@@ -98,16 +98,25 @@ CREATE INDEX IF NOT EXISTS idx_iga_relationship_evidence_rel
 CREATE TABLE IF NOT EXISTS public.iga_object_support (
     id            uuid NOT NULL DEFAULT gen_random_uuid(),
     workspace_id  uuid NOT NULL,
-    -- identity | workload | resource | entitlement | agent. Deliberately a
-    -- discriminator rather than five typed columns: this is a MEMBERSHIP
-    -- record about who still vouches for a row, not a claim about the graph,
-    -- and reconciliation reads it one object_type at a time.
-    object_type   text NOT NULL,
-    object_id     uuid NOT NULL,
+
+    -- TYPED, not (object_type, object_id).
+    --
+    -- A text kind beside a bare uuid IS NOT A FOREIGN KEY -- it is the exact
+    -- A3 pattern §2.9 exists to eliminate, and putting it back here would let
+    -- a support row in workspace A claim to support workspace B's object, or
+    -- an object that does not exist at all. The endpoint set is small and
+    -- fixed, so the same nullable-typed-columns pattern used everywhere else
+    -- in this phase applies.
+    identity_account_id uuid,
+    workload_id         uuid,
+    resource_id         uuid,
+    entitlement_id      uuid,
+    agent_id            uuid,
+
     connector_id  uuid NOT NULL,
     partition_key text NOT NULL,
 
-    state         text NOT NULL DEFAULT 'current',
+    state         text NOT NULL DEFAULT 'current',  -- current|stale|ended
     first_seen_at timestamptz NOT NULL DEFAULT now(),
     last_confirmed_run_id uuid,
     last_confirmed_at     timestamptz,
@@ -119,29 +128,54 @@ CREATE TABLE IF NOT EXISTS public.iga_object_support (
     CONSTRAINT iga_object_support_connector_fkey
         FOREIGN KEY (workspace_id, connector_id)
         REFERENCES public.cloud_connector (workspace_id, id) ON DELETE CASCADE,
-    -- §2.9 again: provenance is workspace-qualified even here.
-    CONSTRAINT iga_object_support_run_fkey
-        FOREIGN KEY (workspace_id, last_confirmed_run_id)
+
+    CONSTRAINT iga_os_identity_fkey FOREIGN KEY (workspace_id, identity_account_id)
+        REFERENCES public.iga_identity_accounts (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_workload_fkey FOREIGN KEY (workspace_id, workload_id)
+        REFERENCES public.iga_workload (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_resource_fkey FOREIGN KEY (workspace_id, resource_id)
+        REFERENCES public.iga_resources (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_entitlement_fkey FOREIGN KEY (workspace_id, entitlement_id)
+        REFERENCES public.iga_entitlements (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT iga_os_agent_fkey FOREIGN KEY (workspace_id, agent_id)
+        REFERENCES public.iga_agents (workspace_id, id) ON DELETE CASCADE,
+
+    -- The confirming run is workspace-qualified too (§2.9).
+    CONSTRAINT iga_os_run_fkey FOREIGN KEY (workspace_id, last_confirmed_run_id)
         REFERENCES public.cloud_scan_run (workspace_id, id)
         ON DELETE SET NULL (last_confirmed_run_id),
 
-    CONSTRAINT iga_object_support_type_chk CHECK (
-        object_type IN ('identity', 'workload', 'resource', 'entitlement', 'agent')),
-    CONSTRAINT iga_object_support_state_chk CHECK (
-        state IN ('current', 'stale', 'ended')),
-    CONSTRAINT iga_object_support_ended_chk CHECK (
-        (state = 'ended') = (ended_reason <> '')),
-    CONSTRAINT iga_object_support_key
-        UNIQUE (workspace_id, object_type, object_id, connector_id, partition_key)
+    CONSTRAINT iga_object_support_one_chk CHECK (
+        (identity_account_id IS NOT NULL)::int + (workload_id    IS NOT NULL)::int
+      + (resource_id         IS NOT NULL)::int + (entitlement_id IS NOT NULL)::int
+      + (agent_id            IS NOT NULL)::int = 1),
+    CONSTRAINT iga_object_support_state_chk CHECK (state IN ('current','stale','ended')),
+    CONSTRAINT iga_object_support_ended_chk CHECK ((state = 'ended') = (ended_reason <> ''))
 );
 
--- The query retireUnsupported runs: "does this object have any support left?"
-CREATE INDEX IF NOT EXISTS idx_iga_object_support_object
-    ON public.iga_object_support (workspace_id, object_type, object_id, state);
+-- One live support row per (object, connector, partition), PER TYPE. Partial
+-- indexes rather than one composite key, because the discriminating column
+-- differs per type. These are the conflict targets for every support upsert,
+-- so they ship WITH the table they index.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_identity
+    ON public.iga_object_support (workspace_id, identity_account_id, connector_id, partition_key)
+    WHERE identity_account_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_workload
+    ON public.iga_object_support (workspace_id, workload_id, connector_id, partition_key)
+    WHERE workload_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_resource
+    ON public.iga_object_support (workspace_id, resource_id, connector_id, partition_key)
+    WHERE resource_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_entitlement
+    ON public.iga_object_support (workspace_id, entitlement_id, connector_id, partition_key)
+    WHERE entitlement_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_os_agent
+    ON public.iga_object_support (workspace_id, agent_id, connector_id, partition_key)
+    WHERE agent_id IS NOT NULL;
 
 -- The query reconcileNodes runs: "what did this partition support?"
 CREATE INDEX IF NOT EXISTS idx_iga_object_support_partition
-    ON public.iga_object_support (workspace_id, object_type, connector_id, partition_key)
+    ON public.iga_object_support (workspace_id, connector_id, partition_key)
     WHERE state <> 'ended';
 
 COMMENT ON TABLE public.iga_object_support IS

@@ -149,11 +149,57 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_iga_agent_instances_source_key
     ON public.iga_agent_instances (workspace_id, source_key)
     WHERE source_key <> '' AND lifecycle <> 'retired';
 
+-- iga_publication -- the durable "this run's projection committed" fact -------
+--
+-- §2.15. Written INSIDE the graph transaction (§4.6 step 6), so "the graph
+-- changed" and "a publication exists for this run" can never disagree. That is
+-- exactly what lets a replayed job tell two opposite situations apart:
+--
+--   this run's projection already committed, then the worker died before
+--   completing the job                      -> SUCCESS: finish the job
+--   a newer run already published over it   -> SUPERSEDED: abandon
+--
+-- A generation comparison alone cannot separate them: after a committed pass
+-- the watermark EQUALS this generation, so a `<=` guard reports the replay as
+-- obsolete and the job fails on every retry, forever.
+CREATE TABLE IF NOT EXISTS public.iga_publication (
+    workspace_id  uuid   NOT NULL,
+    rev           bigint NOT NULL,       -- per-workspace, monotonic, no gaps
+    published_at  timestamptz NOT NULL,
+    scan_run_id   uuid   NOT NULL,       -- the run whose projection this was
+    -- The manifest: every partition's watermark AS OF this revision, so a
+    -- reader can see exactly which run each part of the graph came from.
+    manifest      jsonb  NOT NULL,       -- {partition_key: run_id, ...}
+
+    CONSTRAINT iga_publication_pkey PRIMARY KEY (workspace_id, rev),
+    -- One publication per run, EVER. This is what lets a replayed job
+    -- recognise "I already committed" instead of republishing -- and it holds
+    -- even if the barrier reasoning were ever wrong.
+    CONSTRAINT iga_publication_run_key UNIQUE (workspace_id, scan_run_id),
+    CONSTRAINT iga_publication_run_fkey FOREIGN KEY (workspace_id, scan_run_id)
+        REFERENCES public.cloud_scan_run (workspace_id, id) ON DELETE RESTRICT,
+    CONSTRAINT iga_publication_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT iga_publication_rev_chk CHECK (rev > 0)
+);
+
+-- "What is the current revision for this workspace?" -- the read path pins to
+-- it, and rev = max(rev)+1 reads it under the barrier's FOR UPDATE.
+CREATE INDEX IF NOT EXISTS idx_iga_publication_current
+    ON public.iga_publication (workspace_id, rev DESC);
+
+COMMENT ON TABLE public.iga_publication IS
+    'One row per committed projection. Written in the same transaction as the '
+    'graph writes, so a replayed job can tell "I already committed" from '
+    '"someone newer published over me" -- which a generation comparison alone '
+    'cannot do.';
+
 -- verify ---------------------------------------------------------------------
 SELECT
     (SELECT count(*) FROM information_schema.tables
       WHERE table_schema = 'public'
-        AND table_name IN ('iga_projection_job', 'iga_projection_state')) AS tables_created,
+        AND table_name IN ('iga_projection_job', 'iga_projection_state',
+                           'iga_publication'))                                 AS tables_created,
     (SELECT count(*) FROM information_schema.columns
       WHERE table_name = 'iga_agents' AND column_name = 'origin')          AS agents_origin,
     (SELECT count(*) FROM information_schema.columns

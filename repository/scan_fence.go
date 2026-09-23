@@ -78,3 +78,21 @@ func runFenced(db *gorm.DB, fence *ScanFence, fn func(tx *gorm.DB) error) error 
 		return fn(tx)
 	})
 }
+
+// MigrationHead reports the highest successfully-applied master migration.
+//
+// Read from migration_logs rather than from the files on disk: what matters is
+// what the DATABASE has, not what the binary shipped with.
+func MigrationHead(db *gorm.DB) (int, error) {
+	var head *int
+	err := db.Raw(
+		`SELECT max(version) FROM migration_logs WHERE db_type = 'master' AND success = true`,
+	).Scan(&head).Error
+	if err != nil {
+		return 0, err
+	}
+	if head == nil {
+		return 0, nil
+	}
+	return *head, nil
+}

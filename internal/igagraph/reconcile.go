@@ -195,9 +195,16 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 // Never the node directly: a node touched by this partition may still be held
 // by another account (§2.10B).
 func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, stale bool) error {
+	// The TYPED column for this class. One mapping (models.SupportColumn),
+	// shared with the upsert's conflict target, so a support row cannot be
+	// written against one column and reconciled against another.
+	col := models.SupportColumn(part.Class)
+	if col == "" {
+		return fmt.Errorf("no support column for node class %q", part.Class)
+	}
 	q := tx.Model(&models.IGAObjectSupport{}).
-		Where("workspace_id = ? AND object_type = ? AND connector_id = ? AND partition_key = ?",
-			snap.Run.WorkspaceID, part.Class, part.ConnectorID, part.Key()).
+		Where("workspace_id = ? AND "+col+" IS NOT NULL AND connector_id = ? AND partition_key = ?",
+			snap.Run.WorkspaceID, part.ConnectorID, part.Key()).
 		Where("state <> ?", models.RelEnded).
 		Where("last_confirmed_run_id IS DISTINCT FROM ?", snap.Run.ID)
 
@@ -220,6 +227,8 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 	// The first EXISTS matters: an object with NO support rows at all is
 	// pre-graph, not unsupported, and must not be retired by this pass -- 035
 	// handles those deliberately.
+	// %s is the node table, %s its typed support column. Both come from the
+	// same class, so the join column and the table cannot drift apart.
 	const stmt = `
 		UPDATE %s n
 		   SET lifecycle = 'retired', retired_reason = ?, updated_at = now()
@@ -227,22 +236,25 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot) error {
 		   AND n.lifecycle = 'active'
 		   AND EXISTS (SELECT 1 FROM iga_object_support s
 		                WHERE s.workspace_id = n.workspace_id
-		                  AND s.object_type = ? AND s.object_id = n.id)
+		                  AND s.%s = n.id)
 		   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
 		                    WHERE s.workspace_id = n.workspace_id
-		                      AND s.object_type = ? AND s.object_id = n.id
+		                      AND s.%s = n.id
 		                      AND s.state <> 'ended')`
 
-	for _, t := range []struct{ table, objectType string }{
+	for _, t := range []struct{ table, class string }{
 		{"iga_identity_accounts", models.ObjectIdentity},
 		{"iga_workload", models.ObjectWorkload},
 		{"iga_resources", models.ObjectResource},
 		{"iga_entitlements", models.ObjectEntitlement},
 		{"iga_agents", models.ObjectAgent},
 	} {
-		if err := tx.Exec(fmt.Sprintf(stmt, t.table),
-			models.RetiredUnsupported, snap.Run.WorkspaceID,
-			t.objectType, t.objectType).Error; err != nil {
+		col := models.SupportColumn(t.class)
+		if col == "" {
+			return fmt.Errorf("no support column for node class %q", t.class)
+		}
+		if err := tx.Exec(fmt.Sprintf(stmt, t.table, col, col),
+			models.RetiredUnsupported, snap.Run.WorkspaceID).Error; err != nil {
 			return fmt.Errorf("retire unsupported %s: %w", t.table, err)
 		}
 	}

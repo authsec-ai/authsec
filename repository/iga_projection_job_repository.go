@@ -51,9 +51,10 @@ type IGAProjectionJobRepository interface {
 	// transaction.
 	AssertOwnedTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64) error
 
-	// AssertProjectingTx proves this worker still holds the workspace pipeline
-	// in 'projecting'.
-	AssertProjectingTx(tx *gorm.DB, ws uuid.UUID, version int64) error
+	// CompleteTx and AbandonTx are the transactional terminals, for the
+	// *AndRelease exits that must move the job and the barrier together.
+	CompleteTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64) error
+	AbandonTx(tx *gorm.DB, jobID uuid.UUID, owner string, version int64, reason string) error
 
 	Get(jobID uuid.UUID) (*models.IGAProjectionJob, error)
 }
@@ -201,20 +202,44 @@ func (r *igaProjectionJobRepository) AssertOwnedTx(
 	return nil
 }
 
-func (r *igaProjectionJobRepository) AssertProjectingTx(
-	tx *gorm.DB, ws uuid.UUID, version int64,
+// fencedTx is fenced() against a caller-supplied transaction, so a job
+// terminal can share one transaction with the barrier release.
+func (r *igaProjectionJobRepository) fencedTx(
+	tx *gorm.DB, jobID uuid.UUID, owner string, version int64, updates map[string]any,
 ) error {
-	var lease models.IGAPipelineLease
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("workspace_id = ?", ws).First(&lease).Error
-	if err != nil {
-		return err
+	res := tx.Model(&models.IGAProjectionJob{}).
+		Where("id = ? AND lease_owner = ? AND lease_version = ?", jobID, owner, version).
+		Updates(updates)
+	if res.Error != nil {
+		return res.Error
 	}
-	if lease.State != models.PipelineProjecting || lease.Version != version {
-		return fmt.Errorf("%w: workspace=%s state=%s version=%d (wanted projecting/%d)",
-			ErrPipelineLost, ws, lease.State, lease.Version, version)
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("%w: job=%s owner=%s version=%d", ErrProjectionLeaseLost, jobID, owner, version)
 	}
 	return nil
+}
+
+func (r *igaProjectionJobRepository) CompleteTx(
+	tx *gorm.DB, jobID uuid.UUID, owner string, version int64,
+) error {
+	return r.fencedTx(tx, jobID, owner, version, map[string]any{
+		"status":           models.ProjectionComplete,
+		"completed_at":     time.Now(),
+		"lease_owner":      "",
+		"lease_expires_at": nil,
+	})
+}
+
+func (r *igaProjectionJobRepository) AbandonTx(
+	tx *gorm.DB, jobID uuid.UUID, owner string, version int64, reason string,
+) error {
+	return r.fencedTx(tx, jobID, owner, version, map[string]any{
+		"status":           models.ProjectionAbandoned,
+		"last_error":       truncateError(reason),
+		"completed_at":     time.Now(),
+		"lease_owner":      "",
+		"lease_expires_at": nil,
+	})
 }
 
 func (r *igaProjectionJobRepository) Get(jobID uuid.UUID) (*models.IGAProjectionJob, error) {

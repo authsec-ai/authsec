@@ -181,8 +181,8 @@ func (f *fixture) publishedRun(connector uuid.UUID, generation int, surfaces map
 // below vacuously pass.
 type okFencer struct{}
 
-func (okFencer) AssertOwnedTx(*gorm.DB, uuid.UUID, string, int64) error { return nil }
-func (okFencer) AssertProjectingTx(*gorm.DB, uuid.UUID, int64) error    { return nil }
+func (okFencer) AssertOwnedTx(*gorm.DB, uuid.UUID, string, int64) error   { return nil }
+func (okFencer) AssertHeldTx(*gorm.DB, uuid.UUID, uuid.UUID, int64) error { return nil }
 
 // project runs ONE full pass -- Project then Reconcile -- in one transaction,
 // exactly as ProjectionService does.

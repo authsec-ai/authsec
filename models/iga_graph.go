@@ -303,10 +303,18 @@ func (IGARelationshipEvidence) TableName() string { return "iga_relationship_evi
 // every support of it has ended -- which is what stops account B's scan
 // retiring a bucket account A still holds.
 type IGAObjectSupport struct {
-	ID           uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	WorkspaceID  uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
-	ObjectType   string    `json:"object_type" gorm:"not null"`
-	ObjectID     uuid.UUID `json:"object_id" gorm:"type:uuid;not null"`
+	ID          uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;not null;index"`
+
+	// TYPED endpoints, exactly one set. A text kind beside a bare uuid is not
+	// a foreign key -- it is the A3 pattern §2.9 exists to eliminate, and it
+	// would let a support row in workspace A claim workspace B's object.
+	IdentityAccountID *uuid.UUID `json:"identity_account_id,omitempty" gorm:"type:uuid"`
+	WorkloadID        *uuid.UUID `json:"workload_id,omitempty" gorm:"type:uuid"`
+	ResourceID        *uuid.UUID `json:"resource_id,omitempty" gorm:"type:uuid"`
+	EntitlementID     *uuid.UUID `json:"entitlement_id,omitempty" gorm:"type:uuid"`
+	AgentID           *uuid.UUID `json:"agent_id,omitempty" gorm:"type:uuid"`
+
 	ConnectorID  uuid.UUID `json:"connector_id" gorm:"type:uuid;not null"`
 	PartitionKey string    `json:"partition_key" gorm:"not null"`
 
@@ -318,6 +326,47 @@ type IGAObjectSupport struct {
 }
 
 func (IGAObjectSupport) TableName() string { return "iga_object_support" }
+
+// SetObject points this support row at one object, by class. Returns false for
+// an unknown class rather than leaving every column nil, which the
+// exactly-one CHECK would reject at the end of a long scan instead of here.
+func (s *IGAObjectSupport) SetObject(class string, id uuid.UUID) bool {
+	switch class {
+	case ObjectIdentity:
+		s.IdentityAccountID = &id
+	case ObjectWorkload:
+		s.WorkloadID = &id
+	case ObjectResource:
+		s.ResourceID = &id
+	case ObjectEntitlement:
+		s.EntitlementID = &id
+	case ObjectAgent:
+		s.AgentID = &id
+	default:
+		return false
+	}
+	return true
+}
+
+// SupportColumn maps a node class to its typed column on iga_object_support.
+// ONE mapping, used by the upsert conflict target and by both reconciliation
+// steps, so a row cannot be written against one column and reconciled against
+// another.
+func SupportColumn(class string) string {
+	switch class {
+	case ObjectIdentity:
+		return "identity_account_id"
+	case ObjectWorkload:
+		return "workload_id"
+	case ObjectResource:
+		return "resource_id"
+	case ObjectEntitlement:
+		return "entitlement_id"
+	case ObjectAgent:
+		return "agent_id"
+	}
+	return ""
+}
 
 /* --------------------------- projection job and state --------------------- */
 
@@ -368,6 +417,28 @@ type IGAProjectionState struct {
 }
 
 func (IGAProjectionState) TableName() string { return "iga_projection_state" }
+
+/* ------------------------------ iga_publication --------------------------- */
+
+// IGAPublication is the durable record that one run's projection COMMITTED.
+//
+// Written inside the graph transaction (§4.6 step 6), so "the graph changed"
+// and "a publication exists for this run" can never disagree. That is what
+// lets a replayed job distinguish two opposite situations that a generation
+// comparison cannot: its own committed pass (finish the job) from a newer run
+// having published over it (abandon).
+type IGAPublication struct {
+	WorkspaceID uuid.UUID `json:"workspace_id" gorm:"type:uuid;primaryKey"`
+	// Rev is per-workspace, monotonic and gap-free. Readers pin to it.
+	Rev         int64     `json:"rev" gorm:"primaryKey"`
+	PublishedAt time.Time `json:"published_at" gorm:"not null"`
+	ScanRunID   uuid.UUID `json:"scan_run_id" gorm:"type:uuid;not null"`
+	// Manifest maps partition_key -> run_id as of this revision, so a reader
+	// can see exactly which run each part of the graph came from.
+	Manifest json.RawMessage `json:"manifest" gorm:"type:jsonb;not null;default:'{}'"`
+}
+
+func (IGAPublication) TableName() string { return "iga_publication" }
 
 /* ----------------------------- iga_pipeline_lease ------------------------- */
 

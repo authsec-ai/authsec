@@ -146,7 +146,7 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	// spec states plainly -- a customer with five AWS accounts scans them one
 	// at a time, and nothing narrower is sound because the shared-resource
 	// writer crosses connectors.
-	version, perr := w.pipeline.ClaimForCollection(
+	version, perr := w.pipeline.AcquireForCollection(
 		run.WorkspaceID, w.owner, run.ID, projectionPipelineLease, w.nowFunc())
 	if perr != nil {
 		if rerr := w.runs.Requeue(run.ID, w.owner, run.LeaseVersion); rerr != nil {
@@ -159,8 +159,18 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err := w.execute(ctx, run); err != nil {
 		// Hand the workspace back: publication never happened, so nothing is
 		// waiting to be projected and holding the barrier would block every
-		// other connector until the sweep.
-		if rerr := w.pipeline.Release(run.WorkspaceID, w.pipelineVersion); rerr != nil {
+		// other connector. This is the COLLECTING phase, so abandon is the
+		// correct exit -- it terminalizes the run (already failed below) and
+		// the job (none exists yet) before returning the barrier to idle.
+		// Expiry alone must never do this (§2.10A).
+		if rerr := w.db.Transaction(func(tx *gorm.DB) error {
+			return w.pipeline.AbandonTx(tx, repositories.PipelineFence{
+				WorkspaceID: run.WorkspaceID,
+				Phase:       models.PipelineCollecting,
+				RunID:       run.ID,
+				Version:     w.pipelineVersion,
+			}, "scan failed before publication")
+		}); rerr != nil {
 			log.Printf("aws scan worker %s: could not release pipeline: %v", w.owner, rerr)
 		}
 		// Fail is fenced too. If it returns ErrLeaseLost the run was already
@@ -268,7 +278,7 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun) e
 			// is where a second connector's scan would overwrite a shared
 			// resource row the projection is about to read (§2.10A).
 			if _, err := w.pipeline.ToProjectingTx(tx, published.WorkspaceID,
-				w.owner, w.pipelineVersion, projectionPipelineLease); err != nil {
+				w.owner, published.ID, w.pipelineVersion, projectionPipelineLease); err != nil {
 				return fmt.Errorf("pipeline to projecting: %w", err)
 			}
 			return nil
