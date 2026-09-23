@@ -76,6 +76,7 @@ type GraphWriter interface {
 
 	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
 	NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, error)
+	LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.RawMessage, error)
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) error
 	InsertLifecycleEvents(tx *gorm.DB, events []models.IGALifecycleEvent) error
 }
@@ -173,6 +174,14 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 		return &AlreadyPublished{Rev: pub.Rev}
 	}
 
+	// The estate scope first: it is part of every partition key (D-57), so the
+	// watermark check below, the rows this pass stamps and the manifest must all
+	// see the REAL scope. Resolved only after the replay check -- a replay
+	// writes nothing -- and rolled back with everything else if the pass is
+	// superseded.
+	if err := p.projectEstateScope(tx, snap); err != nil {
+		return err
+	}
 	parts := Partitions(snap)
 	if bad := AssertPartitionVocabulary(parts, snap.RegionsAttempted()); len(bad) > 0 {
 		return fmt.Errorf("igagraph: partitions name unknown surfaces %v", bad)
@@ -204,9 +213,6 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 	p.events = NewEventLog(snap.Run.WorkspaceID, rev, snap.Run.ID, p.now())
 
 	r := newResolved(p.existing)
-	if err := p.projectEstateScope(tx, snap); err != nil {
-		return err
-	}
 
 	steps := []struct {
 		name string
@@ -239,18 +245,33 @@ func (p *Projector) Project(tx *gorm.DB, snap *Snapshot) error {
 
 	// 6. PUBLICATION, in the same transaction as every write above, so "the
 	//    graph changed" and "a publication exists for this run" never disagree.
+	prev, err := p.repo.LatestManifest(tx, snap.Run.WorkspaceID)
+	if err != nil {
+		return fmt.Errorf("read the previous manifest: %w", err)
+	}
 	return p.repo.InsertPublication(tx, &models.IGAPublication{
 		WorkspaceID: snap.Run.WorkspaceID,
 		Rev:         rev,
 		ScanRunID:   snap.Run.ID,
 		PublishedAt: p.now(),
-		Manifest:    manifestOf(snap, parts),
+		Manifest:    manifestOf(prev, snap, parts),
 	})
 }
 
-// manifestOf records which run each partition came from, as of this revision.
-func manifestOf(snap *Snapshot, parts []Partition) json.RawMessage {
-	m := make(map[string]string, len(parts))
+// manifestOf records which run each partition came from AS OF THIS REVISION
+// (033: "every partition's watermark as of this revision"): the previous
+// publication's entries, with this run's partitions overlaid. A revision is
+// workspace-wide, so the other accounts' partitions -- and this account's
+// partitions this run did not carry -- still stand on the runs that last wrote
+// them, and the manifest must say so (D-57). The keys include scope and
+// connector, so one account never overwrites another's.
+func manifestOf(prev json.RawMessage, snap *Snapshot, parts []Partition) json.RawMessage {
+	m := map[string]string{}
+	if len(prev) > 0 {
+		// A manifest this build cannot decode is not carried: claiming less
+		// provenance is safe, inventing it is not.
+		_ = json.Unmarshal(prev, &m)
+	}
 	for _, part := range parts {
 		m[part.Key()] = snap.Run.ID.String()
 	}

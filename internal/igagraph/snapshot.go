@@ -187,15 +187,21 @@ type Partition struct {
 }
 
 // Key is the partition's stable identity and the value stamped on every row:
-// target, class, relationship type, kind, region, and the SORTED required
-// surfaces. It keys iga_projection_state (033), lastGenerationFor and every
-// edge's partition_key -- one value, three call sites.
+// scope, connector, target, class, relationship type, kind, region, and the
+// SORTED required surfaces. It keys iga_projection_state (033),
+// lastGenerationFor, every edge's partition_key and the publication manifest --
+// one value, four call sites.
+//
+// Scope and connector are part of it (§4.8, 033: "keyed by partition, which
+// covers scope and connector"). Without them two accounts produce the same
+// keys, and a cumulative manifest (manifestOf) would let one account's run
+// overwrite the other's under the same key (D-57). Frozen once deployed (D-60).
 func (p Partition) Key() string {
 	target := p.Target
 	if target == "" {
 		target = "node"
 	}
-	parts := []string{target, p.Class, p.RelationshipType, p.Kind, p.Region}
+	parts := []string{p.ScopeID.String(), p.ConnectorID.String(), target, p.Class, p.RelationshipType, p.Kind, p.Region}
 	surfaces := append([]string{}, p.RequiredSurfaces...)
 	sort.Strings(surfaces)
 	parts = append(parts, surfaces...)

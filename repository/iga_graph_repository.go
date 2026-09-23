@@ -65,6 +65,7 @@ type IGAGraphRepository interface {
 
 	PublicationForRun(tx *gorm.DB, ws, runID uuid.UUID) (*models.IGAPublication, error)
 	NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, error)
+	LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.RawMessage, error)
 	InsertPublication(tx *gorm.DB, p *models.IGAPublication) error
 	InsertLifecycleEvents(tx *gorm.DB, events []models.IGALifecycleEvent) error
 }
@@ -557,6 +558,21 @@ func (r *igaGraphRepository) NextRevision(tx *gorm.DB, ws uuid.UUID) (int64, err
 	err := tx.Raw(`SELECT COALESCE(max(rev), 0) + 1 FROM iga_publication WHERE workspace_id = ?`, ws).
 		Scan(&next).Error
 	return next, err
+}
+
+// LatestManifest is the current revision's manifest, or nil when nothing is
+// published: the base the next publication's cumulative manifest is built on
+// (D-57). Read under the same barrier as NextRevision.
+func (r *igaGraphRepository) LatestManifest(tx *gorm.DB, ws uuid.UUID) (json.RawMessage, error) {
+	var rows []struct{ Manifest json.RawMessage }
+	if err := tx.Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? ORDER BY rev DESC LIMIT 1`, ws).
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return rows[0].Manifest, nil
 }
 
 func (r *igaGraphRepository) InsertPublication(tx *gorm.DB, p *models.IGAPublication) error {
