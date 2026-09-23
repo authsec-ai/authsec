@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -29,7 +30,8 @@ import (
 //  1. lock the workload row;
 //  2. THEN look the operation up -- a retry that waited on the lock now sees
 //     the original's committed decision and replays it;
-//  3. then refuse provider-native, retired and stale-version requests;
+//  3. then refuse provider-native and stale-version requests, and only after
+//     those the decision rules (retired, undo, D-30);
 //  4. insert the decision, 5. update the workload and bump the clock, 6. commit.
 //
 // Looking the operation up BEFORE the lock is the defect this ordering exists
@@ -90,16 +92,25 @@ type ClassifyRequest struct {
 	UndoesDecisionID *uuid.UUID
 }
 
+// Free-text bounds (D-30), in characters of the trimmed text. The reason is
+// the audit record and the purpose a label ("Customer support triage"); a
+// body past either is a malformed request, not a decision to store.
+const (
+	MaxClassificationReason  = 2000
+	MaxClassificationPurpose = 500
+)
+
 // normalized trims the free text -- the hash is over trimmed strings (D-29),
 // so the stored row must be too, or a replay would return text that differs
 // from what was hashed -- and validates what can be validated without the
 // database. Every failure is 400 invalid_parameter (D-30).
 //
-// An undo must name the decision it undoes, and only an undo may: §2.14.3
-// defines undo as "a new decision (unclassified) with undoes_decision_id set",
-// and unclassified is reachable only by undo, so an unlinked unclassified or a
-// linked classified_agent would be a record that claims something about its
-// history that is not so.
+// What is NOT checked here is deliberate: whether an unclassified decision
+// names the decision it undoes, and whether a classified_agent one names any,
+// are decision rules about the workload's history. D-30 puts them after the
+// lock, the operation lookup, provider-native and the version check (422
+// invalid_decision, checkTransition), so a client with a stale view is told
+// what changed (409) before it is told its request makes no sense.
 func (r ClassifyRequest) normalized() (ClassifyRequest, *igaread.Error) {
 	r.Purpose = strings.TrimSpace(r.Purpose)
 	r.Reason = strings.TrimSpace(r.Reason)
@@ -114,12 +125,14 @@ func (r ClassifyRequest) normalized() (ClassifyRequest, *igaread.Error) {
 		return r, igaread.InvalidParameter("decision", "decision must be classified_agent or unclassified")
 	case r.Reason == "":
 		return r, igaread.InvalidParameter("reason", "reason is required: it is the audit record")
+	case utf8.RuneCountInString(r.Reason) > MaxClassificationReason:
+		return r, igaread.InvalidParameter("reason", fmt.Sprintf("reason must be at most %d characters", MaxClassificationReason))
+	case utf8.RuneCountInString(r.Purpose) > MaxClassificationPurpose:
+		return r, igaread.InvalidParameter("purpose", fmt.Sprintf("purpose must be at most %d characters", MaxClassificationPurpose))
 	case r.ExpectedVersion < 0:
+		// A version is a count of decisions; a negative one is malformed, not
+		// a stale view of anything.
 		return r, igaread.InvalidParameter("expected_version", "expected_version must be a non-negative integer")
-	case r.Decision == models.ClassificationUnclassified && r.UndoesDecisionID == nil:
-		return r, igaread.InvalidParameter("undoes_decision_id", "an unclassified decision is an undo and must name the decision it undoes")
-	case r.Decision == models.ClassificationClassified && r.UndoesDecisionID != nil:
-		return r, igaread.InvalidParameter("undoes_decision_id", "only an unclassified decision (an undo) may name a decision it undoes")
 	}
 	return r, nil
 }
@@ -198,11 +211,20 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 		// here, so step 2 runs only after any concurrent decision on it has
 		// committed or rolled back -- and at READ COMMITTED it sees that
 		// commit.
+		//
+		// Only a workload the graph routes can read may be decided about
+		// (D-6): an AWS row the projector owns, i.e. with a support row. Any
+		// other id -- another workspace's, a GitHub row, an AWS row nothing
+		// supports -- is 404 with no hint, exactly as GET /workloads/:id
+		// answers it. The EXISTS is a sublink, not a FROM item, so FOR UPDATE
+		// locks the workload row alone.
 		var locked []lockedWorkload
-		if err := tx.Raw(`SELECT id, classification, classification_version, lifecycle
-			FROM iga_workload
-			WHERE workspace_id = ? AND id = ? AND provider = 'aws'
-			FOR UPDATE`, ws, req.WorkloadID).Scan(&locked).Error; err != nil {
+		if err := tx.Raw(`SELECT w.id, w.classification, w.classification_version, w.lifecycle
+			FROM iga_workload w
+			WHERE w.workspace_id = ? AND w.id = ? AND w.provider = 'aws'
+			  AND EXISTS (SELECT 1 FROM iga_object_support s
+			               WHERE s.workspace_id = w.workspace_id AND s.workload_id = w.id)
+			FOR UPDATE OF w`, ws, req.WorkloadID).Scan(&locked).Error; err != nil {
 			return err
 		}
 		if len(locked) == 0 {
@@ -233,21 +255,16 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 			return nil
 		}
 
-		// 3. The rules, against the locked row.
+		// 3. The rules, against the locked row, in §5.5's order and then
+		// D-30's: provider-native, then the version, then the decision rules.
 		if w.Classification == models.ClassificationProviderAgent {
 			// The provider's own API calls it an agent; not human-editable.
 			return igaread.Unprocessable("provider_native", "AWS reports this workload as an agent; its classification is not editable.")
 		}
-		if w.Lifecycle != models.IGALifecycleActive {
-			// Recreation does not carry classification (§2.14.3): a retired row
-			// keeps the decisions it had, and nothing new is decided about an
-			// object no longer observed (D-30).
-			return igaread.Unprocessable("invalid_decision", "The workload is retired; its classification can no longer change.")
-		}
 		if w.ClassificationVersion != req.ExpectedVersion {
-			// Checked before the transition rules: a client with a stale view
-			// is told what changed and by whom, not that its (stale) request
-			// makes no sense.
+			// Checked before the decision rules: a client with a stale view is
+			// told what changed and by whom, not that its (stale) request makes
+			// no sense against a state it has not seen.
 			conflict, err := igaread.ClassificationConflict(tx, ws, w.ID, w.Classification, w.ClassificationVersion)
 			if err != nil {
 				return err
@@ -331,20 +348,39 @@ func (s *ClassificationService) Classify(ctx context.Context, ws uuid.UUID, in C
 }
 
 // checkTransition enforces the decision rules that depend on the locked
-// workload (D-30). Only two transitions exist: unclassified -> classified_agent
-// (classify) and classified_agent -> unclassified (undo, §2.14.3). Deciding
-// what the workload already is, or undoing anything but its latest decision,
+// workload (D-30), after provider-native and the version check. Every refusal
 // is 422 invalid_decision.
+//
+//   - A retired (or tombstoned) workload takes no new decision. Recreation does
+//     not carry classification (§2.14.3): a retired row keeps the decisions it
+//     had, and nothing new is decided about an object no longer observed.
+//   - classified_agent: from unclassified (classify) or from classified_agent
+//     -- the deliberate replacement after a 409 (§2.14.3 "Deliberate
+//     replacement", D-30): a new row with previous = classified_agent and the
+//     version bumped. It undoes nothing, so it may not name a decision to undo:
+//     the record would claim a reversal that §2.14.3 does not allow ("Only
+//     classified_agent -> unclassified").
+//   - unclassified: only as an undo (§2.14.3 "Undo") -- of a classified_agent
+//     workload, naming the workload's LATEST decision, or the record would say
+//     it undid something it did not. An unlinked unclassified names no latest
+//     decision, so it is refused too.
 func (s *ClassificationService) checkTransition(tx *gorm.DB, ws uuid.UUID, w lockedWorkload, req ClassifyRequest) error {
-	if req.Decision == w.Classification {
-		return igaread.Unprocessable("invalid_decision", "The workload is already "+w.Classification+".")
+	if w.Lifecycle != models.IGALifecycleActive {
+		return igaread.Unprocessable("invalid_decision", "The workload is retired; its classification can no longer change.")
 	}
-	if req.Decision != models.ClassificationUnclassified {
+	if req.Decision == models.ClassificationClassified {
+		if req.UndoesDecisionID != nil {
+			return igaread.Unprocessable("invalid_decision", "Only an undo (an unclassified decision) may name a decision it undoes.")
+		}
 		return nil
 	}
-	// An undo. normalized() guarantees it names a decision; it must be the
-	// one that made this workload classified_agent -- its latest -- or the
-	// record would say it undid something it did not.
+	// An undo.
+	if w.Classification != models.ClassificationClassified {
+		return igaread.Unprocessable("invalid_decision", "Only a workload classified as an agent can be unclassified.")
+	}
+	if req.UndoesDecisionID == nil {
+		return igaread.Unprocessable("invalid_decision", "An unclassified decision is an undo: undoes_decision_id must name the workload's latest decision.")
+	}
 	latest, err := igaread.LatestDecisionRow(tx, ws, w.ID)
 	if err != nil {
 		return err

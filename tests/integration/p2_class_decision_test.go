@@ -14,6 +14,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,7 +25,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/models"
@@ -34,6 +39,7 @@ import (
 type classFixture struct {
 	t        *testing.T
 	l        *p2Lab
+	acct     *p2Account
 	api      *readAPI
 	workload uuid.UUID
 	user     uuid.UUID
@@ -43,13 +49,14 @@ type classFixture struct {
 func classSetup(t *testing.T, name string) *classFixture {
 	t.Helper()
 	l := newP2Lab(t, name, true)
-	l.scanAndProject(oneLambda(l))
+	a := oneLambda(l)
+	l.scanAndProject(a)
 	var wl []uuid.UUID
 	l.db.Raw(`SELECT id FROM iga_workload WHERE workspace_id = ? AND display_name = 'refund-processor'`, l.ws).Scan(&wl)
 	if len(wl) != 1 {
 		t.Fatalf("the lab projected %d refund-processor workloads, want 1", len(wl))
 	}
-	f := &classFixture{t: t, l: l, api: l.api(), workload: wl[0]}
+	f := &classFixture{t: t, l: l, acct: a, api: l.api(), workload: wl[0]}
 	name1 := "Priya Shah"
 	f.user, f.member = classMember(t, l.db, l.ws, &name1, "priya@test.local", "active")
 	f.api.withClaims(classClaims(f.user, f.member))
@@ -95,17 +102,23 @@ func classMember(t *testing.T, db *gorm.DB, ws uuid.UUID, name *string, email, s
 	return user, member
 }
 
-// classInsertWorkload adds a workload row directly. Used where the projector
-// cannot produce the shape needed without a Bedrock fake (provider-native) or
-// where a second workload is only a lock target; the classification service
-// reads nothing but the iga_workload row.
-func classInsertWorkload(t *testing.T, l *p2Lab, name, runtimeKind, classification string) uuid.UUID {
-	t.Helper()
+// insertWorkload adds a workload row directly, with one support row from the
+// lab's connector so the graph routes can read it (D-6). Used where the
+// projector cannot produce the shape needed without a Bedrock fake
+// (provider-native) or where a second workload is only a lock target; the
+// classification service reads nothing but the iga_workload row and whether
+// something supports it.
+func (f *classFixture) insertWorkload(name, runtimeKind, classification string) uuid.UUID {
+	f.t.Helper()
 	id := uuid.New()
-	if err := l.db.Exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, display_name, region, source_key, classification)
+	if err := f.l.db.Exec(`INSERT INTO iga_workload (id, workspace_id, runtime_kind, display_name, region, source_key, classification)
 		VALUES (?, ?, ?, ?, 'us-east-1', ?, ?)`,
-		id, l.ws, runtimeKind, name, "aws\x1fclass-test\x1f"+id.String(), classification).Error; err != nil {
-		t.Fatalf("insert workload: %v", err)
+		id, f.l.ws, runtimeKind, name, "aws\x1fclass-test\x1f"+id.String(), classification).Error; err != nil {
+		f.t.Fatalf("insert workload: %v", err)
+	}
+	if err := f.l.db.Exec(`INSERT INTO iga_object_support (workspace_id, workload_id, connector_id, partition_key)
+		VALUES (?, ?, ?, 'class-test')`, f.l.ws, id, f.acct.conn).Error; err != nil {
+		f.t.Fatalf("insert support: %v", err)
 	}
 	return id
 }
@@ -266,7 +279,7 @@ func TestP2ClassConcurrentRetriesReplay(t *testing.T) {
 // back. Unmapped, it is 500 internal.
 func TestP2ClassSameOperationTwoWorkloadsConcurrently(t *testing.T) {
 	f := classSetup(t, "p2-class-two-workloads")
-	other := classInsertWorkload(t, f.l, "cs-handler-b", "lambda_function", models.ClassificationUnclassified)
+	other := f.insertWorkload("cs-handler-b", "lambda_function", models.ClassificationUnclassified)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var calls int32
 	var releaseOnce sync.Once
@@ -356,7 +369,7 @@ func TestP2ClassOperationReusedIs422(t *testing.T) {
 	}
 	// Different workload, identical body and actor.
 	f.api.withClaims(classClaims(f.user, f.member))
-	other := classInsertWorkload(t, f.l, "cs-handler-b", "lambda_function", models.ClassificationUnclassified)
+	other := f.insertWorkload("cs-handler-b", "lambda_function", models.ClassificationUnclassified)
 	st, out = f.post(other, classBody(op, models.ClassificationClassified, "Owns tier-1 ticket routing", 0, nil))
 	if st != http.StatusUnprocessableEntity || errCode(out) != "operation_id_reused" {
 		t.Fatalf("same operation, another workload = %d %v, want 422 operation_id_reused", st, out)
@@ -426,7 +439,7 @@ func TestP2ClassStaleVersionIs409WithCurrentDecision(t *testing.T) {
 // what AWS itself reports as an agent.
 func TestP2ClassProviderNativeIs422(t *testing.T) {
 	f := classSetup(t, "p2-class-native")
-	agent := classInsertWorkload(t, f.l, "support-agent", "bedrock_agent", models.ClassificationProviderAgent)
+	agent := f.insertWorkload("support-agent", "bedrock_agent", models.ClassificationProviderAgent)
 	st, out := f.post(agent, classBody(uuid.New(), models.ClassificationClassified, "it is an agent", 0, nil))
 	if st != http.StatusUnprocessableEntity || errCode(out) != "provider_native" {
 		t.Fatalf("classify a provider-native agent = %d %v, want 422 provider_native", st, out)
@@ -445,7 +458,7 @@ func TestP2ClassUndoIsANewDecision(t *testing.T) {
 	firstID := classUUID(t, digs(first, "data", "decision", "id"))
 
 	// Undoing something that is not this workload's latest decision.
-	other := classInsertWorkload(t, f.l, "cs-handler-b", "lambda_function", models.ClassificationUnclassified)
+	other := f.insertWorkload("cs-handler-b", "lambda_function", models.ClassificationUnclassified)
 	otherDecision := f.classify(other, classBody(uuid.New(), models.ClassificationClassified, "other", 0, nil))
 	otherID := classUUID(t, digs(otherDecision, "data", "decision", "id"))
 	st, out := f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, &otherID))
@@ -486,9 +499,13 @@ func TestP2ClassUndoIsANewDecision(t *testing.T) {
 	}
 }
 
-// Validation (D-30): a missing or malformed field is 400 invalid_parameter;
-// deciding what the workload already is, or anything on a retired workload,
-// is 422 invalid_decision. None of it writes.
+// Validation (D-30): a missing or malformed field, a blank reason, an unknown
+// decision and over-long free text are 400 invalid_parameter naming the
+// field, before anything is locked -- and none of it writes.
+//
+// Safeguards: each check in normalized() and parseClassifyBody. The length
+// bounds count characters, not bytes: 2000 two-byte characters are a valid
+// reason.
 func TestP2ClassValidation(t *testing.T) {
 	f := classSetup(t, "p2-class-validation")
 	good := func() map[string]any {
@@ -500,17 +517,18 @@ func TestP2ClassValidation(t *testing.T) {
 		param string
 	}{
 		{"no operation_id", func(b map[string]any) { delete(b, "operation_id") }, "operation_id"},
+		{"null operation_id", func(b map[string]any) { b["operation_id"] = nil }, "operation_id"},
 		{"operation_id not a UUID", func(b map[string]any) { b["operation_id"] = "op-1" }, "operation_id"},
 		{"no decision", func(b map[string]any) { delete(b, "decision") }, "decision"},
 		{"unknown decision", func(b map[string]any) { b["decision"] = "provider_native_agent" }, "decision"},
 		{"no reason", func(b map[string]any) { delete(b, "reason") }, "reason"},
 		{"blank reason", func(b map[string]any) { b["reason"] = "   " }, "reason"},
+		{"reason over 2000 characters", func(b map[string]any) { b["reason"] = strings.Repeat("é", 2001) }, "reason"},
+		{"purpose over 500 characters", func(b map[string]any) { b["purpose"] = strings.Repeat("é", 501) }, "purpose"},
 		{"no expected_version", func(b map[string]any) { delete(b, "expected_version") }, "expected_version"},
 		{"negative expected_version", func(b map[string]any) { b["expected_version"] = -1 }, "expected_version"},
 		{"expected_version not a number", func(b map[string]any) { b["expected_version"] = "0" }, "body"},
 		{"undoes_decision_id not a UUID", func(b map[string]any) { b["undoes_decision_id"] = "x" }, "undoes_decision_id"},
-		{"undo without the decision it undoes", func(b map[string]any) { b["decision"] = models.ClassificationUnclassified }, "undoes_decision_id"},
-		{"classify naming a decision to undo", func(b map[string]any) { b["undoes_decision_id"] = uuid.NewString() }, "undoes_decision_id"},
 	} {
 		b := good()
 		tc.edit(b)
@@ -519,28 +537,152 @@ func TestP2ClassValidation(t *testing.T) {
 			t.Errorf("%s = %d %v, want 400 invalid_parameter on %s", tc.name, st, out, tc.param)
 		}
 	}
+	for _, raw := range []string{`[]`, `{"operation_id": "`, `{} {}`} {
+		req := httptest.NewRequest(http.MethodPost, "/api/iga/v1"+f.path(f.workload), strings.NewReader(raw))
+		w := httptest.NewRecorder()
+		f.api.eng.ServeHTTP(w, req)
+		var out map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		if w.Code != http.StatusBadRequest || errCode(out) != "invalid_parameter" {
+			t.Errorf("body %q = %d %v, want 400 invalid_parameter", raw, w.Code, out)
+		}
+	}
 	classWant(t, "after every 400", f.state(f.workload),
 		classState{Classification: models.ClassificationUnclassified, Version: 0, Decisions: 0, Seq: 0})
 
-	f.classify(f.workload, good())
-	st, out := f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "again", 1, nil))
+	// At the bounds, in characters: accepted, and stored trimmed.
+	b := good()
+	b["reason"], b["purpose"] = " "+strings.Repeat("é", 2000)+" ", strings.Repeat("é", 500)
+	out := f.classify(f.workload, b)
+	if got := digs(out, "data", "decision", "reason"); got != strings.Repeat("é", 2000) {
+		t.Fatalf("a 2000-character reason came back as %d characters", len([]rune(got)))
+	}
+}
+
+// The deliberate replacement (§2.14.3, D-30): classified_agent on a workload
+// that is already classified_agent, at the expected version, is a NEW
+// decision -- previous = classified_agent, version and clock bumped -- never
+// refused as "already an agent". It is how "Replace with mine" after a 409
+// records the second person's purpose and reason (§2.14.6).
+//
+// Safeguard: the decision rules do not refuse classified -> classified.
+func TestP2ClassReplacementIsANewDecision(t *testing.T) {
+	f := classSetup(t, "p2-class-replace")
+	first := f.classify(f.workload, classBody(uuid.New(), models.ClassificationClassified, "owns refunds", 0, nil))
+
+	alex := "Alex Kim"
+	u2, m2 := classMember(t, f.l.db, f.l.ws, &alex, "alex@test.local", "active")
+	f.api.withClaims(classClaims(u2, m2))
+	out := f.classify(f.workload, classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 1, nil))
+	if digs(out, "data", "classification") != models.ClassificationClassified || num(out, "data", "classification_version") != 2 ||
+		digs(out, "data", "decision", "decided_by", "display") != "Alex Kim" ||
+		digs(out, "data", "decision", "id") == digs(first, "data", "decision", "id") {
+		t.Fatalf("replacement = %v, want a new classified_agent decision @2 by Alex Kim", out)
+	}
+	var row models.IGAWorkloadClassification
+	f.l.db.Raw(`SELECT * FROM iga_workload_classification WHERE id = ?`, classUUID(t, digs(out, "data", "decision", "id"))).Scan(&row)
+	if row.Previous != models.ClassificationClassified || row.AgainstVersion != 1 || row.ResultVersion != 2 ||
+		row.UndoesDecisionID != nil || row.DecidedByUserID != u2 {
+		t.Fatalf("replacement row = %+v, want previous classified_agent, 1 -> 2, no undo, by Alex", row)
+	}
+	classWant(t, "after the replacement", f.state(f.workload),
+		classState{Classification: models.ClassificationClassified, Version: 2, Decisions: 2, Seq: 2})
+}
+
+// D-30's order. After the lock and the operation lookup: provider-native
+// (422), then the version (409 with the current decision), and ONLY THEN the
+// decision rules (422 invalid_decision): unclassified on a workload that is
+// not classified_agent, an undo that does not name this workload's latest
+// decision (naming none included), a classify that names a decision to undo,
+// and a retired workload. None of them writes.
+//
+// Safeguards: each rule, and the rules' position after the version check -- a
+// stale client is told what changed, not that its request makes no sense
+// against a state it never saw.
+func TestP2ClassDecisionRulesComeAfterTheVersion(t *testing.T) {
+	f := classSetup(t, "p2-class-rules")
+	someID := uuid.New()
+
+	// Unclassified on an unclassified workload: 422 at the right version, 409
+	// at a wrong one.
+	st, out := f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 0, &someID))
 	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
-		t.Fatalf("classify an already classified workload = %d %v, want 422 invalid_decision", st, out)
+		t.Fatalf("unclassified on an unclassified workload = %d %v, want 422 invalid_decision", st, out)
+	}
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 3, &someID))
+	if st != http.StatusConflict || errCode(out) != "classification_conflict" {
+		t.Fatalf("the same at a stale version = %d %v, want 409 (the version before the rules)", st, out)
+	}
+	// A classify naming a decision to undo.
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "classify", 0, &someID))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
+		t.Fatalf("classified_agent naming a decision to undo = %d %v, want 422 invalid_decision", st, out)
+	}
+	classWant(t, "after the refused requests", f.state(f.workload),
+		classState{Classification: models.ClassificationUnclassified, Version: 0, Decisions: 0, Seq: 0})
+
+	first := f.classify(f.workload, classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 0, nil))
+	firstID := classUUID(t, digs(first, "data", "decision", "id"))
+	// An undo naming no decision, or one that is not the latest.
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, nil))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
+		t.Fatalf("an undo naming no decision = %d %v, want 422 invalid_decision", st, out)
+	}
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, &someID))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
+		t.Fatalf("an undo naming an unknown decision = %d %v, want 422 invalid_decision", st, out)
+	}
+	classWant(t, "after the refused undos", f.state(f.workload),
+		classState{Classification: models.ClassificationClassified, Version: 1, Decisions: 1, Seq: 1})
+	// The workload's own column is the authority for "not classified_agent",
+	// not its decision history: with the column unclassified (drift the
+	// projector must never cause), even an undo naming the latest
+	// classified_agent decision is refused.
+	f.l.db.Exec(`UPDATE iga_workload SET classification = 'unclassified' WHERE id = ?`, f.workload)
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, &firstID))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
+		t.Fatalf("an undo on a workload whose column says unclassified = %d %v, want 422 invalid_decision", st, out)
+	}
+	f.l.db.Exec(`UPDATE iga_workload SET classification = 'classified_agent' WHERE id = ?`, f.workload)
+
+	// Provider-native comes BEFORE the version: 422 whatever version is sent.
+	agent := f.insertWorkload("support-agent", "bedrock_agent", models.ClassificationProviderAgent)
+	st, out = f.post(agent, classBody(uuid.New(), models.ClassificationClassified, "it is an agent", 7, nil))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "provider_native" {
+		t.Fatalf("a provider-native agent at a wrong version = %d %v, want 422 provider_native", st, out)
 	}
 
-	retired := classInsertWorkload(t, f.l, "old-handler", "lambda_function", models.ClassificationUnclassified)
-	f.l.db.Exec(`UPDATE iga_workload SET lifecycle = 'retired', retired_reason = 'not_seen' WHERE id = ?`, retired)
-	st, out = f.post(retired, good())
+	// A retired workload: 409 at a wrong version, 422 at the right one. A
+	// retry of an operation that landed before it retired still replays: the
+	// lookup comes before every rule.
+	old := f.insertWorkload("old-handler", "lambda_function", models.ClassificationUnclassified)
+	landed := classBody(uuid.New(), models.ClassificationClassified, "handles refunds", 0, nil)
+	oldID := classUUID(t, digs(f.classify(old, landed), "data", "decision", "id"))
+	if err := f.l.db.Exec(`UPDATE iga_workload SET lifecycle = 'retired', retired_reason = 'not_seen' WHERE id = ?`, old).Error; err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	st, out = f.post(old, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 0, &oldID))
+	if st != http.StatusConflict || errCode(out) != "classification_conflict" {
+		t.Fatalf("a retired workload at a stale version = %d %v, want 409", st, out)
+	}
+	st, out = f.post(old, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, &oldID))
 	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
-		t.Fatalf("classify a retired workload = %d %v, want 422 invalid_decision", st, out)
+		t.Fatalf("an undo on a retired workload = %d %v, want 422 invalid_decision", st, out)
 	}
-	if n := f.state(retired).Decisions; n != 0 {
-		t.Fatalf("a retired workload got %d decisions", n)
+	st, out = f.post(old, classBody(uuid.New(), models.ClassificationClassified, "replace", 1, nil))
+	if st != http.StatusUnprocessableEntity || errCode(out) != "invalid_decision" {
+		t.Fatalf("a classify on a retired workload = %d %v, want 422 invalid_decision", st, out)
 	}
+	st, out = f.post(old, landed)
+	if st != http.StatusOK || dig(out, "data", "replayed") != true {
+		t.Fatalf("a retry after the workload retired = %d %v, want 200 replayed", st, out)
+	}
+	classWant(t, "the retired workload", f.state(old),
+		classState{Classification: models.ClassificationClassified, Version: 1, Decisions: 1, Seq: 2})
 	// Its history is still served: a detail route returns retired objects.
-	st, out = f.api.get(f.path(retired))
-	if st != http.StatusOK || len(digl(out, "data")) != 0 {
-		t.Fatalf("history of a retired workload = %d %v, want 200 and an empty list", st, out)
+	st, out = f.api.get(f.path(old))
+	if st != http.StatusOK || len(digl(out, "data")) != 1 {
+		t.Fatalf("history of a retired workload = %d %v, want 200 and its one decision", st, out)
 	}
 }
 
@@ -593,6 +735,42 @@ func TestP2ClassRequiresAVerifiedHuman(t *testing.T) {
 	if by != f.user || digs(out, "data", "decision", "decided_by", "user_id") != f.user.String() {
 		t.Fatalf("decided_by = %s / %v, want the member's USER id %s", by, dig(out, "data", "decision", "decided_by"), f.user)
 	}
+}
+
+// The actor rule's failures are refusals (403); a DATABASE failure while
+// checking the membership is not a refusal -- it is 500 internal, so an outage
+// is never reported to a person as "you may not" -- and can_classify is then
+// an error, never a guessed true or false.
+//
+// Safeguard: verifiedHuman and classifyCaller map only errNotWorkspaceHuman to
+// 403 / false. Here the controller's database is a closed pool.
+func TestP2ClassMembershipCheckFailureIs500(t *testing.T) {
+	f := classSetup(t, "p2-class-db-error")
+	bad, err := gorm.Open(postgres.Open(os.Getenv("IGA_TEST_DSN")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	sqlDB, _ := bad.DB()
+	sqlDB.Close()
+	lab := *f.l
+	lab.db = bad
+	api := lab.api()
+	api.withClaims(classClaims(f.user, f.member))
+	st, out := api.do(http.MethodPost, f.path(f.workload), classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 0, nil))
+	if st != http.StatusInternalServerError || errCode(out) != "internal" {
+		t.Fatalf("a decision whose membership check cannot run = %d %v, want 500 internal", st, out)
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	for k, v := range classClaims(f.user, f.member) {
+		c.Set(k, v)
+	}
+	c.Set("claims", jwt.MapClaims{"scope": "iga:review"})
+	if _, err := api.ctl.ClassificationCapabilityForTest(c, f.l.ws, models.ClassificationUnclassified, models.IGALifecycleActive); err == nil {
+		t.Fatal("can_classify with the membership check failing = no error, want the request's 500")
+	}
+	classWant(t, "after the failed check", f.state(f.workload),
+		classState{Classification: models.ClassificationUnclassified, Version: 0, Decisions: 0, Seq: 0})
 }
 
 // E14: a workload id from another workspace is 404 on both routes -- for a
@@ -682,13 +860,17 @@ func TestP2ClassClockAndListingChanged(t *testing.T) {
 	}
 
 	// No movement on a replay, a 409 or a 422.
+	id := classUUID(t, digs(out, "data", "decision", "id"))
 	f.classify(f.workload, body)
-	f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "stale", 0, nil))
-	f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "same", 1, nil))
+	if st, out := f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "stale", 0, nil)); st != http.StatusConflict {
+		t.Fatalf("stale decision = %d %v, want 409", st, out)
+	}
+	if st, out := f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "undoing?", 1, &id)); st != http.StatusUnprocessableEntity {
+		t.Fatalf("a classify naming a decision to undo = %d %v, want 422", st, out)
+	}
 	if s := seqNow(); s != 1 {
 		t.Fatalf("seq after a replay, a 409 and a 422 = %d, want still 1", s)
 	}
-	id := classUUID(t, digs(out, "data", "decision", "id"))
 	f.classify(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "undo", 1, &id))
 	if s := seqNow(); s != 2 {
 		t.Fatalf("seq after the second decision = %d, want 2", s)
@@ -831,6 +1013,27 @@ func TestP2ClassLatestDecisionForTheDetail(t *testing.T) {
 			t.Errorf("latest decision JSON lacks %q: %s", k, raw)
 		}
 	}
+
+	// "Latest" is by result_version, never decided_at: decided_at is the
+	// transaction's START, so two decisions serialized on the lock can carry
+	// start times in either order. Give the older decision the later start
+	// time; the latest, the history order and an undo check are unchanged.
+	if err := f.l.db.Exec(`UPDATE iga_workload_classification SET decided_at = now() + interval '1 hour' WHERE id = ?`, id).Error; err != nil {
+		t.Fatalf("move decided_at: %v", err)
+	}
+	if d := latest(); d == nil || d.OperationID != undoOp {
+		t.Fatalf("latest after decided_at moved = %+v, want still the undo (result_version 2)", d)
+	}
+	st, hist := f.api.get(f.path(f.workload))
+	mustStatus(t, "history", st, hist, http.StatusOK)
+	if items := digl(hist, "data"); len(items) != 2 || num(items[0], "result_version") != 2 {
+		t.Fatalf("history after decided_at moved = %v, want the undo first", hist)
+	}
+	// The 409's current decision is the latest one too.
+	st, out = f.post(f.workload, classBody(uuid.New(), models.ClassificationClassified, "stale", 0, nil))
+	if st != http.StatusConflict || digs(out, "error", "current", "reason") != "undo" {
+		t.Fatalf("409 current after decided_at moved = %d %v, want the undo's reason", st, out)
+	}
 }
 
 // History paging: keyset on result_version, newest first; the cursor is bound
@@ -854,13 +1057,112 @@ func TestP2ClassHistoryPages(t *testing.T) {
 	if items := digl(p2, "data"); len(items) != 1 || num(items[0], "result_version") != 1 || dig(p2, "meta", "next_cursor") != nil {
 		t.Fatalf("page 2 = %v, want version 1 and no cursor", p2)
 	}
-	other := classInsertWorkload(t, f.l, "cs-handler-b", "lambda_function", models.ClassificationUnclassified)
+	other := f.insertWorkload("cs-handler-b", "lambda_function", models.ClassificationUnclassified)
 	st, bad := f.api.get(f.path(other) + qs("cursor", next))
 	if st != http.StatusBadRequest || errCode(bad) != "cursor_invalid" {
 		t.Fatalf("another workload's history cursor = %d %v, want 400 cursor_invalid", st, bad)
 	}
 	if st, bad := f.api.get(f.path(f.workload) + qs("limit", "0")); st != http.StatusBadRequest {
 		t.Fatalf("limit=0 = %d %v, want 400", st, bad)
+	}
+}
+
+// D-33: the history runs under §5.1 like every route. meta carries the
+// revision; rev pins it; a cursor carries the revision it was issued at, and
+// after a new publication both are 409 revision_stale -- although no decision
+// is part of a revision. An unknown parameter is 400 naming it (D-75).
+//
+// Safeguards: the Pin (rev and the cursor's rev) passed to Read, and the
+// parameter allowlist.
+func TestP2ClassHistoryIsRevisionBound(t *testing.T) {
+	f := classSetup(t, "p2-class-history-rev")
+	out := f.classify(f.workload, classBody(uuid.New(), models.ClassificationClassified, "one", 0, nil))
+	id := classUUID(t, digs(out, "data", "decision", "id"))
+	f.classify(f.workload, classBody(uuid.New(), models.ClassificationUnclassified, "two", 1, &id))
+
+	st, p1 := f.api.get(f.path(f.workload) + qs("limit", "1"))
+	mustStatus(t, "page 1", st, p1, http.StatusOK)
+	rev := num(p1, "meta", "rev")
+	next := digs(p1, "meta", "next_cursor")
+	if rev < 1 || digs(p1, "meta", "graph_state") != igaread.GraphPublished || next == "" {
+		t.Fatalf("page 1 meta = %v, want the current rev, published, and a cursor", dig(p1, "meta"))
+	}
+	if st, out := f.api.get(f.path(f.workload) + qs("rev", strconv.FormatInt(rev, 10))); st != http.StatusOK {
+		t.Fatalf("rev=%d (current) = %d %v, want 200", rev, st, out)
+	}
+	if st, out := f.api.get(f.path(f.workload) + qs("rev", strconv.FormatInt(rev+1, 10))); st != http.StatusConflict ||
+		errCode(out) != "revision_stale" {
+		t.Fatalf("rev=%d (not current) = %d %v, want 409 revision_stale", rev+1, st, out)
+	}
+	for param, v := range map[string]string{"decision": "classified_agent", "sort": "decided_at", "rev": "abc"} {
+		st, out := f.api.get(f.path(f.workload) + qs(param, v))
+		if st != http.StatusBadRequest || errCode(out) != "invalid_parameter" || digs(out, "error", "parameter") != param {
+			t.Errorf("%s=%s = %d %v, want 400 invalid_parameter on %s", param, v, st, out, param)
+		}
+	}
+
+	// A new publication: the role gains a policy and the account is scanned
+	// and projected again.
+	f.acct.attach("refund-lambda-role", f.acct.managed("TicketReadAgain", docTicketRead))
+	f.l.scanAndProject(f.acct)
+	var cur int64
+	f.l.db.Raw(`SELECT max(rev) FROM iga_publication WHERE workspace_id = ?`, f.l.ws).Scan(&cur)
+	if cur <= rev {
+		t.Fatalf("the rescan did not publish: rev %d -> %d", rev, cur)
+	}
+	st, stale := f.api.get(f.path(f.workload) + qs("limit", "1", "cursor", next))
+	if st != http.StatusConflict || errCode(stale) != "revision_stale" || num(stale, "error", "requested_rev") != rev {
+		t.Fatalf("a cursor from rev %d after rev %d published = %d %v, want 409 revision_stale", rev, cur, st, stale)
+	}
+	if st, out := f.api.get(f.path(f.workload) + qs("rev", strconv.FormatInt(rev, 10))); st != http.StatusConflict {
+		t.Fatalf("rev=%d after rev %d published = %d %v, want 409", rev, cur, st, out)
+	}
+	// Restarting from page one works, at the new revision.
+	st, again := f.api.get(f.path(f.workload) + qs("limit", "1"))
+	if st != http.StatusOK || num(again, "meta", "rev") != cur || len(digl(again, "data")) != 1 {
+		t.Fatalf("page 1 after the publication = %d %v, want 200 at rev %d", st, again, cur)
+	}
+}
+
+// D-6: only a workload the graph routes can read -- an AWS row with a support
+// row -- may be decided about or have its history read. An AWS row nothing
+// supports, or a row of another provider, is 404 on both routes, with no hint
+// and nothing written.
+//
+// Safeguards: the support-row and provider conditions in the locking SELECT
+// and in ClassificationWorkloadReadable.
+func TestP2ClassUnreadableWorkloadIs404(t *testing.T) {
+	f := classSetup(t, "p2-class-unreadable")
+	unsupported := f.insertWorkload("orphan", "lambda_function", models.ClassificationUnclassified)
+	f.l.db.Exec(`DELETE FROM iga_object_support WHERE workload_id = ?`, unsupported)
+	github := f.insertWorkload("gh-runner", "lambda_function", models.ClassificationUnclassified)
+	f.l.db.Exec(`UPDATE iga_workload SET provider = 'github' WHERE id = ?`, github)
+
+	for name, w := range map[string]uuid.UUID{"an unsupported AWS row": unsupported, "a GitHub row": github} {
+		st, out := f.post(w, classBody(uuid.New(), models.ClassificationClassified, "handles tier-1 tickets", 0, nil))
+		if st != http.StatusNotFound || errCode(out) != "not_found" {
+			t.Errorf("POST on %s = %d %v, want 404", name, st, out)
+		}
+		st, out = f.api.get(f.path(w))
+		if st != http.StatusNotFound || errCode(out) != "not_found" {
+			t.Errorf("GET history of %s = %d %v, want 404", name, st, out)
+		}
+		classWant(t, name, f.state(w),
+			classState{Classification: models.ClassificationUnclassified, Version: 0, Decisions: 0, Seq: 0})
+	}
+}
+
+// D-4: with nothing published there is no workload to read. Here a supported
+// AWS row stands in for one -- the projector never leaves a workload without
+// a publication -- and its history is still 404, never a list at no revision.
+//
+// Safeguard: the published check in GetWorkloadClassification.
+func TestP2ClassHistoryNothingPublishedIs404(t *testing.T) {
+	l := newP2Lab(t, "p2-class-unpublished", true)
+	f := &classFixture{t: t, l: l, acct: l.account(accountA), api: l.api()}
+	w := f.insertWorkload("early", "lambda_function", models.ClassificationUnclassified)
+	if st, out := f.api.get(f.path(w)); st != http.StatusNotFound || errCode(out) != "not_found" {
+		t.Fatalf("history with nothing published = %d %v, want 404 (D-4)", st, out)
 	}
 }
 
@@ -906,6 +1208,45 @@ func TestP2ClassCanClassifyCaller(t *testing.T) {
 		igaread.CanClassify(both, models.ClassificationProviderAgent, models.IGALifecycleActive) ||
 		igaread.CanClassify(caller(human, readOnly), models.ClassificationUnclassified, models.IGALifecycleActive) {
 		t.Fatal("CanClassify disagrees with its inputs")
+	}
+
+	// The value the workload detail states (D-83), end to end over the
+	// controller: true only for a verified human with iga:review on an active,
+	// non-provider-native workload.
+	capability := func(claims map[string]string, jwtClaims jwt.MapClaims, classification, lifecycle string) bool {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		for k, v := range claims {
+			c.Set(k, v)
+		}
+		c.Set("claims", jwtClaims)
+		got, err := f.api.ctl.ClassificationCapabilityForTest(c, f.l.ws, classification, lifecycle)
+		if err != nil {
+			t.Fatalf("classificationCapability: %v", err)
+		}
+		return got
+	}
+	suspended := "Sam Suspended"
+	su, sm := classMember(t, f.l.db, f.l.ws, &suspended, "sam@test.local", "suspended")
+	for _, tc := range []struct {
+		name           string
+		claims         map[string]string
+		jwt            jwt.MapClaims
+		classification string
+		lifecycle      string
+		want           bool
+	}{
+		{"reviewer, unclassified", human, review, models.ClassificationUnclassified, models.IGALifecycleActive, true},
+		{"reviewer, classified (undo, replace)", human, review, models.ClassificationClassified, models.IGALifecycleActive, true},
+		{"reviewer, provider-native", human, review, models.ClassificationProviderAgent, models.IGALifecycleActive, false},
+		{"reviewer, retired", human, review, models.ClassificationUnclassified, models.IGALifecycleRetired, false},
+		{"member without iga:review", human, readOnly, models.ClassificationUnclassified, models.IGALifecycleActive, false},
+		{"suspended member with iga:review", classClaims(su, sm), review, models.ClassificationUnclassified, models.IGALifecycleActive, false},
+		{"machine token with iga:review", map[string]string{"client_id": "ci-bot"}, review, models.ClassificationUnclassified, models.IGALifecycleActive, false},
+	} {
+		if got := capability(tc.claims, tc.jwt, tc.classification, tc.lifecycle); got != tc.want {
+			t.Errorf("%s: can_classify = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

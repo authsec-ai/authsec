@@ -284,26 +284,52 @@ func HistoryCursorContext(ws, workloadID uuid.UUID) CursorContext {
 	return CursorContext{WS: ws, Route: HistoryRoute(workloadID), Filter: "", Sort: "-result_version"}
 }
 
-// HistoryCursor issues the cursor after the page ending at k. Rev is left 0
-// and is never checked: the history is not part of a revision (D-33), so a
-// publication between pages does not invalidate it.
-func (r *Reader) HistoryCursor(ws, workloadID uuid.UUID, k HistoryKey) string {
+// HistoryCursor issues the cursor after the page ending at k, read at
+// revision rev.
+//
+// The history runs under §5.1 like every route (D-33): the cursor carries the
+// revision it was issued at, and the next page passes it as Pin.CursorRev, so
+// a publication between pages is 409 revision_stale -- the one stale status --
+// even though no decision is part of a revision. It carries no
+// classification_seq: the history neither filters nor sorts on
+// classification, and a new decision's result_version is higher than every
+// existing one, so it lands above page one and never shifts a later page.
+func (r *Reader) HistoryCursor(ws, workloadID uuid.UUID, rev int64, k HistoryKey) string {
 	cc := HistoryCursorContext(ws, workloadID)
 	key, _ := json.Marshal(k.ResultVersion)
-	return r.SignCursor(Cursor{WS: ws, Route: cc.Route, Filter: cc.Filter, Sort: cc.Sort, Key: key, ID: k.ID})
+	return r.SignCursor(Cursor{WS: ws, Rev: rev, Route: cc.Route, Filter: cc.Filter, Sort: cc.Sort, Key: key, ID: k.ID})
 }
 
-// OpenHistoryCursor verifies a history cursor for this workload.
-func (r *Reader) OpenHistoryCursor(token string, ws, workloadID uuid.UUID) (*HistoryKey, *Error) {
+// OpenHistoryCursor verifies a history cursor for this workload and returns
+// its position and the revision it was issued at (for Pin.CursorRev).
+func (r *Reader) OpenHistoryCursor(token string, ws, workloadID uuid.UUID) (*HistoryKey, int64, *Error) {
 	c, e := r.OpenCursor(token, HistoryCursorContext(ws, workloadID))
 	if e != nil {
-		return nil, e
+		return nil, 0, e
 	}
 	var v int64
 	if err := json.Unmarshal(c.Key, &v); err != nil {
-		return nil, CursorInvalid("Malformed cursor.")
+		return nil, 0, CursorInvalid("Malformed cursor.")
 	}
-	return &HistoryKey{ResultVersion: v, ID: c.ID}, nil
+	return &HistoryKey{ResultVersion: v, ID: c.ID}, c.Rev, nil
+}
+
+// ClassificationWorkloadReadable reports whether workloadID is a workload the
+// classification routes may serve in this snapshot: this workspace's, an AWS
+// row the projector owns -- with at least one support row (D-6) -- in any
+// lifecycle (§5.2 "Retired objects": a detail route returns retired objects).
+// Anything else is 404 with no hint. It is the read-side twin of the
+// decision transaction's locking SELECT, which applies the same condition.
+func ClassificationWorkloadReadable(q *Query, workloadID uuid.UUID) (bool, error) {
+	var found []uuid.UUID
+	if err := q.DB().Raw(`SELECT w.id FROM iga_workload w
+		WHERE w.workspace_id = ? AND w.id = ? AND w.provider = 'aws'
+		  AND EXISTS (SELECT 1 FROM iga_object_support s
+		               WHERE s.workspace_id = w.workspace_id AND s.workload_id = w.id)`,
+		q.WS, workloadID).Scan(&found).Error; err != nil {
+		return false, err
+	}
+	return len(found) == 1, nil
 }
 
 // ClassificationHistory reads one page of a workload's decisions, newest
@@ -380,7 +406,14 @@ func ClassificationSeq(q *Query) (int64, error) {
 //
 // Lists that neither filter nor sort on classification must NOT call this:
 // they show each row's classification as of the request and are unaffected by
-// decisions.
+// decisions. A classification FACET alone does not bind either (D-83): its
+// counts are as of each page's snapshot, and a decision between pages moves
+// no row across a page boundary unless the rows are chosen or ordered by it.
+//
+// How a list uses the pair:
+//
+//	first page (no cursor):  seq, err := ClassificationSeq(q)   -> next cursor's ClassSeq = &seq
+//	later page (cursor c):   err := CheckClassificationSeq(q, c) -> next cursor's ClassSeq = c.ClassSeq
 func CheckClassificationSeq(q *Query, c *Cursor) error {
 	if c == nil {
 		return nil
@@ -421,8 +454,9 @@ type ClassifyCaller struct {
 //   - that is not provider-native (422 provider_native, never human-editable).
 //
 // Anything else -- including a classification value this build does not
-// know -- is false. The POST remains the enforcement; this only decides
-// whether to offer.
+// know -- is false, and it is always stated, never absent (D-83). It belongs
+// on the workload detail only. The POST remains the enforcement; this only
+// decides whether to offer.
 func CanClassify(caller ClassifyCaller, classification, lifecycle string) bool {
 	if !caller.Human || !caller.CanReview || lifecycle != models.IGALifecycleActive {
 		return false

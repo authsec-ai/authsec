@@ -81,6 +81,20 @@ func (ctl *IGAGraphReadController) classifyCaller(c *gin.Context, ws uuid.UUID) 
 	return caller, nil
 }
 
+// classificationCapability is meta.capabilities.can_classify for one workload
+// (D-83): classifyCaller's two facts about the caller, then igaread.CanClassify
+// over the workload's classification and lifecycle as the detail read them.
+// The workload detail (GET /workloads/:id) calls it once per request and
+// always states the answer; a database error while checking the membership is
+// the request's 500, never a false or a true.
+func (ctl *IGAGraphReadController) classificationCapability(c *gin.Context, ws uuid.UUID, classification, lifecycle string) (bool, error) {
+	caller, err := ctl.classifyCaller(c, ws)
+	if err != nil {
+		return false, err
+	}
+	return igaread.CanClassify(caller, classification, lifecycle), nil
+}
+
 // classifyBody is the POST body (§5.5). Pointers tell "absent" from a zero
 // value: expected_version 0 is a real version, and a missing one is 400.
 type classifyBody struct {
@@ -176,46 +190,66 @@ func (ctl *IGAGraphReadController) ClassifyWorkload(c *gin.Context) {
 	})
 }
 
+// classHistoryParams are the only parameters the history accepts: it has no
+// filters, sorts or facets (D-33), and an unknown parameter is 400 naming it
+// rather than silently ignored (D-75), so a client never believes a filter
+// applied that did not.
+var classHistoryParams = map[string]bool{"limit": true, "cursor": true, "rev": true}
+
 // GetWorkloadClassification handles GET /workloads/:id/classification: the
-// workload's decision history, newest first by result_version (D-33), 100 per
-// page (limit 1-200), keyset cursor.
+// workload's decision history, newest first by result_version (D-33), in the
+// §5.2 list envelope (D-77): 100 per page, limit 1-200, keyset cursor.
 //
-// Classification is not part of a revision, so the history is read in the
-// request's snapshot but NOT bound to a revision: rev is not checked, and a
-// publication between pages does not invalidate the cursor. A retired
-// workload's history is served like any other detail (§5.2 "Retired
-// objects"); a workload not in this workspace is 404.
+// It runs under §5.1 like every route (D-33): a stale rev, or a cursor issued
+// at an older revision, is 409 revision_stale, although no decision is part of
+// a revision. Nothing published is 404 (D-4: no workload can exist before the
+// first publication). A retired workload's history is served like any other
+// detail (§5.2 "Retired objects"); a workload the graph routes cannot read
+// (another workspace's, or not the projector's, D-6) is 404.
 func (ctl *IGAGraphReadController) GetWorkloadClassification(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
 		id, e := igaread.RouteID(igaread.RefWorkload, c.Param("id"))
 		if e != nil {
 			return nil, e
 		}
+		vals := c.Request.URL.Query()
+		for k := range vals {
+			if !classHistoryParams[k] {
+				return nil, igaread.InvalidParameter(k, "unknown parameter "+k+": the classification history accepts only limit, cursor and rev")
+			}
+		}
 		limit := igaread.DefaultLimit
-		if l := c.Query("limit"); l != "" {
+		if l := vals.Get("limit"); l != "" {
 			n, err := strconv.Atoi(l)
 			if err != nil || n < 1 || n > igaread.MaxLimit {
 				return nil, igaread.InvalidParameter("limit", "limit must be 1-200")
 			}
 			limit = n
 		}
+		rev, e := igaread.ParseRev(vals)
+		if e != nil {
+			return nil, e
+		}
+		pin := igaread.Pin{Rev: rev}
 		var after *igaread.HistoryKey
-		if tok := c.Query("cursor"); tok != "" {
-			k, e := g.Reader.OpenHistoryCursor(tok, g.WS, id)
+		if tok := vals.Get("cursor"); tok != "" {
+			k, cursorRev, e := g.Reader.OpenHistoryCursor(tok, g.WS, id)
 			if e != nil {
 				return nil, e
 			}
-			after = k
+			after, pin.CursorRev = k, &cursorRev
 		}
 
 		var env igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{}, func(q *igaread.Query) error {
-			var found []uuid.UUID
-			if err := q.DB().Raw(`SELECT id FROM iga_workload
-				WHERE workspace_id = ? AND id = ? AND provider = 'aws'`, q.WS, id).Scan(&found).Error; err != nil {
+		err := g.Reader.Read(c.Request.Context(), g.WS, pin, func(q *igaread.Query) error {
+			if !q.Published() {
+				return igaread.NotFound()
+			}
+			ok, err := igaread.ClassificationWorkloadReadable(q, id)
+			if err != nil {
 				return err
 			}
-			if len(found) == 0 {
+			if !ok {
 				return igaread.NotFound()
 			}
 			items, next, err := igaread.ClassificationHistory(q, id, after, limit)
@@ -224,7 +258,7 @@ func (ctl *IGAGraphReadController) GetWorkloadClassification(c *gin.Context) {
 			}
 			meta := igaread.NewListMeta(q, limit)
 			if next != nil {
-				tok := g.Reader.HistoryCursor(q.WS, id, *next)
+				tok := g.Reader.HistoryCursor(q.WS, id, q.Rev.Rev, *next)
 				meta.NextCursor = &tok
 			}
 			n, known, err := q.CountUpTo(func(tx *gorm.DB) *gorm.DB {

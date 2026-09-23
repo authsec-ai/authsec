@@ -100,3 +100,9 @@ func HumanActorForTest(c *gin.Context, db *gorm.DB, ws uuid.UUID) (string, error
 func (ctl *IGAGraphReadController) ClassifyCallerForTest(c *gin.Context, ws uuid.UUID) (igaread.ClassifyCaller, error) {
 	return ctl.classifyCaller(c, ws)
 }
+
+// ClassificationCapabilityForTest exposes classificationCapability, the
+// can_classify value the workload detail states, for the same reason.
+func (ctl *IGAGraphReadController) ClassificationCapabilityForTest(c *gin.Context, ws uuid.UUID, classification, lifecycle string) (bool, error) {
+	return ctl.classificationCapability(c, ws, classification, lifecycle)
+}
