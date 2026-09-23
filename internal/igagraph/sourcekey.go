@@ -67,28 +67,21 @@ func EndpointKey(ci models.CloudIdentity) string {
 }
 
 // WorkloadKey is the recognition key of a runtime: its ARN, CONSTRUCTED where
-// the collector stores a bare id (EC2 instances, and a Bedrock agent or gateway
-// whose detail call failed), so the key never changes with a transient failure.
-func WorkloadKey(w models.CloudWorkload, account string) string {
-	return Key("aws", WorkloadARN(w, account))
+// the collector stores a bare id (EC2 instances, and rows a collector wrote
+// before it constructed Bedrock agent and gateway ARNs itself), so the key
+// never changes with a transient failure.
+func WorkloadKey(w models.CloudWorkload, partition, account string) string {
+	return Key("aws", WorkloadARN(w, partition, account))
 }
 
-// WorkloadARN returns the collected ARN, or constructs one from the bare id.
-func WorkloadARN(w models.CloudWorkload, account string) string {
-	if strings.HasPrefix(w.NativeID, "arn:") {
-		return w.NativeID
-	}
-	switch w.RuntimeKind {
-	case models.WorkloadEC2Instance:
-		return fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", w.Region, account, w.NativeID)
-	case models.WorkloadBedrockAgent:
-		return fmt.Sprintf("arn:aws:bedrock:%s:%s:agent/%s", w.Region, account, w.NativeID)
-	case models.WorkloadBedrockAgentCoreGW:
-		return fmt.Sprintf("arn:aws:bedrock-agentcore:%s:%s:gateway/%s", w.Region, account, w.NativeID)
-	case models.WorkloadBedrockAgentCoreRT:
-		return fmt.Sprintf("arn:aws:bedrock-agentcore:%s:%s:runtime/%s", w.Region, account, w.NativeID)
-	}
-	return w.NativeID
+// WorkloadARN returns the collected ARN, or constructs one from the bare id in
+// the connector's PARTITION ("" means aws). It delegates to
+// awsdiscovery.WorkloadARN -- the same constructor the collector keys a
+// Bedrock agent or gateway with when its detail call fails -- so a row the
+// collector keyed by a constructed ARN and a row the graph keys by one agree
+// byte for byte, in aws-us-gov and aws-cn as in aws (§1.3, T3.6).
+func WorkloadARN(w models.CloudWorkload, partition, account string) string {
+	return awsdiscovery.WorkloadARN(partition, w.RuntimeKind, w.Region, account, w.NativeID)
 }
 
 // PolicyKey is the RECOGNITION key of a policy: what it is called. Managed

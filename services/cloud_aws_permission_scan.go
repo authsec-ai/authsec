@@ -53,6 +53,10 @@ type AWSPermissionScanner struct {
 	// regional and the live path builds one client per selected region; a test
 	// double stands in for all of them.
 	eksAPI awsdiscovery.EKSAPI
+	// regionalEKS, when set, returns the EKS client for ONE region and wins
+	// over eksAPI: one double for every region cannot express "EKS is not
+	// offered in this region, and is read in that one" (T3.8).
+	regionalEKS func(region string) awsdiscovery.EKSAPI
 
 	// s3API/kmsAPI, when set, replace the real resource-policy clients.
 	s3API  awsdiscovery.S3PolicyAPI
@@ -98,6 +102,13 @@ func (s *AWSPermissionScanner) WithIAMAPI(api awsdiscovery.IAMAPI) *AWSPermissio
 // assume-role.
 func (s *AWSPermissionScanner) WithEKSAPI(api awsdiscovery.EKSAPI) *AWSPermissionScanner {
 	s.eksAPI = api
+	return s
+}
+
+// WithRegionalEKSAPI installs a per-region EKS client, bypassing assume-role;
+// it wins over WithEKSAPI. A test seam.
+func (s *AWSPermissionScanner) WithRegionalEKSAPI(f func(region string) awsdiscovery.EKSAPI) *AWSPermissionScanner {
+	s.regionalEKS = f
 	return s
 }
 
@@ -279,7 +290,7 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	// s3:GetBucketPolicy/kms:GetKeyPolicy must not have an otherwise-complete
 	// permission scan refuse to reconcile edges and grants over it.
 	resourcePolicyCount, resourcePolicyErr := s.scanResourcePolicies(ctx, workspaceID, snapshot.ConnectorID, out)
-	out.Surfaces["resource_policies"] = surfaceResult(resourcePolicyCount, resourcePolicyErr)
+	out.Surfaces[models.SurfaceResourcePolicies] = resourcePolicyCoverage(resourcePolicyCount, resourcePolicyErr) // D-93
 
 	if out.Complete {
 		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
@@ -364,11 +375,14 @@ func (s *AWSPermissionScanner) writeAssumeEdges(
 // denied) has no row to hang an edge off, and inventing one would create an
 // identity that no scan discovered.
 //
-// Returns the first listing error, else the first cluster's describe failures
-// (podIdentityCoverage: partial). Regions are independent, so one region
-// failing does not stop the others -- but any failure means this surface was
-// not fully read, which the caller turns into "not complete" so nothing gets
-// reconciled away.
+// Returns every failure, across every region and cluster, as one
+// *podIdentityFailures (nil when nothing failed). Regions are independent, so
+// one region failing does not stop the others -- but any failure means this
+// surface was not fully read, which the caller turns into "not complete" so
+// nothing gets reconciled away, and the coverage names ALL of it: how many
+// clusters and associations could not be described, and every listing that
+// failed outright (§1.4 "the report names how many"). It used to report only
+// the first error, so a second region's denial read as the first one's partial.
 func (s *AWSPermissionScanner) writePodIdentityEdges(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot, out *PermissionSnapshot,
 ) error {
@@ -385,70 +399,72 @@ func (s *AWSPermissionScanner) writePodIdentityEdges(
 		return nil
 	}
 
-	// firstErr is the first failure to LIST (a reader, the clusters, a
-	// cluster's associations): denied or throttled. detailErr is the first
-	// cluster some of whose describes failed (*PodIdentityDetailFailures):
-	// partial. The listing failure wins -- it is the larger one, and either
-	// keeps every binding this run could not read stale.
-	var firstErr, detailErr error
+	failures := newPodIdentityFailures()
 	for _, region := range regions {
 		reader, err := s.eksReaderFor(ctx, workspaceID, snapshot.ConnectorID, region)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			failures.addListing(err, "")
 			continue
 		}
 		clusters, err := reader.Clusters(ctx)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if errors.Is(err, awsdiscovery.ErrServiceNotInRegion) && len(clusters) == 0 {
+			// T3.8: EKS is not offered in this region -- nothing there to
+			// read, and nothing there claimed, so the region is skipped and
+			// costs the rest of the surface nothing (a region that listed
+			// clusters before failing is no such region, and falls through
+			// as the listing failure it is). Unless an earlier scan recorded
+			// a binding that may come from here: then a resolver failure is
+			// the likelier story, and it is reported as the failure it may be
+			// (the same guard regionalCoverage applies to compute). A
+			// connector whose every region is skipped this way holds no
+			// binding at all, so reached -- no binding in any selected
+			// region -- deletes nothing.
+			if why, blocks := s.podIdentityRegionUnread(workspaceID, snapshot.ConnectorID, region); blocks {
+				failures.addListing(err, why)
+			}
+			continue
 		}
+		failures.addClusters(err)
 		for _, cluster := range clusters {
 			assocs, err := reader.PodIdentityAssociations(ctx, cluster.Name)
-			var detail *awsdiscovery.PodIdentityDetailFailures
-			switch {
-			case err == nil:
-			case errors.As(err, &detail):
-				if detailErr == nil {
-					detailErr = err
-				}
-			default:
-				if firstErr == nil {
-					firstErr = err
-				}
-			}
-			// What WAS read is real even when some describes (or a later
-			// page) failed: written, and so confirmed by this run, while the
-			// error keeps the surface from reading reached.
+			failures.addAssociations(err)
+			// T3.6 (S3b): what WAS read is real even when some of the
+			// cluster's describes failed (*awsdiscovery.ItemFailures) --
+			// written, and confirmed, while the failures keep the surface
+			// partial and reconciliation off for the rest.
 			for _, assoc := range assocs {
-				if err := s.writePodIdentityEdge(workspaceID, snapshot, cluster, assoc, out); err != nil {
+				if err := s.writePodIdentityEdge(workspaceID, snapshot, region, cluster, assoc, out); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	if firstErr != nil {
-		return firstErr
-	}
-	return detailErr
+	return failures.err()
 }
 
-// podIdentityCoverage is eks_pod_identity's coverage: a listing that succeeded
-// with some describes failing is partial (§1.4 "a failed detail call makes its
-// surface partial"); anything else is surfaceResult's -- reached, denied or
-// throttled. Every state but reached keeps the bindings this run did not
-// confirm (§2.7).
-func podIdentityCoverage(count int, err error) models.SurfaceCoverage {
-	var detail *awsdiscovery.PodIdentityDetailFailures
-	if errors.As(err, &detail) {
-		return models.SurfaceCoverage{State: models.CloudCoveragePartial, Count: count, Error: err.Error()}
+// podIdentityRegionUnread decides whether a region whose EKS endpoint does not
+// resolve still blocks eks_pod_identity: yes when an earlier scan recorded a
+// binding that may come from it (or that cannot be checked), with the reason
+// to append to the failure; no when none ever did -- EKS is simply not
+// offered there. Never claim more than the data proves.
+func (s *AWSPermissionScanner) podIdentityRegionUnread(
+	workspaceID, connectorID uuid.UUID, region string,
+) (string, bool) {
+	prior, err := s.grants.CountPodIdentityEdges(workspaceID, connectorID, region)
+	switch {
+	case err != nil:
+		return fmt.Sprintf(" (and whether an earlier scan recorded pod identity bindings in %s could not be checked: %v)",
+			region, err), true
+	case prior > 0:
+		return fmt.Sprintf(", but %d pod identity binding(s) an earlier scan recorded may come from %s; not treated as not offered",
+			prior, region), true
 	}
-	return surfaceResult(count, err)
+	return "", false
 }
 
 // writePodIdentityEdge records one association.
 func (s *AWSPermissionScanner) writePodIdentityEdge(
-	workspaceID uuid.UUID, snapshot *IAMSnapshot,
+	workspaceID uuid.UUID, snapshot *IAMSnapshot, region string,
 	cluster awsdiscovery.EKSCluster, assoc awsdiscovery.PodIdentityAssociation,
 	out *PermissionSnapshot,
 ) error {
@@ -478,6 +494,10 @@ func (s *AWSPermissionScanner) writePodIdentityEdge(
 		// Byte-for-byte what the Kubernetes connector records for the same pod.
 		K8sRef:             strPtrOrNil(subject),
 		LastSeenGeneration: snapshot.Generation,
+		// Where the binding was read (podIdentityEdgeAttrs): the region is
+		// what lets a later scan tell "EKS is not offered there" from "a
+		// binding we recorded there cannot be read" (T3.8).
+		Attrs: podIdentityEdgeAttrs(region, cluster, assoc),
 	}
 	// KNOWN LIMITATION. uq_cloud_assume_edge_subject is
 	// (identity_id, subject_kind, subject) and does not include the issuer, so
@@ -488,6 +508,8 @@ func (s *AWSPermissionScanner) writePodIdentityEdge(
 	if _, _, err := s.grants.UpsertAssumeEdge(edge); err != nil {
 		return fmt.Errorf("record pod identity edge for %s: %w", assoc.RoleARN, err)
 	}
+	// T3.5: the association's observation (cloud_aws_collection_evidence.go).
+	s.recordPodIdentityEvidence(identity.ID, cluster, assoc, edge)
 	out.EdgesWritten++
 	out.PodIdentityEdges++
 	return nil
@@ -1205,6 +1227,9 @@ func (s *AWSPermissionScanner) eksReaderFor(
 	ctx context.Context, workspaceID, connectorID uuid.UUID, region string,
 ) (*awsdiscovery.EKSReader, error) {
 
+	if s.regionalEKS != nil {
+		return awsdiscovery.NewEKSReader(s.regionalEKS(region)), nil
+	}
 	if s.eksAPI != nil {
 		return awsdiscovery.NewEKSReader(s.eksAPI), nil
 	}
@@ -1259,6 +1284,11 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 
 	seen := make(map[string]bool, len(out.resourcePolicyCandidates))
 	checked := 0
+	// T3.7: every per-resource read is counted, so resource_policies is
+	// reached only when every read succeeded ("no policy" is a success),
+	// partial or denied otherwise -- never reached "even when every read was
+	// denied" (§1.3). See resourcePolicyCoverage (D-93).
+	reads := awsdiscovery.NewItemFailures("resource policies could not be read", false)
 	for _, c := range out.resourcePolicyCandidates {
 		if seen[c.NativeID] {
 			continue
@@ -1277,8 +1307,10 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 		default:
 			continue
 		}
+		reads.Attempt()
 		if rerr != nil {
 			log.Printf("aws permission scan: resource policy for %s: %v", c.NativeID, rerr)
+			reads.Fail(c.NativeID, resourcePolicySourceAPI(c.Kind), rerr)
 			continue
 		}
 		checked++
@@ -1287,7 +1319,7 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 		}
 		if werr := s.evidence.Record(
 			ResourceSubject(c.ResourceID), resourcePolicySourceAPI(c.Kind),
-			"resource_policies", "", time.Now(), c.NativeID,
+			models.SurfaceResourcePolicies, "", time.Now(), c.NativeID,
 			map[string]any{
 				"kind":         c.Kind,
 				"has_deny":     policy.HasDeny,
@@ -1298,7 +1330,7 @@ func (s *AWSPermissionScanner) scanResourcePolicies(
 			log.Printf("aws permission scan: resource policy evidence for %s: %v", c.NativeID, werr)
 		}
 	}
-	return checked, nil
+	return checked, reads.Err(nil)
 }
 
 // resourcePolicySourceAPI names the call each resource kind's policy came

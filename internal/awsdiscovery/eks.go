@@ -91,85 +91,79 @@ func NewEKSReader(api EKSAPI) *EKSReader { return &EKSReader{api: api} }
 //
 // DescribeCluster is a second call per cluster and is not avoidable:
 // ListClusters returns names only. The issuer is what tells two clusters apart
-// when both present the same namespace and service account name, so a cluster
-// whose describe fails is still returned -- with an empty issuer -- rather than
-// dropped. Losing the whole cluster would lose its associations too, which is a
-// worse answer than an association that cannot yet be attributed to a cluster.
+// when both present the same namespace and service account name, and it is
+// part of every pod-identity edge's identity (D-42). So a cluster whose
+// describe FAILS is left out of this run's list and the failure is RETURNED
+// (*ItemFailures, eks_pod_identity partial): its associations are then not
+// rewritten with an empty issuer -- which would re-key their edges -- and
+// partial keeps every edge they last confirmed, as stale (§1.4). It used to
+// be returned with an empty issuer while the surface read reached.
 func (r *EKSReader) Clusters(ctx context.Context) ([]EKSCluster, error) {
 	var out []EKSCluster
 	var next *string
+	details := NewItemFailures("clusters could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: eks clusters", errTooManyPages)
 		}
 		resp, err := r.api.ListClusters(ctx, &eks.ListClustersInput{NextToken: next})
 		if err != nil {
-			return out, classify(err)
+			// Named (D-71: coverage stamps the call and AWS's code), and an
+			// endpoint that does not resolve is ErrServiceNotInRegion, as for
+			// every regional listing (T3.8). eks_pod_identity is ONE surface
+			// across every region, so the caller never turns that into
+			// "unsupported" for the whole surface: it skips the one region
+			// when no binding was ever recorded there, and otherwise reports
+			// it as the failure it may be (writePodIdentityEdges).
+			return out, listErr("eks:ListClusters", err)
 		}
 		for _, name := range resp.Clusters {
-			out = append(out, r.clusterDetail(ctx, name))
+			details.Attempt()
+			cluster, derr := r.clusterDetail(ctx, name)
+			if derr != nil {
+				details.Fail(name, "eks:DescribeCluster", derr)
+				continue
+			}
+			out = append(out, cluster)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
 // clusterDetail enriches a listed cluster name with DescribeCluster.
-func (r *EKSReader) clusterDetail(ctx context.Context, name string) EKSCluster {
+func (r *EKSReader) clusterDetail(ctx context.Context, name string) (EKSCluster, error) {
 	built := EKSCluster{Name: name}
 
 	detail, err := r.api.DescribeCluster(ctx, &eks.DescribeClusterInput{Name: aws.String(name)})
-	if err != nil || detail.Cluster == nil {
-		return built
+	if err == nil && detail.Cluster == nil {
+		err = fmt.Errorf("DescribeCluster returned no cluster for %s", name)
+	}
+	if err != nil {
+		return built, err
 	}
 	built.ARN = aws.ToString(detail.Cluster.Arn)
 	if id := detail.Cluster.Identity; id != nil && id.Oidc != nil {
 		built.OIDCIssuer = issuerWithoutScheme(aws.ToString(id.Oidc.Issuer))
 	}
-	return built
+	return built, nil
 }
-
-// PodIdentityDetailFailures reports a cluster whose association LISTING
-// succeeded but some of whose per-association describes did not (§1.4: "a
-// failed detail call makes its surface partial"). Returned as
-// PodIdentityAssociations' error, BESIDE the associations that were read, so
-// no caller can take the set for whole: the scanner writes what was read and
-// reports eks_pod_identity partial, and reconciliation then keeps every
-// binding it could not read as stale instead of ending it (§2.7: could-not-look
-// is never the same as gone).
-type PodIdentityDetailFailures struct {
-	Cluster string
-	// Total is how many associations the listing named; Failed how many of
-	// them could not be described.
-	Total, Failed int
-	// First is the first failure, classify()'d, so errors.Is(err,
-	// ErrThrottled) still answers through Unwrap.
-	First error
-}
-
-func (e *PodIdentityDetailFailures) Error() string {
-	return fmt.Sprintf("%d of %d pod identity associations of cluster %s could not be described: %v",
-		e.Failed, e.Total, e.Cluster, e.First)
-}
-
-func (e *PodIdentityDetailFailures) Unwrap() error { return e.First }
 
 // PodIdentityAssociations reads one cluster's associations, resolving the role
 // for each.
 //
 // A describe that fails skips that one association -- an edge without its role
-// would be a binding pointing at nothing -- but is COUNTED: the associations
-// read are returned beside a *PodIdentityDetailFailures. It used to be skipped
-// silently while the surface still read reached, and once the pod-identity
-// can_assume partition reconciles (T4.7), that let one throttled describe END
-// the binding it had merely failed to read -- and recreate it as a new edge,
-// its history lost, on the next good scan.
+// would be a binding pointing at nothing -- and is COUNTED: the associations
+// read are returned beside an *ItemFailures error, so eks_pod_identity reads
+// partial and the skipped association's edge is kept as stale, never ended
+// (§1.4). It used to be skipped silently while the surface read reached, which
+// let reconciliation end a binding it had simply failed to read.
 func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName string) ([]PodIdentityAssociation, error) {
 	var out []PodIdentityAssociation
 	var next *string
-	failures := &PodIdentityDetailFailures{Cluster: clusterName}
+	details := NewItemFailures("pod identity associations could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: pod identity associations", errTooManyPages)
@@ -178,22 +172,17 @@ func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName str
 			ClusterName: aws.String(clusterName), NextToken: next,
 		})
 		if err != nil {
-			// The listing itself failed: the larger failure, reported as
-			// such (denied / throttled), whatever the describes did.
-			return out, classify(err)
+			return out, withCallName("eks:ListPodIdentityAssociations", err)
 		}
 		for _, summary := range resp.Associations {
 			id := aws.ToString(summary.AssociationId)
 			if id == "" {
-				continue // nothing to describe; AWS always names one
+				continue
 			}
-			failures.Total++
+			details.Attempt()
 			assoc, ok, derr := r.associationDetail(ctx, clusterName, id)
 			if derr != nil {
-				failures.Failed++
-				if failures.First == nil {
-					failures.First = classify(derr)
-				}
+				details.Fail(id, "eks:DescribePodIdentityAssociation", derr)
 				continue
 			}
 			if !ok {
@@ -202,20 +191,16 @@ func (r *EKSReader) PodIdentityAssociations(ctx context.Context, clusterName str
 			out = append(out, assoc)
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			if failures.Failed > 0 {
-				return out, failures
-			}
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
 // associationDetail resolves the role ARN, which the list response omits. An
-// error means the describe failed -- the association exists (the listing named
-// it) and was not read; ok=false with no error means AWS answered with an
-// association that cannot be bound (no role, or half a service account), which
-// is skipped as before.
+// error means the describe failed; ok=false with no error means AWS answered
+// with an association this package cannot bind (no role, or half a service
+// account), which is skipped as before.
 func (r *EKSReader) associationDetail(
 	ctx context.Context, clusterName, associationID string,
 ) (PodIdentityAssociation, bool, error) {

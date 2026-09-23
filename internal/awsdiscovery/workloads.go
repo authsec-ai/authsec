@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -92,6 +93,57 @@ type Workload struct {
 	// what the agent thinks with.
 	FoundationModel string
 	Status          string
+
+	// SourceAPI is the call that actually produced this row's data, so its
+	// evidence never names a call that did not return it: bedrock:GetAgent
+	// when the detail read succeeded, bedrock:ListAgents when only the
+	// listing did (T3.5).
+	SourceAPI string
+
+	// DetailIncomplete is true when the item was LISTED but its detail call
+	// failed (§1.3 "silent detail failures"). The row is real -- AWS listed it
+	// -- but its execution role, and whatever else only the detail call
+	// returns, is UNKNOWN this run, never "none" (D-53). DetailError names the
+	// call and the AWS error code, stably: "bedrock:GetAgent AccessDeniedException".
+	DetailIncomplete bool
+	DetailError      string
+
+	// Targets are an AgentCore gateway's targets -- attributes of the gateway,
+	// not objects (§1.4). TargetsIncomplete is true when ListGatewayTargets
+	// failed, so an empty list is unknown rather than "no targets".
+	Targets           []GatewayTarget
+	TargetsIncomplete bool
+}
+
+// WorkloadARN returns nativeID when it is already an ARN, and otherwise the
+// ARN AWS itself would have returned, built in the connector's PARTITION (aws,
+// aws-us-gov, aws-cn). The one constructor: the collector calls it for a
+// Bedrock agent or gateway whose detail call failed, and igagraph.WorkloadARN
+// calls it for an EC2 instance id, so the key a row is written under and the
+// key the graph derives from it cannot disagree (§1.3 "construct the ARN
+// deterministically").
+//
+// runtimeKind is a models.Workload* value, spelled as a string because this
+// package must not import models. With no account or region the bare id is
+// returned unchanged: an ARN built on a guessed account is worse than none.
+func WorkloadARN(partition, runtimeKind, region, account, nativeID string) string {
+	if strings.HasPrefix(nativeID, "arn:") || nativeID == "" || account == "" || region == "" {
+		return nativeID
+	}
+	if partition == "" {
+		partition = "aws"
+	}
+	switch runtimeKind {
+	case "ec2_instance":
+		return fmt.Sprintf("arn:%s:ec2:%s:%s:instance/%s", partition, region, account, nativeID)
+	case "bedrock_agent":
+		return fmt.Sprintf("arn:%s:bedrock:%s:%s:agent/%s", partition, region, account, nativeID)
+	case "bedrock_agentcore_gateway":
+		return fmt.Sprintf("arn:%s:bedrock-agentcore:%s:%s:gateway/%s", partition, region, account, nativeID)
+	case "bedrock_agentcore_runtime":
+		return fmt.Sprintf("arn:%s:bedrock-agentcore:%s:%s:runtime/%s", partition, region, account, nativeID)
+	}
+	return nativeID
 }
 
 // WorkloadReader reads one region's compute.
@@ -104,14 +156,22 @@ type WorkloadReader struct {
 	ecsAPI      ECSAPI
 	ec2API      EC2API
 	profileAPI  InstanceProfileAPI
-	profileSeen map[string]string
+	profileSeen map[string]profileAnswer
+}
+
+// profileAnswer caches one GetInstanceProfile outcome -- the failure too, so
+// every instance behind an unreadable profile is reported incomplete, not only
+// the first one that asked.
+type profileAnswer struct {
+	role string
+	err  error
 }
 
 // NewWorkloadReader constructs a reader over the given clients.
 func NewWorkloadReader(l LambdaAPI, e ECSAPI, c EC2API, p InstanceProfileAPI) *WorkloadReader {
 	return &WorkloadReader{
 		lambdaAPI: l, ecsAPI: e, ec2API: c, profileAPI: p,
-		profileSeen: map[string]string{},
+		profileSeen: map[string]profileAnswer{},
 	}
 }
 
@@ -132,7 +192,7 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 		}
 		resp, err := r.lambdaAPI.ListFunctions(ctx, &lambda.ListFunctionsInput{Marker: marker})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr("lambda:ListFunctions", err)
 		}
 		for _, fn := range resp.Functions {
 			out = append(out, Workload{
@@ -142,6 +202,7 @@ func (r *WorkloadReader) LambdaFunctions(ctx context.Context) ([]Workload, error
 				RoleARN:     aws.ToString(fn.Role),
 				EnvVarNames: lambdaEnvVarNames(fn.Environment),
 				Status:      string(fn.State),
+				SourceAPI:   "lambda:ListFunctions",
 			})
 		}
 		if resp.NextMarker == nil || *resp.NextMarker == "" {
@@ -188,6 +249,7 @@ func (r *WorkloadReader) ECSTaskDefinitions(ctx context.Context) ([]Workload, er
 	}
 	var out []Workload
 	var next *string
+	details := NewItemFailures("task definitions could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: ecs task definitions", errTooManyPages)
@@ -196,29 +258,46 @@ func (r *WorkloadReader) ECSTaskDefinitions(ctx context.Context) ([]Workload, er
 			Status: "ACTIVE", NextToken: next,
 		})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr("ecs:ListTaskDefinitions", err)
 		}
 		for _, arn := range resp.TaskDefinitionArns {
-			w, ok := r.taskDefinitionDetail(ctx, arn)
-			if !ok {
+			if arn == "" {
 				continue
 			}
-			out = append(out, w)
+			details.Attempt()
+			out = append(out, r.taskDefinitionDetail(ctx, arn, details))
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
 // taskDefinitionDetail resolves the two roles, which the list response omits.
-func (r *WorkloadReader) taskDefinitionDetail(ctx context.Context, arn string) (Workload, bool) {
+//
+// A describe that fails KEEPS the task definition, under the ARN the listing
+// returned -- ListTaskDefinitions(ACTIVE) is itself proof that it exists --
+// marked DetailIncomplete: both roles are unknown this run, never "none"
+// (D-53). It used to be dropped, silently, while ecs:<region> reported reached:
+// exactly the shape that lets reconciliation delete what it failed to read.
+func (r *WorkloadReader) taskDefinitionDetail(ctx context.Context, arn string, details *ItemFailures) Workload {
 	detail, err := r.ecsAPI.DescribeTaskDefinition(ctx, &ecs.DescribeTaskDefinitionInput{
 		TaskDefinition: aws.String(arn),
 	})
-	if err != nil || detail.TaskDefinition == nil {
-		return Workload{}, false
+	if err == nil && detail.TaskDefinition == nil {
+		err = fmt.Errorf("DescribeTaskDefinition returned no task definition for %s", arn)
+	}
+	if err != nil {
+		details.Fail(arn, "ecs:DescribeTaskDefinition", err)
+		return Workload{
+			RuntimeKind:      "ecs_task_definition",
+			NativeID:         arn,
+			Name:             taskDefinitionFamily(arn),
+			SourceAPI:        "ecs:ListTaskDefinitions",
+			DetailIncomplete: true,
+			DetailError:      DetailErrorOf("ecs:DescribeTaskDefinition", err),
+		}
 	}
 	td := detail.TaskDefinition
 	return Workload{
@@ -229,7 +308,19 @@ func (r *WorkloadReader) taskDefinitionDetail(ctx context.Context, arn string) (
 		RoleARN:          aws.ToString(td.TaskRoleArn),
 		ExecutionRoleARN: aws.ToString(td.ExecutionRoleArn),
 		Status:           string(td.Status),
-	}, true
+		SourceAPI:        "ecs:DescribeTaskDefinition",
+	}
+}
+
+// taskDefinitionFamily reads the family out of a task definition ARN
+// (".../task-definition/<family>:<revision>"), for a row whose describe failed:
+// the same value DescribeTaskDefinition would have returned as Family.
+func taskDefinitionFamily(arn string) string {
+	name := afterLastSlash(arn)
+	if i := strings.LastIndex(name, ":"); i > 0 {
+		return name[:i]
+	}
+	return name
 }
 
 // EC2Instances lists every instance in the region and resolves the role behind
@@ -246,13 +337,14 @@ func (r *WorkloadReader) EC2Instances(ctx context.Context) ([]Workload, error) {
 	}
 	var out []Workload
 	var next *string
+	details := NewItemFailures("instances could not be read in detail", true)
 	for page := 0; ; page++ {
 		if page >= maxPages {
 			return out, fmt.Errorf("%w: ec2 instances", errTooManyPages)
 		}
 		resp, err := r.ec2API.DescribeInstances(ctx, &ec2.DescribeInstancesInput{NextToken: next})
 		if err != nil {
-			return out, classify(err)
+			return out, listErr("ec2:DescribeInstances", err)
 		}
 		for _, reservation := range resp.Reservations {
 			for _, inst := range reservation.Instances {
@@ -260,48 +352,71 @@ func (r *WorkloadReader) EC2Instances(ctx context.Context) ([]Workload, error) {
 					RuntimeKind: "ec2_instance",
 					NativeID:    aws.ToString(inst.InstanceId),
 					Name:        ec2NameTag(inst.Tags),
-					Status:      string(inst.State.Name),
+					SourceAPI:   "ec2:DescribeInstances",
 				}
+				if inst.State != nil {
+					w.Status = string(inst.State.Name)
+				}
+				details.Attempt()
 				if inst.IamInstanceProfile != nil {
 					w.InstanceProfileARN = aws.ToString(inst.IamInstanceProfile.Arn)
-					w.RoleARN = r.roleForInstanceProfile(ctx, w.InstanceProfileARN)
+					role, perr := r.roleForInstanceProfile(ctx, w.InstanceProfileARN)
+					if perr != nil {
+						// The instance is real (DescribeInstances returned it); the
+						// role behind its profile is UNKNOWN, not absent (D-53).
+						details.Fail(w.NativeID, "iam:GetInstanceProfile", perr)
+						w.DetailIncomplete = true
+						w.DetailError = DetailErrorOf("iam:GetInstanceProfile", perr)
+					}
+					w.RoleARN = role
 				}
 				out = append(out, w)
 			}
 		}
 		if resp.NextToken == nil || *resp.NextToken == "" {
-			return out, nil
+			return out, details.Err(nil)
 		}
 		next = resp.NextToken
 	}
 }
 
+// errNoProfileClient: an instance names a profile and there is no IAM client
+// to resolve it with. Its role was never looked up, which is not "no role".
+var errNoProfileClient = fmt.Errorf("no iam client to resolve the instance profile")
+
 // roleForInstanceProfile resolves a profile ARN to the role it holds, caching
-// the answer. Returns "" when it cannot be resolved: an instance whose profile
-// is unreadable is still a real instance, and recording it unattributed is
-// better than dropping it.
-func (r *WorkloadReader) roleForInstanceProfile(ctx context.Context, profileARN string) string {
-	if profileARN == "" || r.profileAPI == nil {
-		return ""
+// the answer -- failures included. An error means the role is UNKNOWN; the
+// caller keeps the instance (it is still a real instance) and reports its
+// detail as incomplete. A profile that resolves and holds no role is a
+// legitimate "" with no error: that instance really has no role.
+func (r *WorkloadReader) roleForInstanceProfile(ctx context.Context, profileARN string) (string, error) {
+	if profileARN == "" {
+		return "", nil
 	}
-	if role, ok := r.profileSeen[profileARN]; ok {
-		return role
+	if r.profileAPI == nil {
+		return "", errNoProfileClient
+	}
+	if ans, ok := r.profileSeen[profileARN]; ok {
+		return ans.role, ans.err
 	}
 	name := afterLastSlash(profileARN)
 	if name == "" {
-		return ""
+		return "", nil
 	}
 	resp, err := r.profileAPI.GetInstanceProfile(ctx, &iam.GetInstanceProfileInput{
 		InstanceProfileName: aws.String(name),
 	})
-	role := ""
+	ans := profileAnswer{}
+	switch {
+	case err != nil:
+		ans.err = withCallName("iam:GetInstanceProfile", err)
 	// An instance profile holds exactly one role in practice; AWS models it as
 	// a list and has never allowed a second.
-	if err == nil && resp.InstanceProfile != nil && len(resp.InstanceProfile.Roles) > 0 {
-		role = aws.ToString(resp.InstanceProfile.Roles[0].Arn)
+	case resp.InstanceProfile != nil && len(resp.InstanceProfile.Roles) > 0:
+		ans.role = aws.ToString(resp.InstanceProfile.Roles[0].Arn)
 	}
-	r.profileSeen[profileARN] = role
-	return role
+	r.profileSeen[profileARN] = ans
+	return ans.role, ans.err
 }
 
 // ec2NameTag returns the instance's Name tag, which is where operators put the

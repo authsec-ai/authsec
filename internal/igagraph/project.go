@@ -414,11 +414,21 @@ func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.R
 // AWS row is ever written to iga_agents or iga_agent_instances (§2.2).
 func (p *Projector) projectWorkloads(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
-	account := snap.Connector.ScopeID
+	account, partition := snap.Connector.ScopeID, snap.Connector.AWSAttrs().Partition
 	for _, cw := range snap.Workloads {
-		key := WorkloadKey(cw, account)
+		key := WorkloadKey(cw, partition, account)
 		part := snap.PartitionFor(models.ObjectWorkload, cw.RuntimeKind, cw.Region)
 		live := r.existing.workload[key]
+		// D-53 / T3.6: a workload whose detail call failed has an UNKNOWN
+		// execution role, and 029 has no state for unknown -- a new row would
+		// default to 'none', "No execution role configured", a false finding.
+		// With no prior node there is nothing to protect and nothing true to
+		// say, so it is not projected this pass (its surface is partial, and
+		// coverage says how many). A prior node is confirmed as usual: the
+		// listing proves it exists.
+		if live == nil && cw.AWSAttrs().DetailIncomplete {
+			continue
+		}
 
 		row := &models.IGAWorkload{
 			WorkspaceID: snap.Run.WorkspaceID, EstateScopeID: &snap.ScopeID,
@@ -529,13 +539,21 @@ func (p *Projector) projectMemberships(tx *gorm.DB, snap *Snapshot, r *resolved)
 // (§4.6): executes_as, ECS's task_execution_role, and the execution-role state.
 func (p *Projector) projectExecution(tx *gorm.DB, snap *Snapshot, r *resolved) error {
 	now := p.now()
-	account := snap.Connector.ScopeID
+	account, partition := snap.Connector.ScopeID, snap.Connector.AWSAttrs().Partition
 	for _, w := range snap.Workloads {
 		src, ok := r.workload[w.ID]
 		if !ok {
 			continue
 		}
-		wkey := WorkloadKey(w, account)
+		// D-53 / T3.6: the detail call that names the role failed, so this run
+		// knows NOTHING about the execution identity. Leave the state as the
+		// previous pass wrote it (never 'none'), and confirm no executes_as /
+		// task_execution_role edge: unconfirmed, they go stale under the
+		// surface's partial coverage instead of being re-asserted or ended.
+		if w.AWSAttrs().DetailIncomplete {
+			continue
+		}
+		wkey := WorkloadKey(w, partition, account)
 
 		// DETERMINE THE ENDPOINT FIRST, then record what we know. The role is
 		// the one the workload ACTS AS -- never ECS's ExecutionRoleARN.

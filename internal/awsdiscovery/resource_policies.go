@@ -72,16 +72,18 @@ type ResourcePolicy struct {
 
 // resourcePolicyFrom parses a raw policy document (or its absence) into a
 // ResourcePolicy. Shared by the S3 and KMS paths, which differ only in which
-// AWS call produced the string.
-func resourcePolicyFrom(doc string, callErr error) (ResourcePolicy, error) {
-	if callErr != nil {
-		if isNoSuchPolicy(callErr) {
+// AWS call produced the string -- named, so a failed read reports its call and
+// its AWS error code, and a caller counting per-resource failures (T3.7) can
+// say "s3:GetBucketPolicy AccessDenied" rather than a bare message.
+func resourcePolicyFrom(call, doc string, readErr error) (ResourcePolicy, error) {
+	if readErr != nil {
+		if isNoSuchPolicy(readErr) {
 			// No resource policy at all is a real, common, and CLEAN answer --
 			// most buckets and keys rely on identity-based policies alone. It
 			// is not the same as a denied read, which learns nothing.
 			return ResourcePolicy{}, nil
 		}
-		return ResourcePolicy{}, classify(callErr)
+		return ResourcePolicy{}, withCallName(call, readErr)
 	}
 	stmts, _, err := ParsePolicyDocument(doc)
 	if err != nil {
@@ -126,7 +128,7 @@ func (r *ResourcePolicyReader) BucketPolicy(ctx context.Context, bucketName stri
 	if out != nil {
 		doc = aws.ToString(out.Policy)
 	}
-	return resourcePolicyFrom(doc, err)
+	return resourcePolicyFrom("s3:GetBucketPolicy", doc, err)
 }
 
 // KeyPolicy reads one KMS key's policy. keyID accepts either a bare key id or
@@ -142,5 +144,5 @@ func (r *ResourcePolicyReader) KeyPolicy(ctx context.Context, keyID string) (Res
 	if out != nil {
 		doc = aws.ToString(out.Policy)
 	}
-	return resourcePolicyFrom(doc, err)
+	return resourcePolicyFrom("kms:GetKeyPolicy", doc, err)
 }

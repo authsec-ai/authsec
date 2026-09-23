@@ -210,15 +210,12 @@ func trustIdentityID(l *p2Lab, role string) uuid.UUID {
 
 // trustPodEvidenceWriterLanded says whether T3.5's writer of the pod-identity
 // association observation (§4.8, §1.4 "observation added") is on this branch.
-// It is NOT: m1/s3b carries it (recordPodIdentityEvidence, keyed
+// It is, since m1/s3b merged into graph (recordPodIdentityEvidence, keyed
 // igagraph.PodIdentityEvidenceKey, byte-equal to PodIdentitySubjectKey --
-// pinned in internal/igagraph). Until it lands no collector writes that
-// observation, so every production pod-identity can_assume is an edge without
-// evidence and T4.9's zero cannot hold for an account with a pod association.
-// TestP2TrustPodIdentityEvidenceRatchet holds that gap at exactly its known
-// size and fails the moment it moves: flip this to true when the writer
-// merges, and the ratchet becomes T4.9's zero for pod-identity edges.
-const trustPodEvidenceWriterLanded = false
+// pinned in internal/igagraph): TestP2TrustPodIdentityEvidenceRatchet now
+// asserts T4.9's zero for pod-identity edges, and trustPodObservation writes
+// nothing.
+const trustPodEvidenceWriterLanded = true
 
 // trustPodObservation stands in for T3.5's writer ONLY while it has not
 // landed: the association's observation as that writer records it -- the

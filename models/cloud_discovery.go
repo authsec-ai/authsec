@@ -149,14 +149,18 @@ const (
 	// keep prior findings visible without claiming it re-confirmed them.
 	CloudCoverageStale = "stale"
 
-	// CloudCoverageUnsupported is a surface AuthSec has built no collector for.
+	// CloudCoverageUnsupported: nothing there is claimed, for one of two
+	// reasons (§1.4) -- the service is not offered in that region (its regional
+	// endpoint does not resolve; awsdiscovery.ErrServiceNotInRegion), or AuthSec
+	// does not collect the surface at all (organizations: SCPs are not read).
 	//
 	// Distinct from denied and from not_configured, and the distinction is the
 	// whole point: denied is the customer's to fix by granting a permission,
-	// not_configured is their deliberate choice, and unsupported is OURS to
-	// build. Collapsing them lets a gap in our product read as a gap in their
-	// estate. CloudTrail is the live example -- the role template grants it and
-	// no collector calls it.
+	// not_configured is their deliberate choice, and unsupported is neither --
+	// nobody can fix it, because there is nothing to read. Collapsing them lets
+	// a gap in our product, or in AWS's regional footprint, read as a gap in
+	// their estate. NEVER inferred from AccessDenied: an SCP or a region opt-out
+	// produces that too (§2.14.13), and a false unsupported licenses deletion.
 	CloudCoverageUnsupported = "unsupported"
 
 	// CloudCoverageNotSelected is a surface excluded from the scan's selected
@@ -279,19 +283,84 @@ const (
 // SurfaceCompute names the per-region compute stand-in surface.
 func SurfaceCompute(region string) string { return SurfaceComputePrefix + region }
 
+// The rest of the coverage vocabulary (§1.4, §4.10: "the surface names are
+// models.Surface* constants, not invented strings"). Promoted from literals in
+// the scanners so a writer and a reader cannot drift by a typo.
+const (
+	// SurfaceActivity is Access Advisor (GenerateServiceLastAccessedDetails):
+	// partial above the per-scan identity cap, throttled on throttle (T3.7).
+	SurfaceActivity = "activity"
+	// SurfaceIAMCredentialReport is the account credential report. Bonus
+	// evidence, merged only at FinalizeCoverage.
+	SurfaceIAMCredentialReport = "iam_credential_report"
+	// SurfaceResourcePolicies is the per-resource GetBucketPolicy/GetKeyPolicy
+	// read; per-resource failures are counted (T3.7), never silently reached.
+	SurfaceResourcePolicies = "resource_policies"
+	// SurfaceOrganizations is AWS Organizations and SCPs, which AuthSec does
+	// not collect. Always reported unsupported (§1.2, §1.4, T3.8), so coverage
+	// can say what that prevents instead of staying silent about it.
+	SurfaceOrganizations = "organizations"
+)
+
+// Regional surface prefixes: each is reported as "<prefix>:<region>"
+// (SurfaceRegional), one key per service per selected region (§1.4).
+const (
+	SurfaceLambdaPrefix                = "lambda"
+	SurfaceECSPrefix                   = "ecs"
+	SurfaceEC2Prefix                   = "ec2"
+	SurfaceBedrockAgentsPrefix         = "bedrock-agents"
+	SurfaceBedrockAgentCorePrefix      = "bedrock-agentcore"
+	SurfaceAgentCoreGatewaysPrefix     = "agentcore-gateways"
+	SurfaceAgentCoreIdentitiesPrefix   = "agentcore-workload-identities"
+	SurfaceAgentCoreCredProviderPrefix = "agentcore-credential-providers"
+	SurfaceCloudTrailEventsPrefix      = "cloudtrail-events"
+	SurfaceCloudTrailStatusPrefix      = "cloudtrail-status"
+)
+
+// SurfaceRegional names one service's surface in one region: "ecs:eu-west-1".
+func SurfaceRegional(prefix, region string) string { return prefix + ":" + region }
+
+// OrganizationsCoverage is the fixed entry every AWS scan reports for
+// SurfaceOrganizations. unsupported, so ScanCoverage.Complete skips it and no
+// reconciliation gate ever waits on it; the Error is AuthSec's own words
+// because there are no provider words for a call never made.
+func OrganizationsCoverage() SurfaceCoverage {
+	return SurfaceCoverage{
+		State: CloudCoverageUnsupported,
+		Error: "AWS Organizations and service control policies (SCPs) are not collected by AuthSec",
+	}
+}
+
 // SurfaceCoverage is what one scan managed against one surface.
 type SurfaceCoverage struct {
 	State string `json:"state"`
-	// Count is how many objects were read. Only meaningful when State is
-	// reached — a count from a denied surface is a floor, not a total.
+	// CappedAfter is set when a per-scan cap, not a failure, stopped the read
+	// (activity above its identity cap, T3.7): the native id of the LAST item
+	// read, in the surface's deterministic order -- byte order of the ARN
+	// (D-86). An item that sorts after it was not read this run, so its
+	// activity is "not collected", never "no attempt reported". Stamped by the
+	// collector so no reader has to re-derive the sample from a later
+	// inventory.
+	CappedAfter string `json:"capped_after,omitempty"`
+	// Count is how many objects were read. A total when State is reached; a
+	// FLOOR otherwise -- for partial, the rows that were read, with Error
+	// naming how many were not (§1.4: "the report names how many"). One
+	// exception, recorded in D-93: resource_policies counts its FAILED reads
+	// whenever it is not reached.
 	Count int `json:"count"`
-	// Error is the provider's own words when State is not reached.
+	// Error says why State is not reached: the failed call and the provider's
+	// error code, or for partial "N of M <items> could not be read: <call>
+	// <code>". Never a guessed missing permission (§2.14.13).
 	Error string `json:"error,omitempty"`
 
 	// The structured half of Error (P2-DECISIONS D-71), stamped at collection
 	// so a reader never parses the prose back into a code. All optional and
 	// additive: a run collected before they existed decodes with them empty,
 	// and the reader answers null.
+	//
+	// Two collectors stamp them: IAM through awsdiscovery.APICallError, the
+	// workload and permission scanners through awsdiscovery.CallName and
+	// AWSErrorCode (a named call). For partial, the FIRST failing call.
 	//
 	// API is the call that failed, as an operator would search for it
 	// ("iam:GetAccountAuthorizationDetails (Groups)"); ErrorCode is the code
@@ -1400,6 +1469,38 @@ type AWSWorkloadAttrs struct {
 	// not find in inventory, so an unattributed row still says which role it
 	// was looking for.
 	UnresolvedRoleARN string `json:"unresolved_role_arn,omitempty"`
+
+	// DetailIncomplete: the workload was LISTED but its detail call failed
+	// (GetAgent, DescribeTaskDefinition, GetAgentRuntime, GetGateway,
+	// GetInstanceProfile). Its execution role is UNKNOWN this run -- not
+	// absent -- so the repository keeps the previous row's attribution and
+	// attrs instead of blanking them, and the projector leaves the execution
+	// role state and edges as they were rather than writing "none" (D-53).
+	// DetailError names the call and the AWS error code.
+	DetailIncomplete bool   `json:"detail_incomplete,omitempty"`
+	DetailError      string `json:"detail_error,omitempty"`
+
+	// GatewayTargets are an AgentCore gateway's targets, which §1.4 makes
+	// ATTRIBUTES of the gateway, not objects. TargetsIncomplete is set when
+	// ListGatewayTargets failed; the previous list is then kept, never
+	// replaced by an empty one.
+	GatewayTargets    []AWSGatewayTarget `json:"gateway_targets,omitempty"`
+	TargetsIncomplete bool               `json:"targets_incomplete,omitempty"`
+}
+
+// AWSGatewayTarget is one AgentCore gateway target: id, name, status and type
+// verbatim (§1.4). Its backing tool is not collected (§1.2).
+//
+// The JSON keys are exactly the workload detail's provider_attrs shape,
+// gateway_targets [{id, name, status, type}] (D-85), so the projector copies
+// the list as stored instead of renaming keys on the way through. All four
+// keys on every target, "" when AWS returned none: the shape is the contract,
+// and a key that comes and goes with the data is not a shape.
+type AWSGatewayTarget struct {
+	TargetID string `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Type     string `json:"type"`
 }
 
 // AWSAttrs decodes the AWS attrs, returning the zero value on anything
