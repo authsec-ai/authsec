@@ -215,13 +215,29 @@ func TestP2S3bPodIdentityEvidenceIsTheAssociations(t *testing.T) {
 	if edge.Issuer != nil {
 		issuer = *edge.Issuer
 	}
-	// The behaviour first: evidence on none of the role's other edges.
+	// The behaviour first: evidence on none of the role's OTHER edges -- its
+	// grants, its assignments, its executes_as, its trust-document can_assume
+	// -- and on exactly its own pod-identity can_assume, which is that edge's
+	// evidence (§4.8; the trust projection links it since both merged).
 	linked := s3bEdgeEvidence(t, l)
 	if len(linked) == 0 {
 		t.Fatal("setup: no edge evidence at all")
 	}
-	if edge, ok := linked[o.ID]; ok {
-		t.Fatalf("the pod identity observation is linked as evidence on a %s edge of the role", edge)
+	var others, own int64
+	l.db.Raw(`SELECT
+	      (SELECT count(*) FROM iga_access_edge_evidence WHERE observation_id = ?)
+	    + (SELECT count(*) FROM iga_assignment_evidence WHERE observation_id = ?)
+	    + (SELECT count(*) FROM iga_relationship_evidence e JOIN iga_relationship r ON r.id = e.relationship_id
+	        WHERE e.observation_id = ? AND NOT (r.relationship_type = 'can_assume' AND r.mechanism = ?))`,
+		o.ID, o.ID, o.ID, models.MechanismEKSPodIdentity).Row().Scan(&others)
+	l.db.Raw(`SELECT count(*) FROM iga_relationship_evidence e JOIN iga_relationship r ON r.id = e.relationship_id
+	           WHERE e.observation_id = ? AND r.relationship_type = 'can_assume' AND r.mechanism = ?`,
+		o.ID, models.MechanismEKSPodIdentity).Row().Scan(&own)
+	if others != 0 {
+		t.Fatalf("the pod identity observation is linked as evidence on %d other edge(s) of the role", others)
+	}
+	if own != 1 {
+		t.Fatalf("the pod identity observation is evidence on %d pod-identity can_assume edge(s), want its own one (§4.8, T4.9)", own)
 	}
 	wantKey := igagraph.PodIdentityEvidenceKey(role, issuer, edge.Subject)
 	if o.IdentityID == nil || *o.IdentityID != roleID || o.Surface != models.SurfaceEKSPodIdentity ||

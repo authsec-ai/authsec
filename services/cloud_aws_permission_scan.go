@@ -55,7 +55,9 @@ type AWSPermissionScanner struct {
 	eksAPI awsdiscovery.EKSAPI
 	// regionalEKS, when set, returns the EKS client for ONE region and wins
 	// over eksAPI: one double for every region cannot express "EKS is not
-	// offered in this region, and is read in that one" (T3.8).
+	// offered in this region, and is read in that one" (T3.8), nor "this
+	// binding lives in ap-south-2 only", which a region deselection must be
+	// tested with (T2.1).
 	regionalEKS func(region string) awsdiscovery.EKSAPI
 
 	// s3API/kmsAPI, when set, replace the real resource-policy clients.
@@ -277,6 +279,33 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 		models.SurfaceOIDCProviders:  surfaceResult(len(providers), oidcErr),
 		models.SurfaceEKSPodIdentity: podIdentityCoverage(out.PodIdentityEdges, eksErr),
 	}
+
+	// Pod Identity bindings in regions this run did NOT read -- deselected
+	// since an earlier scan found them (PATCH .../connectors/:id). A region
+	// change applies from the next scan, and the scan after it must neither
+	// delete nor confirm what it never looked at: the rows are exempted from
+	// reconciliation below and the surface is not_selected, not reached, so
+	// the pod-identity partition cannot end them either (canEnd requires
+	// eks_pod_identity reached) -- they are kept and marked stale (§2.14.13
+	// l.1856-1859). Only when the EKS read itself succeeded: a failed read
+	// already reports its own state and reconciles nothing.
+	var keepEdges []uuid.UUID
+	if eksErr == nil {
+		kept, regions, err := s.unreadPodIdentityEdges(workspaceID, snapshot)
+		if err != nil {
+			return out, err
+		}
+		if len(kept) > 0 {
+			keepEdges = kept
+			out.Surfaces[models.SurfaceEKSPodIdentity] = models.SurfaceCoverage{
+				State: models.CloudCoverageNotSelected,
+				Count: out.PodIdentityEdges,
+				Error: fmt.Sprintf("not read in %s (no longer in the connector's selected scope): "+
+					"%d EKS Pod Identity binding(s) found there earlier are kept, not confirmed",
+					strings.Join(regions, ", "), len(kept)),
+			}
+		}
+	}
 	if len(out.UnreadableDocuments) > 0 || out.ParseFailures > 0 || out.StatementsSkipped > 0 {
 		out.Surfaces[models.SurfacePolicyDocuments] = policyDocumentsSurface(out, len(snapshot.TrustPolicies))
 	}
@@ -293,8 +322,8 @@ func (s *AWSPermissionScanner) ScanFromSnapshot(
 	out.Surfaces[models.SurfaceResourcePolicies] = resourcePolicyCoverage(resourcePolicyCount, resourcePolicyErr) // D-93
 
 	if out.Complete {
-		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGeneration(
-			workspaceID, snapshot.ConnectorID, snapshot.Generation)
+		edgesRemoved, permsRemoved, resRemoved, err := s.grants.ReconcileGenerationKeeping(
+			workspaceID, snapshot.ConnectorID, snapshot.Generation, keepEdges)
 		if err != nil {
 			return out, err
 		}
@@ -462,7 +491,98 @@ func (s *AWSPermissionScanner) podIdentityRegionUnread(
 	return "", false
 }
 
-// writePodIdentityEdge records one association.
+// unreadPodIdentityEdges lists this connector's Pod Identity edges that this
+// run did not see AND did not look for, with the regions they are in, sorted.
+// Called after writePodIdentityEdges, so every binding this run read is
+// already at its generation.
+//
+// An edge not seen this run is GONE only when its region was read: it is in
+// the run's selection (the pinned connector, ForRun), and the EKS pass read
+// every selected region (the caller only asks when it did). Otherwise it is
+// UNREAD:
+//   - its region is recorded and not selected -- deselected since it was
+//     found (or never in a selection this connector remembers);
+//   - its region is not known -- a row written before regions were recorded,
+//     from a cluster whose issuer names none -- and SOME region was deselected
+//     since (RegionsEverSelected): it may live there. When no region was ever
+//     deselected, every region it could have come from was just read.
+func (s *AWSPermissionScanner) unreadPodIdentityEdges(
+	workspaceID uuid.UUID, snapshot *IAMSnapshot,
+) ([]uuid.UUID, []string, error) {
+	connector, err := s.onboardingConnector(workspaceID, snapshot.ConnectorID)
+	if err != nil {
+		return nil, nil, err
+	}
+	attrs := connector.AWSAttrs()
+	selected := make(map[string]bool, len(attrs.Regions))
+	for _, r := range attrs.Regions {
+		selected[r] = true
+	}
+	deselected := len(attrs.DeselectedRegions()) > 0
+
+	held, err := s.grants.HeldOverAssumeEdges(workspaceID, snapshot.ConnectorID,
+		snapshot.Generation, models.AssumeMechanismEKSPodIdentity)
+	if err != nil {
+		return nil, nil, err
+	}
+	var keep []uuid.UUID
+	regions := map[string]bool{}
+	for _, e := range held {
+		region := podIdentityEdgeRegion(e)
+		switch {
+		case region != "" && selected[region]:
+			continue // read this run, and not there: gone
+		case region == "" && !deselected:
+			continue // every region it could be in was read: gone
+		}
+		keep = append(keep, e.ID)
+		if region == "" {
+			region = "a region not recorded"
+		}
+		regions[region] = true
+	}
+	names := make([]string, 0, len(regions))
+	for r := range regions {
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	return keep, names, nil
+}
+
+// podIdentityEdgeRegion is the region a Pod Identity edge was found in: the
+// one it recorded, else the region its cluster's OIDC issuer names
+// (oidc.eks.<region>.amazonaws.com[.cn]/id/...) -- a row written before the
+// region was recorded -- else "" (not known).
+func podIdentityEdgeRegion(e models.CloudAssumeEdge) string {
+	var a podIdentityEdgeWhere
+	if len(e.Attrs) > 0 && json.Unmarshal(e.Attrs, &a) == nil && a.Region != "" {
+		return a.Region
+	}
+	if e.Issuer == nil {
+		return ""
+	}
+	host, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(*e.Issuer, "https://"), "http://"), "/")
+	rest, ok := strings.CutPrefix(host, "oidc.eks.")
+	if !ok {
+		return ""
+	}
+	region, _, ok := strings.Cut(rest, ".amazonaws.com")
+	if !ok || awsdiscovery.ValidateRegion(region) != nil {
+		return ""
+	}
+	return region
+}
+
+// podIdentityEdgeWhere decodes the one field of a Pod Identity edge's attrs
+// (written by podIdentityEdgeAttrs, cloud_aws_collection_evidence.go) that
+// deselection needs: the region it was found in. That region is what lets a
+// later scan tell a binding it did not look for -- in a region deselected
+// since -- from one that is gone (unreadPodIdentityEdges).
+type podIdentityEdgeWhere struct {
+	Region string `json:"region,omitempty"`
+}
+
+// writePodIdentityEdge records one association, found in region.
 func (s *AWSPermissionScanner) writePodIdentityEdge(
 	workspaceID uuid.UUID, snapshot *IAMSnapshot, region string,
 	cluster awsdiscovery.EKSCluster, assoc awsdiscovery.PodIdentityAssociation,

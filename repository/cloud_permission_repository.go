@@ -58,6 +58,17 @@ type CloudPermissionRepository interface {
 	// recorded a binding there (T3.8, writePodIdentityEdges).
 	CountPodIdentityEdges(workspaceID, connectorID uuid.UUID, region string) (int64, error)
 
+	// ReconcileGenerationKeeping is ReconcileGeneration with named assume
+	// edges exempt: rows the scan did not see because it did not LOOK where
+	// they live (an EKS Pod Identity binding in a region deselected since),
+	// which must be kept and marked stale, never deleted as gone (§2.14.13).
+	ReconcileGenerationKeeping(workspaceID, connectorID uuid.UUID, generation int, keepEdges []uuid.UUID) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
+
+	// HeldOverAssumeEdges lists this connector's assume edges of one
+	// mechanism that the given generation has NOT seen (yet): the rows
+	// reconciliation would delete.
+	HeldOverAssumeEdges(workspaceID, connectorID uuid.UUID, generation int, mechanism string) ([]models.CloudAssumeEdge, error)
+
 	// Fenced returns a view whose mutations refuse to commit unless the
 	// given run is still owned by the caller (§2.10A). Reads are unaffected.
 	Fenced(f ScanFence) CloudPermissionRepository
@@ -128,6 +139,16 @@ func (r *cloudPermissionRepository) UpsertAssumeEdge(e *models.CloudAssumeEdge) 
 		return nil, false, err
 	}
 	return e, e.ID == proposed, nil
+}
+
+func (r *cloudPermissionRepository) HeldOverAssumeEdges(
+	workspaceID, connectorID uuid.UUID, generation int, mechanism string,
+) ([]models.CloudAssumeEdge, error) {
+	var rows []models.CloudAssumeEdge
+	err := r.db.Where(`workspace_id = ? AND connector_id = ? AND mechanism = ? AND last_seen_generation < ?`,
+		workspaceID, connectorID, mechanism, generation).
+		Order("id").Find(&rows).Error
+	return rows, err
 }
 
 func (r *cloudPermissionRepository) UpsertResource(res *models.CloudResource) (*models.CloudResource, bool, error) {
@@ -334,11 +355,21 @@ func (r *cloudPermissionRepository) CountPodIdentityEdges(
 func (r *cloudPermissionRepository) ReconcileGeneration(
 	workspaceID, connectorID uuid.UUID, generation int,
 ) (int64, int64, int64, error) {
+	return r.ReconcileGenerationKeeping(workspaceID, connectorID, generation, nil)
+}
+
+func (r *cloudPermissionRepository) ReconcileGenerationKeeping(
+	workspaceID, connectorID uuid.UUID, generation int, keepEdges []uuid.UUID,
+) (int64, int64, int64, error) {
 
 	var edgesRemoved, permissionsRemoved, resourcesRemoved int64
 	err := runFencedTx(r.db, r.fence, func(tx *gorm.DB) error {
-		res := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
-			workspaceID, connectorID, generation).Delete(&models.CloudAssumeEdge{})
+		edges := tx.Where(`workspace_id = ? AND connector_id = ? AND last_seen_generation < ?`,
+			workspaceID, connectorID, generation)
+		if len(keepEdges) > 0 {
+			edges = edges.Where("id NOT IN ?", keepEdges)
+		}
+		res := edges.Delete(&models.CloudAssumeEdge{})
 		if res.Error != nil {
 			return res.Error
 		}

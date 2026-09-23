@@ -932,18 +932,23 @@ func (s *AWSIAMScanner) FinalizeCoverage(
 	// (could not assume the role, connector vanished mid-scan, …) gets one
 	// surface entry standing in for the surfaces it never got to attempt --
 	// the same reasoning as workload_scan.go's own "compute:region" entry.
+	//
+	// Each carries the call and the AWS code the failure named, when it named
+	// them (§5.3 /coverage api, error_code; D-71): a role that could not be
+	// assumed for the permission scan says sts:AssumeRole and AWS's code, not
+	// only prose.
 	if permErr != nil && permSurfaces == nil {
-		merged.Surfaces[models.SurfacePermissionScan] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfacePermissionScan] = withFailedCall(models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: permErr.Error(),
-		}
+		}, permErr)
 	}
 	for k, v := range permSurfaces {
 		merged.Surfaces[k] = v
 	}
 	if workloadErr != nil && workloadSurfaces == nil {
-		merged.Surfaces[models.SurfaceWorkloadScan] = models.SurfaceCoverage{
+		merged.Surfaces[models.SurfaceWorkloadScan] = withFailedCall(models.SurfaceCoverage{
 			State: models.CloudCoverageDenied, Error: workloadErr.Error(),
-		}
+		}, workloadErr)
 	}
 	for k, v := range workloadSurfaces {
 		merged.Surfaces[k] = v
@@ -1008,7 +1013,20 @@ func surfaceResult(count int, err error) models.SurfaceCoverage {
 	if errors.As(err, &call) {
 		out.API, out.ErrorCode = call.API, call.Code
 	}
+	if out.API == "" && out.ErrorCode == "" {
+		// Neither named layer caught it: the SDK's own operation error, or
+		// nothing when it carries none.
+		out = withFailedCall(out, err)
+	}
 	return out
+}
+
+// withFailedCall records the call and the AWS error code the failure carried,
+// as the SDK stated them (§5.3 /coverage error_code, api) -- and nothing when
+// it carried neither.
+func withFailedCall(s models.SurfaceCoverage, err error) models.SurfaceCoverage {
+	s.API, s.ErrorCode = awsdiscovery.FailedCall(err)
+	return s
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
