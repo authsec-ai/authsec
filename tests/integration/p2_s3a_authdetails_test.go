@@ -277,6 +277,10 @@ func TestP2S3aUserInGroupWithBoundary(t *testing.T) {
 		u.Tags = []iamtypes.Tag{{Key: aws.String("team"), Value: aws.String("ops")}}
 	})
 	s3aJoin(a, "priya", "ops")
+	// One statement of her own, so the boundary has something of HERS to cap.
+	a.iam.inlineUserPolicies["priya"] = map[string]string{
+		"PriyaOwn": s3aDoc("OwnRead", "s3:GetObject", "arn:aws:s3:::priya-scratch/*"),
+	}
 	run := l.scanAndProject(a)
 
 	// ---- collected -------------------------------------------------------
@@ -316,12 +320,33 @@ func TestP2S3aUserInGroupWithBoundary(t *testing.T) {
 		t.Errorf("boundary attachments on priya = %d, want 1", n)
 	}
 	// Cloud Inventory: priya's own statements are read in the light of her
-	// boundary now (§1.3) -- the boundary's statements are written as a
-	// ceiling, never as granted access.
-	if n := l.count(`SELECT count(*) FROM cloud_permission p JOIN cloud_identity i ON i.id = p.identity_id
-	                  WHERE p.workspace_id = ? AND i.name = 'priya' AND p.derivation <> ?`,
-		l.ws, models.PermissionDerivationBoundary); n != 0 {
-		t.Errorf("priya has %d non-boundary cloud_permission rows: the group's grants were copied onto her", n)
+	// boundary now (§1.3: every user statement used to be stored
+	// 'unconstrained'), the boundary's statements are written as a ceiling,
+	// never as granted access, and the group's statements are the GROUP's.
+	var perms []struct {
+		NativeID        string
+		Derivation      string
+		ConstraintState string
+	}
+	l.db.Raw(`SELECT p.native_id, p.derivation, p.constraint_state
+	            FROM cloud_permission p JOIN cloud_identity i ON i.id = p.identity_id
+	           WHERE p.workspace_id = ? AND i.name = 'priya'`, l.ws).Scan(&perms)
+	var own, ceiling int
+	for _, p := range perms {
+		switch {
+		case p.NativeID == "inline:PriyaOwn#s0":
+			own++
+			if p.Derivation != models.PermissionDerivationGranted || p.ConstraintState != models.ConstraintBounded {
+				t.Errorf("priya's own statement = %+v, want granted and %s by her boundary", p, models.ConstraintBounded)
+			}
+		case p.Derivation == models.PermissionDerivationBoundary:
+			ceiling++
+		default:
+			t.Errorf("priya carries %+v: the group's statements were copied onto her", p)
+		}
+	}
+	if own != 1 || ceiling == 0 {
+		t.Errorf("priya's cloud_permission rows = %+v, want her own statement once and the boundary's ceiling", perms)
 	}
 
 	// ---- projected -------------------------------------------------------
@@ -349,7 +374,7 @@ func TestP2S3aUserInGroupWithBoundary(t *testing.T) {
 		t.Errorf("ops' inline assignment = %+v, want current", g)
 	}
 	grants := s3aGrantsByHolder(l)
-	var groupGrants, priyaGrants int
+	var groupGrants, priyaOwn int
 	for _, g := range grants {
 		switch g.Holder {
 		case "ops":
@@ -357,15 +382,18 @@ func TestP2S3aUserInGroupWithBoundary(t *testing.T) {
 				groupGrants++
 			}
 		case "priya":
-			priyaGrants++
+			if g.Policy != "PriyaOwn" || g.State != models.RelCurrent {
+				t.Errorf("priya holds %+v: a boundary never grants, and group access is by traversal, not copied", g)
+				continue
+			}
+			priyaOwn++
 		}
 	}
 	if groupGrants != 2 {
 		t.Errorf("grants held by ops = %+v, want OpsRead's and OpsInline's, current", grants)
 	}
-	if priyaGrants != 0 {
-		t.Errorf("priya holds %d grants: a boundary never grants, and group access is by traversal, not copied (%+v)",
-			priyaGrants, grants)
+	if priyaOwn != 1 {
+		t.Errorf("grants = %+v, want priya holding exactly her own PriyaOwn, current", grants)
 	}
 	// Every edge this adds has evidence (§4.8): member_of from priya's own
 	// observation (it lists the group), the boundary assignment from hers and

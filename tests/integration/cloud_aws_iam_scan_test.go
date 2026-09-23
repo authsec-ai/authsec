@@ -152,9 +152,9 @@ func (f *fakeIAM) GetAccessKeyLastUsed(_ context.Context, in *iam.GetAccessKeyLa
 	}, nil
 }
 
-// policyMeta is a managed policy's default version id and PolicyId, as both
+// s3aPolicyMeta is a managed policy's default version id and PolicyId, as both
 // GetPolicy and the LocalManagedPolicy listing report them.
-func (f *fakeIAM) policyMeta(arn string) (version, policyID string) {
+func (f *fakeIAM) s3aPolicyMeta(arn string) (version, policyID string) {
 	version = f.policyVersions[arn]
 	if version == "" {
 		version = "v3"
@@ -177,7 +177,7 @@ func (f *fakeIAM) GetPolicy(_ context.Context, in *iam.GetPolicyInput, _ ...func
 	if _, ok := f.managedPolicies[arn]; !ok {
 		return nil, &smithy.GenericAPIError{Code: "NoSuchEntity", Message: "no such policy"}
 	}
-	version, policyID := f.policyMeta(arn)
+	version, policyID := f.s3aPolicyMeta(arn)
 	return &iam.GetPolicyOutput{Policy: &iamtypes.Policy{
 		Arn: in.PolicyArn, DefaultVersionId: aws.String(version),
 		PolicyId:   aws.String(policyID),
@@ -232,7 +232,7 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 				CreateDate: r.CreateDate, AssumeRolePolicyDocument: r.AssumeRolePolicyDocument,
 				RoleLastUsed: r.RoleLastUsed, Tags: r.Tags, PermissionsBoundary: r.PermissionsBoundary,
 				AttachedManagedPolicies: f.attachedRolePolicies[name],
-				RolePolicyList:          inlineDetails(f.inlineRolePolicies[name]),
+				RolePolicyList:          s3aInlineDetails(f.inlineRolePolicies[name]),
 				InstanceProfileList:     f.instanceProfiles[name],
 			})
 		}
@@ -246,7 +246,7 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 				CreateDate: u.CreateDate, Tags: u.Tags, PermissionsBoundary: u.PermissionsBoundary,
 				GroupList:               f.userGroups[name],
 				AttachedManagedPolicies: f.attachedUserPolicies[name],
-				UserPolicyList:          inlineDetails(f.inlineUserPolicies[name]),
+				UserPolicyList:          s3aInlineDetails(f.inlineUserPolicies[name]),
 			})
 		}
 	case iamtypes.EntityTypeGroup:
@@ -264,7 +264,7 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 		var from, to int
 		from, to, next = f.page(len(local), in.Marker)
 		for _, arn := range local[from:to] {
-			version, policyID := f.policyMeta(arn)
+			version, policyID := f.s3aPolicyMeta(arn)
 			out.Policies = append(out.Policies, iamtypes.ManagedPolicyDetail{
 				Arn: aws.String(arn), PolicyName: aws.String(arn[strings.LastIndex(arn, "/")+1:]),
 				PolicyId: aws.String(policyID), DefaultVersionId: aws.String(version),
@@ -273,7 +273,7 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 				// fixture declares.
 				PolicyVersionList: []iamtypes.PolicyVersion{
 					{VersionId: aws.String("v0-superseded"), IsDefaultVersion: false,
-						Document: aws.String(url.QueryEscape(fakeSupersededVersion))},
+						Document: aws.String(url.QueryEscape(s3aSupersededVersion))},
 					{VersionId: aws.String(version), IsDefaultVersion: true,
 						Document: aws.String(url.QueryEscape(f.managedPolicies[arn]))},
 				},
@@ -286,13 +286,13 @@ func (f *fakeIAM) GetAccountAuthorizationDetails(_ context.Context, in *iam.GetA
 	return out, nil
 }
 
-// fakeSupersededVersion is a non-default policy version no reader may use.
-const fakeSupersededVersion = `{"Version":"2012-10-17","Statement":[` +
+// s3aSupersededVersion is a non-default policy version no reader may use.
+const s3aSupersededVersion = `{"Version":"2012-10-17","Statement":[` +
 	`{"Sid":"SupersededVersion","Effect":"Allow","Action":"iam:*","Resource":"*"}]}`
 
-// inlineDetails serves inline documents as IAM does: URL-encoded, and in a
+// s3aInlineDetails serves inline documents as IAM does: URL-encoded, and in a
 // stable order.
-func inlineDetails(docs map[string]string) []iamtypes.PolicyDetail {
+func s3aInlineDetails(docs map[string]string) []iamtypes.PolicyDetail {
 	names := make([]string, 0, len(docs))
 	for n := range docs {
 		names = append(names, n)
