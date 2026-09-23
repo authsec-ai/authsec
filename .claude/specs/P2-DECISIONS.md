@@ -173,9 +173,14 @@ defect that should be fixed in the spec itself.
   identity in any connected account, else an external principal). The **edge
   key** uses the principal's normalized recognition string, not the endpoint
   type, so when the far account connects (or its identity retires) the edge is
-  upgraded **in place** and keeps its history (§2.12). *Raise:* §4.7 (identity
-  source) and §3 034 / §2.12 (external principal with derived resolution)
-  disagree.
+  upgraded **in place** and keeps its history (§2.12). *Implementation
+  (corrected):* `UpsertRelationship`'s ON CONFLICT assignments do not touch the
+  source columns today, so the can_assume upsert must set
+  `source_identity_account_id` / `source_external_principal_id` on conflict
+  (exactly one non-null, satisfying `iga_relationship_pair_chk`), and
+  `EndEdgesOnSubject` must not end a can_assume edge whose source is about to be
+  re-pointed in the same pass. *Raise:* §4.7 (identity source) and §3 034 /
+  §2.12 (external principal with derived resolution) disagree.
 - **D-42 External principal identity.** `aws_account`: issuer `aws`, subject =
   the account id (bare id and `:root` ARN are one node). `aws_principal`: issuer
   `aws`, subject = the ARN (also unresolved unique ids and session ARNs).
@@ -226,17 +231,67 @@ defect that should be fixed in the spec itself.
 
 ## Pipeline and coverage (T2.2, T2.3)
 
-- **D-55 Times.** `queued_at` = the run's `created_at` (T1.3 moves
-  `requested_at` on every refused claim); `started_at` is cleared by a refused
-  claim.
+- **D-55 Times (corrected).** `cloud_scan_run` has no `created_at` (020), and
+  T1.3 moves `requested_at` on every refused claim, so the original enqueue
+  time is stored nowhere. `queued_at` = `requested_at`, documented as "last
+  (re)queued at". A refused claim clears `started_at` (Requeue), so
+  `started_at` means "began collecting". *Raise:* §2.14.7's wait metric (p50/p95
+  enqueue → claim) needs a column §3 does not have.
 - **D-56 `last_published_rev`** = the revision that published this connector's
   latest projected run.
-- **D-57 Manifest.** `iga_publication.manifest` is cumulative (the previous
-  publication's partitions merged with this run's), as 033 says; `/coverage`
-  reads the runs it names.
+- **D-57 Which runs the current revision was built from (corrected).**
+  `iga_publication.manifest` is keyed by `Partition.Key()`, which omits the
+  connector, so merging manifests would let account B's run overwrite account
+  A's under the same key. The manifest is left as written. Every reader that
+  needs "the runs the current revision was built from" (`/coverage`, `/pipeline`
+  `last_published_rev`, list `meta.coverage`, evidence `surface_*` and
+  `stale_since`, Changes `coverage_changed`) reads `iga_projection_state`
+  (`UNIQUE(workspace_id, connector_id, partition_key)`, written in the
+  publication's transaction) → `last_run_id` → that run's coverage, inside the
+  snapshot. *Raise:* 033's comment and §4.8 say the key covers scope and
+  connector; the code's key does not.
 - **D-58 `prevents`.** `denied` → `surface_denied`; `partial` →
   `surface_partial`; `throttled`, `error`, `unknown` → `surface_stale`;
   `organizations: unsupported` → `organizations_not_collected`; `reached` and
   `not_selected` → `null`. *Raise:* no mapping is specified.
 - **D-59 A projection job failed below its attempt ceiling** is reported as
   `projecting` with `retrying: true`, `attempts`, `last_error`.
+
+## Added after the gap analysis's completeness critic
+
+- **D-60 Partition keys are frozen.** `Partition.Key()` embeds the sorted
+  `RequiredSurfaces` and is persisted on every support, edge, assignment and
+  projection-state row. Never rename a surface string or add a required surface
+  to an existing partition kind: rows stamped with the old key would never be
+  scoped again. A new surface may be *collected and reported* without becoming
+  a required surface. *Raise:* a change needs a partition_key backfill
+  migration, which §3 does not have.
+- **D-61 One definition of "connected".** The projector's `ConnectedAccounts`
+  (load.go) uses the same rule as the read side (D-3): a connector exists and is
+  not `revoked`.
+- **D-62 Cursor routes carry the object.** Per-object paged routes put the
+  object id (and the section) in `Cursor.Route` — `workloads/<id>/resources`,
+  `identities/<id>/used-by/workloads`, `resources/<id>/access`,
+  `<type>/<id>/changes`, `workloads/<id>/classification`,
+  `graph/expand/<node>/<edge>/<direction>` — so a cursor for one object cannot
+  page another.
+- **D-63 Regions on rows.** Identities (IAM) render `region: "global"`; a
+  resource or workload with no stated region renders `null` (Region not stated,
+  never `global`, §2.14.10).
+- **D-64 Credentials.** A key whose status becomes Inactive is updated in place
+  on its existing row (found by source key regardless of lifecycle), never
+  inserted beside it: 028's partial unique index excludes revoked rows, so an
+  insert never conflicts and duplicates accumulate. *Raise:* §2.5 reserves
+  `revoked` for absence under four conditions; AWS `Inactive` is a status.
+- **D-65 Presence.** `/evidence` accepts an object ref (`workload:<id>` ...)
+  meaning that object's presence (all its support rows); `presence:<id>` names
+  one support row.
+- **D-66 Target evidence.** No junction table exists for
+  `iga_entitlement_target` (032/036 define three). A target's facts come from its
+  statement's policy-version observation. *Raise:* §4.8 and the T4.9 gate expect
+  target evidence.
+- **D-67 Policy retired vs not_seen.** Reconciliation ends edge partitions
+  `not_seen` before `retireUnsupported` runs, so a retired policy's assignments
+  end `not_seen`, not `policy_retired`. The read side (Changes) never relies on
+  `ended_reason` to classify an end; it uses lifecycle events and assignment
+  periods. *Raise:* the T5.2 gate wording.
