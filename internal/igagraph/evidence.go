@@ -132,6 +132,16 @@ func (l *EventLog) add(event, reason, class string, id uuid.UUID) {
 	}
 }
 
+// At is the pass's one timestamp (D-26): every event's occurred_at, and the
+// time Reconcile stamps on every row it ends, so an end joins to the
+// publication of the pass that made it.
+func (l *EventLog) At() time.Time {
+	if l == nil {
+		return time.Time{}
+	}
+	return l.at
+}
+
 // FirstSeen records an insert.
 func (l *EventLog) FirstSeen(class string, id uuid.UUID) {
 	l.add(models.LifecycleFirstSeen, "", class, id)

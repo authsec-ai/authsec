@@ -82,7 +82,7 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 
 	// One timestamp for every row this pass writes -- edges, external
 	// principals, pod-identity edges -- so they join on it (D-26).
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, TrustPartitionKind, "")
 	for _, role := range snap.Roles() {
 		target, ok := r.identity[role.ID]

@@ -50,7 +50,7 @@ func (p *Projector) policyImmutable(snap *Snapshot, r *resolved, cp models.Cloud
 // statements retire policy_recreated, its assignments and grants end
 // policy_recreated, and its live revisions close.
 func (p *Projector) projectPolicies(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	part := snap.PartitionFor(models.ObjectPolicy, "", "")
 	for _, cp := range snap.Policies {
 		holder := snap.IdentityByID(cp.HolderIdentityID)
@@ -156,7 +156,7 @@ func (p *Projector) projectStatements(tx *gorm.DB, snap *Snapshot, r *resolved) 
 				// A Sid-keyed statement whose content changed gains a revision:
 				// the live revision closes and a new one opens.
 				if err := p.repo.RecordRevision(tx, snap.Run.WorkspaceID, id, hash, st.Raw,
-					cp.VersionID, snap.Run.ID, p.now()); err != nil {
+					cp.VersionID, snap.Run.ID, p.at); err != nil {
 					return fmt.Errorf("revision for %s: %w", key, err)
 				}
 			}
@@ -176,7 +176,7 @@ func (p *Projector) upsertStatement(
 	tx *gorm.DB, snap *Snapshot, r *resolved, policyID uuid.UUID,
 	key, hash, continuity, immutable string, st awsdiscovery.PolicyStatement,
 ) (uuid.UUID, error) {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	idx := st.Index
 	row := &models.IGAEntitlement{
 		WorkspaceID: snap.Run.WorkspaceID, Provider: models.ProviderAWS,
@@ -307,10 +307,10 @@ func (p *Projector) resourceRef(tx *gorm.DB, snap *Snapshot, r *resolved, text s
 		Provider: models.ProviderAWS, ResourceKind: kind, DisplayName: text,
 		SourceKey: key, Continuity: ContinuityRecognitionOnly,
 		Stage: "unknown", Lifecycle: models.IGALifecycleActive,
-		ProviderAttrs: attrs, LastSeenAt: p.now(),
+		ProviderAttrs: attrs, LastSeenAt: p.at,
 	}
 	if live == nil {
-		row.FirstSeenAt = p.now()
+		row.FirstSeenAt = p.at
 	} else {
 		row.FirstSeenAt = live.FirstSeenAt
 	}
@@ -366,7 +366,7 @@ func describeResource(text string, connected map[string]bool) (string, json.RawM
 // not: an attachment list is read independently of the document (§1.4), so
 // an unreadable policy's assignments stay current.
 func (p *Projector) projectAssignments(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	part := snap.EdgePartitionFor("assignment", "", "")
 	for _, at := range snap.Attachments {
 		holderID, ok := r.identity[at.PrincipalIdentityID]
@@ -388,7 +388,7 @@ func (p *Projector) projectAssignments(tx *gorm.DB, snap *Snapshot, r *resolved)
 			HolderIdentityAccountID: holderID, AssignmentKind: at.AttachmentKind,
 			Basis: models.BasisDeclared, State: models.RelCurrent,
 			SourceKey: key, ConnectorID: &snap.Run.ConnectorID, PartitionKey: part.Key(),
-			LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
+			ValidFrom: now, LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
 		})
 		if err != nil {
 			return fmt.Errorf("upsert assignment %s: %w", key, err)
@@ -404,7 +404,7 @@ func (p *Projector) projectAssignments(tx *gorm.DB, snap *Snapshot, r *resolved)
 // statements only. A Deny is a restriction and a boundary a ceiling; neither
 // is ever a grant (§2.6). UpsertGrant re-checks the effect at the write.
 func (p *Projector) projectGrants(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+	now := p.at // D-26: the pass's one timestamp
 	part := snap.EdgePartitionFor("access_edge", "", "")
 	for _, at := range snap.Attachments {
 		asg, ok := r.assignment[at.ID]
@@ -431,10 +431,10 @@ func (p *Projector) projectGrants(tx *gorm.DB, snap *Snapshot, r *resolved) erro
 				// Nothing is evaluated: the honesty check (004) requires
 				// unknown unless the calculation is complete, and it never is.
 				CalculationState: models.CalcPartial, EffectiveConclusion: models.ConclusionUnknown,
-				SourceKey:       GrantKey(r.assignKey[at.ID], st.Key),
-				ConnectorID:     &snap.Run.ConnectorID,
-				PartitionKey:    part.Key(),
-				LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
+				SourceKey:    GrantKey(r.assignKey[at.ID], st.Key),
+				ConnectorID:  &snap.Run.ConnectorID,
+				PartitionKey: part.Key(),
+				ValidFrom:    now, LastConfirmedAt: now, LastConfirmedBy: &snap.Run.ID,
 			}, st.Effect)
 			if err != nil {
 				return fmt.Errorf("upsert grant %s: %w", st.Key, err)
