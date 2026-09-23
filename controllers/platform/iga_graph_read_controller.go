@@ -98,10 +98,12 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 func graphFeatures(on bool) gin.H {
 	return gin.H{
 		"workloads": false, "identities": false, "resources": false,
-		"graph": false, "evidence": false, "changes": false,
+		"graph": false, "changes": false,
 		// T6.6: POST and GET /workloads/:id/classification. T2.3: /coverage.
+		// T6.5: GET /evidence.
 		"classification": on,
 		"coverage":       on,
+		"evidence":       on,
 	}
 }
 
