@@ -19,18 +19,25 @@ const changesDocToolboxTwo = `{"Version":"2012-10-17","Statement":[{"Effect":"Al
 // statement_replaced -- one statement ending and another beginning -- and the
 // old grant's end says the path remains through the new grant; (c) a reattach
 // is a NEW assignment period (policy_attached), the earlier detach untouched;
-// (d) a Sid-less statement simply deleted is NOT a replacement.
+// (d) a Sid-less statement simply deleted is NOT a replacement; (e) a
+// Sid-keyed statement deleted while another Sid-keyed statement begins in the
+// same policy and run is NOT a replacement either -- a deletion and a new
+// statement, each its grant's end or start (§5.3: "A Sid-less statement ended
+// and another began").
 //
-// Safeguard (mutation-checked): a replacement's statements ended and began in
-// the SAME run.
+// Safeguards (mutation-checked): a replacement's statements ended and began in
+// the SAME run; the statement that ended is Sid-less (the holders' branch and
+// both resource branches).
 func TestP2ChangesPolicyEdits(t *testing.T) {
 	l := newP2Lab(t, "p2-changes-edits", true)
 	a := l.account(accountA)
 	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
 	ticket := changesManaged(a, "TicketRead", docTicketRead)
 	toolbox := changesManaged(a, "ToolboxRead", changesDocToolboxTwo)
+	archive := changesManaged(a, "ArchiveRead", changesDocArchive)
 	a.attach("SharedToolRole", ticket)
 	a.attach("SharedToolRole", toolbox)
+	a.attach("SharedToolRole", archive)
 	l.scanAndProject(a)
 	roleID := changesIdentity(t, l, "SharedToolRole")
 	ticketID := changesPolicy(t, l, "TicketRead")
@@ -58,6 +65,18 @@ func TestP2ChangesPolicyEdits(t *testing.T) {
 	a.iam.managedPolicies[toolbox] = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",` +
 		`"Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::support-tickets/*"}]}`
 	runD := l.scanAndProject(a)
+
+	// (e) ReadArchive deleted and WriteArchive added to ArchiveRead, in one run.
+	readArchive := changesIDOf(t, l, `SELECT id FROM iga_entitlements WHERE workspace_id = ? AND sid = 'ReadArchive'`, l.ws)
+	a.iam.managedPolicies[archive] = changesDocArchiveWrite
+	a.iam.policyVersions[archive] = "v4"
+	runE := l.scanAndProject(a)
+	writeArchive := changesIDOf(t, l, `SELECT id FROM iga_entitlements WHERE workspace_id = ? AND sid = 'WriteArchive'`, l.ws)
+	if n := l.count(`SELECT count(*) FROM iga_lifecycle_event WHERE workspace_id = ? AND scan_run_id = ?
+	                  AND ((entitlement_id = ? AND event = 'retired' AND reason = ?) OR (entitlement_id = ? AND event = 'first_seen'))`,
+		l.ws, runE.ID, readArchive, models.RetiredUnsupported, writeArchive); n != 2 {
+		t.Fatalf("setup: run E retired ReadArchive (unsupported) and first saw WriteArchive in %d of 2 events", n)
+	}
 
 	api := l.api()
 	events := changesAll(t, api, "identity", roleID, "configuration")
@@ -151,6 +170,32 @@ func TestP2ChangesPolicyEdits(t *testing.T) {
 	changesAssertAttributed(t, l, revents)
 	changesOne(t, revents, "statement_revised", "subject", refOf("statement", stmt))
 	changesOne(t, revents, "statement_replaced", "subject", refOf("policy", toolboxID))
+
+	// (e) On the identity and on the resource both Sid-keyed statements name:
+	// ReadArchive's grant ended and WriteArchive's started in run E, and no
+	// statement_replaced -- whose before list would have nothing in it.
+	archiveID := changesPolicy(t, l, "ArchiveRead")
+	archiveRes, _ := l.resourceID("arn:aws:s3:::ticket-archive/*")
+	for name, evs := range map[string][]map[string]any{
+		"identity": events,
+		"resource": changesAll(t, api, "resource", archiveRes, "configuration"),
+	} {
+		if got := changesPick(evs, "statement_replaced", "subject", refOf("policy", archiveID)); len(got) != 0 {
+			t.Errorf("%s: a Sid-keyed deletion beside a new Sid-keyed statement is shown as a replacement:%s",
+				name, changesDump(got))
+		}
+		var ended, started bool
+		for _, e := range changesPick(evs, "grant_ended", "statement", refOf("statement", readArchive)) {
+			ended = ended || digs(e, "run") == refOf("cloud_scan_run", runE.ID)
+		}
+		for _, e := range changesPick(evs, "grant_started", "statement", refOf("statement", writeArchive)) {
+			started = started || digs(e, "run") == refOf("cloud_scan_run", runE.ID)
+		}
+		if !ended || !started {
+			t.Errorf("%s: in run E ReadArchive's grant ended %v and WriteArchive's started %v; want both:%s",
+				name, ended, started, changesDump(evs))
+		}
+	}
 }
 
 // E8 (a): a role deleted and recreated under the same name (with a same-named

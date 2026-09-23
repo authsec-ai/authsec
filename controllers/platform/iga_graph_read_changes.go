@@ -41,11 +41,13 @@ import (
 // and restored from iga_lifecycle_event -- never the node row (B24);
 // relationship_started/_ended; policy_attached/_detached; grant_started/_ended
 // (remaining and paths on the ends, D-28); statement_revised (before/after:
-// statement, policy_version_id, content_hash); statement_replaced
-// (before/after: the Sid-less statements that ended and those that began in
-// the policy in that run); and, for kind=coverage only, coverage_changed
-// (before/after state per surface). The full contract, and which events
-// belong to which object (D-68), is internal/igaread/changes.go.
+// statement, policy_version_id, content_hash); statement_replaced, one per
+// (policy, run) and its id derived from both (before/after: policy_version_id,
+// null unless an observation proves it, and the Sid-less statements that
+// ended and those that began in the policy in that run); and, for
+// kind=coverage only, coverage_changed (before/after state per surface). The
+// full contract, and which events belong to which object (D-68), is
+// internal/igaread/changes.go.
 //
 // serve() has applied the 503 gate and taken the workspace from the token;
 // the object must be this workspace's graph row, else 404 with no hint.

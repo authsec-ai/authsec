@@ -48,9 +48,11 @@ package igaread
 //	statement_revised     iga_statement_revision              {policy, statement};
 //	                                                          before/after {statement, policy_version_id,
 //	                                                          content_hash} (D-69)
-//	statement_replaced    a Sid-less statement retired         {policy}; before/after {statements:
-//	                      unsupported and a statement of the  [{statement, content, content_hash}]}
-//	                      same policy began, in one run
+//	statement_replaced    a Sid-less statement retired         {policy}; before/after {policy_version_id,
+//	                      unsupported and a statement of the  statements: [{statement, content,
+//	                      same policy began, in one run;      content_hash}]} (D-69; the version is
+//	                      id derived from (policy, run)       null unless an observation proves it,
+//	                                                          changesReplacementVersions)
 //	coverage_changed      consecutive published runs'          {integration, account_id, surface};
 //	                      coverage (D-70)                      before {state, recorded, run, coverage};
 //	                                                          after {state, recorded, error_code, api,
@@ -81,6 +83,11 @@ package igaread
 // Group grants are not copied onto members (the member sees its member_of
 // start and end); nothing walks can_assume.
 //
+// A grant is history of an Allow statement when its statement was Allow AS IT
+// STOOD WHEN THE GRANT STARTED (D-27g, changesGrantWasAllow): a Sid-keyed
+// Allow edited to Deny keeps its grant's start and end. What REMAINS (below)
+// is judged at the current revision.
+//
 // # Remaining (D-28)
 //
 // A grant_ended or policy_detached (attached or inline) carries the holder's
@@ -100,6 +107,7 @@ package igaread
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -476,17 +484,22 @@ func changesSupports(q *Query, obj changesObject, id uuid.UUID) ([]changesSuppor
 
 // changesHistoryBegins is D-70's meta.history_begins: the object's first
 // first_seen event, from the lifecycle history (never the node row, B24).
+//
+// min() over no rows is ONE row holding NULL, so the destination must be
+// nullable: an object with no first_seen event (a row projected before the
+// event log existed, or by any path that skipped it) renders null -- nothing
+// earlier is claimed -- rather than failing the whole page.
 func changesHistoryBegins(q *Query, obj changesObject, id uuid.UUID) (any, error) {
-	var at []*time.Time
+	var at sql.NullTime
 	if err := q.DB().Raw(`SELECT min(le.occurred_at) FROM iga_lifecycle_event le
 	                       WHERE le.workspace_id = ? AND le.`+obj.column+` = ? AND le.event = ?`,
-		q.WS, id, models.LifecycleFirstSeen).Scan(&at).Error; err != nil {
+		q.WS, id, models.LifecycleFirstSeen).Row().Scan(&at); err != nil {
 		return nil, err
 	}
-	if len(at) == 0 || at[0] == nil {
+	if !at.Valid {
 		return nil, nil
 	}
-	return ChangeTime(*at[0]), nil
+	return ChangeTime(at.Time), nil
 }
 
 // changesPartition is the partition igagraph put this support row in: the
@@ -515,7 +528,40 @@ func changesPartition(obj changesObject, node *changesNode, s changesSupport) (i
 //	reason           lifecycle reason, or ended_reason on an end
 //	rev, run_id      when the row itself records them (lifecycle events,
 //	                 revisions' first_seen_run_id)
-const changesCols = `at, event, id, src, via_id, reason, rev, run_id`
+//	policy_id        statement_replaced only: the policy the event is about.
+//	                 Its id is DERIVED from (policy, run) -- one event per
+//	                 (policy, run), D-27c -- so two replacements of one policy
+//	                 in two runs are two ids (D-27: id is unique and stable)
+const changesCols = `at, event, id, src, via_id, reason, rev, run_id, policy_id`
+
+// changesReplacementID is statement_replaced's event id: derived from (policy,
+// run) the way coverage_changed's is from (run, surface). Expects the policy
+// id in e.policy_id and the run in le.scan_run_id.
+const changesReplacementID = `md5(e.policy_id::text || ':' || le.scan_run_id::text)::uuid`
+
+// changesGrantRevisionJoin and changesGrantWasAllow are rule 7 ("every grant
+// query joins its statement with effect = 'allow'", §3 036) applied to
+// HISTORY (D-27g): a grant is shown when its statement was an Allow statement
+// AS IT STOOD WHEN THE GRANT STARTED -- the revision in force at g.valid_from
+// -- never by the statement's current effect. A Sid-keyed statement keeps its
+// id when edited (§2.6), effect included, so judging a past grant by the
+// current effect would erase the grant's start and its end the moment an Allow
+// is edited to Deny, and the access removal would carry no grant_ended and no
+// remaining (D-28). The defence rule 7 exists for still holds: a grant row
+// written for a statement that was Deny at the time is never shown.
+//
+// A statement with no revision covering that instant -- a Sid-less statement,
+// whose key is its content hash, so its effect cannot change in place --
+// falls back to its current effect. A covering revision whose verbatim
+// statement names no Effect is not Allow. Revisions of one statement never
+// overlap ([valid_from, valid_to), one live), so the join adds no rows.
+// Expects the grant as g and its statement as e.
+const changesGrantRevisionJoin = `LEFT JOIN iga_statement_revision gsr
+	               ON gsr.workspace_id = g.workspace_id AND gsr.entitlement_id = g.entitlement_id
+	              AND gsr.valid_from <= g.valid_from AND (gsr.valid_to IS NULL OR g.valid_from < gsr.valid_to)`
+
+const changesGrantWasAllow = `CASE WHEN gsr.id IS NULL THEN e.effect
+	           ELSE lower(COALESCE(gsr.statement->>'Effect', '')) END = '` + models.EffectAllow + `'`
 
 // changesUnion collects a query's UNION ALL branches with their arguments in
 // textual order.
@@ -591,7 +637,8 @@ func changesConfigurationSQL(ws uuid.UUID, obj changesObject, id uuid.UUID) (str
 	// Lifecycle: iga_lifecycle_event ONLY, never the node row -- lifecycle and
 	// retired_reason on the row are overwritten by every later pass (B24).
 	u.add(`SELECT le.occurred_at AS at, le.event::text AS event, le.id AS id, 'lifecycle'::text AS src,
-	              NULL::uuid AS via_id, le.reason::text AS reason, le.rev::bigint AS rev, le.scan_run_id AS run_id
+	              NULL::uuid AS via_id, le.reason::text AS reason, le.rev::bigint AS rev, le.scan_run_id AS run_id,
+	              NULL::uuid AS policy_id
 	         FROM iga_lifecycle_event le
 	        WHERE le.workspace_id = ? AND le.`+obj.column+` = ?`, ws, id)
 
@@ -623,7 +670,7 @@ func changesConfigurationSQL(ws uuid.UUID, obj changesObject, id uuid.UUID) (str
 // includes ended rows: ended is read exactly when a Changes view asks (§5.4).
 // Binds: ws, then pred's arguments.
 func changesRelationshipSQL(pred string) string {
-	return `SELECT x.at, x.event, r.id, 'relationship'::text, NULL::uuid, x.reason, NULL::bigint, NULL::uuid
+	return `SELECT x.at, x.event, r.id, 'relationship'::text, NULL::uuid, x.reason, NULL::bigint, NULL::uuid, NULL::uuid
 	          FROM iga_relationship r
 	         CROSS JOIN LATERAL (VALUES (r.valid_from, '` + ChangeRelationshipStarted + `'::text, ''::text),
 	                                    (r.valid_to, '` + ChangeRelationshipEnded + `'::text, r.ended_reason)) x(at, event, reason)
@@ -640,24 +687,29 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 	// reattach is a new row, so each period is its own pair (§2.6).
 	in, inArgs := h.in("a.holder_identity_account_id")
 	during, duringArgs := h.during("a.holder_identity_account_id", "x.at")
-	u.add(`SELECT x.at, x.event, a.id, 'assignment'::text, `+h.via("a.holder_identity_account_id")+`, x.reason, NULL::bigint, NULL::uuid
+	u.add(`SELECT x.at, x.event, a.id, 'assignment'::text, `+h.via("a.holder_identity_account_id")+`, x.reason, NULL::bigint, NULL::uuid,
+	              NULL::uuid
 	         FROM iga_policy_assignment a
 	        CROSS JOIN LATERAL (VALUES (a.valid_from, '`+ChangePolicyAttached+`'::text, ''::text),
 	                                   (a.valid_to, '`+ChangePolicyDetached+`'::text, a.ended_reason)) x(at, event, reason)
 	        WHERE a.workspace_id = ? AND x.at IS NOT NULL AND `+in+` AND `+during,
 		append(append([]any{ws}, inArgs...), duringArgs...)...)
 
-	// Grants: Allow statements only, joined as rule 7 requires, even though no
-	// Deny grant can exist (UpsertGrant refuses one).
+	// Grants: Allow statements only, as rule 7 requires even though no Deny
+	// grant can exist (UpsertGrant refuses one) -- judged by the statement as
+	// it was when the grant started (changesGrantWasAllow), so an Allow edited
+	// to Deny keeps the history of the grant it had.
 	in, inArgs = h.in("g.subject_identity_account_id")
 	during, duringArgs = h.during("g.subject_identity_account_id", "x.at")
-	u.add(`SELECT x.at, x.event, g.id, 'grant'::text, `+h.via("g.subject_identity_account_id")+`, x.reason, NULL::bigint, NULL::uuid
+	u.add(`SELECT x.at, x.event, g.id, 'grant'::text, `+h.via("g.subject_identity_account_id")+`, x.reason, NULL::bigint, NULL::uuid,
+	              NULL::uuid
 	         FROM iga_access_edges g
-	         JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id
-	                                AND e.provider = 'aws' AND e.effect = '`+models.EffectAllow+`'
+	         JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id AND e.provider = 'aws'
+	         `+changesGrantRevisionJoin+`
 	        CROSS JOIN LATERAL (VALUES (g.valid_from, '`+ChangeGrantStarted+`'::text, ''::text),
 	                                   (g.valid_to, '`+ChangeGrantEnded+`'::text, g.ended_reason)) x(at, event, reason)
 	        WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.assignment_id IS NOT NULL
+	          AND `+changesGrantWasAllow+`
 	          AND x.at IS NOT NULL AND `+in+` AND `+during,
 		append(append([]any{ws}, inArgs...), duringArgs...)...)
 
@@ -682,7 +734,7 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 	// whose content differs, while the holder's grant to it was valid.
 	gv, gvArgs := grantValid("sr.valid_from")
 	u.add(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, `+h.via("hs.holder")+`,
-	              ''::text, NULL::bigint, sr.first_seen_run_id
+	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
 	         FROM `+held+`
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws'
 	         JOIN iga_statement_revision sr ON sr.workspace_id = e.workspace_id AND sr.entitlement_id = e.id
@@ -692,10 +744,10 @@ func changesPermissionBranches(u *changesUnion, h changesHolders) {
 
 	// statement_replaced: a Sid-less statement the holder held a grant to
 	// retired unsupported in a run in which a statement of the same policy
-	// began. One event per (policy, run), keyed by the policy.
+	// began. One event per (policy, run), its id derived from both.
 	gv, gvArgs = grantValid("le.occurred_at")
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, e.policy_id, 'replacement'::text, `+h.via("hs.holder")+`,
-	              ''::text, le.rev::bigint, le.scan_run_id
+	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	              `+h.via("hs.holder")+`, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+held+`
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws' AND e.sid = ''
 	         JOIN iga_lifecycle_event le ON le.workspace_id = e.workspace_id AND le.entitlement_id = e.id
@@ -732,18 +784,20 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 	naming := `(SELECT DISTINCT t.entitlement_id FROM iga_entitlement_target t
 	             WHERE t.workspace_id = ? AND t.resource_id = ? AND t.target_mode = '` + models.TargetResource + `')`
 
-	u.add(`SELECT x.at, x.event, g.id, 'grant'::text, NULL::uuid, x.reason, NULL::bigint, NULL::uuid
+	// Grants: Allow when they started (changesGrantWasAllow), as for holders.
+	u.add(`SELECT x.at, x.event, g.id, 'grant'::text, NULL::uuid, x.reason, NULL::bigint, NULL::uuid, NULL::uuid
 	         FROM iga_access_edges g
-	         JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id
-	                                AND e.provider = 'aws' AND e.effect = '`+models.EffectAllow+`'
+	         JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id AND e.provider = 'aws'
+	         `+changesGrantRevisionJoin+`
 	        CROSS JOIN LATERAL (VALUES (g.valid_from, '`+ChangeGrantStarted+`'::text, ''::text),
 	                                   (g.valid_to, '`+ChangeGrantEnded+`'::text, g.ended_reason)) x(at, event, reason)
 	        WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.assignment_id IS NOT NULL
+	          AND `+changesGrantWasAllow+`
 	          AND x.at IS NOT NULL AND g.entitlement_id IN `+naming,
 		ws, ws, id)
 
 	u.add(`SELECT sr.valid_from, '`+ChangeStatementRevised+`'::text, sr.id, 'revision'::text, NULL::uuid,
-	              ''::text, NULL::bigint, sr.first_seen_run_id
+	              ''::text, NULL::bigint, sr.first_seen_run_id, NULL::uuid
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws'
 	         JOIN iga_statement_revision sr ON sr.workspace_id = e.workspace_id AND sr.entitlement_id = e.id
@@ -751,8 +805,8 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 		ws, id, ws)
 
 	// Replacements: the ended statement named it ...
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, e.policy_id, 'replacement'::text, NULL::uuid,
-	              ''::text, le.rev::bigint, le.scan_run_id
+	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	              NULL::uuid, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements e ON e.workspace_id = ? AND e.id = hs.entitlement_id AND e.provider = 'aws' AND e.sid = ''
 	         JOIN iga_lifecycle_event le ON le.workspace_id = e.workspace_id AND le.entitlement_id = e.id
@@ -760,8 +814,8 @@ func changesResourceBranches(u *changesUnion, ws, id uuid.UUID) {
 	        WHERE `+changesBegunInRunSQL,
 		ws, id, ws)
 	// ... or a statement that began in its place names it.
-	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, e.policy_id, 'replacement'::text, NULL::uuid,
-	              ''::text, le.rev::bigint, le.scan_run_id
+	u.add(`SELECT le.occurred_at, '`+ChangeStatementReplaced+`'::text, `+changesReplacementID+`, 'replacement'::text,
+	              NULL::uuid, ''::text, le.rev::bigint, le.scan_run_id, e.policy_id
 	         FROM `+naming+` hs
 	         JOIN iga_entitlements ne ON ne.workspace_id = ? AND ne.id = hs.entitlement_id AND ne.provider = 'aws'
 	         JOIN iga_lifecycle_event n ON n.workspace_id = ne.workspace_id AND n.entitlement_id = ne.id
@@ -786,6 +840,8 @@ type changesRow struct {
 	Reason string
 	Rev    *int64
 	RunID  *uuid.UUID
+	// statement_replaced only: its policy (ID is derived from policy and run).
+	PolicyID *uuid.UUID
 
 	// coverage_changed only.
 	ConnectorID uuid.UUID
@@ -990,11 +1046,17 @@ func changesRenderConfiguration(q *Query, obj changesObject, objID uuid.UUID, ro
 			ev.After = map[string]any{"statement": rawOrNull(rv.Statement),
 				"policy_version_id": rv.PolicyVersionID, "content_hash": rv.ContentHash}
 		case "replacement":
-			set := repl[changesReplKey{policy: r.ID, run: derefUUID(r.RunID)}]
-			ev.Subject = claims.add(RefPolicy, r.ID)
+			if r.PolicyID == nil {
+				return nil, fmt.Errorf("igaread: changes page names replacement %s without its policy", r.ID)
+			}
+			rp := repl[changesReplKey{policy: *r.PolicyID, run: derefUUID(r.RunID)}]
+			if rp == nil {
+				rp = &changesReplacement{}
+			}
+			ev.Subject = claims.add(RefPolicy, *r.PolicyID)
 			ev.Detail["policy"] = ev.Subject
 			before, after := []map[string]any{}, []map[string]any{}
-			for _, s := range set {
+			for _, s := range rp.statements {
 				item := map[string]any{"statement": claims.add(RefStatement, s.EntitlementID),
 					"content": rawOrNull(s.NativeRights), "content_hash": s.ContentHash}
 				if s.Event == models.LifecycleRetired {
@@ -1003,8 +1065,10 @@ func changesRenderConfiguration(q *Query, obj changesObject, objID uuid.UUID, ro
 					after = append(after, item)
 				}
 			}
-			ev.Before = map[string]any{"statements": before}
-			ev.After = map[string]any{"statements": after}
+			// policy_version_id before and after (D-69): null unless proven
+			// (changesReplacementVersions).
+			ev.Before = map[string]any{"policy_version_id": rp.before, "statements": before}
+			ev.After = map[string]any{"policy_version_id": rp.after, "statements": after}
 		default:
 			return nil, fmt.Errorf("igaread: unknown changes source %q", r.Src)
 		}
@@ -1268,14 +1332,17 @@ func changesLoadGrants(q *Query, ids []uuid.UUID) (map[uuid.UUID]changesGrant, e
 	if len(ids) == 0 {
 		return out, nil
 	}
+	// The same Allow rule as the union that chose these ids
+	// (changesGrantWasAllow): a grant the page names is always found here.
 	var rows []changesGrant
 	if err := q.DB().Raw(`SELECT g.id, g.subject_identity_account_id AS holder, g.entitlement_id, g.assignment_id,
 	                             e.policy_id, g.state, e.native_rights
 	                        FROM iga_access_edges g
 	                        JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id
-	                                               AND e.provider = 'aws' AND e.effect = ?
-	                       WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.id IN ?`,
-		models.EffectAllow, q.WS, ids).Scan(&rows).Error; err != nil {
+	                                               AND e.provider = 'aws'
+	                        `+changesGrantRevisionJoin+`
+	                       WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.id IN ? AND `+changesGrantWasAllow,
+		q.WS, ids).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	for _, r := range rows {
@@ -1335,18 +1402,37 @@ type changesReplStatement struct {
 	NativeRights  json.RawMessage
 }
 
+// changesReplacement is one statement_replaced's content: the statements that
+// ended and began, and the policy's version on each side (D-69) -- a string,
+// or nil when the data does not prove one.
+type changesReplacement struct {
+	rev           int64 // the replacing run's revision (its lifecycle events')
+	statements    []changesReplStatement
+	before, after any
+}
+
 // changesLoadReplacements reads, for each statement_replaced on the page,
 // every statement of the policy that ended (Sid-less, retired unsupported) and
 // that began (first seen or restored) in the run. They are listed as they are,
 // never paired: with several Sid-less statements changed in one run, nothing
 // says which new one replaced which old one.
-func changesLoadReplacements(q *Query, rows []changesRow) (map[changesReplKey][]changesReplStatement, error) {
-	out := map[changesReplKey][]changesReplStatement{}
+func changesLoadReplacements(q *Query, rows []changesRow) (map[changesReplKey]*changesReplacement, error) {
+	out := map[changesReplKey]*changesReplacement{}
 	var policies, runs []uuid.UUID
 	for _, r := range rows {
-		if r.Src == "replacement" && r.RunID != nil {
-			policies = append(policies, r.ID)
-			runs = append(runs, *r.RunID)
+		if r.Src == "replacement" && r.RunID != nil && r.PolicyID != nil {
+			k := changesReplKey{policy: *r.PolicyID, run: *r.RunID}
+			if out[k] == nil {
+				// No revision (never, for a lifecycle row): no confirmation is
+				// provably earlier, so "before" stays null.
+				rp := &changesReplacement{rev: 0}
+				if r.Rev != nil {
+					rp.rev = *r.Rev
+				}
+				out[k] = rp
+				policies = append(policies, k.policy)
+				runs = append(runs, k.run)
+			}
 		}
 	}
 	if len(policies) == 0 {
@@ -1363,17 +1449,213 @@ func changesLoadReplacements(q *Query, rows []changesRow) (map[changesReplKey][]
 		[]string{models.LifecycleFirstSeen, models.LifecycleRestored}).Scan(&found).Error; err != nil {
 		return nil, err
 	}
-	want := map[changesReplKey]bool{}
-	for i := range policies {
-		want[changesReplKey{policy: policies[i], run: runs[i]}] = true
-	}
 	for _, s := range found {
-		k := changesReplKey{policy: s.PolicyID, run: s.ScanRunID}
-		if want[k] {
-			out[k] = append(out[k], s)
+		if rp := out[changesReplKey{policy: s.PolicyID, run: s.ScanRunID}]; rp != nil {
+			rp.statements = append(rp.statements, s)
 		}
 	}
+	if err := changesReplacementVersions(q, out, policies); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// changesObservedSubjectFact is the key under which the observation writer
+// names, inside an observation's facts, the cloud_* row it was observed on:
+// "policy:<cloud_policy id>" for a policy version (services.ObservedSubjectFact;
+// igaread does not import services). It survives the row's deletion, which
+// SETs NULL cloud_observation.policy_id.
+const changesObservedSubjectFact = "observed_subject"
+
+// changesReplacementVersions is D-69 for statement_replaced: the policy's
+// default version before and after the run that replaced its statements.
+//
+// A Sid-less statement has no revision to carry a version
+// (iga_statement_revision holds Sid-keyed statements only, §3 036) and the
+// policy row keeps only its CURRENT version_id, so both sides come from the
+// policy-version observations (D-66's source: the collector records one per
+// version of a managed policy, its facts naming version_id):
+//
+//	after   the version the replacing run itself read
+//	before  the version read by the runs that last confirmed the ended
+//	        statements (their support rows' last_confirmed_run_id), when
+//	        those were published before the replacing run -- the last read
+//	        that still contained them. A statement restored since was
+//	        confirmed again later, and its support row keeps only that.
+//
+// A run is proven to have read a version only when that version's
+// observation was first recorded or last confirmed by that run, from a
+// readable document: an observation keeps no other run. So a side renders
+// null -- never a guess -- when no such observation exists (a policy whose
+// version an older run read and a later run read again: the observation's
+// last confirmation has moved on), when the runs read more than one version,
+// or when the policy has no native id to observe it by. An inline policy has
+// no versions in AWS and renders "" on both sides, as its statement
+// revisions store.
+func changesReplacementVersions(q *Query, out map[changesReplKey]*changesReplacement, policies []uuid.UUID) error {
+	var pols []struct {
+		ID         uuid.UUID
+		PolicyKind string
+		NativeRef  string
+	}
+	if err := q.DB().Raw(`SELECT id, policy_kind, native_ref FROM iga_policy
+	                       WHERE workspace_id = ? AND provider = 'aws' AND id IN ?`, q.WS, policies).Scan(&pols).Error; err != nil {
+		return err
+	}
+	native := map[uuid.UUID]string{}
+	for _, p := range pols {
+		if p.PolicyKind == models.PolicyKindInline {
+			for k, rp := range out {
+				if k.policy == p.ID {
+					rp.before, rp.after = "", ""
+				}
+			}
+			continue
+		}
+		if p.NativeRef != "" {
+			native[p.ID] = p.NativeRef
+		}
+	}
+
+	// The runs that last confirmed each ended statement, with their
+	// publications' revisions: only a confirmation published BEFORE the
+	// replacing run speaks for "before". A statement restored since has been
+	// confirmed again after it, and its support row keeps only that last
+	// confirmation -- the read before the replacement is then not retained.
+	type confirmed struct {
+		run uuid.UUID
+		rev int64
+	}
+	var ended []uuid.UUID
+	for _, rp := range out {
+		for _, s := range rp.statements {
+			if s.Event == models.LifecycleRetired {
+				ended = append(ended, s.EntitlementID)
+			}
+		}
+	}
+	lastRead := map[uuid.UUID][]confirmed{} // statement -> runs that last confirmed it
+	if len(ended) > 0 {
+		var sup []struct {
+			EntitlementID      uuid.UUID
+			LastConfirmedRunID uuid.UUID
+			Rev                int64
+		}
+		if err := q.DB().Raw(`SELECT DISTINCT s.entitlement_id, s.last_confirmed_run_id, p.rev
+		                        FROM iga_object_support s
+		                        JOIN iga_publication p ON p.workspace_id = s.workspace_id AND p.scan_run_id = s.last_confirmed_run_id
+		                       WHERE s.workspace_id = ? AND s.entitlement_id IN ?`,
+			q.WS, ended).Scan(&sup).Error; err != nil {
+			return err
+		}
+		for _, s := range sup {
+			lastRead[s.EntitlementID] = append(lastRead[s.EntitlementID], confirmed{s.LastConfirmedRunID, s.Rev})
+		}
+	}
+	// before is, per event, the ended statements' confirmations published
+	// before the replacing run.
+	before := func(rp *changesReplacement) []uuid.UUID {
+		var runs []uuid.UUID
+		for _, s := range rp.statements {
+			if s.Event != models.LifecycleRetired {
+				continue
+			}
+			for _, c := range lastRead[s.EntitlementID] {
+				if c.rev < rp.rev {
+					runs = append(runs, c.run)
+				}
+			}
+		}
+		return runs
+	}
+
+	// Which run read which version of which policy: one query for the page.
+	natives, runs := []string{}, []uuid.UUID{}
+	seenN, seenR := map[string]bool{}, map[uuid.UUID]bool{}
+	addRun := func(id uuid.UUID) {
+		if !seenR[id] {
+			seenR[id] = true
+			runs = append(runs, id)
+		}
+	}
+	for k, rp := range out {
+		n, ok := native[k.policy]
+		if !ok {
+			continue
+		}
+		if !seenN[n] {
+			seenN[n] = true
+			natives = append(natives, n)
+		}
+		addRun(k.run)
+		for _, run := range before(rp) {
+			addRun(run)
+		}
+	}
+	if len(natives) == 0 {
+		return nil
+	}
+	var obs []struct {
+		SubjectNativeID    string
+		ScanRunID          uuid.UUID
+		LastConfirmedRunID *uuid.UUID
+		VersionID          *string
+	}
+	if err := q.DB().Raw(`SELECT o.subject_native_id, o.scan_run_id, o.last_confirmed_run_id,
+	                             o.sanitized_facts->>'version_id' AS version_id
+	                        FROM cloud_observation o
+	                       WHERE o.workspace_id = ? AND o.subject_native_id IN ?
+	                         AND (o.policy_id IS NOT NULL OR o.sanitized_facts->>? LIKE 'policy:%')
+	                         AND COALESCE(o.sanitized_facts->>'document_error', '') = ''
+	                         AND (o.scan_run_id IN ? OR o.last_confirmed_run_id IN ?)`,
+		q.WS, natives, changesObservedSubjectFact, runs, runs).Scan(&obs).Error; err != nil {
+		return err
+	}
+	type readKey struct {
+		native string
+		run    uuid.UUID
+	}
+	read := map[readKey]map[string]bool{} // (policy, run) -> versions that run read
+	note := func(k readKey, v string) {
+		if read[k] == nil {
+			read[k] = map[string]bool{}
+		}
+		read[k][v] = true
+	}
+	for _, o := range obs {
+		if o.VersionID == nil || *o.VersionID == "" {
+			continue
+		}
+		note(readKey{o.SubjectNativeID, o.ScanRunID}, *o.VersionID)
+		if o.LastConfirmedRunID != nil {
+			note(readKey{o.SubjectNativeID, *o.LastConfirmedRunID}, *o.VersionID)
+		}
+	}
+	// only is the one version the runs read, or nil.
+	only := func(n string, runs []uuid.UUID) any {
+		vs := map[string]bool{}
+		for _, run := range runs {
+			for v := range read[readKey{n, run}] {
+				vs[v] = true
+			}
+		}
+		if len(vs) != 1 {
+			return nil
+		}
+		for v := range vs {
+			return v
+		}
+		return nil
+	}
+	for k, rp := range out {
+		n, ok := native[k.policy]
+		if !ok {
+			continue
+		}
+		rp.after = only(n, []uuid.UUID{k.run})
+		rp.before = only(n, before(rp))
+	}
+	return nil
 }
 
 // changesTargets is each statement's POSITIVE targets (target_mode resource),
@@ -1452,6 +1734,10 @@ func changesRemaining(q *Query, rows []changesRow, grants map[uuid.UUID]changesG
 		}
 	}
 	if len(detached) > 0 {
+		// The ended claim's targets are history: the grants that were Allow
+		// grants through the assignment (changesGrantWasAllow). The remaining
+		// candidates below are the CURRENT revision's, judged by the
+		// statements' current effect.
 		var at []struct {
 			AssignmentID uuid.UUID
 			ResourceID   uuid.UUID
@@ -1459,12 +1745,14 @@ func changesRemaining(q *Query, rows []changesRow, grants map[uuid.UUID]changesG
 		if err := q.DB().Raw(`SELECT DISTINCT g.assignment_id, t.resource_id
 		                        FROM iga_access_edges g
 		                        JOIN iga_entitlements e ON e.workspace_id = g.workspace_id AND e.id = g.entitlement_id
-		                                               AND e.provider = 'aws' AND e.effect = ?
+		                                               AND e.provider = 'aws'
+		                        `+changesGrantRevisionJoin+`
 		                        JOIN iga_entitlement_target t ON t.workspace_id = g.workspace_id
 		                                                     AND t.entitlement_id = g.entitlement_id AND t.target_mode = ?
 		                       WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.assignment_id IN ?
+		                         AND `+changesGrantWasAllow+`
 		                       ORDER BY g.assignment_id, t.resource_id`,
-			models.EffectAllow, models.TargetResource, q.WS, detached).Scan(&at).Error; err != nil {
+			models.TargetResource, q.WS, detached).Scan(&at).Error; err != nil {
 			return nil, err
 		}
 		for _, r := range at {
@@ -1488,6 +1776,8 @@ func changesRemaining(q *Query, rows []changesRow, grants map[uuid.UUID]changesG
 	if len(holders) == 0 || len(resources) == 0 {
 		return set, nil
 	}
+	// The candidates are what remains NOW: non-ended grants of statements that
+	// are Allow at the current revision (rule 7 as written).
 	var cands []changesCandidate
 	if err := q.DB().Raw(`SELECT g.id, g.subject_identity_account_id AS holder, g.state, g.last_confirmed_at,
 	                             g.assignment_id, g.entitlement_id, e.policy_id, t.resource_id

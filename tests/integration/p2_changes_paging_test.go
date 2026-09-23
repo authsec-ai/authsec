@@ -4,6 +4,7 @@ package integration
 // binding, revision_stale), parameters, 404s, and kind=coverage (D-70).
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -138,11 +139,28 @@ func TestP2ChangesPaging(t *testing.T) {
 
 // Parameters and ids: an unknown parameter, a bad kind or limit is 400; a
 // malformed id, another type's reference, another workspace's object, or a
-// workspace with nothing published is 404 with no hint (§5.2, D-4, E14).
+// workspace with nothing published is 404 with no hint (§5.2, D-4, E14). The
+// other workspace has a publication of its own, so its 404 can only come from
+// the object's workspace predicate, never D-4's nothing-published answer. And
+// an object with no first_seen event still has its Changes, with
+// history_begins null (D-70).
+//
+// Safeguards (mutation-checked): the object lookup's workspace predicate;
+// history_begins read into a nullable time.
 func TestP2ChangesParametersAndNotFound(t *testing.T) {
 	l := newP2Lab(t, "p2-changes-params", true)
+	other := newP2Lab(t, "p2-changes-params-other", true)
+	// Each lab empties cloud_scan_run when it is created and again at cleanup,
+	// and publications reference runs RESTRICT: both labs exist before either
+	// scans, and this cleanup (registered last, so run first) removes both
+	// workspaces' graph rows before either lab clears the run table.
+	t.Cleanup(func() { other.cleanup(); l.cleanup() })
 	a := oneLambda(l)
 	l.scanAndProject(a)
+	b := other.account(accountB)
+	b.role("OtherRole", "AROAOTHERROLEOTHERRO")
+	b.attach("OtherRole", changesManaged(b, "OtherRead", docToolboxRead))
+	other.scanAndProject(b)
 	api := l.api()
 	role := changesIdentity(t, l, "refund-lambda-role")
 	wl := changesIDOf(t, l, `SELECT id FROM iga_workload WHERE workspace_id = ?`, l.ws)
@@ -168,12 +186,25 @@ func TestP2ChangesParametersAndNotFound(t *testing.T) {
 		}
 	}
 
-	// Another workspace, with nothing published, asking for these ids.
-	foreign := l.api().asWorkspace(newWorkspace(t, l.db, "p2-changes-params-other"))
+	// Another workspace, WITH a publication of its own, asking for these ids:
+	// 404, and nothing of this workspace in the answer.
+	foreign := other.api()
+	changesGet(t, foreign, changesPath("identity", changesIdentity(t, other, "OtherRole"))) // it is published
+	leaks := []string{wl.String(), role.String(), res.String(), a.conn.String(), accountA, "refund-processor",
+		"refund-lambda-role", "TicketRead"}
+	unpublished := l.api().asWorkspace(newWorkspace(t, l.db, "p2-changes-params-unpublished"))
 	for refType, id := range map[string]uuid.UUID{"workload": wl, "identity": role, "resource": res} {
-		code, body := foreign.get(changesPath(refType, id))
-		if code != http.StatusNotFound || errCode(body) != "not_found" {
-			t.Errorf("%s from another workspace = %d %v, want 404", refType, code, body)
+		for name, probe := range map[string]*readAPI{"a published workspace": foreign, "an unpublished workspace": unpublished} {
+			code, body := probe.get(changesPath(refType, id))
+			if code != http.StatusNotFound || errCode(body) != "not_found" {
+				t.Errorf("%s from %s = %d %v, want 404", refType, name, code, body)
+			}
+			raw, _ := json.Marshal(body)
+			for _, s := range leaks {
+				if strings.Contains(string(raw), s) {
+					t.Errorf("%s from %s leaks %q: %s", refType, name, s, raw)
+				}
+			}
 		}
 		// Positive control: the same ids from their own workspace resolve.
 		changesGet(t, l.api(), changesPath(refType, id))
@@ -192,6 +223,24 @@ func TestP2ChangesParametersAndNotFound(t *testing.T) {
 	}
 	if code, body := off.api().get("/capabilities"); code != http.StatusOK || dig(body, "data", "features", "changes") != false {
 		t.Errorf("/capabilities off = %d %v, want features.changes false", code, body)
+	}
+
+	// An object with no first_seen event -- a row projected before the event
+	// log existed. The projector always writes one, so it is deleted here:
+	// the fakes cannot produce this state. Its Changes still answer, with
+	// history_begins null -- nothing earlier is claimed (D-70) -- and the rest
+	// of its history intact.
+	if err := l.db.Exec(`DELETE FROM iga_lifecycle_event WHERE workspace_id = ? AND identity_account_id = ? AND event = ?`,
+		l.ws, role, models.LifecycleFirstSeen).Error; err != nil {
+		t.Fatalf("delete the role's first_seen: %v", err)
+	}
+	body = changesGet(t, api, changesPath("identity", role))
+	meta, _ := body["meta"].(map[string]any)
+	if v, ok := meta["history_begins"]; !ok || v != nil {
+		t.Errorf("meta.history_begins = %v (present %v), want present and null", v, ok)
+	}
+	if got := changesPick(changesAll(t, api, "identity", role, "configuration"), "policy_attached", "", ""); len(got) != 1 {
+		t.Errorf("the role's policy_attached = %d events, want its history intact (1)", len(got))
 	}
 }
 

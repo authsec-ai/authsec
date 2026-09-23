@@ -227,6 +227,61 @@ func TestP2ChangesRemainingStaleGrant(t *testing.T) {
 	}
 }
 
+// D-28: "a grant still reached through that assignment is not another path".
+// TicketRead, an AWS-managed policy attached to two roles (so it is still
+// fetched), becomes unreadable in the run that detaches it from
+// SharedToolRole. The assignment ends -- attachment lists are read
+// independently of documents -- but the grant it carried is protected by the
+// unreadable document and goes STALE, still naming the ended assignment. That
+// grant is the detached policy's own on its way out, not a path that remains:
+// the detach says nothing remains and the path is none, never "stale".
+//
+// Safeguard (mutation-checked): forAssignment keeps only grants reached
+// through ANOTHER assignment.
+func TestP2ChangesDetachOwnStaleGrantIsNoPath(t *testing.T) {
+	l := newP2Lab(t, "p2-changes-own-stale", true)
+	a := l.account(accountA)
+	a.role("SharedToolRole", "AROASHAREDTOOLROLE01")
+	a.role("OtherRole", "AROAOTHERROLEOTHERRO")
+	ticket := "arn:aws:iam::aws:policy/TicketRead"
+	a.iam.managedPolicies[ticket] = docTicketRead
+	a.attach("SharedToolRole", ticket)
+	a.attach("OtherRole", ticket)
+	l.scanAndProject(a)
+	roleID := changesIdentity(t, l, "SharedToolRole")
+
+	a.iam.failPolicyVersion[ticket] = denied("iam:GetPolicyVersion")
+	a.detach("SharedToolRole", ticket)
+	run := l.scanAndProject(a)
+
+	var own []struct {
+		GrantState string
+		AsgState   string
+	}
+	l.db.Raw(`SELECT g.state AS grant_state, a.state AS asg_state FROM iga_access_edges g
+	           JOIN iga_policy_assignment a ON a.workspace_id = g.workspace_id AND a.id = g.assignment_id
+	          WHERE g.workspace_id = ? AND g.provider = 'aws' AND g.subject_identity_account_id = ?`, l.ws, roleID).Scan(&own)
+	if len(own) != 1 || own[0].GrantState != models.RelStale || own[0].AsgState != models.RelEnded {
+		t.Fatalf("setup: SharedToolRole's grants = %+v, want one stale grant through its ended TicketRead assignment", own)
+	}
+
+	events := changesAll(t, l.api(), "identity", roleID, "configuration")
+	changesAssertAttributed(t, l, events)
+	det := changesOne(t, events, "policy_detached", "policy", refOf("policy", changesPolicy(t, l, "TicketRead")))
+	if digs(det, "run") != refOf("cloud_scan_run", run.ID) {
+		t.Errorf("policy_detached run = %s, want %s", digs(det, "run"), run.ID)
+	}
+	if pols, paths := changesRemainingOf(det); len(pols) != 0 || len(paths) != 1 ||
+		paths["arn:aws:s3:::support-tickets/*"] != "none" {
+		t.Errorf("detach remaining = %v paths %v, want nothing remaining and support-tickets/* none: the "+
+			"detached assignment's own stale grant is not another path", pols, paths)
+	}
+	// The stale grant did not end: it was not looked at.
+	if got := changesPick(events, "grant_ended", "", ""); len(got) != 0 {
+		t.Errorf("a protected grant ended:%s", changesDump(got))
+	}
+}
+
 // changesUnused keeps the uuid import honest in files that only use it via
 // helpers.
 var _ = uuid.Nil
