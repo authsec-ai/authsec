@@ -53,6 +53,23 @@ func wdetailFunctions(a *p2Account, region string, fns ...wdetailFn) {
 	}
 }
 
+// wdetailEnvironmentUnread makes ListFunctions return one function's
+// environment as AWS does when Lambda cannot decrypt its variables with the
+// function's KMS key: an error in place of the variables.
+func wdetailEnvironmentUnread(a *p2Account, region, name string) {
+	a.lab.t.Helper()
+	for i, fn := range a.lambdas[region].functions {
+		if aws.ToString(fn.FunctionName) == name {
+			a.lambdas[region].functions[i].Environment = &lambdatypes.EnvironmentResponse{Error: &lambdatypes.EnvironmentError{
+				ErrorCode: aws.String("KMSAccessDeniedException"),
+				Message:   aws.String("Lambda was unable to decrypt the environment variables because KMS access was denied."),
+			}}
+			return
+		}
+	}
+	a.lab.t.Fatalf("no Lambda function %q in %s", name, region)
+}
+
 // wdetailWorkload is the id of the workspace's workload of this name (the
 // active one when a retired one shares the name).
 func wdetailWorkload(t *testing.T, l *p2Lab, name string) uuid.UUID {

@@ -79,6 +79,14 @@ func (q *Query) resolveWorkloadParts(pairs []PartitionPair) (map[PartitionPair]*
 		q.WS, conns, keys).Scan(&marks).Error; err != nil {
 		return nil, err
 	}
+	return q.resolveWatermarks(marks, want)
+}
+
+// resolveWatermarks resolves watermark rows to their partitions and runs: one
+// read of the runs, and one igagraph.Partitions per (scope, run). want, when
+// not nil, keeps only those pairs.
+func (q *Query) resolveWatermarks(marks []coverageWatermark, want map[PartitionPair]bool) (map[PartitionPair]*workloadResolvedPart, error) {
+	out := map[PartitionPair]*workloadResolvedPart{}
 	runIDs := []uuid.UUID{}
 	seenR := map[uuid.UUID]bool{}
 	for _, m := range marks {
@@ -111,7 +119,7 @@ func (q *Query) resolveWorkloadParts(pairs []PartitionPair) (map[PartitionPair]*
 	for _, m := range marks {
 		pair := PartitionPair{ConnectorID: m.ConnectorID, PartitionKey: m.PartitionKey}
 		run := runByID[m.LastRunID]
-		if !want[pair] || run == nil {
+		if (want != nil && !want[pair]) || run == nil {
 			continue
 		}
 		ck := [2]uuid.UUID{m.EstateScopeID, run.ID}
@@ -195,6 +203,44 @@ func (q *Query) workloadNodeParts(workloadID uuid.UUID) ([]*workloadResolvedPart
 	return out, nil
 }
 
+// workloadTrustParts resolves the trust-document partition (can_assume, kind
+// "trust") of EVERY connector of the workspace, each from the run the current
+// revision holds it from: what the Identities tab's may_assume rests on.
+//
+// Not only the workload's own connector's: a can_assume edge is reconciled
+// under the connector that READ the trust document -- the trusting role's
+// account (igagraph trust.go stamps the reading run's connector and
+// partition) -- and a role in any connected account may name the execution
+// identity as its principal. So an account whose roles were not read bears on
+// may_assume whether or not an edge from it exists yet: its rows could be
+// stale (stale_reason says so, row by row) or missing altogether, and only
+// meta.coverage can say that (§2.14.14 "every gap that bears on this
+// result"). Which partitions are trust partitions is igagraph's own
+// MatchesEdge over the watermark's stored relationship_type, never parsed from
+// the key (D-57). Two statements: the watermarks, then their runs.
+func (q *Query) workloadTrustParts() ([]*workloadResolvedPart, error) {
+	var marks []coverageWatermark
+	if err := q.DB().Raw(`SELECT connector_id, estate_scope_id, partition_key, last_run_id
+	                        FROM iga_projection_state
+	                       WHERE workspace_id = ? AND relationship_type = ?
+	                       ORDER BY connector_id, partition_key`,
+		q.WS, models.RelTypeCanAssume).Scan(&marks).Error; err != nil {
+		return nil, err
+	}
+	res, err := q.resolveWatermarks(marks, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := []*workloadResolvedPart{}
+	for _, m := range marks {
+		rp := res[PartitionPair{ConnectorID: m.ConnectorID, PartitionKey: m.PartitionKey}]
+		if rp != nil && rp.part.MatchesEdge(models.RelTypeCanAssume, "trust", "") {
+			out = append(out, rp)
+		}
+	}
+	return out, nil
+}
+
 // workloadCoverageScope chooses, from the runs a workload's node partitions
 // were projected from, the partitions one response rests on. The node
 // partition itself is always included.
@@ -202,10 +248,12 @@ type workloadCoverageScope struct {
 	// Execution: the workload's executes_as partition (and ECS's
 	// task_execution_role): its runtime surface plus iam_roles.
 	Execution bool
-	// Memberships and Trust: member_of, and the trust documents can_assume is
-	// read from (the Identities tab's groups and may_assume).
+	// Memberships: member_of (the Identities tab's groups).
 	Memberships bool
-	Trust       bool
+	// Trust: the trust partitions may_assume rests on (workloadTrustParts),
+	// each reported under its OWN connector's account, with that connector's
+	// revoked note when it is revoked (D-73 "a revoked account in scope").
+	Trust []*workloadResolvedPart
 	// Permissions: assignments and grants, plus policy_documents -- an
 	// unreadable document protects its grants row by row, not through a
 	// partition (§4.10), so it is named when the run did not reach it.
@@ -215,8 +263,9 @@ type workloadCoverageScope struct {
 // workloadCoverage is meta.coverage for a workload detail or tab (D-73): the
 // gaps of the partitions this answer rests on, per account and surface, from
 // the runs the current revision holds them from; plus {account_id, surface:
-// "*", state: "revoked"} when the workload's connector is revoked (D-89).
-// Sorted by account, then surface; one entry per (account, surface).
+// "*", state: "revoked"} for each revoked connector in scope -- the
+// workload's own, or one whose trust partition may_assume rests on (D-73,
+// D-89). Sorted by account, then surface; one entry per (account, surface).
 func (q *Query) workloadCoverage(accts *Accounts, w *WorkloadRecord, nodes []*workloadResolvedPart, scope workloadCoverageScope) []CoverageNote {
 	type key struct{ account, surface string }
 	seen := map[key]bool{}
@@ -236,6 +285,17 @@ func (q *Query) workloadCoverage(accts *Accounts, w *WorkloadRecord, nodes []*wo
 		}
 	}
 	revoked := map[uuid.UUID]bool{}
+	noteRevoked := func(conn uuid.UUID) {
+		if c := accts.Connector(conn); c != nil && c.Status == models.CloudConnectorRevoked && !revoked[conn] {
+			revoked[conn] = true
+			k := key{c.AccountID, "*"}
+			if !seen[k] {
+				seen[k] = true
+				notes = append(notes, CoverageNote{AccountID: c.AccountID, Surface: "*",
+					State: models.CloudConnectorRevoked, Affects: "everything this account's connector collected"})
+			}
+		}
+	}
 	for _, n := range nodes {
 		conn := n.part.ConnectorID
 		add(conn, workloadCoverageGaps(n.part, n.run.cov))
@@ -251,8 +311,6 @@ func (q *Query) workloadCoverage(accts *Accounts, w *WorkloadRecord, nodes []*wo
 				p.MatchesEdge(models.RelTypeTaskExecutionRole, w.RuntimeKind, w.Region):
 				pick = true
 			case scope.Memberships && p.RelationshipType == models.RelTypeMemberOf:
-				pick = true
-			case scope.Trust && p.MatchesEdge(models.RelTypeCanAssume, "trust", ""):
 				pick = true
 			case scope.Permissions && (p.Target == "assignment" || p.Target == "access_edge"):
 				pick = true
@@ -270,15 +328,11 @@ func (q *Query) workloadCoverage(accts *Accounts, w *WorkloadRecord, nodes []*wo
 				add(conn, []surfaceGap{{models.SurfacePolicyDocuments, st}})
 			}
 		}
-		if c := accts.Connector(conn); c != nil && c.Status == models.CloudConnectorRevoked && !revoked[conn] {
-			revoked[conn] = true
-			k := key{c.AccountID, "*"}
-			if !seen[k] {
-				seen[k] = true
-				notes = append(notes, CoverageNote{AccountID: c.AccountID, Surface: "*",
-					State: models.CloudConnectorRevoked, Affects: "everything this account's connector collected"})
-			}
-		}
+		noteRevoked(conn)
+	}
+	for _, t := range scope.Trust {
+		add(t.part.ConnectorID, workloadCoverageGaps(t.part, t.run.cov))
+		noteRevoked(t.part.ConnectorID)
 	}
 	sort.Slice(notes, func(i, j int) bool {
 		if notes[i].AccountID != notes[j].AccountID {

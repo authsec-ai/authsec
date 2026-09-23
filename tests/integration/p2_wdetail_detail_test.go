@@ -183,6 +183,51 @@ func TestP2WdetailProviderAttrsFollowRescan(t *testing.T) {
 	if targets, ok := attrs("tools-gw")["gateway_targets"].([]any); !ok || len(targets) != 0 {
 		t.Errorf("after the rescan gateway_targets = %v, want [] (read in full, none left)", attrs("tools-gw")["gateway_targets"])
 	}
+
+	// A list this scan did NOT read is null ("not collected"), never [] and
+	// never the list an earlier scan kept (D-85; "never claim more than the
+	// data proves").
+	//
+	// Scan 3: Lambda returns the function's environment as an error (it could
+	// not decrypt the variables with the function's KMS key) -- nothing was
+	// read, so the names are unknown, not "none". The gateway gets a target
+	// again, read in full.
+	wdetailEnvironmentUnread(a, "us-east-1", "attrs-fn")
+	f.agentCore.targetsByGateway["gw-wd"] = []agentcoretypes.TargetSummary{{TargetId: aws.String("tgt-2"), Name: aws.String("mcp-tool"),
+		Status: agentcoretypes.TargetStatusReady, TargetType: agentcoretypes.TargetTypeMcpServer}}
+	s3bScanAndProject(l, a, f)
+	fnAttrs := attrs("attrs-fn")
+	if v, present := fnAttrs["env_var_names"]; !present || v != nil {
+		t.Errorf("env_var_names with the environment returned as an error = %v (present %v), want null: not read, never []", v, present)
+	}
+	if strings.Contains(wdetailJSON(fnAttrs), "KMSAccessDenied") || strings.Contains(wdetailJSON(fnAttrs), "decrypt") {
+		t.Errorf("provider_attrs = %s: the error is not an allowlisted fact", wdetailJSON(fnAttrs))
+	}
+	if targets := digl(attrs("tools-gw"), "gateway_targets"); len(targets) != 1 || digs(targets[0], "id") != "tgt-2" {
+		t.Fatalf("scan 3 gateway_targets = %s, want [tgt-2]", wdetailJSON(targets))
+	}
+
+	// Scan 4: ListGatewayTargets fails. The collector keeps tgt-2 on
+	// cloud_workload (workloadAttrsMerge), but this scan confirmed nothing,
+	// so the detail says "not collected" rather than show tgt-2 as the
+	// gateway's current list. The variables are readable again: a good read
+	// clears the unread flag.
+	f.agentCore.listTargetsFail = denied("bedrock-agentcore:ListGatewayTargets")
+	wdetailFunctions(a, "us-east-1", wdetailFn{name: "attrs-fn", role: role, env: []string{"GAMMA"}})
+	s3bScanAndProject(l, a, f)
+	var kept int64
+	l.db.Raw(`SELECT jsonb_array_length(attrs->'gateway_targets') FROM cloud_workload
+	           WHERE workspace_id = ? AND name = 'tools-gw' AND attrs->>'targets_incomplete' = 'true'`, l.ws).Scan(&kept)
+	if kept != 1 {
+		t.Fatalf("setup: the collector kept %d targets with targets_incomplete, want tgt-2 kept", kept)
+	}
+	gwAttrs := attrs("tools-gw")
+	if v, present := gwAttrs["gateway_targets"]; !present || v != nil {
+		t.Errorf("gateway_targets after a failed ListGatewayTargets = %s (present %v), want null: not read this scan, never the kept list", wdetailJSON(v), present)
+	}
+	if got := strings.Join(wdetailStrings(attrs("attrs-fn")["env_var_names"]), ","); got != "GAMMA" {
+		t.Errorf("env_var_names once readable again = %q, want GAMMA", got)
+	}
 }
 
 // E8 / §5.2 "Retired objects": a retired workload is readable on every route,

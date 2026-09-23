@@ -785,6 +785,7 @@ func (s *AWSWorkloadScanner) recordWorkload(
 		ExecutionRoleARN:   w.ExecutionRoleARN,
 		InstanceProfileARN: w.InstanceProfileARN,
 		EnvVarNames:        w.EnvVarNames,
+		EnvVarsUnread:      w.EnvVarsUnread,
 		FoundationModel:    w.FoundationModel,
 		Status:             w.Status,
 		DetailIncomplete:   w.DetailIncomplete,

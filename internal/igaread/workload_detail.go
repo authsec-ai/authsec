@@ -35,8 +35,10 @@ import (
 // allowlist, never the raw jsonb. The projector writes these from the
 // collected workload (igagraph workloadProviderAttrs); there is no read-side
 // fallback to cloud_*. A fact the collector did not record for this kind is
-// null (not applicable, or not collected); an empty list is a collected
-// answer. Environment variable NAMES only -- values are never collected.
+// null (not applicable, or not collected -- including a list the latest scan
+// could not read, never the list an earlier scan kept); an empty list is a
+// collected answer. Environment variable NAMES only -- values are never
+// collected.
 type WorkloadProviderAttrs struct {
 	Status          *string                   `json:"status"`
 	FoundationModel *string                   `json:"foundation_model"`

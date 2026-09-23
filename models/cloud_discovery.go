@@ -1499,6 +1499,11 @@ type AWSWorkloadAttrs struct {
 	InstanceProfileARN string `json:"instance_profile_arn,omitempty"`
 	// EnvVarNames are Lambda environment variable names. NEVER values.
 	EnvVarNames []string `json:"env_var_names,omitempty"`
+	// EnvVarsUnread: AWS returned the function's environment as an error
+	// (EnvironmentResponse.Error, e.g. Lambda could not decrypt the variables
+	// with the function's KMS key) instead of its variables, so no names were
+	// read -- EnvVarNames empty then means unknown, never "has none".
+	EnvVarsUnread bool `json:"env_vars_unread,omitempty"`
 	// FoundationModel is the Bedrock agent's model id.
 	FoundationModel string `json:"foundation_model,omitempty"`
 	// Status is the provider's own lifecycle string, verbatim.

@@ -9,8 +9,9 @@ import (
 
 // workloadProviderAttrs copies the collected workload's display facts (D-85)
 // and nothing else; a list is written empty only where empty is a collected
-// answer, and an unread gateway target list is left out -- unknown, never
-// empty. The rescan path is proven end to end in
+// answer, and a list this scan did not read (variables returned as an error,
+// a gateway target list not read in full) is left out -- unknown, never empty
+// and never the last list kept. The rescan path is proven end to end in
 // tests/integration/p2_wdetail_detail_test.go.
 func TestP2WdetailWorkloadProviderAttrs(t *testing.T) {
 	attrs := func(kind string, a models.AWSWorkloadAttrs) map[string]any {
@@ -38,6 +39,11 @@ func TestP2WdetailWorkloadProviderAttrs(t *testing.T) {
 	if _, ok := attrs(models.WorkloadECSTaskDefinition, models.AWSWorkloadAttrs{Status: "ACTIVE"})["env_var_names"]; ok {
 		t.Error("an ECS task definition got env_var_names: nothing collected them for that kind")
 	}
+	// AWS returned the environment as an error (e.g. KMS): nothing was read,
+	// so the names are unknown -- absent, never [] ("has none").
+	if v, ok := attrs(models.WorkloadLambdaFunction, models.AWSWorkloadAttrs{Status: "Active", EnvVarsUnread: true})["env_var_names"]; ok {
+		t.Errorf("a Lambda whose variables were NOT read = %v, want env_var_names absent (unknown), never []", v)
+	}
 
 	agent := attrs(models.WorkloadBedrockAgent, models.AWSWorkloadAttrs{Status: "PREPARED", FoundationModel: "m"})
 	if agent["foundation_model"] != "m" || agent["status"] != "PREPARED" || agent["gateway_targets"] != nil {
@@ -58,7 +64,9 @@ func TestP2WdetailWorkloadProviderAttrs(t *testing.T) {
 	if v, ok := gw(models.AWSWorkloadAttrs{TargetsIncomplete: true}); ok {
 		t.Errorf("an UNREAD target list = %v, want absent (unknown), never []", v)
 	}
-	if v, ok := gw(models.AWSWorkloadAttrs{TargetsIncomplete: true, GatewayTargets: []models.AWSGatewayTarget{target}}); !ok || len(v.([]any)) != 1 {
-		t.Errorf("an unread list with the kept previous targets = %v, want the kept list", v)
+	// The collector keeps its last complete list when ListGatewayTargets
+	// fails; this scan did not confirm it, so it is not shown as current.
+	if v, ok := gw(models.AWSWorkloadAttrs{TargetsIncomplete: true, GatewayTargets: []models.AWSGatewayTarget{target}}); ok {
+		t.Errorf("an unread list with the kept previous targets = %v, want absent (not read this scan), never the old list", v)
 	}
 }

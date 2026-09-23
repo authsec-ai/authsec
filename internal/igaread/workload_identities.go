@@ -20,7 +20,8 @@ package igaread
 // the row, marked stale, and the state. Neither hides the other.
 //
 // A multi-section tab (D-77): the detail envelope, each section a page
-// {items, next_cursor, total_known, total}. ?section=<name>&cursor= returns
+// {items, next_cursor, total_known, total} under the §5.2 totals rule (D-15:
+// total_at_least above 10 000, no total when unknown). ?section=<name>&cursor= returns
 // that section alone; the cursor's route carries the workload and the section
 // (D-62), so a cursor for one cannot page another. Each section is ordered by
 // name, then account, then claim id (§2.14.6, D-13); the execution section
@@ -49,12 +50,28 @@ const (
 
 var workloadIdentitySections = []string{WorkloadSectionExecution, WorkloadSectionOther, WorkloadSectionGroups, WorkloadSectionMayAssume}
 
-// PagedSection is one paged section of a multi-section tab (D-77).
+// PagedSection is one paged section of a multi-section tab (D-77): {items,
+// next_cursor, total_known, total}, under the list envelope's totals rule
+// (§5.2 Totals, D-15, §2.14.14): total only when total_known; above TotalCap,
+// total_known false and total_at_least; a count that timed out, total_known
+// false and nothing else -- so "more than 10 000" and "not counted" never
+// read alike. Set the three through SetTotal, never by hand.
 type PagedSection[T any] struct {
-	Items      []T     `json:"items"`
-	NextCursor *string `json:"next_cursor"`
-	TotalKnown bool    `json:"total_known"`
-	Total      *int64  `json:"total"`
+	Items        []T     `json:"items"`
+	NextCursor   *string `json:"next_cursor"`
+	TotalKnown   bool    `json:"total_known"`
+	Total        *int64  `json:"total,omitempty"`
+	TotalAtLeast *int64  `json:"total_at_least,omitempty"`
+}
+
+// SetTotal records a section's counted total -- n rows counted with LIMIT
+// TotalCap+1, known=false when the optional count timed out -- by the one
+// rule ListMeta.SetTotal applies to a list, so a section and a list cannot
+// state the same count differently.
+func (s *PagedSection[T]) SetTotal(n int64, known bool) {
+	var m ListMeta
+	m.SetTotal(n, known)
+	s.TotalKnown, s.Total, s.TotalAtLeast = m.TotalKnown, m.Total, m.TotalAtLeast
 }
 
 // WorkloadIdentityClaim is one item of execution, other and groups: the
@@ -400,6 +417,8 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 		data := WorkloadIdentities{Ref: R(RefWorkload, w.ID)}
 		for _, name := range wanted {
 			s := specs[name]
+			// No sources: nothing to count, and the empty section's total is
+			// exactly 0.
 			total, known := int64(0), true
 			if len(s.sources) > 0 {
 				n, ok, err := q.CountUpTo(func(tx *gorm.DB) *gorm.DB {
@@ -409,15 +428,12 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 				if err != nil {
 					return err
 				}
-				total, known = n, ok && n <= TotalCap
-			}
-			var totalPtr *int64
-			if known {
-				totalPtr = &total
+				total, known = n, ok
 			}
 			switch name {
 			case WorkloadSectionMayAssume:
-				sec := &PagedSection[WorkloadMayAssume]{Items: []WorkloadMayAssume{}, NextCursor: next[name], TotalKnown: known, Total: totalPtr}
+				sec := &PagedSection[WorkloadMayAssume]{Items: []WorkloadMayAssume{}, NextCursor: next[name]}
+				sec.SetTotal(total, known)
 				for _, row := range pages[name] {
 					sec.Items = append(sec.Items, WorkloadMayAssume{
 						Claim: R(RefRelationship, row.ID), Type: row.RelationshipType,
@@ -431,7 +447,8 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 				}
 				data.MayAssume = sec
 			default:
-				sec := &PagedSection[WorkloadIdentityClaim]{Items: []WorkloadIdentityClaim{}, NextCursor: next[name], TotalKnown: known, Total: totalPtr}
+				sec := &PagedSection[WorkloadIdentityClaim]{Items: []WorkloadIdentityClaim{}, NextCursor: next[name]}
+				sec.SetTotal(total, known)
 				for _, row := range pages[name] {
 					item := WorkloadIdentityClaim{
 						Claim: R(RefRelationship, row.ID), Type: row.RelationshipType,
@@ -482,6 +499,19 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 		if err != nil {
 			return err
 		}
+		// may_assume rests on the trust documents of EVERY connected account,
+		// not the workload's own: a can_assume edge is reconciled under the
+		// connector that read the trusting role, and a role in any account may
+		// name the execution identity (workloadTrustParts). Only when this
+		// answer has a may_assume section with sources: with no execution
+		// identity no trust document can name one -- which is also why a
+		// retired workload (its executes_as ended with it) gets none.
+		var trust []*workloadResolvedPart
+		if len(exec) > 0 && contains(wanted, WorkloadSectionMayAssume) {
+			if trust, err = q.workloadTrustParts(); err != nil {
+				return err
+			}
+		}
 		out = Envelope{Data: data, Meta: WorkloadTabMeta{
 			DetailMeta: NewDetailMeta(q),
 			Workload:   WorkloadSubject{Ref: R(RefWorkload, w.ID), Lifecycle: w.Lifecycle, RetiredReason: strPtr(w.RetiredReason)},
@@ -490,7 +520,7 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 			// identities' memberships and the trust documents can_assume is
 			// read from; not_in_scan is explained by iam_roles there.
 			Coverage: q.workloadCoverage(accts, &w.WorkloadRecord, nodes,
-				workloadCoverageScope{Execution: true, Memberships: true, Trust: true}),
+				workloadCoverageScope{Execution: true, Memberships: true, Trust: trust}),
 		}}
 		return nil
 	})

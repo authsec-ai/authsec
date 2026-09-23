@@ -15,7 +15,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
+	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/igaread"
 	"github.com/authsec-ai/authsec/models"
+	"github.com/authsec-ai/authsec/services"
 )
 
 // wdetailIdentities is the tab of a workload, required 200.
@@ -324,5 +327,177 @@ func TestP2WdetailECSTaskExecutionRoleIsOther(t *testing.T) {
 	}
 	if strings.Join(texts, ",") != "arn:aws:s3:::billing/*" {
 		t.Errorf("resources = %v, want only the task role's billing/* -- never the task execution role's grants", texts)
+	}
+}
+
+// §5.2 Totals / D-15 on a section (D-77): above 10 000 a section says so --
+// total_known false, total_at_least 10000, and no total -- exactly as a list
+// does; it never reads like a count that timed out. The rows beyond the one
+// real trust edge are inserted directly: the fakes could produce 10 001
+// trusting roles, but only by pushing them all through the scanner, and the
+// section's count is what is under test here, not the projector.
+func TestP2WdetailIdentitiesSectionTotalAboveTheCap(t *testing.T) {
+	l, a := wdetailSharedLab(t, "p2-wdetail-ids-cap")
+	shared := a.roleARN("SharedToolRole")
+	trustRole(a, "bulk-target", "AROAWDETAILBULKTGT01", trustDoc(trustAllow(`{"AWS":"`+shared+`"}`, "sts:AssumeRole")))
+	l.scanAndProject(a)
+	role, target := wdetailIdentity(t, l, "SharedToolRole"), wdetailIdentity(t, l, "bulk-target")
+	if err := l.db.Exec(`INSERT INTO iga_relationship (workspace_id, relationship_type, source_identity_account_id,
+	                            target_identity_account_id, source_key, mechanism, partition_key, connector_id)
+	                     SELECT ?, 'can_assume', ?, ?, 'wdetail-bulk-' || g, ?, 'wdetail-bulk', ?
+	                       FROM generate_series(1, ?) AS g`,
+		l.ws, role, target, models.MechanismSTSAssumeRole, a.conn, igaread.TotalCap).Error; err != nil {
+		t.Fatalf("insert the bulk trust edges: %v", err)
+	}
+	api := l.api()
+	id := wdetailWorkload(t, l, "ticket-tools").String()
+
+	for _, path := range []string{"/workloads/" + id + "/identities", "/workloads/" + id + "/identities" + qs("section", "may_assume")} {
+		body := wdetailGet(t, api, path)
+		may, _ := dig(body, "data", "may_assume").(map[string]any)
+		if _, present := may["total"]; present || may["total_known"] != false || num(may, "total_at_least") != igaread.TotalCap {
+			t.Errorf("GET %s may_assume totals = total %v (present %v), total_known %v, total_at_least %v; "+
+				"want no total, total_known false, total_at_least %d", path, may["total"], present, may["total_known"], may["total_at_least"], igaread.TotalCap)
+		}
+		if len(digl(may, "items")) != 100 || dig(may, "next_cursor") == nil {
+			t.Errorf("GET %s may_assume = %d items, next_cursor %v; want a full page of 100 and a cursor",
+				path, len(digl(may, "items")), dig(may, "next_cursor"))
+		}
+	}
+	// A section under the cap in the same answer keeps its exact total, and
+	// carries no total_at_least.
+	exec, _ := dig(wdetailGet(t, api, "/workloads/"+id+"/identities"), "data", "execution").(map[string]any)
+	if _, atLeast := exec["total_at_least"]; exec["total_known"] != true || num(exec, "total") != 1 || atLeast {
+		t.Errorf("execution totals = %s, want total_known true, total 1, no total_at_least", wdetailJSON(exec))
+	}
+}
+
+// §2.14.14 "every gap that bears on this result" / D-73 for may_assume: a
+// can_assume edge is reconciled under the connector that READ the trusting
+// role's document -- the trusting account -- so the Identities tab's coverage
+// is not only the workload's own account's. A connected account whose roles
+// were not read bears on may_assume whether its rows exist and are stale, or
+// are missing altogether (no edge from that account was ever projected); a
+// revoked one is named revoked. Gaps that bear only on may_assume are not
+// stated for another section, nor for a workload with no execution identity
+// (no trust document can name one).
+func TestP2WdetailMayAssumeCoverageNamesTrustingAccounts(t *testing.T) {
+	const accountC = "318273645501"
+	l := newP2Lab(t, "p2-wdetail-ids-trust-cov", true)
+	a := l.account(accountA)
+	shared := a.role("SharedToolRole", "AROAWDETAILSHARED001")
+	wdetailFunctions(a, "us-east-1", wdetailFn{name: "ticket-tools", role: shared}, wdetailFn{name: "no-role-fn"})
+	l.scanAndProject(a)
+	// B's b-reader trusts A's SharedToolRole: an identity-sourced edge,
+	// crossing accounts, reconciled under B's trust partition.
+	b := l.account(accountB)
+	trustRole(b, "b-reader", "AROAWDETAILBREADER01", trustDoc(trustAllow(`{"AWS":"`+shared+`"}`, "sts:AssumeRole")))
+	l.scanAndProject(b)
+	api := l.api()
+	id := wdetailWorkload(t, l, "ticket-tools").String()
+	tab := "/workloads/" + id + "/identities"
+
+	type note struct{ account, surface, state string }
+	notes := func(body map[string]any) map[note]bool {
+		t.Helper()
+		out := map[note]bool{}
+		for _, c := range digl(body, "meta", "coverage") {
+			if digs(c, "affects") == "" {
+				t.Errorf("coverage entry %s has no affects", wdetailJSON(c))
+			}
+			out[note{digs(c, "account_id"), digs(c, "surface"), digs(c, "state")}] = true
+		}
+		return out
+	}
+
+	body := wdetailGet(t, api, tab)
+	may := digl(body, "data", "may_assume", "items")
+	if len(may) != 1 || digs(may[0], "target", "name") != "b-reader" || digs(may[0], "target", "account", "id") != accountB ||
+		digs(may[0], "state") != "current" {
+		t.Fatalf("may_assume = %s, want B's b-reader, current", wdetailJSON(may))
+	}
+	if n := l.count(`SELECT count(*) FROM iga_relationship WHERE workspace_id = ? AND relationship_type = 'can_assume'
+	                  AND connector_id = ? AND state = 'current' AND source_identity_account_id = ?`,
+		l.ws, b.conn, wdetailIdentity(t, l, "SharedToolRole")); n != 1 {
+		t.Fatalf("setup: %d current can_assume rows from SharedToolRole under B's connector, want 1", n)
+	}
+	if got := notes(body); len(got) != 0 {
+		t.Fatalf("clean scans: meta.coverage = %v, want []", got)
+	}
+
+	// B's roles are not read: its row goes stale and says why, and the tab's
+	// coverage names B's gap -- although every partition of A, the
+	// workload's own account, was reached.
+	b.iam.fail["GetAccountAuthorizationDetails:Role"] = denied("iam:GetAccountAuthorizationDetails")
+	l.scanAndProject(b)
+	body = wdetailGet(t, api, tab)
+	may = digl(body, "data", "may_assume", "items")
+	if len(may) != 1 || digs(may[0], "state") != "stale" || !strings.Contains(wdetailJSON(dig(may[0], "stale_reason")), `"account_id":"`+accountB+`"`) {
+		t.Fatalf("may_assume after B's roles were denied = %s, want b-reader stale with B's reason", wdetailJSON(may))
+	}
+	bGap := note{accountB, models.SurfaceIAMRoles, models.CloudCoverageDenied}
+	if got := notes(body); !got[bGap] || len(got) != 1 {
+		t.Errorf("meta.coverage = %v, want exactly B's iam_roles denied: the gap may_assume rests on", got)
+	}
+
+	// C is connected with its roles denied from its FIRST scan: no edge from
+	// C exists, stale or otherwise. A role in C may still trust
+	// SharedToolRole, so "b-reader only" is incomplete -- and only
+	// meta.coverage can say so.
+	c := l.account(accountC)
+	trustRole(c, "c-reader", "AROAWDETAILCREADER01", trustDoc(trustAllow(`{"AWS":"`+shared+`"}`, "sts:AssumeRole")))
+	c.iam.fail["GetAccountAuthorizationDetails:Role"] = denied("iam:GetAccountAuthorizationDetails")
+	l.scanAndProject(c)
+	if n := l.count(`SELECT count(*) FROM iga_relationship WHERE workspace_id = ? AND connector_id = ?`, l.ws, c.conn); n != 0 {
+		t.Fatalf("setup: %d relationships under C's connector, want none (its roles were never read)", n)
+	}
+	body = wdetailGet(t, api, tab)
+	cGap := note{accountC, models.SurfaceIAMRoles, models.CloudCoverageDenied}
+	if got := notes(body); !got[bGap] || !got[cGap] || len(got) != 2 {
+		t.Errorf("meta.coverage = %v, want B's and C's iam_roles denied: C's gap bears on rows that are missing", got)
+	}
+	if got := notes(wdetailGet(t, api, tab+qs("section", "may_assume"))); !got[bGap] || !got[cGap] {
+		t.Errorf("?section=may_assume meta.coverage = %v, want B's and C's gaps", got)
+	}
+	// Another section alone does not rest on trust documents.
+	if got := notes(wdetailGet(t, api, tab+qs("section", "execution"))); len(got) != 0 {
+		t.Errorf("?section=execution meta.coverage = %v, want []: trust gaps bear on may_assume only", got)
+	}
+	// A workload with no execution identity has no may_assume to rest on them.
+	if got := notes(wdetailGet(t, api, "/workloads/"+wdetailWorkload(t, l, "no-role-fn").String()+"/identities")); len(got) != 0 {
+		t.Errorf("no-role-fn meta.coverage = %v, want []: with no execution identity no trust document can name one", got)
+	}
+
+	// B's connector is revoked: its stored row stays visible (D-89), and the
+	// account is named revoked -- nothing more will be read from it.
+	if err := l.db.Exec(`UPDATE cloud_connector SET status = ? WHERE id = ?`, models.CloudConnectorRevoked, b.conn).Error; err != nil {
+		t.Fatal(err)
+	}
+	body = wdetailGet(t, api, tab)
+	if got := notes(body); !got[note{accountB, "*", models.CloudConnectorRevoked}] || !got[cGap] {
+		t.Errorf("meta.coverage after B was revoked = %v, want B revoked (and C's gap)", got)
+	}
+	if len(digl(body, "data", "may_assume", "items")) != 1 {
+		t.Errorf("may_assume after B was revoked = %s, want b-reader still shown with its stored state", wdetailJSON(dig(body, "data", "may_assume")))
+	}
+
+	// A's EKS Pod Identity read is denied. Pod Identity edges are can_assume
+	// rows too, under their own partition, but their source is a Kubernetes
+	// service account -- never an IAM role a workload runs as -- so that
+	// partition's gap bears nothing on may_assume.
+	eks := newFakeEKS()
+	eks.fail["ListClusters"] = denied("eks:ListClusters")
+	run := s2ScanWith(l, a, "wdetail-trust-cov-eks", func(_ *services.AWSIAMScanner, p *services.AWSPermissionScanner, _ *services.AWSWorkloadScanner) {
+		p.WithRegionalEKSAPI(func(string) awsdiscovery.EKSAPI { return eks })
+	})
+	if run.Status != models.CloudScanRunPublished || s2Coverage(run).Surfaces[models.SurfaceEKSPodIdentity].State != models.CloudCoverageDenied {
+		t.Fatalf("setup: run %s (%s), eks_pod_identity %+v; want published with eks_pod_identity denied",
+			run.Status, run.LastError, s2Coverage(run).Surfaces[models.SurfaceEKSPodIdentity])
+	}
+	l.project("wdetail-trust-cov-eks-projector")
+	for n := range notes(wdetailGet(t, api, tab)) {
+		if n.surface == models.SurfaceEKSPodIdentity {
+			t.Errorf("meta.coverage names %v: the Pod Identity partition is not what may_assume rests on", n)
+		}
 	}
 }

@@ -439,14 +439,20 @@ func identityProviderAttrs(ci models.CloudIdentity, trust map[string]any) json.R
 //
 // A fact the collector recorded nothing for is left out, and the detail
 // renders it null: not applicable to this kind, or not collected. Two lists
-// are written even when empty, because there empty is a collected answer:
+// are written even when empty, because there empty is a collected answer --
+// and each is left out when this scan did not read it, because an unread list
+// is unknown, never empty and never the last one we saw:
 //
 //   - a Lambda function's variable names come with its ListFunctions entry,
-//     so none listed means the function has none;
+//     so none listed means the function has none. When AWS returned the
+//     environment as an error instead (env_vars_unread: Lambda could not
+//     decrypt the variables with the function's KMS key), nothing was read.
 //   - a gateway's target list read in full is its whole list. One NOT read in
-//     full (targets_incomplete) carries what the collector kept from its last
-//     complete read (workloadAttrsMerge), and nothing when it kept nothing --
-//     an unread target list is unknown, never empty.
+//     full (targets_incomplete) is left out, although the collector keeps the
+//     list of its last complete read on cloud_workload (workloadAttrsMerge):
+//     that list is not confirmed by this scan, and D-85's shape has no field
+//     to say so, so showing it would present an old list as the current one.
+//     A list cut short after its first page is not the gateway's list either.
 //
 // Values are never read: EnvVarNames holds names only, by construction of the
 // collector (awsdiscovery lambdaEnvVarNames).
@@ -460,6 +466,8 @@ func workloadProviderAttrs(cw models.CloudWorkload) json.RawMessage {
 		out["foundation_model"] = a.FoundationModel
 	}
 	switch {
+	case a.EnvVarsUnread:
+		// Not read this scan: null, whatever kind, whatever was kept.
 	case cw.RuntimeKind == models.WorkloadLambdaFunction:
 		names := a.EnvVarNames
 		if names == nil {
@@ -469,7 +477,7 @@ func workloadProviderAttrs(cw models.CloudWorkload) json.RawMessage {
 	case len(a.EnvVarNames) > 0:
 		out["env_var_names"] = a.EnvVarNames
 	}
-	if cw.RuntimeKind == models.WorkloadBedrockAgentCoreGW && (len(a.GatewayTargets) > 0 || !a.TargetsIncomplete) {
+	if cw.RuntimeKind == models.WorkloadBedrockAgentCoreGW && !a.TargetsIncomplete {
 		targets := a.GatewayTargets
 		if targets == nil {
 			targets = []models.AWSGatewayTarget{}

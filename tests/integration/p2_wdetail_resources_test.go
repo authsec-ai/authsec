@@ -234,6 +234,37 @@ func TestP2WdetailResourcesDenyAndBoundaryAreRestrictions(t *testing.T) {
 		}
 	}
 	check("with a grant row on the Deny and on the boundary")
+
+	// Restrictions are the holder's LIVE ones (D-78, D-12): NoDeletes is
+	// detached and the boundary removed, while both policies still exist in
+	// the account -- so their statements stay active and only the ended
+	// assignments can take them out of the count. The defect rows go first:
+	// this stage is about the assignments alone.
+	if err := l.db.Exec(`DELETE FROM iga_access_edges WHERE workspace_id = ? AND partition_key = 'wdetail-defect'`, l.ws).Error; err != nil {
+		t.Fatalf("remove the defect grants: %v", err)
+	}
+	a.detach("guarded-role", a.policyARN("NoDeletes"))
+	s3aEditRole(t, a, "guarded-role", func(r *iamtypes.Role) { r.PermissionsBoundary = nil })
+	l.scanAndProject(a)
+	for _, d := range []struct{ policy, kind string }{{"NoDeletes", "attached"}, {"ToolBoundary", "boundary"}} {
+		if n := l.count(`SELECT count(*) FROM iga_policy_assignment a JOIN iga_policy p ON p.workspace_id = a.workspace_id AND p.id = a.policy_id
+		                  WHERE a.workspace_id = ? AND p.display_name = ? AND a.assignment_kind = ? AND a.state = 'ended'
+		                    AND p.lifecycle = 'active'`, l.ws, d.policy, d.kind); n != 1 {
+			t.Fatalf("setup: %d ended %s assignments of the still-active %s, want 1", n, d.kind, d.policy)
+		}
+	}
+	if n := l.count(`SELECT count(*) FROM iga_entitlements WHERE workspace_id = ? AND provider = 'aws' AND effect = 'deny'
+	                  AND lifecycle = 'active'`, l.ws); n != 1 {
+		t.Fatalf("setup: %d active Deny statements, want NoDeletes' one still active (only its assignment ended)", n)
+	}
+	rows := digl(wdetailResources(t, api, l, "wd-fn"), "data")
+	if len(rows) != 1 || digs(rows[0], "resource", "text") != "arn:aws:s3:::support-tickets/*" || len(digl(rows[0], "grants")) != 2 {
+		t.Fatalf("after the detach: rows = %s, want support-tickets/* with its two Allow lines", wdetailJSON(rows))
+	}
+	if dig(rows[0], "restrictions", "deny_statements") != float64(0) || dig(rows[0], "restrictions", "permissions_boundary") != false {
+		t.Errorf("after the detach: restrictions = %v, want deny_statements 0 and permissions_boundary false: "+
+			"an ended assignment restricts nothing", dig(rows[0], "restrictions"))
+	}
 }
 
 // Paged by resource (D-77): kind order exact < selector < external, then name

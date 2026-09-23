@@ -151,3 +151,38 @@ func TestP2WdetailEdgeStaleReasonsNamesEveryEdge(t *testing.T) {
 		t.Errorf("an unexplained stale edge = %v (present %v), want []", rs, ok)
 	}
 }
+
+// §5.2 Totals / D-15 / §2.14.14 on a multi-section tab's section (D-77): the
+// list envelope's rule exactly. total only when total_known; above 10 000,
+// total_known false with total_at_least; a count that timed out, total_known
+// false and NOTHING else -- so "more than 10 000" and "not counted" never
+// render alike, and a section never writes "total": null.
+func TestP2WdetailSectionTotalsFollowTheListRule(t *testing.T) {
+	for name, tc := range map[string]struct {
+		n     int64
+		known bool
+		want  string
+	}{
+		"counted":             {3, true, `{"items":[],"next_cursor":null,"total_known":true,"total":3}`},
+		"empty":               {0, true, `{"items":[],"next_cursor":null,"total_known":true,"total":0}`},
+		"at the cap":          {TotalCap, true, `{"items":[],"next_cursor":null,"total_known":true,"total":10000}`},
+		"above the cap":       {TotalCap + 1, true, `{"items":[],"next_cursor":null,"total_known":false,"total_at_least":10000}`},
+		"the count timed out": {0, false, `{"items":[],"next_cursor":null,"total_known":false}`},
+	} {
+		sec := PagedSection[WorkloadIdentityClaim]{Items: []WorkloadIdentityClaim{}}
+		sec.SetTotal(tc.n, tc.known)
+		raw, err := json.Marshal(sec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != tc.want {
+			t.Errorf("%s: section = %s, want %s", name, raw, tc.want)
+		}
+		// And the list envelope states the same count the same way.
+		var m ListMeta
+		m.SetTotal(tc.n, tc.known)
+		if m.TotalKnown != sec.TotalKnown || (m.Total == nil) != (sec.Total == nil) || (m.TotalAtLeast == nil) != (sec.TotalAtLeast == nil) {
+			t.Errorf("%s: section %+v and list meta %+v disagree", name, sec, m)
+		}
+	}
+}
