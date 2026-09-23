@@ -575,12 +575,18 @@ func TestP2TrustConnectedIdentityIsTheSource(t *testing.T) {
 		t.Fatalf("after data-reader retires = %+v, want edge %s ended subject_retired, its source unchanged", ended, first[0].ID)
 	}
 	// The retired role's OWN trust edges end with it: its lab Lambda trust is
-	// sourced from an external principal (aws_service), which never retires,
-	// so only the target's cascade can close it.
+	// sourced from an external principal (aws_service), which never retires.
+	// B's trust partition was fully read and no longer names it, so partition
+	// reconciliation ends it not_seen before retireUnsupported runs (D-67); the
+	// retirement cascade alone is proven in tests/igagraph
+	// (TestTrustRetiredRoleEndsItsExternalEdges), where the partition cannot end.
 	own := trustEdgesTo(trustEdges(l), "data-reader")
 	if len(own) != 1 || own[0].ExtKind != models.ExternalPrincipalAWSService || own[0].State != models.RelEnded ||
-		own[0].EndedReason != models.EndedSubjectRetired {
-		t.Errorf("retired data-reader's own trust edges = %+v, want its aws_service edge ended subject_retired", own)
+		own[0].EndedReason != models.EndedNotSeen {
+		t.Errorf("retired data-reader's own trust edges = %+v, want its aws_service edge ended not_seen (D-67)", own)
+	}
+	if _, ok := trustNode(l, "aws", "lambda.amazonaws.com"); !ok {
+		t.Error("the aws_service node was removed with the role; external principals never retire (D-47)")
 	}
 
 	trustCycle(l, a, nil)
@@ -863,5 +869,110 @@ func TestP2TrustRevokedAccountIsNotConnected(t *testing.T) {
 	got := trustEdgesTo(trustEdges(l), "reader-access")
 	if len(got) != 1 || got[0].SourceIdentity != nil || got[0].ExtSubject != reader || got[0].ExtResolved != nil {
 		t.Errorf("reader-access = %+v, want an unresolved aws_principal: account %s is revoked", got, accountB)
+	}
+}
+
+// trustNegatedKeys reads a role's provider_attrs.trust_negated_statements.
+func trustNegatedKeys(l *p2Lab, role string) []string {
+	l.t.Helper()
+	var keys []string
+	if err := l.db.Raw(`SELECT jsonb_array_elements_text(provider_attrs->'trust_negated_statements')
+	                      FROM iga_identity_accounts
+	                     WHERE workspace_id = ? AND display_name = ? AND lifecycle = 'active'
+	                       AND jsonb_typeof(provider_attrs->'trust_negated_statements') = 'array'`,
+		l.ws, role).Scan(&keys).Error; err != nil {
+		l.t.Fatalf("read trust_negated_statements of %s: %v", role, err)
+	}
+	return keys
+}
+
+// D-88: an Allow written with NotAction yields its edge when it does not
+// exclude the assume action, and that edge must carry `negated_statement`. No
+// can_assume column can say so (031), so the role records the statement keys
+// of its NotAction statements -- exactly the edges' statement_key, and only
+// theirs -- and an unreadable document keeps what the same incarnation said.
+func TestP2TrustNotActionMarksItsStatement(t *testing.T) {
+	l := newP2Lab(t, "p2-trust-notaction", true)
+	a := l.account(accountA)
+	trustRole(a, "notaction-role", "AROANOTACTIONROLE001", trustDoc(
+		`{"Sid":"AllButTagging","Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"NotAction":"sts:TagSession"}`,
+		trustAllow(`{"Service":"ecs-tasks.amazonaws.com"}`, "sts:*")))
+	a.role("plain-role", "AROAPLAINROLEPLAINRO") // the lab's Lambda trust: Action, no NotAction
+	trustCycle(l, a, nil)
+
+	edges := trustEdgesTo(trustEdges(l), "notaction-role")
+	bySubject := map[string]trustEdge{}
+	for _, e := range edges {
+		bySubject[e.ExtSubject] = e
+	}
+	negated, plain := bySubject["lambda.amazonaws.com"], bySubject["ecs-tasks.amazonaws.com"]
+	if len(edges) != 2 || negated.ID == uuid.Nil || plain.ID == uuid.Nil {
+		t.Fatalf("notaction-role edges = %+v, want the NotAction lambda edge and the sts:* ecs-tasks edge", edges)
+	}
+	keys := trustNegatedKeys(l, "notaction-role")
+	if len(keys) != 1 || keys[0] != negated.StatementKey {
+		t.Errorf("trust_negated_statements = %v, want exactly the NotAction edge's statement_key %q (not %q)",
+			keys, negated.StatementKey, plain.StatementKey)
+	}
+	if n := len(trustEdgesTo(trustEdges(l), "plain-role")); n != 1 {
+		t.Fatalf("setup: plain-role has %d edges, want its Lambda trust", n)
+	}
+	if other := trustNegatedKeys(l, "plain-role"); len(other) != 0 {
+		t.Errorf("a role with no NotAction statement lists %v", other)
+	}
+
+	// Unreadable next scan: the edges are protected, and so is the marker
+	// their limitation is drawn from.
+	trustSetDoc(a, "notaction-role", trustDoc(
+		`{"Sid":"AllButTagging","Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"NotAction":"sts:TagSession"}`,
+		`{"Effect":"Allow","Principal":{"Service":7},"Action":"sts:AssumeRole"}`))
+	trustCycle(l, a, nil)
+	if got := trustNegatedKeys(l, "notaction-role"); len(got) != 1 || got[0] != negated.StatementKey {
+		t.Errorf("after an unreadable scan trust_negated_statements = %v, want %q kept", got, negated.StatementKey)
+	}
+	for _, e := range trustEdgesTo(trustEdges(l), "notaction-role") {
+		if e.State != models.RelStale {
+			t.Errorf("unreadable role's edge %s = %s, want stale", e.ExtSubject, e.State)
+		}
+	}
+}
+
+// A same-account principal that this run's COMPLETE role listing no longer
+// names (deleted between the listing and the trust read; AWS has not yet
+// rewritten the ARN to its unique id). The prefetched graph still holds it as
+// live -- reconciliation retires it later in the same pass -- so sourcing the
+// edge from it would re-confirm a principal the run proved gone and end the
+// edge in the same breath. It is an unresolved aws_principal instead, and the
+// old identity edge ends with its last confirmation untouched.
+func TestP2TrustUnlistedOwnPrincipalIsNotTheSource(t *testing.T) {
+	l := newP2Lab(t, "p2-trust-unlisted", true)
+	a := l.account(accountA)
+	producer := a.role("producer", "AROAPRODUCERUNLISTED")
+	trustRole(a, "consumer", "AROACONSUMERUNLISTED", trustDoc(trustAllow(`{"AWS":"`+producer+`"}`, "sts:AssumeRole")))
+	trustCycle(l, a, nil)
+	before := trustEdgesTo(trustEdges(l), "consumer")
+	if len(before) != 1 || before[0].SourceName != "producer" {
+		t.Fatalf("setup: consumer = %+v, want identity-sourced from producer", before)
+	}
+
+	trustRemoveRole(a, "producer")
+	time.Sleep(10 * time.Millisecond)
+	trustCycle(l, a, nil)
+
+	var live, ended []trustEdge
+	for _, e := range trustEdgesTo(trustEdges(l), "consumer") {
+		if e.State == models.RelEnded {
+			ended = append(ended, e)
+		} else {
+			live = append(live, e)
+		}
+	}
+	if len(live) != 1 || live[0].State != models.RelCurrent || live[0].ExtKind != models.ExternalPrincipalAWSPrincipal ||
+		live[0].ExtSubject != producer || live[0].ExtResolved != nil || live[0].SourceIdentity != nil {
+		t.Errorf("consumer's live edges = %+v, want one current edge from an unresolved aws_principal %s", live, producer)
+	}
+	if len(ended) != 1 || ended[0].ID != before[0].ID || !ended[0].LastConfirmed.Equal(before[0].LastConfirmed) {
+		t.Errorf("consumer's ended edges = %+v, want the old identity edge, last confirmed %s and never again",
+			ended, before[0].LastConfirmed)
 	}
 }

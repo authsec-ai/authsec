@@ -3,6 +3,7 @@ package igagraph
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +51,13 @@ const TrustPartitionKind = "trust"
 const (
 	TrustHasDenyAttr         = "trust_has_deny"
 	TrustHasNotPrincipalAttr = "trust_has_not_principal"
+	// TrustNegatedStatementsAttr lists the statement_key of every Allow trust
+	// statement written with NotAction, in document order; absent when there
+	// is none. D-88: such a statement's edges carry `negated_statement`, and a
+	// can_assume row has no column that could say so (031) -- the read side
+	// marks an edge whose statement_key is listed on its target role. Not in
+	// D-85's rendered allowlist: it feeds limitations, not the detail panel.
+	TrustNegatedStatementsAttr = "trust_negated_statements"
 )
 
 // trustSource is the ONE source an edge gets (iga_relationship_source_chk):
@@ -72,6 +80,8 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 	}
 	r.liveExternal = live
 
+	// One timestamp for every row this pass writes -- edges, external
+	// principals, pod-identity edges -- so they join on it (D-26).
 	now := p.now()
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, TrustPartitionKind, "")
 	for _, role := range snap.Roles() {
@@ -90,16 +100,14 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 			return err
 		}
 		roleEP := EndpointKey(role)
-		sids, seen := CountTrustSids(doc.Statements), map[string]int{}
-		for _, st := range doc.Statements {
-			// Keyed for EVERY statement, in document order, so #n numbering of
-			// identical Sid-less statements never depends on which are edges.
-			stKey, _ := TrustStatementKey(roleEP, st, sids, seen)
+		stKeys := trustStatementKeys(roleEP, doc)
+		for i, st := range doc.Statements {
+			stKey := stKeys[i]
 			if st.Effect == models.EffectDeny || st.HasNotPrincipal() {
 				continue // D-44: recorded on the role (trustFlags), never an edge
 			}
 			for _, sub := range st.Subjects() {
-				src, err := p.trustSourceFor(tx, snap, r, sub)
+				src, err := p.trustSourceFor(tx, snap, r, sub, now)
 				if err != nil {
 					return fmt.Errorf("trust principal %q of %s: %w", sub.Entry.Value, role.NativeID, err)
 				}
@@ -116,10 +124,23 @@ func (p *Projector) projectTrust(tx *gorm.DB, snap *Snapshot, r *resolved) error
 			}
 		}
 	}
-	if err := p.projectPodIdentity(tx, snap, r); err != nil {
+	if err := p.projectPodIdentity(tx, snap, r, now); err != nil {
 		return err
 	}
 	return p.deriveResolutions(tx, snap, r)
+}
+
+// trustStatementKeys keys EVERY statement of a trust document, in document
+// order -- Deny and NotPrincipal statements included, so the #n numbering of
+// identical Sid-less statements never depends on which of them are edges. The
+// one spelling projectTrust and trustFlags both use.
+func trustStatementKeys(roleEP string, doc *awsdiscovery.TrustDocument) []string {
+	sids, seen := CountTrustSids(doc.Statements), map[string]int{}
+	out := make([]string, len(doc.Statements))
+	for i, st := range doc.Statements {
+		out[i], _ = TrustStatementKey(roleEP, st, sids, seen)
+	}
+	return out
 }
 
 // trustEdge is the can_assume row both declarations write. Stamped with the
@@ -152,19 +173,20 @@ func trustEdge(snap *Snapshot, part Partition, target uuid.UUID, now time.Time,
 //  3. Otherwise an external principal of the principal's kind (D-42):
 //     another account, a service, a federation, a session, a unique id, "*",
 //     or an ARN in an account that is not connected or whose identity is not
-//     live (not scanned yet, its read denied, deleted) -- unresolved.
+//     live (not scanned yet, its read denied, deleted -- including one this
+//     run's own complete listing no longer names) -- unresolved.
 //
 // Only an exact identity ARN can reach rule 2, so only it consults rule 1;
 // every other principal is external whichever way it is asked.
 func (p *Projector) trustSourceFor(tx *gorm.DB, snap *Snapshot, r *resolved,
-	sub awsdiscovery.TrustSubject) (trustSource, error) {
+	sub awsdiscovery.TrustSubject, now time.Time) (trustSource, error) {
 	extKey := ExternalPrincipalKey(sub.Issuer, sub.Subject)
 	if sub.IdentityARN != "" && !r.liveExternal[extKey] {
 		if gid, endpoint, ok := p.trustIdentity(snap, r, sub.IdentityARN, sub.Account); ok {
 			return trustSource{endpoint: endpoint, identity: &gid}, nil
 		}
 	}
-	ext, err := p.upsertExternal(tx, snap, r, sub.Issuer, sub.Subject, sub.Kind)
+	ext, err := p.upsertExternal(tx, snap, r, sub.Issuer, sub.Subject, sub.Kind, now)
 	if err != nil {
 		return trustSource{}, err
 	}
@@ -231,6 +253,16 @@ func (p *Projector) trustIdentity(snap *Snapshot, r *resolved, arn, account stri
 			return gid, EndpointKey(*ci), true
 		}
 	}
+	// THIS RUN LISTED ITS OWN ACCOUNT IN FULL AND DID NOT NAME IT. The
+	// prefetched graph still holds the row as live -- reconciliation retires it
+	// later in this same pass -- so an edge sourced from it would begin and end
+	// in one pass, claiming as its source a principal this run proved gone. It
+	// is an unresolved aws_principal instead (rule 3). Only when that kind's
+	// listing was REACHED: a denied or partial iam_users read proves nothing,
+	// and the live row stands.
+	if account == snap.Connector.ScopeID && listedInFull(snap, arn) {
+		return uuid.Nil, "", false
+	}
 	live := r.existing.identity[IdentityARNKey(arn)]
 	if live == nil || (live.AccountKind != models.CloudIdentityIAMRole && live.AccountKind != models.CloudIdentityIAMUser) {
 		return uuid.Nil, "", false
@@ -238,16 +270,28 @@ func (p *Projector) trustIdentity(snap *Snapshot, r *resolved, arn, account stri
 	return live.ID, IdentityAccountEndpointKey(*live), true
 }
 
+// listedInFull reports whether this run's listing of the identity kind an
+// exact role or user ARN names was complete (its surface reached), so that an
+// ARN of this account absent from the snapshot is absent from the account.
+func listedInFull(snap *Snapshot, arn string) bool {
+	surface := models.SurfaceIAMRoles
+	if parts := strings.SplitN(arn, ":", 6); len(parts) == 6 && strings.HasPrefix(parts[5], "user/") {
+		surface = models.SurfaceIAMUsers
+	}
+	cov, ok := snap.Coverage[surface]
+	return ok && cov.State == models.CloudCoverageReached
+}
+
 // upsertExternal writes (or re-sights) one external principal, once per pass.
 // Workspace-scoped and shared across connectors: lambda.amazonaws.com is ONE
 // node however many roles in however many accounts trust it. No support row,
 // no lifecycle (D-47): its state is derived at read time from its edges.
-func (p *Projector) upsertExternal(tx *gorm.DB, snap *Snapshot, r *resolved, issuer, subject, kind string) (uuid.UUID, error) {
+func (p *Projector) upsertExternal(tx *gorm.DB, snap *Snapshot, r *resolved,
+	issuer, subject, kind string, now time.Time) (uuid.UUID, error) {
 	key := ExternalPrincipalKey(issuer, subject)
 	if id, ok := r.external[key]; ok {
 		return id, nil
 	}
-	now := p.now()
 	id, err := p.repo.UpsertExternalPrincipal(tx, &models.IGAExternalPrincipal{
 		WorkspaceID: snap.Run.WorkspaceID, Issuer: issuer, SubjectClaim: subject,
 		Mechanism: kind, SourceKey: key, FirstSeenAt: now, LastSeenAt: now,
@@ -265,8 +309,7 @@ func (p *Projector) upsertExternal(tx *gorm.DB, snap *Snapshot, r *resolved, iss
 // PodIdentitySubject(system:serviceaccount:<ns>:<sa>) -- to the role (§1.4,
 // §4.7, D-42). An IRSA trust statement naming the same service account is a
 // separate `oidc` node with its own edge.
-func (p *Projector) projectPodIdentity(tx *gorm.DB, snap *Snapshot, r *resolved) error {
-	now := p.now()
+func (p *Projector) projectPodIdentity(tx *gorm.DB, snap *Snapshot, r *resolved, now time.Time) error {
 	part := snap.EdgePartitionFor(models.RelTypeCanAssume, models.MechanismEKSPodIdentity, "")
 	for _, pi := range snap.PodIdentity {
 		// §4.7's loop passes these without looking: a role outside this
@@ -294,7 +337,7 @@ func (p *Projector) projectPodIdentity(tx *gorm.DB, snap *Snapshot, r *resolved)
 			continue
 		}
 		subject := PodIdentitySubject(pi.Subject)
-		ext, err := p.upsertExternal(tx, snap, r, issuer, subject, models.ExternalPrincipalK8sServiceAccount)
+		ext, err := p.upsertExternal(tx, snap, r, issuer, subject, models.ExternalPrincipalK8sServiceAccount, now)
 		if err != nil {
 			return err
 		}
@@ -380,12 +423,14 @@ func (r *resolved) trustDocument(role models.CloudIdentity) (*awsdiscovery.Trust
 }
 
 // trustFlags returns what a role's provider_attrs say about its trust document
-// (D-44, D-85): trust_has_deny and trust_has_not_principal, as booleans. nil
-// for anything that is not a role.
+// (D-44, D-85, D-88): trust_has_deny and trust_has_not_principal, as booleans,
+// and trust_negated_statements when a NotAction statement exists. nil for
+// anything that is not a role.
 //
-// An UNREADABLE document says nothing new, so the flags this SAME incarnation
-// already carried stand. A recreated role (different immutable key) inherits
-// nothing: its flags are unknown until its document is read.
+// An UNREADABLE document says nothing new, so what this SAME incarnation
+// already carried stands -- its protected edges keep the limitations they
+// had. A recreated role (different immutable key) inherits nothing: its flags
+// are unknown until its document is read.
 func (p *Projector) trustFlags(r *resolved, snap *Snapshot, ci models.CloudIdentity,
 	live *models.IGAIdentityAccount) (map[string]any, error) {
 	if ci.Kind != models.CloudIdentityIAMRole {
@@ -403,16 +448,33 @@ func (p *Projector) trustFlags(r *resolved, snap *Snapshot, ci models.CloudIdent
 				out[k] = v
 			}
 		}
+		if v, ok := prev[TrustNegatedStatementsAttr].([]any); ok && len(v) > 0 {
+			out[TrustNegatedStatementsAttr] = v
+		}
 		return out, nil
 	}
 	doc, err := r.trustDocument(ci)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	out := map[string]any{
 		TrustHasDenyAttr:         doc.HasDeny(),
 		TrustHasNotPrincipalAttr: doc.HasNotPrincipal(),
-	}, nil
+	}
+	// D-88: the statement keys of the Allow statements written with
+	// NotAction -- the only ones whose edges are "every action except ...".
+	// Keyed exactly as projectTrust keys the edges.
+	var negated []string
+	for i, key := range trustStatementKeys(EndpointKey(ci), doc) {
+		st := doc.Statements[i]
+		if st.Effect == models.EffectAllow && len(st.NotActions) > 0 && !st.HasNotPrincipal() {
+			negated = append(negated, key)
+		}
+	}
+	if len(negated) > 0 {
+		out[TrustNegatedStatementsAttr] = negated
+	}
+	return out, nil
 }
 
 // trustExclusions names, in graph ids, the roles whose trust edges
