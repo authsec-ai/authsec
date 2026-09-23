@@ -409,7 +409,7 @@ func listsDecodeCursor(c *Cursor, keys []listsKey) (*listsAfter, *Error) {
 // timed out (D-14).
 func listsFacetCounts[S listsScan](q *Query, spec *listsSpec[S], filters []listsFilter, name string, accts *Accounts) ([]FacetValue, error) {
 	f := spec.facets[name]
-	w, args := listsWhere(filters, name)
+	w, args := listsWhere(filters, "")
 	counts := map[string]int64{}
 	ok, err := q.Optional(func(tx *gorm.DB) error {
 		var rows []struct {
